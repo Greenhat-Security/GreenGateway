@@ -642,7 +642,52 @@ impl ToolRegistry {
         Ok(())
     }
 
-    fn from_definitions_with_audit(
+    /// Validate a candidate local lane exactly the way an install would
+    /// (provenance, semantic checks, and the registered validator hook
+    /// over the merged set) without installing anything. Cluster mode
+    /// commits the candidate to the authority between this validation and
+    /// [`ToolRegistry::install_local_definitions`]; the install
+    /// re-validates against the lanes current at install time.
+    #[cfg_attr(not(feature = "postgres"), allow(dead_code))] // Only the
+                                                             // cluster-mode register path calls it; the file path validates inside
+                                                             // `replace_local_definitions_with_persist`.
+    pub fn validate_local_definitions(
+        &self,
+        local_definitions: &[ToolDefinition],
+    ) -> Result<(), ToolRegistryError> {
+        let provenance_problems = local_definition_provenance_problems(local_definitions);
+        if !provenance_problems.is_empty() {
+            return Err(ToolRegistryError::invalid(provenance_problems));
+        }
+        let state = self.state.load();
+        let merged = combined_definitions(
+            local_definitions,
+            &state.managed_openapi_definitions,
+            &state.mcp_proxy_definitions,
+        );
+        drop(state);
+        let semantic_problems = tool_definition_problems(&merged);
+        if !semantic_problems.is_empty() {
+            return Err(ToolRegistryError::invalid(semantic_problems));
+        }
+        self.validate_definitions(&merged)
+    }
+
+    /// Install a local lane that was validated and committed to the
+    /// authority (cluster mode): re-validates against the current lanes
+    /// (managed lanes may have moved since validation) and swaps. A
+    /// rejected install keeps the existing registry active -- fail
+    /// closed, exactly like a rejected file reload.
+    #[cfg_attr(not(feature = "postgres"), allow(dead_code))] // Only the
+                                                             // cluster-mode register path and the tools reconciler call it.
+    pub fn install_local_definitions(
+        &self,
+        local_definitions: Vec<ToolDefinition>,
+    ) -> Result<(), ToolRegistryError> {
+        self.replace_local_definitions(local_definitions)
+    }
+
+    pub(crate) fn from_definitions_with_audit(
         definitions: Vec<ToolDefinition>,
         audit: Option<AuditLog>,
     ) -> Self {
@@ -677,6 +722,15 @@ impl ToolRegistry {
             Err(poisoned) => *poisoned.into_inner() = Some(validator),
         }
         Ok(())
+    }
+
+    /// The currently installed local lane (the document-owned tools), in
+    /// document order. Tests and cluster wiring observe reconciliation
+    /// through this; serving paths use the merged snapshot.
+    #[allow(dead_code)] // Read by the cluster-mode tests; a production
+                        // consumer (cluster status) arrives with #241 PR 14.
+    pub fn current_local_definitions(&self) -> Vec<ToolDefinition> {
+        self.state.load().local_definitions.clone()
     }
 
     fn replace_local_definitions(
@@ -1233,7 +1287,7 @@ fn tools_file_too_large(path: &Path) -> ToolRegistryError {
     }
 }
 
-fn definitions_from_json_value(
+pub(crate) fn definitions_from_json_value(
     value: Value,
     path: Option<&Path>,
 ) -> Result<Vec<ToolDefinition>, ToolRegistryError> {

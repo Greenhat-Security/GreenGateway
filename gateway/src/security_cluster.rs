@@ -30,18 +30,21 @@
 use std::{
     sync::{
         atomic::{AtomicI64, Ordering},
-        Arc,
+        Arc, RwLock,
     },
     time::{Duration, Instant},
 };
 
 use async_trait::async_trait;
-use tokio::sync::{Mutex, RwLock};
+use tokio::sync::Mutex;
 
 use crate::{
     lifecycle::GatewayLifecycle,
     middleware::rbac::{RbacState, SecurityRevisionCheckError, SecurityRevisionGate},
-    storage::{PolicyControlPlane as _, PostgresPolicyStore, SecurityRevisionSource},
+    storage::{
+        PolicyControlPlane as _, PostgresPolicyStore, PostgresToolStore, SecurityRevisionSource,
+        ToolControlPlane as _,
+    },
 };
 
 /// The bounded reconcile wait after observing a new revision (HA state
@@ -105,9 +108,15 @@ impl ClusterSecurityRuntime {
     }
 
     /// Register a resource's reconciler. Startup-only in practice: called
-    /// by the app builder as each store is constructed, before serving.
-    pub(crate) async fn register_resource(&self, resource: Arc<dyn ReconciledResource>) {
-        self.resources.write().await.push(resource);
+    /// by the (synchronous) app builder as each store is constructed,
+    /// before serving.
+    pub(crate) fn register_resource(&self, resource: Arc<dyn ReconciledResource>) {
+        // Lock poisoning here means a reader panicked mid-clone; the set
+        // itself is still structurally valid, so recover it.
+        match self.resources.write() {
+            Ok(mut resources) => resources.push(resource),
+            Err(poisoned) => poisoned.into_inner().push(resource),
+        }
     }
 
     /// The background reconciler: poll the revision counter and reconcile
@@ -165,7 +174,13 @@ impl ClusterSecurityRuntime {
         compiled_revision: i64,
         deadline: Instant,
     ) -> Result<Option<i64>, SecurityRevisionCheckError> {
-        let resources = self.resources.read().await.clone();
+        // Clone the set under the lock and drop the guard before any
+        // await: registrations are startup-only, and no reconcile holds a
+        // reader while a resource runs.
+        let resources = match self.resources.read() {
+            Ok(resources) => resources.clone(),
+            Err(poisoned) => poisoned.into_inner().clone(),
+        };
         let mut moved_past_authority: Option<i64> = None;
         for resource in &resources {
             let remaining = deadline.saturating_duration_since(Instant::now());
@@ -307,6 +322,112 @@ impl ReconciledResource for PolicyResource {
             return Ok(());
         }
         self.reconcile().await
+    }
+}
+
+/// The tools document as a reconciled resource (issue #241, PR 8): the
+/// local lane of the tool registry, owned by the versioned tools document
+/// in the authority. Managed lanes (per-connection catalogs) are derived
+/// from the connection store and publish through their own paths; this
+/// resource only reconciles the document-owned lane.
+pub(crate) struct ToolsResource {
+    store: Arc<PostgresToolStore>,
+    registry: crate::tools::definitions::ToolRegistry,
+    /// The tools-document revision currently installed in the registry's
+    /// local lane. Installs are monotonic: a reconcile for a revision at
+    /// or below this is a no-op, so a slow reconcile can never overwrite a
+    /// newer lane with an older one.
+    installed_revision: AtomicI64,
+}
+
+impl ToolsResource {
+    pub(crate) fn new(
+        store: Arc<PostgresToolStore>,
+        registry: crate::tools::definitions::ToolRegistry,
+        boot_revision: i64,
+    ) -> Arc<Self> {
+        Arc::new(Self {
+            store,
+            registry,
+            installed_revision: AtomicI64::new(boot_revision),
+        })
+    }
+}
+
+#[async_trait]
+impl ReconciledResource for ToolsResource {
+    fn name(&self) -> &'static str {
+        "tools"
+    }
+
+    async fn activation_revision(&self) -> Result<i64, SecurityRevisionCheckError> {
+        match self.store.active_tools().await {
+            Ok(Some(active)) => Ok(active.security_revision),
+            Ok(None) => {
+                // Startup seeds the empty document, and the pointer is
+                // append-only, so this is unreachable in a healthy process.
+                // Fail closed anyway: no tools document authorizes nothing
+                // local, but an authority that lost its pointer is not one
+                // to trust for anything.
+                tracing::error!("the tools authority has no active document");
+                Err(SecurityRevisionCheckError::InvalidDocument)
+            }
+            Err(error) => {
+                tracing::error!(
+                    error = %error,
+                    "the tools activation revision could not be read"
+                );
+                Err(SecurityRevisionCheckError::Unavailable)
+            }
+        }
+    }
+
+    async fn reconcile(&self, compiled_revision: i64) -> Result<(), SecurityRevisionCheckError> {
+        if self.installed_revision.load(Ordering::Acquire) > compiled_revision {
+            return Ok(());
+        }
+        let active = self
+            .store
+            .active_tools()
+            .await
+            .map_err(|error| {
+                tracing::error!(
+                    error = %error,
+                    "tools reconciliation could not read the active document"
+                );
+                SecurityRevisionCheckError::Unavailable
+            })?
+            .ok_or_else(|| {
+                tracing::error!("tools reconciliation found no active document after startup");
+                SecurityRevisionCheckError::InvalidDocument
+            })?;
+
+        // The document must validate exactly the way a file load would;
+        // a document this binary cannot enforce never installs.
+        let definitions =
+            crate::tools::definitions::definitions_from_json_value(active.document, None).map_err(
+                |error| {
+                    tracing::error!(
+                        error = %error,
+                        "tools reconciliation rejected: the active document is invalid"
+                    );
+                    SecurityRevisionCheckError::InvalidDocument
+                },
+            )?;
+        // Install re-validates against the current managed lanes and
+        // swaps atomically; a rejection keeps the existing lane (fail
+        // closed) and surfaces as InvalidDocument to the gate.
+        if let Err(error) = self.registry.install_local_definitions(definitions) {
+            tracing::error!(
+                error = %error,
+                "tools reconciliation rejected: the active document does not validate \
+                 against the current managed lanes"
+            );
+            return Err(SecurityRevisionCheckError::InvalidDocument);
+        }
+        self.installed_revision
+            .store(active.security_revision, Ordering::Release);
+        Ok(())
     }
 }
 

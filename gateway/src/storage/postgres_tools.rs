@@ -54,9 +54,6 @@ pub trait ToolControlPlane: Send + Sync {
         actor_user_id: &str,
         diff_summary: &Value,
     ) -> Result<ActiveToolDocument, PolicyCommitError>;
-
-    /// The current shared security revision.
-    async fn current_security_revision(&self) -> Result<i64, RepositoryError>;
 }
 
 const TOOLS_DOCUMENT_RESOURCE: DocumentResource = DocumentResource {
@@ -84,6 +81,15 @@ pub struct PostgresToolStore {
 impl PostgresToolStore {
     pub fn new(pool: deadpool_postgres::Pool) -> Self {
         Self { pool }
+    }
+
+    /// The shared revision-counter view over this store's pool, for tests
+    /// and later cluster-status surfaces. Read-only; commits advance the
+    /// counter inside their own transactions.
+    #[allow(dead_code)] // The PR 8 tests read it; production consumers
+                        // (cluster status) arrive with #241 PR 14.
+    pub fn revision_source(&self) -> super::postgres_policy::SecurityRevisionSource {
+        super::postgres_policy::SecurityRevisionSource::new(self.pool.clone())
     }
 
     /// Idempotently seed the empty tools document. Racing first boots
@@ -207,11 +213,5 @@ impl ToolControlPlane for PostgresToolStore {
             etag,
             security_revision: committed.security_revision,
         })
-    }
-
-    async fn current_security_revision(&self) -> Result<i64, RepositoryError> {
-        super::postgres_policy::SecurityRevisionSource::new(self.pool.clone())
-            .current()
-            .await
     }
 }

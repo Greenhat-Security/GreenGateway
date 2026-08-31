@@ -70,7 +70,10 @@ use lifecycle::{
 };
 use proxy::{ProxyClassifier, ProxyState};
 #[cfg(feature = "postgres")]
+#[cfg(feature = "postgres")]
 use storage::PolicyControlPlane as _;
+#[cfg(feature = "postgres")]
+use storage::ToolControlPlane;
 use storage::{AuditEventStore as _, PrincipalDirectoryStore};
 
 const REQUEST_COUNTER: &str = "gateway_http_requests";
@@ -479,6 +482,11 @@ struct ToolAdminState {
     client_ip_policy: client_ip::ClientIpPolicy,
     max_body_size: usize,
     write_lock: Arc<Mutex<()>>,
+    /// Cluster mode's authoritative tools control plane. Present exactly
+    /// when `tools_file` is absent-but-cluster: register commits through
+    /// its CAS transaction instead of the file.
+    #[cfg(feature = "postgres")]
+    tool_control_plane: Option<Arc<dyn storage::ToolControlPlane>>,
 }
 
 #[derive(Clone)]
@@ -1393,6 +1401,11 @@ struct GatewayAppBuildOverrides {
     /// to hand to the app builder. None in standalone mode.
     #[cfg(feature = "postgres")]
     pg_policy: Option<ClusterPolicySeed>,
+    /// The cluster-mode tools control plane seed: the store plus the
+    /// authoritative local lane `run()` seeded and loaded. None in
+    /// standalone mode.
+    #[cfg(feature = "postgres")]
+    pg_tools: Option<ClusterToolsSeed>,
     #[cfg(test)]
     egress_resolver: Option<Arc<dyn egress::DnsResolver>>,
     #[cfg(test)]
@@ -1411,6 +1424,59 @@ struct ClusterPolicySeed {
     store: Arc<storage::PostgresPolicyStore>,
     active: storage::ActivePolicy,
 }
+
+/// The tools control plane's equivalent: the store, and the authoritative
+/// local lane the registry installs at boot.
+#[cfg(feature = "postgres")]
+struct ClusterToolsSeed {
+    store: Arc<storage::PostgresToolStore>,
+    active: storage::ActiveToolDocument,
+}
+
+/// Why cluster mode refused to start on the tools control plane. Fail
+/// closed, like the policy plane's startup errors.
+#[cfg(feature = "postgres")]
+#[derive(Debug)]
+enum ClusterToolsStartupError {
+    /// Seeding (or loading) the empty document failed.
+    Seeding(storage::PolicyCommitError),
+    /// The authority could not be read at startup.
+    Store(storage::RepositoryError),
+    /// Unreachable after a successful seed; defensive fail closed.
+    NotSeeded,
+    /// The active document failed validation: this binary refuses to
+    /// activate a tools document it cannot fully parse and enforce.
+    InvalidDocument(String),
+}
+
+#[cfg(feature = "postgres")]
+impl std::fmt::Display for ClusterToolsStartupError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Seeding(error) => write!(
+                formatter,
+                "the cluster-mode tools control plane could not seed its initial \
+                 document: {error}"
+            ),
+            Self::Store(error) => write!(
+                formatter,
+                "the cluster-mode tools control plane could not be read at startup: {error}"
+            ),
+            Self::NotSeeded => write!(
+                formatter,
+                "the cluster-mode tools control plane has no active document after \
+                 seeding; this is an internal validation gap -- please report it"
+            ),
+            Self::InvalidDocument(reason) => write!(
+                formatter,
+                "the active tools document failed validation and will not be served: {reason}"
+            ),
+        }
+    }
+}
+
+#[cfg(feature = "postgres")]
+impl std::error::Error for ClusterToolsStartupError {}
 
 /// Why cluster mode refused to start on the policy control plane. Every
 /// variant is fail-closed: an uninitialized deployment, an unreadable
@@ -1608,6 +1674,36 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         }
         None => None,
     };
+    // The tools control plane rides the same pool. Unlike policy, an empty
+    // tools document is a valid state (it is exactly what standalone mode
+    // serves without TOOLS_FILE), so a first boot seeds one idempotently:
+    // racing replicas produce exactly one seeded document, later boots
+    // no-op. The seed loads the authoritative local lane for the builder.
+    #[cfg(feature = "postgres")]
+    let pg_tools_seed = match &_database_foundation {
+        Some(foundation) => {
+            let store = Arc::new(storage::PostgresToolStore::new(foundation.pool().clone()));
+            if let Err(error) = store.seed_empty_document().await {
+                return Err(Box::new(ClusterToolsStartupError::Seeding(error))
+                    as Box<dyn std::error::Error>);
+            }
+            match ToolControlPlane::active_tools(&*store).await {
+                Ok(Some(active)) => Some(ClusterToolsSeed { store, active }),
+                // Unreachable after a successful seed (ours or a racing
+                // replica's): the pointer exists. Defensive fail closed.
+                Ok(None) => {
+                    return Err(
+                        Box::new(ClusterToolsStartupError::NotSeeded) as Box<dyn std::error::Error>
+                    )
+                }
+                Err(error) => {
+                    return Err(Box::new(ClusterToolsStartupError::Store(error))
+                        as Box<dyn std::error::Error>)
+                }
+            }
+        }
+        None => None,
+    };
     // The durable audit store rides the foundation's pool; the SSE
     // endpoint reads committed events through it in cluster mode. Built
     // here, where both the pool and the replica identity exist, and handed
@@ -1653,6 +1749,8 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             pg_audit: pg_audit_store,
             #[cfg(feature = "postgres")]
             pg_policy: pg_policy_seed,
+            #[cfg(feature = "postgres")]
+            pg_tools: pg_tools_seed,
             #[cfg(test)]
             egress_resolver: None,
             #[cfg(test)]
@@ -2078,6 +2176,39 @@ fn gateway_app_with_process_started_at_and_overrides(
     let mcp_upstream_definitions =
         tools::mcp_upstream::discover_upstream_tools_blocking(&config, Arc::clone(&egress_client))?;
     tool_registry.merge_definitions(mcp_upstream_definitions)?;
+    // Cluster mode: the registry's local lane belongs to the authoritative
+    // tools document (not TOOLS_FILE, which cluster mode rejects). Install
+    // the boot document -- validating it exactly as a file load would, and
+    // failing startup on a document this binary cannot enforce -- and
+    // register the document with the security runtime so every commit
+    // reconciles here.
+    #[cfg(feature = "postgres")]
+    let mut tool_control_plane: Option<Arc<dyn storage::ToolControlPlane>> = None;
+    #[cfg(feature = "postgres")]
+    if let (Some(seed), Some(runtime)) = (
+        build_overrides.pg_tools.as_ref(),
+        cluster_security_runtime.as_ref(),
+    ) {
+        let definitions =
+            tools::definitions::definitions_from_json_value(seed.active.document.clone(), None)
+                .map_err(|error| {
+                    Box::new(ClusterToolsStartupError::InvalidDocument(error.to_string()))
+                        as Box<dyn std::error::Error>
+                })?;
+        tool_registry
+            .install_local_definitions(definitions)
+            .map_err(|error| {
+                Box::new(ClusterToolsStartupError::InvalidDocument(error.to_string()))
+                    as Box<dyn std::error::Error>
+            })?;
+        let resource = security_cluster::ToolsResource::new(
+            seed.store.clone(),
+            tool_registry.clone(),
+            seed.active.security_revision,
+        );
+        runtime.register_resource(resource);
+        tool_control_plane = Some(seed.store.clone());
+    }
     let mcp_catalog_service = connections::mcp::McpConnectionCatalogService::load(
         connection_control_plane.clone(),
         connection_http_runtime.clone(),
@@ -2195,6 +2326,8 @@ fn gateway_app_with_process_started_at_and_overrides(
         client_ip_policy: client_ip_policy.clone(),
         max_body_size: config.max_body_size,
         write_lock: Arc::new(Mutex::new(())),
+        #[cfg(feature = "postgres")]
+        tool_control_plane,
     };
     let schema_admin_state = SchemaAdminState {
         coverage: schema_coverage,
@@ -6377,24 +6510,18 @@ async fn tools_openapi_preview_endpoint(
     let Some(principal) = parts.extensions.get::<auth::Principal>() else {
         return unauthorized();
     };
-    let tools_file = match authorized_tools_file(&state, principal, ADMIN_TOOLS_READ_PERMISSION) {
-        Ok(tools_file) => tools_file,
-        Err(error) => return tool_admin_authz_error_response(error),
+    if let Err(error) = authorized_tool_rbac_state(&state, principal, ADMIN_TOOLS_READ_PERMISSION) {
+        return tool_admin_authz_error_response(error);
+    }
+    let authority = match tools_authority(&state) {
+        Ok(authority) => authority,
+        Err(response) => return *response,
     };
-    let tools_file_value = match read_valid_tools_file_value(tools_file) {
-        Ok(value) => value,
-        Err(error) => {
-            tracing::error!(tools_file = %tools_file.display(), error = %error, "failed to read current tools file for OpenAPI preview");
-            return internal_server_error("tools file read failed");
-        }
-    };
-    let current_etag = match tools_file_etag(&tools_file_value) {
-        Ok(etag) => etag,
-        Err(err) => {
-            tracing::error!(error = %err, "failed to compute tools file ETag");
-            return internal_server_error("tools file ETag computation failed");
-        }
-    };
+    let (_tools_file_value, _current_document, current_etag) =
+        match current_tools_document(&authority).await {
+            Ok(current) => current,
+            Err(response) => return *response,
+        };
 
     let body = match read_request_body(body, state.max_body_size).await {
         Ok(body) => body,
@@ -6428,9 +6555,13 @@ async fn tools_openapi_register_endpoint(
     let Some(principal) = parts.extensions.get::<auth::Principal>().cloned() else {
         return unauthorized();
     };
-    let tools_file = match authorized_tools_file(&state, &principal, ADMIN_TOOLS_WRITE_PERMISSION) {
-        Ok(tools_file) => tools_file,
-        Err(error) => return tool_admin_authz_error_response(error),
+    if let Err(error) = authorized_tool_rbac_state(&state, &principal, ADMIN_TOOLS_WRITE_PERMISSION)
+    {
+        return tool_admin_authz_error_response(error);
+    }
+    let authority = match tools_authority(&state) {
+        Ok(authority) => authority,
+        Err(response) => return *response,
     };
 
     let body = match read_request_body(body, state.max_body_size).await {
@@ -6457,42 +6588,241 @@ async fn tools_openapi_register_endpoint(
         Err(response) => return *response,
     };
 
-    let _tools_write_guard = match state.write_lock.lock() {
-        Ok(guard) => guard,
-        Err(poisoned) => poisoned.into_inner(),
-    };
-    let (current_value, mut current_document) = match read_tools_file_document(tools_file) {
-        Ok(document) => document,
-        Err(error) => {
-            tracing::error!(tools_file = %tools_file.display(), error = %error, "failed to read current tools file for OpenAPI registration");
-            return internal_server_error("tools file read failed");
+    // Each authority owns its whole flow. Standalone holds the write guard
+    // across its local read-modify-write (nothing else serializes it);
+    // cluster mode serializes at the authority's compare-and-swap and holds
+    // no process-local lock across its awaits.
+    match &authority {
+        ToolsAuthority::File(tools_file) => {
+            // Standalone: the write guard spans the local read-modify-write
+            // (there is no authority to serialize it). Validate, write the
+            // file, swap; the restore-on-reject path re-installs the
+            // previous lane so the connection dependency validator sees the
+            // pre-rejection state again.
+            let _tools_write_guard = match state.write_lock.lock() {
+                Ok(guard) => guard,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            // Sync read under the guard: the file branch never awaits
+            // between its read and its write.
+            let (current_value, current_document) = match read_tools_file_document(tools_file) {
+                Ok(document) => document,
+                Err(error) => {
+                    tracing::error!(tools_file = %tools_file.display(), error = %error, "failed to read current tools file for OpenAPI registration");
+                    return internal_server_error("tools file read failed");
+                }
+            };
+            let current_etag = match tools_file_etag(&current_value) {
+                Ok(etag) => etag,
+                Err(err) => {
+                    tracing::error!(error = %err, "failed to compute current tools file ETag");
+                    return internal_server_error("tools file ETag computation failed");
+                }
+            };
+            let merged = match merge_tools_candidate(
+                &parts.headers,
+                &current_etag,
+                current_document,
+                selected,
+            ) {
+                Ok(merged) => merged,
+                Err(response) => return *response,
+            };
+            if let Err(error) = state.registry.replace_local_definitions_with_persist(
+                merged.candidate_local_tools.clone(),
+                || fs::write(tools_file, &merged.candidate_contents),
+            ) {
+                if let Err(restore_error) = state
+                    .registry
+                    .replace_local_definitions_with_persist(merged.previous_local_tools, || {
+                        Ok::<(), Infallible>(())
+                    })
+                {
+                    tracing::error!(
+                        tools_file = %tools_file.display(),
+                        error = ?restore_error,
+                        "failed to restore Connection dependency validation after rejected tools update"
+                    );
+                }
+                return match error {
+                    tools::definitions::McpCatalogPublishError::Registry(error) => {
+                        tracing::warn!(
+                            tools_file = %tools_file.display(),
+                            error = %error,
+                            "merged OpenAPI tools conflicted with the active tool registry"
+                        );
+                        conflict("OpenAPI tools conflict with the active tool registry")
+                    }
+                    tools::definitions::McpCatalogPublishError::Persist(error) => {
+                        tracing::error!(
+                            tools_file = %tools_file.display(),
+                            error = %error,
+                            "failed to persist merged tools file"
+                        );
+                        internal_server_error("tools file persist failed")
+                    }
+                };
+            }
+            tools_register_response(
+                &state,
+                &parts,
+                &principal,
+                &authority.audit_source_label(),
+                merged,
+            )
         }
-    };
-    let current_etag = match tools_file_etag(&current_value) {
-        Ok(etag) => etag,
-        Err(err) => {
-            tracing::error!(error = %err, "failed to compute current tools file ETag");
-            return internal_server_error("tools file ETag computation failed");
+        #[cfg(feature = "postgres")]
+        ToolsAuthority::Postgres(control_plane) => {
+            let (_current_value, current_document, current_etag) =
+                match current_tools_document(&authority).await {
+                    Ok(current) => current,
+                    Err(response) => return *response,
+                };
+            let merged = match merge_tools_candidate(
+                &parts.headers,
+                &current_etag,
+                current_document,
+                selected,
+            ) {
+                Ok(merged) => merged,
+                Err(response) => return *response,
+            };
+            match register_tools_via_control_plane(
+                control_plane,
+                &state.registry,
+                &current_etag,
+                &principal,
+                merged,
+            )
+            .await
+            {
+                Ok(merged) => tools_register_response(
+                    &state,
+                    &parts,
+                    &principal,
+                    &authority.audit_source_label(),
+                    merged,
+                ),
+                Err(response) => *response,
+            }
         }
-    };
-    match if_match_matches(&parts.headers, &current_etag) {
+    }
+}
+
+/// The cluster-mode register flow: validate the merged candidate against
+/// the current lanes, commit the new immutable version through the
+/// authority's compare-and-swap (advancing the shared security revision
+/// and writing the outbox row in one transaction), then install the local
+/// lane. A racing writer loses at the CAS with `412` and writes nothing.
+#[cfg(feature = "postgres")]
+async fn register_tools_via_control_plane(
+    control_plane: &Arc<dyn storage::ToolControlPlane>,
+    registry: &tools::definitions::ToolRegistry,
+    current_etag: &str,
+    principal: &auth::Principal,
+    merged: MergedToolsCandidate,
+) -> Result<MergedToolsCandidate, Box<Response>> {
+    if let Err(error) = registry.validate_local_definitions(&merged.candidate_local_tools) {
+        tracing::warn!(
+            error = %error,
+            "merged OpenAPI tools conflicted with the active tool registry"
+        );
+        return Err(Box::new(conflict(
+            "OpenAPI tools conflict with the active tool registry",
+        )));
+    }
+    let diff_summary = json!({
+        "action": "openapi_tools_registered",
+        "registered_tool_names": merged.registered_tool_names,
+    });
+    match control_plane
+        .commit_tools(
+            storage::PolicyCommitPrecondition::Expected {
+                etag: current_etag.to_owned(),
+            },
+            &merged.candidate_value,
+            &principal.user_id,
+            &diff_summary,
+        )
+        .await
+    {
+        Ok(committed) => {
+            if let Err(error) =
+                registry.install_local_definitions(merged.candidate_local_tools.clone())
+            {
+                // The mutation is durable at the authority; this replica's
+                // managed lanes moved under it and the local compile
+                // failed. Fail closed for this response and let
+                // reconciliation converge (or surface the conflict through
+                // the revision gate).
+                tracing::error!(
+                    error = %error,
+                    revision = committed.security_revision,
+                    "committed tools document could not be activated locally; \
+                     reconciliation will retry"
+                );
+                return Err(Box::new(service_unavailable(
+                    "tools document committed but not activated locally",
+                )));
+            }
+            Ok(merged)
+        }
+        Err(storage::PolicyCommitError::PreconditionFailed) => Err(Box::new(precondition_failed(
+            "If-Match does not match the current tools ETag",
+        ))),
+        Err(storage::PolicyCommitError::Store(error)) => {
+            tracing::error!(
+                error = %error,
+                "tools control-plane commit failed; nothing was written"
+            );
+            Err(Box::new(service_unavailable(
+                "tools mutation could not be committed",
+            )))
+        }
+    }
+}
+
+/// The merged candidate shared by both register authorities: the selected
+/// tools appended to the current document, plus everything the persist and
+/// response paths need.
+#[derive(Debug)]
+struct MergedToolsCandidate {
+    registered_tool_names: Vec<String>,
+    previous_local_tools: Vec<tools::definitions::ToolDefinition>,
+    candidate_value: Value,
+    candidate_contents: String,
+    candidate_local_tools: Vec<tools::definitions::ToolDefinition>,
+    tool_count: usize,
+}
+
+fn merge_tools_candidate(
+    headers: &HeaderMap,
+    current_etag: &str,
+    mut current_document: ToolsFileAdminDocument,
+    selected: Vec<tools::definitions::ToolDefinition>,
+) -> Result<MergedToolsCandidate, Box<Response>> {
+    match if_match_matches(headers, current_etag) {
         Ok(true) => {}
         Ok(false) => {
-            return precondition_failed("If-Match does not match the current tools ETag");
+            return Err(Box::new(precondition_failed(
+                "If-Match does not match the current tools ETag",
+            )));
         }
-        Err(error) => return if_match_error_response(error),
+        Err(error) => return Err(Box::new(if_match_error_response(error))),
     }
 
     let conflicts = conflicting_tool_names(&current_document.tools, &selected);
     if !conflicts.is_empty() {
-        return (
-            StatusCode::CONFLICT,
-            Json(ToolNameConflictResponse {
-                error: "tool name collision",
-                conflicts,
-            }),
-        )
-            .into_response();
+        return Err(Box::new(
+            (
+                StatusCode::CONFLICT,
+                Json(ToolNameConflictResponse {
+                    error: "tool name collision",
+                    conflicts,
+                }),
+            )
+                .into_response(),
+        ));
     }
 
     let registered_tool_names = selected
@@ -6505,64 +6835,43 @@ async fn tools_openapi_register_endpoint(
         Ok(value) => value,
         Err(err) => {
             tracing::error!(error = %err, "failed to serialize merged tools file");
-            return internal_server_error("tools file merge failed");
+            return Err(Box::new(internal_server_error("tools file merge failed")));
         }
     };
     let candidate_contents = match serde_json::to_string_pretty(&candidate_value) {
         Ok(contents) => contents,
         Err(err) => {
             tracing::error!(error = %err, "failed to render merged tools file");
-            return internal_server_error("tools file merge failed");
+            return Err(Box::new(internal_server_error("tools file merge failed")));
         }
     };
-    let candidate_local_tools = current_document.tools.clone();
-    if let Err(error) = state
-        .registry
-        .replace_local_definitions_with_persist(candidate_local_tools, || {
-            fs::write(tools_file, &candidate_contents)
-        })
-    {
-        if let Err(restore_error) = state
-            .registry
-            .replace_local_definitions_with_persist(previous_local_tools, || {
-                Ok::<(), Infallible>(())
-            })
-        {
-            tracing::error!(
-                tools_file = %tools_file.display(),
-                error = ?restore_error,
-                "failed to restore Connection dependency validation after rejected tools update"
-            );
-        }
-        return match error {
-            tools::definitions::McpCatalogPublishError::Registry(error) => {
-                tracing::warn!(
-                    tools_file = %tools_file.display(),
-                    error = %error,
-                    "merged OpenAPI tools conflicted with the active tool registry"
-                );
-                conflict("OpenAPI tools conflict with the active tool registry")
-            }
-            tools::definitions::McpCatalogPublishError::Persist(error) => {
-                tracing::error!(
-                    tools_file = %tools_file.display(),
-                    error = %error,
-                    "failed to persist merged tools file"
-                );
-                internal_server_error("tools file persist failed")
-            }
-        };
-    }
+    let tool_count = current_document.tools.len();
+    Ok(MergedToolsCandidate {
+        registered_tool_names,
+        previous_local_tools,
+        candidate_value,
+        candidate_contents,
+        candidate_local_tools: current_document.tools,
+        tool_count,
+    })
+}
 
+fn tools_register_response(
+    state: &ToolAdminState,
+    parts: &http::request::Parts,
+    principal: &auth::Principal,
+    source_label: &str,
+    merged: MergedToolsCandidate,
+) -> Response {
     emit_tool_registry_changed(
-        &state,
-        &parts,
-        &principal,
-        tools_file,
-        &registered_tool_names,
-        current_document.tools.len(),
+        state,
+        parts,
+        principal,
+        source_label,
+        &merged.registered_tool_names,
+        merged.tool_count,
     );
-    let new_etag = match tools_file_etag(&candidate_value) {
+    let new_etag = match tools_file_etag(&merged.candidate_value) {
         Ok(etag) => etag,
         Err(err) => {
             tracing::error!(error = %err, "failed to compute updated tools file ETag");
@@ -6574,11 +6883,104 @@ async fn tools_openapi_register_endpoint(
         StatusCode::CREATED,
         [(header::ETAG, etag_header_value(&new_etag))],
         Json(OpenApiToolsRegisterResponse {
-            registered_tool_names,
-            tool_count: current_document.tools.len(),
+            registered_tool_names: merged.registered_tool_names,
+            tool_count: merged.tool_count,
         }),
     )
         .into_response()
+}
+
+/// Which authority owns the tools document for this deployment: the
+/// standalone TOOLS_FILE, or (cluster mode) the PostgreSQL control plane.
+enum ToolsAuthority<'a> {
+    File(&'a FsPath),
+    #[cfg(feature = "postgres")]
+    Postgres(&'a Arc<dyn storage::ToolControlPlane>),
+}
+
+impl ToolsAuthority<'_> {
+    fn audit_source_label(&self) -> String {
+        match self {
+            Self::File(path) => path.display().to_string(),
+            #[cfg(feature = "postgres")]
+            Self::Postgres(_) => "postgres-authority".to_owned(),
+        }
+    }
+}
+
+/// Resolve the configured tools authority, or the not-configured response
+/// when neither the file nor the control plane is wired.
+fn tools_authority(state: &ToolAdminState) -> Result<ToolsAuthority<'_>, Box<Response>> {
+    if let Some(tools_file) = state.tools_file.as_deref() {
+        return Ok(ToolsAuthority::File(tools_file));
+    }
+    #[cfg(feature = "postgres")]
+    if let Some(control_plane) = state.tool_control_plane.as_ref() {
+        return Ok(ToolsAuthority::Postgres(control_plane));
+    }
+    Err(Box::new(tool_admin_authz_error_response(
+        ToolAdminAuthzError::ToolsFileNotConfigured,
+    )))
+}
+
+/// The current tools document plus its verified ETag from the authority:
+/// the file (re-read and re-validated) or the active cluster document.
+async fn current_tools_document(
+    authority: &ToolsAuthority<'_>,
+) -> Result<(Value, ToolsFileAdminDocument, String), Box<Response>> {
+    match authority {
+        ToolsAuthority::File(tools_file) => {
+            let (current_value, current_document) = match read_tools_file_document(tools_file) {
+                Ok(document) => document,
+                Err(error) => {
+                    tracing::error!(tools_file = %tools_file.display(), error = %error, "failed to read current tools file");
+                    return Err(Box::new(internal_server_error("tools file read failed")));
+                }
+            };
+            let current_etag = match tools_file_etag(&current_value) {
+                Ok(etag) => etag,
+                Err(err) => {
+                    tracing::error!(error = %err, "failed to compute current tools file ETag");
+                    return Err(Box::new(internal_server_error(
+                        "tools file ETag computation failed",
+                    )));
+                }
+            };
+            Ok((current_value, current_document, current_etag))
+        }
+        #[cfg(feature = "postgres")]
+        ToolsAuthority::Postgres(control_plane) => {
+            let active = match control_plane.active_tools().await {
+                Ok(Some(active)) => active,
+                Ok(None) => {
+                    tracing::error!("tools control plane has no active document");
+                    return Err(Box::new(service_unavailable(
+                        "tools control plane unavailable",
+                    )));
+                }
+                Err(error) => {
+                    tracing::error!(error = %error, "tools control plane read failed");
+                    return Err(Box::new(service_unavailable(
+                        "tools control plane unavailable",
+                    )));
+                }
+            };
+            let document =
+                match serde_json::from_value::<ToolsFileAdminDocument>(active.document.clone()) {
+                    Ok(document) => document,
+                    Err(error) => {
+                        tracing::error!(
+                            error = %error,
+                            "the active tools document does not match the admin schema"
+                        );
+                        return Err(Box::new(service_unavailable(
+                            "tools control plane unavailable",
+                        )));
+                    }
+                };
+            Ok((active.document, document, active.etag))
+        }
+    }
 }
 
 async fn policy_rule_preview_endpoint(
@@ -8770,19 +9172,6 @@ fn authorize_requested_scopes(
     } else {
         Err(TokenScopeAuthzError { disallowed })
     }
-}
-
-fn authorized_tools_file<'a>(
-    state: &'a ToolAdminState,
-    principal: &auth::Principal,
-    permission: &str,
-) -> Result<&'a FsPath, ToolAdminAuthzError> {
-    authorized_tool_rbac_state(state, principal, permission)?;
-
-    state
-        .tools_file
-        .as_deref()
-        .ok_or(ToolAdminAuthzError::ToolsFileNotConfigured)
 }
 
 fn authorized_tool_rbac_state<'a>(
@@ -11323,11 +11712,6 @@ fn serialized_response_etag<T: Serialize>(response: &T) -> Result<String, serde_
     Ok(format!("\"sha256:{}\"", hex::encode(digest)))
 }
 
-fn read_valid_tools_file_value(path: &FsPath) -> Result<Value, String> {
-    let (value, _) = read_tools_file_document(path)?;
-    Ok(value)
-}
-
 fn read_tools_file_document(path: &FsPath) -> Result<(Value, ToolsFileAdminDocument), String> {
     let contents = fs::read_to_string(path)
         .map_err(|err| format!("failed to read tools file {}: {err}", path.display()))?;
@@ -11807,7 +12191,7 @@ fn emit_tool_registry_changed(
     state: &ToolAdminState,
     parts: &http::request::Parts,
     principal: &auth::Principal,
-    tools_file: &FsPath,
+    tools_source: &str,
     registered_tool_names: &[String],
     tool_count: usize,
 ) {
@@ -11815,9 +12199,12 @@ fn emit_tool_registry_changed(
     let source_ip =
         client_ip::canonical_client_ip(&parts.headers, &parts.extensions, &state.client_ip_policy);
     let actor = Some(auth::actor_from_principal(principal));
+    // The payload key keeps its historical name ("tools_file") so the
+    // standalone audit shape is unchanged; in cluster mode the value
+    // names the authority instead of a path.
     let payload = json!({
         "action": "openapi_tools_registered",
-        "tools_file": tools_file.display().to_string(),
+        "tools_file": tools_source,
         "registered_tool_names": registered_tool_names,
         "registered_tool_count": registered_tool_names.len(),
         "tool_count": tool_count,
@@ -40822,6 +41209,601 @@ O2gecI9QwDJNpm29J9wJB2F8
                 Some("gate-updated"),
                 "the last valid snapshot remains installed; nothing regressed"
             );
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // Cluster-mode tools control plane (issue #241, PR 8): seeding, CAS,
+    // the multi-resource gate, and reconciliation against a real
+    // PostgreSQL. Docker-gated on the same locator as the storage suites.
+    // ------------------------------------------------------------------
+
+    #[cfg(feature = "postgres")]
+    mod cluster_tools_tests {
+        use super::*;
+        use crate::security_cluster::{ClusterSecurityRuntime, PolicyResource, ToolsResource};
+        use crate::storage::postgres::PostgresFoundation;
+        use crate::storage::postgres_policy::PostgresPolicyStore;
+        use crate::storage::postgres_tools::PostgresToolStore;
+        use crate::storage::{
+            self, migrations, PolicyCommitPrecondition, PolicyCommitRequest, PolicyControlPlane,
+        };
+        use crate::tools::definitions::ToolRegistry;
+
+        fn locator() -> Option<String> {
+            let key = "GATEWAY_TEST_POSTGRES_URL_FILE".to_owned();
+            let file = std::env::var(&key).ok()?;
+            if file.trim().is_empty() {
+                return None;
+            }
+            let contents = std::fs::read_to_string(file).ok()?;
+            let trimmed = contents.trim();
+            (!trimmed.is_empty()).then(|| trimmed.to_owned())
+        }
+
+        struct DsnFile {
+            path: String,
+            directory: std::path::PathBuf,
+        }
+
+        impl Drop for DsnFile {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.directory);
+            }
+        }
+
+        fn write_dsn_file(dsn: &str) -> DsnFile {
+            let directory = std::env::temp_dir().join(format!(
+                "greengateway-cluster-tools-{}",
+                uuid::Uuid::new_v4()
+            ));
+            std::fs::create_dir_all(&directory).expect("temp directory should create");
+            let path = directory.join("database-url");
+            std::fs::write(&path, format!("{dsn}\n")).expect("DSN file should write");
+            // The foundation's permission check is part of the contract:
+            // credential material grants group/other nothing. On Unix CI
+            // the default mode would be 0644, which the check (correctly)
+            // refuses.
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
+                    .expect("DSN permissions should set");
+            }
+            DsnFile {
+                path: path.display().to_string(),
+                directory,
+            }
+        }
+
+        struct TestDatabase {
+            dsn: String,
+            admin_dsn: String,
+            name: String,
+        }
+
+        impl Drop for TestDatabase {
+            fn drop(&mut self) {
+                let admin_dsn = self.admin_dsn.clone();
+                let name = self.name.clone();
+                std::thread::spawn(move || {
+                    let Ok(runtime) = tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()
+                    else {
+                        return;
+                    };
+                    runtime.block_on(async move {
+                        let Ok((client, connection)) =
+                            tokio_postgres::connect(&admin_dsn, tokio_postgres::NoTls).await
+                        else {
+                            return;
+                        };
+                        let connection = tokio::spawn(connection);
+                        let _ = client
+                            .batch_execute(&format!("DROP DATABASE IF EXISTS {name} WITH (FORCE)"))
+                            .await;
+                        let _ = connection.await;
+                    });
+                });
+            }
+        }
+
+        async fn create_test_database(admin_dsn: &str) -> TestDatabase {
+            let name = format!("ggw_tools_test_{}", uuid::Uuid::new_v4().simple());
+            let (client, connection) = tokio_postgres::connect(admin_dsn, tokio_postgres::NoTls)
+                .await
+                .expect("admin connection");
+            let connection_task = tokio::spawn(connection);
+            client
+                .batch_execute(&format!("CREATE DATABASE {name}"))
+                .await
+                .expect("test database should create");
+            drop(client);
+            let _ = connection_task.await;
+            let database_start = admin_dsn
+                .rfind('/')
+                .expect("locator DSN has a database path segment");
+            let dsn = format!("{}/{}", &admin_dsn[..database_start], name);
+            TestDatabase {
+                dsn,
+                admin_dsn: admin_dsn.to_owned(),
+                name,
+            }
+        }
+
+        async fn migrated_stores(
+            dsn: &str,
+        ) -> (
+            Arc<PostgresPolicyStore>,
+            Arc<PostgresToolStore>,
+            deadpool_postgres::Pool,
+        ) {
+            let dsn_file = write_dsn_file(dsn);
+            let mut config = test_config(Vec::new());
+            config.state_backend = config::StateBackend::Postgres;
+            config.deployment_id = Some("deploy-cluster-tools".to_owned());
+            config.database.url_file = Some(dsn_file.path.clone());
+            config.database.tls_mode = config::DatabaseTlsMode::LoopbackDev;
+            let foundation = PostgresFoundation::establish(&config)
+                .await
+                .expect("test database should establish");
+            migrations::apply_missing_for_startup(foundation.pool(), &config.database)
+                .await
+                .expect("schema should migrate");
+            let pool = foundation.pool().clone();
+            (
+                Arc::new(PostgresPolicyStore::new(pool.clone())),
+                Arc::new(PostgresToolStore::new(pool.clone())),
+                pool,
+            )
+        }
+
+        fn tools_document_with(tool_name: &str) -> Value {
+            json!({
+                "schema_version": "0.1.0",
+                "tools": [{
+                    "name": tool_name,
+                    "description": "Echoes the provided message.",
+                    "input_json_schema": {
+                        "type": "object",
+                        "required": ["message"],
+                        "properties": {
+                            "message": { "type": "string" }
+                        },
+                        "additionalProperties": false
+                    },
+                    "upstream": {
+                        "method": "POST",
+                        "path_template": "/v1/echo",
+                        "body": { "mode": "whole_args_json" }
+                    }
+                }]
+            })
+        }
+
+        static DIFF: std::sync::LazyLock<Value> =
+            std::sync::LazyLock::new(|| json!({ "action": "test" }));
+
+        fn cluster_policy(id: &str) -> rbac::Policy {
+            parse_policy_body(&Bytes::from(format!(
+                r#"{{
+                    "schema_version": "0.1.0",
+                    "id": "{id}",
+                    "default_action": "deny",
+                    "roles": {{
+                        "admin": {{ "permissions": ["admin:policy:read", "admin:policy:write", "admin:tools:write"] }}
+                    }}
+                }}"#
+            )))
+            .expect("cluster policy should parse")
+        }
+
+        #[tokio::test]
+        async fn tools_control_plane_seeds_once_and_commits_with_cas() {
+            let Some(admin_dsn) = locator() else {
+                eprintln!("skipping: no test database locator; CI runs this test");
+                return;
+            };
+            let database = create_test_database(&admin_dsn).await;
+            let (policy_store, tools_store, pool) = migrated_stores(&database.dsn).await;
+
+            // The policy plane initializes first (its startup contract).
+            PolicyControlPlane::commit(
+                &*policy_store,
+                PolicyCommitRequest {
+                    precondition: PolicyCommitPrecondition::Initialize,
+                    candidate: &cluster_policy("tools-cas"),
+                    actor_user_id: "seed",
+                    diff_summary: &DIFF,
+                },
+            )
+            .await
+            .expect("policy should initialize");
+
+            // Two replicas' first boots seed concurrently: exactly one
+            // seeded document exists afterwards.
+            let (seed_a, seed_b) = tokio::join!(
+                tools_store.seed_empty_document(),
+                tools_store.seed_empty_document()
+            );
+            seed_a.expect("replica A seed");
+            seed_b.expect("replica B seed");
+            let active = tools_store
+                .active_tools()
+                .await
+                .expect("active tools read")
+                .expect("seeded document exists");
+            assert_eq!(
+                active.document["tools"]
+                    .as_array()
+                    .expect("tools array")
+                    .len(),
+                0,
+                "the seeded document is the empty local lane"
+            );
+
+            // A commit with the current ETag wins and advances the shared
+            // revision; the same ETag loses afterwards with 412 semantics
+            // and writes nothing.
+            let winner = tools_store
+                .commit_tools(
+                    PolicyCommitPrecondition::Expected {
+                        etag: active.etag.clone(),
+                    },
+                    &tools_document_with("cluster_echo"),
+                    "op-1",
+                    &DIFF,
+                )
+                .await
+                .expect("tools commit should win");
+            assert!(winner.security_revision > active.security_revision);
+            let loser = tools_store
+                .commit_tools(
+                    PolicyCommitPrecondition::Expected {
+                        etag: active.etag.clone(),
+                    },
+                    &tools_document_with("cluster_other"),
+                    "op-2",
+                    &DIFF,
+                )
+                .await
+                .expect_err("the stale ETag must lose");
+            assert_eq!(
+                loser,
+                storage::PolicyCommitError::PreconditionFailed,
+                "{loser}"
+            );
+
+            // One seeded version plus one committed version; the outbox
+            // rows carry the tools resource type.
+            let client = pool.get().await.expect("count checkout");
+            let documents: i64 = client
+                .query_one("SELECT count(*) FROM greengateway.tool_documents", &[])
+                .await
+                .expect("count")
+                .get(0);
+            assert_eq!(documents, 2, "seeding and the winning commit only");
+            let outbox_tools: i64 = client
+                .query_one(
+                    "SELECT count(*) FROM greengateway.security_outbox WHERE resource_type = 'tools'",
+                    &[],
+                )
+                .await
+                .expect("count")
+                .get(0);
+            assert_eq!(outbox_tools, 2, "seed + commit each wrote one record");
+        }
+
+        #[tokio::test]
+        async fn a_tools_revision_does_not_livelock_the_security_gate() {
+            let Some(admin_dsn) = locator() else {
+                eprintln!("skipping: no test database locator; CI runs this test");
+                return;
+            };
+            let database = create_test_database(&admin_dsn).await;
+            let (policy_store, tools_store, _pool) = migrated_stores(&database.dsn).await;
+
+            let active_policy = PolicyControlPlane::commit(
+                &*policy_store,
+                PolicyCommitRequest {
+                    precondition: PolicyCommitPrecondition::Initialize,
+                    candidate: &cluster_policy("gate-tools"),
+                    actor_user_id: "seed",
+                    diff_summary: &DIFF,
+                },
+            )
+            .await
+            .expect("policy should initialize");
+            tools_store
+                .seed_empty_document()
+                .await
+                .expect("tools should seed");
+
+            // A replica boots with both resources registered.
+            let rbac_state = middleware::rbac::RbacState::new(
+                active_policy.policy.clone(),
+                Vec::new(),
+                false,
+                test_audit_log(),
+            );
+            rbac_state.install_revision_snapshot(
+                active_policy.policy.clone(),
+                active_policy.security_revision,
+            );
+            let registry =
+                ToolRegistry::from_definitions_with_audit(Vec::new(), Some(test_audit_log()));
+            let boot_tools = tools_store
+                .active_tools()
+                .await
+                .expect("active tools read")
+                .expect("seeded");
+            let runtime = ClusterSecurityRuntime::new(
+                policy_store.revision_source(),
+                PolicyResource::new(policy_store.clone(), rbac_state.clone()),
+            );
+            runtime.register_resource(ToolsResource::new(
+                tools_store.clone(),
+                registry.clone(),
+                boot_tools.security_revision,
+            ));
+
+            // The pin: with the PR 7 policy-only gate, any revision the
+            // POLICY did not produce (the tools seeding above already
+            // bumped the counter past the policy activation) sent every
+            // replica into a reconcile loop it could not win until the
+            // 250ms deadline, failing closed on healthy state. The
+            // multi-resource gate must reconcile the tools resource (a
+            // no-op at the boot revision) and return Ok.
+            let served = middleware::rbac::SecurityRevisionGate::ensure_current_revision(&*runtime)
+                .await
+                .expect("a tools-only revision must not livelock the gate");
+            assert!(
+                served >= boot_tools.security_revision,
+                "the compiled watermark covers the tools revision ({served} < {})",
+                boot_tools.security_revision
+            );
+
+            // A tools COMMIT after boot: the gate must observe it, install
+            // the new local lane, and stay current -- still no loop.
+            let committed = tools_store
+                .commit_tools(
+                    PolicyCommitPrecondition::Expected {
+                        etag: boot_tools.etag.clone(),
+                    },
+                    &tools_document_with("post_boot_tool"),
+                    "op",
+                    &DIFF,
+                )
+                .await
+                .expect("tools commit should win");
+            let served = middleware::rbac::SecurityRevisionGate::ensure_current_revision(&*runtime)
+                .await
+                .expect("the gate must reconcile a tools commit, not loop");
+            assert_eq!(served, committed.security_revision);
+            assert!(
+                registry
+                    .current_local_definitions()
+                    .iter()
+                    .any(|tool| tool.name == "post_boot_tool"),
+                "reconciliation must install the committed local lane"
+            );
+            // The policy snapshot is untouched: a tools revision re-reads
+            // the policy authority but must not change the active policy.
+            assert_eq!(
+                rbac_state.current_policy().id.as_deref(),
+                Some("gate-tools")
+            );
+        }
+
+        #[tokio::test]
+        async fn tools_reconciliation_installs_and_fails_closed() {
+            let Some(admin_dsn) = locator() else {
+                eprintln!("skipping: no test database locator; CI runs this test");
+                return;
+            };
+            let database = create_test_database(&admin_dsn).await;
+            let (policy_store, tools_store, _pool) = migrated_stores(&database.dsn).await;
+
+            let active_policy = PolicyControlPlane::commit(
+                &*policy_store,
+                PolicyCommitRequest {
+                    precondition: PolicyCommitPrecondition::Initialize,
+                    candidate: &cluster_policy("gate-invalid"),
+                    actor_user_id: "seed",
+                    diff_summary: &DIFF,
+                },
+            )
+            .await
+            .expect("policy should initialize");
+            tools_store
+                .seed_empty_document()
+                .await
+                .expect("tools should seed");
+
+            let rbac_state = middleware::rbac::RbacState::new(
+                active_policy.policy.clone(),
+                Vec::new(),
+                false,
+                test_audit_log(),
+            );
+            rbac_state.install_revision_snapshot(
+                active_policy.policy.clone(),
+                active_policy.security_revision,
+            );
+            let registry =
+                ToolRegistry::from_definitions_with_audit(Vec::new(), Some(test_audit_log()));
+            let boot_tools = tools_store
+                .active_tools()
+                .await
+                .expect("active tools read")
+                .expect("seeded");
+            let tools_resource = ToolsResource::new(tools_store.clone(), registry.clone(), 0);
+            let runtime = ClusterSecurityRuntime::new(
+                policy_store.revision_source(),
+                PolicyResource::new(policy_store.clone(), rbac_state.clone()),
+            );
+            runtime.register_resource(tools_resource.clone());
+
+            // Commit a new tools document; the gate reconciles it in.
+            tools_store
+                .commit_tools(
+                    PolicyCommitPrecondition::Expected {
+                        etag: boot_tools.etag.clone(),
+                    },
+                    &tools_document_with("reconciled_tool"),
+                    "op",
+                    &DIFF,
+                )
+                .await
+                .expect("tools commit should win");
+            middleware::rbac::SecurityRevisionGate::ensure_current_revision(&*runtime)
+                .await
+                .expect("reconcile should succeed");
+            assert!(
+                registry
+                    .current_local_definitions()
+                    .iter()
+                    .any(|tool| tool.name == "reconciled_tool"),
+                "the reconciled lane must contain the committed tool"
+            );
+
+            // A document the registry cannot validate (an unknown field
+            // the tools schema rejects) fails closed: the gate refuses and
+            // the installed lane does not regress.
+            let active = tools_store
+                .active_tools()
+                .await
+                .expect("active read")
+                .expect("active");
+            let mut invalid = tools_document_with("never_installs");
+            invalid["not_a_tools_file_field"] = json!(true);
+            tools_store
+                .commit_tools(
+                    PolicyCommitPrecondition::Expected {
+                        etag: active.etag.clone(),
+                    },
+                    &invalid,
+                    "op",
+                    &DIFF,
+                )
+                .await
+                .expect("the authority accepts the commit; validation is replica-side");
+            let probe =
+                middleware::rbac::SecurityRevisionGate::ensure_current_revision(&*runtime).await;
+            assert!(
+                probe.is_err(),
+                "an invalid tools document must fail closed, not install"
+            );
+            assert!(
+                registry
+                    .current_local_definitions()
+                    .iter()
+                    .any(|tool| tool.name == "reconciled_tool"),
+                "the last valid lane remains installed; nothing regressed"
+            );
+        }
+
+        #[tokio::test]
+        async fn register_via_control_plane_commits_and_rejects_stale_etags() {
+            let Some(admin_dsn) = locator() else {
+                eprintln!("skipping: no test database locator; CI runs this test");
+                return;
+            };
+            let database = create_test_database(&admin_dsn).await;
+            let (policy_store, tools_store, _pool) = migrated_stores(&database.dsn).await;
+
+            PolicyControlPlane::commit(
+                &*policy_store,
+                PolicyCommitRequest {
+                    precondition: PolicyCommitPrecondition::Initialize,
+                    candidate: &cluster_policy("register-tools"),
+                    actor_user_id: "seed",
+                    diff_summary: &DIFF,
+                },
+            )
+            .await
+            .expect("policy should initialize");
+            tools_store
+                .seed_empty_document()
+                .await
+                .expect("tools should seed");
+
+            // The endpoint's cluster arm, exercised directly: a registry
+            // with the validator hook unset (no connections configured),
+            // a principal, and the merged candidate.
+            let registry =
+                ToolRegistry::from_definitions_with_audit(Vec::new(), Some(test_audit_log()));
+            let control_plane: Arc<dyn storage::ToolControlPlane> = tools_store.clone();
+            let principal = test_principal(&["admin"]);
+
+            let active = control_plane
+                .active_tools()
+                .await
+                .expect("active read")
+                .expect("seeded");
+            let mut headers_with_etag = HeaderMap::new();
+            headers_with_etag.insert(
+                header::IF_MATCH,
+                header::HeaderValue::from_str(&active.etag).expect("etag is a valid header value"),
+            );
+            let merged = merge_tools_candidate(
+                &headers_with_etag,
+                &active.etag,
+                ToolsFileAdminDocument {
+                    schema_version: "0.1.0".to_owned(),
+                    tools: Vec::new(),
+                },
+                crate::tools::definitions::definitions_from_json_value(
+                    tools_document_with("registered_tool"),
+                    None,
+                )
+                .expect("candidate should parse"),
+            )
+            .expect("merge should pass with a fresh If-Match");
+            let committed = register_tools_via_control_plane(
+                &control_plane,
+                &registry,
+                &active.etag,
+                &principal,
+                merged,
+            )
+            .await
+            .expect("register should commit");
+            assert_eq!(committed.tool_count, 1);
+            assert!(
+                registry
+                    .current_local_definitions()
+                    .iter()
+                    .any(|tool| tool.name == "registered_tool"),
+                "the committed lane must be installed locally"
+            );
+
+            // The stale ETag now loses with 412.
+            let stale = merge_tools_candidate(
+                &headers_with_etag,
+                &active.etag,
+                ToolsFileAdminDocument {
+                    schema_version: "0.1.0".to_owned(),
+                    tools: Vec::new(),
+                },
+                crate::tools::definitions::definitions_from_json_value(
+                    tools_document_with("second_tool"),
+                    None,
+                )
+                .expect("candidate should parse"),
+            )
+            .expect("merge should pass with the stale If-Match");
+            let response = register_tools_via_control_plane(
+                &control_plane,
+                &registry,
+                &active.etag,
+                &principal,
+                stale,
+            )
+            .await
+            .expect_err("the stale ETag must lose");
+            assert_eq!(response.status(), StatusCode::PRECONDITION_FAILED);
         }
     }
 }

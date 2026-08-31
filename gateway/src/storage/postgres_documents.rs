@@ -232,14 +232,12 @@ pub(crate) async fn commit(
             .map_err(store_error)?;
 
         // 5. Advance (or initialize) the pointer.
-        let append_outbox_sql = format!(
-            r#"
+        const APPEND_OUTBOX_SQL: &str = r#"
             INSERT INTO greengateway.security_outbox (
                 revision, resource_type, from_version, to_version
             )
             VALUES ($1, $2, $3, $4)
-            "#,
-        );
+            "#;
         match current {
             Some((previous_version, _, _)) => {
                 let advance_sql = format!(
@@ -261,7 +259,7 @@ pub(crate) async fn commit(
                     .map_err(store_error)?;
                 client
                     .execute(
-                        append_outbox_sql.as_str(),
+                        APPEND_OUTBOX_SQL,
                         &[
                             &new_revision,
                             &resource.resource_type,
@@ -300,7 +298,7 @@ pub(crate) async fn commit(
                 }
                 client
                     .execute(
-                        append_outbox_sql.as_str(),
+                        APPEND_OUTBOX_SQL,
                         &[
                             &new_revision,
                             &resource.resource_type,
