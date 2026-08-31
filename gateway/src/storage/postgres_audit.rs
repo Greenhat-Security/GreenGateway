@@ -72,30 +72,55 @@ ON CONFLICT (event_id) DO NOTHING
 /// The stream append runs as two statements in the batch's transaction
 /// (the extended protocol allows one statement per prepared call, and the
 /// transaction-scoped lock persists to COMMIT regardless): take the lock,
-/// then append. Positions are assigned from `max(position)+row_number()`
-/// over the ids NOT ALREADY IN THE STREAM, under that lock -- never from a
-/// sequence, which does not roll back and would leave a permanent gap
-/// after an aborted append. The anti-join is load-bearing for gaplessness:
-/// an at-least-once retry may carry ids whose stream rows already exist
-/// (an earlier batch committed them), and assigning `row_number()` over
-/// those ids before `ON CONFLICT` skipped them would consume positions for
-/// rows that are never inserted -- a permanent hole. Filtering first
-/// assigns numbers only to ids that will actually append.
+/// then append.
+///
+/// Positions are reserved from `greengateway.audit_stream_state` -- a
+/// single counter row that retention never deletes -- inside the append
+/// transaction. Three properties come from that shape:
+///
+/// - **Rollback-safe reservation**: an aborted append's counter update
+///   rolls back with the transaction, so its numbers are immediately
+///   reused (the property a bare `GENERATED ... AS IDENTITY` sequence
+///   does not have).
+/// - **Strictly monotonic across retention**: the counter survives
+///   retention deletes of stream rows, so numbering never restarts at 1
+///   the way a `max(position)` read over an emptied table would. A
+///   restart would silently strand every durable cursor at a position
+///   that gets renumbered.
+/// - **Commit-ordered**: the advisory lock (held from reservation until
+///   COMMIT) means the next writer's statement snapshot postdates this
+///   transaction's commit, so its anti-join sees these rows and a
+///   retried batch reserves positions only for ids that will actually
+///   append -- no over-reservation, no gaps.
+///
+/// The anti-join is load-bearing for gaplessness: an at-least-once retry
+/// may carry ids whose stream rows already exist, and assigning
+/// `row_number()` over those ids before `ON CONFLICT` skipped them would
+/// reserve positions for rows that are never inserted.
 const LOCK_STREAM_SQL: &str = "SELECT pg_advisory_xact_lock($1)";
 
 const APPEND_STREAM_SQL: &str = r#"
-INSERT INTO greengateway.audit_stream (position, event_id)
 WITH pending AS (
     SELECT batch.event_id
     FROM UNNEST($1::text[]) AS batch(event_id)
     WHERE NOT EXISTS (
         SELECT 1 FROM greengateway.audit_stream s WHERE s.event_id = batch.event_id
     )
+),
+reserved AS (
+    UPDATE greengateway.audit_stream_state
+    SET last_position = last_position + (SELECT count(*) FROM pending)
+    WHERE singleton
+    RETURNING last_position - (SELECT count(*) FROM pending) AS base_position
+),
+assigned AS (
+    SELECT reserved.base_position
+           + row_number() OVER (ORDER BY pending.event_id) AS position,
+           pending.event_id
+    FROM pending CROSS JOIN reserved
 )
-SELECT (SELECT coalesce(max(position), 0) FROM greengateway.audit_stream)
-       + row_number() OVER (ORDER BY pending.event_id),
-       pending.event_id
-FROM pending
+INSERT INTO greengateway.audit_stream (position, event_id)
+SELECT position, event_id FROM assigned
 ON CONFLICT (event_id) DO NOTHING
 "#;
 
@@ -143,7 +168,6 @@ impl PostgresAuditEventStore {
     /// The durable-cursor read PR 6's SSE transport builds on: positions
     /// advance in commit order, so `after_position` never skips a committed
     /// event, and a bounded `limit` keeps replay bounded.
-    #[allow(dead_code)] // PR 6's SSE consumer; pinned now by the stream tests.
     pub async fn stream_after(
         &self,
         after_position: i64,
@@ -181,7 +205,6 @@ impl PostgresAuditEventStore {
     }
 
     /// The highest assigned stream position, for cursor initialization.
-    #[allow(dead_code)] // PR 6's SSE consumer; pinned now by the stream tests.
     pub async fn stream_head(&self) -> Result<i64, RepositoryError> {
         let client = self.pool.get().await.map_err(classify_pool_error)?;
         let row = client
@@ -191,6 +214,30 @@ impl PostgresAuditEventStore {
             )
             .await
             .map_err(|error| classify_query(error, "audit_stream_head"))?;
+        Ok(row.get::<_, i64>(0))
+    }
+
+    /// The smallest position a reader can still obtain: the oldest
+    /// retained stream row, or, when retention has removed every row,
+    /// one past the never-deleted position counter. A client whose
+    /// cursor is below `first_available - 1` has permanently missed
+    /// events and must resynchronize rather than stream.
+    pub async fn stream_first_available(&self) -> Result<i64, RepositoryError> {
+        const OPERATION: &str = "audit_stream_first_available";
+        let client = self.pool.get().await.map_err(classify_pool_error)?;
+        let row = client
+            .query_one(
+                r#"
+                SELECT coalesce(
+                    (SELECT min(position) FROM greengateway.audit_stream),
+                    (SELECT last_position + 1
+                     FROM greengateway.audit_stream_state WHERE singleton)
+                )
+                "#,
+                &[],
+            )
+            .await
+            .map_err(|error| classify_query(error, OPERATION))?;
         Ok(row.get::<_, i64>(0))
     }
 }

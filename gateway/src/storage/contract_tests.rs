@@ -1290,6 +1290,79 @@ mod postgres_audit_tests {
         &crate::storage::postgres_audit::AUDIT_STREAM_LOCK_KEY
     }
 
+    #[tokio::test]
+    async fn postgres_audit_positions_survive_retention_restart() {
+        let Some(admin_dsn) = locator() else {
+            eprintln!("skipping: no test database locator; CI runs this test");
+            return;
+        };
+        let _guard = DATABASE.lock().await;
+        let database = create_test_database(&admin_dsn).await;
+        let store = migrated_store(&database).await;
+
+        // Batch one occupies positions 1..=2.
+        store
+            .insert_events(&[
+                contract_event("retention-a", "audit.retention", json!({})),
+                contract_event("retention-b", "audit.retention", json!({})),
+            ])
+            .await
+            .expect("first batch should commit");
+        assert_eq!(store.stream_head().await.expect("head"), 2);
+
+        // Retention removes every stream row. Under PR 5's max(position)
+        // assignment this would reset numbering to 1 -- silently stranding
+        // every durable cursor at a position that gets renumbered. The
+        // persistent counter (migration 3) must keep the number space
+        // monotonic.
+        {
+            let test_dsn_file = write_dsn_file(&database.dsn);
+            let mut config = crate::config::Config::test_defaults();
+            config.state_backend = crate::config::StateBackend::Postgres;
+            config.deployment_id = Some("deploy-audit-contract".to_owned());
+            config.database.url_file = Some(test_dsn_file.path.clone());
+            config.database.tls_mode = crate::config::DatabaseTlsMode::LoopbackDev;
+            let foundation = PostgresFoundation::establish(&config)
+                .await
+                .expect("retention connection should establish");
+            foundation
+                .pool()
+                .get()
+                .await
+                .expect("retention checkout")
+                .batch_execute("DELETE FROM greengateway.audit_stream")
+                .await
+                .expect("retention delete should run");
+        }
+
+        // The first-available computation now reports one past the
+        // counter, not past any row.
+        assert_eq!(
+            store.stream_first_available().await.expect("first"),
+            3,
+            "an emptied stream must report the counter as the boundary"
+        );
+
+        // The next batch continues from 3: a client that saw position 2
+        // resumes without ever observing renumbering.
+        store
+            .insert_events(&[contract_event("retention-c", "audit.retention", json!({}))])
+            .await
+            .expect("post-retention batch should commit");
+        let walked = store
+            .stream_after(0, 100)
+            .await
+            .expect("stream should walk");
+        assert_eq!(
+            walked
+                .iter()
+                .map(|(position, event)| (*position, event.event_id.as_str()))
+                .collect::<Vec<_>>(),
+            vec![(3, "retention-c")],
+            "numbering must continue from the counter, not restart at 1"
+        );
+    }
+
     /// The #11 filtered-query benchmark, against PostgreSQL: seed N events
     /// (default 1,000,000; override with the runtime-keyed locator
     /// GATEWAY_TEST_POSTGRES_BENCHMARK_ROWS), then assert a representative
