@@ -26,6 +26,8 @@ pub mod migrations;
 mod policy_history;
 #[cfg(feature = "postgres")]
 pub mod postgres;
+#[cfg(feature = "postgres")]
+pub mod postgres_audit;
 mod principal;
 mod service_token;
 
