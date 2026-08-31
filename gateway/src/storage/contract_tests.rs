@@ -1033,12 +1033,18 @@ mod postgres_audit_tests {
             .rfind('/')
             .expect("locator DSN has a database path segment");
         let dsn = format!("{}/{}", &admin_dsn[..database_start], name);
-        let parsed = tokio_postgres::Config::from_str(&dsn).expect("test DSN should parse");
+        // The teardown pool must connect to the ADMIN database, not the
+        // disposable one: DROP DATABASE cannot run on a session that has
+        // the target open. (An adversarial review caught this exact leak:
+        // every teardown failed with "cannot drop the currently open
+        // database", stranding 800+ MB of test databases per run.)
+        let parsed_admin =
+            tokio_postgres::Config::from_str(admin_dsn).expect("admin DSN should parse");
         TestDatabase {
             dsn,
             name,
             admin_pool: deadpool_postgres::Pool::builder(deadpool_postgres::Manager::new(
-                parsed,
+                parsed_admin,
                 tokio_postgres::NoTls,
             ))
             .config({
@@ -1084,6 +1090,50 @@ mod postgres_audit_tests {
         let database = create_test_database(&admin_dsn).await;
         let store = migrated_store(&database).await;
         super::audit_event_store_contract(&store).await;
+    }
+
+    #[tokio::test]
+    async fn postgres_audit_overlapping_retries_keep_the_stream_contiguous() {
+        let Some(admin_dsn) = locator() else {
+            eprintln!("skipping: no test database locator; CI runs this test");
+            return;
+        };
+        let _guard = DATABASE.lock().await;
+        let database = create_test_database(&admin_dsn).await;
+        let store = migrated_store(&database).await;
+
+        // The at-least-once shape the contract performs on audit_events,
+        // asserted here on the STREAM: a batch, then an overlapping retry
+        // that carries the committed id plus a new one. The already-
+        // streamed id must consume no position (an adversarial review
+        // falsified an earlier append that assigned row_number() over all
+        // input ids before ON CONFLICT skipped them, gapping the stream
+        // permanently at 2).
+        store
+            .insert_events(&[contract_event("overlap-a", "audit.overlap", json!({}))])
+            .await
+            .expect("first batch should commit");
+        store
+            .insert_events(&[
+                contract_event("overlap-a", "audit.overlap", json!({})),
+                contract_event("overlap-b", "audit.overlap", json!({})),
+            ])
+            .await
+            .expect("overlapping retry should commit");
+
+        let walked = store
+            .stream_after(0, 100)
+            .await
+            .expect("stream should walk");
+        assert_eq!(
+            walked
+                .iter()
+                .map(|(position, event)| (*position, event.event_id.as_str()))
+                .collect::<Vec<_>>(),
+            vec![(1, "overlap-a"), (2, "overlap-b")],
+            "an overlapping retry must not consume a position for an already-streamed id"
+        );
+        assert_eq!(store.stream_head().await.expect("head"), 2);
     }
 
     #[tokio::test]

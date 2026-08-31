@@ -6,7 +6,7 @@
 //! (the HA state model's section 6 requirement):
 //!
 //! 1. One batch transaction inserts the events
-//!    (`ON CONFLICT (event_id) DO NOTHING` Ã¢â‚¬â€ replayed batches store exactly
+//!    (`ON CONFLICT (event_id) DO NOTHING` -- replayed batches store exactly
 //!    once) **and** appends their ids to `greengateway.audit_stream`.
 //! 2. Both statements run under a transaction-scoped advisory lock
 //!    (`pg_advisory_xact_lock`), held from stream-position assignment until
@@ -73,19 +73,29 @@ ON CONFLICT (event_id) DO NOTHING
 /// (the extended protocol allows one statement per prepared call, and the
 /// transaction-scoped lock persists to COMMIT regardless): take the lock,
 /// then append. Positions are assigned from `max(position)+row_number()`
-/// under that lock -- never from a sequence, which does not roll back and
-/// would leave a permanent gap after an aborted append. The lock makes the
-/// read-modify-write race-free: only one appender can be between the max
-/// read and the commit at a time, so assignment order is commit order and
-/// an aborted append's numbers are immediately reused.
+/// over the ids NOT ALREADY IN THE STREAM, under that lock -- never from a
+/// sequence, which does not roll back and would leave a permanent gap
+/// after an aborted append. The anti-join is load-bearing for gaplessness:
+/// an at-least-once retry may carry ids whose stream rows already exist
+/// (an earlier batch committed them), and assigning `row_number()` over
+/// those ids before `ON CONFLICT` skipped them would consume positions for
+/// rows that are never inserted -- a permanent hole. Filtering first
+/// assigns numbers only to ids that will actually append.
 const LOCK_STREAM_SQL: &str = "SELECT pg_advisory_xact_lock($1)";
 
 const APPEND_STREAM_SQL: &str = r#"
 INSERT INTO greengateway.audit_stream (position, event_id)
+WITH pending AS (
+    SELECT batch.event_id
+    FROM UNNEST($1::text[]) AS batch(event_id)
+    WHERE NOT EXISTS (
+        SELECT 1 FROM greengateway.audit_stream s WHERE s.event_id = batch.event_id
+    )
+)
 SELECT (SELECT coalesce(max(position), 0) FROM greengateway.audit_stream)
-       + row_number() OVER (ORDER BY batch.event_id),
-       batch.event_id
-FROM UNNEST($1::text[]) AS batch(event_id)
+       + row_number() OVER (ORDER BY pending.event_id),
+       pending.event_id
+FROM pending
 ON CONFLICT (event_id) DO NOTHING
 "#;
 
@@ -329,6 +339,15 @@ impl AuditEventStore for PostgresAuditEventStore {
         &self,
         filters: &AuditQueryFilters,
     ) -> Result<AuditQueryPage, RepositoryError> {
+        // A zero limit is a caller contract violation; answer it as an
+        // empty page rather than the panic a limit+1 fetch would reach
+        // ("has_more implies at least one returned row").
+        if filters.limit == 0 {
+            return Ok(AuditQueryPage {
+                events: Vec::new(),
+                next_cursor: None,
+            });
+        }
         let client = self.pool.get().await.map_err(classify_pool_error)?;
 
         let mut clauses: Vec<String> = Vec::new();
