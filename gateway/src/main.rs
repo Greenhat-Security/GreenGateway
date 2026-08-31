@@ -7863,7 +7863,11 @@ async fn durable_audit_stream_start(
                 .stream_first_available()
                 .await
                 .map_err(|_| DurableStreamStartError::Unavailable)?;
-            if last_seen + 1 < first_available {
+            // Overflow-safe form of `last_seen + 1 < first_available`:
+            // subtracting from first_available (always >= 1) cannot
+            // underflow, while adding to last_seen could overflow at
+            // i64::MAX -- a caller-reachable value via the header.
+            if last_seen < first_available - 1 {
                 return Err(DurableStreamStartError::ExpiredCursor {
                     cursor: last_seen,
                     first_available,
@@ -7884,12 +7888,6 @@ async fn durable_audit_stream_start(
     }
 }
 
-/// The durable stream loop: poll `stream_after` in bounded batches,
-/// emitting every event with its position as the SSE `id:` (so
-/// reconnects resume exactly after it), sleeping or waking on the
-/// broadcast channel while caught up. Backpressure is inherent: each
-/// unfold step polls at most one batch, and the HTTP sink pulls steps only
-/// as fast as the client reads.
 /// The durable stream loop: poll `stream_after` in bounded batches and
 /// emit every retained event with its position as the SSE `id:` (so
 /// reconnects resume exactly after it), applying the endpoint's filters
@@ -29052,6 +29050,10 @@ paths:
 
         /// Drop any databases leaked by earlier runs of these tests, so a
         /// long-lived development database server does not accumulate them.
+        /// Only databases with NO active connections are swept: under
+        /// parallel test execution a sibling test's in-flight database has
+        /// live connections, and dropping it out from under the sibling
+        /// (WITH FORCE) is exactly the flake this guard prevents.
         async fn sweep_stale_test_databases(admin_dsn: &str) {
             let Ok((client, connection)) =
                 tokio_postgres::connect(admin_dsn, tokio_postgres::NoTls).await
@@ -29061,7 +29063,14 @@ paths:
             let connection = tokio::spawn(connection);
             let rows = client
                 .query(
-                    "SELECT datname FROM pg_database WHERE datname LIKE 'ggw_sse_test_%'",
+                    r#"
+                    SELECT datname FROM pg_database
+                    WHERE datname LIKE 'ggw_sse_test_%'
+                      AND NOT EXISTS (
+                          SELECT 1 FROM pg_stat_activity
+                          WHERE pg_stat_activity.datname = pg_database.datname
+                      )
+                    "#,
                     &[],
                 )
                 .await;
@@ -29182,7 +29191,19 @@ paths:
             last_event_id: Option<&str>,
             principal: Option<auth::Principal>,
         ) -> Request<Body> {
-            let mut builder = Request::builder().uri(AUDIT_EVENTS_STREAM_ROUTE);
+            stream_request_filtered(last_event_id, principal, None)
+        }
+
+        fn stream_request_filtered(
+            last_event_id: Option<&str>,
+            principal: Option<auth::Principal>,
+            event_type: Option<&str>,
+        ) -> Request<Body> {
+            let uri = match event_type {
+                Some(event_type) => format!("{AUDIT_EVENTS_STREAM_ROUTE}?event_type={event_type}"),
+                None => AUDIT_EVENTS_STREAM_ROUTE.to_owned(),
+            };
+            let mut builder = Request::builder().uri(uri);
             if let Some(last_event_id) = last_event_id {
                 builder = builder.header("last-event-id", last_event_id);
             }
@@ -29207,6 +29228,113 @@ paths:
                 None,
                 json!({ "path": path, "status": 200 }),
             )
+        }
+
+        #[tokio::test]
+        async fn durable_sse_replays_filtered_events_without_repeating_frames() {
+            let Some(admin_dsn) = locator() else {
+                eprintln!("skipping: no test database locator; CI runs this test");
+                return;
+            };
+            let database = create_test_database(&admin_dsn).await;
+            let store = migrated_store(&database.dsn).await;
+            // Alternating event types: the filter excludes half. An
+            // adversarial review reintroduced the shadowed-cursor defect
+            // (a fully filtered batch never advancing the poll cursor) and
+            // the shipped suite stayed green; this test pins both the
+            // filter and the no-repeat/no-stall behavior.
+            for index in 0..6 {
+                let event_type = if index % 2 == 0 {
+                    "audit.sse.wanted"
+                } else {
+                    "audit.sse.excluded"
+                };
+                store
+                    .insert_events(&[sse_event(event_type, &format!("/filtered/{index}"))])
+                    .await
+                    .expect("seed event should commit");
+            }
+            let (router, _sender) = durable_stream_router(store);
+
+            let response = router
+                .clone()
+                .oneshot(stream_request_filtered(
+                    Some("0"),
+                    Some(streamer_principal("streamer")),
+                    Some("audit.sse.wanted"),
+                ))
+                .await
+                .expect("filtered replay should start");
+            assert_eq!(response.status(), StatusCode::OK);
+            let body = read_sse_until(response.into_body(), |body| {
+                // Count the frame lines, not the JSON payloads: each framed
+                // event carries the type twice (event: line + data JSON),
+                // so matching the bare type would stop after two frames.
+                body.matches("event: audit.sse.wanted").count() >= 3
+            })
+            .await;
+
+            assert_eq!(
+                body.matches("event: audit.sse.wanted").count(),
+                3,
+                "exactly the wanted events must be framed: {body}"
+            );
+            assert_eq!(
+                body.matches("event: audit.sse.excluded").count(),
+                0,
+                "filtered events must never be framed: {body}"
+            );
+            // Each framed position appears exactly once: the cursor
+            // advanced past the excluded positions rather than re-fetching
+            // them.
+            for position in [1, 3, 5] {
+                assert_eq!(
+                    body.matches(&format!("id: {position}")).count(),
+                    1,
+                    "position {position} must be framed exactly once: {body}"
+                );
+            }
+        }
+
+        #[tokio::test]
+        async fn durable_sse_boundary_cursors_do_not_panic() {
+            let Some(admin_dsn) = locator() else {
+                eprintln!("skipping: no test database locator; CI runs this test");
+                return;
+            };
+            let database = create_test_database(&admin_dsn).await;
+            let store = migrated_store(&database.dsn).await;
+            store
+                .insert_events(&[sse_event("audit.sse.boundary", "/boundary")])
+                .await
+                .expect("seed event should commit");
+            let (router, _sender) = durable_stream_router(store);
+
+            // i64::MAX once overflowed the expiry comparison and panicked
+            // the request task; it must answer like any other not-expired
+            // cursor (a live tail from an absurd position).
+            let response = router
+                .clone()
+                .oneshot(stream_request(
+                    Some("9223372036854775807"),
+                    Some(streamer_principal("streamer")),
+                ))
+                .await
+                .expect("i64::MAX cursor must not panic");
+            assert_eq!(response.status(), StatusCode::OK);
+            drop(response.into_body());
+
+            // The head itself: replay from head delivers nothing (live
+            // tail), not an error.
+            let response = router
+                .oneshot(stream_request(
+                    Some("1"),
+                    Some(streamer_principal("streamer")),
+                ))
+                .await
+                .expect("head cursor should start");
+            assert_eq!(response.status(), StatusCode::OK);
+            drop(response.into_body());
         }
 
         #[tokio::test]

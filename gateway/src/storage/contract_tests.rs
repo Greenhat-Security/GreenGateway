@@ -1213,11 +1213,15 @@ mod postgres_audit_tests {
             .await
             .expect("setup batch should commit");
 
-        // An aborted batch: the same statements the store runs, driven on a
-        // raw connection and rolled back. Its stream append would claim the
-        // next position; the rollback must release it leaving no row and,
-        // crucially, no hole -- the next committed batch takes the same
-        // position.
+        // An aborted batch: the exact statements the store's append
+        // protocol runs (advisory lock, then the counter-reserving CTE
+        // append), driven on a raw connection and rolled back. The
+        // rollback must release the reservation leaving no row and, since
+        // the counter update rolls back with the transaction, no consumed
+        // position -- the next committed batch reuses the number. Driving
+        // the real statement (not a hand-rolled approximation) is
+        // load-bearing: the PR-6 review noted the earlier hand-rolled
+        // version tested the replaced protocol, not this one.
         let test_dsn_file = write_dsn_file(&database.dsn);
         let mut config = crate::config::Config::test_defaults();
         config.state_backend = crate::config::StateBackend::Postgres;
@@ -1249,12 +1253,36 @@ mod postgres_audit_tests {
             )
             .await
             .expect("abort batch lock should be taken");
+        // The real reservation CTE: pending anti-join, counter UPDATE with
+        // RETURNING, assignment, INSERT -- identical in shape to
+        // APPEND_STREAM_SQL so the rollback exercises the reservation.
         client
             .execute(
-                "INSERT INTO greengateway.audit_stream (position, event_id) \
-                 VALUES ((SELECT coalesce(max(position), 0) \
-                          FROM greengateway.audit_stream) + 1, 'abort-mid') \
-                 ON CONFLICT DO NOTHING",
+                r#"
+                WITH pending AS (
+                    SELECT batch.event_id
+                    FROM UNNEST(ARRAY['abort-mid']::text[]) AS batch(event_id)
+                    WHERE NOT EXISTS (
+                        SELECT 1 FROM greengateway.audit_stream s
+                        WHERE s.event_id = batch.event_id
+                    )
+                ),
+                reserved AS (
+                    UPDATE greengateway.audit_stream_state
+                    SET last_position = last_position + (SELECT count(*) FROM pending)
+                    WHERE singleton
+                    RETURNING last_position - (SELECT count(*) FROM pending) AS base_position
+                ),
+                assigned AS (
+                    SELECT reserved.base_position
+                           + row_number() OVER (ORDER BY pending.event_id) AS position,
+                           pending.event_id
+                    FROM pending CROSS JOIN reserved
+                )
+                INSERT INTO greengateway.audit_stream (position, event_id)
+                SELECT position, event_id FROM assigned
+                ON CONFLICT (event_id) DO NOTHING
+                "#,
                 &[],
             )
             .await
@@ -1263,6 +1291,25 @@ mod postgres_audit_tests {
             .batch_execute("ROLLBACK")
             .await
             .expect("abort batch should roll back");
+
+        // The counter rolled back with the transaction: reading it must
+        // still report the pre-abort head, not the reserved value.
+        let counter_row = foundation
+            .pool()
+            .get()
+            .await
+            .expect("counter checkout")
+            .query_one(
+                "SELECT last_position FROM greengateway.audit_stream_state WHERE singleton",
+                &[],
+            )
+            .await
+            .expect("counter should read");
+        assert_eq!(
+            counter_row.get::<_, i64>(0),
+            1,
+            "the aborted reservation must roll back with the transaction"
+        );
 
         // The next committed batch continues without a hole.
         store
