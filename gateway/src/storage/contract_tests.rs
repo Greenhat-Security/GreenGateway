@@ -1092,6 +1092,524 @@ mod postgres_audit_tests {
         super::audit_event_store_contract(&store).await;
     }
 
+    // ------------------------------------------------------------------
+    // Versioned policy control plane (issue #241, PR 7)
+    // ------------------------------------------------------------------
+
+    use crate::storage::policy_history::{
+        PolicyCommitError, PolicyCommitPrecondition, PolicyCommitRequest, PolicyControlPlane,
+    };
+    use crate::storage::postgres_policy::PostgresPolicyStore;
+
+    async fn migrated_policy_store(
+        database: &TestDatabase,
+    ) -> (Arc<PostgresPolicyStore>, deadpool_postgres::Pool) {
+        let test_dsn_file = write_dsn_file(&database.dsn);
+        let mut config = crate::config::Config::test_defaults();
+        config.state_backend = crate::config::StateBackend::Postgres;
+        config.deployment_id = Some("deploy-policy-contract".to_owned());
+        config.database.url_file = Some(test_dsn_file.path.clone());
+        config.database.tls_mode = crate::config::DatabaseTlsMode::LoopbackDev;
+        let foundation = PostgresFoundation::establish(&config)
+            .await
+            .expect("the test database should establish");
+        migrations::apply_missing_for_startup(foundation.pool(), &config.database)
+            .await
+            .expect("the policy schema should migrate");
+        let pool = foundation.pool().clone();
+        (Arc::new(PostgresPolicyStore::new(pool.clone())), pool)
+    }
+
+    static TEST_DIFF_SUMMARY: std::sync::LazyLock<Value> =
+        std::sync::LazyLock::new(|| json!({ "action": "test_commit" }));
+
+    fn commit_request<'a>(
+        precondition: PolicyCommitPrecondition,
+        policy: &'a Policy,
+        actor: &'a str,
+    ) -> PolicyCommitRequest<'a> {
+        PolicyCommitRequest {
+            precondition,
+            candidate: policy,
+            actor_user_id: actor,
+            diff_summary: &TEST_DIFF_SUMMARY,
+        }
+    }
+
+    fn policy_with_role(id: &str, role: &str) -> Policy {
+        contract_policy_variant(id, role)
+    }
+
+    fn contract_policy_variant(id: &str, role: &str) -> Policy {
+        Policy::validate_json_value(json!({
+            "schema_version": "0.1.0",
+            "id": id,
+            "default_action": "deny",
+            "roles": {
+                role: { "permissions": ["data:read"] }
+            }
+        }))
+        .expect("test policy should validate")
+    }
+
+    async fn count_rows(pool: &deadpool_postgres::Pool, table: &str) -> i64 {
+        let client = pool.get().await.expect("count checkout");
+        let row = client
+            .query_one(&format!("SELECT count(*) FROM greengateway.{table}"), &[])
+            .await
+            .expect("count query");
+        row.get(0)
+    }
+
+    #[tokio::test]
+    async fn policy_control_plane_initialize_commits_version_revision_and_outbox_atomically() {
+        let Some(admin_dsn) = locator() else {
+            eprintln!("skipping: no test database locator; CI runs this test");
+            return;
+        };
+        let _guard = DATABASE.lock().await;
+        let database = create_test_database(&admin_dsn).await;
+        let (store, pool) = migrated_policy_store(&database).await;
+
+        assert_eq!(
+            PolicyControlPlane::current_security_revision(&*store)
+                .await
+                .expect("initial revision read"),
+            0
+        );
+        assert!(
+            PolicyControlPlane::active(&*store)
+                .await
+                .expect("initial active read")
+                .is_none(),
+            "an unmigrated deployment has no active policy"
+        );
+
+        let initial = policy_with_role("policy-a", "reader");
+        let active = PolicyControlPlane::commit(
+            &*store,
+            commit_request(PolicyCommitPrecondition::Initialize, &initial, "op-1"),
+        )
+        .await
+        .expect("initialize should commit");
+        assert_eq!(active.security_revision, 1);
+        assert_eq!(active.policy, initial);
+        assert_eq!(
+            PolicyControlPlane::active(&*store)
+                .await
+                .expect("active read after initialize")
+                .map(|active| (active.version, active.security_revision)),
+            Some((active.version, 1))
+        );
+        assert_eq!(
+            count_rows(&pool, "policy_documents").await,
+            1,
+            "one immutable version"
+        );
+        assert_eq!(count_rows(&pool, "policy_active").await, 1);
+        assert_eq!(
+            count_rows(&pool, "security_outbox").await,
+            1,
+            "the outbox row commits with the mutation"
+        );
+
+        // A second Initialize loses: exactly one initialization exists.
+        let result = PolicyControlPlane::commit(
+            &*store,
+            commit_request(PolicyCommitPrecondition::Initialize, &initial, "op-2"),
+        )
+        .await;
+        assert_eq!(result.err(), Some(PolicyCommitError::PreconditionFailed));
+        assert_eq!(count_rows(&pool, "policy_documents").await, 1);
+
+        // A commit with the wrong expected ETag is a 412-shaped rejection
+        // that writes nothing.
+        let stale = PolicyControlPlane::commit(
+            &*store,
+            commit_request(
+                PolicyCommitPrecondition::Expected {
+                    etag: "\"sha256:stale\"".to_owned(),
+                },
+                &policy_with_role("policy-b", "reader"),
+                "op-3",
+            ),
+        )
+        .await;
+        assert_eq!(stale.err(), Some(PolicyCommitError::PreconditionFailed));
+        assert_eq!(count_rows(&pool, "policy_documents").await, 1);
+        assert_eq!(count_rows(&pool, "security_outbox").await, 1);
+        assert_eq!(
+            PolicyControlPlane::current_security_revision(&*store)
+                .await
+                .expect("revision after rejects"),
+            1,
+            "a rejected precondition must not consume a revision"
+        );
+
+        // A correct expected ETag wins: new version, revision 2, outbox 2.
+        let second = PolicyControlPlane::commit(
+            &*store,
+            commit_request(
+                PolicyCommitPrecondition::Expected { etag: active.etag },
+                &policy_with_role("policy-b", "writer"),
+                "op-4",
+            ),
+        )
+        .await
+        .expect("second commit should win");
+        assert_eq!(second.security_revision, 2);
+        assert!(second.version > active.version);
+        assert_eq!(count_rows(&pool, "policy_documents").await, 2);
+        assert_eq!(count_rows(&pool, "security_outbox").await, 2);
+
+        // The outbox records the revision, resource, and version pair --
+        // identifiers and revisions only.
+        let entries = store.outbox_after(0, 10).await.expect("outbox should read");
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].revision, 1);
+        assert_eq!(entries[0].resource_type, "policy");
+        assert_eq!(entries[0].from_version, None);
+        assert_eq!(entries[0].to_version, active.version);
+        assert_eq!(entries[1].revision, 2);
+        assert_eq!(entries[1].from_version, Some(active.version));
+        assert_eq!(entries[1].to_version, second.version);
+    }
+
+    #[tokio::test]
+    async fn policy_control_plane_concurrent_same_etag_commits_produce_exactly_one_winner() {
+        let Some(admin_dsn) = locator() else {
+            eprintln!("skipping: no test database locator; CI runs this test");
+            return;
+        };
+        let _guard = DATABASE.lock().await;
+        let database = create_test_database(&admin_dsn).await;
+        // Two store instances on separate pools: two writers as two
+        // replicas would be, racing the same expected ETag.
+        let (store_a, _pool_a) = migrated_policy_store(&database).await;
+        let (store_b, pool_b) = migrated_policy_store(&database).await;
+
+        let initial = policy_with_role("race-base", "reader");
+        let active = PolicyControlPlane::commit(
+            &*store_a,
+            commit_request(PolicyCommitPrecondition::Initialize, &initial, "op-1"),
+        )
+        .await
+        .expect("initialize should commit");
+
+        let candidate_a = policy_with_role("race-a", "reader");
+        let candidate_b = policy_with_role("race-b", "writer");
+        let etag = active.etag.clone();
+        let (result_a, result_b) = tokio::join!(
+            PolicyControlPlane::commit(
+                &*store_a,
+                commit_request(
+                    PolicyCommitPrecondition::Expected { etag: etag.clone() },
+                    &candidate_a,
+                    "replica-a"
+                )
+            ),
+            PolicyControlPlane::commit(
+                &*store_b,
+                commit_request(
+                    PolicyCommitPrecondition::Expected { etag: etag.clone() },
+                    &candidate_b,
+                    "replica-b"
+                )
+            )
+        );
+        let winners = [result_a, result_b]
+            .into_iter()
+            .filter(|result| result.is_ok())
+            .count();
+        assert_eq!(winners, 1, "exactly one of the racing writers wins");
+        // And exactly one new document/revision/outbox row exist: the
+        // loser's transaction wrote nothing.
+        assert_eq!(count_rows(&pool_b, "policy_documents").await, 2);
+        assert_eq!(count_rows(&pool_b, "security_outbox").await, 2);
+        assert_eq!(
+            PolicyControlPlane::current_security_revision(&*store_a)
+                .await
+                .expect("revision after race"),
+            2
+        );
+    }
+
+    #[tokio::test]
+    async fn policy_control_plane_concurrent_initializers_produce_exactly_one_winner() {
+        let Some(admin_dsn) = locator() else {
+            eprintln!("skipping: no test database locator; CI runs this test");
+            return;
+        };
+        let _guard = DATABASE.lock().await;
+        let database = create_test_database(&admin_dsn).await;
+        let (store_a, pool) = migrated_policy_store(&database).await;
+        let (store_b, _pool_b) = migrated_policy_store(&database).await;
+
+        let candidate_a = policy_with_role("init-a", "reader");
+        let candidate_b = policy_with_role("init-b", "writer");
+        let (result_a, result_b) = tokio::join!(
+            PolicyControlPlane::commit(
+                &*store_a,
+                commit_request(
+                    PolicyCommitPrecondition::Initialize,
+                    &candidate_a,
+                    "replica-a"
+                )
+            ),
+            PolicyControlPlane::commit(
+                &*store_b,
+                commit_request(
+                    PolicyCommitPrecondition::Initialize,
+                    &candidate_b,
+                    "replica-b"
+                )
+            )
+        );
+        let winners = [result_a, result_b]
+            .into_iter()
+            .filter(|result| result.is_ok())
+            .count();
+        assert_eq!(winners, 1, "a deployment is initialized exactly once");
+        assert_eq!(count_rows(&pool, "policy_active").await, 1);
+        assert_eq!(count_rows(&pool, "policy_documents").await, 1);
+        assert_eq!(count_rows(&pool, "security_outbox").await, 1);
+    }
+
+    #[tokio::test]
+    async fn policy_control_plane_aborted_commit_writes_nothing() {
+        let Some(admin_dsn) = locator() else {
+            eprintln!("skipping: no test database locator; CI runs this test");
+            return;
+        };
+        let _guard = DATABASE.lock().await;
+        let database = create_test_database(&admin_dsn).await;
+        let (store, pool) = migrated_policy_store(&database).await;
+
+        let initial = policy_with_role("abort-base", "reader");
+        let active = PolicyControlPlane::commit(
+            &*store,
+            commit_request(PolicyCommitPrecondition::Initialize, &initial, "op-1"),
+        )
+        .await
+        .expect("initialize should commit");
+
+        // Drive the commit transaction's real statements on a raw
+        // connection and roll back: the new immutable document, the
+        // reserved revision, the pointer advance, and the outbox row all
+        // roll back together, and the revision counter does not consume
+        // the aborted reservation.
+        let client = pool.get().await.expect("raw checkout");
+        client
+            .batch_execute("BEGIN")
+            .await
+            .expect("abort txn should begin");
+        client
+            .execute(
+                "SELECT active_version, document_etag FROM greengateway.policy_active \
+                 WHERE singleton FOR UPDATE",
+                &[],
+            )
+            .await
+            .expect("abort txn should lock");
+        client
+            .execute(
+                r#"
+                INSERT INTO greengateway.policy_documents (
+                    actor_user_id, diff_summary, document, document_etag
+                )
+                VALUES ('abort-op', '{}'::jsonb, '{}'::jsonb, '"sha256:abort"')
+                "#,
+                &[],
+            )
+            .await
+            .expect("abort document should insert");
+        client
+            .execute(
+                "UPDATE greengateway.security_revision_state \
+                 SET last_revision = last_revision + 1 WHERE singleton",
+                &[],
+            )
+            .await
+            .expect("abort revision should reserve");
+        client
+            .batch_execute("ROLLBACK")
+            .await
+            .expect("abort txn should roll back");
+        drop(client);
+
+        assert_eq!(
+            count_rows(&pool, "policy_documents").await,
+            1,
+            "the aborted document must not exist"
+        );
+        assert_eq!(count_rows(&pool, "security_outbox").await, 1);
+        assert_eq!(
+            PolicyControlPlane::current_security_revision(&*store)
+                .await
+                .expect("revision after abort"),
+            active.security_revision,
+            "an aborted commit must not consume a revision"
+        );
+        let still_active = PolicyControlPlane::active(&*store)
+            .await
+            .expect("active read");
+        assert_eq!(
+            still_active.expect("active row persists").version,
+            active.version
+        );
+    }
+
+    #[tokio::test]
+    async fn policy_control_plane_active_fails_closed_on_a_tampered_etag() {
+        let Some(admin_dsn) = locator() else {
+            eprintln!("skipping: no test database locator; CI runs this test");
+            return;
+        };
+        let _guard = DATABASE.lock().await;
+        let database = create_test_database(&admin_dsn).await;
+        let (store, pool) = migrated_policy_store(&database).await;
+
+        let initial = policy_with_role("tamper-base", "reader");
+        PolicyControlPlane::commit(
+            &*store,
+            commit_request(PolicyCommitPrecondition::Initialize, &initial, "op-1"),
+        )
+        .await
+        .expect("initialize should commit");
+
+        let client = pool.get().await.expect("tamper checkout");
+        client
+            .execute(
+                "UPDATE greengateway.policy_active SET document_etag = '\"sha256:lie\"'",
+                &[],
+            )
+            .await
+            .expect("tamper should apply");
+        drop(client);
+
+        let error = PolicyControlPlane::active(&*store)
+            .await
+            .expect_err("a mismatched ETag must fail closed");
+        assert_eq!(error.kind(), RepositoryErrorKind::InvalidData);
+        // The commit path performs the same self-consistency check inside
+        // its transaction, so a tampered pointer refuses mutations instead
+        // of being silently healed by the next writer (a defect this test
+        // caught in review: the first version verified the ETag only on
+        // the read path).
+        let commit_error = PolicyControlPlane::commit(
+            &*store,
+            commit_request(
+                PolicyCommitPrecondition::Expected {
+                    etag: "\"sha256:lie\"".to_owned(),
+                },
+                &policy_with_role("tamper-next", "reader"),
+                "op-2",
+            ),
+        )
+        .await
+        .expect_err("commit over a tampered pointer must fail closed");
+        assert_eq!(
+            commit_error,
+            PolicyCommitError::Store(RepositoryError::new(
+                RepositoryErrorKind::InvalidData,
+                "policy_commit"
+            )),
+            "store errors classify without leaking query values: {commit_error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn policy_history_contract_on_postgres_matches_the_standalone_shape() {
+        let Some(admin_dsn) = locator() else {
+            eprintln!("skipping: no test database locator; CI runs this test");
+            return;
+        };
+        let _guard = DATABASE.lock().await;
+        let database = create_test_database(&admin_dsn).await;
+        let (store, _pool) = migrated_policy_store(&database).await;
+
+        // Three commits: the immutable documents double as the history.
+        let mut etag = None;
+        for index in 0..3 {
+            let policy = policy_with_role(&format!("history-{index}"), "reader");
+            let precondition = match etag.clone() {
+                Some(etag) => PolicyCommitPrecondition::Expected { etag },
+                None => PolicyCommitPrecondition::Initialize,
+            };
+            etag = Some(
+                PolicyControlPlane::commit(&*store, commit_request(precondition, &policy, "op"))
+                    .await
+                    .expect("history commit should win")
+                    .etag,
+            );
+        }
+
+        let history = store.as_ref() as &dyn PolicyHistory;
+        let page = history
+            .list_versions(&PolicyHistoryListFilters {
+                limit: 2,
+                cursor: None,
+                include_policy: false,
+            })
+            .await
+            .expect("first page");
+        assert_eq!(page.versions.len(), 2);
+        assert!(page.next_cursor.is_some());
+        assert!(
+            page.versions.iter().all(|version| version.policy.is_none()),
+            "include_policy=false must omit snapshots"
+        );
+        // Newest-first.
+        assert!(page.versions[0].version > page.versions[1].version);
+        assert_eq!(page.versions[0].actor_user_id, "op");
+
+        let second = history
+            .list_versions(&PolicyHistoryListFilters {
+                limit: 2,
+                cursor: page.next_cursor.clone(),
+                include_policy: true,
+            })
+            .await
+            .expect("second page");
+        assert_eq!(second.versions.len(), 1);
+        assert!(second.next_cursor.is_none());
+        let snapshot = second.versions[0]
+            .policy
+            .as_ref()
+            .expect("include_policy=true returns the snapshot");
+        assert_eq!(snapshot.id.as_deref(), Some("history-0"));
+
+        // Detail reads return the exact stored snapshot.
+        let detail = history
+            .get_version(page.versions[0].version)
+            .await
+            .expect("detail read")
+            .expect("version exists");
+        assert_eq!(
+            detail.policy.as_ref().and_then(|policy| policy.id.clone()),
+            Some("history-2".to_owned()),
+            "the newest version is the last committed document"
+        );
+
+        // Bad cursors are caller errors, not store failures.
+        let bad = history
+            .list_versions(&PolicyHistoryListFilters {
+                limit: 2,
+                cursor: Some("0".to_owned()),
+                include_policy: false,
+            })
+            .await
+            .expect_err("non-positive cursor must be rejected");
+        assert_eq!(bad.invalid_parameter_name(), Some("cursor"));
+
+        // History appends outside a commit transaction are refused.
+        let append = history
+            .append_version("op", &json!({}), &policy_with_role("no-append", "reader"))
+            .await
+            .expect_err("cluster history is transactional only");
+        assert_eq!(append.kind(), RepositoryErrorKind::Internal);
+    }
+
     #[tokio::test]
     async fn postgres_audit_overlapping_retries_keep_the_stream_contiguous() {
         let Some(admin_dsn) = locator() else {
