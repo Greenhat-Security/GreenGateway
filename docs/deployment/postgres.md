@@ -144,8 +144,22 @@ Every pooled session carries server-side bounds set at connection time, so no st
 
 Client-side bounds: `DATABASE_CONNECT_TIMEOUT_MS` (default 5000) caps establishing one connection, and `DATABASE_ACQUIRE_TIMEOUT_MS` (default 5000) caps checking one out of the pool.
 
-## What PRs 3-4 provide and do not
+## The policy control plane
 
-Provided: mode selection with fail-closed validation, the redacted secret-file DSN, the verified-TLS bounded pool, deployment/instance identity, the static-configuration fingerprint, least-privilege role guidance, the versioned migration system with its CLI and startup validation, and CI against a real PostgreSQL 16 including the no-DDL privilege boundary.
+The policy document is the first shared resource on the ledger (issue #241, PR 7). In cluster mode there is no writable `POLICY_FILE`: the authority is the database, and every mutation through the admin API is one transaction — a new immutable `greengateway.policy_documents` version (which is also the history entry), the next security revision from `greengateway.security_revision_state`, the `greengateway.policy_active` pointer advance, and one `greengateway.security_outbox` change record, all committing together or not at all.
 
-Deliberately not yet present — arriving with the later PRs of #241: shared audit (PR 5), versioned control plane (PR 7-8), shared authentication state (PR 9), distributed rate limiting and leases (PR 10), global discovery (PR 11-12), membership and readiness (PR 13-14), and the import workflow (PR 15). Until the release gate (PR 16) passes, do not deploy this mode expecting HA, and expect that a postgres-mode replica serves with its local-only features unconfigured (any `*_SQLITE_PATH` is rejected), with the shared features arriving as the PRs land.
+What that buys, and what it costs:
+
+- **Compare-and-swap on `If-Match`.** Two writers presenting the same current ETag (on one replica or on two) produce exactly one winner and one `412`; the loser's transaction writes nothing. The ETag is the SHA-256 of the canonicalized document, so it is stable across replicas.
+- **A deployment is initialized exactly once.** The first policy is an explicit act (the standalone-to-cluster import workflow of PR 15, or a seeding tool); a replica that starts against a database with no active policy fails startup saying so. It never serves protected traffic with no policy and never falls back to local state.
+- **Strict per-request revision checks.** Every protected request reads the current security revision from the primary after the request starts. If the replica's compiled snapshot is keyed by that revision, the request serves under it (and the authorization audit event records `security_revision`); if the replica is behind, it reconciles within a bounded 250 ms budget (fetch, validate, atomic swap) and otherwise returns `503` with zero upstream attempts — never a stale allow, and never a `401`/`403` for a dependency failure. The revision check is one round statement per request; the state model's budget for it is 5 ms p99 warm.
+- **An invalid document is refused, everywhere.** A document that fails validation (or whose recorded ETag does not match its body) fails startup, fails reconciliation, and fails commits — fail closed, with the last valid compiled snapshot still serving only until the revision it was keyed by is superseded.
+- **History and rollback.** `GET /v1/admin/policy/history` pages the immutable versions newest-first, and rollback commits the target version as a new version. There is no in-place edit and no delete.
+
+`LISTEN/NOTIFY` is deliberately absent here: correctness comes from the durable revision counter plus reconciliation (per-request checks now; the background poller keeps replicas warm between requests), and notifications can only ever be a latency optimization on top.
+
+## What has landed and what has not
+
+Provided so far: mode selection with fail-closed validation, the redacted secret-file DSN, the verified-TLS bounded pool, deployment/instance identity, the static-configuration fingerprint, least-privilege role guidance, the versioned migration system with its CLI and startup validation, CI against a real PostgreSQL 16 including the no-DDL privilege boundary, the durable audit event store and cross-replica SSE stream (PRs 5-6), and the versioned policy control plane (PR 7, semantics above).
+
+Deliberately not yet present — arriving with the later PRs of #241: shared authentication state (PR 9), distributed rate limiting and leases (PR 10), global discovery (PR 11-12), membership and readiness (PR 13-14), the import workflow (PR 15), and the versioned tool/Connection control plane (PR 8). The versioned policy control plane (PR 7) has landed: the admin policy API serves from PostgreSQL in cluster mode under the semantics above. Until the release gate (PR 16) passes, do not deploy this mode expecting HA, and expect that a postgres-mode replica serves with its local-only features unconfigured (any `*_SQLITE_PATH` is rejected), with the shared features arriving as the PRs land.

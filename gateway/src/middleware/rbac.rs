@@ -8,6 +8,8 @@ use std::{
 };
 
 use arc_swap::ArcSwap;
+#[cfg(feature = "postgres")]
+use async_trait::async_trait;
 use axum::{
     extract::{Request, State},
     middleware::Next,
@@ -17,7 +19,7 @@ use axum::{
 use http::{Method, StatusCode};
 use notify::{RecursiveMode, Watcher};
 use serde::Serialize;
-use serde_json::json;
+use serde_json::{json, Value};
 use tokio::sync::{mpsc, Mutex, MutexGuard};
 use tokio_util::sync::CancellationToken;
 
@@ -49,6 +51,60 @@ const AUTHZ_DENIED: &str = "authz.denied";
 const AUTHZ_WOULD_DENY: &str = "authz.would_deny";
 const POLICY_RELOAD_DEBOUNCE: Duration = Duration::from_millis(200);
 
+/// Why a strict security-revision check refused to let a request proceed.
+/// Every variant maps to `503` with zero upstream attempts; the reason is
+/// a stable audit string, never the underlying error.
+#[cfg(feature = "postgres")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SecurityRevisionCheckError {
+    /// The authority could not be read (pool, connection, timeout).
+    Unavailable,
+    /// The local snapshot was still behind the authority when the bounded
+    /// reconcile deadline passed.
+    ReconcileDeadlineExceeded,
+    /// The authoritative document could not be validated by this binary;
+    /// a replica that cannot compile the current revision never serves it.
+    InvalidDocument,
+}
+
+/// Cluster mode's strict revision check failing is neither an allow nor a
+/// deny: the authority could not be consulted (or the new document could
+/// not be compiled in time), so the request never reached a policy
+/// decision. A distinct event type keeps that fact visible instead of
+/// laundering a dependency failure into `authz.denied`.
+#[cfg(feature = "postgres")]
+const AUTHZ_REVISION_CHECK_FAILED: &str = "authz.revision_check_failed";
+
+#[cfg(feature = "postgres")]
+impl SecurityRevisionCheckError {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Unavailable => "security_revision_unavailable",
+            Self::ReconcileDeadlineExceeded => "security_revision_reconcile_deadline",
+            Self::InvalidDocument => "security_revision_document_invalid",
+        }
+    }
+}
+
+/// Cluster mode's per-request security-revision gate (issue #241, PR 7).
+///
+/// The HA state model's strict rule: every protected request reads the
+/// current security revision from the PostgreSQL primary after the request
+/// starts, and the local compiled policy snapshot is usable only when it is
+/// keyed by that exact revision. The implementation behind this trait
+/// performs that read and, when the replica is behind, reconciles within a
+/// bounded deadline (the state model's 250 ms budget) before giving up.
+///
+/// Absent in standalone mode: no gate, no database on the request path.
+#[cfg(feature = "postgres")]
+#[async_trait]
+pub trait SecurityRevisionGate: Send + Sync {
+    /// Prove the local compiled snapshot is current, returning the
+    /// revision it is keyed by. The snapshot in `RbacState` is only valid
+    /// for serving once this has returned `Ok` for the request at hand.
+    async fn ensure_current_revision(&self) -> Result<i64, SecurityRevisionCheckError>;
+}
+
 #[derive(Clone)]
 pub struct RbacState {
     policy: Arc<ArcSwap<RbacPolicyState>>,
@@ -70,6 +126,11 @@ pub struct RbacState {
     /// (`current_policy()`) under the lock rather than trusting anything the
     /// panicked writer left behind.
     policy_write_lock: Arc<Mutex<()>>,
+    /// Cluster mode's strict per-request revision check. `None` in
+    /// standalone mode, where the local policy file is the authority and
+    /// no gate may put a database on the request path.
+    #[cfg(feature = "postgres")]
+    revision_gate: Option<Arc<dyn SecurityRevisionGate>>,
     rate_limit: Option<RateLimitState>,
     pub exempt_paths: Vec<String>,
     pub client_ip_policy: ClientIpPolicy,
@@ -181,6 +242,13 @@ struct RbacPolicyState {
     default_action: DefaultAction,
     enforcement_mode: EnforcementMode,
     routes: Vec<RouteRule>,
+    /// The security revision this compiled snapshot is keyed by. `0` for
+    /// file-served snapshots (standalone mode has no revisions); a cluster
+    /// snapshot is only installable at the revision of the authority that
+    /// produced it, and [`RbacState::install_revision_snapshot`] refuses to
+    /// regress it.
+    #[cfg_attr(not(feature = "postgres"), allow(dead_code))]
+    security_revision: i64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -221,6 +289,12 @@ struct AuditContext {
     source_ip: String,
     path: String,
     method: String,
+    /// The security revision this request's authorization decisions were
+    /// served under (cluster mode only; `None` in standalone). Set once,
+    /// from the snapshot the middleware actually consulted, so the audit
+    /// records the revision that was in force rather than whatever is
+    /// current at emit time.
+    security_revision: Option<i64>,
 }
 
 impl RbacState {
@@ -268,6 +342,8 @@ impl RbacState {
         Self {
             policy: Arc::new(ArcSwap::from_pointee(RbacPolicyState::from_policy(policy))),
             policy_write_lock: Arc::new(Mutex::new(())),
+            #[cfg(feature = "postgres")]
+            revision_gate: None,
             rate_limit: None,
             exempt_paths,
             client_ip_policy,
@@ -282,6 +358,18 @@ impl RbacState {
         self
     }
 
+    /// Attach cluster mode's strict revision gate. The snapshot installed
+    /// at construction is keyed by revision 0 and therefore not servable
+    /// until the gate has reconciled it; production wiring calls
+    /// [`RbacState::install_revision_snapshot`] with the authority's
+    /// current revision before the listener serves, and the gate keeps it
+    /// current afterwards.
+    #[cfg(feature = "postgres")]
+    pub(crate) fn with_revision_gate(mut self, gate: Arc<dyn SecurityRevisionGate>) -> Self {
+        self.revision_gate = Some(gate);
+        self
+    }
+
     fn replace_policy(&self, policy: Policy) {
         if let Some(rate_limit) = &self.rate_limit {
             rate_limit.replace_policy(&policy);
@@ -289,6 +377,49 @@ impl RbacState {
 
         self.policy
             .store(Arc::new(RbacPolicyState::from_policy(policy)));
+    }
+
+    /// Install a snapshot compiled for a specific authoritative security
+    /// revision (cluster mode). The swap is monotonic: a snapshot for a
+    /// revision the state already holds or has passed is a no-op, so a slow
+    /// reconciler can never overwrite a newer snapshot with an older one
+    /// and two racing installs converge on the higher revision.
+    ///
+    /// Callers serialize installs (admin commits hold the policy write
+    /// guard; the reconciler serializes through its own mutex), so the
+    /// compare-and-swap loop below is defense in depth rather than the
+    /// only guard.
+    #[cfg(feature = "postgres")]
+    pub(crate) fn install_revision_snapshot(&self, policy: Policy, security_revision: i64) {
+        // One candidate Arc built up front: `Arc::ptr_eq` against the rcu's
+        // result then distinguishes "this call installed the snapshot" from
+        // "another install already held this revision", so a duplicate
+        // install does not re-run `replace_policy` and gratuitously reset
+        // the policy-lane rate-limit buckets.
+        let candidate = Arc::new(RbacPolicyState::from_policy_at_revision(
+            policy.clone(),
+            security_revision,
+        ));
+        let installed = self.policy.rcu(|current| {
+            if security_revision <= current.security_revision {
+                // Already at or past this revision (another install won the
+                // race, or this is a duplicate): keep what is installed.
+                return current.clone();
+            }
+            candidate.clone()
+        });
+        if Arc::ptr_eq(&installed, &candidate) {
+            if let Some(rate_limit) = &self.rate_limit {
+                rate_limit.replace_policy(&policy);
+            }
+        }
+    }
+
+    /// The security revision the currently installed snapshot is keyed by.
+    /// `0` in standalone mode, where snapshots are not revisioned.
+    #[cfg(feature = "postgres")]
+    pub(crate) fn snapshot_security_revision(&self) -> i64 {
+        self.policy.load().security_revision
     }
 
     pub fn current_policy(&self) -> Policy {
@@ -460,6 +591,33 @@ impl RbacPolicyState {
             default_action,
             enforcement_mode,
             routes,
+            security_revision: 0,
+        }
+    }
+
+    /// The cluster-mode constructor: a compiled snapshot keyed by the
+    /// authoritative security revision it was built for.
+    #[cfg(feature = "postgres")]
+    fn from_policy_at_revision(policy: Policy, security_revision: i64) -> Self {
+        let default_action = policy.default_action.clone();
+        let enforcement_mode = policy.enforcement_mode;
+        let routes = policy.routes.clone();
+        let rule_ids = policy
+            .rules
+            .iter()
+            .enumerate()
+            .map(|(rule_index, rule)| rule.id.clone().unwrap_or_else(|| rule_index.to_string()))
+            .collect();
+        let rule_matcher = RuleMatcher::new(&policy.rules);
+
+        Self {
+            engine: PolicyEngine::new(policy),
+            rule_matcher,
+            rule_ids,
+            default_action,
+            enforcement_mode,
+            routes,
+            security_revision,
         }
     }
 
@@ -760,7 +918,8 @@ pub async fn rbac_middleware(State(state): State<RbacState>, req: Request, next:
         return next.run(req).await;
     }
 
-    let context = audit_context(&req, &state.client_ip_policy);
+    #[cfg_attr(not(feature = "postgres"), allow(unused_mut))]
+    let mut context = audit_context(&req, &state.client_ip_policy);
     let principal = req.extensions().get::<auth::Principal>().cloned();
     let policy_path = state.policy_path_for_request(path);
     let request_host = upstream_route::request_host_without_port(req.headers());
@@ -782,7 +941,35 @@ pub async fn rbac_middleware(State(state): State<RbacState>, req: Request, next:
         RuleDispatchContext::contextless()
     };
 
+    // Cluster mode's strict revision check (issue #241): this request may
+    // consult the local compiled snapshot only if it is keyed by the
+    // authority's current security revision. A failed check is `503` with
+    // zero upstream attempts -- never a `401`/`403` (a dependency failure
+    // is not a policy decision), and never a stale allow.
+    #[cfg(feature = "postgres")]
+    if let Some(gate) = state.revision_gate.as_ref() {
+        if let Err(error) = gate.ensure_current_revision().await {
+            emit_revision_check_failed(&state, &context, principal.as_ref(), error);
+            return with_policy_decision(
+                service_unavailable_response(),
+                PolicyDecision {
+                    outcome: PolicyDecisionOutcome::Denied,
+                    reason: error.as_str(),
+                    permission: None,
+                    path_prefix: None,
+                    matched_rule_id: None,
+                },
+            );
+        }
+    }
+
     let policy = state.policy.load();
+    // Record the revision this request actually serves under: the snapshot
+    // guard is the exact compiled state every decision below consults.
+    #[cfg(feature = "postgres")]
+    if state.revision_gate.is_some() {
+        context.security_revision = Some(policy.security_revision);
+    }
     // Direct firewall rules run before route-to-permission rules. A direct deny
     // remains global, but host-qualified upstreams require an explicit host-bound
     // route permission. Direct allow cannot authorize them, while first-match
@@ -1101,6 +1288,7 @@ fn audit_context(req: &Request, client_ip_policy: &ClientIpPolicy) -> AuditConte
         source_ip: canonical_client_ip(req.headers(), req.extensions(), client_ip_policy),
         path: req.uri().path().to_owned(),
         method: req.method().as_str().to_owned(),
+        security_revision: None,
     }
 }
 
@@ -1112,7 +1300,7 @@ fn emit_allowed(
     reason: Option<&'static str>,
 ) {
     let actor = principal.map(actor_from_principal);
-    let payload = match rule {
+    let mut payload = match rule {
         Some(rule) => json!({
             "path": &context.path,
             "method": &context.method,
@@ -1126,6 +1314,7 @@ fn emit_allowed(
             "default_allow": true,
         }),
     };
+    apply_security_revision(&mut payload, context);
 
     state.audit.emit(AuditEvent::new(
         AUTHZ_ALLOWED,
@@ -1213,12 +1402,13 @@ fn emit_direct_rule_event(
     event_type: &'static str,
 ) {
     let actor = principal.map(actor_from_principal);
-    let payload = json!({
+    let mut payload = json!({
         "path": &context.path,
         "method": &context.method,
         "reason": reason,
         "matched_rule_id": matched_rule_id,
     });
+    apply_security_revision(&mut payload, context);
 
     state.audit.emit(AuditEvent::new(
         event_type,
@@ -1238,7 +1428,7 @@ fn emit_denial_event(
     event_type: &'static str,
 ) {
     let actor = principal.map(actor_from_principal);
-    let payload = match rule {
+    let mut payload = match rule {
         Some(rule) => json!({
             "path": &context.path,
             "method": &context.method,
@@ -1252,6 +1442,7 @@ fn emit_denial_event(
             "reason": reason,
         }),
     };
+    apply_security_revision(&mut payload, context);
 
     state.audit.emit(AuditEvent::new(
         event_type,
@@ -1269,7 +1460,7 @@ fn emit_host_policy_required(
     proxy_context: &ProxyRouteAuthorizationContext,
 ) {
     let actor = principal.map(actor_from_principal);
-    let payload = json!({
+    let mut payload = json!({
         "path": &context.path,
         "method": &context.method,
         "reason": "host_policy_required",
@@ -1277,6 +1468,7 @@ fn emit_host_policy_required(
         "upstream_path_prefix": &proxy_context.path_prefix,
         "upstream_origin": &proxy_context.upstream_origin,
     });
+    apply_security_revision(&mut payload, context);
 
     state.audit.emit(AuditEvent::new(
         AUTHZ_DENIED,
@@ -1293,6 +1485,58 @@ fn forbidden() -> Response {
         Json(ForbiddenBody { error: "forbidden" }),
     )
         .into_response()
+}
+
+/// The strict revision check's fail-closed response. Deliberately carries
+/// no detail beyond a stable reason: the failure is a dependency state,
+/// not a policy decision, and the underlying store error never crosses
+/// the response boundary.
+#[cfg(feature = "postgres")]
+fn service_unavailable_response() -> Response {
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        Json(ForbiddenBody {
+            error: "policy state unavailable",
+        }),
+    )
+        .into_response()
+}
+
+/// Append the served revision to an authorization event's payload when one
+/// is in force (cluster mode). Keeping it in the payload -- not just the
+/// logs -- is what makes "which revision authorized this request" answerable
+/// from the durable audit trail alone.
+fn apply_security_revision(payload: &mut Value, context: &AuditContext) {
+    if let Some(revision) = context.security_revision {
+        if let Some(object) = payload.as_object_mut() {
+            object.insert("security_revision".to_owned(), Value::from(revision));
+        }
+    }
+}
+
+#[cfg(feature = "postgres")]
+fn emit_revision_check_failed(
+    state: &RbacState,
+    context: &AuditContext,
+    principal: Option<&auth::Principal>,
+    error: SecurityRevisionCheckError,
+) {
+    let actor = principal.map(actor_from_principal);
+    let mut payload = json!({
+        "path": &context.path,
+        "method": &context.method,
+        "reason": error.as_str(),
+        "outcome": "service_unavailable",
+    });
+    apply_security_revision(&mut payload, context);
+
+    state.audit.emit(AuditEvent::new(
+        AUTHZ_REVISION_CHECK_FAILED,
+        &context.request_id,
+        &context.source_ip,
+        actor,
+        payload,
+    ));
 }
 
 fn decision_for_rule(
@@ -3355,6 +3599,173 @@ mod tests {
             .fallback(any(ok))
             .layer(from_fn_with_state(state, rbac_middleware))
             .layer(from_fn_with_state(principal, inject_principal))
+    }
+
+    /// A deterministic revision gate for the middleware's cluster-mode
+    /// behavior tests: no database, just the outcome under test.
+    #[cfg(feature = "postgres")]
+    struct MockRevisionGate(Result<i64, SecurityRevisionCheckError>);
+
+    #[cfg(feature = "postgres")]
+    #[async_trait]
+    impl SecurityRevisionGate for MockRevisionGate {
+        async fn ensure_current_revision(&self) -> Result<i64, SecurityRevisionCheckError> {
+            self.0
+        }
+    }
+
+    #[cfg(feature = "postgres")]
+    fn gated_state(
+        policy: Policy,
+        revision: i64,
+        gate: Result<i64, SecurityRevisionCheckError>,
+    ) -> (RbacState, Arc<crate::audit::sink::tests::CaptureSink>) {
+        let (state, capture) = test_state(policy.clone(), &[]);
+        state.install_revision_snapshot(policy, revision);
+        (
+            state.with_revision_gate(Arc::new(MockRevisionGate(gate))),
+            Arc::new(capture),
+        )
+    }
+
+    #[cfg(feature = "postgres")]
+    #[tokio::test]
+    async fn revision_gate_failure_returns_503_with_zero_upstream_and_a_distinct_audit_event() {
+        // The gate failing is a dependency state, not a policy decision:
+        // the response is 503 (never 401/403), the upstream handler is
+        // never reached, and the audit trail records a dedicated
+        // revision-check event rather than laundering the failure into an
+        // authz denial.
+        let (state, capture) = gated_state(
+            test_policy(
+                DefaultAction::Deny,
+                &[("reader", &["data:read"])],
+                &[route(&[], "/data", "data:read")],
+            ),
+            4,
+            Err(SecurityRevisionCheckError::Unavailable),
+        );
+
+        let response = test_router(state, Some(test_principal(&["reader"])))
+            .oneshot(request(Method::GET, "/data/items"))
+            .await
+            .expect("request should complete");
+
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let body = axum::body::to_bytes(response.into_body(), 4096)
+            .await
+            .expect("body should read");
+        assert_ne!(
+            body.as_ref(),
+            b"ok",
+            "a request the gate refused must never reach the upstream handler"
+        );
+        let event = captured_event(&capture, AUTHZ_REVISION_CHECK_FAILED).await;
+        assert_eq!(
+            event.payload["reason"],
+            json!("security_revision_unavailable")
+        );
+        assert_eq!(event.payload["outcome"], json!("service_unavailable"));
+    }
+
+    #[cfg(feature = "postgres")]
+    #[tokio::test]
+    async fn revision_gate_success_allows_the_request_and_records_the_served_revision() {
+        let policy = test_policy(
+            DefaultAction::Deny,
+            &[("reader", &["data:read"])],
+            &[route(&[], "/data", "data:read")],
+        );
+        let (state, capture) = gated_state(policy, 6, Ok(6));
+
+        let response = test_router(state, Some(test_principal(&["reader"])))
+            .oneshot(request(Method::GET, "/data/items"))
+            .await
+            .expect("request should complete");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let event = captured_event(&capture, AUTHZ_ALLOWED).await;
+        assert_eq!(
+            event.payload["security_revision"],
+            json!(6),
+            "the audit event must record the revision the request served under"
+        );
+    }
+
+    #[tokio::test]
+    async fn audit_payloads_omit_the_revision_in_standalone_mode() {
+        // No gate, no revision: the standalone audit shape is unchanged.
+        let (state, capture) = test_state(
+            test_policy(
+                DefaultAction::Deny,
+                &[("reader", &["data:read"])],
+                &[route(&[], "/data", "data:read")],
+            ),
+            &[],
+        );
+
+        let response = test_router(state, Some(test_principal(&["reader"])))
+            .oneshot(request(Method::GET, "/data/items"))
+            .await
+            .expect("request should complete");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let event = captured_event(&capture, AUTHZ_ALLOWED).await;
+        assert!(event.payload.get("security_revision").is_none());
+    }
+
+    #[cfg(feature = "postgres")]
+    #[test]
+    fn install_revision_snapshot_never_regresses_the_compiled_state() {
+        let (state, _capture) = test_state(
+            test_policy(DefaultAction::Deny, &[("reader", &["data:read"])], &[]),
+            &[],
+        );
+        state.install_revision_snapshot(
+            test_policy(DefaultAction::Deny, &[("reader", &["data:read"])], &[]),
+            5,
+        );
+        assert_eq!(state.snapshot_security_revision(), 5);
+        // A stale reconciler delivering an older revision must not
+        // overwrite a newer compiled snapshot.
+        state.install_revision_snapshot(
+            test_policy(DefaultAction::Deny, &[("reader", &["data:read"])], &[]),
+            3,
+        );
+        assert_eq!(state.snapshot_security_revision(), 5);
+        state.install_revision_snapshot(
+            test_policy(DefaultAction::Deny, &[("reader", &["data:read"])], &[]),
+            9,
+        );
+        assert_eq!(state.snapshot_security_revision(), 9);
+    }
+
+    #[cfg(feature = "postgres")]
+    #[tokio::test]
+    async fn concurrent_snapshot_installs_converge_on_the_higher_revision() {
+        let (state, _capture) = test_state(
+            test_policy(DefaultAction::Deny, &[("reader", &["data:read"])], &[]),
+            &[],
+        );
+        let low = state.clone();
+        let high = state.clone();
+        let (low, high) = tokio::join!(
+            tokio::task::spawn_blocking(move || {
+                low.install_revision_snapshot(
+                    test_policy(DefaultAction::Deny, &[("reader", &["data:read"])], &[]),
+                    7,
+                );
+            }),
+            tokio::task::spawn_blocking(move || {
+                high.install_revision_snapshot(
+                    test_policy(DefaultAction::Deny, &[("reader", &["data:read"])], &[]),
+                    8,
+                );
+            })
+        );
+        low.expect("low install should join");
+        high.expect("high install should join");
+        assert_eq!(state.snapshot_security_revision(), 8);
     }
 
     async fn inject_principal(

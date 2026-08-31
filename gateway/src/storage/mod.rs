@@ -28,6 +28,8 @@ mod policy_history;
 pub mod postgres;
 #[cfg(feature = "postgres")]
 pub mod postgres_audit;
+#[cfg(feature = "postgres")]
+pub mod postgres_policy;
 mod principal;
 mod service_token;
 
@@ -36,6 +38,13 @@ mod contract_tests;
 
 pub use audit::{AuditEventStore, SqliteAuditEventStore};
 pub use policy_history::PolicyHistory;
+#[cfg(feature = "postgres")]
+pub use policy_history::{
+    ActivePolicy, PolicyCommitError, PolicyCommitPrecondition, PolicyCommitRequest,
+    PolicyControlPlane,
+};
+#[cfg(feature = "postgres")]
+pub use postgres_policy::PostgresPolicyStore;
 pub use principal::PrincipalDirectoryStore;
 pub use service_token::ServiceTokenStore;
 

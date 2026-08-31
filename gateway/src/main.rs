@@ -55,6 +55,8 @@ mod mcp;
 mod metrics;
 mod middleware;
 mod path_match;
+#[cfg(feature = "postgres")]
+mod policy_cluster;
 mod proxy;
 mod rbac;
 mod storage;
@@ -67,6 +69,8 @@ use lifecycle::{
     serve_gateway, GatewayApp, GatewayApps, GatewayLifecycle, GrpcApp, ShutdownConfig,
 };
 use proxy::{ProxyClassifier, ProxyState};
+#[cfg(feature = "postgres")]
+use storage::PolicyControlPlane as _;
 use storage::{AuditEventStore as _, PrincipalDirectoryStore};
 
 const REQUEST_COUNTER: &str = "gateway_http_requests";
@@ -427,6 +431,11 @@ struct PolicyAdminState {
     policy_file: Option<PathBuf>,
     rbac_state: Option<middleware::rbac::RbacState>,
     history_store: Option<Arc<dyn storage::PolicyHistory>>,
+    /// Cluster mode's authoritative control plane. Present exactly when
+    /// `policy_file` is absent-but-cluster: mutations commit through its
+    /// CAS transaction instead of the file, and history is its documents.
+    #[cfg(feature = "postgres")]
+    control_plane: Option<Arc<dyn storage::PolicyControlPlane>>,
     query_store: Option<Arc<storage::SqliteAuditEventStore>>,
     audit: audit::AuditLog,
     client_ip_policy: client_ip::ClientIpPolicy,
@@ -533,6 +542,13 @@ struct AdminApiStates {
     suggestions: SuggestionsAdminState,
     traffic: TrafficAdminState,
     principals: PrincipalAdminState,
+    /// Cluster mode's revision gate, layered over every admin API route
+    /// except the (pre-authorization) auth routes: an admin endpoint's
+    /// permission check consults the compiled policy snapshot, so it is a
+    /// protected request under the HA state model's strict rule and must
+    /// never authorize against a stale revision.
+    #[cfg(feature = "postgres")]
+    revision_gate: Option<Arc<dyn middleware::rbac::SecurityRevisionGate>>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -1188,7 +1204,6 @@ struct PolicyRuleCreateResult {
 struct PolicyMutationCommitContext<'a> {
     state: &'a PolicyAdminState,
     rbac_state: &'a middleware::rbac::RbacState,
-    policy_file: &'a std::path::Path,
     parts: &'a http::request::Parts,
     principal: &'a auth::Principal,
 }
@@ -1373,6 +1388,11 @@ struct GatewayAppBuildOverrides {
     /// path.
     #[cfg(feature = "postgres")]
     pg_audit: Option<Arc<storage::postgres_audit::PostgresAuditEventStore>>,
+    /// The cluster-mode policy control plane seed: the store plus the
+    /// authoritative active document `run()` loaded and validated enough
+    /// to hand to the app builder. None in standalone mode.
+    #[cfg(feature = "postgres")]
+    pg_policy: Option<ClusterPolicySeed>,
     #[cfg(test)]
     egress_resolver: Option<Arc<dyn egress::DnsResolver>>,
     #[cfg(test)]
@@ -1382,6 +1402,60 @@ struct GatewayAppBuildOverrides {
     #[cfg(test)]
     stream_proxy_request_bodies: bool,
 }
+
+/// What `run()` proves about the policy authority before the app is built:
+/// the store to serve from, and the active document the first snapshot
+/// compiles from.
+#[cfg(feature = "postgres")]
+struct ClusterPolicySeed {
+    store: Arc<storage::PostgresPolicyStore>,
+    active: storage::ActivePolicy,
+}
+
+/// Why cluster mode refused to start on the policy control plane. Every
+/// variant is fail-closed: an uninitialized deployment, an unreadable
+/// authority, or a document this binary cannot serve all mean "do not
+/// serve", never "serve something local instead".
+#[cfg(feature = "postgres")]
+#[derive(Debug)]
+enum ClusterPolicyStartupError {
+    /// The deployment has no active policy. Initialization is an explicit
+    /// workflow (the standalone-to-cluster import of #241 PR 15, or a
+    /// seeding tool); a gateway that started anyway would either serve
+    /// protected traffic with no authorization policy or fall back to
+    /// local state the mode forbids.
+    Uninitialized,
+    /// The authority could not be read at startup.
+    Store(storage::RepositoryError),
+    /// The active document failed validation: this binary refuses to
+    /// activate a document it cannot fully parse and enforce.
+    InvalidDocument(String),
+}
+
+#[cfg(feature = "postgres")]
+impl std::fmt::Display for ClusterPolicyStartupError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Uninitialized => formatter.write_str(
+                "STATE_BACKEND=postgres requires an initialized deployment: the \
+                 policy control plane has no active policy document. Initialize the \
+                 deployment (the standalone import workflow lands in a later #241 \
+                 PR) or unset STATE_BACKEND to run standalone",
+            ),
+            Self::Store(error) => write!(
+                formatter,
+                "the cluster-mode policy control plane could not be read at startup: {error}"
+            ),
+            Self::InvalidDocument(reason) => write!(
+                formatter,
+                "the active policy document failed validation and will not be served: {reason}"
+            ),
+        }
+    }
+}
+
+#[cfg(feature = "postgres")]
+impl std::error::Error for ClusterPolicyStartupError {}
 
 fn egress_client_for_build(
     config: egress::EgressConfig,
@@ -1511,6 +1585,29 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     #[cfg(feature = "postgres")]
     let _database_foundation =
         storage::postgres::PostgresFoundation::start_if_selected(&config).await?;
+    // The policy control plane rides the same pool. `active()` validates
+    // the document (parse) and verifies its recorded ETag; the proxy-route
+    // cross-check needs the config and runs in the app builder. Serving
+    // without a validated active document is not an option the mode has:
+    // an uninitialized or unreadable deployment fails startup here.
+    #[cfg(feature = "postgres")]
+    let pg_policy_seed = match &_database_foundation {
+        Some(foundation) => {
+            let store = Arc::new(storage::PostgresPolicyStore::new(foundation.pool().clone()));
+            match store.active().await {
+                Ok(Some(active)) => Some(ClusterPolicySeed { store, active }),
+                Ok(None) => {
+                    return Err(Box::new(ClusterPolicyStartupError::Uninitialized)
+                        as Box<dyn std::error::Error>)
+                }
+                Err(error) => {
+                    return Err(Box::new(ClusterPolicyStartupError::Store(error))
+                        as Box<dyn std::error::Error>)
+                }
+            }
+        }
+        None => None,
+    };
     // The durable audit store rides the foundation's pool; the SSE
     // endpoint reads committed events through it in cluster mode. Built
     // here, where both the pool and the replica identity exist, and handed
@@ -1554,6 +1651,8 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             lifecycle: Some(lifecycle.clone()),
             #[cfg(feature = "postgres")]
             pg_audit: pg_audit_store,
+            #[cfg(feature = "postgres")]
+            pg_policy: pg_policy_seed,
             #[cfg(test)]
             egress_resolver: None,
             #[cfg(test)]
@@ -1745,6 +1844,19 @@ fn gateway_app_with_process_started_at_and_overrides(
         })
         .transpose()?
         .map(Arc::new);
+    // Cluster mode: the immutable `policy_documents` rows ARE the history
+    // (written transactionally inside every commit), so the PostgreSQL
+    // store satisfies the same contract the SQLite history does.
+    #[cfg(feature = "postgres")]
+    let policy_history_store: Option<Arc<dyn storage::PolicyHistory>> =
+        match build_overrides.pg_policy.as_ref() {
+            Some(seed) => Some(seed.store.clone()),
+            None => policy_history_sqlite_path(&config)
+                .map(rbac::PolicyHistoryStore::open)
+                .transpose()?
+                .map(|store| Arc::new(store) as Arc<dyn storage::PolicyHistory>),
+        };
+    #[cfg(not(feature = "postgres"))]
     let policy_history_store: Option<Arc<dyn storage::PolicyHistory>> =
         policy_history_sqlite_path(&config)
             .map(rbac::PolicyHistoryStore::open)
@@ -1759,6 +1871,28 @@ fn gateway_app_with_process_started_at_and_overrides(
                     discovery_query_store.clone(),
                 ),
             );
+    // Cluster mode replaces the file with the authority's active document
+    // (already parsed and ETag-verified by `active()`); the proxy-route
+    // cross-check runs here, where the config is at hand, and a document
+    // that fails it fails startup -- a replica must never serve under a
+    // policy it cannot fully enforce.
+    #[cfg(feature = "postgres")]
+    let loaded_policy = match build_overrides.pg_policy.as_ref() {
+        Some(seed) => {
+            if let Err(err) = middleware::rbac::validate_policy_proxy_dispatch_config(
+                &seed.active.policy,
+                &config,
+            ) {
+                return Err(
+                    Box::new(ClusterPolicyStartupError::InvalidDocument(err.to_string()))
+                        as Box<dyn std::error::Error>,
+                );
+            }
+            Some(seed.active.policy.clone())
+        }
+        None => rbac::Policy::from_config(&config)?,
+    };
+    #[cfg(not(feature = "postgres"))]
     let loaded_policy = rbac::Policy::from_config(&config)?;
     if let Some(policy) = loaded_policy.as_ref() {
         middleware::rbac::validate_policy_proxy_dispatch_config(policy, &config)?;
@@ -1895,6 +2029,31 @@ fn gateway_app_with_process_started_at_and_overrides(
             None
         }
     };
+    // Cluster mode: key the initial snapshot to the authority's revision
+    // and attach the strict gate plus the background reconciler. Every
+    // clone made after this point (token, status, tool, schema admin
+    // states, the middleware layer) shares the gated ArcSwap.
+    #[cfg(feature = "postgres")]
+    let mut policy_control_plane: Option<Arc<dyn storage::PolicyControlPlane>> = None;
+    #[cfg(feature = "postgres")]
+    let mut cluster_revision_gate: Option<Arc<dyn middleware::rbac::SecurityRevisionGate>> = None;
+    #[cfg(feature = "postgres")]
+    let rbac_state = match (build_overrides.pg_policy.as_ref(), rbac_state) {
+        (Some(seed), Some(state)) => {
+            state.install_revision_snapshot(
+                seed.active.policy.clone(),
+                seed.active.security_revision,
+            );
+            let runtime =
+                policy_cluster::ClusterPolicyRuntime::new(seed.store.clone(), state.clone());
+            runtime.spawn_poller(&lifecycle);
+            policy_control_plane = Some(seed.store.clone());
+            cluster_revision_gate =
+                Some(runtime.clone() as Arc<dyn middleware::rbac::SecurityRevisionGate>);
+            Some(state.with_revision_gate(runtime))
+        }
+        (_, state) => state,
+    };
     if let (Some(policy_file), Some(rbac_state)) =
         (config.policy_file.as_ref(), rbac_state.as_ref())
     {
@@ -1989,6 +2148,8 @@ fn gateway_app_with_process_started_at_and_overrides(
         policy_file: config.policy_file.as_ref().map(PathBuf::from),
         rbac_state: rbac_state.clone(),
         history_store: policy_history_store,
+        #[cfg(feature = "postgres")]
+        control_plane: policy_control_plane,
         query_store: audit_query_store.clone(),
         audit: audit_log.clone(),
         client_ip_policy: client_ip_policy.clone(),
@@ -2123,6 +2284,8 @@ fn gateway_app_with_process_started_at_and_overrides(
         suggestions: suggestions_admin_state,
         traffic: traffic_admin_state,
         principals: principal_admin_state,
+        #[cfg(feature = "postgres")]
+        revision_gate: cluster_revision_gate,
     };
 
     let grpc = grpc_app(&config, &app_state, &middleware_stack);
@@ -2787,7 +2950,12 @@ fn add_admin_api_routes(
     routes: &GatewayRoutes,
     admin_api_states: AdminApiStates,
 ) -> Router {
-    router
+    // The admin API (minus the pre-authorization auth routes, merged
+    // separately below) is one router so cluster mode can gate all of it
+    // with one layer: every endpoint here authorizes against the compiled
+    // policy snapshot, and that check must never see a stale revision.
+    #[cfg_attr(not(feature = "postgres"), allow(unused_mut))]
+    let mut api = Router::new()
         .merge(
             Router::new()
                 .route(routes.admin.audit_route.as_str(), get(audit_query_endpoint))
@@ -2802,7 +2970,6 @@ fn add_admin_api_routes(
                 .route(routes.admin.status_route.as_str(), get(status_endpoint))
                 .with_state(admin_api_states.status),
         )
-        .merge(admin_auth_router(routes, admin_api_states.auth))
         .merge(
             Router::new()
                 .route(
@@ -3001,7 +3168,40 @@ fn add_admin_api_routes(
                     post(traffic_endpoint_review_endpoint),
                 )
                 .with_state(admin_api_states.traffic),
-        )
+        );
+
+    // Cluster mode's strict revision check for the admin plane: an admin
+    // request whose replica cannot prove a current compiled snapshot fails
+    // closed with 503, exactly like a protected data-plane request, and is
+    // never authorized under a stale allow.
+    #[cfg(feature = "postgres")]
+    if let Some(gate) = admin_api_states.revision_gate.clone() {
+        api = api.layer(axum::middleware::from_fn_with_state(
+            gate,
+            admin_revision_gate_middleware,
+        ));
+    }
+
+    router
+        .merge(api)
+        .merge(admin_auth_router(routes, admin_api_states.auth))
+}
+
+/// The admin API's revision gate (issue #241, PR 7): one bound-checked read
+/// of the authority before any admin endpoint runs. Without this layer the
+/// admin routes -- which the RBAC middleware exempts and which authorize
+/// through `RbacState`'s local snapshot -- would accept `admin:*` decisions
+/// from a stale revision for as long as the replica lags the authority.
+#[cfg(feature = "postgres")]
+async fn admin_revision_gate_middleware(
+    State(gate): State<Arc<dyn middleware::rbac::SecurityRevisionGate>>,
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> Response {
+    match gate.ensure_current_revision().await {
+        Ok(_) => next.run(request).await,
+        Err(_) => service_unavailable("policy state unavailable"),
+    }
 }
 
 fn admin_auth_router(routes: &GatewayRoutes, state: Option<AdminAuthState>) -> Router {
@@ -5218,6 +5418,30 @@ async fn policy_get_endpoint(
         Err(error) => return policy_admin_authz_error_response(error),
     };
 
+    // Cluster mode serves the authoritative active document (ETag already
+    // verified against the document body by `active()`), not the local
+    // snapshot: an admin reading the policy sees exactly what a commit
+    // would compare against.
+    #[cfg(feature = "postgres")]
+    if let Some(control_plane) = state.control_plane.as_ref() {
+        return match control_plane.active().await {
+            Ok(Some(active)) => (
+                StatusCode::OK,
+                [(header::ETAG, etag_header_value(&active.etag))],
+                Json(active.policy),
+            )
+                .into_response(),
+            Ok(None) => {
+                tracing::error!("policy control plane has no active document");
+                service_unavailable("policy control plane unavailable")
+            }
+            Err(error) => {
+                tracing::error!(error = %error, "policy control plane read failed");
+                service_unavailable("policy control plane unavailable")
+            }
+        };
+    }
+
     let policy = rbac_state.current_policy();
     let etag = match policy_etag(&policy) {
         Ok(etag) => etag,
@@ -5250,9 +5474,9 @@ async fn policy_put_endpoint(
             Ok(rbac_state) => rbac_state,
             Err(error) => return policy_admin_authz_error_response(error),
         };
-    let Some(policy_file) = state.policy_file.as_deref() else {
+    if !policy_authority_configured(&state) {
         return policy_not_configured();
-    };
+    }
 
     let body = match read_request_body(body, state.max_body_size).await {
         Ok(body) => body,
@@ -5265,20 +5489,11 @@ async fn policy_put_endpoint(
 
     let _policy_write_guard = rbac_state.policy_write_guard().await;
 
-    let before_policy = rbac_state.current_policy();
-    let current_etag = match policy_etag(&before_policy) {
-        Ok(etag) => etag,
-        Err(err) => {
-            tracing::error!(error = %err, "failed to compute current policy ETag");
-            return internal_server_error("policy ETag computation failed");
-        }
-    };
-
-    match if_match_matches(&parts.headers, &current_etag) {
-        Ok(true) => {}
-        Ok(false) => return precondition_failed("If-Match does not match the current policy ETag"),
-        Err(error) => return if_match_error_response(error),
-    }
+    let (before_policy, current_etag) =
+        match current_policy_and_matching_if_match(&state, rbac_state, &parts.headers).await {
+            Ok(view) => view,
+            Err(response) => return *response,
+        };
 
     if candidate.egress != before_policy.egress {
         return egress_reload_unsupported();
@@ -5288,46 +5503,34 @@ async fn policy_put_endpoint(
         return policy_validation_failed(vec![policy_error_message(&err)]);
     }
 
-    if let Err(err) = candidate.persist_to_file(policy_file) {
-        tracing::error!(policy_file = %policy_file.display(), error = %err, "failed to persist policy");
-        return internal_server_error("policy persist failed");
-    }
-
-    if let Err(err) = middleware::rbac::reload_policy_from_file(rbac_state, policy_file) {
-        tracing::error!(policy_file = %policy_file.display(), error = %err, "failed to reload persisted policy");
-        return internal_server_error("policy reload failed");
-    }
-
-    let after_policy = rbac_state.current_policy();
     let diff_summary = json!({
         "action": "policy_replaced",
     });
-    let history_append_failed =
-        append_policy_version_after_commit(&state, &principal, &after_policy, &diff_summary).await;
-    emit_policy_rule_changed(
-        &state,
-        &parts,
-        &principal,
+    let commit = match persist_policy_mutation(
+        PolicyMutationCommitContext {
+            state: &state,
+            rbac_state,
+            parts: &parts,
+            principal: &principal,
+        },
         &before_policy,
-        &after_policy,
+        &current_etag,
+        &candidate,
         diff_summary,
-    );
-
-    let new_etag = match policy_etag(&after_policy) {
-        Ok(etag) => etag,
-        Err(err) => {
-            tracing::error!(error = %err, "failed to compute updated policy ETag");
-            return internal_server_error("policy ETag computation failed");
-        }
+    )
+    .await
+    {
+        Ok(result) => result,
+        Err(response) => return *response,
     };
 
     let response = (
         StatusCode::OK,
-        [(header::ETAG, etag_header_value(&new_etag))],
-        Json(after_policy),
+        [(header::ETAG, etag_header_value(&commit.new_etag))],
+        Json(commit.after_policy),
     )
         .into_response();
-    with_policy_history_append_warning(response, history_append_failed)
+    with_policy_history_append_warning(response, commit.history_append_failed)
 }
 
 async fn policy_history_endpoint(
@@ -5385,9 +5588,9 @@ async fn policy_rollback_endpoint(
             Ok(rbac_state) => rbac_state,
             Err(error) => return policy_admin_authz_error_response(error),
         };
-    let Some(policy_file) = state.policy_file.as_deref() else {
+    if !policy_authority_configured(&state) {
         return policy_not_configured();
-    };
+    }
     let Some(history_store) = state.history_store.as_ref() else {
         return policy_history_not_configured();
     };
@@ -5410,11 +5613,14 @@ async fn policy_rollback_endpoint(
 
     let _policy_write_guard = rbac_state.policy_write_guard().await;
 
-    let before_policy = rbac_state.current_policy();
-    match require_matching_if_match(&parts.headers, &before_policy) {
-        Ok(_) => {}
-        Err(response) => return *response,
-    }
+    // The view reads the authority (file snapshot or the active row) and
+    // checks the If-Match precondition against it; in cluster mode the
+    // rollback commits as a NEW immutable version of the target document.
+    let (before_policy, current_etag) =
+        match current_policy_and_matching_if_match(&state, rbac_state, &parts.headers).await {
+            Ok(view) => view,
+            Err(response) => return *response,
+        };
 
     let diff_summary = json!({
         "action": "policy_rolled_back",
@@ -5424,11 +5630,11 @@ async fn policy_rollback_endpoint(
         PolicyMutationCommitContext {
             state: &state,
             rbac_state,
-            policy_file,
             parts: &parts,
             principal: &principal,
         },
         &before_policy,
+        &current_etag,
         &target_policy,
         diff_summary,
     )
@@ -5487,7 +5693,7 @@ async fn policy_rule_post_endpoint(
 ) -> Response {
     record_request(POLICY_RULES_ADMIN_ROUTE);
 
-    let (parts, body, principal, rbac_state, policy_file) =
+    let (parts, body, principal, rbac_state) =
         match split_authorized_policy_mutation_request(&state, request) {
             Ok(context) => context,
             Err(response) => return *response,
@@ -5502,11 +5708,10 @@ async fn policy_rule_post_endpoint(
         Err(errors) => return policy_validation_failed(errors),
     };
 
-    let created =
-        match create_policy_rule(&state, &parts, &principal, rbac_state, policy_file, rule).await {
-            Ok(result) => result,
-            Err(response) => return *response,
-        };
+    let created = match create_policy_rule(&state, &parts, &principal, rbac_state, rule).await {
+        Ok(result) => result,
+        Err(response) => return *response,
+    };
 
     let response = (
         StatusCode::CREATED,
@@ -5524,7 +5729,7 @@ async fn policy_rule_patch_endpoint(
 ) -> Response {
     record_request(POLICY_RULE_ADMIN_ROUTE);
 
-    let (parts, body, principal, rbac_state, policy_file) =
+    let (parts, body, principal, rbac_state) =
         match split_authorized_policy_mutation_request(&state, request) {
             Ok(context) => context,
             Err(response) => return *response,
@@ -5546,11 +5751,11 @@ async fn policy_rule_patch_endpoint(
 
     let _policy_write_guard = rbac_state.policy_write_guard().await;
 
-    let before_policy = rbac_state.current_policy();
-    match require_matching_if_match(&parts.headers, &before_policy) {
-        Ok(_) => {}
-        Err(response) => return *response,
-    }
+    let (before_policy, current_etag) =
+        match current_policy_and_matching_if_match(&state, rbac_state, &parts.headers).await {
+            Ok(view) => view,
+            Err(response) => return *response,
+        };
 
     let rule_index = match rule_index_by_id(&before_policy, &rule_id) {
         Ok(rule_index) => rule_index,
@@ -5577,11 +5782,11 @@ async fn policy_rule_patch_endpoint(
         PolicyMutationCommitContext {
             state: &state,
             rbac_state,
-            policy_file,
             parts: &parts,
             principal: &principal,
         },
         &before_policy,
+        &current_etag,
         &candidate,
         diff_summary,
     )
@@ -5614,7 +5819,7 @@ async fn policy_rule_delete_endpoint(
 ) -> Response {
     record_request(POLICY_RULE_ADMIN_ROUTE);
 
-    let (parts, _body, principal, rbac_state, policy_file) =
+    let (parts, _body, principal, rbac_state) =
         match split_authorized_policy_mutation_request(&state, request) {
             Ok(context) => context,
             Err(response) => return *response,
@@ -5622,11 +5827,11 @@ async fn policy_rule_delete_endpoint(
 
     let _policy_write_guard = rbac_state.policy_write_guard().await;
 
-    let before_policy = rbac_state.current_policy();
-    match require_matching_if_match(&parts.headers, &before_policy) {
-        Ok(_) => {}
-        Err(response) => return *response,
-    }
+    let (before_policy, current_etag) =
+        match current_policy_and_matching_if_match(&state, rbac_state, &parts.headers).await {
+            Ok(view) => view,
+            Err(response) => return *response,
+        };
 
     let rule_index = match rule_index_by_id(&before_policy, &rule_id) {
         Ok(rule_index) => rule_index,
@@ -5649,11 +5854,11 @@ async fn policy_rule_delete_endpoint(
         PolicyMutationCommitContext {
             state: &state,
             rbac_state,
-            policy_file,
             parts: &parts,
             principal: &principal,
         },
         &before_policy,
+        &current_etag,
         &candidate,
         diff_summary,
     )
@@ -5680,7 +5885,7 @@ async fn policy_rules_order_put_endpoint(
 ) -> Response {
     record_request(POLICY_RULES_ORDER_ADMIN_ROUTE);
 
-    let (parts, body, principal, rbac_state, policy_file) =
+    let (parts, body, principal, rbac_state) =
         match split_authorized_policy_mutation_request(&state, request) {
             Ok(context) => context,
             Err(response) => return *response,
@@ -5697,11 +5902,11 @@ async fn policy_rules_order_put_endpoint(
 
     let _policy_write_guard = rbac_state.policy_write_guard().await;
 
-    let before_policy = rbac_state.current_policy();
-    match require_matching_if_match(&parts.headers, &before_policy) {
-        Ok(_) => {}
-        Err(response) => return *response,
-    }
+    let (before_policy, current_etag) =
+        match current_policy_and_matching_if_match(&state, rbac_state, &parts.headers).await {
+            Ok(view) => view,
+            Err(response) => return *response,
+        };
 
     let current_order = policy_rule_ids(&before_policy);
     if let Err(errors) = validate_rule_order(&current_order, &requested_order) {
@@ -5723,11 +5928,11 @@ async fn policy_rules_order_put_endpoint(
         PolicyMutationCommitContext {
             state: &state,
             rbac_state,
-            policy_file,
             parts: &parts,
             principal: &principal,
         },
         &before_policy,
+        &current_etag,
         &candidate,
         diff_summary,
     )
@@ -7064,9 +7269,9 @@ async fn rule_suggestion_accept_endpoint(
             Ok(rbac_state) => rbac_state,
             Err(error) => return policy_admin_authz_error_response(error),
         };
-    let Some(policy_file) = state.policy.policy_file.as_deref() else {
+    if !policy_authority_configured(&state.policy) {
         return policy_not_configured();
-    };
+    }
 
     let id = id.trim();
     if id.is_empty() {
@@ -7152,7 +7357,6 @@ async fn rule_suggestion_accept_endpoint(
         &parts,
         &principal,
         rbac_state,
-        policy_file,
         proposed_rule,
     )
     .await
@@ -9615,7 +9819,6 @@ fn split_authorized_policy_mutation_request(
     Body,
     auth::Principal,
     &middleware::rbac::RbacState,
-    &std::path::Path,
 )> {
     let (parts, body) = request.into_parts();
     let Some(principal) = parts.extensions.get::<auth::Principal>().cloned() else {
@@ -9626,11 +9829,25 @@ fn split_authorized_policy_mutation_request(
         Ok(rbac_state) => rbac_state,
         Err(error) => return Err(Box::new(policy_admin_authz_error_response(error))),
     };
-    let Some(policy_file) = state.policy_file.as_deref() else {
+    if !policy_authority_configured(state) {
         return Err(Box::new(policy_not_configured()));
-    };
+    }
 
-    Ok((parts, body, principal, rbac_state, policy_file))
+    Ok((parts, body, principal, rbac_state))
+}
+
+/// Whether any policy authority is wired: the standalone file, or cluster
+/// mode's PostgreSQL control plane. One of the two must exist for the
+/// mutation endpoints to have anything to commit to.
+fn policy_authority_configured(state: &PolicyAdminState) -> bool {
+    if state.policy_file.is_some() {
+        return true;
+    }
+    #[cfg(feature = "postgres")]
+    if state.control_plane.is_some() {
+        return true;
+    }
+    false
 }
 
 fn parse_create_token_body(body: &Bytes) -> ResponseResult<CreateTokenAdminRequest> {
@@ -10666,18 +10883,67 @@ fn require_matching_if_match(
     }
 }
 
+/// The current policy as its authority sees it, behind the request's
+/// `If-Match` precondition: standalone reads the compiled snapshot and
+/// hashes it; cluster mode reads the authoritative active document (whose
+/// recorded ETag `active()` already verified against the document body).
+///
+/// The returned ETag is what a mutation must present to win its
+/// compare-and-swap -- in cluster mode the commit transaction re-verifies
+/// it, so a writer that raced another replica loses with `412` rather
+/// than overwriting.
+async fn current_policy_and_matching_if_match(
+    state: &PolicyAdminState,
+    rbac_state: &middleware::rbac::RbacState,
+    headers: &HeaderMap,
+) -> ResponseResult<(rbac::Policy, String)> {
+    #[cfg(feature = "postgres")]
+    if let Some(control_plane) = state.control_plane.as_ref() {
+        return match control_plane.active().await {
+            Ok(Some(active)) => match if_match_matches(headers, &active.etag) {
+                Ok(true) => Ok((active.policy, active.etag)),
+                Ok(false) => Err(Box::new(precondition_failed(
+                    "If-Match does not match the current policy ETag",
+                ))),
+                Err(error) => Err(Box::new(if_match_error_response(error))),
+            },
+            // Startup refuses an uninitialized deployment and the pointer
+            // is append-only, so both arms are defensive fail-closed paths.
+            Ok(None) => {
+                tracing::error!("policy control plane has no active document");
+                Err(Box::new(service_unavailable(
+                    "policy control plane unavailable",
+                )))
+            }
+            Err(error) => {
+                tracing::error!(error = %error, "policy control plane read failed");
+                Err(Box::new(service_unavailable(
+                    "policy control plane unavailable",
+                )))
+            }
+        };
+    }
+    #[cfg(not(feature = "postgres"))]
+    let _ = state;
+    let before_policy = rbac_state.current_policy();
+    let current_etag = require_matching_if_match(headers, &before_policy)?;
+    Ok((before_policy, current_etag))
+}
+
 async fn create_policy_rule(
     state: &PolicyAdminState,
     parts: &http::request::Parts,
     principal: &auth::Principal,
     rbac_state: &middleware::rbac::RbacState,
-    policy_file: &std::path::Path,
     mut rule: rbac::Rule,
 ) -> ResponseResult<PolicyRuleCreateResult> {
     let _policy_write_guard = rbac_state.policy_write_guard().await;
 
-    let before_policy = rbac_state.current_policy();
-    let current_etag = require_matching_if_match(&parts.headers, &before_policy)?;
+    let (before_policy, current_etag) =
+        match current_policy_and_matching_if_match(state, rbac_state, &parts.headers).await {
+            Ok(view) => view,
+            Err(response) => return Err(response),
+        };
 
     if let Some(rule_id) = rule.id.as_deref() {
         if policy_rule_ids(&before_policy)
@@ -10711,11 +10977,11 @@ async fn create_policy_rule(
         PolicyMutationCommitContext {
             state,
             rbac_state,
-            policy_file,
             parts,
             principal,
         },
         &before_policy,
+        &current_etag,
         &candidate,
         diff_summary,
     )
@@ -10739,9 +11005,12 @@ async fn create_policy_rule(
 async fn persist_policy_mutation(
     context: PolicyMutationCommitContext<'_>,
     before_policy: &rbac::Policy,
+    expected_etag: &str,
     candidate: &rbac::Policy,
     diff_summary: Value,
 ) -> ResponseResult<PolicyMutationCommitResult> {
+    #[cfg(not(feature = "postgres"))]
+    let _ = expected_etag;
     if candidate.egress != before_policy.egress {
         return Err(Box::new(egress_reload_unsupported()));
     }
@@ -10752,15 +11021,69 @@ async fn persist_policy_mutation(
         ])));
     }
 
-    if let Err(err) = candidate.persist_to_file(context.policy_file) {
-        tracing::error!(policy_file = %context.policy_file.display(), error = %err, "failed to persist policy");
+    // Cluster mode: one transaction through the authority -- new immutable
+    // version, revision advance, history row, and outbox record commit
+    // together, or nothing does. The expected ETag is the compare-and-swap;
+    // a racing writer (on this replica or another) makes this a `412`.
+    #[cfg(feature = "postgres")]
+    if let Some(control_plane) = context.state.control_plane.as_ref() {
+        let commit = control_plane
+            .commit(storage::PolicyCommitRequest {
+                precondition: storage::PolicyCommitPrecondition::Expected {
+                    etag: expected_etag.to_owned(),
+                },
+                candidate,
+                actor_user_id: &context.principal.user_id,
+                diff_summary: &diff_summary,
+            })
+            .await;
+        return match commit {
+            Ok(active) => {
+                context
+                    .rbac_state
+                    .install_revision_snapshot(active.policy.clone(), active.security_revision);
+                emit_policy_rule_changed(
+                    context.state,
+                    context.parts,
+                    context.principal,
+                    before_policy,
+                    &active.policy,
+                    diff_summary,
+                );
+                Ok(PolicyMutationCommitResult {
+                    after_policy: active.policy,
+                    new_etag: active.etag,
+                    // History is written inside the commit transaction; a
+                    // mutation cannot succeed without it.
+                    history_append_failed: false,
+                })
+            }
+            Err(storage::PolicyCommitError::PreconditionFailed) => Err(Box::new(
+                precondition_failed("If-Match does not match the current policy ETag"),
+            )),
+            Err(storage::PolicyCommitError::Store(error)) => {
+                tracing::error!(
+                    error = %error,
+                    "policy control-plane commit failed; nothing was written"
+                );
+                Err(Box::new(service_unavailable(
+                    "policy mutation could not be committed",
+                )))
+            }
+        };
+    }
+
+    let Some(policy_file) = context.state.policy_file.as_deref() else {
+        return Err(Box::new(policy_not_configured()));
+    };
+
+    if let Err(err) = candidate.persist_to_file(policy_file) {
+        tracing::error!(policy_file = %policy_file.display(), error = %err, "failed to persist policy");
         return Err(Box::new(internal_server_error("policy persist failed")));
     }
 
-    if let Err(err) =
-        middleware::rbac::reload_policy_from_file(context.rbac_state, context.policy_file)
-    {
-        tracing::error!(policy_file = %context.policy_file.display(), error = %err, "failed to reload persisted policy");
+    if let Err(err) = middleware::rbac::reload_policy_from_file(context.rbac_state, policy_file) {
+        tracing::error!(policy_file = %policy_file.display(), error = %err, "failed to reload persisted policy");
         return Err(Box::new(internal_server_error("policy reload failed")));
     }
 
@@ -39878,4 +40201,614 @@ O2gecI9QwDJNpm29J9wJB2F8
 
     #[path = "issue_257_acceptance_grpc.rs"]
     mod issue_257_acceptance_grpc;
+
+    // ------------------------------------------------------------------
+    // Cluster-mode policy control plane (issue #241, PR 7): endpoint
+    // behavior and replica reconciliation against a real PostgreSQL.
+    // Docker-gated on the same locator as the storage suites.
+    // ------------------------------------------------------------------
+
+    #[cfg(feature = "postgres")]
+    mod cluster_policy_tests {
+        use super::*;
+        use crate::policy_cluster::ClusterPolicyRuntime;
+        use crate::rbac::PolicyHistoryListFilters;
+        use crate::storage::postgres::PostgresFoundation;
+        use crate::storage::postgres_policy::PostgresPolicyStore;
+        use crate::storage::{
+            self, migrations, PolicyCommitPrecondition, PolicyCommitRequest, PolicyControlPlane,
+            PolicyHistory as _,
+        };
+
+        fn locator() -> Option<String> {
+            let key = "GATEWAY_TEST_POSTGRES_URL_FILE".to_owned();
+            let file = std::env::var(&key).ok()?;
+            if file.trim().is_empty() {
+                return None;
+            }
+            let contents = std::fs::read_to_string(file).ok()?;
+            let trimmed = contents.trim();
+            (!trimmed.is_empty()).then(|| trimmed.to_owned())
+        }
+
+        struct DsnFile {
+            path: String,
+            directory: std::path::PathBuf,
+        }
+
+        impl Drop for DsnFile {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.directory);
+            }
+        }
+
+        fn write_dsn_file(dsn: &str) -> DsnFile {
+            let directory = std::env::temp_dir().join(format!(
+                "greengateway-cluster-policy-{}",
+                uuid::Uuid::new_v4()
+            ));
+            std::fs::create_dir_all(&directory).expect("temp directory should create");
+            let path = directory.join("database-url");
+            std::fs::write(&path, format!("{dsn}\n")).expect("DSN file should write");
+            // The foundation's permission check is part of the contract:
+            // credential material grants group/other nothing. On Unix CI
+            // the default mode would be 0644, which the check (correctly)
+            // refuses.
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
+                    .expect("DSN permissions should set");
+            }
+            DsnFile {
+                path: path.display().to_string(),
+                directory,
+            }
+        }
+
+        /// One test's disposable database, dropped fire-and-forget on an
+        /// admin connection (the same teardown contract the SSE tests
+        /// use).
+        struct TestDatabase {
+            dsn: String,
+            admin_dsn: String,
+            name: String,
+        }
+
+        impl Drop for TestDatabase {
+            fn drop(&mut self) {
+                let admin_dsn = self.admin_dsn.clone();
+                let name = self.name.clone();
+                std::thread::spawn(move || {
+                    let Ok(runtime) = tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()
+                    else {
+                        return;
+                    };
+                    runtime.block_on(async move {
+                        let Ok((client, connection)) =
+                            tokio_postgres::connect(&admin_dsn, tokio_postgres::NoTls).await
+                        else {
+                            return;
+                        };
+                        let connection = tokio::spawn(connection);
+                        let _ = client
+                            .batch_execute(&format!("DROP DATABASE IF EXISTS {name} WITH (FORCE)"))
+                            .await;
+                        let _ = connection.await;
+                    });
+                });
+            }
+        }
+
+        async fn create_test_database(admin_dsn: &str) -> TestDatabase {
+            let name = format!("ggw_policy_test_{}", uuid::Uuid::new_v4().simple());
+            // CREATE DATABASE cannot run inside a transaction block: take a
+            // fresh admin connection, create, release it.
+            let (client, connection) = tokio_postgres::connect(admin_dsn, tokio_postgres::NoTls)
+                .await
+                .expect("admin connection");
+            let connection_task = tokio::spawn(connection);
+            client
+                .batch_execute(&format!("CREATE DATABASE {name}"))
+                .await
+                .expect("test database should create");
+            drop(client);
+            let _ = connection_task.await;
+            let database_start = admin_dsn
+                .rfind('/')
+                .expect("locator DSN has a database path segment");
+            let dsn = format!("{}/{}", &admin_dsn[..database_start], name);
+            TestDatabase {
+                dsn,
+                admin_dsn: admin_dsn.to_owned(),
+                name,
+            }
+        }
+
+        async fn migrated_policy_foundation(
+            dsn: &str,
+        ) -> (Arc<PostgresPolicyStore>, deadpool_postgres::Pool) {
+            let dsn_file = write_dsn_file(dsn);
+            let mut config = test_config(Vec::new());
+            config.state_backend = config::StateBackend::Postgres;
+            config.deployment_id = Some("deploy-cluster-policy".to_owned());
+            config.database.url_file = Some(dsn_file.path.clone());
+            config.database.tls_mode = config::DatabaseTlsMode::LoopbackDev;
+            let foundation = PostgresFoundation::establish(&config)
+                .await
+                .expect("test database should establish");
+            migrations::apply_missing_for_startup(foundation.pool(), &config.database)
+                .await
+                .expect("schema should migrate");
+            let pool = foundation.pool().clone();
+            (Arc::new(PostgresPolicyStore::new(pool.clone())), pool)
+        }
+
+        fn cluster_policy_json(id: &str) -> String {
+            format!(
+                r#"{{
+                    "schema_version": "0.1.0",
+                    "id": "{id}",
+                    "default_action": "deny",
+                    "roles": {{
+                        "admin": {{ "permissions": ["admin:policy:read", "admin:policy:write"] }}
+                    }}
+                }}"#
+            )
+        }
+
+        fn cluster_policy(id: &str) -> rbac::Policy {
+            parse_policy_body(&Bytes::from(cluster_policy_json(id)))
+                .expect("cluster policy should parse")
+        }
+
+        static DIFF: std::sync::LazyLock<Value> =
+            std::sync::LazyLock::new(|| json!({ "action": "test" }));
+
+        async fn initialize(store: &PostgresPolicyStore, id: &str) -> storage::ActivePolicy {
+            PolicyControlPlane::commit(
+                store,
+                PolicyCommitRequest {
+                    precondition: PolicyCommitPrecondition::Initialize,
+                    candidate: &cluster_policy(id),
+                    actor_user_id: "seed",
+                    diff_summary: &DIFF,
+                },
+            )
+            .await
+            .expect("deployment should initialize")
+        }
+
+        /// A minimal admin router wired like production's cluster mode:
+        /// no policy file, the PostgreSQL control plane as the authority,
+        /// the PG store as the history store, and the revision gate layered
+        /// over the admin routes exactly as `add_admin_api_routes` does.
+        fn cluster_policy_router(
+            store: Arc<PostgresPolicyStore>,
+        ) -> (Router, middleware::rbac::RbacState) {
+            let rbac_state = middleware::rbac::RbacState::new(
+                cluster_policy("router-seed"),
+                Vec::new(),
+                false,
+                test_audit_log(),
+            );
+            let runtime = ClusterPolicyRuntime::new(store.clone(), rbac_state.clone());
+            let gate: Arc<dyn middleware::rbac::SecurityRevisionGate> = runtime;
+            let router = Router::new()
+                .route(
+                    POLICY_ADMIN_ROUTE,
+                    get(policy_get_endpoint).put(policy_put_endpoint),
+                )
+                .route(POLICY_HISTORY_ADMIN_ROUTE, get(policy_history_endpoint))
+                .route(POLICY_ROLLBACK_ADMIN_ROUTE, post(policy_rollback_endpoint))
+                .with_state(PolicyAdminState {
+                    policy_file: None,
+                    rbac_state: Some(rbac_state.clone().with_revision_gate(gate.clone())),
+                    history_store: Some(store.clone() as Arc<dyn storage::PolicyHistory>),
+                    control_plane: Some(store as Arc<dyn storage::PolicyControlPlane>),
+                    query_store: None,
+                    audit: test_audit_log(),
+                    client_ip_policy: client_ip::ClientIpPolicy::default(),
+                    max_body_size: 1024 * 1024,
+                })
+                .layer(axum::middleware::from_fn_with_state(
+                    gate,
+                    admin_revision_gate_middleware,
+                ));
+            (router, rbac_state)
+        }
+
+        fn admin_request(method: Method, uri: &str, body: Option<(&str, &str)>) -> Request<Body> {
+            let mut builder = Request::builder().method(method).uri(uri);
+            let body = match body {
+                Some((if_match, body)) => {
+                    builder = builder.header(header::IF_MATCH, if_match);
+                    Body::from(body.to_owned())
+                }
+                None => Body::empty(),
+            };
+            let mut request = builder.body(body).expect("admin request should build");
+            request.extensions_mut().insert(admin_principal());
+            request
+        }
+
+        fn admin_principal() -> auth::Principal {
+            test_principal(&["admin"])
+        }
+
+        async fn etag_of(response: Response) -> String {
+            assert_eq!(response.status(), StatusCode::OK);
+            response
+                .headers()
+                .get(header::ETAG)
+                .and_then(|value| value.to_str().ok())
+                .expect("ETag header")
+                .to_owned()
+        }
+
+        #[tokio::test]
+        async fn cluster_policy_endpoints_commit_versions_and_reject_stale_preconditions() {
+            let Some(admin_dsn) = locator() else {
+                eprintln!("skipping: no test database locator; CI runs this test");
+                return;
+            };
+            let database = create_test_database(&admin_dsn).await;
+            let (store, pool) = migrated_policy_foundation(&database.dsn).await;
+            let active = initialize(&store, "ep-init").await;
+            let (router, rbac_state) = cluster_policy_router(store.clone());
+            // The router's local snapshot starts unkeyed; install the
+            // authority's revision like the production startup path does.
+            rbac_state.install_revision_snapshot(active.policy.clone(), active.security_revision);
+
+            // GET serves the authoritative document and its verified ETag.
+            let etag = etag_of(
+                router
+                    .clone()
+                    .oneshot(admin_request(Method::GET, POLICY_ADMIN_ROUTE, None))
+                    .await
+                    .expect("GET should complete"),
+            )
+            .await;
+            assert_eq!(etag, active.etag);
+
+            // PUT with the current ETag commits a new version, advances the
+            // revision, installs the snapshot, and reports the new ETag.
+            let put = router
+                .clone()
+                .oneshot(admin_request(
+                    Method::PUT,
+                    POLICY_ADMIN_ROUTE,
+                    Some((&etag, &cluster_policy_json("ep-next"))),
+                ))
+                .await
+                .expect("PUT should complete");
+            let new_etag = etag_of(put).await;
+            assert_ne!(etag, new_etag);
+            assert_ne!(etag, new_etag);
+            assert_eq!(
+                rbac_state.snapshot_security_revision(),
+                active.security_revision + 1,
+                "a committed mutation must install the new snapshot before the response"
+            );
+
+            // The stale ETag is now a 412 that wrote nothing.
+            let stale = router
+                .clone()
+                .oneshot(admin_request(
+                    Method::PUT,
+                    POLICY_ADMIN_ROUTE,
+                    Some((&etag, &cluster_policy_json("ep-race"))),
+                ))
+                .await
+                .expect("stale PUT should complete");
+            assert_eq!(stale.status(), StatusCode::PRECONDITION_FAILED);
+
+            // History lists both immutable versions through the same API
+            // the standalone mode serves.
+            let history = router
+                .clone()
+                .oneshot(admin_request(
+                    Method::GET,
+                    &format!("{POLICY_HISTORY_ADMIN_ROUTE}?limit=10&include_policy=false"),
+                    None,
+                ))
+                .await
+                .expect("history should complete");
+            assert_eq!(history.status(), StatusCode::OK);
+            let body = axum::body::to_bytes(history.into_body(), 1 << 20)
+                .await
+                .expect("history body");
+            let page: Value = serde_json::from_slice(&body).expect("history JSON");
+            assert_eq!(page["versions"].as_array().map(Vec::len), Some(2));
+
+            // Rollback to the first version commits it as a NEW version.
+            // `list_versions` is newest-first: the oldest version is the
+            // last entry of the full page.
+            let full_page = store
+                .list_versions(&PolicyHistoryListFilters {
+                    limit: 10,
+                    cursor: None,
+                    include_policy: false,
+                })
+                .await
+                .expect("history list");
+            let first_version = full_page
+                .versions
+                .last()
+                .expect("history has versions")
+                .version;
+            let rollback = router
+                .clone()
+                .oneshot(admin_request(
+                    Method::POST,
+                    &format!("/v1/admin/policy/rollback/{first_version}"),
+                    Some((&new_etag, "")),
+                ))
+                .await
+                .expect("rollback should complete");
+            assert_eq!(rollback.status(), StatusCode::OK);
+
+            let documents: i64 = {
+                let client = pool.get().await.expect("count checkout");
+                let row = client
+                    .query_one("SELECT count(*) FROM greengateway.policy_documents", &[])
+                    .await
+                    .expect("count");
+                row.get(0)
+            };
+            assert_eq!(documents, 3, "two commits plus the rollback version");
+        }
+
+        #[tokio::test]
+        async fn identical_if_match_puts_on_two_replicas_produce_exactly_one_winner() {
+            let Some(admin_dsn) = locator() else {
+                eprintln!("skipping: no test database locator; CI runs this test");
+                return;
+            };
+            let database = create_test_database(&admin_dsn).await;
+            // Two routers over two separate pools: two replicas of one
+            // deployment, sharing only the database.
+            let (store_a, _pool_a) = migrated_policy_foundation(&database.dsn).await;
+            let (store_b, pool_b) = migrated_policy_foundation(&database.dsn).await;
+            let active = initialize(&store_a, "race-init").await;
+            let (router_a, _) = cluster_policy_router(store_a.clone());
+            let (router_b, _) = cluster_policy_router(store_b.clone());
+            // Both replicas read the same current ETag.
+            let etag = active.etag.clone();
+
+            let body_a = cluster_policy_json("replica-a-wins");
+            let body_b = cluster_policy_json("replica-b-wins");
+            let (response_a, response_b) = tokio::join!(
+                router_a.clone().oneshot(admin_request(
+                    Method::PUT,
+                    POLICY_ADMIN_ROUTE,
+                    Some((&etag, &body_a)),
+                )),
+                router_b.clone().oneshot(admin_request(
+                    Method::PUT,
+                    POLICY_ADMIN_ROUTE,
+                    Some((&etag, &body_b)),
+                ))
+            );
+            let statuses = [
+                response_a.expect("replica A PUT").status(),
+                response_b.expect("replica B PUT").status(),
+            ];
+            assert_eq!(
+                statuses
+                    .iter()
+                    .filter(|status| **status == StatusCode::OK)
+                    .count(),
+                1,
+                "exactly one replica's write commits: {statuses:?}"
+            );
+            assert_eq!(
+                statuses
+                    .iter()
+                    .filter(|status| **status == StatusCode::PRECONDITION_FAILED)
+                    .count(),
+                1,
+                "the loser sees 412, not a silent overwrite: {statuses:?}"
+            );
+
+            // One new document, one new revision, one new outbox row.
+            let client = pool_b.get().await.expect("count checkout");
+            for (table, expected) in [
+                ("policy_documents", 2),
+                ("security_outbox", 2),
+                ("policy_active", 1),
+            ] {
+                let row = client
+                    .query_one(&format!("SELECT count(*) FROM greengateway.{table}"), &[])
+                    .await
+                    .expect("count");
+                let count: i64 = row.get(0);
+                assert_eq!(count, expected, "{table}");
+            }
+        }
+
+        #[tokio::test]
+        async fn admin_authorization_never_serves_under_a_stale_revision() {
+            let Some(admin_dsn) = locator() else {
+                eprintln!("skipping: no test database locator; CI runs this test");
+                return;
+            };
+            let database = create_test_database(&admin_dsn).await;
+            let (store, _pool) = migrated_policy_foundation(&database.dsn).await;
+            let active = initialize(&store, "stale-init").await;
+            let (router, rbac_state) = cluster_policy_router(store.clone());
+            // Production startup: the snapshot is keyed to the revision the
+            // replica booted against.
+            rbac_state.install_revision_snapshot(active.policy.clone(), active.security_revision);
+
+            // Sanity: the granted admin principal is authorized while the
+            // snapshot is current.
+            let response = router
+                .clone()
+                .oneshot(admin_request(Method::GET, POLICY_ADMIN_ROUTE, None))
+                .await
+                .expect("GET should complete");
+            assert_eq!(response.status(), StatusCode::OK);
+
+            // Another replica commits a revision that revokes every admin
+            // permission. The local snapshot is now stale. Without the
+            // admin-plane revision gate, this replica would keep
+            // authorizing `admin:policy:*` under the old snapshot (an
+            // RBAC-exempt route never reaches the data-plane gate) and the
+            // PUT below would COMMIT at the authority, holding a correct
+            // ETag against a stale authorization. The gate must reconcile
+            // first and refuse.
+            let revoked = rbac::Policy::validate_json_value(json!({
+                "schema_version": "0.1.0",
+                "id": "stale-revoked",
+                "default_action": "deny",
+                "roles": {
+                    "nobody": { "permissions": ["data:read"] }
+                }
+            }))
+            .expect("revocation policy should validate");
+            let current = PolicyControlPlane::active(&*store)
+                .await
+                .expect("active read");
+            PolicyControlPlane::commit(
+                &*store,
+                PolicyCommitRequest {
+                    precondition: PolicyCommitPrecondition::Expected {
+                        etag: current.expect("active").etag,
+                    },
+                    candidate: &revoked,
+                    actor_user_id: "other-replica",
+                    diff_summary: &DIFF,
+                },
+            )
+            .await
+            .expect("revocation should commit");
+
+            let fresh = PolicyControlPlane::active(&*store)
+                .await
+                .expect("active read after revoke")
+                .expect("active row");
+            let put = router
+                .clone()
+                .oneshot(admin_request(
+                    Method::PUT,
+                    POLICY_ADMIN_ROUTE,
+                    Some((
+                        &fresh.etag,
+                        &serde_json::to_string(&fresh.policy).expect("policy JSON"),
+                    )),
+                ))
+                .await
+                .expect("PUT should complete");
+            assert_eq!(
+                put.status(),
+                StatusCode::FORBIDDEN,
+                "a revoked principal must not be authorized under the stale snapshot"
+            );
+
+            let get = router
+                .clone()
+                .oneshot(admin_request(Method::GET, POLICY_ADMIN_ROUTE, None))
+                .await
+                .expect("GET should complete");
+            assert_eq!(get.status(), StatusCode::FORBIDDEN);
+        }
+
+        #[tokio::test]
+        async fn revision_gate_reconciles_to_another_replicas_commit_and_fails_closed() {
+            let Some(admin_dsn) = locator() else {
+                eprintln!("skipping: no test database locator; CI runs this test");
+                return;
+            };
+            let database = create_test_database(&admin_dsn).await;
+            let (store, pool) = migrated_policy_foundation(&database.dsn).await;
+            let active = initialize(&store, "gate-init").await;
+
+            // A replica boots with the runtime gate: its local snapshot is
+            // keyed to the authority's revision at boot.
+            let rbac_state = middleware::rbac::RbacState::new(
+                active.policy.clone(),
+                Vec::new(),
+                false,
+                test_audit_log(),
+            );
+            rbac_state.install_revision_snapshot(active.policy.clone(), active.security_revision);
+            let runtime = ClusterPolicyRuntime::new(store.clone(), rbac_state.clone());
+
+            // Current: the gate passes and reports the served revision.
+            let served = middleware::rbac::SecurityRevisionGate::ensure_current_revision(&*runtime)
+                .await
+                .expect("gate should pass when current");
+            assert_eq!(served, active.security_revision);
+
+            // Another replica commits a new version. The local snapshot is
+            // now behind; the next gate call must reconcile it (fetch,
+            // validate, install) rather than serve the stale one.
+            let mut updated = active.policy.clone();
+            updated.id = Some("gate-updated".to_owned());
+            PolicyControlPlane::commit(
+                &*store,
+                PolicyCommitRequest {
+                    precondition: PolicyCommitPrecondition::Expected {
+                        etag: active.etag.clone(),
+                    },
+                    candidate: &updated,
+                    actor_user_id: "other-replica",
+                    diff_summary: &DIFF,
+                },
+            )
+            .await
+            .expect("other replica's commit should win");
+            let served = middleware::rbac::SecurityRevisionGate::ensure_current_revision(&*runtime)
+                .await
+                .expect("gate should reconcile");
+            assert!(served > active.security_revision);
+            assert_eq!(
+                rbac_state.current_policy().id.as_deref(),
+                Some("gate-updated")
+            );
+
+            // A document this binary cannot serve fails closed: the gate
+            // refuses, and the compiled snapshot is not touched. The
+            // tampered document is valid jsonb but an invalid policy
+            // (`default_action` must be allow or deny), and its row still
+            // carries the previous document's ETag -- either discrepancy
+            // alone is enough; `active()` fails closed on both.
+            let client = pool.get().await.expect("tamper checkout");
+            client
+                .batch_execute(
+                    r#"
+                    UPDATE greengateway.policy_documents
+                    SET document = '{"schema_version": "0.1.0", "default_action": "nope"}'::jsonb
+                    WHERE version = (SELECT active_version FROM greengateway.policy_active);
+                    "#,
+                )
+                .await
+                .expect("tamper should apply");
+            // Force a new revision so the gate must consult the tampered
+            // document rather than answer from its current snapshot.
+            client
+                .batch_execute(
+                    "UPDATE greengateway.security_revision_state \
+                     SET last_revision = last_revision + 1",
+                )
+                .await
+                .expect("revision bump");
+            drop(client);
+
+            let probe =
+                middleware::rbac::SecurityRevisionGate::ensure_current_revision(&*runtime).await;
+            assert!(
+                probe.is_err(),
+                "an invalid authoritative document must fail closed, not serve stale"
+            );
+            assert_eq!(
+                rbac_state.current_policy().id.as_deref(),
+                Some("gate-updated"),
+                "the last valid snapshot remains installed; nothing regressed"
+            );
+        }
+    }
 }
