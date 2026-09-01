@@ -18,16 +18,25 @@
 //! they arrive with the remaining PR 8 wiring. The record layer is
 //! complete and independently tested.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
+
+use serde_json::Value;
 
 use super::store::{
-    binding_count, ensure_etag, expected_bindings, initial_revisions, replacement_revisions,
-    u64_to_i64, utc_timestamp, validate_candidate, ConnectionEtag, ConnectionStoreError,
-    StoredConnection, SOURCE_MANAGED,
+    binding_count, ensure_etag, expected_bindings, increment_revision, initial_revisions,
+    managed_tool_dependency_id, optional_u64_to_i64, parse_reason, parse_state, persisted_revision,
+    reason_as_str, replacement_revisions, state_as_str, supports_managed_mcp_catalog,
+    supports_managed_openapi_catalog, u64_to_i64, utc_timestamp, validate_candidate,
+    validate_dependency_id, validate_mcp_catalog, validate_openapi_catalog_entries,
+    validate_openapi_spec, ConnectionDependency, ConnectionDependencyKind, ConnectionEtag,
+    ConnectionStatusUpdate, ConnectionStoreError, StoredConnection, StoredMcpCatalog,
+    StoredMcpCatalogEntry, StoredMcpResource, StoredMcpResourceTemplate, StoredOpenApiCatalog,
+    StoredOpenApiCatalogEntry, StoredOpenApiInventoryCatalog, MAX_CONNECTION_DEPENDENCIES,
+    SOURCE_MANAGED,
 };
 use super::{
     model::{ConnectionId, ConnectionWrite, MAX_CONNECTIONS, MAX_CREDENTIALS},
-    status::ConnectionRevisions,
+    status::{ConnectionRevisions, ConnectionStatusReason, SafeConnectionStatus},
 };
 
 const OPERATION_LIST: &str = "record_list";
@@ -544,6 +553,1511 @@ impl PostgresConnectionStore {
     }
 }
 
+// ==== Catalog, status, and dependency surfaces (the remaining PR 8 port) ====
+
+const OPERATION_MCP_CATALOG: &str = "mcp_catalog_replace";
+const OPERATION_MCP_READ: &str = "mcp_catalog_read";
+const OPERATION_OPENAPI_CATALOG: &str = "openapi_catalog_replace";
+const OPERATION_OPENAPI_READ: &str = "openapi_catalog_read";
+const OPERATION_STATUS: &str = "status_append";
+const OPERATION_STATUS_READ: &str = "status_read";
+const OPERATION_DEPS: &str = "dependency_write";
+const OPERATION_DEPS_READ: &str = "dependency_read";
+
+impl PostgresConnectionStore {
+    /// Every stored MCP catalog (startup load and the reconciler). Reads
+    /// validate counts and revisions exactly like the SQLite loader; a
+    /// corrupt catalog fails closed instead of loading.
+    pub async fn mcp_catalogs(&self) -> Result<Vec<StoredMcpCatalog>, ConnectionStoreError> {
+        self.read_mcp_catalogs(None).await
+    }
+
+    pub async fn mcp_catalog(
+        &self,
+        id: &ConnectionId,
+    ) -> Result<Option<StoredMcpCatalog>, ConnectionStoreError> {
+        Ok(self.read_mcp_catalogs(Some(id)).await?.into_iter().next())
+    }
+
+    async fn read_mcp_catalogs(
+        &self,
+        requested: Option<&ConnectionId>,
+    ) -> Result<Vec<StoredMcpCatalog>, ConnectionStoreError> {
+        let client = self
+            .pool
+            .get()
+            .await
+            .map_err(|_| pg_unavailable(OPERATION_MCP_READ))?;
+        let retained_bytes: i64 = client
+            .query_one(
+                r#"
+                SELECT COALESCE(SUM(
+                    octet_length(remote_tool_name) + octet_length(description)
+                    + octet_length(input_schema_json::text)
+                ), 0)
+                FROM greengateway.connection_mcp_catalog_entries
+                "#,
+                &[],
+            )
+            .await
+            .map_err(|error| pg_error(OPERATION_MCP_READ, error))?
+            .get(0);
+        if usize::try_from(retained_bytes).unwrap_or(usize::MAX)
+            > super::store::MAX_MANAGED_MCP_CATALOG_BYTES
+        {
+            return Err(ConnectionStoreError::LimitExceeded {
+                resource: "connection MCP catalog bytes",
+                maximum: super::store::MAX_MANAGED_MCP_CATALOG_BYTES,
+            });
+        }
+        let rows = match requested {
+            Some(id) => {
+                client
+                    .query(
+                        r#"
+                        SELECT connection_id::text, catalog_revision, observed_etag, refreshed_at,
+                               entry_count, resource_count, resource_template_count
+                        FROM greengateway.connection_mcp_catalogs
+                        WHERE connection_id = $1::text::uuid
+                        ORDER BY connection_id
+                        "#,
+                        &[&id.as_str()],
+                    )
+                    .await
+            }
+            None => {
+                client
+                    .query(
+                        r#"
+                        SELECT connection_id::text, catalog_revision, observed_etag, refreshed_at,
+                               entry_count, resource_count, resource_template_count
+                        FROM greengateway.connection_mcp_catalogs
+                        ORDER BY connection_id
+                        "#,
+                        &[],
+                    )
+                    .await
+            }
+        }
+        .map_err(|error| pg_error(OPERATION_MCP_READ, error))?;
+
+        let mut catalogs = Vec::with_capacity(rows.len());
+        for row in &rows {
+            let connection_id = parse_catalog_id(&row.get::<_, String>(0))?;
+            let catalog_revision =
+                persisted_revision(&connection_id, row.get(1), "invalid MCP catalog revision")?;
+            if catalog_revision == 0 {
+                return Err(corrupt(&connection_id, "invalid MCP catalog revision"));
+            }
+            let entry_count = row.get::<_, i64>(4);
+            let resource_count = row.get::<_, i64>(5);
+            let template_count = row.get::<_, i64>(6);
+            let total = entry_count
+                .saturating_add(resource_count)
+                .saturating_add(template_count);
+            if total < 0
+                || usize::try_from(total).unwrap_or(usize::MAX) > super::model::MAX_CATALOG_ENTRIES
+            {
+                return Err(corrupt(&connection_id, "invalid MCP catalog entry count"));
+            }
+            let entries = load_mcp_entries(&client, &connection_id).await?;
+            if entries.len() != usize::try_from(entry_count).unwrap_or(usize::MAX) {
+                return Err(corrupt(&connection_id, "MCP catalog entry count mismatch"));
+            }
+            let resources = load_mcp_resources(&client, &connection_id).await?;
+            if resources.len() != usize::try_from(resource_count).unwrap_or(usize::MAX) {
+                return Err(corrupt(&connection_id, "MCP resource count mismatch"));
+            }
+            let resource_templates = load_mcp_resource_templates(&client, &connection_id).await?;
+            if resource_templates.len() != usize::try_from(template_count).unwrap_or(usize::MAX) {
+                return Err(corrupt(
+                    &connection_id,
+                    "MCP resource template count mismatch",
+                ));
+            }
+            catalogs.push(StoredMcpCatalog {
+                connection_id,
+                catalog_revision,
+                observed_etag: parse_etag(&row.get::<_, String>(2))?,
+                refreshed_at: row.get(3),
+                entries,
+                resources,
+                resource_templates,
+            });
+        }
+        Ok(catalogs)
+    }
+
+    /// Replace a connection's MCP catalog under its etag compare-and-swap:
+    /// global entry/byte capacity checks, catalog-revision increment, the
+    /// per-entry managed-tool dependency replacement, and -- the cluster
+    /// addition -- the shared security revision, the connections
+    /// high-water mark, and the outbox row, all in the one transaction.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn replace_mcp_catalog(
+        &self,
+        id: &ConnectionId,
+        expected: &ConnectionEtag,
+        entries: &[StoredMcpCatalogEntry],
+        resources: &[StoredMcpResource],
+        resource_templates: &[StoredMcpResourceTemplate],
+        actor_user_id: &str,
+    ) -> Result<StoredMcpCatalog, ConnectionStoreError> {
+        let validated = validate_mcp_catalog(id, entries, resources, resource_templates)?;
+        let now = utc_timestamp()?;
+        let client = self
+            .pool
+            .get()
+            .await
+            .map_err(|_| pg_unavailable(OPERATION_MCP_CATALOG))?;
+        client
+            .batch_execute("BEGIN")
+            .await
+            .map_err(|error| pg_error(OPERATION_MCP_CATALOG, error))?;
+        let outcome: Result<StoredMcpCatalog, ConnectionStoreError> = async {
+            let current = load_record_for_update(&client, id, OPERATION_MCP_CATALOG)
+                .await?
+                .ok_or_else(|| ConnectionStoreError::NotFound { id: id.to_string() })?;
+            validate_bindings(&client, &current).await?;
+            ensure_etag(id, expected, &current)?;
+            if !supports_managed_mcp_catalog(&current.write) {
+                return Err(ConnectionStoreError::Validation {
+                    problems: vec![
+                        "MCP catalogs require a managed MCP streamable HTTP Connection".to_owned(),
+                    ],
+                });
+            }
+
+            let retained: i64 = client
+                .query_one(
+                    r#"
+                    SELECT
+                        (SELECT COUNT(*) FROM greengateway.connection_mcp_catalog_entries
+                         WHERE connection_id != $1::text::uuid)
+                      + (SELECT COUNT(*) FROM greengateway.connection_mcp_catalog_resources
+                         WHERE connection_id != $1::text::uuid)
+                      + (SELECT COUNT(*) FROM greengateway.connection_mcp_catalog_resource_templates
+                         WHERE connection_id != $1::text::uuid)
+                      + (SELECT COUNT(*) FROM greengateway.connection_openapi_catalog_entries)
+                    "#,
+                    &[&id.as_str()],
+                )
+                .await
+                .map_err(|error| pg_error(OPERATION_MCP_CATALOG, error))?
+                .get(0);
+            let candidate_count = entries
+                .len()
+                .saturating_add(resources.len())
+                .saturating_add(resource_templates.len());
+            if usize::try_from(retained).unwrap_or(usize::MAX).saturating_add(candidate_count)
+                > super::model::MAX_CATALOG_ENTRIES
+            {
+                return Err(ConnectionStoreError::LimitExceeded {
+                    resource: "connection catalog entries",
+                    maximum: super::model::MAX_CATALOG_ENTRIES,
+                });
+            }
+            let retained_bytes: i64 = client
+                .query_one(
+                    r#"
+                    SELECT COALESCE(SUM(
+                        octet_length(remote_tool_name) + octet_length(description)
+                        + octet_length(input_schema_json::text)
+                    ), 0)
+                    FROM greengateway.connection_mcp_catalog_entries
+                    WHERE connection_id != $1::text::uuid
+                    "#,
+                    &[&id.as_str()],
+                )
+                .await
+                .map_err(|error| pg_error(OPERATION_MCP_CATALOG, error))?
+                .get(0);
+            if usize::try_from(retained_bytes).unwrap_or(usize::MAX)
+                .checked_add(validated.stored_bytes)
+                .is_none_or(|total| total > super::store::MAX_MANAGED_MCP_CATALOG_BYTES)
+            {
+                return Err(ConnectionStoreError::LimitExceeded {
+                    resource: "connection MCP catalog bytes",
+                    maximum: super::store::MAX_MANAGED_MCP_CATALOG_BYTES,
+                });
+            }
+
+            let previous_revision: Option<i64> = client
+                .query_opt(
+                    "SELECT catalog_revision FROM greengateway.connection_mcp_catalogs \
+                     WHERE connection_id = $1::text::uuid",
+                    &[&id.as_str()],
+                )
+                .await
+                .map_err(|error| pg_error(OPERATION_MCP_CATALOG, error))?
+                .map(|row| row.get(0));
+            let previous_revision = previous_revision
+                .map(|revision| persisted_revision(id, revision, "invalid MCP catalog revision"))
+                .transpose()?
+                .unwrap_or_default();
+            let catalog_revision = increment_revision(id, previous_revision)?;
+
+            client
+                .execute(
+                    "DELETE FROM greengateway.connection_dependencies \
+                     WHERE connection_id = $1::text::uuid AND consumer_kind = 'managed_tool'",
+                    &[&id.as_str()],
+                )
+                .await
+                .map_err(|error| pg_error(OPERATION_MCP_CATALOG, error))?;
+            let retained_dependencies: i64 = client
+                .query_one(
+                    "SELECT COUNT(*) FROM greengateway.connection_dependencies",
+                    &[],
+                )
+                .await
+                .map_err(|error| pg_error(OPERATION_MCP_CATALOG, error))?
+                .get(0);
+            if usize::try_from(retained_dependencies).unwrap_or(usize::MAX).saturating_add(entries.len())
+                > MAX_CONNECTION_DEPENDENCIES
+            {
+                return Err(ConnectionStoreError::LimitExceeded {
+                    resource: "connection dependencies",
+                    maximum: MAX_CONNECTION_DEPENDENCIES,
+                });
+            }
+
+            client
+                .execute(
+                    "DELETE FROM greengateway.connection_mcp_catalogs WHERE connection_id = $1::text::uuid",
+                    &[&id.as_str()],
+                )
+                .await
+                .map_err(|error| pg_error(OPERATION_MCP_CATALOG, error))?;
+            client
+                .execute(
+                    r#"
+                    INSERT INTO greengateway.connection_mcp_catalogs (
+                        connection_id, catalog_revision, observed_etag, refreshed_at, entry_count,
+                        resource_count, resource_template_count
+                    ) VALUES ($1::text::uuid, $2, $3, $4, $5, $6, $7)
+                    "#,
+                    &[
+                        &id.as_str(),
+                        &u64_to_i64(id, catalog_revision)?,
+                        &expected.as_str(),
+                        &now,
+                        &usize_to_i64(entries.len()),
+                        &usize_to_i64(resources.len()),
+                        &usize_to_i64(resource_templates.len()),
+                    ],
+                )
+                .await
+                .map_err(|error| pg_error(OPERATION_MCP_CATALOG, error))?;
+
+            for (ordinal, (entry, input_schema_json)) in entries
+                .iter()
+                .zip(validated.encoded_tool_schemas.iter())
+                .enumerate()
+            {
+                client
+                    .execute(
+                        r#"
+                        INSERT INTO greengateway.connection_mcp_catalog_entries (
+                            connection_id, remote_tool_name, description, input_schema_json, ordinal
+                        ) VALUES ($1::text::uuid, $2, $3, $4::text::jsonb, $5)
+                        "#,
+                        &[
+                            &id.as_str(),
+                            &entry.remote_tool_name,
+                            &entry.description,
+                            &input_schema_json,
+                            &usize_to_i64(ordinal),
+                        ],
+                    )
+                    .await
+                    .map_err(|error| pg_error(OPERATION_MCP_CATALOG, error))?;
+                client
+                    .execute(
+                        r#"
+                        INSERT INTO greengateway.connection_dependencies (
+                            connection_id, consumer_kind, consumer_id, created_at
+                        ) VALUES ($1::text::uuid, 'managed_tool', $2, $3)
+                        "#,
+                        &[&id.as_str(), &managed_tool_dependency_id(id, &entry.remote_tool_name), &now],
+                    )
+                    .await
+                    .map_err(|error| pg_error(OPERATION_MCP_CATALOG, error))?;
+            }
+
+            for (ordinal, resource) in resources.iter().enumerate() {
+                let size = resource
+                    .size
+                    .map(|size| {
+                        i64::try_from(size).map_err(|_| ConnectionStoreError::Validation {
+                            problems: vec![format!(
+                                "MCP resource {ordinal} size exceeds the durable integer range"
+                            )],
+                        })
+                    })
+                    .transpose()?;
+                client
+                    .execute(
+                        r#"
+                        INSERT INTO greengateway.connection_mcp_catalog_resources (
+                            connection_id, uri, name, title, description, mime_type, size, ordinal
+                        ) VALUES ($1::text::uuid, $2, $3, $4, $5, $6, $7, $8)
+                        "#,
+                        &[
+                            &id.as_str(),
+                            &resource.uri,
+                            &resource.name,
+                            &resource.title,
+                            &resource.description,
+                            &resource.mime_type,
+                            &size,
+                            &usize_to_i64(ordinal),
+                        ],
+                    )
+                    .await
+                    .map_err(|error| pg_error(OPERATION_MCP_CATALOG, error))?;
+            }
+
+            for (ordinal, resource_template) in resource_templates.iter().enumerate() {
+                client
+                    .execute(
+                        r#"
+                        INSERT INTO greengateway.connection_mcp_catalog_resource_templates (
+                            connection_id, uri_template, name, title, description, mime_type, ordinal
+                        ) VALUES ($1::text::uuid, $2, $3, $4, $5, $6, $7)
+                        "#,
+                        &[
+                            &id.as_str(),
+                            &resource_template.uri_template,
+                            &resource_template.name,
+                            &resource_template.title,
+                            &resource_template.description,
+                            &resource_template.mime_type,
+                            &usize_to_i64(ordinal),
+                        ],
+                    )
+                    .await
+                    .map_err(|error| pg_error(OPERATION_MCP_CATALOG, error))?;
+            }
+
+            bump_connection_state(&client, id, Some(previous_revision), catalog_revision).await?;
+            let _ = actor_user_id;
+            Ok(StoredMcpCatalog {
+                connection_id: id.clone(),
+                catalog_revision,
+                observed_etag: expected.clone(),
+                refreshed_at: now.clone(),
+                entries: entries.to_vec(),
+                resources: resources.to_vec(),
+                resource_templates: resource_templates.to_vec(),
+            })
+        }
+        .await;
+        match outcome {
+            Ok(catalog) => {
+                commit(&client, OPERATION_MCP_CATALOG).await?;
+                Ok(catalog)
+            }
+            Err(error) => {
+                let _ = client.batch_execute("ROLLBACK").await;
+                Err(error)
+            }
+        }
+    }
+
+    pub async fn openapi_catalogs(
+        &self,
+    ) -> Result<Vec<StoredOpenApiCatalog>, ConnectionStoreError> {
+        self.read_openapi_catalogs(None).await
+    }
+
+    pub async fn openapi_inventory_catalogs(
+        &self,
+    ) -> Result<Vec<StoredOpenApiInventoryCatalog>, ConnectionStoreError> {
+        Ok(self
+            .read_openapi_catalogs(None)
+            .await?
+            .into_iter()
+            .map(|catalog| StoredOpenApiInventoryCatalog {
+                connection_id: catalog.connection_id,
+                spec_revision: catalog.spec_revision,
+                catalog_revision: catalog.catalog_revision,
+                observed_etag: catalog.observed_etag,
+                spec_digest: catalog.spec_digest,
+                refreshed_at: catalog.refreshed_at,
+                entries: catalog.entries,
+            })
+            .collect())
+    }
+
+    pub async fn openapi_catalog(
+        &self,
+        id: &ConnectionId,
+    ) -> Result<Option<StoredOpenApiCatalog>, ConnectionStoreError> {
+        Ok(self
+            .read_openapi_catalogs(Some(id))
+            .await?
+            .into_iter()
+            .next())
+    }
+
+    async fn read_openapi_catalogs(
+        &self,
+        requested: Option<&ConnectionId>,
+    ) -> Result<Vec<StoredOpenApiCatalog>, ConnectionStoreError> {
+        let client = self
+            .pool
+            .get()
+            .await
+            .map_err(|_| pg_unavailable(OPERATION_OPENAPI_READ))?;
+        let rows = match requested {
+            Some(id) => {
+                client
+                    .query(
+                        r#"
+                        SELECT connection_id::text, spec_revision, catalog_revision, observed_etag,
+                               spec_digest, spec::text, refreshed_at, entry_count
+                        FROM greengateway.connection_openapi_catalogs
+                        WHERE connection_id = $1::text::uuid
+                        ORDER BY connection_id
+                        "#,
+                        &[&id.as_str()],
+                    )
+                    .await
+            }
+            None => {
+                client
+                    .query(
+                        r#"
+                        SELECT connection_id::text, spec_revision, catalog_revision, observed_etag,
+                               spec_digest, spec::text, refreshed_at, entry_count
+                        FROM greengateway.connection_openapi_catalogs
+                        ORDER BY connection_id
+                        "#,
+                        &[],
+                    )
+                    .await
+            }
+        }
+        .map_err(|error| pg_error(OPERATION_OPENAPI_READ, error))?;
+
+        let mut catalogs = Vec::with_capacity(rows.len());
+        for row in &rows {
+            let connection_id = parse_catalog_id(&row.get::<_, String>(0))?;
+            let spec_revision =
+                persisted_revision(&connection_id, row.get(1), "invalid OpenAPI spec revision")?;
+            let catalog_revision = persisted_revision(
+                &connection_id,
+                row.get(2),
+                "invalid OpenAPI catalog revision",
+            )?;
+            if spec_revision == 0 || catalog_revision == 0 {
+                return Err(corrupt(&connection_id, "invalid OpenAPI catalog revision"));
+            }
+            let entry_count = row.get::<_, i64>(7);
+            if entry_count < 0
+                || usize::try_from(entry_count).unwrap_or(usize::MAX)
+                    > super::model::MAX_CATALOG_ENTRIES
+            {
+                return Err(corrupt(
+                    &connection_id,
+                    "invalid OpenAPI catalog entry count",
+                ));
+            }
+            let entries = load_openapi_entries(&client, &connection_id).await?;
+            if entries.len() != usize::try_from(entry_count).unwrap_or(usize::MAX) {
+                return Err(corrupt(
+                    &connection_id,
+                    "OpenAPI catalog entry count mismatch",
+                ));
+            }
+            catalogs.push(StoredOpenApiCatalog {
+                connection_id,
+                spec_revision,
+                catalog_revision,
+                observed_etag: parse_etag(&row.get::<_, String>(3))?,
+                spec_digest: row.get(4),
+                spec: row.get(5),
+                refreshed_at: row.get(6),
+                entries,
+            });
+        }
+        Ok(catalogs)
+    }
+
+    /// Replace a connection's OpenAPI catalog under the triple
+    /// compare-and-swap (connection etag, spec revision, catalog revision)
+    /// with digest revalidation, matching the SQLite store's semantics and
+    /// adding the shared-state bumps in the same transaction.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn replace_openapi_catalog(
+        &self,
+        id: &ConnectionId,
+        expected_connection_etag: &ConnectionEtag,
+        expected_spec_revision: u64,
+        expected_catalog_revision: u64,
+        spec: &str,
+        spec_digest: &str,
+        entries: &[StoredOpenApiCatalogEntry],
+        actor_user_id: &str,
+    ) -> Result<StoredOpenApiCatalog, ConnectionStoreError> {
+        validate_openapi_spec(spec, spec_digest)?;
+        let encoded_entries = validate_openapi_catalog_entries(entries)?;
+        let normalized_entries = encoded_entries
+            .iter()
+            .map(|entry| entry.entry.clone())
+            .collect::<Vec<_>>();
+        let now = utc_timestamp()?;
+        let client = self
+            .pool
+            .get()
+            .await
+            .map_err(|_| pg_unavailable(OPERATION_OPENAPI_CATALOG))?;
+        client
+            .batch_execute("BEGIN")
+            .await
+            .map_err(|error| pg_error(OPERATION_OPENAPI_CATALOG, error))?;
+        let outcome: Result<StoredOpenApiCatalog, ConnectionStoreError> = async {
+            let current = load_record_for_update(&client, id, OPERATION_OPENAPI_CATALOG)
+                .await?
+                .ok_or_else(|| ConnectionStoreError::NotFound { id: id.to_string() })?;
+            validate_bindings(&client, &current).await?;
+            ensure_etag(id, expected_connection_etag, &current)?;
+            if !supports_managed_openapi_catalog(&current.write) {
+                return Err(ConnectionStoreError::Validation {
+                    problems: vec![
+                        "OpenAPI catalogs require a managed HTTP API OpenAPI Connection".to_owned(),
+                    ],
+                });
+            }
+
+            let previous = client
+                .query_opt(
+                    r#"
+                    SELECT spec_revision, catalog_revision, spec_digest
+                    FROM greengateway.connection_openapi_catalogs
+                    WHERE connection_id = $1::text::uuid
+                    "#,
+                    &[&id.as_str()],
+                )
+                .await
+                .map_err(|error| pg_error(OPERATION_OPENAPI_CATALOG, error))?;
+            let (previous_spec_revision, previous_catalog_revision, previous_digest) =
+                match previous {
+                    Some(row) => (
+                        persisted_revision(id, row.get(0), "invalid OpenAPI spec revision")?,
+                        persisted_revision(id, row.get(1), "invalid OpenAPI catalog revision")?,
+                        Some(row.get::<_, String>(2)),
+                    ),
+                    None => (0, 0, None),
+                };
+            if expected_spec_revision != previous_spec_revision
+                || expected_catalog_revision != previous_catalog_revision
+            {
+                return Err(ConnectionStoreError::Conflict {
+                    id: id.to_string(),
+                    current: current.etag(),
+                });
+            }
+
+            let retained: i64 = client
+                .query_one(
+                    r#"
+                    SELECT
+                        (SELECT COUNT(*) FROM greengateway.connection_mcp_catalog_entries)
+                      + (SELECT COUNT(*) FROM greengateway.connection_mcp_catalog_resources)
+                      + (SELECT COUNT(*) FROM greengateway.connection_mcp_catalog_resource_templates)
+                      + (SELECT COUNT(*) FROM greengateway.connection_openapi_catalog_entries
+                         WHERE connection_id != $1::text::uuid)
+                    "#,
+                    &[&id.as_str()],
+                )
+                .await
+                .map_err(|error| pg_error(OPERATION_OPENAPI_CATALOG, error))?
+                .get(0);
+            if usize::try_from(retained).unwrap_or(usize::MAX).saturating_add(entries.len())
+                > super::model::MAX_CATALOG_ENTRIES
+            {
+                return Err(ConnectionStoreError::LimitExceeded {
+                    resource: "connection catalog entries",
+                    maximum: super::model::MAX_CATALOG_ENTRIES,
+                });
+            }
+            let retained_definition_bytes: i64 = client
+                .query_one(
+                    r#"
+                    SELECT COALESCE(SUM(octet_length(definition_json::text)), 0)
+                    FROM greengateway.connection_openapi_catalog_entries
+                    WHERE connection_id != $1::text::uuid
+                    "#,
+                    &[&id.as_str()],
+                )
+                .await
+                .map_err(|error| pg_error(OPERATION_OPENAPI_CATALOG, error))?
+                .get(0);
+            let candidate_definition_bytes =
+                encoded_entries.iter().fold(0_usize, |total, entry| {
+                    total.saturating_add(entry.definition_json.len())
+                });
+            if usize::try_from(retained_definition_bytes).unwrap_or(usize::MAX)
+                .checked_add(candidate_definition_bytes)
+                .is_none_or(|total| total > super::model::MAX_MANAGED_OPENAPI_CATALOG_BYTES)
+            {
+                return Err(ConnectionStoreError::LimitExceeded {
+                    resource: "connection OpenAPI catalog definition bytes",
+                    maximum: super::model::MAX_MANAGED_OPENAPI_CATALOG_BYTES,
+                });
+            }
+
+            let spec_revision = if previous_digest.as_deref() == Some(spec_digest) {
+                previous_spec_revision
+            } else {
+                increment_revision(id, previous_spec_revision)?
+            };
+            let catalog_revision = increment_revision(id, previous_catalog_revision)?;
+
+            client
+                .execute(
+                    "DELETE FROM greengateway.connection_dependencies \
+                     WHERE connection_id = $1::text::uuid AND consumer_kind = 'managed_tool'",
+                    &[&id.as_str()],
+                )
+                .await
+                .map_err(|error| pg_error(OPERATION_OPENAPI_CATALOG, error))?;
+            let retained_dependencies: i64 = client
+                .query_one(
+                    "SELECT COUNT(*) FROM greengateway.connection_dependencies",
+                    &[],
+                )
+                .await
+                .map_err(|error| pg_error(OPERATION_OPENAPI_CATALOG, error))?
+                .get(0);
+            if usize::try_from(retained_dependencies).unwrap_or(usize::MAX).saturating_add(entries.len())
+                > MAX_CONNECTION_DEPENDENCIES
+            {
+                return Err(ConnectionStoreError::LimitExceeded {
+                    resource: "connection dependencies",
+                    maximum: MAX_CONNECTION_DEPENDENCIES,
+                });
+            }
+
+            client
+                .execute(
+                    "DELETE FROM greengateway.connection_openapi_catalogs WHERE connection_id = $1::text::uuid",
+                    &[&id.as_str()],
+                )
+                .await
+                .map_err(|error| pg_error(OPERATION_OPENAPI_CATALOG, error))?;
+            client
+                .execute(
+                    r#"
+                    INSERT INTO greengateway.connection_openapi_catalogs (
+                        connection_id, spec_revision, catalog_revision, observed_etag,
+                        spec_digest, spec, refreshed_at, entry_count
+                    ) VALUES ($1::text::uuid, $2, $3, $4, $5, $6::text::jsonb, $7, $8)
+                    "#,
+                    &[
+                        &id.as_str(),
+                        &u64_to_i64(id, spec_revision)?,
+                        &u64_to_i64(id, catalog_revision)?,
+                        &expected_connection_etag.as_str(),
+                        &spec_digest,
+                        &spec,
+                        &now,
+                        &usize_to_i64(entries.len()),
+                    ],
+                )
+                .await
+                .map_err(|error| pg_error(OPERATION_OPENAPI_CATALOG, error))?;
+
+            for (ordinal, encoded) in encoded_entries.iter().enumerate() {
+                client
+                    .execute(
+                        r#"
+                        INSERT INTO greengateway.connection_openapi_catalog_entries (
+                            connection_id, tool_name, operation_id,
+                            selected_scheme_names_json, definition_json, ordinal
+                        ) VALUES ($1::text::uuid, $2, $3, $4::text::jsonb, $5::text::jsonb, $6)
+                        "#,
+                        &[
+                            &id.as_str(),
+                            &encoded.entry.tool_name,
+                            &encoded.entry.operation_id,
+                            &encoded.selected_scheme_names_json,
+                            &encoded.definition_json,
+                            &usize_to_i64(ordinal),
+                        ],
+                    )
+                    .await
+                    .map_err(|error| pg_error(OPERATION_OPENAPI_CATALOG, error))?;
+                client
+                    .execute(
+                        r#"
+                        INSERT INTO greengateway.connection_dependencies (
+                            connection_id, consumer_kind, consumer_id, created_at
+                        ) VALUES ($1::text::uuid, 'managed_tool', $2, $3)
+                        "#,
+                        &[&id.as_str(), &encoded.entry.tool_name, &now],
+                    )
+                    .await
+                    .map_err(|error| pg_error(OPERATION_OPENAPI_CATALOG, error))?;
+            }
+
+            bump_connection_state(&client, id, Some(previous_catalog_revision), catalog_revision)
+                .await?;
+            let _ = actor_user_id;
+            Ok(StoredOpenApiCatalog {
+                connection_id: id.clone(),
+                spec_revision,
+                catalog_revision,
+                observed_etag: expected_connection_etag.clone(),
+                spec_digest: spec_digest.to_owned(),
+                spec: spec.to_owned(),
+                refreshed_at: now.clone(),
+                entries: normalized_entries,
+            })
+        }
+        .await;
+        match outcome {
+            Ok(catalog) => {
+                commit(&client, OPERATION_OPENAPI_CATALOG).await?;
+                Ok(catalog)
+            }
+            Err(error) => {
+                let _ = client.batch_execute("ROLLBACK").await;
+                Err(error)
+            }
+        }
+    }
+
+    // ==== Status (observational: no security-revision bumps) ====
+
+    pub async fn append_status(
+        &self,
+        id: &ConnectionId,
+        expected: &ConnectionEtag,
+        update: ConnectionStatusUpdate,
+    ) -> Result<SafeConnectionStatus, ConnectionStoreError> {
+        self.append_status_inner(id, expected, update)
+            .await
+            .map(|(status, _)| status)
+    }
+
+    /// The control plane's snapshot-updating variant: returns the updated
+    /// record alongside the status so the runtime map can be republished.
+    pub async fn append_status_before(
+        &self,
+        id: &ConnectionId,
+        expected: &ConnectionEtag,
+        update: ConnectionStatusUpdate,
+    ) -> Result<(SafeConnectionStatus, StoredConnection), ConnectionStoreError> {
+        self.append_status_inner(id, expected, update).await
+    }
+
+    async fn append_status_inner(
+        &self,
+        id: &ConnectionId,
+        expected: &ConnectionEtag,
+        update: ConnectionStatusUpdate,
+    ) -> Result<(SafeConnectionStatus, StoredConnection), ConnectionStoreError> {
+        if update
+            .catalog_entry_count
+            .is_some_and(|count| count > super::model::MAX_CATALOG_ENTRIES)
+        {
+            return Err(ConnectionStoreError::LimitExceeded {
+                resource: "connection catalog entries",
+                maximum: super::model::MAX_CATALOG_ENTRIES,
+            });
+        }
+        let observed_at = utc_timestamp()?;
+        let client = self
+            .pool
+            .get()
+            .await
+            .map_err(|_| pg_unavailable(OPERATION_STATUS))?;
+        client
+            .batch_execute("BEGIN")
+            .await
+            .map_err(|error| pg_error(OPERATION_STATUS, error))?;
+        let outcome: Result<(SafeConnectionStatus, StoredConnection), ConnectionStoreError> =
+            async {
+                let current = load_record_for_update(&client, id, OPERATION_STATUS)
+                    .await?
+                    .ok_or_else(|| ConnectionStoreError::NotFound { id: id.to_string() })?;
+                validate_bindings(&client, &current).await?;
+                ensure_etag(id, expected, &current)?;
+                let status_revision = increment_revision(id, current.revisions.status)?;
+                let latency_ms = optional_u64_to_i64(update.latency_ms, "latency_ms")?;
+                let catalog_age_secs =
+                    optional_u64_to_i64(update.catalog_age_secs, "catalog_age_secs")?;
+                let catalog_entry_count = update
+                    .catalog_entry_count
+                    .map(|value| {
+                        i64::try_from(value).map_err(|_| ConnectionStoreError::LimitExceeded {
+                            resource: "connection catalog entries",
+                            maximum: super::model::MAX_CATALOG_ENTRIES,
+                        })
+                    })
+                    .transpose()?;
+                let ambiguous_failure = matches!(
+                    update.reason,
+                    ConnectionStatusReason::RequestFailed
+                        | ConnectionStatusReason::EgressDenied
+                        | ConnectionStatusReason::SecretUnavailable
+                        | ConnectionStatusReason::InvalidResponse
+                );
+                let last_test_at = (update.reason == ConnectionStatusReason::TestSucceeded
+                    || (ambiguous_failure && update.catalog_entry_count.is_none()))
+                .then_some(observed_at.as_str());
+                let last_refresh_at = (matches!(
+                    update.reason,
+                    ConnectionStatusReason::CatalogRefreshed | ConnectionStatusReason::CatalogStale
+                ) || (ambiguous_failure
+                    && update.catalog_entry_count.is_some()))
+                .then_some(observed_at.as_str());
+                let state = state_as_str(update.state);
+                let reason = reason_as_str(update.reason);
+
+                client
+                    .execute(
+                        r#"
+                        INSERT INTO greengateway.connection_status_history (
+                            connection_id, status_revision, observed_connection_revision,
+                            observed_credential_revision, observed_tls_revision,
+                            observed_discovery_revision, state, reason, observed_at,
+                            latency_ms, catalog_age_secs, catalog_entry_count
+                        ) VALUES ($1::text::uuid, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+                        "#,
+                        &[
+                            &id.as_str(),
+                            &u64_to_i64(id, status_revision)?,
+                            &u64_to_i64(id, current.revisions.connection)?,
+                            &u64_to_i64(id, current.revisions.credential)?,
+                            &u64_to_i64(id, current.revisions.tls)?,
+                            &u64_to_i64(id, current.revisions.discovery)?,
+                            &state,
+                            &reason,
+                            &observed_at,
+                            &latency_ms,
+                            &catalog_age_secs,
+                            &catalog_entry_count,
+                        ],
+                    )
+                    .await
+                    .map_err(|error| pg_error(OPERATION_STATUS, error))?;
+                client
+                    .execute(
+                        r#"
+                        INSERT INTO greengateway.connection_current_status (
+                            connection_id, status_revision, observed_connection_revision,
+                            observed_credential_revision, observed_tls_revision,
+                            observed_discovery_revision, state, reason, observed_at,
+                            latency_ms, catalog_age_secs, catalog_entry_count
+                        ) VALUES ($1::text::uuid, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+                        ON CONFLICT(connection_id) DO UPDATE SET
+                            status_revision = excluded.status_revision,
+                            observed_connection_revision = excluded.observed_connection_revision,
+                            observed_credential_revision = excluded.observed_credential_revision,
+                            observed_tls_revision = excluded.observed_tls_revision,
+                            observed_discovery_revision = excluded.observed_discovery_revision,
+                            state = excluded.state,
+                            reason = excluded.reason,
+                            observed_at = excluded.observed_at,
+                            latency_ms = excluded.latency_ms,
+                            catalog_age_secs = excluded.catalog_age_secs,
+                            catalog_entry_count = excluded.catalog_entry_count
+                        "#,
+                        &[
+                            &id.as_str(),
+                            &u64_to_i64(id, status_revision)?,
+                            &u64_to_i64(id, current.revisions.connection)?,
+                            &u64_to_i64(id, current.revisions.credential)?,
+                            &u64_to_i64(id, current.revisions.tls)?,
+                            &u64_to_i64(id, current.revisions.discovery)?,
+                            &state,
+                            &reason,
+                            &observed_at,
+                            &latency_ms,
+                            &catalog_age_secs,
+                            &catalog_entry_count,
+                        ],
+                    )
+                    .await
+                    .map_err(|error| pg_error(OPERATION_STATUS, error))?;
+                client
+                    .execute(
+                        r#"
+                        UPDATE greengateway.connection_records
+                        SET status_revision = $1,
+                            last_test_at = COALESCE($2, last_test_at),
+                            last_refresh_at = COALESCE($3, last_refresh_at)
+                        WHERE id = $4::text::uuid
+                        "#,
+                        &[
+                            &u64_to_i64(id, status_revision)?,
+                            &last_test_at,
+                            &last_refresh_at,
+                            &id.as_str(),
+                        ],
+                    )
+                    .await
+                    .map_err(|error| pg_error(OPERATION_STATUS, error))?;
+                // Global history pruning: keep the newest
+                // MAX_STATUS_HISTORY_ROWS rows across every connection.
+                client
+                    .execute(
+                        r#"
+                        DELETE FROM greengateway.connection_status_history
+                        WHERE sequence IN (
+                            SELECT sequence
+                            FROM greengateway.connection_status_history
+                            ORDER BY sequence DESC
+                            OFFSET $1
+                        )
+                        "#,
+                        &[&(super::model::MAX_STATUS_HISTORY_ROWS as i64)],
+                    )
+                    .await
+                    .map_err(|error| pg_error(OPERATION_STATUS, error))?;
+
+                let status = SafeConnectionStatus {
+                    state: update.state,
+                    reason: update.reason,
+                    observed_at: Some(observed_at),
+                    latency_ms: update.latency_ms,
+                    catalog_age_secs: update.catalog_age_secs,
+                    catalog_entry_count: update.catalog_entry_count,
+                };
+                let mut updated = current;
+                updated.revisions.status = status_revision;
+                Ok((status, updated))
+            }
+            .await;
+        match outcome {
+            Ok(result) => {
+                commit(&client, OPERATION_STATUS).await?;
+                Ok(result)
+            }
+            Err(error) => {
+                let _ = client.batch_execute("ROLLBACK").await;
+                Err(error)
+            }
+        }
+    }
+
+    pub async fn latest_status(
+        &self,
+        id: &ConnectionId,
+    ) -> Result<Option<SafeConnectionStatus>, ConnectionStoreError> {
+        let client = self
+            .pool
+            .get()
+            .await
+            .map_err(|_| pg_unavailable(OPERATION_STATUS_READ))?;
+        let row = client
+            .query_opt(
+                r#"
+                SELECT state, reason, observed_at, latency_ms, catalog_age_secs, catalog_entry_count
+                FROM greengateway.connection_current_status
+                WHERE connection_id = $1::text::uuid
+                "#,
+                &[&id.as_str()],
+            )
+            .await
+            .map_err(|error| pg_error(OPERATION_STATUS_READ, error))?;
+        row.map(|row| safe_status_from_row(&row, id)).transpose()
+    }
+
+    pub async fn status_history(
+        &self,
+        id: &ConnectionId,
+        limit: usize,
+    ) -> Result<Vec<SafeConnectionStatus>, ConnectionStoreError> {
+        let limit = limit.min(super::model::MAX_STATUS_HISTORY_ROWS);
+        let client = self
+            .pool
+            .get()
+            .await
+            .map_err(|_| pg_unavailable(OPERATION_STATUS_READ))?;
+        let rows = client
+            .query(
+                r#"
+                SELECT state, reason, observed_at, latency_ms, catalog_age_secs, catalog_entry_count
+                FROM greengateway.connection_status_history
+                WHERE connection_id = $1::text::uuid
+                ORDER BY status_revision DESC
+                LIMIT $2
+                "#,
+                &[&id.as_str(), &(usize_to_i64(limit))],
+            )
+            .await
+            .map_err(|error| pg_error(OPERATION_STATUS_READ, error))?;
+        rows.iter()
+            .map(|row| safe_status_from_row(row, id))
+            .collect()
+    }
+
+    // ==== Dependencies (derived state: no security-revision bumps) ====
+
+    pub async fn add_dependency(
+        &self,
+        id: &ConnectionId,
+        kind: ConnectionDependencyKind,
+        consumer_id: &str,
+    ) -> Result<(), ConnectionStoreError> {
+        validate_dependency_id(consumer_id)?;
+        let now = utc_timestamp()?;
+        let client = self
+            .pool
+            .get()
+            .await
+            .map_err(|_| pg_unavailable(OPERATION_DEPS))?;
+        client
+            .batch_execute("BEGIN")
+            .await
+            .map_err(|error| pg_error(OPERATION_DEPS, error))?;
+        let outcome: Result<(), ConnectionStoreError> = async {
+            let exists: bool = client
+                .query_one(
+                    r#"
+                    SELECT EXISTS(
+                        SELECT 1 FROM greengateway.connection_dependencies
+                        WHERE connection_id = $1::text::uuid
+                          AND consumer_kind = $2 AND consumer_id = $3
+                    )
+                    "#,
+                    &[&id.as_str(), &kind.as_str(), &consumer_id],
+                )
+                .await
+                .map_err(|error| pg_error(OPERATION_DEPS, error))?
+                .get(0);
+            if exists {
+                return Ok(());
+            }
+            let count: i64 = client
+                .query_one(
+                    "SELECT COUNT(*) FROM greengateway.connection_dependencies",
+                    &[],
+                )
+                .await
+                .map_err(|error| pg_error(OPERATION_DEPS, error))?
+                .get(0);
+            if usize::try_from(count).unwrap_or(usize::MAX) >= MAX_CONNECTION_DEPENDENCIES {
+                return Err(ConnectionStoreError::LimitExceeded {
+                    resource: "connection dependencies",
+                    maximum: MAX_CONNECTION_DEPENDENCIES,
+                });
+            }
+            client
+                .execute(
+                    r#"
+                    INSERT INTO greengateway.connection_dependencies (
+                        connection_id, consumer_kind, consumer_id, created_at
+                    ) VALUES ($1::text::uuid, $2, $3, $4)
+                    "#,
+                    &[&id.as_str(), &kind.as_str(), &consumer_id, &now],
+                )
+                .await
+                .map_err(|error| pg_error(OPERATION_DEPS, error))?;
+            Ok(())
+        }
+        .await;
+        match outcome {
+            Ok(()) => {
+                commit(&client, OPERATION_DEPS).await?;
+                Ok(())
+            }
+            Err(error) => {
+                let _ = client.batch_execute("ROLLBACK").await;
+                Err(error)
+            }
+        }
+    }
+
+    pub async fn remove_dependency(
+        &self,
+        id: &ConnectionId,
+        kind: ConnectionDependencyKind,
+        consumer_id: &str,
+    ) -> Result<(), ConnectionStoreError> {
+        validate_dependency_id(consumer_id)?;
+        let client = self
+            .pool
+            .get()
+            .await
+            .map_err(|_| pg_unavailable(OPERATION_DEPS))?;
+        client
+            .execute(
+                r#"
+                DELETE FROM greengateway.connection_dependencies
+                WHERE connection_id = $1::text::uuid AND consumer_kind = $2 AND consumer_id = $3
+                "#,
+                &[&id.as_str(), &kind.as_str(), &consumer_id],
+            )
+            .await
+            .map_err(|error| pg_error(OPERATION_DEPS, error))?;
+        Ok(())
+    }
+
+    pub async fn replace_dependencies_for_kind(
+        &self,
+        kind: ConnectionDependencyKind,
+        desired: &[(ConnectionId, String)],
+    ) -> Result<(), ConnectionStoreError> {
+        if desired.len() > MAX_CONNECTION_DEPENDENCIES {
+            return Err(ConnectionStoreError::LimitExceeded {
+                resource: "connection dependencies",
+                maximum: MAX_CONNECTION_DEPENDENCIES,
+            });
+        }
+        let mut unique = BTreeSet::new();
+        for (connection_id, consumer_id) in desired {
+            validate_dependency_id(consumer_id)?;
+            if !unique.insert((connection_id.as_str(), consumer_id.as_str())) {
+                return Err(ConnectionStoreError::Validation {
+                    problems: vec![
+                        "connection dependency set contains duplicate consumers".to_owned()
+                    ],
+                });
+            }
+        }
+        let now = utc_timestamp()?;
+        let client = self
+            .pool
+            .get()
+            .await
+            .map_err(|_| pg_unavailable(OPERATION_DEPS))?;
+        client
+            .batch_execute("BEGIN")
+            .await
+            .map_err(|error| pg_error(OPERATION_DEPS, error))?;
+        let outcome: Result<(), ConnectionStoreError> = async {
+            client
+                .execute(
+                    "DELETE FROM greengateway.connection_dependencies WHERE consumer_kind = $1",
+                    &[&kind.as_str()],
+                )
+                .await
+                .map_err(|error| pg_error(OPERATION_DEPS, error))?;
+            let retained: i64 = client
+                .query_one(
+                    "SELECT COUNT(*) FROM greengateway.connection_dependencies",
+                    &[],
+                )
+                .await
+                .map_err(|error| pg_error(OPERATION_DEPS, error))?
+                .get(0);
+            if usize::try_from(retained).unwrap_or(usize::MAX).saturating_add(desired.len())
+                > MAX_CONNECTION_DEPENDENCIES
+            {
+                return Err(ConnectionStoreError::LimitExceeded {
+                    resource: "connection dependencies",
+                    maximum: MAX_CONNECTION_DEPENDENCIES,
+                });
+            }
+            for (connection_id, consumer_id) in desired {
+                let exists: bool = client
+                    .query_one(
+                        "SELECT EXISTS(SELECT 1 FROM greengateway.connection_records WHERE id = $1::text::uuid)",
+                        &[&connection_id.as_str()],
+                    )
+                    .await
+                    .map_err(|error| pg_error(OPERATION_DEPS, error))?
+                    .get(0);
+                if !exists {
+                    return Err(ConnectionStoreError::NotFound {
+                        id: connection_id.to_string(),
+                    });
+                }
+                client
+                    .execute(
+                        r#"
+                        INSERT INTO greengateway.connection_dependencies (
+                            connection_id, consumer_kind, consumer_id, created_at
+                        ) VALUES ($1::text::uuid, $2, $3, $4)
+                        "#,
+                        &[&connection_id.as_str(), &kind.as_str(), &consumer_id, &now],
+                    )
+                    .await
+                    .map_err(|error| pg_error(OPERATION_DEPS, error))?;
+            }
+            Ok(())
+        }
+        .await;
+        match outcome {
+            Ok(()) => {
+                commit(&client, OPERATION_DEPS).await?;
+                Ok(())
+            }
+            Err(error) => {
+                let _ = client.batch_execute("ROLLBACK").await;
+                Err(error)
+            }
+        }
+    }
+
+    pub async fn dependencies(
+        &self,
+        id: &ConnectionId,
+    ) -> Result<Vec<ConnectionDependency>, ConnectionStoreError> {
+        let client = self
+            .pool
+            .get()
+            .await
+            .map_err(|_| pg_unavailable(OPERATION_DEPS_READ))?;
+        let exists: bool = client
+            .query_one(
+                "SELECT EXISTS(SELECT 1 FROM greengateway.connection_records WHERE id = $1::text::uuid)",
+                &[&id.as_str()],
+            )
+            .await
+            .map_err(|error| pg_error(OPERATION_DEPS_READ, error))?
+            .get(0);
+        if !exists {
+            return Err(ConnectionStoreError::NotFound { id: id.to_string() });
+        }
+        let rows = client
+            .query(
+                r#"
+                SELECT consumer_kind, consumer_id
+                FROM greengateway.connection_dependencies
+                WHERE connection_id = $1::text::uuid
+                ORDER BY consumer_kind ASC, consumer_id ASC
+                LIMIT $2
+                "#,
+                &[
+                    &id.as_str(),
+                    &(usize_to_i64(MAX_CONNECTION_DEPENDENCIES + 1)),
+                ],
+            )
+            .await
+            .map_err(|error| pg_error(OPERATION_DEPS_READ, error))?;
+        if rows.len() > MAX_CONNECTION_DEPENDENCIES {
+            return Err(ConnectionStoreError::LimitExceeded {
+                resource: "connection dependencies",
+                maximum: MAX_CONNECTION_DEPENDENCIES,
+            });
+        }
+        rows.iter()
+            .map(|row| {
+                let kind = ConnectionDependencyKind::parse(&row.get::<_, String>(0))
+                    .ok_or_else(|| corrupt(id, "unknown dependency kind"))?;
+                Ok(ConnectionDependency {
+                    kind,
+                    consumer_id: row.get(1),
+                })
+            })
+            .collect()
+    }
+
+    pub async fn dependency_counts(
+        &self,
+    ) -> Result<BTreeMap<ConnectionId, usize>, ConnectionStoreError> {
+        let client = self
+            .pool
+            .get()
+            .await
+            .map_err(|_| pg_unavailable(OPERATION_DEPS_READ))?;
+        let rows = client
+            .query(
+                r#"
+                SELECT connection_id::text, COUNT(*)
+                FROM greengateway.connection_dependencies
+                GROUP BY connection_id
+                "#,
+                &[],
+            )
+            .await
+            .map_err(|error| pg_error(OPERATION_DEPS_READ, error))?;
+        let mut counts = BTreeMap::new();
+        for row in rows {
+            let id = parse_catalog_id(&row.get::<_, String>(0))?;
+            let count: i64 = row.get(1);
+            counts.insert(id, usize::try_from(count).unwrap_or(usize::MAX));
+        }
+        Ok(counts)
+    }
+
+    pub fn maximum_connections(&self) -> usize {
+        self.maximum_connections
+    }
+}
+
+fn usize_to_i64(value: usize) -> i64 {
+    i64::try_from(value).unwrap_or(i64::MAX)
+}
+
+fn parse_catalog_id(raw: &str) -> Result<ConnectionId, ConnectionStoreError> {
+    ConnectionId::parse(raw).map_err(|_| corrupt_id(raw, "invalid catalog connection ID"))
+}
+
+fn corrupt_id(id: &str, reason: &'static str) -> ConnectionStoreError {
+    ConnectionStoreError::CorruptRecord {
+        id: id.to_owned(),
+        reason,
+    }
+}
+
+fn corrupt(id: &ConnectionId, reason: &'static str) -> ConnectionStoreError {
+    ConnectionStoreError::CorruptRecord {
+        id: id.to_string(),
+        reason,
+    }
+}
+
+fn parse_etag(raw: &str) -> Result<ConnectionEtag, ConnectionStoreError> {
+    // ETags are stored and compared verbatim; round-trip through the
+    // newtype without inventing a parser that could accept non-canonical
+    // forms (the SQLite store stores the same opaque string).
+    Ok(ConnectionEtag::from_stored(raw.to_owned()))
+}
+
+fn safe_status_from_row(
+    row: &tokio_postgres::Row,
+    id: &ConnectionId,
+) -> Result<SafeConnectionStatus, ConnectionStoreError> {
+    let state =
+        parse_state(&row.get::<_, String>(0)).ok_or_else(|| corrupt(id, "unknown status state"))?;
+    let reason = parse_reason(&row.get::<_, String>(1))
+        .ok_or_else(|| corrupt(id, "unknown status reason"))?;
+    let optional = |value: Option<i64>| {
+        value
+            .map(|v| u64::try_from(v).map_err(|_| corrupt(id, "negative safe status count")))
+            .transpose()
+    };
+    Ok(SafeConnectionStatus {
+        state,
+        reason,
+        observed_at: Some(row.get(2)),
+        latency_ms: optional(row.get(3))?,
+        catalog_age_secs: optional(row.get(4))?,
+        catalog_entry_count: optional(row.get(5))?
+            .map(|count| usize::try_from(count).unwrap_or(usize::MAX)),
+    })
+}
+
+async fn load_mcp_entries(
+    client: &deadpool_postgres::Object,
+    id: &ConnectionId,
+) -> Result<Vec<StoredMcpCatalogEntry>, ConnectionStoreError> {
+    let rows = client
+        .query(
+            r#"
+            SELECT remote_tool_name, description, input_schema_json::text
+            FROM greengateway.connection_mcp_catalog_entries
+            WHERE connection_id = $1::text::uuid
+            ORDER BY ordinal
+            "#,
+            &[&id.as_str()],
+        )
+        .await
+        .map_err(|error| pg_error(OPERATION_MCP_READ, error))?;
+    rows.iter()
+        .map(|row| {
+            let input_schema: Value = serde_json::from_str(&row.get::<_, String>(2))
+                .map_err(|_| corrupt(id, "MCP catalog entry schema is not valid JSON"))?;
+            Ok(StoredMcpCatalogEntry {
+                remote_tool_name: row.get(0),
+                description: row.get(1),
+                input_schema,
+            })
+        })
+        .collect()
+}
+
+async fn load_mcp_resources(
+    client: &deadpool_postgres::Object,
+    id: &ConnectionId,
+) -> Result<Vec<StoredMcpResource>, ConnectionStoreError> {
+    let rows = client
+        .query(
+            r#"
+            SELECT uri, name, title, description, mime_type, size
+            FROM greengateway.connection_mcp_catalog_resources
+            WHERE connection_id = $1::text::uuid
+            ORDER BY ordinal
+            "#,
+            &[&id.as_str()],
+        )
+        .await
+        .map_err(|error| pg_error(OPERATION_MCP_READ, error))?;
+    rows.iter()
+        .map(|row| {
+            Ok(StoredMcpResource {
+                uri: row.get(0),
+                name: row.get(1),
+                title: row.get(2),
+                description: row.get(3),
+                mime_type: row.get(4),
+                size: row
+                    .get::<_, Option<i64>>(5)
+                    .map(|size| u64::try_from(size).unwrap_or(u64::MAX)),
+            })
+        })
+        .collect()
+}
+
+async fn load_mcp_resource_templates(
+    client: &deadpool_postgres::Object,
+    id: &ConnectionId,
+) -> Result<Vec<StoredMcpResourceTemplate>, ConnectionStoreError> {
+    let rows = client
+        .query(
+            r#"
+            SELECT uri_template, name, title, description, mime_type
+            FROM greengateway.connection_mcp_catalog_resource_templates
+            WHERE connection_id = $1::text::uuid
+            ORDER BY ordinal
+            "#,
+            &[&id.as_str()],
+        )
+        .await
+        .map_err(|error| pg_error(OPERATION_MCP_READ, error))?;
+    rows.iter()
+        .map(|row| {
+            Ok(StoredMcpResourceTemplate {
+                uri_template: row.get(0),
+                name: row.get(1),
+                title: row.get(2),
+                description: row.get(3),
+                mime_type: row.get(4),
+            })
+        })
+        .collect()
+}
+
+async fn load_openapi_entries(
+    client: &deadpool_postgres::Object,
+    id: &ConnectionId,
+) -> Result<Vec<StoredOpenApiCatalogEntry>, ConnectionStoreError> {
+    let rows = client
+        .query(
+            r#"
+            SELECT tool_name, operation_id, selected_scheme_names_json::text, definition_json::text
+            FROM greengateway.connection_openapi_catalog_entries
+            WHERE connection_id = $1::text::uuid
+            ORDER BY ordinal
+            "#,
+            &[&id.as_str()],
+        )
+        .await
+        .map_err(|error| pg_error(OPERATION_OPENAPI_READ, error))?;
+    rows.iter()
+        .map(|row| {
+            let selected: Vec<String> = serde_json::from_str(&row.get::<_, String>(2))
+                .map_err(|_| corrupt(id, "OpenAPI selected schemes are not valid JSON"))?;
+            let definition: Value = serde_json::from_str(&row.get::<_, String>(3))
+                .map_err(|_| corrupt(id, "OpenAPI tool definition is not valid JSON"))?;
+            Ok(StoredOpenApiCatalogEntry {
+                tool_name: row.get(0),
+                operation_id: row.get(1),
+                selected_scheme_names: selected,
+                definition,
+            })
+        })
+        .collect()
+}
+
 /// Which managed-catalog kind a specification supports; `None` when the
 /// two sides of a replacement agree (no cleanup required).
 fn managed_catalog_kind_changed(current: &StoredConnection, candidate: &ConnectionWrite) -> bool {
@@ -897,6 +2411,7 @@ type ConnectionSnapshot = BTreeMap<ConnectionId, StoredConnection>;
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::connections::status::ConnectionOperationalState;
     use crate::storage::postgres::PostgresFoundation;
     use serde_json::json;
 
@@ -1326,6 +2841,345 @@ mod tests {
         assert!(
             matches!(corrupt, ConnectionStoreError::CorruptRecord { .. }),
             "{corrupt}"
+        );
+    }
+
+    fn mcp_candidate() -> ConnectionWrite {
+        serde_json::from_value(json!({
+            "display_name": "Managed MCP",
+            "enabled": true,
+            "kind": "mcp_streamable_http",
+            "endpoint": {
+                "base_url": "https://mcp.example.test",
+                "base_path": "/mcp"
+            },
+            "authentication": { "type": "none" },
+            "tls": {},
+            "discovery": {
+                "type": "managed_mcp",
+                "use_connection_authentication": false
+            }
+        }))
+        .expect("MCP candidate should deserialize")
+    }
+
+    fn mcp_entry(name: &str) -> StoredMcpCatalogEntry {
+        StoredMcpCatalogEntry {
+            remote_tool_name: name.to_owned(),
+            description: format!("{name} description"),
+            input_schema: json!({ "type": "object", "properties": {} }),
+        }
+    }
+
+    #[tokio::test]
+    async fn mcp_catalog_replaces_with_cas_revisions_dependencies_and_outbox() {
+        let Some(admin_dsn) = locator() else {
+            eprintln!("skipping: no test database locator; CI runs this test");
+            return;
+        };
+        let database = create_test_database(&admin_dsn).await;
+        let (store, pool) = migrated_store(&database.dsn, 64).await;
+        let created = store
+            .create(mcp_candidate(), "op-1")
+            .await
+            .expect("MCP connection should create");
+        let etag = created.etag();
+
+        // The first replace publishes revision 1 with the managed-tool
+        // dependency per entry, and bumps the shared security revision and
+        // the connections high-water mark with an outbox row naming the
+        // connection.
+        let security_before: i64 = count(
+            &pool,
+            "SELECT last_revision FROM greengateway.security_revision_state WHERE singleton",
+        )
+        .await;
+        let catalog = store
+            .replace_mcp_catalog(
+                &created.id,
+                &etag,
+                &[mcp_entry("alpha"), mcp_entry("beta")],
+                &[],
+                &[],
+                "op-2",
+            )
+            .await
+            .expect("catalog replace should win");
+        assert_eq!(catalog.catalog_revision, 1);
+        assert_eq!(catalog.entries.len(), 2);
+        let loaded = store
+            .mcp_catalog(&created.id)
+            .await
+            .expect("catalog read")
+            .expect("catalog exists");
+        assert_eq!(loaded, catalog);
+        assert_eq!(
+            store.mcp_catalogs().await.expect("list").len(),
+            1,
+            "the listing loads every catalog"
+        );
+        let security_after: i64 = count(
+            &pool,
+            "SELECT last_revision FROM greengateway.security_revision_state WHERE singleton",
+        )
+        .await;
+        assert!(
+            security_after > security_before,
+            "catalog replaces bump the shared revision"
+        );
+        assert!(
+            store.state_revision().await.expect("state") > 0,
+            "the connections high-water mark advanced"
+        );
+        let dependencies = store.dependencies(&created.id).await.expect("dependencies");
+        assert_eq!(
+            dependencies.len(),
+            2,
+            "one managed-tool dependency per entry"
+        );
+        assert!(dependencies
+            .iter()
+            .all(|dep| dep.kind == ConnectionDependencyKind::ManagedTool));
+
+        // A stale CONNECTION etag loses with Conflict and leaves the
+        // catalog untouched. Catalog replaces do not change the record's
+        // etag (refresh loops rely on that), so staleness comes from a
+        // record replacement: rename the connection, then present the
+        // pre-rename etag.
+        let mut renamed = mcp_candidate();
+        renamed.display_name = "Renamed MCP".to_owned();
+        let fresh_record_etag = store
+            .replace(&created.id, &etag, renamed, "op-3")
+            .await
+            .expect("record replace should win")
+            .etag();
+        let stale = store
+            .replace_mcp_catalog(&created.id, &etag, &[mcp_entry("gamma")], &[], &[], "op-4")
+            .await
+            .expect_err("the stale connection etag must lose");
+        assert!(
+            matches!(stale, ConnectionStoreError::Conflict { .. }),
+            "{stale}"
+        );
+        assert_eq!(
+            store
+                .mcp_catalog(&created.id)
+                .await
+                .expect("catalog read")
+                .expect("exists")
+                .entries
+                .len(),
+            2
+        );
+
+        // The record's new etag wins; the managed-tool dependencies are
+        // REPLACED (not accumulated) and the catalog revision increments.
+        let second = store
+            .replace_mcp_catalog(
+                &created.id,
+                &fresh_record_etag,
+                &[mcp_entry("alpha"), mcp_entry("beta"), mcp_entry("delta")],
+                &[],
+                &[],
+                "op-5",
+            )
+            .await
+            .expect("the fresh etag should win");
+        assert_eq!(second.catalog_revision, 2);
+        let dependencies = store.dependencies(&created.id).await.expect("dependencies");
+        assert_eq!(dependencies.len(), 3, "dependencies follow the new catalog");
+    }
+
+    #[tokio::test]
+    async fn openapi_catalog_triple_cas_and_status_append() {
+        let Some(admin_dsn) = locator() else {
+            eprintln!("skipping: no test database locator; CI runs this test");
+            return;
+        };
+        let database = create_test_database(&admin_dsn).await;
+        let (store, pool) = migrated_store(&database.dsn, 64).await;
+        let created = store
+            .create(http_candidate("Billing API"), "op-1")
+            .await
+            .expect("OpenAPI connection should create");
+
+        let entry = StoredOpenApiCatalogEntry {
+            tool_name: "billing.list".to_owned(),
+            operation_id: Some("listInvoices".to_owned()),
+            selected_scheme_names: vec![],
+            definition: json!({
+                "name": "billing.list",
+                "description": "Lists invoices.",
+                "input_json_schema": {
+                    "type": "object",
+                    "properties": {},
+                    "additionalProperties": false
+                },
+                "upstream": {
+                    "method": "GET",
+                    "path_template": "/v1/invoices",
+                    "body": { "mode": "whole_args_json" }
+                }
+            }),
+        };
+        // Wrong digest shape is rejected before any transaction runs.
+        let bad_digest = store
+            .replace_openapi_catalog(
+                &created.id,
+                &created.etag(),
+                0,
+                0,
+                "{\"openapi\":\"3.1.0\"}",
+                "not-a-sha256",
+                std::slice::from_ref(&entry),
+                "op-2",
+            )
+            .await
+            .expect_err("an invalid digest must be rejected");
+        assert!(
+            matches!(bad_digest, ConnectionStoreError::Validation { .. }),
+            "{bad_digest}"
+        );
+
+        let digest = {
+            use sha2::Digest;
+            hex::encode(sha2::Sha256::digest(b"{\"openapi\":\"3.1.0\"}"))
+        };
+        let catalog = store
+            .replace_openapi_catalog(
+                &created.id,
+                &created.etag(),
+                0,
+                0,
+                "{\"openapi\":\"3.1.0\"}",
+                &digest,
+                std::slice::from_ref(&entry),
+                "op-3",
+            )
+            .await
+            .expect("the initial triple CAS (0,0) should win");
+        assert_eq!(
+            catalog.spec_revision, 1,
+            "a new digest bumps the spec revision"
+        );
+        assert_eq!(catalog.catalog_revision, 1);
+        assert_eq!(store.openapi_catalogs().await.expect("list").len(), 1);
+        let inventory = store.openapi_inventory_catalogs().await.expect("inventory");
+        assert_eq!(inventory.len(), 1);
+        assert_eq!(inventory[0].entries.len(), 1);
+
+        // A stale catalog revision loses the triple CAS.
+        let stale = store
+            .replace_openapi_catalog(
+                &created.id,
+                &created.etag(),
+                1,
+                0,
+                "{\"openapi\":\"3.1.0\"}",
+                &digest,
+                std::slice::from_ref(&entry),
+                "op-4",
+            )
+            .await
+            .expect_err("the stale catalog revision must lose");
+        assert!(
+            matches!(stale, ConnectionStoreError::Conflict { .. }),
+            "{stale}"
+        );
+
+        // Status appends: etag CAS, latest reads, history, and no
+        // security-revision bump (status is observational state).
+        let security_before: i64 = count(
+            &pool,
+            "SELECT last_revision FROM greengateway.security_revision_state WHERE singleton",
+        )
+        .await;
+        let etag = store
+            .get(&created.id)
+            .await
+            .expect("get")
+            .expect("exists")
+            .etag();
+        let status = store
+            .append_status(
+                &created.id,
+                &etag,
+                ConnectionStatusUpdate {
+                    state: ConnectionOperationalState::Healthy,
+                    reason: ConnectionStatusReason::TestSucceeded,
+                    latency_ms: Some(42),
+                    catalog_age_secs: None,
+                    catalog_entry_count: Some(1),
+                },
+            )
+            .await
+            .expect("status should append");
+        assert_eq!(status.state, ConnectionOperationalState::Healthy);
+        let latest = store
+            .latest_status(&created.id)
+            .await
+            .expect("latest")
+            .expect("status exists");
+        assert_eq!(latest.state, ConnectionOperationalState::Healthy);
+        assert_eq!(latest.latency_ms, Some(42));
+        let history = store
+            .status_history(&created.id, 10)
+            .await
+            .expect("history");
+        assert_eq!(history.len(), 1);
+        let security_after: i64 = count(
+            &pool,
+            "SELECT last_revision FROM greengateway.security_revision_state WHERE singleton",
+        )
+        .await;
+        assert_eq!(
+            security_after, security_before,
+            "status appends must not bump the security revision"
+        );
+
+        // Dependency replacement: kind-scoped, owner-checked.
+        store
+            .add_dependency(
+                &created.id,
+                ConnectionDependencyKind::ProxyRoute,
+                "route-payments",
+            )
+            .await
+            .expect("dependency should add");
+        store
+            .add_dependency(
+                &created.id,
+                ConnectionDependencyKind::ProxyRoute,
+                "route-payments",
+            )
+            .await
+            .expect("duplicate add is an idempotent no-op");
+        store
+            .replace_dependencies_for_kind(
+                ConnectionDependencyKind::ManualTool,
+                &[(created.id.clone(), "manual.echo".to_owned())],
+            )
+            .await
+            .expect("manual-tool dependencies should replace");
+        let deps = store.dependencies(&created.id).await.expect("dependencies");
+        assert_eq!(
+            deps.len(),
+            3,
+            "managed_tool from the catalog + proxy_route + manual_tool"
+        );
+        let missing = store
+            .replace_dependencies_for_kind(
+                ConnectionDependencyKind::ControlPlane,
+                &[(
+                    ConnectionId::parse("11111111-1111-1111-1111-111111111111").expect("id"),
+                    "ghost".to_owned(),
+                )],
+            )
+            .await
+            .expect_err("an unknown owner must be refused");
+        assert!(
+            matches!(missing, ConnectionStoreError::NotFound { .. }),
+            "{missing}"
         );
     }
 }

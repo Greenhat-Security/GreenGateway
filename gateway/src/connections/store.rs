@@ -580,7 +580,7 @@ pub(crate) const SOURCE_MANAGED: &str = "managed";
 const MAX_DEPENDENCY_FIELD_BYTES: usize = 256;
 pub const MAX_CONNECTION_DEPENDENCIES: usize = 4_096;
 const MAX_MCP_CATALOG_ENTRY_BYTES: usize = 262_144;
-const MAX_MANAGED_MCP_CATALOG_BYTES: usize = 16 * 1024 * 1024;
+pub(crate) const MAX_MANAGED_MCP_CATALOG_BYTES: usize = 16 * 1024 * 1024;
 const MAX_MCP_TOOL_NAME_CHARS: usize = 128;
 const MAX_MCP_TOOL_DESCRIPTION_CHARS: usize = 1_024;
 const MAX_MCP_RESOURCE_URI_BYTES: usize = 2_048;
@@ -636,6 +636,13 @@ pub struct ConnectionEtag(String);
 impl ConnectionEtag {
     pub fn as_str(&self) -> &str {
         &self.0
+    }
+
+    /// Rebuild an etag read back from a store, verbatim. Stores persist the
+    /// canonical string; no parsing or validation happens here, matching
+    /// the SQLite store's opaque round-trip.
+    pub(crate) fn from_stored(value: String) -> Self {
+        Self(value)
     }
 
     pub(crate) fn for_record(id: &ConnectionId, revisions: &ConnectionRevisions) -> Self {
@@ -723,7 +730,7 @@ pub enum ConnectionDependencyKind {
 }
 
 impl ConnectionDependencyKind {
-    fn as_str(self) -> &'static str {
+    pub(crate) fn as_str(self) -> &'static str {
         match self {
             Self::ProxyRoute => "proxy_route",
             Self::ManualTool => "manual_tool",
@@ -732,7 +739,7 @@ impl ConnectionDependencyKind {
         }
     }
 
-    fn parse(value: &str) -> Option<Self> {
+    pub(crate) fn parse(value: &str) -> Option<Self> {
         match value {
             "proxy_route" => Some(Self::ProxyRoute),
             "manual_tool" => Some(Self::ManualTool),
@@ -2828,12 +2835,12 @@ fn validate_persisted_state(
         .map_err(|source| sqlite_error(path, "startup validation commit", source))
 }
 
-struct ValidatedMcpCatalog {
-    encoded_tool_schemas: Vec<String>,
-    stored_bytes: usize,
+pub(crate) struct ValidatedMcpCatalog {
+    pub(crate) encoded_tool_schemas: Vec<String>,
+    pub(crate) stored_bytes: usize,
 }
 
-fn validate_mcp_catalog(
+pub(crate) fn validate_mcp_catalog(
     id: &ConnectionId,
     entries: &[StoredMcpCatalogEntry],
     resources: &[StoredMcpResource],
@@ -3204,13 +3211,16 @@ fn validate_optional_mcp_metadata(
 }
 
 #[derive(Clone)]
-struct EncodedOpenApiCatalogEntry {
-    entry: StoredOpenApiCatalogEntry,
-    selected_scheme_names_json: String,
-    definition_json: String,
+pub(crate) struct EncodedOpenApiCatalogEntry {
+    pub(crate) entry: StoredOpenApiCatalogEntry,
+    pub(crate) selected_scheme_names_json: String,
+    pub(crate) definition_json: String,
 }
 
-fn validate_openapi_spec(spec: &str, spec_digest: &str) -> Result<(), ConnectionStoreError> {
+pub(crate) fn validate_openapi_spec(
+    spec: &str,
+    spec_digest: &str,
+) -> Result<(), ConnectionStoreError> {
     let mut problems = Vec::new();
     if spec.is_empty() || spec.len() > MAX_MANAGED_SPEC_BYTES {
         problems.push(format!(
@@ -3236,7 +3246,7 @@ fn validate_openapi_spec(spec: &str, spec_digest: &str) -> Result<(), Connection
     }
 }
 
-fn validate_openapi_catalog_entries(
+pub(crate) fn validate_openapi_catalog_entries(
     entries: &[StoredOpenApiCatalogEntry],
 ) -> Result<Vec<EncodedOpenApiCatalogEntry>, ConnectionStoreError> {
     if entries.len() > MAX_CATALOG_ENTRIES {
@@ -4681,12 +4691,12 @@ pub(crate) fn binding_count(write: &ConnectionWrite) -> usize {
         + usize::from(write.tls.client_private_key_id.is_some())
 }
 
-fn supports_managed_mcp_catalog(write: &ConnectionWrite) -> bool {
+pub(crate) fn supports_managed_mcp_catalog(write: &ConnectionWrite) -> bool {
     write.kind == ConnectionKind::McpStreamableHttp
         && matches!(&write.discovery, Some(DiscoveryConfig::ManagedMcp { .. }))
 }
 
-fn supports_managed_openapi_catalog(write: &ConnectionWrite) -> bool {
+pub(crate) fn supports_managed_openapi_catalog(write: &ConnectionWrite) -> bool {
     write.kind == ConnectionKind::HttpApi
         && matches!(
             &write.discovery,
@@ -4846,11 +4856,11 @@ pub(crate) fn ensure_etag(
 ///
 /// Validation and insertion must agree on the exact string, so both go through
 /// here rather than formatting it independently.
-fn managed_tool_dependency_id(id: &ConnectionId, remote_tool_name: &str) -> String {
+pub(crate) fn managed_tool_dependency_id(id: &ConnectionId, remote_tool_name: &str) -> String {
     format!("{}:{remote_tool_name}", id.as_str())
 }
 
-fn validate_dependency_id(value: &str) -> Result<(), ConnectionStoreError> {
+pub(crate) fn validate_dependency_id(value: &str) -> Result<(), ConnectionStoreError> {
     if value.is_empty() || value.len() > MAX_DEPENDENCY_FIELD_BYTES || value.contains('\0') {
         Err(ConnectionStoreError::Validation {
             problems: vec![format!(
@@ -4862,7 +4872,10 @@ fn validate_dependency_id(value: &str) -> Result<(), ConnectionStoreError> {
     }
 }
 
-fn increment_revision(id: &ConnectionId, revision: u64) -> Result<u64, ConnectionStoreError> {
+pub(crate) fn increment_revision(
+    id: &ConnectionId,
+    revision: u64,
+) -> Result<u64, ConnectionStoreError> {
     revision
         .checked_add(1)
         .ok_or_else(|| ConnectionStoreError::RevisionOverflow { id: id.to_string() })
@@ -4886,7 +4899,7 @@ pub(crate) fn revision_from_i64(
     Ok(value)
 }
 
-fn persisted_revision(
+pub(crate) fn persisted_revision(
     id: &ConnectionId,
     value: i64,
     reason: &'static str,
@@ -4908,7 +4921,7 @@ pub(crate) fn u64_to_i64(id: &ConnectionId, value: u64) -> Result<i64, Connectio
     i64::try_from(value).map_err(|_| ConnectionStoreError::RevisionOverflow { id: id.to_string() })
 }
 
-fn optional_u64_to_i64(
+pub(crate) fn optional_u64_to_i64(
     value: Option<u64>,
     field: &'static str,
 ) -> Result<Option<i64>, ConnectionStoreError> {
@@ -4935,7 +4948,7 @@ fn optional_i64_to_u64(
         .transpose()
 }
 
-fn state_as_str(state: ConnectionOperationalState) -> &'static str {
+pub(crate) fn state_as_str(state: ConnectionOperationalState) -> &'static str {
     match state {
         ConnectionOperationalState::Unknown => "unknown",
         ConnectionOperationalState::Configured => "configured",
@@ -4946,7 +4959,7 @@ fn state_as_str(state: ConnectionOperationalState) -> &'static str {
     }
 }
 
-fn parse_state(value: &str) -> Option<ConnectionOperationalState> {
+pub(crate) fn parse_state(value: &str) -> Option<ConnectionOperationalState> {
     match value {
         "unknown" => Some(ConnectionOperationalState::Unknown),
         "configured" => Some(ConnectionOperationalState::Configured),
@@ -4958,7 +4971,7 @@ fn parse_state(value: &str) -> Option<ConnectionOperationalState> {
     }
 }
 
-fn reason_as_str(reason: ConnectionStatusReason) -> &'static str {
+pub(crate) fn reason_as_str(reason: ConnectionStatusReason) -> &'static str {
     match reason {
         ConnectionStatusReason::NotTested => "not_tested",
         ConnectionStatusReason::LegacyConfigured => "legacy_configured",
@@ -4973,7 +4986,7 @@ fn reason_as_str(reason: ConnectionStatusReason) -> &'static str {
     }
 }
 
-fn parse_reason(value: &str) -> Option<ConnectionStatusReason> {
+pub(crate) fn parse_reason(value: &str) -> Option<ConnectionStatusReason> {
     match value {
         "not_tested" => Some(ConnectionStatusReason::NotTested),
         "legacy_configured" => Some(ConnectionStatusReason::LegacyConfigured),
@@ -4998,7 +5011,7 @@ pub(crate) fn utc_timestamp() -> Result<String, ConnectionStoreError> {
         })
 }
 
-fn remaining_before(
+pub(crate) fn remaining_before(
     deadline: Instant,
     operation: &'static str,
 ) -> Result<Duration, ConnectionStoreError> {

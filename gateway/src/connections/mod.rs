@@ -17,6 +17,8 @@ pub mod gcp_secret;
 pub mod http;
 pub mod kubernetes_secret;
 pub mod local_secret;
+#[cfg(feature = "postgres")]
+pub mod managed_store;
 pub mod mcp;
 pub mod model;
 pub mod oauth;
