@@ -228,6 +228,14 @@ impl OpenApiConnectionCatalogRuntime {
         self.state.load().keys().cloned().collect()
     }
 
+    /// The catalog revision this replica currently serves for a Connection.
+    fn current_revision(&self, connection_id: &ConnectionId) -> Option<u64> {
+        self.state
+            .load()
+            .get(connection_id)
+            .map(|catalog| catalog.catalog_revision)
+    }
+
     fn remove(&self, connection_id: &ConnectionId) {
         self.state.rcu(|current| {
             if !current.contains_key(connection_id) {
@@ -395,6 +403,21 @@ impl OpenApiConnectionCatalogService {
             .map(|catalog| catalog.connection_id.clone())
             .collect::<BTreeSet<_>>();
         for catalog in &active {
+            // See the MCP reconciler: the per-Connection guard a publish
+            // holds, and a monotonic revision check under it.
+            let _guard = self
+                .control_plane
+                .begin_catalog_mutation(&catalog.connection_id)
+                .map_err(|_| ConnectionStoreError::Busy {
+                    resource: "connection catalog lifecycle",
+                })?;
+            if self
+                .runtime
+                .current_revision(&catalog.connection_id)
+                .is_some_and(|live| live >= catalog.catalog_revision)
+            {
+                continue;
+            }
             let definitions = catalog_definitions(catalog)?;
             self.registry
                 .install_openapi_connection_catalog(catalog.connection_id.as_str(), definitions)
@@ -801,6 +824,24 @@ impl OpenApiConnectionCatalogService {
             )
             .await
             .map_err(|error| openapi_store_error(&error))?;
+        // Publication is revision-monotonic: this publish holds the
+        // per-Connection lifecycle guard, but reconciliation may already
+        // have published a NEWER catalog another replica committed while
+        // this one was between its commit and here. Installing over it
+        // would roll the live lane back with no revision left to repair
+        // it; the committed catalog is durable at the authority.
+        if self
+            .runtime
+            .current_revision(&record.id)
+            .is_some_and(|live| live > catalog.catalog_revision)
+        {
+            tracing::info!(
+                connection_id = %record.id,
+                committed = catalog.catalog_revision,
+                "a newer OpenAPI catalog is already live on this replica; the committed one is durable and not installed"
+            );
+            return Err(OpenApiCatalogError::ToolConflict);
+        }
         // The runtime publish stays paired with the registry install so the
         // managed-OpenAPI lane and the runtime map keep publishing
         // together: a request must never find a tool in one and not the

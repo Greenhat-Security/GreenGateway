@@ -1524,8 +1524,21 @@ async fn e2e_04_authenticated_mcp_stream_refresh_lkg_and_delete_workflow() {
     registry
         .validate_mcp_connection_catalog(record.id.as_str(), &[])
         .expect("cleared managed MCP catalog should validate before the authority write");
+    let prior_catalog_revision = store
+        .mcp_catalog(&record.id)
+        .await
+        .expect("prior catalog read should succeed")
+        .map_or(0, |catalog| catalog.catalog_revision);
     store
-        .replace_mcp_catalog(&record.id, &record.etag(), &[], &[], &[], ACCEPTANCE_ACTOR)
+        .replace_mcp_catalog(
+            &record.id,
+            &record.etag(),
+            &[],
+            &[],
+            &[],
+            prior_catalog_revision,
+            ACCEPTANCE_ACTOR,
+        )
         .await
         .expect("managed MCP catalog should clear before delete");
     registry

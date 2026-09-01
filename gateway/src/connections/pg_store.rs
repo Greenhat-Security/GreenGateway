@@ -338,6 +338,7 @@ impl PostgresConnectionStore {
         &self,
         candidate: ConnectionWrite,
         actor_user_id: &str,
+        collection: Option<super::store::CollectionCheck<'_>>,
     ) -> Result<StoredConnection, ConnectionStoreError> {
         let candidate = validate_candidate(candidate)?;
         let spec_json =
@@ -360,6 +361,23 @@ impl PostgresConnectionStore {
         // returning a clean connection to the pool instead of leaving an
         // aborted transaction on it.
         let outcome: Result<StoredConnection, ConnectionStoreError> = async {
+            // The cross-replica half of the caller's `If-Match`: re-derive
+            // the collection ETag from the authority's records, under the
+            // singleton lock every mutation takes, so two replicas that
+            // both passed their local check with the same ETag produce one
+            // create and one conflict rather than two creates.
+            if let Some(check) = collection.as_ref() {
+                let records = load_all_records(&client, OPERATION_CREATE).await?;
+                let current = (check.compute)(
+                    &records
+                        .into_iter()
+                        .map(|record| (record.id.clone(), record))
+                        .collect(),
+                );
+                if current != check.expected_etag {
+                    return Err(ConnectionStoreError::CollectionConflict { current });
+                }
+            }
             let count = count_records(&client).await?;
             if count >= self.maximum_connections {
                 return Err(ConnectionStoreError::LimitExceeded {
@@ -698,6 +716,7 @@ impl PostgresConnectionStore {
         entries: &[StoredMcpCatalogEntry],
         resources: &[StoredMcpResource],
         resource_templates: &[StoredMcpResourceTemplate],
+        expected_catalog_revision: u64,
         actor_user_id: &str,
     ) -> Result<StoredMcpCatalog, ConnectionStoreError> {
         let validated = validate_mcp_catalog(id, entries, resources, resource_templates)?;
@@ -784,6 +803,19 @@ impl PostgresConnectionStore {
                 .map(|revision| persisted_revision(id, revision, "invalid MCP catalog revision"))
                 .transpose()?
                 .unwrap_or_default();
+            // The catalog's own compare-and-swap. The connection ETag above
+            // does not move on a catalog replacement, and the per-process
+            // refresh guard does not reach other replicas, so two replicas
+            // can both discover from the same prior catalog; without this,
+            // whichever commits LAST wins, and a slower, older discovery
+            // result would replace the newer one. `0` means "no catalog
+            // yet", exactly as the OpenAPI path's expected revision does.
+            if previous_revision != expected_catalog_revision {
+                return Err(ConnectionStoreError::Conflict {
+                    id: id.to_string(),
+                    current: current.etag(),
+                });
+            }
             let catalog_revision = increment_revision(id, previous_revision)?;
 
             client
@@ -1540,6 +1572,50 @@ impl PostgresConnectionStore {
             .await
             .map_err(|error| pg_error(OPERATION_STATUS_READ, error))?;
         row.map(|row| safe_status_from_row(&row, id)).transpose()
+    }
+
+    /// The latest safe status of each listed Connection in one round
+    /// trip. See the SQLite store's `latest_statuses`.
+    pub async fn latest_statuses(
+        &self,
+        ids: &[ConnectionId],
+    ) -> Result<BTreeMap<ConnectionId, SafeConnectionStatus>, ConnectionStoreError> {
+        let mut statuses = BTreeMap::new();
+        if ids.is_empty() {
+            return Ok(statuses);
+        }
+        let client = self
+            .pool
+            .get()
+            .await
+            .map_err(|_| pg_unavailable(OPERATION_STATUS_READ))?;
+        let id_texts = ids.iter().map(ConnectionId::as_str).collect::<Vec<_>>();
+        // The status columns come first so `safe_status_from_row`'s indices
+        // hold; the owner id rides last.
+        let rows = client
+            .query(
+                r#"
+                SELECT state, reason, observed_at, latency_ms, catalog_age_secs,
+                       catalog_entry_count, connection_id::text
+                FROM greengateway.connection_current_status
+                WHERE connection_id = ANY($1::text[]::uuid[])
+                "#,
+                &[&id_texts],
+            )
+            .await
+            .map_err(|error| pg_error(OPERATION_STATUS_READ, error))?;
+        for row in &rows {
+            let id_text: String = column(row, 6, "<status>", "status owner id does not decode")?;
+            let id = ConnectionId::parse(id_text.clone()).map_err(|_| {
+                ConnectionStoreError::CorruptRecord {
+                    id: id_text,
+                    reason: "invalid status owner ID",
+                }
+            })?;
+            let status = safe_status_from_row(row, &id)?;
+            statuses.insert(id, status);
+        }
+        Ok(statuses)
     }
 
     pub async fn status_history(
@@ -3625,7 +3701,7 @@ mod tests {
         // one immutable document version, one outbox row identifying the
         // connection, and both revision counters advanced.
         let created = store
-            .create(http_candidate("Billing API"), "op-1")
+            .create(http_candidate("Billing API"), "op-1", None)
             .await
             .expect("create should commit");
         assert_eq!(created.revisions.connection, 1);
@@ -3791,7 +3867,7 @@ mod tests {
         let database = create_test_database(&admin_dsn).await;
         let (store, pool) = migrated_store(&database.dsn, 64).await;
         let created = store
-            .create(http_candidate("Race Base"), "op-1")
+            .create(http_candidate("Race Base"), "op-1", None)
             .await
             .expect("create should commit");
         let etag = created.etag();
@@ -3835,11 +3911,11 @@ mod tests {
         let (store, pool) = migrated_store(&database.dsn, 1).await;
 
         store
-            .create(http_candidate("Only One"), "op-1")
+            .create(http_candidate("Only One"), "op-1", None)
             .await
             .expect("first create fits");
         let limited = store
-            .create(http_candidate("Second"), "op-2")
+            .create(http_candidate("Second"), "op-2", None)
             .await
             .expect_err("the capacity limit must hold");
         assert!(
@@ -3913,8 +3989,8 @@ mod tests {
         let (store_b, _pool_b) = migrated_store(&database.dsn, 1).await;
 
         let (a, b) = tokio::join!(
-            store_a.create(http_candidate("Replica A"), "replica-a"),
-            store_b.create(http_candidate("Replica B"), "replica-b")
+            store_a.create(http_candidate("Replica A"), "replica-a", None),
+            store_b.create(http_candidate("Replica B"), "replica-b", None)
         );
         let winners = usize::from(a.is_ok()) + usize::from(b.is_ok());
         assert_eq!(winners, 1, "the last free slot is taken exactly once");
@@ -3972,6 +4048,7 @@ mod tests {
             .create(
                 http_candidate_with_secret("Snapshot", "billing-token"),
                 "op-1",
+                None,
             )
             .await
             .expect("create should commit");
@@ -4055,7 +4132,7 @@ mod tests {
         let database = create_test_database(&admin_dsn).await;
         let (store, pool) = migrated_store(&database.dsn, 64).await;
         let created = store
-            .create(http_candidate("Counted"), "op-1")
+            .create(http_candidate("Counted"), "op-1", None)
             .await
             .expect("create should commit");
 
@@ -4145,7 +4222,7 @@ mod tests {
         let database = create_test_database(&admin_dsn).await;
         let (store, pool) = migrated_store(&database.dsn, 64).await;
         let created = store
-            .create(mcp_candidate(), "op-1")
+            .create(mcp_candidate(), "op-1", None)
             .await
             .expect("MCP connection should create");
         store
@@ -4155,6 +4232,7 @@ mod tests {
                 &[mcp_entry("alpha"), mcp_entry("beta")],
                 &[],
                 &[],
+                0,
                 "op-2",
             )
             .await
@@ -4238,7 +4316,7 @@ mod tests {
         // Withdraw the catalog, and the same replace is now allowed: the
         // guard tracks live rows, it does not pin the kind forever.
         store
-            .replace_mcp_catalog(&created.id, &unchanged.etag(), &[], &[], &[], "op-4")
+            .replace_mcp_catalog(&created.id, &unchanged.etag(), &[], &[], &[], 1, "op-4")
             .await
             .expect("emptying the catalog should win");
         let after_withdrawal = store
@@ -4280,7 +4358,7 @@ mod tests {
         let database = create_test_database(&admin_dsn).await;
         let (store, pool) = migrated_store(&database.dsn, 64).await;
         let created = store
-            .create(mcp_candidate(), "op-1")
+            .create(mcp_candidate(), "op-1", None)
             .await
             .expect("MCP connection should create");
         let etag = created.etag();
@@ -4301,6 +4379,7 @@ mod tests {
                 &[mcp_entry("alpha"), mcp_entry("beta")],
                 &[],
                 &[],
+                0,
                 "op-2",
             )
             .await
@@ -4354,7 +4433,15 @@ mod tests {
             .expect("record replace should win")
             .etag();
         let stale = store
-            .replace_mcp_catalog(&created.id, &etag, &[mcp_entry("gamma")], &[], &[], "op-4")
+            .replace_mcp_catalog(
+                &created.id,
+                &etag,
+                &[mcp_entry("gamma")],
+                &[],
+                &[],
+                1,
+                "op-4",
+            )
             .await
             .expect_err("the stale connection etag must lose");
         assert!(
@@ -4381,6 +4468,7 @@ mod tests {
                 &[mcp_entry("alpha"), mcp_entry("beta"), mcp_entry("delta")],
                 &[],
                 &[],
+                1,
                 "op-5",
             )
             .await
@@ -4395,6 +4483,158 @@ mod tests {
     /// `stored_bytes`). Summing entries alone made every stored resource
     /// and resource template free, so the two halves of the comparison
     /// described different quantities.
+    /// Two replicas refresh from the same prior catalog. The connection
+    /// ETag does not move on a catalog replacement, so only the catalog's
+    /// own revision can tell the second, older discovery result from a
+    /// legitimate follow-on refresh. Without this CAS the slower, older
+    /// result would commit last and replace the newer catalog.
+    #[tokio::test]
+    async fn a_stale_catalog_revision_is_refused_even_under_a_fresh_connection_etag() {
+        let Some(admin_dsn) = locator() else {
+            eprintln!("skipping: no test database locator; CI runs this test");
+            return;
+        };
+        let database = create_test_database(&admin_dsn).await;
+        let (store, _pool) = migrated_store(&database.dsn, 64).await;
+        let created = store
+            .create(mcp_candidate(), "op-1", None)
+            .await
+            .expect("MCP connection should create");
+
+        // Both replicas observed "no catalog yet" (revision 0).
+        let first = store
+            .replace_mcp_catalog(
+                &created.id,
+                &created.etag(),
+                &[mcp_entry("alpha")],
+                &[],
+                &[],
+                0,
+                "replica-a",
+            )
+            .await
+            .expect("the first discovery commits");
+        assert_eq!(first.catalog_revision, 1);
+
+        // The second replica's discovery was slower. Its connection ETag is
+        // still current (catalog replacements do not move it), so only the
+        // catalog revision it observed can stop it.
+        let stale = store
+            .replace_mcp_catalog(
+                &created.id,
+                &created.etag(),
+                &[mcp_entry("older-view")],
+                &[],
+                &[],
+                0,
+                "replica-b",
+            )
+            .await
+            .expect_err("a discovery from a superseded catalog must be refused");
+        assert!(
+            matches!(stale, ConnectionStoreError::Conflict { .. }),
+            "the refusal is a conflict, got {stale}"
+        );
+        let live = store
+            .mcp_catalog(&created.id)
+            .await
+            .expect("catalog read")
+            .expect("catalog exists");
+        assert_eq!(live.catalog_revision, 1);
+        assert_eq!(
+            live.entries[0].remote_tool_name, "alpha",
+            "the newer catalog stays live"
+        );
+
+        // A refresh that observed revision 1 is the legitimate follow-on.
+        let next = store
+            .replace_mcp_catalog(
+                &created.id,
+                &created.etag(),
+                &[mcp_entry("beta")],
+                &[],
+                &[],
+                1,
+                "replica-b",
+            )
+            .await
+            .expect("a refresh from the live catalog commits");
+        assert_eq!(next.catalog_revision, 2);
+    }
+
+    /// Two replicas create under the same collection `If-Match`. Each passed
+    /// its own process-local check (both snapshots were empty), so only the
+    /// authority can decide: under the singleton lock it re-derives the
+    /// collection ETag from its records and refuses the second create.
+    /// Without this, both inserts succeed and the caller's precondition is
+    /// decoration.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn concurrent_creates_under_one_collection_etag_produce_exactly_one_winner() {
+        let Some(admin_dsn) = locator() else {
+            eprintln!("skipping: no test database locator; CI runs this test");
+            return;
+        };
+        let database = create_test_database(&admin_dsn).await;
+        let (replica_a, _pool_a) = migrated_store(&database.dsn, 64).await;
+        let (replica_b, _pool_b) = migrated_store(&database.dsn, 64).await;
+        let replica_a = std::sync::Arc::new(replica_a);
+        let replica_b = std::sync::Arc::new(replica_b);
+
+        // The derivation the control plane would supply: here, the sorted
+        // ids joined, which is enough to change the moment a row lands.
+        fn derive(records: &BTreeMap<ConnectionId, StoredConnection>) -> String {
+            if records.is_empty() {
+                "empty".to_owned()
+            } else {
+                records
+                    .keys()
+                    .map(ConnectionId::as_str)
+                    .collect::<Vec<_>>()
+                    .join(",")
+            }
+        }
+        let barrier = std::sync::Arc::new(tokio::sync::Barrier::new(2));
+        let create_on = |store: std::sync::Arc<PostgresConnectionStore>, name: &'static str| {
+            let barrier = barrier.clone();
+            tokio::spawn(async move {
+                barrier.wait().await;
+                store
+                    .create(
+                        http_candidate(name),
+                        "op",
+                        Some(super::super::store::CollectionCheck {
+                            expected_etag: "empty",
+                            compute: &derive,
+                        }),
+                    )
+                    .await
+            })
+        };
+        let (first, second) = tokio::join!(
+            create_on(replica_a.clone(), "Replica A"),
+            create_on(replica_b.clone(), "Replica B")
+        );
+        let outcomes = [first.expect("task"), second.expect("task")];
+        let winners = outcomes.iter().filter(|outcome| outcome.is_ok()).count();
+        assert_eq!(
+            winners, 1,
+            "exactly one create wins the collection precondition"
+        );
+        let loser = outcomes
+            .iter()
+            .find_map(|outcome| outcome.as_ref().err())
+            .expect("one create loses");
+        assert!(
+            matches!(loser, ConnectionStoreError::CollectionConflict { current } if current != "empty"),
+            "the loser is told the collection moved, got {loser}"
+        );
+        assert_eq!(
+            replica_a.count().await.expect("count"),
+            1,
+            "the loser wrote nothing"
+        );
+    }
+
     #[tokio::test]
     async fn retained_mcp_catalog_bytes_charge_entries_resources_and_templates() {
         let Some(admin_dsn) = locator() else {
@@ -4404,7 +4644,7 @@ mod tests {
         let database = create_test_database(&admin_dsn).await;
         let (store, pool) = migrated_store(&database.dsn, 64).await;
         let created = store
-            .create(mcp_candidate(), "op-1")
+            .create(mcp_candidate(), "op-1", None)
             .await
             .expect("MCP connection should create");
 
@@ -4431,6 +4671,7 @@ mod tests {
                 std::slice::from_ref(&entry),
                 std::slice::from_ref(&resource),
                 std::slice::from_ref(&template),
+                0,
                 "op-2",
             )
             .await
@@ -4508,7 +4749,7 @@ mod tests {
         let database = create_test_database(&admin_dsn).await;
         let (store, pool) = migrated_store(&database.dsn, 64).await;
         let created = store
-            .create(http_candidate("Billing API"), "op-1")
+            .create(http_candidate("Billing API"), "op-1", None)
             .await
             .expect("OpenAPI connection should create");
 
@@ -4712,11 +4953,11 @@ mod tests {
         let seed_limit = i64::try_from(maximum).expect("history limit should fit PostgreSQL");
 
         let quiet = store
-            .create(http_candidate("Quiet API"), "op-1")
+            .create(http_candidate("Quiet API"), "op-1", None)
             .await
             .expect("quiet connection should create");
         let noisy = store
-            .create(http_candidate("Noisy API"), "op-2")
+            .create(http_candidate("Noisy API"), "op-2", None)
             .await
             .expect("noisy connection should create");
 

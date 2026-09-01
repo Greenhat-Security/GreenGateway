@@ -691,16 +691,14 @@ impl CapabilityInventory {
             .openapi_inventory_catalogs()
             .await
             .map_err(store_inventory_error)?;
-        let mut statuses = BTreeMap::new();
-        for id in snapshot.managed().keys() {
-            if let Some(status) = store
-                .latest_status(id)
-                .await
-                .map_err(store_inventory_error)?
-            {
-                statuses.insert(id.clone(), status);
-            }
-        }
+        // One round trip for every status; the collection listing does
+        // the same read for its own view, so a list request costs two bulk
+        // reads rather than two per Connection.
+        let ids = snapshot.managed().keys().cloned().collect::<Vec<_>>();
+        let statuses = store
+            .latest_statuses(&ids)
+            .await
+            .map_err(store_inventory_error)?;
         Ok((mcp, openapi, statuses))
     }
 }
@@ -1619,6 +1617,7 @@ mod tests {
                         description: Some("Safe template metadata only".to_owned()),
                         mime_type: Some("application/json".to_owned()),
                     }],
+                    0,
                     "test-admin",
                 )
                 .await

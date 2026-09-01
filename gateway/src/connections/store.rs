@@ -900,6 +900,31 @@ pub enum ConnectionStoreError {
     Unavailable {
         operation: &'static str,
     },
+    /// A create's collection precondition (the `If-Match` over the whole
+    /// managed collection) no longer holds at the authority: another
+    /// replica changed the collection after the caller read it. Carries
+    /// the authority's current collection ETag so the response can name
+    /// it, exactly as the process-local check does.
+    CollectionConflict {
+        current: String,
+    },
+}
+
+/// The cross-replica half of a create's `If-Match` (issue #241, PR 8).
+///
+/// The control plane checks the collection ETag against its own runtime
+/// snapshot before calling the store, which is authoritative in standalone
+/// mode -- one process, one snapshot. In cluster mode two replicas can
+/// each pass that local check with the same `If-Match` and both insert, so
+/// the PostgreSQL store re-derives the collection ETag from the authority's
+/// records inside the create transaction, under the same lock every other
+/// mutation takes, and refuses the create if it moved. `compute` is the
+/// control plane's own derivation (it captures the replica's legacy
+/// projections, which the store does not know about), so the two checks
+/// cannot disagree about what the ETag means.
+pub struct CollectionCheck<'a> {
+    pub expected_etag: &'a str,
+    pub compute: &'a (dyn Fn(&BTreeMap<ConnectionId, StoredConnection>) -> String + Send + Sync),
 }
 
 impl fmt::Display for ConnectionStoreError {
@@ -970,6 +995,10 @@ impl fmt::Display for ConnectionStoreError {
             Self::Unavailable { operation } => {
                 write!(formatter, "{operation} could not be executed")
             }
+            Self::CollectionConflict { current } => write!(
+                formatter,
+                "connection collection changed at the authority; current ETag is {current}"
+            ),
         }
     }
 }
@@ -1385,6 +1414,35 @@ impl SqliteConnectionStore {
         resources: &[StoredMcpResource],
         resource_templates: &[StoredMcpResourceTemplate],
     ) -> Result<StoredMcpCatalog, ConnectionStoreError> {
+        self.replace_mcp_catalog_expecting(
+            id,
+            expected,
+            entries,
+            resources,
+            resource_templates,
+            None,
+        )
+    }
+
+    /// [`SqliteConnectionStore::replace_mcp_catalog`] with the catalog's
+    /// own compare-and-swap: `Some(revision)` requires the stored catalog
+    /// revision to equal it (`0` = no catalog yet) and refuses with
+    /// `Conflict` otherwise; `None` skips the check. The connection ETag
+    /// does not move on a catalog replacement, so this is the only
+    /// precondition that can tell two refreshes of the same prior catalog
+    /// apart. Standalone mode serializes refreshes per Connection inside
+    /// the process, so the check is redundant here -- it exists so both
+    /// stores enforce exactly what the cluster path asks for.
+    #[allow(clippy::too_many_arguments)]
+    pub fn replace_mcp_catalog_expecting(
+        &self,
+        id: &ConnectionId,
+        expected: &ConnectionEtag,
+        entries: &[StoredMcpCatalogEntry],
+        resources: &[StoredMcpResource],
+        resource_templates: &[StoredMcpResourceTemplate],
+        expected_catalog_revision: Option<u64>,
+    ) -> Result<StoredMcpCatalog, ConnectionStoreError> {
         let validated = validate_mcp_catalog(id, entries, resources, resource_templates)?;
         let now = utc_timestamp()?;
         let mut connection = self.connection_guard();
@@ -1472,6 +1530,14 @@ impl SqliteConnectionStore {
             })
             .transpose()?
             .unwrap_or_default();
+        if let Some(expected_catalog_revision) = expected_catalog_revision {
+            if previous_revision != expected_catalog_revision {
+                return Err(ConnectionStoreError::Conflict {
+                    id: id.to_string(),
+                    current: current.etag(),
+                });
+            }
+        }
         let catalog_revision = increment_revision(id, previous_revision)?;
 
         transaction
@@ -2150,6 +2216,38 @@ impl SqliteConnectionStore {
             .map_err(|source| sqlite_error(&self.path, "status query", source))?
             .map(|raw| raw.into_safe_status(id))
             .transpose()
+    }
+
+    /// The latest safe status of each listed Connection in one pass under
+    /// one lock. The collection listing and the capability inventory both
+    /// need every status; asking per Connection costs a lock (here) or a
+    /// pool checkout and a round trip (PostgreSQL) each.
+    pub fn latest_statuses(
+        &self,
+        ids: &[ConnectionId],
+    ) -> Result<BTreeMap<ConnectionId, SafeConnectionStatus>, ConnectionStoreError> {
+        let connection = self.connection_guard();
+        let mut statement = connection
+            .prepare(
+                r#"
+                SELECT state, reason, observed_at, latency_ms, catalog_age_secs,
+                       catalog_entry_count
+                FROM connection_current_status
+                WHERE connection_id = ?1
+                "#,
+            )
+            .map_err(|source| sqlite_error(&self.path, "status prepare", source))?;
+        let mut statuses = BTreeMap::new();
+        for id in ids {
+            let raw = statement
+                .query_row(params![id.as_str()], raw_status_from_row)
+                .optional()
+                .map_err(|source| sqlite_error(&self.path, "status query", source))?;
+            if let Some(raw) = raw {
+                statuses.insert(id.clone(), raw.into_safe_status(id)?);
+            }
+        }
+        Ok(statuses)
     }
 
     pub fn status_history(

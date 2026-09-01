@@ -42,6 +42,15 @@
 --   from other authoritative state (policy, tools, configured routes).
 --   Their writes still commit atomically with what they describe.
 
+-- Character versus byte limits: a CHECK below uses char_length exactly
+-- where the Rust validator counts characters (store.rs
+-- validate_mcp_catalog_entries and validate_mcp_resources), and
+-- octet_length where it counts bytes. The two must agree, because the
+-- validator runs first: a limit PostgreSQL enforces more tightly than Rust
+-- turns a request Rust accepted into an opaque storage error instead of a
+-- Validation one (a 300-emoji description is 300 characters and 1,200
+-- bytes).
+
 CREATE TABLE greengateway.connection_records (
     id uuid PRIMARY KEY,
     schema_version text NOT NULL,
@@ -224,10 +233,10 @@ CREATE TABLE greengateway.connection_mcp_catalogs (
 CREATE TABLE greengateway.connection_mcp_catalog_entries (
     connection_id uuid NOT NULL,
     remote_tool_name text NOT NULL CHECK (
-        octet_length(remote_tool_name) BETWEEN 1 AND 128
+        char_length(remote_tool_name) BETWEEN 1 AND 128
     ),
     description text NOT NULL CHECK (
-        octet_length(description) BETWEEN 1 AND 1024
+        char_length(description) BETWEEN 1 AND 1024
     ),
     -- Verbatim schema bytes, NOT jsonb. The whole catalog byte budget is
     -- shared between this backend and the SQLite one, and both sides of
@@ -260,11 +269,15 @@ CREATE TABLE greengateway.connection_mcp_catalog_resources (
         octet_length(uri) BETWEEN 1 AND 2048
     ),
     name text NOT NULL CHECK (
-        octet_length(name) BETWEEN 1 AND 128
+        char_length(name) BETWEEN 1 AND 128 AND octet_length(name) <= 512
     ),
-    title text CHECK (title IS NULL OR octet_length(title) BETWEEN 1 AND 256),
+    title text CHECK (
+        title IS NULL
+        OR (char_length(title) BETWEEN 1 AND 256 AND octet_length(title) <= 1024)
+    ),
     description text CHECK (
-        description IS NULL OR octet_length(description) BETWEEN 1 AND 1024
+        description IS NULL
+        OR (char_length(description) BETWEEN 1 AND 1024 AND octet_length(description) <= 4096)
     ),
     mime_type text CHECK (
         mime_type IS NULL OR octet_length(mime_type) BETWEEN 1 AND 256
@@ -285,11 +298,15 @@ CREATE TABLE greengateway.connection_mcp_catalog_resource_templates (
         octet_length(uri_template) BETWEEN 1 AND 2048
     ),
     name text NOT NULL CHECK (
-        octet_length(name) BETWEEN 1 AND 128
+        char_length(name) BETWEEN 1 AND 128 AND octet_length(name) <= 512
     ),
-    title text CHECK (title IS NULL OR octet_length(title) BETWEEN 1 AND 256),
+    title text CHECK (
+        title IS NULL
+        OR (char_length(title) BETWEEN 1 AND 256 AND octet_length(title) <= 1024)
+    ),
     description text CHECK (
-        description IS NULL OR octet_length(description) BETWEEN 1 AND 1024
+        description IS NULL
+        OR (char_length(description) BETWEEN 1 AND 1024 AND octet_length(description) <= 4096)
     ),
     mime_type text CHECK (
         mime_type IS NULL OR octet_length(mime_type) BETWEEN 1 AND 256
@@ -333,7 +350,7 @@ CREATE TABLE greengateway.connection_openapi_catalogs (
 CREATE TABLE greengateway.connection_openapi_catalog_entries (
     connection_id uuid NOT NULL,
     tool_name text NOT NULL CHECK (
-        octet_length(tool_name) BETWEEN 1 AND 128
+        char_length(tool_name) BETWEEN 1 AND 128
     ),
     operation_id text CHECK (
         operation_id IS NULL OR octet_length(operation_id) BETWEEN 1 AND 256

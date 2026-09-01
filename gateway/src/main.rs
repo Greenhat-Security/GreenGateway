@@ -487,6 +487,11 @@ struct ToolAdminState {
     /// its CAS transaction instead of the file.
     #[cfg(feature = "postgres")]
     tool_control_plane: Option<Arc<dyn storage::ToolControlPlane>>,
+    /// The gate's tools adapter, so a register installs through the same
+    /// revision-guarded step the reconciler uses and can never roll the
+    /// live lane back to an older commit.
+    #[cfg(feature = "postgres")]
+    tools_resource: Option<Arc<security_cluster::ToolsResource>>,
 }
 
 #[derive(Clone)]
@@ -1784,10 +1789,16 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     #[cfg(feature = "postgres")]
     let pg_connections_seed = match &_database_foundation {
         Some(foundation) => {
+            // The bound covers managed records AND this replica's legacy
+            // projections (static configuration, so the same on every
+            // replica); the store gets the remainder, as the SQLite path
+            // gives its store the remainder.
+            let legacy_projection_count =
+                connections::control_plane::legacy_projection_count(&config)?;
             let store = Arc::new(
                 connections::pg_store::PostgresConnectionStore::new(
                     foundation.pool().clone(),
-                    connections::model::MAX_CONNECTIONS,
+                    connections::model::MAX_CONNECTIONS.saturating_sub(legacy_projection_count),
                 )
                 .map_err(|error| {
                     Box::new(ClusterConnectionsStartupError::Store(error))
@@ -1801,6 +1812,13 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             let to_startup_error = |error| {
                 Box::new(ClusterConnectionsStartupError::Store(error)) as Box<dyn std::error::Error>
             };
+            // The revision is read BEFORE the content it labels. These are
+            // separate reads, and a commit can land between them; reading
+            // the revision first means such a commit leaves the authority's
+            // activation revision above the seed's, so the gate's first
+            // pass reconciles rather than trusting the older content under
+            // the newer number.
+            let revision = store.state_revision().await.map_err(to_startup_error)?;
             let records = store.list().await.map_err(to_startup_error)?;
             let boot = connections::managed_store::ClusterConnectionsBoot {
                 mcp_catalogs: store.mcp_catalogs().await.map_err(to_startup_error)?,
@@ -1810,7 +1828,6 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                     .await
                     .map_err(to_startup_error)?,
             };
-            let revision = store.state_revision().await.map_err(to_startup_error)?;
             Some(ClusterConnectionsSeed {
                 store,
                 records,
@@ -2285,7 +2302,6 @@ fn gateway_app_with_process_started_at_and_overrides(
                 seed.store.revision_source(),
                 policy_resource,
             );
-            runtime.spawn_poller(&lifecycle);
             policy_control_plane = Some(seed.store.clone());
             cluster_security_runtime = Some(runtime.clone());
             Some(
@@ -2322,6 +2338,8 @@ fn gateway_app_with_process_started_at_and_overrides(
     #[cfg(feature = "postgres")]
     let mut tool_control_plane: Option<Arc<dyn storage::ToolControlPlane>> = None;
     #[cfg(feature = "postgres")]
+    let mut tools_resource: Option<Arc<security_cluster::ToolsResource>> = None;
+    #[cfg(feature = "postgres")]
     if let (Some(seed), Some(runtime)) = (
         build_overrides.pg_tools.as_ref(),
         cluster_security_runtime.as_ref(),
@@ -2343,7 +2361,8 @@ fn gateway_app_with_process_started_at_and_overrides(
             tool_registry.clone(),
             seed.active.security_revision,
         );
-        runtime.register_resource(resource);
+        runtime.register_resource(resource.clone());
+        tools_resource = Some(resource);
         tool_control_plane = Some(seed.store.clone());
     }
     let mcp_catalog_service = connections::mcp::McpConnectionCatalogService::load(
@@ -2376,6 +2395,17 @@ fn gateway_app_with_process_started_at_and_overrides(
             connection_control_plane.clone(),
             &lifecycle,
         );
+    }
+    // Every resource is registered; only now may the background reconciler
+    // start. A pass that ran before tools or Connections registered would
+    // confirm policy alone and advance the watermark past any commit those
+    // resources took during startup -- and a later gate check would return
+    // early on that watermark with the late resource still stale.
+    // Registration also resets the watermark, so the order is belt and
+    // braces rather than a single point of failure.
+    #[cfg(feature = "postgres")]
+    if let Some(runtime) = cluster_security_runtime.as_ref() {
+        runtime.spawn_poller(&lifecycle);
     }
     let mcp_catalog_runtime = connection_control_plane
         .is_managed_store_configured()
@@ -2486,6 +2516,8 @@ fn gateway_app_with_process_started_at_and_overrides(
         write_lock: Arc::new(Mutex::new(())),
         #[cfg(feature = "postgres")]
         tool_control_plane,
+        #[cfg(feature = "postgres")]
+        tools_resource,
     };
     let schema_admin_state = SchemaAdminState {
         coverage: schema_coverage,
@@ -6808,6 +6840,7 @@ async fn tools_openapi_register_endpoint(
             };
             match register_tools_via_control_plane(
                 control_plane,
+                state.tools_resource.as_ref(),
                 &state.registry,
                 &current_etag,
                 &principal,
@@ -6836,6 +6869,7 @@ async fn tools_openapi_register_endpoint(
 #[cfg(feature = "postgres")]
 async fn register_tools_via_control_plane(
     control_plane: &Arc<dyn storage::ToolControlPlane>,
+    tools_resource: Option<&Arc<security_cluster::ToolsResource>>,
     registry: &tools::definitions::ToolRegistry,
     current_etag: &str,
     principal: &auth::Principal,
@@ -6866,9 +6900,23 @@ async fn register_tools_via_control_plane(
         .await
     {
         Ok(committed) => {
-            if let Err(error) =
-                registry.install_local_definitions(merged.candidate_local_tools.clone())
-            {
+            // Through the gate's adapter when there is one: the install is
+            // then a compare-and-swap on the security revision, so a
+            // commit that paused here while another replica's newer commit
+            // was reconciled cannot roll the live lane back. A skipped
+            // install is success -- the document is durable and the lane
+            // already serves something newer.
+            let installed = match tools_resource {
+                Some(resource) => resource
+                    .install_committed(
+                        merged.candidate_local_tools.clone(),
+                        committed.security_revision,
+                    )
+                    .await
+                    .map(|_| ()),
+                None => registry.install_local_definitions(merged.candidate_local_tools.clone()),
+            };
+            if let Err(error) = installed {
                 // The mutation is durable at the authority; this replica's
                 // managed lanes moved under it and the local compile
                 // failed. Fail closed for this response and let
@@ -10144,21 +10192,19 @@ async fn connection_collection_runtime_data(
                 "managed connection state is unavailable",
             ))
         })?;
-        let mut stored_statuses = BTreeMap::new();
-        for id in &ids {
-            let stored_status = store.latest_status(id).await.map_err(|error| {
-                tracing::error!(connection_id = %id, error = %error, "failed to load connection status");
-                Box::new(service_unavailable(
-                    "managed connection state is unavailable",
-                ))
-            })?;
-            stored_statuses.insert(id.clone(), stored_status);
-        }
+        // One read for every status rather than one per Connection: in
+        // cluster mode each call is a pool checkout and a round trip.
+        let stored_statuses = store.latest_statuses(&ids).await.map_err(|error| {
+            tracing::error!(error = %error, "failed to load connection statuses");
+            Box::new(service_unavailable(
+                "managed connection state is unavailable",
+            ))
+        })?;
         (dependency_counts, activity_times, stored_statuses)
     };
     let mut statuses = BTreeMap::new();
     for (id, record) in snapshot.managed() {
-        let stored_status = stored_statuses.get(id).cloned().flatten();
+        let stored_status = stored_statuses.get(id).cloned();
         let status = state
             .mcp_catalogs
             .status_fallback(id, &record.etag(), stored_status);
@@ -41688,6 +41734,233 @@ O2gecI9QwDJNpm29J9wJB2F8
             );
         }
 
+        /// A register that paused between its commit and its install must
+        /// not roll the live lane back over a newer commit the reconciler
+        /// already installed. Pinned at the adapter: install N+1, then try
+        /// to install N.
+        #[tokio::test]
+        async fn a_stale_tools_install_never_rolls_the_live_lane_back() {
+            let Some(admin_dsn) = locator() else {
+                eprintln!("skipping: no test database locator; CI runs this test");
+                return;
+            };
+            let database = create_test_database(&admin_dsn).await;
+            let (_policy_store, tools_store, _pool) = migrated_stores(&database.dsn).await;
+            tools_store
+                .seed_empty_document()
+                .await
+                .expect("tools should seed");
+            let registry =
+                ToolRegistry::from_definitions_with_audit(Vec::new(), Some(test_audit_log()));
+            let resource = ToolsResource::new(tools_store.clone(), registry.clone(), 0);
+
+            let older = tools_document_with("older_tool");
+            let newer = tools_document_with("newer_tool");
+            let older_definitions =
+                tools::definitions::definitions_from_json_value(older, None).expect("older");
+            let newer_definitions =
+                tools::definitions::definitions_from_json_value(newer, None).expect("newer");
+
+            // Revision 11 is live; a register committed at 10 resumes late.
+            assert!(resource
+                .install_committed(newer_definitions, 11)
+                .await
+                .expect("the newer lane installs"));
+            assert!(
+                !resource
+                    .install_committed(older_definitions, 10)
+                    .await
+                    .expect("the older install is refused, not failed"),
+                "an older commit must not install over a newer live lane"
+            );
+            let live = registry.current_local_definitions();
+            assert!(live.iter().any(|tool| tool.name == "newer_tool"));
+            assert!(
+                !live.iter().any(|tool| tool.name == "older_tool"),
+                "the live lane is still revision 11's"
+            );
+        }
+
+        /// A resource registered after the gate already confirmed a
+        /// watermark must be reconciled on the next check. Without the
+        /// reset on registration, the watermark would already cover the
+        /// resource's commits and every later check would return early
+        /// with the resource stale.
+        #[tokio::test]
+        async fn a_resource_registered_after_the_watermark_advanced_is_reconciled() {
+            let Some(admin_dsn) = locator() else {
+                eprintln!("skipping: no test database locator; CI runs this test");
+                return;
+            };
+            let database = create_test_database(&admin_dsn).await;
+            let (policy_store, _tools_store, pool) = migrated_stores(&database.dsn).await;
+            let connection_store = Arc::new(
+                connections::pg_store::PostgresConnectionStore::new(
+                    pool.clone(),
+                    connections::model::MAX_CONNECTIONS,
+                )
+                .expect("connection store should build"),
+            );
+            let active_policy = PolicyControlPlane::commit(
+                &*policy_store,
+                PolicyCommitRequest {
+                    precondition: PolicyCommitPrecondition::Initialize,
+                    candidate: &cluster_policy("gate-late-register"),
+                    actor_user_id: "seed",
+                    diff_summary: &DIFF,
+                },
+            )
+            .await
+            .expect("policy should initialize");
+            // A connection commit lands BEFORE the connections resource is
+            // registered -- the startup window the poller could observe.
+            connection_store
+                .create(cluster_connection_candidate(), "op", None)
+                .await
+                .expect("connection create should commit");
+            let committed_at = connection_store
+                .state_revision()
+                .await
+                .expect("connections state revision should read");
+
+            let rbac_state = middleware::rbac::RbacState::new(
+                active_policy.policy.clone(),
+                Vec::new(),
+                false,
+                test_audit_log(),
+            );
+            rbac_state.install_revision_snapshot(
+                active_policy.policy.clone(),
+                active_policy.security_revision,
+            );
+            let runtime = ClusterSecurityRuntime::new(
+                policy_store.revision_source(),
+                PolicyResource::new(policy_store.clone(), rbac_state.clone()),
+            );
+            // Policy alone confirms a watermark past the connection commit.
+            let served = middleware::rbac::SecurityRevisionGate::ensure_current_revision(&*runtime)
+                .await
+                .expect("policy-only pass serves");
+            assert!(served >= committed_at);
+
+            // Late registration, then the next check.
+            let reconciled = Arc::new(std::sync::atomic::AtomicI64::new(0));
+            runtime.register_resource(Arc::new(RecordingConnectionsResource {
+                store: connection_store.clone(),
+                reconciled: reconciled.clone(),
+            }));
+            middleware::rbac::SecurityRevisionGate::ensure_current_revision(&*runtime)
+                .await
+                .expect("the check after registration serves");
+            assert_eq!(
+                reconciled.load(std::sync::atomic::Ordering::Acquire),
+                committed_at,
+                "the late-registered resource must be reconciled by the next check"
+            );
+        }
+
+        /// The background pass has its own budget. A resource whose
+        /// reconcile takes longer than the request deadline fails a
+        /// request closed, but the background pass -- the one that does the
+        /// work -- must be allowed to finish, or the replica never becomes
+        /// current.
+        #[tokio::test]
+        async fn the_background_pass_outlives_the_request_deadline() {
+            let Some(admin_dsn) = locator() else {
+                eprintln!("skipping: no test database locator; CI runs this test");
+                return;
+            };
+            let database = create_test_database(&admin_dsn).await;
+            let (policy_store, _tools_store, pool) = migrated_stores(&database.dsn).await;
+            let connection_store = Arc::new(
+                connections::pg_store::PostgresConnectionStore::new(
+                    pool.clone(),
+                    connections::model::MAX_CONNECTIONS,
+                )
+                .expect("connection store should build"),
+            );
+            let active_policy = PolicyControlPlane::commit(
+                &*policy_store,
+                PolicyCommitRequest {
+                    precondition: PolicyCommitPrecondition::Initialize,
+                    candidate: &cluster_policy("gate-budget"),
+                    actor_user_id: "seed",
+                    diff_summary: &DIFF,
+                },
+            )
+            .await
+            .expect("policy should initialize");
+            connection_store
+                .create(cluster_connection_candidate(), "op", None)
+                .await
+                .expect("connection create should commit");
+
+            let rbac_state = middleware::rbac::RbacState::new(
+                active_policy.policy.clone(),
+                Vec::new(),
+                false,
+                test_audit_log(),
+            );
+            rbac_state.install_revision_snapshot(
+                active_policy.policy.clone(),
+                active_policy.security_revision,
+            );
+            let runtime = ClusterSecurityRuntime::new(
+                policy_store.revision_source(),
+                PolicyResource::new(policy_store.clone(), rbac_state.clone()),
+            );
+            runtime.register_resource(Arc::new(SlowConnectionsResource {
+                store: connection_store.clone(),
+                delay: Duration::from_millis(600),
+            }));
+
+            let request =
+                middleware::rbac::SecurityRevisionGate::ensure_current_revision(&*runtime).await;
+            assert_eq!(
+                request.err(),
+                Some(middleware::rbac::SecurityRevisionCheckError::ReconcileDeadlineExceeded),
+                "a request cannot wait out a slow reconcile"
+            );
+            runtime
+                .ensure_current_revision_within(security_cluster::RECONCILE_BACKGROUND_DEADLINE)
+                .await
+                .expect("the background budget lets the slow reconcile finish");
+            middleware::rbac::SecurityRevisionGate::ensure_current_revision(&*runtime)
+                .await
+                .expect("once reconciled, requests serve inside their own deadline");
+        }
+
+        /// A resource whose reconcile is deliberately slower than the
+        /// request deadline.
+        struct SlowConnectionsResource {
+            store: Arc<connections::pg_store::PostgresConnectionStore>,
+            delay: Duration,
+        }
+
+        #[async_trait::async_trait]
+        impl security_cluster::ReconciledResource for SlowConnectionsResource {
+            fn name(&self) -> &'static str {
+                "slow-connections"
+            }
+
+            async fn activation_revision(
+                &self,
+            ) -> Result<i64, middleware::rbac::SecurityRevisionCheckError> {
+                self.store
+                    .state_revision()
+                    .await
+                    .map_err(|_| middleware::rbac::SecurityRevisionCheckError::Unavailable)
+            }
+
+            async fn reconcile(
+                &self,
+                _compiled_revision: i64,
+            ) -> Result<(), middleware::rbac::SecurityRevisionCheckError> {
+                tokio::time::sleep(self.delay).await;
+                Ok(())
+            }
+        }
+
         /// The connections resource must keep reconciling after an
         /// unrelated resource has moved the shared counter.
         ///
@@ -41769,7 +42042,7 @@ O2gecI9QwDJNpm29J9wJB2F8
                 .await
                 .expect("connections state revision should read");
             let created = connection_store
-                .create(cluster_connection_candidate(), "op")
+                .create(cluster_connection_candidate(), "op", None)
                 .await
                 .expect("connection create should commit");
             let after_commit = connection_store
@@ -42070,6 +42343,7 @@ O2gecI9QwDJNpm29J9wJB2F8
             .expect("merge should pass with a fresh If-Match");
             let committed = register_tools_via_control_plane(
                 &control_plane,
+                None,
                 &registry,
                 &active.etag,
                 &principal,
@@ -42103,6 +42377,7 @@ O2gecI9QwDJNpm29J9wJB2F8
             .expect("merge should pass with the stale If-Match");
             let response = register_tools_via_control_plane(
                 &control_plane,
+                None,
                 &registry,
                 &active.etag,
                 &principal,

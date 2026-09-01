@@ -31,10 +31,11 @@ use super::model::ConnectionWrite;
 use super::pg_store::PostgresConnectionStore;
 use super::status::SafeConnectionStatus;
 use super::store::{
-    ConnectionDependency, ConnectionDependencyKind, ConnectionEtag, ConnectionStatusUpdate,
-    ConnectionStore, ConnectionStoreError, SqliteConnectionStore, StoredConnection,
-    StoredMcpCatalog, StoredMcpCatalogEntry, StoredMcpResource, StoredMcpResourceTemplate,
-    StoredOpenApiCatalog, StoredOpenApiCatalogEntry, StoredOpenApiInventoryCatalog,
+    CollectionCheck, ConnectionDependency, ConnectionDependencyKind, ConnectionEtag,
+    ConnectionStatusUpdate, ConnectionStore, ConnectionStoreError, SqliteConnectionStore,
+    StoredConnection, StoredMcpCatalog, StoredMcpCatalogEntry, StoredMcpResource,
+    StoredMcpResourceTemplate, StoredOpenApiCatalog, StoredOpenApiCatalogEntry,
+    StoredOpenApiInventoryCatalog,
 };
 
 /// What the authority held when this replica started, fetched by `run()`
@@ -189,14 +190,21 @@ impl ManagedConnectionStore {
         }
     }
 
+    /// `collection` is the cross-replica half of the caller's `If-Match`
+    /// (see [`CollectionCheck`]). The SQLite arm does not consult it: a
+    /// standalone process's runtime snapshot is the only writer's view, so
+    /// the control plane's local check against it is already
+    /// authoritative. The PostgreSQL arm re-checks under the authority's
+    /// lock, where the local check can be stale.
     pub async fn create(
         &self,
         candidate: ConnectionWrite,
         actor: &str,
+        collection: Option<CollectionCheck<'_>>,
     ) -> Result<StoredConnection, ConnectionStoreError> {
         match self {
             Self::Sqlite(store) => {
-                let _ = actor;
+                let _ = (actor, collection);
                 let store = store.clone();
                 blocking("connection create", move || {
                     ConnectionStore::create(&store, candidate)
@@ -204,7 +212,7 @@ impl ManagedConnectionStore {
                 .await
             }
             #[cfg(feature = "postgres")]
-            Self::Postgres { store, .. } => store.create(candidate, actor).await,
+            Self::Postgres { store, .. } => store.create(candidate, actor, collection).await,
         }
     }
 
@@ -299,11 +307,26 @@ impl ManagedConnectionStore {
             }
             #[cfg(feature = "postgres")]
             Self::Postgres { store, .. } => {
-                // The PostgreSQL authority bounds itself with the session
-                // `lock_timeout`; the entry check above preserves the
-                // "bounded wait, then Busy/DeadlineExceeded" contract
-                // callers rely on.
-                store.append_status_before(id, expected, update).await
+                // The session `lock_timeout` bounds the authority by a
+                // global setting, not by THIS caller's deadline: a probe
+                // with a few milliseconds left must not wait out a pool
+                // checkout and a lock wait measured in seconds. The whole
+                // operation runs inside the remaining budget and reports
+                // `DeadlineExceeded` when it runs out -- the classification
+                // the connection test maps to its own timeout response.
+                let remaining =
+                    super::store::remaining_before(deadline, "connection status persistence")?;
+                match tokio::time::timeout(
+                    remaining,
+                    store.append_status_before(id, expected, update),
+                )
+                .await
+                {
+                    Ok(outcome) => outcome,
+                    Err(_elapsed) => Err(ConnectionStoreError::DeadlineExceeded {
+                        operation: "connection status persistence",
+                    }),
+                }
             }
         }
     }
@@ -320,6 +343,26 @@ impl ManagedConnectionStore {
             }
             #[cfg(feature = "postgres")]
             Self::Postgres { store, .. } => store.latest_status(id).await,
+        }
+    }
+
+    /// Every listed Connection's latest safe status in one pass (one lock
+    /// on SQLite, one round trip on PostgreSQL).
+    pub async fn latest_statuses(
+        &self,
+        ids: &[ConnectionId],
+    ) -> Result<BTreeMap<ConnectionId, SafeConnectionStatus>, ConnectionStoreError> {
+        match self {
+            Self::Sqlite(store) => {
+                let store = store.clone();
+                let ids = ids.to_vec();
+                blocking("connection status read", move || {
+                    store.latest_statuses(&ids)
+                })
+                .await
+            }
+            #[cfg(feature = "postgres")]
+            Self::Postgres { store, .. } => store.latest_statuses(ids).await,
         }
     }
 
@@ -486,6 +529,7 @@ impl ManagedConnectionStore {
         }
     }
 
+    #[allow(clippy::too_many_arguments)] // The store's own signature, one per axis.
     pub async fn replace_mcp_catalog(
         &self,
         id: &ConnectionId,
@@ -493,8 +537,15 @@ impl ManagedConnectionStore {
         entries: &[StoredMcpCatalogEntry],
         resources: &[StoredMcpResource],
         resource_templates: &[StoredMcpResourceTemplate],
+        expected_catalog_revision: u64,
         actor: &str,
     ) -> Result<StoredMcpCatalog, ConnectionStoreError> {
+        // `expected_catalog_revision` is the catalog's own compare-and-swap
+        // (`0` = no catalog yet). The connection ETag does not move on a
+        // catalog replacement and the per-process refresh guard does not
+        // reach other replicas, so without it two replicas discovering
+        // from the same prior catalog would let the slower, older result
+        // commit last. Both arms enforce it.
         match self {
             Self::Sqlite(store) => {
                 let _ = actor;
@@ -505,12 +556,13 @@ impl ManagedConnectionStore {
                 let resources = resources.to_vec();
                 let resource_templates = resource_templates.to_vec();
                 blocking("mcp catalog replace", move || {
-                    store.replace_mcp_catalog(
+                    store.replace_mcp_catalog_expecting(
                         &id,
                         &expected,
                         &entries,
                         &resources,
                         &resource_templates,
+                        Some(expected_catalog_revision),
                     )
                 })
                 .await
@@ -524,6 +576,7 @@ impl ManagedConnectionStore {
                         entries,
                         resources,
                         resource_templates,
+                        expected_catalog_revision,
                         actor,
                     )
                     .await

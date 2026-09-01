@@ -172,6 +172,14 @@ impl McpConnectionCatalogRuntime {
         self.state.load().contains_key(connection_id)
     }
 
+    /// The catalog revision this replica currently serves for a Connection.
+    fn current_revision(&self, connection_id: &ConnectionId) -> Option<u64> {
+        self.state
+            .load()
+            .get(connection_id)
+            .map(|catalog| catalog.catalog_revision)
+    }
+
     /// The Connections whose catalogs this replica is currently serving.
     fn connection_ids(&self) -> Vec<ConnectionId> {
         self.state.load().keys().cloned().collect()
@@ -303,6 +311,25 @@ impl McpConnectionCatalogService {
             .map(|catalog| catalog.connection_id.clone())
             .collect::<std::collections::BTreeSet<_>>();
         for catalog in &active {
+            // The same per-Connection guard a refresh holds while it
+            // publishes. A refresh in flight on this replica means its
+            // install is imminent and would race this one; refusing makes
+            // the gate retry the pass once the refresh releases the guard,
+            // and the monotonic check below then keeps whichever revision
+            // is newer.
+            let _guard = self
+                .control_plane
+                .begin_catalog_mutation(&catalog.connection_id)
+                .map_err(|_| ConnectionStoreError::Busy {
+                    resource: "connection catalog lifecycle",
+                })?;
+            if self
+                .runtime
+                .current_revision(&catalog.connection_id)
+                .is_some_and(|live| live >= catalog.catalog_revision)
+            {
+                continue;
+            }
             let definitions = catalog_definitions(catalog).collect::<Vec<_>>();
             self.registry
                 .install_mcp_connection_catalog(catalog.connection_id.as_str(), definitions)
@@ -536,6 +563,9 @@ impl McpConnectionCatalogService {
                 &stored_entries,
                 &resources,
                 &resource_templates,
+                // The catalog's own compare-and-swap: this refresh may only
+                // replace the catalog it discovered from.
+                prior.as_ref().map_or(0, |prior| prior.catalog_revision),
                 actor,
             )
             .await
@@ -555,6 +585,45 @@ impl McpConnectionCatalogService {
                 return Err(failure);
             }
         };
+        // Publication is revision-monotonic. This refresh holds the
+        // per-Connection lifecycle guard, so nothing else publishes for
+        // this Connection right now -- but between this replica's commit
+        // and this point, reconciliation may already have published a
+        // NEWER catalog another replica committed (it waits for the guard,
+        // and takes it the moment a refresh releases it). Installing this
+        // one over it would roll the live lane back with no revision left
+        // to repair it.
+        if self
+            .runtime
+            .current_revision(&connection_id)
+            .is_some_and(|live| live > catalog.catalog_revision)
+        {
+            tracing::info!(
+                connection_id = %connection_id,
+                committed = catalog.catalog_revision,
+                "a newer MCP catalog is already live on this replica; the committed one is durable and not installed"
+            );
+            drop(active);
+            return Ok(McpCatalogRefreshResult {
+                connection_id,
+                catalog_revision: catalog.catalog_revision,
+                status: self
+                    .runtime
+                    .catalog_status(&catalog.connection_id, &expected)
+                    .unwrap_or(SafeConnectionStatus {
+                        state: ConnectionOperationalState::Healthy,
+                        reason: ConnectionStatusReason::CatalogRefreshed,
+                        observed_at: Some(catalog.refreshed_at.clone()),
+                        latency_ms: Some(duration_millis(started.elapsed())),
+                        catalog_age_secs: Some(0),
+                        catalog_entry_count: Some(catalog_total_count(&catalog)),
+                    }),
+                total_count: catalog_total_count(&catalog),
+                added_count: counts.0,
+                changed_count: counts.1,
+                removed_count: counts.2,
+            });
+        }
         if let Err(error) = registry.install_mcp_connection_catalog(connection_id.as_str(), tools) {
             tracing::error!(
                 connection_id = %connection_id,

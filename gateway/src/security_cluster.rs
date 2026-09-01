@@ -64,6 +64,19 @@ pub(crate) const RECONCILE_DEADLINE: Duration = Duration::from_millis(250);
 /// for the common case, never a correctness parameter.
 pub(crate) const RECONCILE_POLL_INTERVAL: Duration = Duration::from_millis(250);
 
+/// The background reconciler's budget for one pass. Deliberately not the
+/// request deadline: a request must fail closed quickly, but the
+/// background pass is what actually does the work when a resource is
+/// large (the Connections resource re-reads every record and every
+/// catalog), and giving it the request's 250 ms would cancel every pass
+/// that a bounded-but-big deployment needs longer than that -- restarting
+/// from scratch each tick, never advancing `installed_revision`, and
+/// leaving protected traffic at `503` forever. Requests that arrive while
+/// a background pass holds the reconcile lock wait their own bounded
+/// deadline and fail closed; the pass completes and the next request
+/// serves.
+pub(crate) const RECONCILE_BACKGROUND_DEADLINE: Duration = Duration::from_secs(30);
+
 /// One authority-backed resource of the security snapshot. The runtime
 /// owns one adapter per resource; each adapter knows how to read its
 /// authority's activation revision and how to install a validated,
@@ -121,6 +134,13 @@ impl ClusterSecurityRuntime {
             Ok(mut resources) => resources.push(resource),
             Err(poisoned) => poisoned.into_inner().push(resource),
         }
+        // A watermark confirmed before this resource existed says nothing
+        // about it: if a pass ran between this resource's boot seed and
+        // its registration, the watermark may already sit past a commit
+        // the new resource has not installed, and every later gate check
+        // would return early on it. Resetting forces the next check to
+        // confirm every resource, this one included, before serving.
+        self.compiled_revision.store(0, Ordering::Release);
     }
 
     /// The background reconciler: poll the revision counter and reconcile
@@ -137,7 +157,10 @@ impl ClusterSecurityRuntime {
                     _ = ticker.tick() => {}
                     () = cancellation.cancelled() => return,
                 }
-                if let Err(error) = runtime.ensure_current_revision().await {
+                if let Err(error) = runtime
+                    .ensure_current_revision_within(RECONCILE_BACKGROUND_DEADLINE)
+                    .await
+                {
                     tracing::warn!(
                         reason = error.as_str(),
                         "background security reconciliation failed; the per-request gate refuses protected traffic while behind"
@@ -342,6 +365,12 @@ pub(crate) struct ToolsResource {
     /// or below this is a no-op, so a slow reconcile can never overwrite a
     /// newer lane with an older one.
     installed_revision: AtomicI64,
+    /// Serializes the compare-and-install so the comparison and the swap
+    /// are one step. Without it a register at revision N could pass the
+    /// comparison, lose the CPU, and swap after the reconciler installed
+    /// N+1 -- the registry would then serve N while both the authority
+    /// and the watermark say N+1, and nothing would ever reconcile it.
+    install_lock: Mutex<()>,
 }
 
 impl ToolsResource {
@@ -354,7 +383,34 @@ impl ToolsResource {
             store,
             registry,
             installed_revision: AtomicI64::new(boot_revision),
+            install_lock: Mutex::new(()),
         })
+    }
+
+    /// Install a local lane that was committed at `security_revision`,
+    /// unless a newer lane is already live. Returns whether it installed.
+    ///
+    /// The register endpoint calls this after its commit instead of
+    /// installing unconditionally: a commit that pauses between its
+    /// transaction and its install can be overtaken by another replica's
+    /// commit that this replica's reconciler already installed, and an
+    /// unconditional install would then roll the live lane back to the
+    /// older document with no revision left to trigger a repair. A
+    /// skipped install is not a failure -- the document is durable at the
+    /// authority and the lane already serves something newer.
+    pub(crate) async fn install_committed(
+        &self,
+        definitions: Vec<crate::tools::definitions::ToolDefinition>,
+        security_revision: i64,
+    ) -> Result<bool, crate::tools::definitions::ToolRegistryError> {
+        let _guard = self.install_lock.lock().await;
+        if self.installed_revision.load(Ordering::Acquire) >= security_revision {
+            return Ok(false);
+        }
+        self.registry.install_local_definitions(definitions)?;
+        self.installed_revision
+            .store(security_revision, Ordering::Release);
+        Ok(true)
     }
 }
 
@@ -420,18 +476,23 @@ impl ReconciledResource for ToolsResource {
             )?;
         // Install re-validates against the current managed lanes and
         // swaps atomically; a rejection keeps the existing lane (fail
-        // closed) and surfaces as InvalidDocument to the gate.
-        if let Err(error) = self.registry.install_local_definitions(definitions) {
-            tracing::error!(
-                error = %error,
-                "tools reconciliation rejected: the active document does not validate \
-                 against the current managed lanes"
-            );
-            return Err(SecurityRevisionCheckError::InvalidDocument);
+        // closed) and surfaces as InvalidDocument to the gate. The
+        // compare-and-install is the same step the register endpoint
+        // uses, so the two cannot interleave.
+        match self
+            .install_committed(definitions, active.security_revision)
+            .await
+        {
+            Ok(_) => Ok(()),
+            Err(error) => {
+                tracing::error!(
+                    error = %error,
+                    "tools reconciliation rejected: the active document does not validate \
+                     against the current managed lanes"
+                );
+                Err(SecurityRevisionCheckError::InvalidDocument)
+            }
         }
-        self.installed_revision
-            .store(active.security_revision, Ordering::Release);
-        Ok(())
     }
 }
 
@@ -569,10 +630,15 @@ impl ReconciledResource for ConnectionsResource {
     }
 }
 
-#[async_trait]
-impl SecurityRevisionGate for ClusterSecurityRuntime {
-    async fn ensure_current_revision(&self) -> Result<i64, SecurityRevisionCheckError> {
-        let deadline = Instant::now() + RECONCILE_DEADLINE;
+impl ClusterSecurityRuntime {
+    /// The gate's body with an explicit budget. Requests use
+    /// [`RECONCILE_DEADLINE`] through the trait; the background poller
+    /// uses [`RECONCILE_BACKGROUND_DEADLINE`].
+    pub(crate) async fn ensure_current_revision_within(
+        &self,
+        budget: Duration,
+    ) -> Result<i64, SecurityRevisionCheckError> {
+        let deadline = Instant::now() + budget;
         loop {
             // The one authoritative read the strict rule requires. A
             // revision is only visible here once its transaction committed.
@@ -610,5 +676,13 @@ impl SecurityRevisionGate for ClusterSecurityRuntime {
             self.compiled_revision.store(current, Ordering::Release);
             return Ok(current);
         }
+    }
+}
+
+#[async_trait]
+impl SecurityRevisionGate for ClusterSecurityRuntime {
+    async fn ensure_current_revision(&self) -> Result<i64, SecurityRevisionCheckError> {
+        self.ensure_current_revision_within(RECONCILE_DEADLINE)
+            .await
     }
 }

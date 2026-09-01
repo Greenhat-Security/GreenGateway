@@ -49,8 +49,8 @@ use super::{
     },
     status::SafeConnectionStatus,
     store::{
-        ConnectionDependencyKind, ConnectionEtag, ConnectionStatusUpdate, ConnectionStore,
-        ConnectionStoreError, SqliteConnectionStore, StoredConnection,
+        CollectionCheck, ConnectionDependencyKind, ConnectionEtag, ConnectionStatusUpdate,
+        ConnectionStore, ConnectionStoreError, SqliteConnectionStore, StoredConnection,
     },
     vault_secret::{
         EgressVaultTransport, VaultKvV2SecretProvider, VaultProviderConfig,
@@ -233,6 +233,16 @@ pub fn spawn_dependency_flush_task(
         }
     });
     lifecycle.register_background_task(handle);
+}
+
+/// How many legacy projections this replica's static configuration
+/// contributes to the bounded collection. Cluster mode reserves them out
+/// of the managed capacity it hands the PostgreSQL store, exactly as
+/// `from_config` reserves them out of the SQLite store's: the collection
+/// bound covers both, and a store given the full bound would accept a
+/// create that the next reconcile then refuses to publish.
+pub fn legacy_projection_count(config: &Config) -> Result<usize, ConnectionControlPlaneError> {
+    Ok(project_legacy_connections(config)?.connections.len())
 }
 
 /// What the PostgreSQL authority held when this replica started: the
@@ -942,7 +952,33 @@ impl ConnectionControlPlane {
             });
         }
         self.ensure_activatable(&candidate)?;
-        let created = self.managed_store()?.create(candidate, actor).await?;
+        // The local check above is authoritative in standalone mode. In
+        // cluster mode the store re-derives the collection ETag from the
+        // authority's records under its own lock and refuses the create if
+        // another replica moved the collection after this one read it; the
+        // derivation is this control plane's, so the two checks agree.
+        let legacy = Arc::clone(&self.legacy);
+        let omitted = self.omitted_legacy_projection_count;
+        let compute = move |managed: &BTreeMap<ConnectionId, StoredConnection>| {
+            collection_etag(managed, &legacy, omitted)
+        };
+        let created = self
+            .managed_store()?
+            .create(
+                candidate,
+                actor,
+                Some(CollectionCheck {
+                    expected_etag: expected_collection_etag,
+                    compute: &compute,
+                }),
+            )
+            .await
+            .map_err(|error| match error {
+                ConnectionStoreError::CollectionConflict { current } => {
+                    ConnectionMutationError::CollectionConflict { current }
+                }
+                other => ConnectionMutationError::Store(other),
+            })?;
         let mut managed = current.managed().clone();
         managed.insert(created.id.clone(), created.clone());
         self.publish_runtime(managed);
