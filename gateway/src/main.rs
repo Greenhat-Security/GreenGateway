@@ -1406,6 +1406,13 @@ struct GatewayAppBuildOverrides {
     /// standalone mode.
     #[cfg(feature = "postgres")]
     pg_tools: Option<ClusterToolsSeed>,
+    /// The cluster-mode Connection control plane seed: the store, the
+    /// records the runtime snapshot starts from, and the catalogs the
+    /// (synchronous) catalog services read at boot. None in standalone
+    /// mode, where the control plane opens `CONNECTIONS_SQLITE_PATH`
+    /// itself.
+    #[cfg(feature = "postgres")]
+    pg_connections: Option<ClusterConnectionsSeed>,
     #[cfg(test)]
     egress_resolver: Option<Arc<dyn egress::DnsResolver>>,
     #[cfg(test)]
@@ -1523,6 +1530,46 @@ impl std::fmt::Display for ClusterPolicyStartupError {
 #[cfg(feature = "postgres")]
 impl std::error::Error for ClusterPolicyStartupError {}
 
+/// What `run()` proves about the Connection authority before the app is
+/// built: the store to serve from, the records the first runtime snapshot
+/// is published from, the catalogs the synchronous catalog services need,
+/// and the revision the reconciler starts its watermark at.
+#[cfg(feature = "postgres")]
+struct ClusterConnectionsSeed {
+    store: Arc<connections::pg_store::PostgresConnectionStore>,
+    records: Vec<connections::store::StoredConnection>,
+    boot: Arc<connections::managed_store::ClusterConnectionsBoot>,
+    revision: i64,
+}
+
+/// Why a cluster-mode boot refused to serve Connections.
+#[cfg(feature = "postgres")]
+#[derive(Debug)]
+enum ClusterConnectionsStartupError {
+    Store(connections::store::ConnectionStoreError),
+    Corrupt(connections::store::ConnectionStoreError),
+}
+
+#[cfg(feature = "postgres")]
+impl std::fmt::Display for ClusterConnectionsStartupError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Store(error) => write!(
+                formatter,
+                "the cluster-mode Connection control plane could not be read at startup: {error}"
+            ),
+            Self::Corrupt(error) => write!(
+                formatter,
+                "the Connection tables failed their integrity preflight and will not be served: \
+                 {error}"
+            ),
+        }
+    }
+}
+
+#[cfg(feature = "postgres")]
+impl std::error::Error for ClusterConnectionsStartupError {}
+
 fn egress_client_for_build(
     config: egress::EgressConfig,
     _build_overrides: &GatewayAppBuildOverrides,
@@ -1602,10 +1649,30 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 .into(),
         );
     }
-    if let Some(output) = connection_secret_maintenance::run_if_requested(
-        std::env::args_os().skip(1),
-        config::Config::from_env,
-    )? {
+    // `gateway connection-secret ...`: a one-shot command that opens the
+    // connections SQLite database, does its work, prints one line, and
+    // exits. It runs on a blocking thread rather than on this one.
+    //
+    // That is not an optimization. The local-secret manager serializes
+    // against connection mutations on the control plane's mutation lock,
+    // which is a Tokio mutex acquired synchronously (see
+    // `CoordinatedLocalSecretManager::mutation_guard`) -- and acquiring it
+    // synchronously is only legal off a runtime thread. `run()` is async,
+    // so calling straight into the command here panicked the process with
+    // "Cannot block the current thread from within a runtime". This is the
+    // same shape the admin handlers already use for the same manager.
+    let maintenance_arguments = std::env::args_os().skip(1).collect::<Vec<_>>();
+    let maintenance = tokio::task::spawn_blocking(move || {
+        connection_secret_maintenance::run_if_requested(
+            maintenance_arguments,
+            config::Config::from_env,
+        )
+    })
+    .await
+    .map_err(|error| -> Box<dyn std::error::Error> {
+        format!("the connection-secret maintenance command did not complete: {error}").into()
+    })??;
+    if let Some(output) = maintenance {
         println!("{output}");
         return Ok(());
     }
@@ -1704,6 +1771,55 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         }
         None => None,
     };
+    // The Connection control plane rides the same pool. Unlike policy and
+    // tools there is no document to seed: an empty deployment simply has no
+    // Connections, which is exactly what standalone mode serves without
+    // `CONNECTIONS_SQLITE_PATH`. What this does do before serving is run
+    // the integrity preflight the SQLite store runs on every `open` -- the
+    // bounds, the counter agreement, the managed-tool dependency
+    // invariant -- because a replica that starts on tables it cannot vouch
+    // for is a replica serving unbounded state. The records and catalogs
+    // are fetched here, in an async context, because the app builder that
+    // needs them is synchronous.
+    #[cfg(feature = "postgres")]
+    let pg_connections_seed = match &_database_foundation {
+        Some(foundation) => {
+            let store = Arc::new(
+                connections::pg_store::PostgresConnectionStore::new(
+                    foundation.pool().clone(),
+                    connections::model::MAX_CONNECTIONS,
+                )
+                .map_err(|error| {
+                    Box::new(ClusterConnectionsStartupError::Store(error))
+                        as Box<dyn std::error::Error>
+                })?,
+            );
+            store.validate_persisted_state().await.map_err(|error| {
+                Box::new(ClusterConnectionsStartupError::Corrupt(error))
+                    as Box<dyn std::error::Error>
+            })?;
+            let to_startup_error = |error| {
+                Box::new(ClusterConnectionsStartupError::Store(error)) as Box<dyn std::error::Error>
+            };
+            let records = store.list().await.map_err(to_startup_error)?;
+            let boot = connections::managed_store::ClusterConnectionsBoot {
+                mcp_catalogs: store.mcp_catalogs().await.map_err(to_startup_error)?,
+                openapi_catalogs: store.openapi_catalogs().await.map_err(to_startup_error)?,
+                openapi_inventory_catalogs: store
+                    .openapi_inventory_catalogs()
+                    .await
+                    .map_err(to_startup_error)?,
+            };
+            let revision = store.state_revision().await.map_err(to_startup_error)?;
+            Some(ClusterConnectionsSeed {
+                store,
+                records,
+                boot: Arc::new(boot),
+                revision,
+            })
+        }
+        None => None,
+    };
     // The durable audit store rides the foundation's pool; the SSE
     // endpoint reads committed events through it in cluster mode. Built
     // here, where both the pool and the replica identity exist, and handed
@@ -1751,6 +1867,8 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             pg_policy: pg_policy_seed,
             #[cfg(feature = "postgres")]
             pg_tools: pg_tools_seed,
+            #[cfg(feature = "postgres")]
+            pg_connections: pg_connections_seed,
             #[cfg(test)]
             egress_resolver: None,
             #[cfg(test)]
@@ -1891,6 +2009,25 @@ fn gateway_app_with_process_started_at_and_overrides(
         .map(discovery::query::DiscoveryQueryStore::open)
         .transpose()?
         .map(Arc::new);
+    // Cluster mode serves Connections from the authority; standalone mode
+    // opens the local file. `CONNECTIONS_SQLITE_PATH` is rejected outright
+    // in postgres mode (config.rs), so the two are never both present.
+    #[cfg(feature = "postgres")]
+    let connection_control_plane = {
+        let cluster = build_overrides.pg_connections.as_ref().map(|seed| {
+            connections::control_plane::ClusterConnectionStoreSeed {
+                store: connections::managed_store::ManagedConnectionStore::Postgres {
+                    store: seed.store.clone(),
+                    boot: seed.boot.clone(),
+                },
+                records: seed.records.clone(),
+            }
+        });
+        connections::control_plane::ConnectionControlPlane::from_config_with_cluster_seed(
+            &config, cluster,
+        )?
+    };
+    #[cfg(not(feature = "postgres"))]
     let connection_control_plane =
         connections::control_plane::ConnectionControlPlane::from_config(&config)?;
     let mut configured_suggestion_routes = config
@@ -2219,6 +2356,27 @@ fn gateway_app_with_process_started_at_and_overrides(
         connection_http_runtime.clone(),
         tool_registry.clone(),
     )?;
+    // Cluster mode: register the Connection control plane with the security
+    // runtime so every committed record or catalog change reconciles here
+    // before the next protected request is served, and start the task that
+    // publishes the dependency rows the synchronous callers had to queue.
+    #[cfg(feature = "postgres")]
+    if let (Some(seed), Some(runtime)) = (
+        build_overrides.pg_connections.as_ref(),
+        cluster_security_runtime.as_ref(),
+    ) {
+        runtime.register_resource(security_cluster::ConnectionsResource::new(
+            seed.store.clone(),
+            connection_control_plane.clone(),
+            mcp_catalog_service.clone(),
+            openapi_catalog_service.clone(),
+            seed.revision,
+        ));
+        connections::control_plane::spawn_dependency_flush_task(
+            connection_control_plane.clone(),
+            &lifecycle,
+        );
+    }
     let mcp_catalog_runtime = connection_control_plane
         .is_managed_store_configured()
         .then(|| mcp_catalog_service.runtime());
@@ -4677,22 +4835,17 @@ async fn connection_create_endpoint(
     {
         return connection_mutation_error_response(error);
     }
-    // Managed mutations transact against SQLite inside the control plane;
-    // the transaction runs on the blocking pool off the request executor.
-    let created = {
-        let control_plane = state.control_plane.clone();
-        match tokio::task::spawn_blocking(move || {
-            control_plane.create_managed(snapshot.collection_etag(), candidate)
-        })
+    // Managed mutations transact inside the control plane. The store
+    // dispatch owns keeping that work off the request executor: standalone
+    // mode runs its SQLite transaction on the blocking pool, cluster mode
+    // awaits the PostgreSQL authority.
+    let created = match state
+        .control_plane
+        .create_managed(snapshot.collection_etag(), candidate, &principal.user_id)
         .await
-        {
-            Ok(Ok(created)) => created,
-            Ok(Err(error)) => return connection_mutation_error_response(error),
-            Err(error) => {
-                tracing::error!(error = %error, "connection mutation task failed");
-                return internal_server_error("connection mutation failed");
-            }
-        }
+    {
+        Ok(created) => created,
+        Err(error) => return connection_mutation_error_response(error),
     };
     let permissions = connection_permissions(rbac_state, &principal);
     let changed_fields = connections::admin::changed_connection_fields(None, Some(&created.write));
@@ -4826,20 +4979,13 @@ async fn connection_put_endpoint(
     {
         return connection_mutation_error_response(error);
     }
-    let updated = {
-        let control_plane = state.control_plane.clone();
-        match tokio::task::spawn_blocking(move || {
-            control_plane.replace_managed(&id, &current_etag, candidate)
-        })
+    let updated = match state
+        .control_plane
+        .replace_managed(&id, &current_etag, candidate, &principal.user_id)
         .await
-        {
-            Ok(Ok(updated)) => updated,
-            Ok(Err(error)) => return connection_mutation_error_response(error),
-            Err(error) => {
-                tracing::error!(error = %error, "connection mutation task failed");
-                return internal_server_error("connection mutation failed");
-            }
-        }
+    {
+        Ok(updated) => updated,
+        Err(error) => return connection_mutation_error_response(error),
     };
     state.mcp_catalogs.reconcile_connection(&updated);
     state.openapi_catalogs.reconcile_connection(&updated);
@@ -4952,25 +5098,13 @@ async fn connection_delete_endpoint(
         Err(error) => return connection_catalog_lifecycle_error_response(error),
     };
 
-    // The managed delete is a SQLite transaction; it runs on the blocking
-    // pool off the request executor, with the catalog-lifecycle guard still
-    // covering the deletion.
-    let deletion = {
-        let control_plane = state.control_plane.clone();
-        let id_for_delete = id.clone();
-        let etag_for_delete = current_etag.clone();
-        tokio::task::spawn_blocking(move || {
-            control_plane.delete_managed(&id_for_delete, &etag_for_delete)
-        })
+    // The catalog-lifecycle guard stays held across the delete.
+    if let Err(error) = state
+        .control_plane
+        .delete_managed(&id, &current_etag, &principal.user_id)
         .await
-    };
-    match deletion {
-        Ok(Ok(())) => {}
-        Ok(Err(error)) => return connection_mutation_error_response(error),
-        Err(error) => {
-            tracing::error!(error = %error, "connection delete task failed");
-            return internal_server_error("connection delete failed");
-        }
+    {
+        return connection_mutation_error_response(error);
     }
     state.mcp_catalogs.remove_connection(&id);
     state.openapi_catalogs.remove_connection(&id);
@@ -5054,7 +5188,7 @@ async fn connection_refresh_endpoint(
     let refreshed = match &record.write.discovery {
         Some(connections::model::DiscoveryConfig::ManagedMcp { .. }) => state
             .mcp_catalogs
-            .refresh(id.as_str(), current_etag.as_str())
+            .refresh(id.as_str(), current_etag.as_str(), &principal.user_id)
             .await
             .map(ConnectionCatalogRefreshResponse::Mcp)
             .map_err(|error| {
@@ -5065,7 +5199,7 @@ async fn connection_refresh_endpoint(
             }),
         Some(connections::model::DiscoveryConfig::ManagedOpenapi { .. }) => state
             .openapi_catalogs
-            .refresh(id.as_str(), current_etag.as_str())
+            .refresh(id.as_str(), current_etag.as_str(), &principal.user_id)
             .await
             .map(ConnectionCatalogRefreshResponse::OpenApi)
             .map_err(|error| {
@@ -5278,34 +5412,15 @@ async fn connection_test_endpoint(
         .tests
         .execute_before(record, current_etag.as_str(), probe_deadline)
         .await;
-    // Status persistence is a small SQLite transaction; it runs on the
-    // blocking pool off the request executor.
-    let persistence = {
-        let control_plane = state.control_plane.clone();
-        let id_for_status = id.clone();
-        let etag_for_status = current_etag.clone();
-        let status_update = execution.status_update();
-        let deadline = probe_deadline.into_std();
-        match tokio::task::spawn_blocking(move || {
-            control_plane.append_status_before(
-                &id_for_status,
-                &etag_for_status,
-                status_update,
-                deadline,
-            )
-        })
-        .await
-        {
-            Ok(result) => result,
-            Err(error) => {
-                tracing::error!(error = %error, "connection status persistence task failed");
-                return with_etag(
-                    internal_server_error("connection status persistence failed"),
-                    current_etag.as_str(),
-                );
-            }
-        }
-    };
+    let persistence = state
+        .control_plane
+        .append_status_before(
+            &id,
+            &current_etag,
+            execution.status_update(),
+            probe_deadline.into_std(),
+        )
+        .await;
     drop(permit);
 
     if let Err(error) = persistence {
@@ -5407,17 +5522,12 @@ async fn connection_openapi_preview_endpoint(
 
     // Preview validates the candidate spec against the stored catalog; the
     // SQLite read and spec binding run on the blocking pool.
-    let preview = {
-        let catalogs = state.openapi_catalogs.clone();
-        let raw_id_for_preview = raw_id.clone();
-        let spec_for_preview = requested.spec.clone();
-        tokio::task::spawn_blocking(move || {
-            catalogs.preview(&raw_id_for_preview, &spec_for_preview)
-        })
+    match state
+        .openapi_catalogs
+        .preview(&raw_id, &requested.spec)
         .await
-    };
-    match preview {
-        Ok(Ok(preview)) => {
+    {
+        Ok(preview) => {
             let connection_etag = preview.connection_etag.as_str().to_owned();
             (
                 StatusCode::OK,
@@ -5429,11 +5539,7 @@ async fn connection_openapi_preview_endpoint(
             )
                 .into_response()
         }
-        Ok(Err(error)) => openapi_catalog_error_response(error, "preview"),
-        Err(join_error) => {
-            tracing::error!(error = %join_error, "OpenAPI preview task failed");
-            internal_server_error("OpenAPI preview failed")
-        }
+        Err(error) => openapi_catalog_error_response(error, "preview"),
     }
 }
 
@@ -5512,6 +5618,7 @@ async fn connection_openapi_register_endpoint(
             &requested.spec,
             &requested.selected_tool_names,
             &confirmations,
+            &principal.user_id,
         )
         .await
     {
@@ -6303,7 +6410,7 @@ async fn tool_inventory_list_endpoint(
         Err(_) => return bad_request("capability inventory query is invalid"),
     };
 
-    let page = match state.inventory.list(rbac_state, principal, &params) {
+    let page = match state.inventory.list(rbac_state, principal, &params).await {
         Ok(page) => page,
         Err(error) => return capability_inventory_error_response(error),
     };
@@ -6344,13 +6451,17 @@ async fn tool_inventory_detail_endpoint(
             Ok(rbac_state) => rbac_state,
             Err(error) => return tool_admin_authz_error_response(error),
         };
-    let detail = match state.inventory.detail(
-        rbac_state,
-        principal,
-        &raw_id,
-        rbac_state.principal_has_permission(principal, ADMIN_TOOLS_EXECUTE_PERMISSION),
-        true,
-    ) {
+    let detail = match state
+        .inventory
+        .detail(
+            rbac_state,
+            principal,
+            &raw_id,
+            rbac_state.principal_has_permission(principal, ADMIN_TOOLS_EXECUTE_PERMISSION),
+            true,
+        )
+        .await
+    {
         Ok(Some(detail)) => detail,
         Ok(None) => return not_found("capability was not found"),
         Err(error) => return capability_inventory_error_response(error),
@@ -6422,22 +6533,30 @@ async fn tool_playground_execute_endpoint(
     let precondition_rbac_state = rbac_state.clone();
     let precondition_principal = principal.clone();
     let expected_etag = supplied_etag.clone();
-    let precondition = tools::executor::ToolExecutionPrecondition::new(move |current_definition| {
-        if !precondition_rbac_state
-            .principal_has_permission(&precondition_principal, ADMIN_TOOLS_EXECUTE_PERMISSION)
-        {
-            return Err(tools::executor::ToolExecutionPreconditionError::Failed);
-        }
-        match inventory.execution_etag_for_definition(
-            &precondition_rbac_state,
-            &precondition_principal,
-            current_definition,
-        ) {
-            Ok(Some(current_etag)) if current_etag == expected_etag => Ok(()),
-            Ok(_) => Err(tools::executor::ToolExecutionPreconditionError::Failed),
-            Err(_) => Err(tools::executor::ToolExecutionPreconditionError::Unavailable),
-        }
-    });
+    // The inventory read behind this precondition awaits the Connection
+    // store, so the checker is registered as an asynchronous one; the
+    // executor awaits it in place rather than blocking an executor thread.
+    let precondition =
+        tools::executor::ToolExecutionPrecondition::new_async(move |current_definition| {
+            let inventory = inventory.clone();
+            let rbac_state = precondition_rbac_state.clone();
+            let principal = precondition_principal.clone();
+            let expected_etag = expected_etag.clone();
+            Box::pin(async move {
+                if !rbac_state.principal_has_permission(&principal, ADMIN_TOOLS_EXECUTE_PERMISSION)
+                {
+                    return Err(tools::executor::ToolExecutionPreconditionError::Failed);
+                }
+                match inventory
+                    .execution_etag_for_definition(&rbac_state, &principal, &current_definition)
+                    .await
+                {
+                    Ok(Some(current_etag)) if current_etag == expected_etag => Ok(()),
+                    Ok(_) => Err(tools::executor::ToolExecutionPreconditionError::Failed),
+                    Err(_) => Err(tools::executor::ToolExecutionPreconditionError::Unavailable),
+                }
+            })
+        });
     let context = tools::runtime::ToolInvocationContext {
         request_id: client_ip::request_id(&parts.headers, &parts.extensions),
         source_ip: client_ip::canonical_client_ip(
@@ -9958,7 +10077,7 @@ fn connection_secret_error_response(
     }
 }
 
-fn connection_capability_counts(
+async fn connection_capability_counts(
     state: &ConnectionAdminState,
     rbac_state: &middleware::rbac::RbacState,
     principal: &auth::Principal,
@@ -9966,6 +10085,7 @@ fn connection_capability_counts(
     state
         .inventory
         .connection_counts(rbac_state, principal)
+        .await
         .map_err(|error| {
             tracing::error!(
                 reason = ?error,
@@ -9991,7 +10111,7 @@ async fn connection_collection_runtime_data(
     rbac_state: &middleware::rbac::RbacState,
     principal: &auth::Principal,
 ) -> ResponseResult<ConnectionCollectionRuntimeData> {
-    let capability_counts = connection_capability_counts(state, rbac_state, principal)?;
+    let capability_counts = connection_capability_counts(state, rbac_state, principal).await?;
     if snapshot.managed().is_empty() {
         return Ok(ConnectionCollectionRuntimeData {
             statuses: BTreeMap::new(),
@@ -10010,45 +10130,32 @@ async fn connection_collection_runtime_data(
         })?
         .clone();
     let ids = snapshot.managed().keys().cloned().collect::<Vec<_>>();
-    // The dependency, activity, and status reads are SQLite queries; they
-    // run together on the blocking pool off the request executor.
-    let (dependency_counts, activity_times, stored_statuses) =
-        match tokio::task::spawn_blocking(move || -> ResponseResult<_> {
-            let dependency_counts = store.dependency_counts().map_err(|error| {
-                tracing::error!(error = %error, "failed to load connection dependency counts");
+    // The store dispatch keeps these reads off the request executor.
+    let (dependency_counts, activity_times, stored_statuses) = {
+        let dependency_counts = store.dependency_counts().await.map_err(|error| {
+            tracing::error!(error = %error, "failed to load connection dependency counts");
+            Box::new(service_unavailable(
+                "managed connection state is unavailable",
+            ))
+        })?;
+        let activity_times = store.activity_times().await.map_err(|error| {
+            tracing::error!(error = %error, "failed to load connection activity timestamps");
+            Box::new(service_unavailable(
+                "managed connection state is unavailable",
+            ))
+        })?;
+        let mut stored_statuses = BTreeMap::new();
+        for id in &ids {
+            let stored_status = store.latest_status(id).await.map_err(|error| {
+                tracing::error!(connection_id = %id, error = %error, "failed to load connection status");
                 Box::new(service_unavailable(
                     "managed connection state is unavailable",
                 ))
             })?;
-            let activity_times = store.activity_times().map_err(|error| {
-                tracing::error!(error = %error, "failed to load connection activity timestamps");
-                Box::new(service_unavailable(
-                    "managed connection state is unavailable",
-                ))
-            })?;
-            let mut stored_statuses = BTreeMap::new();
-            for id in &ids {
-                let stored_status = store.latest_status(id).map_err(|error| {
-                    tracing::error!(connection_id = %id, error = %error, "failed to load connection status");
-                    Box::new(service_unavailable(
-                        "managed connection state is unavailable",
-                    ))
-                })?;
-                stored_statuses.insert(id.clone(), stored_status);
-            }
-            Ok((dependency_counts, activity_times, stored_statuses))
-        })
-        .await
-        {
-            Ok(Ok(queries)) => queries,
-            Ok(Err(response)) => return Err(response),
-            Err(error) => {
-                tracing::error!(error = %error, "connection collection query task failed");
-                return Err(Box::new(service_unavailable(
-                    "managed connection state is unavailable",
-                )));
-            }
-        };
+            stored_statuses.insert(id.clone(), stored_status);
+        }
+        (dependency_counts, activity_times, stored_statuses)
+    };
     let mut statuses = BTreeMap::new();
     for (id, record) in snapshot.managed() {
         let stored_status = stored_statuses.get(id).cloned().flatten();
@@ -10086,22 +10193,12 @@ async fn connection_detail_runtime_data(
             ))
         })?
         .clone();
-    let status_store = store.clone();
-    let status_id = id.clone();
-    let stored_status = tokio::task::spawn_blocking(move || status_store.latest_status(&status_id))
-        .await
-        .map_err(|error| {
-            tracing::error!(error = %error, "connection status query task failed");
-            Box::new(service_unavailable(
-                "managed connection state is unavailable",
-            ))
-        })?
-        .map_err(|error| {
-            tracing::error!(connection_id = %id, error = %error, "failed to load connection status");
-            Box::new(service_unavailable(
-                "managed connection state is unavailable",
-            ))
-        })?;
+    let stored_status = store.latest_status(id).await.map_err(|error| {
+        tracing::error!(connection_id = %id, error = %error, "failed to load connection status");
+        Box::new(service_unavailable(
+            "managed connection state is unavailable",
+        ))
+    })?;
     let snapshot = state.control_plane.runtime_snapshot();
     let status = snapshot.managed().get(id).and_then(|record| {
         let status = state
@@ -10111,20 +10208,10 @@ async fn connection_detail_runtime_data(
             .openapi_catalogs
             .status_fallback(id, &record.etag(), status)
     });
-    let dependency_store = store;
-    let dependency_id = id.clone();
-    let dependencies = tokio::task::spawn_blocking(move || dependency_store.dependencies(&dependency_id))
-        .await
-        .map_err(|error| {
-            tracing::error!(connection_id = %id, error = %error, "connection dependency query task failed");
-            Box::new(internal_server_error(
-                "connection dependency query failed",
-            ))
-        })?
-        .map_err(|error| {
-            tracing::error!(connection_id = %id, error = %error, "failed to load connection dependencies");
-            Box::new(connection_store_error_response(error))
-        })?;
+    let dependencies = store.dependencies(id).await.map_err(|error| {
+        tracing::error!(connection_id = %id, error = %error, "failed to load connection dependencies");
+        Box::new(connection_store_error_response(error))
+    })?;
     Ok((status, dependencies))
 }
 
@@ -16218,7 +16305,9 @@ mod tests {
                     }
                 }))
                 .expect("test Connection should deserialize"),
+                "test-admin",
             )
+            .await
             .expect("test Connection should create");
         let mut route = path_route("/billing", upstream_addr);
         route.id = Some("billing-route".to_owned());
@@ -16260,8 +16349,11 @@ mod tests {
             Some(&HeaderValue::from_static("preserved"))
         );
 
+        let dependency_protected = control_plane
+            .delete_managed(&created.id, &created.etag(), "test-admin")
+            .await;
         assert!(matches!(
-            control_plane.delete_managed(&created.id, &created.etag()),
+            dependency_protected,
             Err(connections::control_plane::ConnectionMutationError::Store(
                 connections::store::ConnectionStoreError::DependencyConflict { count: 1, .. }
             ))
@@ -41594,6 +41686,221 @@ O2gecI9QwDJNpm29J9wJB2F8
                 rbac_state.current_policy().id.as_deref(),
                 Some("gate-tools")
             );
+        }
+
+        /// The connections resource must keep reconciling after an
+        /// unrelated resource has moved the shared counter.
+        ///
+        /// This pins a defect that compiled, passed every other test, and
+        /// would have silently disabled cluster-mode Connection
+        /// reconciliation in production. `connection_state_revision` was
+        /// being incremented on its own (`last_revision + 1`) rather than
+        /// set to the shared security revision the committing transaction
+        /// had just taken. The gate compares a resource's activation
+        /// revision against a watermark of the SHARED counter, which policy
+        /// and tools commits also advance -- so a private counter drifts
+        /// permanently below the watermark, `activation > compiled` stops
+        /// being true, and connection commits stop triggering
+        /// `ConnectionsResource::reconcile` on every replica. Replicas
+        /// would keep serving withdrawn upstreams and stale credential
+        /// bindings, which is exactly the stale-allow the gate exists to
+        /// prevent.
+        ///
+        /// The shape below is what makes it visible: commit tools FIRST so
+        /// the shared counter runs ahead of anything connections has ever
+        /// written, and only then commit a connection.
+        #[tokio::test]
+        async fn a_connection_commit_reconciles_after_another_resource_moved_the_counter() {
+            let Some(admin_dsn) = locator() else {
+                eprintln!("skipping: no test database locator; CI runs this test");
+                return;
+            };
+            let database = create_test_database(&admin_dsn).await;
+            let (policy_store, tools_store, pool) = migrated_stores(&database.dsn).await;
+            let connection_store = Arc::new(
+                connections::pg_store::PostgresConnectionStore::new(
+                    pool.clone(),
+                    connections::model::MAX_CONNECTIONS,
+                )
+                .expect("connection store should build"),
+            );
+
+            let active_policy = PolicyControlPlane::commit(
+                &*policy_store,
+                PolicyCommitRequest {
+                    precondition: PolicyCommitPrecondition::Initialize,
+                    candidate: &cluster_policy("gate-connections"),
+                    actor_user_id: "seed",
+                    diff_summary: &DIFF,
+                },
+            )
+            .await
+            .expect("policy should initialize");
+            tools_store
+                .seed_empty_document()
+                .await
+                .expect("tools should seed");
+
+            // Push the shared counter well ahead of the connections
+            // high-water mark. On the defective code the connections
+            // counter is still 0 here while the shared counter is 4+, and
+            // no connection commit can ever catch up.
+            let mut tools_etag = tools_store
+                .active_tools()
+                .await
+                .expect("active tools read")
+                .expect("seeded")
+                .etag;
+            for index in 0..3 {
+                tools_etag = tools_store
+                    .commit_tools(
+                        PolicyCommitPrecondition::Expected { etag: tools_etag },
+                        &tools_document_with(&format!("counter_mover_{index}")),
+                        "op",
+                        &DIFF,
+                    )
+                    .await
+                    .expect("tools commit should win")
+                    .etag;
+            }
+
+            let boot_revision = connection_store
+                .state_revision()
+                .await
+                .expect("connections state revision should read");
+            let created = connection_store
+                .create(cluster_connection_candidate(), "op")
+                .await
+                .expect("connection create should commit");
+            let after_commit = connection_store
+                .state_revision()
+                .await
+                .expect("connections state revision should read");
+
+            // The property, stated directly against the store: a committed
+            // connection mutation must leave the connections high-water
+            // mark at the shared revision it took, not one above whatever
+            // it happened to be before. Under the defect this was
+            // `boot_revision + 1` -- far below the shared counter.
+            let shared_now = policy_store
+                .revision_source()
+                .current()
+                .await
+                .expect("shared revision should read");
+            assert_eq!(
+                after_commit, shared_now,
+                "a connection commit must record the SHARED security revision \
+                 ({shared_now}), not a private commit count ({after_commit}); \
+                 the gate compares this against a watermark of the shared counter"
+            );
+            assert!(
+                after_commit > boot_revision + 1,
+                "the tools commits above moved the shared counter, so the \
+                 connections mark must jump past a private increment \
+                 ({after_commit} vs {})",
+                boot_revision + 1
+            );
+
+            // And the consequence, stated through the gate: a replica whose
+            // watermark was compiled before the connection commit must
+            // reconcile it. `ensure_current_revision` returns the watermark
+            // it served under; it must cover the connection commit.
+            let rbac_state = middleware::rbac::RbacState::new(
+                active_policy.policy.clone(),
+                Vec::new(),
+                false,
+                test_audit_log(),
+            );
+            rbac_state.install_revision_snapshot(
+                active_policy.policy.clone(),
+                active_policy.security_revision,
+            );
+            let runtime = ClusterSecurityRuntime::new(
+                policy_store.revision_source(),
+                PolicyResource::new(policy_store.clone(), rbac_state.clone()),
+            );
+            let reconciled = Arc::new(std::sync::atomic::AtomicI64::new(0));
+            runtime.register_resource(Arc::new(RecordingConnectionsResource {
+                store: connection_store.clone(),
+                reconciled: reconciled.clone(),
+            }));
+
+            let served = middleware::rbac::SecurityRevisionGate::ensure_current_revision(&*runtime)
+                .await
+                .expect("the gate must reconcile a connection commit, not loop");
+            assert!(
+                served >= after_commit,
+                "the compiled watermark must cover the connection commit \
+                 ({served} < {after_commit})"
+            );
+            assert_eq!(
+                reconciled.load(std::sync::atomic::Ordering::Acquire),
+                after_commit,
+                "the connections resource must have been asked to reconcile at \
+                 the revision the commit recorded; under the defect its \
+                 activation revision stayed below the watermark and reconcile \
+                 was never called"
+            );
+            assert!(
+                connection_store
+                    .get(&created.id)
+                    .await
+                    .expect("record read")
+                    .is_some(),
+                "the committed connection is readable from the authority"
+            );
+        }
+
+        fn cluster_connection_candidate() -> connections::model::ConnectionWrite {
+            serde_json::from_value(json!({
+                "display_name": "Gate fixture",
+                "enabled": true,
+                "kind": "http_api",
+                "endpoint": {
+                    "base_url": "https://gate.example.test",
+                    "base_path": "/v1"
+                },
+                "authentication": { "type": "none" }
+            }))
+            .expect("gate connection candidate should deserialize")
+        }
+
+        /// A `ReconciledResource` with the real activation-revision read but
+        /// a recording install, so the test can assert that reconciliation
+        /// was actually reached rather than inferring it.
+        struct RecordingConnectionsResource {
+            store: Arc<connections::pg_store::PostgresConnectionStore>,
+            reconciled: Arc<std::sync::atomic::AtomicI64>,
+        }
+
+        #[async_trait::async_trait]
+        impl security_cluster::ReconciledResource for RecordingConnectionsResource {
+            fn name(&self) -> &'static str {
+                "connections"
+            }
+
+            async fn activation_revision(
+                &self,
+            ) -> Result<i64, middleware::rbac::SecurityRevisionCheckError> {
+                self.store
+                    .state_revision()
+                    .await
+                    .map_err(|_| middleware::rbac::SecurityRevisionCheckError::Unavailable)
+            }
+
+            async fn reconcile(
+                &self,
+                _compiled_revision: i64,
+            ) -> Result<(), middleware::rbac::SecurityRevisionCheckError> {
+                let revision = self
+                    .store
+                    .state_revision()
+                    .await
+                    .map_err(|_| middleware::rbac::SecurityRevisionCheckError::Unavailable)?;
+                self.reconciled
+                    .store(revision, std::sync::atomic::Ordering::Release);
+                Ok(())
+            }
         }
 
         #[tokio::test]

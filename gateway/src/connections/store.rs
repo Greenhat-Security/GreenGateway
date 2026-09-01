@@ -720,7 +720,7 @@ impl StoredConnection {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ConnectionDependencyKind {
     ProxyRoute,
@@ -893,6 +893,13 @@ pub enum ConnectionStoreError {
     Postgres {
         operation: &'static str,
     },
+    /// The store could not be consulted at all: the blocking worker that
+    /// runs the standalone store's synchronous body did not complete
+    /// (runtime shutdown, or a panic inside it). Fail closed -- this is
+    /// never a "not found" and never a success.
+    Unavailable {
+        operation: &'static str,
+    },
 }
 
 impl fmt::Display for ConnectionStoreError {
@@ -959,6 +966,9 @@ impl fmt::Display for ConnectionStoreError {
             }
             Self::Postgres { operation } => {
                 write!(formatter, "connection PostgreSQL {operation} failed")
+            }
+            Self::Unavailable { operation } => {
+                write!(formatter, "{operation} could not be executed")
             }
         }
     }
@@ -4270,7 +4280,7 @@ fn ensure_no_invalid_rows(
     }
 }
 
-fn validate_activity_timestamp(
+pub(crate) fn validate_activity_timestamp(
     id: &ConnectionId,
     value: Option<&str>,
 ) -> Result<(), ConnectionStoreError> {

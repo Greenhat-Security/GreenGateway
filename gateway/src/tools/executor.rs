@@ -212,12 +212,47 @@ pub enum ToolExecutionResult {
 type ToolExecutionPreconditionChecker =
     dyn Fn(&ToolDefinition) -> Result<(), ToolExecutionPreconditionError> + Send + Sync + 'static;
 
+/// The asynchronous form of a precondition check. It takes the definition
+/// by value because the returned future outlives the call: a checker that
+/// has to consult shared state (the capability inventory reads the
+/// Connection store) cannot borrow across its own await.
+type ToolExecutionPreconditionFuture = std::pin::Pin<
+    Box<dyn std::future::Future<Output = Result<(), ToolExecutionPreconditionError>> + Send>,
+>;
+
+type ToolExecutionAsyncPreconditionChecker =
+    dyn Fn(ToolDefinition) -> ToolExecutionPreconditionFuture + Send + Sync + 'static;
+
+#[derive(Clone)]
+enum PreconditionChecker {
+    /// A check that needs nothing but the definition in front of it.
+    /// See [`ToolExecutionPrecondition::new`] for why this arm is retained
+    /// with no production constructor today.
+    #[cfg_attr(not(test), allow(dead_code))]
+    Sync(Arc<ToolExecutionPreconditionChecker>),
+    /// A check that has to read shared state. Awaited in place by the
+    /// executor -- never blocked on from an executor thread.
+    Async(Arc<ToolExecutionAsyncPreconditionChecker>),
+}
+
 #[derive(Clone)]
 pub struct ToolExecutionPrecondition {
-    checker: Arc<ToolExecutionPreconditionChecker>,
+    checker: PreconditionChecker,
 }
 
 impl ToolExecutionPrecondition {
+    /// A checker that decides from the definition in front of it and
+    /// nothing else -- no shared state, so no future to await and no
+    /// allocation per execution.
+    ///
+    /// No production caller needs this form today (the admin playground's
+    /// precondition reads the capability inventory, which reads the
+    /// Connection store, so it uses `new_async`), but the arm it
+    /// constructs is a live branch of `check` that the executor's own
+    /// tests exercise. Keeping the cheap form is deliberate: forcing every
+    /// checker through a boxed future would tax callers that have nothing
+    /// to await.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn new<F>(checker: F) -> Self
     where
         F: Fn(&ToolDefinition) -> Result<(), ToolExecutionPreconditionError>
@@ -226,12 +261,27 @@ impl ToolExecutionPrecondition {
             + 'static,
     {
         Self {
-            checker: Arc::new(checker),
+            checker: PreconditionChecker::Sync(Arc::new(checker)),
         }
     }
 
-    fn check(&self, definition: &ToolDefinition) -> Result<(), ToolExecutionPreconditionError> {
-        (self.checker)(definition)
+    pub fn new_async<F>(checker: F) -> Self
+    where
+        F: Fn(ToolDefinition) -> ToolExecutionPreconditionFuture + Send + Sync + 'static,
+    {
+        Self {
+            checker: PreconditionChecker::Async(Arc::new(checker)),
+        }
+    }
+
+    async fn check(
+        &self,
+        definition: &ToolDefinition,
+    ) -> Result<(), ToolExecutionPreconditionError> {
+        match &self.checker {
+            PreconditionChecker::Sync(checker) => checker(definition),
+            PreconditionChecker::Async(checker) => checker(definition.clone()).await,
+        }
     }
 }
 
@@ -683,7 +733,8 @@ impl ToolExecutor {
                 duration_millis(validation_started.elapsed()),
             )?;
             let captured_connection_target = self.capture_mcp_connection_target(&tool, &mapping);
-            self.enforce_execution_precondition(context, &tool, precondition)?;
+            self.enforce_execution_precondition(context, &tool, precondition)
+                .await?;
             if precondition.is_some()
                 && captured_connection_target
                     .as_ref()
@@ -788,7 +839,8 @@ impl ToolExecutor {
             (Some(ToolTarget::Mcp { .. }), _) => None,
             (None, _) => None,
         };
-        self.enforce_execution_precondition(context, &tool, precondition)?;
+        self.enforce_execution_precondition(context, &tool, precondition)
+            .await?;
         if precondition.is_some()
             && !self.runtime.authorize_http_operation(
                 &tool.name,
@@ -913,7 +965,7 @@ impl ToolExecutor {
         }
     }
 
-    fn enforce_execution_precondition(
+    async fn enforce_execution_precondition(
         &self,
         context: &ToolInvocationContext,
         tool: &ToolDefinition,
@@ -924,7 +976,7 @@ impl ToolExecutor {
         };
         let started = Instant::now();
 
-        match precondition.check(tool) {
+        match precondition.check(tool).await {
             Ok(()) => Ok(()),
             Err(ToolExecutionPreconditionError::Failed) => {
                 Err(ToolExecutorError::PreconditionFailed {
@@ -2705,7 +2757,7 @@ mod tests {
     async fn connection_bound_manual_tool_injects_operator_api_key_after_destination_check() {
         let (addr, ca_pem, server) = one_request_tls_server().await;
         let connection =
-            TemporaryStaticAuthRuntime::header_api_key(addr, &ca_pem, b"operator-owned-key");
+            TemporaryStaticAuthRuntime::header_api_key(addr, &ca_pem, b"operator-owned-key").await;
         let capture = CaptureSink::new();
         let audit = AuditLog::new(Arc::new(capture.clone()) as Arc<dyn AuditSink>);
         let runtime = ToolRuntime::new(
@@ -2758,7 +2810,7 @@ mod tests {
     async fn managed_openapi_tool_without_current_catalog_fails_before_upstream_io() {
         let (addr, ca_pem, server) = one_request_tls_server().await;
         let connection =
-            TemporaryStaticAuthRuntime::header_api_key(addr, &ca_pem, b"must-not-be-read");
+            TemporaryStaticAuthRuntime::header_api_key(addr, &ca_pem, b"must-not-be-read").await;
         let capture = CaptureSink::new();
         let audit = AuditLog::new(Arc::new(capture.clone()) as Arc<dyn AuditSink>);
         let runtime = ToolRuntime::new(
@@ -2835,7 +2887,7 @@ mod tests {
     async fn held_old_openapi_definition_fails_before_secret_or_upstream_io() {
         let (addr, ca_pem, server) = one_request_tls_server().await;
         let connection =
-            TemporaryStaticAuthRuntime::header_api_key(addr, &ca_pem, b"must-not-be-read");
+            TemporaryStaticAuthRuntime::header_api_key(addr, &ca_pem, b"must-not-be-read").await;
         let record = connection
             .control_plane
             .runtime_snapshot()
@@ -2959,7 +3011,7 @@ mod tests {
         )
         .await;
         let connection =
-            TemporaryStaticAuthRuntime::header_api_key(addr, &ca_pem, b"operator-owned-key");
+            TemporaryStaticAuthRuntime::header_api_key(addr, &ca_pem, b"operator-owned-key").await;
         let capture = CaptureSink::new();
         let audit = AuditLog::new(Arc::new(capture.clone()) as Arc<dyn AuditSink>);
         let runtime = ToolRuntime::new(
@@ -3008,7 +3060,7 @@ mod tests {
     #[tokio::test]
     async fn oversized_oauth_rejection_invalidates_before_body_buffering() {
         let (addr, ca_pem, server) = oauth_rejection_then_success_tls_server().await;
-        let connection = TemporaryStaticAuthRuntime::oauth_client_credentials(addr, &ca_pem);
+        let connection = TemporaryStaticAuthRuntime::oauth_client_credentials(addr, &ca_pem).await;
         let capture = CaptureSink::new();
         let audit = AuditLog::new(Arc::new(capture.clone()) as Arc<dyn AuditSink>);
         let runtime = ToolRuntime::new(
@@ -3091,7 +3143,7 @@ mod tests {
     async fn connection_tool_checks_egress_before_reading_the_secret_provider() {
         let (addr, ca_pem, server) = one_request_tls_server().await;
         let mut connection =
-            TemporaryStaticAuthRuntime::header_api_key(addr, &ca_pem, b"unread-secret");
+            TemporaryStaticAuthRuntime::header_api_key(addr, &ca_pem, b"unread-secret").await;
         fs::remove_file(&connection.secret_path)
             .expect("provider file should disappear after Connection activation");
         let blocked_config = EgressConfig::default();
@@ -3152,7 +3204,7 @@ mod tests {
     async fn credentialed_connection_trace_fails_before_secret_or_upstream_io() {
         let (addr, ca_pem, server) = one_request_tls_server().await;
         let connection =
-            TemporaryStaticAuthRuntime::header_api_key(addr, &ca_pem, b"must-not-be-read");
+            TemporaryStaticAuthRuntime::header_api_key(addr, &ca_pem, b"must-not-be-read").await;
         fs::remove_file(&connection.secret_path)
             .expect("provider file should disappear before invocation");
         let mut tool = connection_charge_tool(&connection.connection_id);
@@ -3199,7 +3251,7 @@ mod tests {
         const ARGUMENT_CANARY: &str = "admin-playground-argument-canary";
         let (addr, ca_pem, server) = one_request_tls_server().await;
         let connection =
-            TemporaryStaticAuthRuntime::header_api_key(addr, &ca_pem, b"never-log-this");
+            TemporaryStaticAuthRuntime::header_api_key(addr, &ca_pem, b"never-log-this").await;
         fs::remove_file(&connection.secret_path)
             .expect("provider file should disappear after Connection activation");
         let capture = CaptureSink::new();
@@ -3269,7 +3321,8 @@ mod tests {
 
         let (addr, ca_pem, server) = one_request_tls_server().await;
         let connection =
-            TemporaryStaticAuthRuntime::header_api_key(addr, &ca_pem, SECRET_CANARY.as_bytes());
+            TemporaryStaticAuthRuntime::header_api_key(addr, &ca_pem, SECRET_CANARY.as_bytes())
+                .await;
         let record = connection
             .control_plane
             .runtime_snapshot()
@@ -3306,24 +3359,35 @@ mod tests {
                 json!({ "charge_id": ARGUMENT_CANARY }),
                 context,
                 CancellationToken::new(),
-                ToolExecutionPrecondition::new(move |_| {
-                    let observed = control_plane
-                        .runtime_snapshot()
-                        .managed()
-                        .get(&connection_id)
-                        .cloned()
-                        .expect("Connection should still exist before the racing edit");
-                    assert_eq!(
-                        observed.etag(),
-                        expected_etag,
-                        "the validator must first observe the expected old revision"
-                    );
-                    control_plane
-                        .replace_managed(&connection_id, &expected_etag, edited.clone())
-                        .expect("racing Connection edit should publish");
-                    fs::remove_file(&secret_path)
-                        .expect("secret canary should disappear after the validator read");
-                    Ok(())
+                // The racing edit is a control-plane write, which is now
+                // asynchronous, so the validator is registered as an
+                // asynchronous checker and awaited in place.
+                ToolExecutionPrecondition::new_async(move |_| {
+                    let control_plane = control_plane.clone();
+                    let connection_id = connection_id.clone();
+                    let expected_etag = expected_etag.clone();
+                    let edited = edited.clone();
+                    let secret_path = secret_path.clone();
+                    Box::pin(async move {
+                        let observed = control_plane
+                            .runtime_snapshot()
+                            .managed()
+                            .get(&connection_id)
+                            .cloned()
+                            .expect("Connection should still exist before the racing edit");
+                        assert_eq!(
+                            observed.etag(),
+                            expected_etag,
+                            "the validator must first observe the expected old revision"
+                        );
+                        control_plane
+                            .replace_managed(&connection_id, &expected_etag, edited, "test-admin")
+                            .await
+                            .expect("racing Connection edit should publish");
+                        fs::remove_file(&secret_path)
+                            .expect("secret canary should disappear after the validator read");
+                        Ok(())
+                    })
                 }),
             )
             .await
@@ -3363,7 +3427,8 @@ mod tests {
 
         let (addr, ca_pem, server) = one_request_tls_server().await;
         let connection =
-            TemporaryStaticAuthRuntime::header_api_key(addr, &ca_pem, SECRET_CANARY.as_bytes());
+            TemporaryStaticAuthRuntime::header_api_key(addr, &ca_pem, SECRET_CANARY.as_bytes())
+                .await;
         let capture = CaptureSink::new();
         let audit = AuditLog::new(Arc::new(capture.clone()) as Arc<dyn AuditSink>);
         let initial_policy = Policy::validate_json_value(json!({
@@ -5745,7 +5810,7 @@ mod tests {
     }
 
     impl TemporaryStaticAuthRuntime {
-        fn header_api_key(addr: SocketAddr, ca_pem: &str, secret: &[u8]) -> Self {
+        async fn header_api_key(addr: SocketAddr, ca_pem: &str, secret: &[u8]) -> Self {
             let root = std::env::temp_dir().join(format!(
                 "greengateway-tool-static-auth-{}",
                 uuid::Uuid::new_v4()
@@ -5801,7 +5866,9 @@ mod tests {
                         discovery: None,
                         test_profile: None,
                     },
+                    "test-admin",
                 )
+                .await
                 .expect("test Connection should create");
             let mut egress_config = EgressConfig {
                 allowed_hosts: ["127.0.0.1".to_owned()].into_iter().collect(),
@@ -5830,7 +5897,7 @@ mod tests {
             }
         }
 
-        fn oauth_client_credentials(addr: SocketAddr, ca_pem: &str) -> Self {
+        async fn oauth_client_credentials(addr: SocketAddr, ca_pem: &str) -> Self {
             let root = std::env::temp_dir().join(format!(
                 "greengateway-tool-static-auth-{}",
                 uuid::Uuid::new_v4()
@@ -5892,7 +5959,9 @@ mod tests {
                         discovery: None,
                         test_profile: None,
                     },
+                    "test-admin",
                 )
+                .await
                 .expect("OAuth test Connection should create");
             let mut egress_config = EgressConfig {
                 allowed_hosts: ["127.0.0.1".to_owned()].into_iter().collect(),

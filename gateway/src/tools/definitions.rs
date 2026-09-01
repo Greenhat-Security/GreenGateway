@@ -446,39 +446,184 @@ impl ToolRegistry {
         Ok(())
     }
 
+    /// Replace `connection_id`'s managed-MCP lane, persisting inside the
+    /// registry's write lock so validation, durability, and the swap are
+    /// one atomic step. Standalone mode uses this; the asynchronous
+    /// cluster path uses the validate/commit/install split above, which
+    /// cannot hold this lock across its await.
     pub fn replace_mcp_connection_catalog<E>(
         &self,
         connection_id: &str,
         definitions: Vec<ToolDefinition>,
         persist: impl FnOnce() -> Result<(), E>,
     ) -> Result<(), McpCatalogPublishError<E>> {
-        if definitions.iter().any(|definition| {
-            !matches!(
-                &definition.source,
-                ToolSource::Mcp {
-                    connection_id: source_connection_id,
-                    ..
-                } if source_connection_id == connection_id
-            ) || !matches!(
-                &definition.target,
-                Some(ToolTarget::Mcp {
-                    connection_id: target_connection_id,
-                    ..
-                }) if target_connection_id == connection_id
-            )
-        }) {
+        let provenance = mcp_catalog_provenance_problems(connection_id, &definitions);
+        if !provenance.is_empty() {
             return Err(McpCatalogPublishError::Registry(
-                ToolRegistryError::invalid(vec![
-                    "managed MCP catalog contains a definition for a different connection"
-                        .to_owned(),
-                ]),
+                ToolRegistryError::invalid(provenance),
             ));
         }
 
-        let _guard = match self.write_lock.lock() {
-            Ok(guard) => guard,
-            Err(poisoned) => poisoned.into_inner(),
-        };
+        let _guard = self.write_guard();
+        let (local_definitions, managed_openapi_definitions, mcp_proxy_definitions) =
+            self.mcp_lanes_after(connection_id, definitions);
+        self.validate_merged_lanes(
+            &local_definitions,
+            &managed_openapi_definitions,
+            &mcp_proxy_definitions,
+        )
+        .map_err(McpCatalogPublishError::Registry)?;
+        persist().map_err(McpCatalogPublishError::Persist)?;
+        self.state
+            .store(Arc::new(ToolRegistryState::from_definition_sources(
+                local_definitions,
+                managed_openapi_definitions,
+                mcp_proxy_definitions,
+            )));
+        Ok(())
+    }
+
+    /// The managed-OpenAPI counterpart of
+    /// [`ToolRegistry::replace_mcp_connection_catalog`].
+    pub fn replace_openapi_connection_catalog<E>(
+        &self,
+        connection_id: &str,
+        definitions: Vec<ToolDefinition>,
+        persist: impl FnOnce() -> Result<(), E>,
+    ) -> Result<(), OpenApiCatalogPublishError<E>> {
+        let provenance = openapi_catalog_provenance_problems(connection_id, &definitions);
+        if !provenance.is_empty() {
+            return Err(McpCatalogPublishError::Registry(
+                ToolRegistryError::invalid(provenance),
+            ));
+        }
+
+        let _guard = self.write_guard();
+        let (local_definitions, managed_openapi_definitions, mcp_proxy_definitions) =
+            self.openapi_lanes_after(connection_id, definitions);
+        self.validate_merged_lanes(
+            &local_definitions,
+            &managed_openapi_definitions,
+            &mcp_proxy_definitions,
+        )
+        .map_err(McpCatalogPublishError::Registry)?;
+        persist().map_err(McpCatalogPublishError::Persist)?;
+        self.state
+            .store(Arc::new(ToolRegistryState::from_definition_sources(
+                local_definitions,
+                managed_openapi_definitions,
+                mcp_proxy_definitions,
+            )));
+        Ok(())
+    }
+
+    /// Validate a candidate managed-MCP lane for `connection_id` exactly
+    /// the way [`ToolRegistry::replace_mcp_connection_catalog`] would
+    /// (provenance, semantic checks, and the registered validator hook
+    /// over the merged set) without installing anything.
+    ///
+    /// This is the read half of the validate/commit/install split the
+    /// catalog services use once the persist step is asynchronous: a
+    /// `persist` closure cannot await, and the registry's write lock is a
+    /// `std` mutex that must not be held across one. The commit happens
+    /// between this call and
+    /// [`ToolRegistry::install_mcp_connection_catalog`], which re-validates
+    /// against the lanes current at install time. It is the same shape
+    /// [`ToolRegistry::validate_local_definitions`] and
+    /// [`ToolRegistry::install_local_definitions`] already use for the
+    /// document-owned lane.
+    pub fn validate_mcp_connection_catalog(
+        &self,
+        connection_id: &str,
+        definitions: &[ToolDefinition],
+    ) -> Result<(), ToolRegistryError> {
+        let provenance = mcp_catalog_provenance_problems(connection_id, definitions);
+        if !provenance.is_empty() {
+            return Err(ToolRegistryError::invalid(provenance));
+        }
+        let (local, managed_openapi, mcp_proxy) =
+            self.mcp_lanes_after(connection_id, definitions.to_vec());
+        self.validate_merged_lanes(&local, &managed_openapi, &mcp_proxy)
+    }
+
+    /// Install a managed-MCP lane that was validated and committed to the
+    /// authority. Re-validates against the lanes current at install time
+    /// (another lane may have moved since validation) and swaps. A
+    /// rejected install keeps the existing registry active -- fail closed,
+    /// exactly like a rejected file reload.
+    pub fn install_mcp_connection_catalog(
+        &self,
+        connection_id: &str,
+        definitions: Vec<ToolDefinition>,
+    ) -> Result<(), ToolRegistryError> {
+        let provenance = mcp_catalog_provenance_problems(connection_id, &definitions);
+        if !provenance.is_empty() {
+            return Err(ToolRegistryError::invalid(provenance));
+        }
+        let _guard = self.write_guard();
+        let (local, managed_openapi, mcp_proxy) = self.mcp_lanes_after(connection_id, definitions);
+        self.validate_merged_lanes(&local, &managed_openapi, &mcp_proxy)?;
+        self.state
+            .store(Arc::new(ToolRegistryState::from_definition_sources(
+                local,
+                managed_openapi,
+                mcp_proxy,
+            )));
+        Ok(())
+    }
+
+    /// The managed-OpenAPI counterpart of
+    /// [`ToolRegistry::validate_mcp_connection_catalog`].
+    pub fn validate_openapi_connection_catalog(
+        &self,
+        connection_id: &str,
+        definitions: &[ToolDefinition],
+    ) -> Result<(), ToolRegistryError> {
+        let provenance = openapi_catalog_provenance_problems(connection_id, definitions);
+        if !provenance.is_empty() {
+            return Err(ToolRegistryError::invalid(provenance));
+        }
+        let (local, managed_openapi, mcp_proxy) =
+            self.openapi_lanes_after(connection_id, definitions.to_vec());
+        self.validate_merged_lanes(&local, &managed_openapi, &mcp_proxy)
+    }
+
+    /// The managed-OpenAPI counterpart of
+    /// [`ToolRegistry::install_mcp_connection_catalog`].
+    pub fn install_openapi_connection_catalog(
+        &self,
+        connection_id: &str,
+        definitions: Vec<ToolDefinition>,
+    ) -> Result<(), ToolRegistryError> {
+        let provenance = openapi_catalog_provenance_problems(connection_id, &definitions);
+        if !provenance.is_empty() {
+            return Err(ToolRegistryError::invalid(provenance));
+        }
+        let _guard = self.write_guard();
+        let (local, managed_openapi, mcp_proxy) =
+            self.openapi_lanes_after(connection_id, definitions);
+        self.validate_merged_lanes(&local, &managed_openapi, &mcp_proxy)?;
+        self.state
+            .store(Arc::new(ToolRegistryState::from_definition_sources(
+                local,
+                managed_openapi,
+                mcp_proxy,
+            )));
+        Ok(())
+    }
+
+    /// The three lanes as they would stand after `connection_id`'s
+    /// managed-MCP lane is replaced by `definitions`, in
+    /// (local, managed OpenAPI, MCP proxy) order.
+    fn mcp_lanes_after(
+        &self,
+        connection_id: &str,
+        definitions: Vec<ToolDefinition>,
+    ) -> (
+        Vec<ToolDefinition>,
+        Vec<ToolDefinition>,
+        Vec<ToolDefinition>,
+    ) {
         let state = self.state.load();
         let local_definitions = state.local_definitions.clone();
         let managed_openapi_definitions = state.managed_openapi_definitions.clone();
@@ -498,63 +643,23 @@ impl ToolRegistry {
             .collect::<Vec<_>>();
         drop(state);
         mcp_proxy_definitions.extend(definitions);
-
-        let merged = combined_definitions(
-            &local_definitions,
-            &managed_openapi_definitions,
-            &mcp_proxy_definitions,
-        );
-        let semantic_problems = tool_definition_problems(&merged);
-        if !semantic_problems.is_empty() {
-            return Err(McpCatalogPublishError::Registry(
-                ToolRegistryError::invalid(semantic_problems),
-            ));
-        }
-        self.validate_definitions(&merged)
-            .map_err(McpCatalogPublishError::Registry)?;
-        persist().map_err(McpCatalogPublishError::Persist)?;
-        self.state
-            .store(Arc::new(ToolRegistryState::from_definition_sources(
-                local_definitions,
-                managed_openapi_definitions,
-                mcp_proxy_definitions,
-            )));
-        Ok(())
+        (
+            local_definitions,
+            managed_openapi_definitions,
+            mcp_proxy_definitions,
+        )
     }
 
-    pub fn replace_openapi_connection_catalog<E>(
+    /// The managed-OpenAPI counterpart of [`ToolRegistry::mcp_lanes_after`].
+    fn openapi_lanes_after(
         &self,
         connection_id: &str,
         definitions: Vec<ToolDefinition>,
-        persist: impl FnOnce() -> Result<(), E>,
-    ) -> Result<(), OpenApiCatalogPublishError<E>> {
-        if definitions.iter().any(|definition| {
-            !matches!(
-                &definition.source,
-                ToolSource::OpenApi {
-                    connection_id: source_connection_id,
-                    catalog_revision: Some(_),
-                    ..
-                } if source_connection_id == connection_id
-            ) || !matches!(
-                &definition.target,
-                Some(ToolTarget::Http {
-                    connection_id: target_connection_id,
-                    ..
-                }) if target_connection_id == connection_id
-            )
-        }) {
-            return Err(McpCatalogPublishError::Registry(
-                ToolRegistryError::invalid(vec![
-                    "managed OpenAPI catalog contains a definition for a different connection or without a catalog revision".to_owned(),
-                ]),
-            ));
-        }
-
-        let _guard = match self.write_lock.lock() {
-            Ok(guard) => guard,
-            Err(poisoned) => poisoned.into_inner(),
-        };
+    ) -> (
+        Vec<ToolDefinition>,
+        Vec<ToolDefinition>,
+        Vec<ToolDefinition>,
+    ) {
         let state = self.state.load();
         let local_definitions = state.local_definitions.clone();
         let mut managed_openapi_definitions = state
@@ -574,28 +679,37 @@ impl ToolRegistry {
         let mcp_proxy_definitions = state.mcp_proxy_definitions.clone();
         drop(state);
         managed_openapi_definitions.extend(definitions);
+        (
+            local_definitions,
+            managed_openapi_definitions,
+            mcp_proxy_definitions,
+        )
+    }
 
-        let merged = combined_definitions(
-            &local_definitions,
-            &managed_openapi_definitions,
-            &mcp_proxy_definitions,
-        );
+    /// The semantic checks plus the registered validator hook over the
+    /// merged set of three lanes.
+    fn validate_merged_lanes(
+        &self,
+        local: &[ToolDefinition],
+        managed_openapi: &[ToolDefinition],
+        mcp_proxy: &[ToolDefinition],
+    ) -> Result<(), ToolRegistryError> {
+        let merged = combined_definitions(local, managed_openapi, mcp_proxy);
         let semantic_problems = tool_definition_problems(&merged);
         if !semantic_problems.is_empty() {
-            return Err(McpCatalogPublishError::Registry(
-                ToolRegistryError::invalid(semantic_problems),
-            ));
+            return Err(ToolRegistryError::invalid(semantic_problems));
         }
         self.validate_definitions(&merged)
-            .map_err(McpCatalogPublishError::Registry)?;
-        persist().map_err(McpCatalogPublishError::Persist)?;
-        self.state
-            .store(Arc::new(ToolRegistryState::from_definition_sources(
-                local_definitions,
-                managed_openapi_definitions,
-                mcp_proxy_definitions,
-            )));
-        Ok(())
+    }
+
+    /// The registry write lock, recovering a poisoned guard: poisoning
+    /// means a writer panicked mid-swap, which leaves the `ArcSwap`
+    /// structurally valid (it is swapped, never mutated in place).
+    fn write_guard(&self) -> std::sync::MutexGuard<'_, ()> {
+        match self.write_lock.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        }
     }
 
     pub fn replace_local_definitions_with_persist<E>(
@@ -933,6 +1047,67 @@ fn local_definition_provenance_problems(definitions: &[ToolDefinition]) -> Vec<S
             ToolSource::Manual | ToolSource::Legacy => None,
         })
         .collect()
+}
+
+/// Every definition in a managed-MCP catalog must claim -- in both its
+/// source and its target -- the connection whose lane it is being
+/// installed into. A catalog that names another connection would let one
+/// connection's refresh publish tools attributed to another.
+fn mcp_catalog_provenance_problems(
+    connection_id: &str,
+    definitions: &[ToolDefinition],
+) -> Vec<String> {
+    if definitions.iter().any(|definition| {
+        !matches!(
+            &definition.source,
+            ToolSource::Mcp {
+                connection_id: source_connection_id,
+                ..
+            } if source_connection_id == connection_id
+        ) || !matches!(
+            &definition.target,
+            Some(ToolTarget::Mcp {
+                connection_id: target_connection_id,
+                ..
+            }) if target_connection_id == connection_id
+        )
+    }) {
+        vec!["managed MCP catalog contains a definition for a different connection".to_owned()]
+    } else {
+        Vec::new()
+    }
+}
+
+/// The managed-OpenAPI counterpart of [`mcp_catalog_provenance_problems`],
+/// which additionally requires the catalog revision the definition was
+/// derived from: an OpenAPI tool without one cannot be matched back to the
+/// specification revision that authorized it.
+fn openapi_catalog_provenance_problems(
+    connection_id: &str,
+    definitions: &[ToolDefinition],
+) -> Vec<String> {
+    if definitions.iter().any(|definition| {
+        !matches!(
+            &definition.source,
+            ToolSource::OpenApi {
+                connection_id: source_connection_id,
+                catalog_revision: Some(_),
+                ..
+            } if source_connection_id == connection_id
+        ) || !matches!(
+            &definition.target,
+            Some(ToolTarget::Http {
+                connection_id: target_connection_id,
+                ..
+            }) if target_connection_id == connection_id
+        )
+    }) {
+        vec![
+            "managed OpenAPI catalog contains a definition for a different connection or without a catalog revision".to_owned(),
+        ]
+    } else {
+        Vec::new()
+    }
 }
 
 #[allow(dead_code)] // Retained for callers that only reload local tool definitions.

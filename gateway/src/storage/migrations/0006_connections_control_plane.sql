@@ -11,9 +11,21 @@
 -- - Every committed control-plane mutation (record create/replace/delete,
 --   catalog replacement) also advances the shared
 --   greengateway.security_revision_state counter and appends a
---   greengateway.security_outbox row with resource_type 'connection', so
---   the strict per-request security gate covers connection state and
---   replicas reconcile it exactly like policy and tools.
+--   greengateway.security_outbox row, so the strict per-request security
+--   gate covers connection state and replicas reconcile it exactly like
+--   policy and tools. Two resource_type labels are used, because the
+--   outbox's from_version/to_version pair carries a different quantity in
+--   each case and a consumer must not have to guess which:
+--     * 'connection' -- a specification-version transition. from_version
+--       and to_version are greengateway.connection_documents.version
+--       values, so 'connection' rows for one resource_id are that
+--       Connection's version chain; to_version 0 marks the deletion.
+--     * 'connection_catalog' -- a catalog replacement. from_version and
+--       to_version are the per-connection catalog revision
+--       (connection_mcp_catalogs.catalog_revision or
+--       connection_openapi_catalogs.catalog_revision), an unrelated
+--       counter that must not be interleaved into the version chain.
+--   Both label rows identify the Connection through resource_id.
 -- - greengateway.connection_documents keeps the immutable version history
 --   of each record's specification (the issue's versioned-document
 --   contract); connection_records is the active row and carries the
@@ -34,7 +46,17 @@ CREATE TABLE greengateway.connection_records (
     id uuid PRIMARY KEY,
     schema_version text NOT NULL,
     source text NOT NULL CHECK (source = 'managed'),
-    spec_json jsonb NOT NULL CHECK (octet_length(spec_json::text) BETWEEN 2 AND 2097152),
+    -- Verbatim spec bytes, NOT jsonb, for the byte-budget reason the
+    -- catalog columns document: this bound is exactly
+    -- MAX_MANAGED_SPEC_BYTES (model.rs), which the writer already checked
+    -- against serde_json's compact encoding, so measuring jsonb's output
+    -- form instead would reject a maximum-size specification the Rust check
+    -- just accepted -- as an opaque Postgres error rather than a Validation
+    -- one. The read-side guard in RawConnectionRow would mis-measure it the
+    -- same way. Nothing but serde_json consumes this column, and the SQLite
+    -- reference declares it TEXT with the identical bound (store.rs
+    -- MIGRATION_1).
+    spec_json text NOT NULL CHECK (octet_length(spec_json) BETWEEN 2 AND 2097152),
     connection_revision bigint NOT NULL CHECK (connection_revision >= 1),
     credential_revision bigint NOT NULL CHECK (credential_revision >= 0),
     tls_revision bigint NOT NULL CHECK (tls_revision >= 0),
@@ -43,8 +65,15 @@ CREATE TABLE greengateway.connection_records (
     created_at text NOT NULL,
     updated_at text NOT NULL,
     last_test_at text,
-    last_refresh_at text,
-    activation_revision bigint NOT NULL
+    last_refresh_at text
+    -- No per-record activation column. The connections resource's
+    -- activation high-water mark is the singleton
+    -- greengateway.connection_state_revision below, which is what
+    -- security_cluster.rs's ConnectionsResource::activation_revision
+    -- reads; the SQLite reference's connection_records (store.rs
+    -- MIGRATION_1) carries no such column either. A per-record copy has
+    -- no consumer, and one that is written but never maintained is worse
+    -- than absent -- a future reader would trust it.
 );
 
 CREATE INDEX idx_ggw_connection_records_updated
@@ -56,7 +85,10 @@ CREATE INDEX idx_ggw_connection_records_updated
 CREATE TABLE greengateway.connection_documents (
     connection_id uuid NOT NULL,
     version bigint NOT NULL,
-    spec jsonb NOT NULL,
+    -- Verbatim spec bytes for the same reason: document_etag is a SHA-256
+    -- over (id, version, spec bytes), so normalizing the stored value would
+    -- break the guard against out-of-band edits.
+    spec text NOT NULL,
     document_etag text NOT NULL,
     actor_user_id text NOT NULL,
     diff_summary jsonb NOT NULL,
@@ -177,6 +209,14 @@ CREATE TABLE greengateway.connection_mcp_catalogs (
         resource_template_count BETWEEN 0 AND 4096
         AND entry_count + resource_count + resource_template_count <= 4096
     ),
+    -- Who published this catalog. An audit column with the same contract
+    -- (and the same deliberate absence of a length CHECK) as
+    -- connection_documents.actor_user_id: a catalog replacement is a
+    -- committed control-plane mutation, so it is attributable like the
+    -- record writes are. Written on every replacement; the history read
+    -- surface that serves it arrives with the rest of the versioned-
+    -- document API.
+    actor_user_id text NOT NULL,
     FOREIGN KEY (connection_id)
         REFERENCES greengateway.connection_records(id) ON DELETE CASCADE
 );
@@ -189,8 +229,21 @@ CREATE TABLE greengateway.connection_mcp_catalog_entries (
     description text NOT NULL CHECK (
         octet_length(description) BETWEEN 1 AND 1024
     ),
-    input_schema_json jsonb NOT NULL CHECK (
-        octet_length(input_schema_json::text) BETWEEN 2 AND 262144
+    -- Verbatim schema bytes, NOT jsonb. The whole catalog byte budget is
+    -- shared between this backend and the SQLite one, and both sides of
+    -- every comparison must measure the same thing: the candidate side is
+    -- serde_json's compact encoding (store.rs validate_mcp_catalog_entries)
+    -- and this bound is exactly MAX_MCP_CATALOG_ENTRY_BYTES, so jsonb's
+    -- output form -- which re-inserts a space after every ':' and ',' --
+    -- would reject entries the Rust check just accepted, as an opaque
+    -- Postgres error instead of a Validation one. jsonb would also reorder
+    -- object keys and rewrite numeric literals, so a schema read back here
+    -- would not be the schema SQLite reads back. Nothing but serde_json
+    -- ever consumes this column (pg_store.rs load_mcp_entries), so text
+    -- costs nothing and matches the reference column type exactly
+    -- (store.rs MIGRATION_4: input_schema_json TEXT).
+    input_schema_json text NOT NULL CHECK (
+        octet_length(input_schema_json) BETWEEN 2 AND 262144
     ),
     ordinal bigint NOT NULL CHECK (ordinal BETWEEN 0 AND 4095),
     PRIMARY KEY (connection_id, remote_tool_name),
@@ -261,9 +314,18 @@ CREATE TABLE greengateway.connection_openapi_catalogs (
         octet_length(spec_digest) = 64
         AND spec_digest ~ '^[0-9a-f]+$'
     ),
-    spec jsonb NOT NULL CHECK (octet_length(spec::text) BETWEEN 1 AND 2097152),
+    -- Verbatim spec bytes, NOT jsonb: spec_digest is a SHA-256 over the
+    -- exact bytes the caller published (store.rs validate_openapi_spec) and
+    -- reads re-verify it. jsonb would reorder keys, drop duplicates, rewrite
+    -- whitespace and numeric literals, so the digest would stop describing
+    -- the stored value -- and a YAML spec (which the generator accepts) could
+    -- not be stored at all. The bound is on the stored bytes so it agrees
+    -- with the Rust MAX_MANAGED_SPEC_BYTES check.
+    spec text NOT NULL CHECK (octet_length(spec) BETWEEN 1 AND 2097152),
     refreshed_at text NOT NULL CHECK (octet_length(refreshed_at) BETWEEN 1 AND 64),
     entry_count bigint NOT NULL CHECK (entry_count BETWEEN 0 AND 4096),
+    -- Who published this catalog; see connection_mcp_catalogs above.
+    actor_user_id text NOT NULL,
     FOREIGN KEY (connection_id)
         REFERENCES greengateway.connection_records(id) ON DELETE CASCADE
 );
@@ -276,11 +338,19 @@ CREATE TABLE greengateway.connection_openapi_catalog_entries (
     operation_id text CHECK (
         operation_id IS NULL OR octet_length(operation_id) BETWEEN 1 AND 256
     ),
-    selected_scheme_names_json jsonb NOT NULL CHECK (
-        octet_length(selected_scheme_names_json::text) BETWEEN 2 AND 16384
+    -- Verbatim bytes, NOT jsonb, for the reason input_schema_json above
+    -- carries: these bounds are exactly the Rust ones
+    -- (MAX_OPENAPI_SECURITY_SCHEMES_JSON_BYTES and
+    -- MAX_OPENAPI_CATALOG_ENTRY_BYTES, both applied to serde_json's compact
+    -- string in store.rs validate_openapi_catalog_entries), and
+    -- definition_json is also what the retained-byte half of
+    -- MAX_MANAGED_OPENAPI_CATALOG_BYTES is summed from. Both columns are
+    -- read back only through serde_json (pg_store.rs load_openapi_entries).
+    selected_scheme_names_json text NOT NULL CHECK (
+        octet_length(selected_scheme_names_json) BETWEEN 2 AND 16384
     ),
-    definition_json jsonb NOT NULL CHECK (
-        octet_length(definition_json::text) BETWEEN 2 AND 262144
+    definition_json text NOT NULL CHECK (
+        octet_length(definition_json) BETWEEN 2 AND 262144
     ),
     ordinal bigint NOT NULL CHECK (ordinal BETWEEN 0 AND 4095),
     PRIMARY KEY (connection_id, tool_name),

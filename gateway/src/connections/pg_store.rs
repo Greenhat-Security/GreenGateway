@@ -8,11 +8,20 @@
 //! connections resource's high-water mark, and writes a durable outbox
 //! row identifying the connection (identifiers and revisions only).
 //!
-//! Concurrency is the authority's: `SELECT ... FOR UPDATE` on the record
-//! row serializes writers per connection; the etag precondition is
-//! re-verified inside that lock, so two writers presenting the same
-//! expected etag produce exactly one winner and one
-//! [`ConnectionStoreError::Conflict`].
+//! Concurrency is the authority's, on two levels. Per connection,
+//! `SELECT ... FOR UPDATE` on the record row serializes writers; the etag
+//! precondition is re-verified inside that lock, so two writers
+//! presenting the same expected etag produce exactly one winner and one
+//! [`ConnectionStoreError::Conflict`]. Across connections, every mutating
+//! transaction opens by locking the singleton
+//! `connection_state_revision` row (`begin_mutation`), which is what
+//! makes the *global* bounds -- record count, credential bindings,
+//! catalog entries and bytes, dependencies -- hold: under READ COMMITTED
+//! a `COUNT(*)` taken outside that lock is a hint, not an authority, and
+//! two racing creators would both read `maximum - 1` and both commit.
+//! Readers take neither lock; they run on one `REPEATABLE READ` snapshot
+//! (`begin_snapshot`) so a record and the rows it is validated against
+//! are always read from the same instant.
 //!
 //! Catalog, status, and dependency surfaces are not on this store yet;
 //! they arrive with the remaining PR 8 wiring. The record layer is
@@ -26,19 +35,20 @@ use super::store::{
     binding_count, ensure_etag, expected_bindings, increment_revision, initial_revisions,
     managed_tool_dependency_id, optional_u64_to_i64, parse_reason, parse_state, persisted_revision,
     reason_as_str, replacement_revisions, state_as_str, supports_managed_mcp_catalog,
-    supports_managed_openapi_catalog, u64_to_i64, utc_timestamp, validate_candidate,
-    validate_dependency_id, validate_mcp_catalog, validate_openapi_catalog_entries,
-    validate_openapi_spec, ConnectionDependency, ConnectionDependencyKind, ConnectionEtag,
-    ConnectionStatusUpdate, ConnectionStoreError, StoredConnection, StoredMcpCatalog,
-    StoredMcpCatalogEntry, StoredMcpResource, StoredMcpResourceTemplate, StoredOpenApiCatalog,
-    StoredOpenApiCatalogEntry, StoredOpenApiInventoryCatalog, MAX_CONNECTION_DEPENDENCIES,
-    SOURCE_MANAGED,
+    supports_managed_openapi_catalog, u64_to_i64, utc_timestamp, validate_activity_timestamp,
+    validate_candidate, validate_dependency_id, validate_mcp_catalog,
+    validate_openapi_catalog_entries, validate_openapi_spec, ConnectionActivityTimes,
+    ConnectionDependency, ConnectionDependencyKind, ConnectionEtag, ConnectionStatusUpdate,
+    ConnectionStoreError, StoredConnection, StoredMcpCatalog, StoredMcpCatalogEntry,
+    StoredMcpResource, StoredMcpResourceTemplate, StoredOpenApiCatalog, StoredOpenApiCatalogEntry,
+    StoredOpenApiInventoryCatalog, MAX_CONNECTION_DEPENDENCIES, SOURCE_MANAGED,
 };
 use super::{
     model::{ConnectionId, ConnectionWrite, MAX_CONNECTIONS, MAX_CREDENTIALS},
     status::{ConnectionRevisions, ConnectionStatusReason, SafeConnectionStatus},
 };
 
+const OPERATION_VALIDATE: &str = "startup_validation";
 const OPERATION_LIST: &str = "record_list";
 const OPERATION_GET: &str = "record_get";
 const OPERATION_CREATE: &str = "record_create";
@@ -63,20 +73,24 @@ struct RawConnectionRow {
 }
 
 impl RawConnectionRow {
-    fn from_row(row: &tokio_postgres::Row) -> Self {
-        Self {
-            id: row.get(0),
-            schema_version: row.get(1),
-            source: row.get(2),
-            spec_json: row.get(3),
-            connection_revision: row.get(4),
-            credential_revision: row.get(5),
-            tls_revision: row.get(6),
-            discovery_revision: row.get(7),
-            status_revision: row.get(8),
-            created_at: row.get(9),
-            updated_at: row.get(10),
-        }
+    fn from_row(row: &tokio_postgres::Row) -> Result<Self, ConnectionStoreError> {
+        const REASON: &str = "connection record column does not decode as its schema type";
+        // The ID decodes first so every later failure can name the row it
+        // came from; before that there is no identity to report.
+        let id: String = column(row, 0, "<connection-record>", REASON)?;
+        Ok(Self {
+            schema_version: column(row, 1, &id, REASON)?,
+            source: column(row, 2, &id, REASON)?,
+            spec_json: column(row, 3, &id, REASON)?,
+            connection_revision: column(row, 4, &id, REASON)?,
+            credential_revision: column(row, 5, &id, REASON)?,
+            tls_revision: column(row, 6, &id, REASON)?,
+            discovery_revision: column(row, 7, &id, REASON)?,
+            status_revision: column(row, 8, &id, REASON)?,
+            created_at: column(row, 9, &id, REASON)?,
+            updated_at: column(row, 10, &id, REASON)?,
+            id,
+        })
     }
 
     fn into_stored(self) -> Result<StoredConnection, ConnectionStoreError> {
@@ -148,6 +162,62 @@ fn persisted(
     super::store::revision_from_i64(id, value, zero_allowed)
 }
 
+// ==== Column decoding ====
+//
+// `tokio_postgres::Row::get` PANICS on a type mismatch or an
+// out-of-range index. The SQLite reference decodes through
+// `rusqlite::Row::get`, which returns a `Result`, and turns every decode
+// failure into a typed `ConnectionStoreError` -- a store whose entire
+// contract is to fail closed must not convert schema drift into a
+// process abort. `column` and `scalar` are the ONLY decode path in this
+// file; nothing below calls `Row::get` directly.
+
+/// A value this schema stores for one identified durable row. A row that
+/// no longer decodes is corruption, so it fails closed exactly like the
+/// reference's other `CorruptRecord` paths (store.rs `into_stored`,
+/// `into_safe_status`).
+fn column<'a, T>(
+    row: &'a tokio_postgres::Row,
+    index: usize,
+    id: &str,
+    reason: &'static str,
+) -> Result<T, ConnectionStoreError>
+where
+    T: tokio_postgres::types::FromSql<'a>,
+{
+    row.try_get(index).map_err(|error| {
+        tracing::error!(
+            connection_id = id,
+            index,
+            reason,
+            error = %error,
+            "connection PostgreSQL column did not decode"
+        );
+        ConnectionStoreError::CorruptRecord {
+            id: id.to_owned(),
+            reason,
+        }
+    })
+}
+
+/// A value a query computes rather than stores -- `COUNT(*)`, `SUM(...)`,
+/// `EXISTS(...)`, `RETURNING`. There is no record to call corrupt, so a
+/// decode failure is a store failure, which is how the reference
+/// classifies it too: `count_rows` sends its decode error through
+/// `sqlite_error` to `ConnectionStoreError::Sqlite`, whose PostgreSQL
+/// analogue is `Postgres`.
+fn scalar<'a, T>(
+    row: &'a tokio_postgres::Row,
+    index: usize,
+    operation: &'static str,
+) -> Result<T, ConnectionStoreError>
+where
+    T: tokio_postgres::types::FromSql<'a>,
+{
+    row.try_get(index)
+        .map_err(|error| pg_error(operation, error))
+}
+
 /// The PostgreSQL managed-connection record store. Cheap to construct;
 /// borrows the foundation's pool.
 pub struct PostgresConnectionStore {
@@ -156,11 +226,26 @@ pub struct PostgresConnectionStore {
 }
 
 impl PostgresConnectionStore {
-    pub fn new(pool: deadpool_postgres::Pool, maximum_connections: usize) -> Self {
-        Self {
-            pool,
-            maximum_connections: maximum_connections.min(MAX_CONNECTIONS),
+    /// A `maximum_connections` above the hard ceiling is a
+    /// misconfiguration and is REFUSED, not silently clamped, matching
+    /// the reference (`SqliteConnectionStore::open_with_maximum`,
+    /// store.rs). Clamping would let a deployment believe it had a
+    /// capacity it does not have; a store that fails closed says so at
+    /// construction instead.
+    pub fn new(
+        pool: deadpool_postgres::Pool,
+        maximum_connections: usize,
+    ) -> Result<Self, ConnectionStoreError> {
+        if maximum_connections > MAX_CONNECTIONS {
+            return Err(ConnectionStoreError::LimitExceeded {
+                resource: "managed connections",
+                maximum: MAX_CONNECTIONS,
+            });
         }
+        Ok(Self {
+            pool,
+            maximum_connections,
+        })
     }
 
     /// The connections resource's activation high-water mark: the number
@@ -179,11 +264,13 @@ impl PostgresConnectionStore {
             )
             .await
             .map_err(|error| pg_error(OPERATION_STATE_REVISION, error))?;
-        row.map(|row| row.get::<_, i64>(0))
-            .ok_or_else(|| ConnectionStoreError::CorruptRecord {
+        match row {
+            Some(row) => scalar::<i64>(&row, 0, OPERATION_STATE_REVISION),
+            None => Err(ConnectionStoreError::CorruptRecord {
                 id: "<connection-state>".to_owned(),
                 reason: "the connection state revision row is missing",
-            })
+            }),
+        }
     }
 
     pub async fn count(&self) -> Result<usize, ConnectionStoreError> {
@@ -201,27 +288,19 @@ impl PostgresConnectionStore {
             .get()
             .await
             .map_err(|_| pg_unavailable(OPERATION_LIST))?;
-        let rows = client
-            .query(
-                r#"
-                SELECT id::text, schema_version, source, spec_json::text, connection_revision,
-                       credential_revision, tls_revision, discovery_revision,
-                       status_revision, created_at, updated_at
-                FROM greengateway.connection_records
-                ORDER BY created_at, id
-                "#,
-                &[],
-            )
-            .await
-            .map_err(|error| pg_error(OPERATION_LIST, error))?;
-        let mut records = Vec::with_capacity(rows.len());
-        for row in rows {
-            let raw = RawConnectionRow::from_row(&row);
-            let record = raw.into_stored()?;
-            validate_bindings(&client, &record).await?;
-            records.push(record);
+        // One snapshot for the records and their binding validation: a
+        // replacement committing between the two reads must not make a
+        // healthy record read as corrupt (store.rs `list`).
+        begin_snapshot(&client, OPERATION_LIST).await?;
+        let outcome: Result<Vec<StoredConnection>, ConnectionStoreError> = async {
+            let records = load_all_records(&client, OPERATION_LIST).await?;
+            for record in &records {
+                validate_bindings(&client, record).await?;
+            }
+            Ok(records)
         }
-        Ok(records)
+        .await;
+        finish_read(&client, OPERATION_LIST, outcome).await
     }
 
     pub async fn get(
@@ -233,14 +312,22 @@ impl PostgresConnectionStore {
             .get()
             .await
             .map_err(|_| pg_unavailable(OPERATION_GET))?;
-        let record = load_record(&client, id, OPERATION_GET).await?;
-        match record {
-            Some(record) => {
-                validate_bindings(&client, &record).await?;
-                Ok(Some(record))
+        // One snapshot for the record and its binding validation
+        // (store.rs `get`, and its
+        // `record_and_bindings_are_read_from_one_wal_snapshot` test).
+        begin_snapshot(&client, OPERATION_GET).await?;
+        let outcome: Result<Option<StoredConnection>, ConnectionStoreError> = async {
+            let record = load_record(&client, id, OPERATION_GET).await?;
+            match record {
+                Some(record) => {
+                    validate_bindings(&client, &record).await?;
+                    Ok(Some(record))
+                }
+                None => Ok(None),
             }
-            None => Ok(None),
         }
+        .await;
+        finish_read(&client, OPERATION_GET, outcome).await
     }
 
     /// Create a managed connection: capacity-checked, validated, and
@@ -267,10 +354,7 @@ impl PostgresConnectionStore {
             .get()
             .await
             .map_err(|_| pg_unavailable(OPERATION_CREATE))?;
-        client
-            .batch_execute("BEGIN")
-            .await
-            .map_err(|error| pg_error(OPERATION_CREATE, error))?;
+        begin_mutation(&client, OPERATION_CREATE).await?;
         // The outcome pattern (postgres_documents'): any failure rolls the
         // transaction back explicitly, releasing row locks immediately and
         // returning a clean connection to the pool instead of leaving an
@@ -290,8 +374,8 @@ impl PostgresConnectionStore {
                     INSERT INTO greengateway.connection_records (
                         id, schema_version, source, spec_json, connection_revision,
                         credential_revision, tls_revision, discovery_revision,
-                        status_revision, created_at, updated_at, activation_revision
-                    ) VALUES ($1::text::uuid, $2, $3, $4::text::jsonb, $5, $6, $7, $8, $9, $10, $10, 0)
+                        status_revision, created_at, updated_at
+                    ) VALUES ($1::text::uuid, $2, $3, $4, $5, $6, $7, $8, $9, $10, $10)
                     "#,
                     &[
                         &id.as_str(),
@@ -314,11 +398,17 @@ impl PostgresConnectionStore {
                 &id,
                 revisions.connection,
                 &spec_json,
-                &candidate,
                 actor_user_id,
             )
             .await?;
-            bump_connection_state(&client, &id, None, revisions.connection).await?;
+            bump_connection_state(
+                &client,
+                RESOURCE_CONNECTION,
+                &id,
+                None,
+                revisions.connection,
+            )
+            .await?;
             Ok(StoredConnection {
                 id: id.clone(),
                 write: candidate.clone(),
@@ -365,10 +455,7 @@ impl PostgresConnectionStore {
             .get()
             .await
             .map_err(|_| pg_unavailable(OPERATION_REPLACE))?;
-        client
-            .batch_execute("BEGIN")
-            .await
-            .map_err(|error| pg_error(OPERATION_REPLACE, error))?;
+        begin_mutation(&client, OPERATION_REPLACE).await?;
         let outcome: Result<StoredConnection, ConnectionStoreError> = async {
             let current = load_record_for_update(&client, id, OPERATION_REPLACE)
                 .await?
@@ -379,7 +466,7 @@ impl PostgresConnectionStore {
                 return Ok(current);
             }
             if managed_catalog_kind_changed(&current, &candidate) {
-                let managed_tool_count: i64 = client
+                let managed_tool_count_row = client
                     .query_one(
                         r#"
                         SELECT COUNT(*)
@@ -389,8 +476,8 @@ impl PostgresConnectionStore {
                         &[&id.as_str()],
                     )
                     .await
-                    .map_err(|error| pg_error(OPERATION_REPLACE, error))?
-                    .get(0);
+                    .map_err(|error| pg_error(OPERATION_REPLACE, error))?;
+                let managed_tool_count: i64 = scalar(&managed_tool_count_row, 0, OPERATION_REPLACE)?;
                 if managed_tool_count > 0 {
                     return Err(ConnectionStoreError::DependencyConflict {
                         id: id.to_string(),
@@ -422,7 +509,7 @@ impl PostgresConnectionStore {
                 .execute(
                     r#"
                     UPDATE greengateway.connection_records
-                    SET spec_json = $1::text::jsonb,
+                    SET spec_json = $1,
                         connection_revision = $2,
                         credential_revision = $3,
                         tls_revision = $4,
@@ -455,12 +542,12 @@ impl PostgresConnectionStore {
                 id,
                 revisions.connection,
                 &spec_json,
-                &candidate,
                 actor_user_id,
             )
             .await?;
             bump_connection_state(
                 &client,
+                RESOURCE_CONNECTION,
                 id,
                 Some(current.revisions.connection),
                 revisions.connection,
@@ -502,24 +589,21 @@ impl PostgresConnectionStore {
             .get()
             .await
             .map_err(|_| pg_unavailable(OPERATION_DELETE))?;
-        client
-            .batch_execute("BEGIN")
-            .await
-            .map_err(|error| pg_error(OPERATION_DELETE, error))?;
+        begin_mutation(&client, OPERATION_DELETE).await?;
         let outcome: Result<(), ConnectionStoreError> = async {
             let current = load_record_for_update(&client, id, OPERATION_DELETE)
                 .await?
                 .ok_or_else(|| ConnectionStoreError::NotFound { id: id.to_string() })?;
             validate_bindings(&client, &current).await?;
             ensure_etag(id, expected, &current)?;
-            let dependency_count: i64 = client
+            let dependency_count_row = client
                 .query_one(
                     "SELECT COUNT(*) FROM greengateway.connection_dependencies WHERE connection_id = $1::text::uuid",
                     &[&id.as_str()],
                 )
                 .await
-                .map_err(|error| pg_error(OPERATION_DELETE, error))?
-                .get(0);
+                .map_err(|error| pg_error(OPERATION_DELETE, error))?;
+            let dependency_count: i64 = scalar(&dependency_count_row, 0, OPERATION_DELETE)?;
             if dependency_count > 0 {
                 return Err(ConnectionStoreError::DependencyConflict {
                     id: id.to_string(),
@@ -529,7 +613,8 @@ impl PostgresConnectionStore {
             // The outbox row precedes the cascade delete: version 0 marks a
             // deletion (specification versions start at 1). The actor is
             // carried by the outbox revision; the version rows cascade.
-            bump_connection_state(&client, id, Some(current.revisions.connection), 0).await?;
+            bump_connection_state(&client, RESOURCE_CONNECTION, id, Some(current.revisions.connection), 0)
+                .await?;
             client
                 .execute(
                     "DELETE FROM greengateway.connection_records WHERE id = $1::text::uuid",
@@ -563,6 +648,7 @@ const OPERATION_STATUS: &str = "status_append";
 const OPERATION_STATUS_READ: &str = "status_read";
 const OPERATION_DEPS: &str = "dependency_write";
 const OPERATION_DEPS_READ: &str = "dependency_read";
+const OPERATION_ACTIVITY_READ: &str = "connection_activity_read";
 
 impl PostgresConnectionStore {
     /// Every stored MCP catalog (startup load and the reconciler). Reads
@@ -588,104 +674,15 @@ impl PostgresConnectionStore {
             .get()
             .await
             .map_err(|_| pg_unavailable(OPERATION_MCP_READ))?;
-        let retained_bytes: i64 = client
-            .query_one(
-                r#"
-                SELECT COALESCE(SUM(
-                    octet_length(remote_tool_name) + octet_length(description)
-                    + octet_length(input_schema_json::text)
-                ), 0)
-                FROM greengateway.connection_mcp_catalog_entries
-                "#,
-                &[],
-            )
-            .await
-            .map_err(|error| pg_error(OPERATION_MCP_READ, error))?
-            .get(0);
-        if usize::try_from(retained_bytes).unwrap_or(usize::MAX)
-            > super::store::MAX_MANAGED_MCP_CATALOG_BYTES
-        {
-            return Err(ConnectionStoreError::LimitExceeded {
-                resource: "connection MCP catalog bytes",
-                maximum: super::store::MAX_MANAGED_MCP_CATALOG_BYTES,
-            });
-        }
-        let rows = match requested {
-            Some(id) => {
-                client
-                    .query(
-                        r#"
-                        SELECT connection_id::text, catalog_revision, observed_etag, refreshed_at,
-                               entry_count, resource_count, resource_template_count
-                        FROM greengateway.connection_mcp_catalogs
-                        WHERE connection_id = $1::text::uuid
-                        ORDER BY connection_id
-                        "#,
-                        &[&id.as_str()],
-                    )
-                    .await
-            }
-            None => {
-                client
-                    .query(
-                        r#"
-                        SELECT connection_id::text, catalog_revision, observed_etag, refreshed_at,
-                               entry_count, resource_count, resource_template_count
-                        FROM greengateway.connection_mcp_catalogs
-                        ORDER BY connection_id
-                        "#,
-                        &[],
-                    )
-                    .await
-            }
-        }
-        .map_err(|error| pg_error(OPERATION_MCP_READ, error))?;
-
-        let mut catalogs = Vec::with_capacity(rows.len());
-        for row in &rows {
-            let connection_id = parse_catalog_id(&row.get::<_, String>(0))?;
-            let catalog_revision =
-                persisted_revision(&connection_id, row.get(1), "invalid MCP catalog revision")?;
-            if catalog_revision == 0 {
-                return Err(corrupt(&connection_id, "invalid MCP catalog revision"));
-            }
-            let entry_count = row.get::<_, i64>(4);
-            let resource_count = row.get::<_, i64>(5);
-            let template_count = row.get::<_, i64>(6);
-            let total = entry_count
-                .saturating_add(resource_count)
-                .saturating_add(template_count);
-            if total < 0
-                || usize::try_from(total).unwrap_or(usize::MAX) > super::model::MAX_CATALOG_ENTRIES
-            {
-                return Err(corrupt(&connection_id, "invalid MCP catalog entry count"));
-            }
-            let entries = load_mcp_entries(&client, &connection_id).await?;
-            if entries.len() != usize::try_from(entry_count).unwrap_or(usize::MAX) {
-                return Err(corrupt(&connection_id, "MCP catalog entry count mismatch"));
-            }
-            let resources = load_mcp_resources(&client, &connection_id).await?;
-            if resources.len() != usize::try_from(resource_count).unwrap_or(usize::MAX) {
-                return Err(corrupt(&connection_id, "MCP resource count mismatch"));
-            }
-            let resource_templates = load_mcp_resource_templates(&client, &connection_id).await?;
-            if resource_templates.len() != usize::try_from(template_count).unwrap_or(usize::MAX) {
-                return Err(corrupt(
-                    &connection_id,
-                    "MCP resource template count mismatch",
-                ));
-            }
-            catalogs.push(StoredMcpCatalog {
-                connection_id,
-                catalog_revision,
-                observed_etag: parse_etag(&row.get::<_, String>(2))?,
-                refreshed_at: row.get(3),
-                entries,
-                resources,
-                resource_templates,
-            });
-        }
-        Ok(catalogs)
+        // One snapshot for the aggregate byte preflight, the header rows,
+        // and every child query they are checked against: a catalog
+        // replacement committing between the header read and its entry
+        // read would otherwise report a count mismatch on a healthy
+        // catalog. The SQLite loader holds the store's connection for the
+        // whole of `load_mcp_catalogs`, which is the same guarantee.
+        begin_snapshot(&client, OPERATION_MCP_READ).await?;
+        let outcome = load_mcp_catalogs(&client, requested).await;
+        finish_read(&client, OPERATION_MCP_READ, outcome).await
     }
 
     /// Replace a connection's MCP catalog under its etag compare-and-swap:
@@ -710,10 +707,7 @@ impl PostgresConnectionStore {
             .get()
             .await
             .map_err(|_| pg_unavailable(OPERATION_MCP_CATALOG))?;
-        client
-            .batch_execute("BEGIN")
-            .await
-            .map_err(|error| pg_error(OPERATION_MCP_CATALOG, error))?;
+        begin_mutation(&client, OPERATION_MCP_CATALOG).await?;
         let outcome: Result<StoredMcpCatalog, ConnectionStoreError> = async {
             let current = load_record_for_update(&client, id, OPERATION_MCP_CATALOG)
                 .await?
@@ -728,7 +722,7 @@ impl PostgresConnectionStore {
                 });
             }
 
-            let retained: i64 = client
+            let retained_row = client
                 .query_one(
                     r#"
                     SELECT
@@ -743,8 +737,8 @@ impl PostgresConnectionStore {
                     &[&id.as_str()],
                 )
                 .await
-                .map_err(|error| pg_error(OPERATION_MCP_CATALOG, error))?
-                .get(0);
+                .map_err(|error| pg_error(OPERATION_MCP_CATALOG, error))?;
+            let retained: i64 = scalar(&retained_row, 0, OPERATION_MCP_CATALOG)?;
             let candidate_count = entries
                 .len()
                 .saturating_add(resources.len())
@@ -757,22 +751,9 @@ impl PostgresConnectionStore {
                     maximum: super::model::MAX_CATALOG_ENTRIES,
                 });
             }
-            let retained_bytes: i64 = client
-                .query_one(
-                    r#"
-                    SELECT COALESCE(SUM(
-                        octet_length(remote_tool_name) + octet_length(description)
-                        + octet_length(input_schema_json::text)
-                    ), 0)
-                    FROM greengateway.connection_mcp_catalog_entries
-                    WHERE connection_id != $1::text::uuid
-                    "#,
-                    &[&id.as_str()],
-                )
-                .await
-                .map_err(|error| pg_error(OPERATION_MCP_CATALOG, error))?
-                .get(0);
-            if usize::try_from(retained_bytes).unwrap_or(usize::MAX)
+            let retained_bytes =
+                mcp_catalog_bytes(&client, Some(id), OPERATION_MCP_CATALOG).await?;
+            if retained_bytes
                 .checked_add(validated.stored_bytes)
                 .is_none_or(|total| total > super::store::MAX_MANAGED_MCP_CATALOG_BYTES)
             {
@@ -782,7 +763,7 @@ impl PostgresConnectionStore {
                 });
             }
 
-            let previous_revision: Option<i64> = client
+            let previous_revision = client
                 .query_opt(
                     "SELECT catalog_revision FROM greengateway.connection_mcp_catalogs \
                      WHERE connection_id = $1::text::uuid",
@@ -790,7 +771,15 @@ impl PostgresConnectionStore {
                 )
                 .await
                 .map_err(|error| pg_error(OPERATION_MCP_CATALOG, error))?
-                .map(|row| row.get(0));
+                .map(|row| {
+                    column::<i64>(
+                        &row,
+                        0,
+                        id.as_str(),
+                        "MCP catalog revision does not decode as its schema type",
+                    )
+                })
+                .transpose()?;
             let previous_revision = previous_revision
                 .map(|revision| persisted_revision(id, revision, "invalid MCP catalog revision"))
                 .transpose()?
@@ -805,14 +794,14 @@ impl PostgresConnectionStore {
                 )
                 .await
                 .map_err(|error| pg_error(OPERATION_MCP_CATALOG, error))?;
-            let retained_dependencies: i64 = client
+            let retained_dependencies_row = client
                 .query_one(
                     "SELECT COUNT(*) FROM greengateway.connection_dependencies",
                     &[],
                 )
                 .await
-                .map_err(|error| pg_error(OPERATION_MCP_CATALOG, error))?
-                .get(0);
+                .map_err(|error| pg_error(OPERATION_MCP_CATALOG, error))?;
+            let retained_dependencies: i64 = scalar(&retained_dependencies_row, 0, OPERATION_MCP_CATALOG)?;
             if usize::try_from(retained_dependencies).unwrap_or(usize::MAX).saturating_add(entries.len())
                 > MAX_CONNECTION_DEPENDENCIES
             {
@@ -834,8 +823,8 @@ impl PostgresConnectionStore {
                     r#"
                     INSERT INTO greengateway.connection_mcp_catalogs (
                         connection_id, catalog_revision, observed_etag, refreshed_at, entry_count,
-                        resource_count, resource_template_count
-                    ) VALUES ($1::text::uuid, $2, $3, $4, $5, $6, $7)
+                        resource_count, resource_template_count, actor_user_id
+                    ) VALUES ($1::text::uuid, $2, $3, $4, $5, $6, $7, $8)
                     "#,
                     &[
                         &id.as_str(),
@@ -845,6 +834,7 @@ impl PostgresConnectionStore {
                         &usize_to_i64(entries.len()),
                         &usize_to_i64(resources.len()),
                         &usize_to_i64(resource_templates.len()),
+                        &actor_user_id,
                     ],
                 )
                 .await
@@ -860,7 +850,7 @@ impl PostgresConnectionStore {
                         r#"
                         INSERT INTO greengateway.connection_mcp_catalog_entries (
                             connection_id, remote_tool_name, description, input_schema_json, ordinal
-                        ) VALUES ($1::text::uuid, $2, $3, $4::text::jsonb, $5)
+                        ) VALUES ($1::text::uuid, $2, $3, $4, $5)
                         "#,
                         &[
                             &id.as_str(),
@@ -940,8 +930,14 @@ impl PostgresConnectionStore {
                     .map_err(|error| pg_error(OPERATION_MCP_CATALOG, error))?;
             }
 
-            bump_connection_state(&client, id, Some(previous_revision), catalog_revision).await?;
-            let _ = actor_user_id;
+            bump_connection_state(
+                &client,
+                RESOURCE_CONNECTION_CATALOG,
+                id,
+                Some(previous_revision),
+                catalog_revision,
+            )
+            .await?;
             Ok(StoredMcpCatalog {
                 connection_id: id.clone(),
                 catalog_revision,
@@ -1010,79 +1006,12 @@ impl PostgresConnectionStore {
             .get()
             .await
             .map_err(|_| pg_unavailable(OPERATION_OPENAPI_READ))?;
-        let rows = match requested {
-            Some(id) => {
-                client
-                    .query(
-                        r#"
-                        SELECT connection_id::text, spec_revision, catalog_revision, observed_etag,
-                               spec_digest, spec::text, refreshed_at, entry_count
-                        FROM greengateway.connection_openapi_catalogs
-                        WHERE connection_id = $1::text::uuid
-                        ORDER BY connection_id
-                        "#,
-                        &[&id.as_str()],
-                    )
-                    .await
-            }
-            None => {
-                client
-                    .query(
-                        r#"
-                        SELECT connection_id::text, spec_revision, catalog_revision, observed_etag,
-                               spec_digest, spec::text, refreshed_at, entry_count
-                        FROM greengateway.connection_openapi_catalogs
-                        ORDER BY connection_id
-                        "#,
-                        &[],
-                    )
-                    .await
-            }
-        }
-        .map_err(|error| pg_error(OPERATION_OPENAPI_READ, error))?;
-
-        let mut catalogs = Vec::with_capacity(rows.len());
-        for row in &rows {
-            let connection_id = parse_catalog_id(&row.get::<_, String>(0))?;
-            let spec_revision =
-                persisted_revision(&connection_id, row.get(1), "invalid OpenAPI spec revision")?;
-            let catalog_revision = persisted_revision(
-                &connection_id,
-                row.get(2),
-                "invalid OpenAPI catalog revision",
-            )?;
-            if spec_revision == 0 || catalog_revision == 0 {
-                return Err(corrupt(&connection_id, "invalid OpenAPI catalog revision"));
-            }
-            let entry_count = row.get::<_, i64>(7);
-            if entry_count < 0
-                || usize::try_from(entry_count).unwrap_or(usize::MAX)
-                    > super::model::MAX_CATALOG_ENTRIES
-            {
-                return Err(corrupt(
-                    &connection_id,
-                    "invalid OpenAPI catalog entry count",
-                ));
-            }
-            let entries = load_openapi_entries(&client, &connection_id).await?;
-            if entries.len() != usize::try_from(entry_count).unwrap_or(usize::MAX) {
-                return Err(corrupt(
-                    &connection_id,
-                    "OpenAPI catalog entry count mismatch",
-                ));
-            }
-            catalogs.push(StoredOpenApiCatalog {
-                connection_id,
-                spec_revision,
-                catalog_revision,
-                observed_etag: parse_etag(&row.get::<_, String>(3))?,
-                spec_digest: row.get(4),
-                spec: row.get(5),
-                refreshed_at: row.get(6),
-                entries,
-            });
-        }
-        Ok(catalogs)
+        // One snapshot for the header rows and the entry rows their
+        // `entry_count` is checked against (store.rs
+        // `load_openapi_catalogs` holds the connection across both).
+        begin_snapshot(&client, OPERATION_OPENAPI_READ).await?;
+        let outcome = load_openapi_catalogs(&client, requested).await;
+        finish_read(&client, OPERATION_OPENAPI_READ, outcome).await
     }
 
     /// Replace a connection's OpenAPI catalog under the triple
@@ -1113,10 +1042,7 @@ impl PostgresConnectionStore {
             .get()
             .await
             .map_err(|_| pg_unavailable(OPERATION_OPENAPI_CATALOG))?;
-        client
-            .batch_execute("BEGIN")
-            .await
-            .map_err(|error| pg_error(OPERATION_OPENAPI_CATALOG, error))?;
+        begin_mutation(&client, OPERATION_OPENAPI_CATALOG).await?;
         let outcome: Result<StoredOpenApiCatalog, ConnectionStoreError> = async {
             let current = load_record_for_update(&client, id, OPERATION_OPENAPI_CATALOG)
                 .await?
@@ -1144,11 +1070,23 @@ impl PostgresConnectionStore {
                 .map_err(|error| pg_error(OPERATION_OPENAPI_CATALOG, error))?;
             let (previous_spec_revision, previous_catalog_revision, previous_digest) =
                 match previous {
-                    Some(row) => (
-                        persisted_revision(id, row.get(0), "invalid OpenAPI spec revision")?,
-                        persisted_revision(id, row.get(1), "invalid OpenAPI catalog revision")?,
-                        Some(row.get::<_, String>(2)),
-                    ),
+                    Some(row) => {
+                        const REASON: &str =
+                            "OpenAPI catalog column does not decode as its schema type";
+                        (
+                            persisted_revision(
+                                id,
+                                column(&row, 0, id.as_str(), REASON)?,
+                                "invalid OpenAPI spec revision",
+                            )?,
+                            persisted_revision(
+                                id,
+                                column(&row, 1, id.as_str(), REASON)?,
+                                "invalid OpenAPI catalog revision",
+                            )?,
+                            Some(column::<String>(&row, 2, id.as_str(), REASON)?),
+                        )
+                    }
                     None => (0, 0, None),
                 };
             if expected_spec_revision != previous_spec_revision
@@ -1160,7 +1098,7 @@ impl PostgresConnectionStore {
                 });
             }
 
-            let retained: i64 = client
+            let retained_row = client
                 .query_one(
                     r#"
                     SELECT
@@ -1173,8 +1111,8 @@ impl PostgresConnectionStore {
                     &[&id.as_str()],
                 )
                 .await
-                .map_err(|error| pg_error(OPERATION_OPENAPI_CATALOG, error))?
-                .get(0);
+                .map_err(|error| pg_error(OPERATION_OPENAPI_CATALOG, error))?;
+            let retained: i64 = scalar(&retained_row, 0, OPERATION_OPENAPI_CATALOG)?;
             if usize::try_from(retained).unwrap_or(usize::MAX).saturating_add(entries.len())
                 > super::model::MAX_CATALOG_ENTRIES
             {
@@ -1183,18 +1121,22 @@ impl PostgresConnectionStore {
                     maximum: super::model::MAX_CATALOG_ENTRIES,
                 });
             }
-            let retained_definition_bytes: i64 = client
+            let retained_definition_bytes_row = client
                 .query_one(
                     r#"
-                    SELECT COALESCE(SUM(octet_length(definition_json::text)), 0)
+                    -- Verbatim stored bytes, so this retained sum and the
+                    -- candidate sum below measure the same thing: serde_json's
+                    -- compact encoding. See the column comment in migration
+                    -- 0006 for why the column is text and not jsonb.
+                    SELECT COALESCE(SUM(octet_length(definition_json)), 0)
                     FROM greengateway.connection_openapi_catalog_entries
                     WHERE connection_id != $1::text::uuid
                     "#,
                     &[&id.as_str()],
                 )
                 .await
-                .map_err(|error| pg_error(OPERATION_OPENAPI_CATALOG, error))?
-                .get(0);
+                .map_err(|error| pg_error(OPERATION_OPENAPI_CATALOG, error))?;
+            let retained_definition_bytes: i64 = scalar(&retained_definition_bytes_row, 0, OPERATION_OPENAPI_CATALOG)?;
             let candidate_definition_bytes =
                 encoded_entries.iter().fold(0_usize, |total, entry| {
                     total.saturating_add(entry.definition_json.len())
@@ -1224,14 +1166,14 @@ impl PostgresConnectionStore {
                 )
                 .await
                 .map_err(|error| pg_error(OPERATION_OPENAPI_CATALOG, error))?;
-            let retained_dependencies: i64 = client
+            let retained_dependencies_row = client
                 .query_one(
                     "SELECT COUNT(*) FROM greengateway.connection_dependencies",
                     &[],
                 )
                 .await
-                .map_err(|error| pg_error(OPERATION_OPENAPI_CATALOG, error))?
-                .get(0);
+                .map_err(|error| pg_error(OPERATION_OPENAPI_CATALOG, error))?;
+            let retained_dependencies: i64 = scalar(&retained_dependencies_row, 0, OPERATION_OPENAPI_CATALOG)?;
             if usize::try_from(retained_dependencies).unwrap_or(usize::MAX).saturating_add(entries.len())
                 > MAX_CONNECTION_DEPENDENCIES
             {
@@ -1253,8 +1195,8 @@ impl PostgresConnectionStore {
                     r#"
                     INSERT INTO greengateway.connection_openapi_catalogs (
                         connection_id, spec_revision, catalog_revision, observed_etag,
-                        spec_digest, spec, refreshed_at, entry_count
-                    ) VALUES ($1::text::uuid, $2, $3, $4, $5, $6::text::jsonb, $7, $8)
+                        spec_digest, spec, refreshed_at, entry_count, actor_user_id
+                    ) VALUES ($1::text::uuid, $2, $3, $4, $5, $6, $7, $8, $9)
                     "#,
                     &[
                         &id.as_str(),
@@ -1265,6 +1207,7 @@ impl PostgresConnectionStore {
                         &spec,
                         &now,
                         &usize_to_i64(entries.len()),
+                        &actor_user_id,
                     ],
                 )
                 .await
@@ -1277,7 +1220,7 @@ impl PostgresConnectionStore {
                         INSERT INTO greengateway.connection_openapi_catalog_entries (
                             connection_id, tool_name, operation_id,
                             selected_scheme_names_json, definition_json, ordinal
-                        ) VALUES ($1::text::uuid, $2, $3, $4::text::jsonb, $5::text::jsonb, $6)
+                        ) VALUES ($1::text::uuid, $2, $3, $4, $5, $6)
                         "#,
                         &[
                             &id.as_str(),
@@ -1303,9 +1246,14 @@ impl PostgresConnectionStore {
                     .map_err(|error| pg_error(OPERATION_OPENAPI_CATALOG, error))?;
             }
 
-            bump_connection_state(&client, id, Some(previous_catalog_revision), catalog_revision)
-                .await?;
-            let _ = actor_user_id;
+            bump_connection_state(
+                &client,
+                RESOURCE_CONNECTION_CATALOG,
+                id,
+                Some(previous_catalog_revision),
+                catalog_revision,
+            )
+            .await?;
             Ok(StoredOpenApiCatalog {
                 connection_id: id.clone(),
                 spec_revision,
@@ -1375,10 +1323,12 @@ impl PostgresConnectionStore {
             .get()
             .await
             .map_err(|_| pg_unavailable(OPERATION_STATUS))?;
-        client
-            .batch_execute("BEGIN")
-            .await
-            .map_err(|error| pg_error(OPERATION_STATUS, error))?;
+        // Status is observational and does not advance the security
+        // revision, but its global history prune (and the current-status
+        // count that sizes it) is a global aggregate exactly like the
+        // capacity checks, and the SQLite store serializes it the same way
+        // (store.rs `append_status_with_connection` opens Immediate).
+        begin_mutation(&client, OPERATION_STATUS).await?;
         let outcome: Result<(SafeConnectionStatus, StoredConnection), ConnectionStoreError> =
             async {
                 let current = load_record_for_update(&client, id, OPERATION_STATUS)
@@ -1484,6 +1434,29 @@ impl PostgresConnectionStore {
                     )
                     .await
                     .map_err(|error| pg_error(OPERATION_STATUS, error))?;
+                // The global bound covers every persisted status row, and
+                // a connection's current-status row is never pruned, so the
+                // history budget must reserve one slot per live connection
+                // before trimming. Without the reservation history
+                // over-retains by exactly the number of connections and the
+                // restart preflight's `current + history <=
+                // MAX_STATUS_HISTORY_ROWS` no longer holds (store.rs
+                // append_status computes the same `retained_history`).
+                let current_status_count_row = client
+                    .query_one(
+                        "SELECT COUNT(*) FROM greengateway.connection_current_status",
+                        &[],
+                    )
+                    .await
+                    .map_err(|error| pg_error(OPERATION_STATUS, error))?;
+                let current_status_count: i64 =
+                    scalar(&current_status_count_row, 0, OPERATION_STATUS)?;
+                let retained_history = super::model::MAX_STATUS_HISTORY_ROWS
+                    .checked_sub(usize::try_from(current_status_count).unwrap_or(usize::MAX))
+                    .ok_or(ConnectionStoreError::LimitExceeded {
+                        resource: "safe connection status rows",
+                        maximum: super::model::MAX_STATUS_HISTORY_ROWS,
+                    })?;
                 client
                     .execute(
                         r#"
@@ -1503,7 +1476,8 @@ impl PostgresConnectionStore {
                     .await
                     .map_err(|error| pg_error(OPERATION_STATUS, error))?;
                 // Global history pruning: keep the newest
-                // MAX_STATUS_HISTORY_ROWS rows across every connection.
+                // `retained_history` rows across every connection, leaving
+                // room for each connection's retained current-status row.
                 client
                     .execute(
                         r#"
@@ -1515,7 +1489,7 @@ impl PostgresConnectionStore {
                             OFFSET $1
                         )
                         "#,
-                        &[&(super::model::MAX_STATUS_HISTORY_ROWS as i64)],
+                        &[&usize_to_i64(retained_history)],
                     )
                     .await
                     .map_err(|error| pg_error(OPERATION_STATUS, error))?;
@@ -1612,12 +1586,9 @@ impl PostgresConnectionStore {
             .get()
             .await
             .map_err(|_| pg_unavailable(OPERATION_DEPS))?;
-        client
-            .batch_execute("BEGIN")
-            .await
-            .map_err(|error| pg_error(OPERATION_DEPS, error))?;
+        begin_mutation(&client, OPERATION_DEPS).await?;
         let outcome: Result<(), ConnectionStoreError> = async {
-            let exists: bool = client
+            let exists_row = client
                 .query_one(
                     r#"
                     SELECT EXISTS(
@@ -1629,19 +1600,19 @@ impl PostgresConnectionStore {
                     &[&id.as_str(), &kind.as_str(), &consumer_id],
                 )
                 .await
-                .map_err(|error| pg_error(OPERATION_DEPS, error))?
-                .get(0);
+                .map_err(|error| pg_error(OPERATION_DEPS, error))?;
+            let exists: bool = scalar(&exists_row, 0, OPERATION_DEPS)?;
             if exists {
                 return Ok(());
             }
-            let count: i64 = client
+            let count_row = client
                 .query_one(
                     "SELECT COUNT(*) FROM greengateway.connection_dependencies",
                     &[],
                 )
                 .await
-                .map_err(|error| pg_error(OPERATION_DEPS, error))?
-                .get(0);
+                .map_err(|error| pg_error(OPERATION_DEPS, error))?;
+            let count: i64 = scalar(&count_row, 0, OPERATION_DEPS)?;
             if usize::try_from(count).unwrap_or(usize::MAX) >= MAX_CONNECTION_DEPENDENCIES {
                 return Err(ConnectionStoreError::LimitExceeded {
                     resource: "connection dependencies",
@@ -1727,10 +1698,7 @@ impl PostgresConnectionStore {
             .get()
             .await
             .map_err(|_| pg_unavailable(OPERATION_DEPS))?;
-        client
-            .batch_execute("BEGIN")
-            .await
-            .map_err(|error| pg_error(OPERATION_DEPS, error))?;
+        begin_mutation(&client, OPERATION_DEPS).await?;
         let outcome: Result<(), ConnectionStoreError> = async {
             client
                 .execute(
@@ -1739,14 +1707,14 @@ impl PostgresConnectionStore {
                 )
                 .await
                 .map_err(|error| pg_error(OPERATION_DEPS, error))?;
-            let retained: i64 = client
+            let retained_row = client
                 .query_one(
                     "SELECT COUNT(*) FROM greengateway.connection_dependencies",
                     &[],
                 )
                 .await
-                .map_err(|error| pg_error(OPERATION_DEPS, error))?
-                .get(0);
+                .map_err(|error| pg_error(OPERATION_DEPS, error))?;
+            let retained: i64 = scalar(&retained_row, 0, OPERATION_DEPS)?;
             if usize::try_from(retained).unwrap_or(usize::MAX).saturating_add(desired.len())
                 > MAX_CONNECTION_DEPENDENCIES
             {
@@ -1756,14 +1724,14 @@ impl PostgresConnectionStore {
                 });
             }
             for (connection_id, consumer_id) in desired {
-                let exists: bool = client
+                let exists_row = client
                     .query_one(
                         "SELECT EXISTS(SELECT 1 FROM greengateway.connection_records WHERE id = $1::text::uuid)",
                         &[&connection_id.as_str()],
                     )
                     .await
-                    .map_err(|error| pg_error(OPERATION_DEPS, error))?
-                    .get(0);
+                    .map_err(|error| pg_error(OPERATION_DEPS, error))?;
+                let exists: bool = scalar(&exists_row, 0, OPERATION_DEPS)?;
                 if !exists {
                     return Err(ConnectionStoreError::NotFound {
                         id: connection_id.to_string(),
@@ -1805,49 +1773,13 @@ impl PostgresConnectionStore {
             .get()
             .await
             .map_err(|_| pg_unavailable(OPERATION_DEPS_READ))?;
-        let exists: bool = client
-            .query_one(
-                "SELECT EXISTS(SELECT 1 FROM greengateway.connection_records WHERE id = $1::text::uuid)",
-                &[&id.as_str()],
-            )
-            .await
-            .map_err(|error| pg_error(OPERATION_DEPS_READ, error))?
-            .get(0);
-        if !exists {
-            return Err(ConnectionStoreError::NotFound { id: id.to_string() });
-        }
-        let rows = client
-            .query(
-                r#"
-                SELECT consumer_kind, consumer_id
-                FROM greengateway.connection_dependencies
-                WHERE connection_id = $1::text::uuid
-                ORDER BY consumer_kind ASC, consumer_id ASC
-                LIMIT $2
-                "#,
-                &[
-                    &id.as_str(),
-                    &(usize_to_i64(MAX_CONNECTION_DEPENDENCIES + 1)),
-                ],
-            )
-            .await
-            .map_err(|error| pg_error(OPERATION_DEPS_READ, error))?;
-        if rows.len() > MAX_CONNECTION_DEPENDENCIES {
-            return Err(ConnectionStoreError::LimitExceeded {
-                resource: "connection dependencies",
-                maximum: MAX_CONNECTION_DEPENDENCIES,
-            });
-        }
-        rows.iter()
-            .map(|row| {
-                let kind = ConnectionDependencyKind::parse(&row.get::<_, String>(0))
-                    .ok_or_else(|| corrupt(id, "unknown dependency kind"))?;
-                Ok(ConnectionDependency {
-                    kind,
-                    consumer_id: row.get(1),
-                })
-            })
-            .collect()
+        // One snapshot for the existence check and the rows it guards, so
+        // a delete landing between them cannot return an empty list for a
+        // connection this read has already decided exists (store.rs
+        // `dependencies` opens a transaction for exactly this pair).
+        begin_snapshot(&client, OPERATION_DEPS_READ).await?;
+        let outcome = load_dependencies(&client, id).await;
+        finish_read(&client, OPERATION_DEPS_READ, outcome).await
     }
 
     pub async fn dependency_counts(
@@ -1869,17 +1801,559 @@ impl PostgresConnectionStore {
             )
             .await
             .map_err(|error| pg_error(OPERATION_DEPS_READ, error))?;
+        const REASON: &str = "dependency count column does not decode as its schema type";
         let mut counts = BTreeMap::new();
         for row in rows {
-            let id = parse_catalog_id(&row.get::<_, String>(0))?;
-            let count: i64 = row.get(1);
-            counts.insert(id, usize::try_from(count).unwrap_or(usize::MAX));
+            let raw_id: String = column(&row, 0, "<dependency-counts>", REASON)?;
+            let id = parse_catalog_id(&raw_id)?;
+            let count: i64 = column(&row, 1, &raw_id, REASON)?;
+            // Fail closed on an unrepresentable count and on one that
+            // exceeds the bound, exactly like the SQLite reader
+            // (store.rs `dependency_counts`): saturating to `usize::MAX`
+            // would turn a corrupt row into a plausible-looking number and
+            // skip the bound entirely.
+            let count =
+                usize::try_from(count).map_err(|_| ConnectionStoreError::CorruptRecord {
+                    id: id.to_string(),
+                    reason: "invalid dependency count",
+                })?;
+            if count > MAX_CONNECTION_DEPENDENCIES {
+                return Err(ConnectionStoreError::LimitExceeded {
+                    resource: "connection dependencies",
+                    maximum: MAX_CONNECTION_DEPENDENCIES,
+                });
+            }
+            counts.insert(id, count);
         }
         Ok(counts)
     }
 
+    /// The per-connection activity timestamps the control plane decorates
+    /// its listings with, keyed by connection.
+    ///
+    /// The SQLite counterpart (`SqliteConnectionStore::activity_times`)
+    /// bounds the read at `MAX_CONNECTIONS + 1` rows and refuses the whole
+    /// result if the extra row came back, rather than silently serving a
+    /// truncated map from a store that has already exceeded its own
+    /// capacity; both timestamps are re-parsed as RFC 3339 on the way out,
+    /// so a row written out of band fails closed as corruption instead of
+    /// reaching a caller as an opaque string. This reproduces both.
+    pub async fn activity_times(
+        &self,
+    ) -> Result<BTreeMap<ConnectionId, ConnectionActivityTimes>, ConnectionStoreError> {
+        let client = self
+            .pool
+            .get()
+            .await
+            .map_err(|_| pg_unavailable(OPERATION_ACTIVITY_READ))?;
+        // `id` is a uuid here and TEXT in SQLite, but the canonical text
+        // form is fixed-width lowercase hex, so uuid order and the
+        // reference's `ORDER BY id ASC` agree row for row -- which is what
+        // decides who survives the bound below.
+        let rows = client
+            .query(
+                r#"
+                SELECT id::text, last_test_at, last_refresh_at
+                FROM greengateway.connection_records
+                ORDER BY id ASC
+                LIMIT $1
+                "#,
+                &[&usize_to_i64(MAX_CONNECTIONS.saturating_add(1))],
+            )
+            .await
+            .map_err(|error| pg_error(OPERATION_ACTIVITY_READ, error))?;
+        if rows.len() > MAX_CONNECTIONS {
+            return Err(ConnectionStoreError::LimitExceeded {
+                resource: "connection activity metadata",
+                maximum: MAX_CONNECTIONS,
+            });
+        }
+        rows.iter()
+            .map(|row| {
+                const REASON: &str =
+                    "connection activity column does not decode as its schema type";
+                let raw: String = column(row, 0, "<connection-activity>", REASON)?;
+                let parsed = ConnectionId::parse(raw.clone())
+                    .map_err(|_| corrupt_id(&raw, "invalid activity owner ID"))?;
+                let last_test_at: Option<String> = column(row, 1, &raw, REASON)?;
+                let last_refresh_at: Option<String> = column(row, 2, &raw, REASON)?;
+                validate_activity_timestamp(&parsed, last_test_at.as_deref())?;
+                validate_activity_timestamp(&parsed, last_refresh_at.as_deref())?;
+                Ok((
+                    parsed,
+                    ConnectionActivityTimes {
+                        last_test_at,
+                        last_refresh_at,
+                    },
+                ))
+            })
+            .collect()
+    }
+
+    /// The load-time integrity preflight: the async twin of the SQLite
+    /// store's `validate_persisted_state`, which `open` runs on every
+    /// open (store.rs). PostgreSQL had no equivalent, so a replica
+    /// started serving whatever happened to be in the tables and a
+    /// violated invariant surfaced per request, if at all.
+    ///
+    /// STARTUP MUST CALL THIS ONCE -- after migrations, before the store
+    /// is published to the runtime -- and MUST abort the boot on an
+    /// error rather than degrade. Every invariant checked here is one the
+    /// writers in this file maintain unconditionally, so a violation
+    /// means this database is not the one this build wrote, and a store
+    /// whose contract is to fail closed must not serve from it. (The call
+    /// belongs to the boot sequence in main.rs and is not wired here.)
+    ///
+    /// Every query is bounded. The aggregates and the integrity checks
+    /// are single-row whatever they join. Each row scan runs only after
+    /// the count that bounds it has been checked against its ceiling on
+    /// this same snapshot -- records and catalogs are bounded that way --
+    /// and the activity, status and managed-tool-dependency scans carry
+    /// an explicit LIMIT on top, so they stay bounded even if the
+    /// aggregate that precedes them is itself the thing that is wrong.
+    pub async fn validate_persisted_state(&self) -> Result<(), ConnectionStoreError> {
+        let client = self
+            .pool
+            .get()
+            .await
+            .map_err(|_| pg_unavailable(OPERATION_VALIDATE))?;
+        // One snapshot for the whole preflight. The cross-table
+        // invariants below -- a catalog's counters against its own rows,
+        // managed-tool dependencies against catalog entries -- are only
+        // meaningful against a single consistent view, and another
+        // replica may be committing while this one boots: under read
+        // committed a catalog replace landing between two of these reads
+        // would be reported as corruption and would abort a healthy boot.
+        begin_snapshot(&client, OPERATION_VALIDATE).await?;
+        let outcome = self.validate_within(&client).await;
+        finish_read(&client, OPERATION_VALIDATE, outcome).await
+    }
+
+    async fn validate_within(
+        &self,
+        client: &deadpool_postgres::Object,
+    ) -> Result<(), ConnectionStoreError> {
+        let counts = client
+            .query_one(
+                r#"
+                SELECT
+                    (SELECT COUNT(*) FROM greengateway.connection_records),
+                    (SELECT COUNT(*) FROM greengateway.connection_credential_bindings),
+                    (SELECT COUNT(*) FROM greengateway.connection_dependencies),
+                    (SELECT COUNT(*) FROM greengateway.connection_mcp_catalog_entries)
+                  + (SELECT COUNT(*) FROM greengateway.connection_mcp_catalog_resources)
+                  + (SELECT COUNT(*) FROM greengateway.connection_mcp_catalog_resource_templates)
+                  + (SELECT COUNT(*) FROM greengateway.connection_openapi_catalog_entries),
+                    (SELECT COUNT(*) FROM greengateway.connection_current_status)
+                  + (SELECT COUNT(*) FROM greengateway.connection_status_history),
+                    (SELECT COALESCE(SUM(octet_length(definition_json)), 0)
+                     FROM greengateway.connection_openapi_catalog_entries)
+                "#,
+                &[],
+            )
+            .await
+            .map_err(|error| pg_error(OPERATION_VALIDATE, error))?;
+
+        // The persisted bounds, in the reference's order. The record
+        // count gates every row scan below, so it is checked first.
+        let records_count = counted(&counts, 0, "<connections>")?;
+        if records_count > self.maximum_connections {
+            return Err(ConnectionStoreError::LimitExceeded {
+                resource: "managed connections",
+                maximum: self.maximum_connections,
+            });
+        }
+        if counted(&counts, 1, "<bindings>")? > MAX_CREDENTIALS {
+            return Err(ConnectionStoreError::LimitExceeded {
+                resource: "connection credential bindings",
+                maximum: MAX_CREDENTIALS,
+            });
+        }
+        // The reference also bounds connection_local_secrets. That table
+        // has no PostgreSQL counterpart -- the local keyring is bound to
+        // CONNECTIONS_SQLITE_PATH, which cluster mode rejects (migration
+        // 0006's header) -- so there is nothing here to bound.
+        let dependencies_count = counted(&counts, 2, "<dependencies>")?;
+        if dependencies_count > MAX_CONNECTION_DEPENDENCIES {
+            return Err(ConnectionStoreError::LimitExceeded {
+                resource: "connection dependencies",
+                maximum: MAX_CONNECTION_DEPENDENCIES,
+            });
+        }
+        if counted(&counts, 3, "<catalog-entries>")? > super::model::MAX_CATALOG_ENTRIES {
+            return Err(ConnectionStoreError::LimitExceeded {
+                resource: "connection catalog entries",
+                maximum: super::model::MAX_CATALOG_ENTRIES,
+            });
+        }
+        // Current status plus history against ONE budget: a
+        // current-status row is never pruned, so the two together are
+        // what the writer's pruning has to keep under the bound.
+        if counted(&counts, 4, "<status>")? > super::model::MAX_STATUS_HISTORY_ROWS {
+            return Err(ConnectionStoreError::LimitExceeded {
+                resource: "safe connection status rows",
+                maximum: super::model::MAX_STATUS_HISTORY_ROWS,
+            });
+        }
+        if counted(&counts, 5, "<openapi-catalogs>")?
+            > super::model::MAX_MANAGED_OPENAPI_CATALOG_BYTES
+        {
+            return Err(ConnectionStoreError::LimitExceeded {
+                resource: "connection OpenAPI catalog definition bytes",
+                maximum: super::model::MAX_MANAGED_OPENAPI_CATALOG_BYTES,
+            });
+        }
+        if mcp_catalog_bytes(client, None, OPERATION_VALIDATE).await?
+            > super::store::MAX_MANAGED_MCP_CATALOG_BYTES
+        {
+            return Err(ConnectionStoreError::LimitExceeded {
+                resource: "connection MCP catalog bytes",
+                maximum: super::store::MAX_MANAGED_MCP_CATALOG_BYTES,
+            });
+        }
+
+        // The set-shaped invariants. Migration 0006 already CHECKs some
+        // of these per row, which is precisely why they are re-checked
+        // here: a constraint can be dropped out of band, and this
+        // preflight exists to catch a database that no longer matches
+        // the schema this build wrote.
+        ensure_no_invalid_rows(
+            client,
+            "<current-status>",
+            r#"
+            SELECT COUNT(*)
+            FROM greengateway.connection_current_status AS status
+            JOIN greengateway.connection_records AS record ON record.id = status.connection_id
+            WHERE status.status_revision != record.status_revision
+               OR status.observed_connection_revision != record.connection_revision
+               OR status.observed_credential_revision != record.credential_revision
+               OR status.observed_tls_revision != record.tls_revision
+               OR status.observed_discovery_revision != record.discovery_revision
+               OR status.catalog_entry_count < 0
+               OR status.catalog_entry_count > 4096
+            "#,
+            "current connection status is stale or invalid",
+        )
+        .await?;
+        ensure_no_invalid_rows(
+            client,
+            "<mcp-catalogs>",
+            r#"
+            SELECT COUNT(*)
+            FROM greengateway.connection_mcp_catalogs AS catalog
+            JOIN greengateway.connection_records AS record ON record.id = catalog.connection_id
+            WHERE catalog.entry_count != (
+                    SELECT COUNT(*)
+                    FROM greengateway.connection_mcp_catalog_entries AS entry
+                    WHERE entry.connection_id = catalog.connection_id
+                  )
+               OR catalog.resource_count != (
+                    SELECT COUNT(*)
+                    FROM greengateway.connection_mcp_catalog_resources AS resource
+                    WHERE resource.connection_id = catalog.connection_id
+                  )
+               OR catalog.resource_template_count != (
+                    SELECT COUNT(*)
+                    FROM greengateway.connection_mcp_catalog_resource_templates AS template
+                    WHERE template.connection_id = catalog.connection_id
+                  )
+               OR catalog.entry_count + catalog.resource_count
+                    + catalog.resource_template_count > 4096
+               OR catalog.catalog_revision < 1
+               OR catalog.entry_count < 0
+               OR catalog.entry_count > 4096
+               OR catalog.resource_count < 0
+               OR catalog.resource_count > 4096
+               OR catalog.resource_template_count < 0
+               OR catalog.resource_template_count > 4096
+            "#,
+            "stored MCP catalog metadata is inconsistent",
+        )
+        .await?;
+        ensure_no_invalid_rows(
+            client,
+            "<openapi-catalogs>",
+            r#"
+            SELECT COUNT(*)
+            FROM greengateway.connection_openapi_catalogs AS catalog
+            JOIN greengateway.connection_records AS record ON record.id = catalog.connection_id
+            WHERE catalog.entry_count != (
+                    SELECT COUNT(*)
+                    FROM greengateway.connection_openapi_catalog_entries AS entry
+                    WHERE entry.connection_id = catalog.connection_id
+                  )
+               OR catalog.spec_revision < 1
+               OR catalog.catalog_revision < 1
+               OR catalog.entry_count < 0
+               OR catalog.entry_count > 4096
+               OR octet_length(catalog.spec) < 1
+               OR octet_length(catalog.spec) > 2097152
+               OR octet_length(catalog.spec_digest) != 64
+               OR catalog.spec_digest !~ '^[0-9a-f]+$'
+            "#,
+            "stored OpenAPI catalog metadata is inconsistent",
+        )
+        .await?;
+        ensure_no_invalid_rows(
+            client,
+            "<catalogs>",
+            r#"
+            SELECT COUNT(*)
+            FROM greengateway.connection_mcp_catalogs AS mcp
+            JOIN greengateway.connection_openapi_catalogs AS openapi
+              ON openapi.connection_id = mcp.connection_id
+            "#,
+            "a Connection owns more than one managed catalog kind",
+        )
+        .await?;
+        ensure_no_invalid_rows(
+            client,
+            "<status-history>",
+            r#"
+            SELECT COUNT(*)
+            FROM greengateway.connection_status_history AS status
+            JOIN greengateway.connection_records AS record ON record.id = status.connection_id
+            WHERE status.status_revision > record.status_revision
+               OR status.observed_connection_revision > record.connection_revision
+               OR status.observed_credential_revision > record.credential_revision
+               OR status.observed_tls_revision > record.tls_revision
+               OR status.observed_discovery_revision > record.discovery_revision
+               OR status.catalog_entry_count < 0
+               OR status.catalog_entry_count > 4096
+            "#,
+            "connection status history contains an impossible revision or count",
+        )
+        .await?;
+
+        // Every record decodes, still validates, and agrees with its
+        // derived credential bindings.
+        let records = load_all_records(client, OPERATION_VALIDATE).await?;
+        for record in &records {
+            validate_bindings(client, record).await?;
+        }
+        validate_activity_rows(client, records_count).await?;
+        // Both status tables decode into a SafeConnectionStatus: an
+        // unknown state, an unknown reason or a negative count fails
+        // closed at load instead of at the first read that touches it.
+        validate_status_rows(client, "greengateway.connection_current_status").await?;
+        validate_status_rows(client, "greengateway.connection_status_history").await?;
+
+        // Every stored catalog loads, and belongs to a Connection whose
+        // specification still declares that managed catalog kind.
+        let mcp_catalogs = load_mcp_catalogs(client, None).await?;
+        let openapi_catalogs = load_openapi_catalogs(client, None).await?;
+        let record_by_id = records
+            .iter()
+            .map(|record| (record.id.clone(), record))
+            .collect::<BTreeMap<_, _>>();
+        for catalog in &mcp_catalogs {
+            if record_by_id
+                .get(&catalog.connection_id)
+                .is_none_or(|record| !supports_managed_mcp_catalog(&record.write))
+            {
+                return Err(corrupt(
+                    &catalog.connection_id,
+                    "MCP catalog owner is not a compatible managed MCP Connection",
+                ));
+            }
+        }
+        for catalog in &openapi_catalogs {
+            if record_by_id
+                .get(&catalog.connection_id)
+                .is_none_or(|record| !supports_managed_openapi_catalog(&record.write))
+            {
+                return Err(corrupt(
+                    &catalog.connection_id,
+                    "OpenAPI catalog owner is not a compatible managed OpenAPI Connection",
+                ));
+            }
+        }
+        validate_managed_catalog_dependencies(
+            client,
+            dependencies_count,
+            &mcp_catalogs,
+            &openapi_catalogs,
+        )
+        .await
+    }
+
     pub fn maximum_connections(&self) -> usize {
         self.maximum_connections
+    }
+}
+
+/// One bounded aggregate from the preflight's counts row, as a `usize`.
+/// Mirrors the reference's `count_rows` (store.rs): the decode is a store
+/// failure, a negative or oversized total is corruption.
+fn counted(
+    row: &tokio_postgres::Row,
+    index: usize,
+    resource: &'static str,
+) -> Result<usize, ConnectionStoreError> {
+    let value: i64 = scalar(row, index, OPERATION_VALIDATE)?;
+    usize::try_from(value).map_err(|_| ConnectionStoreError::CorruptRecord {
+        id: resource.to_owned(),
+        reason: "negative or oversized persisted row count",
+    })
+}
+
+/// Fail closed when a bounded integrity query finds any offending row --
+/// the reference's `ensure_no_invalid_rows` (store.rs). `query` is a
+/// literal from this module returning a single `COUNT(*)`, so it is
+/// bounded whatever it joins.
+async fn ensure_no_invalid_rows(
+    client: &deadpool_postgres::Object,
+    scope: &'static str,
+    query: &'static str,
+    reason: &'static str,
+) -> Result<(), ConnectionStoreError> {
+    let row = client
+        .query_one(query, &[])
+        .await
+        .map_err(|error| pg_error(OPERATION_VALIDATE, error))?;
+    let offending: i64 = scalar(&row, 0, OPERATION_VALIDATE)?;
+    if offending == 0 {
+        Ok(())
+    } else {
+        Err(corrupt_id(scope, reason))
+    }
+}
+
+/// Every persisted activity timestamp parses as RFC 3339 -- the
+/// reference's `validate_connection_activity_rows` (store.rs). Bounded by
+/// the record count the caller has already checked against the ceiling.
+async fn validate_activity_rows(
+    client: &deadpool_postgres::Object,
+    records_count: usize,
+) -> Result<(), ConnectionStoreError> {
+    const REASON: &str = "connection activity column does not decode as its schema type";
+    let rows = client
+        .query(
+            r#"
+            SELECT id::text, last_test_at, last_refresh_at
+            FROM greengateway.connection_records
+            WHERE last_test_at IS NOT NULL OR last_refresh_at IS NOT NULL
+            ORDER BY id ASC
+            LIMIT $1
+            "#,
+            &[&usize_to_i64(records_count.saturating_add(1))],
+        )
+        .await
+        .map_err(|error| pg_error(OPERATION_VALIDATE, error))?;
+    if rows.len() > records_count {
+        return Err(corrupt_id(
+            "<connection-activity>",
+            "more activity rows than connection records",
+        ));
+    }
+    for row in &rows {
+        let raw: String = column(row, 0, "<connection-activity>", REASON)?;
+        let id = ConnectionId::parse(raw.clone())
+            .map_err(|_| corrupt_id(&raw, "activity row has an invalid connection ID"))?;
+        let last_test_at: Option<String> = column(row, 1, &raw, REASON)?;
+        let last_refresh_at: Option<String> = column(row, 2, &raw, REASON)?;
+        validate_activity_timestamp(&id, last_test_at.as_deref())?;
+        validate_activity_timestamp(&id, last_refresh_at.as_deref())?;
+    }
+    Ok(())
+}
+
+/// Every row of a status table decodes into a `SafeConnectionStatus` --
+/// the reference's `validate_safe_status_rows` (store.rs). `table` is a
+/// literal from this module, never caller input; the LIMIT holds even if
+/// the aggregate bound the caller checked has been violated.
+async fn validate_status_rows(
+    client: &deadpool_postgres::Object,
+    table: &'static str,
+) -> Result<(), ConnectionStoreError> {
+    const REASON: &str = "status column does not decode as its schema type";
+    let query = format!(
+        "SELECT state, reason, observed_at, latency_ms, catalog_age_secs, \
+         catalog_entry_count, connection_id::text FROM {table} LIMIT $1"
+    );
+    let rows = client
+        .query(
+            query.as_str(),
+            &[&usize_to_i64(
+                super::model::MAX_STATUS_HISTORY_ROWS.saturating_add(1),
+            )],
+        )
+        .await
+        .map_err(|error| pg_error(OPERATION_VALIDATE, error))?;
+    if rows.len() > super::model::MAX_STATUS_HISTORY_ROWS {
+        return Err(ConnectionStoreError::LimitExceeded {
+            resource: "safe connection status rows",
+            maximum: super::model::MAX_STATUS_HISTORY_ROWS,
+        });
+    }
+    for row in &rows {
+        let raw: String = column(row, 6, "<connection-status>", REASON)?;
+        let id = ConnectionId::parse(raw.clone())
+            .map_err(|_| corrupt_id(&raw, "status row has an invalid connection ID"))?;
+        safe_status_from_row(row, &id)?;
+    }
+    Ok(())
+}
+
+/// Every `managed_tool` dependency row corresponds to a durable catalog
+/// entry, and every durable catalog entry has its row -- the reference's
+/// `validate_managed_catalog_dependencies` (store.rs), which derives the
+/// expected keys exactly this way: the MCP key is the Connection ID
+/// joined to the remote tool name (`managed_tool_dependency_id`, the same
+/// helper both writers use), the OpenAPI key is the tool name.
+async fn validate_managed_catalog_dependencies(
+    client: &deadpool_postgres::Object,
+    dependencies_count: usize,
+    mcp_catalogs: &[StoredMcpCatalog],
+    openapi_catalogs: &[StoredOpenApiCatalog],
+) -> Result<(), ConnectionStoreError> {
+    const REASON: &str = "managed tool dependency column does not decode as its schema type";
+    let mut expected = BTreeSet::new();
+    for catalog in mcp_catalogs {
+        for entry in &catalog.entries {
+            expected.insert((
+                catalog.connection_id.to_string(),
+                managed_tool_dependency_id(&catalog.connection_id, &entry.remote_tool_name),
+            ));
+        }
+    }
+    for catalog in openapi_catalogs {
+        for entry in &catalog.entries {
+            expected.insert((catalog.connection_id.to_string(), entry.tool_name.clone()));
+        }
+    }
+    let rows = client
+        .query(
+            r#"
+            SELECT connection_id::text, consumer_id
+            FROM greengateway.connection_dependencies
+            WHERE consumer_kind = 'managed_tool'
+            ORDER BY connection_id ASC, consumer_id ASC
+            LIMIT $1
+            "#,
+            &[&usize_to_i64(dependencies_count.saturating_add(1))],
+        )
+        .await
+        .map_err(|error| pg_error(OPERATION_VALIDATE, error))?;
+    if rows.len() > dependencies_count {
+        return Err(corrupt_id(
+            "<catalog-dependencies>",
+            "more managed tool dependencies than dependency rows",
+        ));
+    }
+    let mut actual = BTreeSet::new();
+    for row in &rows {
+        let owner: String = column(row, 0, "<catalog-dependencies>", REASON)?;
+        let consumer: String = column(row, 1, &owner, REASON)?;
+        actual.insert((owner, consumer));
+    }
+    if actual == expected {
+        Ok(())
+    } else {
+        Err(corrupt_id(
+            "<catalog-dependencies>",
+            "managed tool dependencies do not match durable catalog entries",
+        ))
     }
 }
 
@@ -1916,9 +2390,10 @@ fn safe_status_from_row(
     row: &tokio_postgres::Row,
     id: &ConnectionId,
 ) -> Result<SafeConnectionStatus, ConnectionStoreError> {
-    let state =
-        parse_state(&row.get::<_, String>(0)).ok_or_else(|| corrupt(id, "unknown status state"))?;
-    let reason = parse_reason(&row.get::<_, String>(1))
+    const REASON: &str = "safe status column does not decode as its schema type";
+    let state = parse_state(&column::<String>(row, 0, id.as_str(), REASON)?)
+        .ok_or_else(|| corrupt(id, "unknown status state"))?;
+    let reason = parse_reason(&column::<String>(row, 1, id.as_str(), REASON)?)
         .ok_or_else(|| corrupt(id, "unknown status reason"))?;
     let optional = |value: Option<i64>| {
         value
@@ -1928,12 +2403,319 @@ fn safe_status_from_row(
     Ok(SafeConnectionStatus {
         state,
         reason,
-        observed_at: Some(row.get(2)),
-        latency_ms: optional(row.get(3))?,
-        catalog_age_secs: optional(row.get(4))?,
-        catalog_entry_count: optional(row.get(5))?
-            .map(|count| usize::try_from(count).unwrap_or(usize::MAX)),
+        observed_at: Some(column(row, 2, id.as_str(), REASON)?),
+        latency_ms: optional(column(row, 3, id.as_str(), REASON)?)?,
+        catalog_age_secs: optional(column(row, 4, id.as_str(), REASON)?)?,
+        // The SQLite reader raises `CorruptRecord { reason: "invalid
+        // catalog entry count" }` for a count it cannot represent
+        // (store.rs `RawStatus::into_safe_status`); saturating instead
+        // would hand a caller a fabricated `usize::MAX` entry count.
+        catalog_entry_count: optional(column(row, 5, id.as_str(), REASON)?)?
+            .map(|count| {
+                usize::try_from(count).map_err(|_| corrupt(id, "invalid catalog entry count"))
+            })
+            .transpose()?,
     })
+}
+
+/// The MCP catalog bytes already retained across the whole store,
+/// optionally excluding one connection (the one a replacement is about to
+/// rewrite).
+///
+/// Three tables, not one. The candidate side of the comparison --
+/// `validate_mcp_catalog`'s `stored_bytes` in store.rs -- charges entries,
+/// resources AND resource templates against the single
+/// `MAX_MANAGED_MCP_CATALOG_BYTES` budget, so summing entries alone would
+/// measure a different quantity than the value it is added to: every
+/// resource and template already stored would be free, and the budget could
+/// be overrun without the check ever tripping. The arithmetic below mirrors
+/// `mcp_catalog_bytes` in store.rs term for term -- including the flat 8
+/// bytes charged for a resource that carries a size, and the zero charged
+/// for each absent optional column.
+///
+/// `octet_length` measures the stored bytes directly because the JSON
+/// columns are `text`, not `jsonb`: what is summed here is byte for byte
+/// what serde_json wrote, which is what the candidate side counts. See the
+/// column comments in migration 0006.
+async fn mcp_catalog_bytes(
+    client: &deadpool_postgres::Object,
+    excluded: Option<&ConnectionId>,
+    operation: &'static str,
+) -> Result<usize, ConnectionStoreError> {
+    let filter = if excluded.is_some() {
+        "WHERE connection_id != $1::text::uuid"
+    } else {
+        ""
+    };
+    let query = format!(
+        r#"
+        SELECT
+            (SELECT COALESCE(SUM(
+                 octet_length(remote_tool_name)
+               + octet_length(description)
+               + octet_length(input_schema_json)
+             ), 0)
+             FROM greengateway.connection_mcp_catalog_entries {filter})
+          + (SELECT COALESCE(SUM(
+                 octet_length(uri)
+               + octet_length(name)
+               + COALESCE(octet_length(title), 0)
+               + COALESCE(octet_length(description), 0)
+               + COALESCE(octet_length(mime_type), 0)
+               + CASE WHEN size IS NULL THEN 0 ELSE 8 END
+             ), 0)
+             FROM greengateway.connection_mcp_catalog_resources {filter})
+          + (SELECT COALESCE(SUM(
+                 octet_length(uri_template)
+               + octet_length(name)
+               + COALESCE(octet_length(title), 0)
+               + COALESCE(octet_length(description), 0)
+               + COALESCE(octet_length(mime_type), 0)
+             ), 0)
+             FROM greengateway.connection_mcp_catalog_resource_templates {filter})
+        "#
+    );
+    let row = match excluded {
+        Some(id) => client.query_one(query.as_str(), &[&id.as_str()]).await,
+        None => client.query_one(query.as_str(), &[]).await,
+    }
+    .map_err(|error| pg_error(operation, error))?;
+    let bytes: i64 = scalar(&row, 0, operation)?;
+    usize::try_from(bytes)
+        .map_err(|_| corrupt_id("<mcp-catalogs>", "invalid MCP catalog byte count"))
+}
+
+/// Total stored definition bytes across every managed OpenAPI catalog.
+/// Verbatim stored bytes, so this measures exactly what the candidate side
+/// measures (serde_json's compact encoding); see the column comment in
+/// migration 0006 for why `definition_json` is `text` and not `jsonb`.
+async fn openapi_definition_bytes(
+    client: &deadpool_postgres::Object,
+    operation: &'static str,
+) -> Result<usize, ConnectionStoreError> {
+    let row = client
+        .query_one(
+            r#"
+            SELECT COALESCE(SUM(octet_length(definition_json)), 0)
+            FROM greengateway.connection_openapi_catalog_entries
+            "#,
+            &[],
+        )
+        .await
+        .map_err(|error| pg_error(operation, error))?;
+    let bytes: i64 = scalar(&row, 0, operation)?;
+    usize::try_from(bytes).map_err(|_| ConnectionStoreError::CorruptRecord {
+        id: "<openapi-catalogs>".to_owned(),
+        reason: "negative or oversized stored OpenAPI definition byte total",
+    })
+}
+
+/// The MCP catalog read, on the CALLER'S client and inside whatever
+/// snapshot the caller has already opened. `read_mcp_catalogs` wraps this
+/// in its own snapshot for ordinary reads; the restart preflight calls it
+/// directly so its catalog reads and the dependency rows it checks them
+/// against come from one consistent view.
+async fn load_mcp_catalogs(
+    client: &deadpool_postgres::Object,
+    requested: Option<&ConnectionId>,
+) -> Result<Vec<StoredMcpCatalog>, ConnectionStoreError> {
+    let retained_bytes = mcp_catalog_bytes(client, None, OPERATION_MCP_READ).await?;
+    if retained_bytes > super::store::MAX_MANAGED_MCP_CATALOG_BYTES {
+        return Err(ConnectionStoreError::LimitExceeded {
+            resource: "connection MCP catalog bytes",
+            maximum: super::store::MAX_MANAGED_MCP_CATALOG_BYTES,
+        });
+    }
+    let rows = match requested {
+        Some(id) => {
+            client
+                .query(
+                    r#"
+                SELECT connection_id::text, catalog_revision, observed_etag, refreshed_at,
+                       entry_count, resource_count, resource_template_count
+                FROM greengateway.connection_mcp_catalogs
+                WHERE connection_id = $1::text::uuid
+                ORDER BY connection_id
+                "#,
+                    &[&id.as_str()],
+                )
+                .await
+        }
+        None => {
+            client
+                .query(
+                    r#"
+                SELECT connection_id::text, catalog_revision, observed_etag, refreshed_at,
+                       entry_count, resource_count, resource_template_count
+                FROM greengateway.connection_mcp_catalogs
+                ORDER BY connection_id
+                "#,
+                    &[],
+                )
+                .await
+        }
+    }
+    .map_err(|error| pg_error(OPERATION_MCP_READ, error))?;
+
+    const REASON: &str = "MCP catalog column does not decode as its schema type";
+    let mut catalogs = Vec::with_capacity(rows.len());
+    for row in &rows {
+        let raw_id: String = column(row, 0, "<mcp-catalog>", REASON)?;
+        let connection_id = parse_catalog_id(&raw_id)?;
+        let catalog_revision = persisted_revision(
+            &connection_id,
+            column(row, 1, &raw_id, REASON)?,
+            "invalid MCP catalog revision",
+        )?;
+        if catalog_revision == 0 {
+            return Err(corrupt(&connection_id, "invalid MCP catalog revision"));
+        }
+        let entry_count: i64 = column(row, 4, &raw_id, REASON)?;
+        let resource_count: i64 = column(row, 5, &raw_id, REASON)?;
+        let template_count: i64 = column(row, 6, &raw_id, REASON)?;
+        let total = entry_count
+            .saturating_add(resource_count)
+            .saturating_add(template_count);
+        if total < 0
+            || usize::try_from(total).unwrap_or(usize::MAX) > super::model::MAX_CATALOG_ENTRIES
+        {
+            return Err(corrupt(&connection_id, "invalid MCP catalog entry count"));
+        }
+        let entries = load_mcp_entries(client, &connection_id).await?;
+        if entries.len() != usize::try_from(entry_count).unwrap_or(usize::MAX) {
+            return Err(corrupt(&connection_id, "MCP catalog entry count mismatch"));
+        }
+        let resources = load_mcp_resources(client, &connection_id).await?;
+        if resources.len() != usize::try_from(resource_count).unwrap_or(usize::MAX) {
+            return Err(corrupt(&connection_id, "MCP resource count mismatch"));
+        }
+        let resource_templates = load_mcp_resource_templates(client, &connection_id).await?;
+        if resource_templates.len() != usize::try_from(template_count).unwrap_or(usize::MAX) {
+            return Err(corrupt(
+                &connection_id,
+                "MCP resource template count mismatch",
+            ));
+        }
+        catalogs.push(StoredMcpCatalog {
+            connection_id,
+            catalog_revision,
+            observed_etag: parse_etag(&column::<String>(row, 2, &raw_id, REASON)?)?,
+            refreshed_at: column(row, 3, &raw_id, REASON)?,
+            entries,
+            resources,
+            resource_templates,
+        });
+    }
+    Ok(catalogs)
+}
+
+/// The OpenAPI catalog read, on the CALLER'S client and inside the
+/// caller's snapshot; see `load_mcp_catalogs`.
+async fn load_openapi_catalogs(
+    client: &deadpool_postgres::Object,
+    requested: Option<&ConnectionId>,
+) -> Result<Vec<StoredOpenApiCatalog>, ConnectionStoreError> {
+    // The same aggregate bound the MCP loader above enforces, and for the
+    // same reason: the SQLite reference refuses to serve an over-budget
+    // catalog set on every read (store.rs `load_openapi_catalogs` and
+    // `load_openapi_inventory_catalogs`), not only at startup. Boot alone
+    // is not enough -- another replica can commit between this replica's
+    // preflight and this read.
+    let retained_definition_bytes =
+        openapi_definition_bytes(client, OPERATION_OPENAPI_READ).await?;
+    if retained_definition_bytes > super::model::MAX_MANAGED_OPENAPI_CATALOG_BYTES {
+        return Err(ConnectionStoreError::LimitExceeded {
+            resource: "connection OpenAPI catalog definition bytes",
+            maximum: super::model::MAX_MANAGED_OPENAPI_CATALOG_BYTES,
+        });
+    }
+    let rows = match requested {
+        Some(id) => {
+            client
+                .query(
+                    r#"
+                SELECT connection_id::text, spec_revision, catalog_revision, observed_etag,
+                       spec_digest, spec, refreshed_at, entry_count
+                FROM greengateway.connection_openapi_catalogs
+                WHERE connection_id = $1::text::uuid
+                ORDER BY connection_id
+                "#,
+                    &[&id.as_str()],
+                )
+                .await
+        }
+        None => {
+            client
+                .query(
+                    r#"
+                SELECT connection_id::text, spec_revision, catalog_revision, observed_etag,
+                       spec_digest, spec, refreshed_at, entry_count
+                FROM greengateway.connection_openapi_catalogs
+                ORDER BY connection_id
+                "#,
+                    &[],
+                )
+                .await
+        }
+    }
+    .map_err(|error| pg_error(OPERATION_OPENAPI_READ, error))?;
+
+    const REASON: &str = "OpenAPI catalog column does not decode as its schema type";
+    let mut catalogs = Vec::with_capacity(rows.len());
+    for row in &rows {
+        let raw_id: String = column(row, 0, "<openapi-catalog>", REASON)?;
+        let connection_id = parse_catalog_id(&raw_id)?;
+        let spec_revision = persisted_revision(
+            &connection_id,
+            column(row, 1, &raw_id, REASON)?,
+            "invalid OpenAPI spec revision",
+        )?;
+        let catalog_revision = persisted_revision(
+            &connection_id,
+            column(row, 2, &raw_id, REASON)?,
+            "invalid OpenAPI catalog revision",
+        )?;
+        if spec_revision == 0 || catalog_revision == 0 {
+            return Err(corrupt(&connection_id, "invalid OpenAPI catalog revision"));
+        }
+        // The spec column holds the verbatim bytes the publisher signed
+        // and spec_digest is the SHA-256 over exactly those bytes, so
+        // every read re-verifies the pair and fails closed on a tampered
+        // or truncated row -- the same guard the SQLite store applies on
+        // every catalog read (store.rs read_openapi_catalogs).
+        let spec_digest: String = column(row, 4, &raw_id, REASON)?;
+        let spec: String = column(row, 5, &raw_id, REASON)?;
+        validate_openapi_spec(&spec, &spec_digest)
+            .map_err(|_| corrupt(&connection_id, "invalid stored OpenAPI spec or digest"))?;
+        let entry_count: i64 = column(row, 7, &raw_id, REASON)?;
+        if entry_count < 0
+            || usize::try_from(entry_count).unwrap_or(usize::MAX)
+                > super::model::MAX_CATALOG_ENTRIES
+        {
+            return Err(corrupt(
+                &connection_id,
+                "invalid OpenAPI catalog entry count",
+            ));
+        }
+        let entries = load_openapi_entries(client, &connection_id).await?;
+        if entries.len() != usize::try_from(entry_count).unwrap_or(usize::MAX) {
+            return Err(corrupt(
+                &connection_id,
+                "OpenAPI catalog entry count mismatch",
+            ));
+        }
+        catalogs.push(StoredOpenApiCatalog {
+            connection_id,
+            spec_revision,
+            catalog_revision,
+            observed_etag: parse_etag(&column::<String>(row, 3, &raw_id, REASON)?)?,
+            spec_digest,
+            spec,
+            refreshed_at: column(row, 6, &raw_id, REASON)?,
+            entries,
+        });
+    }
+    Ok(catalogs)
 }
 
 async fn load_mcp_entries(
@@ -1943,7 +2725,7 @@ async fn load_mcp_entries(
     let rows = client
         .query(
             r#"
-            SELECT remote_tool_name, description, input_schema_json::text
+            SELECT remote_tool_name, description, input_schema_json
             FROM greengateway.connection_mcp_catalog_entries
             WHERE connection_id = $1::text::uuid
             ORDER BY ordinal
@@ -1952,13 +2734,15 @@ async fn load_mcp_entries(
         )
         .await
         .map_err(|error| pg_error(OPERATION_MCP_READ, error))?;
+    const REASON: &str = "MCP catalog entry column does not decode as its schema type";
     rows.iter()
         .map(|row| {
-            let input_schema: Value = serde_json::from_str(&row.get::<_, String>(2))
-                .map_err(|_| corrupt(id, "MCP catalog entry schema is not valid JSON"))?;
+            let input_schema: Value =
+                serde_json::from_str(&column::<String>(row, 2, id.as_str(), REASON)?)
+                    .map_err(|_| corrupt(id, "MCP catalog entry schema is not valid JSON"))?;
             Ok(StoredMcpCatalogEntry {
-                remote_tool_name: row.get(0),
-                description: row.get(1),
+                remote_tool_name: column(row, 0, id.as_str(), REASON)?,
+                description: column(row, 1, id.as_str(), REASON)?,
                 input_schema,
             })
         })
@@ -1981,17 +2765,24 @@ async fn load_mcp_resources(
         )
         .await
         .map_err(|error| pg_error(OPERATION_MCP_READ, error))?;
+    const REASON: &str = "MCP resource column does not decode as its schema type";
     rows.iter()
         .map(|row| {
             Ok(StoredMcpResource {
-                uri: row.get(0),
-                name: row.get(1),
-                title: row.get(2),
-                description: row.get(3),
-                mime_type: row.get(4),
-                size: row
-                    .get::<_, Option<i64>>(5)
-                    .map(|size| u64::try_from(size).unwrap_or(u64::MAX)),
+                uri: column(row, 0, id.as_str(), REASON)?,
+                name: column(row, 1, id.as_str(), REASON)?,
+                title: column(row, 2, id.as_str(), REASON)?,
+                description: column(row, 3, id.as_str(), REASON)?,
+                mime_type: column(row, 4, id.as_str(), REASON)?,
+                // A negative persisted size is corruption, not a resource
+                // of size `u64::MAX`: the SQLite loader raises
+                // `CorruptRecord { reason: "invalid MCP resource size" }`
+                // for the same row and this must too.
+                size: column::<Option<i64>>(row, 5, id.as_str(), REASON)?
+                    .map(|size| {
+                        u64::try_from(size).map_err(|_| corrupt(id, "invalid MCP resource size"))
+                    })
+                    .transpose()?,
             })
         })
         .collect()
@@ -2013,14 +2804,15 @@ async fn load_mcp_resource_templates(
         )
         .await
         .map_err(|error| pg_error(OPERATION_MCP_READ, error))?;
+    const REASON: &str = "MCP resource template column does not decode as its schema type";
     rows.iter()
         .map(|row| {
             Ok(StoredMcpResourceTemplate {
-                uri_template: row.get(0),
-                name: row.get(1),
-                title: row.get(2),
-                description: row.get(3),
-                mime_type: row.get(4),
+                uri_template: column(row, 0, id.as_str(), REASON)?,
+                name: column(row, 1, id.as_str(), REASON)?,
+                title: column(row, 2, id.as_str(), REASON)?,
+                description: column(row, 3, id.as_str(), REASON)?,
+                mime_type: column(row, 4, id.as_str(), REASON)?,
             })
         })
         .collect()
@@ -2033,7 +2825,7 @@ async fn load_openapi_entries(
     let rows = client
         .query(
             r#"
-            SELECT tool_name, operation_id, selected_scheme_names_json::text, definition_json::text
+            SELECT tool_name, operation_id, selected_scheme_names_json, definition_json
             FROM greengateway.connection_openapi_catalog_entries
             WHERE connection_id = $1::text::uuid
             ORDER BY ordinal
@@ -2044,15 +2836,74 @@ async fn load_openapi_entries(
         .map_err(|error| pg_error(OPERATION_OPENAPI_READ, error))?;
     rows.iter()
         .map(|row| {
-            let selected: Vec<String> = serde_json::from_str(&row.get::<_, String>(2))
-                .map_err(|_| corrupt(id, "OpenAPI selected schemes are not valid JSON"))?;
-            let definition: Value = serde_json::from_str(&row.get::<_, String>(3))
-                .map_err(|_| corrupt(id, "OpenAPI tool definition is not valid JSON"))?;
+            const REASON: &str = "OpenAPI catalog entry column does not decode as its schema type";
+            let selected: Vec<String> =
+                serde_json::from_str(&column::<String>(row, 2, id.as_str(), REASON)?)
+                    .map_err(|_| corrupt(id, "OpenAPI selected schemes are not valid JSON"))?;
+            let definition: Value =
+                serde_json::from_str(&column::<String>(row, 3, id.as_str(), REASON)?)
+                    .map_err(|_| corrupt(id, "OpenAPI tool definition is not valid JSON"))?;
             Ok(StoredOpenApiCatalogEntry {
-                tool_name: row.get(0),
-                operation_id: row.get(1),
+                tool_name: column(row, 0, id.as_str(), REASON)?,
+                operation_id: column(row, 1, id.as_str(), REASON)?,
                 selected_scheme_names: selected,
                 definition,
+            })
+        })
+        .collect()
+}
+
+/// One connection's dependency rows, bounded and sorted. The caller runs
+/// this inside a snapshot: the existence check and the rows it guards
+/// have to describe the same instant, or a concurrent delete turns a
+/// `NotFound` into an empty list (or the reverse).
+async fn load_dependencies(
+    client: &deadpool_postgres::Object,
+    id: &ConnectionId,
+) -> Result<Vec<ConnectionDependency>, ConnectionStoreError> {
+    let exists_row = client
+        .query_one(
+            "SELECT EXISTS(\
+             SELECT 1 FROM greengateway.connection_records WHERE id = $1::text::uuid)",
+            &[&id.as_str()],
+        )
+        .await
+        .map_err(|error| pg_error(OPERATION_DEPS_READ, error))?;
+    let exists: bool = scalar(&exists_row, 0, OPERATION_DEPS_READ)?;
+    if !exists {
+        return Err(ConnectionStoreError::NotFound { id: id.to_string() });
+    }
+    let rows = client
+        .query(
+            r#"
+            SELECT consumer_kind, consumer_id
+            FROM greengateway.connection_dependencies
+            WHERE connection_id = $1::text::uuid
+            ORDER BY consumer_kind ASC, consumer_id ASC
+            LIMIT $2
+            "#,
+            &[
+                &id.as_str(),
+                &(usize_to_i64(MAX_CONNECTION_DEPENDENCIES + 1)),
+            ],
+        )
+        .await
+        .map_err(|error| pg_error(OPERATION_DEPS_READ, error))?;
+    if rows.len() > MAX_CONNECTION_DEPENDENCIES {
+        return Err(ConnectionStoreError::LimitExceeded {
+            resource: "connection dependencies",
+            maximum: MAX_CONNECTION_DEPENDENCIES,
+        });
+    }
+    const REASON: &str = "dependency column does not decode as its schema type";
+    rows.iter()
+        .map(|row| {
+            let raw_kind: String = column(row, 0, id.as_str(), REASON)?;
+            let kind = ConnectionDependencyKind::parse(&raw_kind)
+                .ok_or_else(|| corrupt(id, "unknown dependency kind"))?;
+            Ok(ConnectionDependency {
+                kind,
+                consumer_id: column(row, 1, id.as_str(), REASON)?,
             })
         })
         .collect()
@@ -2084,15 +2935,45 @@ fn managed_catalog_kind_changed(current: &StoredConnection, candidate: &Connecti
 }
 
 async fn count_records(client: &deadpool_postgres::Object) -> Result<usize, ConnectionStoreError> {
-    let count: i64 = client
+    let count_row = client
         .query_one("SELECT COUNT(*) FROM greengateway.connection_records", &[])
         .await
-        .map_err(|error| pg_error(OPERATION_LIST, error))?
-        .get(0);
+        .map_err(|error| pg_error(OPERATION_LIST, error))?;
+    let count: i64 = scalar(&count_row, 0, OPERATION_LIST)?;
     usize::try_from(count).map_err(|_| ConnectionStoreError::CorruptRecord {
         id: "<collection>".to_owned(),
         reason: "negative or oversized record count",
     })
+}
+
+/// Every record, ordered by ID. The reference orders the same way
+/// (`load_all_records`, store.rs: `ORDER BY id ASC` over the TEXT ID) and
+/// its `list` is that function verbatim; ordering by `created_at` instead
+/// would put two records written in the same timestamp granularity in an
+/// order the reference never produces. `id` is a `uuid` here, whose
+/// comparison is over the same 16 bytes that the canonical lowercase text
+/// form spells out at fixed positions, so the two orderings agree and the
+/// primary-key index still serves this.
+async fn load_all_records(
+    client: &deadpool_postgres::Object,
+    operation: &'static str,
+) -> Result<Vec<StoredConnection>, ConnectionStoreError> {
+    let rows = client
+        .query(
+            r#"
+            SELECT id::text, schema_version, source, spec_json, connection_revision,
+                   credential_revision, tls_revision, discovery_revision,
+                   status_revision, created_at, updated_at
+            FROM greengateway.connection_records
+            ORDER BY id ASC
+            "#,
+            &[],
+        )
+        .await
+        .map_err(|error| pg_error(operation, error))?;
+    rows.iter()
+        .map(|row| RawConnectionRow::from_row(row)?.into_stored())
+        .collect()
 }
 
 async fn load_record(
@@ -2104,7 +2985,7 @@ async fn load_record(
         .query_opt(record_query("").as_str(), &[&id.as_str()])
         .await
         .map_err(|error| pg_error(operation, error))?;
-    row.map(|row| RawConnectionRow::from_row(&row).into_stored())
+    row.map(|row| RawConnectionRow::from_row(&row)?.into_stored())
         .transpose()
 }
 
@@ -2117,14 +2998,14 @@ async fn load_record_for_update(
         .query_opt(record_query(" FOR UPDATE").as_str(), &[&id.as_str()])
         .await
         .map_err(|error| pg_error(operation, error))?;
-    row.map(|row| RawConnectionRow::from_row(&row).into_stored())
+    row.map(|row| RawConnectionRow::from_row(&row)?.into_stored())
         .transpose()
 }
 
 fn record_query(lock: &str) -> String {
     format!(
         r#"
-        SELECT id::text, schema_version, source, spec_json::text, connection_revision,
+        SELECT id::text, schema_version, source, spec_json, connection_revision,
                credential_revision, tls_revision, discovery_revision,
                status_revision, created_at, updated_at
         FROM greengateway.connection_records
@@ -2152,10 +3033,17 @@ async fn validate_bindings(
         )
         .await
         .map_err(|error| pg_error(OPERATION_GET, error))?;
+    const REASON: &str = "credential binding column does not decode as its schema type";
     let mut actual: Vec<(String, String, i64)> = rows
         .iter()
-        .map(|row| (row.get(0), row.get(1), row.get(2)))
-        .collect();
+        .map(|row| {
+            Ok((
+                column(row, 0, record.id.as_str(), REASON)?,
+                column(row, 1, record.id.as_str(), REASON)?,
+                column(row, 2, record.id.as_str(), REASON)?,
+            ))
+        })
+        .collect::<Result<Vec<_>, ConnectionStoreError>>()?;
     let mut expected: Vec<(String, String, i64)> =
         expected_bindings(&record.write, &record.revisions)
             .into_iter()
@@ -2220,28 +3108,28 @@ async fn ensure_binding_capacity(
     replaced_binding_count: usize,
     candidate_binding_count: usize,
 ) -> Result<(), ConnectionStoreError> {
-    let persisted: i64 = client
+    let persisted_row = client
         .query_one(
             "SELECT COUNT(*) FROM greengateway.connection_credential_bindings",
             &[],
         )
         .await
-        .map_err(|error| pg_error(OPERATION_CREATE, error))?
-        .get(0);
+        .map_err(|error| pg_error(OPERATION_CREATE, error))?;
+    let persisted: i64 = scalar(&persisted_row, 0, OPERATION_CREATE)?;
     let persisted =
         usize::try_from(persisted).map_err(|_| ConnectionStoreError::CorruptRecord {
             id: "<bindings>".to_owned(),
             reason: "negative or oversized binding count",
         })?;
     if let Some(id) = replaced_id {
-        let record_bindings: i64 = client
+        let record_bindings_row = client
             .query_one(
                 "SELECT COUNT(*) FROM greengateway.connection_credential_bindings WHERE connection_id = $1::text::uuid",
                 &[&id.as_str()],
             )
             .await
-            .map_err(|error| pg_error(OPERATION_CREATE, error))?
-            .get(0);
+            .map_err(|error| pg_error(OPERATION_CREATE, error))?;
+        let record_bindings: i64 = scalar(&record_bindings_row, 0, OPERATION_CREATE)?;
         if usize::try_from(record_bindings).ok() != Some(replaced_binding_count) {
             return Err(ConnectionStoreError::CorruptRecord {
                 id: id.to_string(),
@@ -2273,26 +3161,14 @@ async fn append_version(
     id: &ConnectionId,
     version: u64,
     spec_json: &str,
-    write: &ConnectionWrite,
     actor_user_id: &str,
 ) -> Result<(), ConnectionStoreError> {
-    let revisions = ConnectionRevisions {
-        connection: version,
-        credential: 0,
-        tls: 0,
-        discovery: 0,
-        status: 0,
-    };
-    let _ = write;
-    let _ = revisions;
-    // The document etag: the same derivation the active row's etag uses,
-    // recomputed from the persisted spec plus its revisions. Binding the
-    // etag here would require the axis revisions of this exact version;
-    // callers pass the freshly computed set, so derive directly.
-    // (The active-row etag is computed by StoredConnection::etag; for the
-    // version row we hash the spec document itself -- the version is
-    // already addressable by (id, version), and the hash guards the body
-    // against out-of-band edits.)
+    // The document etag hashes the spec document itself rather than
+    // reusing the active row's etag derivation. The active-row etag
+    // (`StoredConnection::etag`) is keyed by the five axis revisions, and a
+    // version row does not have them: it is already addressable by
+    // (id, version). What the etag is for here is guarding the stored body
+    // against an out-of-band edit, which the spec bytes alone answer.
     let digest = {
         use sha2::Digest;
         let mut hasher = sha2::Sha256::new();
@@ -2306,7 +3182,7 @@ async fn append_version(
             r#"
             INSERT INTO greengateway.connection_documents (
                 connection_id, version, spec, document_etag, actor_user_id, diff_summary
-            ) VALUES ($1::text::uuid, $2, $3::text::jsonb, $4, $5, '{}'::text::jsonb)
+            ) VALUES ($1::text::uuid, $2, $3, $4, $5, '{}'::text::jsonb)
             "#,
             &[
                 &id.as_str(),
@@ -2321,12 +3197,38 @@ async fn append_version(
     Ok(())
 }
 
+/// The outbox `resource_type` for a specification-version transition:
+/// `from_version`/`to_version` are `connection_documents.version` values,
+/// which is also `connection_records.connection_revision`. Reading every
+/// `resource_type = 'connection'` row for one `resource_id` in revision
+/// order therefore reconstructs that Connection's version chain exactly.
+/// `to_version` 0 marks a deletion (specification versions start at 1).
+const RESOURCE_CONNECTION: &str = "connection";
+
+/// The outbox `resource_type` for a catalog replacement.
+///
+/// A catalog replacement advances the per-connection CATALOG revision --
+/// `connection_mcp_catalogs.catalog_revision` or
+/// `connection_openapi_catalogs.catalog_revision` -- and leaves the
+/// specification version untouched. Emitting those numbers under
+/// `'connection'` put two unrelated counters in one column, so a consumer
+/// reconstructing a version chain from `outbox_after`
+/// (storage/postgres_policy.rs, which returns `from_version`/`to_version`
+/// verbatim) saw a non-monotonic interleaving of the two. Its own label
+/// keeps both sequences readable without changing the outbox schema or
+/// breaking `outbox_after`'s existing 'policy'/'tools'/'connection'
+/// consumers: `resource_type` is unconstrained text and no consumer
+/// filters on 'connection' today.
+const RESOURCE_CONNECTION_CATALOG: &str = "connection_catalog";
+
 /// Advance the shared security revision and the connections high-water
 /// mark and append the outbox row, all inside the caller's transaction:
 /// a connection mutation cannot succeed without its durable record.
-/// `to_version` 0 marks a deletion (specification versions start at 1).
+/// `resource_type` says which counter `from_version`/`to_version` carry;
+/// see the two constants above.
 async fn bump_connection_state(
     client: &deadpool_postgres::Object,
+    resource_type: &str,
     id: &ConnectionId,
     from_version: Option<u64>,
     to_version: u64,
@@ -2336,7 +3238,7 @@ async fn bump_connection_state(
         None => 0,
     };
     let to = u64_to_i64(id, to_version)?;
-    let security_revision: i64 = client
+    let revision_row = client
         .query_one(
             r#"
             UPDATE greengateway.security_revision_state
@@ -2347,16 +3249,29 @@ async fn bump_connection_state(
             &[],
         )
         .await
-        .map_err(|error| pg_error(OPERATION_CREATE, error))?
-        .get(0);
+        .map_err(|error| pg_error(OPERATION_CREATE, error))?;
+    let security_revision: i64 = scalar(&revision_row, 0, OPERATION_CREATE)?;
+    // The connections high-water mark is SET to the shared revision this
+    // transaction just took, never incremented on its own.
+    //
+    // `ConnectionsResource::activation_revision` returns this value and the
+    // gate compares it against `ClusterSecurityRuntime`'s compiled
+    // watermark, which tracks the shared counter that policy and tools
+    // commits also advance. A private per-resource counter would therefore
+    // drift permanently below that watermark, `activation > compiled` would
+    // stop being true, and connection commits would silently stop
+    // triggering reconciliation on every replica -- the exact stale-allow
+    // the gate exists to prevent. Policy and tools avoid this by recording
+    // the shared revision on the document itself; connections record it
+    // here.
     client
         .execute(
             r#"
             UPDATE greengateway.connection_state_revision
-            SET last_revision = last_revision + 1
+            SET last_revision = $1
             WHERE singleton
             "#,
-            &[],
+            &[&security_revision],
         )
         .await
         .map_err(|error| pg_error(OPERATION_CREATE, error))?;
@@ -2365,24 +3280,131 @@ async fn bump_connection_state(
             r#"
             INSERT INTO greengateway.security_outbox (
                 revision, resource_type, from_version, to_version, resource_id
-            ) VALUES ($1, 'connection', $2, $3, $4::text)
+            ) VALUES ($1, $2, $3, $4, $5::text)
             "#,
-            &[&security_revision, &from, &to, &id.as_str()],
+            &[&security_revision, &resource_type, &from, &to, &id.as_str()],
         )
         .await
         .map_err(|error| pg_error(OPERATION_CREATE, error))?;
     Ok(())
 }
 
-async fn transaction(
-    client: deadpool_postgres::Object,
+/// Open a mutating transaction: `BEGIN`, then immediately take the one
+/// lock that serializes connection mutations.
+///
+/// Every mutating path goes through this, so no capacity check can be
+/// written that runs outside the lock.
+async fn begin_mutation(
+    client: &deadpool_postgres::Object,
     operation: &'static str,
-) -> Result<deadpool_postgres::Object, ConnectionStoreError> {
+) -> Result<(), ConnectionStoreError> {
     client
         .batch_execute("BEGIN")
         .await
         .map_err(|error| pg_error(operation, error))?;
-    Ok(client)
+    if let Err(error) = lock_connection_state(client, operation).await {
+        // The transaction is already open; close it before handing the
+        // connection back to the pool.
+        let _ = client.batch_execute("ROLLBACK").await;
+        return Err(error);
+    }
+    Ok(())
+}
+
+/// The serializing lock every mutating connection transaction takes
+/// FIRST, before its first global aggregate read.
+///
+/// PostgreSQL runs these transactions at READ COMMITTED, where a
+/// `COUNT(*)` taken before an INSERT is only a hint: two transactions can
+/// both read `maximum - 1` and both insert, and the bound is exceeded.
+/// The SQLite reference store cannot do that -- every mutation opens with
+/// `TransactionBehavior::Immediate`, which takes the database write lock
+/// *before* the first count, so the count is authoritative
+/// (store.rs `create`, `add_dependency`, `replace_dependencies_for_kind`,
+/// the catalog replacements). `SELECT ... FOR UPDATE` on the record row
+/// is not equivalent: it serializes writers on one connection, not
+/// writers against the *global* aggregates (record count, binding count,
+/// catalog entries and bytes, dependency count) that those checks read.
+///
+/// `connection_state_revision` is a single row, so locking it is exactly
+/// SQLite's write lock: every mutating connection transaction is
+/// serialized against every other one, counts included. It is the row
+/// `bump_connection_state` already advances, so no mutating path pays for
+/// a lock it did not already need.
+///
+/// Lock order -- identical in every mutating path, which is what makes a
+/// deadlock between two of them impossible:
+///
+/// 1. `greengateway.connection_state_revision` (this singleton row),
+/// 2. the `greengateway.connection_records` row, under the existing
+///    `SELECT ... FOR UPDATE`,
+/// 3. `greengateway.security_revision_state` (the singleton
+///    `bump_connection_state` updates last).
+///
+/// Readers take none of these -- they use a `REPEATABLE READ` snapshot
+/// instead (see `begin_snapshot`) -- and `remove_dependency` takes none
+/// because deleting a row cannot exceed a bound; the SQLite store
+/// likewise runs `remove_dependency` outside a transaction.
+async fn lock_connection_state(
+    client: &deadpool_postgres::Object,
+    operation: &'static str,
+) -> Result<(), ConnectionStoreError> {
+    let locked = client
+        .query_opt(
+            "SELECT last_revision FROM greengateway.connection_state_revision \
+             WHERE singleton FOR UPDATE",
+            &[],
+        )
+        .await
+        .map_err(|error| pg_error(operation, error))?;
+    if locked.is_none() {
+        return Err(ConnectionStoreError::CorruptRecord {
+            id: "<connection-state>".to_owned(),
+            reason: "the connection state revision row is missing",
+        });
+    }
+    Ok(())
+}
+
+/// Open a reader's transaction.
+///
+/// `REPEATABLE READ` gives every statement in the reader one snapshot,
+/// which is what the SQLite store gets for free: `list` and `get` read
+/// the record and validate its credential bindings inside a single
+/// transaction (store.rs `list`/`get`, pinned by
+/// `record_and_bindings_are_read_from_one_wal_snapshot`), and the catalog
+/// and dependency readers hold the store's connection mutex across their
+/// header and child queries. Issued separately under READ COMMITTED, a
+/// concurrent commit landing between the two queries makes a healthy
+/// record read as corrupt -- a spurious fail-closed on live data.
+async fn begin_snapshot(
+    client: &deadpool_postgres::Object,
+    operation: &'static str,
+) -> Result<(), ConnectionStoreError> {
+    client
+        .batch_execute("BEGIN ISOLATION LEVEL REPEATABLE READ")
+        .await
+        .map_err(|error| pg_error(operation, error))
+}
+
+/// Close a reader's snapshot: commit on success, roll back on failure so
+/// an aborted read never leaves an open transaction on a pooled
+/// connection.
+async fn finish_read<T>(
+    client: &deadpool_postgres::Object,
+    operation: &'static str,
+    outcome: Result<T, ConnectionStoreError>,
+) -> Result<T, ConnectionStoreError> {
+    match outcome {
+        Ok(value) => {
+            commit(client, operation).await?;
+            Ok(value)
+        }
+        Err(error) => {
+            let _ = client.batch_execute("ROLLBACK").await;
+            Err(error)
+        }
+    }
 }
 
 async fn commit(
@@ -2528,7 +3550,11 @@ mod tests {
             .await
             .expect("schema should migrate");
         let pool = foundation.pool().clone();
-        (PostgresConnectionStore::new(pool.clone(), maximum), pool)
+        (
+            PostgresConnectionStore::new(pool.clone(), maximum)
+                .expect("the test maximum is within the hard ceiling"),
+            pool,
+        )
     }
 
     fn http_candidate(display_name: &str) -> ConnectionWrite {
@@ -2770,8 +3796,8 @@ mod tests {
             .expect("create should commit");
         let etag = created.etag();
 
-        let store_a = PostgresConnectionStore::new(pool.clone(), 64);
-        let store_b = PostgresConnectionStore::new(pool.clone(), 64);
+        let store_a = PostgresConnectionStore::new(pool.clone(), 64).expect("store a");
+        let store_b = PostgresConnectionStore::new(pool.clone(), 64).expect("store b");
         let (a, b) = tokio::join!(
             store_a.replace(
                 &created.id,
@@ -2844,6 +3870,230 @@ mod tests {
         );
     }
 
+    /// The same shape as `http_candidate`, with the bearer secret under
+    /// the caller's control: changing it moves the credential axis, so
+    /// the derived binding row's `secret_id` *and* `binding_version` both
+    /// change with the record.
+    fn http_candidate_with_secret(display_name: &str, secret_id: &str) -> ConnectionWrite {
+        serde_json::from_value(json!({
+            "display_name": display_name,
+            "enabled": false,
+            "kind": "http_api",
+            "endpoint": {
+                "base_url": "https://billing.example.test",
+                "base_path": "/v1"
+            },
+            "authentication": {
+                "type": "static_bearer",
+                "secret_id": secret_id
+            },
+            "tls": {},
+            "discovery": {
+                "type": "managed_openapi",
+                "path": "/openapi.json",
+                "use_connection_authentication": true
+            }
+        }))
+        .expect("candidate should deserialize")
+    }
+
+    /// The capacity bound is global, so the lock that makes it hold has to
+    /// be global too. Two replicas race the last free slot from separate
+    /// pools: without the `connection_state_revision` lock taken before
+    /// the count, both read `maximum - 1` under READ COMMITTED and both
+    /// commit, and the store ends up over its configured maximum.
+    #[tokio::test]
+    async fn concurrent_creates_at_capacity_produce_exactly_one_winner() {
+        let Some(admin_dsn) = locator() else {
+            eprintln!("skipping: no test database locator; CI runs this test");
+            return;
+        };
+        let database = create_test_database(&admin_dsn).await;
+        let (store_a, pool_a) = migrated_store(&database.dsn, 1).await;
+        let (store_b, _pool_b) = migrated_store(&database.dsn, 1).await;
+
+        let (a, b) = tokio::join!(
+            store_a.create(http_candidate("Replica A"), "replica-a"),
+            store_b.create(http_candidate("Replica B"), "replica-b")
+        );
+        let winners = usize::from(a.is_ok()) + usize::from(b.is_ok());
+        assert_eq!(winners, 1, "the last free slot is taken exactly once");
+        let loser = match (a, b) {
+            (Ok(_), Err(error)) | (Err(error), Ok(_)) => error,
+            _ => unreachable!("exactly one winner was just asserted"),
+        };
+        assert!(
+            matches!(
+                loser,
+                ConnectionStoreError::LimitExceeded {
+                    resource: "managed connections",
+                    maximum: 1,
+                }
+            ),
+            "{loser}"
+        );
+        assert_eq!(
+            count(
+                &pool_a,
+                "SELECT COUNT(*) FROM greengateway.connection_records"
+            )
+            .await,
+            1,
+            "the loser's transaction wrote nothing"
+        );
+        assert_eq!(
+            count(
+                &pool_a,
+                "SELECT COUNT(*) FROM greengateway.connection_documents"
+            )
+            .await,
+            1,
+            "and appended no specification version"
+        );
+    }
+
+    /// A record and the credential bindings it is validated against must
+    /// come from one instant, or a replacement committing between the two
+    /// reads makes a healthy record read as corrupt. The SQLite store gets
+    /// this from its single transaction
+    /// (`record_and_bindings_are_read_from_one_wal_snapshot`); here it is
+    /// the reader's `REPEATABLE READ` snapshot.
+    #[tokio::test]
+    async fn record_and_bindings_are_read_from_one_snapshot() {
+        let Some(admin_dsn) = locator() else {
+            eprintln!("skipping: no test database locator; CI runs this test");
+            return;
+        };
+        let database = create_test_database(&admin_dsn).await;
+        let (reader, reader_pool) = migrated_store(&database.dsn, 64).await;
+        let (writer, _writer_pool) = migrated_store(&database.dsn, 64).await;
+
+        let created = reader
+            .create(
+                http_candidate_with_secret("Snapshot", "billing-token"),
+                "op-1",
+            )
+            .await
+            .expect("create should commit");
+
+        // The negative control, and the reason the snapshot is needed:
+        // read the record and its bindings as two autocommit statements
+        // and let a replacement land between them. The record is healthy
+        // and the bindings are healthy, but they describe two different
+        // instants, so the comparison reports corruption.
+        let client = reader_pool.get().await.expect("reader checkout");
+        let stale = load_record(&client, &created.id, OPERATION_GET)
+            .await
+            .expect("record read")
+            .expect("record exists");
+        let replaced = writer
+            .replace(
+                &created.id,
+                &stale.etag(),
+                http_candidate_with_secret("Snapshot", "billing-token-v2"),
+                "op-2",
+            )
+            .await
+            .expect("the concurrent replacement should commit");
+        let spurious = validate_bindings(&client, &stale)
+            .await
+            .expect_err("two autocommit reads see two instants");
+        assert!(
+            matches!(spurious, ConnectionStoreError::CorruptRecord { .. }),
+            "{spurious}"
+        );
+        drop(client);
+
+        // The same interleaving inside the reader's snapshot: the bindings
+        // are read from the instant the record was, so the commit in
+        // between is invisible and the healthy record stays healthy.
+        let client = reader_pool.get().await.expect("reader checkout");
+        begin_snapshot(&client, OPERATION_GET)
+            .await
+            .expect("the reader's snapshot should begin");
+        let snapshot = load_record(&client, &created.id, OPERATION_GET)
+            .await
+            .expect("record read")
+            .expect("record exists");
+        let replaced_again = writer
+            .replace(
+                &created.id,
+                &replaced.etag(),
+                http_candidate_with_secret("Snapshot", "billing-token-v3"),
+                "op-3",
+            )
+            .await
+            .expect("the second concurrent replacement should commit");
+        validate_bindings(&client, &snapshot)
+            .await
+            .expect("binding validation must use the record's own snapshot");
+        commit(&client, OPERATION_GET)
+            .await
+            .expect("the read transaction should commit");
+        drop(client);
+
+        // And the public readers serve the committed state afterwards.
+        let after = reader
+            .get(&created.id)
+            .await
+            .expect("get should succeed")
+            .expect("the record remains");
+        assert_eq!(after.etag(), replaced_again.etag());
+        assert_eq!(reader.list().await.expect("list should succeed").len(), 1);
+    }
+
+    /// A persisted dependency count past the bound is refused, not served:
+    /// the SQLite reader raises `LimitExceeded` for the same row
+    /// (store.rs `dependency_counts`), where saturating the conversion
+    /// would have skipped the bound entirely.
+    #[tokio::test]
+    async fn dependency_counts_fail_closed_above_the_dependency_bound() {
+        let Some(admin_dsn) = locator() else {
+            eprintln!("skipping: no test database locator; CI runs this test");
+            return;
+        };
+        let database = create_test_database(&admin_dsn).await;
+        let (store, pool) = migrated_store(&database.dsn, 64).await;
+        let created = store
+            .create(http_candidate("Counted"), "op-1")
+            .await
+            .expect("create should commit");
+
+        let excess = i32::try_from(MAX_CONNECTION_DEPENDENCIES + 1)
+            .expect("the dependency bound fits in an int4");
+        pool.get()
+            .await
+            .expect("dependency checkout")
+            .execute(
+                r#"
+                INSERT INTO greengateway.connection_dependencies (
+                    connection_id, consumer_kind, consumer_id, created_at
+                )
+                SELECT $1::text::uuid, 'proxy_route', 'route-' || series.ordinal,
+                       '2026-01-01T00:00:00Z'
+                FROM generate_series(1, $2::int) AS series(ordinal)
+                "#,
+                &[&created.id.as_str(), &excess],
+            )
+            .await
+            .expect("out-of-band dependency rows should insert");
+
+        let error = store
+            .dependency_counts()
+            .await
+            .expect_err("a count past the bound must fail closed");
+        assert!(
+            matches!(
+                error,
+                ConnectionStoreError::LimitExceeded {
+                    resource: "connection dependencies",
+                    ..
+                }
+            ),
+            "{error}"
+        );
+    }
+
     fn mcp_candidate() -> ConnectionWrite {
         serde_json::from_value(json!({
             "display_name": "Managed MCP",
@@ -2869,6 +4119,156 @@ mod tests {
             description: format!("{name} description"),
             input_schema: json!({ "type": "object", "properties": {} }),
         }
+    }
+
+    /// Changing a Connection's managed-catalog kind while a catalog is
+    /// still published must be refused, not silently applied.
+    ///
+    /// The catalog's rows are attributed to the kind that produced them: an
+    /// MCP catalog's entries each own a `managed_tool` dependency row, and
+    /// the tool registry serves definitions derived from them. Letting the
+    /// kind change out from under those rows would leave the registry
+    /// advertising MCP tools for a Connection the authority now says is an
+    /// OpenAPI one -- tools bound to an upstream contract nothing checks
+    /// them against any more. The SQLite reference refuses it
+    /// (`store.rs`, the `managed_catalog_kind_changed` branch of `replace`)
+    /// and so must the authority.
+    ///
+    /// Withdraw the catalog first and the same replace is allowed, which is
+    /// what makes this a guard rather than a permanent lock.
+    #[tokio::test]
+    async fn changing_the_catalog_kind_under_a_published_catalog_is_refused() {
+        let Some(admin_dsn) = locator() else {
+            eprintln!("skipping: no test database locator; CI runs this test");
+            return;
+        };
+        let database = create_test_database(&admin_dsn).await;
+        let (store, pool) = migrated_store(&database.dsn, 64).await;
+        let created = store
+            .create(mcp_candidate(), "op-1")
+            .await
+            .expect("MCP connection should create");
+        store
+            .replace_mcp_catalog(
+                &created.id,
+                &created.etag(),
+                &[mcp_entry("alpha"), mcp_entry("beta")],
+                &[],
+                &[],
+                "op-2",
+            )
+            .await
+            .expect("catalog replace should win");
+        assert_eq!(
+            count(
+                &pool,
+                "SELECT COUNT(*) FROM greengateway.connection_dependencies \
+                 WHERE consumer_kind = 'managed_tool'",
+            )
+            .await,
+            2,
+            "the published catalog owns one managed-tool dependency per entry"
+        );
+
+        let current = store
+            .get(&created.id)
+            .await
+            .expect("record read")
+            .expect("record exists");
+        let mut different_kind: ConnectionWrite = serde_json::from_value(json!({
+            "display_name": "Now an OpenAPI connection",
+            "enabled": true,
+            "kind": "http_api",
+            "endpoint": {
+                "base_url": "https://mcp.example.test",
+                "base_path": "/mcp"
+            },
+            "authentication": { "type": "none" },
+            "tls": {},
+            "discovery": {
+                "type": "managed_openapi",
+                "use_connection_authentication": false
+            }
+        }))
+        .expect("OpenAPI candidate should deserialize");
+
+        let refused = store
+            .replace(&created.id, &current.etag(), different_kind.clone(), "op-3")
+            .await
+            .expect_err("the kind change must be refused while a catalog is published");
+        assert!(
+            matches!(
+                refused,
+                ConnectionStoreError::DependencyConflict { count: 2, .. }
+            ),
+            "the refusal names the managed-tool rows that block it, got {refused:?}"
+        );
+
+        // Nothing partially applied: the record, its catalog, and its
+        // dependency rows are exactly as they were.
+        let unchanged = store
+            .get(&created.id)
+            .await
+            .expect("record read")
+            .expect("record exists");
+        assert_eq!(
+            unchanged, current,
+            "a refused kind change leaves the record untouched"
+        );
+        assert_eq!(
+            count(
+                &pool,
+                "SELECT COUNT(*) FROM greengateway.connection_mcp_catalogs",
+            )
+            .await,
+            1,
+            "the published catalog survives the refusal"
+        );
+        assert_eq!(
+            count(
+                &pool,
+                "SELECT COUNT(*) FROM greengateway.connection_dependencies \
+                 WHERE consumer_kind = 'managed_tool'",
+            )
+            .await,
+            2,
+            "the dependency rows survive the refusal"
+        );
+
+        // Withdraw the catalog, and the same replace is now allowed: the
+        // guard tracks live rows, it does not pin the kind forever.
+        store
+            .replace_mcp_catalog(&created.id, &unchanged.etag(), &[], &[], &[], "op-4")
+            .await
+            .expect("emptying the catalog should win");
+        let after_withdrawal = store
+            .get(&created.id)
+            .await
+            .expect("record read")
+            .expect("record exists");
+        different_kind.display_name = "Now an OpenAPI connection".to_owned();
+        let replaced = store
+            .replace(
+                &created.id,
+                &after_withdrawal.etag(),
+                different_kind,
+                "op-5",
+            )
+            .await
+            .expect("the kind change is allowed once no managed-tool rows remain");
+        assert_eq!(
+            replaced.write.kind,
+            crate::connections::model::ConnectionKind::HttpApi
+        );
+        assert_eq!(
+            count(
+                &pool,
+                "SELECT COUNT(*) FROM greengateway.connection_mcp_catalogs",
+            )
+            .await,
+            0,
+            "the obsolete catalog is dropped with the kind change"
+        );
     }
 
     #[tokio::test]
@@ -2988,6 +4388,115 @@ mod tests {
         assert_eq!(second.catalog_revision, 2);
         let dependencies = store.dependencies(&created.id).await.expect("dependencies");
         assert_eq!(dependencies.len(), 3, "dependencies follow the new catalog");
+    }
+
+    /// The retained half of the MCP catalog byte budget must measure the
+    /// same three tables the candidate half does (`validate_mcp_catalog`'s
+    /// `stored_bytes`). Summing entries alone made every stored resource
+    /// and resource template free, so the two halves of the comparison
+    /// described different quantities.
+    #[tokio::test]
+    async fn retained_mcp_catalog_bytes_charge_entries_resources_and_templates() {
+        let Some(admin_dsn) = locator() else {
+            eprintln!("skipping: no test database locator; CI runs this test");
+            return;
+        };
+        let database = create_test_database(&admin_dsn).await;
+        let (store, pool) = migrated_store(&database.dsn, 64).await;
+        let created = store
+            .create(mcp_candidate(), "op-1")
+            .await
+            .expect("MCP connection should create");
+
+        let entry = mcp_entry("alpha");
+        let resource = StoredMcpResource {
+            uri: "res://alpha".to_owned(),
+            name: "alpha".to_owned(),
+            title: Some("Alpha".to_owned()),
+            description: None,
+            mime_type: Some("text/plain".to_owned()),
+            size: Some(12),
+        };
+        let template = StoredMcpResourceTemplate {
+            uri_template: "res://alpha/{id}".to_owned(),
+            name: "alpha-template".to_owned(),
+            title: None,
+            description: Some("templated alpha".to_owned()),
+            mime_type: None,
+        };
+        store
+            .replace_mcp_catalog(
+                &created.id,
+                &created.etag(),
+                std::slice::from_ref(&entry),
+                std::slice::from_ref(&resource),
+                std::slice::from_ref(&template),
+                "op-2",
+            )
+            .await
+            .expect("catalog replace should win");
+
+        fn optional_len(value: &Option<String>) -> usize {
+            value.as_ref().map_or(0, String::len)
+        }
+        let encoded_schema =
+            serde_json::to_string(&entry.input_schema).expect("entry schema should encode");
+        let entry_bytes =
+            entry.remote_tool_name.len() + entry.description.len() + encoded_schema.len();
+        let resource_bytes = resource.uri.len()
+            + resource.name.len()
+            + optional_len(&resource.title)
+            + optional_len(&resource.description)
+            + optional_len(&resource.mime_type)
+            + 8;
+        let template_bytes = template.uri_template.len()
+            + template.name.len()
+            + optional_len(&template.title)
+            + optional_len(&template.description)
+            + optional_len(&template.mime_type);
+
+        let client = pool.get().await.expect("pooled client");
+        let retained = mcp_catalog_bytes(&client, None, "test retained bytes")
+            .await
+            .expect("retained byte count should read");
+        assert_eq!(
+            retained,
+            entry_bytes + resource_bytes + template_bytes,
+            "the retained sum charges entries, resources AND resource templates,              exactly as store.rs mcp_catalog_bytes does"
+        );
+        assert!(
+            retained > entry_bytes,
+            "resources and templates are not free: summing entries alone under-counts by {}",
+            resource_bytes + template_bytes
+        );
+
+        // The bytes are the ones serde_json wrote, not a jsonb rendering:
+        // the schema column is text, so this is byte-identical to SQLite.
+        let stored_schema_bytes: i64 = client
+            .query_one(
+                // octet_length is int4; the sum above is int8 because SUM
+                // widens. Cast so both read back as the same Rust type.
+                "SELECT octet_length(input_schema_json)::bigint                  FROM greengateway.connection_mcp_catalog_entries",
+                &[],
+            )
+            .await
+            .expect("stored schema length should read")
+            .get(0);
+        assert_eq!(
+            usize::try_from(stored_schema_bytes).expect("length fits"),
+            encoded_schema.len(),
+            "the persisted schema is verbatim, so both stores count the same bytes"
+        );
+
+        // The replacement preflight excludes the connection it is about to
+        // rewrite, so the only stored catalog contributes nothing.
+        let excluded = mcp_catalog_bytes(&client, Some(&created.id), "test retained bytes")
+            .await
+            .expect("excluding byte count should read");
+        assert_eq!(
+            excluded, 0,
+            "the connection being replaced is excluded from all three tables"
+        );
     }
 
     #[tokio::test]
@@ -3180,6 +4689,221 @@ mod tests {
         assert!(
             matches!(missing, ConnectionStoreError::NotFound { .. }),
             "{missing}"
+        );
+    }
+
+    /// The global status-history bound covers every persisted status row,
+    /// and a connection's current-status row is never pruned -- so the
+    /// prune has to reserve one history slot per live connection. Without
+    /// the reservation the store over-retains by exactly the number of
+    /// connections and `current + history <= MAX_STATUS_HISTORY_ROWS` --
+    /// the bound the restart preflight asserts -- stops holding. Same
+    /// shape as the SQLite store's
+    /// `global_history_pruning_preserves_every_connections_current_status`.
+    #[tokio::test]
+    async fn global_history_pruning_preserves_every_connections_current_status() {
+        let Some(admin_dsn) = locator() else {
+            eprintln!("skipping: no test database locator; CI runs this test");
+            return;
+        };
+        let database = create_test_database(&admin_dsn).await;
+        let (store, pool) = migrated_store(&database.dsn, 64).await;
+        let maximum = crate::connections::model::MAX_STATUS_HISTORY_ROWS;
+        let seed_limit = i64::try_from(maximum).expect("history limit should fit PostgreSQL");
+
+        let quiet = store
+            .create(http_candidate("Quiet API"), "op-1")
+            .await
+            .expect("quiet connection should create");
+        let noisy = store
+            .create(http_candidate("Noisy API"), "op-2")
+            .await
+            .expect("noisy connection should create");
+
+        // Quiet writes the two OLDEST history rows in the database and then
+        // never speaks again: it is the connection a global prune would
+        // otherwise evict entirely.
+        let quiet_test = store
+            .append_status(
+                &quiet.id,
+                &quiet.etag(),
+                ConnectionStatusUpdate {
+                    state: ConnectionOperationalState::Healthy,
+                    reason: ConnectionStatusReason::TestSucceeded,
+                    latency_ms: Some(3),
+                    catalog_age_secs: None,
+                    catalog_entry_count: None,
+                },
+            )
+            .await
+            .expect("quiet status should append");
+        let quiet_test_at = quiet_test
+            .observed_at
+            .expect("quiet test should carry an observation time");
+        let quiet_after_test = store
+            .get(&quiet.id)
+            .await
+            .expect("quiet Connection should load")
+            .expect("quiet Connection should remain");
+        let quiet_refresh = store
+            .append_status(
+                &quiet.id,
+                &quiet_after_test.etag(),
+                ConnectionStatusUpdate {
+                    state: ConnectionOperationalState::Healthy,
+                    reason: ConnectionStatusReason::CatalogRefreshed,
+                    latency_ms: Some(4),
+                    catalog_age_secs: Some(0),
+                    catalog_entry_count: Some(1),
+                },
+            )
+            .await
+            .expect("quiet refresh should append");
+        let quiet_refresh_at = quiet_refresh
+            .observed_at
+            .expect("quiet refresh should carry an observation time");
+        store
+            .append_status(
+                &noisy.id,
+                &noisy.etag(),
+                ConnectionStatusUpdate {
+                    state: ConnectionOperationalState::Degraded,
+                    reason: ConnectionStatusReason::RequestFailed,
+                    latency_ms: None,
+                    catalog_age_secs: None,
+                    catalog_entry_count: None,
+                },
+            )
+            .await
+            .expect("initial noisy status should append");
+
+        // Seed the noisy connection's history out of band, exactly as the
+        // SQLite fixture does, so the very next append has to prune.
+        let client = pool.get().await.expect("seed checkout");
+        client
+            .execute(
+                r#"
+                INSERT INTO greengateway.connection_status_history (
+                    connection_id, status_revision, observed_connection_revision,
+                    observed_credential_revision, observed_tls_revision,
+                    observed_discovery_revision, state, reason, observed_at
+                )
+                SELECT $1::text::uuid, revision, 1, 1, 0, 1,
+                       'degraded', 'request_failed', $2
+                FROM generate_series(2, $3::bigint) AS revision
+                "#,
+                &[
+                    &noisy.id.as_str(),
+                    &utc_timestamp().expect("timestamp should format"),
+                    &seed_limit,
+                ],
+            )
+            .await
+            .expect("noisy history rows should seed");
+        client
+            .execute(
+                "UPDATE greengateway.connection_records SET status_revision = $1 \
+                 WHERE id = $2::text::uuid",
+                &[&seed_limit, &noisy.id.as_str()],
+            )
+            .await
+            .expect("noisy record revision should update");
+        client
+            .execute(
+                "UPDATE greengateway.connection_current_status SET status_revision = $1 \
+                 WHERE connection_id = $2::text::uuid",
+                &[&seed_limit, &noisy.id.as_str()],
+            )
+            .await
+            .expect("noisy current revision should update");
+        drop(client);
+
+        let noisy_current = store
+            .get(&noisy.id)
+            .await
+            .expect("noisy Connection should load")
+            .expect("noisy Connection should remain");
+        store
+            .append_status(
+                &noisy.id,
+                &noisy_current.etag(),
+                ConnectionStatusUpdate {
+                    state: ConnectionOperationalState::Healthy,
+                    reason: ConnectionStatusReason::TestSucceeded,
+                    latency_ms: Some(4),
+                    catalog_age_secs: None,
+                    catalog_entry_count: None,
+                },
+            )
+            .await
+            .expect("bounded noisy append should succeed");
+
+        // Every connection keeps its current-status row, and the prune
+        // reserved a slot for each of them: the total is exactly the bound,
+        // not the bound plus one row per live connection.
+        let current_rows = count(
+            &pool,
+            "SELECT COUNT(*) FROM greengateway.connection_current_status",
+        )
+        .await;
+        assert_eq!(current_rows, 2, "both connections keep a current status");
+        let history_rows = count(
+            &pool,
+            "SELECT COUNT(*) FROM greengateway.connection_status_history",
+        )
+        .await;
+        assert_eq!(
+            history_rows,
+            seed_limit - current_rows,
+            "history is trimmed to the budget MINUS the retained current-status rows"
+        );
+        let total_status_rows = count(
+            &pool,
+            r#"
+            SELECT
+                (SELECT COUNT(*) FROM greengateway.connection_current_status)
+                + (SELECT COUNT(*) FROM greengateway.connection_status_history)
+            "#,
+        )
+        .await;
+        assert_eq!(
+            total_status_rows, seed_limit,
+            "the persisted status-row bound the restart preflight asserts must hold"
+        );
+
+        // The quiet connection lost its history to the global prune but
+        // kept the state that is never pruned.
+        let quiet_latest = store
+            .latest_status(&quiet.id)
+            .await
+            .expect("quiet latest query should succeed")
+            .expect("quiet current status must be retained");
+        assert_eq!(quiet_latest.state, ConnectionOperationalState::Healthy);
+        assert_eq!(
+            quiet_latest.reason,
+            ConnectionStatusReason::CatalogRefreshed
+        );
+        assert!(
+            store
+                .status_history(&quiet.id, maximum)
+                .await
+                .expect("quiet history query should succeed")
+                .is_empty(),
+            "the global prune fixture removes both quiet history rows"
+        );
+        let quiet_activity = store
+            .activity_times()
+            .await
+            .expect("quiet activity should load")
+            .remove(&quiet.id)
+            .expect("quiet activity metadata must be retained");
+        assert_eq!(
+            quiet_activity,
+            ConnectionActivityTimes {
+                last_test_at: Some(quiet_test_at),
+                last_refresh_at: Some(quiet_refresh_at),
+            },
+            "durable activity timestamps must survive global history pruning"
         );
     }
 }

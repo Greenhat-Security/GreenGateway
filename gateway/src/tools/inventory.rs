@@ -337,7 +337,7 @@ impl CapabilityInventory {
         }
     }
 
-    pub fn list(
+    pub async fn list(
         &self,
         rbac_state: &RbacState,
         principal: &Principal,
@@ -356,7 +356,7 @@ impl CapabilityInventory {
             return Err(CapabilityInventoryError::InvalidCursor);
         }
 
-        let mut capabilities = self.build(rbac_state, principal)?;
+        let mut capabilities = self.build(rbac_state, principal).await?;
         capabilities.sort_by(|left, right| left.summary.id.cmp(&right.summary.id));
         let collection_etag = collection_etag(&capabilities)?;
         if let Some(cursor) = cursor.as_ref() {
@@ -421,7 +421,7 @@ impl CapabilityInventory {
         }
     }
 
-    pub fn detail(
+    pub async fn detail(
         &self,
         rbac_state: &RbacState,
         principal: &Principal,
@@ -433,7 +433,8 @@ impl CapabilityInventory {
             return Ok(None);
         }
         let Some(capability) = self
-            .build(rbac_state, principal)?
+            .build(rbac_state, principal)
+            .await?
             .into_iter()
             .find(|capability| capability.summary.id == raw_id)
         else {
@@ -466,7 +467,7 @@ impl CapabilityInventory {
     /// Recomputes the current execution validator for one exact registry
     /// definition. Callers must invoke this only after normal tool-policy,
     /// schema, mapping, and direct-rule authorization.
-    pub fn execution_etag_for_definition(
+    pub async fn execution_etag_for_definition(
         &self,
         rbac_state: &RbacState,
         principal: &Principal,
@@ -474,7 +475,8 @@ impl CapabilityInventory {
     ) -> Result<Option<String>, CapabilityInventoryError> {
         let expected_id = capability_id(&["tool", definition.name.as_str()]);
         let Some(capability) = self
-            .build(rbac_state, principal)?
+            .build(rbac_state, principal)
+            .await?
             .into_iter()
             .find(|capability| capability.summary.id == expected_id)
         else {
@@ -490,23 +492,24 @@ impl CapabilityInventory {
         Ok(Some(result.execution_etag))
     }
 
-    pub fn connection_counts(
+    pub async fn connection_counts(
         &self,
         rbac_state: &RbacState,
         principal: &Principal,
     ) -> Result<BTreeMap<ConnectionId, usize>, CapabilityInventoryError> {
         Ok(connection_counts_from_capabilities(
-            self.build(rbac_state, principal)?,
+            self.build(rbac_state, principal).await?,
         ))
     }
 
-    fn build(
+    async fn build(
         &self,
         rbac_state: &RbacState,
         principal: &Principal,
     ) -> Result<Vec<BuiltCapability>, CapabilityInventoryError> {
         let snapshot = self.control_plane.runtime_snapshot();
-        let (mcp_catalogs, openapi_catalogs, statuses) = self.load_managed_inventory(&snapshot)?;
+        let (mcp_catalogs, openapi_catalogs, statuses) =
+            self.load_managed_inventory(&snapshot).await?;
         let connections = connection_contexts(&snapshot, &statuses);
         let registry = self
             .registry
@@ -672,7 +675,7 @@ impl CapabilityInventory {
         Ok(built.into_values().collect())
     }
 
-    fn load_managed_inventory(
+    async fn load_managed_inventory(
         &self,
         snapshot: &ConnectionRuntimeSnapshot,
     ) -> Result<ManagedInventory, CapabilityInventoryError> {
@@ -683,13 +686,18 @@ impl CapabilityInventory {
             .control_plane
             .managed_store()
             .map_err(|_| CapabilityInventoryError::StoreUnavailable)?;
-        let mcp = store.mcp_catalogs().map_err(store_inventory_error)?;
+        let mcp = store.mcp_catalogs().await.map_err(store_inventory_error)?;
         let openapi = store
             .openapi_inventory_catalogs()
+            .await
             .map_err(store_inventory_error)?;
         let mut statuses = BTreeMap::new();
         for id in snapshot.managed().keys() {
-            if let Some(status) = store.latest_status(id).map_err(store_inventory_error)? {
+            if let Some(status) = store
+                .latest_status(id)
+                .await
+                .map_err(store_inventory_error)?
+            {
                 statuses.insert(id.clone(), status);
             }
         }
@@ -1532,14 +1540,15 @@ mod tests {
     }
 
     impl ManagedInventoryFixture {
-        fn new(test_name: &str) -> Self {
+        async fn new(test_name: &str) -> Self {
             let database = TemporaryInventoryDatabase::new(test_name);
             let control_plane = ConnectionControlPlane::from_config(&database.config())
                 .expect("managed inventory control plane should open");
 
-            let mcp_record = create_managed_connection(&control_plane, managed_mcp_candidate());
+            let mcp_record =
+                create_managed_connection(&control_plane, managed_mcp_candidate()).await;
             let openapi_record =
-                create_managed_connection(&control_plane, managed_openapi_candidate());
+                create_managed_connection(&control_plane, managed_openapi_candidate()).await;
             let mcp_tool_name = format!("{}:lookup", mcp_record.id);
             let openapi_tool_name = "inventory_openapi_lookup".to_owned();
             let mcp_definition = ToolDefinition::mcp_connection(
@@ -1610,7 +1619,9 @@ mod tests {
                         description: Some("Safe template metadata only".to_owned()),
                         mime_type: Some("application/json".to_owned()),
                     }],
+                    "test-admin",
                 )
+                .await
                 .expect("managed MCP inventory catalog should persist");
 
             let spec =
@@ -1631,7 +1642,9 @@ mod tests {
                         definition: serde_json::to_value(&openapi_definition)
                             .expect("OpenAPI definition should serialize"),
                     }],
+                    "test-admin",
                 )
+                .await
                 .expect("managed OpenAPI inventory catalog should persist");
 
             let registry = ToolRegistry::from_json_value(json!({
@@ -1694,14 +1707,15 @@ mod tests {
             }
         }
 
-        fn list(&self, params: CapabilityListParams) -> CapabilityListPage {
+        async fn list(&self, params: CapabilityListParams) -> CapabilityListPage {
             self.inventory
                 .list(&self.rbac_state, &self.principal, &params)
+                .await
                 .expect("managed capability inventory should list")
         }
     }
 
-    fn create_managed_connection(
+    async fn create_managed_connection(
         control_plane: &ConnectionControlPlane,
         candidate: ConnectionWrite,
     ) -> StoredConnection {
@@ -1710,7 +1724,8 @@ mod tests {
             .collection_etag()
             .to_owned();
         control_plane
-            .create_managed(&collection_etag, candidate)
+            .create_managed(&collection_etag, candidate, "test-admin")
+            .await
             .expect("managed inventory Connection should create")
     }
 
@@ -1757,13 +1772,14 @@ mod tests {
         .expect("managed OpenAPI candidate should deserialize")
     }
 
-    #[test]
-    fn durable_tool_index_borrows_catalogs_and_entries() {
-        let fixture = ManagedInventoryFixture::new("borrowed-durable-index");
+    #[tokio::test]
+    async fn durable_tool_index_borrows_catalogs_and_entries() {
+        let fixture = ManagedInventoryFixture::new("borrowed-durable-index").await;
         let snapshot = fixture.control_plane.runtime_snapshot();
         let (mcp_catalogs, openapi_catalogs, _) = fixture
             .inventory
             .load_managed_inventory(&snapshot)
+            .await
             .expect("managed catalogs should load");
         let durable = durable_tool_catalogs(&mcp_catalogs, &openapi_catalogs)
             .expect("durable tool index should build");
@@ -1897,12 +1913,13 @@ mod tests {
         );
     }
 
-    #[test]
-    fn execution_etag_binds_detail_action_definition_and_managed_revisions() {
-        let fixture = ManagedInventoryFixture::new("execution-etag-binding");
+    #[tokio::test]
+    async fn execution_etag_binds_detail_action_definition_and_managed_revisions() {
+        let fixture = ManagedInventoryFixture::new("execution-etag-binding").await;
         let built = fixture
             .inventory
             .build(&fixture.rbac_state, &fixture.principal)
+            .await
             .expect("managed inventory should build")
             .into_iter()
             .find(|capability| capability.summary.name == fixture.openapi_tool_name)
@@ -1922,11 +1939,13 @@ mod tests {
                 true,
                 true,
             )
+            .await
             .expect("detail should build")
             .expect("detail should exist");
         let recomputed = fixture
             .inventory
             .execution_etag_for_definition(&fixture.rbac_state, &fixture.principal, &definition)
+            .await
             .expect("execution ETag should recompute")
             .expect("registered tool should remain executable");
         assert_eq!(detail.execution_etag(), recomputed);
@@ -1986,6 +2005,7 @@ mod tests {
                     &fixture.principal,
                     &stale_definition,
                 )
+                .await
                 .expect("stale definition check should complete"),
             None,
             "an exact definition not present in the current registry must fail closed"
@@ -2105,16 +2125,18 @@ mod tests {
         assert!(!description.contains("secret-tail"));
     }
 
-    #[test]
-    fn managed_catalog_inventory_has_typed_provenance_and_metadata_only_resources() {
-        let fixture = ManagedInventoryFixture::new("typed-provenance");
-        let mcp_tools = fixture.list(CapabilityListParams {
-            kind: Some(CapabilityKind::Tool),
-            connection_id: Some(fixture.mcp_record.id.to_string()),
-            source: Some(CapabilitySourceFilter::McpDiscovery),
-            available: Some(true),
-            ..CapabilityListParams::default()
-        });
+    #[tokio::test]
+    async fn managed_catalog_inventory_has_typed_provenance_and_metadata_only_resources() {
+        let fixture = ManagedInventoryFixture::new("typed-provenance").await;
+        let mcp_tools = fixture
+            .list(CapabilityListParams {
+                kind: Some(CapabilityKind::Tool),
+                connection_id: Some(fixture.mcp_record.id.to_string()),
+                source: Some(CapabilitySourceFilter::McpDiscovery),
+                available: Some(true),
+                ..CapabilityListParams::default()
+            })
+            .await;
         assert_eq!(mcp_tools.total_count, 1);
         let mcp_tool = &mcp_tools.capabilities[0];
         assert_eq!(mcp_tool.name, fixture.mcp_tool_name);
@@ -2136,14 +2158,16 @@ mod tests {
         assert!(mcp_tool.policy.eligible);
         assert_eq!(mcp_tool.policy.reason, "eligible");
 
-        let resources = fixture.list(CapabilityListParams {
-            kind: Some(CapabilityKind::Resource),
-            connection_id: Some(fixture.mcp_record.id.to_string()),
-            source: Some(CapabilitySourceFilter::McpDiscovery),
-            availability: Some(CapabilityAvailabilityFilter::Available),
-            text: Some("inventory-resource".to_owned()),
-            ..CapabilityListParams::default()
-        });
+        let resources = fixture
+            .list(CapabilityListParams {
+                kind: Some(CapabilityKind::Resource),
+                connection_id: Some(fixture.mcp_record.id.to_string()),
+                source: Some(CapabilitySourceFilter::McpDiscovery),
+                availability: Some(CapabilityAvailabilityFilter::Available),
+                text: Some("inventory-resource".to_owned()),
+                ..CapabilityListParams::default()
+            })
+            .await;
         assert_eq!(resources.total_count, 1);
         let resource = &resources.capabilities[0];
         assert_eq!(resource.uri.as_deref(), Some("urn:inventory:resource"));
@@ -2158,6 +2182,7 @@ mod tests {
                 true,
                 true,
             )
+            .await
             .expect("resource detail should build")
             .expect("resource detail should exist")
             .detail;
@@ -2175,12 +2200,14 @@ mod tests {
         assert!(!encoded.contains("contents"));
         assert!(!encoded.contains("resource-content-canary"));
 
-        let templates = fixture.list(CapabilityListParams {
-            kind: Some(CapabilityKind::ResourceTemplate),
-            connection_id: Some(fixture.mcp_record.id.to_string()),
-            source: Some(CapabilitySourceFilter::McpDiscovery),
-            ..CapabilityListParams::default()
-        });
+        let templates = fixture
+            .list(CapabilityListParams {
+                kind: Some(CapabilityKind::ResourceTemplate),
+                connection_id: Some(fixture.mcp_record.id.to_string()),
+                source: Some(CapabilitySourceFilter::McpDiscovery),
+                ..CapabilityListParams::default()
+            })
+            .await;
         assert_eq!(templates.total_count, 1);
         assert_eq!(
             templates.capabilities[0].uri_template.as_deref(),
@@ -2188,11 +2215,13 @@ mod tests {
         );
         assert_eq!(templates.capabilities[0].policy.reason, "metadata_only");
 
-        let openapi_tools = fixture.list(CapabilityListParams {
-            kind: Some(CapabilityKind::Tool),
-            source: Some(CapabilitySourceFilter::Openapi),
-            ..CapabilityListParams::default()
-        });
+        let openapi_tools = fixture
+            .list(CapabilityListParams {
+                kind: Some(CapabilityKind::Tool),
+                source: Some(CapabilitySourceFilter::Openapi),
+                ..CapabilityListParams::default()
+            })
+            .await;
         assert_eq!(openapi_tools.total_count, 1);
         let openapi_tool = &openapi_tools.capabilities[0];
         assert_eq!(openapi_tool.name, fixture.openapi_tool_name);
@@ -2208,9 +2237,9 @@ mod tests {
         assert!(openapi_tool.policy.eligible);
     }
 
-    #[test]
-    fn connection_counts_build_once_and_include_all_managed_capability_kinds() {
-        let fixture = ManagedInventoryFixture::new("connection-counts");
+    #[tokio::test]
+    async fn connection_counts_build_once_and_include_all_managed_capability_kinds() {
+        let fixture = ManagedInventoryFixture::new("connection-counts").await;
         let manual_mapping = HttpToolMapping {
             method: "GET".to_owned(),
             path_template: "/unassociated".to_owned(),
@@ -2233,6 +2262,7 @@ mod tests {
         let counts = fixture
             .inventory
             .connection_counts(&fixture.rbac_state, &fixture.principal)
+            .await
             .expect("connection capability counts should build");
 
         assert_eq!(counts.get(&fixture.mcp_record.id), Some(&3));
@@ -2346,21 +2376,29 @@ mod tests {
         );
     }
 
-    #[test]
-    fn disabled_connection_retains_catalog_as_stale_unavailable_metadata() {
-        let fixture = ManagedInventoryFixture::new("disabled-stale");
+    #[tokio::test]
+    async fn disabled_connection_retains_catalog_as_stale_unavailable_metadata() {
+        let fixture = ManagedInventoryFixture::new("disabled-stale").await;
         let mut disabled = fixture.mcp_record.write.clone();
         disabled.enabled = false;
         fixture
             .control_plane
-            .replace_managed(&fixture.mcp_record.id, &fixture.mcp_record.etag(), disabled)
+            .replace_managed(
+                &fixture.mcp_record.id,
+                &fixture.mcp_record.etag(),
+                disabled,
+                "test-admin",
+            )
+            .await
             .expect("managed MCP Connection should disable");
 
-        let stale = fixture.list(CapabilityListParams {
-            connection_id: Some(fixture.mcp_record.id.to_string()),
-            availability: Some(CapabilityAvailabilityFilter::Stale),
-            ..CapabilityListParams::default()
-        });
+        let stale = fixture
+            .list(CapabilityListParams {
+                connection_id: Some(fixture.mcp_record.id.to_string()),
+                availability: Some(CapabilityAvailabilityFilter::Stale),
+                ..CapabilityListParams::default()
+            })
+            .await;
         assert_eq!(
             stale.total_count, 3,
             "tool, resource, and template should remain visible as last-known-good metadata"

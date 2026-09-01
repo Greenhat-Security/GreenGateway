@@ -172,6 +172,11 @@ impl McpConnectionCatalogRuntime {
         self.state.load().contains_key(connection_id)
     }
 
+    /// The Connections whose catalogs this replica is currently serving.
+    fn connection_ids(&self) -> Vec<ConnectionId> {
+        self.state.load().keys().cloned().collect()
+    }
+
     fn remove(&self, connection_id: &ConnectionId) {
         self.state.rcu(|current| {
             if !current.contains_key(connection_id) {
@@ -222,7 +227,7 @@ impl McpConnectionCatalogService {
                 .map_err(|_| ConnectionStoreError::Validation {
                     problems: vec!["managed Connection store is unavailable".to_owned()],
                 })?
-                .mcp_catalogs()?
+                .boot_mcp_catalogs()?
         } else {
             Vec::new()
         };
@@ -260,6 +265,61 @@ impl McpConnectionCatalogService {
 
     pub fn runtime(&self) -> McpConnectionCatalogRuntime {
         self.runtime.clone()
+    }
+
+    /// Rebuild the managed-MCP lane from the authority (issue #241, PR 8).
+    ///
+    /// The cluster reconciler calls this after the connection records have
+    /// been republished, so the "is this catalog still active" filter sees
+    /// the same records the authority does. It is the same computation
+    /// [`McpConnectionCatalogService::load`] performs at startup, done
+    /// asynchronously against the authority instead of against a
+    /// boot-time snapshot, and it installs through the registry's
+    /// re-validating install so a catalog this binary cannot enforce fails
+    /// closed rather than becoming live.
+    pub async fn reconcile_from_authority(&self) -> Result<(), ConnectionStoreError> {
+        let catalogs = self
+            .control_plane
+            .managed_store()
+            .map_err(|_| ConnectionStoreError::Validation {
+                problems: vec!["managed Connection store is unavailable".to_owned()],
+            })?
+            .mcp_catalogs()
+            .await?;
+        let snapshot = self.control_plane.runtime_snapshot();
+        let active = catalogs
+            .into_iter()
+            .filter(|catalog| {
+                snapshot
+                    .managed()
+                    .get(&catalog.connection_id)
+                    .is_some_and(|record| {
+                        record.write.enabled && supports_managed_mcp_catalog(record)
+                    })
+            })
+            .collect::<Vec<_>>();
+        let active_ids = active
+            .iter()
+            .map(|catalog| catalog.connection_id.clone())
+            .collect::<std::collections::BTreeSet<_>>();
+        for catalog in &active {
+            let definitions = catalog_definitions(catalog).collect::<Vec<_>>();
+            self.registry
+                .install_mcp_connection_catalog(catalog.connection_id.as_str(), definitions)
+                .map_err(tool_registry_store_error)?;
+            self.runtime.publish(catalog);
+        }
+        // A catalog that is no longer active at the authority -- its
+        // Connection was disabled, deleted, or changed kind on another
+        // replica -- must stop being served here too. Withdrawing is the
+        // fail-closed direction, so it happens even if an install above
+        // failed.
+        for connection_id in self.runtime.connection_ids() {
+            if !active_ids.contains(&connection_id) {
+                self.discard_runtime_catalog(&connection_id);
+            }
+        }
+        Ok(())
     }
 
     pub(crate) fn begin_connection_mutation(
@@ -329,6 +389,7 @@ impl McpConnectionCatalogService {
         &self,
         raw_connection_id: &str,
         expected_etag: &str,
+        actor: &str,
     ) -> Result<McpCatalogRefreshResult, McpCatalogRefreshError> {
         if !self.control_plane.is_managed_store_configured() {
             return Err(McpCatalogRefreshError::StoreUnavailable);
@@ -373,17 +434,12 @@ impl McpConnectionCatalogService {
             .managed_store()
             .map_err(|_| McpCatalogRefreshError::StoreUnavailable)?
             .clone();
-        // The prior-catalog read is a SQLite query; it runs on the blocking
-        // pool off the request executor.
-        let prior = {
-            let store = store.clone();
-            let connection_id_for_prior = connection_id.clone();
-            match tokio::task::spawn_blocking(move || store.mcp_catalog(&connection_id_for_prior))
-                .await
-            {
-                Ok(Ok(prior)) => prior,
-                Ok(Err(_)) | Err(_) => return Err(McpCatalogRefreshError::StorageUnavailable),
-            }
+        // The store dispatch keeps standalone mode's SQLite query on the
+        // blocking pool and awaits the authority in cluster mode; either
+        // way the request executor stays free.
+        let prior = match store.mcp_catalog(&connection_id).await {
+            Ok(prior) => prior,
+            Err(_) => return Err(McpCatalogRefreshError::StorageUnavailable),
         };
 
         let candidate = match mcp_upstream::discover_connection_catalog(
@@ -439,99 +495,93 @@ impl McpConnectionCatalogService {
             resource_templates,
         } = candidate;
         let expected = record.etag();
-        // The registry publish and its SQLite catalog persist run on the
-        // blocking pool: the persist callback executes a transaction and
-        // must not sit on the request executor.
-        let persisted = {
-            let registry = self.registry.clone();
-            let connection_id_for_persist = connection_id.clone();
-            let expected_for_persist = expected.clone();
-            match tokio::task::spawn_blocking(
-                move || -> Result<Option<StoredMcpCatalog>, McpCatalogPublishError<ConnectionStoreError>> {
-                    let mut persisted = None;
-                    registry.replace_mcp_connection_catalog(
-                        connection_id_for_persist.as_str(),
-                        tools,
-                        || {
-                            let catalog = store.replace_mcp_catalog(
-                                &connection_id_for_persist,
-                                &expected_for_persist,
-                                &stored_entries,
-                                &resources,
-                                &resource_templates,
-                            )?;
-                            persisted = Some(catalog);
-                            Ok::<(), ConnectionStoreError>(())
-                        },
-                    )
-                    .map(|()| persisted)
-                },
+        // Validate, commit, install. The commit is an `await` now (a round
+        // trip to the authority in cluster mode), and the registry write
+        // lock is a `std` mutex that must not be held across one -- so the
+        // atomic `replace_mcp_connection_catalog` is split exactly the way
+        // the tools control plane splits its own document publish. The
+        // install re-validates against the lanes current at install time
+        // and fails closed, so a candidate that stops being enforceable
+        // between the two halves never becomes live. The residual window
+        // is the tools plane's documented one: a catalog can be durable at
+        // the authority while this replica declines to serve it, and the
+        // next refresh or restart converges.
+        let registry = self.registry.clone();
+        if let Err(error) = registry.validate_mcp_connection_catalog(connection_id.as_str(), &tools)
+        {
+            // The safe reason cannot carry the rejected definitions, and
+            // without them an operator has no way to tell an upstream
+            // schema fault from a registry capacity limit.
+            tracing::warn!(
+                connection_id = %connection_id,
+                error = %error,
+                "discovered MCP catalog was rejected by the tool registry"
+            );
+            let failure = McpCatalogRefreshError::InvalidResponse;
+            self.record_failed_status(
+                &connection_id,
+                &expected,
+                prior.as_ref(),
+                failure,
+                started.elapsed(),
+            )
+            .await;
+            drop(active);
+            return Err(failure);
+        }
+        let catalog = match store
+            .replace_mcp_catalog(
+                &connection_id,
+                &expected,
+                &stored_entries,
+                &resources,
+                &resource_templates,
+                actor,
             )
             .await
-            {
-                Ok(Ok(persisted)) => persisted,
-                Ok(Err(error)) => {
-                    let failure = match error {
-                        McpCatalogPublishError::Registry(error) => {
-                            // The safe reason cannot carry the rejected definitions, and
-                            // without them an operator has no way to tell an upstream
-                            // schema fault from a registry capacity limit.
-                            tracing::warn!(
-                                connection_id = %connection_id,
-                                error = %error,
-                                "discovered MCP catalog was rejected by the tool registry"
-                            );
-                            McpCatalogRefreshError::InvalidResponse
-                        }
-                        McpCatalogPublishError::Persist(error) => refresh_store_error(&error),
-                    };
-                    self.record_failed_status(
-                        &connection_id,
-                        &expected,
-                        prior.as_ref(),
-                        failure,
-                        started.elapsed(),
-                    )
-                    .await;
-                    drop(active);
-                    return Err(failure);
-                }
-                Err(join_error) => {
-                    // The publish task died without reporting; whether the
-                    // catalog committed is unknown, so the refresh fails
-                    // closed with the storage-unavailable contract.
-                    tracing::error!(
-                        connection_id = %connection_id,
-                        error = %join_error,
-                        "MCP catalog publish task failed"
-                    );
-                    self.record_failed_status(
-                        &connection_id,
-                        &expected,
-                        prior.as_ref(),
-                        McpCatalogRefreshError::StorageUnavailable,
-                        started.elapsed(),
-                    )
-                    .await;
-                    drop(active);
-                    return Err(McpCatalogRefreshError::StorageUnavailable);
-                }
+        {
+            Ok(catalog) => catalog,
+            Err(error) => {
+                let failure = refresh_store_error(&error);
+                self.record_failed_status(
+                    &connection_id,
+                    &expected,
+                    prior.as_ref(),
+                    failure,
+                    started.elapsed(),
+                )
+                .await;
+                drop(active);
+                return Err(failure);
             }
         };
-        let catalog = persisted.ok_or(McpCatalogRefreshError::StorageUnavailable)?;
+        if let Err(error) = registry.install_mcp_connection_catalog(connection_id.as_str(), tools) {
+            tracing::error!(
+                connection_id = %connection_id,
+                error = %error,
+                "MCP catalog is durable but could not be installed into the tool registry; this replica will not serve it until the next refresh or restart"
+            );
+            let failure = McpCatalogRefreshError::InvalidResponse;
+            self.record_failed_status(
+                &connection_id,
+                &expected,
+                prior.as_ref(),
+                failure,
+                started.elapsed(),
+            )
+            .await;
+            drop(active);
+            return Err(failure);
+        }
         let total_count = catalog_total_count(&catalog);
         self.runtime.publish(&catalog);
-        // Status persistence is a small SQLite transaction; it runs on the
-        // blocking pool off the request executor.
         let status = {
-            let control_plane = self.control_plane.clone();
-            let connection_id_for_status = connection_id.clone();
-            let expected_for_status = expected.clone();
             let latency = duration_millis(started.elapsed());
-            match tokio::task::spawn_blocking(move || {
-                control_plane.append_status(
-                    &connection_id_for_status,
-                    &expected_for_status,
+            match self
+                .control_plane
+                .append_status(
+                    &connection_id,
+                    &expected,
                     ConnectionStatusUpdate {
                         state: ConnectionOperationalState::Healthy,
                         reason: ConnectionStatusReason::CatalogRefreshed,
@@ -540,30 +590,14 @@ impl McpConnectionCatalogService {
                         catalog_entry_count: Some(total_count),
                     },
                 )
-            })
-            .await
+                .await
             {
-                Ok(Ok(status)) => status,
-                Ok(Err(error)) => {
+                Ok(status) => status,
+                Err(error) => {
                     tracing::error!(
                         connection_id = %connection_id,
                         error = %error,
                         "MCP catalog was published but its safe status could not be recorded"
-                    );
-                    SafeConnectionStatus {
-                        state: ConnectionOperationalState::Healthy,
-                        reason: ConnectionStatusReason::CatalogRefreshed,
-                        observed_at: Some(catalog.refreshed_at.clone()),
-                        latency_ms: Some(duration_millis(started.elapsed())),
-                        catalog_age_secs: Some(0),
-                        catalog_entry_count: Some(total_count),
-                    }
-                }
-                Err(join_error) => {
-                    tracing::error!(
-                        connection_id = %connection_id,
-                        error = %join_error,
-                        "MCP catalog status persistence task failed"
                     );
                     SafeConnectionStatus {
                         state: ConnectionOperationalState::Healthy,
@@ -622,17 +656,15 @@ impl McpConnectionCatalogService {
                 Some(0),
             )
         };
-        // Failure-status persistence is a small SQLite transaction; it runs
-        // on the blocking pool off the request executor. Both a failed
-        // statement and a failed task only log, exactly as before.
-        let control_plane = self.control_plane.clone();
-        let connection_id_for_status = connection_id.to_owned();
-        let expected_for_status = expected.clone();
+        // A failed status write only logs, exactly as before: the refresh
+        // failure it describes is already being returned to the caller, and
+        // losing the breadcrumb must not turn one failure into two.
         let latency = duration_millis(elapsed);
-        let append = tokio::task::spawn_blocking(move || {
-            control_plane.append_status(
-                &connection_id_for_status,
-                &expected_for_status,
+        if let Err(error) = self
+            .control_plane
+            .append_status(
+                connection_id,
+                expected,
                 ConnectionStatusUpdate {
                     state,
                     reason,
@@ -641,24 +673,13 @@ impl McpConnectionCatalogService {
                     catalog_entry_count: count,
                 },
             )
-        })
-        .await;
-        match append {
-            Ok(Ok(_)) => {}
-            Ok(Err(error)) => {
-                tracing::error!(
-                    connection_id = %connection_id,
-                    error = %error,
-                    "failed to persist bounded MCP refresh failure status"
-                );
-            }
-            Err(join_error) => {
-                tracing::error!(
-                    connection_id = %connection_id,
-                    error = %join_error,
-                    "MCP refresh failure-status task failed"
-                );
-            }
+            .await
+        {
+            tracing::error!(
+                connection_id = %connection_id,
+                error = %error,
+                "failed to persist bounded MCP refresh failure status"
+            );
         }
     }
 }
@@ -1021,7 +1042,8 @@ mod tests {
         }))
         .expect("managed MCP Connection should deserialize");
         let record = control_plane
-            .create_managed(snapshot.collection_etag(), candidate)
+            .create_managed(snapshot.collection_etag(), candidate, "test-admin")
+            .await
             .expect("managed MCP Connection should create");
         let egress_client = Arc::new(
             EgressClient::new(EgressConfig::from_config(&config))
@@ -1038,7 +1060,7 @@ mod tests {
                 .expect("managed MCP catalog service should load");
 
         let first = service
-            .refresh(record.id.as_str(), record.etag().as_str())
+            .refresh(record.id.as_str(), record.etag().as_str(), "test-admin")
             .await
             .expect("first complete MCP catalog should publish");
         assert_eq!(first.catalog_revision, 1);
@@ -1048,7 +1070,7 @@ mod tests {
         assert!(registry.get(&public_name).is_some());
 
         let failure = service
-            .refresh(record.id.as_str(), record.etag().as_str())
+            .refresh(record.id.as_str(), record.etag().as_str(), "test-admin")
             .await
             .expect_err("duplicate remote names should reject the whole refresh");
         assert_eq!(failure, McpCatalogRefreshError::InvalidResponse);
@@ -1058,6 +1080,7 @@ mod tests {
             .managed_store()
             .expect("managed store should exist")
             .mcp_catalog(&record.id)
+            .await
             .expect("catalog should load")
             .expect("last-known-good catalog should remain");
         assert_eq!(retained.catalog_revision, 1);
@@ -1066,6 +1089,7 @@ mod tests {
             .managed_store()
             .expect("managed store should exist")
             .latest_status(&record.id)
+            .await
             .expect("status should load")
             .expect("failed refresh should record status");
         assert_eq!(status.state, ConnectionOperationalState::Degraded);
@@ -1075,7 +1099,8 @@ mod tests {
         let mut renamed = record.write.clone();
         renamed.display_name = "Managed MCP renamed".to_owned();
         let renamed = control_plane
-            .replace_managed(&record.id, &record.etag(), renamed)
+            .replace_managed(&record.id, &record.etag(), renamed, "test-admin")
+            .await
             .expect("presentation-only Connection update should succeed");
         let expected_catalog_etag = service
             .runtime()
@@ -1165,7 +1190,8 @@ mod tests {
         }))
         .expect("managed MCP Connection should deserialize");
         let record = control_plane
-            .create_managed(snapshot.collection_etag(), candidate)
+            .create_managed(snapshot.collection_etag(), candidate, "test-admin")
+            .await
             .expect("managed MCP Connection should create");
         let egress_client = Arc::new(
             EgressClient::new(EgressConfig::from_config(&config))
@@ -1185,7 +1211,7 @@ mod tests {
         .expect("managed MCP catalog service should load");
 
         service
-            .refresh(record.id.as_str(), record.etag().as_str())
+            .refresh(record.id.as_str(), record.etag().as_str(), "test-admin")
             .await
             .expect("managed MCP catalog should publish");
         let public_name = format!("{}:alpha", record.id);
@@ -1194,7 +1220,8 @@ mod tests {
         let mut disabled_write = record.write.clone();
         disabled_write.enabled = false;
         let disabled = control_plane
-            .replace_managed(&record.id, &record.etag(), disabled_write)
+            .replace_managed(&record.id, &record.etag(), disabled_write, "test-admin")
+            .await
             .expect("published Connection should be disableable");
         service.reconcile_connection(&disabled);
 
@@ -1240,13 +1267,14 @@ mod tests {
             ConnectionStatusReason::Disabled,
             "a disabled persisted catalog must retain its disabled reason after restart"
         );
+        let retained_disabled_catalog = control_plane
+            .managed_store()
+            .expect("managed store should exist")
+            .mcp_catalog(&disabled.id)
+            .await
+            .expect("catalog read should succeed");
         assert!(
-            control_plane
-                .managed_store()
-                .expect("managed store should exist")
-                .mcp_catalog(&disabled.id)
-                .expect("catalog read should succeed")
-                .is_some(),
+            retained_disabled_catalog.is_some(),
             "disabling must retain the last-known-good catalog for re-enablement"
         );
 
@@ -1332,7 +1360,8 @@ mod tests {
         .expect("managed MCP resource Connection should deserialize");
         let snapshot = control_plane.runtime_snapshot();
         let record = control_plane
-            .create_managed(snapshot.collection_etag(), candidate)
+            .create_managed(snapshot.collection_etag(), candidate, "test-admin")
+            .await
             .expect("managed MCP resource Connection should create");
         let egress_client = Arc::new(
             EgressClient::new(EgressConfig::from_config(&config))

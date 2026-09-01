@@ -45,7 +45,7 @@ use cap_std::{
     ambient_authority,
     fs::{Dir, OpenOptions as CapabilityOpenOptions},
 };
-use deadpool_postgres::{Manager, Pool, PoolConfig, Runtime};
+use deadpool_postgres::{Manager, ManagerConfig, Pool, PoolConfig, RecyclingMethod, Runtime};
 use tokio_postgres::{
     config::{Host, SslMode},
     tls::MakeTlsConnect,
@@ -718,7 +718,31 @@ where
     T::TlsConnect: Send + Sync,
     <T::TlsConnect as tokio_postgres::tls::TlsConnect<tokio_postgres::Socket>>::Future: Send,
 {
-    let manager = Manager::new(pg_config, tls);
+    // Recycle every connection with a ROLLBACK before it is handed out
+    // again.
+    //
+    // deadpool's default recycling is `Fast`: it checks `is_closed()` and
+    // nothing else. That is not enough here. A store opens its transaction
+    // with an explicit `BEGIN` on a pooled connection and closes it with an
+    // explicit `COMMIT`/`ROLLBACK` -- but a dropped future closes neither.
+    // An axum handler whose client disconnects mid-read is exactly that
+    // case, and the connection would return to the pool *idle in
+    // transaction*. The next borrower's `BEGIN` would then be a no-op
+    // warning and its work would silently run inside the abandoned
+    // snapshot -- including the capacity counts the connection store's
+    // mutation lock exists to make authoritative.
+    //
+    // `ROLLBACK` outside a transaction is a no-op that logs a warning, so
+    // the cost is one cheap statement per checkout. `Clean` (`DISCARD ALL`)
+    // would also do it, but it throws away the prepared-statement cache
+    // that makes the pool worth having.
+    let manager = Manager::from_config(
+        pg_config,
+        tls,
+        ManagerConfig {
+            recycling_method: RecyclingMethod::Custom("ROLLBACK".to_owned()),
+        },
+    );
     let mut pool_config = PoolConfig::new(settings.pool_max);
     pool_config.timeouts.create = Some(Duration::from_millis(settings.connect_timeout_ms));
     pool_config.timeouts.wait = Some(Duration::from_millis(settings.acquire_timeout_ms));

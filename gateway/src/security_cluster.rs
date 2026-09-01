@@ -39,6 +39,10 @@ use async_trait::async_trait;
 use tokio::sync::Mutex;
 
 use crate::{
+    connections::{
+        control_plane::ConnectionControlPlane, mcp::McpConnectionCatalogService,
+        openapi::OpenApiConnectionCatalogService, pg_store::PostgresConnectionStore,
+    },
     lifecycle::GatewayLifecycle,
     middleware::rbac::{RbacState, SecurityRevisionCheckError, SecurityRevisionGate},
     storage::{
@@ -428,6 +432,140 @@ impl ReconciledResource for ToolsResource {
         self.installed_revision
             .store(active.security_revision, Ordering::Release);
         Ok(())
+    }
+}
+
+/// The Connection control plane as a reconciled resource (issue #241,
+/// PR 8): the connection records, and the managed catalogs derived from
+/// them.
+///
+/// Connections are authorization-relevant in three ways, which is why they
+/// belong behind the gate rather than in a periodically refreshed cache:
+/// a record carries whether the Connection is enabled at all, the egress
+/// destination a proxy route or tool is allowed to reach, and the
+/// credential binding that request will present. A replica serving a stale
+/// record can send a request to an upstream a commit already withdrew.
+pub(crate) struct ConnectionsResource {
+    store: Arc<PostgresConnectionStore>,
+    control_plane: ConnectionControlPlane,
+    mcp_catalogs: McpConnectionCatalogService,
+    openapi_catalogs: OpenApiConnectionCatalogService,
+    /// The connections revision currently published on this replica.
+    /// Installs are monotonic: a reconcile for a revision at or below this
+    /// is a no-op, so a slow reconcile cannot overwrite a newer snapshot
+    /// with an older one.
+    installed_revision: AtomicI64,
+}
+
+impl ConnectionsResource {
+    pub(crate) fn new(
+        store: Arc<PostgresConnectionStore>,
+        control_plane: ConnectionControlPlane,
+        mcp_catalogs: McpConnectionCatalogService,
+        openapi_catalogs: OpenApiConnectionCatalogService,
+        boot_revision: i64,
+    ) -> Arc<Self> {
+        Arc::new(Self {
+            store,
+            control_plane,
+            mcp_catalogs,
+            openapi_catalogs,
+            installed_revision: AtomicI64::new(boot_revision),
+        })
+    }
+
+    /// Republish the records, then the catalogs derived from them, then
+    /// flush any dependency rows a synchronous caller queued.
+    ///
+    /// The order matters. The catalog republish filters on "is this
+    /// Connection still enabled and still of the right kind", so it has to
+    /// see the records the authority just returned -- filtering against the
+    /// previous snapshot would keep serving a catalog whose Connection was
+    /// disabled on another replica.
+    async fn reconcile(&self) -> Result<(), SecurityRevisionCheckError> {
+        let revision = self.store.state_revision().await.map_err(|error| {
+            tracing::error!(
+                error = %error,
+                "connection reconciliation could not read the state revision"
+            );
+            SecurityRevisionCheckError::Unavailable
+        })?;
+        let records = self.store.list().await.map_err(|error| {
+            tracing::error!(
+                error = %error,
+                "connection reconciliation could not read the authoritative records"
+            );
+            SecurityRevisionCheckError::Unavailable
+        })?;
+        // A record whose binding cannot be resolved is not enforceable
+        // here. Publishing it would leave this replica dispatching to an
+        // upstream it cannot authenticate to; refusing keeps the gate
+        // closed until an operator fixes the binding or the authority
+        // withdraws the record.
+        if let Err(error) = self
+            .control_plane
+            .publish_authoritative_records(records)
+            .await
+        {
+            tracing::error!(
+                error = %error,
+                "connection reconciliation rejected: an authoritative record is not enforceable \
+                 on this replica"
+            );
+            return Err(SecurityRevisionCheckError::InvalidDocument);
+        }
+        if let Err(error) = self.mcp_catalogs.reconcile_from_authority().await {
+            tracing::error!(
+                error = %error,
+                "connection reconciliation could not republish the managed MCP catalogs"
+            );
+            return Err(SecurityRevisionCheckError::Unavailable);
+        }
+        if let Err(error) = self.openapi_catalogs.reconcile_from_authority().await {
+            tracing::error!(
+                error = %error,
+                "connection reconciliation could not republish the managed OpenAPI catalogs"
+            );
+            return Err(SecurityRevisionCheckError::Unavailable);
+        }
+        // Dependency rows are derived state queued by synchronous callers
+        // (the proxy builder and the tool registry's definition validator,
+        // neither of which can await). A failure here is logged, not
+        // fatal: these rows guard admin deletes, they authorize no request,
+        // and the queue retries on the next pass.
+        if let Err(error) = self.control_plane.flush_pending_dependencies().await {
+            tracing::warn!(
+                error = %error,
+                "connection dependency rows could not be published; the delete guard is \
+                 incomplete until the next reconcile"
+            );
+        }
+        self.installed_revision.store(revision, Ordering::Release);
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl ReconciledResource for ConnectionsResource {
+    fn name(&self) -> &'static str {
+        "connections"
+    }
+
+    async fn activation_revision(&self) -> Result<i64, SecurityRevisionCheckError> {
+        self.store.state_revision().await.map_err(|error| {
+            tracing::error!(
+                error = %error,
+                "the connections activation revision could not be read"
+            );
+            SecurityRevisionCheckError::Unavailable
+        })
+    }
+
+    async fn reconcile(&self, compiled_revision: i64) -> Result<(), SecurityRevisionCheckError> {
+        if self.installed_revision.load(Ordering::Acquire) > compiled_revision {
+            return Ok(());
+        }
+        self.reconcile().await
     }
 }
 

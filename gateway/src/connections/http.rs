@@ -1286,7 +1286,7 @@ mod tests {
     }
 
     impl TemporaryRuntime {
-        fn header_api_key(name: &str, header_name: &str, secret: &[u8]) -> Self {
+        async fn header_api_key(name: &str, header_name: &str, secret: &[u8]) -> Self {
             let root = std::env::temp_dir().join(format!(
                 "greengateway-static-auth-{name}-{}",
                 uuid::Uuid::new_v4()
@@ -1323,7 +1323,8 @@ mod tests {
                 secret_id: Some("billing-api-key".to_owned()),
             };
             let created = control_plane
-                .create_managed(initial.collection_etag(), write)
+                .create_managed(initial.collection_etag(), write, "test-admin")
+                .await
                 .expect("connection should create");
             let egress_config = EgressConfig {
                 allowed_hosts: HashSet::from(["billing.example.test".to_owned()]),
@@ -1364,15 +1365,15 @@ mod tests {
     }
 
     impl TemporaryManagedRuntime {
-        fn from_write(name: &str, write: ConnectionWrite) -> Self {
-            Self::build(name, write, Vec::new(), None)
+        async fn from_write(name: &str, write: ConnectionWrite) -> Self {
+            Self::build(name, write, Vec::new(), None).await
         }
 
-        fn tls_identity(name: &str) -> Self {
-            Self::tls_identity_with_oauth(name, false)
+        async fn tls_identity(name: &str) -> Self {
+            Self::tls_identity_with_oauth(name, false).await
         }
 
-        fn tls_identity_with_oauth(name: &str, with_oauth: bool) -> Self {
+        async fn tls_identity_with_oauth(name: &str, with_oauth: bool) -> Self {
             let root = temporary_managed_root(name);
             fs::create_dir(&root).expect("temporary managed root should create");
             let identity_key = rcgen::KeyPair::generate().expect("test identity key should build");
@@ -1443,10 +1444,10 @@ mod tests {
                     },
                 });
             }
-            Self::build_with_root(name, root, write, aliases, Some(ca_path))
+            Self::build_with_root(name, root, write, aliases, Some(ca_path)).await
         }
 
-        fn build(
+        async fn build(
             name: &str,
             write: ConnectionWrite,
             aliases: Vec<OperatorSecretAliasConfig>,
@@ -1454,10 +1455,10 @@ mod tests {
         ) -> Self {
             let root = temporary_managed_root(name);
             fs::create_dir(&root).expect("temporary managed root should create");
-            Self::build_with_root(name, root, write, aliases, ca_path)
+            Self::build_with_root(name, root, write, aliases, ca_path).await
         }
 
-        fn build_with_root(
+        async fn build_with_root(
             _name: &str,
             root: PathBuf,
             write: ConnectionWrite,
@@ -1486,7 +1487,8 @@ mod tests {
                 ConnectionControlPlane::from_config(&config).expect("control plane should build");
             let initial = control_plane.runtime_snapshot();
             let created = control_plane
-                .create_managed(initial.collection_etag(), write)
+                .create_managed(initial.collection_etag(), write, "test-admin")
+                .await
                 .expect("managed connection should create");
             let egress_config = EgressConfig {
                 allowed_hosts: HashSet::from([
@@ -1554,7 +1556,7 @@ mod tests {
     }
 
     impl TemporaryOAuthRuntime {
-        fn new(
+        async fn new(
             name: &str,
             base_url: String,
             token_url: String,
@@ -1604,7 +1606,8 @@ mod tests {
                 client_auth_method: OAuthClientAuthMethod::ClientSecretBasic,
             };
             let created = control_plane
-                .create_managed(initial.collection_etag(), write)
+                .create_managed(initial.collection_etag(), write, "test-admin")
+                .await
                 .expect("OAuth connection should create");
 
             let mut egress_config = EgressConfig {
@@ -1729,7 +1732,7 @@ mod tests {
 
     #[tokio::test]
     async fn connection_tls_is_resolved_only_after_egress_preflight() {
-        let temporary = TemporaryManagedRuntime::tls_identity("tls-preflight-order");
+        let temporary = TemporaryManagedRuntime::tls_identity("tls-preflight-order").await;
         let target = temporary
             .runtime
             .target(temporary.connection_id.as_str(), "/health")
@@ -1760,7 +1763,7 @@ mod tests {
     #[tokio::test]
     async fn malformed_runtime_tls_material_has_only_stable_redacted_error() {
         const INVALID_TLS_CANARY: &[u8] = b"invalid-tls-private-canary";
-        let temporary = TemporaryManagedRuntime::tls_identity("invalid-runtime-tls");
+        let temporary = TemporaryManagedRuntime::tls_identity("invalid-runtime-tls").await;
         fs::write(
             temporary
                 .ca_path
@@ -1793,7 +1796,7 @@ mod tests {
     #[tokio::test]
     async fn prepared_upstream_applies_identity_without_leaking_it_to_oauth() {
         let temporary =
-            TemporaryManagedRuntime::tls_identity_with_oauth("tls-oauth-isolation", true);
+            TemporaryManagedRuntime::tls_identity_with_oauth("tls-oauth-isolation", true).await;
         let target = temporary
             .runtime
             .target(temporary.connection_id.as_str(), "/health")
@@ -1833,7 +1836,7 @@ mod tests {
 
     #[tokio::test]
     async fn tls_material_is_resolved_again_before_each_cache_selection() {
-        let temporary = TemporaryManagedRuntime::tls_identity("tls-runtime-rotation");
+        let temporary = TemporaryManagedRuntime::tls_identity("tls-runtime-rotation").await;
         let target = temporary
             .runtime
             .target(temporary.connection_id.as_str(), "/health")
@@ -1884,8 +1887,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn persisted_http_test_target_can_probe_disabled_connection_without_widening_runtime() {
+    #[tokio::test]
+    async fn persisted_http_test_target_can_probe_disabled_connection_without_widening_runtime() {
         let mut write = record("/v1").write;
         write.enabled = false;
         write.test_profile = Some(ConnectionTestProfile {
@@ -1893,7 +1896,7 @@ mod tests {
             path: "/ready".to_owned(),
             expected_statuses: vec![200, 204],
         });
-        let temporary = TemporaryManagedRuntime::from_write("disabled-http-test", write);
+        let temporary = TemporaryManagedRuntime::from_write("disabled-http-test", write).await;
 
         let normal_error = match temporary
             .runtime
@@ -1914,15 +1917,15 @@ mod tests {
         assert_eq!(test.expected_statuses(), &[200, 204]);
     }
 
-    #[test]
-    fn persisted_mcp_test_target_can_probe_disabled_managed_mcp_only() {
+    #[tokio::test]
+    async fn persisted_mcp_test_target_can_probe_disabled_managed_mcp_only() {
         let mut write = record("/mcp").write;
         write.enabled = false;
         write.kind = ConnectionKind::McpStreamableHttp;
         write.discovery = Some(DiscoveryConfig::ManagedMcp {
             use_connection_authentication: false,
         });
-        let temporary = TemporaryManagedRuntime::from_write("disabled-mcp-test", write);
+        let temporary = TemporaryManagedRuntime::from_write("disabled-mcp-test", write).await;
 
         let normal_error = match temporary
             .runtime
@@ -1945,7 +1948,7 @@ mod tests {
     #[tokio::test]
     async fn stale_http_test_etag_stops_before_client_tls_or_secret_preparation() {
         let temporary =
-            TemporaryManagedRuntime::tls_identity_with_oauth("stale-http-test-etag", true);
+            TemporaryManagedRuntime::tls_identity_with_oauth("stale-http-test-etag", true).await;
         let original = temporary.stored_connection();
         let stale_etag = original.etag();
         let mut replacement = original.write.clone();
@@ -1957,7 +1960,8 @@ mod tests {
         let record = temporary
             .runtime
             .control_plane
-            .replace_managed(&original.id, &stale_etag, replacement)
+            .replace_managed(&original.id, &stale_etag, replacement, "test-admin")
+            .await
             .expect("current connection should gain a valid persisted test profile");
         assert_ne!(record.etag(), stale_etag);
         for secret in [
@@ -1994,14 +1998,14 @@ mod tests {
         );
     }
 
-    #[test]
-    fn stale_mcp_test_etag_stops_before_client_selection() {
+    #[tokio::test]
+    async fn stale_mcp_test_etag_stops_before_client_selection() {
         let mut write = record("/mcp").write;
         write.kind = ConnectionKind::McpStreamableHttp;
         write.discovery = Some(DiscoveryConfig::ManagedMcp {
             use_connection_authentication: false,
         });
-        let temporary = TemporaryManagedRuntime::from_write("stale-mcp-test-etag", write);
+        let temporary = TemporaryManagedRuntime::from_write("stale-mcp-test-etag", write).await;
         assert_eq!(temporary.cached_client_count(), 0);
 
         let target = temporary
@@ -2048,7 +2052,7 @@ mod tests {
             path: "/".to_owned(),
             expected_statuses: vec![200],
         });
-        let temporary = TemporaryManagedRuntime::from_write("http-test-response-idle", write);
+        let temporary = TemporaryManagedRuntime::from_write("http-test-response-idle", write).await;
         let record = temporary.stored_connection();
         let expected_etag = record.etag().to_string();
 
@@ -2107,7 +2111,8 @@ mod tests {
             format!("https://127.0.0.1:{}/oauth/token", addr.port()),
             HashSet::from(["127.0.0.1".to_owned()]),
             Some(&ca_pem),
-        );
+        )
+        .await;
         let original = temporary.stored_connection();
         let mut replacement = original.write.clone();
         replacement.test_profile = Some(ConnectionTestProfile {
@@ -2118,7 +2123,8 @@ mod tests {
         let record = temporary
             .runtime
             .control_plane
-            .replace_managed(&original.id, &original.etag(), replacement)
+            .replace_managed(&original.id, &original.etag(), replacement, "test-admin")
+            .await
             .expect("OAuth test profile should replace");
         let expected_etag = record.etag().to_string();
 
@@ -2243,7 +2249,8 @@ mod tests {
             format!("https://127.0.0.1:{}/oauth/token", token_addr.port()),
             HashSet::from(["127.0.0.1".to_owned()]),
             Some(&trusted_ca_pem),
-        );
+        )
+        .await;
         let original = temporary.stored_connection();
         let mut replacement = original.write.clone();
         replacement.timeouts = Some(ConnectionTimeouts {
@@ -2259,7 +2266,8 @@ mod tests {
         let record = temporary
             .runtime
             .control_plane
-            .replace_managed(&original.id, &original.etag(), replacement)
+            .replace_managed(&original.id, &original.etag(), replacement, "test-admin")
+            .await
             .expect("OAuth test profile should replace");
         let expected_etag = record.etag().to_string();
 
@@ -2430,7 +2438,7 @@ mod tests {
     #[tokio::test]
     async fn runtime_binds_url_and_secret_resolution_to_the_stored_connection() {
         let temporary =
-            TemporaryRuntime::header_api_key("bound-runtime", "x-api-key", b"operator-key");
+            TemporaryRuntime::header_api_key("bound-runtime", "x-api-key", b"operator-key").await;
         let target = temporary
             .runtime
             .target(
@@ -2469,7 +2477,7 @@ mod tests {
     #[tokio::test]
     async fn secret_provider_failure_returns_only_a_safe_bounded_reason() {
         let temporary =
-            TemporaryRuntime::header_api_key("provider-failure", "x-api-key", b"do-not-leak");
+            TemporaryRuntime::header_api_key("provider-failure", "x-api-key", b"do-not-leak").await;
         let target = temporary
             .runtime
             .target(temporary.connection_id.as_str(), "/charges")
@@ -2505,7 +2513,8 @@ mod tests {
             format!("https://127.0.0.1:{}/oauth/token", addr.port()),
             HashSet::from(["127.0.0.1".to_owned()]),
             Some(&ca_pem),
-        );
+        )
+        .await;
         let target = temporary
             .runtime
             .target(temporary.connection_id.as_str(), "/charges")
@@ -2640,7 +2649,8 @@ mod tests {
             format!("https://127.0.0.1:{}/oauth/token", addr.port()),
             HashSet::from(["127.0.0.1".to_owned()]),
             Some(&ca_pem),
-        );
+        )
+        .await;
         let target = temporary
             .runtime
             .target(temporary.connection_id.as_str(), "/charges")
@@ -2680,7 +2690,8 @@ mod tests {
             "https://blocked.example.test/oauth/token".to_owned(),
             HashSet::from(["allowed.example.test".to_owned()]),
             None,
-        );
+        )
+        .await;
         let target = temporary
             .runtime
             .target(temporary.connection_id.as_str(), "/charges")
@@ -2727,7 +2738,8 @@ mod tests {
             format!("https://127.0.0.1:{}/oauth/token", addr.port()),
             HashSet::from(["127.0.0.1".to_owned()]),
             Some(&ca_pem),
-        );
+        )
+        .await;
         let target = temporary
             .runtime
             .target(temporary.connection_id.as_str(), "/charges")
@@ -2798,7 +2810,8 @@ mod tests {
                 format!("https://127.0.0.1:{}/oauth/token", addr.port()),
                 HashSet::from(["127.0.0.1".to_owned()]),
                 Some(&ca_pem),
-            );
+            )
+            .await;
             let target = temporary
                 .runtime
                 .target(temporary.connection_id.as_str(), "/charges")
