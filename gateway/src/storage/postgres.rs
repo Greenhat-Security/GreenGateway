@@ -821,6 +821,39 @@ impl fmt::Display for DeploymentBindingError {
 
 impl std::error::Error for DeploymentBindingError {}
 
+/// The deployment the database is bound to, if any: a read, never a
+/// binding, so a validation-only path (`migrate check`) can run under a
+/// read-only role and never claims an unbound database.
+pub async fn read_deployment_binding(
+    pool: &Pool,
+) -> Result<Option<String>, DeploymentBindingError> {
+    const OPERATION: &str = "deployment_binding_read";
+    let client = pool
+        .get()
+        .await
+        .map_err(classify_pool_error)
+        .map_err(DeploymentBindingError::Store)?;
+    let row = client
+        .query_opt(
+            "SELECT deployment_id FROM greengateway.deployment_binding WHERE singleton",
+            &[],
+        )
+        .await
+        .map_err(|error| {
+            let kind = classify_postgres_error(&error);
+            DeploymentBindingError::Store(RepositoryError::new(kind, OPERATION))
+        })?;
+    row.map(|row| {
+        row.try_get::<_, String>(0).map_err(|_| {
+            DeploymentBindingError::Store(RepositoryError::new(
+                RepositoryErrorKind::InvalidData,
+                OPERATION,
+            ))
+        })
+    })
+    .transpose()
+}
+
 /// Bind the database to `deployment_id` on first use and refuse any other
 /// deployment afterwards (migration 0007's `deployment_binding`). Two
 /// first boots racing with different IDs produce exactly one binding; the

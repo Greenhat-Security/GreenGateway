@@ -1745,8 +1745,14 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         match store
             .revoke(&jti, expires_at.as_deref(), "operator:revoke-jwt")
             .await
-            .map_err(|error| {
-                Box::<dyn std::error::Error>::from(format!("JWT revocation failed: {error}"))
+            .map_err(|error| match error.invalid_parameter_name() {
+                Some("jti") => Box::<dyn std::error::Error>::from(
+                    "revoke-jwt requires a non-empty JTI (an empty one names no token)",
+                ),
+                Some("expires_at") => Box::<dyn std::error::Error>::from(
+                    "revoke-jwt: expires_at must be an RFC 3339 instant no earlier than the validator's expiry leeway before now",
+                ),
+                _ => Box::<dyn std::error::Error>::from(format!("JWT revocation failed: {error}")),
             })? {
             storage::JwtRevocationOutcome::Revoked { security_revision } => {
                 println!("revoked: issuer={boundary} security_revision={security_revision}");

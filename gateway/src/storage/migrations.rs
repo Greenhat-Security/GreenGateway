@@ -423,7 +423,10 @@ where
 }
 
 #[cfg(feature = "postgres")]
-async fn execute(config: &Config, check_only: bool) -> Result<MigrateOutput, MigrateError> {
+pub(crate) async fn execute(
+    config: &Config,
+    check_only: bool,
+) -> Result<MigrateOutput, MigrateError> {
     use crate::config::StateBackend;
 
     if config.state_backend != StateBackend::Postgres {
@@ -439,7 +442,10 @@ async fn execute(config: &Config, check_only: bool) -> Result<MigrateOutput, Mig
             // database bound to another deployment is not "current" for
             // this one. An older schema reports the upgrade it needs first.
             SchemaStatus::Current => {
-                refuse_other_deployment(&foundation, config).await?;
+                // Validation only: read the binding, never write it. An
+                // unbound database is left for `migrate up` or startup to
+                // claim, and a read-only check role can run this.
+                refuse_other_deployment_read_only(&foundation, config).await?;
                 Ok(MigrateOutput::CheckCurrent)
             }
             SchemaStatus::NotInitialized => Ok(MigrateOutput::CheckNotInitialized),
@@ -474,6 +480,27 @@ async fn refuse_other_deployment(
             }
             super::postgres::DeploymentBindingError::Store(_) => MigrateError::DatabaseUnavailable,
         })
+}
+
+/// Refuse a database bound to another deployment, reading the binding
+/// only: `migrate check` must not write, and must not claim an unbound
+/// database for whichever deployment ran the check.
+#[cfg(feature = "postgres")]
+async fn refuse_other_deployment_read_only(
+    foundation: &super::postgres::PostgresFoundation,
+    config: &Config,
+) -> Result<(), MigrateError> {
+    let deployment_id = config
+        .deployment_id
+        .as_deref()
+        .ok_or(MigrateError::ModeNotSelected)?;
+    match super::postgres::read_deployment_binding(foundation.pool()).await {
+        Ok(Some(bound)) if bound != deployment_id => {
+            Err(MigrateError::DeploymentMismatch { bound })
+        }
+        Ok(_) => Ok(()),
+        Err(_) => Err(MigrateError::DatabaseUnavailable),
+    }
 }
 
 /// Read the ledger from a pool and validate it against this binary's

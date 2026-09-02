@@ -122,20 +122,37 @@ impl PostgresJwtRevocationStore {
         expires_at: Option<&str>,
         actor_user_id: &str,
     ) -> Result<JwtRevocationOutcome, RepositoryError> {
+        // An empty `jti` names no token: the validator never consults the
+        // store for one, so a row for it would be a false assurance.
+        if jti.trim().is_empty() {
+            return Err(RepositoryError::invalid_parameter(OPERATION_REVOKE, "jti"));
+        }
+        // The expiry is RFC 3339 by contract: parsed here, so a value only
+        // PostgreSQL would accept (`tomorrow`, a zone-less date,
+        // `infinity`) is the caller's error rather than a server-dependent
+        // or unbounded lifetime.
+        let expires_at = expires_at
+            .map(|value| canonical_rfc3339(value, OPERATION_REVOKE, "expires_at"))
+            .transpose()?;
         let digest = self.jti_digest(jti);
         let client = self.pool.get().await.map_err(classify_pool_error)?;
-        if let Some(expires_at) = expires_at {
-            // An expiry already in the past (by the database clock) could
-            // only produce a row nothing is refused by, reported as
-            // "revoked": the caller's input, refused before anything is
-            // written or any revision spent.
-            let in_the_future: bool = client
-                .query_one("SELECT $1::text::timestamptz > now()", &[&expires_at])
+        if let Some(expires_at) = expires_at.as_deref() {
+            // An expiry the validator can no longer accept a token at (by
+            // the database clock, past the retention window) could only
+            // produce a row nothing is refused by, reported as "revoked":
+            // the caller's input, refused before anything is written or
+            // any revision spent. An expiry inside the window -- a token's
+            // own `exp` a few seconds ago -- is still a live revocation.
+            let still_effective: bool = client
+                .query_one(
+                    "SELECT $1::text::timestamptz > now() - make_interval(secs => $2)",
+                    &[&expires_at, &self.retention_leeway_secs],
+                )
                 .await
                 .map_err(|error| classify_query(error, OPERATION_REVOKE))?
                 .try_get(0)
                 .map_err(|_| invalid_data(OPERATION_REVOKE))?;
-            if !in_the_future {
+            if !still_effective {
                 return Err(RepositoryError::invalid_parameter(
                     OPERATION_REVOKE,
                     "expires_at",
@@ -189,7 +206,7 @@ impl PostgresJwtRevocationStore {
                     &[
                         &self.issuer.as_ref(),
                         &digest,
-                        &expires_at,
+                        &expires_at.as_deref(),
                         &actor_user_id,
                         &security_revision,
                         &self.retention_leeway_secs,
@@ -290,6 +307,20 @@ impl RevocationStore for PostgresJwtRevocationStore {
 /// `503`; it is never an invalid credential and never "not revoked".
 fn dependency_failure(error: RepositoryError) -> AuthError {
     AuthError::Upstream(format!("JWT revocation store error: {error}"))
+}
+
+/// Parse an RFC 3339 instant and return it re-serialized in RFC 3339, so
+/// only that grammar reaches the database.
+fn canonical_rfc3339(
+    value: &str,
+    operation: &'static str,
+    parameter: &'static str,
+) -> Result<String, RepositoryError> {
+    use time::format_description::well_known::Rfc3339;
+    time::OffsetDateTime::parse(value, &Rfc3339)
+        .ok()
+        .and_then(|instant| instant.format(&Rfc3339).ok())
+        .ok_or_else(|| RepositoryError::invalid_parameter(operation, parameter))
 }
 
 fn classify_query(error: tokio_postgres::Error, operation: &'static str) -> RepositoryError {

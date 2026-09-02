@@ -1694,6 +1694,28 @@ mod postgres_audit_tests {
             .expect_err("an expiry in the past is refused");
         assert_eq!(refused.invalid_parameter_name(), Some("expires_at"));
         assert!(!store.is_revoked("jti-lapsed").await.expect("lookup"));
+        // Only RFC 3339 reaches the database: a PostgreSQL-only spelling is
+        // the caller's error, not a server-dependent lifetime.
+        for spelling in ["tomorrow", "infinity", "2030-01-01", "2030-01-01 00:00:00"] {
+            let refused = store
+                .revoke("jti-grammar", Some(spelling), "operator")
+                .await
+                .expect_err("a non-RFC-3339 expiry is refused");
+            assert_eq!(
+                refused.invalid_parameter_name(),
+                Some("expires_at"),
+                "{spelling}"
+            );
+        }
+        assert!(!store.is_revoked("jti-grammar").await.expect("lookup"));
+        // An empty jti names no token; the validator never asks about one.
+        for empty in ["", "   "] {
+            let refused = store
+                .revoke(empty, None, "operator")
+                .await
+                .expect_err("an empty jti is refused");
+            assert_eq!(refused.invalid_parameter_name(), Some("jti"));
+        }
         let again = store
             .revoke("jti-lapsed", None, "operator")
             .await
@@ -1738,6 +1760,112 @@ mod postgres_audit_tests {
             store.is_revoked("jti-short").await.expect("lookup"),
             "the extended row outlives the original expiry"
         );
+    }
+
+    /// A revocation keyed on a token's own `exp` a few seconds in the past
+    /// is still live: the validator accepts the token through its leeway,
+    /// so the store accepts (and honours) an expiry inside the retention
+    /// window rather than refusing it as "already past".
+    #[tokio::test]
+    async fn an_expiry_inside_the_leeway_window_is_a_live_revocation() {
+        let Some(admin_dsn) = locator() else {
+            eprintln!("skipping: no test database locator; CI runs this test");
+            return;
+        };
+        let _guard = DATABASE.lock().await;
+        let database = create_test_database(&admin_dsn).await;
+        let (_tokens, pool) = migrated_service_token_store(&database).await;
+        let store = crate::storage::PostgresJwtRevocationStore::new(
+            pool.clone(),
+            "deploy-jwt-leeway",
+            "https://issuer-a.example",
+        )
+        .with_retention_leeway_for_test(30.0);
+        let ten_seconds_ago = (time::OffsetDateTime::now_utc()
+            - std::time::Duration::from_secs(10))
+        .format(&time::format_description::well_known::Rfc3339)
+        .expect("rfc3339");
+        let outcome = store
+            .revoke("jti-recent", Some(&ten_seconds_ago), "operator")
+            .await
+            .expect("an expiry inside the leeway window is accepted");
+        assert!(matches!(
+            outcome,
+            crate::storage::JwtRevocationOutcome::Revoked { .. }
+        ));
+        assert!(
+            store.is_revoked("jti-recent").await.expect("lookup"),
+            "the revocation is effective for as long as the validator accepts the token"
+        );
+        assert_eq!(store.cleanup_expired(100).await.expect("cleanup"), 0);
+        // Past the window it is refused, as before.
+        let a_minute_ago = (time::OffsetDateTime::now_utc() - std::time::Duration::from_secs(60))
+            .format(&time::format_description::well_known::Rfc3339)
+            .expect("rfc3339");
+        let refused = store
+            .revoke("jti-stale", Some(&a_minute_ago), "operator")
+            .await
+            .expect_err("an expiry past the window is refused");
+        assert_eq!(refused.invalid_parameter_name(), Some("expires_at"));
+    }
+
+    /// `migrate check` is validation only: it reads the deployment binding
+    /// and never writes one, so a read-only check role can run it and an
+    /// unbound database is not claimed by whichever deployment checked it.
+    #[tokio::test]
+    async fn migrate_check_reads_the_binding_and_never_writes_it() {
+        use crate::storage::migrations::{execute, MigrateError, MigrateOutput};
+        let Some(admin_dsn) = locator() else {
+            eprintln!("skipping: no test database locator; CI runs this test");
+            return;
+        };
+        let _guard = DATABASE.lock().await;
+        let database = create_test_database(&admin_dsn).await;
+        let (_tokens, pool) = migrated_service_token_store(&database).await;
+        let test_dsn_file = write_dsn_file(&database.dsn);
+        let config_for = |deployment: &str| {
+            let mut config = crate::config::Config::test_defaults();
+            config.state_backend = crate::config::StateBackend::Postgres;
+            config.deployment_id = Some(deployment.to_owned());
+            config.database.url_file = Some(test_dsn_file.path.clone());
+            config.database.tls_mode = crate::config::DatabaseTlsMode::LoopbackDev;
+            config
+        };
+        let bound_rows = || async {
+            let client = pool.get().await.expect("client");
+            client
+                .query_one("SELECT count(*) FROM greengateway.deployment_binding", &[])
+                .await
+                .expect("count")
+                .get::<_, i64>(0)
+        };
+        assert!(matches!(
+            execute(&config_for("deploy-check-a"), true)
+                .await
+                .expect("check"),
+            MigrateOutput::CheckCurrent
+        ));
+        assert_eq!(
+            bound_rows().await,
+            0,
+            "a check never claims an unbound database"
+        );
+        crate::storage::postgres::bind_deployment(&pool, "deploy-check-a")
+            .await
+            .expect("bind");
+        assert!(matches!(
+            execute(&config_for("deploy-check-a"), true)
+                .await
+                .expect("check"),
+            MigrateOutput::CheckCurrent
+        ));
+        let refused = execute(&config_for("deploy-check-b"), true)
+            .await
+            .expect_err("another deployment's database is refused");
+        assert!(
+            matches!(refused, MigrateError::DeploymentMismatch { ref bound } if bound == "deploy-check-a")
+        );
+        assert_eq!(bound_rows().await, 1);
     }
 
     /// An oversized creator ID and a malformed cursor timestamp are the
