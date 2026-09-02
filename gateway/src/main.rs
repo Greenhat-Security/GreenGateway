@@ -2306,7 +2306,8 @@ fn gateway_app_with_process_started_at_and_overrides(
             cluster_security_runtime = Some(runtime.clone());
             Some(
                 state
-                    .with_revision_gate(runtime as Arc<dyn middleware::rbac::SecurityRevisionGate>),
+                    .with_revision_gate(runtime as Arc<dyn middleware::rbac::SecurityRevisionGate>)
+                    .with_connection_control_plane(connection_control_plane.clone()),
             )
         }
         (_, state) => state,
@@ -2350,8 +2351,15 @@ fn gateway_app_with_process_started_at_and_overrides(
                     Box::new(ClusterToolsStartupError::InvalidDocument(error.to_string()))
                         as Box<dyn std::error::Error>
                 })?;
+        // Authoritative content read at boot: a name a legacy lane holds is
+        // refused as a collision, while a stale managed holder (the seeds
+        // are read one resource at a time) is evicted and reconciled on the
+        // gate's first pass.
         tool_registry
-            .install_local_definitions(definitions)
+            .install_local_definitions_with(
+                definitions,
+                tools::definitions::LaneConflicts::EvictStale,
+            )
             .map_err(|error| {
                 Box::new(ClusterToolsStartupError::InvalidDocument(error.to_string()))
                     as Box<dyn std::error::Error>
@@ -2365,15 +2373,30 @@ fn gateway_app_with_process_started_at_and_overrides(
         tools_resource = Some(resource);
         tool_control_plane = Some(seed.store.clone());
     }
-    let mcp_catalog_service = connections::mcp::McpConnectionCatalogService::load(
+    // Cluster mode's boot seeds are read one resource at a time; a name that
+    // moved between two seeds' revisions must not abort startup, because
+    // the gate's first pass reconciles every resource before a request is
+    // served. Standalone mode's single store is consistent by construction
+    // and keeps refusing.
+    #[cfg(feature = "postgres")]
+    let boot_conflicts = if build_overrides.pg_connections.is_some() {
+        tools::definitions::LaneConflicts::EvictStale
+    } else {
+        tools::definitions::LaneConflicts::Refuse
+    };
+    #[cfg(not(feature = "postgres"))]
+    let boot_conflicts = tools::definitions::LaneConflicts::Refuse;
+    let mcp_catalog_service = connections::mcp::McpConnectionCatalogService::load_with(
         connection_control_plane.clone(),
         connection_http_runtime.clone(),
         tool_registry.clone(),
+        boot_conflicts,
     )?;
-    let openapi_catalog_service = connections::openapi::OpenApiConnectionCatalogService::load(
+    let openapi_catalog_service = connections::openapi::OpenApiConnectionCatalogService::load_with(
         connection_control_plane.clone(),
         connection_http_runtime.clone(),
         tool_registry.clone(),
+        boot_conflicts,
     )?;
     // Cluster mode: register the Connection control plane with the security
     // runtime so every committed record or catalog change reconciles here

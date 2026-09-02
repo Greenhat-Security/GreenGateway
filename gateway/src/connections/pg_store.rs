@@ -2703,6 +2703,12 @@ async fn load_mcp_catalogs(
                 "MCP resource template count mismatch",
             ));
         }
+        // What the standalone loader does: a persisted catalog is
+        // re-validated before it is served. Rows edited out of band, or a
+        // constraint dropped, must surface as corruption here rather than
+        // as invalid tools in the registry or the capability inventory.
+        validate_mcp_catalog(&connection_id, &entries, &resources, &resource_templates)
+            .map_err(|_| corrupt(&connection_id, "persisted MCP catalog fails validation"))?;
         catalogs.push(StoredMcpCatalog {
             connection_id,
             catalog_revision,
@@ -2804,12 +2810,28 @@ async fn load_openapi_catalogs(
                 "invalid OpenAPI catalog entry count",
             ));
         }
-        let entries = load_openapi_entries(client, &connection_id).await?;
+        let (entries, stored_json) = load_openapi_entries(client, &connection_id).await?;
         if entries.len() != usize::try_from(entry_count).unwrap_or(usize::MAX) {
             return Err(corrupt(
                 &connection_id,
                 "OpenAPI catalog entry count mismatch",
             ));
+        }
+        // Re-validate and compare canonical encodings, as the standalone
+        // loader does: an entry whose stored JSON is not what this binary
+        // would write for it was edited out of band and is corruption, not
+        // a catalog to activate.
+        let encoded = validate_openapi_catalog_entries(&entries)
+            .map_err(|_| corrupt(&connection_id, "persisted OpenAPI catalog fails validation"))?;
+        for (encoded, (selected_json, definition_json)) in encoded.iter().zip(&stored_json) {
+            if &encoded.selected_scheme_names_json != selected_json
+                || &encoded.definition_json != definition_json
+            {
+                return Err(corrupt(
+                    &connection_id,
+                    "persisted OpenAPI catalog entry is not in canonical form",
+                ));
+            }
         }
         catalogs.push(StoredOpenApiCatalog {
             connection_id,
@@ -2832,7 +2854,7 @@ async fn load_mcp_entries(
     let rows = client
         .query(
             r#"
-            SELECT remote_tool_name, description, input_schema_json
+            SELECT remote_tool_name, description, input_schema_json, ordinal
             FROM greengateway.connection_mcp_catalog_entries
             WHERE connection_id = $1::text::uuid
             ORDER BY ordinal
@@ -2842,6 +2864,7 @@ async fn load_mcp_entries(
         .await
         .map_err(|error| pg_error(OPERATION_MCP_READ, error))?;
     const REASON: &str = "MCP catalog entry column does not decode as its schema type";
+    ensure_contiguous_ordinals(&rows, 3, id, "MCP catalog entries")?;
     rows.iter()
         .map(|row| {
             let input_schema: Value =
@@ -2863,7 +2886,7 @@ async fn load_mcp_resources(
     let rows = client
         .query(
             r#"
-            SELECT uri, name, title, description, mime_type, size
+            SELECT uri, name, title, description, mime_type, size, ordinal
             FROM greengateway.connection_mcp_catalog_resources
             WHERE connection_id = $1::text::uuid
             ORDER BY ordinal
@@ -2873,6 +2896,7 @@ async fn load_mcp_resources(
         .await
         .map_err(|error| pg_error(OPERATION_MCP_READ, error))?;
     const REASON: &str = "MCP resource column does not decode as its schema type";
+    ensure_contiguous_ordinals(&rows, 6, id, "MCP resources")?;
     rows.iter()
         .map(|row| {
             Ok(StoredMcpResource {
@@ -2902,7 +2926,7 @@ async fn load_mcp_resource_templates(
     let rows = client
         .query(
             r#"
-            SELECT uri_template, name, title, description, mime_type
+            SELECT uri_template, name, title, description, mime_type, ordinal
             FROM greengateway.connection_mcp_catalog_resource_templates
             WHERE connection_id = $1::text::uuid
             ORDER BY ordinal
@@ -2912,6 +2936,7 @@ async fn load_mcp_resource_templates(
         .await
         .map_err(|error| pg_error(OPERATION_MCP_READ, error))?;
     const REASON: &str = "MCP resource template column does not decode as its schema type";
+    ensure_contiguous_ordinals(&rows, 5, id, "MCP resource templates")?;
     rows.iter()
         .map(|row| {
             Ok(StoredMcpResourceTemplate {
@@ -2925,14 +2950,16 @@ async fn load_mcp_resource_templates(
         .collect()
 }
 
+/// The entries plus the JSON exactly as stored (selected schemes,
+/// definition), so the loader can compare them with the canonical encoding.
 async fn load_openapi_entries(
     client: &deadpool_postgres::Object,
     id: &ConnectionId,
-) -> Result<Vec<StoredOpenApiCatalogEntry>, ConnectionStoreError> {
+) -> Result<(Vec<StoredOpenApiCatalogEntry>, Vec<(String, String)>), ConnectionStoreError> {
     let rows = client
         .query(
             r#"
-            SELECT tool_name, operation_id, selected_scheme_names_json, definition_json
+            SELECT tool_name, operation_id, selected_scheme_names_json, definition_json, ordinal
             FROM greengateway.connection_openapi_catalog_entries
             WHERE connection_id = $1::text::uuid
             ORDER BY ordinal
@@ -2941,23 +2968,46 @@ async fn load_openapi_entries(
         )
         .await
         .map_err(|error| pg_error(OPERATION_OPENAPI_READ, error))?;
-    rows.iter()
-        .map(|row| {
-            const REASON: &str = "OpenAPI catalog entry column does not decode as its schema type";
-            let selected: Vec<String> =
-                serde_json::from_str(&column::<String>(row, 2, id.as_str(), REASON)?)
-                    .map_err(|_| corrupt(id, "OpenAPI selected schemes are not valid JSON"))?;
-            let definition: Value =
-                serde_json::from_str(&column::<String>(row, 3, id.as_str(), REASON)?)
-                    .map_err(|_| corrupt(id, "OpenAPI tool definition is not valid JSON"))?;
-            Ok(StoredOpenApiCatalogEntry {
-                tool_name: column(row, 0, id.as_str(), REASON)?,
-                operation_id: column(row, 1, id.as_str(), REASON)?,
-                selected_scheme_names: selected,
-                definition,
-            })
-        })
-        .collect()
+    ensure_contiguous_ordinals(&rows, 4, id, "OpenAPI catalog entries")?;
+    let mut entries = Vec::with_capacity(rows.len());
+    let mut stored_json = Vec::with_capacity(rows.len());
+    for row in &rows {
+        const REASON: &str = "OpenAPI catalog entry column does not decode as its schema type";
+        let selected_json: String = column(row, 2, id.as_str(), REASON)?;
+        let definition_json: String = column(row, 3, id.as_str(), REASON)?;
+        let selected: Vec<String> = serde_json::from_str(&selected_json)
+            .map_err(|_| corrupt(id, "OpenAPI selected schemes are not valid JSON"))?;
+        let definition: Value = serde_json::from_str(&definition_json)
+            .map_err(|_| corrupt(id, "OpenAPI tool definition is not valid JSON"))?;
+        entries.push(StoredOpenApiCatalogEntry {
+            tool_name: column(row, 0, id.as_str(), REASON)?,
+            operation_id: column(row, 1, id.as_str(), REASON)?,
+            selected_scheme_names: selected,
+            definition,
+        });
+        stored_json.push((selected_json, definition_json));
+    }
+    Ok((entries, stored_json))
+}
+
+/// Persisted catalog rows are written with ordinals 0..n; a gap or a
+/// duplicate means a row was edited out of band or a constraint dropped.
+fn ensure_contiguous_ordinals(
+    rows: &[tokio_postgres::Row],
+    ordinal_column: usize,
+    id: &ConnectionId,
+    what: &'static str,
+) -> Result<(), ConnectionStoreError> {
+    for (index, row) in rows.iter().enumerate() {
+        let ordinal: i64 = row
+            .try_get(ordinal_column)
+            .map_err(|_| corrupt(id, "persisted catalog ordinal does not decode"))?;
+        if usize::try_from(ordinal).ok() != Some(index) {
+            let _ = what;
+            return Err(corrupt(id, "persisted catalog ordinals are not contiguous"));
+        }
+    }
+    Ok(())
 }
 
 /// One connection's dependency rows, bounded and sorted. The caller runs
@@ -4845,6 +4895,153 @@ mod tests {
     fn reservation_spec_digest() -> String {
         use sha2::Digest;
         hex::encode(sha2::Sha256::digest(RESERVATION_SPEC.as_bytes()))
+    }
+
+    fn mcp_resource(uri: &str) -> StoredMcpResource {
+        StoredMcpResource {
+            uri: uri.to_owned(),
+            name: format!("resource {uri}"),
+            title: None,
+            description: None,
+            mime_type: Some("text/plain".to_owned()),
+            size: None,
+        }
+    }
+
+    async fn published_mcp_catalog(store: &PostgresConnectionStore) -> StoredConnection {
+        let mcp = store
+            .create(mcp_candidate(), "op-1", None)
+            .await
+            .expect("create");
+        store
+            .replace_mcp_catalog(
+                &mcp.id,
+                &mcp.etag(),
+                &[mcp_entry("alpha"), mcp_entry("beta")],
+                &[mcp_resource("file:///a"), mcp_resource("file:///b")],
+                &[],
+                0,
+                "op-2",
+            )
+            .await
+            .expect("MCP catalog publishes");
+        assert_eq!(store.mcp_catalogs().await.expect("loads").len(), 1);
+        mcp
+    }
+
+    /// Persisted catalog rows carry ordinals 0..n; a gap left by an
+    /// out-of-band edit (the schema allows it) is corruption when loaded.
+    #[tokio::test]
+    async fn persisted_mcp_ordinals_shifted_out_of_band_load_as_corruption() {
+        let Some(admin_dsn) = locator() else {
+            eprintln!("skipping: no test database locator; CI runs this test");
+            return;
+        };
+        let database = create_test_database(&admin_dsn).await;
+        let (store, pool) = migrated_store(&database.dsn, 64).await;
+        let mcp = published_mcp_catalog(&store).await;
+        pool.get()
+            .await
+            .expect("client")
+            .execute(
+                "UPDATE greengateway.connection_mcp_catalog_entries SET ordinal = ordinal + 7 \
+                 WHERE connection_id = $1::text::uuid",
+                &[&mcp.id.as_str()],
+            )
+            .await
+            .expect("tamper");
+        let error = store
+            .mcp_catalogs()
+            .await
+            .expect_err("non-contiguous persisted ordinals are corruption");
+        assert!(
+            matches!(error, ConnectionStoreError::CorruptRecord { .. }),
+            "{error}"
+        );
+    }
+
+    /// A persisted catalog is re-validated when loaded, as the standalone
+    /// loader does: a resource locator carrying a query component (nothing
+    /// in the schema forbids it) is a validator verdict, surfaced as
+    /// corruption.
+    #[tokio::test]
+    async fn persisted_mcp_resources_duplicated_out_of_band_load_as_corruption() {
+        let Some(admin_dsn) = locator() else {
+            eprintln!("skipping: no test database locator; CI runs this test");
+            return;
+        };
+        let database = create_test_database(&admin_dsn).await;
+        let (store, pool) = migrated_store(&database.dsn, 64).await;
+        let mcp = published_mcp_catalog(&store).await;
+        pool.get()
+            .await
+            .expect("client")
+            .execute(
+                "UPDATE greengateway.connection_mcp_catalog_resources SET uri = 'file:///b?leak=1' \
+                 WHERE connection_id = $1::text::uuid AND ordinal = 1",
+                &[&mcp.id.as_str()],
+            )
+            .await
+            .expect("tamper");
+        let error = store
+            .mcp_catalogs()
+            .await
+            .expect_err("a persisted catalog the validator rejects is corruption");
+        assert!(
+            matches!(error, ConnectionStoreError::CorruptRecord { .. }),
+            "{error}"
+        );
+    }
+
+    /// A persisted OpenAPI entry whose stored JSON is not what this binary
+    /// would write for it -- here the same definition with a trailing space,
+    /// which still parses and still validates -- was edited out of band:
+    /// corruption, never a definition to activate.
+    #[tokio::test]
+    async fn persisted_openapi_entry_edited_out_of_band_loads_as_corruption() {
+        let Some(admin_dsn) = locator() else {
+            eprintln!("skipping: no test database locator; CI runs this test");
+            return;
+        };
+        let database = create_test_database(&admin_dsn).await;
+        let (store, pool) = migrated_store(&database.dsn, 64).await;
+        let api = store
+            .create(http_candidate("Billing API"), "op-3", None)
+            .await
+            .expect("create");
+        store
+            .replace_openapi_catalog(
+                &api.id,
+                &api.etag(),
+                0,
+                0,
+                RESERVATION_SPEC,
+                &reservation_spec_digest(),
+                &[openapi_entry("billing.list"), openapi_entry("billing.get")],
+                "op-4",
+            )
+            .await
+            .expect("OpenAPI catalog publishes");
+        assert_eq!(store.openapi_catalogs().await.expect("loads").len(), 1);
+        pool.get()
+            .await
+            .expect("client")
+            .execute(
+                "UPDATE greengateway.connection_openapi_catalog_entries \
+                 SET definition_json = definition_json || ' ' \
+                 WHERE connection_id = $1::text::uuid AND ordinal = 0",
+                &[&api.id.as_str()],
+            )
+            .await
+            .expect("tamper");
+        let error = store
+            .openapi_catalogs()
+            .await
+            .expect_err("a definition that is not what this binary would write is corruption");
+        assert!(
+            matches!(error, ConnectionStoreError::CorruptRecord { .. }),
+            "{error}"
+        );
     }
 
     /// A delete waits for a dependency batch the background flusher has

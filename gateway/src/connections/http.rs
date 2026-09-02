@@ -170,6 +170,18 @@ impl ConnectionHttpRuntime {
         self
     }
 
+    /// The Connection snapshot a target is resolved from: the one pinned
+    /// for the current request when the security gate admitted it, or the
+    /// live one outside a request. A request admitted at revision N must
+    /// dispatch to the Connection state of N -- never to an endpoint a
+    /// later reconcile installed while the request was in flight, under an
+    /// allow that a later policy would have withdrawn.
+    fn effective_snapshot(&self) -> Arc<super::control_plane::ConnectionRuntimeSnapshot> {
+        PINNED_CONNECTIONS
+            .try_with(Arc::clone)
+            .unwrap_or_else(|_| self.control_plane.runtime_snapshot())
+    }
+
     pub fn target(
         &self,
         connection_id: &str,
@@ -177,7 +189,7 @@ impl ConnectionHttpRuntime {
     ) -> Result<ConnectionHttpTarget, ConnectionHttpError> {
         let connection_id = ConnectionId::parse(connection_id.to_owned())
             .map_err(|_| ConnectionHttpError::InvalidConnectionId)?;
-        let snapshot = self.control_plane.runtime_snapshot();
+        let snapshot = self.effective_snapshot();
         let record = snapshot
             .managed()
             .get(&connection_id)
@@ -203,7 +215,7 @@ impl ConnectionHttpRuntime {
     ) -> Result<ConnectionHttpTarget, ConnectionHttpError> {
         let connection_id = ConnectionId::parse(connection_id.to_owned())
             .map_err(|_| ConnectionHttpError::InvalidConnectionId)?;
-        let snapshot = self.control_plane.runtime_snapshot();
+        let snapshot = self.effective_snapshot();
         let record = snapshot
             .managed()
             .get(&connection_id)
@@ -377,8 +389,7 @@ impl ConnectionHttpRuntime {
     /// in-memory control-plane snapshot; it performs no DNS, egress, TLS, OAuth,
     /// or secret-provider work.
     pub fn target_is_current(&self, target: &ConnectionHttpTarget) -> bool {
-        self.control_plane
-            .runtime_snapshot()
+        self.effective_snapshot()
             .managed()
             .get(target.connection_id())
             .is_some_and(|record| record.etag().as_str() == target.connection_etag())
@@ -2844,4 +2855,21 @@ mod tests {
             assert!(rendered.contains("oauth_token_invalid_response"), "{name}");
         }
     }
+}
+
+tokio::task_local! {
+    /// The Connection snapshot pinned for the request being served, set by
+    /// the security gate when it admits the request. Everything that
+    /// resolves a Connection target inside the request -- the proxy, the
+    /// tool executor -- reads it through `ConnectionHttpRuntime`, so one
+    /// admitted request sees one Connection state.
+    static PINNED_CONNECTIONS: Arc<super::control_plane::ConnectionRuntimeSnapshot>;
+}
+
+/// Run `future` with `snapshot` pinned as the request's Connection state.
+pub async fn with_pinned_connections<F: std::future::Future>(
+    snapshot: Arc<super::control_plane::ConnectionRuntimeSnapshot>,
+    future: F,
+) -> F::Output {
+    PINNED_CONNECTIONS.scope(snapshot, future).await
 }

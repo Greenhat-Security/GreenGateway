@@ -423,6 +423,21 @@ impl ToolRegistry {
         &self,
         definitions: Vec<ToolDefinition>,
     ) -> Result<(), ToolRegistryError> {
+        self.merge_definitions_with(definitions, LaneConflicts::Refuse)
+    }
+
+    /// `merge_definitions` with a conflict policy. Cluster-mode boot merges
+    /// authoritative catalogs with [`LaneConflicts::EvictStale`]: the boot
+    /// seeds are read one resource at a time and a commit can land between
+    /// the reads, so a name may appear in two seeds that never coexisted at
+    /// the authority; the gate's first pass reconciles every resource to
+    /// the current revision before a request is served, so the boot merge
+    /// only needs to install *something* consistent rather than refuse.
+    pub fn merge_definitions_with(
+        &self,
+        definitions: Vec<ToolDefinition>,
+        conflicts: LaneConflicts,
+    ) -> Result<(), ToolRegistryError> {
         if definitions.is_empty() {
             return Ok(());
         }
@@ -437,6 +452,23 @@ impl ToolRegistry {
         let mut managed_openapi_definitions = state.managed_openapi_definitions.clone();
         let mut mcp_proxy_definitions = state.mcp_proxy_definitions.clone();
         drop(state);
+        if conflicts == LaneConflicts::EvictStale {
+            let incoming = definitions
+                .iter()
+                .map(|definition| definition.name.clone())
+                .collect::<BTreeSet<_>>();
+            evict_stale_holders(
+                "boot",
+                "authority",
+                &incoming,
+                [
+                    &mut local_definitions,
+                    &mut managed_openapi_definitions,
+                    &mut mcp_proxy_definitions,
+                ],
+                |_| false,
+            );
+        }
 
         let (new_local_definitions, new_managed_openapi_definitions, new_mcp_proxy_definitions) =
             split_definitions_by_source(definitions);
@@ -1207,6 +1239,14 @@ fn incoming_names(
 /// is not the incoming owner's own: under [`LaneConflicts::EvictStale`] such
 /// a holder is provably stale (the authority reserved the name for the
 /// installing owner), and its own authoritative content follows.
+///
+/// Provably -- which is why a holder the authority never reserved is not
+/// evicted: a legacy projection's MCP proxy (a `Legacy` source in the MCP
+/// lane) comes from this replica's static configuration, not from the
+/// authority, so an authoritative name colliding with it is a real
+/// collision, not staleness. It stays, the merged validation refuses the
+/// install, and the gate fails closed rather than silently rebinding what
+/// an existing policy name invokes.
 fn evict_stale_holders<const N: usize>(
     lane: &'static str,
     owner: &str,
@@ -1215,14 +1255,30 @@ fn evict_stale_holders<const N: usize>(
     is_incoming: impl Fn(&ToolDefinition) -> bool,
 ) {
     let mut evicted = Vec::new();
+    let mut unreserved = Vec::new();
     for entries in lanes {
         entries.retain(|definition| {
-            let stale = incoming.contains(&definition.name) && !is_incoming(definition);
-            if stale {
-                evicted.push(definition.name.clone());
+            if !incoming.contains(&definition.name) || is_incoming(definition) {
+                return true;
             }
-            !stale
+            if definition.upstream.is_mcp_proxy()
+                && !matches!(definition.source, ToolSource::Mcp { .. })
+            {
+                unreserved.push(definition.name.clone());
+                return true;
+            }
+            evicted.push(definition.name.clone());
+            false
         });
+    }
+    if !unreserved.is_empty() {
+        tracing::error!(
+            lane,
+            owner,
+            names = ?unreserved,
+            "authoritative install collides with tool names this replica's static \
+             configuration holds; the install is refused rather than rebinding them"
+        );
     }
     if !evicted.is_empty() {
         tracing::info!(
@@ -2330,6 +2386,70 @@ mod tests {
                 .all(|definition| definition.name != "shared_tool"),
             "the stale local entry is gone"
         );
+    }
+
+    /// A legacy projection's MCP proxy is not reserved at the authority, so
+    /// an authoritative catalog claiming its name is a collision, not
+    /// staleness: the install is refused and the legacy holder stays.
+    #[test]
+    fn an_unreserved_legacy_holder_is_never_evicted() {
+        let registry = ToolRegistry::disabled();
+        registry
+            .replace_local_and_legacy_mcp_definitions(
+                Vec::new(),
+                vec![mcp_proxy_tool(
+                    "weather:get_forecast",
+                    "weather",
+                    "get_forecast",
+                )],
+            )
+            .expect("the legacy proxy installs");
+        let managed = ToolDefinition::mcp_connection(
+            "weather".to_owned(),
+            "An authoritative catalog claiming the legacy name.".to_owned(),
+            json!({"type": "object", "properties": {}, "additionalProperties": false}),
+            "get_forecast".to_owned(),
+        );
+        registry
+            .install_mcp_connection_catalog_with(
+                "weather",
+                vec![managed],
+                LaneConflicts::EvictStale,
+            )
+            .expect_err("a name this replica's static configuration holds is refused");
+        let served = registry
+            .get("weather:get_forecast")
+            .expect("the legacy proxy is still served");
+        assert!(
+            matches!(served.source, ToolSource::Legacy),
+            "the legacy holder was not rebound: {:?}",
+            served.source
+        );
+    }
+
+    /// A cluster-mode boot merge evicts a stale holder the same way a
+    /// reconcile does, so seeds read at different revisions cannot abort
+    /// startup on a name that moved between them; a standalone merge still
+    /// refuses.
+    #[test]
+    fn a_boot_merge_can_evict_a_stale_holder_when_asked() {
+        let registry = ToolRegistry::disabled();
+        registry
+            .install_local_definitions(vec![local_definition("moved_tool")])
+            .expect("the local seed installs");
+        registry
+            .merge_definitions(vec![openapi_definition("conn-a", "moved_tool")])
+            .expect_err("a standalone merge refuses the collision");
+        registry
+            .merge_definitions_with(
+                vec![openapi_definition("conn-a", "moved_tool")],
+                LaneConflicts::EvictStale,
+            )
+            .expect("a cluster boot merge evicts the stale local holder");
+        assert!(matches!(
+            registry.get("moved_tool").expect("served").source,
+            ToolSource::OpenApi { .. }
+        ));
     }
 
     /// Two catalogs that swapped names converge on a lagging replica in

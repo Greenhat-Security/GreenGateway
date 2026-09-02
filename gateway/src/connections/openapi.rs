@@ -324,6 +324,24 @@ impl OpenApiConnectionCatalogService {
         http: ConnectionHttpRuntime,
         registry: ToolRegistry,
     ) -> Result<Self, ConnectionStoreError> {
+        Self::load_with(
+            control_plane,
+            http,
+            registry,
+            crate::tools::definitions::LaneConflicts::Refuse,
+        )
+    }
+
+    /// `load` with the boot merge's conflict policy: cluster mode passes
+    /// [`crate::tools::definitions::LaneConflicts::EvictStale`], because its
+    /// boot seeds are read one resource at a time and the gate's first pass
+    /// reconciles them before a request is served.
+    pub fn load_with(
+        control_plane: ConnectionControlPlane,
+        http: ConnectionHttpRuntime,
+        registry: ToolRegistry,
+        conflicts: crate::tools::definitions::LaneConflicts,
+    ) -> Result<Self, ConnectionStoreError> {
         let catalogs = if control_plane.is_managed_store_configured() {
             control_plane
                 .managed_store()
@@ -354,7 +372,7 @@ impl OpenApiConnectionCatalogService {
             .flatten()
             .collect::<Vec<_>>();
         registry
-            .merge_definitions(definitions)
+            .merge_definitions_with(definitions, conflicts)
             .map_err(tool_registry_store_error)?;
         let runtime = OpenApiConnectionCatalogRuntime::new(&active_catalogs)?;
         Ok(Self {
@@ -1621,6 +1639,62 @@ mod tests {
             &first,
             &entry(changed_mapping)
         ));
+    }
+
+    /// A request admitted by the gate dispatches under the Connection
+    /// snapshot pinned at admission, not under whatever a later reconcile
+    /// installed while it was in flight: the runtime resolves targets from
+    /// the pinned snapshot, and only from the live one outside a request.
+    #[tokio::test]
+    async fn targets_resolve_from_the_pinned_snapshot_inside_a_request() {
+        let database = TemporaryDatabase::new();
+        let mut config = Config::test_defaults();
+        config.connections_sqlite_path = Some(database.0.display().to_string());
+        let control_plane =
+            ConnectionControlPlane::from_config(&config).expect("control plane should build");
+        let snapshot = control_plane.runtime_snapshot();
+        let candidate: ConnectionWrite = serde_json::from_value(json!({
+            "display_name": "Pinned API",
+            "enabled": true,
+            "kind": "http_api",
+            "endpoint": {
+                "base_url": "https://pinned.example.test",
+                "base_path": "/v1"
+            },
+            "authentication": {"type": "none"},
+            "tls": {},
+            "timeouts": {
+                "connect_timeout_ms": 1000,
+                "request_timeout_ms": 3000,
+                "response_idle_timeout_ms": 1000
+            }
+        }))
+        .expect("HTTP Connection should deserialize");
+        let record = control_plane
+            .create_managed(snapshot.collection_etag(), candidate, "test-admin")
+            .await
+            .expect("HTTP Connection should create");
+        let egress_config = EgressConfig::from_config(&config);
+        let egress_client =
+            Arc::new(EgressClient::new(egress_config.clone()).expect("egress should build"));
+        let http = ConnectionHttpRuntime::new(control_plane.clone(), egress_config, egress_client);
+        let pinned = control_plane.runtime_snapshot();
+
+        // The Connection disappears from the live state after admission.
+        control_plane
+            .delete_managed(&record.id, &record.etag(), "test-admin")
+            .await
+            .expect("delete");
+        assert!(
+            http.target(record.id.as_str(), "/invoices").is_err(),
+            "outside a request the live snapshot no longer has it"
+        );
+        let target = crate::connections::http::with_pinned_connections(pinned, async {
+            http.target(record.id.as_str(), "/invoices")
+        })
+        .await
+        .expect("inside the admitted request the pinned snapshot still has it");
+        assert_eq!(target.connection_id(), &record.id);
     }
 
     /// A registry install that fails after the authority commit -- another

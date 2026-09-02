@@ -131,6 +131,11 @@ pub struct RbacState {
     /// no gate may put a database on the request path.
     #[cfg(feature = "postgres")]
     revision_gate: Option<Arc<dyn SecurityRevisionGate>>,
+    /// Cluster mode's Connection control plane, so an admitted request
+    /// pins the Connection snapshot it will dispatch under alongside the
+    /// policy snapshot it was authorized under.
+    #[cfg(feature = "postgres")]
+    connections: Option<crate::connections::control_plane::ConnectionControlPlane>,
     rate_limit: Option<RateLimitState>,
     pub exempt_paths: Vec<String>,
     pub client_ip_policy: ClientIpPolicy,
@@ -344,6 +349,8 @@ impl RbacState {
             policy_write_lock: Arc::new(Mutex::new(())),
             #[cfg(feature = "postgres")]
             revision_gate: None,
+            #[cfg(feature = "postgres")]
+            connections: None,
             rate_limit: None,
             exempt_paths,
             client_ip_policy,
@@ -364,6 +371,17 @@ impl RbacState {
     /// [`RbacState::install_revision_snapshot`] with the authority's
     /// current revision before the listener serves, and the gate keeps it
     /// current afterwards.
+    /// Cluster mode: the control plane whose snapshot an admitted request
+    /// pins for its dispatch.
+    #[cfg(feature = "postgres")]
+    pub(crate) fn with_connection_control_plane(
+        mut self,
+        connections: crate::connections::control_plane::ConnectionControlPlane,
+    ) -> Self {
+        self.connections = Some(connections);
+        self
+    }
+
     #[cfg(feature = "postgres")]
     pub(crate) fn with_revision_gate(mut self, gate: Arc<dyn SecurityRevisionGate>) -> Self {
         self.revision_gate = Some(gate);
@@ -876,7 +894,38 @@ fn spawn_sighup_reload_task(
     None
 }
 
+/// `next.run(req)` with the request's Connection snapshot pinned (cluster
+/// mode) or without one (standalone, or an exempt path that skipped the
+/// gate).
+#[cfg(feature = "postgres")]
+async fn run_pinned(
+    pinned: Option<Arc<crate::connections::control_plane::ConnectionRuntimeSnapshot>>,
+    next: Next,
+    req: Request,
+) -> Response {
+    match pinned {
+        Some(snapshot) => {
+            crate::connections::http::with_pinned_connections(snapshot, next.run(req)).await
+        }
+        None => next.run(req).await,
+    }
+}
+
+#[cfg(not(feature = "postgres"))]
+async fn run_pinned(_pinned: Option<Arc<()>>, next: Next, req: Request) -> Response {
+    next.run(req).await
+}
+
 pub async fn rbac_middleware(State(state): State<RbacState>, req: Request, next: Next) -> Response {
+    // Pinned for the whole request once the gate admits it (cluster mode):
+    // the proxy and the tool executor resolve every Connection target from
+    // this snapshot, never from one a later reconcile installed mid-flight.
+    #[cfg(feature = "postgres")]
+    let mut pinned_connections: Option<
+        Arc<crate::connections::control_plane::ConnectionRuntimeSnapshot>,
+    > = None;
+    #[cfg(not(feature = "postgres"))]
+    let pinned_connections: Option<Arc<()>> = None;
     let path = req.uri().path();
     let proxy_context = req
         .extensions()
@@ -968,6 +1017,13 @@ pub async fn rbac_middleware(State(state): State<RbacState>, req: Request, next:
         }
     }
 
+    #[cfg(feature = "postgres")]
+    if served_security_revision.is_some() {
+        pinned_connections = state
+            .connections
+            .as_ref()
+            .map(|control_plane| control_plane.runtime_snapshot());
+    }
     let policy = state.policy.load();
     // Record the revision this request actually serves under: the compiled
     // watermark the gate proved current for this request, covering every
@@ -1024,7 +1080,7 @@ pub async fn rbac_middleware(State(state): State<RbacState>, req: Request, next:
                     matched_rule_id,
                 );
                 drop(policy);
-                let response = next.run(req).await;
+                let response = run_pinned(pinned_connections.clone(), next, req).await;
                 with_policy_decision(response, decision)
             }
             RuleAction::Deny => {
@@ -1046,7 +1102,7 @@ pub async fn rbac_middleware(State(state): State<RbacState>, req: Request, next:
                     matched_rule_id,
                 );
                 drop(policy);
-                let response = next.run(req).await;
+                let response = run_pinned(pinned_connections.clone(), next, req).await;
                 with_policy_decision(response, decision)
             }
         };
@@ -1070,7 +1126,7 @@ pub async fn rbac_middleware(State(state): State<RbacState>, req: Request, next:
             emit_allowed(&state, &context, principal.as_ref(), Some(rule), None);
             let decision = decision_for_rule(PolicyDecisionOutcome::Allowed, "matched_rule", rule);
             drop(policy);
-            let response = next.run(req).await;
+            let response = run_pinned(pinned_connections.clone(), next, req).await;
             return with_policy_decision(response, decision);
         }
 
@@ -1091,7 +1147,7 @@ pub async fn rbac_middleware(State(state): State<RbacState>, req: Request, next:
                 emit_would_deny(&state, &context, principal.as_ref(), reason, Some(rule));
                 let decision = decision_for_rule(PolicyDecisionOutcome::WouldDeny, reason, rule);
                 drop(policy);
-                let response = next.run(req).await;
+                let response = run_pinned(pinned_connections.clone(), next, req).await;
                 with_policy_decision(response, decision)
             }
         };
@@ -1138,7 +1194,7 @@ pub async fn rbac_middleware(State(state): State<RbacState>, req: Request, next:
                 None,
                 Some("default_allow"),
             );
-            let response = next.run(req).await;
+            let response = run_pinned(pinned_connections.clone(), next, req).await;
             with_policy_decision(response, decision)
         }
         DefaultAction::Deny => match enforcement_mode {
@@ -1157,7 +1213,7 @@ pub async fn rbac_middleware(State(state): State<RbacState>, req: Request, next:
             }
             EnforcementMode::Shadow => {
                 emit_would_deny(&state, &context, principal.as_ref(), "default_deny", None);
-                let response = next.run(req).await;
+                let response = run_pinned(pinned_connections.clone(), next, req).await;
                 with_policy_decision(
                     response,
                     PolicyDecision {

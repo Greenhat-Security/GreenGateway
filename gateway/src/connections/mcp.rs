@@ -233,6 +233,24 @@ impl McpConnectionCatalogService {
         http: ConnectionHttpRuntime,
         registry: ToolRegistry,
     ) -> Result<Self, ConnectionStoreError> {
+        Self::load_with(
+            control_plane,
+            http,
+            registry,
+            crate::tools::definitions::LaneConflicts::Refuse,
+        )
+    }
+
+    /// `load` with the boot merge's conflict policy: cluster mode passes
+    /// [`crate::tools::definitions::LaneConflicts::EvictStale`], because its
+    /// boot seeds are read one resource at a time and the gate's first pass
+    /// reconciles them before a request is served.
+    pub fn load_with(
+        control_plane: ConnectionControlPlane,
+        http: ConnectionHttpRuntime,
+        registry: ToolRegistry,
+        conflicts: crate::tools::definitions::LaneConflicts,
+    ) -> Result<Self, ConnectionStoreError> {
         let catalogs = if control_plane.is_managed_store_configured() {
             control_plane
                 .managed_store()
@@ -264,7 +282,7 @@ impl McpConnectionCatalogService {
             .flat_map(catalog_definitions)
             .collect::<Vec<_>>();
         registry
-            .merge_definitions(definitions)
+            .merge_definitions_with(definitions, conflicts)
             .map_err(tool_registry_store_error)?;
         let runtime = McpConnectionCatalogRuntime::new(&active_catalogs);
         Ok(Self {
