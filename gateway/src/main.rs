@@ -1418,8 +1418,22 @@ struct GatewayAppBuildOverrides {
     /// itself.
     #[cfg(feature = "postgres")]
     pg_connections: Option<ClusterConnectionsSeed>,
+    /// The cluster-mode service-token store and the revision it was read
+    /// at. None in standalone mode, where SERVICE_TOKEN_SQLITE_PATH is the
+    /// store.
+    #[cfg(feature = "postgres")]
+    pg_service_tokens: Option<ClusterServiceTokenSeed>,
+    /// The cluster-mode pending-login store: the pool, the deployment ID
+    /// the digests and associated data bind, and the loaded login keyring.
+    /// None in standalone mode, or when no admin login provider is set.
+    #[cfg(feature = "postgres")]
+    pg_pending_logins: Option<ClusterPendingLoginSeed>,
     #[cfg(test)]
     egress_resolver: Option<Arc<dyn egress::DnsResolver>>,
+    /// Test seam: the pending-login backend the admin login flow uses,
+    /// so a handler test can stand in an unavailable store.
+    #[cfg(test)]
+    pending_login_backend: Option<Arc<dyn auth::oidc_login::PendingLoginBackend>>,
     #[cfg(test)]
     request_selection_count: Option<Arc<std::sync::atomic::AtomicUsize>>,
     #[cfg(test)]
@@ -1547,6 +1561,47 @@ struct ClusterConnectionsSeed {
     revision: i64,
 }
 
+/// The cluster-mode service-token authority and the security revision
+/// its state was last changed at, read by `run()` for the gate's boot
+/// watermark.
+#[cfg(feature = "postgres")]
+struct ClusterServiceTokenSeed {
+    store: Arc<storage::PostgresServiceTokenStore>,
+    revision: i64,
+    /// For the per-provider JWT revocation stores, which are built inside
+    /// the validator chain where only the seed reaches.
+    pool: deadpool_postgres::Pool,
+    deployment_id: String,
+}
+
+#[cfg(feature = "postgres")]
+#[derive(Debug)]
+struct ClusterServiceTokenStartupError(storage::RepositoryError);
+
+#[cfg(feature = "postgres")]
+impl std::fmt::Display for ClusterServiceTokenStartupError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "the cluster-mode service-token store could not be read at startup: {}",
+            self.0
+        )
+    }
+}
+
+#[cfg(feature = "postgres")]
+impl std::error::Error for ClusterServiceTokenStartupError {}
+
+/// What `run()` loads for the pending-login store before the app is
+/// built: the keyring must be read from disk with the same care the
+/// connections keyring gets, and that is startup work.
+#[cfg(feature = "postgres")]
+struct ClusterPendingLoginSeed {
+    pool: deadpool_postgres::Pool,
+    deployment_id: String,
+    keyring: connections::local_secret::LocalSecretKeyring,
+}
+
 /// Why a cluster-mode boot refused to serve Connections.
 #[cfg(feature = "postgres")]
 #[derive(Debug)]
@@ -1643,6 +1698,125 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
     }
+    // `gateway revoke-jwt <issuer> <jti> [expires_at]` (issue #241, PR 9):
+    // the shared denylist's write path. A one-shot command like `migrate`:
+    // it connects, records the withdrawal as a committed control-plane
+    // mutation, prints one line, and exits. There is deliberately no admin
+    // HTTP endpoint for this yet -- a permission model for revoking other
+    // people's sessions is a product decision, and until it is made the
+    // operator's shell is the right place for a break-glass action. The
+    // jti is digested before it reaches the database and is never echoed.
+    #[cfg(feature = "postgres")]
+    if std::env::args_os()
+        .nth(1)
+        .is_some_and(|word| word == *"revoke-jwt")
+    {
+        initialize_tracing_for_one_shot_commands();
+        let arguments = std::env::args_os()
+            .skip(2)
+            .map(|argument| argument.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        let (issuer, jti, expires_at) = match arguments.as_slice() {
+            [issuer, jti] => (issuer.clone(), jti.clone(), None),
+            [issuer, jti, expires_at] => (issuer.clone(), jti.clone(), Some(expires_at.clone())),
+            _ => {
+                return Err(
+                    "usage: gateway revoke-jwt <issuer> <jti> [expires_at RFC 3339]".into(),
+                );
+            }
+        };
+        let config = config::Config::from_env()
+            .map_err(|error| Box::<dyn std::error::Error>::from(error.to_string()))?;
+        let Some(foundation) =
+            storage::postgres::PostgresFoundation::start_if_selected(&config).await?
+        else {
+            return Err("gateway revoke-jwt requires STATE_BACKEND=postgres".into());
+        };
+        let deployment_id = config
+            .deployment_id
+            .clone()
+            .ok_or("STATE_BACKEND=postgres requires DEPLOYMENT_ID")?;
+        storage::postgres::bind_deployment(foundation.pool(), &deployment_id).await?;
+        let boundary = auth::JwtValidator::issuer_boundary(&issuer)?;
+        let store = storage::PostgresJwtRevocationStore::new(
+            foundation.pool().clone(),
+            &deployment_id,
+            &boundary,
+        );
+        match store
+            .revoke(&jti, expires_at.as_deref(), "operator:revoke-jwt")
+            .await
+            .map_err(|error| {
+                Box::<dyn std::error::Error>::from(format!("JWT revocation failed: {error}"))
+            })? {
+            storage::JwtRevocationOutcome::Revoked { security_revision } => {
+                println!("revoked: issuer={boundary} security_revision={security_revision}");
+                println!(
+                    "note: replicas older than this release do not enforce JWT revocations; \
+                     the withdrawal is deployment-wide once the rollout completes"
+                );
+            }
+            storage::JwtRevocationOutcome::AlreadyRevoked => {
+                println!("already revoked: issuer={boundary}");
+            }
+        }
+        return Ok(());
+    }
+    // `gateway jwt-revocations-cleanup [limit]`: delete revocations whose
+    // expiry has passed, at most `limit` (default 1000) per run. Idempotent
+    // and bounded, so an operator can schedule it until the membership PR
+    // makes it fenced singleton work. Expired rows are already ignored on
+    // the read path; this only reclaims space.
+    #[cfg(feature = "postgres")]
+    if std::env::args_os()
+        .nth(1)
+        .is_some_and(|word| word == *"jwt-revocations-cleanup")
+    {
+        initialize_tracing_for_one_shot_commands();
+        let limit = match std::env::args_os().nth(2) {
+            None => 1_000,
+            Some(raw) => raw
+                .to_string_lossy()
+                .parse::<usize>()
+                .ok()
+                .filter(|limit| (1..=100_000).contains(limit))
+                .ok_or("usage: gateway jwt-revocations-cleanup [limit 1-100000]")?,
+        };
+        let config = config::Config::from_env()
+            .map_err(|error| Box::<dyn std::error::Error>::from(error.to_string()))?;
+        let Some(foundation) =
+            storage::postgres::PostgresFoundation::start_if_selected(&config).await?
+        else {
+            return Err("gateway jwt-revocations-cleanup requires STATE_BACKEND=postgres".into());
+        };
+        let deployment_id = config
+            .deployment_id
+            .clone()
+            .ok_or("STATE_BACKEND=postgres requires DEPLOYMENT_ID")?;
+        storage::postgres::bind_deployment(foundation.pool(), &deployment_id).await?;
+        // Cleanup is issuer-agnostic; the store's issuer is irrelevant here.
+        let store = storage::PostgresJwtRevocationStore::new(
+            foundation.pool().clone(),
+            &deployment_id,
+            "-",
+        );
+        let deleted = store.cleanup_expired(limit).await.map_err(|error| {
+            Box::<dyn std::error::Error>::from(format!("JWT revocation cleanup failed: {error}"))
+        })?;
+        println!("deleted expired JWT revocations: {deleted}");
+        return Ok(());
+    }
+    #[cfg(not(feature = "postgres"))]
+    if std::env::args_os()
+        .nth(1)
+        .is_some_and(|word| word == *"revoke-jwt" || word == *"jwt-revocations-cleanup")
+    {
+        return Err(
+            "this gateway binary was built without the `postgres` cargo feature and \
+                    cannot run the JWT revocation commands; build with default features"
+                .into(),
+        );
+    }
     #[cfg(not(feature = "postgres"))]
     if std::env::args_os()
         .nth(1)
@@ -1723,6 +1897,18 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     #[cfg(feature = "postgres")]
     let _database_foundation =
         storage::postgres::PostgresFoundation::start_if_selected(&config).await?;
+    // The database is bound to one deployment: the first boot records this
+    // DEPLOYMENT_ID and every later boot refuses another. Deployments never
+    // share a database -- every authoritative pointer and counter in the
+    // schema is a singleton.
+    #[cfg(feature = "postgres")]
+    if let Some(foundation) = &_database_foundation {
+        let deployment_id = config
+            .deployment_id
+            .as_deref()
+            .ok_or("STATE_BACKEND=postgres requires DEPLOYMENT_ID")?;
+        storage::postgres::bind_deployment(foundation.pool(), deployment_id).await?;
+    }
     // The policy control plane rides the same pool. `active()` validates
     // the document (parse) and verifies its recorded ETag; the proxy-route
     // cross-check needs the config and runs in the app builder. Serving
@@ -1837,6 +2023,68 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         }
         None => None,
     };
+    // Service tokens ride the same pool (issue #241, PR 9). Nothing to
+    // seed: an empty deployment has no tokens. The revision is the gate's
+    // boot watermark for the resource.
+    #[cfg(feature = "postgres")]
+    let pg_service_tokens_seed = match &_database_foundation {
+        Some(foundation) => {
+            let store = Arc::new(storage::PostgresServiceTokenStore::new(
+                foundation.pool().clone(),
+            ));
+            let revision = store.state_revision().await.map_err(|error| {
+                Box::new(ClusterServiceTokenStartupError(error)) as Box<dyn std::error::Error>
+            })?;
+            // Postgres mode requires DEPLOYMENT_ID (config.rs); it is the
+            // domain separator under which every jti digest is computed.
+            let deployment_id = config.deployment_id.clone().ok_or_else(|| {
+                Box::<dyn std::error::Error>::from(
+                    "STATE_BACKEND=postgres requires DEPLOYMENT_ID for the JWT revocation store",
+                )
+            })?;
+            Some(ClusterServiceTokenSeed {
+                store,
+                revision,
+                pool: foundation.pool().clone(),
+                deployment_id,
+            })
+        }
+        None => None,
+    };
+    // Pending admin logins ride the same pool when an admin login provider
+    // is configured. The keyring is loaded here, from files beneath the
+    // secrets root, with the connections keyring's reader.
+    #[cfg(feature = "postgres")]
+    let pg_pending_logins_seed = match (&_database_foundation, config.admin_login_provider.as_ref())
+    {
+        (Some(foundation), Some(_)) => {
+            let root = config.connection_secrets_root.as_ref().ok_or_else(|| {
+                Box::<dyn std::error::Error>::from(
+                    "ADMIN_LOGIN_KEYRING requires CONNECTION_SECRETS_ROOT for its key files",
+                )
+            })?;
+            let keyring = connections::local_secret::LocalSecretKeyring::load(
+                &config.admin_login_keyring,
+                root,
+            )
+            .map_err(|error| {
+                Box::<dyn std::error::Error>::from(format!(
+                    "the admin login keyring could not be loaded: {error}"
+                ))
+            })?;
+            let deployment_id = config.deployment_id.clone().ok_or_else(|| {
+                Box::<dyn std::error::Error>::from(
+                    "STATE_BACKEND=postgres requires DEPLOYMENT_ID for the pending-login store",
+                )
+            })?;
+            Some(ClusterPendingLoginSeed {
+                pool: foundation.pool().clone(),
+                deployment_id,
+                keyring,
+            })
+        }
+        _ => None,
+    };
     // The durable audit store rides the foundation's pool; the SSE
     // endpoint reads committed events through it in cluster mode. Built
     // here, where both the pool and the replica identity exist, and handed
@@ -1886,8 +2134,14 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             pg_tools: pg_tools_seed,
             #[cfg(feature = "postgres")]
             pg_connections: pg_connections_seed,
+            #[cfg(feature = "postgres")]
+            pg_service_tokens: pg_service_tokens_seed,
+            #[cfg(feature = "postgres")]
+            pg_pending_logins: pg_pending_logins_seed,
             #[cfg(test)]
             egress_resolver: None,
+            #[cfg(test)]
+            pending_login_backend: None,
             #[cfg(test)]
             request_selection_count: None,
             #[cfg(test)]
@@ -2239,26 +2493,90 @@ fn gateway_app_with_process_started_at_and_overrides(
             );
         }
     }
-    let service_token_store = config
+    let service_token_store: Option<Arc<dyn storage::ServiceTokenStore>> = config
         .service_token_sqlite_path
         .as_deref()
         .map(auth::SqliteTokenStore::open)
         .transpose()?
-        .map(Arc::new);
+        .map(|store| Arc::new(store) as Arc<dyn storage::ServiceTokenStore>);
+    // Cluster mode serves tokens from the authority; SERVICE_TOKEN_SQLITE_PATH
+    // is rejected there (config.rs), so the two never coexist.
+    #[cfg(feature = "postgres")]
+    let service_token_store = match build_overrides.pg_service_tokens.as_ref() {
+        Some(seed) => Some(seed.store.clone() as Arc<dyn storage::ServiceTokenStore>),
+        None => service_token_store,
+    };
     let service_token_validator = service_token_store.as_ref().map(|store| {
-        Arc::new(auth::ServiceTokenValidator::new(
-            Arc::clone(store) as Arc<dyn storage::ServiceTokenStore>,
+        let validator = auth::ServiceTokenValidator::new(
+            Arc::clone(store),
             Duration::from_millis(config.service_token_cache_ttl_ms),
-        ))
+        );
+        // In cluster mode the cache is only trusted at the revision the
+        // authority reports for the request at hand: a revoke on any
+        // replica moves it, so the next request here re-verifies.
+        #[cfg(feature = "postgres")]
+        let validator = match build_overrides.pg_service_tokens.as_ref() {
+            Some(seed) => validator.with_revision_source(Arc::new(seed.store.revision_source())),
+            None => validator,
+        };
+        Arc::new(validator)
     });
+    // Cluster mode: every JWT provider's validator consults the shared
+    // denylist, keyed by that provider's principal issuer under this
+    // deployment's ID.
+    #[cfg(feature = "postgres")]
+    let jwt_revocation_factory = build_overrides.pg_service_tokens.as_ref().map(|seed| {
+        let pool = seed.pool.clone();
+        let deployment_id = seed.deployment_id.clone();
+        move |issuer: &str| {
+            Arc::new(storage::PostgresJwtRevocationStore::new(
+                pool.clone(),
+                &deployment_id,
+                issuer,
+            )) as Arc<dyn auth::RevocationStore>
+        }
+    });
+    #[cfg(feature = "postgres")]
+    let jwt_revocation: Option<JwtRevocationStoreFactory<'_>> = jwt_revocation_factory
+        .as_ref()
+        .map(|factory| factory as JwtRevocationStoreFactory<'_>);
+    #[cfg(not(feature = "postgres"))]
+    let jwt_revocation: Option<JwtRevocationStoreFactory<'_>> = None;
     let validator = auth_validator_from_config(
         &config,
         Arc::clone(&egress_client),
         service_token_validator.clone(),
         &discovered_oidc.jwks_urls,
+        jwt_revocation,
+        Some(&lifecycle),
     )?;
-    let admin_auth_state =
-        admin_auth_state_from_config(&config, &discovered_oidc, Arc::clone(&egress_client))?;
+    #[cfg(feature = "postgres")]
+    let pending_login_backend: Option<Arc<dyn auth::oidc_login::PendingLoginBackend>> =
+        build_overrides.pg_pending_logins.as_ref().map(|seed| {
+            Arc::new(storage::PostgresPendingLoginStore::new(
+                seed.pool.clone(),
+                &seed.deployment_id,
+                seed.keyring.clone(),
+                auth::PendingLoginLimits {
+                    ttl: Duration::from_secs(config.admin_login_pending_ttl_secs),
+                    max_entries: config.admin_login_pending_max_entries,
+                    max_per_ip: config.admin_login_pending_max_per_ip,
+                },
+            )) as Arc<dyn auth::oidc_login::PendingLoginBackend>
+        });
+    #[cfg(not(feature = "postgres"))]
+    let pending_login_backend: Option<Arc<dyn auth::oidc_login::PendingLoginBackend>> = None;
+    #[cfg(test)]
+    let pending_login_backend = build_overrides
+        .pending_login_backend
+        .clone()
+        .or(pending_login_backend);
+    let admin_auth_state = admin_auth_state_from_config(
+        &config,
+        &discovered_oidc,
+        Arc::clone(&egress_client),
+        pending_login_backend,
+    )?;
     let principal_directory = auth::PrincipalDirectory::from_config(&config)?;
     let rbac_status = RbacStatus {
         policy_loaded: loaded_policy.is_some(),
@@ -2429,6 +2747,18 @@ fn gateway_app_with_process_started_at_and_overrides(
             connection_control_plane.runtime_handle(),
         );
     }
+    #[cfg(feature = "postgres")]
+    if let (Some(seed), Some(runtime), Some(validator)) = (
+        build_overrides.pg_service_tokens.as_ref(),
+        cluster_security_runtime.as_ref(),
+        service_token_validator.as_ref(),
+    ) {
+        runtime.register_resource(security_cluster::ServiceTokensResource::new(
+            seed.store.clone(),
+            validator.clone(),
+            seed.revision,
+        ));
+    }
     // Every resource is registered; only now may the background reconciler
     // start. A pass that ran before tools or Connections registered would
     // confirm policy alone and advance the watermark past any commit those
@@ -2514,7 +2844,7 @@ fn gateway_app_with_process_started_at_and_overrides(
         max_body_size: config.max_body_size,
     };
     let token_admin_state = TokenAdminState {
-        store: service_token_store.map(|store| store as Arc<dyn storage::ServiceTokenStore>),
+        store: service_token_store,
         validator: service_token_validator,
         rbac_state: rbac_state.clone(),
         audit: audit_log.clone(),
@@ -2822,11 +3152,20 @@ async fn grpc_endpoint(State(state): State<AppState>, request: AxumRequest) -> R
     proxy.handle_grpc_call(request, &source_ip).await
 }
 
+/// Builds one revocation store per JWT provider, keyed by the issuer the
+/// validator stamps on its principals. Cluster mode supplies the
+/// PostgreSQL-backed one; standalone mode has none and keeps the no-op
+/// store.
+type JwtRevocationStoreFactory<'a> =
+    &'a (dyn Fn(&str) -> Arc<dyn auth::RevocationStore> + Send + Sync);
+
 fn auth_validator_from_config(
     config: &config::Config,
     egress_client: Arc<egress::EgressClient>,
     service_token_validator: Option<Arc<auth::ServiceTokenValidator>>,
     discovered_oidc_jwks_urls: &HashMap<String, String>,
+    jwt_revocation: Option<JwtRevocationStoreFactory<'_>>,
+    lifecycle: Option<&GatewayLifecycle>,
 ) -> Result<Option<Arc<dyn auth::SessionValidator>>, auth::AuthError> {
     let client_certificate_auth = config.client_certificate_auth_enabled();
     if config.auth_providers.is_empty()
@@ -2878,11 +3217,34 @@ fn auth_validator_from_config(
                     }
                 };
                 let jwt_config = auth::JwtAuthConfig::from_provider_config(provider, jwks_url);
-                validators.push(Arc::new(auth::JwtValidator::new_for_provider(
-                    jwt_config,
-                    &provider.name,
-                    Arc::clone(&egress_client),
-                )?) as Arc<dyn auth::SessionValidator>);
+                let validator = match jwt_revocation {
+                    Some(factory) => {
+                        // The denylist is keyed by exactly the issuer the
+                        // validator will stamp on its principals.
+                        let boundary = auth::JwtValidator::provider_principal_issuer(
+                            &jwt_config,
+                            &provider.name,
+                        )?;
+                        auth::JwtValidator::new_for_provider_with_revocation(
+                            jwt_config,
+                            &provider.name,
+                            Arc::clone(&egress_client),
+                            factory(&boundary),
+                        )?
+                    }
+                    None => auth::JwtValidator::new_for_provider(
+                        jwt_config,
+                        &provider.name,
+                        Arc::clone(&egress_client),
+                    )?,
+                };
+                let validator = Arc::new(validator);
+                // Keys are refreshed on a schedule, not only on a kid miss,
+                // so a withdrawn signing key disappears promptly.
+                if let Some(lifecycle) = lifecycle {
+                    validator.spawn_background_refresh(lifecycle);
+                }
+                validators.push(validator as Arc<dyn auth::SessionValidator>);
             }
             config::AuthProviderType::CookieSession => {
                 let cookie_config = auth::CookieSessionAuthConfig::from_provider_config(provider)?;
@@ -2904,6 +3266,7 @@ fn admin_auth_state_from_config(
     config: &config::Config,
     discovered_oidc: &DiscoveredOidcConfig,
     egress_client: Arc<egress::EgressClient>,
+    pending_login_backend: Option<Arc<dyn auth::oidc_login::PendingLoginBackend>>,
 ) -> Result<Option<AdminAuthState>, auth::AuthError> {
     let Some(admin_login_provider) = config.admin_login_provider.as_deref() else {
         return Ok(None);
@@ -2945,6 +3308,7 @@ fn admin_auth_state_from_config(
         authorization_endpoint: endpoints.authorization_endpoint.clone(),
         token_endpoint: endpoints.token_endpoint.clone(),
         http_timeout: Duration::from_millis(provider.jwks_timeout_ms),
+        jwks_max_key_age: Duration::from_secs(provider.jwks_max_key_age_secs),
     };
 
     let pending_limits = auth::PendingLoginLimits {
@@ -2952,9 +3316,17 @@ fn admin_auth_state_from_config(
         max_entries: config.admin_login_pending_max_entries,
         max_per_ip: config.admin_login_pending_max_per_ip,
     };
+    // Cluster mode consumes the login on whichever replica the callback
+    // lands; standalone mode keeps the process-local store.
+    let login = match pending_login_backend {
+        Some(backend) => {
+            auth::OidcLoginState::new_with_backend(login_config, egress_client, backend)?
+        }
+        None => auth::OidcLoginState::new(login_config, egress_client, pending_limits)?,
+    };
 
     Ok(Some(AdminAuthState {
-        login: auth::OidcLoginState::new(login_config, egress_client, pending_limits)?,
+        login,
         admin_prefix: config.admin_prefix.clone(),
         client_ip_policy: client_ip::ClientIpPolicy::from_config(config),
     }))
@@ -4043,8 +4415,12 @@ async fn admin_auth_login_endpoint(
         &state.client_ip_policy,
     );
 
-    match state.login.begin_login(&source_ip) {
+    match state.login.begin_login(&source_ip).await {
         Ok(start) => found_redirect(start.authorization_url),
+        Err(err) if err.is_store_unavailable() => {
+            tracing::error!(error = %err, "admin OIDC login state store is unavailable");
+            service_unavailable("login state store is unavailable")
+        }
         Err(err) => {
             tracing::warn!(error = %err, "failed to start admin OIDC login");
             found_redirect(admin_auth_error_url(
@@ -4087,6 +4463,13 @@ async fn admin_auth_callback_endpoint(
             &state.admin_prefix,
             &exchange.access_token,
         )),
+        // A store that cannot be consulted is a dependency failure: 503,
+        // never "unknown state" -- "cannot check" is not "checked and
+        // denied", and no code is exchanged at the IdP.
+        Err(err) if err.is_store_unavailable() => {
+            tracing::error!(error = %err, "admin OIDC login state store is unavailable");
+            service_unavailable("login state store is unavailable")
+        }
         Err(err) if err.is_invalid_state() => {
             tracing::warn!("admin OIDC callback rejected unknown or expired state");
             found_redirect(admin_auth_error_url(&state.admin_prefix, "invalid_state"))
@@ -6291,6 +6674,16 @@ async fn token_create_endpoint(
         Ok(requested) => requested,
         Err(response) => return *response,
     };
+    // The store bounds the serialized scope list (the PostgreSQL column's
+    // check constraint); judge it here, before delegation is even
+    // considered, so an oversized list is the client's error rather than a
+    // store failure.
+    if serde_json::to_string(&requested.scopes)
+        .map(|scopes| scopes.len() > auth::tokens::MAX_SERVICE_TOKEN_SCOPES_JSON_BYTES)
+        .unwrap_or(true)
+    {
+        return bad_request("service-token scopes exceed the maximum serialized size");
+    }
 
     let Some(rbac_state) = state.rbac_state.as_ref() else {
         return token_rbac_not_configured();
@@ -13090,8 +13483,20 @@ fn token_store_error_response(error: storage::RepositoryError) -> Response {
     // violation, for instance) is a store failure this responder logs and
     // answers `500`, which is the pre-#340 behavior the async-contract
     // refactor's blanket translation had broadened to every operation.
-    tracing::error!(error = %error, "service-token store operation failed");
-    internal_server_error("service-token store operation failed")
+    // A store that cannot be reached, or that could not answer inside its
+    // contention budget, is a dependency failure: `503`, so a load
+    // balancer and an operator see "the authority is unavailable" rather
+    // than "the gateway is broken". Everything else stays `500`.
+    match error.kind() {
+        storage::RepositoryErrorKind::Unavailable | storage::RepositoryErrorKind::Timeout => {
+            tracing::error!(error = %error, "service-token store is unavailable");
+            service_unavailable("service-token store is unavailable")
+        }
+        _ => {
+            tracing::error!(error = %error, "service-token store operation failed");
+            internal_server_error("service-token store operation failed")
+        }
+    }
 }
 
 fn record_request(route: &'static str) {
@@ -13214,6 +13619,7 @@ mod tests {
             admin_login_pending_ttl_secs: config::DEFAULT_ADMIN_LOGIN_PENDING_TTL_SECS,
             admin_login_pending_max_entries: config::DEFAULT_ADMIN_LOGIN_PENDING_MAX_ENTRIES,
             admin_login_pending_max_per_ip: config::DEFAULT_ADMIN_LOGIN_PENDING_MAX_PER_IP,
+            admin_login_keyring: Vec::new(),
             gateway_public_url: None,
             audit_log_file: None,
             audit_sqlite_path: None,
@@ -13289,6 +13695,7 @@ mod tests {
             jwt_issuer: None,
             jwt_audience: None,
             jwt_jwks_timeout_ms: 2000,
+            jwt_jwks_max_key_age_secs: 300,
             jwt_require_jti: false,
             roles_claim: "roles".to_owned(),
             service_token_sqlite_path: None,
@@ -13765,6 +14172,7 @@ mod tests {
             issuer: Some(issuer.to_owned()),
             audience: None,
             jwks_timeout_ms: 2000,
+            jwks_max_key_age_secs: 300,
             require_jti: false,
             roles_claim: "roles".to_owned(),
             roles_claim_delimiter: None,
@@ -17728,6 +18136,7 @@ mod tests {
             issuer: Some("https://auth.example.test/".to_owned()),
             audience: None,
             jwks_timeout_ms: config.jwt_jwks_timeout_ms,
+            jwks_max_key_age_secs: 300,
             require_jti: false,
             roles_claim: "roles".to_owned(),
             roles_claim_delimiter: None,
@@ -26270,6 +26679,35 @@ mod tests {
     /// Pins the narrowed create mapping restored from the #340 review: a
     /// malformed `expires_at` is a `400` naming the field, because it is the
     /// one invalid-input case the caller controls on create.
+    /// An oversized scope list is refused before the store (and before
+    /// delegation is judged): the bound is the client's error, never the
+    /// store's check constraint surfacing as a `500`.
+    #[tokio::test]
+    async fn token_create_with_an_oversized_scope_list_is_a_bad_request() {
+        let token_db = TempDb::new("token-create-oversized-scopes");
+        let policy = TempPolicyFile::new(&token_policy_document_string());
+        let router = token_admin_router(&token_db, &policy, test_audit_log());
+        let scopes = (0..3_000)
+            .map(|index| format!("probe-reader-{index:0>40}"))
+            .collect::<Vec<_>>();
+
+        let response = router
+            .oneshot(token_admin_request(
+                Method::POST,
+                TOKENS_ADMIN_ROUTE,
+                Some(test_principal(&["tokens-writer", "probe-reader"])),
+                Some(json!({ "scopes": scopes }).to_string()),
+            ))
+            .await
+            .expect("oversized-scopes create request should complete");
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            body_string(response).await,
+            r#"{"error":"service-token scopes exceed the maximum serialized size"}"#
+        );
+    }
+
     #[tokio::test]
     async fn token_create_with_malformed_expires_at_is_a_bad_request() {
         let token_db = TempDb::new("token-create-malformed-expires-at");
@@ -33665,6 +34103,7 @@ paths:
             issuer: Some(issuer),
             audience: None,
             jwks_timeout_ms: 2000,
+            jwks_max_key_age_secs: 300,
             require_jti: false,
             roles_claim: "roles".to_owned(),
             roles_claim_delimiter: None,
@@ -33687,10 +34126,16 @@ paths:
             discover_oidc_jwks_urls_from_config(&config, Arc::clone(&egress_client))
                 .expect("issuer-only provider should discover JWKS URI");
 
-        let validator =
-            auth_validator_from_config(&config, egress_client, None, &discovered_oidc_jwks_urls)
-                .expect("issuer-only provider should build")
-                .expect("auth validator should be configured");
+        let validator = auth_validator_from_config(
+            &config,
+            egress_client,
+            None,
+            &discovered_oidc_jwks_urls,
+            None,
+            None,
+        )
+        .expect("issuer-only provider should build")
+        .expect("auth validator should be configured");
         let principal = validator
             .validate_session(&auth::SessionCredential::Bearer(signed_token_with_issuer(
                 "oidc-user",
@@ -33737,12 +34182,13 @@ paths:
                 .expect("egress client should build"),
         );
 
-        let validator = auth_validator_from_config(&config, egress_client, None, &HashMap::new())
-            .expect("a certificate-only configuration should build")
-            .expect(
-                "a certificate-only configuration must produce a validator, not None; None \
+        let validator =
+            auth_validator_from_config(&config, egress_client, None, &HashMap::new(), None, None)
+                .expect("a certificate-only configuration should build")
+                .expect(
+                    "a certificate-only configuration must produce a validator, not None; None \
                      makes the auth middleware fail closed on every request",
-            );
+                );
 
         assert!(
             validator.supports_client_certificate(),
@@ -33831,6 +34277,7 @@ paths:
             issuer: Some(issuer),
             audience: None,
             jwks_timeout_ms: 2000,
+            jwks_max_key_age_secs: 300,
             require_jti: false,
             roles_claim: "roles".to_owned(),
             roles_claim_delimiter: None,
@@ -33879,6 +34326,7 @@ paths:
             issuer: Some(issuer),
             audience: None,
             jwks_timeout_ms: 2000,
+            jwks_max_key_age_secs: 300,
             require_jti: false,
             roles_claim: "roles".to_owned(),
             roles_claim_delimiter: None,
@@ -33924,6 +34372,7 @@ paths:
             issuer: Some(issuer),
             audience: None,
             jwks_timeout_ms: 2000,
+            jwks_max_key_age_secs: 300,
             require_jti: false,
             roles_claim: "roles".to_owned(),
             roles_claim_delimiter: None,
@@ -34073,6 +34522,107 @@ paths:
             Some(oidc.authorization_endpoint.as_str())
         );
 
+        oidc.finish();
+    }
+
+    struct UnavailablePendingLoginBackend;
+
+    fn unavailable_pending_login_store() -> auth::oidc_login::PendingLoginStoreError {
+        auth::oidc_login::PendingLoginStoreError(storage::RepositoryError::new(
+            storage::RepositoryErrorKind::Unavailable,
+            "pending_login_test",
+        ))
+    }
+
+    #[async_trait::async_trait]
+    impl auth::oidc_login::PendingLoginBackend for UnavailablePendingLoginBackend {
+        async fn insert(
+            &self,
+            _state: &str,
+            _pending: auth::oidc_login::PendingLogin,
+        ) -> Result<bool, auth::oidc_login::PendingLoginStoreError> {
+            Err(unavailable_pending_login_store())
+        }
+
+        async fn take(
+            &self,
+            _state: &str,
+        ) -> Result<Option<auth::oidc_login::PendingLogin>, auth::oidc_login::PendingLoginStoreError>
+        {
+            Err(unavailable_pending_login_store())
+        }
+    }
+
+    async fn json_error_message(response: Response) -> String {
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("response body should be readable");
+        let json: serde_json::Value =
+            serde_json::from_slice(&body).expect("response body should be JSON");
+        json["error"]
+            .as_str()
+            .expect("response should carry an error message")
+            .to_owned()
+    }
+
+    /// A pending-login store that cannot be consulted is a dependency
+    /// failure on both legs: `503`, never "login failed" and never
+    /// "unknown state" -- "cannot check" is not "checked and denied" --
+    /// and the callback exchanges no code at the provider.
+    #[tokio::test]
+    async fn admin_oidc_login_answers_503_when_the_pending_login_store_is_unavailable() {
+        let token_endpoint =
+            spawn_mock_oidc_token_endpoint(Ipv4Addr::new(127, 0, 0, 2), None).await;
+        let oidc = spawn_mock_oidc_discovery_endpoint(Some(token_endpoint.url.clone()));
+        let mut config = admin_oidc_login_config(&oidc.issuer);
+        config.egress_deny_private_ips = false;
+        let recorder = PrometheusBuilder::new().build_recorder();
+        let apps = gateway_app_with_process_started_at_and_overrides(
+            config,
+            recorder.handle(),
+            test_audit_log(),
+            test_audit_event_sender(),
+            Instant::now(),
+            GatewayAppBuildOverrides {
+                pending_login_backend: Some(Arc::new(UnavailablePendingLoginBackend)),
+                ..GatewayAppBuildOverrides::default()
+            },
+        )
+        .expect("admin OIDC login app should build");
+        let router = match apps.http {
+            GatewayApp::Unified(router) => router,
+            GatewayApp::Split { .. } => panic!("admin OIDC login app should be unified"),
+        };
+
+        let login_response = router
+            .clone()
+            .oneshot(admin_oidc_login_request(Ipv4Addr::new(192, 0, 2, 7), None))
+            .await
+            .expect("login request should complete");
+        assert_eq!(login_response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            json_error_message(login_response).await,
+            "login state store is unavailable"
+        );
+
+        let callback_response = router
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/admin/auth/callback?code=admin-code&state=any-state")
+                    .body(Body::empty())
+                    .expect("callback request should build"),
+            )
+            .await
+            .expect("callback request should complete");
+        assert_eq!(callback_response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            json_error_message(callback_response).await,
+            "login state store is unavailable"
+        );
+        assert!(
+            token_endpoint.requests().is_empty(),
+            "no code is exchanged when the state cannot be checked"
+        );
         oidc.finish();
     }
 
@@ -34540,6 +35090,7 @@ paths:
             issuer: Some(issuer),
             audience: None,
             jwks_timeout_ms: 2000,
+            jwks_max_key_age_secs: 300,
             require_jti: false,
             roles_claim: "roles".to_owned(),
             roles_claim_delimiter: None,
@@ -34609,6 +35160,7 @@ paths:
             issuer: Some(issuer),
             audience: None,
             jwks_timeout_ms: 2000,
+            jwks_max_key_age_secs: 300,
             require_jti: false,
             roles_claim: "roles".to_owned(),
             roles_claim_delimiter: None,
@@ -39125,6 +39677,7 @@ O2gecI9QwDJNpm29J9wJB2F8
             issuer: None,
             audience: None,
             jwks_timeout_ms: config.jwt_jwks_timeout_ms,
+            jwks_max_key_age_secs: 300,
             require_jti: config.jwt_require_jti,
             roles_claim: config.roles_claim.clone(),
             roles_claim_delimiter: None,
@@ -39148,6 +39701,7 @@ O2gecI9QwDJNpm29J9wJB2F8
             issuer: Some(issuer),
             audience: None,
             jwks_timeout_ms: 2000,
+            jwks_max_key_age_secs: 300,
             require_jti: false,
             roles_claim: "roles".to_owned(),
             roles_claim_delimiter: None,
@@ -39174,6 +39728,7 @@ O2gecI9QwDJNpm29J9wJB2F8
             issuer: None,
             audience: None,
             jwks_timeout_ms: config.jwt_jwks_timeout_ms,
+            jwks_max_key_age_secs: 300,
             require_jti: false,
             roles_claim: "account.scope".to_owned(),
             roles_claim_delimiter: Some(" ".to_owned()),
@@ -41929,6 +42484,66 @@ O2gecI9QwDJNpm29J9wJB2F8
             assert_eq!(
                 rbac_state.current_policy().id.as_deref(),
                 Some("gate-tools")
+            );
+        }
+
+        /// A revoke committed through one replica is refused by the very
+        /// next request on another replica, inside that replica's cache
+        /// TTL. This is the property the documented standalone caveat
+        /// ("revocations made in another process take effect no later
+        /// than the TTL") gives up, and the one cluster mode must hold.
+        #[tokio::test]
+        async fn a_revoke_on_one_replica_is_refused_by_the_next_request_on_another() {
+            let Some(admin_dsn) = locator() else {
+                eprintln!("skipping: no test database locator; CI runs this test");
+                return;
+            };
+            let database = create_test_database(&admin_dsn).await;
+            let (_policy_store, _tools_store, pool) = migrated_stores(&database.dsn).await;
+            let store = Arc::new(storage::PostgresServiceTokenStore::new(pool.clone()));
+            let created = storage::ServiceTokenStore::create(
+                &*store,
+                auth::tokens::CreateTokenRequest {
+                    scopes: vec!["admin:tokens:read".to_owned()],
+                    created_by: "seed".to_owned(),
+                    expires_at: None,
+                },
+            )
+            .await
+            .expect("token should create");
+            let replica = || {
+                Arc::new(
+                    auth::ServiceTokenValidator::new(
+                        store.clone() as Arc<dyn storage::ServiceTokenStore>,
+                        Duration::from_secs(60),
+                    )
+                    .with_revision_source(Arc::new(store.revision_source())),
+                )
+            };
+            let replica_a = replica();
+            let replica_b = replica();
+            let bearer = auth::SessionCredential::Bearer(created.plaintext_token.clone());
+
+            auth::SessionValidator::validate_session(&*replica_a, &bearer)
+                .await
+                .expect("replica A accepts and caches");
+            auth::SessionValidator::validate_session(&*replica_b, &bearer)
+                .await
+                .expect("replica B accepts and caches");
+
+            // The revoke commits through replica A's admin path.
+            storage::ServiceTokenStore::revoke(&*store, &created.record.id)
+                .await
+                .expect("revoke should commit")
+                .expect("token exists");
+
+            // Replica B's very next request, 60 s of TTL to spare.
+            let refused = auth::SessionValidator::validate_session(&*replica_b, &bearer)
+                .await
+                .expect_err("the revoked token must be refused on the next request");
+            assert!(
+                matches!(refused, auth::AuthError::InvalidSession(_)),
+                "refused as an invalid credential, got {refused:?}"
             );
         }
 

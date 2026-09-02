@@ -12,7 +12,7 @@ Every piece of mutable state is classified into exactly one row. A PR that intro
 | Tool definitions (and Connections per #240) | Local file/process snapshot | Same versioned CAS/revision/outbox contract as policy | Linearizable; strict per-request revision |
 | Service tokens | SQLite + per-process caches | PostgreSQL rows; atomic create/rotate/revoke; authoritative check on every request | Revocation effective on next request cluster-wide |
 | JWT revocations | Production no-op store today | PostgreSQL rows keyed by normalized issuer + hashed `jti`, with expiry | Required-check failure is `503` |
-| OIDC pending login (state/nonce/PKCE) | Process-local map (sticky sessions required today) | Hashed lookup + AEAD-encrypted fields; single atomic consume; DB-time expiry and quotas | Exactly one callback consumes a login, on any replica |
+| OIDC pending login (state/nonce/PKCE) | Process-local map in standalone mode (sticky sessions); PostgreSQL in cluster mode since PR 9 | Hashed lookup + AEAD-encrypted fields; single atomic consume; DB-time expiry and quotas | Exactly one callback consumes a login, on any replica |
 | Rate-limit buckets | Process-local bounded store (per #338) | Atomic PostgreSQL operation on database time; HMAC'd keys; bounded cardinality | One burst of N permits N across the cluster |
 | Tool/global concurrency | Process-local semaphores | PostgreSQL leases: expiry, renewal, cancellation, fencing | A stale holder cannot commit after a successor fences |
 | Audit events | stdout/file/SQLite sinks | Idempotent PostgreSQL event log; commit-safe durable cursor | At-least-once with exactly-once storage via `event_id` |
@@ -88,5 +88,5 @@ Aggregate rule: the authority adds no more than **25 ms p99** to a protected req
 ## 7. Compatibility
 
 - Checked-in, ordered, checksummed migrations; expand/contract so version N and N+1 binaries coexist; no automatic downgrade; a dirty, unknown, or too-new schema never serves.
-- Every authoritative primary key, unique constraint, lock namespace, and notification derives from the deployment ID; two logical deployments in one database are isolated and that isolation is tested.
+- One logical deployment per database. Every authoritative pointer and revision counter in the schema is a singleton by construction, so a database holds exactly one deployment's state; the first boot binds the database to its `DEPLOYMENT_ID` (`greengateway.deployment_binding`) and every later boot and one-shot command refuses another. The deployment ID remains the domain separator for every digest, sealed envelope, and lock namespace, so state restored under another ID cannot be mistaken for it.
 - ADR-0002 holds: one cluster is one tenant and one trust domain. Multi-region active/active and multiple writable primaries are non-goals.

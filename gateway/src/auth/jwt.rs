@@ -6,6 +6,8 @@ use std::{
 };
 
 use http::Method;
+
+use crate::lifecycle::GatewayLifecycle;
 use jsonwebtoken::{decode, decode_header, Algorithm, DecodingKey, Validation};
 use serde::Deserialize;
 use serde_json::{Map, Value};
@@ -27,19 +29,28 @@ use super::{
 };
 
 const INVALID_TOKEN: &str = "invalid or expired token";
+/// The floor between two *demand-driven* JWKS fetches. Unknown kids are
+/// attacker-controlled, so a kid miss cannot be allowed to turn into an IdP
+/// request each time; this is the per-validator, per-replica cap on that
+/// traffic. The scheduled background refresh is not subject to it -- it is
+/// operator-paced -- but it stamps the same clock, so a storm of misses
+/// right after a scheduled fetch is still throttled.
 const MIN_JWKS_REFRESH_INTERVAL: Duration = Duration::from_secs(10);
 
-/// How long a fetched JWKS key set stays trusted.
-///
-/// Without a bound, a cached `kid` is trusted for the life of the process:
-/// `decode` only refreshes on a kid *miss*, so a key the issuer has withdrawn is
-/// never evicted as long as callers keep presenting it. Revoking a compromised
-/// signing key at the IdP would then have no effect on this gateway until it
-/// restarts. This is the same shape as caching a secret past its expiry — the
-/// artifact's validity must survive into the cache rather than being discarded
-/// at fetch time — so the key set carries the instant it was fetched and is
-/// re-fetched once it ages out.
-const MAX_JWKS_KEY_AGE: Duration = Duration::from_secs(300);
+/// The cap on the operator's maximum key age: a day. Past that a withdrawn
+/// key would be honoured for longer than any rotation window an IdP
+/// documents.
+pub const MAX_JWKS_KEY_AGE_SECS_LIMIT: u64 = 86_400;
+/// The floor on the operator's maximum key age: the demand-refresh
+/// throttle. Below it a key set could go stale before a demand refresh was
+/// allowed again, and every request would fail closed against a reachable
+/// issuer until the throttle window passed.
+pub const MIN_JWKS_KEY_AGE_SECS_LIMIT: u64 = MIN_JWKS_REFRESH_INTERVAL.as_secs();
+/// The `exp` leeway the validator grants (jsonwebtoken's default, made
+/// explicit): a token is accepted until `exp + leeway`, so a revocation
+/// keyed on the token's `exp` must stay effective at least that long past
+/// it. The revocation store retains rows for exactly this leeway.
+pub const JWT_EXP_LEEWAY_SECS: u64 = 60;
 
 /// JWT bearer-token validator configuration.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -52,6 +63,19 @@ pub struct JwtAuthConfig {
     pub audience: Option<String>,
     /// Timeout for JWKS HTTP fetches.
     pub http_timeout: Duration,
+    /// How long a fetched JWKS key set stays trusted.
+    ///
+    /// Without a bound, a cached `kid` is trusted for the life of the
+    /// process: on-demand refresh happens only on a kid *miss*, so a key the
+    /// issuer has withdrawn would never be evicted as long as callers keep
+    /// presenting it. The key set carries the instant it was fetched, is
+    /// refreshed in the background at half this age, and past this age is
+    /// not trusted at all: a request then refreshes first or fails closed.
+    /// Operator-configured (`JWT_JWKS_MAX_KEY_AGE_SECS` / a provider's
+    /// `jwks_max_key_age_secs`), bounded above by
+    /// [`MAX_JWKS_KEY_AGE_SECS_LIMIT`], and part of the static configuration
+    /// fingerprint replicas must agree on.
+    pub jwks_max_key_age: Duration,
     /// Reject tokens without a non-empty `jti` claim.
     pub require_jti: bool,
     /// Literal claim key or dotted nested claim path used to extract roles.
@@ -70,6 +94,7 @@ impl JwtAuthConfig {
             issuer: normalize_auth_config_issuer(config.jwt_issuer.as_deref()),
             audience: config.jwt_audience.clone(),
             http_timeout: Duration::from_millis(config.jwt_jwks_timeout_ms),
+            jwks_max_key_age: Duration::from_secs(config.jwt_jwks_max_key_age_secs),
             require_jti: config.jwt_require_jti,
             roles_claim: config.roles_claim.clone(),
             roles_claim_delimiter: None,
@@ -83,6 +108,7 @@ impl JwtAuthConfig {
             issuer: normalize_auth_config_issuer(config.issuer.as_deref()),
             audience: config.audience.clone(),
             http_timeout: Duration::from_millis(config.jwks_timeout_ms),
+            jwks_max_key_age: Duration::from_secs(config.jwks_max_key_age_secs),
             require_jti: config.require_jti,
             roles_claim: config.roles_claim.clone(),
             roles_claim_delimiter: config.roles_claim_delimiter.clone(),
@@ -166,6 +192,49 @@ impl JwtValidator {
         )
     }
 
+    /// [`JwtValidator::new_for_provider`] with a real revocation store
+    /// (issue #241, PR 9). The store is expected to be keyed by
+    /// [`JwtValidator::provider_principal_issuer`] for the same
+    /// configuration, so the denylist's identity boundary is the
+    /// principal's.
+    pub fn new_for_provider_with_revocation(
+        cfg: JwtAuthConfig,
+        provider_name: &str,
+        egress_client: Arc<EgressClient>,
+        revocation: Arc<dyn RevocationStore>,
+    ) -> Result<Self, AuthError> {
+        Self::with_keys(
+            cfg,
+            Some(provider_issuer(provider_name)),
+            egress_client,
+            revocation,
+            HashMap::new(),
+        )
+    }
+
+    /// The issuer a validator built from `cfg` for `provider_name` stamps
+    /// on every principal: the configured issuer, normalized, or the
+    /// provider's own label when none is configured. A revocation store
+    /// keyed by anything else would let a `jti` revoked for one identity
+    /// boundary go unrecognized -- or be recognized for the wrong one.
+    pub fn provider_principal_issuer(
+        cfg: &JwtAuthConfig,
+        provider_name: &str,
+    ) -> Result<String, AuthError> {
+        match cfg.issuer.as_deref() {
+            Some(issuer) => Self::issuer_boundary(issuer),
+            None => Ok(provider_issuer(provider_name)),
+        }
+    }
+
+    /// A configured issuer as the validator would normalize it -- the
+    /// identity boundary a revocation must be recorded under. The
+    /// operator's `revoke-jwt` command uses this so a revocation it writes
+    /// is keyed exactly as the validators look it up.
+    pub fn issuer_boundary(issuer: &str) -> Result<String, AuthError> {
+        normalize_configured_issuer(issuer)
+    }
+
     #[allow(dead_code)] // Future wiring can supply a real jti revocation store.
     pub fn new_with_revocation(
         cfg: JwtAuthConfig,
@@ -220,6 +289,83 @@ impl JwtValidator {
             last_jwks_refresh: Arc::new(Mutex::new(None)),
             revocation,
         })
+    }
+
+    /// Keep the key set fresh without waiting for a kid miss: refresh at
+    /// half the maximum key age (never faster than the demand floor), with
+    /// jitter so replicas that booted together do not fetch together.
+    ///
+    /// This is what makes "remove keys the issuer withdrew" prompt rather
+    /// than eventual: every successful fetch replaces the whole set, so a
+    /// withdrawn `kid` disappears at the next scheduled refresh instead of
+    /// surviving until some request happens to age the set out. A failed
+    /// refresh is logged and retried at the next tick; requests keep their
+    /// own on-demand refresh and their fail-closed answer past the maximum
+    /// age, so the task is a latency and hygiene improvement, never a
+    /// correctness dependency.
+    ///
+    /// Cross-replica pressure on the IdP is bounded by construction at
+    /// `replicas x JWT providers x (1 / interval)` scheduled fetches plus at
+    /// most one demand fetch per [`MIN_JWKS_REFRESH_INTERVAL`] per validator;
+    /// a shared lease that would let one replica fetch for all arrives with
+    /// the membership work.
+    pub fn spawn_background_refresh(self: &Arc<Self>, lifecycle: &GatewayLifecycle) {
+        let interval = background_refresh_interval(self.cfg.jwks_max_key_age);
+        self.spawn_background_refresh_every(interval, lifecycle);
+    }
+
+    fn spawn_background_refresh_every(
+        self: &Arc<Self>,
+        base: Duration,
+        lifecycle: &GatewayLifecycle,
+    ) {
+        let validator = Arc::clone(self);
+        let cancellation = lifecycle.background_cancellation();
+        let handle = tokio::spawn(async move {
+            loop {
+                let wait = base + refresh_jitter(base);
+                tokio::select! {
+                    () = tokio::time::sleep(wait) => {}
+                    () = cancellation.cancelled() => return,
+                }
+                if let Err(error) = validator.refresh_jwks_scheduled().await {
+                    tracing::warn!(
+                        error = %error,
+                        "scheduled JWKS refresh failed; requests refresh on demand and fail \
+                         closed past the maximum key age"
+                    );
+                }
+            }
+        });
+        lifecycle.register_background_task(handle);
+    }
+
+    /// The scheduled refresh: not subject to the demand floor (it is
+    /// operator-paced, not attacker-paced), but it stamps the same clock so
+    /// a burst of kid misses right after it is still throttled.
+    async fn refresh_jwks_scheduled(&self) -> Result<(), AuthError> {
+        let mut last_refresh = self.last_jwks_refresh.lock().await;
+        let result = self.fetch_jwks().await;
+        *last_refresh = Some(Instant::now());
+        result
+    }
+
+    #[cfg(test)]
+    pub(crate) fn spawn_background_refresh_for_test(
+        self: &Arc<Self>,
+        interval: Duration,
+        lifecycle: &GatewayLifecycle,
+    ) {
+        self.spawn_background_refresh_every(interval, lifecycle);
+    }
+
+    /// Test seam: make the key set look `by` older than it is, and forget
+    /// the last demand fetch so the next refresh is not throttled.
+    #[cfg(test)]
+    pub(crate) async fn age_key_set(&self, by: Duration) {
+        let mut fetched_at = self.keys_fetched_at.write().await;
+        *fetched_at = fetched_at.and_then(|instant| instant.checked_sub(by));
+        *self.last_jwks_refresh.lock().await = None;
     }
 
     async fn refresh_jwks(&self) -> Result<bool, AuthError> {
@@ -288,7 +434,7 @@ impl JwtValidator {
         self.keys_fetched_at
             .read()
             .await
-            .is_some_and(|fetched_at| fetched_at.elapsed() < MAX_JWKS_KEY_AGE)
+            .is_some_and(|fetched_at| fetched_at.elapsed() < self.cfg.jwks_max_key_age)
     }
 
     async fn decode(&self, token: &str) -> Result<JwtClaims, AuthError> {
@@ -338,6 +484,7 @@ impl JwtValidator {
     ) -> Result<JwtClaims, AuthError> {
         let mut validation = Validation::new(key.algorithm);
         validation.validate_exp = true;
+        validation.leeway = JWT_EXP_LEEWAY_SECS;
         // RFC 7519 4.1.5: a token must not be accepted before its `nbf`. The
         // library default is off, so an issuer that stamps a future start on a
         // scheduled-access token would otherwise have that window ignored.
@@ -551,6 +698,21 @@ fn invalid_token() -> AuthError {
     AuthError::InvalidSession(INVALID_TOKEN.to_owned())
 }
 
+/// Half the maximum key age, never below the demand floor: a key set is
+/// refreshed well before it stops being trusted.
+fn background_refresh_interval(max_key_age: Duration) -> Duration {
+    (max_key_age / 2).max(MIN_JWKS_REFRESH_INTERVAL)
+}
+
+/// Up to one eighth of the interval, from the OS random source, so replicas
+/// drift apart rather than fetching in lockstep. Randomness failing here
+/// costs only the jitter.
+fn refresh_jitter(base: Duration) -> Duration {
+    let mut byte = [0u8; 1];
+    let _ = getrandom::fill(&mut byte);
+    base.mul_f64(f64::from(byte[0]) / 255.0 / 8.0)
+}
+
 fn normalize_configured_issuer(issuer: &str) -> Result<String, AuthError> {
     oidc::normalize_issuer(issuer)
         .ok_or_else(|| AuthError::Upstream("JWT issuer must be non-empty".to_owned()))
@@ -730,6 +892,47 @@ RowSUZV5FSmOGJ7JyROZ80k=
         async fn is_revoked(&self, jti: &str) -> Result<bool, AuthError> {
             Ok(self.revoked.contains(jti))
         }
+    }
+
+    /// The key a revocation store is built under must be exactly the
+    /// issuer the validator stamps on its principals, in both the
+    /// configured-issuer and the provider-fallback shapes.
+    #[test]
+    fn provider_principal_issuer_matches_the_validator_boundary() {
+        let mut cfg =
+            JwtAuthConfig::from_config(&test_config(Some("https://jwks.example.test/keys")))
+                .expect("a JWKS URL yields a JWT config");
+        cfg.issuer = Some("https://issuer.example.test/".to_owned());
+        assert_eq!(
+            JwtValidator::provider_principal_issuer(&cfg, "workforce").expect("issuer"),
+            "https://issuer.example.test",
+            "a configured issuer is normalized exactly as the validator normalizes it"
+        );
+        let validator =
+            JwtValidator::new_for_provider(cfg.clone(), "workforce", test_egress_client())
+                .expect("validator");
+        assert_eq!(
+            validator.principal_issuer.as_deref(),
+            Some("https://issuer.example.test")
+        );
+
+        cfg.issuer = None;
+        assert_eq!(
+            JwtValidator::provider_principal_issuer(&cfg, "work force").expect("issuer"),
+            "provider:work%20force",
+            "without a configured issuer the provider label is the boundary"
+        );
+        let validator = JwtValidator::new_for_provider(cfg, "work force", test_egress_client())
+            .expect("validator");
+        assert_eq!(
+            validator.principal_issuer.as_deref(),
+            Some("provider:work%20force")
+        );
+        assert_eq!(
+            JwtValidator::issuer_boundary("https://issuer.example.test///").expect("boundary"),
+            "https://issuer.example.test",
+            "the operator command normalizes an issuer the same way"
+        );
     }
 
     #[tokio::test]
@@ -1353,6 +1556,141 @@ RowSUZV5FSmOGJ7JyROZ80k=
         server.await.expect("JWKS test server task should finish");
     }
 
+    /// A `kid` the issuer withdrew is refused once the key set is refreshed:
+    /// a successful fetch replaces the whole set, and a request past the
+    /// maximum key age refreshes before trusting anything.
+    #[tokio::test]
+    async fn a_kid_withdrawn_from_a_fresh_jwks_is_refused_once_the_key_set_ages_out() {
+        let with_kid = json!({
+            "keys": [{
+                "kty": "RSA", "kid": KID, "use": "sig", "alg": "RS256",
+                "n": TEST_PUBLIC_KEY_N, "e": TEST_PUBLIC_KEY_E
+            }]
+        })
+        .to_string();
+        let without_kid = json!({
+            "keys": [{
+                "kty": "RSA", "kid": "rotated-kid", "use": "sig", "alg": "RS256",
+                "n": TEST_PUBLIC_KEY_N, "e": TEST_PUBLIC_KEY_E
+            }]
+        })
+        .to_string();
+        let listener = TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .expect("JWKS test server should bind");
+        let addr = listener.local_addr().expect("address");
+        let server = tokio::spawn(async move {
+            for body in [with_kid, without_kid] {
+                let (stream, _) = listener.accept().await.expect("accept");
+                read_one_request(&stream).await;
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                write_all(&stream, response.as_bytes()).await;
+            }
+        });
+        let mut cfg = default_cfg();
+        cfg.jwks_url = format!("http://127.0.0.1:{}/.well-known/jwks.json", addr.port());
+        cfg.jwks_max_key_age = Duration::from_secs(60);
+        let mut config = test_config(Some(&cfg.jwks_url));
+        config.egress_deny_private_ips = false;
+        let egress_client =
+            Arc::new(EgressClient::new(EgressConfig::from_config(&config)).expect("egress client"));
+        let validator = JwtValidator::new(cfg, egress_client).expect("validator should build");
+        let token = signed_token(base_claims(), TEST_PRIVATE_KEY);
+
+        validator
+            .validate_session(&SessionCredential::Bearer(token.clone()))
+            .await
+            .expect("the key is live in the first key set");
+
+        // The issuer withdraws the key; the local set ages past its bound.
+        validator.age_key_set(Duration::from_secs(61)).await;
+        let error = validator
+            .validate_session(&SessionCredential::Bearer(token))
+            .await
+            .expect_err("a withdrawn kid must be refused after the refresh");
+        assert!(
+            matches!(&error, AuthError::InvalidSession(reason) if reason == "unknown kid"),
+            "refused as an unknown kid, got {error:?}"
+        );
+        server.await.expect("both fetches were served");
+    }
+
+    /// The scheduled refresh keeps the set fresh without any request
+    /// missing a kid -- the property that makes a withdrawn key disappear
+    /// promptly rather than eventually.
+    #[tokio::test]
+    async fn the_scheduled_refresh_fetches_without_a_kid_miss() {
+        let jwks = json!({
+            "keys": [{
+                "kty": "RSA", "kid": KID, "use": "sig", "alg": "RS256",
+                "n": TEST_PUBLIC_KEY_N, "e": TEST_PUBLIC_KEY_E
+            }]
+        })
+        .to_string();
+        let listener = TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .expect("JWKS test server should bind");
+        let addr = listener.local_addr().expect("address");
+        let fetches = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let served = Arc::clone(&fetches);
+        let server = tokio::spawn(async move {
+            loop {
+                let Ok((stream, _)) = listener.accept().await else {
+                    return;
+                };
+                read_one_request(&stream).await;
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    jwks.len(),
+                    jwks
+                );
+                write_all(&stream, response.as_bytes()).await;
+                served.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }
+        });
+        let mut cfg = default_cfg();
+        cfg.jwks_url = format!("http://127.0.0.1:{}/.well-known/jwks.json", addr.port());
+        let mut config = test_config(Some(&cfg.jwks_url));
+        config.egress_deny_private_ips = false;
+        let egress_client =
+            Arc::new(EgressClient::new(EgressConfig::from_config(&config)).expect("egress client"));
+        let validator = Arc::new(JwtValidator::new(cfg, egress_client).expect("validator"));
+        let lifecycle = GatewayLifecycle::new();
+        validator.spawn_background_refresh_for_test(Duration::from_millis(40), &lifecycle);
+
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        assert!(
+            fetches.load(std::sync::atomic::Ordering::SeqCst) >= 2,
+            "the scheduler fetched repeatedly with no request in flight"
+        );
+        assert!(
+            validator.keys_are_fresh().await,
+            "the set is fresh without a kid miss"
+        );
+        server.abort();
+    }
+
+    #[test]
+    fn background_refresh_runs_at_half_the_key_age_but_never_below_the_demand_floor() {
+        assert_eq!(
+            background_refresh_interval(Duration::from_secs(300)),
+            Duration::from_secs(150)
+        );
+        assert_eq!(
+            background_refresh_interval(Duration::from_secs(4)),
+            MIN_JWKS_REFRESH_INTERVAL
+        );
+        let jitter = refresh_jitter(Duration::from_secs(80));
+        assert!(
+            jitter <= Duration::from_secs(10),
+            "jitter is at most an eighth"
+        );
+    }
+
     #[tokio::test]
     async fn concurrent_first_use_shares_jwks_refresh_without_rejecting_valid_tokens() {
         const CONCURRENCY: usize = 50;
@@ -1674,7 +2012,7 @@ RowSUZV5FSmOGJ7JyROZ80k=
         // cache hit alone must no longer be enough: without a refresh the
         // issuer could have withdrawn this key and we would never notice.
         *validator.keys_fetched_at.write().await =
-            Some(Instant::now() - MAX_JWKS_KEY_AGE - Duration::from_secs(1));
+            Some(Instant::now() - validator.cfg.jwks_max_key_age - Duration::from_secs(1));
 
         let error = validator
             .decode(&token)
@@ -1770,6 +2108,7 @@ RowSUZV5FSmOGJ7JyROZ80k=
             issuer: None,
             audience: None,
             http_timeout: Duration::from_secs(1),
+            jwks_max_key_age: Duration::from_secs(300),
             require_jti: false,
             roles_claim: "roles".to_owned(),
             roles_claim_delimiter: None,
@@ -1863,6 +2202,7 @@ RowSUZV5FSmOGJ7JyROZ80k=
             admin_login_pending_ttl_secs: crate::config::DEFAULT_ADMIN_LOGIN_PENDING_TTL_SECS,
             admin_login_pending_max_entries: crate::config::DEFAULT_ADMIN_LOGIN_PENDING_MAX_ENTRIES,
             admin_login_pending_max_per_ip: crate::config::DEFAULT_ADMIN_LOGIN_PENDING_MAX_PER_IP,
+            admin_login_keyring: Vec::new(),
             gateway_public_url: None,
             audit_log_file: None,
             audit_sqlite_path: None,
@@ -1930,6 +2270,7 @@ RowSUZV5FSmOGJ7JyROZ80k=
             jwt_issuer: None,
             jwt_audience: None,
             jwt_jwks_timeout_ms: 2000,
+            jwt_jwks_max_key_age_secs: 300,
             jwt_require_jti: false,
             roles_claim: "roles".to_owned(),
             service_token_sqlite_path: None,

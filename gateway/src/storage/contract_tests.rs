@@ -818,6 +818,7 @@ impl ServiceTokenStore for GatedTokenStore {
             scopes: vec!["admin:tokens:read".to_owned()],
             expires_at: None,
             last_used_at: None,
+            remaining_lifetime: None,
         }))
     }
 
@@ -1118,6 +1119,997 @@ mod postgres_audit_tests {
             .expect("the policy schema should migrate");
         let pool = foundation.pool().clone();
         (Arc::new(PostgresPolicyStore::new(pool.clone())), pool)
+    }
+
+    // ------------------------------------------------------------------
+    // Shared service-token store (issue #241, PR 9)
+    // ------------------------------------------------------------------
+
+    use crate::storage::postgres_service_tokens::PostgresServiceTokenStore;
+
+    /// A migrated store on its own pool. Called twice by the race tests so
+    /// the two writers are two replicas, not two tasks on one pool.
+    async fn migrated_service_token_store(
+        database: &TestDatabase,
+    ) -> (Arc<PostgresServiceTokenStore>, deadpool_postgres::Pool) {
+        let test_dsn_file = write_dsn_file(&database.dsn);
+        let mut config = crate::config::Config::test_defaults();
+        config.state_backend = crate::config::StateBackend::Postgres;
+        config.deployment_id = Some("deploy-token-contract".to_owned());
+        config.database.url_file = Some(test_dsn_file.path.clone());
+        config.database.tls_mode = crate::config::DatabaseTlsMode::LoopbackDev;
+        let foundation = PostgresFoundation::establish(&config)
+            .await
+            .expect("the test database should establish");
+        migrations::apply_missing_for_startup(foundation.pool(), &config.database)
+            .await
+            .expect("the service-token schema should migrate");
+        let pool = foundation.pool().clone();
+        (Arc::new(PostgresServiceTokenStore::new(pool.clone())), pool)
+    }
+
+    async fn scalar_i64(pool: &deadpool_postgres::Pool, sql: &str) -> i64 {
+        let client = pool.get().await.expect("client");
+        client
+            .query_one(sql, &[])
+            .await
+            .expect("scalar query")
+            .get(0)
+    }
+
+    fn token_request(scopes: &[&str]) -> CreateTokenRequest {
+        CreateTokenRequest {
+            scopes: scopes.iter().map(|scope| (*scope).to_owned()).collect(),
+            created_by: "contract-actor".to_owned(),
+            expires_at: None,
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // Shared JWT revocation denylist (issue #241, PR 9)
+    // ------------------------------------------------------------------
+
+    use crate::auth::RevocationStore;
+    use crate::storage::postgres_jwt_revocations::{
+        JwtRevocationOutcome, PostgresJwtRevocationStore,
+    };
+
+    /// One revoke through one replica is refused by another replica on its
+    /// next lookup; an equal jti under a different issuer is untouched; a
+    /// revocation past its expiry is a no-op on read and is removed by
+    /// cleanup; a repeat revoke is idempotent and spends no revision.
+    #[tokio::test]
+    async fn jwt_revocations_are_shared_issuer_scoped_and_expire_on_database_time() {
+        let Some(admin_dsn) = locator() else {
+            eprintln!("skipping: no test database locator; CI runs this test");
+            return;
+        };
+        let _guard = DATABASE.lock().await;
+        let database = create_test_database(&admin_dsn).await;
+        let (_tokens, pool_a) = migrated_service_token_store(&database).await;
+        let (_tokens_b, pool_b) = migrated_service_token_store(&database).await;
+        const SHARED: &str =
+            "SELECT last_revision FROM greengateway.security_revision_state WHERE singleton";
+        let deployment = "deploy-jwt-contract";
+        let replica_a =
+            PostgresJwtRevocationStore::new(pool_a.clone(), deployment, "https://issuer-a.example");
+        let replica_b =
+            PostgresJwtRevocationStore::new(pool_b.clone(), deployment, "https://issuer-a.example");
+        let other_issuer =
+            PostgresJwtRevocationStore::new(pool_b.clone(), deployment, "https://issuer-b.example");
+
+        assert!(!replica_b.is_revoked("jti-1").await.expect("lookup"));
+        let before = scalar_i64(&pool_a, SHARED).await;
+        let first = replica_a
+            .revoke("jti-1", None, "operator")
+            .await
+            .expect("revoke");
+        let JwtRevocationOutcome::Revoked { security_revision } = first else {
+            panic!("the first revoke inserts");
+        };
+        assert_eq!(
+            security_revision,
+            before + 1,
+            "a revoke advances the shared revision once"
+        );
+        assert!(
+            replica_b.is_revoked("jti-1").await.expect("lookup"),
+            "the other replica refuses the jti on its next lookup"
+        );
+        assert!(
+            !other_issuer.is_revoked("jti-1").await.expect("lookup"),
+            "an equal jti under another issuer is a different JWT"
+        );
+        assert_eq!(
+            replica_b
+                .revoke("jti-1", None, "operator")
+                .await
+                .expect("revoke again"),
+            JwtRevocationOutcome::AlreadyRevoked
+        );
+        assert_eq!(
+            scalar_i64(&pool_a, SHARED).await,
+            before + 1,
+            "a repeat revoke spends no revision"
+        );
+        let digest = replica_a.jti_digest("jti-1");
+        let outbox = scalar_i64(
+            &pool_a,
+            &format!(
+                "SELECT COUNT(*) FROM greengateway.security_outbox \
+                 WHERE resource_type = 'jwt_revocation' AND resource_id = '{digest}'"
+            ),
+        )
+        .await;
+        assert_eq!(outbox, 1, "exactly one outbox row, naming the digest");
+        let raw_jti_rows = scalar_i64(
+            &pool_a,
+            "SELECT COUNT(*) FROM greengateway.security_outbox WHERE resource_id = 'jti-1'",
+        )
+        .await;
+        assert_eq!(raw_jti_rows, 0, "the raw jti is nowhere in the database");
+
+        // Expiry by the database clock.
+        replica_a
+            .revoke("jti-expired", Some("2000-01-01T00:00:00Z"), "operator")
+            .await
+            .expect("revoke expired");
+        assert!(
+            !replica_b.is_revoked("jti-expired").await.expect("lookup"),
+            "a revocation past its expiry is a no-op on read"
+        );
+        assert_eq!(replica_a.cleanup_expired(100).await.expect("cleanup"), 1);
+        assert_eq!(
+            replica_a.cleanup_expired(100).await.expect("cleanup again"),
+            0
+        );
+        assert!(
+            replica_b.is_revoked("jti-1").await.expect("lookup"),
+            "unexpired rows survive cleanup"
+        );
+    }
+
+    /// A denylist that cannot be consulted is a dependency failure (503),
+    /// never "not revoked" and never an invalid credential.
+    #[tokio::test]
+    async fn an_unreachable_revocation_authority_is_a_dependency_failure() {
+        let mut pg_config = tokio_postgres::Config::new();
+        pg_config
+            .host("127.0.0.1")
+            .port(1)
+            .user("nobody")
+            .dbname("nowhere")
+            .connect_timeout(std::time::Duration::from_millis(200));
+        let mut pool_config = deadpool_postgres::PoolConfig::new(1);
+        pool_config.timeouts.wait = Some(std::time::Duration::from_millis(500));
+        pool_config.timeouts.create = Some(std::time::Duration::from_millis(500));
+        let unreachable = deadpool_postgres::Pool::builder(deadpool_postgres::Manager::new(
+            pg_config,
+            tokio_postgres::NoTls,
+        ))
+        .config(pool_config)
+        .runtime(deadpool_postgres::Runtime::Tokio1)
+        .build()
+        .expect("pool builds without connecting");
+        let store =
+            PostgresJwtRevocationStore::new(unreachable, "deploy", "https://issuer.example");
+        let error = store
+            .is_revoked("jti")
+            .await
+            .expect_err("no authority, no answer");
+        assert!(
+            matches!(error, crate::auth::AuthError::Upstream(_)),
+            "dependency failure must be Upstream (503), got {error:?}"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // Shared admin pending-login store (issue #241, PR 9)
+    // ------------------------------------------------------------------
+
+    use crate::auth::oidc_login::{PendingLogin, PendingLoginBackend, PendingLoginLimits};
+    use crate::connections::local_secret::LocalSecretKeyring;
+    use crate::storage::postgres_pending_logins::PostgresPendingLoginStore;
+
+    fn login_keyring() -> LocalSecretKeyring {
+        LocalSecretKeyring::from_material_for_test(
+            "login-key-1",
+            vec![("login-key-1".to_owned(), [7u8; 32])],
+        )
+    }
+
+    fn pending(client_ip: &str) -> PendingLogin {
+        PendingLogin {
+            code_verifier: "verifier-abcdefghijklmnopqrstuvwxyz0123456789".to_owned(),
+            nonce: "nonce-0123456789".to_owned(),
+            created_at: std::time::Instant::now(),
+            client_ip: client_ip.to_owned(),
+        }
+    }
+
+    async fn pending_store(
+        database: &TestDatabase,
+        limits: PendingLoginLimits,
+    ) -> (PostgresPendingLoginStore, deadpool_postgres::Pool) {
+        let (_tokens, pool) = migrated_service_token_store(database).await;
+        (
+            PostgresPendingLoginStore::new(
+                pool.clone(),
+                "deploy-login-contract",
+                login_keyring(),
+                limits,
+            ),
+            pool,
+        )
+    }
+
+    /// A login begun on one replica is consumed exactly once, on whichever
+    /// replica the callback lands; the second callback -- on either -- gets
+    /// nothing. Nothing in the database is the state or the verifier.
+    #[tokio::test]
+    async fn a_pending_login_is_consumed_exactly_once_across_replicas() {
+        let Some(admin_dsn) = locator() else {
+            eprintln!("skipping: no test database locator; CI runs this test");
+            return;
+        };
+        let _guard = DATABASE.lock().await;
+        let database = create_test_database(&admin_dsn).await;
+        let (replica_a, pool) = pending_store(&database, PendingLoginLimits::default()).await;
+        let (replica_b, _) = pending_store(&database, PendingLoginLimits::default()).await;
+
+        assert!(replica_a
+            .insert("state-1", pending("203.0.113.9"))
+            .await
+            .expect("insert"));
+        let stored_verifiers = scalar_i64(
+            &pool,
+            "SELECT COUNT(*) FROM greengateway.admin_pending_logins \
+             WHERE state_hash = 'state-1' OR client_key = '203.0.113.9' \
+             OR verifier_ct = 'verifier-abcdefghijklmnopqrstuvwxyz0123456789'::bytea",
+        )
+        .await;
+        assert_eq!(
+            stored_verifiers, 0,
+            "no raw state, client, or verifier in the table"
+        );
+
+        let consumed = replica_b
+            .take("state-1")
+            .await
+            .expect("take")
+            .expect("the other replica consumes the login");
+        assert_eq!(
+            consumed.code_verifier,
+            "verifier-abcdefghijklmnopqrstuvwxyz0123456789"
+        );
+        assert_eq!(consumed.nonce, "nonce-0123456789");
+        assert!(
+            replica_a.take("state-1").await.expect("take").is_none(),
+            "consumed once"
+        );
+        assert!(
+            replica_b.take("state-1").await.expect("take").is_none(),
+            "consumed once"
+        );
+        assert!(replica_a
+            .take("never-issued")
+            .await
+            .expect("take")
+            .is_none());
+    }
+
+    /// Two callbacks with the same state race on two replicas: exactly one
+    /// wins the row.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn concurrent_callbacks_consume_a_login_exactly_once() {
+        let Some(admin_dsn) = locator() else {
+            eprintln!("skipping: no test database locator; CI runs this test");
+            return;
+        };
+        let _guard = DATABASE.lock().await;
+        let database = create_test_database(&admin_dsn).await;
+        let (replica_a, _) = pending_store(&database, PendingLoginLimits::default()).await;
+        let (replica_b, _) = pending_store(&database, PendingLoginLimits::default()).await;
+        let replica_a = Arc::new(replica_a);
+        let replica_b = Arc::new(replica_b);
+        for round in 0..6 {
+            let state = format!("race-{round}");
+            assert!(replica_a
+                .insert(&state, pending("198.51.100.4"))
+                .await
+                .expect("insert"));
+            let barrier = Arc::new(tokio::sync::Barrier::new(2));
+            let take_on = |store: Arc<PostgresPendingLoginStore>, state: String| {
+                let barrier = barrier.clone();
+                tokio::spawn(async move {
+                    barrier.wait().await;
+                    store.take(&state).await
+                })
+            };
+            let (first, second) = tokio::join!(
+                take_on(replica_a.clone(), state.clone()),
+                take_on(replica_b.clone(), state.clone())
+            );
+            let winners = [
+                first.expect("task").expect("take"),
+                second.expect("task").expect("take"),
+            ]
+            .into_iter()
+            .filter(Option::is_some)
+            .count();
+            assert_eq!(winners, 1, "exactly one callback consumes the login");
+        }
+    }
+
+    /// Expiry is the database clock's; the quotas are enforced in the
+    /// insert transaction, per client and globally, without evicting a
+    /// still-valid login.
+    #[tokio::test]
+    async fn pending_logins_expire_on_database_time_and_quotas_hold() {
+        let Some(admin_dsn) = locator() else {
+            eprintln!("skipping: no test database locator; CI runs this test");
+            return;
+        };
+        let _guard = DATABASE.lock().await;
+        let database = create_test_database(&admin_dsn).await;
+        let (short_lived, _) = pending_store(
+            &database,
+            PendingLoginLimits {
+                ttl: std::time::Duration::from_secs(1),
+                max_entries: 3,
+                max_per_ip: 2,
+            },
+        )
+        .await;
+        assert!(short_lived
+            .insert("expiring", pending("192.0.2.1"))
+            .await
+            .expect("insert"));
+        tokio::time::sleep(std::time::Duration::from_millis(1300)).await;
+        assert!(
+            short_lived.take("expiring").await.expect("take").is_none(),
+            "an expired login cannot complete"
+        );
+
+        assert!(short_lived
+            .insert("a-1", pending("192.0.2.1"))
+            .await
+            .expect("insert"));
+        assert!(short_lived
+            .insert("a-2", pending("192.0.2.1"))
+            .await
+            .expect("insert"));
+        assert!(
+            !short_lived
+                .insert("a-3", pending("192.0.2.1"))
+                .await
+                .expect("insert"),
+            "the per-client quota refuses the third login from one client"
+        );
+        assert!(short_lived
+            .insert("b-1", pending("192.0.2.2"))
+            .await
+            .expect("insert"));
+        assert!(
+            !short_lived
+                .insert("c-1", pending("192.0.2.3"))
+                .await
+                .expect("insert"),
+            "the global quota refuses the fourth login"
+        );
+        assert!(
+            short_lived.take("a-1").await.expect("take").is_some(),
+            "a refused admission never evicted a valid login"
+        );
+    }
+
+    /// A row whose ciphertext was altered, or that was sealed under a key
+    /// this replica does not hold, fails closed as a store failure -- the
+    /// handlers answer 503 -- never as "unknown state".
+    #[tokio::test]
+    async fn a_tampered_or_foreign_key_row_fails_closed() {
+        let Some(admin_dsn) = locator() else {
+            eprintln!("skipping: no test database locator; CI runs this test");
+            return;
+        };
+        let _guard = DATABASE.lock().await;
+        let database = create_test_database(&admin_dsn).await;
+        let (store, pool) = pending_store(&database, PendingLoginLimits::default()).await;
+
+        assert!(store
+            .insert("tampered", pending("192.0.2.9"))
+            .await
+            .expect("insert"));
+        let digest = store.state_digest("tampered");
+        let client = pool.get().await.expect("client");
+        client
+            .execute(
+                "UPDATE greengateway.admin_pending_logins \
+                 SET verifier_ct = set_byte(verifier_ct, 0, (get_byte(verifier_ct, 0) # 255)) \
+                 WHERE state_hash = $1",
+                &[&digest],
+            )
+            .await
+            .expect("tamper");
+        let error = store
+            .take("tampered")
+            .await
+            .err()
+            .unwrap_or_else(|| panic!("a tampered envelope must not open"));
+        assert_eq!(error.0.kind(), RepositoryErrorKind::InvalidData);
+
+        assert!(store
+            .insert("foreign", pending("192.0.2.9"))
+            .await
+            .expect("insert"));
+        let digest = store.state_digest("foreign");
+        client
+            .execute(
+                "UPDATE greengateway.admin_pending_logins SET key_id = 'someone-elses-key' \
+                 WHERE state_hash = $1",
+                &[&digest],
+            )
+            .await
+            .expect("relabel");
+        let error = store
+            .take("foreign")
+            .await
+            .err()
+            .unwrap_or_else(|| panic!("a key this replica does not hold fails closed"));
+        assert_eq!(error.0.kind(), RepositoryErrorKind::InvalidData);
+
+        // The associated data binds each envelope to its own row: two
+        // validly sealed verifiers swapped between rows both fail to open.
+        assert!(store
+            .insert("swap-a", pending("192.0.2.9"))
+            .await
+            .expect("insert"));
+        assert!(store
+            .insert("swap-b", pending("192.0.2.9"))
+            .await
+            .expect("insert"));
+        let (digest_a, digest_b) = (store.state_digest("swap-a"), store.state_digest("swap-b"));
+        client
+            .execute(SWAP_SEALED_VERIFIERS, &[&digest_a, &digest_b])
+            .await
+            .expect("swap");
+        for state in ["swap-a", "swap-b"] {
+            let error = store
+                .take(state)
+                .await
+                .err()
+                .unwrap_or_else(|| panic!("an envelope moved to another row must not open"));
+            assert_eq!(error.0.kind(), RepositoryErrorKind::InvalidData);
+        }
+    }
+
+    const SWAP_SEALED_VERIFIERS: &str = "WITH a AS (SELECT verifier_nonce, verifier_ct FROM greengateway.admin_pending_logins WHERE state_hash = $1), b AS (SELECT verifier_nonce, verifier_ct FROM greengateway.admin_pending_logins WHERE state_hash = $2), swap_a AS (UPDATE greengateway.admin_pending_logins SET verifier_nonce = b.verifier_nonce, verifier_ct = b.verifier_ct FROM b WHERE state_hash = $1) UPDATE greengateway.admin_pending_logins SET verifier_nonce = a.verifier_nonce, verifier_ct = a.verifier_ct FROM a WHERE state_hash = $2";
+
+    /// A revocation given the token's own `exp` stays effective through the
+    /// validator's `exp` leeway -- the token is accepted until then -- and
+    /// cleanup reclaims it only afterwards.
+    #[tokio::test]
+    async fn a_revocation_outlives_its_expiry_by_the_validator_leeway() {
+        use crate::auth::RevocationStore;
+        let Some(admin_dsn) = locator() else {
+            eprintln!("skipping: no test database locator; CI runs this test");
+            return;
+        };
+        let _guard = DATABASE.lock().await;
+        let database = create_test_database(&admin_dsn).await;
+        let (_tokens, pool) = migrated_service_token_store(&database).await;
+        let store = crate::storage::PostgresJwtRevocationStore::new(
+            pool.clone(),
+            "deploy-leeway",
+            "https://issuer.example",
+        )
+        .with_retention_leeway_for_test(2.0);
+        let exp = (time::OffsetDateTime::now_utc() + std::time::Duration::from_secs(1))
+            .format(&time::format_description::well_known::Rfc3339)
+            .expect("rfc3339");
+        store
+            .revoke("jti-leeway", Some(&exp), "operator")
+            .await
+            .expect("revoke");
+
+        // Past `exp`, inside the leeway: the token is still accepted by the
+        // validator, so it must still be refused here.
+        tokio::time::sleep(std::time::Duration::from_millis(1400)).await;
+        assert!(
+            store.is_revoked("jti-leeway").await.expect("lookup"),
+            "still revoked inside the leeway"
+        );
+        assert_eq!(
+            store.cleanup_expired(100).await.expect("cleanup"),
+            0,
+            "not reclaimed inside the leeway"
+        );
+
+        // Past `exp + leeway`: no validator accepts the token any more.
+        tokio::time::sleep(std::time::Duration::from_millis(1900)).await;
+        assert!(!store.is_revoked("jti-leeway").await.expect("lookup"));
+        assert_eq!(store.cleanup_expired(100).await.expect("cleanup"), 1);
+    }
+
+    /// A replica whose keyring cannot open a pending login rolls its
+    /// consumption back, so a replica that can still completes it.
+    #[tokio::test]
+    async fn a_replica_without_the_key_leaves_the_login_for_one_that_has_it() {
+        let Some(admin_dsn) = locator() else {
+            eprintln!("skipping: no test database locator; CI runs this test");
+            return;
+        };
+        let _guard = DATABASE.lock().await;
+        let database = create_test_database(&admin_dsn).await;
+        let (with_key, _) = pending_store(&database, PendingLoginLimits::default()).await;
+        let (_tokens, pool) = migrated_service_token_store(&database).await;
+        let without_key = PostgresPendingLoginStore::new(
+            pool,
+            "deploy-login-contract",
+            LocalSecretKeyring::from_material_for_test(
+                "login-key-2",
+                vec![("login-key-2".to_owned(), [9u8; 32])],
+            ),
+            PendingLoginLimits::default(),
+        );
+
+        assert!(with_key
+            .insert("state-k", pending("203.0.113.5"))
+            .await
+            .expect("insert"));
+        let error = without_key
+            .take("state-k")
+            .await
+            .err()
+            .unwrap_or_else(|| panic!("a replica without the key must not complete the login"));
+        assert_eq!(error.0.kind(), RepositoryErrorKind::InvalidData);
+        let consumed = with_key
+            .take("state-k")
+            .await
+            .expect("take")
+            .expect("the login survived the failed consumption");
+        assert_eq!(consumed.nonce, "nonce-0123456789");
+        assert!(
+            with_key.take("state-k").await.expect("take").is_none(),
+            "consumed once"
+        );
+    }
+
+    /// A database binds to the first deployment that boots against it
+    /// and refuses any other: deployments never share a database.
+    #[tokio::test]
+    async fn a_database_binds_to_its_first_deployment_and_refuses_another() {
+        use crate::storage::postgres::{bind_deployment, DeploymentBindingError};
+        let Some(admin_dsn) = locator() else {
+            eprintln!("skipping: no test database locator; CI runs this test");
+            return;
+        };
+        let _guard = DATABASE.lock().await;
+        let database = create_test_database(&admin_dsn).await;
+        let (_tokens, pool) = migrated_service_token_store(&database).await;
+        bind_deployment(&pool, "deploy-one")
+            .await
+            .expect("the first boot binds the database");
+        bind_deployment(&pool, "deploy-one")
+            .await
+            .expect("the same deployment binds again");
+        let refused = bind_deployment(&pool, "deploy-two")
+            .await
+            .expect_err("another deployment is refused");
+        assert!(
+            matches!(&refused, DeploymentBindingError::Mismatch { bound } if bound == "deploy-one"),
+            "{refused}"
+        );
+    }
+
+    /// The per-client quota key is an HMAC under the login keyring, not a
+    /// plain digest a database reader could invert by enumerating
+    /// addresses.
+    #[tokio::test]
+    async fn the_client_quota_key_is_keyed_by_the_login_keyring() {
+        let Some(admin_dsn) = locator() else {
+            eprintln!("skipping: no test database locator; CI runs this test");
+            return;
+        };
+        let _guard = DATABASE.lock().await;
+        let database = create_test_database(&admin_dsn).await;
+        let (store_a, pool) = pending_store(&database, PendingLoginLimits::default()).await;
+        let store_b = PostgresPendingLoginStore::new(
+            pool.clone(),
+            "deploy-login-contract",
+            LocalSecretKeyring::from_material_for_test(
+                "login-key-2",
+                vec![("login-key-2".to_owned(), [9u8; 32])],
+            ),
+            PendingLoginLimits::default(),
+        );
+        assert!(store_a
+            .insert("ck-a", pending("203.0.113.77"))
+            .await
+            .expect("insert"));
+        assert!(store_b
+            .insert("ck-b", pending("203.0.113.77"))
+            .await
+            .expect("insert"));
+        let client = pool.get().await.expect("client");
+        let mut keys = Vec::new();
+        for (store, state) in [(&store_a, "ck-a"), (&store_b, "ck-b")] {
+            let key: String = client
+                .query_one(
+                    "SELECT client_key FROM greengateway.admin_pending_logins WHERE state_hash = $1",
+                    &[&store.state_digest(state)],
+                )
+                .await
+                .expect("row")
+                .get(0);
+            keys.push(key);
+        }
+        assert_ne!(
+            keys[0], keys[1],
+            "the key depends on the keyring, not only on the address"
+        );
+        let plain = {
+            use sha2::Digest;
+            let mut hasher = sha2::Sha256::new();
+            hasher.update(b"deploy-login-contract");
+            hasher.update([0u8]);
+            hasher.update(b"client");
+            hasher.update([0u8]);
+            hasher.update(b"203.0.113.77");
+            hex::encode(hasher.finalize())
+        };
+        assert!(
+            keys.iter().all(|key| key != &plain),
+            "neither key is the unkeyed digest of the address"
+        );
+    }
+
+    #[tokio::test]
+    async fn postgres_service_token_store_satisfies_the_contract() {
+        let Some(admin_dsn) = locator() else {
+            eprintln!("skipping: no test database locator; CI runs this test");
+            return;
+        };
+        let _guard = DATABASE.lock().await;
+        let database = create_test_database(&admin_dsn).await;
+        let (store, _pool) = migrated_service_token_store(&database).await;
+        super::service_token_store_contract(&*store).await;
+    }
+
+    /// Create, revoke, and rotate are committed control-plane mutations:
+    /// each advances the shared counter by exactly one, SETS the token
+    /// high-water mark to that same value (never a private count), and
+    /// writes one outbox row naming the token. Verify is observational
+    /// and moves neither.
+    #[tokio::test]
+    async fn service_token_mutations_advance_the_shared_revision_and_set_the_high_water_mark() {
+        let Some(admin_dsn) = locator() else {
+            eprintln!("skipping: no test database locator; CI runs this test");
+            return;
+        };
+        let _guard = DATABASE.lock().await;
+        let database = create_test_database(&admin_dsn).await;
+        let (store, pool) = migrated_service_token_store(&database).await;
+        const SHARED: &str =
+            "SELECT last_revision FROM greengateway.security_revision_state WHERE singleton";
+
+        // Push the shared counter ahead with a resource that is not tokens,
+        // so a private increment would be visibly wrong.
+        let (policy_store, _) = migrated_policy_store(&database).await;
+        PolicyControlPlane::commit(
+            &*policy_store,
+            commit_request(
+                PolicyCommitPrecondition::Initialize,
+                &policy_with_role("token-revision", "admin"),
+                "seed",
+            ),
+        )
+        .await
+        .expect("policy should initialize");
+        let before = scalar_i64(&pool, SHARED).await;
+        assert!(before >= 1);
+        assert_eq!(
+            store.state_revision().await.expect("mark"),
+            0,
+            "no token has ever changed, so the mark is still the seed"
+        );
+
+        let created = store.create(token_request(&["a"])).await.expect("create");
+        let after_create = scalar_i64(&pool, SHARED).await;
+        assert_eq!(
+            after_create,
+            before + 1,
+            "create advances the shared counter once"
+        );
+        assert_eq!(
+            store.state_revision().await.expect("mark"),
+            after_create,
+            "the mark is SET to the shared revision, not incremented from 0"
+        );
+
+        assert!(matches!(
+            store
+                .verify(&created.plaintext_token)
+                .await
+                .expect("verify"),
+            TokenVerification::Valid(_)
+        ));
+        assert_eq!(
+            scalar_i64(&pool, SHARED).await,
+            after_create,
+            "verify is observational and reserves no revision"
+        );
+
+        store.rotate(&created.record.id).await.expect("rotate");
+        let after_rotate = scalar_i64(&pool, SHARED).await;
+        assert_eq!(after_rotate, after_create + 1);
+        assert_eq!(store.state_revision().await.expect("mark"), after_rotate);
+
+        store.revoke(&created.record.id).await.expect("revoke");
+        let after_revoke = scalar_i64(&pool, SHARED).await;
+        assert_eq!(after_revoke, after_rotate + 1);
+        assert_eq!(store.state_revision().await.expect("mark"), after_revoke);
+
+        // A second revoke is idempotent: no revision, no outbox row.
+        store
+            .revoke(&created.record.id)
+            .await
+            .expect("revoke again");
+        assert_eq!(scalar_i64(&pool, SHARED).await, after_revoke);
+
+        let outbox_rows = scalar_i64(
+            &pool,
+            &format!(
+                "SELECT COUNT(*) FROM greengateway.security_outbox \
+                 WHERE resource_type = 'service_token' AND resource_id = '{}'",
+                created.record.id
+            ),
+        )
+        .await;
+        assert_eq!(
+            outbox_rows, 3,
+            "create, rotate, revoke: one outbox row each"
+        );
+        let chain = {
+            let client = pool.get().await.expect("client");
+            client
+                .query(
+                    "SELECT from_version, to_version FROM greengateway.security_outbox \
+                     WHERE resource_type = 'service_token' AND resource_id = $1 \
+                     ORDER BY revision",
+                    &[&created.record.id],
+                )
+                .await
+                .expect("outbox chain")
+                .iter()
+                .map(|row| (row.get::<_, Option<i64>>(0), row.get::<_, i64>(1)))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            chain,
+            vec![(None, 1), (Some(1), 2), (Some(2), 3)],
+            "the outbox carries the row revision chain"
+        );
+    }
+
+    /// Two replicas rotate the same token at once. The row lock serializes
+    /// them; both succeed; the documented outcome is that the LATER
+    /// rotation's plaintext is the live one and every earlier plaintext --
+    /// the original and the first rotation's -- is dead. Exactly two
+    /// revisions are spent.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn concurrent_rotations_serialize_and_leave_exactly_one_live_plaintext() {
+        let Some(admin_dsn) = locator() else {
+            eprintln!("skipping: no test database locator; CI runs this test");
+            return;
+        };
+        let _guard = DATABASE.lock().await;
+        let database = create_test_database(&admin_dsn).await;
+        let (replica_a, pool) = migrated_service_token_store(&database).await;
+        let (replica_b, _) = migrated_service_token_store(&database).await;
+        let created = replica_a
+            .create(token_request(&["a"]))
+            .await
+            .expect("create");
+        let id = created.record.id.clone();
+
+        let barrier = Arc::new(tokio::sync::Barrier::new(2));
+        let rotate_on = |store: Arc<PostgresServiceTokenStore>, id: String| {
+            let barrier = barrier.clone();
+            tokio::spawn(async move {
+                barrier.wait().await;
+                store.rotate(&id).await
+            })
+        };
+        let (first, second) = tokio::join!(
+            rotate_on(replica_a.clone(), id.clone()),
+            rotate_on(replica_b.clone(), id.clone())
+        );
+        let first = first.expect("task").expect("rotate a").expect("exists");
+        let second = second.expect("task").expect("rotate b").expect("exists");
+
+        let mut live = 0;
+        for plaintext in [
+            &created.plaintext_token,
+            &first.plaintext_token,
+            &second.plaintext_token,
+        ] {
+            if matches!(
+                replica_a.verify(plaintext).await.expect("verify"),
+                TokenVerification::Valid(_)
+            ) {
+                live += 1;
+            }
+        }
+        assert_eq!(live, 1, "exactly one plaintext survives two rotations");
+        assert_eq!(
+            replica_a
+                .verify(&created.plaintext_token)
+                .await
+                .expect("verify"),
+            TokenVerification::Invalid(TokenVerificationFailure::NotFound),
+            "the original plaintext is dead"
+        );
+        let revision = scalar_i64(
+            &pool,
+            &format!("SELECT revision FROM greengateway.service_tokens WHERE id = '{id}'"),
+        )
+        .await;
+        assert_eq!(revision, 3, "two committed rotations, two revisions");
+    }
+
+    /// A revoke and a rotate race on two replicas. The row lock picks a
+    /// winner and the loser sees the winner's committed state: revoke-first
+    /// makes the rotate a conflict; rotate-first lets the revoke close the
+    /// rotated token. Either way NO plaintext -- original or rotated -- is
+    /// live afterwards, which is the property that matters: a rotation can
+    /// never race a revoke into a live token.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn revoke_and_rotate_race_never_leaves_a_live_plaintext() {
+        let Some(admin_dsn) = locator() else {
+            eprintln!("skipping: no test database locator; CI runs this test");
+            return;
+        };
+        let _guard = DATABASE.lock().await;
+        let database = create_test_database(&admin_dsn).await;
+        let (replica_a, _pool) = migrated_service_token_store(&database).await;
+        let (replica_b, _) = migrated_service_token_store(&database).await;
+
+        let mut saw_revoke_first = false;
+        let mut saw_rotate_first = false;
+        for _ in 0..8 {
+            let created = replica_a
+                .create(token_request(&["a"]))
+                .await
+                .expect("create");
+            let id = created.record.id.clone();
+            let barrier = Arc::new(tokio::sync::Barrier::new(2));
+            let revoke = {
+                let store = replica_a.clone();
+                let id = id.clone();
+                let barrier = barrier.clone();
+                tokio::spawn(async move {
+                    barrier.wait().await;
+                    store.revoke(&id).await
+                })
+            };
+            let rotate = {
+                let store = replica_b.clone();
+                let id = id.clone();
+                let barrier = barrier.clone();
+                tokio::spawn(async move {
+                    barrier.wait().await;
+                    store.rotate(&id).await
+                })
+            };
+            let (revoke, rotate) = tokio::join!(revoke, rotate);
+            let revoked = revoke
+                .expect("task")
+                .expect("revoke queries")
+                .expect("token exists");
+            assert!(revoked.revoked_at.is_some(), "the revoke always lands");
+
+            let mut plaintexts = vec![created.plaintext_token.clone()];
+            match rotate.expect("task") {
+                Err(error) => {
+                    assert_eq!(
+                        error.kind(),
+                        RepositoryErrorKind::Conflict,
+                        "revoke-first: the rotate is refused as a conflict"
+                    );
+                    saw_revoke_first = true;
+                }
+                Ok(Some(rotated)) => {
+                    plaintexts.push(rotated.plaintext_token);
+                    saw_rotate_first = true;
+                }
+                Ok(None) => panic!("the token exists"),
+            }
+            for plaintext in &plaintexts {
+                assert!(
+                    matches!(
+                        replica_a.verify(plaintext).await.expect("verify"),
+                        TokenVerification::Invalid(_)
+                    ),
+                    "no plaintext may be live after a revoke, whichever order won"
+                );
+            }
+        }
+        // Eight rounds through a barrier on two pools reliably produce both
+        // orders; if a scheduler ever does not, the property above still
+        // held on every round, which is what this test exists to prove.
+        eprintln!(
+            "orders observed: revoke-first={saw_revoke_first} rotate-first={saw_rotate_first}"
+        );
+    }
+
+    /// A verify that lands after a revoke reports Revoked and writes
+    /// nothing: last_used_at is exactly what it was before the revoke.
+    #[tokio::test]
+    async fn a_verify_after_revoke_cannot_touch_the_revoked_row() {
+        let Some(admin_dsn) = locator() else {
+            eprintln!("skipping: no test database locator; CI runs this test");
+            return;
+        };
+        let _guard = DATABASE.lock().await;
+        let database = create_test_database(&admin_dsn).await;
+        let (store, _pool) = migrated_service_token_store(&database).await;
+        let created = store.create(token_request(&["a"])).await.expect("create");
+        assert!(matches!(
+            store
+                .verify(&created.plaintext_token)
+                .await
+                .expect("verify"),
+            TokenVerification::Valid(_)
+        ));
+        let before = store
+            .get_by_id(&created.record.id)
+            .await
+            .expect("get")
+            .expect("exists");
+        assert!(before.last_used_at.is_some());
+        store.revoke(&created.record.id).await.expect("revoke");
+
+        assert_eq!(
+            store
+                .verify(&created.plaintext_token)
+                .await
+                .expect("verify"),
+            TokenVerification::Invalid(TokenVerificationFailure::Revoked)
+        );
+        let after = store
+            .get_by_id(&created.record.id)
+            .await
+            .expect("get")
+            .expect("exists");
+        assert_eq!(
+            after.last_used_at, before.last_used_at,
+            "a revoked row is never written by a verify"
+        );
+        // And an expired token is judged by the database clock.
+        let expired = store
+            .create(CreateTokenRequest {
+                expires_at: Some("2000-01-01T00:00:00Z".to_owned()),
+                ..token_request(&["a"])
+            })
+            .await
+            .expect("create expired");
+        assert_eq!(
+            store
+                .verify(&expired.plaintext_token)
+                .await
+                .expect("verify"),
+            TokenVerification::Invalid(TokenVerificationFailure::Expired)
+        );
+        let touched = store
+            .touch_last_used(&expired.record.id)
+            .await
+            .expect("touch")
+            .expect("exists");
+        assert!(
+            touched.last_used_at.is_none(),
+            "touch never writes an expired row"
+        );
     }
 
     static TEST_DIFF_SUMMARY: std::sync::LazyLock<Value> =

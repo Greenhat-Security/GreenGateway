@@ -283,7 +283,15 @@ At startup, GreenGateway fetches the selected provider's OIDC discovery document
 
 The admin UI login flow uses OAuth2 authorization-code with PKCE. `GET /v1{ADMIN_PREFIX}/auth/login` creates a short-lived in-memory pending login state, generates a PKCE S256 challenge, and redirects the browser to the discovered `authorization_endpoint` with `scope=openid email profile`. `GET /v1{ADMIN_PREFIX}/auth/callback` consumes that state exactly once, exchanges the returned `code` at the discovered `token_endpoint` through the shared egress client, and returns the resulting `access_token` to the admin UI in a URL fragment: `{ADMIN_PREFIX}/#/auth/complete?token=...`. The admin UI stores that token through the same `sessionStorage` helper used by the manual paste flow and then clears the fragment from the address bar.
 
-The pending-login state is intentionally process-local and bounded in memory. It is suitable for a single GreenGateway instance; multi-instance deployments need sticky routing or a future shared state store for the login callback. When either the global or per-client limit is reached, GreenGateway rejects the new login attempt without evicting an earlier valid state. Expired entries are removed before capacity is evaluated, so capacity self-heals after the configured TTL.
+In standalone mode the pending-login state is process-local and bounded in memory, which is why a standalone deployment with more than one instance needs sticky routing for the callback. In cluster mode (`STATE_BACKEND=postgres`) it lives in the database, sealed under `ADMIN_LOGIN_KEYRING`, and the callback completes on whichever replica receives it. In both modes, when either the global or per-client limit is reached, GreenGateway rejects the new login attempt without evicting an earlier valid state, and expired entries are removed before capacity is evaluated, so capacity self-heals after the configured TTL. In cluster mode the three limits govern one shared store, so they are part of the static-configuration fingerprint replicas must agree on.
+
+### ADMIN_LOGIN_KEYRING
+
+Cluster mode's keyring for sealing pending admin logins in the database.
+
+Default: empty
+
+Format and validation: the same JSON array of `{ "id", "file", "role" }` objects as `CONNECTION_LOCAL_SECRET_KEYRING`, with key files beneath `CONNECTION_SECRETS_ROOT` and exactly one `primary`. Required when `STATE_BACKEND=postgres` and `ADMIN_LOGIN_PROVIDER` is set; rejected when `STATE_BACKEND=sqlite`, where nothing reads it. The PKCE verifier and nonce of every pending login are AEAD-encrypted under the primary key with the deployment ID, the row, and the field bound as associated data; the login `state` is stored only as a digest. To rotate, add the new key as `primary`, demote the old one to `decrypt_only`, and keep it in the ring for at least one `ADMIN_LOGIN_PENDING_TTL_SECS` so logins sealed before the rotation can still complete. Key IDs and roles are part of the static-configuration fingerprint replicas must agree on.
 
 ### ADMIN_LOGIN_PENDING_TTL_SECS
 
@@ -295,7 +303,7 @@ Format and validation: must be an integer greater than `0`. The value is parsed 
 
 ### ADMIN_LOGIN_PENDING_MAX_ENTRIES
 
-Maximum number of pending admin OIDC login states retained by one GreenGateway process.
+Maximum number of pending admin OIDC login states retained by one GreenGateway process (standalone mode) or by the deployment as a whole (cluster mode, where the limit is enforced in the database).
 
 Default: `1024`
 
@@ -1294,7 +1302,7 @@ Default: empty, which means the legacy single-provider `JWT_*` settings below ar
 
 Format and validation: unset, empty, or whitespace-only values use the legacy fallback. Non-empty values must be a JSON array. Each entry must include a non-empty unique `name` and `type` set to `jwt` or `cookie_session`.
 
-For `type:"jwt"`, each entry must set at least one of `jwks_url` or `issuer`. When the array contains more than one JWT provider, every JWT provider must set `issuer`; startup rejects an issuerless JWT chain because validators that share keys could otherwise assign identity according to provider order. Optional fields are `audience`, `jwks_timeout_ms`, `require_jti`, `roles_claim`, `roles_claim_delimiter`, `org_claim`, `client_id`, `client_secret`, and `redirect_uri`. The OAuth client fields are ignored unless `ADMIN_LOGIN_PROVIDER` names that provider; when selected for admin login, `client_id`, `client_secret`, and `redirect_uri` are required and the provider must use OIDC discovery through `issuer`. `jwks_url`, `audience`, `org_claim`, `client_id`, `client_secret`, and `redirect_uri` are trimmed, and blank values are treated as unset. `issuer` is trimmed and trailing slashes are removed; an explicitly configured value that becomes empty after canonicalization is rejected at startup. `roles_claim_delimiter` preserves its exact configured value so a single space can split OAuth2-style scope strings; an empty delimiter is treated as unset. `jwks_timeout_ms` defaults to `2000`, `require_jti` defaults to `false`, and `roles_claim` defaults to `roles`.
+For `type:"jwt"`, each entry must set at least one of `jwks_url` or `issuer`. When the array contains more than one JWT provider, every JWT provider must set `issuer`; startup rejects an issuerless JWT chain because validators that share keys could otherwise assign identity according to provider order. Optional fields are `audience`, `jwks_timeout_ms`, `jwks_max_key_age_secs`, `require_jti`, `roles_claim`, `roles_claim_delimiter`, `org_claim`, `client_id`, `client_secret`, and `redirect_uri`. The OAuth client fields are ignored unless `ADMIN_LOGIN_PROVIDER` names that provider; when selected for admin login, `client_id`, `client_secret`, and `redirect_uri` are required and the provider must use OIDC discovery through `issuer`. `jwks_url`, `audience`, `org_claim`, `client_id`, `client_secret`, and `redirect_uri` are trimmed, and blank values are treated as unset. `issuer` is trimmed and trailing slashes are removed; an explicitly configured value that becomes empty after canonicalization is rejected at startup. `roles_claim_delimiter` preserves its exact configured value so a single space can split OAuth2-style scope strings; an empty delimiter is treated as unset. `jwks_timeout_ms` defaults to `2000`, `jwks_max_key_age_secs` defaults to `300` (see `JWT_JWKS_MAX_KEY_AGE_SECS`), `require_jti` defaults to `false`, and `roles_claim` defaults to `roles`.
 
 For `type:"cookie_session"`, each entry must set `introspection_url` and `user_id_claim`. Optional fields are `introspection_timeout_ms`, `cache_ttl_ms`, `email_claim`, `org_claim`, `roles_claim`, and `roles_claim_delimiter`. `introspection_timeout_ms` defaults to `2000`; `cache_ttl_ms` defaults to `5000` and must be greater than `0`; `roles_claim` defaults to `roles`. Cookie-session-irrelevant JWT fields and JWT-irrelevant cookie-session fields are accepted by the flat JSON schema but ignored for the wrong provider type, so they do not affect validator construction or egress allowlisting.
 
@@ -1364,13 +1372,21 @@ Default: `2000`
 
 Format and validation: must parse as a `u64` millisecond duration.
 
+### JWT_JWKS_MAX_KEY_AGE_SECS
+
+How long a fetched JWKS key set stays trusted, in seconds.
+
+Default: `300`
+
+Format and validation: must parse as a `u64` between `10` and `86400`; the floor is the validator's demand-refresh throttle (one fetch per 10 seconds per validator), below which a stale key set could not refresh on demand and every request would fail closed against a reachable issuer. The validator refreshes its key set in the background at half this age (never faster than every 10 seconds, with jitter so replicas do not fetch in lockstep), and past this age trusts nothing: a request refreshes first or fails closed with `503`. Every successful fetch replaces the whole set, so a signing key the issuer withdrew disappears at the next scheduled refresh rather than surviving until some request happens to age the set out. Unknown `kid` values never trigger more than one fetch per 10 seconds per validator, so an attacker cannot use them to multiply calls to the identity provider. This setting is part of the static-configuration fingerprint replicas must agree on in cluster mode.
+
 ### JWT_REQUIRE_JTI
 
 Whether bearer JWTs must include a non-empty `jti` claim.
 
 Default: `false`
 
-Format and validation: must parse as a Rust boolean, `true` or `false`. When enabled, tokens without a non-empty `jti` are rejected.
+Format and validation: must parse as a Rust boolean, `true` or `false`. When enabled, tokens without a non-empty `jti` are rejected. A `jti` identifies a JWT; it is not consumed once. In cluster mode (`STATE_BACKEND=postgres`) every JWT that carries a `jti` is also checked against the shared revocation denylist on every request (`docs/deployment/postgres.md`, "JWT revocations"); a denylist that cannot be consulted answers `503`.
 
 ### ROLES_CLAIM
 
@@ -1396,9 +1412,9 @@ Service-token verification cache TTL, in milliseconds.
 
 Default: `5000`
 
-Format and validation: must parse as a positive `u64` millisecond duration. The validator caches successful and failed `ggw_` bearer-token verification results in-process so normal requests do not require a fresh SQLite lookup every time. Revocations or rotations performed by this process's admin API invalidate that process's cached entry immediately; revocations made outside this process or in another process take effect no later than this TTL. Keep the value short for security-sensitive deployments.
+Format and validation: must parse as a positive `u64` millisecond duration. The validator caches successful and failed `ggw_` bearer-token verification results in-process so normal requests do not require a fresh SQLite lookup every time. Revocations or rotations performed by this process's admin API invalidate that process's cached entry immediately; in standalone mode, revocations made outside this process or in another process take effect no later than this TTL. In cluster mode (`STATE_BACKEND=postgres`) a cached entry is additionally served only while the shared security revision still reads what it read when the entry was made — and every token create, revoke, or rotation advances that revision inside its own transaction — so a revoke committed on any replica is refused by the very next request on every replica; the TTL then bounds only repeated lookups of an unchanged token. Keep the value short for security-sensitive deployments.
 
-Service token admin API: when `SERVICE_TOKEN_SQLITE_PATH` and `POLICY_FILE` are configured, `POST /v1{ADMIN_PREFIX}/tokens` creates a service token and requires `admin:tokens:write`; `GET /v1{ADMIN_PREFIX}/tokens` and `GET /v1{ADMIN_PREFIX}/tokens/{id}` require `admin:tokens:read`; `DELETE /v1{ADMIN_PREFIX}/tokens/{id}` revokes a token and requires `admin:tokens:write`; `POST /v1{ADMIN_PREFIX}/tokens/{id}/rotate` rotates a token and requires `admin:tokens:write`. Create and rotate responses include the plaintext `ggw_` token exactly once with a notice that it will not be shown again. List and get responses return only token metadata. Create, revoke, and rotate emit `service_token.changed` audit events with actor attribution, token id, display prefix, scopes, and lifecycle timestamps, never plaintext tokens or token hashes.
+Service token admin API: when `SERVICE_TOKEN_SQLITE_PATH` and `POLICY_FILE` are configured (in cluster mode the PostgreSQL authority is the store, and `SERVICE_TOKEN_SQLITE_PATH` is rejected), `POST /v1{ADMIN_PREFIX}/tokens` creates a service token and requires `admin:tokens:write`; `GET /v1{ADMIN_PREFIX}/tokens` and `GET /v1{ADMIN_PREFIX}/tokens/{id}` require `admin:tokens:read`; `DELETE /v1{ADMIN_PREFIX}/tokens/{id}` revokes a token and requires `admin:tokens:write`; `POST /v1{ADMIN_PREFIX}/tokens/{id}/rotate` rotates a token and requires `admin:tokens:write`. Create and rotate responses include the plaintext `ggw_` token exactly once with a notice that it will not be shown again. List and get responses return only token metadata. Create, revoke, and rotate emit `service_token.changed` audit events with actor attribution, token id, display prefix, scopes, and lifecycle timestamps, never plaintext tokens or token hashes.
 
 Token scope delegation is bounded by the creator's live RBAC authority. A creator with an identity-matched role that grants `*` may delegate any scope. Otherwise, every requested scope must name a policy role that the creator both carries and can activate for its current issuer and authentication method. Requests containing unknown, unheld, or identity-inactive roles return `403 Forbidden` before a token is stored. This also means a non-wildcard creator may add the `mcp:tools` marker only when it is a defined, active role the creator carries; use a wildcard administrator if the deployment intentionally treats that marker outside the role map. Rejections emit `service_token.delegation_rejected` with the actor and requested/disallowed role names, but no token secret. Tokens created before this rule are not narrowed automatically; review and revoke any token whose scopes should not have been delegatable by its creator.
 
@@ -1912,7 +1928,7 @@ Cluster mode is experimental and is not a supported HA configuration until the #
 
 ### DEPLOYMENT_ID
 
-Stable, non-secret identifier scoping every authoritative row, unique key, lock, lease, and notification of one logical PostgreSQL-mode deployment. Two logical deployments sharing one database must carry different IDs, and two replicas of one deployment must carry the same one.
+Stable, non-secret identifier of one logical PostgreSQL-mode deployment: the domain separator for every digest, sealed envelope, lock, and lease the deployment writes. A database is bound to the first deployment ID that boots against it and refuses any other, so two logical deployments never share a database; two replicas of one deployment must carry the same ID.
 
 Default: empty (unused, and rejected, in standalone mode)
 

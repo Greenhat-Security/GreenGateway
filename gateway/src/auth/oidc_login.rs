@@ -57,6 +57,8 @@ pub struct OidcLoginConfig {
     pub authorization_endpoint: String,
     pub token_endpoint: String,
     pub http_timeout: Duration,
+    /// See `JwtAuthConfig::jwks_max_key_age`.
+    pub jwks_max_key_age: Duration,
 }
 
 impl fmt::Debug for OidcLoginConfig {
@@ -80,7 +82,7 @@ pub struct OidcLoginState {
     cfg: Arc<OidcLoginConfig>,
     egress_client: Arc<EgressClient>,
     id_token_validator: Arc<JwtValidator>,
-    pending: Arc<PendingLoginStore>,
+    pending: Arc<dyn PendingLoginBackend>,
 }
 
 #[derive(Debug)]
@@ -93,12 +95,46 @@ pub struct TokenExchange {
     pub access_token: String,
 }
 
+/// The pending-login store could not be consulted (issue #241, PR 9).
+/// Carries only the classified repository failure -- no state, no values.
+#[derive(Debug)]
+pub struct PendingLoginStoreError(pub crate::storage::RepositoryError);
+
+impl fmt::Display for PendingLoginStoreError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "pending-login store failed: {}", self.0)
+    }
+}
+
+impl Error for PendingLoginStoreError {}
+
+/// Where pending logins live. Standalone mode uses the process-local map;
+/// cluster mode uses the PostgreSQL store, so the callback can land on
+/// any replica.
+#[async_trait::async_trait]
+pub trait PendingLoginBackend: Send + Sync {
+    /// Store a pending login. `Ok(false)` means a capacity limit refused
+    /// it; still-valid entries are never evicted to make room.
+    async fn insert(
+        &self,
+        state: &str,
+        pending: PendingLogin,
+    ) -> Result<bool, PendingLoginStoreError>;
+
+    /// Consume a pending login exactly once. `Ok(None)` is unknown,
+    /// expired, or already consumed -- indistinguishable by design.
+    async fn take(&self, state: &str) -> Result<Option<PendingLogin>, PendingLoginStoreError>;
+}
+
 #[derive(Debug)]
 pub enum OidcLoginError {
     Random(getrandom::Error),
     InvalidAuthorizationEndpoint(String),
     InvalidState,
     PendingStoreFull,
+    /// The pending-login store could not be consulted: a dependency
+    /// failure, answered `503`, never laundered into `InvalidState`.
+    StoreUnavailable(PendingLoginStoreError),
     TokenExchangeTimedOut,
     TokenExchangeFailed,
     InvalidTokenResponse,
@@ -118,6 +154,7 @@ impl fmt::Display for OidcLoginError {
             Self::PendingStoreFull => {
                 write!(formatter, "OIDC login pending-state store is at capacity")
             }
+            Self::StoreUnavailable(error) => write!(formatter, "OIDC login {error}"),
             Self::TokenExchangeTimedOut => write!(formatter, "OIDC token exchange timed out"),
             Self::TokenExchangeFailed => write!(formatter, "OIDC token exchange failed"),
             Self::InvalidTokenResponse => write!(formatter, "OIDC token response is invalid"),
@@ -134,6 +171,7 @@ impl Error for OidcLoginError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
             Self::Random(err) => Some(err),
+            Self::StoreUnavailable(err) => Some(err),
             _ => None,
         }
     }
@@ -143,6 +181,10 @@ impl OidcLoginError {
     pub fn is_invalid_state(&self) -> bool {
         matches!(self, Self::InvalidState)
     }
+
+    pub fn is_store_unavailable(&self) -> bool {
+        matches!(self, Self::StoreUnavailable(_))
+    }
 }
 
 impl OidcLoginState {
@@ -151,12 +193,23 @@ impl OidcLoginState {
         egress_client: Arc<EgressClient>,
         limits: PendingLoginLimits,
     ) -> Result<Self, AuthError> {
+        Self::new_with_backend(cfg, egress_client, Arc::new(PendingLoginStore::new(limits)))
+    }
+
+    /// Build over an explicit pending-login backend (cluster mode's
+    /// PostgreSQL store).
+    pub fn new_with_backend(
+        cfg: OidcLoginConfig,
+        egress_client: Arc<EgressClient>,
+        pending: Arc<dyn PendingLoginBackend>,
+    ) -> Result<Self, AuthError> {
         let id_token_validator = JwtValidator::new(
             JwtAuthConfig {
                 jwks_url: cfg.jwks_url.clone(),
                 issuer: Some(cfg.issuer.clone()),
                 audience: Some(cfg.client_id.clone()),
                 http_timeout: cfg.http_timeout,
+                jwks_max_key_age: cfg.jwks_max_key_age,
                 require_jti: false,
                 roles_claim: "roles".to_owned(),
                 roles_claim_delimiter: None,
@@ -169,25 +222,29 @@ impl OidcLoginState {
             cfg: Arc::new(cfg),
             egress_client,
             id_token_validator: Arc::new(id_token_validator),
-            pending: Arc::new(PendingLoginStore::new(limits)),
+            pending,
         })
     }
 
-    pub fn begin_login(&self, client_ip: &str) -> Result<LoginStart, OidcLoginError> {
+    pub async fn begin_login(&self, client_ip: &str) -> Result<LoginStart, OidcLoginError> {
         let state = Uuid::new_v4().to_string();
         let nonce = Uuid::new_v4().to_string();
         let pkce = PkcePair::generate()?;
         let authorization_url = self.authorization_url(&state, &nonce, &pkce.code_challenge)?;
 
-        let accepted = self.pending.insert(
-            state,
-            PendingLogin {
-                code_verifier: pkce.code_verifier,
-                nonce,
-                created_at: Instant::now(),
-                client_ip: client_ip.to_owned(),
-            },
-        );
+        let accepted = self
+            .pending
+            .insert(
+                &state,
+                PendingLogin {
+                    code_verifier: pkce.code_verifier,
+                    nonce,
+                    created_at: Instant::now(),
+                    client_ip: client_ip.to_owned(),
+                },
+            )
+            .await
+            .map_err(OidcLoginError::StoreUnavailable)?;
         if !accepted {
             return Err(OidcLoginError::PendingStoreFull);
         }
@@ -200,7 +257,12 @@ impl OidcLoginState {
         code: &str,
         state: &str,
     ) -> Result<TokenExchange, OidcLoginError> {
-        let Some(pending) = self.pending.take(state) else {
+        let Some(pending) = self
+            .pending
+            .take(state)
+            .await
+            .map_err(OidcLoginError::StoreUnavailable)?
+        else {
             return Err(OidcLoginError::InvalidState);
         };
 
@@ -321,14 +383,20 @@ impl PkcePair {
     }
 }
 
-struct PendingLogin {
-    code_verifier: String,
-    nonce: String,
-    created_at: Instant,
-    client_ip: String,
+/// One pending login. In the process-local store every field is held in
+/// memory; the PostgreSQL store persists the verifier and nonce sealed and
+/// reconstructs `created_at`/`client_ip` as placeholders on consumption
+/// (neither is read after consumption -- expiry and the per-client quota
+/// are enforced at insert and in the database).
+pub struct PendingLogin {
+    pub code_verifier: String,
+    pub nonce: String,
+    pub created_at: Instant,
+    pub client_ip: String,
 }
 
-struct PendingLoginStore {
+/// The process-local backend: standalone mode's store.
+pub struct PendingLoginStore {
     limits: PendingLoginLimits,
     inner: Mutex<HashMap<String, PendingLogin>>,
 }
@@ -382,6 +450,21 @@ impl PendingLoginStore {
                 poisoned.into_inner()
             }
         }
+    }
+}
+
+#[async_trait::async_trait]
+impl PendingLoginBackend for PendingLoginStore {
+    async fn insert(
+        &self,
+        state: &str,
+        pending: PendingLogin,
+    ) -> Result<bool, PendingLoginStoreError> {
+        Ok(PendingLoginStore::insert(self, state.to_owned(), pending))
+    }
+
+    async fn take(&self, state: &str) -> Result<Option<PendingLogin>, PendingLoginStoreError> {
+        Ok(PendingLoginStore::take(self, state))
     }
 }
 
@@ -463,6 +546,7 @@ mod tests {
             authorization_endpoint: "https://issuer.example.test/oauth2/authorize".to_owned(),
             token_endpoint: "https://issuer.example.test/oauth2/token".to_owned(),
             http_timeout: Duration::from_secs(2),
+            jwks_max_key_age: Duration::from_secs(300),
         };
 
         let output = format!("{config:?}");

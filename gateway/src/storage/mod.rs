@@ -31,7 +31,13 @@ pub mod postgres_audit;
 #[cfg(feature = "postgres")]
 pub(crate) mod postgres_documents;
 #[cfg(feature = "postgres")]
+pub mod postgres_jwt_revocations;
+#[cfg(feature = "postgres")]
+pub mod postgres_pending_logins;
+#[cfg(feature = "postgres")]
 pub mod postgres_policy;
+#[cfg(feature = "postgres")]
+pub mod postgres_service_tokens;
 #[cfg(feature = "postgres")]
 pub(crate) mod postgres_tool_names;
 #[cfg(feature = "postgres")]
@@ -50,7 +56,13 @@ pub use policy_history::{
     PolicyControlPlane,
 };
 #[cfg(feature = "postgres")]
+pub use postgres_jwt_revocations::{JwtRevocationOutcome, PostgresJwtRevocationStore};
+#[cfg(feature = "postgres")]
+pub use postgres_pending_logins::PostgresPendingLoginStore;
+#[cfg(feature = "postgres")]
 pub use postgres_policy::{PostgresPolicyStore, SecurityRevisionSource};
+#[cfg(feature = "postgres")]
+pub use postgres_service_tokens::PostgresServiceTokenStore;
 #[cfg(feature = "postgres")]
 pub use postgres_tools::{ActiveToolDocument, PostgresToolStore, ToolControlPlane};
 pub use principal::PrincipalDirectoryStore;

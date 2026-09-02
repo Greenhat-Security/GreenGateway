@@ -167,6 +167,13 @@ static MANIFEST: LazyLock<Vec<Migration>> = LazyLock::new(|| {
         )
         .finalize()
         .with_pinned_checksum("46209bad8cf579733ab7996194f76e972ff0dec102fe5299e9de8c2dc33ac32a"),
+        Migration::new(
+            7,
+            "service_tokens",
+            include_str!("migrations/0007_service_tokens.sql"),
+        )
+        .finalize()
+        .with_pinned_checksum("ea451758adee74af5f71a842c4ea6b11bb6485a259dc3a8dcdcb778b37afb2ad"),
     ]
 });
 
