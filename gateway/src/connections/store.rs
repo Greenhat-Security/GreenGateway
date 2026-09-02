@@ -873,6 +873,14 @@ pub enum ConnectionStoreError {
         id: String,
         current: ConnectionEtag,
     },
+    /// A catalog tool name is already published by another lane at the
+    /// authority (cluster mode). The caller surfaces `409`.
+    ToolNameConflict {
+        id: String,
+        tool_name: String,
+        lane: String,
+        owner_id: String,
+    },
     DependencyConflict {
         id: String,
         count: usize,
@@ -976,6 +984,15 @@ impl fmt::Display for ConnectionStoreError {
             Self::DependencyConflict { id, count } => write!(
                 formatter,
                 "connection '{id}' is referenced by {count} retained control-plane records"
+            ),
+            Self::ToolNameConflict {
+                id,
+                tool_name,
+                lane,
+                owner_id,
+            } => write!(
+                formatter,
+                "connection '{id}' cannot publish tool '{tool_name}': it is already published by the {lane} lane ({owner_id})"
             ),
             Self::RevisionOverflow { id } => {
                 write!(

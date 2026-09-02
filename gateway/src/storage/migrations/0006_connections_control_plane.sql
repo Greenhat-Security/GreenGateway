@@ -26,10 +26,18 @@
 --       connection_openapi_catalogs.catalog_revision), an unrelated
 --       counter that must not be interleaved into the version chain.
 --   Both label rows identify the Connection through resource_id.
--- - greengateway.connection_documents keeps the immutable version history
---   of each record's specification (the issue's versioned-document
---   contract); connection_records is the active row and carries the
---   computed per-axis revisions that make up the ConnectionEtag.
+-- - greengateway.connection_documents keeps every version of each record's
+--   specification for as long as the record exists (the issue's
+--   versioned-document contract): versions are never rewritten, and a
+--   replacing write appends. A deleted record takes its versions with it,
+--   as the standalone store does; the deletion itself is attributed by the
+--   admin audit event the handler records with its actor. connection_records
+--   is the active row and carries the computed per-axis revisions that make
+--   up the ConnectionEtag.
+-- - greengateway.tool_name_reservations is the authority's own guarantee of
+--   the one invariant every replica's tool registry enforces only
+--   process-locally: one tool name, one publisher, across the local tools
+--   document, every managed OpenAPI catalog, and every managed MCP catalog.
 -- - greengateway.connection_state_revision is the connections resource's
 --   high-water mark for the gate (the audit_stream_state pattern): bumped
 --   inside every connection commit, never deleted, so the reconciler's
@@ -382,3 +390,22 @@ CREATE UNIQUE INDEX idx_ggw_connection_openapi_catalog_ordinal
 -- the connection and versions (identifiers and revisions only).
 ALTER TABLE greengateway.security_outbox
     ADD COLUMN resource_id text;
+
+-- Tool-name reservations. Each lane's commit replaces its own rows inside
+-- its transaction; the primary key refuses a name another lane holds, so
+-- two lanes racing to publish one name produce exactly one winner and an
+-- authority every replica can compile. Without it, two commits could both
+-- survive holding a conflict no replica's registry can install, and the
+-- security gate would fail closed on every replica.
+--
+-- Lanes: 'local' (the tools document; owner_id 'tools'), 'openapi' and
+-- 'mcp' (owner_id is the Connection id). MCP names are the registry's
+-- "<connection id>:<remote tool name>" form.
+CREATE TABLE greengateway.tool_name_reservations (
+    tool_name text PRIMARY KEY CHECK (octet_length(tool_name) BETWEEN 1 AND 512),
+    lane text NOT NULL CHECK (lane IN ('local', 'openapi', 'mcp')),
+    owner_id text NOT NULL CHECK (octet_length(owner_id) BETWEEN 1 AND 128)
+);
+
+CREATE INDEX idx_ggw_tool_name_reservations_owner
+    ON greengateway.tool_name_reservations(lane, owner_id);

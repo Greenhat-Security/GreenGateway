@@ -60,6 +60,10 @@ pub(crate) struct DocumentCommit<'a> {
     pub document_etag: &'a str,
     pub actor_user_id: &'a str,
     pub diff_summary_json: &'a str,
+    /// The tool names this document publishes into the local lane, to be
+    /// reserved at the authority in the same transaction. `None` for
+    /// documents that publish no tools (policies).
+    pub tool_names: Option<&'a [String]>,
 }
 
 /// The committed state, mirroring `ActivePolicy`'s facts.
@@ -211,6 +215,32 @@ pub(crate) async fn commit(
             .map_err(|error| classify_query(error, resource.operation))
             .map_err(store_error)?;
         let new_version: i64 = document_row.get(0);
+
+        // 3b. The local lane's tool names, reserved at the authority so no
+        // other lane can commit one of them while this document holds it.
+        if let Some(names) = commit.tool_names {
+            super::postgres_tool_names::reserve_tool_names(
+                &client,
+                super::postgres_tool_names::LANE_LOCAL,
+                super::postgres_tool_names::LOCAL_OWNER,
+                names.iter().cloned(),
+            )
+            .await
+            .map_err(|error| match error {
+                super::postgres_tool_names::ToolNameReservationError::Taken {
+                    tool_name,
+                    lane,
+                    owner_id,
+                } => PolicyCommitError::ToolNameTaken {
+                    tool_name,
+                    lane,
+                    owner_id,
+                },
+                super::postgres_tool_names::ToolNameReservationError::Postgres(error) => {
+                    store_error(classify_query(error, resource.operation))
+                }
+            })?;
+        }
 
         // 4. Reserve the next security revision (rollback-safe).
         let revision_row = client

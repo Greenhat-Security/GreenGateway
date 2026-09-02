@@ -1012,6 +1012,11 @@ impl ConnectionControlPlane {
         actor: &str,
     ) -> Result<(), ConnectionMutationError> {
         let _guard = self.mutation_guard().await;
+        // Cluster mode queues dependency guard rows for a background flush;
+        // a delete must not outrun them, or ON DELETE RESTRICT has no child
+        // row to protect and a live route or tool is orphaned. Flush first;
+        // a flush that fails refuses the delete rather than risk that.
+        self.flush_pending_dependencies().await?;
         self.managed_store()?.delete(id, expected, actor).await?;
         let current = self.runtime.load_full();
         let mut managed = current.managed().clone();

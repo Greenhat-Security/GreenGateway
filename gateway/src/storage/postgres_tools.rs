@@ -78,6 +78,21 @@ pub struct PostgresToolStore {
     pool: deadpool_postgres::Pool,
 }
 
+/// `tools[].name` as strings, without judging the document: a value the
+/// schema rejects reserves the names it does carry and fails closed at
+/// the replica.
+fn local_tool_names(document: &Value) -> Vec<String> {
+    document["tools"]
+        .as_array()
+        .map(|tools| {
+            tools
+                .iter()
+                .filter_map(|tool| tool["name"].as_str().map(str::to_owned))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 impl PostgresToolStore {
     pub fn new(pool: deadpool_postgres::Pool) -> Self {
         Self { pool }
@@ -111,6 +126,7 @@ impl PostgresToolStore {
                 document_etag: &etag,
                 actor_user_id: "bootstrap",
                 diff_summary_json: r#"{"action":"tools_seeded"}"#,
+                tool_names: None,
             },
         )
         .await
@@ -195,6 +211,14 @@ impl ToolControlPlane for PostgresToolStore {
         let etag = crate::tools_file_etag(document).map_err(|_| {
             PolicyCommitError::Store(invalid_data(TOOLS_DOCUMENT_RESOURCE.operation))
         })?;
+        // The names are read from the document as the registry will name
+        // the tools (`tools[].name`, verbatim), so what is reserved is
+        // exactly what every replica installs. The authority does not
+        // validate the document -- validation is replica-side, and the gate
+        // fails closed on a document this binary cannot enforce (see
+        // `tools_reconciliation_installs_and_fails_closed`); it refuses
+        // only a name another lane holds.
+        let tool_names = local_tool_names(document);
         let committed = postgres_documents::commit(
             &self.pool,
             TOOLS_DOCUMENT_RESOURCE,
@@ -204,6 +228,7 @@ impl ToolControlPlane for PostgresToolStore {
                 document_etag: &etag,
                 actor_user_id,
                 diff_summary_json: &diff_summary.to_string(),
+                tool_names: Some(&tool_names),
             },
         )
         .await?;

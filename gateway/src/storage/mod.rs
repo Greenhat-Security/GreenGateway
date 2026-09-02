@@ -33,6 +33,8 @@ pub(crate) mod postgres_documents;
 #[cfg(feature = "postgres")]
 pub mod postgres_policy;
 #[cfg(feature = "postgres")]
+pub(crate) mod postgres_tool_names;
+#[cfg(feature = "postgres")]
 pub mod postgres_tools;
 mod principal;
 mod service_token;

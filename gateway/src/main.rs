@@ -6937,6 +6937,15 @@ async fn register_tools_via_control_plane(
         Err(storage::PolicyCommitError::PreconditionFailed) => Err(Box::new(precondition_failed(
             "If-Match does not match the current tools ETag",
         ))),
+        // The authority refused a name another lane holds: a verdict on
+        // this document, not a storage failure, and nothing was written.
+        Err(storage::PolicyCommitError::ToolNameTaken {
+            tool_name,
+            lane,
+            owner_id,
+        }) => Err(Box::new(conflict(&format!(
+            "tool name '{tool_name}' is already published by the {lane} lane ({owner_id})"
+        )))),
         Err(storage::PolicyCommitError::Store(error)) => {
             tracing::error!(
                 error = %error,
@@ -10327,6 +10336,14 @@ fn connection_store_error_response(error: connections::store::ConnectionStoreErr
             precondition_failed("connection changed during the mutation"),
             current.as_str(),
         ),
+        connections::store::ConnectionStoreError::ToolNameConflict {
+            tool_name,
+            lane,
+            owner_id,
+            ..
+        } => conflict(&format!(
+            "tool name '{tool_name}' is already published by the {lane} lane ({owner_id})"
+        )),
         connections::store::ConnectionStoreError::DependencyConflict { count, .. } => conflict(
             &format!("connection is referenced by {count} retained control-plane records"),
         ),
@@ -11590,6 +11607,13 @@ async fn persist_policy_mutation(
             Err(storage::PolicyCommitError::PreconditionFailed) => Err(Box::new(
                 precondition_failed("If-Match does not match the current policy ETag"),
             )),
+            // Policies publish no tool names; the variant is unreachable
+            // here and answered as the conflict it would be.
+            Err(storage::PolicyCommitError::ToolNameTaken { tool_name, .. }) => {
+                Err(Box::new(conflict(&format!(
+                    "policy commit reported a reserved tool name '{tool_name}'"
+                ))))
+            }
             Err(storage::PolicyCommitError::Store(error)) => {
                 tracing::error!(
                     error = %error,
@@ -12896,7 +12920,8 @@ fn connection_refresh_error_response(error: connections::mcp::McpCatalogRefreshE
         connections::mcp::McpCatalogRefreshError::PreconditionFailed => {
             StatusCode::PRECONDITION_FAILED
         }
-        connections::mcp::McpCatalogRefreshError::RefreshInProgress
+        connections::mcp::McpCatalogRefreshError::ToolNameConflict
+        | connections::mcp::McpCatalogRefreshError::RefreshInProgress
         | connections::mcp::McpCatalogRefreshError::ConnectionDisabled
         | connections::mcp::McpCatalogRefreshError::ConnectionKindMismatch
         | connections::mcp::McpCatalogRefreshError::DiscoveryNotConfigured => StatusCode::CONFLICT,

@@ -58,6 +58,10 @@ pub struct OpenApiConnectionCatalogService {
     http: ConnectionHttpRuntime,
     registry: ToolRegistry,
     runtime: OpenApiConnectionCatalogRuntime,
+    /// Test seam: runs between the authority commit and the registry
+    /// install, where another lane can move underneath a publish.
+    #[cfg(test)]
+    install_hook: Option<Arc<dyn Fn() + Send + Sync>>,
 }
 
 struct OpenApiPublishCandidate<'a> {
@@ -358,7 +362,15 @@ impl OpenApiConnectionCatalogService {
             http,
             registry,
             runtime,
+            #[cfg(test)]
+            install_hook: None,
         })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_install_hook_for_test(mut self, hook: Arc<dyn Fn() + Send + Sync>) -> Self {
+        self.install_hook = Some(hook);
+        self
     }
 
     pub fn runtime(&self) -> OpenApiConnectionCatalogRuntime {
@@ -842,22 +854,30 @@ impl OpenApiConnectionCatalogService {
             );
             return Err(OpenApiCatalogError::ToolConflict);
         }
-        // The runtime publish stays paired with the registry install so the
-        // managed-OpenAPI lane and the runtime map keep publishing
-        // together: a request must never find a tool in one and not the
-        // other.
-        self.runtime
-            .publish_prevalidated(&catalog, definition_digests);
+        // Registry first, runtime marker second. The marker is what
+        // `reconcile_from_authority` compares against: publishing it before
+        // a registry install that then fails would leave this replica
+        // treating the catalog as live while the registry lacks its tools,
+        // and nothing would ever retry. With the registry installed first a
+        // failed install publishes nothing locally, and the reconciler
+        // installs the durable catalog on its next pass -- the same order
+        // the reconciler itself uses.
+        #[cfg(test)]
+        if let Some(hook) = self.install_hook.as_ref() {
+            hook();
+        }
         if let Err(error) =
             registry.install_openapi_connection_catalog(record.id.as_str(), binding_definitions)
         {
             tracing::error!(
                 connection_id = %record.id,
                 error = %error,
-                "OpenAPI catalog is durable but could not be installed into the tool registry; this replica will not serve it until the next publish or restart"
+                "OpenAPI catalog is durable but could not be installed into the tool registry; reconciliation will retry"
             );
             return Err(OpenApiCatalogError::ToolConflict);
         }
+        self.runtime
+            .publish_prevalidated(&catalog, definition_digests);
         let status = {
             let latency = duration_millis(started.elapsed());
             match self
@@ -1401,6 +1421,7 @@ fn egress_error(error: EgressError) -> OpenApiCatalogError {
 
 fn openapi_store_error(error: &ConnectionStoreError) -> OpenApiCatalogError {
     match error {
+        ConnectionStoreError::ToolNameConflict { .. } => OpenApiCatalogError::ToolConflict,
         ConnectionStoreError::Conflict { .. } => OpenApiCatalogError::StalePreview,
         ConnectionStoreError::Validation { .. } | ConnectionStoreError::LimitExceeded { .. } => {
             OpenApiCatalogError::InvalidSpec
@@ -1593,6 +1614,154 @@ mod tests {
             &first,
             &entry(changed_mapping)
         ));
+    }
+
+    /// A registry install that fails after the authority commit -- another
+    /// lane moved underneath the publish -- publishes no runtime marker,
+    /// so `reconcile_from_authority` still sees the durable catalog as
+    /// newer than what is live and installs it on its next pass. Publishing
+    /// the marker first would have left this replica believing the catalog
+    /// was live with its tools absent from the registry, forever.
+    #[tokio::test]
+    async fn a_failed_registry_install_publishes_no_runtime_marker() {
+        let database = TemporaryDatabase::new();
+        let mut config = Config::test_defaults();
+        config.connections_sqlite_path = Some(database.0.display().to_string());
+        let control_plane =
+            ConnectionControlPlane::from_config(&config).expect("control plane should build");
+        let snapshot = control_plane.runtime_snapshot();
+        let candidate: ConnectionWrite = serde_json::from_value(json!({
+            "display_name": "Managed Billing OpenAPI",
+            "enabled": true,
+            "kind": "http_api",
+            "endpoint": {
+                "base_url": "https://billing.example.test",
+                "base_path": "/v1"
+            },
+            "authentication": {"type": "none"},
+            "tls": {},
+            "timeouts": {
+                "connect_timeout_ms": 1000,
+                "request_timeout_ms": 3000,
+                "response_idle_timeout_ms": 1000
+            },
+            "discovery": {
+                "type": "managed_openapi",
+                "use_connection_authentication": false
+            }
+        }))
+        .expect("managed OpenAPI Connection should deserialize");
+        let record = control_plane
+            .create_managed(snapshot.collection_etag(), candidate, "test-admin")
+            .await
+            .expect("managed OpenAPI Connection should create");
+        let egress_config = EgressConfig::from_config(&config);
+        let egress_client =
+            Arc::new(EgressClient::new(egress_config.clone()).expect("egress should build"));
+        let http = ConnectionHttpRuntime::new(control_plane.clone(), egress_config, egress_client);
+        let registry = ToolRegistry::disabled();
+        // Between the commit and the install, the local lane takes the
+        // name the catalog is about to publish.
+        let racing_registry = registry.clone();
+        let service = OpenApiConnectionCatalogService::load(
+            control_plane.clone(),
+            http.clone(),
+            registry.clone(),
+        )
+        .expect("managed OpenAPI service should load")
+        .with_install_hook_for_test(Arc::new(move || {
+            let local = crate::tools::definitions::definitions_from_json_value(
+                json!({
+                    "schema_version": "0.1.0",
+                    "tools": [{
+                        "name": "get_invoice",
+                        "description": "A local tool that takes the name first.",
+                        "input_json_schema": {
+                            "type": "object",
+                            "properties": {},
+                            "additionalProperties": false
+                        },
+                        "upstream": {
+                            "method": "POST",
+                            "path_template": "/v1/echo",
+                            "body": { "mode": "whole_args_json" }
+                        }
+                    }]
+                }),
+                None,
+            )
+            .expect("local definitions should parse");
+            racing_registry
+                .install_local_definitions(local)
+                .expect("the local lane installs against the old registry");
+        }));
+        let spec = r#"
+openapi: 3.0.3
+info:
+  title: Billing
+  version: 1.0.0
+paths:
+  /invoices/{invoice_id}:
+    get:
+      operationId: get_invoice
+      summary: Read one invoice
+      parameters:
+        - in: path
+          name: invoice_id
+          required: true
+          schema:
+            type: string
+"#;
+        let preview = service
+            .preview(record.id.as_str(), spec)
+            .await
+            .expect("bounded managed spec should preview");
+        let selected_tool_names = preview
+            .binding
+            .definitions
+            .iter()
+            .map(|definition| definition.name.clone())
+            .collect::<Vec<_>>();
+        let confirmations = preview.binding.security_selections.clone();
+
+        let refused = service
+            .register(
+                record.id.as_str(),
+                record.etag().as_str(),
+                preview.spec_revision,
+                preview.catalog_revision,
+                &preview.spec_digest,
+                spec,
+                &selected_tool_names,
+                &confirmations,
+                "test-admin",
+            )
+            .await
+            .expect_err("the registry install must be refused");
+        assert_eq!(refused, OpenApiCatalogError::ToolConflict);
+        assert_eq!(
+            service.runtime().current_revision(&record.id),
+            None,
+            "no runtime marker is published for a catalog the registry does not serve"
+        );
+        // The catalog is durable at the authority: the next preview sees
+        // its revision, which is what reconciliation will install once the
+        // conflict is resolved.
+        let next = service
+            .preview(record.id.as_str(), spec)
+            .await
+            .expect("the durable catalog previews");
+        assert_eq!(next.catalog_revision, 1);
+        assert!(
+            registry.get("get_invoice").is_some_and(|definition| {
+                !matches!(
+                    definition.source,
+                    crate::tools::definitions::ToolSource::OpenApi { .. }
+                        | crate::tools::definitions::ToolSource::Mcp { .. }
+                )
+            }),
+            "the local lane keeps the name it took"
+        );
     }
 
     #[tokio::test]

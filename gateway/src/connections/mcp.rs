@@ -73,6 +73,9 @@ pub enum McpCatalogRefreshError {
     ConnectionKindMismatch,
     DiscoveryNotConfigured,
     PreconditionFailed,
+    /// A discovered tool's registry name is already published by another
+    /// lane at the authority.
+    ToolNameConflict,
     RefreshInProgress,
     EgressDenied,
     SecretUnavailable,
@@ -92,6 +95,7 @@ impl McpCatalogRefreshError {
             Self::ConnectionKindMismatch => "connection_kind_mismatch",
             Self::DiscoveryNotConfigured => "discovery_not_configured",
             Self::PreconditionFailed => "connection_changed",
+            Self::ToolNameConflict => "tool_name_conflict",
             Self::RefreshInProgress => "refresh_in_progress",
             Self::EgressDenied => "egress_denied",
             Self::SecretUnavailable => "secret_unavailable",
@@ -920,6 +924,7 @@ fn refresh_transport_error(error: &McpUpstreamCallError) -> McpCatalogRefreshErr
 fn refresh_store_error(error: &ConnectionStoreError) -> McpCatalogRefreshError {
     match error {
         ConnectionStoreError::Conflict { .. } => McpCatalogRefreshError::PreconditionFailed,
+        ConnectionStoreError::ToolNameConflict { .. } => McpCatalogRefreshError::ToolNameConflict,
         ConnectionStoreError::Validation { .. } | ConnectionStoreError::LimitExceeded { .. } => {
             McpCatalogRefreshError::InvalidResponse
         }

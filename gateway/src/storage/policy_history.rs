@@ -100,6 +100,14 @@ pub enum PolicyCommitError {
     /// The authority could not be consulted or rejected the mutation for
     /// a store-level reason. Nothing committed.
     Store(RepositoryError),
+    /// A tool name in the committed document is already published by
+    /// another lane at the authority. The caller surfaces `409`; nothing
+    /// committed.
+    ToolNameTaken {
+        tool_name: String,
+        lane: String,
+        owner_id: String,
+    },
 }
 
 #[cfg(feature = "postgres")]
@@ -110,6 +118,14 @@ impl fmt::Display for PolicyCommitError {
                 "the active policy changed before the mutation committed; nothing was written",
             ),
             Self::Store(error) => write!(formatter, "policy commit failed: {error}"),
+            Self::ToolNameTaken {
+                tool_name,
+                lane,
+                owner_id,
+            } => write!(
+                formatter,
+                "tool name '{tool_name}' is already published by the {lane} lane ({owner_id}); nothing was written"
+            ),
         }
     }
 }

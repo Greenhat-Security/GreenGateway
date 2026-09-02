@@ -31,6 +31,8 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use serde_json::Value;
 
+use crate::storage::postgres_tool_names::{self, ToolNameReservationError};
+
 use super::store::{
     binding_count, ensure_etag, expected_bindings, increment_revision, initial_revisions,
     managed_tool_dependency_id, optional_u64_to_i64, parse_reason, parse_state, persisted_revision,
@@ -629,10 +631,17 @@ impl PostgresConnectionStore {
                 });
             }
             // The outbox row precedes the cascade delete: version 0 marks a
-            // deletion (specification versions start at 1). The actor is
-            // carried by the outbox revision; the version rows cascade.
+            // deletion (specification versions start at 1). The version
+            // rows cascade with the record, as they do in the standalone
+            // store; the deletion is attributed by the admin audit event
+            // the handler records with its actor, which is why the actor
+            // is not written here. Any tool names the record's catalogs
+            // held are released in the same transaction.
             bump_connection_state(&client, RESOURCE_CONNECTION, id, Some(current.revisions.connection), 0)
                 .await?;
+            postgres_tool_names::release_tool_names(&client, id.as_str())
+                .await
+                .map_err(|error| pg_error(OPERATION_DELETE, error))?;
             client
                 .execute(
                     "DELETE FROM greengateway.connection_records WHERE id = $1::text::uuid",
@@ -962,6 +971,18 @@ impl PostgresConnectionStore {
                     .map_err(|error| pg_error(OPERATION_MCP_CATALOG, error))?;
             }
 
+            // The registry names a proxied tool "<connection id>:<remote
+            // name>"; the reservation is made in that form.
+            reserve_catalog_tool_names(
+                &client,
+                postgres_tool_names::LANE_MCP,
+                id,
+                entries
+                    .iter()
+                    .map(|entry| format!("{}:{}", id.as_str(), entry.remote_tool_name)),
+                OPERATION_MCP_CATALOG,
+            )
+            .await?;
             bump_connection_state(
                 &client,
                 RESOURCE_CONNECTION_CATALOG,
@@ -1278,6 +1299,16 @@ impl PostgresConnectionStore {
                     .map_err(|error| pg_error(OPERATION_OPENAPI_CATALOG, error))?;
             }
 
+            reserve_catalog_tool_names(
+                &client,
+                postgres_tool_names::LANE_OPENAPI,
+                id,
+                encoded_entries
+                    .iter()
+                    .map(|encoded| encoded.entry.tool_name.clone()),
+                OPERATION_OPENAPI_CATALOG,
+            )
+            .await?;
             bump_connection_state(
                 &client,
                 RESOURCE_CONNECTION_CATALOG,
@@ -3497,6 +3528,32 @@ fn pg_unavailable(operation: &'static str) -> ConnectionStoreError {
     ConnectionStoreError::Postgres { operation }
 }
 
+/// Reserve a catalog lane's tool names at the authority inside the
+/// caller's transaction, naming the holder on a conflict.
+async fn reserve_catalog_tool_names(
+    client: &tokio_postgres::Client,
+    lane: &'static str,
+    id: &ConnectionId,
+    names: impl IntoIterator<Item = String>,
+    operation: &'static str,
+) -> Result<(), ConnectionStoreError> {
+    postgres_tool_names::reserve_tool_names(client, lane, id.as_str(), names)
+        .await
+        .map_err(|error| match error {
+            ToolNameReservationError::Taken {
+                tool_name,
+                lane,
+                owner_id,
+            } => ConnectionStoreError::ToolNameConflict {
+                id: id.to_string(),
+                tool_name,
+                lane,
+                owner_id,
+            },
+            ToolNameReservationError::Postgres(error) => pg_error(operation, error),
+        })
+}
+
 fn pg_error(operation: &'static str, error: impl std::error::Error) -> ConnectionStoreError {
     tracing::error!(operation, error = %error, "connection PostgreSQL operation failed");
     ConnectionStoreError::Postgres { operation }
@@ -4738,6 +4795,409 @@ mod tests {
             excluded, 0,
             "the connection being replaced is excluded from all three tables"
         );
+    }
+
+    fn openapi_entry(tool_name: &str) -> StoredOpenApiCatalogEntry {
+        StoredOpenApiCatalogEntry {
+            tool_name: tool_name.to_owned(),
+            operation_id: Some("listInvoices".to_owned()),
+            selected_scheme_names: vec![],
+            definition: json!({
+                "name": tool_name,
+                "description": "Lists invoices.",
+                "input_json_schema": {
+                    "type": "object",
+                    "properties": {},
+                    "additionalProperties": false
+                },
+                "upstream": {
+                    "method": "GET",
+                    "path_template": "/v1/invoices",
+                    "body": { "mode": "whole_args_json" }
+                }
+            }),
+        }
+    }
+
+    fn local_tools_document(tool_names: &[&str]) -> Value {
+        json!({
+            "schema_version": "0.1.0",
+            "tools": tool_names.iter().map(|name| json!({
+                "name": name,
+                "description": "Echoes the provided message.",
+                "input_json_schema": {
+                    "type": "object",
+                    "required": ["message"],
+                    "properties": { "message": { "type": "string" } },
+                    "additionalProperties": false
+                },
+                "upstream": {
+                    "method": "POST",
+                    "path_template": "/v1/echo",
+                    "body": { "mode": "whole_args_json" }
+                }
+            })).collect::<Vec<_>>()
+        })
+    }
+
+    const RESERVATION_SPEC: &str = "{\"openapi\":\"3.1.0\"}";
+
+    fn reservation_spec_digest() -> String {
+        use sha2::Digest;
+        hex::encode(sha2::Sha256::digest(RESERVATION_SPEC.as_bytes()))
+    }
+
+    /// Cluster mode queues dependency guard rows for a background flush.
+    /// An admin delete flushes them first, so a Connection a live route
+    /// references is refused even before the background task has run --
+    /// and a delete after the reference is gone succeeds.
+    #[tokio::test]
+    async fn delete_flushes_queued_dependency_guards_before_it_is_judged() {
+        use crate::connections::control_plane::{
+            ClusterConnectionStoreSeed, ConnectionControlPlane, ConnectionMutationError,
+        };
+        use crate::connections::managed_store::{ClusterConnectionsBoot, ManagedConnectionStore};
+        use crate::connections::store::ConnectionDependencyKind;
+        let Some(admin_dsn) = locator() else {
+            eprintln!("skipping: no test database locator; CI runs this test");
+            return;
+        };
+        let database = create_test_database(&admin_dsn).await;
+        let (store, pool) = migrated_store(&database.dsn, 64).await;
+        let config = crate::config::Config::test_defaults();
+        let control_plane = ConnectionControlPlane::from_config_with_cluster_seed(
+            &config,
+            Some(ClusterConnectionStoreSeed {
+                store: ManagedConnectionStore::Postgres {
+                    store: std::sync::Arc::new(store),
+                    boot: std::sync::Arc::new(ClusterConnectionsBoot {
+                        mcp_catalogs: Vec::new(),
+                        openapi_catalogs: Vec::new(),
+                        openapi_inventory_catalogs: Vec::new(),
+                    }),
+                },
+                records: Vec::new(),
+            }),
+        )
+        .expect("cluster control plane should build");
+        let snapshot = control_plane.runtime_snapshot();
+        let record = control_plane
+            .create_managed(
+                snapshot.collection_etag(),
+                http_candidate("Referenced API"),
+                "op-1",
+            )
+            .await
+            .expect("create");
+
+        // A route references the Connection; in cluster mode the guard row
+        // is only queued.
+        control_plane
+            .replace_runtime_dependencies(
+                ConnectionDependencyKind::ProxyRoute,
+                &[(record.id.clone(), "route-1".to_owned())],
+            )
+            .expect("the dependency set queues");
+        let client = pool.get().await.expect("client");
+        let queued_only: i64 = client
+            .query_one(
+                "SELECT COUNT(*) FROM greengateway.connection_dependencies WHERE connection_id = $1::text::uuid",
+                &[&record.id.as_str()],
+            )
+            .await
+            .expect("count")
+            .get(0);
+        assert_eq!(queued_only, 0, "nothing is written until a flush");
+
+        let refused = control_plane
+            .delete_managed(&record.id, &record.etag(), "op-2")
+            .await
+            .expect_err("a referenced Connection must not be deleted");
+        assert!(
+            matches!(
+                refused,
+                ConnectionMutationError::Store(ConnectionStoreError::DependencyConflict { .. })
+            ),
+            "{refused}"
+        );
+        let flushed: i64 = client
+            .query_one(
+                "SELECT COUNT(*) FROM greengateway.connection_dependencies WHERE connection_id = $1::text::uuid",
+                &[&record.id.as_str()],
+            )
+            .await
+            .expect("count")
+            .get(0);
+        assert_eq!(
+            flushed, 1,
+            "the delete flushed the guard before judging itself"
+        );
+
+        // The reference goes away; the next delete flushes that too and
+        // succeeds.
+        control_plane
+            .replace_runtime_dependencies(ConnectionDependencyKind::ProxyRoute, &[])
+            .expect("the empty set queues");
+        control_plane
+            .delete_managed(&record.id, &record.etag(), "op-3")
+            .await
+            .expect("an unreferenced Connection deletes");
+    }
+
+    /// The authority itself refuses a tool name another lane holds, so two
+    /// lanes can never both commit a name that only one replica-side
+    /// registry could install (the review of PR 8). Replacing the holder's
+    /// catalog without the name frees it.
+    #[tokio::test]
+    async fn tool_names_are_reserved_across_lanes_at_the_authority() {
+        use crate::storage::{PolicyCommitError, PolicyCommitPrecondition, ToolControlPlane};
+        let Some(admin_dsn) = locator() else {
+            eprintln!("skipping: no test database locator; CI runs this test");
+            return;
+        };
+        let database = create_test_database(&admin_dsn).await;
+        let (store, pool) = migrated_store(&database.dsn, 64).await;
+        let tools = crate::storage::PostgresToolStore::new(pool.clone());
+        tools.seed_empty_document().await.expect("seed");
+        let digest = reservation_spec_digest();
+        let api = store
+            .create(http_candidate("Billing API"), "op-1", None)
+            .await
+            .expect("create");
+        store
+            .replace_openapi_catalog(
+                &api.id,
+                &api.etag(),
+                0,
+                0,
+                RESERVATION_SPEC,
+                &digest,
+                &[openapi_entry("shared_tool")],
+                "op-2",
+            )
+            .await
+            .expect("the OpenAPI lane publishes first");
+
+        // The local lane cannot take the name; nothing is written.
+        let active = tools.active_tools().await.expect("active").expect("seeded");
+        let refused = tools
+            .commit_tools(
+                PolicyCommitPrecondition::Expected {
+                    etag: active.etag.clone(),
+                },
+                &local_tools_document(&["shared_tool"]),
+                "op-3",
+                &json!({"action": "test"}),
+            )
+            .await
+            .expect_err("the name is held by the OpenAPI lane");
+        assert!(
+            matches!(
+                &refused,
+                PolicyCommitError::ToolNameTaken { tool_name, lane, owner_id }
+                    if tool_name == "shared_tool" && lane == "openapi" && owner_id == api.id.as_str()
+            ),
+            "{refused}"
+        );
+        let unchanged = tools.active_tools().await.expect("active").expect("seeded");
+        assert_eq!(
+            unchanged.version, active.version,
+            "a refused commit writes nothing"
+        );
+
+        // Nor can a second Connection.
+        let other = store
+            .create(http_candidate("Other API"), "op-4", None)
+            .await
+            .expect("create");
+        let refused = store
+            .replace_openapi_catalog(
+                &other.id,
+                &other.etag(),
+                0,
+                0,
+                RESERVATION_SPEC,
+                &digest,
+                &[openapi_entry("shared_tool")],
+                "op-5",
+            )
+            .await
+            .expect_err("the name is held by another Connection");
+        assert!(
+            matches!(
+                &refused,
+                ConnectionStoreError::ToolNameConflict { tool_name, lane, owner_id, .. }
+                    if tool_name == "shared_tool" && lane == "openapi" && owner_id == api.id.as_str()
+            ),
+            "{refused}"
+        );
+
+        // Replacing the holder's catalog without the name frees it for the
+        // local lane -- and then the OpenAPI lane cannot take it back.
+        let api_now = store
+            .get(&api.id)
+            .await
+            .expect("get")
+            .expect("the Connection exists");
+        store
+            .replace_openapi_catalog(
+                &api.id,
+                &api_now.etag(),
+                1,
+                1,
+                RESERVATION_SPEC,
+                &digest,
+                &[openapi_entry("renamed_tool")],
+                "op-6",
+            )
+            .await
+            .expect("republish without the name");
+        let committed = tools
+            .commit_tools(
+                PolicyCommitPrecondition::Expected {
+                    etag: unchanged.etag.clone(),
+                },
+                &local_tools_document(&["shared_tool"]),
+                "op-7",
+                &json!({"action": "test"}),
+            )
+            .await
+            .expect("the local lane takes the freed name");
+        assert!(committed.version > unchanged.version);
+        let api_now = store
+            .get(&api.id)
+            .await
+            .expect("get")
+            .expect("the Connection exists");
+        let refused = store
+            .replace_openapi_catalog(
+                &api.id,
+                &api_now.etag(),
+                // The spec is unchanged, so its revision stays at 1; only
+                // the catalog revision advanced.
+                1,
+                2,
+                RESERVATION_SPEC,
+                &digest,
+                &[openapi_entry("shared_tool"), openapi_entry("renamed_tool")],
+                "op-8",
+            )
+            .await
+            .expect_err("the local lane holds it now");
+        assert!(
+            matches!(
+                &refused,
+                ConnectionStoreError::ToolNameConflict { tool_name, lane, owner_id, .. }
+                    if tool_name == "shared_tool" && lane == "local" && owner_id == "tools"
+            ),
+            "{refused}"
+        );
+        // A refused catalog publish wrote nothing: the previous catalog
+        // and its reservation stand.
+        let client = pool.get().await.expect("client");
+        let held: i64 = client
+            .query_one(
+                "SELECT COUNT(*) FROM greengateway.tool_name_reservations WHERE tool_name = 'renamed_tool' AND lane = 'openapi'",
+                &[],
+            )
+            .await
+            .expect("count")
+            .get(0);
+        assert_eq!(held, 1);
+    }
+
+    /// Two lanes racing to publish one name: exactly one wins, on the
+    /// authority's own guarantee rather than any replica's registry.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn concurrent_cross_lane_publishes_of_one_tool_name_produce_exactly_one_winner() {
+        use crate::storage::{PolicyCommitPrecondition, ToolControlPlane};
+        let Some(admin_dsn) = locator() else {
+            eprintln!("skipping: no test database locator; CI runs this test");
+            return;
+        };
+        let database = create_test_database(&admin_dsn).await;
+        let (store, pool) = migrated_store(&database.dsn, 64).await;
+        let store = std::sync::Arc::new(store);
+        let tools = std::sync::Arc::new(crate::storage::PostgresToolStore::new(pool.clone()));
+        tools.seed_empty_document().await.expect("seed");
+        let digest = reservation_spec_digest();
+        // The local lane must be able to win on its own terms, or a parse
+        // failure would masquerade as losing every race.
+        let seeded = tools.active_tools().await.expect("active").expect("seeded");
+        tools
+            .commit_tools(
+                PolicyCommitPrecondition::Expected {
+                    etag: seeded.etag.clone(),
+                },
+                &local_tools_document(&["warmup_tool"]),
+                "op-w",
+                &json!({"action": "warmup"}),
+            )
+            .await
+            .expect("the local lane commits an uncontested name");
+        for round in 0..4 {
+            let name = format!("raced_{round}");
+            let api = store
+                .create(http_candidate(&format!("API {round}")), "op-c", None)
+                .await
+                .expect("create");
+            let active = tools.active_tools().await.expect("active").expect("seeded");
+            let barrier = std::sync::Arc::new(tokio::sync::Barrier::new(2));
+            let local = {
+                let (tools, barrier, name) = (tools.clone(), barrier.clone(), name.clone());
+                let etag = active.etag.clone();
+                tokio::spawn(async move {
+                    barrier.wait().await;
+                    tools
+                        .commit_tools(
+                            PolicyCommitPrecondition::Expected { etag },
+                            &local_tools_document(&[name.as_str()]),
+                            "op-l",
+                            &json!({"action": "race"}),
+                        )
+                        .await
+                        .is_ok()
+                })
+            };
+            let openapi = {
+                let (store, barrier, name, digest) =
+                    (store.clone(), barrier.clone(), name.clone(), digest.clone());
+                let (id, etag) = (api.id.clone(), api.etag());
+                tokio::spawn(async move {
+                    barrier.wait().await;
+                    store
+                        .replace_openapi_catalog(
+                            &id,
+                            &etag,
+                            0,
+                            0,
+                            RESERVATION_SPEC,
+                            &digest,
+                            &[openapi_entry(&name)],
+                            "op-o",
+                        )
+                        .await
+                        .is_ok()
+                })
+            };
+            let (local_won, openapi_won) = tokio::join!(local, openapi);
+            let winners =
+                usize::from(local_won.expect("task")) + usize::from(openapi_won.expect("task"));
+            assert_eq!(
+                winners, 1,
+                "round {round}: exactly one lane publishes '{name}'"
+            );
+            let client = pool.get().await.expect("client");
+            let holders: i64 = client
+                .query_one(
+                    "SELECT COUNT(*) FROM greengateway.tool_name_reservations WHERE tool_name = $1",
+                    &[&name],
+                )
+                .await
+                .expect("count")
+                .get(0);
+            assert_eq!(holders, 1, "round {round}: one reservation for '{name}'");
+        }
     }
 
     #[tokio::test]

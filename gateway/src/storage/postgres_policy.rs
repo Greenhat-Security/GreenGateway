@@ -227,6 +227,7 @@ impl PolicyControlPlane for PostgresPolicyStore {
                 document_etag: &etag,
                 actor_user_id: request.actor_user_id,
                 diff_summary_json: &diff_summary_json,
+                tool_names: None,
             },
         )
         .await?;
