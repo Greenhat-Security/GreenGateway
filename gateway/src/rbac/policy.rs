@@ -3016,6 +3016,12 @@ mod tests {
             tool_runtime_global_concurrency: crate::config::DEFAULT_TOOL_RUNTIME_GLOBAL_CONCURRENCY,
             tool_runtime_queue_timeout_ms: crate::config::DEFAULT_TOOL_RUNTIME_QUEUE_TIMEOUT_MS,
             tool_lease_ttl_ms: crate::config::DEFAULT_TOOL_LEASE_TTL_MS,
+            cluster_heartbeat_ms: crate::config::DEFAULT_CLUSTER_HEARTBEAT_MS,
+            cluster_member_stale_ms: crate::config::DEFAULT_CLUSTER_MEMBER_STALE_MS,
+            cluster_maintenance_interval_ms: crate::config::DEFAULT_CLUSTER_MAINTENANCE_INTERVAL_MS,
+            cluster_maintenance_lease_ttl_ms:
+                crate::config::DEFAULT_CLUSTER_MAINTENANCE_LEASE_TTL_MS,
+            audit_postgres_retention_days: None,
             tool_runtime_default_timeout_ms: crate::config::DEFAULT_TOOL_RUNTIME_DEFAULT_TIMEOUT_MS,
             csrf_enabled: true,
             csrf_cookie_name: "csrf_token".to_owned(),

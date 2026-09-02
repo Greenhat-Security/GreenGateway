@@ -62,6 +62,19 @@ use super::{log_classified, postgres::classify_pool_error, RepositoryError, Repo
 
 const OPERATION_INSERT: &str = "pending_login_insert";
 const OPERATION_TAKE: &str = "pending_login_take";
+const OPERATION_PRUNE: &str = "pending_login_prune";
+/// The bound on one singleton prune step (`prune_expired`), independent
+/// of the per-admission batch.
+const MAX_PRUNE_BATCH: u32 = 10_000;
+/// Expired rows are judged on the statement clock, the same basis the
+/// admission path uses for its TTL and quota count (see `insert`).
+const PRUNE_EXPIRED_SQL: &str = r#"
+    DELETE FROM greengateway.admin_pending_logins
+    WHERE ctid IN (
+        SELECT ctid FROM greengateway.admin_pending_logins
+        WHERE expires_at <= clock_timestamp() LIMIT $1
+    )
+    "#;
 /// The AEAD envelope's schema, bound into the associated data.
 const ENVELOPE_SCHEMA_VERSION: u16 = 1;
 const NONCE_BYTES: usize = 24;
@@ -107,6 +120,34 @@ impl PostgresPendingLoginStore {
     pub(crate) fn with_after_lock_delay_for_test(mut self, delay: std::time::Duration) -> Self {
         self.after_lock_delay = Some(delay);
         self
+    }
+
+    /// Delete up to `limit` expired rows on the statement clock: the
+    /// maintenance singleton's bounded step (issue #241, PR 13). Every
+    /// admission also prunes a small batch inside its own transaction, so
+    /// this only matters for a deployment whose logins stopped arriving
+    /// with expired rows still on disk. Returns how many rows were removed.
+    #[allow(dead_code)] // the singleton runs `prune_expired_with`; this is the store-level surface for the CLI (PR 13, section 7)
+    pub async fn prune_expired(&self, limit: u32) -> Result<u64, RepositoryError> {
+        let client = self.pool.get().await.map_err(classify_pool_error)?;
+        Self::prune_expired_with(&client, limit).await
+    }
+
+    /// [`Self::prune_expired`] without a store and over a connection the
+    /// caller holds: the statement needs no keyring, so the singleton can
+    /// run it whether or not an admin login provider is configured on this
+    /// replica, and it runs on the dedicated session that holds the
+    /// maintenance advisory lock so the lock covers the statement itself.
+    pub(crate) async fn prune_expired_with(
+        client: &tokio_postgres::Client,
+        limit: u32,
+    ) -> Result<u64, RepositoryError> {
+        prune_expired_statement(
+            client,
+            i64::from(limit.clamp(1, MAX_PRUNE_BATCH)),
+            OPERATION_PRUNE,
+        )
+        .await
     }
 
     fn digest(&self, kind: &str, value: &str) -> String {
@@ -218,6 +259,19 @@ impl PostgresPendingLoginStore {
     }
 }
 
+/// The prune statement over whichever client the caller holds: the
+/// admission transaction, or the singleton's dedicated session.
+async fn prune_expired_statement(
+    client: &tokio_postgres::Client,
+    limit: i64,
+    operation: &'static str,
+) -> Result<u64, RepositoryError> {
+    client
+        .execute(PRUNE_EXPIRED_SQL, &[&limit])
+        .await
+        .map_err(|error| classify_query(error, operation))
+}
+
 #[async_trait]
 impl PendingLoginBackend for PostgresPendingLoginStore {
     async fn insert(
@@ -267,19 +321,7 @@ impl PendingLoginBackend for PostgresPendingLoginStore {
             // lapsed by the time the row is written -- an admitted login
             // whose callback is guaranteed to fail. Pruning and the quota
             // count use the same basis so they agree with the expiry.
-            client
-                .execute(
-                    r#"
-                    DELETE FROM greengateway.admin_pending_logins
-                    WHERE ctid IN (
-                        SELECT ctid FROM greengateway.admin_pending_logins
-                        WHERE expires_at <= clock_timestamp() LIMIT $1
-                    )
-                    "#,
-                    &[&PRUNE_BATCH],
-                )
-                .await
-                .map_err(|error| classify_query(error, OPERATION_INSERT))?;
+            prune_expired_statement(&client, PRUNE_BATCH, OPERATION_INSERT).await?;
             let counts = client
                 .query_one(
                     r#"

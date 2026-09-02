@@ -131,6 +131,19 @@ pub const MIN_DISCOVERY_PROJECTOR_POLL_MS: u64 = 50;
 /// flush transaction.
 pub const DEFAULT_DISCOVERY_PROJECTOR_BATCH: usize = 500;
 pub const MAX_DISCOVERY_PROJECTOR_BATCH: usize = 5_000;
+/// Cluster membership (issue #241, PR 13): how often a replica refreshes
+/// its `cluster_members` row, and how old a heartbeat may be before the
+/// row is stale. The stale window must cover several missed heartbeats so
+/// one slow authority round trip never makes a live replica look gone.
+pub const DEFAULT_CLUSTER_HEARTBEAT_MS: u64 = 5_000;
+pub const MIN_CLUSTER_HEARTBEAT_MS: u64 = 1_000;
+pub const DEFAULT_CLUSTER_MEMBER_STALE_MS: u64 = 30_000;
+pub const DEFAULT_CLUSTER_MAINTENANCE_INTERVAL_MS: u64 = 60_000;
+pub const MIN_CLUSTER_MAINTENANCE_INTERVAL_MS: u64 = 1_000;
+pub const DEFAULT_CLUSTER_MAINTENANCE_LEASE_TTL_MS: u64 = 15_000;
+pub const MIN_CLUSTER_MAINTENANCE_LEASE_TTL_MS: u64 = 1_000;
+/// The stale window is at least this many heartbeat intervals.
+pub const MIN_CLUSTER_STALE_HEARTBEATS: u64 = 3;
 pub const DEFAULT_TOOL_RUNTIME_DEFAULT_TIMEOUT_MS: u64 = 30_000;
 /// TLS 1.2 rather than 1.3, because raising a floor is an operator decision
 /// with a compatibility cost attached, and a default that silently refuses a
@@ -308,6 +321,11 @@ const TOOL_RUNTIME_GLOBAL_CONCURRENCY: &str = "TOOL_RUNTIME_GLOBAL_CONCURRENCY";
 const TOOL_RUNTIME_QUEUE_DEPTH: &str = "TOOL_RUNTIME_QUEUE_DEPTH";
 const TOOL_RUNTIME_QUEUE_TIMEOUT_MS: &str = "TOOL_RUNTIME_QUEUE_TIMEOUT_MS";
 const TOOL_LEASE_TTL_MS: &str = "TOOL_LEASE_TTL_MS";
+const CLUSTER_HEARTBEAT_MS: &str = "CLUSTER_HEARTBEAT_MS";
+const CLUSTER_MEMBER_STALE_MS: &str = "CLUSTER_MEMBER_STALE_MS";
+const CLUSTER_MAINTENANCE_INTERVAL_MS: &str = "CLUSTER_MAINTENANCE_INTERVAL_MS";
+const CLUSTER_MAINTENANCE_LEASE_TTL_MS: &str = "CLUSTER_MAINTENANCE_LEASE_TTL_MS";
+const AUDIT_POSTGRES_RETENTION_DAYS: &str = "AUDIT_POSTGRES_RETENTION_DAYS";
 const TOOLS_FILE: &str = "TOOLS_FILE";
 const CLIENT_CERT_CA_FILE: &str = "CLIENT_CERT_CA_FILE";
 const CLIENT_CERT_CRL_FILE: &str = "CLIENT_CERT_CRL_FILE";
@@ -467,6 +485,21 @@ pub struct Config {
     pub tool_runtime_global_concurrency: usize,
     pub tool_runtime_queue_timeout_ms: u64,
     pub tool_lease_ttl_ms: u64,
+    /// Cluster membership heartbeat interval (issue #241, PR 13); cluster
+    /// mode only, rejected in standalone mode.
+    pub cluster_heartbeat_ms: u64,
+    /// How old a member's heartbeat may be before the row is stale and
+    /// the maintenance singleton sweeps it; cluster mode only.
+    pub cluster_member_stale_ms: u64,
+    /// How often the maintenance leader runs one bounded pass of the
+    /// singleton jobs; cluster mode only.
+    pub cluster_maintenance_interval_ms: u64,
+    /// The maintenance lease's TTL on the database clock (renewed at a
+    /// third of it); cluster mode only.
+    pub cluster_maintenance_lease_ttl_ms: u64,
+    /// PostgreSQL audit retention in days, pruned by the maintenance
+    /// singleton; `None` (or `0`) keeps everything. Cluster mode only.
+    pub audit_postgres_retention_days: Option<u32>,
     pub tool_runtime_default_timeout_ms: u64,
     pub csrf_enabled: bool,
     pub csrf_cookie_name: String,
@@ -1734,8 +1767,9 @@ impl Config {
             parse_optional_string(AUDIT_LOG_FILE, get_var(AUDIT_LOG_FILE), &mut problems);
         let audit_sqlite_path =
             parse_optional_string(AUDIT_SQLITE_PATH, get_var(AUDIT_SQLITE_PATH), &mut problems);
-        let audit_sqlite_retention_days = normalize_audit_sqlite_retention_days(
+        let audit_sqlite_retention_days = normalize_audit_retention_days(
             AUDIT_SQLITE_RETENTION_DAYS,
+            "SQLite",
             parse_optional_var(
                 AUDIT_SQLITE_RETENTION_DAYS,
                 get_var(AUDIT_SQLITE_RETENTION_DAYS),
@@ -2327,6 +2361,124 @@ impl Config {
         } else {
             tool_lease_ttl_ms
         };
+        // Cluster membership (issue #241, PR 13). Both settings exist only
+        // in postgres mode; their presence in standalone mode is refused
+        // below with the other cluster-only material. A blank value is
+        // absence, as it is for the other cluster-only variables
+        // (RATE_LIMIT_KEYRING, DEPLOYMENT_ID): `.env.example` ships every
+        // cluster-only variable blank under its STATE_BACKEND=sqlite
+        // default, and a verbatim copy must boot.
+        let cluster_heartbeat_raw = blank_as_unset(get_var(CLUSTER_HEARTBEAT_MS));
+        let cluster_heartbeat_set = cluster_heartbeat_raw.is_ok();
+        let cluster_heartbeat_ms = validate_positive_u64(
+            CLUSTER_HEARTBEAT_MS,
+            parse_var(
+                CLUSTER_HEARTBEAT_MS,
+                cluster_heartbeat_raw,
+                DEFAULT_CLUSTER_HEARTBEAT_MS,
+                "millisecond duration",
+                &mut problems,
+            ),
+            DEFAULT_CLUSTER_HEARTBEAT_MS,
+            &mut problems,
+        );
+        let cluster_heartbeat_ms = if cluster_heartbeat_ms < MIN_CLUSTER_HEARTBEAT_MS {
+            problems.push(format!(
+                "{CLUSTER_HEARTBEAT_MS} must be at least {MIN_CLUSTER_HEARTBEAT_MS} milliseconds, got '{cluster_heartbeat_ms}'"
+            ));
+            DEFAULT_CLUSTER_HEARTBEAT_MS
+        } else {
+            cluster_heartbeat_ms
+        };
+        let cluster_member_stale_raw = blank_as_unset(get_var(CLUSTER_MEMBER_STALE_MS));
+        let cluster_member_stale_set = cluster_member_stale_raw.is_ok();
+        let cluster_member_stale_ms = validate_positive_u64(
+            CLUSTER_MEMBER_STALE_MS,
+            parse_var(
+                CLUSTER_MEMBER_STALE_MS,
+                cluster_member_stale_raw,
+                DEFAULT_CLUSTER_MEMBER_STALE_MS,
+                "millisecond duration",
+                &mut problems,
+            ),
+            DEFAULT_CLUSTER_MEMBER_STALE_MS,
+            &mut problems,
+        );
+        let minimum_stale_ms = cluster_heartbeat_ms.saturating_mul(MIN_CLUSTER_STALE_HEARTBEATS);
+        let cluster_member_stale_ms = if cluster_member_stale_ms < minimum_stale_ms {
+            problems.push(format!(
+                "{CLUSTER_MEMBER_STALE_MS} must be at least {MIN_CLUSTER_STALE_HEARTBEATS} x {CLUSTER_HEARTBEAT_MS} ({minimum_stale_ms} milliseconds) so one slow heartbeat never makes a live replica look stale, got '{cluster_member_stale_ms}'"
+            ));
+            minimum_stale_ms.max(DEFAULT_CLUSTER_MEMBER_STALE_MS)
+        } else {
+            cluster_member_stale_ms
+        };
+        // The maintenance singleton (issue #241, PR 13): the pass interval,
+        // the leader lease TTL, and PostgreSQL audit retention. Cluster
+        // mode only, refused in standalone mode below.
+        let cluster_maintenance_interval_raw =
+            blank_as_unset(get_var(CLUSTER_MAINTENANCE_INTERVAL_MS));
+        let cluster_maintenance_interval_set = cluster_maintenance_interval_raw.is_ok();
+        let cluster_maintenance_interval_ms = validate_positive_u64(
+            CLUSTER_MAINTENANCE_INTERVAL_MS,
+            parse_var(
+                CLUSTER_MAINTENANCE_INTERVAL_MS,
+                cluster_maintenance_interval_raw,
+                DEFAULT_CLUSTER_MAINTENANCE_INTERVAL_MS,
+                "millisecond duration",
+                &mut problems,
+            ),
+            DEFAULT_CLUSTER_MAINTENANCE_INTERVAL_MS,
+            &mut problems,
+        );
+        let cluster_maintenance_interval_ms = if cluster_maintenance_interval_ms
+            < MIN_CLUSTER_MAINTENANCE_INTERVAL_MS
+        {
+            problems.push(format!(
+                    "{CLUSTER_MAINTENANCE_INTERVAL_MS} must be at least {MIN_CLUSTER_MAINTENANCE_INTERVAL_MS} milliseconds, got '{cluster_maintenance_interval_ms}'"
+                ));
+            DEFAULT_CLUSTER_MAINTENANCE_INTERVAL_MS
+        } else {
+            cluster_maintenance_interval_ms
+        };
+        let cluster_maintenance_lease_ttl_raw =
+            blank_as_unset(get_var(CLUSTER_MAINTENANCE_LEASE_TTL_MS));
+        let cluster_maintenance_lease_ttl_set = cluster_maintenance_lease_ttl_raw.is_ok();
+        let cluster_maintenance_lease_ttl_ms = validate_positive_u64(
+            CLUSTER_MAINTENANCE_LEASE_TTL_MS,
+            parse_var(
+                CLUSTER_MAINTENANCE_LEASE_TTL_MS,
+                cluster_maintenance_lease_ttl_raw,
+                DEFAULT_CLUSTER_MAINTENANCE_LEASE_TTL_MS,
+                "millisecond duration",
+                &mut problems,
+            ),
+            DEFAULT_CLUSTER_MAINTENANCE_LEASE_TTL_MS,
+            &mut problems,
+        );
+        let cluster_maintenance_lease_ttl_ms = if cluster_maintenance_lease_ttl_ms
+            < MIN_CLUSTER_MAINTENANCE_LEASE_TTL_MS
+        {
+            problems.push(format!(
+                    "{CLUSTER_MAINTENANCE_LEASE_TTL_MS} must be at least {MIN_CLUSTER_MAINTENANCE_LEASE_TTL_MS} milliseconds (the lease is renewed at a third of its TTL), got '{cluster_maintenance_lease_ttl_ms}'"
+                ));
+            DEFAULT_CLUSTER_MAINTENANCE_LEASE_TTL_MS
+        } else {
+            cluster_maintenance_lease_ttl_ms
+        };
+        let audit_postgres_retention_raw = blank_as_unset(get_var(AUDIT_POSTGRES_RETENTION_DAYS));
+        let audit_postgres_retention_set = audit_postgres_retention_raw.is_ok();
+        let audit_postgres_retention_days = normalize_audit_retention_days(
+            AUDIT_POSTGRES_RETENTION_DAYS,
+            "PostgreSQL",
+            parse_optional_var(
+                AUDIT_POSTGRES_RETENTION_DAYS,
+                audit_postgres_retention_raw,
+                "day count",
+                &mut problems,
+            ),
+            &mut problems,
+        );
         let tool_runtime_default_timeout_ms = validate_positive_u64(
             TOOL_RUNTIME_DEFAULT_TIMEOUT_MS,
             parse_var(
@@ -2744,6 +2896,31 @@ impl Config {
                         ));
                     }
                 }
+                if cluster_heartbeat_set {
+                    problems.push(format!(
+                        "{CLUSTER_HEARTBEAT_MS} is set while {STATE_BACKEND} is sqlite; standalone mode has no cluster membership and never reads it"
+                    ));
+                }
+                if cluster_member_stale_set {
+                    problems.push(format!(
+                        "{CLUSTER_MEMBER_STALE_MS} is set while {STATE_BACKEND} is sqlite; standalone mode has no cluster membership and never reads it"
+                    ));
+                }
+                if cluster_maintenance_interval_set {
+                    problems.push(format!(
+                        "{CLUSTER_MAINTENANCE_INTERVAL_MS} is set while {STATE_BACKEND} is sqlite; standalone mode has no maintenance singleton and never reads it"
+                    ));
+                }
+                if cluster_maintenance_lease_ttl_set {
+                    problems.push(format!(
+                        "{CLUSTER_MAINTENANCE_LEASE_TTL_MS} is set while {STATE_BACKEND} is sqlite; standalone mode has no maintenance singleton and never reads it"
+                    ));
+                }
+                if audit_postgres_retention_set {
+                    problems.push(format!(
+                        "{AUDIT_POSTGRES_RETENTION_DAYS} is set while {STATE_BACKEND} is sqlite; standalone mode has no PostgreSQL audit store and never reads it (use {AUDIT_SQLITE_RETENTION_DAYS})"
+                    ));
+                }
             }
         }
         // Payload-shape capture needs a destination. Standalone mode's is the
@@ -2866,6 +3043,11 @@ impl Config {
                 tool_runtime_global_concurrency,
                 tool_runtime_queue_timeout_ms,
                 tool_lease_ttl_ms,
+                cluster_heartbeat_ms,
+                cluster_member_stale_ms,
+                cluster_maintenance_interval_ms,
+                cluster_maintenance_lease_ttl_ms,
+                audit_postgres_retention_days,
                 tool_runtime_default_timeout_ms,
                 csrf_enabled,
                 csrf_cookie_name,
@@ -2929,6 +3111,38 @@ impl Config {
     #[cfg_attr(not(feature = "postgres"), allow(dead_code))] // Read by cluster startup.
     pub fn discovery_projector_poll_interval(&self) -> std::time::Duration {
         std::time::Duration::from_millis(self.discovery_projector_poll_ms)
+    }
+
+    /// The cluster membership heartbeat interval (issue #241, PR 13).
+    #[cfg_attr(not(feature = "postgres"), allow(dead_code))] // read by the cluster wiring only
+    pub fn cluster_heartbeat_interval(&self) -> std::time::Duration {
+        std::time::Duration::from_millis(self.cluster_heartbeat_ms)
+    }
+
+    /// How old a member's heartbeat may be before its row is stale.
+    #[cfg_attr(not(feature = "postgres"), allow(dead_code))] // read by the cluster wiring only
+    pub fn cluster_member_stale_window(&self) -> std::time::Duration {
+        std::time::Duration::from_millis(self.cluster_member_stale_ms)
+    }
+
+    /// How often the maintenance leader runs one pass (issue #241, PR 13).
+    #[cfg_attr(not(feature = "postgres"), allow(dead_code))] // read by the cluster wiring only
+    pub fn cluster_maintenance_interval(&self) -> std::time::Duration {
+        std::time::Duration::from_millis(self.cluster_maintenance_interval_ms)
+    }
+
+    /// The maintenance lease TTL on the database clock.
+    #[cfg_attr(not(feature = "postgres"), allow(dead_code))] // read by the cluster wiring only
+    pub fn cluster_maintenance_lease_ttl(&self) -> std::time::Duration {
+        std::time::Duration::from_millis(self.cluster_maintenance_lease_ttl_ms)
+    }
+
+    /// The PostgreSQL audit retention window, or `None` to keep everything.
+    #[cfg_attr(not(feature = "postgres"), allow(dead_code))] // read by the cluster wiring only
+    pub fn audit_postgres_retention(&self) -> Option<std::time::Duration> {
+        self.audit_postgres_retention_days
+            .filter(|days| *days > 0)
+            .map(|days| std::time::Duration::from_secs(u64::from(days) * 86_400))
     }
 
     pub(crate) fn rate_limit_bucket_idle_ttl(&self) -> std::time::Duration {
@@ -3367,18 +3581,19 @@ fn validate_optional_positive_timeout_ms(
 /// configuration it refuses is one that was already failing.
 pub const MAX_AUDIT_SQLITE_RETENTION_DAYS: u32 = 36_500;
 
-/// Fold `AUDIT_SQLITE_RETENTION_DAYS=0` into the same "no pruning" state an
-/// empty value produces.
+/// Fold `AUDIT_SQLITE_RETENTION_DAYS=0` (and `AUDIT_POSTGRES_RETENTION_DAYS=0`)
+/// into the same "no pruning" state an empty value produces.
 ///
 /// Read literally, a zero-day window means "retain nothing": the prune cutoff
 /// becomes the current instant, so the next prune tick deletes every audit row
 /// the database holds, silently and on a 60-second repeat. No operator
-/// configures a SQLite audit store in order to keep nothing in it; `0` is
+/// configures an audit store in order to keep nothing in it; `0` is
 /// written to mean "no retention limit", which is what leaving the variable
 /// empty already does. Reinterpreting is also the safe upgrade: rejecting `0`
 /// would abort the boot of a deployment that is running with the value today.
-fn normalize_audit_sqlite_retention_days(
+fn normalize_audit_retention_days(
     name: &str,
+    store: &str,
     value: Option<u32>,
     problems: &mut Vec<String>,
 ) -> Option<u32> {
@@ -3392,9 +3607,11 @@ fn normalize_audit_sqlite_retention_days(
     }
     match value {
         Some(0) => {
+            // The SQLite wording predates PR 13 and is what standalone
+            // runbooks grep for; it must not change.
             tracing::warn!(
                 setting = name,
-                "audit SQLite retention of 0 days is treated as disabled pruning; set a positive day count to prune, or leave the variable empty"
+                "audit {store} retention of 0 days is treated as disabled pruning; set a positive day count to prune, or leave the variable empty"
             );
             None
         }
@@ -3431,6 +3648,18 @@ fn validate_minimum_u64(
             "{name} must be at least {minimum} {unit}, got '{value}'"
         ));
         default
+    }
+}
+
+/// A present-but-blank variable read as absent. Every cluster-only
+/// variable ships blank in `.env.example` under the file's own
+/// `STATE_BACKEND=sqlite` default, and a loader that exports `KEY=` as an
+/// empty variable (docker compose `env_file`, systemd `EnvironmentFile`)
+/// must not turn that into a startup refusal.
+fn blank_as_unset(value: Result<String, VarError>) -> Result<String, VarError> {
+    match value {
+        Ok(value) if value.trim().is_empty() => Err(VarError::NotPresent),
+        other => other,
     }
 }
 
@@ -10628,6 +10857,270 @@ mod tests {
             "{}",
             error
         );
+    }
+
+    #[test]
+    fn cluster_membership_settings_have_defaults_floors_and_standalone_rejection() {
+        let config = Config::from_env_vars(postgres_mode_vars(&[])).expect("postgres mode config");
+        assert_eq!(config.cluster_heartbeat_ms, DEFAULT_CLUSTER_HEARTBEAT_MS);
+        assert_eq!(
+            config.cluster_member_stale_ms,
+            DEFAULT_CLUSTER_MEMBER_STALE_MS
+        );
+        assert_eq!(
+            config.cluster_heartbeat_interval(),
+            std::time::Duration::from_millis(DEFAULT_CLUSTER_HEARTBEAT_MS)
+        );
+
+        let config = Config::from_env_vars(postgres_mode_vars(&[
+            ("CLUSTER_HEARTBEAT_MS", "2000"),
+            ("CLUSTER_MEMBER_STALE_MS", "6000"),
+        ]))
+        .expect("a stale window of three heartbeats is accepted");
+        assert_eq!(config.cluster_heartbeat_ms, 2_000);
+        assert_eq!(config.cluster_member_stale_ms, 6_000);
+
+        let error = Config::from_env_vars(postgres_mode_vars(&[("CLUSTER_HEARTBEAT_MS", "500")]))
+            .expect_err("a heartbeat below the floor must not start");
+        assert!(
+            error
+                .to_string()
+                .contains("CLUSTER_HEARTBEAT_MS must be at least 1000 milliseconds"),
+            "{error}"
+        );
+        let error = Config::from_env_vars(postgres_mode_vars(&[
+            ("CLUSTER_HEARTBEAT_MS", "5000"),
+            ("CLUSTER_MEMBER_STALE_MS", "10000"),
+        ]))
+        .expect_err("a stale window under three heartbeats must not start");
+        assert!(
+            error
+                .to_string()
+                .contains("CLUSTER_MEMBER_STALE_MS must be at least 3 x CLUSTER_HEARTBEAT_MS (15000 milliseconds)"),
+            "{error}"
+        );
+        let error = Config::from_env_vars(postgres_mode_vars(&[("CLUSTER_MEMBER_STALE_MS", "0")]))
+            .expect_err("a zero stale window must not start");
+        assert!(
+            error
+                .to_string()
+                .contains("CLUSTER_MEMBER_STALE_MS must be greater than 0"),
+            "{error}"
+        );
+
+        for name in ["CLUSTER_HEARTBEAT_MS", "CLUSTER_MEMBER_STALE_MS"] {
+            let error = Config::from_env_vars(|key| {
+                if key == name {
+                    Ok("30000".to_owned())
+                } else {
+                    Err(VarError::NotPresent)
+                }
+            })
+            .expect_err("a cluster membership setting in standalone mode must not start");
+            assert!(
+                error
+                    .to_string()
+                    .contains(&format!("{name} is set while STATE_BACKEND is sqlite")),
+                "{error}"
+            );
+        }
+    }
+
+    /// A blank cluster-only variable is absence, in both modes: a loader
+    /// that exports `KEY=` (docker compose `env_file`, systemd
+    /// `EnvironmentFile`) must not turn `.env.example`'s blank lines into
+    /// a standalone-mode refusal, and blank means the default in postgres
+    /// mode too.
+    #[test]
+    fn blank_cluster_only_variables_are_unset_in_both_modes() {
+        let names = [
+            "CLUSTER_HEARTBEAT_MS",
+            "CLUSTER_MEMBER_STALE_MS",
+            "CLUSTER_MAINTENANCE_INTERVAL_MS",
+            "CLUSTER_MAINTENANCE_LEASE_TTL_MS",
+            "AUDIT_POSTGRES_RETENTION_DAYS",
+        ];
+        for name in names {
+            for blank in ["", "  "] {
+                let config = Config::from_env_vars(|key| {
+                    if key == name {
+                        Ok(blank.to_owned())
+                    } else {
+                        Err(VarError::NotPresent)
+                    }
+                })
+                .unwrap_or_else(|error| {
+                    panic!("a blank {name} must boot in standalone mode: {error}")
+                });
+                assert_eq!(config.state_backend, StateBackend::Sqlite);
+                let config = Config::from_env_vars(postgres_mode_vars(&[(name, blank)]))
+                    .unwrap_or_else(|error| {
+                        panic!("a blank {name} must boot in postgres mode: {error}")
+                    });
+                assert_eq!(config.cluster_heartbeat_ms, DEFAULT_CLUSTER_HEARTBEAT_MS);
+                assert_eq!(
+                    config.cluster_member_stale_ms,
+                    DEFAULT_CLUSTER_MEMBER_STALE_MS
+                );
+                assert_eq!(
+                    config.cluster_maintenance_interval_ms,
+                    DEFAULT_CLUSTER_MAINTENANCE_INTERVAL_MS
+                );
+                assert_eq!(
+                    config.cluster_maintenance_lease_ttl_ms,
+                    DEFAULT_CLUSTER_MAINTENANCE_LEASE_TTL_MS
+                );
+                assert_eq!(config.audit_postgres_retention_days, None);
+            }
+        }
+    }
+
+    /// `.env.example` boots as shipped: every assignment in it, taken
+    /// verbatim under the file's own `STATE_BACKEND=sqlite` default, is a
+    /// valid standalone configuration -- the cluster-only lines included.
+    #[test]
+    fn the_env_example_boots_verbatim_in_standalone_mode() {
+        let example =
+            std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/../.env.example"))
+                .expect(".env.example is readable");
+        let vars: std::collections::BTreeMap<String, String> = example
+            .lines()
+            .map(str::trim_end)
+            .filter(|line| !line.is_empty() && !line.trim_start().starts_with('#'))
+            .filter_map(|line| line.split_once('='))
+            .map(|(key, value)| (key.trim().to_owned(), value.to_owned()))
+            .collect();
+        for name in [
+            "CLUSTER_HEARTBEAT_MS",
+            "CLUSTER_MEMBER_STALE_MS",
+            "CLUSTER_MAINTENANCE_INTERVAL_MS",
+            "CLUSTER_MAINTENANCE_LEASE_TTL_MS",
+            "AUDIT_POSTGRES_RETENTION_DAYS",
+        ] {
+            assert_eq!(
+                vars.get(name).map(String::as_str),
+                Some(""),
+                "{name} ships blank: a value would refuse the file's own sqlite default"
+            );
+        }
+        let config =
+            Config::from_env_vars(|key| vars.get(key).cloned().ok_or(VarError::NotPresent))
+                .unwrap_or_else(|error| {
+                    panic!("a verbatim copy of .env.example must boot in standalone mode: {error}")
+                });
+        assert_eq!(config.state_backend, StateBackend::Sqlite);
+        assert_eq!(config.cluster_heartbeat_ms, DEFAULT_CLUSTER_HEARTBEAT_MS);
+        assert_eq!(config.audit_postgres_retention_days, None);
+    }
+
+    #[test]
+    fn cluster_maintenance_settings_have_defaults_floors_and_standalone_rejection() {
+        let config = Config::from_env_vars(postgres_mode_vars(&[])).expect("postgres mode config");
+        assert_eq!(
+            config.cluster_maintenance_interval_ms,
+            DEFAULT_CLUSTER_MAINTENANCE_INTERVAL_MS
+        );
+        assert_eq!(
+            config.cluster_maintenance_lease_ttl_ms,
+            DEFAULT_CLUSTER_MAINTENANCE_LEASE_TTL_MS
+        );
+        assert_eq!(config.audit_postgres_retention_days, None);
+        assert_eq!(config.audit_postgres_retention(), None);
+        assert_eq!(
+            config.cluster_maintenance_interval(),
+            std::time::Duration::from_millis(DEFAULT_CLUSTER_MAINTENANCE_INTERVAL_MS)
+        );
+        assert_eq!(
+            config.cluster_maintenance_lease_ttl(),
+            std::time::Duration::from_millis(DEFAULT_CLUSTER_MAINTENANCE_LEASE_TTL_MS)
+        );
+
+        let config = Config::from_env_vars(postgres_mode_vars(&[
+            ("CLUSTER_MAINTENANCE_INTERVAL_MS", "30000"),
+            ("CLUSTER_MAINTENANCE_LEASE_TTL_MS", "6000"),
+            ("AUDIT_POSTGRES_RETENTION_DAYS", "90"),
+        ]))
+        .expect("explicit maintenance settings are accepted");
+        assert_eq!(config.cluster_maintenance_interval_ms, 30_000);
+        assert_eq!(config.cluster_maintenance_lease_ttl_ms, 6_000);
+        assert_eq!(config.audit_postgres_retention_days, Some(90));
+        assert_eq!(
+            config.audit_postgres_retention(),
+            Some(std::time::Duration::from_secs(90 * 86_400))
+        );
+
+        let config = Config::from_env_vars(postgres_mode_vars(&[(
+            "AUDIT_POSTGRES_RETENTION_DAYS",
+            "0",
+        )]))
+        .expect("zero retention disables pruning without aborting startup");
+        assert_eq!(config.audit_postgres_retention_days, None);
+
+        let error = Config::from_env_vars(postgres_mode_vars(&[(
+            "CLUSTER_MAINTENANCE_INTERVAL_MS",
+            "500",
+        )]))
+        .expect_err("an interval below the floor must not start");
+        assert!(
+            error
+                .to_string()
+                .contains("CLUSTER_MAINTENANCE_INTERVAL_MS must be at least 1000 milliseconds"),
+            "{error}"
+        );
+        let error = Config::from_env_vars(postgres_mode_vars(&[(
+            "CLUSTER_MAINTENANCE_LEASE_TTL_MS",
+            "999",
+        )]))
+        .expect_err("a lease TTL below the floor must not start");
+        assert!(
+            error
+                .to_string()
+                .contains("CLUSTER_MAINTENANCE_LEASE_TTL_MS must be at least 1000 milliseconds"),
+            "{error}"
+        );
+        let error = Config::from_env_vars(postgres_mode_vars(&[(
+            "AUDIT_POSTGRES_RETENTION_DAYS",
+            "40000",
+        )]))
+        .expect_err("a retention beyond the representable range must not start");
+        assert!(
+            error
+                .to_string()
+                .contains("AUDIT_POSTGRES_RETENTION_DAYS must be at most 36500"),
+            "{error}"
+        );
+        let error = Config::from_env_vars(postgres_mode_vars(&[(
+            "AUDIT_POSTGRES_RETENTION_DAYS",
+            "forever",
+        )]))
+        .expect_err("a non-numeric retention must not start");
+        assert!(
+            error
+                .to_string()
+                .contains("AUDIT_POSTGRES_RETENTION_DAYS must be a valid day count"),
+            "{error}"
+        );
+
+        for name in [
+            "CLUSTER_MAINTENANCE_INTERVAL_MS",
+            "CLUSTER_MAINTENANCE_LEASE_TTL_MS",
+            "AUDIT_POSTGRES_RETENTION_DAYS",
+        ] {
+            let error = Config::from_env_vars(|key| {
+                if key == name {
+                    Ok("30000".to_owned())
+                } else {
+                    Err(VarError::NotPresent)
+                }
+            })
+            .expect_err("a maintenance setting in standalone mode must not start");
+            assert!(
+                error
+                    .to_string()
+                    .contains(&format!("{name} is set while STATE_BACKEND is sqlite")),
+                "{error}"
+            );
+        }
     }
 
     #[test]

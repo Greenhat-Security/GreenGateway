@@ -37,11 +37,16 @@ const OPERATION_ACQUIRE: &str = "execution_lease_acquire";
 const OPERATION_RENEW: &str = "execution_lease_renew";
 const OPERATION_RELEASE: &str = "execution_lease_release";
 const OPERATION_CHECK: &str = "execution_lease_check";
+const OPERATION_REAP: &str = "execution_lease_reap";
 
 /// The largest scope capacity one acquisition enumerates: the configured
 /// global concurrency is bounded far below this, and `generate_series`
 /// over it stays a trivial statement.
 const MAX_CAPACITY: u32 = 100_000;
+
+/// The bound on one reaper step, so the singleton's statement stays short
+/// however many scopes were abandoned.
+const MAX_REAP_BATCH: u32 = 10_000;
 
 /// The bound the schema puts on an invocation identifier; longer request
 /// IDs are truncated at a character boundary for the row, never refused.
@@ -72,6 +77,48 @@ impl PostgresExecutionLeaseStore {
 
     fn ttl_secs(&self) -> f64 {
         self.ttl.as_secs_f64()
+    }
+
+    /// Delete up to `limit` lease rows of this deployment, in any scope,
+    /// whose expiry passed at least `grace` ago on the database clock. For
+    /// the maintenance singleton's reaper (issue #241, PR 13): acquisition
+    /// already reclaims an expired slot in place, so this is defensive
+    /// housekeeping for scopes nobody acquires in any more (a tool that was
+    /// removed, a renamed scope), never a correctness step. A live lease
+    /// (`expires_at > now()`) is never matched, and with `grace` of one TTL
+    /// a slot that merely lapsed a moment ago is left for acquisition to
+    /// take over with its history intact. Returns how many rows were
+    /// removed.
+    #[allow(dead_code)] // the singleton runs `reap_expired_with` on its session; this is the store-level surface, pinned by the contract tests
+    pub async fn reap_expired(&self, grace: Duration, limit: u32) -> Result<u64, RepositoryError> {
+        let client = self.pool.get().await.map_err(classify_pool_error)?;
+        self.reap_expired_with(&client, grace, limit).await
+    }
+
+    /// [`Self::reap_expired`] over a connection the caller holds: the
+    /// singleton runs its step on the dedicated session that holds the
+    /// maintenance advisory lock, so the lock covers the statement itself.
+    pub(crate) async fn reap_expired_with(
+        &self,
+        client: &tokio_postgres::Client,
+        grace: Duration,
+        limit: u32,
+    ) -> Result<u64, RepositoryError> {
+        let grace_secs = grace.as_secs_f64();
+        let limit = i64::from(limit.clamp(1, MAX_REAP_BATCH));
+        client
+            .execute(
+                "DELETE FROM greengateway.execution_leases
+                 WHERE ctid = ANY(ARRAY(
+                     SELECT ctid FROM greengateway.execution_leases
+                     WHERE deployment_id = $1
+                       AND expires_at <= now() - make_interval(secs => $2::double precision)
+                     ORDER BY expires_at ASC
+                     LIMIT $3))",
+                &[&self.deployment_id, &grace_secs, &limit],
+            )
+            .await
+            .map_err(|error| classify_query(error, OPERATION_REAP))
     }
 }
 

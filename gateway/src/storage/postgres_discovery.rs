@@ -390,12 +390,11 @@ impl PostgresDiscoveryStore {
     }
 
     /// The lowest audit stream position retention must keep: one past the
-    /// committed checkpoint. There is no PostgreSQL audit retention path
-    /// yet (PR 13 owns the job); when it lands it may delete stream rows
-    /// only with `position < minimum_retained_position()`, read in the
-    /// same transaction as its delete, so the projector can never find its
-    /// next batch already trimmed.
-    #[allow(dead_code)] // The predicate PR 13's retention job consumes.
+    /// committed checkpoint. The maintenance singleton's audit retention
+    /// job (PR 13) deletes stream rows only below the checkpoint it reads
+    /// through `AuditRetentionFloor`, which is inside this bound, so the
+    /// projector can never find its next batch already trimmed.
+    #[allow(dead_code)] // The contract the retention floor satisfies.
     pub async fn minimum_retained_position(&self) -> Result<i64, RepositoryError> {
         Ok(self
             .checkpoint()

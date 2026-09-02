@@ -2074,6 +2074,46 @@ Default: `60000`
 
 Format and validation: an integer greater than 0 and at most 600000.
 
+### CLUSTER_HEARTBEAT_MS
+
+How often, in milliseconds, a cluster-mode replica refreshes its row in the deployment's membership roster, `greengateway.cluster_members` (issue #241, PR 13). Every heartbeat carries the replica's instance and boot identity, binary version, migration-manifest and document-schema ranges, static-configuration fingerprint, and the security revisions it has compiled and last observed, so the roster shows each replica's reconciliation lag. The row is also written at boot, stamped `ready_at` once the replica is serving and agrees with the roster, and stamped `draining_at` when it begins draining.
+
+Default: `5000`
+
+Format and validation: must parse as a `u64` millisecond duration of at least `1000`. Cluster mode only: rejected when `STATE_BACKEND=sqlite`, which has no membership.
+
+### CLUSTER_MEMBER_STALE_MS
+
+How old a member's heartbeat may be, in milliseconds, before its roster row is stale. Liveness is judged on the database clock. A stale row is ignored by the fingerprint-agreement check a booting replica runs -- a replica refuses readiness (`/readyz` answers `503` with reason `config_fingerprint_mismatch`) while any live, non-draining member carries a different static-configuration fingerprint, and is admitted on the first heartbeat after the last such member drains or goes stale -- and is swept by the maintenance singleton, never by request handling. Because agreement is one-way, a fingerprint change completes on its own only where the old replicas leave without waiting for the newcomer's readiness (a `Recreate` rollout, or a rolling update whose `maxUnavailable` covers every old replica); under a readiness-gated rolling update it stalls at the door until the operator forces the old replicas out -- see [the PostgreSQL deployment guide](deployment/postgres.md).
+
+Default: `30000`
+
+Format and validation: must parse as a `u64` millisecond duration of at least `3 x CLUSTER_HEARTBEAT_MS`, so one slow authority round trip never makes a live replica look gone. Cluster mode only: rejected when `STATE_BACKEND=sqlite`.
+
+### CLUSTER_MAINTENANCE_INTERVAL_MS
+
+How often, in milliseconds, the replica holding the maintenance lease runs one bounded pass of the singleton housekeeping jobs (issue #241, PR 13): JWT revocation cleanup, rate-limit idle sweep, pending-login prune, stale member sweep, PostgreSQL audit retention (when `AUDIT_POSTGRES_RETENTION_DAYS` is set), and execution-lease reaping, in that fixed order, each bounded to 1000 rows per step. A replica that does not hold the lease retries it with a jittered backoff of a quarter of this interval plus or minus up to an eighth, the offset fixed by its instance ID, so a leader's crash is followed by one staggered takeover rather than a stampede.
+
+Default: `60000`
+
+Format and validation: must parse as a `u64` millisecond duration of at least `1000`. Cluster mode only: rejected when `STATE_BACKEND=sqlite`, which has no maintenance singleton.
+
+### CLUSTER_MAINTENANCE_LEASE_TTL_MS
+
+How long the maintenance lease (`greengateway.execution_leases`, scope `maintenance`, one slot) lives on the database clock before an unrenewed slot can be taken over, in milliseconds. The leader renews at a third of this and stops its jobs -- cancelling the pass in flight -- on the first renewal that finds the lease gone, or once half the TTL has passed without a renewal the authority could answer, always before the slot can be reclaimed. A crashed leader's slot returns after this TTL elapses on the database clock, and a successor takes it within its acquisition backoff after that; every write to `greengateway.maintenance_jobs` carries the writer's fence and requires the lease at that fence to be live, so a paused leader finds its late writes refused from the instant its lease lapses.
+
+Default: `15000`
+
+Format and validation: must parse as a `u64` millisecond duration of at least `1000`. Cluster mode only: rejected when `STATE_BACKEND=sqlite`.
+
+### AUDIT_POSTGRES_RETENTION_DAYS
+
+Retention window, in days, for the PostgreSQL audit store (`greengateway.audit_events`). On each pass the maintenance leader deletes a bounded batch (1000 rows) of the oldest events whose `occurred_at` is past the window, oldest stream position first, drawn from an index-ordered window of ten times the batch so the step's work is bounded by the step rather than by the backlog, and never at or past the position a durable stream consumer has yet to apply (the retention floor: the discovery projector's committed checkpoint, PR 11). The stream's position counter is never deleted, so cursors keep their meaning across retention. Empty or `0` keeps everything.
+
+Default: (empty)
+
+Format and validation: an integer day count of at most `36500`; `0` is treated as disabled with a warning rather than as "retain nothing". Cluster mode only: rejected when `STATE_BACKEND=sqlite`, where `AUDIT_SQLITE_RETENTION_DAYS` is the equivalent.
+
 ## Production Deployment And Migration
 
 Adopt pool behavior one logical route at a time. Existing `UPSTREAM_URL` and

@@ -141,6 +141,12 @@ pub(crate) struct ClusterSecurityRuntime {
     /// has been confirmed current on this replica. `0` until the first
     /// gate pass completes.
     compiled_revision: AtomicI64,
+    /// The authority's security revision as this replica last read it,
+    /// whether or not the replica has caught up to it. With
+    /// `compiled_revision` it is the revision acknowledgement the
+    /// membership heartbeat publishes (issue #241, PR 13): the gap between
+    /// the two is this replica's reconciliation lag.
+    observed_revision: AtomicI64,
     /// Serializes reconciles so a burst of requests behind the revision
     /// frontier produces one fetch-and-compile, not one per waiter.
     reconcile_lock: Mutex<()>,
@@ -172,6 +178,7 @@ impl ClusterSecurityRuntime {
             policy_lane,
             resources: RwLock::new(vec![policy as Arc<dyn ReconciledResource>]),
             compiled_revision: AtomicI64::new(0),
+            observed_revision: AtomicI64::new(0),
             reconcile_lock: Mutex::new(()),
             sources: std::sync::Mutex::new(None),
             published: ArcSwapOption::from(None),
@@ -306,6 +313,18 @@ impl ClusterSecurityRuntime {
         lifecycle.register_background_task(handle);
     }
 
+    /// The watermark: the highest security revision at which every
+    /// registered resource has been confirmed current on this replica.
+    pub(crate) fn compiled_revision(&self) -> i64 {
+        self.compiled_revision.load(Ordering::Acquire)
+    }
+
+    /// The authority's security revision as last read by any gate pass or
+    /// poller tick on this replica; `0` before the first read.
+    pub(crate) fn observed_revision(&self) -> i64 {
+        self.observed_revision.load(Ordering::Acquire)
+    }
+
     /// Read the current security revision from the authority, bounded by
     /// the remaining deadline.
     async fn current_revision(&self, deadline: Instant) -> Result<i64, SecurityRevisionCheckError> {
@@ -313,7 +332,7 @@ impl ClusterSecurityRuntime {
         if remaining.is_zero() {
             return Err(SecurityRevisionCheckError::ReconcileDeadlineExceeded);
         }
-        tokio::time::timeout(remaining, self.revisions.current())
+        let current = tokio::time::timeout(remaining, self.revisions.current())
             .await
             .map_err(|_| SecurityRevisionCheckError::ReconcileDeadlineExceeded)?
             .map_err(|error| {
@@ -322,7 +341,11 @@ impl ClusterSecurityRuntime {
                     "the security revision could not be read from the authority"
                 );
                 SecurityRevisionCheckError::Unavailable
-            })
+            })?;
+        // Reads race; keep the highest so the acknowledgement never moves
+        // backwards on an out-of-order completion.
+        self.observed_revision.fetch_max(current, Ordering::AcqRel);
+        Ok(current)
     }
 
     /// Reconcile every registered resource against `compiled_revision`.

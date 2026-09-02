@@ -240,7 +240,146 @@ impl PostgresAuditEventStore {
             .map_err(|error| classify_query(error, OPERATION))?;
         Ok(row.get::<_, i64>(0))
     }
+
+    /// Retention: delete up to `limit` of the oldest events whose
+    /// `occurred_at` is at least `retention` old on the database clock,
+    /// never at or past `min_retained_position` on the stream (issue #241,
+    /// PR 13). The stream row goes with the event (`ON DELETE CASCADE`) and
+    /// the position counter is never touched, so cursors keep their
+    /// meaning across retention ([`Self::stream_first_available`] moves
+    /// forward, numbering never restarts).
+    ///
+    /// The position floor is what keeps retention from deleting an event a
+    /// durable consumer has not yet projected: with `Some(p)` only
+    /// positions strictly below `p` are candidates, whatever their age. An
+    /// event that was never appended to the stream (the import path can
+    /// write one) has no position to protect and is judged by age alone.
+    /// Oldest positions go first, so a bounded step always frees the
+    /// stream's tail rather than a random slice of it.
+    #[allow(dead_code)] // the singleton runs `prune_older_than_with` on its session; this is the store-level surface, pinned by the contract tests
+    pub async fn prune_older_than(
+        &self,
+        retention: std::time::Duration,
+        min_retained_position: Option<i64>,
+        limit: u32,
+    ) -> Result<u64, RepositoryError> {
+        let client = self.pool.get().await.map_err(classify_pool_error)?;
+        self.prune_older_than_with(&client, retention, min_retained_position, limit)
+            .await
+    }
+
+    /// [`Self::prune_older_than`] over a connection the caller holds (the
+    /// maintenance singleton's dedicated session, so its advisory lock
+    /// covers the statements themselves).
+    ///
+    /// The work of one step is bounded by the step, not by the backlog:
+    /// the candidates are drawn from a window of `limit x`
+    /// [`RETENTION_SCAN_FACTOR`] rows walked in index order, never from a
+    /// scan of the whole table, so a deployment that turns retention on
+    /// over a large history (or fell far behind) drains it one bounded step
+    /// per pass instead of timing out every pass on a sort of everything.
+    /// Two statements do it: the first walks `audit_stream` by position
+    /// (its primary key) below the floor and deletes the old events among
+    /// the lowest positions; only when that frees fewer than `limit` rows
+    /// does the second walk `audit_events` by `occurred_at` (its index)
+    /// for old events that were never streamed. Because positions are
+    /// assigned in commit order, the oldest events sit at the lowest
+    /// positions, so the window hides a deletable row only behind a burst
+    /// of younger rows larger than the window -- and finds it once those
+    /// are gone.
+    pub(crate) async fn prune_older_than_with(
+        &self,
+        client: &tokio_postgres::Client,
+        retention: std::time::Duration,
+        min_retained_position: Option<i64>,
+        limit: u32,
+    ) -> Result<u64, RepositoryError> {
+        const OPERATION: &str = "audit_retention_prune";
+        let retention_secs = retention.as_secs_f64();
+        let limit = i64::from(limit.clamp(1, MAX_RETENTION_BATCH));
+        let window = limit.saturating_mul(RETENTION_SCAN_FACTOR);
+        let streamed = client
+            .execute(
+                PRUNE_STREAMED_SQL,
+                &[&retention_secs, &min_retained_position, &limit, &window],
+            )
+            .await
+            .map_err(|error| classify_query(error, OPERATION))?;
+        let remaining = limit.saturating_sub(i64::try_from(streamed).unwrap_or(i64::MAX));
+        if remaining <= 0 {
+            return Ok(streamed);
+        }
+        let unstreamed = client
+            .execute(
+                PRUNE_UNSTREAMED_SQL,
+                &[&retention_secs, &remaining, &window],
+            )
+            .await
+            .map_err(|error| classify_query(error, OPERATION))?;
+        Ok(streamed + unstreamed)
+    }
 }
+
+/// The bound on one retention step, so the singleton's delete stays a short
+/// statement however far behind retention fell.
+const MAX_RETENTION_BATCH: u32 = 10_000;
+
+/// How many index-ordered rows one retention step examines per row it may
+/// delete: the window the candidates are drawn from. The step's cost is
+/// `O(limit x this)` whatever the backlog; a window this many times the
+/// limit absorbs bursts of younger rows interleaved with older ones (clock
+/// skew between replicas, a slow commit) without ever scanning the table.
+pub(crate) const RETENTION_SCAN_FACTOR: i64 = 10;
+
+/// Retention over streamed events: `$1` retention seconds, `$2` the
+/// position floor (`NULL` for none), `$3` the row limit, `$4` the scan
+/// window. Walks `audit_stream` by position, looks each event up, keeps
+/// the old ones, deletes the lowest positions first.
+///
+/// The event lookup is a correlated scalar subquery rather than a join on
+/// purpose: a join leaves the planner free to hash or scan the whole
+/// events table when its estimates make that look cheap, and a stale
+/// estimate on a large table is exactly the O(backlog) step this shape
+/// exists to rule out. A per-row subplan is one index probe per window
+/// row whatever the planner thinks of the table.
+pub(crate) const PRUNE_STREAMED_SQL: &str = r#"
+DELETE FROM greengateway.audit_events
+WHERE id = ANY(ARRAY(
+    SELECT candidate.id
+    FROM (SELECT tail.position,
+                 (SELECT e.id FROM greengateway.audit_events e
+                  WHERE e.event_id = tail.event_id
+                    AND e.occurred_at <= now() - make_interval(secs => $1::double precision)) AS id
+          FROM (SELECT s.position, s.event_id
+                FROM greengateway.audit_stream s
+                WHERE $2::bigint IS NULL OR s.position < $2::bigint
+                ORDER BY s.position ASC
+                LIMIT $4) AS tail) AS candidate
+    WHERE candidate.id IS NOT NULL
+    ORDER BY candidate.position ASC
+    LIMIT $3))
+"#;
+
+/// Retention over events that were never appended to the stream: `$1`
+/// retention seconds, `$2` the row limit, `$3` the scan window. Walks
+/// `audit_events` by `occurred_at`, keeps the ones without a stream row,
+/// deletes the oldest first. The stream lookup is a correlated scalar
+/// subquery for the reason given on [`PRUNE_STREAMED_SQL`]: `NOT EXISTS`
+/// becomes an anti-join the planner may run as a scan of the whole stream.
+pub(crate) const PRUNE_UNSTREAMED_SQL: &str = r#"
+DELETE FROM greengateway.audit_events
+WHERE id = ANY(ARRAY(
+    SELECT oldest.id
+    FROM (SELECT e.id, e.event_id, e.occurred_at
+          FROM greengateway.audit_events e
+          WHERE e.occurred_at <= now() - make_interval(secs => $1::double precision)
+          ORDER BY e.occurred_at ASC, e.id ASC
+          LIMIT $3) AS oldest
+    WHERE (SELECT s.position FROM greengateway.audit_stream s
+           WHERE s.event_id = oldest.event_id) IS NULL
+    ORDER BY oldest.occurred_at ASC, oldest.id ASC
+    LIMIT $2))
+"#;
 
 #[async_trait]
 impl AuditEventStore for PostgresAuditEventStore {
