@@ -3960,6 +3960,2166 @@ mod postgres_audit_tests {
     }
 
     use std::str::FromStr as _;
+
+    // ------------------------------------------------------------------
+    // Durable observations and the fenced discovery projector
+    // (issue #241, PR 11)
+    // ------------------------------------------------------------------
+
+    use crate::discovery::{
+        aggregator::{AggregatorState, LoadedRows, ObservedRequest, PendingFlush},
+        projector::{BatchOutcome, ProjectorConfig, ProjectorTerm},
+        signals::{self, NewSignal, SignalDetectorConfig, SignalLifecycleState},
+    };
+    use crate::storage::postgres_discovery::PostgresDiscoveryStore;
+    use tokio_util::sync::CancellationToken;
+
+    async fn migrated_discovery_pool(database: &TestDatabase) -> deadpool_postgres::Pool {
+        let test_dsn_file = write_dsn_file(&database.dsn);
+        let mut config = crate::config::Config::test_defaults();
+        config.state_backend = crate::config::StateBackend::Postgres;
+        config.deployment_id = Some("deploy-discovery-contract".to_owned());
+        config.database.url_file = Some(test_dsn_file.path.clone());
+        config.database.tls_mode = crate::config::DatabaseTlsMode::LoopbackDev;
+        let foundation = PostgresFoundation::establish(&config)
+            .await
+            .expect("the test database should establish");
+        migrations::apply_missing_for_startup(foundation.pool(), &config.database)
+            .await
+            .expect("the discovery schema should migrate");
+        foundation.pool().clone()
+    }
+
+    /// An `http.request_observed` event as the observation middleware
+    /// emits it, with a sortable event id: the stream numbers a batch's
+    /// events in event-id order, so ids that sort like their index make
+    /// stream order the order the test wrote them in.
+    fn projector_event(
+        index: usize,
+        method: &str,
+        path: &str,
+        status: u16,
+        latency_ms: u64,
+        user_id: Option<&str>,
+    ) -> AuditEvent {
+        let actor = user_id.map(|user_id| Actor {
+            user_id: user_id.to_owned(),
+            issuer: Some("https://issuer.example/".to_owned()),
+            email: None,
+            roles: Some(vec!["reader".to_owned()]),
+            auth_mode: "bearer_token".to_owned(),
+        });
+        let mut event = AuditEvent::new(
+            "http.request_observed",
+            format!("request-{index}"),
+            "203.0.113.10",
+            actor,
+            json!({
+                "method": method,
+                "path": path,
+                "status": status,
+                "latency_ms": latency_ms,
+                "routing_context_known": true,
+                "upstream_origin": "http://upstream.internal:8080",
+                "upstream_route_host": "api.example",
+                "upstream_route_path_prefix": "/",
+            }),
+        );
+        event.event_id = format!("evt-{index:06}");
+        event.timestamp = format!("2024-06-01T12:{:02}:{:02}Z", (index / 60) % 60, index % 60);
+        event
+    }
+
+    fn projector_config(batch_size: usize, flush_every: usize) -> ProjectorConfig {
+        ProjectorConfig {
+            payload_capture_enabled: false,
+            endpoint_limit: 0,
+            signal_detector_config: SignalDetectorConfig::default(),
+            poll_interval: Duration::from_millis(10),
+            batch_size,
+            flush_every,
+        }
+    }
+
+    fn ingest_identity() -> IngestIdentity {
+        IngestIdentity {
+            instance_id: uuid::Uuid::new_v4(),
+            boot_id: uuid::Uuid::new_v4(),
+        }
+    }
+
+    async fn ingest(pool: &deadpool_postgres::Pool, events: &[AuditEvent]) {
+        PostgresAuditEventStore::new(pool.clone(), Some(ingest_identity()))
+            .insert_events(events)
+            .await
+            .expect("observed events should ingest");
+    }
+
+    async fn begin_term(
+        pool: &deadpool_postgres::Pool,
+        store: &Arc<PostgresDiscoveryStore>,
+        config: ProjectorConfig,
+        fence: i64,
+        sender: Option<crate::audit::AuditEventSender>,
+    ) -> ProjectorTerm {
+        let holder = uuid::Uuid::new_v4();
+        let checkpoint = store
+            .claim_leadership(fence, holder)
+            .await
+            .expect("the fence should be claimable");
+        ProjectorTerm::begin(
+            Arc::new(PostgresAuditEventStore::new(pool.clone(), None)),
+            Arc::clone(store),
+            config,
+            sender,
+            fence,
+            checkpoint,
+        )
+        .await
+        .expect("the term should load its state")
+    }
+
+    /// The in-memory reference: the same aggregation the SQLite sink runs,
+    /// fed the stream in stream order.
+    async fn reference_state(pool: &deadpool_postgres::Pool) -> AggregatorState {
+        reference_state_with_limit(pool, 0).await
+    }
+
+    async fn reference_state_with_limit(
+        pool: &deadpool_postgres::Pool,
+        endpoint_limit: usize,
+    ) -> AggregatorState {
+        let audit = PostgresAuditEventStore::new(pool.clone(), None);
+        let mut state = AggregatorState::from_rows(
+            LoadedRows::default(),
+            false,
+            endpoint_limit,
+            SignalDetectorConfig::default(),
+        )
+        .expect("an empty state builds");
+        for (_, event) in audit.stream_after(0, 10_000).await.expect("stream") {
+            if let Some(observation) = ObservedRequest::from_event(&event) {
+                state.observe(observation);
+            }
+        }
+        state
+    }
+
+    async fn reloaded_state(store: &PostgresDiscoveryStore) -> AggregatorState {
+        AggregatorState::from_rows(
+            store.load_rows().await.expect("rows should load"),
+            false,
+            0,
+            SignalDetectorConfig::default(),
+        )
+        .expect("persisted rows should rebuild")
+    }
+
+    /// Endpoint-by-endpoint parity between two working sets: counts,
+    /// status histogram, principal set with first/last seen, routing
+    /// contexts, latency reservoir, and the detector counters/windows.
+    fn assert_same_inventory(left: &AggregatorState, right: &AggregatorState) {
+        let mut left_keys = left.aggregates().keys().cloned().collect::<Vec<_>>();
+        let mut right_keys = right.aggregates().keys().cloned().collect::<Vec<_>>();
+        left_keys.sort_by(|a, b| {
+            (&a.method, &a.endpoint_template).cmp(&(&b.method, &b.endpoint_template))
+        });
+        right_keys.sort_by(|a, b| {
+            (&a.method, &a.endpoint_template).cmp(&(&b.method, &b.endpoint_template))
+        });
+        assert_eq!(left_keys, right_keys, "the endpoint sets differ");
+        for key in left_keys {
+            let l = &left.aggregates()[&key];
+            let r = &right.aggregates()[&key];
+            let context = format!("{} {}", key.method, key.endpoint_template);
+            assert_eq!(l.call_count, r.call_count, "call_count for {context}");
+            assert_eq!(l.error_count, r.error_count, "error_count for {context}");
+            assert_eq!(
+                l.schema_mismatch_count, r.schema_mismatch_count,
+                "schema_mismatch_count for {context}"
+            );
+            assert_eq!(
+                l.status_counts, r.status_counts,
+                "status_counts for {context}"
+            );
+            assert_eq!(l.first_seen, r.first_seen, "first_seen for {context}");
+            assert_eq!(l.last_seen, r.last_seen, "last_seen for {context}");
+            assert_eq!(
+                l.latency_count, r.latency_count,
+                "latency_count for {context}"
+            );
+            assert_eq!(
+                l.latency_samples, r.latency_samples,
+                "latency_samples for {context}"
+            );
+            let principals = |aggregate: &crate::discovery::aggregator::EndpointAggregate| {
+                let mut seen = aggregate
+                    .principals
+                    .iter()
+                    .map(|(identity, seen)| {
+                        (
+                            identity.user_id.clone(),
+                            identity.issuer.clone(),
+                            identity.auth_method.clone(),
+                            seen.first_seen.clone(),
+                            seen.last_seen.clone(),
+                        )
+                    })
+                    .collect::<Vec<_>>();
+                seen.sort();
+                seen
+            };
+            assert_eq!(principals(l), principals(r), "principals for {context}");
+            let contexts = |aggregate: &crate::discovery::aggregator::EndpointAggregate| {
+                let mut contexts = aggregate
+                    .routing_contexts
+                    .values()
+                    .map(|context| {
+                        (
+                            context.key.route_host.clone(),
+                            context.key.route_path_prefix.clone(),
+                            context.key.upstream_origin.clone(),
+                            context.first_seen.clone(),
+                            context.last_seen.clone(),
+                            context.call_count,
+                            context.principals.len(),
+                        )
+                    })
+                    .collect::<Vec<_>>();
+                contexts.sort();
+                contexts
+            };
+            assert_eq!(contexts(l), contexts(r), "routing contexts for {context}");
+            assert_eq!(
+                l.routing_context_known_since, r.routing_context_known_since,
+                "routing_context_known_since for {context}"
+            );
+            let ls = &l.classified_signal_state;
+            let rs = &r.classified_signal_state;
+            assert_eq!(
+                ls.call_count, rs.call_count,
+                "detector call_count for {context}"
+            );
+            assert_eq!(
+                ls.error_count, rs.error_count,
+                "detector error_count for {context}"
+            );
+            assert_eq!(
+                ls.principals.len(),
+                rs.principals.len(),
+                "detector principals for {context}"
+            );
+            assert_eq!(
+                ls.recent_error_window.samples, rs.recent_error_window.samples,
+                "recent error window for {context}"
+            );
+            assert_eq!(
+                serde_json::to_value(&ls.volume_window).expect("window"),
+                serde_json::to_value(&rs.volume_window).expect("window"),
+                "volume window for {context}"
+            );
+        }
+    }
+
+    async fn signal_count(pool: &deadpool_postgres::Pool, signal_type: &str) -> i64 {
+        let client = pool.get().await.expect("client");
+        client
+            .query_one(
+                "SELECT count(*) FROM greengateway.discovery_signals WHERE signal_type = $1",
+                &[&signal_type],
+            )
+            .await
+            .expect("count")
+            .get(0)
+    }
+
+    /// Contract test 1: N observed events ingested by two replicas project
+    /// to exactly the inventory the in-memory aggregator computes over the
+    /// same stream; a second pass changes nothing; re-ingesting the same
+    /// event ids changes nothing.
+    #[tokio::test]
+    async fn projector_projects_the_stream_exactly_once() {
+        let Some(admin_dsn) = locator() else {
+            eprintln!("skipping: no test database locator; CI runs this test");
+            return;
+        };
+        let _guard = DATABASE.lock().await;
+        let database = create_test_database(&admin_dsn).await;
+        let pool = migrated_discovery_pool(&database).await;
+        let store = Arc::new(PostgresDiscoveryStore::new(pool.clone()));
+
+        let paths = ["/orders", "/orders", "/users", "/health"];
+        let users = [Some("alice"), Some("bob"), None, Some("alice")];
+        let statuses = [200_u16, 201, 404, 500, 200];
+        let events = (0..40)
+            .map(|index| {
+                projector_event(
+                    index,
+                    if index % 5 == 0 { "POST" } else { "GET" },
+                    paths[index % paths.len()],
+                    statuses[index % statuses.len()],
+                    (index as u64 * 7) % 90 + 1,
+                    users[index % users.len()],
+                )
+            })
+            .collect::<Vec<_>>();
+        // Two replicas ingest half each, as two ingest identities.
+        ingest(&pool, &events[..20]).await;
+        ingest(&pool, &events[20..]).await;
+
+        let mut term = begin_term(&pool, &store, projector_config(7, 5), 1, None).await;
+        let stop = CancellationToken::new();
+        let applied = term
+            .project_until_caught_up(&stop)
+            .await
+            .expect("projection should run")
+            .expect("the term should catch up");
+        assert_eq!(applied, 40);
+        assert_eq!(term.committed_position(), 40);
+
+        let reference = reference_state(&pool).await;
+        assert_same_inventory(&reference, &reloaded_state(&store).await);
+        let checkpoint = store.checkpoint().await.expect("checkpoint");
+        assert_eq!(checkpoint.checkpoint_position, 40);
+        assert_eq!(checkpoint.projected_events, 40);
+        assert_eq!(checkpoint.fence, 1);
+        let endpoint_rows = scalar_i64(
+            &pool,
+            "SELECT count(*) FROM greengateway.discovery_endpoint_aggregates",
+        )
+        .await;
+        assert_eq!(endpoint_rows as usize, reference.aggregates().len());
+        assert_eq!(
+            signal_count(&pool, signals::NEW_ENDPOINT_SEEN_SIGNAL_TYPE).await as usize,
+            reference.aggregates().len(),
+            "one new_endpoint_seen per endpoint"
+        );
+
+        // A second pass has nothing to do and changes nothing.
+        let again = term
+            .project_until_caught_up(&stop)
+            .await
+            .expect("second pass")
+            .expect("still leading");
+        assert_eq!(again, 0);
+        assert_same_inventory(&reference, &reloaded_state(&store).await);
+        assert_eq!(
+            store
+                .checkpoint()
+                .await
+                .expect("checkpoint")
+                .projected_events,
+            40
+        );
+
+        // Replaying the same event ids stores nothing new (the audit
+        // store's idempotent ingest) and so projects nothing new.
+        ingest(&pool, &events).await;
+        let audit = PostgresAuditEventStore::new(pool.clone(), None);
+        assert_eq!(audit.stream_head().await.expect("head"), 40);
+        let replayed = term
+            .project_until_caught_up(&stop)
+            .await
+            .expect("replay pass")
+            .expect("still leading");
+        assert_eq!(replayed, 0);
+        assert_same_inventory(&reference, &reloaded_state(&store).await);
+        let after_replay = store.checkpoint().await.expect("checkpoint");
+        assert_eq!(after_replay.checkpoint_position, 40);
+        assert_eq!(after_replay.projected_events, 40);
+    }
+
+    /// Contract test 2: a flush that fails after the fence check leaves
+    /// the checkpoint, the counters, and every table untouched, and the
+    /// retry commits the same observations exactly once without re-reading
+    /// the stream.
+    #[tokio::test]
+    async fn a_flush_that_fails_leaves_the_checkpoint_and_counters_untouched() {
+        let Some(admin_dsn) = locator() else {
+            eprintln!("skipping: no test database locator; CI runs this test");
+            return;
+        };
+        let _guard = DATABASE.lock().await;
+        let database = create_test_database(&admin_dsn).await;
+        let pool = migrated_discovery_pool(&database).await;
+        let store = Arc::new(PostgresDiscoveryStore::new(pool.clone()));
+
+        let events = (0..10)
+            .map(|index| projector_event(index, "GET", "/orders", 200, 5, Some("alice")))
+            .collect::<Vec<_>>();
+        ingest(&pool, &events).await;
+
+        let mut term = begin_term(&pool, &store, projector_config(100, 100), 1, None).await;
+        let stop = CancellationToken::new();
+
+        // The flush's aggregate upsert runs after the fence check and
+        // after the child-table deletes; failing it there must roll the
+        // whole transaction back.
+        {
+            let client = pool.get().await.expect("client");
+            client
+                .batch_execute(
+                    "ALTER TABLE greengateway.discovery_endpoint_aggregates \
+                     RENAME TO discovery_endpoint_aggregates_gone",
+                )
+                .await
+                .expect("rename");
+        }
+        let error = term
+            .project_batch(&stop)
+            .await
+            .expect_err("the flush must fail while the table is missing");
+        assert_ne!(error.kind(), crate::storage::RepositoryErrorKind::Conflict);
+        let checkpoint = store.checkpoint().await.expect("checkpoint");
+        assert_eq!(
+            checkpoint.checkpoint_position, 0,
+            "the checkpoint must not move"
+        );
+        assert_eq!(checkpoint.projected_events, 0, "the counter must not move");
+        assert_eq!(term.committed_position(), 0);
+        assert_eq!(
+            scalar_i64(
+                &pool,
+                "SELECT count(*) FROM greengateway.discovery_endpoint_status_counts"
+            )
+            .await,
+            0,
+            "no child row from the aborted transaction survives"
+        );
+        assert_eq!(
+            signal_count(&pool, signals::NEW_ENDPOINT_SEEN_SIGNAL_TYPE).await,
+            0
+        );
+
+        {
+            let client = pool.get().await.expect("client");
+            client
+                .batch_execute(
+                    "ALTER TABLE greengateway.discovery_endpoint_aggregates_gone \
+                     RENAME TO discovery_endpoint_aggregates",
+                )
+                .await
+                .expect("rename back");
+        }
+        let outcome = term.project_batch(&stop).await.expect("the retry commits");
+        assert_eq!(
+            outcome,
+            BatchOutcome::Projected {
+                observed: 10,
+                last_position: 10
+            }
+        );
+        let checkpoint = store.checkpoint().await.expect("checkpoint");
+        assert_eq!(checkpoint.checkpoint_position, 10);
+        assert_eq!(checkpoint.projected_events, 10);
+        assert_eq!(
+            scalar_i64(
+                &pool,
+                "SELECT call_count FROM greengateway.discovery_endpoint_aggregates \
+                 WHERE method = 'GET' AND endpoint_template = '/orders'"
+            )
+            .await,
+            10,
+            "the retried flush applies the ten observations exactly once"
+        );
+        assert_eq!(
+            term.project_batch(&stop).await.expect("nothing left"),
+            BatchOutcome::Empty
+        );
+    }
+
+    /// Contract test 3: leader A projects part of the stream; B claims a
+    /// higher fence, reloads A's committed state (detector windows and
+    /// learner groups included) and projects the rest; A's next flush is
+    /// refused and applies nothing. An error-rate spike whose 20-sample
+    /// window straddles the failover fires exactly once.
+    #[tokio::test]
+    async fn a_successor_resumes_from_the_committed_checkpoint_and_the_old_leader_is_fenced() {
+        let Some(admin_dsn) = locator() else {
+            eprintln!("skipping: no test database locator; CI runs this test");
+            return;
+        };
+        let _guard = DATABASE.lock().await;
+        let database = create_test_database(&admin_dsn).await;
+        let pool = migrated_discovery_pool(&database).await;
+        let store = Arc::new(PostgresDiscoveryStore::new(pool.clone()));
+        let spike = signals::ERROR_RATE_SPIKE_SIGNAL_TYPE;
+
+        // 20 successes, then 19 errors: one error short of the spike.
+        let events = (0..39)
+            .map(|index| {
+                let status = if index < 20 { 200 } else { 500 };
+                projector_event(index, "GET", "/errors/steady", status, 10, Some("alice"))
+            })
+            .collect::<Vec<_>>();
+        ingest(&pool, &events).await;
+
+        let mut leader_a = begin_term(&pool, &store, projector_config(100, 100), 1, None).await;
+        let stop = CancellationToken::new();
+        assert_eq!(
+            leader_a
+                .project_until_caught_up(&stop)
+                .await
+                .expect("A projects")
+                .expect("A leads"),
+            39
+        );
+        assert_eq!(
+            signal_count(&pool, spike).await,
+            0,
+            "the spike needs one more sample"
+        );
+        assert_eq!(
+            scalar_i64(
+                &pool,
+                "SELECT count(*) FROM greengateway.discovery_detector_state"
+            )
+            .await,
+            1,
+            "A persisted the endpoint's detector windows"
+        );
+        assert_eq!(
+            scalar_i64(
+                &pool,
+                "SELECT count(*) FROM greengateway.discovery_template_groups"
+            )
+            .await,
+            1,
+            "A persisted the learner's groups"
+        );
+
+        // The 40th sample arrives; A fails over before projecting it.
+        ingest(
+            &pool,
+            &[projector_event(
+                39,
+                "GET",
+                "/errors/steady",
+                500,
+                10,
+                Some("alice"),
+            )],
+        )
+        .await;
+
+        let mut leader_b = begin_term(&pool, &store, projector_config(100, 100), 2, None).await;
+        assert_eq!(
+            leader_b.committed_position(),
+            39,
+            "B resumes from A's checkpoint"
+        );
+        assert_eq!(
+            leader_b
+                .project_until_caught_up(&stop)
+                .await
+                .expect("B projects")
+                .expect("B leads"),
+            1,
+            "B projects exactly the one pending position"
+        );
+        assert_eq!(
+            signal_count(&pool, spike).await,
+            1,
+            "the restored window completes the spike exactly once"
+        );
+        let checkpoint = store.checkpoint().await.expect("checkpoint");
+        assert_eq!(checkpoint.checkpoint_position, 40);
+        assert_eq!(checkpoint.projected_events, 40);
+        assert_eq!(checkpoint.fence, 2);
+
+        // A stale claim at the old fence is refused.
+        let stale = store
+            .claim_leadership(1, uuid::Uuid::new_v4())
+            .await
+            .expect_err("a lower fence cannot claim");
+        assert_eq!(stale.kind(), crate::storage::RepositoryErrorKind::Conflict);
+
+        // A wakes up, reads the position it never committed, applies it in
+        // memory (queueing the same spike), and is refused at the fence:
+        // nothing it holds reaches the tables.
+        assert_eq!(
+            leader_a
+                .project_batch(&stop)
+                .await
+                .expect("A's flush is refused, not failed"),
+            BatchOutcome::Fenced
+        );
+        assert_eq!(leader_a.committed_position(), 39);
+        assert_eq!(signal_count(&pool, spike).await, 1, "A inserted nothing");
+        let checkpoint = store.checkpoint().await.expect("checkpoint");
+        assert_eq!(checkpoint.checkpoint_position, 40);
+        assert_eq!(checkpoint.projected_events, 40);
+        assert_eq!(
+            scalar_i64(
+                &pool,
+                "SELECT call_count FROM greengateway.discovery_endpoint_aggregates \
+                 WHERE method = 'GET' AND endpoint_template = '/errors/steady'"
+            )
+            .await,
+            40,
+            "the endpoint counted every observation exactly once across the failover"
+        );
+
+        // The persisted inventory is what one uninterrupted aggregator
+        // would have computed over the same stream.
+        assert_same_inventory(&reference_state(&pool).await, &reloaded_state(&store).await);
+    }
+
+    /// Contract test 5: a signal identity inserts once cluster-wide. A
+    /// second flush carrying the same identity (a different id, as a
+    /// successor or a replayed batch would produce) inserts nothing and
+    /// reports nothing opened, and a replayed projection announces no
+    /// second `signal.opened`.
+    #[tokio::test]
+    async fn signal_identities_are_unique_cluster_wide() {
+        let Some(admin_dsn) = locator() else {
+            eprintln!("skipping: no test database locator; CI runs this test");
+            return;
+        };
+        let _guard = DATABASE.lock().await;
+        let database = create_test_database(&admin_dsn).await;
+        let pool = migrated_discovery_pool(&database).await;
+        let store = Arc::new(PostgresDiscoveryStore::new(pool.clone()));
+        store
+            .claim_leadership(1, uuid::Uuid::new_v4())
+            .await
+            .expect("claim");
+
+        let signal = |id: &str| NewSignal {
+            id: id.to_owned(),
+            signal_type: signals::SCHEMA_MISMATCH_SIGNAL_TYPE.to_owned(),
+            target_kind: signals::ENDPOINT_TARGET_KIND.to_owned(),
+            target_key: "POST /orders".to_owned(),
+            target_identity: json!({"method": "POST", "endpoint_template": "/orders"}),
+            explanation: "schema mismatches crossed the threshold".to_owned(),
+            evidence: json!({"schema_mismatch_count": 5}),
+            state: SignalLifecycleState::Open,
+            created_at: "2024-06-01T12:00:00Z".to_owned(),
+        };
+        let first = PendingFlush {
+            pending_signals: vec![signal("signal-1")],
+            ..PendingFlush::default()
+        };
+        let opened = store
+            .flush(
+                &first,
+                &[],
+                None,
+                // Position 0: these hand-driven flushes must not move the
+                // checkpoint past the stream positions ingested below.
+                crate::storage::postgres_discovery::FlushCheckpoint {
+                    position: 0,
+                    fence: 1,
+                    projected_events: 0,
+                },
+                false,
+            )
+            .await
+            .expect("first flush");
+        assert_eq!(opened.len(), 1);
+        assert_eq!(opened[0].id, "signal-1");
+
+        let duplicate = PendingFlush {
+            pending_signals: vec![signal("signal-2")],
+            ..PendingFlush::default()
+        };
+        let opened = store
+            .flush(
+                &duplicate,
+                &[],
+                None,
+                crate::storage::postgres_discovery::FlushCheckpoint {
+                    position: 0,
+                    fence: 1,
+                    projected_events: 0,
+                },
+                false,
+            )
+            .await
+            .expect("duplicate flush commits");
+        assert!(opened.is_empty(), "a duplicate identity opens nothing");
+        assert_eq!(
+            signal_count(&pool, signals::SCHEMA_MISMATCH_SIGNAL_TYPE).await,
+            1
+        );
+        assert_eq!(
+            scalar_i64(
+                &pool,
+                "SELECT count(*) FROM greengateway.discovery_signals WHERE id = 'signal-1'"
+            )
+            .await,
+            1,
+            "the first row is kept, not replaced"
+        );
+        assert_eq!(store.checkpoint().await.expect("checkpoint").fence, 1);
+
+        // Through the projector: one endpoint's new_endpoint_seen is
+        // announced once; a successor replaying the same positions (the
+        // checkpoint wound back, as a restored backup would leave it)
+        // neither inserts nor announces it again.
+        let (sender, mut opened_events) = tokio::sync::broadcast::channel(64);
+        ingest(
+            &pool,
+            &[projector_event(
+                0,
+                "GET",
+                "/replayed",
+                200,
+                5,
+                Some("alice"),
+            )],
+        )
+        .await;
+        let stop = CancellationToken::new();
+        let mut first_term = begin_term(
+            &pool,
+            &store,
+            projector_config(10, 10),
+            2,
+            Some(sender.clone()),
+        )
+        .await;
+        assert_eq!(
+            first_term
+                .project_until_caught_up(&stop)
+                .await
+                .expect("projects")
+                .expect("leads"),
+            1
+        );
+        assert_eq!(
+            signal_count(&pool, signals::NEW_ENDPOINT_SEEN_SIGNAL_TYPE).await,
+            1
+        );
+        let announced = opened_events
+            .try_recv()
+            .expect("one signal.opened is announced");
+        assert_eq!(announced.event_type, crate::audit::event::SIGNAL_OPENED);
+        assert!(
+            opened_events.try_recv().is_err(),
+            "exactly one announcement"
+        );
+
+        {
+            let client = pool.get().await.expect("client");
+            client
+                .batch_execute(
+                    "UPDATE greengateway.discovery_projector_state SET checkpoint_position = 0",
+                )
+                .await
+                .expect("wind the checkpoint back");
+        }
+        let mut replaying_term =
+            begin_term(&pool, &store, projector_config(10, 10), 3, Some(sender)).await;
+        assert_eq!(replaying_term.committed_position(), 0);
+        assert_eq!(
+            replaying_term
+                .project_until_caught_up(&stop)
+                .await
+                .expect("replays")
+                .expect("leads"),
+            1
+        );
+        assert_eq!(
+            signal_count(&pool, signals::NEW_ENDPOINT_SEEN_SIGNAL_TYPE).await,
+            1,
+            "the replayed crossing inserts no second row"
+        );
+        assert!(
+            opened_events.try_recv().is_err(),
+            "a signal that did not insert is not announced"
+        );
+    }
+
+    /// The endpoint templates the aggregates table holds, sorted.
+    async fn resident_templates(pool: &deadpool_postgres::Pool) -> Vec<String> {
+        let client = pool.get().await.expect("client");
+        client
+            .query(
+                "SELECT endpoint_template FROM greengateway.discovery_endpoint_aggregates \
+                 ORDER BY endpoint_template",
+                &[],
+            )
+            .await
+            .expect("resident templates")
+            .iter()
+            .map(|row| row.get::<_, String>(0))
+            .collect()
+    }
+
+    /// Rows in `table` keyed by an endpoint template outside `resident`:
+    /// what an incomplete eviction leaves behind.
+    async fn orphan_rows(pool: &deadpool_postgres::Pool, table: &str, resident: &[&str]) -> i64 {
+        let client = pool.get().await.expect("client");
+        let resident = resident
+            .iter()
+            .map(|template| (*template).to_owned())
+            .collect::<Vec<_>>();
+        client
+            .query_one(
+                &format!(
+                    "SELECT count(*) FROM greengateway.{table} \
+                     WHERE NOT (endpoint_template = ANY($1::text[]))"
+                ),
+                &[&resident],
+            )
+            .await
+            .expect("orphan count")
+            .get(0)
+    }
+
+    /// The target keys of every `new_endpoint_seen` signal, sorted.
+    async fn new_endpoint_signal_targets(pool: &deadpool_postgres::Pool) -> Vec<String> {
+        let client = pool.get().await.expect("client");
+        client
+            .query(
+                "SELECT target_key FROM greengateway.discovery_signals \
+                 WHERE signal_type = $1 ORDER BY target_key",
+                &[&signals::NEW_ENDPOINT_SEEN_SIGNAL_TYPE],
+            )
+            .await
+            .expect("signal targets")
+            .iter()
+            .map(|row| row.get::<_, String>(0))
+            .collect()
+    }
+
+    /// Every table keyed by endpoint identity that an eviction must clear.
+    const ENDPOINT_KEYED_TABLES: [&str; 9] = [
+        "discovery_endpoint_aggregates",
+        "discovery_endpoint_status_counts",
+        "discovery_endpoint_principals",
+        "discovery_endpoint_routing_contexts",
+        "discovery_endpoint_routing_principals",
+        "discovery_endpoint_routing_classifications",
+        "discovery_endpoint_classified_signal_stats",
+        "discovery_endpoint_classified_signal_principals",
+        "discovery_detector_state",
+    ];
+
+    /// Exactly `resident` is persisted: the aggregates table holds those
+    /// templates and no other, no endpoint-keyed table has a row outside
+    /// them, and the `new_endpoint_seen` signals are theirs alone.
+    async fn assert_exactly_resident(pool: &deadpool_postgres::Pool, resident: &[&str]) {
+        assert_eq!(
+            resident_templates(pool).await,
+            resident
+                .iter()
+                .map(|template| (*template).to_owned())
+                .collect::<Vec<_>>(),
+            "the aggregates table holds exactly the resident endpoints"
+        );
+        for table in ENDPOINT_KEYED_TABLES {
+            assert_eq!(
+                orphan_rows(pool, table, resident).await,
+                0,
+                "{table} keeps no row of an evicted endpoint"
+            );
+        }
+        assert_eq!(
+            new_endpoint_signal_targets(pool).await,
+            resident
+                .iter()
+                .map(|template| signals::endpoint_target_key("GET", template))
+                .collect::<Vec<_>>(),
+            "an evicted endpoint's signals go with it"
+        );
+    }
+
+    /// A flush retried with the identical batch and checkpoint -- what the
+    /// projector does after a COMMIT the server applied but the client
+    /// never heard about -- changes nothing: the aggregates and child rows
+    /// are the same, `projected_events` is not counted twice, and the
+    /// signals the batch opened (never announced, since the first attempt
+    /// errored) are reported again so the retry announces them once.
+    #[tokio::test]
+    async fn a_retried_flush_of_a_committed_checkpoint_counts_nothing_twice_and_reports_its_signals(
+    ) {
+        let Some(admin_dsn) = locator() else {
+            eprintln!("skipping: no test database locator; CI runs this test");
+            return;
+        };
+        let _guard = DATABASE.lock().await;
+        let database = create_test_database(&admin_dsn).await;
+        let pool = migrated_discovery_pool(&database).await;
+        let store = Arc::new(PostgresDiscoveryStore::new(pool.clone()));
+        store
+            .claim_leadership(1, uuid::Uuid::new_v4())
+            .await
+            .expect("claim");
+
+        let events = (0..6)
+            .map(|index| {
+                projector_event(
+                    index,
+                    "GET",
+                    if index % 2 == 0 { "/orders" } else { "/users" },
+                    200,
+                    5,
+                    Some("alice"),
+                )
+            })
+            .collect::<Vec<_>>();
+        ingest(&pool, &events).await;
+        let mut state = reference_state(&pool).await;
+        let batch = state.pending_flush();
+        assert_eq!(batch.dirty_aggregates.len(), 2);
+        assert_eq!(
+            batch.pending_signals.len(),
+            2,
+            "one new_endpoint_seen per endpoint is queued"
+        );
+        let detector_states = AggregatorState::detector_states_for(&batch);
+        let groups = state.template_groups_json_within(usize::MAX);
+        let checkpoint = crate::storage::postgres_discovery::FlushCheckpoint {
+            position: 6,
+            fence: 1,
+            projected_events: 6,
+        };
+
+        let opened = store
+            .flush(&batch, &detector_states, Some(&groups), checkpoint, false)
+            .await
+            .expect("first flush");
+        let mut opened_ids = opened.iter().map(|s| s.id.clone()).collect::<Vec<_>>();
+        opened_ids.sort();
+        assert_eq!(opened_ids.len(), 2);
+        let committed = store.checkpoint().await.expect("checkpoint");
+        assert_eq!(committed.checkpoint_position, 6);
+        assert_eq!(committed.projected_events, 6);
+        let inventory_after = |pool: deadpool_postgres::Pool| async move {
+            (
+                scalar_i64(
+                    &pool,
+                    "SELECT sum(call_count)::bigint FROM greengateway.discovery_endpoint_aggregates",
+                )
+                .await,
+                scalar_i64(
+                    &pool,
+                    "SELECT count(*) FROM greengateway.discovery_endpoint_principals",
+                )
+                .await,
+                scalar_i64(
+                    &pool,
+                    "SELECT count(*) FROM greengateway.discovery_endpoint_status_counts",
+                )
+                .await,
+                scalar_i64(&pool, "SELECT count(*) FROM greengateway.discovery_signals").await,
+            )
+        };
+        let first = inventory_after(pool.clone()).await;
+        assert_eq!(first, (6, 2, 2, 2));
+
+        // The retry: the same batch, the same checkpoint, the same fence.
+        let reopened = store
+            .flush(&batch, &detector_states, Some(&groups), checkpoint, false)
+            .await
+            .expect("the retry commits");
+        let mut reopened_ids = reopened.iter().map(|s| s.id.clone()).collect::<Vec<_>>();
+        reopened_ids.sort();
+        assert_eq!(
+            reopened_ids, opened_ids,
+            "the retry reports the signals the batch opened, by their ids"
+        );
+        let retried = store.checkpoint().await.expect("checkpoint");
+        assert_eq!(retried.checkpoint_position, 6);
+        assert_eq!(
+            retried.projected_events, 6,
+            "an already-counted checkpoint is not counted again"
+        );
+        assert_eq!(inventory_after(pool.clone()).await, first);
+
+        // The next real flush still counts: the checkpoint advances.
+        ingest(
+            &pool,
+            &[projector_event(6, "GET", "/orders", 200, 5, Some("bob"))],
+        )
+        .await;
+        let state = reference_state(&pool).await;
+        let next = state.pending_flush();
+        let next_states = AggregatorState::detector_states_for(&next);
+        store
+            .flush(
+                &next,
+                &next_states,
+                None,
+                crate::storage::postgres_discovery::FlushCheckpoint {
+                    position: 7,
+                    fence: 1,
+                    projected_events: 1,
+                },
+                false,
+            )
+            .await
+            .expect("the next flush commits");
+        let advanced = store.checkpoint().await.expect("checkpoint");
+        assert_eq!(advanced.checkpoint_position, 7);
+        assert_eq!(advanced.projected_events, 7);
+    }
+
+    /// Contract test 4: the endpoint bound is applied by the one leader
+    /// over the global stream order, so what is evicted is the least
+    /// recently seen endpoint across every replica's traffic, never the
+    /// least recent of one replica's. The row count is exactly the limit
+    /// after every flush; an evicted endpoint leaves no child row, detector
+    /// state, or signal behind; a successor re-seeds the access order from
+    /// the persisted `last_seen` and evicts the same endpoint the
+    /// uninterrupted aggregator would; and a fenced-out leader's own
+    /// eviction decision reaches nothing.
+    #[tokio::test]
+    async fn the_endpoint_bound_evicts_least_recently_seen_globally() {
+        let Some(admin_dsn) = locator() else {
+            eprintln!("skipping: no test database locator; CI runs this test");
+            return;
+        };
+        let _guard = DATABASE.lock().await;
+        let database = create_test_database(&admin_dsn).await;
+        let pool = migrated_discovery_pool(&database).await;
+        let store = Arc::new(PostgresDiscoveryStore::new(pool.clone()));
+        const LIMIT: usize = 4;
+        // Flush after every observation so each admitted endpoint's signal
+        // is committed before a later eviction has to remove it.
+        let bounded = || ProjectorConfig {
+            endpoint_limit: LIMIT,
+            ..projector_config(100, 1)
+        };
+        let event =
+            |index: usize, path: &str| projector_event(index, "GET", path, 200, 5, Some("alice"));
+
+        // Two replicas ingest alternately. The stream orders their batches
+        // by commit, so the global order is 0..=6: /alpha is touched again
+        // at position 5, which makes /bravo -- replica A's own most recent
+        // endpoint at the time -- the least recently seen overall.
+        ingest(&pool, &[event(0, "/alpha"), event(1, "/bravo")]).await;
+        ingest(&pool, &[event(2, "/charlie"), event(3, "/delta")]).await;
+        ingest(&pool, &[event(4, "/alpha"), event(5, "/echo")]).await;
+        ingest(&pool, &[event(6, "/foxtrot")]).await;
+
+        let mut leader_a = begin_term(&pool, &store, bounded(), 1, None).await;
+        let stop = CancellationToken::new();
+        assert_eq!(
+            leader_a
+                .project_until_caught_up(&stop)
+                .await
+                .expect("A projects")
+                .expect("A leads"),
+            7
+        );
+        // Admitting /echo evicted /bravo; admitting /foxtrot evicted
+        // /charlie. /alpha survived because the global order saw it last
+        // at position 5.
+        assert_exactly_resident(&pool, &["/alpha", "/delta", "/echo", "/foxtrot"]).await;
+        let checkpoint = store.checkpoint().await.expect("checkpoint");
+        assert_eq!(checkpoint.checkpoint_position, 7);
+        assert_eq!(checkpoint.projected_events, 7);
+        assert_same_inventory(
+            &reference_state_with_limit(&pool, LIMIT).await,
+            &reloaded_state(&store).await,
+        );
+
+        // Failover. The successor rebuilds its access order from the
+        // persisted last_seen, so the next admission evicts /delta (last
+        // seen at position 4), exactly as the uninterrupted aggregator
+        // would.
+        ingest(&pool, &[event(7, "/golf")]).await;
+        let mut leader_b = begin_term(&pool, &store, bounded(), 2, None).await;
+        assert_eq!(leader_b.committed_position(), 7);
+        assert_eq!(
+            leader_b
+                .project_until_caught_up(&stop)
+                .await
+                .expect("B projects")
+                .expect("B leads"),
+            1
+        );
+        assert_exactly_resident(&pool, &["/alpha", "/echo", "/foxtrot", "/golf"]).await;
+        let checkpoint = store.checkpoint().await.expect("checkpoint");
+        assert_eq!(checkpoint.checkpoint_position, 8);
+        assert_eq!(checkpoint.projected_events, 8);
+        assert_same_inventory(
+            &reference_state_with_limit(&pool, LIMIT).await,
+            &reloaded_state(&store).await,
+        );
+
+        // The old leader wakes, reads position 8, evicts /delta in its own
+        // memory and is refused at the fence: the tables are B's alone.
+        assert_eq!(
+            leader_a
+                .project_batch(&stop)
+                .await
+                .expect("A's flush is refused, not failed"),
+            BatchOutcome::Fenced
+        );
+        assert_exactly_resident(&pool, &["/alpha", "/echo", "/foxtrot", "/golf"]).await;
+        assert_eq!(
+            store
+                .checkpoint()
+                .await
+                .expect("checkpoint")
+                .projected_events,
+            8
+        );
+    }
+
+    /// Contract test 6: the retention predicate. No PostgreSQL audit
+    /// retention job exists yet (PR 13 owns it); the boundary it must
+    /// honour is `minimum_retained_position()`, one past the committed
+    /// checkpoint. A trim of every position below that boundary leaves the
+    /// projector's next batch in place, so a successor resuming from the
+    /// checkpoint still projects the remainder exactly once.
+    #[tokio::test]
+    async fn retention_never_passes_the_projector_checkpoint() {
+        let Some(admin_dsn) = locator() else {
+            eprintln!("skipping: no test database locator; CI runs this test");
+            return;
+        };
+        let _guard = DATABASE.lock().await;
+        let database = create_test_database(&admin_dsn).await;
+        let pool = migrated_discovery_pool(&database).await;
+        let store = Arc::new(PostgresDiscoveryStore::new(pool.clone()));
+
+        let events = (0..40)
+            .map(|index| {
+                projector_event(
+                    index,
+                    "GET",
+                    "/orders",
+                    if index % 4 == 3 { 500 } else { 200 },
+                    5,
+                    Some(if index % 2 == 0 { "alice" } else { "bob" }),
+                )
+            })
+            .collect::<Vec<_>>();
+        ingest(&pool, &events).await;
+        // The reference sees the whole stream, before any of it is trimmed.
+        let reference = reference_state(&pool).await;
+
+        let mut leader_a = begin_term(&pool, &store, projector_config(20, 20), 1, None).await;
+        let stop = CancellationToken::new();
+        assert_eq!(
+            leader_a.project_batch(&stop).await.expect("A projects"),
+            BatchOutcome::Projected {
+                observed: 20,
+                last_position: 20
+            }
+        );
+        let checkpoint = store.checkpoint().await.expect("checkpoint");
+        assert_eq!(checkpoint.checkpoint_position, 20);
+
+        // The trim PR 13's job will run: every event whose stream position
+        // is below the boundary, read in the same transaction.
+        let boundary = store
+            .minimum_retained_position()
+            .await
+            .expect("the boundary reads");
+        let trimmed = {
+            let client = pool.get().await.expect("client");
+            client
+                .execute(
+                    "DELETE FROM greengateway.audit_events AS e
+                     USING greengateway.audit_stream AS s
+                     WHERE s.event_id = e.event_id AND s.position < $1",
+                    &[&boundary],
+                )
+                .await
+                .expect("the trim runs")
+        };
+        assert_eq!(
+            trimmed, 20,
+            "the trim removes exactly the applied positions"
+        );
+        let audit = PostgresAuditEventStore::new(pool.clone(), None);
+        assert_eq!(
+            audit.stream_first_available().await.expect("first"),
+            checkpoint.checkpoint_position + 1,
+            "the first retained position is the first the projector has not applied"
+        );
+
+        // A fails over. B resumes from the checkpoint and finds every
+        // position it needs still in the stream.
+        let mut leader_b = begin_term(&pool, &store, projector_config(20, 20), 2, None).await;
+        assert_eq!(leader_b.committed_position(), 20);
+        assert_eq!(
+            leader_b
+                .project_until_caught_up(&stop)
+                .await
+                .expect("B projects")
+                .expect("B leads"),
+            20,
+            "every position after the checkpoint survived the trim"
+        );
+        let checkpoint = store.checkpoint().await.expect("checkpoint");
+        assert_eq!(checkpoint.checkpoint_position, 40);
+        assert_eq!(checkpoint.projected_events, 40);
+        assert_eq!(
+            scalar_i64(
+                &pool,
+                "SELECT call_count FROM greengateway.discovery_endpoint_aggregates \
+                 WHERE method = 'GET' AND endpoint_template = '/orders'"
+            )
+            .await,
+            40,
+            "the trimmed prefix was applied once and the retained suffix once"
+        );
+        assert_same_inventory(&reference, &reloaded_state(&store).await);
+
+        // The boundary moves with the checkpoint: a trim at the new one
+        // removes only what has been applied, and the stream stays readable
+        // from the checkpoint.
+        let boundary = store
+            .minimum_retained_position()
+            .await
+            .expect("the boundary reads");
+        assert_eq!(boundary, checkpoint.checkpoint_position + 1);
+        assert_eq!(
+            leader_b.project_batch(&stop).await.expect("nothing left"),
+            BatchOutcome::Empty
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // Read-store parity: the PostgreSQL read store answers every read of
+    // the trait exactly as the SQLite store does over the same events
+    // (issue #241, PR 11, contract test 7)
+    // ------------------------------------------------------------------
+
+    use crate::audit::AuditSink;
+    use crate::discovery::{
+        aggregator::{EndpointAggregatorSink, EndpointAggregatorSinkConfig},
+        query::{
+            DiscoveryQueryError, DiscoveryQueryStore, DiscoveryReadStore, EndpointListFilters,
+            EndpointSort, PrincipalPageFilters, DEFAULT_NEW_SINCE_HOURS, MAX_NEW_SINCE_HOURS,
+        },
+        signals::SignalListFilters,
+    };
+    use crate::storage::postgres_discovery_read::PostgresDiscoveryReadStore;
+    use time::{format_description::well_known::Rfc3339, OffsetDateTime};
+
+    /// An observation as the middleware emits it, with the fields the
+    /// parity fixture varies: an unrouted request carries no upstream
+    /// context and is not classified; a captured shape feeds the inferred
+    /// schema.
+    #[allow(clippy::too_many_arguments)]
+    fn parity_event(
+        index: usize,
+        method: &str,
+        path: &str,
+        status: u16,
+        latency_ms: u64,
+        user_id: Option<&str>,
+        routed: bool,
+        payload_shape: Option<Value>,
+    ) -> AuditEvent {
+        let mut event = projector_event(index, method, path, status, latency_ms, user_id);
+        let payload = event.payload.as_object_mut().expect("payload is an object");
+        if !routed {
+            payload.insert("routing_context_known".to_owned(), json!(false));
+            payload.remove("upstream_origin");
+            payload.remove("upstream_route_host");
+            payload.remove("upstream_route_path_prefix");
+        }
+        if let Some(shape) = payload_shape {
+            payload.insert("payload_shape".to_owned(), shape);
+        }
+        event
+    }
+
+    /// One fixture observation: method, path, status, latency, principal,
+    /// routed, captured payload shape.
+    type ParitySpec<'a> = (
+        &'a str,
+        String,
+        u16,
+        u64,
+        Option<&'a str>,
+        bool,
+        Option<Value>,
+    );
+
+    /// 36 observations over six endpoints: two principals sharing one,
+    /// captured shapes on another, a learned template, a call-count tie
+    /// (to exercise the method/template tiebreak), and two unrouted
+    /// endpoints (one anonymous) that never get a routing context.
+    fn parity_events() -> Vec<AuditEvent> {
+        let order_shape = |with_page: bool| {
+            let mut query_params = Vec::new();
+            if with_page {
+                query_params
+                    .push(json!({"name": "page", "redacted": false, "value_type": "number"}));
+            }
+            json!({
+                "query_params": query_params,
+                "json_body": {
+                    "top_level_keys": [
+                        {"name": "sku", "redacted": false},
+                        {"name": "quantity", "redacted": false}
+                    ]
+                }
+            })
+        };
+        let mut specs: Vec<ParitySpec<'_>> = Vec::new();
+        for i in 0..12 {
+            specs.push((
+                "GET",
+                "/orders".to_owned(),
+                [200, 200, 500, 404][i % 4],
+                5 + i as u64,
+                Some(["alice", "bob"][i % 2]),
+                true,
+                None,
+            ));
+        }
+        for i in 0..8 {
+            specs.push((
+                "POST",
+                "/orders".to_owned(),
+                201,
+                20 + i as u64,
+                Some("alice"),
+                true,
+                Some(order_shape(i % 3 != 0)),
+            ));
+        }
+        for i in 0..6 {
+            specs.push((
+                "GET",
+                format!("/users/{}", 100 + i),
+                200,
+                3,
+                Some("carol"),
+                true,
+                None,
+            ));
+        }
+        for _ in 0..4 {
+            specs.push((
+                "DELETE",
+                "/orders/42".to_owned(),
+                204,
+                7,
+                Some("bob"),
+                true,
+                None,
+            ));
+        }
+        for _ in 0..4 {
+            specs.push(("GET", "/health".to_owned(), 200, 1, None, false, None));
+        }
+        for _ in 0..2 {
+            specs.push((
+                "GET",
+                "/legacy/report".to_owned(),
+                200,
+                9,
+                Some("alice"),
+                false,
+                None,
+            ));
+        }
+        specs
+            .into_iter()
+            .enumerate()
+            .map(
+                |(index, (method, path, status, latency, user, routed, shape))| {
+                    parity_event(index, method, &path, status, latency, user, routed, shape)
+                },
+            )
+            .collect()
+    }
+
+    /// The standalone inventory: the SQLite sink fed the events directly,
+    /// flushed, and reopened through the query store.
+    fn sqlite_inventory(events: &[AuditEvent], db: &TempDb) -> DiscoveryQueryStore {
+        let sink = EndpointAggregatorSink::new(EndpointAggregatorSinkConfig {
+            path: db.path.clone(),
+            payload_capture_enabled: true,
+            endpoint_limit: 0,
+            signal_event_sender: None,
+            signal_detector_config: SignalDetectorConfig::default(),
+        })
+        .expect("the SQLite sink should open");
+        for event in events {
+            sink.emit(event);
+        }
+        sink.flush().expect("the SQLite sink should flush");
+        drop(sink);
+        DiscoveryQueryStore::open(&db.path).expect("the SQLite query store should open")
+    }
+
+    /// The cluster inventory: the events ingested onto the stream and
+    /// projected to completion in small batches (several flushes), then
+    /// read through the PostgreSQL read store.
+    async fn postgres_inventory(
+        pool: &deadpool_postgres::Pool,
+        events: &[AuditEvent],
+    ) -> PostgresDiscoveryReadStore {
+        ingest(pool, events).await;
+        let store = Arc::new(PostgresDiscoveryStore::new(pool.clone()));
+        let config = ProjectorConfig {
+            payload_capture_enabled: true,
+            endpoint_limit: 0,
+            signal_detector_config: SignalDetectorConfig::default(),
+            poll_interval: Duration::from_millis(10),
+            batch_size: 7,
+            flush_every: 5,
+        };
+        let mut term = begin_term(pool, &store, config, 1, None).await;
+        let projected = term
+            .project_until_caught_up(&CancellationToken::new())
+            .await
+            .expect("the projector should run")
+            .expect("the term should catch up");
+        assert_eq!(projected, events.len());
+        PostgresDiscoveryReadStore::new(pool.clone())
+    }
+
+    fn endpoint_filters(sort: EndpointSort, limit: usize) -> EndpointListFilters {
+        EndpointListFilters {
+            method: None,
+            endpoint_template_contains: None,
+            endpoint_template_prefix: None,
+            first_seen_after: None,
+            first_seen_before: None,
+            last_seen_after: None,
+            last_seen_before: None,
+            min_call_count: None,
+            new_since_hours: DEFAULT_NEW_SINCE_HOURS,
+            is_new: None,
+            reviewed: None,
+            sort,
+            limit,
+            cursor: None,
+        }
+    }
+
+    fn signal_filters(limit: usize) -> SignalListFilters {
+        SignalListFilters {
+            state: None,
+            signal_type: None,
+            target_kind: None,
+            target_key: None,
+            limit,
+            cursor: None,
+        }
+    }
+
+    /// The comparable form of a read. `scrub_keys` are removed from every
+    /// object (the ids and write timestamps each backend generates itself);
+    /// every RFC 3339 string is re-rendered canonically, because the
+    /// durable audit stream renders event times with fixed microseconds
+    /// (`...:26.000000Z`) where the standalone sink keeps the event's own
+    /// text (`...:26Z`) -- the same instant, which is what every ordering
+    /// and filter compares; and page cursors are decoded (they are hex
+    /// JSON on both backends) so the timestamps inside them get the same
+    /// treatment and the cursor's content, not its bytes, is compared.
+    fn comparable<T: serde::Serialize>(value: &T, scrub_keys: &[&str]) -> Value {
+        fn canonicalize(value: &mut Value, scrub_keys: &[&str]) {
+            match value {
+                Value::Object(object) => {
+                    for key in scrub_keys {
+                        object.remove(*key);
+                    }
+                    for (key, child) in object.iter_mut() {
+                        if key == "next_cursor" {
+                            if let Some(decoded) = child
+                                .as_str()
+                                .and_then(|cursor| hex::decode(cursor).ok())
+                                .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+                            {
+                                *child = decoded;
+                            }
+                        }
+                        canonicalize(child, scrub_keys);
+                    }
+                }
+                Value::Array(items) => {
+                    for item in items {
+                        canonicalize(item, scrub_keys);
+                    }
+                }
+                Value::String(text) => {
+                    // Token-wise, so a timestamp quoted inside prose (a
+                    // signal's explanation) is canonicalized as well.
+                    let canonical = text
+                        .split(' ')
+                        .map(|token| match OffsetDateTime::parse(token, &Rfc3339) {
+                            Ok(instant) => instant.format(&Rfc3339).expect("instant formats"),
+                            Err(_) => token.to_owned(),
+                        })
+                        .collect::<Vec<_>>()
+                        .join(" ");
+                    *text = canonical;
+                }
+                _ => {}
+            }
+        }
+        let mut value = serde_json::to_value(value).expect("value serializes");
+        canonicalize(&mut value, scrub_keys);
+        value
+    }
+
+    /// Signals compare as a set: ids are per-backend UUIDs, so an order
+    /// that breaks a `created_at` tie on the id is legitimately different.
+    fn signal_set(signals: &[signals::Signal]) -> Vec<Value> {
+        let mut set = signals
+            .iter()
+            .map(|signal| comparable(signal, &["id", "updated_at", "transitioned_at"]))
+            .collect::<Vec<_>>();
+        set.sort_by_key(|signal| signal.to_string());
+        set
+    }
+
+    async fn all_signal_pages(
+        store: &dyn DiscoveryReadStore,
+        mut filters: SignalListFilters,
+    ) -> Vec<signals::Signal> {
+        let mut signals = Vec::new();
+        loop {
+            let page = store.list_signals(&filters).await.expect("signals page");
+            signals.extend(page.signals);
+            match page.next_cursor {
+                Some(cursor) => filters.cursor = Some(cursor),
+                None => return signals,
+            }
+        }
+    }
+
+    /// Walk the endpoint pages of both stores in lockstep and require each
+    /// page, cursor included, to be identical.
+    async fn assert_same_endpoint_pages(
+        sqlite: &dyn DiscoveryReadStore,
+        postgres: &dyn DiscoveryReadStore,
+        mut filters: EndpointListFilters,
+        include_open_signals: bool,
+        context: &str,
+    ) -> usize {
+        let mut listed = 0;
+        let mut pages = 0;
+        loop {
+            let left = sqlite
+                .list_endpoints_with_open_signal_summaries(&filters, include_open_signals)
+                .await
+                .expect("SQLite page");
+            let right = postgres
+                .list_endpoints_with_open_signal_summaries(&filters, include_open_signals)
+                .await
+                .expect("PostgreSQL page");
+            assert_eq!(
+                comparable(&left, &[]),
+                comparable(&right, &[]),
+                "{context}: page {pages} (cursor {:?}) differs",
+                filters.cursor
+            );
+            listed += left.endpoints.len();
+            pages += 1;
+            match left.next_cursor {
+                Some(cursor) => filters.cursor = Some(cursor),
+                None => return listed,
+            }
+        }
+    }
+
+    async fn parity_fixture(
+        database: &TestDatabase,
+        sqlite_db: &TempDb,
+    ) -> (DiscoveryQueryStore, PostgresDiscoveryReadStore) {
+        let events = parity_events();
+        let pool = migrated_discovery_pool(database).await;
+        let postgres = postgres_inventory(&pool, &events).await;
+        let sqlite = sqlite_inventory(&events, sqlite_db);
+        (sqlite, postgres)
+    }
+
+    #[tokio::test]
+    async fn read_store_lists_endpoints_and_pages_like_the_sqlite_store() {
+        let Some(admin_dsn) = locator() else {
+            eprintln!("skipping: no test database locator; CI runs this test");
+            return;
+        };
+        let _guard = DATABASE.lock().await;
+        let database = create_test_database(&admin_dsn).await;
+        let sqlite_db = TempDb::new("read-parity-endpoints");
+        let (sqlite, postgres) = parity_fixture(&database, &sqlite_db).await;
+        let sqlite: &dyn DiscoveryReadStore = &sqlite;
+        let postgres: &dyn DiscoveryReadStore = &postgres;
+
+        // The observed inventory, routed and unrouted endpoints alike.
+        let observed = sqlite.observed_endpoints().await.expect("SQLite observed");
+        assert_eq!(
+            comparable(&observed, &[]),
+            comparable(
+                &postgres
+                    .observed_endpoints()
+                    .await
+                    .expect("PostgreSQL observed"),
+                &[]
+            )
+        );
+        assert!(
+            observed
+                .iter()
+                .any(|endpoint| endpoint.upstream_origin.is_none()),
+            "the fixture has unrouted endpoints"
+        );
+        assert!(
+            observed
+                .iter()
+                .any(|endpoint| endpoint.upstream_origin.is_some()),
+            "the fixture has routed endpoints"
+        );
+        let endpoint_count = observed
+            .iter()
+            .map(|endpoint| (&endpoint.method, &endpoint.endpoint_template))
+            .collect::<std::collections::BTreeSet<_>>()
+            .len();
+        assert!(endpoint_count >= 6, "six endpoints were observed");
+
+        // Every sort, paged two at a time, with and without signal
+        // summaries: identical pages and identical cursors.
+        for sort in [
+            EndpointSort::LastSeen,
+            EndpointSort::CallCount,
+            EndpointSort::FirstSeen,
+        ] {
+            for include_open_signals in [true, false] {
+                let listed = assert_same_endpoint_pages(
+                    sqlite,
+                    postgres,
+                    endpoint_filters(sort, 2),
+                    include_open_signals,
+                    &format!("sort {sort:?}, open signals {include_open_signals}"),
+                )
+                .await;
+                assert_eq!(listed, endpoint_count, "every endpoint is paged, once");
+            }
+        }
+
+        // Every filter the list accepts, and a few combinations.
+        let mid = "2024-06-01T12:00:20Z".to_owned();
+        let filtered = [
+            EndpointListFilters {
+                method: Some("GET".to_owned()),
+                ..endpoint_filters(EndpointSort::LastSeen, 10)
+            },
+            EndpointListFilters {
+                endpoint_template_contains: Some("ORDERS".to_owned()),
+                ..endpoint_filters(EndpointSort::CallCount, 10)
+            },
+            EndpointListFilters {
+                endpoint_template_prefix: Some("/users".to_owned()),
+                ..endpoint_filters(EndpointSort::FirstSeen, 10)
+            },
+            EndpointListFilters {
+                endpoint_template_contains: Some("%".to_owned()),
+                ..endpoint_filters(EndpointSort::LastSeen, 10)
+            },
+            EndpointListFilters {
+                min_call_count: Some(5),
+                ..endpoint_filters(EndpointSort::CallCount, 10)
+            },
+            EndpointListFilters {
+                is_new: Some(false),
+                ..endpoint_filters(EndpointSort::LastSeen, 10)
+            },
+            EndpointListFilters {
+                is_new: Some(true),
+                ..endpoint_filters(EndpointSort::LastSeen, 10)
+            },
+            EndpointListFilters {
+                is_new: Some(true),
+                new_since_hours: MAX_NEW_SINCE_HOURS,
+                ..endpoint_filters(EndpointSort::FirstSeen, 10)
+            },
+            EndpointListFilters {
+                reviewed: Some(false),
+                ..endpoint_filters(EndpointSort::LastSeen, 10)
+            },
+            EndpointListFilters {
+                reviewed: Some(true),
+                ..endpoint_filters(EndpointSort::LastSeen, 10)
+            },
+            EndpointListFilters {
+                first_seen_after: Some(mid.clone()),
+                ..endpoint_filters(EndpointSort::FirstSeen, 10)
+            },
+            EndpointListFilters {
+                first_seen_before: Some(mid.clone()),
+                ..endpoint_filters(EndpointSort::FirstSeen, 10)
+            },
+            EndpointListFilters {
+                last_seen_after: Some(mid.clone()),
+                ..endpoint_filters(EndpointSort::LastSeen, 10)
+            },
+            EndpointListFilters {
+                last_seen_before: Some(mid.clone()),
+                ..endpoint_filters(EndpointSort::LastSeen, 10)
+            },
+            EndpointListFilters {
+                method: Some("GET".to_owned()),
+                endpoint_template_prefix: Some("/".to_owned()),
+                min_call_count: Some(4),
+                last_seen_after: Some("2024-06-01T12:00:00Z".to_owned()),
+                ..endpoint_filters(EndpointSort::CallCount, 1)
+            },
+        ];
+        let mut non_empty = 0;
+        for (index, filters) in filtered.into_iter().enumerate() {
+            let listed = assert_same_endpoint_pages(
+                sqlite,
+                postgres,
+                filters,
+                true,
+                &format!("filter set {index}"),
+            )
+            .await;
+            if listed > 0 {
+                non_empty += 1;
+            }
+        }
+        assert!(non_empty >= 10, "most filter sets match rows");
+
+        // Detail for every endpoint; `updated_at` is each backend's own
+        // write time.
+        for endpoint in &observed {
+            for include_open_signals in [true, false] {
+                let left = sqlite
+                    .get_endpoint_with_open_signal_summaries(
+                        &endpoint.method,
+                        &endpoint.endpoint_template,
+                        DEFAULT_NEW_SINCE_HOURS,
+                        include_open_signals,
+                    )
+                    .await
+                    .expect("SQLite detail")
+                    .expect("the endpoint exists");
+                let right = postgres
+                    .get_endpoint_with_open_signal_summaries(
+                        &endpoint.method,
+                        &endpoint.endpoint_template,
+                        DEFAULT_NEW_SINCE_HOURS,
+                        include_open_signals,
+                    )
+                    .await
+                    .expect("PostgreSQL detail")
+                    .expect("the endpoint exists");
+                assert_eq!(
+                    comparable(&left, &["updated_at"]),
+                    comparable(&right, &["updated_at"]),
+                    "detail of {} {}",
+                    endpoint.method,
+                    endpoint.endpoint_template
+                );
+                assert_eq!(
+                    left.open_signals.is_some(),
+                    include_open_signals,
+                    "the summary follows the permission"
+                );
+            }
+        }
+        assert!(sqlite
+            .get_endpoint_with_open_signal_summaries("GET", "/nope", 24, true)
+            .await
+            .expect("SQLite detail")
+            .is_none());
+        assert!(postgres
+            .get_endpoint_with_open_signal_summaries("GET", "/nope", 24, true)
+            .await
+            .expect("PostgreSQL detail")
+            .is_none());
+
+        // The inferred schema over the captured shapes, and none where
+        // nothing was captured.
+        let left = sqlite
+            .inferred_request_schema("POST", "/orders")
+            .await
+            .expect("SQLite schema")
+            .expect("POST /orders has samples");
+        let right = postgres
+            .inferred_request_schema("POST", "/orders")
+            .await
+            .expect("PostgreSQL schema")
+            .expect("POST /orders has samples");
+        assert_eq!(left, right);
+        assert_eq!(left.sample_count, 8);
+        assert!(left.json_body_keys.iter().any(|key| key.required));
+        assert!(sqlite
+            .inferred_request_schema("GET", "/orders")
+            .await
+            .expect("SQLite schema")
+            .is_none());
+        assert!(postgres
+            .inferred_request_schema("GET", "/orders")
+            .await
+            .expect("PostgreSQL schema")
+            .is_none());
+
+        // Cursor validation: garbage, and a cursor minted for another sort.
+        let garbage = EndpointListFilters {
+            cursor: Some("not-a-cursor".to_owned()),
+            ..endpoint_filters(EndpointSort::LastSeen, 2)
+        };
+        for store in [sqlite, postgres] {
+            assert!(matches!(
+                store
+                    .list_endpoints_with_open_signal_summaries(&garbage, true)
+                    .await,
+                Err(DiscoveryQueryError::InvalidCursor {
+                    parameter: "cursor"
+                })
+            ));
+        }
+        let first_page = postgres
+            .list_endpoints_with_open_signal_summaries(
+                &endpoint_filters(EndpointSort::LastSeen, 1),
+                true,
+            )
+            .await
+            .expect("first page");
+        let wrong_sort = EndpointListFilters {
+            cursor: first_page.next_cursor.clone(),
+            ..endpoint_filters(EndpointSort::CallCount, 1)
+        };
+        for store in [sqlite, postgres] {
+            assert!(matches!(
+                store
+                    .list_endpoints_with_open_signal_summaries(&wrong_sort, true)
+                    .await,
+                Err(DiscoveryQueryError::InvalidCursor {
+                    parameter: "cursor"
+                })
+            ));
+        }
+    }
+
+    #[tokio::test]
+    async fn read_store_serves_signals_principals_and_reviews_like_the_sqlite_store() {
+        let Some(admin_dsn) = locator() else {
+            eprintln!("skipping: no test database locator; CI runs this test");
+            return;
+        };
+        let _guard = DATABASE.lock().await;
+        let database = create_test_database(&admin_dsn).await;
+        let sqlite_db = TempDb::new("read-parity-signals");
+        let (sqlite, postgres) = parity_fixture(&database, &sqlite_db).await;
+        let sqlite: &dyn DiscoveryReadStore = &sqlite;
+        let postgres: &dyn DiscoveryReadStore = &postgres;
+
+        // Signals, paged three at a time and under every filter.
+        let left = all_signal_pages(sqlite, signal_filters(3)).await;
+        let right = all_signal_pages(postgres, signal_filters(3)).await;
+        assert!(
+            left.len() >= 4,
+            "each of the four routed endpoints opened a signal (unrouted ones never do)"
+        );
+        assert_eq!(left.len(), right.len());
+        assert_eq!(signal_set(&left), signal_set(&right));
+        for filters in [
+            SignalListFilters {
+                signal_type: Some(signals::NEW_ENDPOINT_SEEN_SIGNAL_TYPE.to_owned()),
+                ..signal_filters(10)
+            },
+            SignalListFilters {
+                target_kind: Some(signals::PRINCIPAL_ENDPOINT_TARGET_KIND.to_owned()),
+                ..signal_filters(10)
+            },
+            SignalListFilters {
+                state: Some(SignalLifecycleState::Open),
+                ..signal_filters(10)
+            },
+            SignalListFilters {
+                state: Some(SignalLifecycleState::Dismissed),
+                ..signal_filters(10)
+            },
+            SignalListFilters {
+                target_key: Some(signals::endpoint_target_key("GET", "/orders")),
+                ..signal_filters(10)
+            },
+        ] {
+            let left = all_signal_pages(sqlite, filters.clone()).await;
+            let right = all_signal_pages(postgres, filters).await;
+            assert_eq!(signal_set(&left), signal_set(&right));
+        }
+
+        // Principals of the shared endpoint, one per page: identical pages
+        // and cursors (nothing here is backend-generated).
+        let mut principal_filters = PrincipalPageFilters {
+            limit: 1,
+            cursor: None,
+        };
+        let mut principals = Vec::new();
+        loop {
+            let left = sqlite
+                .list_principals("GET", "/orders", &principal_filters)
+                .await
+                .expect("SQLite principals");
+            let right = postgres
+                .list_principals("GET", "/orders", &principal_filters)
+                .await
+                .expect("PostgreSQL principals");
+            assert_eq!(comparable(&left, &[]), comparable(&right, &[]));
+            principals.extend(left.principals);
+            match left.next_cursor {
+                Some(cursor) => principal_filters.cursor = Some(cursor),
+                None => break,
+            }
+        }
+        assert_eq!(principals.len(), 2, "alice and bob");
+        let bob = principals
+            .iter()
+            .find(|principal| principal.user_id == "bob")
+            .expect("bob was seen");
+
+        // Bob's principal_new_to_endpoint history (he arrived on GET
+        // /orders after alice), by his identity as the aggregator
+        // canonicalized it: the issuer without its trailing slash.
+        let issuer = bob.issuer.clone().unwrap_or_default();
+        assert_eq!(issuer, "https://issuer.example");
+        let left = sqlite
+            .list_principal_endpoint_signals("bob", &issuer, &bob.auth_method, 10)
+            .await
+            .expect("SQLite history");
+        let right = postgres
+            .list_principal_endpoint_signals("bob", &issuer, &bob.auth_method, 10)
+            .await
+            .expect("PostgreSQL history");
+        assert!(!left.is_empty(), "bob is new to at least one endpoint");
+        assert_eq!(signal_set(&left), signal_set(&right));
+        for store in [sqlite, postgres] {
+            assert!(store
+                .list_principal_endpoint_signals("bob", &issuer, &bob.auth_method, 0)
+                .await
+                .expect("history")
+                .is_empty());
+            assert!(store
+                .list_principal_endpoint_signals(
+                    "bob",
+                    "https://elsewhere.example",
+                    &bob.auth_method,
+                    10
+                )
+                .await
+                .expect("history")
+                .is_empty());
+            assert!(
+                store
+                    .list_principal_endpoint_signals("alice", &issuer, &bob.auth_method, 10)
+                    .await
+                    .expect("history")
+                    .is_empty(),
+                "alice was first everywhere, so she is new nowhere"
+            );
+        }
+
+        // Reviews: set, observe through detail and the reviewed filter,
+        // clear, and the unknown endpoint. `reviewed_at` is each backend's
+        // own clock.
+        let left = sqlite
+            .set_endpoint_review("GET", "/orders", true, Some("reviewer"))
+            .await
+            .expect("SQLite review")
+            .expect("the endpoint exists");
+        let right = postgres
+            .set_endpoint_review("GET", "/orders", true, Some("reviewer"))
+            .await
+            .expect("PostgreSQL review")
+            .expect("the endpoint exists");
+        assert_eq!(
+            comparable(&left, &["reviewed_at"]),
+            comparable(&right, &["reviewed_at"])
+        );
+        assert!(left.reviewed && left.reviewed_at.is_some());
+        for store in [sqlite, postgres] {
+            let detail = store
+                .get_endpoint_with_open_signal_summaries("GET", "/orders", 24, true)
+                .await
+                .expect("detail")
+                .expect("exists");
+            assert!(detail.reviewed);
+            assert_eq!(detail.reviewed_by.as_deref(), Some("reviewer"));
+            let reviewed = store
+                .list_endpoints_with_open_signal_summaries(
+                    &EndpointListFilters {
+                        reviewed: Some(true),
+                        ..endpoint_filters(EndpointSort::LastSeen, 10)
+                    },
+                    true,
+                )
+                .await
+                .expect("reviewed list");
+            assert_eq!(reviewed.endpoints.len(), 1);
+            assert_eq!(reviewed.endpoints[0].endpoint_template, "/orders");
+            assert_eq!(reviewed.endpoints[0].method, "GET");
+            let cleared = store
+                .set_endpoint_review("GET", "/orders", false, Some("reviewer"))
+                .await
+                .expect("clear review")
+                .expect("exists");
+            assert!(!cleared.reviewed && cleared.reviewed_at.is_none());
+            assert!(store
+                .set_endpoint_review("GET", "/nope", true, Some("reviewer"))
+                .await
+                .expect("unknown review")
+                .is_none());
+        }
+
+        // Signal lifecycle: the same logical signal on each side, moved to
+        // acknowledged by the same actor.
+        let new_endpoint_signal = |store: &'static str, signals: &[signals::Signal]| {
+            signals
+                .iter()
+                .find(|signal| {
+                    signal.signal_type == signals::NEW_ENDPOINT_SEEN_SIGNAL_TYPE
+                        && signal.target.identity["endpoint_template"] == json!("/orders")
+                        && signal.target.identity["method"] == json!("GET")
+                })
+                .map(|signal| signal.id.clone())
+                .unwrap_or_else(|| panic!("{store} opened new_endpoint_seen for GET /orders"))
+        };
+        let left_id = new_endpoint_signal("SQLite", &left_signals(sqlite).await);
+        let right_id = new_endpoint_signal("PostgreSQL", &left_signals(postgres).await);
+        let left = sqlite
+            .transition_signal(
+                &left_id,
+                SignalLifecycleState::Acknowledged,
+                Some("reviewer"),
+            )
+            .await
+            .expect("SQLite transition")
+            .expect("the signal exists");
+        let right = postgres
+            .transition_signal(
+                &right_id,
+                SignalLifecycleState::Acknowledged,
+                Some("reviewer"),
+            )
+            .await
+            .expect("PostgreSQL transition")
+            .expect("the signal exists");
+        assert_eq!(
+            signal_set(std::slice::from_ref(&left)),
+            signal_set(std::slice::from_ref(&right))
+        );
+        assert_eq!(left.state, SignalLifecycleState::Acknowledged);
+        assert_eq!(left.transitioned_by.as_deref(), Some("reviewer"));
+        assert!(left.transitioned_at.is_some());
+        for store in [sqlite, postgres] {
+            let acknowledged = all_signal_pages(
+                store,
+                SignalListFilters {
+                    state: Some(SignalLifecycleState::Acknowledged),
+                    ..signal_filters(10)
+                },
+            )
+            .await;
+            assert_eq!(acknowledged.len(), 1);
+            assert!(store
+                .transition_signal("no-such-signal", SignalLifecycleState::Dismissed, None)
+                .await
+                .expect("unknown transition")
+                .is_none());
+        }
+
+        // Cursor validation on the signal and principal pages.
+        for store in [sqlite, postgres] {
+            assert!(matches!(
+                store
+                    .list_signals(&SignalListFilters {
+                        cursor: Some("zz".to_owned()),
+                        ..signal_filters(3)
+                    })
+                    .await,
+                Err(DiscoveryQueryError::InvalidCursor {
+                    parameter: "cursor"
+                })
+            ));
+            assert!(matches!(
+                store
+                    .list_principals(
+                        "GET",
+                        "/orders",
+                        &PrincipalPageFilters {
+                            limit: 1,
+                            cursor: Some("zz".to_owned()),
+                        }
+                    )
+                    .await,
+                Err(DiscoveryQueryError::InvalidCursor {
+                    parameter: "principal_cursor"
+                })
+            ));
+        }
+    }
+
+    async fn left_signals(store: &dyn DiscoveryReadStore) -> Vec<signals::Signal> {
+        all_signal_pages(store, signal_filters(50)).await
+    }
+
+    /// The bulk schema read the cluster conformance refresher uses answers
+    /// every requested endpoint in order, exactly as the single-endpoint
+    /// read would, in one query; an endpoint whose samples are corrupt is
+    /// answered with no schema instead of failing the whole set.
+    #[tokio::test]
+    async fn read_store_infers_schemas_in_bulk_and_skips_a_corrupt_endpoint() {
+        let Some(admin_dsn) = locator() else {
+            eprintln!("skipping: no test database locator; CI runs this test");
+            return;
+        };
+        let _guard = DATABASE.lock().await;
+        let database = create_test_database(&admin_dsn).await;
+        let pool = migrated_discovery_pool(&database).await;
+        let postgres = postgres_inventory(&pool, &parity_events()).await;
+        let postgres: &dyn DiscoveryReadStore = &postgres;
+
+        {
+            let client = pool.get().await.expect("client");
+            client
+                .execute(
+                    "INSERT INTO greengateway.discovery_payload_shape_samples
+                         (method, endpoint_template, sample_slot, observed_at, shape_hash,
+                          shape_json)
+                     VALUES ('PUT', '/corrupt', 0, '2024-06-01T12:00:00Z', 'h', $1)",
+                    &[&r#"{"json_body": 5}"#],
+                )
+                .await
+                .expect("a corrupt sample row inserts");
+        }
+
+        let requested = [
+            ("POST".to_owned(), "/orders".to_owned()),
+            ("PUT".to_owned(), "/corrupt".to_owned()),
+            ("GET".to_owned(), "/orders".to_owned()),
+            ("GET".to_owned(), "/never-observed".to_owned()),
+        ];
+        let schemas = postgres
+            .inferred_request_schemas(&requested)
+            .await
+            .expect("the bulk read answers");
+        assert_eq!(schemas.len(), requested.len());
+        let single = postgres
+            .inferred_request_schema("POST", "/orders")
+            .await
+            .expect("single read")
+            .expect("POST /orders has samples");
+        assert_eq!(schemas[0].as_ref(), Some(&single));
+        assert!(
+            schemas[1].is_none(),
+            "the corrupt endpoint is answered with no schema"
+        );
+        assert!(schemas[2].is_none(), "GET /orders captured nothing");
+        assert!(schemas[3].is_none(), "an unknown endpoint has no schema");
+        assert!(
+            postgres
+                .inferred_request_schema("PUT", "/corrupt")
+                .await
+                .is_err(),
+            "the single-endpoint read still reports the corruption"
+        );
+        assert!(postgres
+            .inferred_request_schemas(&[])
+            .await
+            .expect("an empty request answers")
+            .is_empty());
+    }
 }
 
 fn contract_policy(id: &str) -> Policy {

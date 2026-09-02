@@ -12,7 +12,7 @@ use crate::{
         sqlite_sink::{SqliteSink, SqliteSinkConfig},
         AuditEvent, AuditEventSender, AUDIT_EVENTS_DROPPED_TOTAL,
     },
-    config::Config,
+    config::{Config, StateBackend},
     discovery::aggregator::{EndpointAggregatorSink, EndpointAggregatorSinkConfig},
     discovery::signals::SignalDetectorConfig,
     metrics::LOCK_POISON_RECOVERIES_TOTAL,
@@ -404,14 +404,23 @@ fn build_sink_members(
 
 pub fn build_sink_from_config(config: &Config) -> Result<ConfiguredAuditSink, Box<dyn Error>> {
     let (broadcast_sender, _) = tokio::sync::broadcast::channel(AUDIT_BROADCAST_CAPACITY);
+    // Cluster mode has no SQLite aggregator sink: `DISCOVERY_SQLITE_PATH` is
+    // rejected there (config.rs), and captured payload shapes reach the
+    // fenced discovery projector through the durable audit stream instead
+    // of a local file, so the sink must not demand one (issue #241, PR 11).
+    let cluster_mode = config.state_backend == StateBackend::Postgres;
     let base_sink = build_sink(
         config.audit_log_file.as_deref(),
         config.audit_sqlite_path.as_deref(),
         config.audit_sqlite_retention_days,
         DiscoverySinkOptions {
-            sqlite_path: config.discovery_sqlite_path.as_deref(),
+            sqlite_path: if cluster_mode {
+                None
+            } else {
+                config.discovery_sqlite_path.as_deref()
+            },
             endpoint_limit: config.discovery_endpoint_limit,
-            payload_capture_enabled: config.payload_capture_enabled,
+            payload_capture_enabled: config.payload_capture_enabled && !cluster_mode,
         },
         Some(broadcast_sender.clone()),
         config.signal_detector_config(),

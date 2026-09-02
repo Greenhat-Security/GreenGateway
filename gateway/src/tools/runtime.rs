@@ -384,8 +384,9 @@ impl Drop for LeaseGuard {
 /// reports the lease gone cancels `lost` at once; a renewal the authority
 /// cannot answer is retried briefly, and `lost` is cancelled once half the
 /// TTL has passed since the last successful renewal -- always before the
-/// slot can be reclaimed at the TTL.
-async fn renew_until_lost(
+/// slot can be reclaimed at the TTL. Shared with the discovery projector,
+/// whose leader term is one long-held lease with the same rules.
+pub(crate) async fn renew_until_lost(
     store: Arc<dyn ExecutionLeaseStore>,
     lease: ExecutionLease,
     lost: CancellationToken,
