@@ -277,12 +277,29 @@ impl LocalSecretKeyring {
         })
     }
 
-    fn primary_id(&self) -> &str {
+    pub(crate) fn primary_id(&self) -> &str {
         &self.primary_id
     }
 
-    fn key(&self, id: &str) -> Option<&[u8; MASTER_KEY_BYTES]> {
+    pub(crate) fn key(&self, id: &str) -> Option<&[u8; MASTER_KEY_BYTES]> {
         self.keys.get(id).map(|material| material.expose())
+    }
+
+    /// A ring from in-memory material, for tests of the stores that seal
+    /// under it. Production rings come only from key files.
+    #[cfg(test)]
+    pub(crate) fn from_material_for_test(
+        primary_id: &str,
+        keys: Vec<(String, [u8; MASTER_KEY_BYTES])>,
+    ) -> Self {
+        Self {
+            primary_id: Arc::from(primary_id),
+            keys: Arc::new(
+                keys.into_iter()
+                    .map(|(id, material)| (id, Arc::new(KeyMaterial(Zeroizing::new(material)))))
+                    .collect(),
+            ),
+        }
     }
 }
 

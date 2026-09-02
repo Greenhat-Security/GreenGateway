@@ -234,6 +234,10 @@ fn cloudflare_forwarding_matches_supported_gateway_env_vars() {
         "DATABASE_STARTUP_RETRY_LIMIT",
         "DATABASE_AUTO_MIGRATE",
         "DATABASE_MIGRATION_STATEMENT_TIMEOUT_MS",
+        // Cluster-mode-only: the keyring that seals pending admin logins in
+        // PostgreSQL. It is rejected outright when STATE_BACKEND is sqlite,
+        // so with STATE_BACKEND excluded it can never be honoured here.
+        "ADMIN_LOGIN_KEYRING",
     ] {
         assert!(
             expected.remove(excluded),

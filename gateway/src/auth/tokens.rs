@@ -61,6 +61,17 @@ pub trait TokenStore: Send + Sync {
     fn touch_last_used(&self, id: &str) -> Result<Option<TokenRecord>, TokenStoreError>;
 }
 
+/// The bound on the serialized scope list, judged before the store is
+/// asked (the PostgreSQL column carries the same bound as a check
+/// constraint, so an oversized list is the client's error, not a store
+/// failure).
+pub const MAX_SERVICE_TOKEN_SCOPES_JSON_BYTES: usize = 65_536;
+
+/// The bound on a token's `created_by` (the creating principal's ID) in
+/// the PostgreSQL store, judged before the insert so an oversized principal
+/// is the caller's error rather than the column's check constraint.
+pub const MAX_SERVICE_TOKEN_CREATED_BY_BYTES: usize = 512;
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CreateTokenRequest {
     pub scopes: Vec<String>,
@@ -120,6 +131,10 @@ pub struct VerifiedToken {
     pub scopes: Vec<String>,
     pub expires_at: Option<String>,
     pub last_used_at: Option<String>,
+    /// How long the store's own clock says the token remains valid;
+    /// `None` for a token without an expiry. A cache must not serve the
+    /// token past it, whatever the caching replica's clock says.
+    pub remaining_lifetime: Option<std::time::Duration>,
 }
 
 #[derive(Debug)]
@@ -408,6 +423,7 @@ impl TokenStore for SqliteTokenStore {
             id: record.id,
             token_prefix: record.token_prefix,
             scopes: record.scopes,
+            remaining_lifetime: remaining_lifetime(record.expires_at.as_deref(), now)?,
             expires_at: record.expires_at,
             last_used_at: record.last_used_at,
         }))
@@ -507,10 +523,12 @@ impl Error for TokenStoreError {
     }
 }
 
+/// The keyset cursor both stores encode identically, so a page cursor
+/// minted by one backend is opaque to callers in exactly the same way.
 #[derive(Serialize, Deserialize)]
-struct TokenCursor {
-    created_at: String,
-    id: String,
+pub(crate) struct TokenCursor {
+    pub(crate) created_at: String,
+    pub(crate) id: String,
 }
 
 struct RawTokenRecord {
@@ -661,18 +679,18 @@ fn build_token_list_query(
     (sql, params)
 }
 
-fn generate_plaintext_token() -> Result<String, TokenStoreError> {
+pub(crate) fn generate_plaintext_token() -> Result<String, TokenStoreError> {
     let mut bytes = [0_u8; TOKEN_RANDOM_BYTES];
     getrandom::fill(&mut bytes).map_err(TokenStoreError::Random)?;
     Ok(format!("{TOKEN_MARKER}{}", hex::encode(bytes)))
 }
 
-fn hash_token(plaintext_token: &str) -> String {
+pub(crate) fn hash_token(plaintext_token: &str) -> String {
     let digest = Sha256::digest(plaintext_token.as_bytes());
     hex::encode(digest)
 }
 
-fn display_prefix(plaintext_token: &str) -> String {
+pub(crate) fn display_prefix(plaintext_token: &str) -> String {
     let suffix = plaintext_token
         .strip_prefix(TOKEN_MARKER)
         .unwrap_or(plaintext_token);
@@ -683,11 +701,11 @@ fn display_prefix(plaintext_token: &str) -> String {
     format!("{TOKEN_MARKER}{visible_suffix}")
 }
 
-fn new_token_id() -> String {
+pub(crate) fn new_token_id() -> String {
     format!("token_{}", uuid::Uuid::new_v4())
 }
 
-fn validate_optional_timestamp(
+pub(crate) fn validate_optional_timestamp(
     value: Option<&str>,
     context: &'static str,
 ) -> Result<(), TokenStoreError> {
@@ -696,6 +714,19 @@ fn validate_optional_timestamp(
     }
 
     Ok(())
+}
+
+/// Time left before `expires_at` by this store's clock (zero once past
+/// it); `None` without an expiry.
+fn remaining_lifetime(
+    expires_at: Option<&str>,
+    now: OffsetDateTime,
+) -> Result<Option<std::time::Duration>, TokenStoreError> {
+    let Some(expires_at) = expires_at else {
+        return Ok(None);
+    };
+    let expires_at = parse_rfc3339(expires_at, "expires_at")?;
+    Ok(Some((expires_at - now).try_into().unwrap_or_default()))
 }
 
 fn is_expired(expires_at: Option<&str>, now: OffsetDateTime) -> Result<bool, TokenStoreError> {
@@ -714,7 +745,7 @@ fn parse_rfc3339(value: &str, context: &'static str) -> Result<OffsetDateTime, T
     })
 }
 
-fn encode_cursor<T: Serialize>(cursor: &T) -> Result<String, TokenStoreError> {
+pub(crate) fn encode_cursor<T: Serialize>(cursor: &T) -> Result<String, TokenStoreError> {
     let json = serde_json::to_vec(cursor).map_err(|source| TokenStoreError::Json {
         context: "cursor",
         source,
@@ -722,7 +753,7 @@ fn encode_cursor<T: Serialize>(cursor: &T) -> Result<String, TokenStoreError> {
     Ok(hex::encode(json))
 }
 
-fn decode_cursor<T: DeserializeOwned>(
+pub(crate) fn decode_cursor<T: DeserializeOwned>(
     parameter: &'static str,
     value: &str,
 ) -> Result<T, TokenStoreError> {
@@ -730,7 +761,7 @@ fn decode_cursor<T: DeserializeOwned>(
     serde_json::from_slice(&bytes).map_err(|_| TokenStoreError::InvalidCursor { parameter })
 }
 
-fn query_limit(limit: usize) -> i64 {
+pub(crate) fn query_limit(limit: usize) -> i64 {
     i64::try_from(limit.saturating_add(1)).unwrap_or(i64::MAX)
 }
 

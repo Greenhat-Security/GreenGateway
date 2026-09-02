@@ -42,6 +42,7 @@ use async_trait::async_trait;
 use tokio::sync::Mutex;
 
 use crate::{
+    auth::ServiceTokenValidator,
     connections::{
         control_plane::ConnectionControlPlane, mcp::McpConnectionCatalogService,
         openapi::OpenApiConnectionCatalogService, pg_store::PostgresConnectionStore,
@@ -49,8 +50,8 @@ use crate::{
     lifecycle::GatewayLifecycle,
     middleware::rbac::{RbacState, SecurityRevisionCheckError, SecurityRevisionGate},
     storage::{
-        PolicyControlPlane as _, PostgresPolicyStore, PostgresToolStore, SecurityRevisionSource,
-        ToolControlPlane as _,
+        PolicyControlPlane as _, PostgresPolicyStore, PostgresServiceTokenStore, PostgresToolStore,
+        SecurityRevisionSource, ToolControlPlane as _,
     },
 };
 
@@ -895,6 +896,68 @@ impl ClusterSecurityRuntime {
                 },
             ));
         }
+    }
+}
+
+/// Service tokens as a reconciled resource (issue #241, PR 9).
+///
+/// There is no document to compile: verification is authoritative per
+/// request (the validator reads the shared revision and consults the
+/// store whenever it moved), so the per-request check is what carries
+/// correctness. This adapter keeps the gate's resource loop uniform --
+/// every revision the token store takes is claimed by a resource -- and
+/// gives the reconciler a hook to drop cached verifications eagerly
+/// rather than letting them age out.
+pub(crate) struct ServiceTokensResource {
+    store: Arc<PostgresServiceTokenStore>,
+    validator: Arc<ServiceTokenValidator>,
+    installed_revision: AtomicI64,
+}
+
+impl ServiceTokensResource {
+    pub(crate) fn new(
+        store: Arc<PostgresServiceTokenStore>,
+        validator: Arc<ServiceTokenValidator>,
+        boot_revision: i64,
+    ) -> Arc<Self> {
+        Arc::new(Self {
+            store,
+            validator,
+            installed_revision: AtomicI64::new(boot_revision),
+        })
+    }
+}
+
+#[async_trait]
+impl ReconciledResource for ServiceTokensResource {
+    fn name(&self) -> &'static str {
+        "service_tokens"
+    }
+
+    async fn activation_revision(&self) -> Result<i64, SecurityRevisionCheckError> {
+        self.store.state_revision().await.map_err(|error| {
+            tracing::error!(
+                error = %error,
+                "the service-token activation revision could not be read"
+            );
+            SecurityRevisionCheckError::Unavailable
+        })
+    }
+
+    async fn reconcile(&self, compiled_revision: i64) -> Result<(), SecurityRevisionCheckError> {
+        if self.installed_revision.load(Ordering::Acquire) > compiled_revision {
+            return Ok(());
+        }
+        let revision = self.store.state_revision().await.map_err(|error| {
+            tracing::error!(
+                error = %error,
+                "service-token reconciliation could not read the state revision"
+            );
+            SecurityRevisionCheckError::Unavailable
+        })?;
+        self.validator.invalidate_all();
+        self.installed_revision.store(revision, Ordering::Release);
+        Ok(())
     }
 }
 

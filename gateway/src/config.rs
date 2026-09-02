@@ -100,6 +100,10 @@ const DEFAULT_EXEMPT_PROBE_PATHS: &[&str] = &[
     "/metrics",
 ];
 const DEFAULT_JWT_JWKS_TIMEOUT_MS: u64 = 2000;
+/// Five minutes: the longest a cached signing key is trusted before it must
+/// be re-fetched (issue #241, PR 9). Matches what the validator hard-coded
+/// before it became an operator setting.
+pub const DEFAULT_JWT_JWKS_MAX_KEY_AGE_SECS: u64 = 300;
 const DEFAULT_ROLES_CLAIM: &str = "roles";
 pub const DEFAULT_COOKIE_SESSION_INTROSPECTION_TIMEOUT_MS: u64 = 2000;
 pub const DEFAULT_COOKIE_SESSION_CACHE_TTL_MS: u64 = DEFAULT_SERVICE_TOKEN_CACHE_TTL_MS;
@@ -215,6 +219,7 @@ const CONNECTION_GCP_PROVIDER: &str = "CONNECTION_GCP_PROVIDER";
 const CONNECTION_AWS_PROVIDER: &str = "CONNECTION_AWS_PROVIDER";
 const CONNECTION_KUBERNETES_PROVIDER: &str = "CONNECTION_KUBERNETES_PROVIDER";
 const CONNECTION_LOCAL_SECRET_KEYRING: &str = "CONNECTION_LOCAL_SECRET_KEYRING";
+const ADMIN_LOGIN_KEYRING: &str = "ADMIN_LOGIN_KEYRING";
 const CONNECTION_SECRET_ALIASES: &str = "CONNECTION_SECRET_ALIASES";
 const CONNECTION_VAULT_PROVIDER: &str = "CONNECTION_VAULT_PROVIDER";
 const CONNECTION_SECRETS_ROOT: &str = "CONNECTION_SECRETS_ROOT";
@@ -247,6 +252,7 @@ const GATEWAY_PUBLIC_URL: &str = "GATEWAY_PUBLIC_URL";
 const JWT_AUDIENCE: &str = "JWT_AUDIENCE";
 const JWT_ISSUER: &str = "JWT_ISSUER";
 const JWT_JWKS_TIMEOUT_MS: &str = "JWT_JWKS_TIMEOUT_MS";
+const JWT_JWKS_MAX_KEY_AGE_SECS: &str = "JWT_JWKS_MAX_KEY_AGE_SECS";
 const JWT_JWKS_URL: &str = "JWT_JWKS_URL";
 const JWT_REQUIRE_JTI: &str = "JWT_REQUIRE_JTI";
 const MAX_BODY_SIZE: &str = "MAX_BODY_SIZE";
@@ -350,6 +356,11 @@ pub struct Config {
     pub admin_login_pending_ttl_secs: u64,
     pub admin_login_pending_max_entries: usize,
     pub admin_login_pending_max_per_ip: usize,
+    /// Cluster mode's keyring for sealing pending admin logins (issue #241,
+    /// PR 9): the same key-file shape as the connections keyring, with files
+    /// beneath `CONNECTION_SECRETS_ROOT`. Required in postgres mode when an
+    /// admin login provider is set; rejected in standalone mode.
+    pub admin_login_keyring: Vec<LocalSecretKeyConfig>,
     pub gateway_public_url: Option<String>,
     pub audit_log_file: Option<String>,
     pub audit_sqlite_path: Option<String>,
@@ -410,6 +421,7 @@ pub struct Config {
     pub jwt_issuer: Option<String>,
     pub jwt_audience: Option<String>,
     pub jwt_jwks_timeout_ms: u64,
+    pub jwt_jwks_max_key_age_secs: u64,
     pub jwt_require_jti: bool,
     pub roles_claim: String,
     pub service_token_sqlite_path: Option<String>,
@@ -1239,6 +1251,7 @@ pub struct AuthProviderConfig {
     pub issuer: Option<String>,
     pub audience: Option<String>,
     pub jwks_timeout_ms: u64,
+    pub jwks_max_key_age_secs: u64,
     pub require_jti: bool,
     pub roles_claim: String,
     pub roles_claim_delimiter: Option<String>,
@@ -1301,6 +1314,8 @@ struct RawAuthProviderConfig {
     audience: Option<String>,
     #[serde(default)]
     jwks_timeout_ms: Option<u64>,
+    #[serde(default)]
+    jwks_max_key_age_secs: Option<u64>,
     #[serde(default)]
     require_jti: bool,
     #[serde(default)]
@@ -1785,6 +1800,20 @@ impl Config {
         ) {
             problems.push(format!("{CONNECTION_LOCAL_SECRET_KEYRING}: {error}"));
         }
+        let admin_login_keyring = parse_local_secret_keyring(
+            ADMIN_LOGIN_KEYRING,
+            get_var(ADMIN_LOGIN_KEYRING),
+            &mut problems,
+        );
+        // The login keyring seals rows in PostgreSQL, so it needs the
+        // secrets root for its key files but no local store.
+        if let Err(error) = validate_local_secret_keyring_config(
+            &admin_login_keyring,
+            connection_secrets_root.is_some(),
+            true,
+        ) {
+            problems.push(format!("{ADMIN_LOGIN_KEYRING}: {error}"));
+        }
         let connection_vault_provider = parse_vault_provider_config(
             CONNECTION_VAULT_PROVIDER,
             get_var(CONNECTION_VAULT_PROVIDER),
@@ -2104,6 +2133,17 @@ impl Config {
             "millisecond duration",
             &mut problems,
         );
+        let jwt_jwks_max_key_age_secs = validate_jwks_max_key_age(
+            JWT_JWKS_MAX_KEY_AGE_SECS,
+            parse_var(
+                JWT_JWKS_MAX_KEY_AGE_SECS,
+                get_var(JWT_JWKS_MAX_KEY_AGE_SECS),
+                DEFAULT_JWT_JWKS_MAX_KEY_AGE_SECS,
+                "second duration",
+                &mut problems,
+            ),
+            &mut problems,
+        );
         let jwt_require_jti = parse_var(
             JWT_REQUIRE_JTI,
             get_var(JWT_REQUIRE_JTI),
@@ -2190,6 +2230,7 @@ impl Config {
                         jwt_issuer.as_deref(),
                         jwt_audience.as_deref(),
                         jwt_jwks_timeout_ms,
+                        jwt_jwks_max_key_age_secs,
                         jwt_require_jti,
                         &roles_claim,
                     )
@@ -2545,6 +2586,22 @@ impl Config {
         // The same rule the client-certificate settings apply to a CA bundle
         // configured against an off mode, and a deployment ID names a cluster
         // namespace that does not exist in standalone mode.
+        match state_backend {
+            StateBackend::Postgres => {
+                if admin_login_provider.is_some() && admin_login_keyring.is_empty() {
+                    problems.push(format!(
+                        "{ADMIN_LOGIN_KEYRING} is required when {STATE_BACKEND}=postgres and {ADMIN_LOGIN_PROVIDER} is set; pending admin logins are sealed in the database under it"
+                    ));
+                }
+            }
+            StateBackend::Sqlite => {
+                if !admin_login_keyring.is_empty() {
+                    problems.push(format!(
+                        "{ADMIN_LOGIN_KEYRING} is set while {STATE_BACKEND} is sqlite; standalone mode keeps pending admin logins in memory and never reads it"
+                    ));
+                }
+            }
+        }
         if state_backend == StateBackend::Sqlite {
             if database_url_file.is_some() {
                 problems.push(format!(
@@ -2589,6 +2646,7 @@ impl Config {
                 admin_login_pending_ttl_secs,
                 admin_login_pending_max_entries,
                 admin_login_pending_max_per_ip,
+                admin_login_keyring,
                 gateway_public_url,
                 audit_log_file,
                 audit_sqlite_path,
@@ -2640,6 +2698,7 @@ impl Config {
                 jwt_issuer,
                 jwt_audience,
                 jwt_jwks_timeout_ms,
+                jwt_jwks_max_key_age_secs,
                 jwt_require_jti,
                 roles_claim,
                 service_token_sqlite_path,
@@ -2998,6 +3057,55 @@ fn validate_payload_capture_sample_rate(
     }
 }
 
+/// The JWKS maximum key age must be positive and at most a day: zero would
+/// distrust every fetch instantly, and more than a day would honour a
+/// withdrawn signing key for longer than any rotation window.
+fn validate_jwks_max_key_age(name: &str, value: u64, problems: &mut Vec<String>) -> u64 {
+    if (crate::auth::jwt::MIN_JWKS_KEY_AGE_SECS_LIMIT
+        ..=crate::auth::jwt::MAX_JWKS_KEY_AGE_SECS_LIMIT)
+        .contains(&value)
+    {
+        value
+    } else {
+        problems.push(format!(
+            "{name} must be between {} and {} seconds, got '{value}'",
+            crate::auth::jwt::MIN_JWKS_KEY_AGE_SECS_LIMIT,
+            crate::auth::jwt::MAX_JWKS_KEY_AGE_SECS_LIMIT
+        ));
+        DEFAULT_JWT_JWKS_MAX_KEY_AGE_SECS
+    }
+}
+
+#[cfg(test)]
+mod jwks_key_age_bound_tests {
+    use super::{validate_jwks_max_key_age, DEFAULT_JWT_JWKS_MAX_KEY_AGE_SECS};
+
+    /// A key age below the demand-refresh throttle is rejected: a set that
+    /// went stale sooner could not refresh on demand, and every request
+    /// would fail closed against a reachable issuer until the throttle
+    /// window passed.
+    #[test]
+    fn a_key_age_below_the_demand_floor_is_rejected() {
+        let mut problems = Vec::new();
+        let value = validate_jwks_max_key_age("JWT_JWKS_MAX_KEY_AGE_SECS", 5, &mut problems);
+        assert_eq!(value, DEFAULT_JWT_JWKS_MAX_KEY_AGE_SECS);
+        assert_eq!(problems.len(), 1, "{problems:?}");
+        assert!(
+            problems[0].contains("between 10 and 86400"),
+            "the problem names the floor: {}",
+            problems[0]
+        );
+
+        let mut problems = Vec::new();
+        assert_eq!(
+            validate_jwks_max_key_age("JWT_JWKS_MAX_KEY_AGE_SECS", 10, &mut problems),
+            10,
+            "the floor itself is accepted"
+        );
+        assert!(problems.is_empty(), "{problems:?}");
+    }
+}
+
 fn validate_positive_u64(name: &str, value: u64, default: u64, problems: &mut Vec<String>) -> u64 {
     if value > 0 {
         value
@@ -3341,6 +3449,7 @@ fn validate_auth_providers(
         let mut issuer = None;
         let mut audience = None;
         let mut jwks_timeout_ms = DEFAULT_JWT_JWKS_TIMEOUT_MS;
+        let mut jwks_max_key_age_secs = DEFAULT_JWT_JWKS_MAX_KEY_AGE_SECS;
         let mut require_jti = false;
         let mut introspection_url = None;
         let mut introspection_timeout_ms = DEFAULT_COOKIE_SESSION_INTROSPECTION_TIMEOUT_MS;
@@ -3378,6 +3487,13 @@ fn validate_auth_providers(
                 jwks_timeout_ms = provider
                     .jwks_timeout_ms
                     .unwrap_or(DEFAULT_JWT_JWKS_TIMEOUT_MS);
+                jwks_max_key_age_secs = validate_jwks_max_key_age(
+                    &format!("{provider_name}.jwks_max_key_age_secs"),
+                    provider
+                        .jwks_max_key_age_secs
+                        .unwrap_or(DEFAULT_JWT_JWKS_MAX_KEY_AGE_SECS),
+                    problems,
+                );
                 require_jti = provider.require_jti;
                 if jwks_url.is_none() && issuer.is_none() {
                     problems.push(format!(
@@ -3418,6 +3534,7 @@ fn validate_auth_providers(
             issuer,
             audience,
             jwks_timeout_ms,
+            jwks_max_key_age_secs,
             require_jti,
             roles_claim,
             roles_claim_delimiter,
@@ -3569,6 +3686,7 @@ fn legacy_auth_providers(
     jwt_issuer: Option<&str>,
     jwt_audience: Option<&str>,
     jwt_jwks_timeout_ms: u64,
+    jwt_jwks_max_key_age_secs: u64,
     jwt_require_jti: bool,
     roles_claim: &str,
 ) -> Vec<AuthProviderConfig> {
@@ -3583,6 +3701,7 @@ fn legacy_auth_providers(
         issuer: jwt_issuer.map(str::to_owned),
         audience: jwt_audience.map(str::to_owned),
         jwks_timeout_ms: jwt_jwks_timeout_ms,
+        jwks_max_key_age_secs: jwt_jwks_max_key_age_secs,
         require_jti: jwt_require_jti,
         roles_claim: roles_claim.to_owned(),
         roles_claim_delimiter: None,
@@ -6732,6 +6851,31 @@ mod tests {
     }
 
     #[test]
+    fn jwks_max_key_age_is_bounded_and_defaults_to_five_minutes() {
+        let defaulted = Config::from_env_vars(|_| Err(VarError::NotPresent)).expect("defaults");
+        assert_eq!(defaulted.jwt_jwks_max_key_age_secs, 300);
+
+        for rejected in ["0", "86401", "-5", "soon"] {
+            let error = Config::from_env_vars(|name| match name {
+                "JWT_JWKS_MAX_KEY_AGE_SECS" => Ok(rejected.to_owned()),
+                _ => Err(VarError::NotPresent),
+            })
+            .expect_err("out-of-range or unparseable key age must fail startup");
+            assert!(
+                error.to_string().contains("JWT_JWKS_MAX_KEY_AGE_SECS"),
+                "the problem names the setting: {error}"
+            );
+        }
+
+        let providers = Config::from_env_vars(|name| match name {
+            "AUTH_PROVIDERS" => Ok(r#"[{"name":"idp","type":"jwt","jwks_url":"https://idp.example/jwks","jwks_max_key_age_secs":42}]"#.to_owned()),
+            _ => Err(VarError::NotPresent),
+        })
+        .expect("provider config should parse");
+        assert_eq!(providers.auth_providers[0].jwks_max_key_age_secs, 42);
+    }
+
+    #[test]
     fn connections_sqlite_path_is_explicit_and_optional() {
         let configured = Config::from_env_vars(|name| match name {
             "CONNECTIONS_SQLITE_PATH" => {
@@ -7708,6 +7852,7 @@ mod tests {
                     issuer: Some("https://primary.example.test".to_owned()),
                     audience: Some("greengateway".to_owned()),
                     jwks_timeout_ms: 7000,
+                    jwks_max_key_age_secs: 300,
                     require_jti: true,
                     roles_claim: "groups".to_owned(),
                     roles_claim_delimiter: Some(" ".to_owned()),
@@ -7730,6 +7875,7 @@ mod tests {
                     issuer: Some("https://secondary.example.test".to_owned()),
                     audience: None,
                     jwks_timeout_ms: DEFAULT_JWT_JWKS_TIMEOUT_MS,
+                    jwks_max_key_age_secs: 300,
                     require_jti: false,
                     roles_claim: DEFAULT_ROLES_CLAIM.to_owned(),
                     roles_claim_delimiter: None,
@@ -8069,6 +8215,7 @@ mod tests {
                 issuer: None,
                 audience: None,
                 jwks_timeout_ms: DEFAULT_JWT_JWKS_TIMEOUT_MS,
+                jwks_max_key_age_secs: 300,
                 require_jti: false,
                 roles_claim: DEFAULT_ROLES_CLAIM.to_owned(),
                 roles_claim_delimiter: None,
@@ -8114,6 +8261,7 @@ mod tests {
                 issuer: None,
                 audience: None,
                 jwks_timeout_ms: DEFAULT_JWT_JWKS_TIMEOUT_MS,
+                jwks_max_key_age_secs: 300,
                 require_jti: false,
                 roles_claim: "account.scope".to_owned(),
                 roles_claim_delimiter: Some(" ".to_owned()),
@@ -8333,6 +8481,7 @@ mod tests {
             issuer: canonical_issuer(issuer),
             audience: audience.map(str::to_owned),
             jwks_timeout_ms: DEFAULT_JWT_JWKS_TIMEOUT_MS,
+            jwks_max_key_age_secs: 300,
             require_jti: false,
             roles_claim: roles_claim.to_owned(),
             roles_claim_delimiter: roles_claim_delimiter.map(str::to_owned),
@@ -8371,6 +8520,7 @@ mod tests {
                 issuer: Some("https://issuer.example.test".to_owned()),
                 audience: Some("greengateway".to_owned()),
                 jwks_timeout_ms: DEFAULT_JWT_JWKS_TIMEOUT_MS,
+                jwks_max_key_age_secs: 300,
                 require_jti: false,
                 roles_claim: DEFAULT_ROLES_CLAIM.to_owned(),
                 roles_claim_delimiter: None,
@@ -8550,6 +8700,7 @@ mod tests {
                 issuer: Some("https://legacy.example.test/".to_owned()),
                 audience: Some("greengateway".to_owned()),
                 jwks_timeout_ms: 6000,
+                jwks_max_key_age_secs: 300,
                 require_jti: true,
                 roles_claim: "groups".to_owned(),
                 roles_claim_delimiter: None,
@@ -8601,6 +8752,7 @@ mod tests {
                 issuer: Some("https://declared.example.test".to_owned()),
                 audience: Some("declared-audience".to_owned()),
                 jwks_timeout_ms: 8000,
+                jwks_max_key_age_secs: 300,
                 require_jti: false,
                 roles_claim: "declared_roles".to_owned(),
                 roles_claim_delimiter: None,

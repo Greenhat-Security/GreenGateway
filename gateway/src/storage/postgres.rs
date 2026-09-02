@@ -145,6 +145,9 @@ pub(crate) enum PostgresFoundationError {
     /// from the validation failures so the operator reads "the migration
     /// job failed", not "the schema could not be validated".
     SchemaMigrationFailed,
+    /// The database is bound to another deployment (migration 0007's
+    /// `deployment_binding`); deployments never share a database.
+    DeploymentMismatch { bound: String },
     /// Cluster mode was selected but the configuration this build validated
     /// did not carry the settings the mode requires. Unreachable through
     /// `Config::from_env`; a defensive fail-closed arm.
@@ -210,6 +213,12 @@ impl fmt::Display for PostgresFoundationError {
                 "development auto-migration (DATABASE_AUTO_MIGRATE) attempted and failed; the \
                  database is left at its previous schema version -- run `gateway migrate up` \
                  from a migration job and address its diagnostics before restarting"
+            ),
+            Self::DeploymentMismatch { bound } => write!(
+                formatter,
+                "this database is bound to deployment '{bound}'; STATE_BACKEND=postgres \
+                 deployments never share a database -- point DEPLOYMENT_ID at that deployment \
+                 or this replica at its own database"
             ),
             Self::NotConfigured => write!(
                 formatter,
@@ -293,6 +302,22 @@ impl PostgresFoundation {
             // be consulted is a fail-closed condition, never a serve-anyway.
             Err(_) => return Err(PostgresFoundationError::SchemaCheckFailed),
         }
+        // Bound to one deployment: the first boot records this
+        // DEPLOYMENT_ID and every later boot refuses another. The binding
+        // table arrives with migration 0007, which the schema check above
+        // has just required, so it is always present here.
+        let deployment_id = config
+            .deployment_id
+            .as_deref()
+            .ok_or(PostgresFoundationError::NotConfigured)?;
+        bind_deployment(foundation.pool(), deployment_id)
+            .await
+            .map_err(|error| match error {
+                DeploymentBindingError::Mismatch { bound } => {
+                    PostgresFoundationError::DeploymentMismatch { bound }
+                }
+                DeploymentBindingError::Store(_) => PostgresFoundationError::SchemaCheckFailed,
+            })?;
         Ok(Some(foundation))
     }
 
@@ -767,6 +792,116 @@ where
         pool_max: settings.pool_max,
         tls_mode: settings.tls_mode,
     })
+}
+
+/// Why a database refused to be used by this deployment.
+#[derive(Debug)]
+pub enum DeploymentBindingError {
+    /// The database is bound to another deployment. Deployments never
+    /// share a database: every authoritative pointer and counter in the
+    /// schema is a singleton.
+    Mismatch {
+        bound: String,
+    },
+    Store(RepositoryError),
+}
+
+impl fmt::Display for DeploymentBindingError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Mismatch { bound } => write!(
+                formatter,
+                "this database is bound to deployment '{bound}'; STATE_BACKEND=postgres \
+                 deployments never share a database"
+            ),
+            Self::Store(error) => write!(formatter, "deployment binding failed: {error}"),
+        }
+    }
+}
+
+impl std::error::Error for DeploymentBindingError {}
+
+/// The deployment the database is bound to, if any: a read, never a
+/// binding, so a validation-only path (`migrate check`) can run under a
+/// read-only role and never claims an unbound database.
+pub async fn read_deployment_binding(
+    pool: &Pool,
+) -> Result<Option<String>, DeploymentBindingError> {
+    const OPERATION: &str = "deployment_binding_read";
+    let client = pool
+        .get()
+        .await
+        .map_err(classify_pool_error)
+        .map_err(DeploymentBindingError::Store)?;
+    let row = client
+        .query_opt(
+            "SELECT deployment_id FROM greengateway.deployment_binding WHERE singleton",
+            &[],
+        )
+        .await
+        .map_err(|error| {
+            let kind = classify_postgres_error(&error);
+            DeploymentBindingError::Store(RepositoryError::new(kind, OPERATION))
+        })?;
+    row.map(|row| {
+        row.try_get::<_, String>(0).map_err(|_| {
+            DeploymentBindingError::Store(RepositoryError::new(
+                RepositoryErrorKind::InvalidData,
+                OPERATION,
+            ))
+        })
+    })
+    .transpose()
+}
+
+/// Bind the database to `deployment_id` on first use and refuse any other
+/// deployment afterwards (migration 0007's `deployment_binding`). Two
+/// first boots racing with different IDs produce exactly one binding; the
+/// other sees the mismatch.
+pub async fn bind_deployment(
+    pool: &Pool,
+    deployment_id: &str,
+) -> Result<(), DeploymentBindingError> {
+    const OPERATION: &str = "deployment_binding";
+    let client = pool
+        .get()
+        .await
+        .map_err(classify_pool_error)
+        .map_err(DeploymentBindingError::Store)?;
+    client
+        .execute(
+            r#"
+            INSERT INTO greengateway.deployment_binding (singleton, deployment_id)
+            VALUES (true, $1)
+            ON CONFLICT (singleton) DO NOTHING
+            "#,
+            &[&deployment_id],
+        )
+        .await
+        .map_err(|error| {
+            let kind = classify_postgres_error(&error);
+            DeploymentBindingError::Store(RepositoryError::new(kind, OPERATION))
+        })?;
+    let row = client
+        .query_one(
+            "SELECT deployment_id FROM greengateway.deployment_binding WHERE singleton",
+            &[],
+        )
+        .await
+        .map_err(|error| {
+            let kind = classify_postgres_error(&error);
+            DeploymentBindingError::Store(RepositoryError::new(kind, OPERATION))
+        })?;
+    let bound: String = row.try_get(0).map_err(|_| {
+        DeploymentBindingError::Store(RepositoryError::new(
+            RepositoryErrorKind::InvalidData,
+            OPERATION,
+        ))
+    })?;
+    if bound != deployment_id {
+        return Err(DeploymentBindingError::Mismatch { bound });
+    }
+    Ok(())
 }
 
 /// Prove the database answers before startup completes, with the documented

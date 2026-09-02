@@ -213,6 +213,20 @@ fn insert_public_and_cookie_settings(input: &mut BTreeMap<String, String>, confi
         "admin_login_provider".into(),
         config.admin_login_provider.clone().unwrap_or_default(),
     );
+    // Cluster mode's pending-login store is shared, so its limits must be
+    // one set across replicas.
+    input.insert(
+        "admin_login_pending_ttl_secs".into(),
+        config.admin_login_pending_ttl_secs.to_string(),
+    );
+    input.insert(
+        "admin_login_pending_max_entries".into(),
+        config.admin_login_pending_max_entries.to_string(),
+    );
+    input.insert(
+        "admin_login_pending_max_per_ip".into(),
+        config.admin_login_pending_max_per_ip.to_string(),
+    );
     input.insert("auth_cookie_name".into(), config.auth_cookie_name.clone());
     input.insert("csrf_enabled".into(), config.csrf_enabled.to_string());
     input.insert("csrf_cookie_name".into(), config.csrf_cookie_name.clone());
@@ -260,6 +274,10 @@ fn insert_auth_settings(input: &mut BTreeMap<String, String>, config: &Config) {
         "jwt_jwks_timeout_ms".into(),
         config.jwt_jwks_timeout_ms.to_string(),
     );
+    input.insert(
+        "jwt_jwks_max_key_age_secs".into(),
+        config.jwt_jwks_max_key_age_secs.to_string(),
+    );
     input.insert("jwt_require_jti".into(), config.jwt_require_jti.to_string());
     input.insert(
         "service_token_cache_ttl_ms".into(),
@@ -291,6 +309,10 @@ fn insert_auth_settings(input: &mut BTreeMap<String, String>, config: &Config) {
         input.insert(
             format!("{prefix}.jwks_timeout_ms"),
             provider.jwks_timeout_ms.to_string(),
+        );
+        input.insert(
+            format!("{prefix}.jwks_max_key_age_secs"),
+            provider.jwks_max_key_age_secs.to_string(),
         );
         input.insert(
             format!("{prefix}.require_jti"),
@@ -566,6 +588,13 @@ fn insert_egress_restrictions(input: &mut BTreeMap<String, String>, config: &Con
 /// secret-provider entries, never their material or locators. A replica that
 /// would encrypt or resolve with a different generation set must not match.
 fn insert_secret_generation_ids(input: &mut BTreeMap<String, String>, config: &Config) {
+    for (index, key) in config.admin_login_keyring.iter().enumerate() {
+        input.insert(format!("admin_login_keyring[{index}].id"), key.id.clone());
+        input.insert(
+            format!("admin_login_keyring[{index}].role"),
+            format!("{:?}", key.role),
+        );
+    }
     for (index, key) in config.connection_local_secret_keyring.iter().enumerate() {
         input.insert(format!("local_secret_keyring[{index}].id"), key.id.clone());
         // Debug of a fieldless enum is its variant name: stable, non-secret,
