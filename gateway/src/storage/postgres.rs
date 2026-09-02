@@ -145,6 +145,9 @@ pub(crate) enum PostgresFoundationError {
     /// from the validation failures so the operator reads "the migration
     /// job failed", not "the schema could not be validated".
     SchemaMigrationFailed,
+    /// The database is bound to another deployment (migration 0007's
+    /// `deployment_binding`); deployments never share a database.
+    DeploymentMismatch { bound: String },
     /// Cluster mode was selected but the configuration this build validated
     /// did not carry the settings the mode requires. Unreachable through
     /// `Config::from_env`; a defensive fail-closed arm.
@@ -210,6 +213,12 @@ impl fmt::Display for PostgresFoundationError {
                 "development auto-migration (DATABASE_AUTO_MIGRATE) attempted and failed; the \
                  database is left at its previous schema version -- run `gateway migrate up` \
                  from a migration job and address its diagnostics before restarting"
+            ),
+            Self::DeploymentMismatch { bound } => write!(
+                formatter,
+                "this database is bound to deployment '{bound}'; STATE_BACKEND=postgres \
+                 deployments never share a database -- point DEPLOYMENT_ID at that deployment \
+                 or this replica at its own database"
             ),
             Self::NotConfigured => write!(
                 formatter,
@@ -293,6 +302,22 @@ impl PostgresFoundation {
             // be consulted is a fail-closed condition, never a serve-anyway.
             Err(_) => return Err(PostgresFoundationError::SchemaCheckFailed),
         }
+        // Bound to one deployment: the first boot records this
+        // DEPLOYMENT_ID and every later boot refuses another. The binding
+        // table arrives with migration 0007, which the schema check above
+        // has just required, so it is always present here.
+        let deployment_id = config
+            .deployment_id
+            .as_deref()
+            .ok_or(PostgresFoundationError::NotConfigured)?;
+        bind_deployment(foundation.pool(), deployment_id)
+            .await
+            .map_err(|error| match error {
+                DeploymentBindingError::Mismatch { bound } => {
+                    PostgresFoundationError::DeploymentMismatch { bound }
+                }
+                DeploymentBindingError::Store(_) => PostgresFoundationError::SchemaCheckFailed,
+            })?;
         Ok(Some(foundation))
     }
 

@@ -1736,7 +1736,6 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             .deployment_id
             .clone()
             .ok_or("STATE_BACKEND=postgres requires DEPLOYMENT_ID")?;
-        storage::postgres::bind_deployment(foundation.pool(), &deployment_id).await?;
         let boundary = auth::JwtValidator::issuer_boundary(&issuer)?;
         let store = storage::PostgresJwtRevocationStore::new(
             foundation.pool().clone(),
@@ -1793,7 +1792,6 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             .deployment_id
             .clone()
             .ok_or("STATE_BACKEND=postgres requires DEPLOYMENT_ID")?;
-        storage::postgres::bind_deployment(foundation.pool(), &deployment_id).await?;
         // Cleanup is issuer-agnostic; the store's issuer is irrelevant here.
         let store = storage::PostgresJwtRevocationStore::new(
             foundation.pool().clone(),
@@ -1897,18 +1895,9 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     #[cfg(feature = "postgres")]
     let _database_foundation =
         storage::postgres::PostgresFoundation::start_if_selected(&config).await?;
-    // The database is bound to one deployment: the first boot records this
-    // DEPLOYMENT_ID and every later boot refuses another. Deployments never
-    // share a database -- every authoritative pointer and counter in the
-    // schema is a singleton.
-    #[cfg(feature = "postgres")]
-    if let Some(foundation) = &_database_foundation {
-        let deployment_id = config
-            .deployment_id
-            .as_deref()
-            .ok_or("STATE_BACKEND=postgres requires DEPLOYMENT_ID")?;
-        storage::postgres::bind_deployment(foundation.pool(), deployment_id).await?;
-    }
+    // The foundation bound the database to this DEPLOYMENT_ID (or refused
+    // one bound elsewhere) as part of establishing itself: deployments
+    // never share a database.
     // The policy control plane rides the same pool. `active()` validates
     // the document (parse) and verifies its recorded ETag; the proxy-route
     // cross-check needs the config and runs in the app builder. Serving
@@ -41830,6 +41819,45 @@ O2gecI9QwDJNpm29J9wJB2F8
                 let count: i64 = row.get(0);
                 assert_eq!(count, expected, "{table}");
             }
+        }
+
+        /// The foundation binds a database to the first deployment that boots
+        /// against it and refuses any other at startup.
+        #[tokio::test]
+        async fn a_database_bound_to_another_deployment_is_refused_at_startup() {
+            let Some(admin_dsn) = locator() else {
+                eprintln!("skipping: no test database locator; CI runs this test");
+                return;
+            };
+            let database = create_test_database(&admin_dsn).await;
+            let dsn_file = write_dsn_file(&database.dsn);
+            let mut config = test_config(Vec::new());
+            config.state_backend = config::StateBackend::Postgres;
+            config.deployment_id = Some("deploy-first".to_owned());
+            config.database.url_file = Some(dsn_file.path.clone());
+            config.database.tls_mode = config::DatabaseTlsMode::LoopbackDev;
+            config.database.auto_migrate = true;
+            PostgresFoundation::start_if_selected(&config)
+                .await
+                .expect("the first deployment boots and binds")
+                .expect("postgres mode is selected");
+            PostgresFoundation::start_if_selected(&config)
+                .await
+                .expect("the same deployment boots again");
+
+            config.deployment_id = Some("deploy-second".to_owned());
+            let refused = PostgresFoundation::start_if_selected(&config)
+                .await
+                .err()
+                .unwrap_or_else(|| panic!("another deployment must be refused"));
+            assert!(
+                matches!(
+                    &refused,
+                    storage::postgres::PostgresFoundationError::DeploymentMismatch { bound }
+                        if bound == "deploy-first"
+                ),
+                "{refused}"
+            );
         }
 
         async fn commit_policy(store: &PostgresPolicyStore, id: &str) -> storage::ActivePolicy {

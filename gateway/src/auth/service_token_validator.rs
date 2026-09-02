@@ -5,7 +5,6 @@ use std::{
 };
 
 use sha2::{Digest, Sha256};
-use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 
 use super::{
     protected_resource,
@@ -180,7 +179,6 @@ enum CachedVerification {
 struct CachedValidToken {
     id: String,
     scopes: Vec<String>,
-    expires_at: Option<String>,
 }
 
 struct CacheEntry<T> {
@@ -272,7 +270,6 @@ impl CachedVerification {
             TokenVerification::Valid(verified) => Self::Valid(CachedValidToken {
                 id: verified.id,
                 scopes: verified.scopes,
-                expires_at: verified.expires_at,
             }),
             TokenVerification::Invalid(failure) => Self::Invalid(failure),
         }
@@ -280,23 +277,19 @@ impl CachedVerification {
 
     fn into_principal(self) -> Result<Principal, AuthError> {
         match self {
-            Self::Valid(valid) => {
-                if cached_token_expired(valid.expires_at.as_deref()) {
-                    return Err(AuthError::InvalidSession(
-                        "service token is expired".to_owned(),
-                    ));
-                }
-
-                Ok(Principal {
-                    user_id: format!("service-token:{}", valid.id),
-                    issuer: None,
-                    email: None,
-                    org_id: None,
-                    roles: valid.scopes,
-                    session_id: valid.id,
-                    auth_method: AuthMethod::ServiceToken,
-                })
-            }
+            // Validity is the store's verdict, judged on its own clock:
+            // this replica's wall clock never rejects a token the authority
+            // accepted, and the entry's lifetime cap (measured at the
+            // store) is what expires it here.
+            Self::Valid(valid) => Ok(Principal {
+                user_id: format!("service-token:{}", valid.id),
+                issuer: None,
+                email: None,
+                org_id: None,
+                roles: valid.scopes,
+                session_id: valid.id,
+                auth_method: AuthMethod::ServiceToken,
+            }),
             Self::Invalid(failure) => Err(AuthError::InvalidSession(format!(
                 "service token is {}",
                 verification_failure_label(failure)
@@ -338,15 +331,6 @@ fn verification_failure_label(failure: TokenVerificationFailure) -> &'static str
         TokenVerificationFailure::Revoked => "revoked",
         TokenVerificationFailure::Expired => "expired",
     }
-}
-
-fn cached_token_expired(expires_at: Option<&str>) -> bool {
-    let Some(expires_at) = expires_at else {
-        return false;
-    };
-
-    OffsetDateTime::parse(expires_at, &Rfc3339)
-        .is_ok_and(|expires_at| expires_at <= OffsetDateTime::now_utc())
 }
 
 #[cfg(test)]
@@ -850,6 +834,76 @@ mod tests {
         async fn touch_last_used(&self, _id: &str) -> Result<Option<TokenRecord>, RepositoryError> {
             unimplemented!("not needed by this validator test")
         }
+    }
+
+    /// Validity is the store's verdict on the store's clock. A replica
+    /// whose wall clock runs ahead of the authority must not reject a token
+    /// the authority just accepted: the store reports it valid with life
+    /// remaining, and the cached entry expires by that lifetime, not by
+    /// this replica's reading of `expires_at`.
+    #[tokio::test]
+    async fn a_store_verified_token_is_accepted_whatever_this_replica_clock_says() {
+        struct PastByLocalClockStore;
+
+        #[async_trait::async_trait]
+        impl ServiceTokenStore for PastByLocalClockStore {
+            async fn create(
+                &self,
+                _request: CreateTokenRequest,
+            ) -> Result<CreatedToken, RepositoryError> {
+                unimplemented!("not needed by this validator test")
+            }
+
+            async fn list(
+                &self,
+                _filters: &TokenListFilters,
+            ) -> Result<TokenPage, RepositoryError> {
+                unimplemented!("not needed by this validator test")
+            }
+
+            async fn get_by_id(&self, _id: &str) -> Result<Option<TokenRecord>, RepositoryError> {
+                unimplemented!("not needed by this validator test")
+            }
+
+            async fn revoke(&self, _id: &str) -> Result<Option<TokenRecord>, RepositoryError> {
+                unimplemented!("not needed by this validator test")
+            }
+
+            async fn rotate(&self, _id: &str) -> Result<Option<CreatedToken>, RepositoryError> {
+                unimplemented!("not needed by this validator test")
+            }
+
+            async fn verify(
+                &self,
+                _plaintext_token: &str,
+            ) -> Result<TokenVerification, RepositoryError> {
+                Ok(TokenVerification::Valid(VerifiedToken {
+                    id: "tok-authority-says-valid".to_owned(),
+                    token_prefix: FAKE_PREFIX.to_owned(),
+                    scopes: vec!["admin:tokens:read".to_owned()],
+                    // Long past by this replica's clock; the authority
+                    // nevertheless verified it with life remaining.
+                    expires_at: Some("2000-01-01T00:00:00Z".to_owned()),
+                    last_used_at: None,
+                    remaining_lifetime: Some(Duration::from_secs(30)),
+                }))
+            }
+
+            async fn touch_last_used(
+                &self,
+                _id: &str,
+            ) -> Result<Option<TokenRecord>, RepositoryError> {
+                unimplemented!("not needed by this validator test")
+            }
+        }
+
+        let validator =
+            ServiceTokenValidator::new(Arc::new(PastByLocalClockStore), Duration::from_secs(60));
+        let principal = validator
+            .validate_session(&SessionCredential::Bearer("ggw_ahead-of-time".to_owned()))
+            .await
+            .expect("the authority's verdict stands over this replica's clock");
+        assert_eq!(principal.session_id, "tok-authority-says-valid");
     }
 
     /// The lifetime cap is anchored before the verification round-trip:

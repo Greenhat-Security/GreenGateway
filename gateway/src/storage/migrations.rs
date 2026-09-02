@@ -327,6 +327,11 @@ pub(crate) enum MigrateError {
     ConfigurationInvalid(String),
     /// The database could not be reached within the bounded retry budget.
     DatabaseUnavailable,
+    /// The database is bound to another deployment; neither `check` nor
+    /// `up` may proceed against it.
+    DeploymentMismatch {
+        bound: String,
+    },
     /// The ledger disagrees with this binary's manifest.
     LedgerInvalid(LedgerProblem),
     /// Applying a migration failed. The classified detail is logged at the
@@ -350,6 +355,11 @@ impl fmt::Display for MigrateError {
             Self::DatabaseUnavailable => formatter.write_str(
                 "the PostgreSQL database did not become reachable within the bounded retry \
                  budget; see DATABASE_STARTUP_RETRY_LIMIT",
+            ),
+            Self::DeploymentMismatch { bound } => write!(
+                formatter,
+                "this database is bound to deployment '{bound}'; deployments never share a \
+                 database, so `gateway migrate` refuses to run against it"
             ),
             Self::LedgerInvalid(problem) => {
                 write!(formatter, "schema ledger invalid: {problem}")
@@ -425,7 +435,13 @@ async fn execute(config: &Config, check_only: bool) -> Result<MigrateOutput, Mig
 
     if check_only {
         return match read_and_validate(foundation.pool()).await? {
-            SchemaStatus::Current => Ok(MigrateOutput::CheckCurrent),
+            // A current schema carries the deployment binding (0007): a
+            // database bound to another deployment is not "current" for
+            // this one. An older schema reports the upgrade it needs first.
+            SchemaStatus::Current => {
+                refuse_other_deployment(&foundation, config).await?;
+                Ok(MigrateOutput::CheckCurrent)
+            }
             SchemaStatus::NotInitialized => Ok(MigrateOutput::CheckNotInitialized),
             SchemaStatus::NeedsUpgrade { applied, missing } => {
                 Ok(MigrateOutput::CheckNeedsUpgrade { applied, missing })
@@ -433,7 +449,31 @@ async fn execute(config: &Config, check_only: bool) -> Result<MigrateOutput, Mig
         };
     }
 
-    apply_missing(foundation.pool(), &config.database).await
+    let output = apply_missing(foundation.pool(), &config.database).await?;
+    // The schema now carries the binding table; bind this deployment (a
+    // first migration) or refuse another deployment's database.
+    refuse_other_deployment(&foundation, config).await?;
+    Ok(output)
+}
+
+/// Bind the database to this deployment, or refuse one bound elsewhere.
+#[cfg(feature = "postgres")]
+async fn refuse_other_deployment(
+    foundation: &super::postgres::PostgresFoundation,
+    config: &Config,
+) -> Result<(), MigrateError> {
+    let deployment_id = config
+        .deployment_id
+        .as_deref()
+        .ok_or(MigrateError::ModeNotSelected)?;
+    super::postgres::bind_deployment(foundation.pool(), deployment_id)
+        .await
+        .map_err(|error| match error {
+            super::postgres::DeploymentBindingError::Mismatch { bound } => {
+                MigrateError::DeploymentMismatch { bound }
+            }
+            super::postgres::DeploymentBindingError::Store(_) => MigrateError::DatabaseUnavailable,
+        })
 }
 
 /// Read the ledger from a pool and validate it against this binary's

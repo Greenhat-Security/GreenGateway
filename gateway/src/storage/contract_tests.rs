@@ -1631,6 +1631,91 @@ mod postgres_audit_tests {
         assert_eq!(store.cleanup_expired(100).await.expect("cleanup"), 1);
     }
 
+    /// A repeat revoke of a `jti` whose earlier finite row has lapsed
+    /// reactivates it; one with a later expiry extends the row; one inside
+    /// the effective window with no longer expiry spends nothing.
+    #[tokio::test]
+    async fn a_repeat_revoke_reactivates_a_lapsed_row_and_extends_a_shorter_one() {
+        use crate::auth::RevocationStore;
+        use crate::storage::JwtRevocationOutcome;
+        let Some(admin_dsn) = locator() else {
+            eprintln!("skipping: no test database locator; CI runs this test");
+            return;
+        };
+        let _guard = DATABASE.lock().await;
+        let database = create_test_database(&admin_dsn).await;
+        let (_tokens, pool) = migrated_service_token_store(&database).await;
+        let store = crate::storage::PostgresJwtRevocationStore::new(
+            pool.clone(),
+            "deploy-reactivate",
+            "https://issuer.example",
+        )
+        .with_retention_leeway_for_test(1.0);
+        let in_one_second = || {
+            (time::OffsetDateTime::now_utc() + std::time::Duration::from_secs(1))
+                .format(&time::format_description::well_known::Rfc3339)
+                .expect("rfc3339")
+        };
+        let in_one_minute = (time::OffsetDateTime::now_utc() + std::time::Duration::from_secs(60))
+            .format(&time::format_description::well_known::Rfc3339)
+            .expect("rfc3339");
+
+        // Lapsed row, then an unbounded revoke: reactivated, with a new revision.
+        store
+            .revoke("jti-lapsed", Some(&in_one_second()), "operator")
+            .await
+            .expect("revoke");
+        tokio::time::sleep(std::time::Duration::from_millis(2300)).await;
+        assert!(
+            !store.is_revoked("jti-lapsed").await.expect("lookup"),
+            "lapsed"
+        );
+        let again = store
+            .revoke("jti-lapsed", None, "operator")
+            .await
+            .expect("repeat revoke");
+        assert!(
+            matches!(again, JwtRevocationOutcome::Revoked { .. }),
+            "a lapsed row is reactivated, not reported as already revoked: {again:?}"
+        );
+        assert!(store.is_revoked("jti-lapsed").await.expect("lookup"));
+        assert_eq!(
+            store
+                .revoke("jti-lapsed", None, "operator")
+                .await
+                .expect("repeat"),
+            JwtRevocationOutcome::AlreadyRevoked,
+            "an unbounded row already covers any repeat"
+        );
+
+        // A shorter row inside its window, then a longer expiry: extended.
+        store
+            .revoke("jti-short", Some(&in_one_second()), "operator")
+            .await
+            .expect("revoke");
+        let extended = store
+            .revoke("jti-short", Some(&in_one_minute), "operator")
+            .await
+            .expect("extend");
+        assert!(
+            matches!(extended, JwtRevocationOutcome::Revoked { .. }),
+            "{extended:?}"
+        );
+        assert_eq!(
+            store
+                .revoke("jti-short", Some(&in_one_second()), "operator")
+                .await
+                .expect("repeat"),
+            JwtRevocationOutcome::AlreadyRevoked,
+            "a shorter repeat inside the window spends nothing"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(2300)).await;
+        assert!(
+            store.is_revoked("jti-short").await.expect("lookup"),
+            "the extended row outlives the original expiry"
+        );
+    }
+
     /// A replica whose keyring cannot open a pending login rolls its
     /// consumption back, so a replica that can still completes it.
     #[tokio::test]

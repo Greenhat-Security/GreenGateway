@@ -28,8 +28,11 @@
 //! - **A revoke is a committed control-plane mutation**: one transaction
 //!   that reserves the shared security revision, inserts the row with it,
 //!   and appends a `security_outbox` row (`resource_type =
-//!   'jwt_revocation'`, `resource_id` = the digest). A repeat revoke of the
-//!   same `jti` is idempotent and spends nothing.
+//!   'jwt_revocation'`, `resource_id` = the digest). A repeat revoke of a
+//!   `jti` whose row is still effective for at least as long spends
+//!   nothing; one whose earlier finite row has lapsed, or that carries a
+//!   later or unbounded expiry, replaces the row -- a lapsed row must never
+//!   turn a break-glass revoke into a silent no-op.
 //!
 //! Failure classification on the read path: a store that cannot be
 //! consulted is `AuthError::Upstream`, which the middleware answers with
@@ -139,7 +142,21 @@ impl PostgresJwtRevocationStore {
                     INSERT INTO greengateway.jwt_revocations (
                         issuer, jti_hash, expires_at, actor_user_id, security_revision
                     ) VALUES ($1, $2, $3::text::timestamptz, $4, $5)
-                    ON CONFLICT (issuer, jti_hash) DO NOTHING
+                    ON CONFLICT (issuer, jti_hash) DO UPDATE SET
+                        expires_at = CASE
+                            WHEN EXCLUDED.expires_at IS NULL
+                              OR greengateway.jwt_revocations.expires_at IS NULL THEN NULL
+                            ELSE GREATEST(greengateway.jwt_revocations.expires_at, EXCLUDED.expires_at)
+                        END,
+                        revoked_at = now(),
+                        actor_user_id = EXCLUDED.actor_user_id,
+                        security_revision = EXCLUDED.security_revision
+                    WHERE greengateway.jwt_revocations.expires_at IS NOT NULL
+                      AND (
+                          greengateway.jwt_revocations.expires_at <= now() - make_interval(secs => $6)
+                          OR EXCLUDED.expires_at IS NULL
+                          OR EXCLUDED.expires_at > greengateway.jwt_revocations.expires_at
+                      )
                     "#,
                     &[
                         &self.issuer.as_ref(),
@@ -147,6 +164,7 @@ impl PostgresJwtRevocationStore {
                         &expires_at,
                         &actor_user_id,
                         &security_revision,
+                        &self.retention_leeway_secs,
                     ],
                 )
                 .await
@@ -201,7 +219,7 @@ impl PostgresJwtRevocationStore {
                 WHERE ctid IN (
                     SELECT ctid FROM greengateway.jwt_revocations
                     WHERE expires_at IS NOT NULL
-                      AND expires_at + make_interval(secs => $2) <= now()
+                      AND expires_at <= now() - make_interval(secs => $2)
                     LIMIT $1
                 )
                 "#,
@@ -228,7 +246,7 @@ impl RevocationStore for PostgresJwtRevocationStore {
                 SELECT EXISTS (
                     SELECT 1 FROM greengateway.jwt_revocations
                     WHERE issuer = $1 AND jti_hash = $2
-                      AND (expires_at IS NULL OR expires_at + make_interval(secs => $3) > now())
+                      AND (expires_at IS NULL OR expires_at > now() - make_interval(secs => $3))
                 )
                 "#,
                 &[&self.issuer.as_ref(), &digest, &self.retention_leeway_secs],
