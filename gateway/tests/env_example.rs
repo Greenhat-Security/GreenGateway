@@ -241,6 +241,13 @@ fn cloudflare_forwarding_matches_supported_gateway_env_vars() {
         // Likewise the keyring the shared rate limiter keys its buckets
         // under: cluster mode only, rejected in standalone mode.
         "RATE_LIMIT_KEYRING",
+        // And the discovery projector's cadence: the projector runs only in
+        // cluster mode and its settings are rejected in standalone mode, so
+        // with STATE_BACKEND excluded a forwarded value could only ever
+        // fail the container's startup.
+        "DISCOVERY_PROJECTOR_LEASE_TTL_MS",
+        "DISCOVERY_PROJECTOR_POLL_MS",
+        "DISCOVERY_PROJECTOR_BATCH",
     ] {
         assert!(
             expected.remove(excluded),

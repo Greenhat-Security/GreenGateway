@@ -22,6 +22,8 @@
 
 use std::collections::HashSet;
 
+use serde::{Deserialize, Serialize};
+
 const ID_PLACEHOLDER: &str = "{id}";
 const PARAM_PLACEHOLDER: &str = "{param}";
 const DEFAULT_DISTINCT_VALUE_CAP: usize = 64;
@@ -113,6 +115,29 @@ impl PathTemplateLearner {
         )
     }
 
+    /// Serialize the learned shape groups (and only those: `config` is the
+    /// caller's, not the learner's) so a second process can continue templating
+    /// the same way this one would have. Groups are written in observation
+    /// order, which is also their match-tie-break order, so a round trip
+    /// preserves every templating decision.
+    pub fn export_groups_json(&self) -> String {
+        serde_json::to_string(&self.groups)
+            .expect("path template groups are plain data and always serialize")
+    }
+
+    /// Replace the learned shape groups with a previously exported set. The
+    /// configured group cap is applied on import so a snapshot taken under a
+    /// larger cap cannot exceed this learner's memory bound; groups past the
+    /// cap are dropped from the end because they were learned last.
+    pub fn import_groups_json(&mut self, groups_json: &str) -> Result<(), serde_json::Error> {
+        let mut groups = serde_json::from_str::<Vec<ShapeGroup>>(groups_json)?;
+        if self.config.max_groups != 0 {
+            groups.truncate(self.config.max_groups);
+        }
+        self.groups = groups;
+        Ok(())
+    }
+
     fn find_group_index(&self, segments: &[&str]) -> Option<usize> {
         let mut best_match = None;
 
@@ -137,7 +162,7 @@ pub fn template_stateless(path: &str) -> String {
     template_stateless_segments(&split_path(path))
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 struct ShapeGroup {
     positions: Vec<SegmentPosition>,
 }
@@ -187,7 +212,8 @@ impl ShapeGroup {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
 enum SegmentPosition {
     Literal(String),
     Varying { values: HashSet<String> },
@@ -270,7 +296,8 @@ impl SegmentPosition {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
 enum LearnedReason {
     Cardinality,
     Overflow,
@@ -545,6 +572,52 @@ mod tests {
         assert_eq!(learner.groups.len(), 2);
         assert_eq!(learner.observe("/c"), "/c");
         assert_eq!(learner.groups.len(), 2);
+    }
+
+    #[test]
+    fn exported_groups_round_trip_and_keep_learned_decisions() {
+        let mut learner = PathTemplateLearner::new();
+        for slug in ["apple", "banana", "cherry", "date"] {
+            learner.observe(&format!("/products/{slug}"));
+        }
+        learner.observe("/status/active");
+        learner.observe("/status/pending");
+        learner.observe("/users/123");
+
+        let exported = learner.export_groups_json();
+        let mut restored = PathTemplateLearner::new();
+        restored
+            .import_groups_json(&exported)
+            .expect("exported groups should import");
+
+        assert_eq!(restored.groups.len(), learner.groups.len());
+        assert_eq!(restored.template("/products/fig"), "/products/{param}");
+        assert_eq!(restored.template("/status/closed"), "/status/closed");
+        assert_eq!(tracked_value_count(&restored, "status", 1), Some(2));
+        assert_eq!(restored.observe("/status/closed"), "/status/closed");
+        assert_eq!(restored.observe("/status/archived"), "/status/{param}");
+        assert_eq!(restored.template("/users/456"), "/users/{id}");
+    }
+
+    #[test]
+    fn imported_groups_are_capped_by_the_importing_config() {
+        let mut learner = PathTemplateLearner::new();
+        learner.observe("/a");
+        learner.observe("/b");
+        learner.observe("/c");
+
+        let mut capped = PathTemplateLearner::with_config(PathTemplateConfig {
+            max_groups: 2,
+            ..PathTemplateConfig::default()
+        });
+        capped
+            .import_groups_json(&learner.export_groups_json())
+            .expect("exported groups should import");
+        assert_eq!(capped.groups.len(), 2);
+
+        assert!(PathTemplateLearner::new()
+            .import_groups_json("not json")
+            .is_err());
     }
 
     fn learned_reason(

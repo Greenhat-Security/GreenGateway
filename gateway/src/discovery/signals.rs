@@ -174,7 +174,9 @@ impl NewSignal {
         }
     }
 
-    fn as_signal(&self) -> Signal {
+    /// The stored form of this signal as the backends report it once
+    /// inserted: `updated_at` starts equal to `created_at`, no transition.
+    pub(crate) fn as_signal(&self) -> Signal {
         Signal {
             id: self.id.clone(),
             signal_type: self.signal_type.clone(),

@@ -29,6 +29,10 @@ pub mod postgres;
 #[cfg(feature = "postgres")]
 pub mod postgres_audit;
 #[cfg(feature = "postgres")]
+pub mod postgres_discovery;
+#[cfg(feature = "postgres")]
+pub mod postgres_discovery_read;
+#[cfg(feature = "postgres")]
 pub(crate) mod postgres_documents;
 #[cfg(feature = "postgres")]
 pub mod postgres_execution_leases;

@@ -385,6 +385,8 @@ Optional SQLite endpoint discovery inventory store path.
 
 Default: empty, which disables endpoint aggregation.
 
+Standalone mode only. In cluster mode (`STATE_BACKEND=postgres`) this setting is rejected like every other `*_SQLITE_PATH`: discovery is always on there, served from the shared PostgreSQL tables one fenced projector fills from the durable audit stream (see [the PostgreSQL deployment guide](deployment/postgres.md), "Global discovery"), and the admin discovery surfaces described below answer identically on every replica.
+
 Format and validation: unset, empty, or whitespace-only values become `None`. Non-empty values must be valid Unicode and are used as a filesystem path. When set, the gateway opens or creates the database at startup, creates discovery aggregate tables and indexes if needed, creates the persisted endpoint-review, signal, and rule-suggestion tables if needed, and consumes `http.request_observed` audit events into per-method, per-endpoint-template aggregates on the audit writer thread. Proxy dispatch classification runs immediately inside observation, before validation, rate limiting, authentication, or RBAC can reject a request. Every new observation is stamped with `routing_context_known`, and each classified observation records a routing context in `discovery_endpoint_routing_contexts`; contextless traffic uses an empty internal origin sentinel, while selected proxy routes additionally record the configured route host/path prefix and upstream origin. This preserves contextless and routed variants when both are observed for the same endpoint. Raw caller-supplied Host values are retained in the audit event but are not used as aggregate keys; only the bounded configured route host is keyed. `discovery_endpoint_routing_classifications` stores the earliest trusted classification timestamp for each endpoint. `discovery_endpoint_classified_signal_stats` and `discovery_endpoint_classified_signal_principals` separately persist only classified observations used by suggestion-eligible signal detectors. This keeps aggregation and signal persistence out of the request hot path without creating an attacker-controlled Host-cardinality surface.
 
 Upgrade behavior is fail closed. Aggregate and audit rows created before routing classification was available have no trusted classification timestamp and are reported as unknown rather than contextless. They cannot produce direct-rule suggestions. If classification begins after an endpoint aggregate's `first_seen`, that endpoint remains `routing_context_known:false` while the aggregate retains the older observations, even though `routing_context_known_since` and newer classified routing contexts are returned for diagnosis. Coverage therefore remains `unknown` instead of treating a context-bound rule as covering mixed historical evidence. Legacy aggregate counts, error baselines, and principal history are excluded from classified signal-detector state, so the first classified observation cannot combine with old evidence to open a suggestion-eligible signal. Classified detector counters and principal history survive restarts; transient error and volume windows are rebuilt only from classified observations. Existing open suggestions are revalidated against current discovery state before acceptance; host-routed targets and suggestions that predate trusted classification return `409 Conflict` without changing policy or suggestion state. A newly classified observation establishes context for future generation, but does not retroactively make older evidence trusted. Operators must dismiss a rejected pre-classification suggestion and review newly classified traffic instead of accepting the stale suggestion.
@@ -408,6 +410,32 @@ Default: `10000`.
 Format and validation: must be a positive integer greater than zero. The limit applies whenever discovery aggregation is enabled. On admission of a new endpoint at capacity, GreenGateway uses approximate-LRU batch eviction so recently observed endpoints remain discoverable without scanning the full map for every request. Evicted aggregate, status, principal, routing-context, classified-signal, payload-shape, and derived signal rows are removed transactionally on the next discovery flush. The path-template learner's in-memory shape-group count is bounded by the same value and falls back to stateless templating for novel shapes after reaching the cap.
 
 On restart, access order is approximated from each persisted aggregate's `last_seen` timestamp. If an existing database exceeds a newly configured lower limit, startup retains the most recently seen entries in memory and queues the complete excess for deletion on the first flush. No schema or manual data migration is required.
+
+In cluster mode (`STATE_BACKEND=postgres`) the same limit bounds the projector's working set and the shared `greengateway.discovery_endpoint_aggregates` table: eviction is performed only by the replica holding the projector lease, under its fence, on the global last-seen order, so no replica can evict an endpoint another replica's traffic still evidences.
+
+### DISCOVERY_PROJECTOR_LEASE_TTL_MS
+
+How long the cluster-mode discovery projector's leadership lease lives on the database clock before another replica may take the slot, in milliseconds.
+
+Default: `15000`
+
+Format and validation: must parse as a `u64` millisecond duration of at least `1000`. In cluster mode (`STATE_BACKEND=postgres`) discovery is not a per-process SQLite aggregator but one replica projecting the durable audit stream into the shared discovery tables (see [the PostgreSQL deployment guide](deployment/postgres.md), "Global discovery"). Leadership is the single slot of the `discovery-projector` scope in `greengateway.execution_leases`, held under this TTL — its own setting, separate from `TOOL_LEASE_TTL_MS`, because failover of a long-running job and admission of one tool invocation have different needs. The leader renews at a third of the TTL and stops projecting on the first renewal that finds the lease gone, or once half the TTL has passed without an answer, always before the slot can be reclaimed; a crashed leader's slot returns after the TTL elapses on the database clock, which is therefore the longest discovery views can go without a projector after a crash. Rejected when `STATE_BACKEND=sqlite`: standalone mode never starts a projector.
+
+### DISCOVERY_PROJECTOR_POLL_MS
+
+How long the cluster-mode discovery projector waits when the durable audit stream has nothing new before reading again, in milliseconds; also its retry wait after a flush the authority could not commit for a transient reason.
+
+Default: `250`
+
+Format and validation: must parse as a `u64` millisecond duration of at least `50`. The default matches the standalone aggregator's flush cadence, so discovery views lag live traffic by about the same amount in either mode; a replica that does not hold the lease waits four times this, with jitter, between attempts to take it. Rejected when `STATE_BACKEND=sqlite`.
+
+### DISCOVERY_PROJECTOR_BATCH
+
+How many durable audit stream rows the cluster-mode discovery projector reads per batch.
+
+Default: `500`
+
+Format and validation: must parse as an integer between `1` and `5000`. Each batch is one bounded stream read followed by bounded flush transactions (one per 200 applied observations and one at the batch's end), and the projector's checkpoint advances to the last position read even when nothing in the batch was an observation, so the bound is on the size of one transaction, not on how far behind the projector may fall. Rejected when `STATE_BACKEND=sqlite`.
 
 ### PRINCIPAL_SQLITE_PATH
 
@@ -730,7 +758,7 @@ Explicit opt-in for sampled request-shape capture into the discovery SQLite data
 
 Default: `false`, which disables payload-shape capture. With the default, the request path does not create payload capture handles, observation events do not include `payload_shape`, and fresh discovery databases do not create the payload capture tables.
 
-Format and validation: must parse as a boolean. When set to `true`, `DISCOVERY_SQLITE_PATH` must also be set; otherwise startup fails closed with a clear configuration error because this feature has no output destination without the discovery database.
+Format and validation: must parse as a boolean. When set to `true` in standalone mode, `DISCOVERY_SQLITE_PATH` must also be set; otherwise startup fails closed with a clear configuration error because this feature has no output destination without the discovery database. In cluster mode (`STATE_BACKEND=postgres`) the destination is the shared discovery tables the projector writes, so no local path is needed (or accepted): captured shapes travel inside the `http.request_observed` event on the durable audit stream and are persisted by the projector.
 
 When enabled and sampled, GreenGateway captures request shape only:
 
@@ -1938,7 +1966,7 @@ Which store owns shared mutable state: `sqlite` or `postgres`. `sqlite` is stand
 
 Default: `sqlite`
 
-Format and validation: exactly `sqlite` or `postgres`; anything else fails startup. Selecting `postgres` requires `DEPLOYMENT_ID` and `DATABASE_URL_FILE`, and rejects every writable local authority (`POLICY_FILE`, `TOOLS_FILE`, `CONNECTION_LOCAL_SECRET_KEYRING`, and every `*_SQLITE_PATH`) by naming the setting. Selecting `sqlite` rejects `DEPLOYMENT_ID`, `DATABASE_URL_FILE`, and `DATABASE_TLS_CA_FILE` for the inverse reason: material a mode will never read invites an operator to believe something is configured that nothing consults. Mode is a startup-time setting, deliberately not hot-swappable: it participates in the security-configuration fingerprint two replicas must agree on, and moving from sqlite to postgres is a one-way verified import, not a live switch.
+Format and validation: exactly `sqlite` or `postgres`; anything else fails startup. Selecting `postgres` requires `DEPLOYMENT_ID` and `DATABASE_URL_FILE`, and rejects every writable local authority (`POLICY_FILE`, `TOOLS_FILE`, `CONNECTION_LOCAL_SECRET_KEYRING`, and every `*_SQLITE_PATH`) by naming the setting. Selecting `sqlite` rejects `DEPLOYMENT_ID`, `DATABASE_URL_FILE`, `DATABASE_TLS_CA_FILE`, the cluster-only keyrings (`ADMIN_LOGIN_KEYRING`, `RATE_LIMIT_KEYRING`), and the discovery projector's settings (`DISCOVERY_PROJECTOR_LEASE_TTL_MS`, `DISCOVERY_PROJECTOR_POLL_MS`, `DISCOVERY_PROJECTOR_BATCH`) for the inverse reason: material a mode will never read invites an operator to believe something is configured that nothing consults. Mode is a startup-time setting, deliberately not hot-swappable: it participates in the security-configuration fingerprint two replicas must agree on, and moving from sqlite to postgres is a one-way verified import, not a live switch.
 
 Cluster mode is experimental and is not a supported HA configuration until the #241 release gate passes.
 

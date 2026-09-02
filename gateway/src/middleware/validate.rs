@@ -217,6 +217,10 @@ mod tests {
             audit_drain_timeout_ms: crate::config::DEFAULT_AUDIT_DRAIN_TIMEOUT_MS,
             discovery_sqlite_path: None,
             discovery_endpoint_limit: crate::config::DEFAULT_DISCOVERY_ENDPOINT_LIMIT,
+            discovery_projector_lease_ttl_ms:
+                crate::config::DEFAULT_DISCOVERY_PROJECTOR_LEASE_TTL_MS,
+            discovery_projector_poll_ms: crate::config::DEFAULT_DISCOVERY_PROJECTOR_POLL_MS,
+            discovery_projector_batch: crate::config::DEFAULT_DISCOVERY_PROJECTOR_BATCH,
             principal_sqlite_path: None,
             connections_sqlite_path: None,
             connection_local_secret_keyring: Vec::new(),

@@ -10,6 +10,7 @@ use std::{
 #[cfg(test)]
 use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 
+use async_trait::async_trait;
 use rusqlite::{params, params_from_iter, types::Value as SqlValue, Connection, OptionalExtension};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use serde_json::Value;
@@ -21,7 +22,244 @@ use crate::{
         suggestions,
     },
     metrics::LOCK_POISON_RECOVERIES_TOTAL,
+    storage::{run_blocking, RepositoryError},
 };
+
+/// The backend-neutral read side of the discovery inventory (issue #241,
+/// PR 11): what the admin traffic, signals, principals, and schema surfaces
+/// ask of the store. Standalone mode answers from the SQLite file the
+/// aggregator sink writes; cluster mode answers from the PostgreSQL tables
+/// the projector writes. Both implementations return the same shapes,
+/// orderings, cursors, and filter semantics, so a handler is written once.
+///
+/// Every method is `async` and must never block a request executor: the
+/// SQLite implementation runs its synchronous queries on the blocking pool,
+/// the PostgreSQL one awaits the driver.
+#[async_trait]
+pub trait DiscoveryReadStore: Send + Sync {
+    /// Every observed endpoint, one row per routing context it was seen
+    /// under (or one row with no context when it was never classified),
+    /// ordered by method, template, then context.
+    async fn observed_endpoints(&self) -> Result<Vec<ObservedEndpoint>, DiscoveryQueryError>;
+
+    /// One page of the endpoint inventory. `include_open_signals` attaches
+    /// the open-signal summary to each endpoint; a caller without the
+    /// signals permission passes `false` and gets no summary field.
+    async fn list_endpoints_with_open_signal_summaries(
+        &self,
+        filters: &EndpointListFilters,
+        include_open_signals: bool,
+    ) -> Result<EndpointListPage, DiscoveryQueryError>;
+
+    /// One endpoint's detail, or `None` when it was never observed.
+    async fn get_endpoint_with_open_signal_summaries(
+        &self,
+        method: &str,
+        endpoint_template: &str,
+        new_since_hours: u64,
+        include_open_signals: bool,
+    ) -> Result<Option<EndpointAggregateDetail>, DiscoveryQueryError>;
+
+    /// The request schema inferred from the endpoint's retained payload
+    /// shape samples, or `None` when it has no samples.
+    async fn inferred_request_schema(
+        &self,
+        method: &str,
+        endpoint_template: &str,
+    ) -> Result<Option<InferredRequestSchema>, DiscoveryQueryError>;
+
+    /// Mark or clear an endpoint's review. `None` when the endpoint was
+    /// never observed.
+    async fn set_endpoint_review(
+        &self,
+        method: &str,
+        endpoint_template: &str,
+        reviewed: bool,
+        reviewed_by: Option<&str>,
+    ) -> Result<Option<EndpointReviewState>, DiscoveryQueryError>;
+
+    /// One page of signals, newest first.
+    async fn list_signals(
+        &self,
+        filters: &SignalListFilters,
+    ) -> Result<signals::SignalListPage, DiscoveryQueryError>;
+
+    /// The `principal_new_to_endpoint` signals raised for one principal
+    /// identity, newest first, at most `limit`.
+    async fn list_principal_endpoint_signals(
+        &self,
+        principal: &str,
+        issuer: &str,
+        auth_method: &str,
+        limit: usize,
+    ) -> Result<Vec<Signal>, DiscoveryQueryError>;
+
+    /// Move a signal to `state`. `None` when no signal has that id.
+    async fn transition_signal(
+        &self,
+        signal_id: &str,
+        state: SignalLifecycleState,
+        transitioned_by: Option<&str>,
+    ) -> Result<Option<Signal>, DiscoveryQueryError>;
+
+    /// One page of the principals seen on an endpoint, most recently seen
+    /// first.
+    async fn list_principals(
+        &self,
+        method: &str,
+        endpoint_template: &str,
+        filters: &PrincipalPageFilters,
+    ) -> Result<PrincipalPage, DiscoveryQueryError>;
+}
+
+/// The SQLite store satisfies the read contract by running its synchronous
+/// queries on the blocking pool. The synchronous methods stay: the
+/// standalone sink, the suggestion engine, and the standalone conformance
+/// hot path call them directly.
+#[async_trait]
+impl DiscoveryReadStore for DiscoveryQueryStore {
+    async fn observed_endpoints(&self) -> Result<Vec<ObservedEndpoint>, DiscoveryQueryError> {
+        let store = self.clone();
+        blocking_query(move || store.observed_endpoints()).await
+    }
+
+    async fn list_endpoints_with_open_signal_summaries(
+        &self,
+        filters: &EndpointListFilters,
+        include_open_signals: bool,
+    ) -> Result<EndpointListPage, DiscoveryQueryError> {
+        let store = self.clone();
+        let filters = filters.clone();
+        blocking_query(move || {
+            store.list_endpoints_with_open_signal_summaries(&filters, include_open_signals)
+        })
+        .await
+    }
+
+    async fn get_endpoint_with_open_signal_summaries(
+        &self,
+        method: &str,
+        endpoint_template: &str,
+        new_since_hours: u64,
+        include_open_signals: bool,
+    ) -> Result<Option<EndpointAggregateDetail>, DiscoveryQueryError> {
+        let store = self.clone();
+        let method = method.to_owned();
+        let endpoint_template = endpoint_template.to_owned();
+        blocking_query(move || {
+            store.get_endpoint_with_open_signal_summaries(
+                &method,
+                &endpoint_template,
+                new_since_hours,
+                include_open_signals,
+            )
+        })
+        .await
+    }
+
+    async fn inferred_request_schema(
+        &self,
+        method: &str,
+        endpoint_template: &str,
+    ) -> Result<Option<InferredRequestSchema>, DiscoveryQueryError> {
+        let store = self.clone();
+        let method = method.to_owned();
+        let endpoint_template = endpoint_template.to_owned();
+        blocking_query(move || store.inferred_request_schema(&method, &endpoint_template)).await
+    }
+
+    async fn set_endpoint_review(
+        &self,
+        method: &str,
+        endpoint_template: &str,
+        reviewed: bool,
+        reviewed_by: Option<&str>,
+    ) -> Result<Option<EndpointReviewState>, DiscoveryQueryError> {
+        let store = self.clone();
+        let method = method.to_owned();
+        let endpoint_template = endpoint_template.to_owned();
+        let reviewed_by = reviewed_by.map(str::to_owned);
+        blocking_query(move || {
+            store.set_endpoint_review(
+                &method,
+                &endpoint_template,
+                reviewed,
+                reviewed_by.as_deref(),
+            )
+        })
+        .await
+    }
+
+    async fn list_signals(
+        &self,
+        filters: &SignalListFilters,
+    ) -> Result<signals::SignalListPage, DiscoveryQueryError> {
+        let store = self.clone();
+        let filters = filters.clone();
+        blocking_query(move || store.list_signals(&filters)).await
+    }
+
+    async fn list_principal_endpoint_signals(
+        &self,
+        principal: &str,
+        issuer: &str,
+        auth_method: &str,
+        limit: usize,
+    ) -> Result<Vec<Signal>, DiscoveryQueryError> {
+        let store = self.clone();
+        let principal = principal.to_owned();
+        let issuer = issuer.to_owned();
+        let auth_method = auth_method.to_owned();
+        blocking_query(move || {
+            store.list_principal_endpoint_signals(&principal, &issuer, &auth_method, limit)
+        })
+        .await
+    }
+
+    async fn transition_signal(
+        &self,
+        signal_id: &str,
+        state: SignalLifecycleState,
+        transitioned_by: Option<&str>,
+    ) -> Result<Option<Signal>, DiscoveryQueryError> {
+        let store = self.clone();
+        let signal_id = signal_id.to_owned();
+        let transitioned_by = transitioned_by.map(str::to_owned);
+        blocking_query(move || {
+            store.transition_signal(&signal_id, state, transitioned_by.as_deref())
+        })
+        .await
+    }
+
+    async fn list_principals(
+        &self,
+        method: &str,
+        endpoint_template: &str,
+        filters: &PrincipalPageFilters,
+    ) -> Result<PrincipalPage, DiscoveryQueryError> {
+        let store = self.clone();
+        let method = method.to_owned();
+        let endpoint_template = endpoint_template.to_owned();
+        let filters = PrincipalPageFilters {
+            limit: filters.limit,
+            cursor: filters.cursor.clone(),
+        };
+        blocking_query(move || store.list_principals(&method, &endpoint_template, &filters)).await
+    }
+}
+
+/// Run one synchronous SQLite query on the blocking pool. The query's own
+/// error is carried through unchanged; only a failed blocking task (a panic
+/// or cancellation) becomes a classified repository failure.
+async fn blocking_query<T, F>(query: F) -> Result<T, DiscoveryQueryError>
+where
+    T: Send + 'static,
+    F: FnOnce() -> Result<T, DiscoveryQueryError> + Send + 'static,
+{
+    run_blocking(move || Ok(query()))
+        .await
+        .map_err(DiscoveryQueryError::Repository)?
+}
 
 pub const DEFAULT_NEW_SINCE_HOURS: u64 = 24;
 /// 100 years, comfortably inside `OffsetDateTime`'s representable range and
@@ -270,6 +508,10 @@ pub enum DiscoveryQueryError {
     InvalidSignalState {
         state: String,
     },
+    /// A classified failure of the backend-neutral repository layer: the
+    /// PostgreSQL read store's driver and pool failures, and a failed
+    /// blocking task in the SQLite adapter.
+    Repository(RepositoryError),
 }
 
 impl fmt::Display for DiscoveryQueryError {
@@ -297,6 +539,9 @@ impl fmt::Display for DiscoveryQueryError {
                     "invalid discovery signal state in database: {state}"
                 )
             }
+            Self::Repository(source) => {
+                write!(formatter, "discovery repository query failed: {source}")
+            }
         }
     }
 }
@@ -306,8 +551,15 @@ impl Error for DiscoveryQueryError {
         match self {
             Self::Open { source, .. } | Self::Sqlite { source, .. } => Some(source),
             Self::Json { source, .. } => Some(source),
+            Self::Repository(source) => Some(source),
             Self::InvalidCursor { .. } | Self::InvalidSignalState { .. } => None,
         }
+    }
+}
+
+impl From<RepositoryError> for DiscoveryQueryError {
+    fn from(source: RepositoryError) -> Self {
+        Self::Repository(source)
     }
 }
 
@@ -569,7 +821,7 @@ impl DiscoveryQueryStore {
                     &new_since_cutoff,
                 ))
             })
-            .collect::<Result<Vec<_>, _>>()?;
+            .collect::<Result<Vec<_>, DiscoveryQueryError>>()?;
 
         Ok(EndpointListPage {
             endpoints,
@@ -1135,27 +1387,31 @@ impl DiscoveryQueryStore {
     }
 }
 
+/// One aggregate row joined with its review, before the derived fields
+/// (`is_new`, the effective review state, routing coverage) are computed.
+/// Shared with the PostgreSQL read store so both backends derive those
+/// fields with the same code.
 #[derive(Debug)]
-struct RawEndpointAggregate {
-    method: String,
-    endpoint_template: String,
-    first_seen: String,
-    last_seen: String,
-    call_count: i64,
-    schema_mismatch_count: i64,
-    latency_count: i64,
-    latency_p50_ms: i64,
-    latency_p95_ms: i64,
-    latency_p99_ms: i64,
-    latency_samples_json: String,
-    distinct_principal_count: i64,
-    updated_at: String,
-    reviewed_at: Option<String>,
-    reviewed_by: Option<String>,
+pub(crate) struct RawEndpointAggregate {
+    pub(crate) method: String,
+    pub(crate) endpoint_template: String,
+    pub(crate) first_seen: String,
+    pub(crate) last_seen: String,
+    pub(crate) call_count: i64,
+    pub(crate) schema_mismatch_count: i64,
+    pub(crate) latency_count: i64,
+    pub(crate) latency_p50_ms: i64,
+    pub(crate) latency_p95_ms: i64,
+    pub(crate) latency_p99_ms: i64,
+    pub(crate) latency_samples_json: String,
+    pub(crate) distinct_principal_count: i64,
+    pub(crate) updated_at: String,
+    pub(crate) reviewed_at: Option<String>,
+    pub(crate) reviewed_by: Option<String>,
 }
 
 #[derive(Deserialize)]
-struct CapturedPayloadShapeSample {
+pub(crate) struct CapturedPayloadShapeSample {
     #[serde(default)]
     query_params: Vec<CapturedQueryParamSample>,
     json_body: Option<CapturedJsonBodyShapeSample>,
@@ -1198,7 +1454,7 @@ struct FieldPresenceInference {
     present_count: u64,
 }
 
-fn infer_request_schema(
+pub(crate) fn infer_request_schema(
     method: &str,
     endpoint_template: &str,
     shapes: &[CapturedPayloadShapeSample],
@@ -1407,7 +1663,7 @@ impl RawEndpointAggregate {
         }
     }
 
-    fn into_summary(
+    pub(crate) fn into_summary(
         self,
         status_counts: Vec<StatusCount>,
         open_signals: Option<OpenSignalSummary>,
@@ -1446,7 +1702,7 @@ impl RawEndpointAggregate {
         }
     }
 
-    fn into_detail(
+    pub(crate) fn into_detail(
         self,
         status_counts: Vec<StatusCount>,
         open_signals: Option<OpenSignalSummary>,
@@ -1513,28 +1769,30 @@ impl RawEndpointAggregate {
     }
 }
 
+/// The keyset cursors are hex-encoded JSON and identical for both backends,
+/// so a page cursor minted by one replica is valid on any other.
 #[derive(Deserialize, Serialize)]
-struct EndpointCursor {
-    sort: EndpointSort,
-    sort_value: String,
-    method: String,
-    endpoint_template: String,
+pub(crate) struct EndpointCursor {
+    pub(crate) sort: EndpointSort,
+    pub(crate) sort_value: String,
+    pub(crate) method: String,
+    pub(crate) endpoint_template: String,
 }
 
 #[derive(Deserialize, Serialize)]
-struct PrincipalCursor {
-    last_seen: String,
-    user_id: String,
+pub(crate) struct PrincipalCursor {
+    pub(crate) last_seen: String,
+    pub(crate) user_id: String,
     #[serde(default)]
-    issuer: String,
+    pub(crate) issuer: String,
     #[serde(default)]
-    auth_method: String,
+    pub(crate) auth_method: String,
 }
 
 #[derive(Deserialize, Serialize)]
-struct SignalCursor {
-    created_at: String,
-    id: String,
+pub(crate) struct SignalCursor {
+    pub(crate) created_at: String,
+    pub(crate) id: String,
 }
 
 impl Serialize for EndpointSort {
@@ -1834,7 +2092,7 @@ fn build_signal_list_query(
     (sql, params)
 }
 
-fn endpoint_cursor(
+pub(crate) fn endpoint_cursor(
     row: &RawEndpointAggregate,
     sort: EndpointSort,
 ) -> Result<String, DiscoveryQueryError> {
@@ -1852,20 +2110,22 @@ fn endpoint_cursor(
     })
 }
 
+/// One `discovery_signals` row as stored, shared with the PostgreSQL read
+/// store so both backends decode it into a `Signal` identically.
 #[derive(Debug)]
-struct RawSignal {
-    id: String,
-    signal_type: String,
-    target_kind: String,
-    target_key: String,
-    target_identity_json: String,
-    explanation: String,
-    evidence_json: String,
-    state: String,
-    created_at: String,
-    updated_at: String,
-    transitioned_at: Option<String>,
-    transitioned_by: Option<String>,
+pub(crate) struct RawSignal {
+    pub(crate) id: String,
+    pub(crate) signal_type: String,
+    pub(crate) target_kind: String,
+    pub(crate) target_key: String,
+    pub(crate) target_identity_json: String,
+    pub(crate) explanation: String,
+    pub(crate) evidence_json: String,
+    pub(crate) state: String,
+    pub(crate) created_at: String,
+    pub(crate) updated_at: String,
+    pub(crate) transitioned_at: Option<String>,
+    pub(crate) transitioned_by: Option<String>,
 }
 
 impl RawSignal {
@@ -1886,7 +2146,7 @@ impl RawSignal {
         })
     }
 
-    fn into_signal(self) -> Result<Signal, DiscoveryQueryError> {
+    pub(crate) fn into_signal(self) -> Result<Signal, DiscoveryQueryError> {
         let identity =
             serde_json::from_str::<Value>(&self.target_identity_json).map_err(|source| {
                 DiscoveryQueryError::Json {
@@ -2200,7 +2460,7 @@ fn discovery_endpoint_aggregate_columns(connection: &Connection) -> rusqlite::Re
     Ok(columns)
 }
 
-fn new_since_cutoff(new_since_hours: u64) -> String {
+pub(crate) fn new_since_cutoff(new_since_hours: u64) -> String {
     let hours = i64::try_from(new_since_hours).unwrap_or(i64::MAX);
     (OffsetDateTime::now_utc() - TimeDuration::hours(hours))
         .format(&Rfc3339)
@@ -2235,13 +2495,13 @@ fn routing_context_covers_full_history(
     routing_context_known_since.is_some_and(|known_since| !timestamp_after(known_since, first_seen))
 }
 
-fn utc_timestamp_rfc3339() -> String {
+pub(crate) fn utc_timestamp_rfc3339() -> String {
     OffsetDateTime::now_utc()
         .format(&Rfc3339)
         .expect("current UTC timestamp should format as RFC 3339")
 }
 
-fn encode_cursor<T: Serialize>(cursor: &T) -> Result<String, DiscoveryQueryError> {
+pub(crate) fn encode_cursor<T: Serialize>(cursor: &T) -> Result<String, DiscoveryQueryError> {
     let json = serde_json::to_vec(cursor).map_err(|source| DiscoveryQueryError::Json {
         context: "cursor",
         source,
@@ -2250,7 +2510,7 @@ fn encode_cursor<T: Serialize>(cursor: &T) -> Result<String, DiscoveryQueryError
     Ok(hex::encode(json))
 }
 
-fn decode_cursor<T: DeserializeOwned>(
+pub(crate) fn decode_cursor<T: DeserializeOwned>(
     parameter: &'static str,
     value: &str,
 ) -> Result<T, DiscoveryQueryError> {
@@ -2258,7 +2518,7 @@ fn decode_cursor<T: DeserializeOwned>(
     serde_json::from_slice(&bytes).map_err(|_| DiscoveryQueryError::InvalidCursor { parameter })
 }
 
-fn like_escape(value: &str) -> String {
+pub(crate) fn like_escape(value: &str) -> String {
     let mut escaped = String::with_capacity(value.len());
     for character in value.chars() {
         match character {
@@ -2272,11 +2532,11 @@ fn like_escape(value: &str) -> String {
     escaped
 }
 
-fn query_limit(limit: usize) -> i64 {
+pub(crate) fn query_limit(limit: usize) -> i64 {
     i64::try_from(limit.saturating_add(1)).unwrap_or(i64::MAX)
 }
 
-fn non_negative_i64_to_u64(value: i64) -> u64 {
+pub(crate) fn non_negative_i64_to_u64(value: i64) -> u64 {
     u64::try_from(value).unwrap_or(0)
 }
 

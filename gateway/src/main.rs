@@ -501,17 +501,22 @@ struct AdminAuthState {
     client_ip_policy: client_ip::ClientIpPolicy,
 }
 
+/// The discovery inventory the admin surfaces read: the SQLite file in
+/// standalone mode, the PostgreSQL tables the projector writes in cluster
+/// mode. The handlers are written once against the trait.
+type DiscoveryReadHandle = Arc<dyn discovery::query::DiscoveryReadStore>;
+
 #[derive(Clone)]
 struct SchemaAdminState {
     coverage: discovery::openapi::SchemaCoverage,
-    query_store: Option<Arc<discovery::query::DiscoveryQueryStore>>,
+    query_store: Option<DiscoveryReadHandle>,
     rbac_state: Option<middleware::rbac::RbacState>,
     payload_capture_enabled: bool,
 }
 
 #[derive(Clone)]
 struct SignalsAdminState {
-    discovery_store: Option<Arc<discovery::query::DiscoveryQueryStore>>,
+    discovery_store: Option<DiscoveryReadHandle>,
     rbac_state: Option<middleware::rbac::RbacState>,
     audit: audit::AuditLog,
     client_ip_policy: client_ip::ClientIpPolicy,
@@ -521,11 +526,16 @@ struct SignalsAdminState {
 struct SuggestionsAdminState {
     suggestion_engine: Option<Arc<discovery::suggestions::RuleSuggestionEngine>>,
     policy: PolicyAdminState,
+    /// Cluster mode has no suggestion engine yet (PR 12): the read routes
+    /// answer "not configured" as they do without a discovery store, and
+    /// `generate` is refused with `409` and a stable reason rather than
+    /// pretending the SQLite engine exists on one replica.
+    cluster_mode: bool,
 }
 
 #[derive(Clone)]
 struct TrafficAdminState {
-    discovery_store: Option<Arc<discovery::query::DiscoveryQueryStore>>,
+    discovery_store: Option<DiscoveryReadHandle>,
     audit_query_store: Option<Arc<storage::SqliteAuditEventStore>>,
     rbac_state: Option<middleware::rbac::RbacState>,
     audit: audit::AuditLog,
@@ -537,7 +547,7 @@ struct TrafficAdminState {
 struct PrincipalAdminState {
     directory: auth::PrincipalDirectory,
     audit_query_store: Option<Arc<storage::SqliteAuditEventStore>>,
-    discovery_store: Option<Arc<discovery::query::DiscoveryQueryStore>>,
+    discovery_store: Option<DiscoveryReadHandle>,
     rbac_state: Option<middleware::rbac::RbacState>,
 }
 
@@ -1433,6 +1443,12 @@ struct GatewayAppBuildOverrides {
     /// replica's instance identity. None in standalone mode.
     #[cfg(feature = "postgres")]
     pg_limits: Option<ClusterLimitsSeed>,
+    /// The cluster-mode discovery seed: the pool, the identity the
+    /// projector leads under, and the durable audit store it projects.
+    /// None in standalone mode, where the SQLite aggregator sink and
+    /// query store are discovery.
+    #[cfg(feature = "postgres")]
+    pg_discovery: Option<ClusterDiscoverySeed>,
     #[cfg(test)]
     egress_resolver: Option<Arc<dyn egress::DnsResolver>>,
     /// Test seam: the pending-login backend the admin login flow uses,
@@ -1617,6 +1633,19 @@ struct ClusterLimitsSeed {
     deployment_id: String,
     keyring: connections::local_secret::LocalSecretKeyring,
     instance_id: uuid::Uuid,
+}
+
+/// What `run()` loads for cluster-mode discovery (issue #241, PR 11): the
+/// pool the read store and the projector's write store ride, the
+/// deployment ID and instance identity the projector's leadership lease is
+/// scoped to and held by, and the durable audit store the projector reads
+/// observations from.
+#[cfg(feature = "postgres")]
+struct ClusterDiscoverySeed {
+    pool: deadpool_postgres::Pool,
+    deployment_id: String,
+    instance_id: uuid::Uuid,
+    audit: Arc<storage::postgres_audit::PostgresAuditEventStore>,
 }
 
 /// Why a cluster-mode boot refused to serve Connections.
@@ -2217,6 +2246,27 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         )),
         _ => None,
     };
+    // Cluster-mode discovery rides the same pool and reads the durable audit
+    // store above (issue #241, PR 11): one replica at a time projects the
+    // stream under a fenced lease, and every replica serves the admin
+    // discovery surfaces from the projected tables.
+    #[cfg(feature = "postgres")]
+    let pg_discovery_seed = match (&_database_foundation, &_ha_foundation, &pg_audit_store) {
+        (Some(foundation), Some(ha_foundation), Some(audit)) => {
+            let deployment_id = config.deployment_id.clone().ok_or_else(|| {
+                Box::<dyn std::error::Error>::from(
+                    "STATE_BACKEND=postgres requires DEPLOYMENT_ID for the discovery projector",
+                )
+            })?;
+            Some(ClusterDiscoverySeed {
+                pool: foundation.pool().clone(),
+                deployment_id,
+                instance_id: ha_foundation.identity().instance_id(),
+                audit: audit.clone(),
+            })
+        }
+        _ => None,
+    };
     let metrics_handle = install_metrics_recorder()?;
     let listen_addr = config.listen_addr;
     let admin_listen_addr = config.admin_listen_addr;
@@ -2255,6 +2305,8 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             pg_pending_logins: pg_pending_logins_seed,
             #[cfg(feature = "postgres")]
             pg_limits: pg_limits_seed,
+            #[cfg(feature = "postgres")]
+            pg_discovery: pg_discovery_seed,
             #[cfg(test)]
             egress_resolver: None,
             #[cfg(test)]
@@ -2397,6 +2449,99 @@ fn gateway_app_with_process_started_at_and_overrides(
         .map(discovery::query::DiscoveryQueryStore::open)
         .transpose()?
         .map(Arc::new);
+    // The admin surfaces read through the backend-neutral trait: standalone
+    // mode's implementation is the SQLite store opened above, cluster mode's
+    // the PostgreSQL read store over the projector's tables (issue #241,
+    // PR 11). `DISCOVERY_SQLITE_PATH` is rejected in postgres mode
+    // (config.rs), so the two are never both present.
+    #[cfg(feature = "postgres")]
+    let cluster_discovery_read_store: Option<DiscoveryReadHandle> =
+        build_overrides.pg_discovery.as_ref().map(|seed| {
+            Arc::new(
+                storage::postgres_discovery_read::PostgresDiscoveryReadStore::new(
+                    seed.pool.clone(),
+                ),
+            ) as DiscoveryReadHandle
+        });
+    #[cfg(not(feature = "postgres"))]
+    let cluster_discovery_read_store: Option<DiscoveryReadHandle> = None;
+    let discovery_read_store: Option<DiscoveryReadHandle> =
+        cluster_discovery_read_store.clone().or_else(|| {
+            discovery_query_store
+                .clone()
+                .map(|store| store as DiscoveryReadHandle)
+        });
+    // Cluster mode's schema-conformance check reads a snapshot a background
+    // task refreshes from the read store, so the request path never waits
+    // on PostgreSQL; standalone mode keeps its SQLite store behind the TTL
+    // cache.
+    #[cfg(feature = "postgres")]
+    let cluster_conformance_cache = build_overrides
+        .pg_discovery
+        .as_ref()
+        .map(|_| Arc::new(middleware::observation::ClusterConformanceCache::new()));
+    #[cfg(feature = "postgres")]
+    let schema_conformance_state = match cluster_conformance_cache.as_ref() {
+        Some(cache) => middleware::observation::SchemaConformanceState::from_config_cluster(
+            &config,
+            schema_coverage.clone(),
+            Some(cache.clone()),
+        ),
+        None => middleware::observation::SchemaConformanceState::from_config(
+            &config,
+            schema_coverage.clone(),
+            discovery_query_store.clone(),
+        ),
+    };
+    #[cfg(not(feature = "postgres"))]
+    let schema_conformance_state = middleware::observation::SchemaConformanceState::from_config(
+        &config,
+        schema_coverage.clone(),
+        discovery_query_store.clone(),
+    );
+    #[cfg(feature = "postgres")]
+    if let Some(seed) = build_overrides.pg_discovery.as_ref() {
+        if let (Some(cache), Some(read_store)) = (
+            cluster_conformance_cache.clone(),
+            cluster_discovery_read_store.clone(),
+        ) {
+            middleware::observation::spawn_cluster_conformance_refresher(
+                &lifecycle,
+                cache,
+                read_store,
+                middleware::observation::CLUSTER_CONFORMANCE_REFRESH_INTERVAL,
+            );
+        }
+        // The projector's leadership lease is a slot of the PR 10 lease
+        // store on the same pool, with its own TTL: leadership of a
+        // long-running job and admission of one tool invocation have
+        // different failover needs.
+        let projector_leases = Arc::new(storage::PostgresExecutionLeaseStore::new(
+            seed.pool.clone(),
+            &seed.deployment_id,
+            seed.instance_id,
+            config.discovery_projector_lease_ttl(),
+        )) as Arc<dyn tools::lease::ExecutionLeaseStore>;
+        discovery::projector::spawn_discovery_projector(
+            &lifecycle,
+            seed.audit.clone(),
+            Arc::new(storage::postgres_discovery::PostgresDiscoveryStore::new(
+                seed.pool.clone(),
+            )),
+            projector_leases,
+            seed.instance_id,
+            discovery::projector::ProjectorConfig {
+                payload_capture_enabled: config.payload_capture_enabled,
+                endpoint_limit: config.discovery_endpoint_limit,
+                signal_detector_config: config.signal_detector_config(),
+                poll_interval: config.discovery_projector_poll_interval(),
+                batch_size: config.discovery_projector_batch,
+                flush_every: discovery::aggregator::AGGREGATOR_BATCH_SIZE,
+            },
+            Some(audit_event_sender.clone()),
+        );
+    }
+    let cluster_mode = matches!(config.state_backend, config::StateBackend::Postgres);
     // Cluster mode serves Connections from the authority; standalone mode
     // opens the local file. `CONNECTIONS_SQLITE_PATH` is rejected outright
     // in postgres mode (config.rs), so the two are never both present.
@@ -2487,13 +2632,7 @@ fn gateway_app_with_process_started_at_and_overrides(
             .map(|store| Arc::new(store) as Arc<dyn storage::PolicyHistory>);
     let observation_state =
         middleware::observation::ObservationState::from_config(&config, audit_log.clone())
-            .with_conformance(
-                middleware::observation::SchemaConformanceState::from_config(
-                    &config,
-                    schema_coverage.clone(),
-                    discovery_query_store.clone(),
-                ),
-            );
+            .with_conformance(schema_conformance_state);
     // Cluster mode replaces the file with the authority's active document
     // (already parsed and ETag-verified by `active()`); the proxy-route
     // cross-check runs here, where the config is at hand, and a document
@@ -3033,7 +3172,7 @@ fn gateway_app_with_process_started_at_and_overrides(
     };
     let schema_admin_state = SchemaAdminState {
         coverage: schema_coverage,
-        query_store: discovery_query_store.clone(),
+        query_store: discovery_read_store.clone(),
         rbac_state: rbac_state.clone(),
         payload_capture_enabled: config.payload_capture_enabled,
     };
@@ -3089,7 +3228,7 @@ fn gateway_app_with_process_started_at_and_overrides(
         pg_audit: build_overrides.pg_audit,
     };
     let signals_admin_state = SignalsAdminState {
-        discovery_store: discovery_query_store.clone(),
+        discovery_store: discovery_read_store.clone(),
         rbac_state: rbac_state.clone(),
         audit: audit_log.clone(),
         client_ip_policy: client_ip_policy.clone(),
@@ -3097,15 +3236,16 @@ fn gateway_app_with_process_started_at_and_overrides(
     let suggestions_admin_state = SuggestionsAdminState {
         suggestion_engine: rule_suggestion_engine,
         policy: policy_admin_state.clone(),
+        cluster_mode,
     };
     let principal_admin_state = PrincipalAdminState {
         directory: principal_directory,
         audit_query_store: audit_admin_state.query_store.clone(),
-        discovery_store: discovery_query_store.clone(),
+        discovery_store: discovery_read_store.clone(),
         rbac_state: rbac_state.clone(),
     };
     let traffic_admin_state = TrafficAdminState {
-        discovery_store: discovery_query_store,
+        discovery_store: discovery_read_store,
         audit_query_store: audit_admin_state.query_store.clone(),
         rbac_state,
         audit: audit_log,
@@ -7940,18 +8080,14 @@ async fn schema_coverage_endpoint(
         return schema_discovery_not_configured();
     };
 
-    let observed = {
-        let query_store = Arc::clone(query_store);
-        match tokio::task::spawn_blocking(move || query_store.observed_endpoints()).await {
-            Ok(Ok(observed)) => observed,
-            Ok(Err(err)) => {
-                tracing::error!(error = %err, "failed to query schema coverage discovery inventory");
-                return internal_server_error("schema coverage discovery query failed");
-            }
-            Err(err) => {
-                tracing::error!(error = %err, "schema coverage discovery query task failed");
-                return internal_server_error("schema coverage discovery query failed");
-            }
+    let observed = match query_store.observed_endpoints().await {
+        Ok(observed) => observed,
+        Err(error) => {
+            return discovery_query_error_response(
+                error,
+                "failed to query schema coverage discovery inventory",
+                "schema coverage discovery query failed",
+            )
         }
     };
 
@@ -7982,26 +8118,17 @@ async fn schema_inferred_endpoint(
         Err(parameter) => return bad_request(&format!("invalid query parameter: {parameter}")),
     };
 
-    let inferred = {
-        let query_store = Arc::clone(query_store);
-        let method = query.method.clone();
-        let endpoint_template = query.endpoint_template.clone();
-        tokio::task::spawn_blocking(move || {
-            query_store.inferred_request_schema(&method, &endpoint_template)
-        })
+    match query_store
+        .inferred_request_schema(&query.method, &query.endpoint_template)
         .await
-    };
-    match inferred {
-        Ok(Ok(Some(schema))) => (StatusCode::OK, Json(schema)).into_response(),
-        Ok(Ok(None)) => inferred_schema_no_samples(),
-        Ok(Err(err)) => {
-            tracing::error!(error = %err, "failed to query inferred request schema");
-            internal_server_error("inferred schema query failed")
-        }
-        Err(err) => {
-            tracing::error!(error = %err, "inferred schema query task failed");
-            internal_server_error("inferred schema query failed")
-        }
+    {
+        Ok(Some(schema)) => (StatusCode::OK, Json(schema)).into_response(),
+        Ok(None) => inferred_schema_no_samples(),
+        Err(error) => discovery_query_error_response(
+            error,
+            "failed to query inferred request schema",
+            "inferred schema query failed",
+        ),
     }
 }
 
@@ -8230,21 +8357,14 @@ async fn signals_list_endpoint(
         Err(parameter) => return bad_request(&format!("invalid query parameter: {parameter}")),
     };
 
-    let signals_page = {
-        let discovery_store = Arc::clone(discovery_store);
-        match tokio::task::spawn_blocking(move || discovery_store.list_signals(&filters)).await {
-            Ok(Ok(page)) => page,
-            Ok(Err(discovery::query::DiscoveryQueryError::InvalidCursor { parameter })) => {
-                return bad_request(&format!("invalid query parameter: {parameter}"))
-            }
-            Ok(Err(err)) => {
-                tracing::error!(error = %err, "failed to query discovery signals");
-                return internal_server_error("signals query failed");
-            }
-            Err(err) => {
-                tracing::error!(error = %err, "signals query task failed");
-                return internal_server_error("signals query failed");
-            }
+    let signals_page = match discovery_store.list_signals(&filters).await {
+        Ok(page) => page,
+        Err(error) => {
+            return discovery_query_error_response(
+                error,
+                "failed to query discovery signals",
+                "signals query failed",
+            )
         }
     };
 
@@ -8307,24 +8427,18 @@ async fn signal_transition_endpoint(
     let Some(discovery_store) = state.discovery_store.as_ref() else {
         return signals_discovery_not_configured();
     };
-    let signal = {
-        let discovery_store = Arc::clone(discovery_store);
-        let actor = principal.user_id.clone();
-        match tokio::task::spawn_blocking(move || {
-            discovery_store.transition_signal(&id, lifecycle_state, Some(&actor))
-        })
+    let signal = match discovery_store
+        .transition_signal(&id, lifecycle_state, Some(&principal.user_id))
         .await
-        {
-            Ok(Ok(Some(signal))) => signal,
-            Ok(Ok(None)) => return not_found("signal was not found"),
-            Ok(Err(err)) => {
-                tracing::error!(error = %err, "failed to transition discovery signal");
-                return internal_server_error("signal transition failed");
-            }
-            Err(err) => {
-                tracing::error!(error = %err, "signal transition task failed");
-                return internal_server_error("signal transition failed");
-            }
+    {
+        Ok(Some(signal)) => signal,
+        Ok(None) => return not_found("signal was not found"),
+        Err(error) => {
+            return discovery_query_error_response(
+                error,
+                "failed to transition discovery signal",
+                "signal transition failed",
+            )
         }
     };
     emit_signal_lifecycle_changed(&state, &parts, &principal, &signal);
@@ -8398,6 +8512,9 @@ async fn rule_suggestions_generate_endpoint(
         Err(error) => return suggestions_admin_authz_error_response(error),
     };
 
+    if state.cluster_mode {
+        return conflict(SUGGESTION_GENERATION_CLUSTER_DEFERRED_REASON);
+    }
     let Some(suggestion_engine) = state.suggestion_engine.as_ref() else {
         return suggestions_discovery_not_configured();
     };
@@ -8798,30 +8915,24 @@ async fn principal_detail_endpoint(
     };
     let anomaly_history = match state.discovery_store.as_ref() {
         Some(discovery_store) => {
-            let anomaly_store = Arc::clone(discovery_store);
-            let subject = principal_record.subject.clone();
-            let issuer = principal_record.issuer.clone();
             let auth_method =
-                principal_directory_audit_auth_mode(principal_record.auth_method.as_str())
-                    .to_owned();
-            match tokio::task::spawn_blocking(move || {
-                anomaly_store.list_principal_endpoint_signals(
-                    &subject,
-                    &issuer,
-                    &auth_method,
+                principal_directory_audit_auth_mode(principal_record.auth_method.as_str());
+            match discovery_store
+                .list_principal_endpoint_signals(
+                    &principal_record.subject,
+                    &principal_record.issuer,
+                    auth_method,
                     DEFAULT_PRINCIPAL_ANOMALY_HISTORY_LIMIT,
                 )
-            })
-            .await
+                .await
             {
-                Ok(Ok(signals)) => signals,
-                Ok(Err(err)) => {
-                    tracing::error!(error = %err, "failed to query principal anomaly history");
-                    return internal_server_error("principal anomaly history query failed");
-                }
-                Err(err) => {
-                    tracing::error!(error = %err, "principal anomaly history task failed");
-                    return internal_server_error("principal anomaly history query failed");
+                Ok(signals) => signals,
+                Err(error) => {
+                    return discovery_query_error_response(
+                        error,
+                        "failed to query principal anomaly history",
+                        "principal anomaly history query failed",
+                    )
                 }
             }
         }
@@ -8867,34 +8978,23 @@ async fn traffic_endpoint_list_endpoint(
         Err(parameter) => return bad_request(&format!("invalid query parameter: {parameter}")),
     };
 
-    // The inventory query pages the discovery store synchronously; it runs
-    // on the blocking pool so the SQLite reads never sit on the executor.
-    let inventory = {
-        let discovery_store = Arc::clone(discovery_store);
-        let rbac_state_for_query = rbac_state.clone();
-        tokio::task::spawn_blocking(move || {
-            list_traffic_endpoint_page(
-                &discovery_store,
-                &query,
-                Some(&rbac_state_for_query),
-                include_open_signals,
-            )
-        })
-        .await
-    };
-    match inventory {
-        Ok(Ok(page)) => (StatusCode::OK, Json(page)).into_response(),
-        Ok(Err(discovery::query::DiscoveryQueryError::InvalidCursor { parameter })) => {
-            bad_request(&format!("invalid query parameter: {parameter}"))
-        }
-        Ok(Err(err)) => {
-            tracing::error!(error = %err, "failed to query traffic endpoint inventory");
-            internal_server_error("traffic endpoint inventory query failed")
-        }
-        Err(err) => {
-            tracing::error!(error = %err, "traffic endpoint inventory task failed");
-            internal_server_error("traffic endpoint inventory query failed")
-        }
+    // The inventory query pages the discovery store through the read
+    // trait: the SQLite implementation runs on the blocking pool, so the
+    // reads never sit on the executor either way.
+    match list_traffic_endpoint_page(
+        discovery_store.as_ref(),
+        &query,
+        Some(&rbac_state),
+        include_open_signals,
+    )
+    .await
+    {
+        Ok(page) => (StatusCode::OK, Json(page)).into_response(),
+        Err(error) => discovery_query_error_response(
+            error,
+            "failed to query traffic endpoint inventory",
+            "traffic endpoint inventory query failed",
+        ),
     }
 }
 
@@ -8924,59 +9024,45 @@ async fn traffic_endpoint_detail_endpoint(
         Err(parameter) => return bad_request(&format!("invalid query parameter: {parameter}")),
     };
 
-    let mut endpoint = {
-        let detail_store = Arc::clone(discovery_store);
-        let method = params.method.clone();
-        let endpoint_template = params.endpoint_template.clone();
-        let new_since_hours = params.new_since_hours;
-        match tokio::task::spawn_blocking(move || {
-            detail_store.get_endpoint_with_open_signal_summaries(
-                &method,
-                &endpoint_template,
-                new_since_hours,
-                include_open_signals,
-            )
-        })
+    let mut endpoint = match discovery_store
+        .get_endpoint_with_open_signal_summaries(
+            &params.method,
+            &params.endpoint_template,
+            params.new_since_hours,
+            include_open_signals,
+        )
         .await
-        {
-            Ok(Ok(Some(endpoint))) => endpoint,
-            Ok(Ok(None)) => return not_found("traffic endpoint was not found"),
-            Ok(Err(err)) => {
-                tracing::error!(error = %err, "failed to query traffic endpoint detail");
-                return internal_server_error("traffic endpoint detail query failed");
-            }
-            Err(err) => {
-                tracing::error!(error = %err, "traffic endpoint detail task failed");
-                return internal_server_error("traffic endpoint detail query failed");
-            }
+    {
+        Ok(Some(endpoint)) => endpoint,
+        Ok(None) => return not_found("traffic endpoint was not found"),
+        Err(error) => {
+            return discovery_query_error_response(
+                error,
+                "failed to query traffic endpoint detail",
+                "traffic endpoint detail query failed",
+            )
         }
     };
     apply_endpoint_detail_rule_coverage(&mut endpoint, Some(rbac_state));
-    let principals = {
-        let principal_store = Arc::clone(discovery_store);
-        let method = params.method.clone();
-        let endpoint_template = params.endpoint_template.clone();
-        let principal_filters = discovery::query::PrincipalPageFilters {
-            limit: params.principal_limit,
-            cursor: params.principal_cursor.clone(),
-        };
-        tokio::task::spawn_blocking(move || {
-            principal_store.list_principals(&method, &endpoint_template, &principal_filters)
-        })
-        .await
+    let principal_filters = discovery::query::PrincipalPageFilters {
+        limit: params.principal_limit,
+        cursor: params.principal_cursor.clone(),
     };
-    let principals = match principals {
-        Ok(Ok(page)) => page,
-        Ok(Err(discovery::query::DiscoveryQueryError::InvalidCursor { parameter })) => {
-            return bad_request(&format!("invalid query parameter: {parameter}"));
-        }
-        Ok(Err(err)) => {
-            tracing::error!(error = %err, "failed to query traffic endpoint principals");
-            return internal_server_error("traffic endpoint principal query failed");
-        }
-        Err(err) => {
-            tracing::error!(error = %err, "traffic endpoint principal query task failed");
-            return internal_server_error("traffic endpoint principal query failed");
+    let principals = match discovery_store
+        .list_principals(
+            &params.method,
+            &params.endpoint_template,
+            &principal_filters,
+        )
+        .await
+    {
+        Ok(page) => page,
+        Err(error) => {
+            return discovery_query_error_response(
+                error,
+                "failed to query traffic endpoint principals",
+                "traffic endpoint principal query failed",
+            )
         }
     };
 
@@ -9077,31 +9163,23 @@ async fn traffic_endpoint_review_endpoint(
         return bad_request("invalid traffic endpoint review request body: endpoint_template");
     }
 
-    let review = {
-        let review_store = Arc::clone(discovery_store);
-        let method = method.to_owned();
-        let endpoint_template = endpoint_template.to_owned();
-        let actor = principal.user_id.clone();
-        match tokio::task::spawn_blocking(move || {
-            review_store.set_endpoint_review(
-                &method,
-                &endpoint_template,
-                request.reviewed,
-                Some(&actor),
-            )
-        })
+    let review = match discovery_store
+        .set_endpoint_review(
+            method,
+            endpoint_template,
+            request.reviewed,
+            Some(&principal.user_id),
+        )
         .await
-        {
-            Ok(Ok(Some(review))) => review,
-            Ok(Ok(None)) => return not_found("traffic endpoint was not found"),
-            Ok(Err(err)) => {
-                tracing::error!(error = %err, "failed to update traffic endpoint review state");
-                return internal_server_error("traffic endpoint review update failed");
-            }
-            Err(err) => {
-                tracing::error!(error = %err, "traffic endpoint review task failed");
-                return internal_server_error("traffic endpoint review update failed");
-            }
+    {
+        Ok(Some(review)) => review,
+        Ok(None) => return not_found("traffic endpoint was not found"),
+        Err(error) => {
+            return discovery_query_error_response(
+                error,
+                "failed to update traffic endpoint review state",
+                "traffic endpoint review update failed",
+            )
         }
     };
     emit_traffic_endpoint_review_changed(
@@ -11315,15 +11393,16 @@ fn enrich_endpoint_summaries_with_rule_coverage(
     }
 }
 
-fn list_traffic_endpoint_page(
-    discovery_store: &discovery::query::DiscoveryQueryStore,
+async fn list_traffic_endpoint_page(
+    discovery_store: &dyn discovery::query::DiscoveryReadStore,
     query: &TrafficEndpointListQuery,
     rbac_state: Option<&middleware::rbac::RbacState>,
     include_open_signals: bool,
 ) -> Result<discovery::query::EndpointListPage, discovery::query::DiscoveryQueryError> {
     let Some(covered_by_rule) = query.covered_by_rule else {
         let mut page = discovery_store
-            .list_endpoints_with_open_signal_summaries(&query.filters, include_open_signals)?;
+            .list_endpoints_with_open_signal_summaries(&query.filters, include_open_signals)
+            .await?;
         enrich_endpoint_summaries_with_rule_coverage(&mut page.endpoints, rbac_state);
         return Ok(page);
     };
@@ -11338,7 +11417,8 @@ fn list_traffic_endpoint_page(
     loop {
         scan_filters.cursor = cursor;
         let mut page = discovery_store
-            .list_endpoints_with_open_signal_summaries(&scan_filters, include_open_signals)?;
+            .list_endpoints_with_open_signal_summaries(&scan_filters, include_open_signals)
+            .await?;
         enrich_endpoint_summaries_with_rule_coverage(&mut page.endpoints, rbac_state);
 
         if let Some(endpoint) = page.endpoints.into_iter().next() {
@@ -13469,6 +13549,43 @@ fn discovery_not_configured() -> Response {
         .into_response()
 }
 
+/// The stable reason cluster mode's `generate` answers with `409` until the
+/// cluster suggestion engine lands (issue #241, PR 12). The read routes keep
+/// answering "not configured" exactly as they do without a discovery store.
+const SUGGESTION_GENERATION_CLUSTER_DEFERRED_REASON: &str =
+    "rule suggestion generation is not available in cluster mode yet";
+
+/// Map a discovery read-store failure for the admin surfaces. An invalid
+/// cursor is the caller's `400`. A store that cannot be reached, or that
+/// could not answer inside its contention budget (cluster mode's authority
+/// down), is a dependency failure: `503`. Everything else is logged under
+/// `context` and answered `500` with `failure`, which is what every
+/// discovery handler answered before the read trait existed.
+fn discovery_query_error_response(
+    error: discovery::query::DiscoveryQueryError,
+    context: &'static str,
+    failure: &str,
+) -> Response {
+    match error {
+        discovery::query::DiscoveryQueryError::InvalidCursor { parameter } => {
+            bad_request(&format!("invalid query parameter: {parameter}"))
+        }
+        discovery::query::DiscoveryQueryError::Repository(repository)
+            if matches!(
+                repository.kind(),
+                storage::RepositoryErrorKind::Unavailable | storage::RepositoryErrorKind::Timeout
+            ) =>
+        {
+            tracing::error!(error = %repository, context, "discovery store is unavailable");
+            service_unavailable("discovery store is unavailable")
+        }
+        error => {
+            tracing::error!(error = %error, "{context}");
+            internal_server_error(failure)
+        }
+    }
+}
+
 fn principal_directory_not_configured() -> Response {
     (
         StatusCode::NOT_FOUND,
@@ -13799,6 +13916,9 @@ mod tests {
             audit_drain_timeout_ms: config::DEFAULT_AUDIT_DRAIN_TIMEOUT_MS,
             discovery_sqlite_path: None,
             discovery_endpoint_limit: config::DEFAULT_DISCOVERY_ENDPOINT_LIMIT,
+            discovery_projector_lease_ttl_ms: config::DEFAULT_DISCOVERY_PROJECTOR_LEASE_TTL_MS,
+            discovery_projector_poll_ms: config::DEFAULT_DISCOVERY_PROJECTOR_POLL_MS,
+            discovery_projector_batch: config::DEFAULT_DISCOVERY_PROJECTOR_BATCH,
             principal_sqlite_path: None,
             connections_sqlite_path: None,
             connection_local_secret_keyring: Vec::new(),
@@ -32779,6 +32899,130 @@ paths:
         assert_eq!(unauthenticated.status(), StatusCode::UNAUTHORIZED);
     }
 
+    /// Cluster mode has no suggestion engine until PR 12 (issue #241): the
+    /// read routes answer exactly what they answer without a discovery
+    /// store, and `generate` is refused with `409` and a stable reason --
+    /// after authorization, so the refusal never leaks to a caller who may
+    /// not generate. Standalone without a store keeps its `404` on both.
+    #[tokio::test]
+    async fn suggestions_admin_cluster_mode_answers_not_configured_and_refuses_generate() {
+        let policy = parse_policy_body(&axum::body::Bytes::from(
+            suggestions_policy_document_string(),
+        ))
+        .expect("suggestions policy should parse");
+        let rbac_state =
+            middleware::rbac::RbacState::new(policy, Vec::new(), false, test_audit_log());
+        let router_for = |cluster_mode: bool| {
+            Router::new()
+                .route(SUGGESTIONS_ADMIN_ROUTE, get(rule_suggestions_list_endpoint))
+                .route(
+                    SUGGESTIONS_GENERATE_ADMIN_ROUTE,
+                    post(rule_suggestions_generate_endpoint),
+                )
+                .with_state(SuggestionsAdminState {
+                    suggestion_engine: None,
+                    policy: PolicyAdminState {
+                        policy_file: None,
+                        rbac_state: Some(rbac_state.clone()),
+                        history_store: None,
+                        #[cfg(feature = "postgres")]
+                        control_plane: None,
+                        query_store: None,
+                        audit: test_audit_log(),
+                        client_ip_policy: client_ip::ClientIpPolicy::default(),
+                        max_body_size: 1024 * 1024,
+                    },
+                    cluster_mode,
+                })
+        };
+        let not_configured_error =
+            "suggestions API requires DISCOVERY_SQLITE_PATH to be configured";
+
+        let cluster = router_for(true);
+        let listed = cluster
+            .clone()
+            .oneshot(suggestions_admin_request(
+                Method::GET,
+                SUGGESTIONS_ADMIN_ROUTE,
+                Some(test_principal(&["suggestions-reader"])),
+                None,
+                None,
+            ))
+            .await
+            .expect("cluster list request should complete");
+        assert_eq!(listed.status(), StatusCode::NOT_FOUND);
+        assert_eq!(
+            json_body(listed).await["error"],
+            json!(not_configured_error)
+        );
+
+        let refused = cluster
+            .clone()
+            .oneshot(suggestions_admin_request(
+                Method::POST,
+                SUGGESTIONS_GENERATE_ADMIN_ROUTE,
+                Some(test_principal(&["suggestions-writer"])),
+                None,
+                None,
+            ))
+            .await
+            .expect("cluster generate request should complete");
+        assert_eq!(refused.status(), StatusCode::CONFLICT);
+        assert_eq!(
+            json_body(refused).await["error"],
+            json!(SUGGESTION_GENERATION_CLUSTER_DEFERRED_REASON)
+        );
+
+        let forbidden = cluster
+            .oneshot(suggestions_admin_request(
+                Method::POST,
+                SUGGESTIONS_GENERATE_ADMIN_ROUTE,
+                Some(test_principal(&["suggestions-reader"])),
+                None,
+                None,
+            ))
+            .await
+            .expect("cluster generate request should complete");
+        assert_eq!(
+            forbidden.status(),
+            StatusCode::FORBIDDEN,
+            "authorization is judged before the cluster refusal"
+        );
+
+        let standalone = router_for(false);
+        let listed = standalone
+            .clone()
+            .oneshot(suggestions_admin_request(
+                Method::GET,
+                SUGGESTIONS_ADMIN_ROUTE,
+                Some(test_principal(&["suggestions-reader"])),
+                None,
+                None,
+            ))
+            .await
+            .expect("standalone list request should complete");
+        assert_eq!(listed.status(), StatusCode::NOT_FOUND);
+        assert_eq!(
+            json_body(listed).await["error"],
+            json!(not_configured_error)
+        );
+        let generated = standalone
+            .oneshot(suggestions_admin_request(
+                Method::POST,
+                SUGGESTIONS_GENERATE_ADMIN_ROUTE,
+                Some(test_principal(&["suggestions-writer"])),
+                None,
+                None,
+            ))
+            .await
+            .expect("standalone generate request should complete");
+        assert_eq!(generated.status(), StatusCode::NOT_FOUND);
+        assert_eq!(
+            json_body(generated).await["error"],
+            json!(not_configured_error)
+        );
+    }
+
     #[tokio::test]
     async fn suggestions_admin_generate_is_explicit_and_list_does_not_refresh() {
         let discovery_db = TempDb::new("suggestions-generate-discovery");
@@ -43409,6 +43653,294 @@ O2gecI9QwDJNpm29J9wJB2F8
             .await
             .expect_err("the stale ETag must lose");
             assert_eq!(response.status(), StatusCode::PRECONDITION_FAILED);
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // Cluster-mode discovery wiring (issue #241, PR 11): the app builder
+    // spawns the fenced projector from the discovery seed and serves the
+    // read store from the same pool, with no SQLite sink in the way.
+    // Docker-gated on the same locator as the storage suites.
+    // ------------------------------------------------------------------
+
+    #[cfg(feature = "postgres")]
+    mod cluster_discovery_tests {
+        use super::*;
+        use crate::audit::Actor;
+        use crate::discovery::query::DiscoveryReadStore as _;
+        use crate::storage::migrations;
+        use crate::storage::postgres::PostgresFoundation;
+        use crate::storage::postgres_audit::{IngestIdentity, PostgresAuditEventStore};
+        use crate::storage::postgres_discovery::PostgresDiscoveryStore;
+        use crate::storage::postgres_discovery_read::PostgresDiscoveryReadStore;
+
+        fn locator() -> Option<String> {
+            let key = "GATEWAY_TEST_POSTGRES_URL_FILE".to_owned();
+            let file = std::env::var(&key).ok()?;
+            if file.trim().is_empty() {
+                return None;
+            }
+            let contents = std::fs::read_to_string(file).ok()?;
+            let trimmed = contents.trim();
+            (!trimmed.is_empty()).then(|| trimmed.to_owned())
+        }
+
+        struct DsnFile {
+            path: String,
+            directory: std::path::PathBuf,
+        }
+
+        impl Drop for DsnFile {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.directory);
+            }
+        }
+
+        fn write_dsn_file(dsn: &str) -> DsnFile {
+            let directory = std::env::temp_dir().join(format!(
+                "greengateway-cluster-discovery-{}",
+                uuid::Uuid::new_v4()
+            ));
+            std::fs::create_dir_all(&directory).expect("temp directory should create");
+            let path = directory.join("database-url");
+            std::fs::write(&path, format!("{dsn}\n")).expect("DSN file should write");
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
+                    .expect("DSN permissions should set");
+            }
+            DsnFile {
+                path: path.display().to_string(),
+                directory,
+            }
+        }
+
+        struct TestDatabase {
+            dsn: String,
+            admin_dsn: String,
+            name: String,
+        }
+
+        impl Drop for TestDatabase {
+            fn drop(&mut self) {
+                let admin_dsn = self.admin_dsn.clone();
+                let name = self.name.clone();
+                std::thread::spawn(move || {
+                    let Ok(runtime) = tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()
+                    else {
+                        return;
+                    };
+                    runtime.block_on(async move {
+                        let Ok((client, connection)) =
+                            tokio_postgres::connect(&admin_dsn, tokio_postgres::NoTls).await
+                        else {
+                            return;
+                        };
+                        let connection = tokio::spawn(connection);
+                        let _ = client
+                            .batch_execute(&format!("DROP DATABASE IF EXISTS {name} WITH (FORCE)"))
+                            .await;
+                        let _ = connection.await;
+                    });
+                });
+            }
+        }
+
+        async fn create_test_database(admin_dsn: &str) -> TestDatabase {
+            let name = format!("ggw_discovery_test_{}", uuid::Uuid::new_v4().simple());
+            let (client, connection) = tokio_postgres::connect(admin_dsn, tokio_postgres::NoTls)
+                .await
+                .expect("admin connection");
+            let connection_task = tokio::spawn(connection);
+            client
+                .batch_execute(&format!("CREATE DATABASE {name}"))
+                .await
+                .expect("test database should create");
+            drop(client);
+            let _ = connection_task.await;
+            let database_start = admin_dsn
+                .rfind('/')
+                .expect("locator DSN has a database path segment");
+            let dsn = format!("{}/{}", &admin_dsn[..database_start], name);
+            TestDatabase {
+                dsn,
+                admin_dsn: admin_dsn.to_owned(),
+                name,
+            }
+        }
+
+        const DEPLOYMENT_ID: &str = "deploy-cluster-discovery";
+
+        async fn migrated_pool(dsn: &str) -> deadpool_postgres::Pool {
+            let dsn_file = write_dsn_file(dsn);
+            let mut config = test_config(Vec::new());
+            config.state_backend = config::StateBackend::Postgres;
+            config.deployment_id = Some(DEPLOYMENT_ID.to_owned());
+            config.database.url_file = Some(dsn_file.path.clone());
+            config.database.tls_mode = config::DatabaseTlsMode::LoopbackDev;
+            let foundation = PostgresFoundation::establish(&config)
+                .await
+                .expect("test database should establish");
+            migrations::apply_missing_for_startup(foundation.pool(), &config.database)
+                .await
+                .expect("schema should migrate");
+            foundation.pool().clone()
+        }
+
+        fn observed_event(index: usize, method: &str, path: &str) -> audit::AuditEvent {
+            let mut event = audit::AuditEvent::new(
+                "http.request_observed",
+                format!("request-{index}"),
+                "203.0.113.10",
+                Some(Actor {
+                    user_id: "alice".to_owned(),
+                    issuer: Some("https://issuer.example/".to_owned()),
+                    email: None,
+                    roles: Some(vec!["reader".to_owned()]),
+                    auth_mode: "bearer_token".to_owned(),
+                }),
+                json!({
+                    "method": method,
+                    "path": path,
+                    "status": 200,
+                    "latency_ms": 12,
+                    "routing_context_known": true,
+                    "upstream_origin": "http://upstream.internal:8080",
+                    "upstream_route_host": "api.example",
+                    "upstream_route_path_prefix": "/",
+                }),
+            );
+            event.event_id = format!("wiring-{index:06}");
+            event
+        }
+
+        async fn wait_for_checkpoint(store: &PostgresDiscoveryStore, position: i64) {
+            let deadline = Instant::now() + Duration::from_secs(20);
+            loop {
+                let checkpoint = store
+                    .checkpoint()
+                    .await
+                    .expect("the projector state should read");
+                if checkpoint.checkpoint_position >= position {
+                    return;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "the projector spawned by the app builder never reached position {position}: {checkpoint:?}"
+                );
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        }
+
+        /// The builder, handed the discovery seed, runs the projector as a
+        /// registered background task and answers discovery reads from the
+        /// projected tables: events ingested before boot and after it both
+        /// reach the inventory, and shutdown stops the task.
+        #[tokio::test]
+        async fn the_app_builder_spawns_the_projector_and_serves_the_read_store() {
+            let Some(admin_dsn) = locator() else {
+                eprintln!("skipping: no test database locator; CI runs this test");
+                return;
+            };
+            let database = create_test_database(&admin_dsn).await;
+            let pool = migrated_pool(&database.dsn).await;
+            let instance_id = uuid::Uuid::new_v4();
+            let audit_store = Arc::new(PostgresAuditEventStore::new(
+                pool.clone(),
+                Some(IngestIdentity {
+                    instance_id,
+                    boot_id: uuid::Uuid::new_v4(),
+                }),
+            ));
+            // Traffic a peer replica observed before this one booted.
+            audit_store
+                .insert_events(&[
+                    observed_event(1, "GET", "/orders"),
+                    observed_event(2, "GET", "/orders"),
+                    observed_event(3, "POST", "/orders"),
+                ])
+                .await
+                .expect("pre-boot observations should ingest");
+
+            let lifecycle = GatewayLifecycle::new();
+            let mut config = test_config(Vec::new());
+            config.state_backend = config::StateBackend::Postgres;
+            config.deployment_id = Some(DEPLOYMENT_ID.to_owned());
+            config.discovery_projector_poll_ms = 50;
+            let recorder = PrometheusBuilder::new().build_recorder();
+            let app = gateway_app_with_process_started_at_and_overrides(
+                config,
+                recorder.handle(),
+                test_audit_log(),
+                test_audit_event_sender(),
+                Instant::now(),
+                GatewayAppBuildOverrides {
+                    lifecycle: Some(lifecycle.clone()),
+                    pg_audit: Some(audit_store.clone()),
+                    pg_discovery: Some(ClusterDiscoverySeed {
+                        pool: pool.clone(),
+                        deployment_id: DEPLOYMENT_ID.to_owned(),
+                        instance_id,
+                        audit: audit_store.clone(),
+                    }),
+                    disable_proxy_health_checks: true,
+                    ..GatewayAppBuildOverrides::default()
+                },
+            )
+            .expect("a cluster-mode app with the discovery seed should build");
+
+            let store = PostgresDiscoveryStore::new(pool.clone());
+            wait_for_checkpoint(&store, 3).await;
+            let checkpoint = store.checkpoint().await.expect("checkpoint");
+            assert_eq!(checkpoint.projected_events, 3);
+            assert!(
+                checkpoint.fence >= 1,
+                "leadership was claimed: {checkpoint:?}"
+            );
+
+            // Traffic observed while this replica leads is projected as it
+            // arrives, and the read store every replica serves sees it.
+            audit_store
+                .insert_events(&[
+                    observed_event(4, "GET", "/users/42"),
+                    observed_event(5, "GET", "/users/43"),
+                ])
+                .await
+                .expect("post-boot observations should ingest");
+            wait_for_checkpoint(&store, 5).await;
+
+            let read_store = PostgresDiscoveryReadStore::new(pool.clone());
+            let mut observed = read_store
+                .observed_endpoints()
+                .await
+                .expect("the read store should answer")
+                .into_iter()
+                .map(|endpoint| (endpoint.method, endpoint.endpoint_template))
+                .collect::<Vec<_>>();
+            observed.sort();
+            observed.dedup();
+            assert_eq!(
+                observed,
+                vec![
+                    ("GET".to_owned(), "/orders".to_owned()),
+                    ("GET".to_owned(), "/users/{id}".to_owned()),
+                    ("POST".to_owned(), "/orders".to_owned()),
+                ]
+            );
+
+            // The projector is a registered background task: shutdown ends
+            // it rather than leaving a leader behind.
+            lifecycle.background_cancellation().cancel();
+            tokio::time::timeout(
+                Duration::from_secs(10),
+                lifecycle.shutdown_background_tasks(),
+            )
+            .await
+            .expect("the projector should stop on shutdown");
+            drop(app);
         }
     }
 }

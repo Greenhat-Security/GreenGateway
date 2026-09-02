@@ -7,6 +7,7 @@ use std::{
     time::{Duration, Instant},
 };
 
+use arc_swap::ArcSwap;
 use axum::{
     extract::{Request, State},
     middleware::Next,
@@ -27,10 +28,11 @@ use crate::{
     discovery::{
         openapi::{OpenApiRequestShape, SchemaCoverage},
         query::{
-            DiscoveryQueryStore, InferredJsonBodyKey, InferredQueryParam, InferredRequestSchema,
-            ObservedEndpoint,
+            DiscoveryQueryError, DiscoveryQueryStore, DiscoveryReadStore, InferredJsonBodyKey,
+            InferredQueryParam, InferredRequestSchema, ObservedEndpoint,
         },
     },
+    lifecycle::GatewayLifecycle,
     upstream_route::{
         request_host_without_port, ProxyRouteClassificationCompleted, ProxyRouteObservationContext,
     },
@@ -45,6 +47,15 @@ pub(crate) const MIN_INFERRED_CONFORMANCE_SAMPLE_COUNT: u64 = 5;
 /// this window without scanning SQLite or reparsing historical samples on every
 /// request.
 const INFERRED_SCHEMA_CACHE_TTL: Duration = Duration::from_secs(5);
+/// Cluster mode refreshes its conformance snapshot on the same cadence the
+/// standalone cache expires on, so an endpoint's samples become visible to
+/// every replica within one window either way.
+#[cfg_attr(not(feature = "postgres"), allow(dead_code))] // Read by cluster startup.
+pub(crate) const CLUSTER_CONFORMANCE_REFRESH_INTERVAL: Duration = INFERRED_SCHEMA_CACHE_TTL;
+/// How many endpoints a replica tracks inferred schemas for in cluster
+/// mode: the endpoints its own traffic has asked about, bounded so one
+/// replica's refresh is at most this many schema reads per interval.
+const MAX_TRACKED_INFERRED_ENDPOINTS: usize = 4096;
 /// A captured payload shape carries one entry per distinct query parameter and
 /// per top-level JSON body key, and every retained sample of it is stored whole.
 /// The request body itself is only bounded by `EGRESS_MAX_REQUEST_BODY_BYTES`,
@@ -86,12 +97,43 @@ pub struct PayloadCaptureConfig {
 #[derive(Clone)]
 pub struct SchemaConformanceState {
     coverage: SchemaCoverage,
-    query_store: Option<Arc<DiscoveryQueryStore>>,
+    inferred: Option<InferredSchemaSource>,
     payload_capture_enabled: bool,
     min_inferred_sample_count: u64,
     skip_exact_paths: Vec<String>,
     skip_path_prefixes: Vec<String>,
-    inferred_cache: Arc<InferredSchemaCache>,
+}
+
+/// Where the inferred-schema conformance check gets its schemas.
+#[derive(Clone)]
+enum InferredSchemaSource {
+    /// Standalone: the SQLite store, read on the request path behind the
+    /// short TTL cache (a local file read, never a network round trip).
+    Sqlite {
+        store: Arc<DiscoveryQueryStore>,
+        cache: Arc<InferredSchemaCache>,
+    },
+    /// Cluster: a snapshot a background task refreshes from the PostgreSQL
+    /// read store. The request path reads the snapshot and nothing else --
+    /// it holds no store handle at all, so it cannot reach the authority.
+    Cluster(Arc<ClusterConformanceCache>),
+}
+
+/// The cluster conformance cache: the last refreshed snapshot, and the set
+/// of endpoints this replica's traffic has asked about, which the next
+/// refresh loads inferred schemas for.
+pub struct ClusterConformanceCache {
+    snapshot: Arc<ArcSwap<ObservedSnapshot>>,
+    wanted: Mutex<BTreeSet<EndpointSchemaCacheKey>>,
+}
+
+/// What the cluster hot path reads: the observed endpoints (for template
+/// matching) and the inferred schemas of the tracked endpoints that have
+/// samples, as of the last refresh.
+#[derive(Default)]
+pub struct ObservedSnapshot {
+    endpoints: Arc<Vec<ObservedEndpoint>>,
+    schemas: BTreeMap<EndpointSchemaCacheKey, Arc<InferredRequestSchema>>,
 }
 
 struct InferredSchemaCache {
@@ -408,22 +450,46 @@ impl PayloadCaptureConfig {
 }
 
 impl SchemaConformanceState {
+    /// Standalone mode: inferred schemas come from the SQLite store on the
+    /// request path, behind the TTL cache.
     pub fn from_config(
         config: &Config,
         coverage: SchemaCoverage,
         query_store: Option<Arc<DiscoveryQueryStore>>,
     ) -> Option<Self> {
         let mut state = Self::from_parts(coverage, query_store, config.payload_capture_enabled)?;
-        state.skip_exact_paths = vec![
+        state.apply_config_skips(config);
+        Some(state)
+    }
+
+    /// Cluster mode: inferred schemas come from `cache`, which
+    /// [`spawn_cluster_conformance_refresher`] keeps current from the
+    /// PostgreSQL read store; the request path never queries the store.
+    #[cfg_attr(not(feature = "postgres"), allow(dead_code))] // Wired by cluster startup.
+    pub fn from_config_cluster(
+        config: &Config,
+        coverage: SchemaCoverage,
+        cache: Option<Arc<ClusterConformanceCache>>,
+    ) -> Option<Self> {
+        let mut state = Self::from_source(
+            coverage,
+            cache.map(InferredSchemaSource::Cluster),
+            config.payload_capture_enabled,
+        )?;
+        state.apply_config_skips(config);
+        Some(state)
+    }
+
+    fn apply_config_skips(&mut self, config: &Config) {
+        self.skip_exact_paths = vec![
             "/health".to_owned(),
             "/version".to_owned(),
             "/metrics".to_owned(),
         ];
-        state.skip_path_prefixes = vec![
+        self.skip_path_prefixes = vec![
             config.admin_prefix.clone(),
             format!("/v1{}", config.admin_prefix),
         ];
-        Some(state)
     }
 
     pub fn from_parts(
@@ -445,16 +511,31 @@ impl SchemaConformanceState {
         payload_capture_enabled: bool,
         inferred_cache_ttl: Duration,
     ) -> Option<Self> {
-        (coverage.spec_configured() || (payload_capture_enabled && query_store.is_some()))
-            .then_some(Self {
+        Self::from_source(
+            coverage,
+            query_store.map(|store| InferredSchemaSource::Sqlite {
+                store,
+                cache: Arc::new(InferredSchemaCache::new(inferred_cache_ttl)),
+            }),
+            payload_capture_enabled,
+        )
+    }
+
+    fn from_source(
+        coverage: SchemaCoverage,
+        inferred: Option<InferredSchemaSource>,
+        payload_capture_enabled: bool,
+    ) -> Option<Self> {
+        (coverage.spec_configured() || (payload_capture_enabled && inferred.is_some())).then_some(
+            Self {
                 coverage,
-                query_store,
+                inferred,
                 payload_capture_enabled,
                 min_inferred_sample_count: MIN_INFERRED_CONFORMANCE_SAMPLE_COUNT,
                 skip_exact_paths: Vec::new(),
                 skip_path_prefixes: Vec::new(),
-                inferred_cache: Arc::new(InferredSchemaCache::new(inferred_cache_ttl)),
-            })
+            },
+        )
     }
 
     #[cfg(test)]
@@ -478,14 +559,29 @@ impl SchemaConformanceState {
         payload_capture_enabled: bool,
         inferred_cache_ttl: Duration,
     ) -> Self {
+        Self::new_for_test_with_source(
+            coverage,
+            query_store.map(|store| InferredSchemaSource::Sqlite {
+                store,
+                cache: Arc::new(InferredSchemaCache::new(inferred_cache_ttl)),
+            }),
+            payload_capture_enabled,
+        )
+    }
+
+    #[cfg(test)]
+    fn new_for_test_with_source(
+        coverage: SchemaCoverage,
+        inferred: Option<InferredSchemaSource>,
+        payload_capture_enabled: bool,
+    ) -> Self {
         Self {
             coverage,
-            query_store,
+            inferred,
             payload_capture_enabled,
             min_inferred_sample_count: MIN_INFERRED_CONFORMANCE_SAMPLE_COUNT,
             skip_exact_paths: Vec::new(),
             skip_path_prefixes: Vec::new(),
-            inferred_cache: Arc::new(InferredSchemaCache::new(inferred_cache_ttl)),
         }
     }
 
@@ -529,9 +625,12 @@ impl SchemaConformanceState {
         method: &str,
         path: &str,
     ) -> Option<Arc<InferredRequestSchema>> {
-        let query_store = self.query_store.as_ref()?;
-        self.inferred_cache
-            .schema_for_request(query_store, method, path)
+        match self.inferred.as_ref()? {
+            InferredSchemaSource::Sqlite { store, cache } => {
+                cache.schema_for_request(store, method, path)
+            }
+            InferredSchemaSource::Cluster(cache) => cache.schema_for_request(method, path),
+        }
     }
 
     fn should_skip_path(&self, path: &str) -> bool {
@@ -558,15 +657,7 @@ impl InferredSchemaCache {
         path: &str,
     ) -> Option<Arc<InferredRequestSchema>> {
         let endpoints = self.observed_endpoints(query_store);
-        let endpoint_template = endpoints
-            .iter()
-            .filter(|endpoint| endpoint.method == method)
-            .filter_map(|endpoint| {
-                endpoint_template_match_score(&endpoint.endpoint_template, path)
-                    .map(|score| (score, endpoint.endpoint_template.as_str()))
-            })
-            .max_by(|(left, _), (right, _)| left.cmp(right))
-            .map(|(_, endpoint_template)| endpoint_template)?;
+        let endpoint_template = best_matching_endpoint_template(&endpoints, method, path)?;
 
         self.schema_for_endpoint(query_store, method, endpoint_template)
     }
@@ -659,6 +750,156 @@ impl<T: Clone> CacheEntry<T> {
     fn fresh_value(&self, now: Instant) -> Option<T> {
         (now < self.expires_at).then(|| self.value.clone())
     }
+}
+
+/// The observed endpoint template that best matches `path` for `method`:
+/// the most exact literal segments, then the fewest wildcard segments.
+fn best_matching_endpoint_template<'a>(
+    endpoints: &'a [ObservedEndpoint],
+    method: &str,
+    path: &str,
+) -> Option<&'a str> {
+    endpoints
+        .iter()
+        .filter(|endpoint| endpoint.method == method)
+        .filter_map(|endpoint| {
+            endpoint_template_match_score(&endpoint.endpoint_template, path)
+                .map(|score| (score, endpoint.endpoint_template.as_str()))
+        })
+        .max_by(|(left, _), (right, _)| left.cmp(right))
+        .map(|(_, endpoint_template)| endpoint_template)
+}
+
+impl Default for ClusterConformanceCache {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl ClusterConformanceCache {
+    pub fn new() -> Self {
+        Self {
+            snapshot: Arc::new(ArcSwap::from_pointee(ObservedSnapshot::default())),
+            wanted: Mutex::new(BTreeSet::new()),
+        }
+    }
+
+    /// The request-path lookup: match the path against the snapshot's
+    /// endpoints and return the snapshot's schema for the match. A miss
+    /// records the endpoint as wanted so the next refresh loads its
+    /// schema; nothing here touches a store.
+    fn schema_for_request(&self, method: &str, path: &str) -> Option<Arc<InferredRequestSchema>> {
+        let snapshot = self.snapshot.load();
+        let endpoint_template = best_matching_endpoint_template(&snapshot.endpoints, method, path)?;
+        let key = EndpointSchemaCacheKey {
+            method: method.to_owned(),
+            endpoint_template: endpoint_template.to_owned(),
+        };
+        match snapshot.schemas.get(&key) {
+            Some(schema) => Some(Arc::clone(schema)),
+            None => {
+                self.note_wanted(key);
+                None
+            }
+        }
+    }
+
+    fn note_wanted(&self, key: EndpointSchemaCacheKey) {
+        let mut wanted = self.wanted_guard();
+        if wanted.len() < MAX_TRACKED_INFERRED_ENDPOINTS || wanted.contains(&key) {
+            wanted.insert(key);
+        }
+    }
+
+    /// Load a fresh snapshot from `store`: every observed endpoint, and the
+    /// inferred schema of every wanted endpoint that is still observed
+    /// (endpoints that are gone are dropped from the wanted set). On a
+    /// failure the previous snapshot stays in service.
+    pub(crate) async fn refresh(
+        &self,
+        store: &dyn DiscoveryReadStore,
+    ) -> Result<(), DiscoveryQueryError> {
+        let endpoints = store.observed_endpoints().await?;
+        let observed = endpoints
+            .iter()
+            .map(|endpoint| EndpointSchemaCacheKey {
+                method: endpoint.method.clone(),
+                endpoint_template: endpoint.endpoint_template.clone(),
+            })
+            .collect::<BTreeSet<_>>();
+        let wanted = {
+            let mut wanted = self.wanted_guard();
+            wanted.retain(|key| observed.contains(key));
+            wanted.clone()
+        };
+        let mut schemas = BTreeMap::new();
+        for key in wanted {
+            if let Some(schema) = store
+                .inferred_request_schema(&key.method, &key.endpoint_template)
+                .await?
+            {
+                schemas.insert(key, Arc::new(schema));
+            }
+        }
+        self.snapshot.store(Arc::new(ObservedSnapshot {
+            endpoints: Arc::new(endpoints),
+            schemas,
+        }));
+        Ok(())
+    }
+
+    /// The snapshot the request path is reading right now.
+    #[cfg(test)]
+    pub(crate) fn snapshot(&self) -> arc_swap::Guard<Arc<ObservedSnapshot>> {
+        self.snapshot.load()
+    }
+
+    fn wanted_guard(&self) -> std::sync::MutexGuard<'_, BTreeSet<EndpointSchemaCacheKey>> {
+        match self.wanted.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        }
+    }
+}
+
+#[cfg(test)]
+impl ObservedSnapshot {
+    pub(crate) fn endpoints(&self) -> &[ObservedEndpoint] {
+        &self.endpoints
+    }
+
+    pub(crate) fn schema_count(&self) -> usize {
+        self.schemas.len()
+    }
+}
+
+/// Keep `cache` current from `store` for the life of the process: one
+/// refresh now, then one every `interval` until the lifecycle's background
+/// cancellation fires. A refresh that fails is logged and the previous
+/// snapshot keeps serving; the request path is never blocked on it.
+#[cfg_attr(not(feature = "postgres"), allow(dead_code))] // Wired by cluster startup.
+pub(crate) fn spawn_cluster_conformance_refresher(
+    lifecycle: &GatewayLifecycle,
+    cache: Arc<ClusterConformanceCache>,
+    store: Arc<dyn DiscoveryReadStore>,
+    interval: Duration,
+) {
+    let cancellation = lifecycle.background_cancellation();
+    let handle = tokio::spawn(async move {
+        loop {
+            if let Err(error) = cache.refresh(store.as_ref()).await {
+                tracing::warn!(
+                    error = %error,
+                    "cluster conformance snapshot refresh failed; the previous snapshot stays in service"
+                );
+            }
+            tokio::select! {
+                () = tokio::time::sleep(interval) => {}
+                () = cancellation.cancelled() => return,
+            }
+        }
+    });
+    lifecycle.register_background_task(handle);
 }
 
 enum PreparedSchemaConformanceCheck {
@@ -1195,19 +1436,26 @@ mod tests {
     use serde_json::json;
     use tower::ServiceExt;
 
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering as AtomicOrdering};
+
     use super::*;
     use crate::{
         audit::{sink::tests::CaptureSink, AuditSink},
         auth::{AuthError, AuthMethod, Principal, SessionCredential, SessionValidator},
         discovery::{
             openapi::{OpenApiSpec, SchemaCoverage},
-            query::DiscoveryQueryStore,
+            query::{
+                DiscoveryQueryStore, EndpointAggregateDetail, EndpointListFilters,
+                EndpointListPage, EndpointReviewState, PrincipalPage, PrincipalPageFilters,
+            },
+            signals::{Signal, SignalLifecycleState, SignalListFilters, SignalListPage},
         },
         middleware::{auth, rbac},
         rbac::{
             policy::{EgressPolicy, RoleEntry},
             DefaultAction, EnforcementMode, Policy, PrincipalMatcher, RouteRule, Rule, RuleAction,
         },
+        storage::{RepositoryError, RepositoryErrorKind},
     };
 
     #[test]
@@ -1815,6 +2063,301 @@ paths:
             Some(true)
         );
         assert_eq!(store.query_counts_for_test(), (2, 2));
+    }
+
+    /// A read store that counts what the refresher asks of it and can be
+    /// made to fail. The methods the conformance path never needs are
+    /// unreachable: reaching one is a test failure, not a stub answer.
+    struct CountingReadStore {
+        endpoints: Mutex<Vec<ObservedEndpoint>>,
+        schemas: Vec<InferredRequestSchema>,
+        observed_calls: AtomicU64,
+        inferred_calls: AtomicU64,
+        fail: AtomicBool,
+    }
+
+    impl CountingReadStore {
+        fn new(endpoints: Vec<ObservedEndpoint>, schemas: Vec<InferredRequestSchema>) -> Self {
+            Self {
+                endpoints: Mutex::new(endpoints),
+                schemas,
+                observed_calls: AtomicU64::new(0),
+                inferred_calls: AtomicU64::new(0),
+                fail: AtomicBool::new(false),
+            }
+        }
+
+        /// `(observed_endpoints calls, inferred_request_schema calls)`.
+        fn counts(&self) -> (u64, u64) {
+            (
+                self.observed_calls.load(AtomicOrdering::Relaxed),
+                self.inferred_calls.load(AtomicOrdering::Relaxed),
+            )
+        }
+
+        fn set_endpoints(&self, endpoints: Vec<ObservedEndpoint>) {
+            *self.endpoints.lock().expect("endpoints lock") = endpoints;
+        }
+
+        fn set_failing(&self, failing: bool) {
+            self.fail.store(failing, AtomicOrdering::Relaxed);
+        }
+
+        fn failure(&self) -> Result<(), DiscoveryQueryError> {
+            if self.fail.load(AtomicOrdering::Relaxed) {
+                Err(DiscoveryQueryError::Repository(RepositoryError::new(
+                    RepositoryErrorKind::Unavailable,
+                    "counting_read_store",
+                )))
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl DiscoveryReadStore for CountingReadStore {
+        async fn observed_endpoints(&self) -> Result<Vec<ObservedEndpoint>, DiscoveryQueryError> {
+            self.observed_calls.fetch_add(1, AtomicOrdering::Relaxed);
+            self.failure()?;
+            Ok(self.endpoints.lock().expect("endpoints lock").clone())
+        }
+
+        async fn list_endpoints_with_open_signal_summaries(
+            &self,
+            _filters: &EndpointListFilters,
+            _include_open_signals: bool,
+        ) -> Result<EndpointListPage, DiscoveryQueryError> {
+            unreachable!("the conformance path never lists endpoints")
+        }
+
+        async fn get_endpoint_with_open_signal_summaries(
+            &self,
+            _method: &str,
+            _endpoint_template: &str,
+            _new_since_hours: u64,
+            _include_open_signals: bool,
+        ) -> Result<Option<EndpointAggregateDetail>, DiscoveryQueryError> {
+            unreachable!("the conformance path never reads endpoint detail")
+        }
+
+        async fn inferred_request_schema(
+            &self,
+            method: &str,
+            endpoint_template: &str,
+        ) -> Result<Option<InferredRequestSchema>, DiscoveryQueryError> {
+            self.inferred_calls.fetch_add(1, AtomicOrdering::Relaxed);
+            self.failure()?;
+            Ok(self
+                .schemas
+                .iter()
+                .find(|schema| {
+                    schema.method == method && schema.endpoint_template == endpoint_template
+                })
+                .cloned())
+        }
+
+        async fn set_endpoint_review(
+            &self,
+            _method: &str,
+            _endpoint_template: &str,
+            _reviewed: bool,
+            _reviewed_by: Option<&str>,
+        ) -> Result<Option<EndpointReviewState>, DiscoveryQueryError> {
+            unreachable!("the conformance path never writes reviews")
+        }
+
+        async fn list_signals(
+            &self,
+            _filters: &SignalListFilters,
+        ) -> Result<SignalListPage, DiscoveryQueryError> {
+            unreachable!("the conformance path never lists signals")
+        }
+
+        async fn list_principal_endpoint_signals(
+            &self,
+            _principal: &str,
+            _issuer: &str,
+            _auth_method: &str,
+            _limit: usize,
+        ) -> Result<Vec<Signal>, DiscoveryQueryError> {
+            unreachable!("the conformance path never lists principal signals")
+        }
+
+        async fn transition_signal(
+            &self,
+            _signal_id: &str,
+            _state: SignalLifecycleState,
+            _transitioned_by: Option<&str>,
+        ) -> Result<Option<Signal>, DiscoveryQueryError> {
+            unreachable!("the conformance path never transitions signals")
+        }
+
+        async fn list_principals(
+            &self,
+            _method: &str,
+            _endpoint_template: &str,
+            _filters: &PrincipalPageFilters,
+        ) -> Result<PrincipalPage, DiscoveryQueryError> {
+            unreachable!("the conformance path never lists principals")
+        }
+    }
+
+    fn observed(method: &str, endpoint_template: &str) -> ObservedEndpoint {
+        ObservedEndpoint {
+            method: method.to_owned(),
+            endpoint_template: endpoint_template.to_owned(),
+            route_host: None,
+            route_path_prefix: None,
+            upstream_origin: None,
+            routing_context_known_since: None,
+        }
+    }
+
+    fn inferred_schema_with_required_body_key(
+        method: &str,
+        endpoint_template: &str,
+        key: &str,
+        sample_count: u64,
+    ) -> InferredRequestSchema {
+        InferredRequestSchema {
+            method: method.to_owned(),
+            endpoint_template: endpoint_template.to_owned(),
+            sample_count,
+            required_threshold: crate::discovery::query::INFERRED_SCHEMA_REQUIRED_THRESHOLD,
+            query_params: Vec::new(),
+            json_body_keys: vec![InferredJsonBodyKey {
+                name: Some(key.to_owned()),
+                name_hash: None,
+                redacted: false,
+                present_count: sample_count,
+                frequency: 1.0,
+                required: true,
+            }],
+        }
+    }
+
+    fn cluster_conformance(cache: &Arc<ClusterConformanceCache>) -> SchemaConformanceState {
+        SchemaConformanceState::new_for_test_with_source(
+            SchemaCoverage::default(),
+            Some(InferredSchemaSource::Cluster(Arc::clone(cache))),
+            true,
+        )
+    }
+
+    /// PR 11 contract test 8: in cluster mode the conformance hot path
+    /// reads the refreshed snapshot and nothing else. The state holds no
+    /// store handle at all; every read of the authority is the refresher's,
+    /// and a thousand requests add none.
+    #[tokio::test]
+    async fn the_request_path_never_queries_the_authority() {
+        let store = Arc::new(CountingReadStore::new(
+            vec![observed("POST", "/users"), observed("GET", "/health")],
+            vec![inferred_schema_with_required_body_key(
+                "POST",
+                "/users",
+                "display_name",
+                MIN_INFERRED_CONFORMANCE_SAMPLE_COUNT,
+            )],
+        ));
+        let cache = Arc::new(ClusterConformanceCache::new());
+        let conformance = cluster_conformance(&cache);
+
+        // Before the first refresh the snapshot is empty: no check, no read.
+        assert!(conformance.prepare_check("POST", "/users", None).is_none());
+        assert_eq!(store.counts(), (0, 0));
+
+        cache.refresh(store.as_ref()).await.expect("first refresh");
+        assert_eq!(cache.snapshot().endpoints().len(), 2);
+        assert_eq!(
+            store.counts(),
+            (1, 0),
+            "nothing was wanted yet, so no schema was read"
+        );
+
+        // The first request for the endpoint finds no schema in the
+        // snapshot (and prepares no check), and records the endpoint as
+        // wanted -- without reading the store.
+        assert!(conformance.prepare_check("POST", "/users", None).is_none());
+        assert!(conformance.prepare_check("GET", "/health", None).is_none());
+        assert_eq!(store.counts(), (1, 0));
+
+        cache.refresh(store.as_ref()).await.expect("second refresh");
+        assert_eq!(
+            store.counts(),
+            (2, 2),
+            "the refresh read one schema per wanted endpoint"
+        );
+        assert_eq!(
+            cache.snapshot().schema_count(),
+            1,
+            "only the endpoint with samples has a schema"
+        );
+
+        for _ in 0..1_000 {
+            let check = conformance
+                .prepare_check("POST", "/users", None)
+                .expect("the snapshot schema prepares the check");
+            assert!(check.needs_body_capture());
+            assert!(conformance.prepare_check("GET", "/health", None).is_none());
+        }
+        assert_eq!(
+            store.counts(),
+            (2, 2),
+            "a thousand requests made zero reads of the authority"
+        );
+    }
+
+    /// A failed refresh keeps the previous snapshot in service, and a
+    /// successful one drops endpoints the authority no longer lists (and
+    /// stops asking for their schemas).
+    #[tokio::test]
+    async fn cluster_conformance_refresh_keeps_serving_through_failures_and_prunes_gone_endpoints()
+    {
+        let store = Arc::new(CountingReadStore::new(
+            vec![observed("POST", "/users")],
+            vec![inferred_schema_with_required_body_key(
+                "POST",
+                "/users",
+                "display_name",
+                MIN_INFERRED_CONFORMANCE_SAMPLE_COUNT,
+            )],
+        ));
+        let cache = Arc::new(ClusterConformanceCache::new());
+        let conformance = cluster_conformance(&cache);
+
+        cache.refresh(store.as_ref()).await.expect("refresh");
+        assert!(conformance.prepare_check("POST", "/users", None).is_none());
+        cache.refresh(store.as_ref()).await.expect("refresh");
+        assert!(conformance.prepare_check("POST", "/users", None).is_some());
+        assert_eq!(store.counts(), (2, 1));
+
+        store.set_failing(true);
+        let error = cache
+            .refresh(store.as_ref())
+            .await
+            .expect_err("the refresh reports the store failure");
+        assert!(matches!(error, DiscoveryQueryError::Repository(_)));
+        assert_eq!(cache.snapshot().endpoints().len(), 1);
+        assert_eq!(cache.snapshot().schema_count(), 1);
+        assert!(
+            conformance.prepare_check("POST", "/users", None).is_some(),
+            "the previous snapshot keeps serving"
+        );
+
+        store.set_failing(false);
+        store.set_endpoints(Vec::new());
+        cache.refresh(store.as_ref()).await.expect("refresh");
+        assert!(cache.snapshot().endpoints().is_empty());
+        assert_eq!(cache.snapshot().schema_count(), 0);
+        assert!(conformance.prepare_check("POST", "/users", None).is_none());
+        let (_, inferred_before) = store.counts();
+        cache.refresh(store.as_ref()).await.expect("refresh");
+        assert_eq!(
+            store.counts().1,
+            inferred_before,
+            "an endpoint the authority no longer lists is no longer asked about"
+        );
     }
 
     #[tokio::test]

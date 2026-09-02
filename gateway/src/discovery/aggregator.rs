@@ -5,6 +5,14 @@
 //! writer thread, keeps an in-memory working set, and periodically flushes
 //! endpoint inventory to SQLite.
 //!
+//! The in-memory working set (`AggregatorState` and the types it holds) is
+//! backend-neutral: it is rebuilt from `LoadedRows`, hands the next flush out
+//! as a `PendingFlush`, and is told what was committed with `mark_flushed`.
+//! The SQLite sink in this file is one consumer of that model; the cluster
+//! discovery projector is another and persists the same state to PostgreSQL,
+//! including the rolling detector windows and path-template learner groups
+//! that SQLite rebuilds empty after a restart.
+//!
 //! Endpoint aggregates are keyed by `(method, endpoint_template)`. Proxy routing
 //! variants are retained separately by configured route host/path and upstream
 //! origin, avoiding attacker-controlled Host cardinality while preserving every
@@ -36,6 +44,7 @@ use std::{
 };
 
 use rusqlite::{params, Connection};
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 
@@ -56,7 +65,9 @@ use crate::{
 };
 
 const HTTP_REQUEST_OBSERVED: &str = "http.request_observed";
-const AGGREGATOR_BATCH_SIZE: usize = 200;
+/// Observations the SQLite sink applies between flushes; the cluster
+/// projector flushes on the same cadence within a batch.
+pub(crate) const AGGREGATOR_BATCH_SIZE: usize = 200;
 const AGGREGATOR_FLUSH_INTERVAL: StdDuration = StdDuration::from_millis(250);
 const LATENCY_SAMPLE_LIMIT: usize = 1024;
 /// Evict a fraction of the least-recently-observed endpoint aggregates at a
@@ -531,29 +542,17 @@ impl EndpointAggregatorShared {
             return Ok(());
         }
 
-        let deleted_keys = state.deleted_keys.iter().cloned().collect::<Vec<_>>();
-        let dirty_keys = state.dirty_keys.iter().cloned().collect::<Vec<_>>();
-        let pending_signals = state.pending_signals.clone();
-        let dirty_aggregates = dirty_keys
-            .iter()
-            .filter_map(|key| state.aggregates.get(key).cloned())
-            .collect::<Vec<_>>();
+        let batch = state.pending_flush();
         let payload_capture_enabled = state.payload_capture_enabled;
 
         let result = {
             let mut connection = self.connection_guard();
-            write_flush(
-                &mut connection,
-                &deleted_keys,
-                &dirty_aggregates,
-                &pending_signals,
-                payload_capture_enabled,
-            )
+            write_flush(&mut connection, &batch, payload_capture_enabled)
         };
 
         match result {
             Ok(opened_signals) => {
-                state.mark_flushed(&deleted_keys, &dirty_keys, pending_signals.len());
+                state.mark_flushed(&batch);
                 self.emit_signal_opened_events(&opened_signals);
                 Ok(())
             }
@@ -562,35 +561,7 @@ impl EndpointAggregatorShared {
     }
 
     fn emit_signal_opened_events(&self, signals: &[signals::Signal]) {
-        let Some(sender) = &self.signal_event_sender else {
-            return;
-        };
-
-        for signal in signals {
-            let payload = json!({
-                "id": &signal.id,
-                "signal_type": &signal.signal_type,
-                "target": &signal.target,
-                "explanation": &signal.explanation,
-                "evidence": &signal.evidence,
-                "state": signal.state.as_str(),
-                "created_at": &signal.created_at,
-                "updated_at": &signal.updated_at,
-                "transitioned_at": &signal.transitioned_at,
-                "transitioned_by": &signal.transitioned_by,
-            });
-            let event = AuditEvent::new(
-                event::SIGNAL_OPENED,
-                "discovery-signal",
-                "127.0.0.1",
-                None,
-                payload,
-            );
-
-            if sender.send(event).is_err() {
-                tracing::trace!("no active audit event stream subscribers for signal.opened");
-            }
-        }
+        emit_signal_opened_events(self.signal_event_sender.as_ref(), signals);
     }
 
     fn state_guard(&self) -> MutexGuard<'_, AggregatorState> {
@@ -632,14 +603,53 @@ impl EndpointAggregatorShared {
     }
 }
 
+/// Publish one `signal.opened` audit event per signal a flush inserted, on
+/// the live event stream only (a `None` sender means no stream is
+/// configured). Shared by the SQLite sink and the cluster projector so both
+/// backends announce a newly opened signal identically.
+pub(crate) fn emit_signal_opened_events(
+    sender: Option<&AuditEventSender>,
+    signals: &[signals::Signal],
+) {
+    let Some(sender) = sender else {
+        return;
+    };
+
+    for signal in signals {
+        let payload = json!({
+            "id": &signal.id,
+            "signal_type": &signal.signal_type,
+            "target": &signal.target,
+            "explanation": &signal.explanation,
+            "evidence": &signal.evidence,
+            "state": signal.state.as_str(),
+            "created_at": &signal.created_at,
+            "updated_at": &signal.updated_at,
+            "transitioned_at": &signal.transitioned_at,
+            "transitioned_by": &signal.transitioned_by,
+        });
+        let event = AuditEvent::new(
+            event::SIGNAL_OPENED,
+            "discovery-signal",
+            "127.0.0.1",
+            None,
+            payload,
+        );
+
+        if sender.send(event).is_err() {
+            tracing::trace!("no active audit event stream subscribers for signal.opened");
+        }
+    }
+}
+
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
-struct EndpointKey {
-    method: String,
-    endpoint_template: String,
+pub(crate) struct EndpointKey {
+    pub(crate) method: String,
+    pub(crate) endpoint_template: String,
 }
 
 impl EndpointKey {
-    fn new(method: impl Into<String>, endpoint_template: impl Into<String>) -> Self {
+    pub(crate) fn new(method: impl Into<String>, endpoint_template: impl Into<String>) -> Self {
         Self {
             method: method.into(),
             endpoint_template: endpoint_template.into(),
@@ -648,29 +658,29 @@ impl EndpointKey {
 }
 
 #[derive(Clone, Debug)]
-struct EndpointAggregate {
-    key: EndpointKey,
-    last_access_seq: u64,
-    first_seen: String,
-    last_seen: String,
-    call_count: u64,
-    schema_mismatch_count: u64,
-    error_count: u64,
-    status_counts: BTreeMap<u16, u64>,
-    latency_count: u64,
-    latency_samples: Vec<u64>,
-    payload_shape_observation_count: u64,
-    payload_shape_samples: Vec<PayloadShapeSample>,
+pub(crate) struct EndpointAggregate {
+    pub(crate) key: EndpointKey,
+    pub(crate) last_access_seq: u64,
+    pub(crate) first_seen: String,
+    pub(crate) last_seen: String,
+    pub(crate) call_count: u64,
+    pub(crate) schema_mismatch_count: u64,
+    pub(crate) error_count: u64,
+    pub(crate) status_counts: BTreeMap<u16, u64>,
+    pub(crate) latency_count: u64,
+    pub(crate) latency_samples: Vec<u64>,
+    pub(crate) payload_shape_observation_count: u64,
+    pub(crate) payload_shape_samples: Vec<PayloadShapeSample>,
     /// Known limitation: exact principal entries are never capped or evicted.
     /// This map grows one entry per distinct identity tuple seen for this
     /// endpoint for the lifetime of the process, and the matching
     /// `discovery_endpoint_principals` rows grow for the lifetime of the
     /// database. Future work should add TTL pruning or a configured
     /// cardinality cap if exactness becomes too costly.
-    principals: HashMap<PrincipalIdentity, PrincipalSeen>,
-    routing_contexts: HashMap<RoutingContextKey, RoutingContextAggregate>,
-    routing_context_known_since: Option<String>,
-    classified_signal_state: ClassifiedSignalState,
+    pub(crate) principals: HashMap<PrincipalIdentity, PrincipalSeen>,
+    pub(crate) routing_contexts: HashMap<RoutingContextKey, RoutingContextAggregate>,
+    pub(crate) routing_context_known_since: Option<String>,
+    pub(crate) classified_signal_state: ClassifiedSignalState,
 }
 
 impl EndpointAggregate {
@@ -874,8 +884,17 @@ impl EndpointAggregate {
         }
     }
 
-    fn latency_percentiles(&self) -> LatencyPercentiles {
+    pub(crate) fn latency_percentiles(&self) -> LatencyPercentiles {
         LatencyPercentiles::from_samples(&self.latency_samples)
+    }
+
+    /// The rolling detector state as JSON, so a backend that persists it can
+    /// hand a successor the same error and volume windows this process had.
+    /// The SQLite sink never stores this; it rebuilds the counters from its
+    /// stat tables and starts the windows empty.
+    pub(crate) fn detector_state_json(&self) -> String {
+        serde_json::to_string(&self.classified_signal_state)
+            .expect("classified signal state is plain data and always serializes")
     }
 
     fn reset_transient_signal_windows(&mut self) {
@@ -884,14 +903,14 @@ impl EndpointAggregate {
 }
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
-struct RoutingContextKey {
-    route_host: String,
-    route_path_prefix: String,
-    upstream_origin: String,
+pub(crate) struct RoutingContextKey {
+    pub(crate) route_host: String,
+    pub(crate) route_path_prefix: String,
+    pub(crate) upstream_origin: String,
 }
 
 impl RoutingContextKey {
-    fn new(
+    pub(crate) fn new(
         route_host: Option<String>,
         route_path_prefix: Option<String>,
         upstream_origin: String,
@@ -905,12 +924,12 @@ impl RoutingContextKey {
 }
 
 #[derive(Clone, Debug)]
-struct RoutingContextAggregate {
-    key: RoutingContextKey,
-    first_seen: String,
-    last_seen: String,
-    call_count: u64,
-    principals: HashSet<PrincipalIdentity>,
+pub(crate) struct RoutingContextAggregate {
+    pub(crate) key: RoutingContextKey,
+    pub(crate) first_seen: String,
+    pub(crate) last_seen: String,
+    pub(crate) call_count: u64,
+    pub(crate) principals: HashSet<PrincipalIdentity>,
 }
 
 impl RoutingContextAggregate {
@@ -954,14 +973,18 @@ struct EndpointAggregateObservation {
     classified_signal: Option<ClassifiedSignalObservation>,
 }
 
-#[derive(Clone, Debug, Default)]
-struct ClassifiedSignalState {
-    call_count: u64,
-    schema_mismatch_count: u64,
-    error_count: u64,
-    principals: HashSet<PrincipalIdentity>,
-    recent_error_window: RecentErrorWindow,
-    volume_window: VolumeWindow,
+/// Counters and rolling windows the signal detectors evaluate against. The
+/// counters are persisted by every backend; the windows are transient for the
+/// SQLite sink (rebuilt empty after a restart) and serialized whole by the
+/// cluster projector so a successor continues from the same history.
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+pub(crate) struct ClassifiedSignalState {
+    pub(crate) call_count: u64,
+    pub(crate) schema_mismatch_count: u64,
+    pub(crate) error_count: u64,
+    pub(crate) principals: HashSet<PrincipalIdentity>,
+    pub(crate) recent_error_window: RecentErrorWindow,
+    pub(crate) volume_window: VolumeWindow,
 }
 
 impl ClassifiedSignalState {
@@ -1026,10 +1049,10 @@ struct ClassifiedSignalObservation {
     completed_volume_window: Option<CompletedVolumeWindow>,
 }
 
-#[derive(Clone, Debug, Default)]
-struct RecentErrorWindow {
-    samples: VecDeque<bool>,
-    error_count: u64,
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+pub(crate) struct RecentErrorWindow {
+    pub(crate) samples: VecDeque<bool>,
+    pub(crate) error_count: u64,
 }
 
 impl RecentErrorWindow {
@@ -1057,11 +1080,11 @@ struct ErrorRateWindowSnapshot {
     error_count: u64,
 }
 
-#[derive(Clone, Debug, Default)]
-struct VolumeWindow {
-    current: Option<OpenVolumeWindow>,
-    baseline_window_count: u64,
-    baseline_rate_per_second: f64,
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+pub(crate) struct VolumeWindow {
+    pub(crate) current: Option<OpenVolumeWindow>,
+    pub(crate) baseline_window_count: u64,
+    pub(crate) baseline_rate_per_second: f64,
 }
 
 impl VolumeWindow {
@@ -1116,11 +1139,11 @@ impl VolumeWindow {
     }
 }
 
-#[derive(Clone, Copy, Debug)]
-struct OpenVolumeWindow {
-    first_timestamp_seconds: i64,
-    last_timestamp_seconds: i64,
-    call_count: u64,
+#[derive(Clone, Copy, Debug, Deserialize, Serialize)]
+pub(crate) struct OpenVolumeWindow {
+    pub(crate) first_timestamp_seconds: i64,
+    pub(crate) last_timestamp_seconds: i64,
+    pub(crate) call_count: u64,
 }
 
 impl OpenVolumeWindow {
@@ -1146,14 +1169,14 @@ struct CompletedVolumeWindow {
 }
 
 #[derive(Clone, Debug)]
-struct PayloadShapeSample {
-    observed_at: String,
-    shape_hash: String,
-    shape: Value,
+pub(crate) struct PayloadShapeSample {
+    pub(crate) observed_at: String,
+    pub(crate) shape_hash: String,
+    pub(crate) shape: Value,
 }
 
 impl PayloadShapeSample {
-    fn new(observed_at: &str, shape: Value) -> Self {
+    pub(crate) fn new(observed_at: &str, shape: Value) -> Self {
         let shape_hash = hash_args(&shape);
         Self {
             observed_at: observed_at.to_owned(),
@@ -1164,16 +1187,16 @@ impl PayloadShapeSample {
 }
 
 #[derive(Clone, Debug)]
-struct PrincipalSeen {
-    first_seen: String,
-    last_seen: String,
+pub(crate) struct PrincipalSeen {
+    pub(crate) first_seen: String,
+    pub(crate) last_seen: String,
 }
 
-#[derive(Clone, Debug, Eq, Hash, PartialEq)]
-struct PrincipalIdentity {
-    user_id: String,
-    issuer: String,
-    auth_method: String,
+#[derive(Clone, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
+pub(crate) struct PrincipalIdentity {
+    pub(crate) user_id: String,
+    pub(crate) issuer: String,
+    pub(crate) auth_method: String,
 }
 
 impl PrincipalSeen {
@@ -1187,8 +1210,89 @@ impl PrincipalSeen {
     }
 }
 
+/// Everything a backend has persisted for the aggregator, in the row shapes the
+/// tables use, so the in-memory model can be rebuilt without knowing which
+/// database it came from. The SQLite sink fills the first ten from its own
+/// tables and leaves `detector_states` empty and `template_groups_json` unset;
+/// the cluster projector fills all twelve from PostgreSQL.
 #[derive(Debug, Default)]
-struct AggregatorState {
+pub(crate) struct LoadedRows {
+    pub(crate) aggregates: Vec<AggregateRow>,
+    pub(crate) statuses: Vec<StatusRow>,
+    pub(crate) principals: Vec<PrincipalRow>,
+    pub(crate) routing_contexts: Vec<RoutingContextRow>,
+    pub(crate) routing_principals: Vec<RoutingPrincipalRow>,
+    pub(crate) classifications: Vec<RoutingClassificationRow>,
+    pub(crate) classified_stats: Vec<ClassifiedSignalStatRow>,
+    pub(crate) classified_principals: Vec<ClassifiedSignalPrincipalRow>,
+    pub(crate) payload_stats: Vec<PayloadShapeStatRow>,
+    pub(crate) payload_samples: Vec<PayloadShapeSampleRow>,
+    /// Serialized `ClassifiedSignalState` per endpoint. When present it
+    /// replaces the state reconstructed from `classified_stats` and
+    /// `classified_principals`, windows included.
+    pub(crate) detector_states: Vec<DetectorStateRow>,
+    /// `PathTemplateLearner::export_groups_json` output, restored when present.
+    pub(crate) template_groups_json: Option<String>,
+}
+
+/// The work one flush has to persist: keys that left the working set, the
+/// current absolute value of every aggregate touched since the last flush, and
+/// the signals queued in that window. `mark_flushed` takes the same value back
+/// so state observed between snapshot and commit is never cleared by mistake.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct PendingFlush {
+    pub(crate) deleted_keys: Vec<EndpointKey>,
+    pub(crate) dirty_aggregates: Vec<EndpointAggregate>,
+    pub(crate) pending_signals: Vec<NewSignal>,
+}
+
+impl PendingFlush {
+    pub(crate) fn is_empty(&self) -> bool {
+        self.deleted_keys.is_empty()
+            && self.dirty_aggregates.is_empty()
+            && self.pending_signals.is_empty()
+    }
+
+    /// The queued signals minus any whose target endpoint is deleted in this
+    /// same flush. A key admitted and evicted inside one flush window has had
+    /// its (not yet written) rows deleted before its signals would be inserted,
+    /// so writing those signals would leave rows no eviction can ever reach.
+    pub(crate) fn signals_surviving_deletions(&self) -> Vec<NewSignal> {
+        signals_without_deleted_targets(&self.deleted_keys, &self.pending_signals)
+    }
+}
+
+/// Filter `pending_signals` down to the ones whose target endpoint is not in
+/// `deleted_keys`, for every backend that deletes keys and inserts signals in
+/// the same transaction.
+pub(crate) fn signals_without_deleted_targets(
+    deleted_keys: &[EndpointKey],
+    pending_signals: &[NewSignal],
+) -> Vec<NewSignal> {
+    let deleted_targets = deleted_keys
+        .iter()
+        .map(|key| {
+            let endpoint_target = signals::endpoint_target_key(&key.method, &key.endpoint_template);
+            let principal_prefix = format!("{endpoint_target} ");
+            (endpoint_target, principal_prefix)
+        })
+        .collect::<Vec<_>>();
+    pending_signals
+        .iter()
+        .filter(|signal| {
+            !deleted_targets
+                .iter()
+                .any(|(endpoint_target, principal_prefix)| {
+                    SignalIdentity::from(*signal)
+                        .targets_endpoint(endpoint_target, principal_prefix)
+                })
+        })
+        .cloned()
+        .collect()
+}
+
+#[derive(Debug, Default)]
+pub(crate) struct AggregatorState {
     payload_capture_enabled: bool,
     /// Maximum number of endpoint aggregates retained. Zero is reserved for
     /// internal callers and tests that explicitly need unbounded behavior.
@@ -1211,6 +1315,31 @@ impl AggregatorState {
         endpoint_limit: usize,
         signal_detector_config: SignalDetectorConfig,
     ) -> Result<Self, EndpointAggregatorLoadError> {
+        let rows = load_rows_sqlite(connection, payload_capture_enabled)?;
+        Self::from_rows(
+            rows,
+            payload_capture_enabled,
+            endpoint_limit,
+            signal_detector_config,
+        )
+        .map_err(EndpointAggregatorLoadError::from)
+    }
+
+    /// Rebuild the working set from persisted rows. This touches no database:
+    /// the only failure is JSON that a backend stored and can no longer parse
+    /// (latency samples, payload shapes, detector state, learner groups), which
+    /// is reported rather than silently dropped so a corrupt store is noticed.
+    ///
+    /// Rows for endpoints missing from `rows.aggregates` are ignored, the
+    /// access order is reseeded from `last_seen`, and a store holding more
+    /// endpoints than `endpoint_limit` is trimmed with the excess queued for
+    /// deletion on the first flush.
+    pub(crate) fn from_rows(
+        rows: LoadedRows,
+        payload_capture_enabled: bool,
+        endpoint_limit: usize,
+        signal_detector_config: SignalDetectorConfig,
+    ) -> Result<Self, serde_json::Error> {
         let mut state = Self {
             payload_capture_enabled,
             endpoint_limit,
@@ -1222,7 +1351,7 @@ impl AggregatorState {
             ..Self::default()
         };
 
-        for row in load_aggregate_rows(connection)? {
+        for row in rows.aggregates {
             let key = EndpointKey::new(row.method, row.endpoint_template);
             let latency_samples = serde_json::from_str::<Vec<u64>>(&row.latency_samples_json)?;
             state.aggregates.insert(
@@ -1248,7 +1377,7 @@ impl AggregatorState {
             );
         }
 
-        for row in load_status_rows(connection)? {
+        for row in rows.statuses {
             let key = EndpointKey::new(row.method, row.endpoint_template);
             let Some(aggregate) = state.aggregates.get_mut(&key) else {
                 continue;
@@ -1263,7 +1392,7 @@ impl AggregatorState {
             }
         }
 
-        for row in load_principal_rows(connection)? {
+        for row in rows.principals {
             let key = EndpointKey::new(row.method, row.endpoint_template);
             let Some(aggregate) = state.aggregates.get_mut(&key) else {
                 continue;
@@ -1281,7 +1410,7 @@ impl AggregatorState {
             );
         }
 
-        for row in load_routing_context_rows(connection)? {
+        for row in rows.routing_contexts {
             let key = EndpointKey::new(row.method, row.endpoint_template);
             let Some(aggregate) = state.aggregates.get_mut(&key) else {
                 continue;
@@ -1303,7 +1432,7 @@ impl AggregatorState {
             );
         }
 
-        for row in load_routing_classification_rows(connection)? {
+        for row in rows.classifications {
             let key = EndpointKey::new(row.method, row.endpoint_template);
             let Some(aggregate) = state.aggregates.get_mut(&key) else {
                 continue;
@@ -1314,7 +1443,7 @@ impl AggregatorState {
             );
         }
 
-        for row in load_routing_principal_rows(connection)? {
+        for row in rows.routing_principals {
             let key = EndpointKey::new(row.method, row.endpoint_template);
             let Some(aggregate) = state.aggregates.get_mut(&key) else {
                 continue;
@@ -1333,7 +1462,7 @@ impl AggregatorState {
             }
         }
 
-        for row in load_classified_signal_stat_rows(connection)? {
+        for row in rows.classified_stats {
             let key = EndpointKey::new(row.method, row.endpoint_template);
             let Some(aggregate) = state.aggregates.get_mut(&key) else {
                 continue;
@@ -1345,7 +1474,7 @@ impl AggregatorState {
                 non_negative_i64_to_u64(row.error_count);
         }
 
-        for row in load_classified_signal_principal_rows(connection)? {
+        for row in rows.classified_principals {
             let key = EndpointKey::new(row.method, row.endpoint_template);
             let Some(aggregate) = state.aggregates.get_mut(&key) else {
                 continue;
@@ -1361,7 +1490,7 @@ impl AggregatorState {
         }
 
         if payload_capture_enabled {
-            for row in load_payload_shape_stat_rows(connection)? {
+            for row in rows.payload_stats {
                 let key = EndpointKey::new(row.method, row.endpoint_template);
                 let Some(aggregate) = state.aggregates.get_mut(&key) else {
                     continue;
@@ -1370,7 +1499,7 @@ impl AggregatorState {
                     non_negative_i64_to_u64(row.shape_observation_count);
             }
 
-            for row in load_payload_shape_sample_rows(connection)? {
+            for row in rows.payload_samples {
                 let key = EndpointKey::new(row.method, row.endpoint_template);
                 let Some(aggregate) = state.aggregates.get_mut(&key) else {
                     continue;
@@ -1382,6 +1511,19 @@ impl AggregatorState {
                     shape,
                 });
             }
+        }
+
+        for row in rows.detector_states {
+            let key = EndpointKey::new(row.method, row.endpoint_template);
+            let Some(aggregate) = state.aggregates.get_mut(&key) else {
+                continue;
+            };
+            aggregate.classified_signal_state =
+                serde_json::from_str::<ClassifiedSignalState>(&row.state_json)?;
+        }
+
+        if let Some(groups_json) = rows.template_groups_json.as_deref() {
+            state.learner.import_groups_json(groups_json)?;
         }
 
         state.reseed_access_order_by_last_seen();
@@ -1479,7 +1621,9 @@ impl AggregatorState {
             .retain(|identity| !identity.targets_endpoint(&endpoint_target, &principal_prefix));
     }
 
-    fn observe(&mut self, observation: ObservedRequest) -> bool {
+    /// Apply one observation. Returns `true` when enough events have
+    /// accumulated since the last flush that the caller should flush now.
+    pub(crate) fn observe(&mut self, observation: ObservedRequest) -> bool {
         let endpoint_template = observation
             .endpoint_template
             .clone()
@@ -1655,25 +1799,64 @@ impl AggregatorState {
         self.aggregates.insert(target_key, target);
     }
 
-    fn has_pending_flush(&self) -> bool {
+    /// The working set, for parity tests that compare one backend's
+    /// reloaded state against another's.
+    #[cfg(test)]
+    pub(crate) fn aggregates(&self) -> &HashMap<EndpointKey, EndpointAggregate> {
+        &self.aggregates
+    }
+
+    pub(crate) fn has_pending_flush(&self) -> bool {
         !self.dirty_keys.is_empty()
             || !self.deleted_keys.is_empty()
             || !self.pending_signals.is_empty()
     }
 
-    fn mark_flushed(
-        &mut self,
-        deleted_keys: &[EndpointKey],
-        dirty_keys: &[EndpointKey],
-        signal_count: usize,
-    ) {
-        for key in deleted_keys {
+    /// Snapshot what the next flush has to persist. The state is not changed:
+    /// call `mark_flushed` with the same value once the backend has committed
+    /// it, or drop it to retry later with a fresh snapshot.
+    pub(crate) fn pending_flush(&self) -> PendingFlush {
+        let deleted_keys = self.deleted_keys.iter().cloned().collect::<Vec<_>>();
+        let dirty_aggregates = self
+            .dirty_keys
+            .iter()
+            .filter_map(|key| self.aggregates.get(key).cloned())
+            .collect::<Vec<_>>();
+        PendingFlush {
+            deleted_keys,
+            dirty_aggregates,
+            pending_signals: self.pending_signals.clone(),
+        }
+    }
+
+    /// Serialized detector state for every aggregate in `batch`, for a backend
+    /// that persists the rolling windows alongside the aggregates.
+    pub(crate) fn detector_states_for(batch: &PendingFlush) -> Vec<(EndpointKey, String)> {
+        batch
+            .dirty_aggregates
+            .iter()
+            .map(|aggregate| (aggregate.key.clone(), aggregate.detector_state_json()))
+            .collect()
+    }
+
+    /// The learner's groups as JSON, for a backend that persists them.
+    pub(crate) fn template_groups_json(&self) -> String {
+        self.learner.export_groups_json()
+    }
+
+    /// Clear exactly the work in `batch` now that it is committed. Keys that
+    /// were dirtied or deleted again after the snapshot are cleared too, which
+    /// matches the previous behaviour: the next observation re-dirties them,
+    /// and a deletion re-queued after the snapshot was already applied by the
+    /// batch's own delete.
+    pub(crate) fn mark_flushed(&mut self, batch: &PendingFlush) {
+        for key in &batch.deleted_keys {
             self.deleted_keys.remove(key);
         }
-        for key in dirty_keys {
-            self.dirty_keys.remove(key);
+        for aggregate in &batch.dirty_aggregates {
+            self.dirty_keys.remove(&aggregate.key);
         }
-        let signal_count = signal_count.min(self.pending_signals.len());
+        let signal_count = batch.pending_signals.len().min(self.pending_signals.len());
         self.pending_signals.drain(..signal_count);
         if self.dirty_keys.is_empty() {
             self.dirty_events = 0;
@@ -1691,16 +1874,16 @@ impl AggregatorState {
 }
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
-struct SignalIdentity {
-    signal_type: String,
-    target_kind: String,
-    target_key: String,
+pub(crate) struct SignalIdentity {
+    pub(crate) signal_type: String,
+    pub(crate) target_kind: String,
+    pub(crate) target_key: String,
 }
 
 impl SignalIdentity {
     /// `endpoint` signals key on `"{method} {template}"` exactly;
     /// `principal_endpoint` signals append the principal to that same prefix.
-    fn targets_endpoint(&self, endpoint_target: &str, principal_prefix: &str) -> bool {
+    pub(crate) fn targets_endpoint(&self, endpoint_target: &str, principal_prefix: &str) -> bool {
         match self.target_kind.as_str() {
             ENDPOINT_TARGET_KIND => self.target_key == endpoint_target,
             PRINCIPAL_ENDPOINT_TARGET_KIND => self.target_key.starts_with(principal_prefix),
@@ -1719,24 +1902,29 @@ impl From<&NewSignal> for SignalIdentity {
     }
 }
 
-struct ObservedRequest {
-    method: String,
-    path: String,
-    status: u16,
-    latency_ms: u64,
-    timestamp: String,
-    principal: Option<PrincipalIdentity>,
-    endpoint_template: Option<String>,
-    payload_shape: Option<Value>,
-    schema_mismatch: bool,
-    route_host: Option<String>,
-    route_path_prefix: Option<String>,
-    upstream_origin: Option<String>,
-    routing_context_known: bool,
+#[derive(Clone, Debug)]
+pub(crate) struct ObservedRequest {
+    /// The audit event this observation came from. The aggregator does not
+    /// dedupe on it (the audit store already ingests events idempotently by
+    /// id); it is carried so a durable backend can attribute what it applied.
+    pub(crate) event_id: String,
+    pub(crate) method: String,
+    pub(crate) path: String,
+    pub(crate) status: u16,
+    pub(crate) latency_ms: u64,
+    pub(crate) timestamp: String,
+    pub(crate) principal: Option<PrincipalIdentity>,
+    pub(crate) endpoint_template: Option<String>,
+    pub(crate) payload_shape: Option<Value>,
+    pub(crate) schema_mismatch: bool,
+    pub(crate) route_host: Option<String>,
+    pub(crate) route_path_prefix: Option<String>,
+    pub(crate) upstream_origin: Option<String>,
+    pub(crate) routing_context_known: bool,
 }
 
 impl ObservedRequest {
-    fn from_event(event: &AuditEvent) -> Option<Self> {
+    pub(crate) fn from_event(event: &AuditEvent) -> Option<Self> {
         if event.event_type != HTTP_REQUEST_OBSERVED {
             return None;
         }
@@ -1751,6 +1939,7 @@ impl ObservedRequest {
         }
 
         Some(Self {
+            event_id: event.event_id.clone(),
             method: method.to_owned(),
             path: path.to_owned(),
             status,
@@ -1817,99 +2006,108 @@ fn update_earliest_timestamp(target: &mut Option<String>, candidate: &str) {
 }
 
 #[derive(Debug)]
-struct AggregateRow {
-    method: String,
-    endpoint_template: String,
-    first_seen: String,
-    last_seen: String,
-    call_count: i64,
-    schema_mismatch_count: i64,
-    latency_count: i64,
-    latency_samples_json: String,
+pub(crate) struct AggregateRow {
+    pub(crate) method: String,
+    pub(crate) endpoint_template: String,
+    pub(crate) first_seen: String,
+    pub(crate) last_seen: String,
+    pub(crate) call_count: i64,
+    pub(crate) schema_mismatch_count: i64,
+    pub(crate) latency_count: i64,
+    pub(crate) latency_samples_json: String,
 }
 
 #[derive(Debug)]
-struct StatusRow {
-    method: String,
-    endpoint_template: String,
-    status: i64,
-    count: i64,
+pub(crate) struct StatusRow {
+    pub(crate) method: String,
+    pub(crate) endpoint_template: String,
+    pub(crate) status: i64,
+    pub(crate) count: i64,
 }
 
 #[derive(Debug)]
-struct PrincipalRow {
-    method: String,
-    endpoint_template: String,
-    user_id: String,
-    issuer: String,
-    auth_method: String,
-    first_seen: String,
-    last_seen: String,
+pub(crate) struct PrincipalRow {
+    pub(crate) method: String,
+    pub(crate) endpoint_template: String,
+    pub(crate) user_id: String,
+    pub(crate) issuer: String,
+    pub(crate) auth_method: String,
+    pub(crate) first_seen: String,
+    pub(crate) last_seen: String,
 }
 
 #[derive(Debug)]
-struct RoutingContextRow {
-    method: String,
-    endpoint_template: String,
-    route_host: String,
-    route_path_prefix: String,
-    upstream_origin: String,
-    first_seen: String,
-    last_seen: String,
-    call_count: i64,
+pub(crate) struct RoutingContextRow {
+    pub(crate) method: String,
+    pub(crate) endpoint_template: String,
+    pub(crate) route_host: String,
+    pub(crate) route_path_prefix: String,
+    pub(crate) upstream_origin: String,
+    pub(crate) first_seen: String,
+    pub(crate) last_seen: String,
+    pub(crate) call_count: i64,
 }
 
 #[derive(Debug)]
-struct RoutingPrincipalRow {
-    method: String,
-    endpoint_template: String,
-    route_host: String,
-    route_path_prefix: String,
-    upstream_origin: String,
-    user_id: String,
-    issuer: String,
-    auth_method: String,
+pub(crate) struct RoutingPrincipalRow {
+    pub(crate) method: String,
+    pub(crate) endpoint_template: String,
+    pub(crate) route_host: String,
+    pub(crate) route_path_prefix: String,
+    pub(crate) upstream_origin: String,
+    pub(crate) user_id: String,
+    pub(crate) issuer: String,
+    pub(crate) auth_method: String,
 }
 
 #[derive(Debug)]
-struct RoutingClassificationRow {
-    method: String,
-    endpoint_template: String,
-    first_classified_at: String,
+pub(crate) struct RoutingClassificationRow {
+    pub(crate) method: String,
+    pub(crate) endpoint_template: String,
+    pub(crate) first_classified_at: String,
 }
 
 #[derive(Debug)]
-struct ClassifiedSignalStatRow {
-    method: String,
-    endpoint_template: String,
-    call_count: i64,
-    schema_mismatch_count: i64,
-    error_count: i64,
+pub(crate) struct ClassifiedSignalStatRow {
+    pub(crate) method: String,
+    pub(crate) endpoint_template: String,
+    pub(crate) call_count: i64,
+    pub(crate) schema_mismatch_count: i64,
+    pub(crate) error_count: i64,
 }
 
 #[derive(Debug)]
-struct ClassifiedSignalPrincipalRow {
-    method: String,
-    endpoint_template: String,
-    user_id: String,
-    issuer: String,
-    auth_method: String,
+pub(crate) struct ClassifiedSignalPrincipalRow {
+    pub(crate) method: String,
+    pub(crate) endpoint_template: String,
+    pub(crate) user_id: String,
+    pub(crate) issuer: String,
+    pub(crate) auth_method: String,
 }
 
 #[derive(Debug)]
-struct PayloadShapeStatRow {
-    method: String,
-    endpoint_template: String,
-    shape_observation_count: i64,
+pub(crate) struct PayloadShapeStatRow {
+    pub(crate) method: String,
+    pub(crate) endpoint_template: String,
+    pub(crate) shape_observation_count: i64,
 }
 
 #[derive(Debug)]
-struct PayloadShapeSampleRow {
-    method: String,
-    endpoint_template: String,
-    observed_at: String,
-    shape_hash: String,
-    shape_json: String,
+pub(crate) struct PayloadShapeSampleRow {
+    pub(crate) method: String,
+    pub(crate) endpoint_template: String,
+    pub(crate) observed_at: String,
+    pub(crate) shape_hash: String,
+    pub(crate) shape_json: String,
+}
+
+/// One endpoint's serialized `ClassifiedSignalState`, as a backend that
+/// persists detector windows stores it.
+#[derive(Debug)]
+pub(crate) struct DetectorStateRow {
+    pub(crate) method: String,
+    pub(crate) endpoint_template: String,
+    pub(crate) state_json: String,
 }
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -1919,10 +2117,10 @@ struct TemplateMatchScore {
 }
 
 #[derive(Debug, Eq, PartialEq)]
-struct LatencyPercentiles {
-    p50_ms: u64,
-    p95_ms: u64,
-    p99_ms: u64,
+pub(crate) struct LatencyPercentiles {
+    pub(crate) p50_ms: u64,
+    pub(crate) p95_ms: u64,
+    pub(crate) p99_ms: u64,
 }
 
 impl LatencyPercentiles {
@@ -2243,6 +2441,38 @@ fn configure_payload_capture_connection(connection: &Connection) -> rusqlite::Re
     connection.execute_batch(CREATE_PAYLOAD_CAPTURE_SCHEMA_SQL)
 }
 
+/// Read every persisted row from the SQLite tables. Payload tables are only
+/// read when capture is enabled because they only exist then. Detector
+/// windows and learner groups are never stored in SQLite.
+fn load_rows_sqlite(
+    connection: &Connection,
+    payload_capture_enabled: bool,
+) -> Result<LoadedRows, EndpointAggregatorLoadError> {
+    let (payload_stats, payload_samples) = if payload_capture_enabled {
+        (
+            load_payload_shape_stat_rows(connection)?,
+            load_payload_shape_sample_rows(connection)?,
+        )
+    } else {
+        (Vec::new(), Vec::new())
+    };
+
+    Ok(LoadedRows {
+        aggregates: load_aggregate_rows(connection)?,
+        statuses: load_status_rows(connection)?,
+        principals: load_principal_rows(connection)?,
+        routing_contexts: load_routing_context_rows(connection)?,
+        routing_principals: load_routing_principal_rows(connection)?,
+        classifications: load_routing_classification_rows(connection)?,
+        classified_stats: load_classified_signal_stat_rows(connection)?,
+        classified_principals: load_classified_signal_principal_rows(connection)?,
+        payload_stats,
+        payload_samples,
+        detector_states: Vec::new(),
+        template_groups_json: None,
+    })
+}
+
 fn load_aggregate_rows(
     connection: &Connection,
 ) -> Result<Vec<AggregateRow>, EndpointAggregatorLoadError> {
@@ -2526,44 +2756,23 @@ fn load_payload_shape_sample_rows(
 
 fn write_flush(
     connection: &mut Connection,
-    deleted_keys: &[EndpointKey],
-    dirty_aggregates: &[EndpointAggregate],
-    pending_signals: &[NewSignal],
+    batch: &PendingFlush,
     payload_capture_enabled: bool,
 ) -> Result<Vec<signals::Signal>, EndpointAggregatorFlushError> {
     let transaction = connection.transaction()?;
 
-    for key in deleted_keys {
+    for key in &batch.deleted_keys {
         delete_key(&transaction, key, payload_capture_enabled)?;
     }
 
-    for aggregate in dirty_aggregates {
+    for aggregate in &batch.dirty_aggregates {
         upsert_aggregate(&transaction, aggregate, payload_capture_enabled)?;
     }
 
     // A key admitted and evicted inside the same flush window has already had
     // its (not yet written) rows deleted above, so writing its queued signal
     // now would leave a row no eviction can ever reach again.
-    let deleted_targets = deleted_keys
-        .iter()
-        .map(|key| {
-            let endpoint_target = signals::endpoint_target_key(&key.method, &key.endpoint_template);
-            let principal_prefix = format!("{endpoint_target} ");
-            (endpoint_target, principal_prefix)
-        })
-        .collect::<Vec<_>>();
-    let pending_signals = pending_signals
-        .iter()
-        .filter(|signal| {
-            !deleted_targets
-                .iter()
-                .any(|(endpoint_target, principal_prefix)| {
-                    SignalIdentity::from(*signal)
-                        .targets_endpoint(endpoint_target, principal_prefix)
-                })
-        })
-        .cloned()
-        .collect::<Vec<_>>();
+    let pending_signals = batch.signals_surviving_deletions();
 
     let opened_signals = signals::insert_signals(&transaction, &pending_signals)?;
 
@@ -4075,6 +4284,321 @@ mod tests {
             signal_rows_by_type(&db.path, "error_rate_spike").len(),
             1,
             "error rate spike signal should be idempotent per endpoint"
+        );
+    }
+
+    fn in_memory_state(signal_detector_config: SignalDetectorConfig) -> AggregatorState {
+        AggregatorState::from_rows(LoadedRows::default(), false, 0, signal_detector_config)
+            .expect("empty rows should build a state")
+    }
+
+    fn observation(event: &AuditEvent) -> ObservedRequest {
+        ObservedRequest::from_event(event).expect("event should be an observation")
+    }
+
+    fn aggregate_row(aggregate: &EndpointAggregate) -> AggregateRow {
+        AggregateRow {
+            method: aggregate.key.method.clone(),
+            endpoint_template: aggregate.key.endpoint_template.clone(),
+            first_seen: aggregate.first_seen.clone(),
+            last_seen: aggregate.last_seen.clone(),
+            call_count: i64_from_u64(aggregate.call_count),
+            schema_mismatch_count: i64_from_u64(aggregate.schema_mismatch_count),
+            latency_count: i64_from_u64(aggregate.latency_count),
+            latency_samples_json: serde_json::to_string(&aggregate.latency_samples)
+                .expect("latency samples should serialize"),
+        }
+    }
+
+    fn classified_stat_row(aggregate: &EndpointAggregate) -> ClassifiedSignalStatRow {
+        let state = &aggregate.classified_signal_state;
+        ClassifiedSignalStatRow {
+            method: aggregate.key.method.clone(),
+            endpoint_template: aggregate.key.endpoint_template.clone(),
+            call_count: i64_from_u64(state.call_count),
+            schema_mismatch_count: i64_from_u64(state.schema_mismatch_count),
+            error_count: i64_from_u64(state.error_count),
+        }
+    }
+
+    #[test]
+    fn observed_request_carries_the_audit_event_id() {
+        let event = observed_event("GET", "/orders/1", 200, 10, Some("alice"), timestamp(0));
+        let observation = observation(&event);
+
+        assert_eq!(observation.event_id, event.event_id);
+        assert!(!observation.event_id.is_empty());
+    }
+
+    #[test]
+    fn persisted_detector_state_lets_a_successor_continue_the_error_window() {
+        let config = SignalDetectorConfig {
+            error_rate_spike_threshold: 0.40,
+            ..SignalDetectorConfig::default()
+        };
+        let mut leader = in_memory_state(config);
+        for index in 0..20 {
+            leader.observe(observation(&observed_event(
+                "GET",
+                "/errors/steady",
+                200,
+                10,
+                Some("alice"),
+                timestamp_at(index),
+            )));
+        }
+        for index in 20..39 {
+            leader.observe(observation(&observed_event(
+                "GET",
+                "/errors/steady",
+                500,
+                10,
+                Some("alice"),
+                timestamp_at(index),
+            )));
+        }
+        let batch = leader.pending_flush();
+        assert_eq!(batch.dirty_aggregates.len(), 1);
+        assert!(
+            !batch
+                .pending_signals
+                .iter()
+                .any(|signal| signal.signal_type == signals::ERROR_RATE_SPIKE_SIGNAL_TYPE),
+            "the spike needs one more error sample"
+        );
+        let aggregate = &batch.dirty_aggregates[0];
+        let detector_states = AggregatorState::detector_states_for(&batch);
+        assert_eq!(detector_states.len(), 1);
+        assert_eq!(detector_states[0].0, aggregate.key);
+
+        let last_error = observation(&observed_event(
+            "GET",
+            "/errors/steady",
+            500,
+            10,
+            Some("alice"),
+            timestamp_at(39),
+        ));
+
+        let rows_with_windows = LoadedRows {
+            aggregates: vec![aggregate_row(aggregate)],
+            classified_stats: vec![classified_stat_row(aggregate)],
+            detector_states: vec![DetectorStateRow {
+                method: aggregate.key.method.clone(),
+                endpoint_template: aggregate.key.endpoint_template.clone(),
+                state_json: detector_states[0].1.clone(),
+            }],
+            ..LoadedRows::default()
+        };
+        let mut successor = AggregatorState::from_rows(rows_with_windows, false, 0, config)
+            .expect("rows with detector state should load");
+        successor.observe(last_error.clone());
+        let fired = successor
+            .pending_flush()
+            .pending_signals
+            .into_iter()
+            .filter(|signal| signal.signal_type == signals::ERROR_RATE_SPIKE_SIGNAL_TYPE)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            fired.len(),
+            1,
+            "the restored window should complete the spike"
+        );
+        assert_eq!(fired[0].target_key, "GET /errors/steady");
+
+        let rows_without_windows = LoadedRows {
+            aggregates: vec![aggregate_row(aggregate)],
+            classified_stats: vec![classified_stat_row(aggregate)],
+            ..LoadedRows::default()
+        };
+        let mut restarted = AggregatorState::from_rows(rows_without_windows, false, 0, config)
+            .expect("rows without detector state should load");
+        restarted.observe(last_error);
+        assert!(
+            !restarted
+                .pending_flush()
+                .pending_signals
+                .iter()
+                .any(|signal| signal.signal_type == signals::ERROR_RATE_SPIKE_SIGNAL_TYPE),
+            "without the persisted window the sample floor starts over"
+        );
+    }
+
+    #[test]
+    fn detector_state_json_round_trips_windows_and_principals() {
+        let mut state = ClassifiedSignalState::default();
+        for index in 0..5 {
+            state.observe(&observation(&observed_event(
+                "GET",
+                "/w",
+                if index % 2 == 0 { 500 } else { 200 },
+                10,
+                Some(if index < 3 { "alice" } else { "bob" }),
+                timestamp_at(index),
+            )));
+        }
+
+        let json = serde_json::to_string(&state).expect("state should serialize");
+        let restored: ClassifiedSignalState =
+            serde_json::from_str(&json).expect("state should deserialize");
+
+        assert_eq!(restored.call_count, 5);
+        assert_eq!(restored.error_count, 3);
+        assert_eq!(restored.principals, state.principals);
+        assert_eq!(
+            restored.recent_error_window.samples,
+            VecDeque::from(vec![true, false, true, false, true])
+        );
+        assert_eq!(restored.recent_error_window.error_count, 3);
+        let current = restored
+            .volume_window
+            .current
+            .expect("an open volume window should survive");
+        assert_eq!(current.call_count, 5);
+        assert_eq!(
+            current.first_timestamp_seconds,
+            timestamp_seconds(&timestamp_at(0)).unwrap()
+        );
+        assert_eq!(
+            current.last_timestamp_seconds,
+            timestamp_seconds(&timestamp_at(4)).unwrap()
+        );
+    }
+
+    #[test]
+    fn from_rows_restores_learner_groups() {
+        let mut leader = in_memory_state(SignalDetectorConfig::default());
+        for (index, slug) in ["apple", "banana", "cherry", "date"].iter().enumerate() {
+            leader.observe(observation(&observed_event(
+                "GET",
+                &format!("/products/{slug}"),
+                200,
+                10,
+                None,
+                timestamp(index),
+            )));
+        }
+        assert_eq!(
+            leader.learner.template("/products/fig"),
+            "/products/{param}"
+        );
+
+        let successor = AggregatorState::from_rows(
+            LoadedRows {
+                template_groups_json: Some(leader.template_groups_json()),
+                ..LoadedRows::default()
+            },
+            false,
+            0,
+            SignalDetectorConfig::default(),
+        )
+        .expect("rows with learner groups should load");
+        assert_eq!(
+            successor.learner.template("/products/fig"),
+            "/products/{param}"
+        );
+
+        let corrupt = AggregatorState::from_rows(
+            LoadedRows {
+                template_groups_json: Some("{".to_owned()),
+                ..LoadedRows::default()
+            },
+            false,
+            0,
+            SignalDetectorConfig::default(),
+        );
+        assert!(
+            corrupt.is_err(),
+            "corrupt learner groups must not load silently"
+        );
+    }
+
+    #[test]
+    fn mark_flushed_clears_only_the_snapshot_it_was_given() {
+        let mut state = in_memory_state(SignalDetectorConfig::default());
+        state.observe(observation(&observed_event(
+            "GET",
+            "/a",
+            200,
+            10,
+            Some("alice"),
+            timestamp(0),
+        )));
+        state.observe(observation(&observed_event(
+            "GET",
+            "/b",
+            200,
+            10,
+            Some("alice"),
+            timestamp(1),
+        )));
+        assert!(state.has_pending_flush());
+
+        let batch = state.pending_flush();
+        assert!(!batch.is_empty());
+        assert_eq!(batch.dirty_aggregates.len(), 2);
+        assert!(batch.deleted_keys.is_empty());
+        assert_eq!(
+            batch.pending_signals.len(),
+            2,
+            "one new_endpoint_seen per endpoint"
+        );
+
+        state.observe(observation(&observed_event(
+            "GET",
+            "/c",
+            200,
+            10,
+            Some("alice"),
+            timestamp(2),
+        )));
+        state.mark_flushed(&batch);
+
+        assert!(state.has_pending_flush());
+        let remaining = state.pending_flush();
+        assert_eq!(remaining.dirty_aggregates.len(), 1);
+        assert_eq!(
+            remaining.dirty_aggregates[0].key,
+            EndpointKey::new("GET", "/c")
+        );
+        assert_eq!(remaining.pending_signals.len(), 1);
+        assert_eq!(remaining.pending_signals[0].target_key, "GET /c");
+
+        state.mark_flushed(&remaining);
+        assert!(!state.has_pending_flush());
+        assert!(state.pending_flush().is_empty());
+        assert_eq!(state.dirty_events, 0);
+    }
+
+    #[test]
+    fn signals_targeting_keys_deleted_in_the_same_flush_are_dropped() {
+        let mut state = in_memory_state(SignalDetectorConfig::default());
+        state.observe(observation(&observed_event(
+            "GET",
+            "/gone",
+            200,
+            10,
+            Some("alice"),
+            timestamp(0),
+        )));
+        state.observe(observation(&observed_event(
+            "GET",
+            "/kept",
+            200,
+            10,
+            Some("alice"),
+            timestamp(1),
+        )));
+        let mut batch = state.pending_flush();
+        assert_eq!(batch.pending_signals.len(), 2);
+
+        batch.deleted_keys = vec![EndpointKey::new("GET", "/gone")];
+        let surviving = batch.signals_surviving_deletions();
+        assert_eq!(surviving.len(), 1);
+        assert_eq!(surviving[0].target_key, "GET /kept");
+        assert_eq!(
+            signals_without_deleted_targets(&[], &batch.pending_signals).len(),
+            2
         );
     }
 

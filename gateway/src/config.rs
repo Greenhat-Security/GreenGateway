@@ -116,6 +116,21 @@ pub const DEFAULT_TOOL_RUNTIME_QUEUE_TIMEOUT_MS: u64 = 1_000;
 /// a third of this, so the floor keeps renewal from becoming a busy loop.
 pub const DEFAULT_TOOL_LEASE_TTL_MS: u64 = 15_000;
 pub const MIN_TOOL_LEASE_TTL_MS: u64 = 1_000;
+/// How long the cluster-mode discovery projector's leadership lease lives on
+/// the database clock before another replica may take the slot (issue #241,
+/// PR 11). Renewed at a third of this, like every execution lease; the floor
+/// keeps renewal from becoming a busy loop.
+pub const DEFAULT_DISCOVERY_PROJECTOR_LEASE_TTL_MS: u64 = 15_000;
+pub const MIN_DISCOVERY_PROJECTOR_LEASE_TTL_MS: u64 = 1_000;
+/// How long the projector waits when the durable audit stream has nothing
+/// new; also the retry wait after a transient flush failure. Matches the
+/// SQLite sink's 250 ms flush cadence.
+pub const DEFAULT_DISCOVERY_PROJECTOR_POLL_MS: u64 = 250;
+pub const MIN_DISCOVERY_PROJECTOR_POLL_MS: u64 = 50;
+/// Stream rows the projector reads per batch: one bounded read, one bounded
+/// flush transaction.
+pub const DEFAULT_DISCOVERY_PROJECTOR_BATCH: usize = 500;
+pub const MAX_DISCOVERY_PROJECTOR_BATCH: usize = 5_000;
 pub const DEFAULT_TOOL_RUNTIME_DEFAULT_TIMEOUT_MS: u64 = 30_000;
 /// TLS 1.2 rather than 1.3, because raising a floor is an operator decision
 /// with a compatibility cost attached, and a default that silently refuses a
@@ -245,6 +260,9 @@ const DEPLOYMENT_ID: &str = "DEPLOYMENT_ID";
 const STATE_BACKEND: &str = "STATE_BACKEND";
 const DISCOVERY_SQLITE_PATH: &str = "DISCOVERY_SQLITE_PATH";
 const DISCOVERY_ENDPOINT_LIMIT: &str = "DISCOVERY_ENDPOINT_LIMIT";
+const DISCOVERY_PROJECTOR_LEASE_TTL_MS: &str = "DISCOVERY_PROJECTOR_LEASE_TTL_MS";
+const DISCOVERY_PROJECTOR_POLL_MS: &str = "DISCOVERY_PROJECTOR_POLL_MS";
+const DISCOVERY_PROJECTOR_BATCH: &str = "DISCOVERY_PROJECTOR_BATCH";
 const ERROR_RATE_SPIKE_SIGNAL_THRESHOLD: &str = "ERROR_RATE_SPIKE_SIGNAL_THRESHOLD";
 const EGRESS_ALLOWED_HOSTS: &str = "EGRESS_ALLOWED_HOSTS";
 const EGRESS_CONNECT_TIMEOUT_MS: &str = "EGRESS_CONNECT_TIMEOUT_MS";
@@ -382,6 +400,13 @@ pub struct Config {
     pub audit_drain_timeout_ms: u64,
     pub discovery_sqlite_path: Option<String>,
     pub discovery_endpoint_limit: usize,
+    /// Cluster mode only (issue #241, PR 11): the discovery projector's
+    /// leadership lease TTL, stream poll interval, and batch size. Parsed and
+    /// validated in both modes so one pass reports every problem; standalone
+    /// mode rejects them when set, since it never runs a projector.
+    pub discovery_projector_lease_ttl_ms: u64,
+    pub discovery_projector_poll_ms: u64,
+    pub discovery_projector_batch: usize,
     pub principal_sqlite_path: Option<String>,
     pub connections_sqlite_path: Option<String>,
     pub connection_local_secret_keyring: Vec<LocalSecretKeyConfig>,
@@ -1775,6 +1800,56 @@ impl Config {
             DEFAULT_DISCOVERY_ENDPOINT_LIMIT,
             &mut problems,
         );
+        // The cluster-mode discovery projector's cadence (issue #241, PR 11).
+        // Blank is unset (the shape `.env.example` ships), and whether each
+        // was set at all is remembered so standalone mode can reject
+        // material it never reads, exactly as it does for the rate-limit
+        // keyring.
+        let discovery_projector_lease_ttl_set =
+            is_var_set(get_var(DISCOVERY_PROJECTOR_LEASE_TTL_MS));
+        let discovery_projector_lease_ttl_ms = validate_minimum_u64(
+            DISCOVERY_PROJECTOR_LEASE_TTL_MS,
+            parse_optional_var(
+                DISCOVERY_PROJECTOR_LEASE_TTL_MS,
+                get_var(DISCOVERY_PROJECTOR_LEASE_TTL_MS),
+                "millisecond duration",
+                &mut problems,
+            )
+            .unwrap_or(DEFAULT_DISCOVERY_PROJECTOR_LEASE_TTL_MS),
+            MIN_DISCOVERY_PROJECTOR_LEASE_TTL_MS,
+            "milliseconds (the lease is renewed at a third of its TTL)",
+            DEFAULT_DISCOVERY_PROJECTOR_LEASE_TTL_MS,
+            &mut problems,
+        );
+        let discovery_projector_poll_set = is_var_set(get_var(DISCOVERY_PROJECTOR_POLL_MS));
+        let discovery_projector_poll_ms = validate_minimum_u64(
+            DISCOVERY_PROJECTOR_POLL_MS,
+            parse_optional_var(
+                DISCOVERY_PROJECTOR_POLL_MS,
+                get_var(DISCOVERY_PROJECTOR_POLL_MS),
+                "millisecond duration",
+                &mut problems,
+            )
+            .unwrap_or(DEFAULT_DISCOVERY_PROJECTOR_POLL_MS),
+            MIN_DISCOVERY_PROJECTOR_POLL_MS,
+            "milliseconds (an idle projector polls the audit stream this often)",
+            DEFAULT_DISCOVERY_PROJECTOR_POLL_MS,
+            &mut problems,
+        );
+        let discovery_projector_batch_set = is_var_set(get_var(DISCOVERY_PROJECTOR_BATCH));
+        let discovery_projector_batch = validate_positive_bounded_u64(
+            DISCOVERY_PROJECTOR_BATCH,
+            parse_optional_var::<u64>(
+                DISCOVERY_PROJECTOR_BATCH,
+                get_var(DISCOVERY_PROJECTOR_BATCH),
+                "positive integer",
+                &mut problems,
+            )
+            .unwrap_or(DEFAULT_DISCOVERY_PROJECTOR_BATCH as u64),
+            MAX_DISCOVERY_PROJECTOR_BATCH as u64,
+            DEFAULT_DISCOVERY_PROJECTOR_BATCH as u64,
+            &mut problems,
+        ) as usize;
         let principal_sqlite_path = parse_optional_string(
             PRINCIPAL_SQLITE_PATH,
             get_var(PRINCIPAL_SQLITE_PATH),
@@ -1930,11 +2005,6 @@ impl Config {
             DEFAULT_PAYLOAD_CAPTURE_SAMPLE_RATE,
             &mut problems,
         );
-        if payload_capture_enabled && discovery_sqlite_path.is_none() {
-            problems.push(format!(
-                "{PAYLOAD_CAPTURE_ENABLED}=true requires {DISCOVERY_SQLITE_PATH} to be set so captured request shapes have an explicit SQLite storage destination"
-            ));
-        }
         let schema_mismatch_signal_threshold = validate_positive_u64(
             SCHEMA_MISMATCH_SIGNAL_THRESHOLD,
             parse_var(
@@ -2657,7 +2727,35 @@ impl Config {
                         "{RATE_LIMIT_KEYRING} is set while {STATE_BACKEND} is sqlite; standalone mode keeps rate-limit buckets in memory and never reads it"
                     ));
                 }
+                // The discovery projector is cluster mode's replacement for
+                // the SQLite aggregator sink; standalone mode never starts
+                // one, so its cadence settings are material nothing reads.
+                for (setting, set) in [
+                    (
+                        DISCOVERY_PROJECTOR_LEASE_TTL_MS,
+                        discovery_projector_lease_ttl_set,
+                    ),
+                    (DISCOVERY_PROJECTOR_POLL_MS, discovery_projector_poll_set),
+                    (DISCOVERY_PROJECTOR_BATCH, discovery_projector_batch_set),
+                ] {
+                    if set {
+                        problems.push(format!(
+                            "{setting} is set while {STATE_BACKEND} is sqlite; the discovery projector runs only in cluster mode and standalone mode never reads it — set {STATE_BACKEND}=postgres or unset {setting}"
+                        ));
+                    }
+                }
             }
+        }
+        // Payload-shape capture needs a destination. Standalone mode's is the
+        // discovery SQLite database; cluster mode's is the projector's
+        // PostgreSQL tables, which every cluster replica has.
+        if payload_capture_enabled
+            && discovery_sqlite_path.is_none()
+            && state_backend == StateBackend::Sqlite
+        {
+            problems.push(format!(
+                "{PAYLOAD_CAPTURE_ENABLED}=true requires {DISCOVERY_SQLITE_PATH} to be set so captured request shapes have an explicit SQLite storage destination"
+            ));
         }
         if state_backend == StateBackend::Sqlite {
             if database_url_file.is_some() {
@@ -2714,6 +2812,9 @@ impl Config {
                 audit_drain_timeout_ms,
                 discovery_sqlite_path,
                 discovery_endpoint_limit,
+                discovery_projector_lease_ttl_ms,
+                discovery_projector_poll_ms,
+                discovery_projector_batch,
                 principal_sqlite_path,
                 connections_sqlite_path,
                 connection_local_secret_keyring,
@@ -2815,6 +2916,19 @@ impl Config {
     #[cfg_attr(not(feature = "postgres"), allow(dead_code))] // read by the cluster wiring only
     pub fn tool_lease_ttl(&self) -> std::time::Duration {
         std::time::Duration::from_millis(self.tool_lease_ttl_ms)
+    }
+
+    /// The cluster-mode discovery projector's leadership lease TTL.
+    #[cfg_attr(not(feature = "postgres"), allow(dead_code))] // Read by cluster startup.
+    pub fn discovery_projector_lease_ttl(&self) -> std::time::Duration {
+        std::time::Duration::from_millis(self.discovery_projector_lease_ttl_ms)
+    }
+
+    /// How long the cluster-mode discovery projector waits on an empty
+    /// audit stream before reading again.
+    #[cfg_attr(not(feature = "postgres"), allow(dead_code))] // Read by cluster startup.
+    pub fn discovery_projector_poll_interval(&self) -> std::time::Duration {
+        std::time::Duration::from_millis(self.discovery_projector_poll_ms)
     }
 
     pub(crate) fn rate_limit_bucket_idle_ttl(&self) -> std::time::Duration {
@@ -3285,6 +3399,38 @@ fn normalize_audit_sqlite_retention_days(
             None
         }
         other => other,
+    }
+}
+
+/// Whether a variable was set to something other than whitespace, without
+/// parsing it: the mode-pairing checks need to know a setting was supplied
+/// even when its value was also rejected.
+fn is_var_set(value: Result<String, VarError>) -> bool {
+    match value {
+        Ok(value) => !value.trim().is_empty(),
+        Err(VarError::NotPresent) => false,
+        // A non-Unicode value is reported by the parse; it was still set.
+        Err(VarError::NotUnicode(_)) => true,
+    }
+}
+
+/// Reject a value below a floor, naming the unit and the reason the floor
+/// exists.
+fn validate_minimum_u64(
+    name: &str,
+    value: u64,
+    minimum: u64,
+    unit: &str,
+    default: u64,
+    problems: &mut Vec<String>,
+) -> u64 {
+    if value >= minimum {
+        value
+    } else {
+        problems.push(format!(
+            "{name} must be at least {minimum} {unit}, got '{value}'"
+        ));
+        default
     }
 }
 
@@ -10500,6 +10646,156 @@ mod tests {
         let config = Config::from_env_vars(postgres_mode_vars(&[("TOOL_LEASE_TTL_MS", "4000")]))
             .expect("a lease TTL above the floor is accepted");
         assert_eq!(config.tool_lease_ttl(), std::time::Duration::from_secs(4));
+    }
+
+    // --- discovery projector cadence (issue #241, PR 11) ---------------------
+
+    #[test]
+    fn the_discovery_projector_settings_have_defaults_and_accessors() {
+        let config = Config::from_env_vars(postgres_mode_vars(&[])).expect("postgres mode config");
+        assert_eq!(
+            config.discovery_projector_lease_ttl_ms,
+            DEFAULT_DISCOVERY_PROJECTOR_LEASE_TTL_MS
+        );
+        assert_eq!(
+            config.discovery_projector_poll_ms,
+            DEFAULT_DISCOVERY_PROJECTOR_POLL_MS
+        );
+        assert_eq!(
+            config.discovery_projector_batch,
+            DEFAULT_DISCOVERY_PROJECTOR_BATCH
+        );
+        let config = Config::from_env_vars(postgres_mode_vars(&[
+            ("DISCOVERY_PROJECTOR_LEASE_TTL_MS", "4000"),
+            ("DISCOVERY_PROJECTOR_POLL_MS", "50"),
+            ("DISCOVERY_PROJECTOR_BATCH", "5000"),
+        ]))
+        .expect("values at and above the floors are accepted");
+        assert_eq!(
+            config.discovery_projector_lease_ttl(),
+            std::time::Duration::from_secs(4)
+        );
+        assert_eq!(
+            config.discovery_projector_poll_interval(),
+            std::time::Duration::from_millis(50)
+        );
+        assert_eq!(config.discovery_projector_batch, 5_000);
+    }
+
+    #[test]
+    fn the_discovery_projector_settings_are_bounded() {
+        for (setting, value, expected) in [
+            (
+                "DISCOVERY_PROJECTOR_LEASE_TTL_MS",
+                "999",
+                "DISCOVERY_PROJECTOR_LEASE_TTL_MS must be at least 1000 milliseconds",
+            ),
+            (
+                "DISCOVERY_PROJECTOR_POLL_MS",
+                "49",
+                "DISCOVERY_PROJECTOR_POLL_MS must be at least 50 milliseconds",
+            ),
+            (
+                "DISCOVERY_PROJECTOR_BATCH",
+                "0",
+                "DISCOVERY_PROJECTOR_BATCH must be between 1 and 5000, got '0'",
+            ),
+            (
+                "DISCOVERY_PROJECTOR_BATCH",
+                "5001",
+                "DISCOVERY_PROJECTOR_BATCH must be between 1 and 5000, got '5001'",
+            ),
+            (
+                "DISCOVERY_PROJECTOR_POLL_MS",
+                "soon",
+                "DISCOVERY_PROJECTOR_POLL_MS must be a valid millisecond duration, got 'soon'",
+            ),
+        ] {
+            let error = Config::from_env_vars(postgres_mode_vars(&[(setting, value)]))
+                .expect_err("an out-of-range projector setting must not start");
+            let message = error.to_string();
+            assert!(
+                message.contains(expected),
+                "expected {expected:?} in: {message}"
+            );
+            assert_eq!(error.problems.len(), 1, "{message}");
+        }
+    }
+
+    /// Standalone mode never starts a projector, so its settings are
+    /// material nothing reads and are rejected by name, like the keyrings.
+    #[test]
+    fn standalone_mode_refuses_the_discovery_projector_settings() {
+        for (setting, value) in [
+            ("DISCOVERY_PROJECTOR_LEASE_TTL_MS", "15000"),
+            ("DISCOVERY_PROJECTOR_POLL_MS", "250"),
+            ("DISCOVERY_PROJECTOR_BATCH", "500"),
+            // Rejected for being set, not for its value: an invalid value in
+            // the wrong mode reports both problems.
+            ("DISCOVERY_PROJECTOR_BATCH", "0"),
+        ] {
+            let error = Config::from_env_vars(|name| {
+                if name == setting {
+                    Ok(value.to_owned())
+                } else {
+                    Err(VarError::NotPresent)
+                }
+            })
+            .expect_err("a projector setting in standalone mode must not start");
+            let message = error.to_string();
+            assert!(
+                message.contains(&format!("{setting} is set while STATE_BACKEND is sqlite")),
+                "the rejection must name {setting} and the mode: {message}"
+            );
+        }
+        // Empty is unset, exactly as the keyrings and paths treat it, so a
+        // copied .env.example with the variables left blank still starts.
+        Config::from_env_vars(|name| match name {
+            "DISCOVERY_PROJECTOR_LEASE_TTL_MS"
+            | "DISCOVERY_PROJECTOR_POLL_MS"
+            | "DISCOVERY_PROJECTOR_BATCH" => Ok(String::new()),
+            _ => Err(VarError::NotPresent),
+        })
+        .expect("blank projector settings are unset");
+    }
+
+    /// The discovery SQLite file is the standalone aggregator's store;
+    /// cluster mode's discovery is the projector's PostgreSQL tables, so the
+    /// path is refused like every other local authority.
+    #[test]
+    fn postgres_mode_refuses_the_discovery_sqlite_path() {
+        let error = Config::from_env_vars(postgres_mode_vars(&[(
+            "DISCOVERY_SQLITE_PATH",
+            "/var/lib/greengateway/discovery.sqlite3",
+        )]))
+        .expect_err("a discovery SQLite path in cluster mode must not start");
+        let message = error.to_string();
+        assert!(
+            message.contains("DISCOVERY_SQLITE_PATH is set while STATE_BACKEND=postgres"),
+            "{message}"
+        );
+        assert!(message.contains("unset DISCOVERY_SQLITE_PATH"), "{message}");
+    }
+
+    /// Payload-shape capture has a destination in cluster mode -- the
+    /// projector's tables -- so it no longer demands the SQLite path that
+    /// cluster mode rejects.
+    #[test]
+    fn postgres_mode_allows_payload_capture_without_a_discovery_sqlite_path() {
+        let config =
+            Config::from_env_vars(postgres_mode_vars(&[("PAYLOAD_CAPTURE_ENABLED", "true")]))
+                .expect("payload capture in cluster mode needs no local file");
+        assert!(config.payload_capture_enabled);
+        assert_eq!(config.discovery_sqlite_path, None);
+
+        let error = Config::from_env_vars(|name| match name {
+            "PAYLOAD_CAPTURE_ENABLED" => Ok("true".to_owned()),
+            _ => Err(VarError::NotPresent),
+        })
+        .expect_err("standalone payload capture still needs the SQLite path");
+        assert!(error
+            .to_string()
+            .contains("PAYLOAD_CAPTURE_ENABLED=true requires DISCOVERY_SQLITE_PATH to be set"));
     }
 
     #[test]
