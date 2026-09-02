@@ -18,6 +18,9 @@ use time::{format_description::well_known::Rfc3339, Duration as TimeDuration, Of
 
 use crate::{
     discovery::{
+        lifecycle::{
+            self, TransitionOutcome, TransitionPrecondition, TransitionRefused, UNREVIEWED_REVISION,
+        },
         signals::{self, Signal, SignalLifecycleState, SignalListFilters, SignalTarget},
         suggestions,
     },
@@ -86,15 +89,19 @@ pub trait DiscoveryReadStore: Send + Sync {
         Ok(schemas)
     }
 
-    /// Mark or clear an endpoint's review. `None` when the endpoint was
-    /// never observed.
+    /// Mark or clear an endpoint's review, conditionally (issue #241,
+    /// PR 12): `expected_revision` is the review revision the caller last
+    /// read (`UNREVIEWED_REVISION` for "not yet reviewed"), or `None` for an
+    /// unconditional write. A review that moved since is refused with its
+    /// current state; `NotFound` when the endpoint was never observed.
     async fn set_endpoint_review(
         &self,
         method: &str,
         endpoint_template: &str,
         reviewed: bool,
         reviewed_by: Option<&str>,
-    ) -> Result<Option<EndpointReviewState>, DiscoveryQueryError>;
+        expected_revision: Option<i64>,
+    ) -> Result<TransitionOutcome<EndpointReviewState>, DiscoveryQueryError>;
 
     /// One page of signals, newest first.
     async fn list_signals(
@@ -112,13 +119,17 @@ pub trait DiscoveryReadStore: Send + Sync {
         limit: usize,
     ) -> Result<Vec<Signal>, DiscoveryQueryError>;
 
-    /// Move a signal to `state`. `None` when no signal has that id.
+    /// Move a signal to `state` if it is still in `expected.from_state`
+    /// (and at `expected.revision`, when given): one conditional statement
+    /// on both backends, refused with the current row when the predicate
+    /// no longer holds; `NotFound` when no signal has that id.
     async fn transition_signal(
         &self,
         signal_id: &str,
         state: SignalLifecycleState,
         transitioned_by: Option<&str>,
-    ) -> Result<Option<Signal>, DiscoveryQueryError>;
+        expected: TransitionPrecondition<SignalLifecycleState>,
+    ) -> Result<TransitionOutcome<Signal>, DiscoveryQueryError>;
 
     /// One page of the principals seen on an endpoint, most recently seen
     /// first.
@@ -192,7 +203,8 @@ impl DiscoveryReadStore for DiscoveryQueryStore {
         endpoint_template: &str,
         reviewed: bool,
         reviewed_by: Option<&str>,
-    ) -> Result<Option<EndpointReviewState>, DiscoveryQueryError> {
+        expected_revision: Option<i64>,
+    ) -> Result<TransitionOutcome<EndpointReviewState>, DiscoveryQueryError> {
         let store = self.clone();
         let method = method.to_owned();
         let endpoint_template = endpoint_template.to_owned();
@@ -203,6 +215,7 @@ impl DiscoveryReadStore for DiscoveryQueryStore {
                 &endpoint_template,
                 reviewed,
                 reviewed_by.as_deref(),
+                expected_revision,
             )
         })
         .await
@@ -239,12 +252,13 @@ impl DiscoveryReadStore for DiscoveryQueryStore {
         signal_id: &str,
         state: SignalLifecycleState,
         transitioned_by: Option<&str>,
-    ) -> Result<Option<Signal>, DiscoveryQueryError> {
+        expected: TransitionPrecondition<SignalLifecycleState>,
+    ) -> Result<TransitionOutcome<Signal>, DiscoveryQueryError> {
         let store = self.clone();
         let signal_id = signal_id.to_owned();
         let transitioned_by = transitioned_by.map(str::to_owned);
         blocking_query(move || {
-            store.transition_signal(&signal_id, state, transitioned_by.as_deref())
+            store.transition_signal(&signal_id, state, transitioned_by.as_deref(), expected)
         })
         .await
     }
@@ -288,12 +302,21 @@ pub const MAX_NEW_SINCE_HOURS: u64 = 876_000;
 /// fraction of the payload-shape reservoir samples for an endpoint.
 pub const INFERRED_SCHEMA_REQUIRED_THRESHOLD: f64 = 0.95;
 
+/// The review row outlives the review: clearing one sets `reviewed_at` to
+/// NULL and bumps the revision rather than deleting the row, so an
+/// endpoint's review revision only ever increases (issue #241, PR 12).
+/// Deleting it made revisions restart at 1, and a stale `If-Match: 1` held
+/// against a long-gone review then matched an unrelated newer one -- the
+/// ABA overwrite the precondition exists to refuse. A row whose
+/// `reviewed_at` is NULL reads exactly as no row at all, which every read
+/// already expresses as `reviewed_at IS NULL`.
 const CREATE_REVIEW_SCHEMA_SQL: &str = r#"
 CREATE TABLE IF NOT EXISTS discovery_endpoint_reviews (
     method TEXT NOT NULL,
     endpoint_template TEXT NOT NULL,
-    reviewed_at TEXT NOT NULL,
+    reviewed_at TEXT,
     reviewed_by TEXT,
+    revision INTEGER NOT NULL DEFAULT 1,
     PRIMARY KEY (method, endpoint_template)
 );
 "#;
@@ -392,6 +415,9 @@ pub struct EndpointSummary {
     pub reviewed: bool,
     pub reviewed_at: Option<String>,
     pub reviewed_by: Option<String>,
+    /// The stored review row's revision (`UNREVIEWED_REVISION` when there
+    /// is none): what a conditional review write must expect.
+    pub review_revision: i64,
     pub covered_by_rule: bool,
     pub coverage_scope: EndpointCoverageScope,
     pub routing_context_known: bool,
@@ -416,6 +442,9 @@ pub struct EndpointAggregateDetail {
     pub reviewed: bool,
     pub reviewed_at: Option<String>,
     pub reviewed_by: Option<String>,
+    /// The stored review row's revision (`UNREVIEWED_REVISION` when there
+    /// is none): what a conditional review write must expect.
+    pub review_revision: i64,
     pub covered_by_rule: bool,
     pub coverage_scope: EndpointCoverageScope,
     pub routing_context_known: bool,
@@ -428,11 +457,26 @@ pub struct EndpointAggregateDetail {
     pub updated_at: String,
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct EndpointReviewState {
     pub reviewed: bool,
     pub reviewed_at: Option<String>,
     pub reviewed_by: Option<String>,
+    /// The review row's revision, `UNREVIEWED_REVISION` (0) while the
+    /// endpoint has no review; the expected value a conditional write
+    /// can require.
+    pub revision: i64,
+}
+
+impl EndpointReviewState {
+    pub(crate) fn unreviewed() -> Self {
+        Self {
+            reviewed: false,
+            reviewed_at: None,
+            reviewed_by: None,
+            revision: UNREVIEWED_REVISION,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize)]
@@ -888,7 +932,8 @@ impl DiscoveryQueryStore {
                     distinct_principal_count,
                     updated_at,
                     r.reviewed_at,
-                    r.reviewed_by
+                    r.reviewed_by,
+                    r.revision
                 FROM discovery_endpoint_aggregates
                 LEFT JOIN discovery_endpoint_reviews r
                     USING (method, endpoint_template)
@@ -1064,14 +1109,30 @@ impl DiscoveryQueryStore {
         load_open_signal_summaries(connection, &self.path, endpoint_keys)
     }
 
+    /// The conditional review write (issue #241, PR 12). A mark is an
+    /// upsert whose predicate is the expected revision: `None` replaces
+    /// whatever is there (revision + 1), `UNREVIEWED_REVISION` inserts only
+    /// when no row exists, and any other value updates only the row at that
+    /// revision. A clear does not delete the row -- it nulls `reviewed_at`
+    /// and bumps the revision, so the endpoint's review revision never
+    /// restarts and a stale `If-Match` from an earlier review cannot match
+    /// a later one. Clearing an endpoint that is already unreviewed at the
+    /// revision the caller expected (including "never reviewed", revision
+    /// `UNREVIEWED_REVISION`) is a no-op that applies. Zero rows is a
+    /// refusal carrying the review as stored now.
     pub fn set_endpoint_review(
         &self,
         method: &str,
         endpoint_template: &str,
         reviewed: bool,
         reviewed_by: Option<&str>,
-    ) -> Result<Option<EndpointReviewState>, DiscoveryQueryError> {
+        expected_revision: Option<i64>,
+    ) -> Result<TransitionOutcome<EndpointReviewState>, DiscoveryQueryError> {
         let connection = self.connection_guard();
+        let sqlite_error = |source| DiscoveryQueryError::Sqlite {
+            path: self.path.clone(),
+            source,
+        };
         let exists = connection
             .query_row(
                 r#"
@@ -1083,61 +1144,120 @@ impl DiscoveryQueryStore {
                 |row| row.get::<_, i64>(0),
             )
             .optional()
-            .map_err(|source| DiscoveryQueryError::Sqlite {
-                path: self.path.clone(),
-                source,
-            })?
+            .map_err(sqlite_error)?
             .is_some();
         if !exists {
-            return Ok(None);
+            return Ok(TransitionOutcome::NotFound);
         }
 
         if reviewed {
             let reviewed_at = utc_timestamp_rfc3339();
-            connection
-                .execute(
-                    r#"
-                    INSERT INTO discovery_endpoint_reviews (
+            let written = match expected_revision {
+                None => connection
+                    .query_row(
+                        r#"
+                        INSERT INTO discovery_endpoint_reviews (
+                            method,
+                            endpoint_template,
+                            reviewed_at,
+                            reviewed_by,
+                            revision
+                        ) VALUES (?1, ?2, ?3, ?4, 1)
+                        ON CONFLICT(method, endpoint_template) DO UPDATE SET
+                            reviewed_at = excluded.reviewed_at,
+                            reviewed_by = excluded.reviewed_by,
+                            revision = discovery_endpoint_reviews.revision + 1
+                        RETURNING revision
+                        "#,
+                        params![method, endpoint_template, reviewed_at, reviewed_by],
+                        |row| row.get::<_, i64>(0),
+                    )
+                    .optional()
+                    .map_err(sqlite_error)?,
+                Some(UNREVIEWED_REVISION) => connection
+                    .query_row(
+                        r#"
+                        INSERT INTO discovery_endpoint_reviews (
+                            method,
+                            endpoint_template,
+                            reviewed_at,
+                            reviewed_by,
+                            revision
+                        ) VALUES (?1, ?2, ?3, ?4, 1)
+                        ON CONFLICT(method, endpoint_template) DO NOTHING
+                        RETURNING revision
+                        "#,
+                        params![method, endpoint_template, reviewed_at, reviewed_by],
+                        |row| row.get::<_, i64>(0),
+                    )
+                    .optional()
+                    .map_err(sqlite_error)?,
+                Some(expected) => connection
+                    .query_row(
+                        r#"
+                        UPDATE discovery_endpoint_reviews
+                        SET reviewed_at = ?3,
+                            reviewed_by = ?4,
+                            revision = revision + 1
+                        WHERE method = ?1 AND endpoint_template = ?2 AND revision = ?5
+                        RETURNING revision
+                        "#,
+                        params![
+                            method,
+                            endpoint_template,
+                            reviewed_at,
+                            reviewed_by,
+                            expected
+                        ],
+                        |row| row.get::<_, i64>(0),
+                    )
+                    .optional()
+                    .map_err(sqlite_error)?,
+            };
+            match written {
+                Some(revision) => Ok(TransitionOutcome::Applied(EndpointReviewState {
+                    reviewed: true,
+                    reviewed_at: Some(reviewed_at),
+                    reviewed_by: reviewed_by.map(str::to_owned),
+                    revision,
+                })),
+                None => Ok(TransitionOutcome::Refused(TransitionRefused {
+                    current: load_review_by_key(
+                        &connection,
+                        &self.path,
                         method,
                         endpoint_template,
-                        reviewed_at,
-                        reviewed_by
-                    ) VALUES (?1, ?2, ?3, ?4)
-                    ON CONFLICT(method, endpoint_template) DO UPDATE SET
-                        reviewed_at = excluded.reviewed_at,
-                        reviewed_by = excluded.reviewed_by
-                    "#,
-                    params![method, endpoint_template, reviewed_at, reviewed_by],
-                )
-                .map_err(|source| DiscoveryQueryError::Sqlite {
-                    path: self.path.clone(),
-                    source,
-                })?;
-
-            Ok(Some(EndpointReviewState {
-                reviewed: true,
-                reviewed_at: Some(reviewed_at),
-                reviewed_by: reviewed_by.map(str::to_owned),
-            }))
+                    )?,
+                })),
+            }
         } else {
-            connection
+            let cleared = connection
                 .execute(
                     r#"
-                    DELETE FROM discovery_endpoint_reviews
+                    UPDATE discovery_endpoint_reviews
+                    SET reviewed_at = NULL,
+                        reviewed_by = NULL,
+                        revision = revision + 1
                     WHERE method = ?1 AND endpoint_template = ?2
+                      AND reviewed_at IS NOT NULL
+                      AND (?3 IS NULL OR revision = ?3)
                     "#,
-                    params![method, endpoint_template],
+                    params![method, endpoint_template, expected_revision],
                 )
-                .map_err(|source| DiscoveryQueryError::Sqlite {
-                    path: self.path.clone(),
-                    source,
-                })?;
-
-            Ok(Some(EndpointReviewState {
-                reviewed: false,
-                reviewed_at: None,
-                reviewed_by: None,
-            }))
+                .map_err(sqlite_error)?;
+            let current = load_review_by_key(&connection, &self.path, method, endpoint_template)?;
+            if cleared > 0 {
+                return Ok(TransitionOutcome::Applied(current));
+            }
+            // Nothing to clear: applying only when the endpoint is
+            // unreviewed AT the revision the caller expected keeps a stale
+            // expectation from passing as an idempotent no-op.
+            if !current.reviewed
+                && expected_revision.unwrap_or(current.revision) == current.revision
+            {
+                return Ok(TransitionOutcome::Applied(current));
+            }
+            Ok(TransitionOutcome::Refused(TransitionRefused { current }))
         }
     }
 
@@ -1219,21 +1339,9 @@ impl DiscoveryQueryStore {
         let rows = {
             let connection = self.connection_guard();
             let mut statement = connection
-                .prepare(
+                .prepare(&format!(
                     r#"
-                    SELECT
-                        id,
-                        signal_type,
-                        target_kind,
-                        target_key,
-                        target_identity_json,
-                        explanation,
-                        evidence_json,
-                        state,
-                        created_at,
-                        updated_at,
-                        transitioned_at,
-                        transitioned_by
+                    SELECT {SIGNAL_COLUMNS}
                     FROM discovery_signals
                     WHERE signal_type = ?1
                       AND target_kind = ?2
@@ -1246,8 +1354,8 @@ impl DiscoveryQueryStore {
                           END
                     ORDER BY julianday(created_at) DESC, id ASC
                     LIMIT ?6
-                    "#,
-                )
+                    "#
+                ))
                 .map_err(|source| DiscoveryQueryError::Sqlite {
                     path: self.path.clone(),
                     source,
@@ -1279,13 +1387,19 @@ impl DiscoveryQueryStore {
         rows.into_iter().map(RawSignal::into_signal).collect()
     }
 
+    /// The conditional transition (issue #241, PR 12): one statement whose
+    /// predicate is the id, the expected state(s), and (when given) the
+    /// expected revision. Zero rows is a refusal carrying the row as it is
+    /// now, or `NotFound` when there is no such row.
     pub fn transition_signal(
         &self,
         signal_id: &str,
         state: SignalLifecycleState,
         transitioned_by: Option<&str>,
-    ) -> Result<Option<Signal>, DiscoveryQueryError> {
+        expected: TransitionPrecondition<SignalLifecycleState>,
+    ) -> Result<TransitionOutcome<Signal>, DiscoveryQueryError> {
         let transitioned_at = utc_timestamp_rfc3339();
+        let (from_state, also_from_state) = expected.bound_states();
         let connection = self.connection_guard();
         let updated = connection
             .execute(
@@ -1294,20 +1408,34 @@ impl DiscoveryQueryStore {
                 SET state = ?2,
                     updated_at = ?3,
                     transitioned_at = ?3,
-                    transitioned_by = ?4
+                    transitioned_by = ?4,
+                    revision = revision + 1
                 WHERE id = ?1
+                  AND (state = ?5 OR state = ?7)
+                  AND (?6 IS NULL OR revision = ?6)
                 "#,
-                params![signal_id, state.as_str(), transitioned_at, transitioned_by,],
+                params![
+                    signal_id,
+                    state.as_str(),
+                    transitioned_at,
+                    transitioned_by,
+                    from_state.as_str(),
+                    expected.revision,
+                    also_from_state.as_str(),
+                ],
             )
             .map_err(|source| DiscoveryQueryError::Sqlite {
                 path: self.path.clone(),
                 source,
             })?;
-        if updated == 0 {
-            return Ok(None);
-        }
 
-        load_signal_by_id(&connection, &self.path, signal_id)
+        let current = load_signal_by_id(&connection, &self.path, signal_id)?;
+        Ok(match (updated, current) {
+            (0, None) => TransitionOutcome::NotFound,
+            (0, Some(current)) => TransitionOutcome::Refused(TransitionRefused { current }),
+            (_, Some(transitioned)) => TransitionOutcome::Applied(transitioned),
+            (_, None) => TransitionOutcome::NotFound,
+        })
     }
 
     pub fn list_principals(
@@ -1426,6 +1554,9 @@ pub(crate) struct RawEndpointAggregate {
     pub(crate) updated_at: String,
     pub(crate) reviewed_at: Option<String>,
     pub(crate) reviewed_by: Option<String>,
+    /// The joined review row's revision; `None` (no row) reads as
+    /// `UNREVIEWED_REVISION`.
+    pub(crate) review_revision: Option<i64>,
 }
 
 #[derive(Deserialize)]
@@ -1669,6 +1800,7 @@ impl RawEndpointAggregate {
             updated_at: row.get(12)?,
             reviewed_at: row.get(13)?,
             reviewed_by: row.get(14)?,
+            review_revision: row.get(15)?,
         })
     }
 
@@ -1709,6 +1841,7 @@ impl RawEndpointAggregate {
             reviewed: review.reviewed,
             reviewed_at: review.reviewed_at,
             reviewed_by: review.reviewed_by,
+            review_revision: review.revision,
             covered_by_rule: false,
             coverage_scope: EndpointCoverageScope::None,
             routing_context_known,
@@ -1761,6 +1894,7 @@ impl RawEndpointAggregate {
             reviewed: review.reviewed,
             reviewed_at: review.reviewed_at,
             reviewed_by: review.reviewed_by,
+            review_revision: review.revision,
             covered_by_rule: false,
             coverage_scope: EndpointCoverageScope::None,
             routing_context_known,
@@ -1773,6 +1907,9 @@ impl RawEndpointAggregate {
         })
     }
 
+    /// The effective review: a review made before the endpoint's routing
+    /// context changed no longer counts, but its row (and revision) is
+    /// still what a conditional re-review must expect.
     fn review_state(&self, routing_contexts: &[EndpointRoutingContext]) -> EndpointReviewState {
         let reviewed_at = self.reviewed_at.clone().filter(|reviewed_at| {
             routing_contexts
@@ -1783,6 +1920,7 @@ impl RawEndpointAggregate {
             reviewed: reviewed_at.is_some(),
             reviewed_at: reviewed_at.clone(),
             reviewed_by: reviewed_at.and(self.reviewed_by.clone()),
+            revision: self.review_revision.unwrap_or(UNREVIEWED_REVISION),
         }
     }
 }
@@ -1881,7 +2019,8 @@ fn build_endpoint_list_query(
             a.distinct_principal_count,
             a.updated_at,
             r.reviewed_at,
-            r.reviewed_by
+            r.reviewed_by,
+            r.revision
         FROM discovery_endpoint_aggregates a
         LEFT JOIN discovery_endpoint_reviews r
             USING (method, endpoint_template)
@@ -2053,24 +2192,7 @@ fn build_signal_list_query(
     filters: &SignalListFilters,
     cursor: Option<&SignalCursor>,
 ) -> (String, Vec<SqlValue>) {
-    let mut sql = String::from(
-        r#"
-        SELECT
-            id,
-            signal_type,
-            target_kind,
-            target_key,
-            target_identity_json,
-            explanation,
-            evidence_json,
-            state,
-            created_at,
-            updated_at,
-            transitioned_at,
-            transitioned_by
-        FROM discovery_signals
-        "#,
-    );
+    let mut sql = format!("SELECT {SIGNAL_COLUMNS} FROM discovery_signals");
     let mut clauses = Vec::new();
     let mut params = Vec::new();
 
@@ -2144,7 +2266,14 @@ pub(crate) struct RawSignal {
     pub(crate) updated_at: String,
     pub(crate) transitioned_at: Option<String>,
     pub(crate) transitioned_by: Option<String>,
+    pub(crate) revision: i64,
 }
+
+/// The signal columns every read selects, in the order `RawSignal` reads
+/// them; identical on both backends.
+pub(crate) const SIGNAL_COLUMNS: &str = "id, signal_type, target_kind, target_key, \
+     target_identity_json, explanation, evidence_json, state, created_at, updated_at, \
+     transitioned_at, transitioned_by, revision";
 
 impl RawSignal {
     fn from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Self> {
@@ -2161,6 +2290,7 @@ impl RawSignal {
             updated_at: row.get(9)?,
             transitioned_at: row.get(10)?,
             transitioned_by: row.get(11)?,
+            revision: row.get(12)?,
         })
     }
 
@@ -2199,6 +2329,7 @@ impl RawSignal {
             updated_at: self.updated_at,
             transitioned_at: self.transitioned_at,
             transitioned_by: self.transitioned_by,
+            revision: self.revision,
         })
     }
 }
@@ -2209,25 +2340,9 @@ fn load_signal_by_id(
     signal_id: &str,
 ) -> Result<Option<Signal>, DiscoveryQueryError> {
     let mut statement = connection
-        .prepare(
-            r#"
-            SELECT
-                id,
-                signal_type,
-                target_kind,
-                target_key,
-                target_identity_json,
-                explanation,
-                evidence_json,
-                state,
-                created_at,
-                updated_at,
-                transitioned_at,
-                transitioned_by
-            FROM discovery_signals
-            WHERE id = ?1
-            "#,
-        )
+        .prepare(&format!(
+            "SELECT {SIGNAL_COLUMNS} FROM discovery_signals WHERE id = ?1"
+        ))
         .map_err(|source| DiscoveryQueryError::Sqlite {
             path: path.to_path_buf(),
             source,
@@ -2242,6 +2357,43 @@ fn load_signal_by_id(
         })?
         .map(RawSignal::into_signal)
         .transpose()
+}
+
+/// The review row as stored (not the effective, reclassification-aware
+/// state): what a refused conditional write hands back.
+fn load_review_by_key(
+    connection: &Connection,
+    path: &Path,
+    method: &str,
+    endpoint_template: &str,
+) -> Result<EndpointReviewState, DiscoveryQueryError> {
+    connection
+        .query_row(
+            r#"
+            SELECT reviewed_at, reviewed_by, revision
+            FROM discovery_endpoint_reviews
+            WHERE method = ?1 AND endpoint_template = ?2
+            "#,
+            params![method, endpoint_template],
+            |row| {
+                // A row whose review was cleared keeps its revision and
+                // reads as unreviewed.
+                let reviewed_at: Option<String> = row.get(0)?;
+                let reviewed_by: Option<String> = row.get(1)?;
+                Ok(EndpointReviewState {
+                    reviewed: reviewed_at.is_some(),
+                    reviewed_by: reviewed_at.as_ref().and(reviewed_by),
+                    reviewed_at,
+                    revision: row.get(2)?,
+                })
+            },
+        )
+        .optional()
+        .map_err(|source| DiscoveryQueryError::Sqlite {
+            path: path.to_path_buf(),
+            source,
+        })
+        .map(|review| review.unwrap_or_else(EndpointReviewState::unreviewed))
 }
 
 fn load_status_counts(
@@ -2443,6 +2595,13 @@ fn configure_connection(connection: &Connection) -> rusqlite::Result<()> {
         "#,
     )?;
     connection.execute_batch(CREATE_REVIEW_SCHEMA_SQL)?;
+    lifecycle::ensure_sqlite_column(
+        connection,
+        "discovery_endpoint_reviews",
+        "revision",
+        "INTEGER NOT NULL DEFAULT 1",
+    )?;
+    ensure_review_reviewed_at_is_nullable(connection)?;
     super::aggregator::ensure_discovery_endpoint_principal_identity_schema(connection)?;
     connection.execute_batch(CREATE_ROUTING_CONTEXT_SCHEMA_SQL)?;
     ensure_discovery_endpoint_aggregate_column(
@@ -2452,6 +2611,52 @@ fn configure_connection(connection: &Connection) -> rusqlite::Result<()> {
     )?;
     signals::configure_connection(connection)?;
     suggestions::configure_connection(connection)
+}
+
+/// Rebuild a review table created before clearing kept the row (issue
+/// #241, PR 12): `reviewed_at` was `NOT NULL` there, so the clear's
+/// `SET reviewed_at = NULL` would fail. SQLite cannot drop a column
+/// constraint in place, so this is the table rebuild the aggregator uses
+/// for the same kind of change -- create, copy, drop, rename, in one
+/// transaction. A no-op once the column is nullable, and on a database
+/// that has no review table yet.
+fn ensure_review_reviewed_at_is_nullable(connection: &Connection) -> rusqlite::Result<()> {
+    let not_null = {
+        let mut statement = connection.prepare("PRAGMA table_info(discovery_endpoint_reviews)")?;
+        let columns = statement
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(1)?, row.get::<_, i64>(3)?))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        columns
+            .iter()
+            .any(|(name, not_null)| name == "reviewed_at" && *not_null != 0)
+    };
+    if !not_null {
+        return Ok(());
+    }
+
+    let transaction = connection.unchecked_transaction()?;
+    transaction.execute_batch(
+        r#"
+        DROP TABLE IF EXISTS discovery_endpoint_reviews_v2;
+        CREATE TABLE discovery_endpoint_reviews_v2 (
+            method TEXT NOT NULL,
+            endpoint_template TEXT NOT NULL,
+            reviewed_at TEXT,
+            reviewed_by TEXT,
+            revision INTEGER NOT NULL DEFAULT 1,
+            PRIMARY KEY (method, endpoint_template)
+        );
+        INSERT OR IGNORE INTO discovery_endpoint_reviews_v2
+            (method, endpoint_template, reviewed_at, reviewed_by, revision)
+        SELECT method, endpoint_template, reviewed_at, reviewed_by, revision
+        FROM discovery_endpoint_reviews;
+        DROP TABLE discovery_endpoint_reviews;
+        ALTER TABLE discovery_endpoint_reviews_v2 RENAME TO discovery_endpoint_reviews;
+        "#,
+    )?;
+    transaction.commit()
 }
 
 fn ensure_discovery_endpoint_aggregate_column(
@@ -2987,6 +3192,328 @@ mod tests {
                 )
                 .expect("payload shape sample should insert");
         }
+    }
+
+    // ------------------------------------------------------------------
+    // Conditional lifecycle transitions (issue #241, PR 12). Standalone
+    // has one process, so the "two handles" here are two query stores
+    // over the same file taking turns: the second one's transition must
+    // be refused with the row the first one wrote, never overwrite it.
+    // ------------------------------------------------------------------
+
+    fn seed_open_signal(path: &PathBuf, id: &str, method: &str, endpoint_template: &str) {
+        let connection = Connection::open(path).expect("test database should open");
+        signals::configure_connection(&connection).expect("signal schema should configure");
+        connection
+            .execute(
+                r#"
+                INSERT INTO discovery_signals (
+                    id, signal_type, target_kind, target_key, target_identity_json,
+                    explanation, evidence_json, state, created_at, updated_at,
+                    transitioned_at, transitioned_by
+                ) VALUES (?1, 'new_endpoint_seen', 'endpoint', ?2, ?3, 'seeded', '{}',
+                          'open', '2024-06-01T00:00:00Z', '2024-06-01T00:00:00Z', NULL, NULL)
+                "#,
+                params![
+                    id,
+                    signals::endpoint_target_key(method, endpoint_template),
+                    json!({"method": method, "endpoint_template": endpoint_template}).to_string(),
+                ],
+            )
+            .expect("open signal should insert");
+    }
+
+    fn two_stores(db: &TempDb) -> (DiscoveryQueryStore, DiscoveryQueryStore) {
+        (
+            DiscoveryQueryStore::open(&db.path).expect("first store opens"),
+            DiscoveryQueryStore::open(&db.path).expect("second store opens"),
+        )
+    }
+
+    #[test]
+    fn signal_revision_column_is_added_in_place_and_starts_at_one() {
+        let db = TempDb::new("signal-revision-column");
+        // The table predates the column (the seed creates it without one
+        // through the same CREATE the sink uses, then the column is added).
+        let connection = Connection::open(&db.path).expect("test database should open");
+        connection
+            .execute_batch(
+                "CREATE TABLE discovery_signals (
+                    id TEXT PRIMARY KEY, signal_type TEXT NOT NULL, target_kind TEXT NOT NULL,
+                    target_key TEXT NOT NULL, target_identity_json TEXT NOT NULL,
+                    explanation TEXT NOT NULL, evidence_json TEXT NOT NULL, state TEXT NOT NULL,
+                    created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+                    transitioned_at TEXT, transitioned_by TEXT
+                );",
+            )
+            .expect("legacy signal table should create");
+        drop(connection);
+        seed_open_signal(&db.path, "sig-legacy", "GET", "/legacy");
+
+        let store = DiscoveryQueryStore::open(&db.path).expect("store opens");
+        let page = store
+            .list_signals(&SignalListFilters {
+                state: None,
+                signal_type: None,
+                target_kind: None,
+                target_key: None,
+                limit: 10,
+                cursor: None,
+            })
+            .expect("signals list");
+        assert_eq!(page.signals.len(), 1);
+        assert_eq!(page.signals[0].revision, 1);
+    }
+
+    /// A review table created before clearing kept the row has
+    /// `reviewed_at NOT NULL`, which a clear would violate. Opening the
+    /// store rebuilds it, keeping the rows and their revisions (issue
+    /// #241, PR 12).
+    #[test]
+    fn a_legacy_review_table_is_rebuilt_so_a_clear_can_keep_the_row() {
+        let db = TempDb::new("legacy-review-table");
+        seed_endpoint(&db.path, "GET", "/legacy-review");
+        let connection = Connection::open(&db.path).expect("test database should open");
+        connection
+            .execute_batch(
+                "CREATE TABLE discovery_endpoint_reviews (
+                    method TEXT NOT NULL,
+                    endpoint_template TEXT NOT NULL,
+                    reviewed_at TEXT NOT NULL,
+                    reviewed_by TEXT,
+                    PRIMARY KEY (method, endpoint_template)
+                );
+                INSERT INTO discovery_endpoint_reviews
+                    (method, endpoint_template, reviewed_at, reviewed_by)
+                VALUES ('GET', '/legacy-review', '2024-06-01T00:00:00Z', 'admin-legacy');",
+            )
+            .expect("legacy review table should create");
+        drop(connection);
+
+        let store = DiscoveryQueryStore::open(&db.path).expect("store opens");
+        let cleared = store
+            .set_endpoint_review("GET", "/legacy-review", false, Some("admin-a"), Some(1))
+            .expect("clear")
+            .expect_applied("the migrated row clears");
+        assert!(!cleared.reviewed);
+        assert_eq!(cleared.revision, 2);
+        // The row is still there, so the next mark cannot reuse revision 1.
+        assert!(store
+            .set_endpoint_review(
+                "GET",
+                "/legacy-review",
+                true,
+                Some("admin-b"),
+                Some(UNREVIEWED_REVISION)
+            )
+            .expect("first-mark after the clear")
+            .expect_refused("the endpoint has a review history")
+            .revision
+            .eq(&2));
+    }
+
+    #[test]
+    fn two_handles_acknowledging_one_signal_get_exactly_one_winner() {
+        for target in [
+            SignalLifecycleState::Acknowledged,
+            SignalLifecycleState::Dismissed,
+        ] {
+            let db = TempDb::new("signal-race");
+            seed_open_signal(&db.path, "sig-race", "GET", "/race");
+            let (replica_a, replica_b) = two_stores(&db);
+            let from_open = TransitionPrecondition::from_state(SignalLifecycleState::Open);
+
+            let winner = replica_a
+                .transition_signal("sig-race", target, Some("admin-a"), from_open)
+                .expect("first transition")
+                .expect_applied("the first replica wins");
+            assert_eq!(winner.state, target);
+            assert_eq!(winner.revision, 2);
+            assert_eq!(winner.transitioned_by.as_deref(), Some("admin-a"));
+
+            let refused = replica_b
+                .transition_signal("sig-race", target, Some("admin-b"), from_open)
+                .expect("second transition")
+                .expect_refused("the second replica is refused");
+            assert_eq!(refused.state, target);
+            assert_eq!(refused.revision, 2);
+            assert_eq!(
+                refused.transitioned_by.as_deref(),
+                Some("admin-a"),
+                "the refusal carries the winner's row; nothing was overwritten"
+            );
+
+            // The revision predicate on its own: the right revision applies
+            // (a re-dismissal of an acknowledged signal from Acknowledged),
+            // a stale one is refused even though the state matches.
+            let stale = replica_b
+                .transition_signal(
+                    "sig-race",
+                    SignalLifecycleState::Dismissed,
+                    Some("admin-b"),
+                    TransitionPrecondition::from_state(target).with_revision(Some(1)),
+                )
+                .expect("stale transition")
+                .expect_refused("a stale revision is refused");
+            assert_eq!(stale.revision, 2);
+            let moved = replica_b
+                .transition_signal(
+                    "sig-race",
+                    SignalLifecycleState::Dismissed,
+                    Some("admin-b"),
+                    TransitionPrecondition::from_state(target).with_revision(Some(2)),
+                )
+                .expect("exact transition")
+                .expect_applied("the exact revision applies");
+            assert_eq!(moved.revision, 3);
+            assert!(replica_a
+                .transition_signal("sig-missing", target, None, from_open)
+                .expect("unknown transition")
+                .is_not_found());
+        }
+    }
+
+    #[test]
+    fn two_handles_marking_and_clearing_one_review_get_exactly_one_winner() {
+        let db = TempDb::new("review-race");
+        seed_endpoint(&db.path, "GET", "/reviewed");
+        Connection::open(&db.path)
+            .expect("test database should open")
+            .execute_batch(
+                "CREATE TABLE IF NOT EXISTS discovery_endpoint_status_counts (
+                    method TEXT NOT NULL, endpoint_template TEXT NOT NULL,
+                    status INTEGER NOT NULL, count INTEGER NOT NULL,
+                    PRIMARY KEY (method, endpoint_template, status)
+                );",
+            )
+            .expect("status count table should create");
+        let (replica_a, replica_b) = two_stores(&db);
+        let expect_unreviewed = Some(UNREVIEWED_REVISION);
+
+        // Two first marks: one row, one winner.
+        let marked = replica_a
+            .set_endpoint_review("GET", "/reviewed", true, Some("admin-a"), expect_unreviewed)
+            .expect("first mark")
+            .expect_applied("the first mark wins");
+        assert!(marked.reviewed);
+        assert_eq!(marked.revision, 1);
+        let refused = replica_b
+            .set_endpoint_review("GET", "/reviewed", true, Some("admin-b"), expect_unreviewed)
+            .expect("second mark")
+            .expect_refused("the second mark is refused");
+        assert_eq!(refused.reviewed_by.as_deref(), Some("admin-a"));
+        assert_eq!(refused.revision, 1);
+        let detail = replica_b
+            .get_endpoint_with_open_signal_summaries("GET", "/reviewed", 24, false)
+            .expect("detail")
+            .expect("exists");
+        assert_eq!(detail.reviewed_by.as_deref(), Some("admin-a"));
+        assert_eq!(detail.review_revision, 1);
+
+        // Two clears of revision 1: one wins, the other is refused. The
+        // cleared endpoint is unreviewed at a HIGHER revision -- the row
+        // survives the clear so revisions never restart.
+        let cleared = replica_b
+            .set_endpoint_review("GET", "/reviewed", false, Some("admin-b"), Some(1))
+            .expect("first clear")
+            .expect_applied("the first clear wins");
+        assert!(!cleared.reviewed);
+        assert_eq!(cleared.reviewed_at, None);
+        assert_eq!(cleared.reviewed_by, None);
+        assert_eq!(cleared.revision, 2);
+        let refused = replica_a
+            .set_endpoint_review("GET", "/reviewed", false, Some("admin-a"), Some(1))
+            .expect("second clear")
+            .expect_refused("the second clear is refused");
+        assert!(!refused.reviewed);
+        assert_eq!(refused.revision, 2);
+        let detail = replica_a
+            .get_endpoint_with_open_signal_summaries("GET", "/reviewed", 24, false)
+            .expect("detail")
+            .expect("exists");
+        assert!(!detail.reviewed);
+        assert_eq!(detail.reviewed_by, None);
+        assert_eq!(detail.review_revision, 2);
+
+        // The generation that mattered: an admin still holding the FIRST
+        // review's revision cannot mark or clear the endpoint. Expecting
+        // "never reviewed" is refused for the same reason.
+        let aba_mark = replica_b
+            .set_endpoint_review("GET", "/reviewed", true, Some("admin-b"), Some(1))
+            .expect("stale-generation mark")
+            .expect_refused("a revision from a cleared review is stale, not a match");
+        assert_eq!(aba_mark.revision, 2);
+        let aba_first_mark = replica_b
+            .set_endpoint_review("GET", "/reviewed", true, Some("admin-b"), expect_unreviewed)
+            .expect("first-mark after a clear")
+            .expect_refused("the endpoint has a review history, so it is not unreviewed at 0");
+        assert_eq!(aba_first_mark.revision, 2);
+
+        // A re-mark against a stale revision is refused; against the row's
+        // revision it applies; unconditional always applies.
+        let remarked = replica_a
+            .set_endpoint_review("GET", "/reviewed", true, Some("admin-a"), None)
+            .expect("unconditional mark")
+            .expect_applied("unconditional");
+        assert_eq!(remarked.revision, 3);
+        let stale = replica_b
+            .set_endpoint_review("GET", "/reviewed", true, Some("admin-b"), Some(7))
+            .expect("stale mark")
+            .expect_refused("stale");
+        assert_eq!(stale.reviewed_by.as_deref(), Some("admin-a"));
+        let exact = replica_b
+            .set_endpoint_review("GET", "/reviewed", true, Some("admin-b"), Some(3))
+            .expect("exact mark")
+            .expect_applied("exact");
+        assert_eq!(exact.revision, 4);
+        assert_eq!(exact.reviewed_by.as_deref(), Some("admin-b"));
+        let replaced = replica_a
+            .set_endpoint_review("GET", "/reviewed", true, Some("admin-a"), None)
+            .expect("unconditional replace")
+            .expect_applied("unconditional");
+        assert_eq!(replaced.revision, 5);
+
+        // A clear names a revision too: a stale one clears nothing.
+        let stale_clear = replica_b
+            .set_endpoint_review("GET", "/reviewed", false, Some("admin-b"), Some(9))
+            .expect("stale clear")
+            .expect_refused("a stale clear is refused");
+        assert!(stale_clear.reviewed);
+        assert_eq!(stale_clear.revision, 5);
+
+        // Clearing an already-unreviewed endpoint at the revision it
+        // actually carries is a no-op that applies; an unknown endpoint is
+        // not found.
+        let cleared = replica_a
+            .set_endpoint_review("GET", "/reviewed", false, None, None)
+            .expect("clear")
+            .expect_applied("clear");
+        assert_eq!(cleared.revision, 6);
+        let noop = replica_b
+            .set_endpoint_review("GET", "/reviewed", false, None, Some(6))
+            .expect("no-op clear")
+            .expect_applied("clearing nothing, expecting exactly that, applies");
+        assert!(!noop.reviewed);
+        assert_eq!(noop.revision, 6);
+        let stale_noop = replica_b
+            .set_endpoint_review("GET", "/reviewed", false, None, Some(1))
+            .expect("stale clear of an already-cleared review")
+            .expect_refused("a stale expectation is not an idempotent no-op");
+        assert!(!stale_noop.reviewed);
+        assert_eq!(stale_noop.revision, 6);
+        assert!(replica_a
+            .set_endpoint_review("GET", "/missing", true, None, None)
+            .expect("unknown endpoint")
+            .is_not_found());
+
+        // An endpoint that never had a review is unreviewed at revision 0,
+        // and clearing it while expecting exactly that still applies.
+        seed_endpoint(&db.path, "GET", "/never-reviewed");
+        let never = replica_a
+            .set_endpoint_review("GET", "/never-reviewed", false, None, expect_unreviewed)
+            .expect("clear of a never-reviewed endpoint")
+            .expect_applied("nothing to clear, and nothing was expected");
+        assert_eq!(never, EndpointReviewState::unreviewed());
     }
 
     struct TempDb {

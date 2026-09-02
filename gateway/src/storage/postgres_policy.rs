@@ -22,6 +22,13 @@
 //!    revisions only (the state model's privacy section).
 //! 7. `COMMIT` -- once. Every step above rolls back together.
 //!
+//! Steps 1-6 are [`commit_policy_in`], over a client whose transaction the
+//! caller owns: the `PolicyControlPlane::commit` endpoint path wraps it in
+//! `BEGIN`/`COMMIT`, and rule-suggestion acceptance (issue #241, PR 12;
+//! `postgres_discovery_lifecycle`) runs it between locking the suggestion
+//! row and transitioning it, so a suggestion is accepted in the same
+//! transaction as the rule it proposes and never without it.
+//!
 //! Reads are plain committed reads: `active` re-verifies the stored ETag
 //! against the recomputed document hash (a tampered pointer fails closed as
 //! `InvalidData` rather than serving an unverifiable document) and parses
@@ -204,41 +211,62 @@ impl PolicyControlPlane for PostgresPolicyStore {
         &self,
         request: PolicyCommitRequest<'_>,
     ) -> Result<ActivePolicy, PolicyCommitError> {
-        let document_json = serde_json::to_string(request.candidate)
-            .map_err(|_| invalid_data(OPERATION_COMMIT))
+        let client = self
+            .pool
+            .get()
+            .await
+            .map_err(classify_pool_error)
             .map_err(store_error)?;
-        let diff_summary_json = serde_json::to_string(request.diff_summary)
-            .map_err(|_| invalid_data(OPERATION_COMMIT))
+        postgres_documents::begin(&client, OPERATION_COMMIT)
+            .await
             .map_err(store_error)?;
-        let etag = crate::policy_etag(request.candidate)
-            .map_err(|_| invalid_data(OPERATION_COMMIT))
-            .map_err(store_error)?;
-
-        // The shared section-2 transaction (postgres_documents): lock and
-        // self-verify the pointer, re-check the precondition, write the
-        // immutable version, reserve the revision, advance the pointer,
-        // append the outbox row, commit once.
-        let committed = postgres_documents::commit(
-            &self.pool,
-            POLICY_DOCUMENT_RESOURCE,
-            request.precondition.clone(),
-            postgres_documents::DocumentCommit {
-                document_json: &document_json,
-                document_etag: &etag,
-                actor_user_id: request.actor_user_id,
-                diff_summary_json: &diff_summary_json,
-                tool_names: None,
-            },
-        )
-        .await?;
-
-        Ok(ActivePolicy {
-            policy: request.candidate.clone(),
-            version: committed.version,
-            etag,
-            security_revision: committed.security_revision,
-        })
+        let outcome = commit_policy_in(&client, request).await;
+        postgres_documents::end_transaction(&client, OPERATION_COMMIT, outcome, store_error).await
     }
+}
+
+/// The policy commit's steps 1-6 over a client whose transaction the
+/// caller opened and will close (see the module documentation): lock and
+/// self-verify the pointer, re-check the precondition, write the immutable
+/// version (the history row), reserve the security revision, advance the
+/// pointer, append the outbox row. A `PreconditionFailed` -- the caller's
+/// expected ETag is not the active one -- is returned before anything is
+/// written, so the caller's `ROLLBACK` has nothing of the policy's to undo
+/// and everything of its own.
+pub(crate) async fn commit_policy_in(
+    client: &deadpool_postgres::Object,
+    request: PolicyCommitRequest<'_>,
+) -> Result<ActivePolicy, PolicyCommitError> {
+    let document_json = serde_json::to_string(request.candidate)
+        .map_err(|_| invalid_data(OPERATION_COMMIT))
+        .map_err(store_error)?;
+    let diff_summary_json = serde_json::to_string(request.diff_summary)
+        .map_err(|_| invalid_data(OPERATION_COMMIT))
+        .map_err(store_error)?;
+    let etag = crate::policy_etag(request.candidate)
+        .map_err(|_| invalid_data(OPERATION_COMMIT))
+        .map_err(store_error)?;
+
+    let committed = postgres_documents::commit_in(
+        client,
+        POLICY_DOCUMENT_RESOURCE,
+        request.precondition.clone(),
+        postgres_documents::DocumentCommit {
+            document_json: &document_json,
+            document_etag: &etag,
+            actor_user_id: request.actor_user_id,
+            diff_summary_json: &diff_summary_json,
+            tool_names: None,
+        },
+    )
+    .await?;
+
+    Ok(ActivePolicy {
+        policy: request.candidate.clone(),
+        version: committed.version,
+        etag,
+        security_revision: committed.security_revision,
+    })
 }
 
 #[async_trait]

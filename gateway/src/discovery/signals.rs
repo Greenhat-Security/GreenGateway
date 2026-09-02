@@ -30,7 +30,8 @@ CREATE TABLE IF NOT EXISTS discovery_signals (
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL,
     transitioned_at TEXT,
-    transitioned_by TEXT
+    transitioned_by TEXT,
+    revision INTEGER NOT NULL DEFAULT 1
 );
 
 CREATE UNIQUE INDEX IF NOT EXISTS idx_discovery_signals_identity
@@ -120,6 +121,10 @@ pub struct Signal {
     pub updated_at: String,
     pub transitioned_at: Option<String>,
     pub transitioned_by: Option<String>,
+    /// The row's revision (issue #241, PR 12): 1 when opened, incremented by
+    /// every lifecycle transition; the expected value a conditional
+    /// transition can require.
+    pub revision: i64,
 }
 
 #[derive(Serialize)]
@@ -191,6 +196,7 @@ impl NewSignal {
             updated_at: self.created_at.clone(),
             transitioned_at: None,
             transitioned_by: None,
+            revision: 1,
         }
     }
 }
@@ -628,7 +634,13 @@ impl VolumeOutlierDetector {
 }
 
 pub fn configure_connection(connection: &Connection) -> rusqlite::Result<()> {
-    connection.execute_batch(CREATE_SIGNAL_SCHEMA_SQL)
+    connection.execute_batch(CREATE_SIGNAL_SCHEMA_SQL)?;
+    super::lifecycle::ensure_sqlite_column(
+        connection,
+        "discovery_signals",
+        "revision",
+        "INTEGER NOT NULL DEFAULT 1",
+    )
 }
 
 pub fn insert_signals(

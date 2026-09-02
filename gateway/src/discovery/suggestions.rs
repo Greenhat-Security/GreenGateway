@@ -3,7 +3,7 @@ use std::{
     error::Error,
     fmt,
     path::{Path, PathBuf},
-    sync::{Mutex, MutexGuard},
+    sync::{Arc, Mutex, MutexGuard},
 };
 
 use rusqlite::{params, params_from_iter, types::Value as SqlValue, Connection};
@@ -11,14 +11,17 @@ use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use serde_json::{json, Value};
 use time::{format_description::well_known::Rfc3339, Duration as TimeDuration, OffsetDateTime};
 
+#[cfg(feature = "postgres")]
+use crate::discovery::cluster_suggestions::ClusterRuleSuggestionEngine;
 use crate::{
     audit::query::{
         AuditQueryStore, RoleEndpointObservation, RoleEndpointObservationFilters,
-        MAX_RULE_SUGGESTION_AUDIT_SCAN_ROWS,
+        RoleEndpointObservationMatrix, MAX_RULE_SUGGESTION_AUDIT_SCAN_ROWS,
     },
     auth::{AuthMethod, Principal},
     discovery::{
-        query::{DiscoveryQueryError, DiscoveryQueryStore},
+        lifecycle::{self, TransitionOutcome, TransitionPrecondition, TransitionRefused},
+        query::{DiscoveryQueryError, DiscoveryQueryStore, ObservedEndpoint},
         signals::{self, Signal, SignalLifecycleState, SignalListFilters},
     },
     metrics::LOCK_POISON_RECOVERIES_TOTAL,
@@ -26,6 +29,7 @@ use crate::{
         Policy, PrincipalMatcher, Rule, RuleAction, RuleDispatchContext, RuleDispatchMatcher,
         RuleMatcher,
     },
+    storage::{RepositoryError, RepositoryErrorKind},
 };
 
 pub const BASELINE_ALLOW_SUGGESTION_TYPE: &str = "baseline_allow";
@@ -55,7 +59,8 @@ CREATE TABLE IF NOT EXISTS discovery_rule_suggestions (
     updated_at TEXT NOT NULL,
     transitioned_at TEXT,
     transitioned_by TEXT,
-    source_signal_id TEXT
+    source_signal_id TEXT,
+    revision INTEGER NOT NULL DEFAULT 1
 );
 
 CREATE UNIQUE INDEX IF NOT EXISTS idx_discovery_rule_suggestions_identity
@@ -148,6 +153,10 @@ pub struct RuleSuggestion {
     pub transitioned_at: Option<String>,
     pub transitioned_by: Option<String>,
     pub source_signal_id: Option<String>,
+    /// The row's revision (issue #241, PR 12): 1 when generated,
+    /// incremented by every lifecycle transition; the expected value a
+    /// conditional transition can require.
+    pub revision: i64,
 }
 
 impl RuleSuggestion {
@@ -319,11 +328,46 @@ impl RuleSuggestionEngine {
         self
     }
 
+    /// One explicit generation run: gather the two inputs (the observed
+    /// endpoints and the audit role/endpoint matrix, plus the open signals),
+    /// plan through the backend-neutral [`SuggestionPlanner`], and persist
+    /// with `INSERT OR IGNORE` so re-running changes nothing.
     pub fn generate(&self, policy: &Policy) -> Result<RuleSuggestionRun, RuleSuggestionError> {
         let created_at = utc_timestamp_rfc3339();
         let mut run = RuleSuggestionRun::default();
-        let mut suggestions = self.baseline_suggestions(policy, &created_at, &mut run.baseline)?;
-        suggestions.extend(self.anomaly_suggestions(policy, &created_at, &mut run.anomaly)?);
+        let observed_endpoints = self.discovery_store.observed_endpoints()?;
+        let planner = SuggestionPlanner::new(
+            policy,
+            self.config,
+            &self.configured_proxy_routes,
+            &observed_endpoints,
+        );
+
+        let mut suggestions = match self.audit_store.as_ref() {
+            None => {
+                run.baseline.available = false;
+                run.baseline.omitted_reason = Some(BASELINE_AUDIT_UNAVAILABLE_REASON.to_owned());
+                Vec::new()
+            }
+            Some(_) if observed_endpoints.is_empty() => Vec::new(),
+            Some(audit_store) => {
+                let from = lookback_cutoff(self.config.baseline_window_hours);
+                let matrix = audit_store
+                    .observed_role_endpoint_matrix(&planner.matrix_filters(&from, &created_at))?;
+                planner.baseline_suggestions(
+                    matrix,
+                    &from,
+                    &created_at,
+                    AUDIT_SQLITE_EVIDENCE_SOURCE,
+                    &mut run.baseline,
+                )?
+            }
+        };
+        suggestions.extend(planner.anomaly_suggestions(
+            self.open_signals()?,
+            &created_at,
+            &mut run.anomaly,
+        )?);
 
         let inserted = self.suggestion_store.insert_suggestions(&suggestions)?;
         run.inserted_count = inserted.len();
@@ -348,16 +392,23 @@ impl RuleSuggestionEngine {
         self.suggestion_store.get_suggestion(suggestion_id)
     }
 
+    /// Move a suggestion to `state` if it is still in `expected.from_state`
+    /// (and at `expected.revision`, when given); see
+    /// [`crate::discovery::lifecycle`].
     pub fn transition_suggestion(
         &self,
         suggestion_id: &str,
         state: RuleSuggestionLifecycleState,
         transitioned_by: Option<&str>,
-    ) -> Result<Option<RuleSuggestion>, RuleSuggestionError> {
+        expected: TransitionPrecondition<RuleSuggestionLifecycleState>,
+    ) -> Result<TransitionOutcome<RuleSuggestion>, RuleSuggestionError> {
         self.suggestion_store
-            .transition_suggestion(suggestion_id, state, transitioned_by)
+            .transition_suggestion(suggestion_id, state, transitioned_by, expected)
     }
 
+    /// Re-validate a stored suggestion's routing context against the
+    /// inventory as it is NOW, so acceptance binds the rule to trusted
+    /// routing state rather than the copy persisted with the suggestion.
     pub fn direct_rule_suggestion_safety(
         &self,
         suggestion: &RuleSuggestion,
@@ -369,31 +420,103 @@ impl RuleSuggestionEngine {
         )
     }
 
-    fn baseline_suggestions(
+    fn direct_rule_safety_for_target(
         &self,
-        policy: &Policy,
-        created_at: &str,
-        run: &mut BaselineSuggestionRun,
-    ) -> Result<Vec<NewRuleSuggestion>, RuleSuggestionError> {
-        let Some(audit_store) = self.audit_store.as_ref() else {
-            run.available = false;
-            run.omitted_reason = Some(BASELINE_AUDIT_UNAVAILABLE_REASON.to_owned());
-            return Ok(Vec::new());
-        };
+        method: &str,
+        endpoint_template: &str,
+        evidence_created_at: &str,
+    ) -> Result<DirectRuleSuggestionSafety, RuleSuggestionError> {
+        let observed_endpoints = self.discovery_store.observed_endpoints()?;
+        Ok(direct_rule_safety_for_target(
+            &observed_endpoints,
+            &self.configured_proxy_routes,
+            method,
+            endpoint_template,
+            evidence_created_at,
+        ))
+    }
 
-        let endpoints = self.discovery_store.observed_endpoints()?;
-        if endpoints.is_empty() {
-            return Ok(Vec::new());
+    fn open_signals(&self) -> Result<Vec<Signal>, RuleSuggestionError> {
+        let mut cursor = None;
+        let mut signals = Vec::new();
+
+        loop {
+            let page = self.discovery_store.list_signals(&SignalListFilters {
+                state: Some(SignalLifecycleState::Open),
+                signal_type: None,
+                target_kind: None,
+                target_key: None,
+                limit: 500,
+                cursor,
+            })?;
+            signals.extend(page.signals);
+            let Some(next_cursor) = page.next_cursor else {
+                break;
+            };
+            cursor = Some(next_cursor);
         }
 
-        let from = lookback_cutoff(self.config.baseline_window_hours);
-        let matrix =
-            audit_store.observed_role_endpoint_matrix(&RoleEndpointObservationFilters {
-                endpoints,
-                from: Some(from.clone()),
-                to: Some(created_at.to_owned()),
-                max_scan_rows: MAX_RULE_SUGGESTION_AUDIT_SCAN_ROWS,
-            })?;
+        Ok(signals)
+    }
+}
+
+/// The `evidence.source` a baseline suggestion records: which audit store
+/// the observations were read from.
+pub(crate) const AUDIT_SQLITE_EVIDENCE_SOURCE: &str = "audit_sqlite";
+#[cfg(feature = "postgres")]
+pub(crate) const AUDIT_POSTGRES_EVIDENCE_SOURCE: &str = "audit_postgres";
+
+/// The backend-neutral heart of generation (issue #241, PR 12): given the
+/// policy, the configuration, and a snapshot of the observed endpoints, it
+/// turns an audit role/endpoint matrix into baseline-allow candidates and
+/// open signals into shadow candidates. The standalone engine feeds it from
+/// SQLite, the cluster engine from PostgreSQL; neither backend has planning
+/// logic of its own, so the suggestion set for a given fixture is the same
+/// on both.
+pub(crate) struct SuggestionPlanner<'a> {
+    policy: &'a Policy,
+    config: RuleSuggestionConfig,
+    configured_proxy_routes: &'a [ConfiguredProxyRoute],
+    observed_endpoints: &'a [ObservedEndpoint],
+}
+
+impl<'a> SuggestionPlanner<'a> {
+    pub(crate) fn new(
+        policy: &'a Policy,
+        config: RuleSuggestionConfig,
+        configured_proxy_routes: &'a [ConfiguredProxyRoute],
+        observed_endpoints: &'a [ObservedEndpoint],
+    ) -> Self {
+        Self {
+            policy,
+            config,
+            configured_proxy_routes,
+            observed_endpoints,
+        }
+    }
+
+    /// The audit scan the baseline needs: every observed endpoint, over the
+    /// lookback window `[from, to]`, under the shared scan budget.
+    pub(crate) fn matrix_filters(&self, from: &str, to: &str) -> RoleEndpointObservationFilters {
+        RoleEndpointObservationFilters {
+            endpoints: self.observed_endpoints.to_vec(),
+            from: Some(from.to_owned()),
+            to: Some(to.to_owned()),
+            max_scan_rows: MAX_RULE_SUGGESTION_AUDIT_SCAN_ROWS,
+        }
+    }
+
+    /// Baseline-allow candidates from the matrix; `evidence_source` names
+    /// the audit store the matrix was read from.
+    pub(crate) fn baseline_suggestions(
+        &self,
+        matrix: RoleEndpointObservationMatrix,
+        from: &str,
+        created_at: &str,
+        evidence_source: &str,
+        run: &mut BaselineSuggestionRun,
+    ) -> Result<Vec<NewRuleSuggestion>, RuleSuggestionError> {
+        let policy = self.policy;
         run.observed_role_endpoint_count = matrix.observations.len();
         run.scanned_event_count = matrix.scanned_event_count;
         run.scan_truncated = matrix.scan_truncated;
@@ -434,11 +557,11 @@ impl RuleSuggestionEngine {
                 run.skipped_policy_covered = run.skipped_policy_covered.saturating_add(1);
                 continue;
             }
-            let dispatch = match self.direct_rule_safety_for_target(
+            let dispatch = match self.safety(
                 &observation.method,
                 &observation.endpoint_template,
                 created_at,
-            )? {
+            ) {
                 DirectRuleSuggestionSafety::Safe(dispatch) => dispatch,
                 DirectRuleSuggestionSafety::HostRouted => {
                     run.skipped_host_routed_observations =
@@ -472,7 +595,7 @@ impl RuleSuggestionEngine {
             );
             let rationale = baseline_rationale(&observation, self.config.baseline_window_hours);
             let evidence = json!({
-                "source": "audit_sqlite",
+                "source": evidence_source,
                 "lookback_window_hours": self.config.baseline_window_hours,
                 "from": from,
                 "to": created_at,
@@ -512,13 +635,14 @@ impl RuleSuggestionEngine {
         Ok(suggestions)
     }
 
-    fn anomaly_suggestions(
+    /// Shadow candidates from the open signals.
+    pub(crate) fn anomaly_suggestions(
         &self,
-        policy: &Policy,
+        signals: Vec<Signal>,
         created_at: &str,
         run: &mut AnomalySuggestionRun,
     ) -> Result<Vec<NewRuleSuggestion>, RuleSuggestionError> {
-        let signals = self.open_signals()?;
+        let policy = self.policy;
         run.open_signal_count = signals.len();
         let mut suggestions = Vec::new();
 
@@ -527,30 +651,28 @@ impl RuleSuggestionEngine {
                 run.skipped_unusable_target = run.skipped_unusable_target.saturating_add(1);
                 continue;
             };
-            let dispatch = match self.direct_rule_safety_for_target(
-                &target.method,
-                &target.path_pattern,
-                &signal.created_at,
-            )? {
-                DirectRuleSuggestionSafety::Safe(dispatch) => dispatch,
-                DirectRuleSuggestionSafety::HostRouted => {
-                    run.skipped_host_routed = run.skipped_host_routed.saturating_add(1);
-                    continue;
-                }
-                DirectRuleSuggestionSafety::PathRouted => {
-                    run.skipped_path_routed = run.skipped_path_routed.saturating_add(1);
-                    continue;
-                }
-                DirectRuleSuggestionSafety::AmbiguousRouting => {
-                    run.skipped_ambiguous_routing = run.skipped_ambiguous_routing.saturating_add(1);
-                    continue;
-                }
-                DirectRuleSuggestionSafety::UnknownRoutingContext => {
-                    run.skipped_unknown_routing_context =
-                        run.skipped_unknown_routing_context.saturating_add(1);
-                    continue;
-                }
-            };
+            let dispatch =
+                match self.safety(&target.method, &target.path_pattern, &signal.created_at) {
+                    DirectRuleSuggestionSafety::Safe(dispatch) => dispatch,
+                    DirectRuleSuggestionSafety::HostRouted => {
+                        run.skipped_host_routed = run.skipped_host_routed.saturating_add(1);
+                        continue;
+                    }
+                    DirectRuleSuggestionSafety::PathRouted => {
+                        run.skipped_path_routed = run.skipped_path_routed.saturating_add(1);
+                        continue;
+                    }
+                    DirectRuleSuggestionSafety::AmbiguousRouting => {
+                        run.skipped_ambiguous_routing =
+                            run.skipped_ambiguous_routing.saturating_add(1);
+                        continue;
+                    }
+                    DirectRuleSuggestionSafety::UnknownRoutingContext => {
+                        run.skipped_unknown_routing_context =
+                            run.skipped_unknown_routing_context.saturating_add(1);
+                        continue;
+                    }
+                };
             if policy_has_covering_action(
                 policy,
                 &target.method,
@@ -596,137 +718,254 @@ impl RuleSuggestionEngine {
         Ok(suggestions)
     }
 
-    fn direct_rule_safety_for_target(
+    fn safety(
         &self,
         method: &str,
         endpoint_template: &str,
         evidence_created_at: &str,
-    ) -> Result<DirectRuleSuggestionSafety, RuleSuggestionError> {
-        let mcp_tool_target = tool_name_from_mcp_endpoint(method, endpoint_template).is_some();
-        let mut matched = false;
-        let mut unknown_routing_context = false;
-        let mut host_routed = false;
-        let mut path_routed = false;
-        let mut observed_dispatch_identities = BTreeSet::new();
-        for endpoint in self
-            .discovery_store
-            .observed_endpoints()?
-            .into_iter()
-            .filter(|endpoint| {
-                endpoint.method == method && endpoint.endpoint_template == endpoint_template
-            })
-        {
-            matched = true;
-            host_routed |= endpoint.route_host.is_some();
-            path_routed |= endpoint.route_path_prefix.is_some();
-            unknown_routing_context |=
-                endpoint
-                    .routing_context_known_since
-                    .as_deref()
-                    .is_none_or(|known_since| {
-                        timestamp_before_or_unparseable(evidence_created_at, known_since)
-                    });
-            observed_dispatch_identities.insert((
-                endpoint.route_path_prefix.clone(),
-                endpoint.upstream_origin.clone(),
-            ));
-        }
+    ) -> DirectRuleSuggestionSafety {
+        direct_rule_safety_for_target(
+            self.observed_endpoints,
+            self.configured_proxy_routes,
+            method,
+            endpoint_template,
+            evidence_created_at,
+        )
+    }
+}
 
-        if !matched {
-            return Ok(DirectRuleSuggestionSafety::UnknownRoutingContext);
-        }
-        if unknown_routing_context {
-            return Ok(DirectRuleSuggestionSafety::UnknownRoutingContext);
-        }
-        if mcp_tool_target {
-            if host_routed {
-                return Ok(DirectRuleSuggestionSafety::HostRouted);
-            }
-            if path_routed {
-                return Ok(DirectRuleSuggestionSafety::PathRouted);
-            }
-            let contextless = observed_dispatch_identities.len() == 1
-                && observed_dispatch_identities.contains(&(None, None));
-            return Ok(if contextless {
-                DirectRuleSuggestionSafety::Safe(RuleDispatchMatcher::contextless())
-            } else {
-                DirectRuleSuggestionSafety::AmbiguousRouting
-            });
-        }
-
-        let mut configured_dispatch_identities = BTreeSet::new();
-        for route in self.configured_proxy_routes.iter().filter(|route| {
-            route_path_prefix_overlaps_pattern(
-                route.route_path_prefix.as_deref(),
-                endpoint_template,
-            )
-        }) {
-            host_routed |= route.route_host.is_some();
-            path_routed |= route.route_path_prefix.is_some();
-            configured_dispatch_identities.insert((
-                route.route_path_prefix.clone(),
-                Some(route.upstream_origin.clone()),
-            ));
-        }
-
-        if host_routed {
-            return Ok(DirectRuleSuggestionSafety::HostRouted);
-        }
-        if path_routed {
-            return Ok(DirectRuleSuggestionSafety::PathRouted);
-        }
-
-        let observed_identity = observed_dispatch_identities.iter().next();
-        let configured_identity = configured_dispatch_identities.iter().next();
-        let safe_dispatch = if observed_dispatch_identities.len() == 1 {
-            match configured_dispatch_identities.len() {
-                0 => observed_identity.and_then(|(path_prefix, upstream_origin)| {
-                    (path_prefix.is_none() && upstream_origin.is_none())
-                        .then_some(RuleDispatchMatcher::contextless())
-                }),
-                1 if observed_identity == configured_identity => {
-                    observed_identity.and_then(|(_, upstream_origin)| {
-                        upstream_origin.clone().map(|origin| {
-                            origin.strip_prefix("pool:").map_or_else(
-                                || RuleDispatchMatcher::legacy(origin.clone()),
-                                |route_id| RuleDispatchMatcher::route(route_id.to_owned()),
-                            )
-                        })
-                    })
-                }
-                _ => None,
-            }
-        } else {
-            None
-        };
-
-        Ok(safe_dispatch.map_or(
-            DirectRuleSuggestionSafety::AmbiguousRouting,
-            DirectRuleSuggestionSafety::Safe,
-        ))
+/// Whether a direct rule for `method endpoint_template` can be bound to one
+/// trusted routing context, judged against a snapshot of the observed
+/// endpoints and the configured proxy routes. Pure, so both engines and
+/// the acceptance re-validation share it.
+pub(crate) fn direct_rule_safety_for_target(
+    observed_endpoints: &[ObservedEndpoint],
+    configured_proxy_routes: &[ConfiguredProxyRoute],
+    method: &str,
+    endpoint_template: &str,
+    evidence_created_at: &str,
+) -> DirectRuleSuggestionSafety {
+    let mcp_tool_target = tool_name_from_mcp_endpoint(method, endpoint_template).is_some();
+    let mut matched = false;
+    let mut unknown_routing_context = false;
+    let mut host_routed = false;
+    let mut path_routed = false;
+    let mut observed_dispatch_identities = BTreeSet::new();
+    for endpoint in observed_endpoints.iter().filter(|endpoint| {
+        endpoint.method == method && endpoint.endpoint_template == endpoint_template
+    }) {
+        matched = true;
+        host_routed |= endpoint.route_host.is_some();
+        path_routed |= endpoint.route_path_prefix.is_some();
+        unknown_routing_context |=
+            endpoint
+                .routing_context_known_since
+                .as_deref()
+                .is_none_or(|known_since| {
+                    timestamp_before_or_unparseable(evidence_created_at, known_since)
+                });
+        observed_dispatch_identities.insert((
+            endpoint.route_path_prefix.clone(),
+            endpoint.upstream_origin.clone(),
+        ));
     }
 
-    fn open_signals(&self) -> Result<Vec<Signal>, RuleSuggestionError> {
-        let mut cursor = None;
-        let mut signals = Vec::new();
-
-        loop {
-            let page = self.discovery_store.list_signals(&SignalListFilters {
-                state: Some(SignalLifecycleState::Open),
-                signal_type: None,
-                target_kind: None,
-                target_key: None,
-                limit: 500,
-                cursor,
-            })?;
-            signals.extend(page.signals);
-            let Some(next_cursor) = page.next_cursor else {
-                break;
-            };
-            cursor = Some(next_cursor);
+    if !matched {
+        return DirectRuleSuggestionSafety::UnknownRoutingContext;
+    }
+    if unknown_routing_context {
+        return DirectRuleSuggestionSafety::UnknownRoutingContext;
+    }
+    if mcp_tool_target {
+        if host_routed {
+            return DirectRuleSuggestionSafety::HostRouted;
         }
+        if path_routed {
+            return DirectRuleSuggestionSafety::PathRouted;
+        }
+        let contextless = observed_dispatch_identities.len() == 1
+            && observed_dispatch_identities.contains(&(None, None));
+        return if contextless {
+            DirectRuleSuggestionSafety::Safe(RuleDispatchMatcher::contextless())
+        } else {
+            DirectRuleSuggestionSafety::AmbiguousRouting
+        };
+    }
 
-        Ok(signals)
+    let mut configured_dispatch_identities = BTreeSet::new();
+    for route in configured_proxy_routes.iter().filter(|route| {
+        route_path_prefix_overlaps_pattern(route.route_path_prefix.as_deref(), endpoint_template)
+    }) {
+        host_routed |= route.route_host.is_some();
+        path_routed |= route.route_path_prefix.is_some();
+        configured_dispatch_identities.insert((
+            route.route_path_prefix.clone(),
+            Some(route.upstream_origin.clone()),
+        ));
+    }
+
+    if host_routed {
+        return DirectRuleSuggestionSafety::HostRouted;
+    }
+    if path_routed {
+        return DirectRuleSuggestionSafety::PathRouted;
+    }
+
+    let observed_identity = observed_dispatch_identities.iter().next();
+    let configured_identity = configured_dispatch_identities.iter().next();
+    let safe_dispatch = if observed_dispatch_identities.len() == 1 {
+        match configured_dispatch_identities.len() {
+            0 => observed_identity.and_then(|(path_prefix, upstream_origin)| {
+                (path_prefix.is_none() && upstream_origin.is_none())
+                    .then_some(RuleDispatchMatcher::contextless())
+            }),
+            1 if observed_identity == configured_identity => {
+                observed_identity.and_then(|(_, upstream_origin)| {
+                    upstream_origin.clone().map(|origin| {
+                        origin.strip_prefix("pool:").map_or_else(
+                            || RuleDispatchMatcher::legacy(origin.clone()),
+                            |route_id| RuleDispatchMatcher::route(route_id.to_owned()),
+                        )
+                    })
+                })
+            }
+            _ => None,
+        }
+    } else {
+        None
+    };
+
+    safe_dispatch.map_or(
+        DirectRuleSuggestionSafety::AmbiguousRouting,
+        DirectRuleSuggestionSafety::Safe,
+    )
+}
+
+/// The suggestion engine the admin handlers hold (issue #241, PR 12):
+/// standalone mode's SQLite engine behind the blocking pool, or cluster
+/// mode's PostgreSQL engine awaited directly. Every method is `async` and
+/// never blocks a request executor; the handlers are written once.
+#[derive(Clone)]
+pub enum SuggestionEngineHandle {
+    Standalone(Arc<RuleSuggestionEngine>),
+    #[cfg(feature = "postgres")]
+    Cluster(Arc<ClusterRuleSuggestionEngine>),
+}
+
+impl SuggestionEngineHandle {
+    /// The cluster engine, when this is cluster mode.
+    #[cfg(feature = "postgres")]
+    pub fn cluster(&self) -> Option<&Arc<ClusterRuleSuggestionEngine>> {
+        match self {
+            Self::Standalone(_) => None,
+            Self::Cluster(engine) => Some(engine),
+        }
+    }
+
+    pub async fn generate(&self, policy: Policy) -> Result<RuleSuggestionRun, RuleSuggestionError> {
+        match self {
+            Self::Standalone(engine) => {
+                let engine = Arc::clone(engine);
+                blocking(move || engine.generate(&policy)).await
+            }
+            #[cfg(feature = "postgres")]
+            Self::Cluster(engine) => engine.generate(&policy).await,
+        }
+    }
+
+    pub async fn list_suggestion_page(
+        &self,
+        filters: RuleSuggestionListFilters,
+    ) -> Result<RuleSuggestionListPage, RuleSuggestionError> {
+        match self {
+            Self::Standalone(engine) => {
+                let engine = Arc::clone(engine);
+                blocking(move || engine.list_suggestion_page(&filters)).await
+            }
+            #[cfg(feature = "postgres")]
+            Self::Cluster(engine) => engine.list_suggestion_page(&filters).await,
+        }
+    }
+
+    pub async fn get_suggestion(
+        &self,
+        suggestion_id: String,
+    ) -> Result<Option<RuleSuggestion>, RuleSuggestionError> {
+        match self {
+            Self::Standalone(engine) => {
+                let engine = Arc::clone(engine);
+                blocking(move || engine.get_suggestion(&suggestion_id)).await
+            }
+            #[cfg(feature = "postgres")]
+            Self::Cluster(engine) => engine.get_suggestion(&suggestion_id).await,
+        }
+    }
+
+    pub async fn transition_suggestion(
+        &self,
+        suggestion_id: String,
+        state: RuleSuggestionLifecycleState,
+        transitioned_by: Option<String>,
+        expected: TransitionPrecondition<RuleSuggestionLifecycleState>,
+    ) -> Result<TransitionOutcome<RuleSuggestion>, RuleSuggestionError> {
+        match self {
+            Self::Standalone(engine) => {
+                let engine = Arc::clone(engine);
+                blocking(move || {
+                    engine.transition_suggestion(
+                        &suggestion_id,
+                        state,
+                        transitioned_by.as_deref(),
+                        expected,
+                    )
+                })
+                .await
+            }
+            #[cfg(feature = "postgres")]
+            Self::Cluster(engine) => {
+                engine
+                    .transition_suggestion(
+                        &suggestion_id,
+                        state,
+                        transitioned_by.as_deref(),
+                        expected,
+                    )
+                    .await
+            }
+        }
+    }
+
+    pub async fn direct_rule_suggestion_safety(
+        &self,
+        suggestion: RuleSuggestion,
+    ) -> Result<DirectRuleSuggestionSafety, RuleSuggestionError> {
+        match self {
+            Self::Standalone(engine) => {
+                let engine = Arc::clone(engine);
+                blocking(move || engine.direct_rule_suggestion_safety(&suggestion)).await
+            }
+            #[cfg(feature = "postgres")]
+            Self::Cluster(engine) => engine.direct_rule_suggestion_safety(&suggestion).await,
+        }
+    }
+}
+
+/// Run one synchronous SQLite engine call on the blocking pool. A task that
+/// panics or is cancelled is an `Internal` repository failure.
+async fn blocking<T, F>(task: F) -> Result<T, RuleSuggestionError>
+where
+    T: Send + 'static,
+    F: FnOnce() -> Result<T, RuleSuggestionError> + Send + 'static,
+{
+    match tokio::task::spawn_blocking(task).await {
+        Ok(result) => result,
+        Err(join_error) => {
+            tracing::error!(error = %join_error, "rule suggestion blocking task failed");
+            Err(RuleSuggestionError::Repository(RepositoryError::new(
+                RepositoryErrorKind::Internal,
+                "rule_suggestion_blocking_task",
+            )))
+        }
     }
 }
 
@@ -801,6 +1040,9 @@ pub enum RuleSuggestionError {
     UnsafeBaselineSuggestion {
         id: String,
     },
+    /// A classified failure of the backend-neutral repository layer: the
+    /// PostgreSQL lifecycle store's driver and pool failures.
+    Repository(RepositoryError),
 }
 
 impl fmt::Display for RuleSuggestionError {
@@ -808,6 +1050,9 @@ impl fmt::Display for RuleSuggestionError {
         match self {
             Self::Discovery(err) => write!(formatter, "{err}"),
             Self::Audit(err) => write!(formatter, "{err}"),
+            Self::Repository(source) => {
+                write!(formatter, "rule suggestion repository query failed: {source}")
+            }
             Self::Sqlite { path, source } => write!(
                 formatter,
                 "failed to persist rule suggestions at {}: {source}",
@@ -846,6 +1091,7 @@ impl Error for RuleSuggestionError {
             Self::InvalidState { .. } => None,
             Self::InvalidCursor { .. } => None,
             Self::UnsafeBaselineSuggestion { .. } => None,
+            Self::Repository(source) => Some(source),
         }
     }
 }
@@ -856,25 +1102,34 @@ impl From<DiscoveryQueryError> for RuleSuggestionError {
     }
 }
 
+impl From<RepositoryError> for RuleSuggestionError {
+    fn from(source: RepositoryError) -> Self {
+        Self::Repository(source)
+    }
+}
+
 impl From<crate::audit::query::AuditQueryError> for RuleSuggestionError {
     fn from(err: crate::audit::query::AuditQueryError) -> Self {
         Self::Audit(err)
     }
 }
 
+/// A suggestion the planner produced and a store has yet to persist. Shared
+/// with the PostgreSQL lifecycle store, which inserts it under the same
+/// identity uniqueness the SQLite store does.
 #[derive(Clone, Debug)]
-struct NewRuleSuggestion {
-    id: String,
-    suggestion_type: String,
-    method: String,
-    path_pattern: String,
-    principal_key: String,
-    proposed_rule: Rule,
-    rationale: String,
-    evidence: Value,
-    state: RuleSuggestionLifecycleState,
-    created_at: String,
-    source_signal_id: Option<String>,
+pub(crate) struct NewRuleSuggestion {
+    pub(crate) id: String,
+    pub(crate) suggestion_type: String,
+    pub(crate) method: String,
+    pub(crate) path_pattern: String,
+    pub(crate) principal_key: String,
+    pub(crate) proposed_rule: Rule,
+    pub(crate) rationale: String,
+    pub(crate) evidence: Value,
+    pub(crate) state: RuleSuggestionLifecycleState,
+    pub(crate) created_at: String,
+    pub(crate) source_signal_id: Option<String>,
 }
 
 impl NewRuleSuggestion {
@@ -904,7 +1159,9 @@ impl NewRuleSuggestion {
         })
     }
 
-    fn as_suggestion(&self) -> RuleSuggestion {
+    /// The row as a freshly inserted suggestion reads back: revision 1,
+    /// `updated_at` equal to `created_at`, no transition yet.
+    pub(crate) fn as_suggestion(&self) -> RuleSuggestion {
         RuleSuggestion {
             id: self.id.clone(),
             suggestion_type: self.suggestion_type.clone(),
@@ -920,6 +1177,7 @@ impl NewRuleSuggestion {
             transitioned_at: None,
             transitioned_by: None,
             source_signal_id: self.source_signal_id.clone(),
+            revision: 1,
         }
     }
 }
@@ -1080,23 +1338,29 @@ impl RuleSuggestionStore {
         load_suggestion_by_id(&connection, &self.path, suggestion_id)
     }
 
+    /// The conditional transition (issue #241, PR 12): one statement whose
+    /// predicate is the id, the expected state, and (when given) the
+    /// expected revision. Zero rows is a refusal carrying the row as it is
+    /// now, or `NotFound` when there is no such row.
     fn transition_suggestion(
         &self,
         suggestion_id: &str,
         state: RuleSuggestionLifecycleState,
         transitioned_by: Option<&str>,
-    ) -> Result<Option<RuleSuggestion>, RuleSuggestionError> {
+        expected: TransitionPrecondition<RuleSuggestionLifecycleState>,
+    ) -> Result<TransitionOutcome<RuleSuggestion>, RuleSuggestionError> {
         let transitioned_at = utc_timestamp_rfc3339();
         let connection = self.connection_guard();
         if state == RuleSuggestionLifecycleState::Accepted {
             let Some(suggestion) = load_suggestion_by_id(&connection, &self.path, suggestion_id)?
             else {
-                return Ok(None);
+                return Ok(TransitionOutcome::NotFound);
             };
             if !suggestion.is_identity_bound_for_acceptance() {
                 return Err(RuleSuggestionError::UnsafeBaselineSuggestion { id: suggestion.id });
             }
         }
+        let (from_state, also_from_state) = expected.bound_states();
         let updated = connection
             .execute(
                 r#"
@@ -1104,25 +1368,34 @@ impl RuleSuggestionStore {
                 SET state = ?2,
                     updated_at = ?3,
                     transitioned_at = ?3,
-                    transitioned_by = ?4
+                    transitioned_by = ?4,
+                    revision = revision + 1
                 WHERE id = ?1
+                  AND (state = ?5 OR state = ?7)
+                  AND (?6 IS NULL OR revision = ?6)
                 "#,
                 params![
                     suggestion_id,
                     state.as_str(),
                     transitioned_at,
                     transitioned_by,
+                    from_state.as_str(),
+                    expected.revision,
+                    also_from_state.as_str(),
                 ],
             )
             .map_err(|source| RuleSuggestionError::Sqlite {
                 path: self.path.clone(),
                 source,
             })?;
-        if updated == 0 {
-            return Ok(None);
-        }
 
-        load_suggestion_by_id(&connection, &self.path, suggestion_id)
+        let current = load_suggestion_by_id(&connection, &self.path, suggestion_id)?;
+        Ok(match (updated, current) {
+            (0, None) => TransitionOutcome::NotFound,
+            (0, Some(current)) => TransitionOutcome::Refused(TransitionRefused { current }),
+            (_, Some(transitioned)) => TransitionOutcome::Applied(transitioned),
+            (_, None) => TransitionOutcome::NotFound,
+        })
     }
 
     fn connection_guard(&self) -> MutexGuard<'_, Connection> {
@@ -1145,22 +1418,33 @@ impl RuleSuggestionStore {
     }
 }
 
-struct RawRuleSuggestion {
-    id: String,
-    suggestion_type: String,
-    method: String,
-    path_pattern: String,
-    principal_key: String,
-    proposed_rule_json: String,
-    rationale: String,
-    evidence_json: String,
-    state: String,
-    created_at: String,
-    updated_at: String,
-    transitioned_at: Option<String>,
-    transitioned_by: Option<String>,
-    source_signal_id: Option<String>,
+/// One `discovery_rule_suggestions` row as stored, shared with the
+/// PostgreSQL lifecycle store so both backends decode it into a
+/// `RuleSuggestion` identically. The column order is
+/// [`RULE_SUGGESTION_COLUMNS`].
+pub(crate) struct RawRuleSuggestion {
+    pub(crate) id: String,
+    pub(crate) suggestion_type: String,
+    pub(crate) method: String,
+    pub(crate) path_pattern: String,
+    pub(crate) principal_key: String,
+    pub(crate) proposed_rule_json: String,
+    pub(crate) rationale: String,
+    pub(crate) evidence_json: String,
+    pub(crate) state: String,
+    pub(crate) created_at: String,
+    pub(crate) updated_at: String,
+    pub(crate) transitioned_at: Option<String>,
+    pub(crate) transitioned_by: Option<String>,
+    pub(crate) source_signal_id: Option<String>,
+    pub(crate) revision: i64,
 }
+
+/// The suggestion columns every read selects, in the order
+/// `RawRuleSuggestion` reads them; identical on both backends.
+pub(crate) const RULE_SUGGESTION_COLUMNS: &str = "id, suggestion_type, method, path_pattern, \
+     principal_key, proposed_rule_json, rationale, evidence_json, state, created_at, updated_at, \
+     transitioned_at, transitioned_by, source_signal_id, revision";
 
 impl RawRuleSuggestion {
     fn from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Self> {
@@ -1179,10 +1463,11 @@ impl RawRuleSuggestion {
             transitioned_at: row.get(11)?,
             transitioned_by: row.get(12)?,
             source_signal_id: row.get(13)?,
+            revision: row.get(14)?,
         })
     }
 
-    fn into_suggestion(self) -> Result<RuleSuggestion, RuleSuggestionError> {
+    pub(crate) fn into_suggestion(self) -> Result<RuleSuggestion, RuleSuggestionError> {
         let proposed_rule =
             serde_json::from_str::<Rule>(&self.proposed_rule_json).map_err(|source| {
                 RuleSuggestionError::Json {
@@ -1217,6 +1502,7 @@ impl RawRuleSuggestion {
             transitioned_at: self.transitioned_at,
             transitioned_by: self.transitioned_by,
             source_signal_id: self.source_signal_id,
+            revision: self.revision,
         })
     }
 }
@@ -1227,14 +1513,21 @@ struct SignalSuggestionTarget {
     principal: PrincipalMatcher,
 }
 
+/// The keyset cursor of a suggestion page, shared by both backends.
 #[derive(Clone, Debug, Deserialize, Serialize)]
-struct RuleSuggestionCursor {
-    created_at: String,
-    id: String,
+pub(crate) struct RuleSuggestionCursor {
+    pub(crate) created_at: String,
+    pub(crate) id: String,
 }
 
 pub fn configure_connection(connection: &Connection) -> rusqlite::Result<()> {
     connection.execute_batch(CREATE_RULE_SUGGESTION_SCHEMA_SQL)?;
+    lifecycle::ensure_sqlite_column(
+        connection,
+        "discovery_rule_suggestions",
+        "revision",
+        "INTEGER NOT NULL DEFAULT 1",
+    )?;
 
     let transitioned_at = utc_timestamp_rfc3339();
     connection.execute(
@@ -1270,27 +1563,9 @@ fn load_suggestion_by_id(
     suggestion_id: &str,
 ) -> Result<Option<RuleSuggestion>, RuleSuggestionError> {
     let mut statement = connection
-        .prepare(
-            r#"
-            SELECT
-                id,
-                suggestion_type,
-                method,
-                path_pattern,
-                principal_key,
-                proposed_rule_json,
-                rationale,
-                evidence_json,
-                state,
-                created_at,
-                updated_at,
-                transitioned_at,
-                transitioned_by,
-                source_signal_id
-            FROM discovery_rule_suggestions
-            WHERE id = ?1
-            "#,
-        )
+        .prepare(&format!(
+            "SELECT {RULE_SUGGESTION_COLUMNS} FROM discovery_rule_suggestions WHERE id = ?1"
+        ))
         .map_err(|source| RuleSuggestionError::Sqlite {
             path: path.to_path_buf(),
             source,
@@ -1317,26 +1592,7 @@ fn build_rule_suggestion_list_query(
     filters: &RuleSuggestionListFilters,
     cursor: Option<&RuleSuggestionCursor>,
 ) -> (String, Vec<SqlValue>) {
-    let mut sql = String::from(
-        r#"
-        SELECT
-            id,
-            suggestion_type,
-            method,
-            path_pattern,
-            principal_key,
-            proposed_rule_json,
-            rationale,
-            evidence_json,
-            state,
-            created_at,
-            updated_at,
-            transitioned_at,
-            transitioned_by,
-            source_signal_id
-        FROM discovery_rule_suggestions
-        "#,
-    );
+    let mut sql = format!("SELECT {RULE_SUGGESTION_COLUMNS} FROM discovery_rule_suggestions");
     let mut clauses = Vec::new();
     let mut params = Vec::new();
 
@@ -1690,7 +1946,8 @@ fn anomaly_rationale(signal: &Signal, method: &str, endpoint_template: &str) -> 
     )
 }
 
-fn lookback_cutoff(lookback_hours: u64) -> String {
+/// The start of the baseline window, `lookback_hours` before now.
+pub(crate) fn lookback_cutoff(lookback_hours: u64) -> String {
     let hours = i64::try_from(lookback_hours).unwrap_or(i64::MAX);
     (OffsetDateTime::now_utc() - TimeDuration::hours(hours))
         .format(&Rfc3339)
@@ -1991,10 +2248,12 @@ mod tests {
                 &suggestion.id,
                 RuleSuggestionLifecycleState::Accepted,
                 Some("reviewer"),
+                TransitionPrecondition::from_state(RuleSuggestionLifecycleState::Open),
             )
             .expect("service-token suggestion acceptance should succeed")
-            .expect("service-token suggestion should still exist");
+            .expect_applied("service-token suggestion should still exist");
         assert_eq!(accepted.state, RuleSuggestionLifecycleState::Accepted);
+        assert_eq!(accepted.revision, suggestion.revision + 1);
     }
 
     #[test]
@@ -2929,6 +3188,7 @@ mod tests {
                 "unsafe-baseline",
                 RuleSuggestionLifecycleState::Accepted,
                 Some("reviewer"),
+                TransitionPrecondition::from_state(RuleSuggestionLifecycleState::Open),
             )
             .expect_err("unbound baseline acceptance should fail closed");
 
@@ -2945,6 +3205,102 @@ mod tests {
             )
             .expect("unsafe suggestion should query");
         assert_eq!(state, RULE_SUGGESTION_STATE_OPEN);
+    }
+
+    /// Two store handles over one file (standalone's "two replicas") taking
+    /// turns on the same Open suggestion: exactly one dismiss applies, the
+    /// other is refused with the winner's row, and the revision predicate
+    /// refuses a stale expectation on its own.
+    #[test]
+    fn two_handles_dismissing_one_suggestion_get_exactly_one_winner() {
+        let db = TempDb::new("suggestion-race");
+        let replica_a = RuleSuggestionStore::open(&db.path).expect("first store opens");
+        let replica_b = RuleSuggestionStore::open(&db.path).expect("second store opens");
+        let connection = Connection::open(&db.path).expect("suggestion database should open");
+        insert_stored_baseline(&connection, "raced", &["provider:test"], &["bearer_token"]);
+        let from_open = TransitionPrecondition::from_state(RuleSuggestionLifecycleState::Open);
+
+        let seeded = replica_a
+            .get_suggestion("raced")
+            .expect("seeded suggestion loads")
+            .expect("seeded suggestion exists");
+        assert_eq!(
+            seeded.revision, 1,
+            "a row that predates the column starts at 1"
+        );
+
+        let winner = replica_a
+            .transition_suggestion(
+                "raced",
+                RuleSuggestionLifecycleState::Dismissed,
+                Some("admin-a"),
+                from_open,
+            )
+            .expect("first dismiss")
+            .expect_applied("the first replica wins");
+        assert_eq!(winner.state, RuleSuggestionLifecycleState::Dismissed);
+        assert_eq!(winner.revision, 2);
+
+        let refused = replica_b
+            .transition_suggestion(
+                "raced",
+                RuleSuggestionLifecycleState::Dismissed,
+                Some("admin-b"),
+                from_open,
+            )
+            .expect("second dismiss")
+            .expect_refused("the second replica is refused");
+        assert_eq!(refused.state, RuleSuggestionLifecycleState::Dismissed);
+        assert_eq!(refused.revision, 2);
+        assert_eq!(
+            refused.transitioned_by.as_deref(),
+            Some("admin-a"),
+            "the refusal carries the winner's row; nothing was overwritten"
+        );
+
+        // Acceptance requires Open too, and the revision predicate refuses
+        // a stale expectation even when the state matches.
+        insert_stored_baseline(&connection, "open-2", &["provider:test"], &["bearer_token"]);
+        let stale = replica_b
+            .transition_suggestion(
+                "open-2",
+                RuleSuggestionLifecycleState::Accepted,
+                Some("admin-b"),
+                from_open.with_revision(Some(9)),
+            )
+            .expect("stale accept")
+            .expect_refused("a stale revision is refused");
+        assert_eq!(stale.state, RuleSuggestionLifecycleState::Open);
+        assert_eq!(stale.revision, 1);
+        let accepted = replica_a
+            .transition_suggestion(
+                "open-2",
+                RuleSuggestionLifecycleState::Accepted,
+                Some("admin-a"),
+                from_open.with_revision(Some(1)),
+            )
+            .expect("exact accept")
+            .expect_applied("the exact revision applies");
+        assert_eq!(accepted.revision, 2);
+        let too_late = replica_b
+            .transition_suggestion(
+                "open-2",
+                RuleSuggestionLifecycleState::Accepted,
+                Some("admin-b"),
+                from_open,
+            )
+            .expect("late accept")
+            .expect_refused("an accepted suggestion is not Open");
+        assert_eq!(too_late.transitioned_by.as_deref(), Some("admin-a"));
+        assert!(replica_a
+            .transition_suggestion(
+                "missing",
+                RuleSuggestionLifecycleState::Dismissed,
+                None,
+                from_open
+            )
+            .expect("unknown transition")
+            .is_not_found());
     }
 
     fn suggestion_engine(
