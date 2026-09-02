@@ -3336,6 +3336,14 @@ mod tests {
             .expect_applied("unconditional");
         assert_eq!(replaced.revision, 3);
 
+        // A clear names a revision too: a stale one deletes nothing.
+        let stale_clear = replica_b
+            .set_endpoint_review("GET", "/reviewed", false, Some("admin-b"), Some(9))
+            .expect("stale clear")
+            .expect_refused("a stale clear is refused");
+        assert!(stale_clear.reviewed);
+        assert_eq!(stale_clear.revision, 3);
+
         // Clearing an unreviewed endpoint expecting it unreviewed is a
         // no-op that applies; an unknown endpoint is not found.
         replica_a

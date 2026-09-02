@@ -46,11 +46,6 @@
 //! Errors classify into the repository vocabulary and carry an operation
 //! label only: no SQL text, no values.
 
-// The atomic acceptance (`accept_suggestion` and its request/outcome
-// types) is exercised by the PR 12 contract tests; the cluster-mode accept
-// handler wires it in once its policy candidate/commit split lands.
-#![allow(dead_code)]
-
 use std::fmt;
 
 #[cfg(test)]

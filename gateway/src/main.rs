@@ -122,6 +122,12 @@ const CONNECTION_SECRETS_ADMIN_ROUTE: &str = "/v1/admin/connection-secrets";
 const CONNECTION_SECRET_ADMIN_ROUTE: &str = "/v1/admin/connection-secrets/{id}";
 const CONNECTION_COLLECTION_ETAG_HEADER: &str = "x-greengateway-connections-etag";
 const CONNECTION_SECRET_COLLECTION_ETAG_HEADER: &str = "x-greengateway-connection-secrets-etag";
+/// The expected suggestion revision on the accept route (issue #241,
+/// PR 12). Acceptance is a two-resource precondition: `If-Match` there
+/// carries the policy ETag the rule is committed against, so the
+/// suggestion's own `revision` -- the same `If-Match`-style value the
+/// dismiss route reads -- travels in this header instead.
+const SUGGESTION_REVISION_HEADER: &str = "x-greengateway-suggestion-revision";
 const MANAGED_OPENAPI_JSON_ENVELOPE_OVERHEAD_BYTES: usize = 64 * 1024;
 const TOOLS_ADMIN_ROUTE: &str = "/v1/admin/tools";
 const TOOL_ADMIN_ROUTE: &str = "/v1/admin/tools/{id}";
@@ -8879,18 +8885,38 @@ async fn signal_transition_endpoint(
 /// unconditional transition (the from-state predicate still applies); the
 /// value is the `revision` a read returned, bare or as a quoted ETag.
 fn expected_revision_from_if_match(headers: &HeaderMap) -> ResponseResult<Option<i64>> {
-    let mut values = headers.get_all(header::IF_MATCH).iter();
+    expected_revision_header(headers, header::IF_MATCH.as_str(), "If-Match")
+}
+
+/// The expected suggestion revision on the accept route, where `If-Match`
+/// is already the policy ETag; see [`SUGGESTION_REVISION_HEADER`].
+fn expected_suggestion_revision(headers: &HeaderMap) -> ResponseResult<Option<i64>> {
+    expected_revision_header(
+        headers,
+        SUGGESTION_REVISION_HEADER,
+        SUGGESTION_REVISION_HEADER,
+    )
+}
+
+/// One `If-Match`-style revision precondition from `name`, reported
+/// against `label`.
+fn expected_revision_header(
+    headers: &HeaderMap,
+    name: &str,
+    label: &str,
+) -> ResponseResult<Option<i64>> {
+    let mut values = headers.get_all(name).iter();
     let Some(value) = values.next() else {
         return Ok(None);
     };
     if values.next().is_some() {
-        return Err(Box::new(bad_request(
-            "If-Match must carry exactly one expected revision",
-        )));
+        return Err(Box::new(bad_request(&format!(
+            "{label} must carry exactly one expected revision"
+        ))));
     }
     let value = value
         .to_str()
-        .map_err(|_| Box::new(bad_request("If-Match header must be valid ASCII")))?
+        .map_err(|_| Box::new(bad_request(&format!("{label} header must be valid ASCII"))))?
         .trim();
     let value = value
         .strip_prefix('"')
@@ -8901,7 +8927,11 @@ fn expected_revision_from_if_match(headers: &HeaderMap) -> ResponseResult<Option
         .ok()
         .filter(|revision| *revision >= 0)
         .map(Some)
-        .ok_or_else(|| Box::new(bad_request("If-Match must be the revision a read returned")))
+        .ok_or_else(|| {
+            Box::new(bad_request(&format!(
+                "{label} must be the revision a read returned"
+            )))
+        })
 }
 
 /// `409` for a refused conditional transition: a stable `reason` and the
@@ -8922,6 +8952,31 @@ fn lifecycle_transition_refused<T: Serialize>(
         })),
     )
         .into_response()
+}
+
+/// `409` for a suggestion whose lifecycle precondition failed, on every
+/// route that writes one (dismiss and accept, standalone and cluster):
+/// the row as it is now plus a stable reason, so a caller that lost the
+/// race re-reads instead of retrying blindly. A row still Open failed on
+/// its revision; any other state means another admin moved it.
+fn suggestion_transition_refused_response(
+    current: &discovery::suggestions::RuleSuggestion,
+) -> Response {
+    if current.state == discovery::suggestions::RuleSuggestionLifecycleState::Open {
+        lifecycle_transition_refused(
+            "suggestion is not at the expected revision",
+            "suggestion_revision_mismatch",
+            "suggestion",
+            current,
+        )
+    } else {
+        lifecycle_transition_refused(
+            "suggestion is not open",
+            "suggestion_not_open",
+            "suggestion",
+            current,
+        )
+    }
 }
 
 async fn rule_suggestions_list_endpoint(
@@ -9032,14 +9087,10 @@ async fn rule_suggestion_accept_endpoint(
     let Some(suggestion_engine) = state.suggestion_engine.as_ref() else {
         return suggestions_discovery_not_configured();
     };
-    // Cluster-mode acceptance must be the lifecycle store's single
-    // transaction (policy commit and transition together); until the
-    // handler runs it, refuse with a stable reason rather than run the
-    // standalone two-step sequence against the authority.
-    #[cfg(feature = "postgres")]
-    if suggestion_engine.cluster().is_some() {
-        return conflict(SUGGESTION_ACCEPTANCE_CLUSTER_DEFERRED_REASON);
-    }
+    let expected_revision = match expected_suggestion_revision(&parts.headers) {
+        Ok(expected_revision) => expected_revision,
+        Err(response) => return *response,
+    };
     let suggestion = match suggestion_engine.get_suggestion(id.to_owned()).await {
         Ok(Some(suggestion)) => suggestion,
         Ok(None) => return not_found("suggestion was not found"),
@@ -9048,8 +9099,14 @@ async fn rule_suggestion_accept_endpoint(
             return internal_server_error("suggestion query failed");
         }
     };
-    if suggestion.state != discovery::suggestions::RuleSuggestionLifecycleState::Open {
-        return conflict("suggestion is not open");
+    // The row must still be Open, and at the revision the caller read if
+    // it named one (issue #241, PR 12). This is the early answer; the
+    // authoritative check is the transition's own predicate below, which
+    // is what two replicas cannot both pass.
+    if suggestion.state != discovery::suggestions::RuleSuggestionLifecycleState::Open
+        || expected_revision.is_some_and(|expected| expected != suggestion.revision)
+    {
+        return suggestion_transition_refused_response(&suggestion);
     }
     if !suggestion.is_identity_bound_for_acceptance() {
         return conflict(
@@ -9093,6 +9150,26 @@ async fn rule_suggestion_accept_endpoint(
         // Recompute this binding from current trusted routing state instead of
         // trusting the copy persisted with the advisory suggestion.
         proposed_rule.dispatch = Some(dispatch);
+    }
+
+    // Cluster mode commits the rule and the transition in ONE transaction
+    // at the authority (issue #241, PR 12): there is no window in which a
+    // crash or another replica's commit can separate them.
+    #[cfg(feature = "postgres")]
+    if let Some(engine) = suggestion_engine.cluster() {
+        return accept_suggestion_in_cluster(
+            SuggestionAcceptContext {
+                state: &state,
+                parts: &parts,
+                principal: &principal,
+                rbac_state,
+            },
+            engine,
+            id,
+            suggestion.revision,
+            proposed_rule,
+        )
+        .await;
     }
 
     let created = match create_policy_rule(
@@ -9159,6 +9236,161 @@ async fn rule_suggestion_accept_endpoint(
     with_policy_history_append_warning(response, created.history_append_failed)
 }
 
+/// What the accept handler has already established when it hands the
+/// request to the cluster path: the state it answers from, the request
+/// itself, who is accepting, and the RBAC state both permissions were
+/// checked against.
+#[cfg(feature = "postgres")]
+struct SuggestionAcceptContext<'a> {
+    state: &'a SuggestionsAdminState,
+    parts: &'a http::request::Parts,
+    principal: &'a auth::Principal,
+    rbac_state: &'a middleware::rbac::RbacState,
+}
+
+/// Cluster mode's acceptance (issue #241, PR 12): the rule the suggestion
+/// proposes and the suggestion's transition to `accepted` commit in ONE
+/// transaction at the authority, so the HA state model's rule 7 holds --
+/// no partial success exists. The candidate is prepared exactly as
+/// [`create_policy_rule`] prepares it (same `If-Match` precondition, same
+/// validation, same diff summary), then committed by
+/// [`storage::postgres_discovery_lifecycle::PostgresDiscoveryLifecycleStore::accept_suggestion`]
+/// alongside the transition instead of on its own.
+///
+/// Everything with an effect outside the transaction happens AFTER it
+/// commits: the local revision snapshot install and both audit events.
+/// Audit is at-least-once by design, so an event describing an acceptance
+/// that rolled back must be impossible, while losing the events of a
+/// committed acceptance to a crash is tolerable.
+#[cfg(feature = "postgres")]
+async fn accept_suggestion_in_cluster(
+    context: SuggestionAcceptContext<'_>,
+    engine: &discovery::cluster_suggestions::ClusterRuleSuggestionEngine,
+    suggestion_id: &str,
+    expected_revision: i64,
+    proposed_rule: rbac::Rule,
+) -> Response {
+    let SuggestionAcceptContext {
+        state,
+        parts,
+        principal,
+        rbac_state,
+    } = context;
+    let _policy_write_guard = rbac_state.policy_write_guard().await;
+
+    let prepared =
+        match prepare_policy_rule_create(&state.policy, rbac_state, &parts.headers, proposed_rule)
+            .await
+        {
+            Ok(prepared) => prepared,
+            Err(response) => return *response,
+        };
+
+    let accepted = engine
+        .suggestion_store()
+        .accept_suggestion(
+            storage::postgres_discovery_lifecycle::AcceptSuggestionRequest {
+                suggestion_id,
+                expected_revision: Some(expected_revision),
+                actor: &principal.user_id,
+                policy_commit: storage::PolicyCommitRequest {
+                    precondition: storage::PolicyCommitPrecondition::Expected {
+                        etag: prepared.current_etag.clone(),
+                    },
+                    candidate: &prepared.candidate,
+                    actor_user_id: &principal.user_id,
+                    diff_summary: &prepared.diff_summary,
+                },
+            },
+        )
+        .await;
+    let accepted = match accepted {
+        Ok(accepted) => accepted,
+        Err(refused) => return suggestion_acceptance_refused_response(refused),
+    };
+
+    // Committed. Install the authority's snapshot before answering, as
+    // every other cluster-mode policy mutation does, then emit the two
+    // changes this request made.
+    rbac_state.install_revision_snapshot(
+        accepted.policy.policy.clone(),
+        accepted.policy.security_revision,
+    );
+    let rule = accepted
+        .policy
+        .policy
+        .rules
+        .get(prepared.position)
+        .cloned()
+        .unwrap_or(prepared.created_rule);
+    emit_policy_rule_changed(
+        &state.policy,
+        parts,
+        principal,
+        &prepared.before_policy,
+        &accepted.policy.policy,
+        prepared.diff_summary,
+    );
+    emit_suggestion_lifecycle_changed(state, parts, principal, &accepted.suggestion);
+
+    // No history warning header: cluster mode writes the history row
+    // inside the same transaction, so an acceptance cannot succeed
+    // without it.
+    (
+        StatusCode::CREATED,
+        [(header::ETAG, etag_header_value(&accepted.policy.etag))],
+        Json(RuleSuggestionAcceptResponse {
+            suggestion: accepted.suggestion,
+            rule,
+        }),
+    )
+        .into_response()
+}
+
+/// Every way an atomic acceptance can decline, answered as the standalone
+/// path answers the same condition. Each variant means nothing was
+/// written -- no rule, no history row, no outbox row, no transition.
+#[cfg(feature = "postgres")]
+fn suggestion_acceptance_refused_response(
+    refused: storage::postgres_discovery_lifecycle::AcceptRefused,
+) -> Response {
+    use storage::postgres_discovery_lifecycle::AcceptRefused;
+
+    match refused {
+        AcceptRefused::Suggestion(refused) => {
+            suggestion_transition_refused_response(&refused.current)
+        }
+        AcceptRefused::NotFound => not_found("suggestion was not found"),
+        AcceptRefused::UnsafeBaselineSuggestion { .. } => {
+            conflict("baseline suggestion is missing issuer or authentication-method constraints")
+        }
+        AcceptRefused::Policy(storage::PolicyCommitError::PreconditionFailed) => {
+            precondition_failed("If-Match does not match the current policy ETag")
+        }
+        // Policies publish no tool names; the variant is unreachable here
+        // and answered as the conflict it would be.
+        AcceptRefused::Policy(storage::PolicyCommitError::ToolNameTaken { tool_name, .. }) => {
+            conflict(&format!(
+                "policy commit reported a reserved tool name '{tool_name}'"
+            ))
+        }
+        AcceptRefused::Policy(storage::PolicyCommitError::Store(error)) => {
+            tracing::error!(
+                error = %error,
+                "policy commit inside suggestion acceptance failed; nothing was written"
+            );
+            service_unavailable("policy mutation could not be committed")
+        }
+        AcceptRefused::Store(error) => {
+            tracing::error!(
+                error = %error,
+                "rule suggestion acceptance failed; nothing was written"
+            );
+            internal_server_error("suggestion acceptance failed")
+        }
+    }
+}
+
 async fn rule_suggestion_dismiss_endpoint(
     State(state): State<SuggestionsAdminState>,
     Path(id): Path<String>,
@@ -9222,19 +9454,7 @@ async fn rule_suggestion_transition_endpoint(
     {
         Ok(discovery::lifecycle::TransitionOutcome::Applied(suggestion)) => suggestion,
         Ok(discovery::lifecycle::TransitionOutcome::Refused(refused)) => {
-            let current = refused.current;
-            let reason =
-                if current.state == discovery::suggestions::RuleSuggestionLifecycleState::Open {
-                    "suggestion_revision_mismatch"
-                } else {
-                    "suggestion_not_open"
-                };
-            return lifecycle_transition_refused(
-                "suggestion is not open at the expected revision",
-                reason,
-                "suggestion",
-                &current,
-            );
+            return suggestion_transition_refused_response(&refused.current);
         }
         Ok(discovery::lifecycle::TransitionOutcome::NotFound) => {
             return not_found("suggestion was not found")
@@ -12661,20 +12881,41 @@ async fn current_policy_and_matching_if_match(
     Ok((before_policy, current_etag))
 }
 
-async fn create_policy_rule(
-    state: &PolicyAdminState,
-    parts: &http::request::Parts,
-    principal: &auth::Principal,
-    rbac_state: &middleware::rbac::RbacState,
-    mut rule: rbac::Rule,
-) -> ResponseResult<PolicyRuleCreateResult> {
-    let _policy_write_guard = rbac_state.policy_write_guard().await;
+/// A rule-creating policy mutation, built and validated against the
+/// current authoritative document but not yet written: the candidate a
+/// commit installs, the ETag that commit must present, and where the new
+/// rule sits in it.
+///
+/// Preparation and commit are separate steps because suggestion
+/// acceptance in cluster mode (issue #241, PR 12) commits this candidate
+/// INSIDE the suggestion's transaction rather than through
+/// [`persist_policy_mutation`]. Both paths must build and validate the
+/// candidate identically, so they share this.
+struct PreparedPolicyRuleCreate {
+    before_policy: rbac::Policy,
+    /// What the commit must present as its compare-and-swap value.
+    current_etag: String,
+    candidate: rbac::Policy,
+    diff_summary: Value,
+    /// Index of the created rule in the candidate's rule list.
+    position: usize,
+    /// The created rule as the candidate holds it: the answer when a
+    /// committed document somehow does not carry that position.
+    created_rule: rbac::Rule,
+}
 
+/// Build and validate the candidate that appends `rule`, behind the
+/// request's `If-Match` precondition. Writes nothing. The caller holds the
+/// policy write guard across preparation AND commit, so the ETag this
+/// returns is still current when the commit presents it.
+async fn prepare_policy_rule_create(
+    state: &PolicyAdminState,
+    rbac_state: &middleware::rbac::RbacState,
+    headers: &HeaderMap,
+    mut rule: rbac::Rule,
+) -> ResponseResult<PreparedPolicyRuleCreate> {
     let (before_policy, current_etag) =
-        match current_policy_and_matching_if_match(state, rbac_state, &parts.headers).await {
-            Ok(view) => view,
-            Err(response) => return Err(response),
-        };
+        current_policy_and_matching_if_match(state, rbac_state, headers).await?;
 
     if let Some(rule_id) = rule.id.as_deref() {
         if policy_rule_ids(&before_policy)
@@ -12698,12 +12939,34 @@ async fn create_policy_rule(
     candidate.rules.push(rule);
     let candidate = validate_policy_candidate(&candidate)?;
     let created_rule = candidate.rules[position].clone();
+    validate_policy_mutation_candidate(rbac_state, &before_policy, &candidate)?;
 
     let diff_summary = json!({
         "action": "rule_created",
         "rule_id": rule_id,
         "position": position,
     });
+
+    Ok(PreparedPolicyRuleCreate {
+        before_policy,
+        current_etag,
+        candidate,
+        diff_summary,
+        position,
+        created_rule,
+    })
+}
+
+async fn create_policy_rule(
+    state: &PolicyAdminState,
+    parts: &http::request::Parts,
+    principal: &auth::Principal,
+    rbac_state: &middleware::rbac::RbacState,
+    rule: rbac::Rule,
+) -> ResponseResult<PolicyRuleCreateResult> {
+    let _policy_write_guard = rbac_state.policy_write_guard().await;
+
+    let prepared = prepare_policy_rule_create(state, rbac_state, &parts.headers, rule).await?;
     let commit = persist_policy_mutation(
         PolicyMutationCommitContext {
             state,
@@ -12711,26 +12974,49 @@ async fn create_policy_rule(
             parts,
             principal,
         },
-        &before_policy,
-        &current_etag,
-        &candidate,
-        diff_summary,
+        &prepared.before_policy,
+        &prepared.current_etag,
+        &prepared.candidate,
+        prepared.diff_summary,
     )
     .await?;
 
-    debug_assert_ne!(current_etag, commit.new_etag);
+    debug_assert_ne!(prepared.current_etag, commit.new_etag);
     let created_rule = commit
         .after_policy
         .rules
-        .get(position)
+        .get(prepared.position)
         .cloned()
-        .unwrap_or(created_rule);
+        .unwrap_or(prepared.created_rule);
 
     Ok(PolicyRuleCreateResult {
         rule: created_rule,
         new_etag: commit.new_etag,
         history_append_failed: commit.history_append_failed,
     })
+}
+
+/// What every policy mutation must satisfy before any authority sees its
+/// candidate: egress cannot change through a mutation endpoint, and the
+/// candidate's proxy dispatch must be valid for this deployment. Pure --
+/// shared by [`persist_policy_mutation`] and by suggestion acceptance,
+/// which commits its candidate inside the suggestion's transaction.
+fn validate_policy_mutation_candidate(
+    rbac_state: &middleware::rbac::RbacState,
+    before_policy: &rbac::Policy,
+    candidate: &rbac::Policy,
+) -> ResponseResult<()> {
+    if candidate.egress != before_policy.egress {
+        return Err(Box::new(egress_reload_unsupported()));
+    }
+
+    if let Err(error) = rbac_state.validate_proxy_dispatch_policy(candidate) {
+        return Err(Box::new(policy_validation_failed(vec![
+            policy_error_message(&error),
+        ])));
+    }
+
+    Ok(())
 }
 
 async fn persist_policy_mutation(
@@ -12742,15 +13028,7 @@ async fn persist_policy_mutation(
 ) -> ResponseResult<PolicyMutationCommitResult> {
     #[cfg(not(feature = "postgres"))]
     let _ = expected_etag;
-    if candidate.egress != before_policy.egress {
-        return Err(Box::new(egress_reload_unsupported()));
-    }
-
-    if let Err(error) = context.rbac_state.validate_proxy_dispatch_policy(candidate) {
-        return Err(Box::new(policy_validation_failed(vec![
-            policy_error_message(&error),
-        ])));
-    }
+    validate_policy_mutation_candidate(context.rbac_state, before_policy, candidate)?;
 
     // Cluster mode: one transaction through the authority -- new immutable
     // version, revision advance, history row, and outbox record commit
@@ -14024,15 +14302,6 @@ fn discovery_not_configured() -> Response {
     )
         .into_response()
 }
-
-/// The stable reason cluster mode's `accept` answers with `409` until the
-/// handler runs the lifecycle store's single-transaction acceptance (issue
-/// #241, PR 12). Generation, listing, and dismissal already run against
-/// PostgreSQL; acceptance is refused rather than run as the standalone
-/// two-step sequence, which the HA state model forbids on the authority.
-#[cfg(feature = "postgres")]
-const SUGGESTION_ACCEPTANCE_CLUSTER_DEFERRED_REASON: &str =
-    "rule suggestion acceptance is not available in cluster mode yet";
 
 /// Map a discovery read-store failure for the admin surfaces. An invalid
 /// cursor is the caller's `400`. A store that cannot be reached, or that
@@ -33807,10 +34076,13 @@ paths:
             .expect("legacy suggestion accept request should complete");
 
         assert_eq!(response.status(), StatusCode::CONFLICT);
-        assert_eq!(
-            json_body(response).await,
-            json!({ "error": "suggestion is not open" })
-        );
+        // The refusal carries the row as it is now and a stable reason
+        // (issue #241, PR 12), so the caller can see who moved it.
+        let refusal = json_body(response).await;
+        assert_eq!(refusal["error"], json!("suggestion is not open"));
+        assert_eq!(refusal["reason"], json!("suggestion_not_open"));
+        assert_eq!(refusal["suggestion"]["state"], json!("dismissed"));
+        assert_eq!(refusal["suggestion"]["id"], json!("sug-legacy-unbound"));
         assert_eq!(
             fs::read_to_string(&policy.path).expect("policy should read"),
             before_contents
@@ -44174,11 +44446,14 @@ O2gecI9QwDJNpm29J9wJB2F8
         use super::*;
         use crate::audit::Actor;
         use crate::discovery::query::DiscoveryReadStore as _;
+        use crate::rbac::PolicyHistoryListFilters;
         use crate::storage::migrations;
         use crate::storage::postgres::PostgresFoundation;
         use crate::storage::postgres_audit::{IngestIdentity, PostgresAuditEventStore};
         use crate::storage::postgres_discovery::PostgresDiscoveryStore;
         use crate::storage::postgres_discovery_read::PostgresDiscoveryReadStore;
+        use crate::storage::postgres_policy::PostgresPolicyStore;
+        use crate::storage::PolicyControlPlane;
 
         fn locator() -> Option<String> {
             let key = "GATEWAY_TEST_POSTGRES_URL_FILE".to_owned();
@@ -44449,29 +44724,14 @@ O2gecI9QwDJNpm29J9wJB2F8
             drop(app);
         }
 
-        /// The suggestion routes in cluster mode (issue #241, PR 12):
-        /// `generate` runs against PostgreSQL instead of being refused,
-        /// the list shows what it stored, dismissal is the conditional
-        /// transition with `If-Match`, and acceptance -- not yet the single
-        /// transaction -- is refused with its stable reason after
-        /// authorization.
-        #[tokio::test]
-        async fn cluster_mode_suggestion_routes_generate_list_and_dismiss_from_postgres() {
-            let Some(admin_dsn) = locator() else {
-                eprintln!("skipping: no test database locator; CI runs this test");
-                return;
-            };
-            let database = create_test_database(&admin_dsn).await;
-            let pool = migrated_pool(&database.dsn).await;
-            let audit_store = Arc::new(PostgresAuditEventStore::new(
-                pool.clone(),
-                Some(IngestIdentity {
-                    instance_id: uuid::Uuid::new_v4(),
-                    boot_id: uuid::Uuid::new_v4(),
-                }),
-            ));
-            // One observed endpoint the projector classified, and one
-            // observation of it by a role the policy does not cover yet.
+        /// One classified endpoint and one observation of it by a role the
+        /// policy does not cover: the smallest fixture that makes an
+        /// explicit generation run produce exactly one identity-bound
+        /// baseline suggestion for `GET /orders/{id}`.
+        async fn seed_baseline_generation_fixture(
+            pool: &deadpool_postgres::Pool,
+            audit_store: &PostgresAuditEventStore,
+        ) {
             let client = pool.get().await.expect("client");
             client
                 .execute(
@@ -44496,6 +44756,7 @@ O2gecI9QwDJNpm29J9wJB2F8
                 .await
                 .expect("the classification seeds");
             drop(client);
+
             let mut observed = audit::AuditEvent::new(
                 "http.request_observed",
                 "request-cluster-generate".to_owned(),
@@ -44520,14 +44781,49 @@ O2gecI9QwDJNpm29J9wJB2F8
                 .insert_events(&[observed])
                 .await
                 .expect("the observation ingests");
+        }
 
+        /// A cluster-mode suggestions router wired the way production
+        /// wires one: no policy file, the PostgreSQL control plane as the
+        /// policy authority and history store, and the cluster suggestion
+        /// engine over the same pool.
+        struct ClusterSuggestionsHarness {
+            router: Router,
+            rbac_state: middleware::rbac::RbacState,
+            policy_store: Arc<PostgresPolicyStore>,
+            audit: audit::sink::tests::CaptureSink,
+        }
+
+        async fn cluster_suggestions_harness(
+            pool: &deadpool_postgres::Pool,
+            audit_store: Arc<PostgresAuditEventStore>,
+        ) -> ClusterSuggestionsHarness {
             let policy = parse_policy_body(&axum::body::Bytes::from(
                 suggestions_policy_document_string(),
             ))
             .expect("suggestions policy should parse");
+            let policy_store = Arc::new(PostgresPolicyStore::new(pool.clone()));
+            let seed_diff = json!({ "action": "seed" });
+            let active = PolicyControlPlane::commit(
+                policy_store.as_ref(),
+                storage::PolicyCommitRequest {
+                    precondition: storage::PolicyCommitPrecondition::Initialize,
+                    candidate: &policy,
+                    actor_user_id: "installer",
+                    diff_summary: &seed_diff,
+                },
+            )
+            .await
+            .expect("the deployment should initialize");
+
+            let capture = audit::sink::tests::CaptureSink::new();
+            let audit_log = audit::AuditLog::new(Arc::new(capture.clone()));
             let rbac_state =
-                middleware::rbac::RbacState::new(policy, Vec::new(), false, test_audit_log());
-            let policy_file = TempPolicyFile::new(&suggestions_policy_document_string());
+                middleware::rbac::RbacState::new(policy, Vec::new(), false, audit_log.clone());
+            // Startup installs the authority's revision; without it the
+            // handler's snapshot is unkeyed.
+            rbac_state.install_revision_snapshot(active.policy.clone(), active.security_revision);
+
             let engine = discovery::cluster_suggestions::ClusterRuleSuggestionEngine::new(
                 Arc::new(PostgresDiscoveryReadStore::new(pool.clone())),
                 audit_store,
@@ -44538,35 +44834,597 @@ O2gecI9QwDJNpm29J9wJB2F8
                     baseline_window_hours: 876_000,
                 },
             );
-            let router = Router::new()
-                .route(SUGGESTIONS_ADMIN_ROUTE, get(rule_suggestions_list_endpoint))
-                .route(
+            let router =
+                Router::new()
+                    .route(SUGGESTIONS_ADMIN_ROUTE, get(rule_suggestions_list_endpoint))
+                    .route(
+                        SUGGESTIONS_GENERATE_ADMIN_ROUTE,
+                        post(rule_suggestions_generate_endpoint),
+                    )
+                    .route(
+                        SUGGESTION_DISMISS_ADMIN_ROUTE,
+                        post(rule_suggestion_dismiss_endpoint),
+                    )
+                    .route(
+                        SUGGESTION_ACCEPT_ADMIN_ROUTE,
+                        post(rule_suggestion_accept_endpoint),
+                    )
+                    .with_state(SuggestionsAdminState {
+                        suggestion_engine: Some(
+                            discovery::suggestions::SuggestionEngineHandle::Cluster(Arc::new(
+                                engine,
+                            )),
+                        ),
+                        policy: PolicyAdminState {
+                            policy_file: None,
+                            rbac_state: Some(rbac_state.clone()),
+                            history_store: Some(
+                                policy_store.clone() as Arc<dyn storage::PolicyHistory>
+                            ),
+                            control_plane: Some(
+                                policy_store.clone() as Arc<dyn storage::PolicyControlPlane>
+                            ),
+                            query_store: None,
+                            audit: audit_log,
+                            client_ip_policy: client_ip::ClientIpPolicy::default(),
+                            max_body_size: 1024 * 1024,
+                        },
+                    });
+
+            ClusterSuggestionsHarness {
+                router,
+                rbac_state,
+                policy_store,
+                audit: capture,
+            }
+        }
+
+        async fn cluster_audit_store(
+            pool: &deadpool_postgres::Pool,
+        ) -> Arc<PostgresAuditEventStore> {
+            Arc::new(PostgresAuditEventStore::new(
+                pool.clone(),
+                Some(IngestIdentity {
+                    instance_id: uuid::Uuid::new_v4(),
+                    boot_id: uuid::Uuid::new_v4(),
+                }),
+            ))
+        }
+
+        /// Generate once and return the single open suggestion's id.
+        async fn generate_one_suggestion(router: &Router) -> String {
+            let generated = router
+                .clone()
+                .oneshot(suggestions_admin_request(
+                    Method::POST,
                     SUGGESTIONS_GENERATE_ADMIN_ROUTE,
-                    post(rule_suggestions_generate_endpoint),
+                    Some(test_principal(&["suggestions-writer"])),
+                    None,
+                    None,
+                ))
+                .await
+                .expect("generate request should complete");
+            assert_eq!(generated.status(), StatusCode::OK);
+            assert_eq!(json_body(generated).await["inserted_count"], json!(1));
+
+            let listed = suggestions_json(
+                router,
+                "/v1/admin/suggestions?state=open",
+                Some(test_principal(&["suggestions-reader"])),
+            )
+            .await;
+            let ids = suggestion_ids(&listed);
+            assert_eq!(ids.len(), 1, "{listed}");
+            ids.into_iter().next().expect("one suggestion")
+        }
+
+        /// An accept request: `If-Match` is the policy ETag, and the
+        /// suggestion's own expected revision rides its own header.
+        fn accept_request(
+            id: &str,
+            policy_etag: Option<&str>,
+            suggestion_revision: Option<&str>,
+        ) -> Request<Body> {
+            let mut request = suggestions_admin_request(
+                Method::POST,
+                &format!("/v1/admin/suggestions/{id}/accept"),
+                Some(test_principal(&["suggestions-policy-writer"])),
+                None,
+                policy_etag,
+            );
+            if let Some(revision) = suggestion_revision {
+                request.headers_mut().insert(
+                    HeaderName::from_static(SUGGESTION_REVISION_HEADER),
+                    HeaderValue::from_str(revision).expect("revision header should build"),
+                );
+            }
+            request
+        }
+
+        async fn count_rows(pool: &deadpool_postgres::Pool, table: &str) -> i64 {
+            let client = pool.get().await.expect("client");
+            client
+                .query_one(
+                    &format!("SELECT count(*)::bigint FROM greengateway.{table}"),
+                    &[],
                 )
+                .await
+                .expect("count should read")
+                .get(0)
+        }
+
+        /// Everything an acceptance would change on the policy side, plus
+        /// the suggestion row: byte-for-byte equality means nothing was
+        /// written.
+        #[derive(Debug, Eq, PartialEq)]
+        struct AcceptanceFootprint {
+            active_version: i64,
+            active_etag: String,
+            security_revision: i64,
+            rule_count: usize,
+            document_rows: i64,
+            outbox_rows: i64,
+            suggestion_state: String,
+            suggestion_revision: i64,
+        }
+
+        async fn acceptance_footprint(
+            store: &PostgresPolicyStore,
+            pool: &deadpool_postgres::Pool,
+            suggestion_id: &str,
+        ) -> AcceptanceFootprint {
+            let active = PolicyControlPlane::active(store)
+                .await
+                .expect("active policy reads")
+                .expect("a policy is active");
+            let suggestion =
+                storage::postgres_discovery_lifecycle::PostgresDiscoveryLifecycleStore::new(
+                    pool.clone(),
+                )
+                .get_suggestion(suggestion_id)
+                .await
+                .expect("the suggestion reads")
+                .expect("the suggestion exists");
+            AcceptanceFootprint {
+                active_version: active.version,
+                active_etag: active.etag,
+                security_revision: active.security_revision,
+                rule_count: active.policy.rules.len(),
+                document_rows: count_rows(pool, "policy_documents").await,
+                outbox_rows: count_rows(pool, "security_outbox").await,
+                suggestion_state: suggestion.state.as_str().to_owned(),
+                suggestion_revision: suggestion.revision,
+            }
+        }
+
+        /// The signal routes in cluster mode (issue #241, PR 12): the
+        /// admin router over the PostgreSQL read store, exercising the
+        /// same conditional lifecycle transitions the SQLite variant
+        /// covers -- the revision on every read, `If-Match` as the
+        /// precondition, and a `409` that carries the row as it stands.
+        #[tokio::test]
+        async fn cluster_mode_signal_routes_transition_conditionally_from_postgres() {
+            let Some(admin_dsn) = locator() else {
+                eprintln!("skipping: no test database locator; CI runs this test");
+                return;
+            };
+            let database = create_test_database(&admin_dsn).await;
+            let pool = migrated_pool(&database.dsn).await;
+
+            let client = pool.get().await.expect("client");
+            for (id, endpoint_template) in
+                [("sig-ack", "/ack/{id}"), ("sig-dismiss", "/dismiss/{id}")]
+            {
+                client
+                    .execute(
+                        "INSERT INTO greengateway.discovery_signals
+                             (id, signal_type, target_kind, target_key, target_identity_json,
+                              explanation, evidence_json, state, created_at, updated_at)
+                         VALUES ($1, 'new_endpoint_seen', 'endpoint', $2, $3,
+                                 'New endpoint observed.', '{}', 'open',
+                                 '2024-06-01T00:00:00Z', '2024-06-01T00:00:00Z')",
+                        &[
+                            &id,
+                            &discovery::signals::endpoint_target_key("GET", endpoint_template),
+                            &json!({
+                                "method": "GET",
+                                "endpoint_template": endpoint_template,
+                            })
+                            .to_string(),
+                        ],
+                    )
+                    .await
+                    .expect("the open signal seeds");
+            }
+            drop(client);
+
+            let policy =
+                parse_policy_body(&axum::body::Bytes::from(signals_policy_document_string()))
+                    .expect("signals policy should parse");
+            let router = Router::new()
+                .route(SIGNALS_ADMIN_ROUTE, get(signals_list_endpoint))
                 .route(
-                    SUGGESTION_DISMISS_ADMIN_ROUTE,
-                    post(rule_suggestion_dismiss_endpoint),
+                    SIGNAL_ACKNOWLEDGE_ADMIN_ROUTE,
+                    post(signal_acknowledge_endpoint),
                 )
-                .route(
-                    SUGGESTION_ACCEPT_ADMIN_ROUTE,
-                    post(rule_suggestion_accept_endpoint),
-                )
-                .with_state(SuggestionsAdminState {
-                    suggestion_engine: Some(
-                        discovery::suggestions::SuggestionEngineHandle::Cluster(Arc::new(engine)),
-                    ),
-                    policy: PolicyAdminState {
-                        policy_file: Some(policy_file.path.clone()),
-                        rbac_state: Some(rbac_state),
-                        history_store: None,
-                        control_plane: None,
-                        query_store: None,
-                        audit: test_audit_log(),
-                        client_ip_policy: client_ip::ClientIpPolicy::default(),
-                        max_body_size: 1024 * 1024,
-                    },
+                .route(SIGNAL_DISMISS_ADMIN_ROUTE, post(signal_dismiss_endpoint))
+                .with_state(SignalsAdminState {
+                    discovery_store: Some(Arc::new(PostgresDiscoveryReadStore::new(pool.clone()))),
+                    rbac_state: Some(middleware::rbac::RbacState::new(
+                        policy,
+                        Vec::new(),
+                        false,
+                        test_audit_log(),
+                    )),
+                    audit: test_audit_log(),
+                    client_ip_policy: client_ip::ClientIpPolicy::default(),
                 });
+
+            let signal_request = |method: Method, uri: &str, role: &str, if_match: Option<&str>| {
+                let mut builder = Request::builder()
+                    .method(method)
+                    .uri(uri)
+                    .header(header::CONTENT_TYPE, "application/json");
+                if let Some(if_match) = if_match {
+                    builder = builder.header(header::IF_MATCH, if_match);
+                }
+                let mut request = builder.body(Body::empty()).expect("request should build");
+                request
+                    .extensions_mut()
+                    .insert(test_principal(&[role.to_owned().as_str()]));
+                request
+            };
+
+            // Reads carry the revision an `If-Match` must present.
+            let listed = router
+                .clone()
+                .oneshot(signal_request(
+                    Method::GET,
+                    "/v1/admin/signals?state=open",
+                    "signals-reader",
+                    None,
+                ))
+                .await
+                .expect("list request should complete");
+            assert_eq!(listed.status(), StatusCode::OK);
+            let listed = json_body(listed).await;
+            let signals = listed["signals"].as_array().expect("signals is an array");
+            assert_eq!(signals.len(), 2, "{listed}");
+            assert!(signals
+                .iter()
+                .all(|signal| signal["revision"] == json!(1) && signal["state"] == json!("open")));
+
+            let forbidden = router
+                .clone()
+                .oneshot(signal_request(
+                    Method::POST,
+                    "/v1/admin/signals/sig-ack/acknowledge",
+                    "signals-reader",
+                    None,
+                ))
+                .await
+                .expect("read-only acknowledge should complete");
+            assert_eq!(forbidden.status(), StatusCode::FORBIDDEN);
+
+            let stale = router
+                .clone()
+                .oneshot(signal_request(
+                    Method::POST,
+                    "/v1/admin/signals/sig-ack/acknowledge",
+                    "signals-writer",
+                    Some("4"),
+                ))
+                .await
+                .expect("stale acknowledge should complete");
+            assert_eq!(stale.status(), StatusCode::CONFLICT);
+            let stale = json_body(stale).await;
+            assert_eq!(stale["reason"], json!("signal_revision_mismatch"));
+            assert_eq!(stale["signal"]["state"], json!("open"));
+            assert_eq!(stale["signal"]["revision"], json!(1));
+
+            let acknowledged = router
+                .clone()
+                .oneshot(signal_request(
+                    Method::POST,
+                    "/v1/admin/signals/sig-ack/acknowledge",
+                    "signals-writer",
+                    Some("1"),
+                ))
+                .await
+                .expect("acknowledge should complete");
+            assert_eq!(acknowledged.status(), StatusCode::OK);
+            let acknowledged = json_body(acknowledged).await;
+            assert_eq!(acknowledged["state"], json!("acknowledged"));
+            assert_eq!(acknowledged["revision"], json!(2));
+            assert_eq!(acknowledged["transitioned_by"], json!("user-123"));
+
+            // The from-state predicate stands on its own: an
+            // unconditional repeat is refused, not re-applied.
+            let repeat = router
+                .clone()
+                .oneshot(signal_request(
+                    Method::POST,
+                    "/v1/admin/signals/sig-ack/acknowledge",
+                    "signals-writer",
+                    None,
+                ))
+                .await
+                .expect("repeat acknowledge should complete");
+            assert_eq!(repeat.status(), StatusCode::CONFLICT);
+            let repeat = json_body(repeat).await;
+            assert_eq!(repeat["reason"], json!("signal_not_open"));
+            assert_eq!(repeat["signal"]["revision"], json!(2));
+
+            let dismissed = router
+                .clone()
+                .oneshot(signal_request(
+                    Method::POST,
+                    "/v1/admin/signals/sig-dismiss/dismiss",
+                    "signals-writer",
+                    None,
+                ))
+                .await
+                .expect("dismiss should complete");
+            assert_eq!(dismissed.status(), StatusCode::OK);
+            let dismissed = json_body(dismissed).await;
+            assert_eq!(dismissed["state"], json!("dismissed"));
+            assert_eq!(dismissed["revision"], json!(2));
+
+            let missing = router
+                .oneshot(signal_request(
+                    Method::POST,
+                    "/v1/admin/signals/sig-missing/dismiss",
+                    "signals-writer",
+                    None,
+                ))
+                .await
+                .expect("unknown-signal dismiss should complete");
+            assert_eq!(missing.status(), StatusCode::NOT_FOUND);
+        }
+
+        /// The traffic endpoint-review route in cluster mode (issue #241,
+        /// PR 12). The review is a conditional write against the shared
+        /// table: reads carry the stored row's `review_revision`, `If-Match:
+        /// 0` marks only an endpoint still unreviewed, a stale expectation
+        /// is refused with the review as it stands, and clearing deletes the
+        /// row only at its revision, which puts the endpoint back at
+        /// revision 0.
+        #[tokio::test]
+        async fn cluster_mode_traffic_review_route_writes_conditionally_from_postgres() {
+            let Some(admin_dsn) = locator() else {
+                eprintln!("skipping: no test database locator; CI runs this test");
+                return;
+            };
+            let database = create_test_database(&admin_dsn).await;
+            let pool = migrated_pool(&database.dsn).await;
+
+            let client = pool.get().await.expect("client");
+            client
+                .execute(
+                    "INSERT INTO greengateway.discovery_endpoint_aggregates
+                         (method, endpoint_template, first_seen, last_seen, call_count,
+                          latency_count, latency_p50_ms, latency_p95_ms, latency_p99_ms,
+                          latency_samples_json, distinct_principal_count, updated_at)
+                     VALUES ('GET', '/reviewed/{id}', '2024-06-01T00:00:00Z',
+                             '2024-06-01T01:00:00Z', 1, 1, 10, 10, 10, '[]', 0,
+                             '2024-06-01T01:00:00Z')",
+                    &[],
+                )
+                .await
+                .expect("the aggregate seeds");
+            drop(client);
+
+            let policy =
+                parse_policy_body(&axum::body::Bytes::from(traffic_policy_document_string()))
+                    .expect("traffic policy should parse");
+            let capture = audit::sink::tests::CaptureSink::new();
+            let audit_log =
+                audit::AuditLog::new(Arc::new(capture.clone()) as Arc<dyn audit::AuditSink>);
+            let router = Router::new()
+                .route(
+                    TRAFFIC_ENDPOINTS_ADMIN_ROUTE,
+                    get(traffic_endpoint_list_endpoint),
+                )
+                .route(
+                    TRAFFIC_ENDPOINT_REVIEW_ADMIN_ROUTE,
+                    post(traffic_endpoint_review_endpoint),
+                )
+                .with_state(TrafficAdminState {
+                    discovery_store: Some(Arc::new(PostgresDiscoveryReadStore::new(pool.clone()))),
+                    audit_query_store: None,
+                    rbac_state: Some(middleware::rbac::RbacState::new(
+                        policy,
+                        Vec::new(),
+                        false,
+                        test_audit_log(),
+                    )),
+                    audit: audit_log,
+                    client_ip_policy: client_ip::ClientIpPolicy::default(),
+                    max_body_size: 64 * 1024,
+                });
+
+            let review_request =
+                |role: &str, template: &str, reviewed: bool, if_match: Option<&str>| {
+                    let mut builder = Request::builder()
+                        .method(Method::POST)
+                        .uri(TRAFFIC_ENDPOINT_REVIEW_ADMIN_ROUTE)
+                        .header(header::CONTENT_TYPE, "application/json");
+                    if let Some(if_match) = if_match {
+                        builder = builder.header(header::IF_MATCH, if_match);
+                    }
+                    let body = json!({
+                        "method": "GET",
+                        "endpoint_template": template,
+                        "reviewed": reviewed,
+                    })
+                    .to_string();
+                    let mut request = builder
+                        .body(Body::from(body))
+                        .expect("request should build");
+                    request
+                        .extensions_mut()
+                        .insert(test_principal(&[role.to_owned().as_str()]));
+                    request
+                };
+            let listed_endpoint = |router: Router| async move {
+                let mut request = Request::builder()
+                    .uri(TRAFFIC_ENDPOINTS_ADMIN_ROUTE)
+                    .body(Body::empty())
+                    .expect("request should build");
+                request
+                    .extensions_mut()
+                    .insert(test_principal(&["traffic-reader"]));
+                let response = router
+                    .oneshot(request)
+                    .await
+                    .expect("endpoint list should complete");
+                assert_eq!(response.status(), StatusCode::OK);
+                let body = json_body(response).await;
+                body["endpoints"][0].clone()
+            };
+
+            // Reads carry the revision a conditional write must present.
+            let endpoint = listed_endpoint(router.clone()).await;
+            assert_eq!(endpoint["endpoint_template"], json!("/reviewed/{id}"));
+            assert_eq!(endpoint["reviewed"], json!(false));
+            assert_eq!(endpoint["review_revision"], json!(0));
+
+            let forbidden = router
+                .clone()
+                .oneshot(review_request(
+                    "traffic-reader",
+                    "/reviewed/{id}",
+                    true,
+                    None,
+                ))
+                .await
+                .expect("read-only review should complete");
+            assert_eq!(forbidden.status(), StatusCode::FORBIDDEN);
+
+            // Expecting a revision no review row has ever had writes nothing.
+            let stale = router
+                .clone()
+                .oneshot(review_request(
+                    "traffic-writer",
+                    "/reviewed/{id}",
+                    true,
+                    Some("3"),
+                ))
+                .await
+                .expect("stale mark should complete");
+            assert_eq!(stale.status(), StatusCode::CONFLICT);
+            let stale = json_body(stale).await;
+            assert_eq!(stale["reason"], json!("review_revision_mismatch"));
+            assert_eq!(stale["review"]["reviewed"], json!(false));
+            assert_eq!(stale["review"]["revision"], json!(0));
+
+            let marked = router
+                .clone()
+                .oneshot(review_request(
+                    "traffic-writer",
+                    "/reviewed/{id}",
+                    true,
+                    Some("0"),
+                ))
+                .await
+                .expect("mark should complete");
+            assert_eq!(marked.status(), StatusCode::OK);
+            let marked = json_body(marked).await;
+            assert_eq!(marked["reviewed"], json!(true));
+            assert_eq!(marked["revision"], json!(1));
+            assert_eq!(marked["reviewed_by"], json!("user-123"));
+
+            // The second replica's "mark it if nobody has" loses.
+            let raced = router
+                .clone()
+                .oneshot(review_request(
+                    "traffic-writer",
+                    "/reviewed/{id}",
+                    true,
+                    Some("0"),
+                ))
+                .await
+                .expect("raced mark should complete");
+            assert_eq!(raced.status(), StatusCode::CONFLICT);
+            let raced = json_body(raced).await;
+            assert_eq!(raced["reason"], json!("review_revision_mismatch"));
+            assert_eq!(raced["review"]["reviewed"], json!(true));
+            assert_eq!(raced["review"]["revision"], json!(1));
+
+            let endpoint = listed_endpoint(router.clone()).await;
+            assert_eq!(endpoint["reviewed"], json!(true));
+            assert_eq!(endpoint["review_revision"], json!(1));
+            assert_eq!(endpoint["reviewed_by"], json!("user-123"));
+
+            let stale_clear = router
+                .clone()
+                .oneshot(review_request(
+                    "traffic-writer",
+                    "/reviewed/{id}",
+                    false,
+                    Some("9"),
+                ))
+                .await
+                .expect("stale clear should complete");
+            assert_eq!(stale_clear.status(), StatusCode::CONFLICT);
+            let stale_clear = json_body(stale_clear).await;
+            assert_eq!(stale_clear["reason"], json!("review_revision_mismatch"));
+            assert_eq!(stale_clear["review"]["revision"], json!(1));
+
+            let cleared = router
+                .clone()
+                .oneshot(review_request(
+                    "traffic-writer",
+                    "/reviewed/{id}",
+                    false,
+                    Some("1"),
+                ))
+                .await
+                .expect("clear should complete");
+            assert_eq!(cleared.status(), StatusCode::OK);
+            let cleared = json_body(cleared).await;
+            assert_eq!(cleared["reviewed"], json!(false));
+            assert_eq!(cleared["revision"], json!(0));
+
+            let endpoint = listed_endpoint(router.clone()).await;
+            assert_eq!(endpoint["reviewed"], json!(false));
+            assert_eq!(endpoint["review_revision"], json!(0));
+
+            let missing = router
+                .clone()
+                .oneshot(review_request("traffic-writer", "/absent/{id}", true, None))
+                .await
+                .expect("unknown-endpoint review should complete");
+            assert_eq!(missing.status(), StatusCode::NOT_FOUND);
+
+            assert_eventually(Duration::from_secs(1), || {
+                capture
+                    .events()
+                    .iter()
+                    .filter(|event| {
+                        event.event_type == audit::event::TRAFFIC_ENDPOINT_REVIEW_CHANGED
+                    })
+                    .count()
+                    == 2
+            });
+        }
+
+        /// The suggestion routes in cluster mode (issue #241, PR 12):
+        /// `generate` runs against PostgreSQL instead of being refused,
+        /// the list shows what it stored (with its revision), and dismissal
+        /// is the conditional transition with `If-Match`. Acceptance needs
+        /// the policy authority and has its own tests below.
+        #[tokio::test]
+        async fn cluster_mode_suggestion_routes_generate_list_and_dismiss_from_postgres() {
+            let Some(admin_dsn) = locator() else {
+                eprintln!("skipping: no test database locator; CI runs this test");
+                return;
+            };
+            let database = create_test_database(&admin_dsn).await;
+            let pool = migrated_pool(&database.dsn).await;
+            let audit_store = cluster_audit_store(&pool).await;
+            seed_baseline_generation_fixture(&pool, &audit_store).await;
+            let router = cluster_suggestions_harness(&pool, audit_store).await.router;
 
             let forbidden = router
                 .clone()
@@ -44644,23 +45502,6 @@ O2gecI9QwDJNpm29J9wJB2F8
             assert_eq!(suggestion["revision"], json!(1));
             let id = suggestion["id"].as_str().expect("id").to_owned();
 
-            let deferred = router
-                .clone()
-                .oneshot(suggestions_admin_request(
-                    Method::POST,
-                    &format!("/v1/admin/suggestions/{id}/accept"),
-                    Some(test_principal(&["suggestions-policy-writer"])),
-                    None,
-                    None,
-                ))
-                .await
-                .expect("accept request should complete");
-            assert_eq!(deferred.status(), StatusCode::CONFLICT);
-            assert_eq!(
-                json_body(deferred).await["error"],
-                json!(SUGGESTION_ACCEPTANCE_CLUSTER_DEFERRED_REASON)
-            );
-
             let stale = router
                 .clone()
                 .oneshot(suggestions_admin_request(
@@ -44708,6 +45549,310 @@ O2gecI9QwDJNpm29J9wJB2F8
             let not_open = json_body(not_open).await;
             assert_eq!(not_open["reason"], json!("suggestion_not_open"));
             assert_eq!(not_open["suggestion"]["revision"], json!(2));
+        }
+
+        /// Cluster-mode acceptance end to end (issue #241, PR 12): one
+        /// request installs the rule, moves the suggestion, writes the
+        /// immutable history version and the outbox row, installs the new
+        /// security revision locally, and emits both audit events -- and a
+        /// second acceptance of the same suggestion is refused with the row
+        /// as it now stands.
+        #[tokio::test]
+        async fn cluster_mode_accept_commits_the_rule_the_transition_and_the_history_row() {
+            let Some(admin_dsn) = locator() else {
+                eprintln!("skipping: no test database locator; CI runs this test");
+                return;
+            };
+            let database = create_test_database(&admin_dsn).await;
+            let pool = migrated_pool(&database.dsn).await;
+            let audit_store = cluster_audit_store(&pool).await;
+            seed_baseline_generation_fixture(&pool, &audit_store).await;
+            let harness = cluster_suggestions_harness(&pool, audit_store).await;
+            let id = generate_one_suggestion(&harness.router).await;
+
+            let before = acceptance_footprint(&harness.policy_store, &pool, &id).await;
+            assert_eq!(before.active_version, 1);
+            assert_eq!(before.rule_count, 0);
+            assert_eq!(before.suggestion_state, "open");
+            assert_eq!(before.suggestion_revision, 1);
+
+            // The suggestion's expected revision is its own precondition:
+            // a stale one is refused before anything is written.
+            let stale_revision = harness
+                .router
+                .clone()
+                .oneshot(accept_request(&id, Some(&before.active_etag), Some("9")))
+                .await
+                .expect("stale-revision accept should complete");
+            assert_eq!(stale_revision.status(), StatusCode::CONFLICT);
+            let stale_revision = json_body(stale_revision).await;
+            assert_eq!(
+                stale_revision["reason"],
+                json!("suggestion_revision_mismatch")
+            );
+            assert_eq!(stale_revision["suggestion"]["revision"], json!(1));
+            assert_eq!(
+                acceptance_footprint(&harness.policy_store, &pool, &id).await,
+                before,
+                "a refused precondition must write nothing"
+            );
+
+            let accepted = harness
+                .router
+                .clone()
+                .oneshot(accept_request(&id, Some(&before.active_etag), Some("1")))
+                .await
+                .expect("accept request should complete");
+            assert_eq!(accepted.status(), StatusCode::CREATED);
+            let accepted_etag = policy_etag_header(&accepted);
+            assert_ne!(accepted_etag, before.active_etag);
+            let accepted_body = json_body(accepted).await;
+            assert_eq!(accepted_body["suggestion"]["state"], json!("accepted"));
+            assert_eq!(accepted_body["suggestion"]["revision"], json!(2));
+            assert_eq!(
+                accepted_body["suggestion"]["transitioned_by"],
+                json!("user-123")
+            );
+            assert_eq!(accepted_body["rule"]["path"], json!("/orders/{id}"));
+            assert_eq!(accepted_body["rule"]["action"], json!("allow"));
+            assert_eq!(
+                accepted_body["rule"]["principal"]["roles"],
+                json!(["orders-reader"])
+            );
+            assert_eq!(
+                accepted_body["rule"]["principal"]["issuers"],
+                json!(["provider:test"])
+            );
+            assert_eq!(
+                accepted_body["rule"]["principal"]["auth_methods"],
+                json!(["bearer_token"])
+            );
+
+            // Both halves are durable, and so is everything the policy
+            // commit writes alongside them.
+            let after = acceptance_footprint(&harness.policy_store, &pool, &id).await;
+            assert_eq!(
+                after,
+                AcceptanceFootprint {
+                    active_version: 2,
+                    active_etag: accepted_etag.clone(),
+                    security_revision: before.security_revision + 1,
+                    rule_count: 1,
+                    document_rows: 2,
+                    outbox_rows: 2,
+                    suggestion_state: "accepted".to_owned(),
+                    suggestion_revision: 2,
+                }
+            );
+            let active = PolicyControlPlane::active(harness.policy_store.as_ref())
+                .await
+                .expect("active reads")
+                .expect("a policy is active");
+            assert_eq!(
+                serde_json::to_value(&active.policy.rules[0]).expect("rule serializes"),
+                accepted_body["rule"]
+            );
+            // The replica answered with the revision it had already
+            // installed, as every cluster-mode policy mutation does.
+            assert_eq!(
+                harness.rbac_state.snapshot_security_revision(),
+                after.security_revision
+            );
+
+            // The immutable version the same transaction wrote is the
+            // history row.
+            let history = storage::PolicyHistory::list_versions(
+                harness.policy_store.as_ref(),
+                &PolicyHistoryListFilters {
+                    limit: 10,
+                    cursor: None,
+                    include_policy: false,
+                },
+            )
+            .await
+            .expect("history should list");
+            assert_eq!(history.versions.len(), 2, "{history:?}");
+            assert_eq!(history.versions[0].version, 2);
+            assert_eq!(
+                history.versions[0].diff_summary["action"],
+                json!("rule_created")
+            );
+            assert_eq!(history.versions[0].actor_user_id, "user-123");
+
+            // Both events are emitted after COMMIT, describing changes
+            // that really happened.
+            assert_eventually(Duration::from_secs(2), || {
+                let events = harness.audit.events();
+                events
+                    .iter()
+                    .any(|event| event.event_type == audit::event::POLICY_CHANGED)
+                    && events
+                        .iter()
+                        .any(|event| event.event_type == audit::event::SUGGESTION_LIFECYCLE_CHANGED)
+            });
+            let events = harness.audit.events();
+            let policy_event = events
+                .iter()
+                .find(|event| event.event_type == audit::event::POLICY_CHANGED)
+                .expect("policy.changed should be emitted");
+            assert_eq!(
+                policy_event.payload["diff_summary"]["action"],
+                json!("rule_created")
+            );
+            let lifecycle_event = events
+                .iter()
+                .find(|event| event.event_type == audit::event::SUGGESTION_LIFECYCLE_CHANGED)
+                .expect("suggestion.lifecycle_changed should be emitted");
+            assert_eq!(lifecycle_event.payload["id"], json!(id));
+            assert_eq!(lifecycle_event.payload["state"], json!("accepted"));
+
+            // The transition is the precondition: accepting again is
+            // refused with the row as it stands, not re-applied.
+            let repeat = harness
+                .router
+                .clone()
+                .oneshot(accept_request(&id, Some(&accepted_etag), None))
+                .await
+                .expect("repeat accept should complete");
+            assert_eq!(repeat.status(), StatusCode::CONFLICT);
+            let repeat = json_body(repeat).await;
+            assert_eq!(repeat["reason"], json!("suggestion_not_open"));
+            assert_eq!(repeat["suggestion"]["state"], json!("accepted"));
+            assert_eq!(repeat["suggestion"]["revision"], json!(2));
+            assert_eq!(
+                acceptance_footprint(&harness.policy_store, &pool, &id).await,
+                after,
+                "a refused acceptance must write nothing"
+            );
+        }
+
+        /// An acceptance whose policy commit loses its compare-and-swap
+        /// INSIDE the transaction writes neither half (issue #241, PR 12).
+        ///
+        /// The race is made deterministic: an external transaction holds
+        /// the suggestion row `FOR UPDATE`, so the acceptance blocks after
+        /// it has already read the policy ETag and built its candidate.
+        /// While it waits, another writer commits a policy version, which
+        /// invalidates that ETag. When the lock is released, the
+        /// acceptance's own transaction reaches the policy precondition,
+        /// fails it, and rolls back -- the suggestion stays open and the
+        /// proposed rule is nowhere.
+        #[tokio::test]
+        async fn a_cluster_acceptance_that_loses_the_policy_race_writes_neither_half() {
+            let Some(admin_dsn) = locator() else {
+                eprintln!("skipping: no test database locator; CI runs this test");
+                return;
+            };
+            let database = create_test_database(&admin_dsn).await;
+            let pool = migrated_pool(&database.dsn).await;
+            let audit_store = cluster_audit_store(&pool).await;
+            seed_baseline_generation_fixture(&pool, &audit_store).await;
+            let harness = cluster_suggestions_harness(&pool, audit_store).await;
+            let id = generate_one_suggestion(&harness.router).await;
+            let before = acceptance_footprint(&harness.policy_store, &pool, &id).await;
+
+            // Hold the suggestion row exactly as a peer replica's
+            // acceptance would.
+            let blocker = pool.get().await.expect("blocker client");
+            blocker.batch_execute("BEGIN").await.expect("BEGIN");
+            blocker
+                .query_one(
+                    "SELECT id FROM greengateway.discovery_rule_suggestions
+                     WHERE id = $1 FOR UPDATE",
+                    &[&id.as_str()],
+                )
+                .await
+                .expect("the row locks");
+
+            let request = accept_request(&id, Some(&before.active_etag), Some("1"));
+            let router = harness.router.clone();
+            let accepting = tokio::spawn(async move {
+                router
+                    .oneshot(request)
+                    .await
+                    .expect("accept request should complete")
+            });
+
+            // It is blocked on the row, having written nothing.
+            tokio::time::sleep(Duration::from_millis(250)).await;
+            assert!(
+                !accepting.is_finished(),
+                "the acceptance must wait for the suggestion row"
+            );
+            assert_eq!(
+                acceptance_footprint(&harness.policy_store, &pool, &id).await,
+                before,
+                "a blocked acceptance must not have written its policy"
+            );
+
+            // Another writer commits a policy version: the ETag the
+            // blocked acceptance is holding is now stale.
+            let interfering_diff = json!({ "action": "interfering_commit" });
+            let mut interfering_candidate =
+                PolicyControlPlane::active(harness.policy_store.as_ref())
+                    .await
+                    .expect("active reads")
+                    .expect("a policy is active")
+                    .policy;
+            interfering_candidate.id = Some("interfering".to_owned());
+            let interfering = PolicyControlPlane::commit(
+                harness.policy_store.as_ref(),
+                storage::PolicyCommitRequest {
+                    precondition: storage::PolicyCommitPrecondition::Expected {
+                        etag: before.active_etag.clone(),
+                    },
+                    candidate: &interfering_candidate,
+                    actor_user_id: "peer",
+                    diff_summary: &interfering_diff,
+                },
+            )
+            .await
+            .expect("the interfering commit should win");
+            assert_ne!(interfering.etag, before.active_etag);
+
+            blocker.batch_execute("COMMIT").await.expect("COMMIT");
+            drop(blocker);
+
+            let refused = accepting.await.expect("the acceptance task should finish");
+            assert_eq!(refused.status(), StatusCode::PRECONDITION_FAILED);
+
+            // Neither half landed: the only new version is the interfering
+            // one, and the suggestion is untouched.
+            assert_eq!(
+                acceptance_footprint(&harness.policy_store, &pool, &id).await,
+                AcceptanceFootprint {
+                    active_version: 2,
+                    active_etag: interfering.etag.clone(),
+                    security_revision: interfering.security_revision,
+                    rule_count: 0,
+                    document_rows: 2,
+                    outbox_rows: 2,
+                    suggestion_state: "open".to_owned(),
+                    suggestion_revision: 1,
+                }
+            );
+            assert!(
+                !harness
+                    .audit
+                    .events()
+                    .iter()
+                    .any(|event| event.event_type == audit::event::SUGGESTION_LIFECYCLE_CHANGED),
+                "a rolled-back acceptance must emit no lifecycle event"
+            );
+
+            // The suggestion is still acceptable: retrying against the
+            // current ETag commits both halves.
+            let retried = harness
+                .router
+                .clone()
+                .oneshot(accept_request(&id, Some(&interfering.etag), Some("1")))
+                .await
+                .expect("retry should complete");
+            assert_eq!(retried.status(), StatusCode::CREATED);
+            let retried = acceptance_footprint(&harness.policy_store, &pool, &id).await;
+            assert_eq!(retried.rule_count, 1);
+            assert_eq!(retried.suggestion_state, "accepted");
+            assert_eq!(retried.suggestion_revision, 2);
         }
     }
 }
