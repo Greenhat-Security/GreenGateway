@@ -52,6 +52,14 @@ const OPERATION_LOOKUP: &str = "jwt_revocation_lookup";
 const OPERATION_REVOKE: &str = "jwt_revocation_revoke";
 const OPERATION_CLEANUP: &str = "jwt_revocation_cleanup";
 const RESOURCE_TYPE: &str = "jwt_revocation";
+/// Retained past the validator's `exp` leeway as well: the validator
+/// samples a whole-second clock and accepts while `exp < now - leeway` is
+/// false, so a row that lapsed exactly at `exp + leeway` on the database
+/// clock could still meet an accepting validator for up to a second --
+/// longer with skew between the two clocks. Two seconds covers the
+/// rounding and ordinary NTP skew; the decisions are still two clocks, so
+/// this is a margin, not an equivalence.
+pub const REVOCATION_RETENTION_MARGIN_SECS: u64 = 2;
 
 /// What a revoke did.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -71,8 +79,9 @@ pub struct PostgresJwtRevocationStore {
     deployment_id: Arc<str>,
     issuer: Arc<str>,
     /// How long past `expires_at` a row stays effective: the validator's
-    /// `exp` leeway, so a revocation keyed on the token's own `exp` covers
-    /// the whole window in which the token is still accepted.
+    /// `exp` leeway plus [`REVOCATION_RETENTION_MARGIN_SECS`], so a
+    /// revocation keyed on the token's own `exp` covers the whole window in
+    /// which some validator may still accept the token.
     retention_leeway_secs: f64,
 }
 
@@ -82,7 +91,8 @@ impl PostgresJwtRevocationStore {
             pool,
             deployment_id: Arc::from(deployment_id),
             issuer: Arc::from(issuer),
-            retention_leeway_secs: crate::auth::jwt::JWT_EXP_LEEWAY_SECS as f64,
+            retention_leeway_secs: (crate::auth::jwt::JWT_EXP_LEEWAY_SECS
+                + REVOCATION_RETENTION_MARGIN_SECS) as f64,
         }
     }
 
@@ -114,6 +124,24 @@ impl PostgresJwtRevocationStore {
     ) -> Result<JwtRevocationOutcome, RepositoryError> {
         let digest = self.jti_digest(jti);
         let client = self.pool.get().await.map_err(classify_pool_error)?;
+        if let Some(expires_at) = expires_at {
+            // An expiry already in the past (by the database clock) could
+            // only produce a row nothing is refused by, reported as
+            // "revoked": the caller's input, refused before anything is
+            // written or any revision spent.
+            let in_the_future: bool = client
+                .query_one("SELECT $1::text::timestamptz > now()", &[&expires_at])
+                .await
+                .map_err(|error| classify_query(error, OPERATION_REVOKE))?
+                .try_get(0)
+                .map_err(|_| invalid_data(OPERATION_REVOKE))?;
+            if !in_the_future {
+                return Err(RepositoryError::invalid_parameter(
+                    OPERATION_REVOKE,
+                    "expires_at",
+                ));
+            }
+        }
         client
             .batch_execute("BEGIN")
             .await

@@ -67,6 +67,11 @@ pub trait TokenStore: Send + Sync {
 /// failure).
 pub const MAX_SERVICE_TOKEN_SCOPES_JSON_BYTES: usize = 65_536;
 
+/// The bound on a token's `created_by` (the creating principal's ID) in
+/// the PostgreSQL store, judged before the insert so an oversized principal
+/// is the caller's error rather than the column's check constraint.
+pub const MAX_SERVICE_TOKEN_CREATED_BY_BYTES: usize = 512;
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CreateTokenRequest {
     pub scopes: Vec<String>,

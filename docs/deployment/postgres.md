@@ -202,13 +202,13 @@ What changes, and why it is safe:
 - **Concurrent rotations are serialized by the token's row lock** and both succeed; the later commit's plaintext is the live one and every earlier plaintext is dead. A rotate that loses to a revoke is refused as a conflict; a revoke that lands after a rotate closes the rotated token. Either way no plaintext is live after a revoke.
 - **A dependency failure is `503`.** A store or revision read that fails answers `503`, on the request path and on the token admin endpoints alike — never `401`/`403`, and never a fallback to the cache.
 
-The plaintext token continues to appear exactly once, in the response to create and rotate; the store holds only its SHA-256.
+The plaintext token continues to appear exactly once, in the response to create and rotate; the store holds only its SHA-256. A creating principal whose ID exceeds the record's 512-byte bound, and a list cursor whose timestamp does not parse, are refused as the caller's errors (`400`) before the insert or the cast that would otherwise surface them as store failures.
 
 ### JWT revocations
 
 Cluster mode wires a real `RevocationStore` behind every JWT provider's validator: `greengateway.jwt_revocations`, a shared denylist keyed by the provider's principal issuer (the configured issuer, normalized, or `provider:<name>` when none is configured) and a SHA-256 digest of the `jti` under the deployment ID and that issuer. The raw `jti` never reaches the database, and an equal `jti` from two issuers is two different JWTs. A `jti` is not consume-once: a row means the JWT was withdrawn, its absence means nothing, and bearer reuse stays valid.
 
-Every JWT that carries a `jti` is checked against the denylist on every request, on every replica; a denylist that cannot be consulted answers `503`, never `401`. Expiry is judged by the database clock. A row stays effective for the validator's `exp` leeway (60 seconds) past its `expires_at` (the token's own `exp` when known) — the validator accepts the token until then — and only after that is it a no-op on read and reclaimable by cleanup.
+Every JWT that carries a `jti` is checked against the denylist on every request, on every replica; a denylist that cannot be consulted answers `503`, never `401`. Expiry is judged by the database clock. A row stays effective for the validator's `exp` leeway (60 seconds) plus a two-second rounding and clock-skew margin past its `expires_at` (the token's own `exp` when known) — the validator accepts the token until the leeway ends, sampling a whole-second clock of its own — and only after that is it a no-op on read and reclaimable by cleanup. A revoke whose `expires_at` has already passed is refused as the caller's error rather than recorded as an ineffective row.
 
 There is deliberately no admin HTTP endpoint for revoking JWTs yet — a permission model for withdrawing other people's sessions is a product decision — so the write path is an operator command, run with the same environment as a replica:
 

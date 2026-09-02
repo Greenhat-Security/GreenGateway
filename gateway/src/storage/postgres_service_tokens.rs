@@ -149,6 +149,14 @@ impl ServiceTokenStore for PostgresServiceTokenStore {
         // rejected before any connection is taken.
         validate_optional_timestamp(request.expires_at.as_deref(), "expires_at")
             .map_err(|error| map_helper_error(OPERATION_CREATE, error))?;
+        // The column bounds the creator; judge it here so an oversized
+        // principal ID is the caller's error, not a check-constraint 500.
+        if request.created_by.len() > crate::auth::tokens::MAX_SERVICE_TOKEN_CREATED_BY_BYTES {
+            return Err(RepositoryError::invalid_parameter(
+                OPERATION_CREATE,
+                "created_by",
+            ));
+        }
         let plaintext_token = generate_plaintext_token()
             .map_err(|error| map_helper_error(OPERATION_CREATE, error))?;
         let token_hash = hash_token(&plaintext_token);
@@ -213,6 +221,13 @@ impl ServiceTokenStore for PostgresServiceTokenStore {
             .map(|value| decode_cursor::<TokenCursor>("cursor", value))
             .transpose()
             .map_err(|error| map_helper_error(OPERATION_LIST, error))?;
+        // The cursor's instant is cast in the query; a cursor that decodes
+        // but carries a malformed timestamp is the caller's error, judged
+        // here rather than surfacing as a cast failure.
+        if let Some(cursor) = cursor.as_ref() {
+            validate_optional_timestamp(Some(&cursor.created_at), "cursor")
+                .map_err(|error| map_helper_error(OPERATION_LIST, error))?;
+        }
         let limit = query_limit(filters.limit);
         let client = self.pool.get().await.map_err(classify_pool_error)?;
         // The keyset predicate mirrors the SQLite store's
@@ -647,7 +662,12 @@ fn remaining_lifetime_from_row(
 
 fn map_helper_error(operation: &'static str, error: TokenStoreError) -> RepositoryError {
     let classified = match &error {
-        TokenStoreError::TimeParse { context, .. } if operation == OPERATION_CREATE => {
+        // On create and list the only timestamps parsed are the caller's
+        // (`expires_at`, the cursor's instant), so a parse failure names
+        // the caller's parameter.
+        TokenStoreError::TimeParse { context, .. }
+            if operation == OPERATION_CREATE || operation == OPERATION_LIST =>
+        {
             RepositoryError::invalid_parameter(operation, context)
         }
         TokenStoreError::InvalidCursor { parameter } => {

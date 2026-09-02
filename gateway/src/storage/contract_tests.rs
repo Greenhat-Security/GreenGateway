@@ -1249,18 +1249,30 @@ mod postgres_audit_tests {
         .await;
         assert_eq!(raw_jti_rows, 0, "the raw jti is nowhere in the database");
 
-        // Expiry by the database clock.
-        replica_a
-            .revoke("jti-expired", Some("2000-01-01T00:00:00Z"), "operator")
+        // Expiry by the database clock: a short retention so the test can
+        // watch the row lapse (an expiry already in the past is refused as
+        // the caller's error, which the reactivation test covers).
+        let short_lived =
+            PostgresJwtRevocationStore::new(pool_a.clone(), deployment, "https://issuer-a.example")
+                .with_retention_leeway_for_test(0.5);
+        let in_one_second = (time::OffsetDateTime::now_utc() + std::time::Duration::from_secs(1))
+            .format(&time::format_description::well_known::Rfc3339)
+            .expect("rfc3339");
+        short_lived
+            .revoke("jti-expired", Some(&in_one_second), "operator")
             .await
-            .expect("revoke expired");
+            .expect("revoke with a short expiry");
+        tokio::time::sleep(std::time::Duration::from_millis(1800)).await;
         assert!(
-            !replica_b.is_revoked("jti-expired").await.expect("lookup"),
-            "a revocation past its expiry is a no-op on read"
+            !short_lived.is_revoked("jti-expired").await.expect("lookup"),
+            "a revocation past its expiry and retention is a no-op on read"
         );
-        assert_eq!(replica_a.cleanup_expired(100).await.expect("cleanup"), 1);
+        assert_eq!(short_lived.cleanup_expired(100).await.expect("cleanup"), 1);
         assert_eq!(
-            replica_a.cleanup_expired(100).await.expect("cleanup again"),
+            short_lived
+                .cleanup_expired(100)
+                .await
+                .expect("cleanup again"),
             0
         );
         assert!(
@@ -1670,6 +1682,18 @@ mod postgres_audit_tests {
             !store.is_revoked("jti-lapsed").await.expect("lookup"),
             "lapsed"
         );
+        // A repeat carrying an expiry already in the past would produce a
+        // row nothing is refused by; it is the caller's error, and no
+        // revision is spent.
+        let past = (time::OffsetDateTime::now_utc() - std::time::Duration::from_secs(5))
+            .format(&time::format_description::well_known::Rfc3339)
+            .expect("rfc3339");
+        let refused = store
+            .revoke("jti-lapsed", Some(&past), "operator")
+            .await
+            .expect_err("an expiry in the past is refused");
+        assert_eq!(refused.invalid_parameter_name(), Some("expires_at"));
+        assert!(!store.is_revoked("jti-lapsed").await.expect("lookup"));
         let again = store
             .revoke("jti-lapsed", None, "operator")
             .await
@@ -1714,6 +1738,49 @@ mod postgres_audit_tests {
             store.is_revoked("jti-short").await.expect("lookup"),
             "the extended row outlives the original expiry"
         );
+    }
+
+    /// An oversized creator ID and a malformed cursor timestamp are the
+    /// caller's errors, judged before the insert and the cast that would
+    /// otherwise surface them as store failures.
+    #[tokio::test]
+    async fn oversized_creator_and_malformed_cursor_are_the_callers_errors() {
+        use crate::auth::tokens::{
+            encode_cursor, CreateTokenRequest, TokenCursor, TokenListFilters,
+        };
+        use crate::storage::ServiceTokenStore;
+        let Some(admin_dsn) = locator() else {
+            eprintln!("skipping: no test database locator; CI runs this test");
+            return;
+        };
+        let _guard = DATABASE.lock().await;
+        let database = create_test_database(&admin_dsn).await;
+        let (store, _pool) = migrated_service_token_store(&database).await;
+
+        let refused = store
+            .create(CreateTokenRequest {
+                scopes: vec!["admin:tokens:read".to_owned()],
+                created_by: "x".repeat(600),
+                expires_at: None,
+            })
+            .await
+            .err()
+            .unwrap_or_else(|| panic!("a 600-byte creator exceeds the record bound"));
+        assert_eq!(refused.invalid_parameter_name(), Some("created_by"));
+
+        let cursor = encode_cursor(&TokenCursor {
+            created_at: "not-a-timestamp".to_owned(),
+            id: "tok-cursor".to_owned(),
+        })
+        .expect("cursor encodes");
+        let refused = store
+            .list(&TokenListFilters {
+                limit: 10,
+                cursor: Some(cursor),
+            })
+            .await
+            .expect_err("a cursor whose timestamp does not parse is refused");
+        assert_eq!(refused.invalid_parameter_name(), Some("cursor"));
     }
 
     /// A replica whose keyring cannot open a pending login rolls its

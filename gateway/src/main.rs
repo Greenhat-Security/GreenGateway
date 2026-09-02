@@ -6706,6 +6706,9 @@ async fn token_create_endpoint(
         Err(error) if error.invalid_parameter_name() == Some("expires_at") => {
             return bad_request("invalid service-token expires_at timestamp");
         }
+        Err(error) if error.invalid_parameter_name() == Some("created_by") => {
+            return bad_request("principal identifier exceeds the service-token record bound");
+        }
         Err(error) => return token_store_error_response(error),
     };
 
