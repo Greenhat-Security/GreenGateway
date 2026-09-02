@@ -248,6 +248,17 @@ fn cloudflare_forwarding_matches_supported_gateway_env_vars() {
         "DISCOVERY_PROJECTOR_LEASE_TTL_MS",
         "DISCOVERY_PROJECTOR_POLL_MS",
         "DISCOVERY_PROJECTOR_BATCH",
+        // Cluster membership (issue #241, PR 13): the heartbeat interval
+        // and stale window of the `cluster_members` roster. Cluster mode
+        // only, rejected in standalone mode, so never honoured here.
+        "CLUSTER_HEARTBEAT_MS",
+        "CLUSTER_MEMBER_STALE_MS",
+        // The maintenance singleton (issue #241, PR 13): pass interval,
+        // leader lease TTL, and PostgreSQL audit retention. Cluster mode
+        // only, rejected in standalone mode, so never honoured here.
+        "CLUSTER_MAINTENANCE_INTERVAL_MS",
+        "CLUSTER_MAINTENANCE_LEASE_TTL_MS",
+        "AUDIT_POSTGRES_RETENTION_DAYS",
     ] {
         assert!(
             expected.remove(excluded),

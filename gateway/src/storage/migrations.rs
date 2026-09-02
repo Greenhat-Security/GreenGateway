@@ -188,8 +188,30 @@ static MANIFEST: LazyLock<Vec<Migration>> = LazyLock::new(|| {
         )
         .finalize()
         .with_pinned_checksum("a13f87e19303cb8f37fa06b447bebf04bf37d6b85636f8a0b872e843f30d54e3"),
+        Migration::new(
+            10,
+            "cluster_membership",
+            include_str!("migrations/0010_cluster_membership.sql"),
+        )
+        .finalize()
+        .with_pinned_checksum("74b264596e14a1a01b17c212c558051c6fc74f340c0e238597b75d77362974d8"),
     ]
 });
+
+/// The schema-version range this binary accepts, as a cluster member
+/// advertises it (issue #241, PR 13): `(min, max)` in manifest versions.
+///
+/// Both ends are the manifest length. The ledger rules above admit exactly
+/// one shape -- a checksum-matching prefix covering the whole manifest --
+/// so a serving replica tolerates neither a ledger behind its manifest
+/// (it refuses to serve until migrated) nor one ahead of it (written by a
+/// newer gateway). The range is still advertised as a pair so PR 14's
+/// status view and a future expand/contract release that widens the
+/// tolerated window need no schema change to say so.
+pub(crate) fn schema_version_range() -> (i32, i32) {
+    let len = i32::try_from(MANIFEST.len()).unwrap_or(i32::MAX);
+    (len, len)
+}
 
 /// What `check` (and startup validation) concluded about the schema.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

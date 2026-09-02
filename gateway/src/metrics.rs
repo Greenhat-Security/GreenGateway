@@ -46,6 +46,27 @@ pub const RATE_LIMIT_BUCKET_EVICTIONS_TOTAL: &str = "rate_limit_bucket_evictions
 #[cfg(feature = "postgres")]
 pub const RATE_LIMIT_SHARED_DECISIONS_TOTAL: &str =
     "greengateway_rate_limit_shared_decisions_total";
+/// Live members of the deployment's roster (`cluster_members` rows whose
+/// heartbeat is inside `CLUSTER_MEMBER_STALE_MS`), as counted by the
+/// maintenance leader on each stale sweep; issue #241, PR 13. Reported by
+/// the leader only, so a replica that is not leading holds the last value
+/// it set while it led (or nothing).
+#[cfg(feature = "postgres")]
+pub const CLUSTER_MEMBERS_LIVE: &str = "greengateway_cluster_members_live";
+/// Singleton maintenance job runs by job and outcome (`success`,
+/// `failure`); issue #241, PR 13. Every label value is a compile-time
+/// constant: the job names are fixed, and a failure's classification goes
+/// to the ledger's `last_failure_code`, not to a label.
+#[cfg(feature = "postgres")]
+pub const CLUSTER_MAINTENANCE_JOB_RUNS_TOTAL: &str =
+    "greengateway_cluster_maintenance_job_runs_total";
+/// Whether this replica currently holds the maintenance lease: `1` while
+/// it leads, `0` otherwise; issue #241, PR 13. Summed across the
+/// deployment it must read `1`; `0` for longer than the acquisition
+/// backoff means no replica can take the lease, and `2` means the lease
+/// authority is being lied to.
+#[cfg(feature = "postgres")]
+pub const CLUSTER_MAINTENANCE_LEADER: &str = "greengateway_cluster_maintenance_leader";
 /// Client-certificate outcomes, per listener.
 ///
 /// Every label value is a compile-time constant. The identity a rejected

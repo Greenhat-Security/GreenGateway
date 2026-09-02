@@ -152,6 +152,54 @@ impl HaFoundation {
     }
 }
 
+/// The cluster-wide readiness gate a replica's `/readyz` consults in
+/// addition to its own lifecycle phase (issue #241, PR 13).
+///
+/// A replica starts *not agreed*: until it has read the deployment's live
+/// membership and found every live, non-draining member carrying its own
+/// fingerprint, it answers `503` with reason `config_fingerprint_mismatch`
+/// (HA state model invariant 14). Agreement is sticky. Once a replica has
+/// been admitted it keeps serving even if a later, mismatched replica
+/// boots: the gate is on *joining*, so a bad rollout is held at the door
+/// rather than allowed to take the already-serving replicas out of
+/// rotation with it. The replica does not exit while disagreeing, so a
+/// rolling change can finish and the gate re-evaluates on every
+/// heartbeat.
+///
+/// Standalone mode has no membership and never constructs one; a `None`
+/// gate in the app state is "always agreed".
+#[derive(Debug, Default)]
+pub struct ClusterReadiness {
+    fingerprint_agreed: std::sync::atomic::AtomicBool,
+}
+
+impl ClusterReadiness {
+    /// The readiness reason a mismatched replica reports.
+    pub const FINGERPRINT_MISMATCH: &'static str = "config_fingerprint_mismatch";
+
+    #[cfg_attr(not(feature = "postgres"), allow(dead_code))] // constructed by the cluster wiring only
+    pub fn new() -> std::sync::Arc<Self> {
+        std::sync::Arc::new(Self::default())
+    }
+
+    pub fn fingerprint_agreed(&self) -> bool {
+        self.fingerprint_agreed
+            .load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// Record that every live member agrees with this replica. One-way.
+    #[cfg_attr(not(feature = "postgres"), allow(dead_code))] // called by the membership heartbeat only
+    pub fn record_fingerprint_agreement(&self) {
+        self.fingerprint_agreed
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
+
+    /// Why this gate refuses readiness, or `None` when it does not.
+    pub fn blocked_reason(&self) -> Option<&'static str> {
+        (!self.fingerprint_agreed()).then_some(Self::FINGERPRINT_MISMATCH)
+    }
+}
+
 /// Compute the static-configuration fingerprint of a validated
 /// configuration.
 ///

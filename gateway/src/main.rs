@@ -43,6 +43,10 @@ use zeroize::{Zeroize, Zeroizing};
 mod audit;
 mod auth;
 mod client_ip;
+#[cfg(feature = "postgres")]
+mod cluster_maintenance;
+#[cfg(feature = "postgres")]
+mod cluster_membership;
 mod config;
 mod connection_secret_maintenance;
 mod connections;
@@ -196,6 +200,9 @@ struct AppState {
     mcp: mcp::McpState,
     protected_resource_metadata: Option<auth::protected_resource::ProtectedResourceMetadataConfig>,
     lifecycle: GatewayLifecycle,
+    /// Cluster mode's fingerprint-agreement gate for `/readyz` (issue
+    /// #241, PR 13); None in standalone mode, which is always agreed.
+    cluster_readiness: Option<Arc<ha::ClusterReadiness>>,
     _connections: connections::control_plane::ConnectionControlPlane,
 }
 
@@ -1449,6 +1456,17 @@ struct GatewayAppBuildOverrides {
     /// query store are discovery.
     #[cfg(feature = "postgres")]
     pg_discovery: Option<ClusterDiscoverySeed>,
+    /// The cluster-mode membership runtime (issue #241, PR 13): its boot
+    /// row is written and its first fingerprint check run before the app
+    /// is built; the builder starts its heartbeat task and wires its
+    /// readiness gate into `/readyz`. None in standalone mode.
+    #[cfg(feature = "postgres")]
+    pg_membership: Option<Arc<cluster_membership::ClusterMembership>>,
+    /// Test seam: a readiness gate for `/readyz` without a membership
+    /// store behind it, so the `config_fingerprint_mismatch` answer is
+    /// testable without PostgreSQL.
+    #[cfg(test)]
+    cluster_readiness: Option<Arc<ha::ClusterReadiness>>,
     #[cfg(test)]
     egress_resolver: Option<Arc<dyn egress::DnsResolver>>,
     /// Test seam: the pending-login backend the admin login flow uses,
@@ -1648,6 +1666,29 @@ struct ClusterDiscoverySeed {
     audit: Arc<storage::postgres_audit::PostgresAuditEventStore>,
 }
 
+/// Why a cluster-mode boot could not register itself in the membership
+/// roster (issue #241, PR 13). The database was proven reachable a moment
+/// earlier, so a row that cannot be written is a fail-closed startup
+/// error, not a warning. A fingerprint disagreement is *not* an error:
+/// the replica boots unready and waits for agreement.
+#[cfg(feature = "postgres")]
+#[derive(Debug)]
+struct ClusterMembershipStartupError(storage::RepositoryError);
+
+#[cfg(feature = "postgres")]
+impl std::fmt::Display for ClusterMembershipStartupError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "the cluster-mode membership row could not be written at startup: {}",
+            self.0
+        )
+    }
+}
+
+#[cfg(feature = "postgres")]
+impl std::error::Error for ClusterMembershipStartupError {}
+
 /// Why a cluster-mode boot refused to serve Connections.
 #[cfg(feature = "postgres")]
 #[derive(Debug)]
@@ -1815,9 +1856,10 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     }
     // `gateway jwt-revocations-cleanup [limit]`: delete revocations whose
     // expiry has passed, at most `limit` (default 1000) per run. Idempotent
-    // and bounded, so an operator can schedule it until the membership PR
-    // makes it fenced singleton work. Expired rows are already ignored on
-    // the read path; this only reclaims space.
+    // and bounded; the maintenance singleton (`cluster_maintenance.rs`)
+    // runs the same step on every pass, so this stays for operators rather
+    // than schedules. Expired rows are already ignored on the read path;
+    // this only reclaims space.
     #[cfg(feature = "postgres")]
     if std::env::args_os()
         .nth(1)
@@ -1859,9 +1901,10 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     // `gateway rate-limit-buckets-cleanup [limit]`: reclaim shared rate-limit
     // buckets idle for at least RATE_LIMIT_BUCKET_TTL_MS by the database
     // clock, at most `limit` (default 1000) per run, keeping the live-bucket
-    // count exact. Idempotent and bounded, so an operator can schedule it
-    // until the membership PR makes it fenced singleton work; the bound on
-    // live buckets is enforced on the request path regardless.
+    // count exact. Idempotent and bounded; the maintenance singleton
+    // (`cluster_maintenance.rs`) runs the same step on every pass, so this
+    // stays for operators rather than schedules. The bound on live buckets
+    // is enforced on the request path regardless.
     #[cfg(feature = "postgres")]
     if std::env::args_os()
         .nth(1)
@@ -1922,15 +1965,234 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         println!("removed idle rate-limit buckets: {removed} (live: {live})");
         return Ok(());
     }
+    // `gateway cluster-members`: one line per member row of the deployment
+    // (issue #241, PR 13), liveness judged on the database clock against
+    // CLUSTER_MEMBER_STALE_MS. Read-only: the command is not a member and
+    // writes no row of its own. The status API/UI is PR 14.
+    #[cfg(feature = "postgres")]
+    if std::env::args_os()
+        .nth(1)
+        .is_some_and(|word| word == *"cluster-members")
+    {
+        initialize_tracing_for_one_shot_commands();
+        if std::env::args_os().nth(2).is_some() {
+            return Err("usage: gateway cluster-members".into());
+        }
+        let config = config::Config::from_env()
+            .map_err(|error| Box::<dyn std::error::Error>::from(error.to_string()))?;
+        let Some(foundation) =
+            storage::postgres::PostgresFoundation::start_if_selected(&config).await?
+        else {
+            return Err("gateway cluster-members requires STATE_BACKEND=postgres".into());
+        };
+        let deployment_id = config
+            .deployment_id
+            .clone()
+            .ok_or("STATE_BACKEND=postgres requires DEPLOYMENT_ID")?;
+        let store = storage::PostgresMembershipStore::new(
+            foundation.pool().clone(),
+            &deployment_id,
+            ha::InstanceIdentity::generate(),
+        );
+        let stale_window = config.cluster_member_stale_window();
+        let members = store.members(stale_window).await.map_err(|error| {
+            Box::<dyn std::error::Error>::from(format!("cluster member listing failed: {error}"))
+        })?;
+        let live = members.iter().filter(|member| member.live).count();
+        println!(
+            "deployment={deployment_id} members={} live={live} stale_window_ms={}",
+            members.len(),
+            stale_window.as_millis()
+        );
+        for member in &members {
+            let state = match (
+                member.live,
+                member.draining_at.is_some(),
+                member.ready_at.is_some(),
+            ) {
+                (false, _, _) => "stale",
+                (true, true, _) => "draining",
+                (true, false, true) => "ready",
+                (true, false, false) => "starting",
+            };
+            println!(
+                "{state:<9} instance={} boot={} version={} schema={}..{} document={}..{} fingerprint={} started={} heartbeat={} age_secs={:.1} revisions=compiled:{}/observed:{} last_error={}",
+                member.instance_id,
+                member.boot_id,
+                member.binary_version,
+                member.schema_version_min,
+                member.schema_version_max,
+                member.document_version_min,
+                member.document_version_max,
+                member.fingerprint,
+                member.started_at,
+                member.last_heartbeat_at,
+                member.heartbeat_age_secs,
+                member.compiled_security_revision,
+                member.observed_security_revision,
+                member.last_error_code.as_deref().unwrap_or("-"),
+            );
+        }
+        return Ok(());
+    }
+    // `gateway maintenance-run`: one bounded pass of the singleton jobs
+    // (issue #241, PR 13) for an operator's cron until the in-process
+    // singleton is trusted. It takes the `maintenance` lease like any
+    // leader -- with CLUSTER_MAINTENANCE_LEASE_TTL_MS as its TTL, renewed
+    // while the pass runs -- so a live leader's slot is reported held and
+    // nothing runs, and every ledger write carries the one-shot's fence.
+    #[cfg(feature = "postgres")]
+    if std::env::args_os()
+        .nth(1)
+        .is_some_and(|word| word == *"maintenance-run")
+    {
+        initialize_tracing_for_one_shot_commands();
+        if std::env::args_os().nth(2).is_some() {
+            return Err("usage: gateway maintenance-run".into());
+        }
+        let config = config::Config::from_env()
+            .map_err(|error| Box::<dyn std::error::Error>::from(error.to_string()))?;
+        let Some(foundation) =
+            storage::postgres::PostgresFoundation::start_if_selected(&config).await?
+        else {
+            return Err("gateway maintenance-run requires STATE_BACKEND=postgres".into());
+        };
+        let deployment_id = config
+            .deployment_id
+            .clone()
+            .ok_or("STATE_BACKEND=postgres requires DEPLOYMENT_ID")?;
+        let root = config
+            .connection_secrets_root
+            .as_ref()
+            .ok_or("RATE_LIMIT_KEYRING requires CONNECTION_SECRETS_ROOT for its key files")?;
+        let keyring =
+            connections::local_secret::LocalSecretKeyring::load(&config.rate_limit_keyring, root)
+                .map_err(|error| {
+                Box::<dyn std::error::Error>::from(format!(
+                    "the rate-limit keyring could not be loaded: {error}"
+                ))
+            })?;
+        // The one-shot is not a member: a fresh identity names its lease
+        // and nothing else, and no member row is written for it.
+        let identity = ha::InstanceIdentity::generate();
+        let pool = foundation.pool().clone();
+        let membership = Arc::new(storage::PostgresMembershipStore::new(
+            pool.clone(),
+            &deployment_id,
+            identity,
+        ));
+        let jobs = cluster_maintenance::standard_jobs(cluster_maintenance::StandardJobSources {
+            pool: pool.clone(),
+            deployment_id: deployment_id.clone(),
+            rate_limit_keyring: keyring,
+            rate_limit_max_buckets: config.rate_limit_max_buckets,
+            rate_limit_idle: config.rate_limit_bucket_idle_ttl(),
+            membership: Arc::clone(&membership),
+            stale_window: config.cluster_member_stale_window(),
+            audit: Some(Arc::new(
+                storage::postgres_audit::PostgresAuditEventStore::new(pool.clone(), None),
+            )),
+            audit_retention: config.audit_postgres_retention(),
+            // The discovery projector's committed checkpoint is the
+            // retention floor: nothing it has not applied is ever trimmed.
+            audit_floor: Some(Arc::new(
+                storage::postgres_discovery::PostgresDiscoveryStore::new(pool.clone()),
+            )),
+            lease_holder: identity.instance_id(),
+            tool_lease_ttl: config.tool_lease_ttl(),
+        });
+        let runner = cluster_maintenance::MaintenanceRunner::new(
+            pool.clone(),
+            Arc::new(storage::PostgresExecutionLeaseStore::new(
+                pool,
+                &deployment_id,
+                identity.instance_id(),
+                config.cluster_maintenance_lease_ttl(),
+            )),
+            Arc::clone(&membership),
+            jobs,
+            config.cluster_maintenance_interval(),
+            identity.instance_id(),
+        );
+        let outcome = runner.run_once().await.map_err(|error| {
+            Box::<dyn std::error::Error>::from(format!("maintenance pass failed: {error}"))
+        })?;
+        match outcome {
+            cluster_maintenance::OnePassOutcome::LeaseHeld => {
+                return Err(
+                    "a live leader holds the maintenance lease; nothing ran (retry after CLUSTER_MAINTENANCE_LEASE_TTL_MS if it is dead)"
+                        .into(),
+                );
+            }
+            cluster_maintenance::OnePassOutcome::LeaseLost { fence } => {
+                return Err(format!(
+                    "the maintenance lease (fence {fence}) was lost mid-pass; the pass was cancelled"
+                )
+                .into());
+            }
+            cluster_maintenance::OnePassOutcome::Ran { fence, outcome } => {
+                let jobs = membership.maintenance_jobs().await.map_err(|error| {
+                    Box::<dyn std::error::Error>::from(format!(
+                        "maintenance ledger read failed: {error}"
+                    ))
+                })?;
+                for record in &jobs {
+                    println!(
+                        "job={} fence={} started={} success={} failure={} duration_ms={}",
+                        record.job,
+                        record.fence,
+                        record.last_started_at.as_deref().unwrap_or("-"),
+                        record.last_success_at.as_deref().unwrap_or("-"),
+                        record.last_failure_code.as_deref().unwrap_or("-"),
+                        record
+                            .last_duration_ms
+                            .map_or_else(|| "-".to_owned(), |ms| ms.to_string()),
+                    );
+                }
+                match outcome {
+                    cluster_maintenance::PassOutcome::Completed { failed_jobs: 0 } => {
+                        println!("maintenance pass completed: fence={fence}");
+                    }
+                    cluster_maintenance::PassOutcome::Completed { failed_jobs } => {
+                        return Err(format!(
+                            "maintenance pass completed with {failed_jobs} failing job(s): fence={fence}"
+                        )
+                        .into());
+                    }
+                    cluster_maintenance::PassOutcome::Skipped => {
+                        return Err(format!(
+                            "maintenance pass skipped: another session holds the maintenance advisory lock (fence={fence})"
+                        )
+                        .into());
+                    }
+                    cluster_maintenance::PassOutcome::Stale => {
+                        return Err(format!(
+                            "maintenance pass refused by the ledger fence: a successor holds a higher fence (fence={fence})"
+                        )
+                        .into());
+                    }
+                    cluster_maintenance::PassOutcome::ConnectionLost => {
+                        return Err(format!(
+                            "maintenance session lost mid-pass; the remaining jobs did not run (fence={fence})"
+                        )
+                        .into());
+                    }
+                }
+            }
+        }
+        return Ok(());
+    }
     #[cfg(not(feature = "postgres"))]
     if std::env::args_os().nth(1).is_some_and(|word| {
         word == *"revoke-jwt"
             || word == *"jwt-revocations-cleanup"
             || word == *"rate-limit-buckets-cleanup"
+            || word == *"cluster-members"
+            || word == *"maintenance-run"
     }) {
         return Err(
             "this gateway binary was built without the `postgres` cargo feature and \
-                    cannot run the JWT revocation or rate-limit maintenance commands; build with default features"
+                    cannot run the JWT revocation, rate-limit, or cluster maintenance commands; build with default features"
                 .into(),
         );
     }
@@ -2229,6 +2491,43 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         }
         _ => None,
     };
+    // Cluster membership (issue #241, PR 13): register this boot in the
+    // roster and run the first fingerprint-agreement check before the app
+    // is built. A disagreement is logged and leaves the replica unready
+    // (`/readyz` answers `config_fingerprint_mismatch`) until the members
+    // agree; only a row that cannot be written aborts startup.
+    #[cfg(feature = "postgres")]
+    let pg_membership_seed = match (&_database_foundation, &_ha_foundation) {
+        (Some(foundation), Some(ha_foundation)) => {
+            let deployment_id = config.deployment_id.clone().ok_or_else(|| {
+                Box::<dyn std::error::Error>::from(
+                    "STATE_BACKEND=postgres requires DEPLOYMENT_ID for the membership roster",
+                )
+            })?;
+            let store = storage::PostgresMembershipStore::new(
+                foundation.pool().clone(),
+                &deployment_id,
+                *ha_foundation.identity(),
+            );
+            let registration = storage::MemberRegistration {
+                binary_version: env!("CARGO_PKG_VERSION").to_owned(),
+                schema_version: storage::migrations::schema_version_range(),
+                document_version: cluster_membership::DOCUMENT_VERSION_RANGE,
+                fingerprint: ha_foundation.fingerprint().hex(),
+            };
+            let membership = cluster_membership::ClusterMembership::new(
+                store,
+                registration,
+                config.cluster_heartbeat_interval(),
+                config.cluster_member_stale_window(),
+            );
+            membership.register_boot().await.map_err(|error| {
+                Box::new(ClusterMembershipStartupError(error)) as Box<dyn std::error::Error>
+            })?;
+            Some(membership)
+        }
+        _ => None,
+    };
     // The durable audit store rides the foundation's pool; the SSE
     // endpoint reads committed events through it in cluster mode. Built
     // here, where both the pool and the replica identity exist, and handed
@@ -2307,6 +2606,10 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             pg_limits: pg_limits_seed,
             #[cfg(feature = "postgres")]
             pg_discovery: pg_discovery_seed,
+            #[cfg(feature = "postgres")]
+            pg_membership: pg_membership_seed,
+            #[cfg(test)]
+            cluster_readiness: None,
             #[cfg(test)]
             egress_resolver: None,
             #[cfg(test)]
@@ -3042,6 +3345,65 @@ fn gateway_app_with_process_started_at_and_overrides(
     if let Some(runtime) = cluster_security_runtime.as_ref() {
         runtime.spawn_poller(&lifecycle);
     }
+    // Cluster membership (issue #241, PR 13): the heartbeat task carries
+    // the security runtime's compiled/observed revisions, and the
+    // readiness gate it owns is what `/readyz` consults for fingerprint
+    // agreement. Standalone mode has neither.
+    #[cfg(feature = "postgres")]
+    let cluster_readiness: Option<Arc<ha::ClusterReadiness>> =
+        build_overrides.pg_membership.as_ref().map(|membership| {
+            membership.spawn_heartbeat(&lifecycle, cluster_security_runtime.clone());
+            membership.readiness()
+        });
+    #[cfg(not(feature = "postgres"))]
+    let cluster_readiness: Option<Arc<ha::ClusterReadiness>> = None;
+    #[cfg(test)]
+    let cluster_readiness = build_overrides
+        .cluster_readiness
+        .clone()
+        .or(cluster_readiness);
+    // The maintenance singleton (issue #241, PR 13): every cluster-mode
+    // replica runs the runner, and the one holding the `maintenance` lease
+    // runs the bounded housekeeping jobs under its fence. The lease store
+    // here carries the maintenance TTL, not the tool lease TTL.
+    #[cfg(feature = "postgres")]
+    if let (Some(membership), Some(seed)) = (
+        build_overrides.pg_membership.as_ref(),
+        build_overrides.pg_limits.as_ref(),
+    ) {
+        let jobs = cluster_maintenance::standard_jobs(cluster_maintenance::StandardJobSources {
+            pool: seed.pool.clone(),
+            deployment_id: seed.deployment_id.clone(),
+            rate_limit_keyring: seed.keyring.clone(),
+            rate_limit_max_buckets: config.rate_limit_max_buckets,
+            rate_limit_idle: config.rate_limit_bucket_idle_ttl(),
+            membership: membership.store(),
+            stale_window: config.cluster_member_stale_window(),
+            audit: build_overrides.pg_audit.clone(),
+            audit_retention: config.audit_postgres_retention(),
+            // The discovery projector's committed checkpoint is the
+            // retention floor: nothing it has not applied is ever trimmed.
+            audit_floor: Some(Arc::new(
+                storage::postgres_discovery::PostgresDiscoveryStore::new(seed.pool.clone()),
+            )),
+            lease_holder: seed.instance_id,
+            tool_lease_ttl: config.tool_lease_ttl(),
+        });
+        let runner = cluster_maintenance::MaintenanceRunner::new(
+            seed.pool.clone(),
+            Arc::new(storage::PostgresExecutionLeaseStore::new(
+                seed.pool.clone(),
+                &seed.deployment_id,
+                seed.instance_id,
+                config.cluster_maintenance_lease_ttl(),
+            )),
+            membership.store(),
+            jobs,
+            config.cluster_maintenance_interval(),
+            seed.instance_id,
+        );
+        runner.spawn(&lifecycle);
+    }
     let mcp_catalog_runtime = connection_control_plane
         .is_managed_store_configured()
         .then(|| mcp_catalog_service.runtime());
@@ -3218,6 +3580,7 @@ fn gateway_app_with_process_started_at_and_overrides(
         mcp: mcp_state,
         protected_resource_metadata,
         lifecycle,
+        cluster_readiness,
         _connections: connection_control_plane,
     };
     let audit_admin_state = AuditAdminState {
@@ -4610,6 +4973,16 @@ async fn readyz(State(state): State<AppState>) -> Response {
         } else {
             "starting"
         })
+    } else if let Some(reason) = state
+        .cluster_readiness
+        .as_ref()
+        .and_then(|readiness| readiness.blocked_reason())
+    {
+        // Cluster mode: a replica whose static configuration disagrees
+        // with a live member's is not ready however healthy it is locally
+        // (HA state model invariant 14). The membership heartbeat
+        // re-evaluates the gate and opens it once the members agree.
+        Some(reason)
     } else if state
         .proxy
         .as_ref()
@@ -13994,6 +14367,11 @@ mod tests {
             tool_runtime_global_concurrency: config::DEFAULT_TOOL_RUNTIME_GLOBAL_CONCURRENCY,
             tool_runtime_queue_timeout_ms: config::DEFAULT_TOOL_RUNTIME_QUEUE_TIMEOUT_MS,
             tool_lease_ttl_ms: config::DEFAULT_TOOL_LEASE_TTL_MS,
+            cluster_heartbeat_ms: config::DEFAULT_CLUSTER_HEARTBEAT_MS,
+            cluster_member_stale_ms: config::DEFAULT_CLUSTER_MEMBER_STALE_MS,
+            cluster_maintenance_interval_ms: config::DEFAULT_CLUSTER_MAINTENANCE_INTERVAL_MS,
+            cluster_maintenance_lease_ttl_ms: config::DEFAULT_CLUSTER_MAINTENANCE_LEASE_TTL_MS,
+            audit_postgres_retention_days: None,
             tool_runtime_default_timeout_ms: config::DEFAULT_TOOL_RUNTIME_DEFAULT_TIMEOUT_MS,
             csrf_enabled: true,
             csrf_cookie_name: "csrf_token".to_owned(),
@@ -21300,6 +21678,64 @@ mod tests {
             "probe path subtrees must be evaluated against policy before proxying",
         )
         .await;
+    }
+
+    /// Cluster mode's fingerprint gate (issue #241, PR 13): a replica that
+    /// is serving locally but has not yet found every live member on its
+    /// static-configuration fingerprint answers `503` with
+    /// `config_fingerprint_mismatch`, and is ready the moment the gate
+    /// records agreement. Liveness and startup are untouched by the gate.
+    #[tokio::test]
+    async fn readiness_is_refused_while_the_cluster_fingerprint_disagrees() {
+        let lifecycle = GatewayLifecycle::new();
+        let readiness = ha::ClusterReadiness::new();
+        let recorder = PrometheusBuilder::new().build_recorder();
+        let app = gateway_app_with_process_started_at_and_overrides(
+            test_config(Vec::new()),
+            recorder.handle(),
+            test_audit_log(),
+            test_audit_event_sender(),
+            Instant::now(),
+            GatewayAppBuildOverrides {
+                lifecycle: Some(lifecycle.clone()),
+                cluster_readiness: Some(readiness.clone()),
+                disable_proxy_health_checks: true,
+                ..GatewayAppBuildOverrides::default()
+            },
+        )
+        .expect("gateway app should build");
+        let router = match app.http {
+            GatewayApp::Unified(router) => router,
+            GatewayApp::Split { .. } => panic!("test app should be unified"),
+        };
+        lifecycle.mark_ready();
+
+        let probe = |path: &'static str| {
+            router.clone().oneshot(
+                Request::builder()
+                    .uri(path)
+                    .body(Body::empty())
+                    .expect("request should build"),
+            )
+        };
+        let response = probe("/readyz")
+            .await
+            .expect("readiness request should complete");
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let body = json_body(response).await;
+        assert_eq!(body["status"], "not_ready");
+        assert_eq!(body["reason"], "config_fingerprint_mismatch");
+        for path in ["/livez", "/startupz"] {
+            let response = probe(path).await.expect("probe request should complete");
+            assert_eq!(response.status(), StatusCode::OK, "{path} is not gated");
+        }
+
+        readiness.record_fingerprint_agreement();
+        let response = probe("/readyz")
+            .await
+            .expect("readiness request should complete");
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(json_body(response).await["status"], "ready");
     }
 
     #[tokio::test]

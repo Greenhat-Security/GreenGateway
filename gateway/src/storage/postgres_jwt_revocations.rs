@@ -296,6 +296,18 @@ impl PostgresJwtRevocationStore {
     /// membership PR. Returns how many rows were deleted.
     pub async fn cleanup_expired(&self, limit: usize) -> Result<u64, RepositoryError> {
         let client = self.pool.get().await.map_err(classify_pool_error)?;
+        self.cleanup_expired_with(&client, limit).await
+    }
+
+    /// [`Self::cleanup_expired`] over a connection the caller holds: the
+    /// maintenance singleton (issue #241, PR 13) runs its step on the
+    /// dedicated session that holds the maintenance advisory lock, so the
+    /// lock covers the statement itself.
+    pub(crate) async fn cleanup_expired_with(
+        &self,
+        client: &tokio_postgres::Client,
+        limit: usize,
+    ) -> Result<u64, RepositoryError> {
         let limit = i64::try_from(limit).unwrap_or(i64::MAX);
         client
             .execute(

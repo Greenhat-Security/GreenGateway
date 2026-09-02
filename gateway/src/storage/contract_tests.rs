@@ -6120,6 +6120,1961 @@ mod postgres_audit_tests {
             .expect("an empty request answers")
             .is_empty());
     }
+
+    // ------------------------------------------------------------------
+    // Cluster membership and the maintenance ledger (issue #241, PR 13)
+    // ------------------------------------------------------------------
+
+    use crate::cluster_membership::{ClusterMembership, FingerprintAgreement};
+    use crate::ha::InstanceIdentity;
+    use crate::storage::{
+        JobOutcome, MemberRegistration, MemberRevisions, PostgresMembershipStore,
+    };
+
+    const MEMBERS_DEPLOYMENT: &str = "deploy-members";
+
+    fn registration(fingerprint_byte: char) -> MemberRegistration {
+        MemberRegistration {
+            binary_version: env!("CARGO_PKG_VERSION").to_owned(),
+            schema_version: migrations::schema_version_range(),
+            document_version: crate::cluster_membership::DOCUMENT_VERSION_RANGE,
+            fingerprint: std::iter::repeat_n(fingerprint_byte, 64).collect(),
+        }
+    }
+
+    fn member_store(pool: &deadpool_postgres::Pool) -> PostgresMembershipStore {
+        PostgresMembershipStore::new(
+            pool.clone(),
+            MEMBERS_DEPLOYMENT,
+            InstanceIdentity::generate(),
+        )
+    }
+
+    /// Move a member's heartbeat into the past on the database clock, as
+    /// a partitioned or crashed replica's row would look.
+    async fn backdate_heartbeat(
+        pool: &deadpool_postgres::Pool,
+        instance_id: uuid::Uuid,
+        seconds: f64,
+    ) {
+        let client = pool.get().await.expect("client");
+        let updated = client
+            .execute(
+                "UPDATE greengateway.cluster_members
+                 SET last_heartbeat_at = now() - make_interval(secs => $2::double precision)
+                 WHERE instance_id = $1::text::uuid",
+                &[&instance_id.to_string(), &seconds],
+            )
+            .await
+            .expect("backdate");
+        assert_eq!(updated, 1, "the member row exists to backdate");
+    }
+
+    /// Heartbeats create the row with the registration, refresh it with
+    /// the revisions and the carried error code, and the ready/draining
+    /// stamps are written once and count as heartbeats. Deployments never
+    /// see each other's rows, and a malformed fingerprint is refused
+    /// before it reaches the schema's check.
+    #[tokio::test]
+    async fn heartbeats_appear_update_and_carry_the_lifecycle_stamps() {
+        let Some(admin_dsn) = locator() else {
+            eprintln!("skipping: no test database locator; CI runs this test");
+            return;
+        };
+        let _guard = DATABASE.lock().await;
+        let database = create_test_database(&admin_dsn).await;
+        let pool = migrated_limits_pool(&database).await;
+        let store = member_store(&pool);
+        let registration = registration('a');
+        let window = Duration::from_secs(30);
+
+        store
+            .heartbeat(&registration, MemberRevisions::default(), None)
+            .await
+            .expect("boot heartbeat");
+        let members = store.members(window).await.expect("members");
+        assert_eq!(members.len(), 1);
+        let first = &members[0];
+        assert_eq!(first.instance_id, store.instance_id());
+        assert!(first.live);
+        assert_eq!(first.fingerprint, registration.fingerprint);
+        assert_eq!(first.binary_version, env!("CARGO_PKG_VERSION"));
+        assert_eq!(
+            (first.schema_version_min, first.schema_version_max),
+            migrations::schema_version_range()
+        );
+        assert_eq!(
+            (first.document_version_min, first.document_version_max),
+            (0, 0)
+        );
+        assert_eq!(first.compiled_security_revision, 0);
+        assert_eq!(first.observed_security_revision, 0);
+        assert!(first.ready_at.is_none() && first.draining_at.is_none());
+        assert!(first.last_error_code.is_none());
+        assert!(first.heartbeat_age_secs < 30.0);
+
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        store
+            .heartbeat(
+                &registration,
+                MemberRevisions {
+                    compiled: 3,
+                    observed: 5,
+                },
+                Some("unavailable"),
+            )
+            .await
+            .expect("second heartbeat");
+        let members = store.members(window).await.expect("members");
+        assert_eq!(members.len(), 1, "a heartbeat refreshes, never duplicates");
+        let second = &members[0];
+        assert_eq!(second.started_at, first.started_at, "boot time is kept");
+        assert!(
+            second.last_heartbeat_at > first.last_heartbeat_at,
+            "the heartbeat moved forward: {} -> {}",
+            first.last_heartbeat_at,
+            second.last_heartbeat_at
+        );
+        assert_eq!(second.compiled_security_revision, 3);
+        assert_eq!(second.observed_security_revision, 5);
+        assert_eq!(second.last_error_code.as_deref(), Some("unavailable"));
+
+        store.mark_ready().await.expect("ready stamp");
+        let ready_at = store.members(window).await.expect("members")[0]
+            .ready_at
+            .clone()
+            .expect("ready_at is stamped");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        store.mark_ready().await.expect("repeat ready stamp");
+        store.mark_draining().await.expect("draining stamp");
+        let stamped = store.members(window).await.expect("members");
+        assert_eq!(
+            stamped[0].ready_at.as_deref(),
+            Some(ready_at.as_str()),
+            "the first ready instant is kept"
+        );
+        assert!(stamped[0].draining_at.is_some());
+        assert!(
+            stamped[0].last_heartbeat_at > second.last_heartbeat_at,
+            "a stamp counts as a heartbeat"
+        );
+
+        let other_deployment = PostgresMembershipStore::new(
+            pool.clone(),
+            "deploy-elsewhere",
+            InstanceIdentity::generate(),
+        );
+        assert!(
+            other_deployment
+                .members(window)
+                .await
+                .expect("members")
+                .is_empty(),
+            "deployments never see each other's rosters"
+        );
+
+        let mut malformed = registration.clone();
+        malformed.fingerprint = "not-hex".to_owned();
+        let error = store
+            .heartbeat(&malformed, MemberRevisions::default(), None)
+            .await
+            .expect_err("a malformed fingerprint is refused");
+        assert_eq!(error.kind(), RepositoryErrorKind::InvalidData);
+    }
+
+    /// A member that stops heartbeating is live until the window passes
+    /// on the database clock, reported stale after it, and swept only by
+    /// the singleton's sweep -- bounded per call, oldest first, and never
+    /// touching a live row.
+    #[tokio::test]
+    async fn stale_members_are_swept_only_after_the_window() {
+        let Some(admin_dsn) = locator() else {
+            eprintln!("skipping: no test database locator; CI runs this test");
+            return;
+        };
+        let _guard = DATABASE.lock().await;
+        let database = create_test_database(&admin_dsn).await;
+        let pool = migrated_limits_pool(&database).await;
+        let live = member_store(&pool);
+        let silent = member_store(&pool);
+        let older = member_store(&pool);
+        for store in [&live, &silent, &older] {
+            store
+                .heartbeat(&registration('a'), MemberRevisions::default(), None)
+                .await
+                .expect("heartbeat");
+        }
+        backdate_heartbeat(&pool, silent.instance_id(), 10.0).await;
+        backdate_heartbeat(&pool, older.instance_id(), 40.0).await;
+
+        let wide = Duration::from_secs(60);
+        let narrow = Duration::from_secs(5);
+        let by_id = |members: Vec<crate::storage::ClusterMember>| {
+            members
+                .into_iter()
+                .map(|member| (member.instance_id, member.live))
+                .collect::<std::collections::HashMap<_, _>>()
+        };
+        let within_wide = by_id(live.members(wide).await.expect("members"));
+        assert_eq!(within_wide.len(), 3);
+        assert!(
+            within_wide.values().all(|live| *live),
+            "inside the window everyone is live"
+        );
+        let within_narrow = by_id(live.members(narrow).await.expect("members"));
+        assert!(within_narrow[&live.instance_id()]);
+        assert!(!within_narrow[&silent.instance_id()]);
+        assert!(!within_narrow[&older.instance_id()]);
+
+        assert_eq!(
+            live.sweep_stale(wide, 10).await.expect("sweep"),
+            0,
+            "nothing is stale inside the wide window"
+        );
+        assert_eq!(
+            live.sweep_stale(narrow, 1).await.expect("sweep"),
+            1,
+            "the sweep is bounded per call"
+        );
+        let after_one = by_id(live.members(wide).await.expect("members"));
+        assert!(
+            !after_one.contains_key(&older.instance_id()),
+            "the oldest heartbeat goes first"
+        );
+        assert!(after_one.contains_key(&silent.instance_id()));
+        assert_eq!(live.sweep_stale(narrow, 10).await.expect("sweep"), 1);
+        let remaining = live.members(wide).await.expect("members");
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(
+            remaining[0].instance_id,
+            live.instance_id(),
+            "a live row is never swept"
+        );
+        assert_eq!(live.sweep_stale(narrow, 10).await.expect("sweep"), 0);
+    }
+
+    /// The fingerprint gate: a lone replica agrees with itself; a second
+    /// replica with another fingerprint is refused readiness while the
+    /// first is live and not draining, and admitted once it drains or
+    /// goes stale; a replica with the same fingerprint as every live
+    /// member is admitted at once; and agreement, once granted, is not
+    /// revoked by a later mismatched arrival.
+    #[tokio::test]
+    async fn readiness_is_refused_on_fingerprint_mismatch_and_granted_on_agreement() {
+        let Some(admin_dsn) = locator() else {
+            eprintln!("skipping: no test database locator; CI runs this test");
+            return;
+        };
+        let _guard = DATABASE.lock().await;
+        let database = create_test_database(&admin_dsn).await;
+        let pool = migrated_limits_pool(&database).await;
+        let heartbeat = Duration::from_secs(1);
+        let window = Duration::from_secs(30);
+
+        let first_store = member_store(&pool);
+        let first_id = first_store.instance_id();
+        let first =
+            ClusterMembership::new(first_store.clone(), registration('a'), heartbeat, window);
+        assert_eq!(
+            first.register_boot().await.expect("boot"),
+            FingerprintAgreement::Agreed,
+            "a lone replica agrees with itself"
+        );
+        assert_eq!(first.readiness().blocked_reason(), None);
+
+        let second_store = member_store(&pool);
+        let second_id = second_store.instance_id();
+        let second =
+            ClusterMembership::new(second_store.clone(), registration('b'), heartbeat, window);
+        assert_eq!(
+            second.register_boot().await.expect("boot"),
+            FingerprintAgreement::Disagreeing(vec![first_id]),
+            "the live member with another fingerprint is named"
+        );
+        assert_eq!(
+            second.readiness().blocked_reason(),
+            Some("config_fingerprint_mismatch")
+        );
+        assert_eq!(
+            second.check_fingerprint_agreement().await.expect("check"),
+            FingerprintAgreement::Disagreeing(vec![first_id]),
+            "the refusal holds while the member is live"
+        );
+        assert_eq!(
+            first.check_fingerprint_agreement().await.expect("check"),
+            FingerprintAgreement::Agreed,
+            "agreement is sticky: the serving replica is not taken out by the newcomer"
+        );
+
+        let same_store = member_store(&pool);
+        let same_id = same_store.instance_id();
+        let same = ClusterMembership::new(same_store, registration('a'), heartbeat, window);
+        assert_eq!(
+            same.register_boot().await.expect("boot"),
+            FingerprintAgreement::Disagreeing(vec![second_id]),
+            "the mismatched newcomer blocks a later replica on the first's fingerprint too"
+        );
+
+        first_store.mark_draining().await.expect("drain");
+        assert_eq!(
+            second.check_fingerprint_agreement().await.expect("check"),
+            FingerprintAgreement::Disagreeing(vec![same_id]),
+            "a draining member no longer blocks; a live one on the old fingerprint still does"
+        );
+        backdate_heartbeat(&pool, same_id, 60.0).await;
+        assert_eq!(
+            second.check_fingerprint_agreement().await.expect("check"),
+            FingerprintAgreement::Agreed,
+            "a stale member no longer blocks"
+        );
+        assert_eq!(second.readiness().blocked_reason(), None);
+
+        let third_store = member_store(&pool);
+        let third = ClusterMembership::new(third_store, registration('c'), heartbeat, window);
+        assert_eq!(
+            third.register_boot().await.expect("boot"),
+            FingerprintAgreement::Disagreeing(vec![second_id]),
+            "only the live, non-draining member with another fingerprint blocks"
+        );
+        backdate_heartbeat(&pool, second_id, 60.0).await;
+        assert_eq!(
+            third.check_fingerprint_agreement().await.expect("check"),
+            FingerprintAgreement::Agreed,
+            "a stale member no longer blocks"
+        );
+
+        let fourth_store = member_store(&pool);
+        let fourth = ClusterMembership::new(fourth_store, registration('c'), heartbeat, window);
+        assert_eq!(
+            fourth.register_boot().await.expect("boot"),
+            FingerprintAgreement::Agreed,
+            "the same fingerprint as every live member is admitted at once"
+        );
+    }
+
+    /// A swept row comes back as the same boot: a replica partitioned past
+    /// the stale window has its row swept by the singleton; when it
+    /// reconnects, its next heartbeat re-creates the row with the
+    /// `started_at` and `ready_at` the database rendered the first time,
+    /// not as a fresh, unready boot -- and the ready stamp stays
+    /// idempotent afterwards.
+    #[tokio::test]
+    async fn a_swept_member_that_reconnects_keeps_its_boot_and_ready_instants() {
+        let Some(admin_dsn) = locator() else {
+            eprintln!("skipping: no test database locator; CI runs this test");
+            return;
+        };
+        let _guard = DATABASE.lock().await;
+        let database = create_test_database(&admin_dsn).await;
+        let pool = migrated_limits_pool(&database).await;
+        let window = Duration::from_secs(30);
+        let store = member_store(&pool);
+        store
+            .heartbeat(&registration('a'), MemberRevisions::default(), None)
+            .await
+            .expect("heartbeat");
+        store.mark_ready().await.expect("ready");
+        let before = store.members(window).await.expect("members");
+        assert_eq!(before.len(), 1);
+        let before = before[0].clone();
+        assert!(before.ready_at.is_some(), "the ready stamp landed");
+
+        // Partitioned past the window: the singleton sweeps the row.
+        backdate_heartbeat(&pool, store.instance_id(), 60.0).await;
+        assert_eq!(store.sweep_stale(window, 10).await.expect("sweep"), 1);
+        assert!(store.members(window).await.expect("members").is_empty());
+
+        // Reconnected: the next heartbeat is the same boot, still ready.
+        store
+            .heartbeat(
+                &registration('a'),
+                MemberRevisions {
+                    compiled: 3,
+                    observed: 4,
+                },
+                None,
+            )
+            .await
+            .expect("heartbeat");
+        let after = store.members(window).await.expect("members");
+        assert_eq!(after.len(), 1);
+        let after = &after[0];
+        assert!(after.live);
+        assert_eq!(after.instance_id, before.instance_id);
+        assert_eq!(after.boot_id, before.boot_id);
+        assert_eq!(
+            after.started_at, before.started_at,
+            "the boot instant survives the sweep"
+        );
+        assert_eq!(
+            after.ready_at, before.ready_at,
+            "the ready instant survives the sweep"
+        );
+        assert_eq!(after.compiled_security_revision, 3);
+        assert_eq!(after.observed_security_revision, 4);
+
+        // A clone of the store is the same replica and remembers the same
+        // instants; a repeat of the ready stamp keeps the first one.
+        let clone = store.clone();
+        clone.mark_ready().await.expect("ready");
+        backdate_heartbeat(&pool, store.instance_id(), 60.0).await;
+        assert_eq!(clone.sweep_stale(window, 10).await.expect("sweep"), 1);
+        clone
+            .heartbeat(&registration('a'), MemberRevisions::default(), None)
+            .await
+            .expect("heartbeat");
+        let again = store.members(window).await.expect("members");
+        assert_eq!(again[0].started_at, before.started_at);
+        assert_eq!(again[0].ready_at, before.ready_at);
+    }
+
+    /// The maintenance ledger's write predicate: a leader adopts the rows
+    /// at its lease fence and writes under it while its lease is live; its
+    /// writes are refused from the instant the lease lapses -- before any
+    /// successor has acquired, and before one that has adopts the rows --
+    /// and a successor adopts at a higher fence; the stale leader's late
+    /// writes (start, outcome, re-adoption) match no row and change
+    /// nothing. A fence no lease carries adopts nothing at all.
+    #[tokio::test]
+    async fn maintenance_job_writes_are_refused_by_the_fence() {
+        let Some(admin_dsn) = locator() else {
+            eprintln!("skipping: no test database locator; CI runs this test");
+            return;
+        };
+        let _guard = DATABASE.lock().await;
+        let database = create_test_database(&admin_dsn).await;
+        let pool = migrated_limits_pool(&database).await;
+        let store = member_store(&pool);
+        let jobs = ["alpha", "beta"];
+        let ttl = Duration::from_secs(30);
+        let leases_a = maintenance_leases(&pool, uuid::Uuid::new_v4(), ttl);
+        let leases_b = maintenance_leases(&pool, uuid::Uuid::new_v4(), ttl);
+        let acquired = |attempt: LeaseAttempt| match attempt {
+            LeaseAttempt::Acquired(lease) => lease,
+            LeaseAttempt::Full => panic!("expected the maintenance slot free"),
+        };
+
+        assert!(
+            !store.adopt_jobs(&jobs, 5).await.expect("adopt"),
+            "a fence no live lease carries adopts nothing"
+        );
+        assert!(store.maintenance_jobs().await.expect("records").is_empty());
+
+        let lease_a = acquired(
+            leases_a
+                .try_acquire(MAINTENANCE_SCOPE, 1, "a")
+                .await
+                .expect("acquire"),
+        );
+        let fence_a = lease_a.fence;
+        assert!(store.adopt_jobs(&jobs, fence_a).await.expect("adopt"));
+        assert!(store
+            .record_job_started("alpha", fence_a)
+            .await
+            .expect("start"));
+        assert!(store
+            .record_job_outcome("alpha", fence_a, &JobOutcome::Success { duration_ms: 12 })
+            .await
+            .expect("outcome"));
+        let records = store.maintenance_jobs().await.expect("records");
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[0].job, "alpha");
+        assert_eq!(records[0].fence, fence_a);
+        assert!(records[0].last_started_at.is_some());
+        assert!(records[0].last_success_at.is_some());
+        assert_eq!(records[0].last_failure_code, None);
+        assert_eq!(records[0].last_duration_ms, Some(12));
+        assert_eq!(records[1].job, "beta");
+        assert_eq!(records[1].fence, fence_a);
+        assert!(records[1].last_started_at.is_none());
+
+        // The holder's lease lapses on the database clock (it stopped
+        // renewing) while the rows still carry its fence and nobody has
+        // taken the slot: its writes are already refused.
+        let client = pool.get().await.expect("client");
+        assert_eq!(
+            client
+                .execute(
+                    "UPDATE greengateway.execution_leases
+                     SET expires_at = now() - interval '1 second'
+                     WHERE fence = $1",
+                    &[&fence_a],
+                )
+                .await
+                .expect("lapse"),
+            1
+        );
+        assert!(
+            !leases_a.is_current(&lease_a).await.expect("check"),
+            "the lease lapsed"
+        );
+        assert!(
+            !store
+                .record_job_started("alpha", fence_a)
+                .await
+                .expect("start"),
+            "a lapsed lease refuses the start though the row still carries its fence"
+        );
+        assert!(
+            !store
+                .record_job_outcome(
+                    "alpha",
+                    fence_a,
+                    &JobOutcome::Failure {
+                        code: "timeout".to_owned(),
+                        duration_ms: 99,
+                    },
+                )
+                .await
+                .expect("outcome"),
+            "a lapsed lease refuses the outcome though the row still carries its fence"
+        );
+        assert!(
+            !store.adopt_jobs(&jobs, fence_a).await.expect("adopt"),
+            "a lapsed lease cannot re-adopt at its own fence"
+        );
+        let held = store.maintenance_jobs().await.expect("records");
+        assert_eq!(held[0].fence, fence_a, "the rows are untouched");
+        assert_eq!(held[0].last_failure_code, None);
+        assert_eq!(held[0].last_started_at, records[0].last_started_at);
+
+        let lease_b = acquired(
+            leases_b
+                .try_acquire(MAINTENANCE_SCOPE, 1, "b")
+                .await
+                .expect("acquire"),
+        );
+        let fence_b = lease_b.fence;
+        assert!(fence_b > fence_a);
+        assert!(
+            !store
+                .record_job_started("alpha", fence_a)
+                .await
+                .expect("start"),
+            "still refused once a successor holds the slot but has not adopted"
+        );
+        assert!(
+            !store
+                .record_job_started("alpha", fence_b)
+                .await
+                .expect("start"),
+            "a live holder that has not adopted the rows cannot write them either"
+        );
+        assert!(
+            !store
+                .record_job_outcome("alpha", fence_b, &JobOutcome::Success { duration_ms: 1 })
+                .await
+                .expect("outcome"),
+            "nor record an outcome on rows it has not adopted"
+        );
+        assert!(
+            store.adopt_jobs(&jobs, fence_b).await.expect("adopt"),
+            "a successor adopts at a higher fence"
+        );
+        assert!(
+            !store
+                .record_job_started("alpha", fence_a)
+                .await
+                .expect("start"),
+            "the stale leader's start is refused"
+        );
+        assert!(
+            !store
+                .record_job_outcome(
+                    "alpha",
+                    fence_a,
+                    &JobOutcome::Failure {
+                        code: "timeout".to_owned(),
+                        duration_ms: 99,
+                    },
+                )
+                .await
+                .expect("outcome"),
+            "the stale leader's outcome is refused"
+        );
+        assert!(
+            !store.adopt_jobs(&jobs, fence_a).await.expect("adopt"),
+            "the stale leader cannot lower the fence"
+        );
+        let unchanged = store.maintenance_jobs().await.expect("records");
+        assert_eq!(unchanged[0].fence, fence_b);
+        assert_eq!(unchanged[0].last_failure_code, None);
+        assert_eq!(unchanged[0].last_duration_ms, Some(12));
+        assert_eq!(unchanged[0].last_success_at, records[0].last_success_at);
+
+        assert!(store
+            .record_job_outcome(
+                "beta",
+                fence_b,
+                &JobOutcome::Failure {
+                    code: "unavailable".to_owned(),
+                    duration_ms: 3,
+                },
+            )
+            .await
+            .expect("outcome"));
+        assert!(
+            store.adopt_jobs(&["alpha"], fence_b).await.expect("adopt"),
+            "the holder re-adopts at its own fence"
+        );
+        let after = store.maintenance_jobs().await.expect("records");
+        assert_eq!(after[1].fence, fence_b);
+        assert_eq!(after[1].last_failure_code.as_deref(), Some("unavailable"));
+        assert_eq!(after[1].last_success_at, None);
+        assert_eq!(after[1].last_duration_ms, Some(3));
+
+        // A row carried past the holder's fence (a later adoption whose
+        // lease has since gone) is never pulled back down, even by a live
+        // holder: adoption raises fences only.
+        assert_eq!(
+            client
+                .execute(
+                    "UPDATE greengateway.maintenance_jobs SET fence = fence + 1000 WHERE job = 'beta'",
+                    &[],
+                )
+                .await
+                .expect("advance"),
+            1
+        );
+        assert!(
+            !store.adopt_jobs(&jobs, fence_b).await.expect("adopt"),
+            "a live holder never lowers a row's fence"
+        );
+        let raised = store.maintenance_jobs().await.expect("records");
+        assert_eq!(
+            raised[0].fence, fence_b,
+            "alpha re-adopted at the holder's fence"
+        );
+        assert_eq!(
+            raised[1].fence,
+            fence_b + 1000,
+            "beta kept the higher fence"
+        );
+        leases_b.release(&lease_b).await.expect("release");
+    }
+
+    // ------------------------------------------------------------------
+    // The maintenance singleton (issue #241, PR 13, sections 4 and 5)
+    // ------------------------------------------------------------------
+
+    use crate::cluster_maintenance::{
+        AuditRetention, AuditRetentionFloor, ExecutionLeaseReaper, JwtRevocationCleanup,
+        MaintenanceJob, MaintenanceRunner, OnePassOutcome, PassOutcome, PendingLoginPrune,
+        RateLimitIdleSweep, StaleMemberSweep, MAINTENANCE_LOCK_KEY, MAINTENANCE_SCOPE,
+    };
+    use crate::storage::DedicatedSession;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    /// A job that counts its runs and can be told to fail, so a pass is
+    /// observable without touching a real table.
+    struct CountingJob {
+        runs: Arc<AtomicU64>,
+        fail: bool,
+    }
+
+    #[async_trait::async_trait]
+    impl MaintenanceJob for CountingJob {
+        fn name(&self) -> &'static str {
+            "counting"
+        }
+
+        async fn run_step(&self, _client: &tokio_postgres::Client) -> Result<u64, RepositoryError> {
+            self.runs.fetch_add(1, Ordering::SeqCst);
+            if self.fail {
+                Err(RepositoryError::new(
+                    RepositoryErrorKind::Unavailable,
+                    "counting_job",
+                ))
+            } else {
+                Ok(1)
+            }
+        }
+    }
+
+    /// A job whose step is one long statement on the connection it is
+    /// handed, so a test can see which backend runs it and cut it short.
+    struct SleepingJob {
+        secs: f64,
+    }
+
+    #[async_trait::async_trait]
+    impl MaintenanceJob for SleepingJob {
+        fn name(&self) -> &'static str {
+            "sleeping"
+        }
+
+        async fn run_step(&self, client: &tokio_postgres::Client) -> Result<u64, RepositoryError> {
+            client
+                .execute("SELECT pg_sleep($1::double precision)", &[&self.secs])
+                .await
+                .map(|_| 1)
+                .map_err(|_| RepositoryError::new(RepositoryErrorKind::Unavailable, "sleeping_job"))
+        }
+    }
+
+    /// Run one job step over a pooled connection, as the runner would over
+    /// its session.
+    async fn step(job: &dyn MaintenanceJob, pool: &deadpool_postgres::Pool) -> u64 {
+        let client = pool.get().await.expect("client");
+        job.run_step(&client).await.expect("step")
+    }
+
+    struct FixedFloor(Option<i64>);
+
+    #[async_trait::async_trait]
+    impl AuditRetentionFloor for FixedFloor {
+        async fn durably_consumed_position(&self) -> Result<Option<i64>, RepositoryError> {
+            Ok(self.0)
+        }
+    }
+
+    fn maintenance_leases(
+        pool: &deadpool_postgres::Pool,
+        holder: uuid::Uuid,
+        ttl: Duration,
+    ) -> Arc<dyn ExecutionLeaseStore> {
+        Arc::new(PostgresExecutionLeaseStore::new(
+            pool.clone(),
+            MEMBERS_DEPLOYMENT,
+            holder,
+            ttl,
+        ))
+    }
+
+    fn runner_with(
+        pool: &deadpool_postgres::Pool,
+        ledger: &Arc<PostgresMembershipStore>,
+        jobs: Vec<Arc<dyn MaintenanceJob>>,
+        interval: Duration,
+        ttl: Duration,
+    ) -> (Arc<MaintenanceRunner>, Arc<dyn ExecutionLeaseStore>) {
+        let holder = uuid::Uuid::new_v4();
+        let leases = maintenance_leases(pool, holder, ttl);
+        let runner = MaintenanceRunner::new(
+            pool.clone(),
+            Arc::clone(&leases),
+            Arc::clone(ledger),
+            jobs,
+            interval,
+            holder,
+        );
+        (runner, leases)
+    }
+
+    async fn wait_until(deadline: Duration, mut condition: impl FnMut() -> bool) -> bool {
+        let started = std::time::Instant::now();
+        while started.elapsed() < deadline {
+            if condition() {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(15)).await;
+        }
+        condition()
+    }
+
+    async fn scalar_count(pool: &deadpool_postgres::Pool, sql: &str) -> i64 {
+        let client = pool.get().await.expect("client");
+        client.query_one(sql, &[]).await.expect("count").get(0)
+    }
+
+    /// Exactly one of two runtimes holds the maintenance lease and runs
+    /// the jobs under its fence; when the holder dies without releasing,
+    /// the other takes over only after the TTL lapses on the database
+    /// clock (plus its jittered backoff), adopts the ledger at a higher
+    /// fence, and runs; a drained leader releases at once so the slot is
+    /// free without waiting for the TTL.
+    #[tokio::test]
+    async fn the_maintenance_lease_is_held_by_one_runtime_and_fails_over_with_jitter() {
+        let Some(admin_dsn) = locator() else {
+            eprintln!("skipping: no test database locator; CI runs this test");
+            return;
+        };
+        let _guard = DATABASE.lock().await;
+        let database = create_test_database(&admin_dsn).await;
+        let pool = migrated_limits_pool(&database).await;
+        let ledger = Arc::new(member_store(&pool));
+        let ttl = Duration::from_millis(900);
+        let interval = Duration::from_millis(200);
+        let runs_a = Arc::new(AtomicU64::new(0));
+        let runs_b = Arc::new(AtomicU64::new(0));
+        let job = |runs: &Arc<AtomicU64>| -> Vec<Arc<dyn MaintenanceJob>> {
+            vec![Arc::new(CountingJob {
+                runs: Arc::clone(runs),
+                fail: false,
+            })]
+        };
+        let (runner_a, _leases_a) = runner_with(&pool, &ledger, job(&runs_a), interval, ttl);
+        let (runner_b, _leases_b) = runner_with(&pool, &ledger, job(&runs_b), interval, ttl);
+        let backoff_b = runner_b.acquisition_backoff();
+        assert!(
+            backoff_b >= interval / 8 && backoff_b <= interval * 3 / 8,
+            "the backoff is jittered inside [interval/8, 3*interval/8]: {backoff_b:?}"
+        );
+
+        let cancel_a = CancellationToken::new();
+        let task_a = tokio::spawn(Arc::clone(&runner_a).serve(cancel_a.clone()));
+        assert!(
+            wait_until(Duration::from_secs(5), || runner_a.is_leading()).await,
+            "the first runtime takes the free lease"
+        );
+        let cancel_b = CancellationToken::new();
+        let task_b = tokio::spawn(Arc::clone(&runner_b).serve(cancel_b.clone()));
+        // Several backoffs' worth of attempts by B: it never gets the slot
+        // while A renews, and A keeps running passes on its interval.
+        tokio::time::sleep(backoff_b * 4 + interval * 2).await;
+        assert!(runner_a.is_leading());
+        assert!(!runner_b.is_leading(), "only one runtime leads");
+        assert!(
+            runner_a.passes_completed() >= 2,
+            "the leader runs a pass at once and then every interval: {}",
+            runner_a.passes_completed()
+        );
+        assert_eq!(
+            runs_b.load(Ordering::SeqCst),
+            0,
+            "the follower runs nothing"
+        );
+        let records = ledger.maintenance_jobs().await.expect("ledger");
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].job, "counting");
+        let fence_a = records[0].fence;
+        assert!(records[0].last_success_at.is_some());
+        assert_eq!(records[0].last_failure_code, None);
+
+        // A dies without releasing: its task is aborted, so it stops
+        // renewing. B may not take over before the TTL lapses.
+        task_a.abort();
+        let _ = task_a.await;
+        let runs_a_at_death = runs_a.load(Ordering::SeqCst);
+        tokio::time::sleep(ttl / 3).await;
+        assert!(
+            !runner_b.is_leading(),
+            "the slot is not free before the TTL lapses on the database clock"
+        );
+        assert!(
+            wait_until(ttl * 3, || runner_b.is_leading()).await,
+            "the survivor takes over after the TTL and its backoff"
+        );
+        assert!(
+            wait_until(Duration::from_secs(5), || runner_b.passes_completed() >= 1).await,
+            "the new leader runs a pass"
+        );
+        assert!(runs_b.load(Ordering::SeqCst) >= 1);
+        assert_eq!(
+            runs_a.load(Ordering::SeqCst),
+            runs_a_at_death,
+            "the dead leader ran nothing more"
+        );
+        let records = ledger.maintenance_jobs().await.expect("ledger");
+        assert!(
+            records[0].fence > fence_a,
+            "the successor adopted the ledger at a higher fence: {} > {fence_a}",
+            records[0].fence
+        );
+
+        // Draining B releases the lease at once: a third acquirer finds
+        // the slot free without waiting for the TTL.
+        cancel_b.cancel();
+        let _ = task_b.await;
+        assert!(!runner_b.is_leading());
+        let third = maintenance_leases(&pool, uuid::Uuid::new_v4(), ttl);
+        assert!(
+            matches!(
+                third
+                    .try_acquire(MAINTENANCE_SCOPE, 1, "test")
+                    .await
+                    .expect("acquire"),
+                LeaseAttempt::Acquired(_)
+            ),
+            "a drained leader's slot is free at once"
+        );
+        cancel_a.cancel();
+    }
+
+    /// The classic stale-leader test at the pass level: the holder runs a
+    /// pass, is paused past its TTL (no renewals), a successor takes the
+    /// lease and adopts the ledger at a higher fence, and the resumed
+    /// holder's pass is refused by the fence before any job runs -- its
+    /// late writes never land. A failing job is recorded with its
+    /// classified code and does not block the next job.
+    #[tokio::test]
+    async fn a_stale_leaders_pass_is_refused_by_the_fence() {
+        let Some(admin_dsn) = locator() else {
+            eprintln!("skipping: no test database locator; CI runs this test");
+            return;
+        };
+        let _guard = DATABASE.lock().await;
+        let database = create_test_database(&admin_dsn).await;
+        let pool = migrated_limits_pool(&database).await;
+        let ledger = Arc::new(member_store(&pool));
+        let ttl = Duration::from_millis(500);
+        let interval = Duration::from_secs(60);
+        let runs_a = Arc::new(AtomicU64::new(0));
+        let runs_b = Arc::new(AtomicU64::new(0));
+        let (runner_a, leases_a) = runner_with(
+            &pool,
+            &ledger,
+            vec![Arc::new(CountingJob {
+                runs: Arc::clone(&runs_a),
+                fail: false,
+            })],
+            interval,
+            ttl,
+        );
+        let (runner_b, leases_b) = runner_with(
+            &pool,
+            &ledger,
+            vec![Arc::new(CountingJob {
+                runs: Arc::clone(&runs_b),
+                fail: true,
+            })],
+            interval,
+            ttl,
+        );
+        let acquired = |attempt: LeaseAttempt| match attempt {
+            LeaseAttempt::Acquired(lease) => lease,
+            LeaseAttempt::Full => panic!("expected the maintenance slot free"),
+        };
+
+        let lease_a = acquired(
+            leases_a
+                .try_acquire(MAINTENANCE_SCOPE, 1, "a")
+                .await
+                .expect("acquire"),
+        );
+        assert!(ledger
+            .adopt_jobs(&runner_a.job_names(), lease_a.fence)
+            .await
+            .expect("adopt"));
+        assert_eq!(
+            runner_a.run_pass(lease_a.fence).await,
+            PassOutcome::Completed { failed_jobs: 0 }
+        );
+        assert_eq!(runs_a.load(Ordering::SeqCst), 1);
+        let before = ledger.maintenance_jobs().await.expect("ledger");
+        assert_eq!(before[0].fence, lease_a.fence);
+        let first_success = before[0].last_success_at.clone().expect("stamped");
+
+        // A pauses past its TTL. Nobody renews.
+        tokio::time::sleep(ttl + Duration::from_millis(300)).await;
+        assert!(
+            !leases_a.is_current(&lease_a).await.expect("check"),
+            "the paused holder's lease lapsed"
+        );
+        // A resumes before anyone has taken the slot: the rows still carry
+        // its fence, but the lease behind it is gone, and its pass is
+        // refused before any job runs.
+        assert!(
+            !ledger
+                .record_job_started("counting", lease_a.fence)
+                .await
+                .expect("start"),
+            "a lapsed lease refuses the write before any successor exists"
+        );
+        assert_eq!(
+            runner_a.run_pass(lease_a.fence).await,
+            PassOutcome::Stale,
+            "the lapsed leader's pass is refused before any successor exists"
+        );
+        assert_eq!(runs_a.load(Ordering::SeqCst), 1);
+        let lease_b = acquired(
+            leases_b
+                .try_acquire(MAINTENANCE_SCOPE, 1, "b")
+                .await
+                .expect("acquire"),
+        );
+        assert!(lease_b.fence > lease_a.fence);
+        // The successor holds the slot but has not adopted the rows yet:
+        // still refused, the window between the two is closed.
+        assert_eq!(
+            runner_a.run_pass(lease_a.fence).await,
+            PassOutcome::Stale,
+            "the stale leader's pass is refused while the successor has yet to adopt"
+        );
+        assert_eq!(runs_a.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            runner_b.run_pass(lease_b.fence).await,
+            PassOutcome::Stale,
+            "the successor cannot write rows it has not adopted, live lease or not"
+        );
+        assert_eq!(runs_b.load(Ordering::SeqCst), 0);
+        assert!(ledger
+            .adopt_jobs(&runner_b.job_names(), lease_b.fence)
+            .await
+            .expect("adopt"));
+
+        // A resumes and tries to run under its old fence.
+        assert_eq!(
+            runner_a.run_pass(lease_a.fence).await,
+            PassOutcome::Stale,
+            "the stale leader's pass is refused before any job runs"
+        );
+        assert_eq!(
+            runs_a.load(Ordering::SeqCst),
+            1,
+            "no job ran under the stale fence"
+        );
+        let unchanged = ledger.maintenance_jobs().await.expect("ledger");
+        assert_eq!(unchanged[0].fence, lease_b.fence);
+        assert_eq!(
+            unchanged[0].last_success_at.as_deref(),
+            Some(first_success.as_str())
+        );
+
+        // The successor's pass lands, failure code and all.
+        assert_eq!(
+            runner_b.run_pass(lease_b.fence).await,
+            PassOutcome::Completed { failed_jobs: 1 }
+        );
+        assert_eq!(runs_b.load(Ordering::SeqCst), 1);
+        let after = ledger.maintenance_jobs().await.expect("ledger");
+        assert_eq!(after[0].fence, lease_b.fence);
+        assert_eq!(after[0].last_failure_code.as_deref(), Some("unavailable"));
+        assert_eq!(
+            after[0].last_success_at.as_deref(),
+            Some(first_success.as_str()),
+            "a failed run keeps the last success instant"
+        );
+        assert!(after[0].last_started_at > before[0].last_started_at);
+
+        // And A, trying once more, is still refused.
+        assert_eq!(runner_a.run_pass(lease_a.fence).await, PassOutcome::Stale);
+        assert_eq!(runs_a.load(Ordering::SeqCst), 1);
+    }
+
+    /// `gateway maintenance-run`'s one-shot: with the slot free it takes
+    /// the lease, runs one pass under its fence, and releases (the slot is
+    /// free again at once, not after the TTL); while a leader holds the
+    /// slot it runs nothing and says so; a later one-shot's fence is
+    /// higher than the leader's, so the leader's ledger writes are then
+    /// refused.
+    #[tokio::test]
+    async fn a_one_shot_pass_takes_the_lease_and_never_runs_beside_a_leader() {
+        let Some(admin_dsn) = locator() else {
+            eprintln!("skipping: no test database locator; CI runs this test");
+            return;
+        };
+        let _guard = DATABASE.lock().await;
+        let database = create_test_database(&admin_dsn).await;
+        let pool = migrated_limits_pool(&database).await;
+        let ledger = Arc::new(member_store(&pool));
+        let ttl = Duration::from_millis(900);
+        let interval = Duration::from_secs(60);
+        let runs = Arc::new(AtomicU64::new(0));
+        let (one_shot, one_shot_leases) = runner_with(
+            &pool,
+            &ledger,
+            vec![Arc::new(CountingJob {
+                runs: Arc::clone(&runs),
+                fail: false,
+            })],
+            interval,
+            ttl,
+        );
+
+        // Slot free: the pass runs under the one-shot's fence.
+        let first = one_shot.run_once().await.expect("one-shot");
+        let OnePassOutcome::Ran {
+            fence: first_fence,
+            outcome,
+        } = first
+        else {
+            panic!("expected the pass to run, got {first:?}");
+        };
+        assert_eq!(outcome, PassOutcome::Completed { failed_jobs: 0 });
+        assert_eq!(runs.load(Ordering::SeqCst), 1);
+        let ledger_rows = ledger.maintenance_jobs().await.expect("ledger");
+        assert_eq!(ledger_rows[0].fence, first_fence);
+        assert!(ledger_rows[0].last_success_at.is_some());
+
+        // Released at once: a leader can take the slot without waiting
+        // for the TTL, at a higher fence.
+        let leader_runs = Arc::new(AtomicU64::new(0));
+        let (leader, leader_leases) = runner_with(
+            &pool,
+            &ledger,
+            vec![Arc::new(CountingJob {
+                runs: Arc::clone(&leader_runs),
+                fail: false,
+            })],
+            interval,
+            ttl,
+        );
+        let leader_lease = match leader_leases
+            .try_acquire(MAINTENANCE_SCOPE, 1, "leader")
+            .await
+            .expect("acquire")
+        {
+            LeaseAttempt::Acquired(lease) => lease,
+            LeaseAttempt::Full => panic!("the one-shot did not release its lease"),
+        };
+        assert!(leader_lease.fence > first_fence);
+        assert!(ledger
+            .adopt_jobs(&leader.job_names(), leader_lease.fence)
+            .await
+            .expect("adopt"));
+
+        // A live leader: the one-shot runs nothing.
+        assert_eq!(
+            one_shot.run_once().await.expect("one-shot"),
+            OnePassOutcome::LeaseHeld
+        );
+        assert_eq!(
+            runs.load(Ordering::SeqCst),
+            1,
+            "nothing ran beside the leader"
+        );
+        assert!(
+            leader_leases
+                .is_current(&leader_lease)
+                .await
+                .expect("check"),
+            "the refused one-shot left the leader's lease alone"
+        );
+
+        // The leader releases; the next one-shot fences it out of the
+        // ledger, so a late write under the leader's fence is refused.
+        leader_leases.release(&leader_lease).await.expect("release");
+        let OnePassOutcome::Ran {
+            fence: second_fence,
+            outcome,
+        } = one_shot.run_once().await.expect("one-shot")
+        else {
+            panic!("expected the pass to run after the leader released");
+        };
+        assert!(second_fence > leader_lease.fence);
+        assert_eq!(outcome, PassOutcome::Completed { failed_jobs: 0 });
+        assert_eq!(runs.load(Ordering::SeqCst), 2);
+        assert_eq!(
+            leader.run_pass(leader_lease.fence).await,
+            PassOutcome::Stale
+        );
+        assert_eq!(leader_runs.load(Ordering::SeqCst), 0);
+        assert!(
+            !one_shot_leases
+                .try_acquire(MAINTENANCE_SCOPE, 1, "probe")
+                .await
+                .map(|attempt| matches!(attempt, LeaseAttempt::Full))
+                .expect("acquire"),
+            "the one-shot released its lease on the way out"
+        );
+    }
+
+    /// The dedicated session's advisory lock: a held key refuses a second
+    /// session (and a pass finds nothing to do), release frees it, and a
+    /// session dropped without release frees it too because the connection
+    /// is closed rather than recycled.
+    #[tokio::test]
+    async fn a_dedicated_session_refuses_a_held_key_and_never_leaks_the_lock() {
+        let Some(admin_dsn) = locator() else {
+            eprintln!("skipping: no test database locator; CI runs this test");
+            return;
+        };
+        let _guard = DATABASE.lock().await;
+        let database = create_test_database(&admin_dsn).await;
+        let pool = migrated_limits_pool(&database).await;
+        let ledger = Arc::new(member_store(&pool));
+        let runs = Arc::new(AtomicU64::new(0));
+        let (runner, leases) = runner_with(
+            &pool,
+            &ledger,
+            vec![Arc::new(CountingJob {
+                runs: Arc::clone(&runs),
+                fail: false,
+            })],
+            Duration::from_secs(60),
+            Duration::from_secs(5),
+        );
+        let lease = match leases
+            .try_acquire(MAINTENANCE_SCOPE, 1, "x")
+            .await
+            .expect("acquire")
+        {
+            LeaseAttempt::Acquired(lease) => lease,
+            LeaseAttempt::Full => panic!("free slot"),
+        };
+        assert!(ledger
+            .adopt_jobs(&runner.job_names(), lease.fence)
+            .await
+            .expect("adopt"));
+
+        let mut held = DedicatedSession::acquire(&pool, *MAINTENANCE_LOCK_KEY)
+            .await
+            .expect("first session takes the key");
+        held.probe().await.expect("the connection is alive");
+        let refused = match DedicatedSession::acquire(&pool, *MAINTENANCE_LOCK_KEY).await {
+            Ok(_) => panic!("a held key must be refused"),
+            Err(error) => error,
+        };
+        assert_eq!(refused.kind(), RepositoryErrorKind::Conflict);
+        assert_eq!(
+            runner.run_pass(lease.fence).await,
+            PassOutcome::Skipped,
+            "a pass that cannot take the key runs nothing"
+        );
+        assert_eq!(runs.load(Ordering::SeqCst), 0);
+        held.release().await.expect("release");
+
+        let dropped = DedicatedSession::acquire(&pool, *MAINTENANCE_LOCK_KEY)
+            .await
+            .expect("the released key is free");
+        drop(dropped);
+        let started = std::time::Instant::now();
+        loop {
+            let held = scalar_count(
+                &pool,
+                "SELECT count(*) FROM pg_locks WHERE locktype = 'advisory' AND granted",
+            )
+            .await;
+            if held == 0 {
+                break;
+            }
+            assert!(
+                started.elapsed() < Duration::from_secs(5),
+                "a dropped session closes its connection and the server releases the lock; {held} still held"
+            );
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        assert_eq!(
+            runner.run_pass(lease.fence).await,
+            PassOutcome::Completed { failed_jobs: 0 },
+            "the key is free again for a pass"
+        );
+        assert_eq!(runs.load(Ordering::SeqCst), 1);
+        leases.release(&lease).await.expect("release");
+    }
+
+    /// The belt covers the statement: a job step runs on the connection
+    /// holding the maintenance advisory lock, so the key stays held while
+    /// the step runs (a second session is refused), and terminating that
+    /// backend fails the step at once -- the pass ends `ConnectionLost`
+    /// well inside the step's own duration, the next job never runs, no
+    /// outcome is recorded for the cut step, and the key is free again
+    /// only once the backend is gone.
+    #[tokio::test]
+    async fn a_lost_session_fails_the_step_in_flight_and_the_lock_covers_it() {
+        let Some(admin_dsn) = locator() else {
+            eprintln!("skipping: no test database locator; CI runs this test");
+            return;
+        };
+        let _guard = DATABASE.lock().await;
+        let database = create_test_database(&admin_dsn).await;
+        let pool = migrated_limits_pool(&database).await;
+        let ledger = Arc::new(member_store(&pool));
+        let runs = Arc::new(AtomicU64::new(0));
+        let sleep = Duration::from_secs(4);
+        let (runner, leases) = runner_with(
+            &pool,
+            &ledger,
+            vec![
+                Arc::new(SleepingJob {
+                    secs: sleep.as_secs_f64(),
+                }),
+                Arc::new(CountingJob {
+                    runs: Arc::clone(&runs),
+                    fail: false,
+                }),
+            ],
+            Duration::from_secs(60),
+            Duration::from_secs(30),
+        );
+        let lease = match leases
+            .try_acquire(MAINTENANCE_SCOPE, 1, "x")
+            .await
+            .expect("acquire")
+        {
+            LeaseAttempt::Acquired(lease) => lease,
+            LeaseAttempt::Full => panic!("free slot"),
+        };
+        assert!(ledger
+            .adopt_jobs(&runner.job_names(), lease.fence)
+            .await
+            .expect("adopt"));
+
+        let pass = tokio::spawn({
+            let runner = Arc::clone(&runner);
+            async move {
+                let started = std::time::Instant::now();
+                (runner.run_pass(lease.fence).await, started.elapsed())
+            }
+        });
+
+        // The sleeping statement is in flight on the backend that holds
+        // the advisory lock.
+        let client = pool.get().await.expect("client");
+        let mut holder: Option<i32> = None;
+        let started = std::time::Instant::now();
+        while holder.is_none() && started.elapsed() < Duration::from_secs(5) {
+            holder = client
+                .query_opt(
+                    "SELECT l.pid FROM pg_locks l
+                     JOIN pg_stat_activity a ON a.pid = l.pid
+                     WHERE l.locktype = 'advisory' AND l.granted
+                       AND a.datname = current_database()
+                       AND a.query LIKE '%pg_sleep%'",
+                    &[],
+                )
+                .await
+                .expect("locks")
+                .map(|row| row.get::<_, i32>(0));
+            if holder.is_none() {
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+        }
+        let holder = holder.expect("the job step runs on the connection holding the advisory lock");
+        let refused = match DedicatedSession::acquire(&pool, *MAINTENANCE_LOCK_KEY).await {
+            Ok(_) => panic!("the key is held while the step runs"),
+            Err(error) => error,
+        };
+        assert_eq!(refused.kind(), RepositoryErrorKind::Conflict);
+
+        // The session's backend dies under the step.
+        let terminated: bool = client
+            .query_one("SELECT pg_terminate_backend($1)", &[&holder])
+            .await
+            .expect("terminate")
+            .get(0);
+        assert!(terminated);
+        let (outcome, elapsed) = pass.await.expect("pass task");
+        assert_eq!(outcome, PassOutcome::ConnectionLost);
+        assert!(
+            elapsed < sleep,
+            "the step failed with its connection rather than sleeping out: {elapsed:?}"
+        );
+        assert_eq!(
+            runs.load(Ordering::SeqCst),
+            0,
+            "the job after the lost session never ran"
+        );
+        let records = ledger.maintenance_jobs().await.expect("ledger");
+        let sleeping = records
+            .iter()
+            .find(|record| record.job == "sleeping")
+            .expect("sleeping row");
+        assert!(sleeping.last_started_at.is_some());
+        assert_eq!(
+            sleeping.last_duration_ms, None,
+            "a step cut by its lost session records no outcome"
+        );
+        assert_eq!(sleeping.last_failure_code, None);
+        let counting = records
+            .iter()
+            .find(|record| record.job == "counting")
+            .expect("counting row");
+        assert!(counting.last_started_at.is_none());
+
+        // The key is free again once the backend is gone.
+        let started = std::time::Instant::now();
+        loop {
+            match DedicatedSession::acquire(&pool, *MAINTENANCE_LOCK_KEY).await {
+                Ok(session) => {
+                    session.release().await.expect("release");
+                    break;
+                }
+                Err(error) => {
+                    assert_eq!(error.kind(), RepositoryErrorKind::Conflict);
+                    assert!(
+                        started.elapsed() < Duration::from_secs(5),
+                        "the terminated backend releases the key"
+                    );
+                    tokio::time::sleep(Duration::from_millis(25)).await;
+                }
+            }
+        }
+        leases.release(&lease).await.expect("release");
+    }
+
+    /// Every job's step respects its limit: three candidates, a limit of
+    /// two, two removed, then one, then nothing; and no live row is ever
+    /// touched.
+    #[tokio::test]
+    async fn each_maintenance_job_is_bounded_per_step() {
+        let Some(admin_dsn) = locator() else {
+            eprintln!("skipping: no test database locator; CI runs this test");
+            return;
+        };
+        let _guard = DATABASE.lock().await;
+        let database = create_test_database(&admin_dsn).await;
+        let pool = migrated_limits_pool(&database).await;
+        let client = pool.get().await.expect("client");
+
+        // JWT revocations: three expired, one live.
+        let jwt = PostgresJwtRevocationStore::new(
+            pool.clone(),
+            MEMBERS_DEPLOYMENT,
+            "https://issuer.example",
+        )
+        .with_retention_leeway_for_test(0.0);
+        let far = (time::OffsetDateTime::now_utc() + std::time::Duration::from_secs(3600))
+            .format(&time::format_description::well_known::Rfc3339)
+            .expect("rfc3339");
+        for jti in ["jti-1", "jti-2", "jti-3"] {
+            jwt.revoke(jti, Some(&far), "operator")
+                .await
+                .expect("revoke");
+        }
+        client
+            .execute(
+                "UPDATE greengateway.jwt_revocations SET expires_at = now() - interval '1 hour'",
+                &[],
+            )
+            .await
+            .expect("backdate");
+        jwt.revoke("jti-live", Some(&far), "operator")
+            .await
+            .expect("revoke");
+        let job = JwtRevocationCleanup {
+            store: jwt,
+            limit: 2,
+        };
+        assert_eq!(step(&job, &pool).await, 2);
+        assert_eq!(step(&job, &pool).await, 1);
+        assert_eq!(step(&job, &pool).await, 0);
+        assert!(job.store.is_revoked("jti-live").await.expect("lookup"));
+
+        // Rate-limit buckets: three idle, one fresh.
+        let limits =
+            PostgresRateLimitStore::new(pool.clone(), MEMBERS_DEPLOYMENT, limits_keyring(), 100);
+        let limit = SharedLimit {
+            requests_per_second: 10.0,
+            burst: 10,
+        };
+        for key in ["idle-1", "idle-2", "idle-3"] {
+            limits
+                .decide(SharedLane::Read, key, limit)
+                .await
+                .expect("decide");
+        }
+        client
+            .execute(
+                "UPDATE greengateway.rate_limit_buckets SET updated_at = now() - interval '1 hour'",
+                &[],
+            )
+            .await
+            .expect("backdate");
+        limits
+            .decide(SharedLane::Read, "fresh", limit)
+            .await
+            .expect("decide");
+        assert_eq!(limits.live_buckets().await.expect("live"), 4);
+        let job = RateLimitIdleSweep {
+            store: limits,
+            idle: Duration::from_secs(60),
+            limit: 2,
+        };
+        assert_eq!(step(&job, &pool).await, 2);
+        assert_eq!(step(&job, &pool).await, 1);
+        assert_eq!(step(&job, &pool).await, 0);
+        assert_eq!(job.store.live_buckets().await.expect("live"), 1);
+
+        // Pending logins: three expired, one live.
+        for (index, offset) in [("1", "-1"), ("2", "-1"), ("3", "-1"), ("4", "+1")] {
+            client
+                .execute(
+                    &format!(
+                        "INSERT INTO greengateway.admin_pending_logins \
+                         (id, state_hash, client_key, key_id, verifier_nonce, verifier_ct, \
+                          nonce_nonce, nonce_ct, expires_at) \
+                         VALUES ($1::text::uuid, $2, $3, 'k', $4, $5, $4, $5, \
+                                 now() + interval '{offset} hour')"
+                    ),
+                    &[
+                        &uuid::Uuid::new_v4().to_string(),
+                        &format!("{:0>64}", index),
+                        &"a".repeat(64),
+                        &vec![0u8; 24],
+                        &vec![0u8; 32],
+                    ],
+                )
+                .await
+                .expect("insert pending login");
+        }
+        let job = PendingLoginPrune { limit: 2 };
+        assert_eq!(step(&job, &pool).await, 2);
+        assert_eq!(step(&job, &pool).await, 1);
+        assert_eq!(step(&job, &pool).await, 0);
+        assert_eq!(
+            scalar_count(
+                &pool,
+                "SELECT count(*) FROM greengateway.admin_pending_logins"
+            )
+            .await,
+            1
+        );
+
+        // Members: three stale, one live.
+        let live = member_store(&pool);
+        let stale = [
+            member_store(&pool),
+            member_store(&pool),
+            member_store(&pool),
+        ];
+        for store in stale.iter().chain(std::iter::once(&live)) {
+            store
+                .heartbeat(&registration('a'), MemberRevisions::default(), None)
+                .await
+                .expect("heartbeat");
+        }
+        for store in &stale {
+            backdate_heartbeat(&pool, store.instance_id(), 3_600.0).await;
+        }
+        let job = StaleMemberSweep {
+            store: Arc::new(live.clone()),
+            stale_window: Duration::from_secs(30),
+            limit: 2,
+        };
+        assert_eq!(step(&job, &pool).await, 2);
+        assert_eq!(step(&job, &pool).await, 1);
+        assert_eq!(step(&job, &pool).await, 0);
+        let remaining = live
+            .members(Duration::from_secs(30))
+            .await
+            .expect("members");
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].instance_id, live.instance_id());
+
+        // Audit events: three old, one fresh.
+        let audit = Arc::new(PostgresAuditEventStore::new(pool.clone(), None));
+        audit
+            .insert_events(&[
+                contract_event("old-1", "audit.retention", json!({})),
+                contract_event("old-2", "audit.retention", json!({})),
+                contract_event("old-3", "audit.retention", json!({})),
+            ])
+            .await
+            .expect("insert");
+        client
+            .execute(
+                "UPDATE greengateway.audit_events SET occurred_at = now() - interval '2 days'",
+                &[],
+            )
+            .await
+            .expect("backdate");
+        audit
+            .insert_events(&[contract_event("fresh", "audit.retention", json!({}))])
+            .await
+            .expect("insert");
+        let job = AuditRetention {
+            store: Arc::clone(&audit),
+            retention: Duration::from_secs(86_400),
+            floor: None,
+            limit: 2,
+        };
+        assert_eq!(step(&job, &pool).await, 2);
+        assert_eq!(step(&job, &pool).await, 1);
+        assert_eq!(step(&job, &pool).await, 0);
+        assert_eq!(
+            scalar_count(&pool, "SELECT count(*) FROM greengateway.audit_events").await,
+            1
+        );
+        assert_eq!(audit.stream_first_available().await.expect("first"), 4);
+
+        // Leases: three lapsed, one live -- the reaper test below covers
+        // the live-row guarantee in depth; here only the bound.
+        let short = PostgresExecutionLeaseStore::new(
+            pool.clone(),
+            MEMBERS_DEPLOYMENT,
+            uuid::Uuid::new_v4(),
+            Duration::from_millis(200),
+        );
+        for index in 0..3 {
+            assert!(matches!(
+                short
+                    .try_acquire("tool:gone", 3, &format!("req-{index}"))
+                    .await
+                    .expect("acquire"),
+                LeaseAttempt::Acquired(_)
+            ));
+        }
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        let job = ExecutionLeaseReaper {
+            store: short,
+            grace: Duration::ZERO,
+            limit: 2,
+        };
+        assert_eq!(step(&job, &pool).await, 2);
+        assert_eq!(step(&job, &pool).await, 1);
+        assert_eq!(step(&job, &pool).await, 0);
+    }
+
+    /// The work of one retention step is bounded by the step, not by the
+    /// backlog: over twenty thousand old streamed events, every scan in
+    /// either statement's plan touches at most the step's window of rows
+    /// (no scan or sort of the whole table), and the step still deletes
+    /// its limit, lowest positions first, never at or past the floor.
+    #[tokio::test]
+    async fn audit_retention_work_is_bounded_by_the_step_not_the_backlog() {
+        let Some(admin_dsn) = locator() else {
+            eprintln!("skipping: no test database locator; CI runs this test");
+            return;
+        };
+        let _guard = DATABASE.lock().await;
+        let database = create_test_database(&admin_dsn).await;
+        let pool = migrated_limits_pool(&database).await;
+        let client = pool.get().await.expect("client");
+        let backlog: i64 = 20_000;
+        client
+            .execute(
+                "INSERT INTO greengateway.audit_events
+                     (event_id, event_type, occurred_at, schema_version, request_id, source_ip, payload_json)
+                 SELECT 'ev-' || g, 'audit.retention',
+                        now() - interval '100 days' + (g * interval '1 second'),
+                        '1', 'req', '203.0.113.10', '{}'::jsonb
+                 FROM generate_series(1, $1::bigint) AS g",
+                &[&backlog],
+            )
+            .await
+            .expect("events");
+        client
+            .batch_execute(
+                "INSERT INTO greengateway.audit_stream (position, event_id)
+                 SELECT id, event_id FROM greengateway.audit_events;
+                 ANALYZE greengateway.audit_events;
+                 ANALYZE greengateway.audit_stream",
+            )
+            .await
+            .expect("stream");
+        let retention_secs = Duration::from_secs(30 * 86_400).as_secs_f64();
+        let limit = 100_u32;
+        let window = i64::from(limit) * crate::storage::postgres_audit::RETENTION_SCAN_FACTOR;
+        let floor: Option<i64> = None;
+
+        // Rows examined by any scan node of an EXPLAIN ANALYZE plan
+        // (actual rows times loops, plus rows a filter removed).
+        fn rows_examined(plan: &[String]) -> (i64, String) {
+            let number = |line: &str, key: &str| -> i64 {
+                line.find(key)
+                    .map(|at| {
+                        line[at + key.len()..]
+                            .chars()
+                            .take_while(char::is_ascii_digit)
+                            .collect::<String>()
+                    })
+                    .and_then(|digits| digits.parse().ok())
+                    .unwrap_or(0)
+            };
+            let mut worst = 0_i64;
+            let mut current = 0_i64;
+            let mut loops = 1_i64;
+            for line in plan {
+                if line.contains("Scan") && line.contains("(actual") {
+                    let actual = &line[line.find("(actual").unwrap_or(0)..];
+                    loops = number(actual, "loops=").max(1);
+                    current = number(actual, "rows=") * loops;
+                    worst = worst.max(current);
+                } else if line.contains("Rows Removed by") {
+                    current += number(line, ": ") * loops;
+                    worst = worst.max(current);
+                }
+            }
+            (worst, plan.join("\n"))
+        }
+        let explain =
+            |sql: &'static str, params: Vec<Box<dyn tokio_postgres::types::ToSql + Sync>>| {
+                let client = &client;
+                async move {
+                    client.batch_execute("BEGIN").await.expect("begin");
+                    let refs: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> =
+                        params.iter().map(|param| param.as_ref()).collect();
+                    let rows = client
+                        .query(&format!("EXPLAIN (ANALYZE, FORMAT TEXT) {sql}"), &refs)
+                        .await
+                        .expect("explain");
+                    client.batch_execute("ROLLBACK").await.expect("rollback");
+                    rows.iter()
+                        .map(|row| row.get::<_, String>(0))
+                        .collect::<Vec<_>>()
+                }
+            };
+        let streamed = explain(
+            crate::storage::postgres_audit::PRUNE_STREAMED_SQL,
+            vec![
+                Box::new(retention_secs),
+                Box::new(floor),
+                Box::new(i64::from(limit)),
+                Box::new(window),
+            ],
+        )
+        .await;
+        // An index walk under a LIMIT reads one row past the window to
+        // learn it is done (and an incremental sort a few more), so the
+        // bound is a small multiple of the window -- against a backlog
+        // twenty times larger.
+        let bound = 2 * window;
+        let (examined, plan) = rows_examined(&streamed);
+        assert!(
+            examined <= bound,
+            "the streamed step examined {examined} rows over a backlog of {backlog} (window {window}):\n{plan}"
+        );
+        let unstreamed = explain(
+            crate::storage::postgres_audit::PRUNE_UNSTREAMED_SQL,
+            vec![
+                Box::new(retention_secs),
+                Box::new(i64::from(limit)),
+                Box::new(window),
+            ],
+        )
+        .await;
+        let (examined, plan) = rows_examined(&unstreamed);
+        assert!(
+            examined <= bound,
+            "the unstreamed step examined {examined} rows over a backlog of {backlog} (window {window}):\n{plan}"
+        );
+
+        // And the step itself: its limit, lowest positions first, floor
+        // respected, the counter untouched.
+        let audit = PostgresAuditEventStore::new(pool.clone(), None);
+        let retention = Duration::from_secs(30 * 86_400);
+        assert_eq!(
+            audit
+                .prune_older_than(retention, None, limit)
+                .await
+                .expect("prune"),
+            u64::from(limit)
+        );
+        assert_eq!(audit.stream_first_available().await.expect("first"), 101);
+        assert_eq!(
+            audit
+                .prune_older_than(retention, Some(150), limit)
+                .await
+                .expect("prune"),
+            49,
+            "only positions below the floor go"
+        );
+        assert_eq!(
+            audit
+                .prune_older_than(retention, Some(150), limit)
+                .await
+                .expect("prune"),
+            0
+        );
+        assert_eq!(audit.stream_first_available().await.expect("first"), 150);
+        assert_eq!(
+            scalar_count(&pool, "SELECT count(*) FROM greengateway.audit_events").await,
+            backlog - 149
+        );
+    }
+
+    /// Retention deletes only what is both old enough and at or below the
+    /// floor the consumer reports: a consumer that has applied position 2
+    /// frees positions 1 and 2, one that has applied nothing frees
+    /// nothing, and with no consumer age alone decides. The position
+    /// counter survives, so the first available position moves forward
+    /// and never restarts.
+    #[tokio::test]
+    async fn audit_retention_never_passes_the_retention_floor() {
+        let Some(admin_dsn) = locator() else {
+            eprintln!("skipping: no test database locator; CI runs this test");
+            return;
+        };
+        let _guard = DATABASE.lock().await;
+        let database = create_test_database(&admin_dsn).await;
+        let pool = migrated_limits_pool(&database).await;
+        let audit = Arc::new(PostgresAuditEventStore::new(pool.clone(), None));
+        let events: Vec<AuditEvent> = (1..=5)
+            .map(|index| contract_event(&format!("event-{index}"), "audit.retention", json!({})))
+            .collect();
+        // Sequential inserts so positions follow the names.
+        for event in &events {
+            audit
+                .insert_events(std::slice::from_ref(event))
+                .await
+                .expect("insert");
+        }
+        let client = pool.get().await.expect("client");
+        client
+            .execute(
+                "UPDATE greengateway.audit_events SET occurred_at = now() - interval '10 days'",
+                &[],
+            )
+            .await
+            .expect("backdate");
+        let retention = Duration::from_secs(86_400);
+        let remaining = |after: i64| {
+            let audit = Arc::clone(&audit);
+            async move {
+                audit
+                    .stream_after(after, 100)
+                    .await
+                    .expect("stream")
+                    .into_iter()
+                    .map(|(position, event)| (position, event.event_id))
+                    .collect::<Vec<_>>()
+            }
+        };
+
+        let nothing_consumed = AuditRetention {
+            store: Arc::clone(&audit),
+            retention,
+            floor: Some(Arc::new(FixedFloor(None))),
+            limit: 100,
+        };
+        assert_eq!(
+            step(&nothing_consumed, &pool).await,
+            0,
+            "a consumer that has applied nothing keeps every streamed event"
+        );
+        assert_eq!(remaining(0).await.len(), 5);
+
+        let consumed_two = AuditRetention {
+            store: Arc::clone(&audit),
+            retention,
+            floor: Some(Arc::new(FixedFloor(Some(2)))),
+            limit: 100,
+        };
+        assert_eq!(step(&consumed_two, &pool).await, 2);
+        assert_eq!(
+            remaining(0).await,
+            vec![
+                (3, "event-3".to_owned()),
+                (4, "event-4".to_owned()),
+                (5, "event-5".to_owned())
+            ],
+            "only positions at or below the consumed position went"
+        );
+        assert_eq!(audit.stream_first_available().await.expect("first"), 3);
+        assert_eq!(
+            step(&consumed_two, &pool).await,
+            0,
+            "the floor holds however old the rest is"
+        );
+
+        // Age bounds too: a floor above everything frees nothing fresh.
+        audit
+            .insert_events(&[contract_event("event-6", "audit.retention", json!({}))])
+            .await
+            .expect("insert");
+        let far_ahead = AuditRetention {
+            store: Arc::clone(&audit),
+            retention,
+            floor: Some(Arc::new(FixedFloor(Some(100)))),
+            limit: 100,
+        };
+        assert_eq!(
+            step(&far_ahead, &pool).await,
+            3,
+            "old events below the floor go; the fresh one stays"
+        );
+        assert_eq!(remaining(0).await, vec![(6, "event-6".to_owned())]);
+
+        // No consumer at all: age alone decides, and the counter survives.
+        client
+            .execute(
+                "UPDATE greengateway.audit_events SET occurred_at = now() - interval '10 days'",
+                &[],
+            )
+            .await
+            .expect("backdate");
+        let unfloored = AuditRetention {
+            store: Arc::clone(&audit),
+            retention,
+            floor: None,
+            limit: 100,
+        };
+        assert_eq!(step(&unfloored, &pool).await, 1);
+        assert!(remaining(0).await.is_empty());
+        assert_eq!(
+            audit.stream_first_available().await.expect("first"),
+            7,
+            "numbering never restarts after retention empties the stream"
+        );
+        audit
+            .insert_events(&[contract_event("event-7", "audit.retention", json!({}))])
+            .await
+            .expect("insert");
+        assert_eq!(remaining(0).await, vec![(7, "event-7".to_owned())]);
+    }
+
+    /// The reaper deletes only rows expired for longer than its grace: a
+    /// live lease is never touched (its holder can still renew and its
+    /// fence stands), a lapsed one inside the grace is left for
+    /// acquisition to take over, and only a lapsed one past the grace goes.
+    #[tokio::test]
+    async fn the_lease_reaper_never_touches_a_live_lease() {
+        let Some(admin_dsn) = locator() else {
+            eprintln!("skipping: no test database locator; CI runs this test");
+            return;
+        };
+        let _guard = DATABASE.lock().await;
+        let database = create_test_database(&admin_dsn).await;
+        let pool = migrated_limits_pool(&database).await;
+        let long_lived = PostgresExecutionLeaseStore::new(
+            pool.clone(),
+            MEMBERS_DEPLOYMENT,
+            uuid::Uuid::new_v4(),
+            Duration::from_secs(30),
+        );
+        let short_lived = PostgresExecutionLeaseStore::new(
+            pool.clone(),
+            MEMBERS_DEPLOYMENT,
+            uuid::Uuid::new_v4(),
+            Duration::from_millis(300),
+        );
+        let acquired = |attempt: LeaseAttempt| match attempt {
+            LeaseAttempt::Acquired(lease) => lease,
+            LeaseAttempt::Full => panic!("expected a free slot"),
+        };
+        let live = acquired(
+            long_lived
+                .try_acquire("global", 1, "live")
+                .await
+                .expect("acquire"),
+        );
+        let maintenance = acquired(
+            long_lived
+                .try_acquire(MAINTENANCE_SCOPE, 1, "leader")
+                .await
+                .expect("acquire"),
+        );
+        let lapsed = acquired(
+            short_lived
+                .try_acquire("tool:gone", 1, "lapsed")
+                .await
+                .expect("acquire"),
+        );
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let rows = || scalar_count(&pool, "SELECT count(*) FROM greengateway.execution_leases");
+        assert_eq!(rows().await, 3);
+
+        let patient = ExecutionLeaseReaper {
+            store: long_lived.clone(),
+            grace: Duration::from_secs(30),
+            limit: 10,
+        };
+        assert_eq!(
+            step(&patient, &pool).await,
+            0,
+            "a lapse inside the grace is acquisition's to reclaim, not the reaper's"
+        );
+        let eager = ExecutionLeaseReaper {
+            store: long_lived.clone(),
+            grace: Duration::ZERO,
+            limit: 10,
+        };
+        assert_eq!(step(&eager, &pool).await, 1);
+        assert_eq!(rows().await, 2);
+        assert!(
+            long_lived.is_current(&live).await.expect("check"),
+            "the live lease stands"
+        );
+        assert!(
+            long_lived.is_current(&maintenance).await.expect("check"),
+            "the leader's own lease stands"
+        );
+        assert!(long_lived.renew(&live).await.expect("renew"));
+        assert!(
+            !short_lived.is_current(&lapsed).await.expect("check"),
+            "the lapsed lease is gone"
+        );
+        assert!(matches!(
+            short_lived
+                .try_acquire("tool:gone", 1, "again")
+                .await
+                .expect("acquire"),
+            LeaseAttempt::Acquired(_)
+        ));
+        assert_eq!(step(&eager, &pool).await, 0);
+    }
 }
 
 fn contract_policy(id: &str) -> Policy {

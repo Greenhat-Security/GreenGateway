@@ -253,8 +253,21 @@ impl PostgresRateLimitStore {
     /// database clock, keeping the count exact. For the maintenance
     /// singleton; returns how many were removed.
     pub async fn cleanup_idle(&self, idle_secs: f64, limit: u32) -> Result<u64, RepositoryError> {
-        let limit = i64::from(limit.max(1));
         let client = self.pool.get().await.map_err(classify_pool_error)?;
+        self.cleanup_idle_with(&client, idle_secs, limit).await
+    }
+
+    /// [`Self::cleanup_idle`] over a connection the caller holds: the
+    /// maintenance singleton (issue #241, PR 13) runs its step on the
+    /// dedicated session that holds the maintenance advisory lock, so the
+    /// lock covers the statement itself.
+    pub(crate) async fn cleanup_idle_with(
+        &self,
+        client: &tokio_postgres::Client,
+        idle_secs: f64,
+        limit: u32,
+    ) -> Result<u64, RepositoryError> {
+        let limit = i64::from(limit.max(1));
         let row = client
             .query_opt(
                 "WITH gone AS (
