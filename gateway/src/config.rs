@@ -2517,6 +2517,17 @@ impl Config {
                 (DISCOVERY_SQLITE_PATH, discovery_sqlite_path.is_some()),
                 (PRINCIPAL_SQLITE_PATH, principal_sqlite_path.is_some()),
                 (CONNECTIONS_SQLITE_PATH, connections_sqlite_path.is_some()),
+                // The local secret keyring encrypts material stored in the
+                // connections SQLite database, which cluster mode does not
+                // have: migration 0006 deliberately omits the
+                // `connection_local_secrets` table, and a cluster deployment
+                // binds credentials through an external secret provider
+                // instead. Naming the setting is better than failing later
+                // inside the provider with "a managed store is required".
+                (
+                    CONNECTION_LOCAL_SECRET_KEYRING,
+                    !connection_local_secret_keyring.is_empty(),
+                ),
                 (
                     POLICY_HISTORY_SQLITE_PATH,
                     policy_history_sqlite_path.is_some(),

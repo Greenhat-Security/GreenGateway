@@ -60,6 +60,7 @@ use crate::{
 use super::*;
 
 const FORBIDDEN_CREDENTIAL_CANARY: &[u8] = b"acceptance-forbidden-bearer-canary";
+const ACCEPTANCE_ACTOR: &str = "test-admin";
 
 struct AcceptanceRoot {
     path: PathBuf,
@@ -223,7 +224,7 @@ fn runtime_fixture(
     }
 }
 
-fn create_managed(
+async fn create_managed(
     control_plane: &ConnectionControlPlane,
     write: ConnectionWrite,
 ) -> StoredConnection {
@@ -232,7 +233,8 @@ fn create_managed(
         .collection_etag()
         .to_owned();
     control_plane
-        .create_managed(&collection_etag, write)
+        .create_managed(&collection_etag, write, ACCEPTANCE_ACTOR)
+        .await
         .expect("acceptance Connection should create")
 }
 
@@ -323,7 +325,8 @@ async fn e2e_06_stored_tests_reject_ssrf_and_never_forward_credentials_to_redire
             bearer_auth("forbidden-token"),
             TlsProfile::default(),
         ),
-    );
+    )
+    .await;
     let private = create_managed(
         &fixture.control_plane,
         http_connection(
@@ -332,7 +335,8 @@ async fn e2e_06_stored_tests_reject_ssrf_and_never_forward_credentials_to_redire
             bearer_auth("forbidden-token"),
             TlsProfile::default(),
         ),
-    );
+    )
+    .await;
     let mixed = create_managed(
         &fixture.control_plane,
         http_connection(
@@ -341,7 +345,8 @@ async fn e2e_06_stored_tests_reject_ssrf_and_never_forward_credentials_to_redire
             bearer_auth("forbidden-token"),
             TlsProfile::default(),
         ),
-    );
+    )
+    .await;
 
     fs::remove_file(&credential_path)
         .expect("credential should be removed after Connection activation");
@@ -422,7 +427,8 @@ async fn e2e_06_stored_tests_reject_ssrf_and_never_forward_credentials_to_redire
                 client_private_key_id: None,
             },
         ),
-    );
+    )
+    .await;
     let execution = ConnectionTestService::new(redirect_fixture.runtime)
         .execute(&redirect, redirect.etag().as_str())
         .await;
@@ -793,7 +799,8 @@ async fn e2e_07_mtls_rotation_preserves_two_origin_ca_and_client_isolation() {
             ConnectionAuthentication::None,
             mtls_profile("a"),
         ),
-    );
+    )
+    .await;
     let connection_b = create_managed(
         &fixture.control_plane,
         http_connection(
@@ -802,7 +809,8 @@ async fn e2e_07_mtls_rotation_preserves_two_origin_ca_and_client_isolation() {
             ConnectionAuthentication::None,
             mtls_profile("b"),
         ),
-    );
+    )
+    .await;
 
     let first_a_fingerprint = call_connection(&fixture.runtime, &connection_a.id)
         .await
@@ -826,7 +834,8 @@ async fn e2e_07_mtls_rotation_preserves_two_origin_ca_and_client_isolation() {
                 client_private_key_id: Some("a-client-key".to_owned()),
             },
         ),
-    );
+    )
+    .await;
     assert!(
         call_connection(&fixture.runtime, &crossed_identity.id)
             .await
@@ -845,7 +854,8 @@ async fn e2e_07_mtls_rotation_preserves_two_origin_ca_and_client_isolation() {
                 client_private_key_id: Some("b-client-key".to_owned()),
             },
         ),
-    );
+    )
+    .await;
     assert!(
         call_connection(&fixture.runtime, &crossed_ca.id)
             .await
@@ -879,7 +889,13 @@ async fn e2e_07_mtls_rotation_preserves_two_origin_ca_and_client_isolation() {
         format!("https://{ORIGIN_A}:{}", rotated_server_a.address.port());
     let rotated_a = fixture
         .control_plane
-        .replace_managed(&connection_a.id, &current_a.etag(), rotated_write)
+        .replace_managed(
+            &connection_a.id,
+            &current_a.etag(),
+            rotated_write,
+            ACCEPTANCE_ACTOR,
+        )
+        .await
         .expect("origin A rotation should publish atomically");
     let rotated_a_fingerprint = call_connection(&fixture.runtime, &rotated_a.id)
         .await
@@ -961,8 +977,8 @@ async fn e2e_08_barrier_race_rejects_stale_openapi_and_mcp_publications() {
         true,
         resolver_trait,
     );
-    let openapi_record = create_managed(&fixture.control_plane, no_auth_openapi_connection());
-    let mcp_record = create_managed(&fixture.control_plane, no_auth_mcp_connection());
+    let openapi_record = create_managed(&fixture.control_plane, no_auth_openapi_connection()).await;
+    let mcp_record = create_managed(&fixture.control_plane, no_auth_mcp_connection()).await;
     let captured_collection_etag = fixture
         .control_plane
         .runtime_snapshot()
@@ -983,6 +999,7 @@ async fn e2e_08_barrier_race_rejects_stale_openapi_and_mcp_publications() {
     .expect("MCP catalog service should load");
     let preview = openapi
         .preview(openapi_record.id.as_str(), ACCEPTANCE_OPENAPI_SPEC)
+        .await
         .expect("OpenAPI preview should bind to the captured Connection revision");
 
     // OpenAPI and MCP are mutually exclusive Connection kinds. The update task therefore
@@ -1002,18 +1019,24 @@ async fn e2e_08_barrier_race_rejects_stale_openapi_and_mcp_publications() {
         update_start.wait().await;
         let mut openapi_write = update_openapi_record.write.clone();
         openapi_write.display_name = "Managed OpenAPI updated".to_owned();
-        let updated_openapi = update_control_plane.replace_managed(
-            &update_openapi_record.id,
-            &update_openapi_record.etag(),
-            openapi_write,
-        );
+        let updated_openapi = update_control_plane
+            .replace_managed(
+                &update_openapi_record.id,
+                &update_openapi_record.etag(),
+                openapi_write,
+                ACCEPTANCE_ACTOR,
+            )
+            .await;
         let mut mcp_write = update_mcp_record.write.clone();
         mcp_write.display_name = "Managed MCP updated".to_owned();
-        let updated_mcp = update_control_plane.replace_managed(
-            &update_mcp_record.id,
-            &update_mcp_record.etag(),
-            mcp_write,
-        );
+        let updated_mcp = update_control_plane
+            .replace_managed(
+                &update_mcp_record.id,
+                &update_mcp_record.etag(),
+                mcp_write,
+                ACCEPTANCE_ACTOR,
+            )
+            .await;
         update_visible.wait().await;
         (updated_openapi, updated_mcp)
     });
@@ -1039,6 +1062,7 @@ async fn e2e_08_barrier_race_rejects_stale_openapi_and_mcp_publications() {
                 ACCEPTANCE_OPENAPI_SPEC,
                 &["ping".to_owned()],
                 &[],
+                ACCEPTANCE_ACTOR,
             )
             .await
     });
@@ -1051,7 +1075,9 @@ async fn e2e_08_barrier_race_rejects_stale_openapi_and_mcp_publications() {
     let refresh_task = tokio::spawn(async move {
         refresh_start.wait().await;
         refresh_visible.wait().await;
-        refresh_service.refresh(&refresh_id, &refresh_etag).await
+        refresh_service
+            .refresh(&refresh_id, &refresh_etag, ACCEPTANCE_ACTOR)
+            .await
     });
 
     start.wait().await;
@@ -1106,6 +1132,7 @@ async fn e2e_08_barrier_race_rejects_stale_openapi_and_mcp_publications() {
             .managed_store()
             .expect("managed store should remain available")
             .mcp_catalog(&updated_mcp.id)
+            .await
             .expect("MCP catalog lookup should succeed")
             .is_none(),
         "the stale MCP refresh must leave no durable catalog"
@@ -1113,6 +1140,7 @@ async fn e2e_08_barrier_race_rejects_stale_openapi_and_mcp_publications() {
 
     let fresh_preview = openapi
         .preview(updated_openapi.id.as_str(), ACCEPTANCE_OPENAPI_SPEC)
+        .await
         .expect("the winning Connection revision should support a fresh preview");
     let selected = fresh_preview
         .binding
@@ -1131,6 +1159,7 @@ async fn e2e_08_barrier_race_rejects_stale_openapi_and_mcp_publications() {
             ACCEPTANCE_OPENAPI_SPEC,
             &selected,
             &confirmations,
+            ACCEPTANCE_ACTOR,
         )
         .await
         .expect("a fresh post-race registration should publish");
@@ -1233,11 +1262,11 @@ async fn e2e_09_all_references_disable_atomically_and_block_delete_without_orpha
     let mut http_write = no_auth_openapi_connection();
     http_write.endpoint.base_url = format!("http://127.0.0.1:{}", http_addr.port());
     http_write.endpoint.base_path = "/".to_owned();
-    let http_connection = create_managed(&fixture.control_plane, http_write);
+    let http_connection = create_managed(&fixture.control_plane, http_write).await;
     let mut mcp_write = no_auth_mcp_connection();
     mcp_write.endpoint.base_url = format!("http://127.0.0.1:{}", mcp_upstream.addr.port());
     mcp_write.endpoint.base_path = "/mcp".to_owned();
-    let mcp_connection = create_managed(&fixture.control_plane, mcp_write);
+    let mcp_connection = create_managed(&fixture.control_plane, mcp_write).await;
 
     let registry = ToolRegistry::from_json_value(json!({
         "schema_version": "0.1.0",
@@ -1270,6 +1299,7 @@ async fn e2e_09_all_references_disable_atomically_and_block_delete_without_orpha
     .expect("OpenAPI catalog service should load");
     let preview = openapi_catalogs
         .preview(http_connection.id.as_str(), ACCEPTANCE_OPENAPI_SPEC)
+        .await
         .expect("OpenAPI preview should bind to the referenced Connection");
     let selected = preview
         .binding
@@ -1288,6 +1318,7 @@ async fn e2e_09_all_references_disable_atomically_and_block_delete_without_orpha
             ACCEPTANCE_OPENAPI_SPEC,
             &selected,
             &confirmations,
+            ACCEPTANCE_ACTOR,
         )
         .await
         .expect("managed OpenAPI capability should publish");
@@ -1299,7 +1330,11 @@ async fn e2e_09_all_references_disable_atomically_and_block_delete_without_orpha
     )
     .expect("MCP catalog service should load");
     mcp_catalogs
-        .refresh(mcp_connection.id.as_str(), mcp_connection.etag().as_str())
+        .refresh(
+            mcp_connection.id.as_str(),
+            mcp_connection.etag().as_str(),
+            ACCEPTANCE_ACTOR,
+        )
         .await
         .expect("managed MCP capability should publish");
     let mcp_tool_name = format!("{}:remote_acceptance", mcp_connection.id);
@@ -1393,21 +1428,24 @@ async fn e2e_09_all_references_disable_atomically_and_block_delete_without_orpha
         registry.clone(),
         fixture.control_plane.clone(),
     );
-    let list_for = |connection_id: &ConnectionId| {
-        inventory
-            .list(
-                &rbac_state,
-                &inventory_principal,
-                &crate::tools::inventory::CapabilityListParams {
-                    connection_id: Some(connection_id.to_string()),
-                    limit: Some(100),
-                    ..crate::tools::inventory::CapabilityListParams::default()
-                },
-            )
-            .expect("capability inventory should list")
+    let inventory_ref = &inventory;
+    let rbac_state_ref = &rbac_state;
+    let inventory_principal_ref = &inventory_principal;
+    let list_for = move |connection_id: &ConnectionId| {
+        let params = crate::tools::inventory::CapabilityListParams {
+            connection_id: Some(connection_id.to_string()),
+            limit: Some(100),
+            ..crate::tools::inventory::CapabilityListParams::default()
+        };
+        async move {
+            inventory_ref
+                .list(rbac_state_ref, inventory_principal_ref, &params)
+                .await
+                .expect("capability inventory should list")
+        }
     };
-    let active_http_inventory = list_for(&http_connection.id);
-    let active_mcp_inventory = list_for(&mcp_connection.id);
+    let active_http_inventory = list_for(&http_connection.id).await;
+    let active_mcp_inventory = list_for(&mcp_connection.id).await;
     assert_eq!(active_http_inventory.total_count, 2);
     assert_eq!(active_mcp_inventory.total_count, 1);
     assert!(active_http_inventory
@@ -1424,7 +1462,9 @@ async fn e2e_09_all_references_disable_atomically_and_block_delete_without_orpha
             &http_connection.id,
             &http_connection.etag(),
             disabled_http_write,
+            ACCEPTANCE_ACTOR,
         )
+        .await
         .expect("HTTP Connection disable should publish atomically");
     openapi_catalogs.reconcile_connection(&disabled_http);
     let mut disabled_mcp_write = mcp_connection.write.clone();
@@ -1435,7 +1475,9 @@ async fn e2e_09_all_references_disable_atomically_and_block_delete_without_orpha
             &mcp_connection.id,
             &mcp_connection.etag(),
             disabled_mcp_write,
+            ACCEPTANCE_ACTOR,
         )
+        .await
         .expect("MCP Connection disable should publish atomically");
     mcp_catalogs.reconcile_connection(&disabled_mcp);
 
@@ -1520,8 +1562,8 @@ async fn e2e_09_all_references_disable_atomically_and_block_delete_without_orpha
         mcp_calls_before_denials
     );
 
-    let disabled_http_inventory = list_for(&disabled_http.id);
-    let disabled_mcp_inventory = list_for(&disabled_mcp.id);
+    let disabled_http_inventory = list_for(&disabled_http.id).await;
+    let disabled_mcp_inventory = list_for(&disabled_mcp.id).await;
     assert_eq!(disabled_http_inventory.total_count, 2);
     assert_eq!(disabled_mcp_inventory.total_count, 1);
     assert!(disabled_http_inventory
@@ -1540,6 +1582,7 @@ async fn e2e_09_all_references_disable_atomically_and_block_delete_without_orpha
         .expect("managed store should remain available");
     let http_dependencies = store
         .dependencies(&disabled_http.id)
+        .await
         .expect("HTTP dependencies should load");
     assert!(http_dependencies
         .iter()
@@ -1552,6 +1595,7 @@ async fn e2e_09_all_references_disable_atomically_and_block_delete_without_orpha
         .any(|dependency| dependency.kind == ConnectionDependencyKind::ManagedTool));
     let mcp_dependencies = store
         .dependencies(&disabled_mcp.id)
+        .await
         .expect("MCP dependencies should load");
     assert!(mcp_dependencies
         .iter()
@@ -1560,7 +1604,8 @@ async fn e2e_09_all_references_disable_atomically_and_block_delete_without_orpha
     for disabled in [&disabled_http, &disabled_mcp] {
         let delete_error = fixture
             .control_plane
-            .delete_managed(&disabled.id, &disabled.etag())
+            .delete_managed(&disabled.id, &disabled.etag(), ACCEPTANCE_ACTOR)
+            .await
             .expect_err("referenced disabled Connection deletion must conflict");
         assert!(matches!(
             delete_error,

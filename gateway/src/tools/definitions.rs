@@ -320,12 +320,47 @@ impl fmt::Debug for ToolRegistry {
     }
 }
 
+#[cfg(feature = "postgres")]
+tokio::task_local! {
+    /// The registry state pinned for the request being served, set when
+    /// the gate admits it, so every tool lookup inside the request sees
+    /// the lane the request was admitted with.
+    static PINNED_TOOLS: Arc<ToolRegistryState>;
+}
+
+/// Run `future` with `state` pinned as the request's registry state.
+#[cfg(feature = "postgres")]
+pub(crate) async fn with_pinned_tools<F: std::future::Future>(
+    state: Arc<ToolRegistryState>,
+    future: F,
+) -> F::Output {
+    PINNED_TOOLS.scope(state, future).await
+}
+
 #[allow(dead_code)] // Future MCP executor and admin surfaces will query this registry state.
-struct ToolRegistryState {
+pub(crate) struct ToolRegistryState {
     tools: BTreeMap<String, Arc<ToolDefinition>>,
     local_definitions: Vec<ToolDefinition>,
     managed_openapi_definitions: Vec<ToolDefinition>,
     mcp_proxy_definitions: Vec<ToolDefinition>,
+}
+
+/// How an install treats a tool name another lane already holds.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LaneConflicts {
+    /// Refuse the install: the request-path installs, which run before
+    /// the authority has accepted anything.
+    Refuse,
+    /// Evict the holder: the reconciliation installs of content the
+    /// authority has already committed. The authority reserves every tool
+    /// name across the local lane and the managed catalogs, and legacy
+    /// projections carry no catalogs, so a holder that conflicts with
+    /// authoritative content is provably stale -- its own authoritative
+    /// content, which no longer carries the name, follows in the same
+    /// pass. Refusing instead would make convergence depend on the order
+    /// lanes are reconciled in: a name that moved between lanes, or two
+    /// names swapped, would never install on a lagging replica.
+    EvictStale,
 }
 
 impl ToolRegistry {
@@ -383,19 +418,36 @@ impl ToolRegistry {
         Ok(Self::from_definitions_with_audit(definitions, None))
     }
 
+    /// The registry state this request reads: the one the gate pinned at
+    /// admission (cluster mode), else the live lane. Dispatch reads go
+    /// through it; install paths read the live lane directly.
+    fn effective_state(&self) -> Arc<ToolRegistryState> {
+        #[cfg(feature = "postgres")]
+        if let Ok(pinned) = PINNED_TOOLS.try_with(Arc::clone) {
+            return pinned;
+        }
+        self.state.load_full()
+    }
+
+    /// The live registry lane, for the security runtime to capture
+    /// bundles from.
+    #[cfg(feature = "postgres")]
+    pub(crate) fn state_handle(&self) -> Arc<ArcSwap<ToolRegistryState>> {
+        Arc::clone(&self.state)
+    }
+
     #[allow(dead_code)] // Future MCP call handling will query by tool name.
     pub fn get(&self, name: &str) -> Option<Arc<ToolDefinition>> {
-        self.state.load().tools.get(name).cloned()
+        self.effective_state().tools.get(name).cloned()
     }
 
     #[allow(dead_code)] // Future MCP list-tools handling will expose registry contents.
     pub fn list(&self) -> Vec<Arc<ToolDefinition>> {
-        self.state.load().tools.values().cloned().collect()
+        self.effective_state().tools.values().cloned().collect()
     }
 
     pub fn has_legacy_http_tools(&self) -> bool {
-        self.state
-            .load()
+        self.effective_state()
             .tools
             .values()
             .any(|definition| definition.target.is_none() && !definition.upstream.is_mcp_proxy())
@@ -404,6 +456,21 @@ impl ToolRegistry {
     pub fn merge_definitions(
         &self,
         definitions: Vec<ToolDefinition>,
+    ) -> Result<(), ToolRegistryError> {
+        self.merge_definitions_with(definitions, LaneConflicts::Refuse)
+    }
+
+    /// `merge_definitions` with a conflict policy. Cluster-mode boot merges
+    /// authoritative catalogs with [`LaneConflicts::EvictStale`]: the boot
+    /// seeds are read one resource at a time and a commit can land between
+    /// the reads, so a name may appear in two seeds that never coexisted at
+    /// the authority; the gate's first pass reconciles every resource to
+    /// the current revision before a request is served, so the boot merge
+    /// only needs to install *something* consistent rather than refuse.
+    pub fn merge_definitions_with(
+        &self,
+        definitions: Vec<ToolDefinition>,
+        conflicts: LaneConflicts,
     ) -> Result<(), ToolRegistryError> {
         if definitions.is_empty() {
             return Ok(());
@@ -419,6 +486,23 @@ impl ToolRegistry {
         let mut managed_openapi_definitions = state.managed_openapi_definitions.clone();
         let mut mcp_proxy_definitions = state.mcp_proxy_definitions.clone();
         drop(state);
+        if conflicts == LaneConflicts::EvictStale {
+            let incoming = definitions
+                .iter()
+                .map(|definition| definition.name.clone())
+                .collect::<BTreeSet<_>>();
+            evict_stale_holders(
+                "boot",
+                "authority",
+                &incoming,
+                [
+                    &mut local_definitions,
+                    &mut managed_openapi_definitions,
+                    &mut mcp_proxy_definitions,
+                ],
+                |_| false,
+            );
+        }
 
         let (new_local_definitions, new_managed_openapi_definitions, new_mcp_proxy_definitions) =
             split_definitions_by_source(definitions);
@@ -446,39 +530,231 @@ impl ToolRegistry {
         Ok(())
     }
 
+    /// Replace `connection_id`'s managed-MCP lane, persisting inside the
+    /// registry's write lock so validation, durability, and the swap are
+    /// one atomic step. Standalone mode uses this; the asynchronous
+    /// cluster path uses the validate/commit/install split above, which
+    /// cannot hold this lock across its await.
     pub fn replace_mcp_connection_catalog<E>(
         &self,
         connection_id: &str,
         definitions: Vec<ToolDefinition>,
         persist: impl FnOnce() -> Result<(), E>,
     ) -> Result<(), McpCatalogPublishError<E>> {
-        if definitions.iter().any(|definition| {
-            !matches!(
-                &definition.source,
-                ToolSource::Mcp {
-                    connection_id: source_connection_id,
-                    ..
-                } if source_connection_id == connection_id
-            ) || !matches!(
-                &definition.target,
-                Some(ToolTarget::Mcp {
-                    connection_id: target_connection_id,
-                    ..
-                }) if target_connection_id == connection_id
-            )
-        }) {
+        let provenance = mcp_catalog_provenance_problems(connection_id, &definitions);
+        if !provenance.is_empty() {
             return Err(McpCatalogPublishError::Registry(
-                ToolRegistryError::invalid(vec![
-                    "managed MCP catalog contains a definition for a different connection"
-                        .to_owned(),
-                ]),
+                ToolRegistryError::invalid(provenance),
             ));
         }
 
-        let _guard = match self.write_lock.lock() {
-            Ok(guard) => guard,
-            Err(poisoned) => poisoned.into_inner(),
-        };
+        let _guard = self.write_guard();
+        let (local_definitions, managed_openapi_definitions, mcp_proxy_definitions) =
+            self.mcp_lanes_after(connection_id, definitions);
+        self.validate_merged_lanes(
+            &local_definitions,
+            &managed_openapi_definitions,
+            &mcp_proxy_definitions,
+        )
+        .map_err(McpCatalogPublishError::Registry)?;
+        persist().map_err(McpCatalogPublishError::Persist)?;
+        self.state
+            .store(Arc::new(ToolRegistryState::from_definition_sources(
+                local_definitions,
+                managed_openapi_definitions,
+                mcp_proxy_definitions,
+            )));
+        Ok(())
+    }
+
+    /// The managed-OpenAPI counterpart of
+    /// [`ToolRegistry::replace_mcp_connection_catalog`].
+    pub fn replace_openapi_connection_catalog<E>(
+        &self,
+        connection_id: &str,
+        definitions: Vec<ToolDefinition>,
+        persist: impl FnOnce() -> Result<(), E>,
+    ) -> Result<(), OpenApiCatalogPublishError<E>> {
+        let provenance = openapi_catalog_provenance_problems(connection_id, &definitions);
+        if !provenance.is_empty() {
+            return Err(McpCatalogPublishError::Registry(
+                ToolRegistryError::invalid(provenance),
+            ));
+        }
+
+        let _guard = self.write_guard();
+        let (local_definitions, managed_openapi_definitions, mcp_proxy_definitions) =
+            self.openapi_lanes_after(connection_id, definitions);
+        self.validate_merged_lanes(
+            &local_definitions,
+            &managed_openapi_definitions,
+            &mcp_proxy_definitions,
+        )
+        .map_err(McpCatalogPublishError::Registry)?;
+        persist().map_err(McpCatalogPublishError::Persist)?;
+        self.state
+            .store(Arc::new(ToolRegistryState::from_definition_sources(
+                local_definitions,
+                managed_openapi_definitions,
+                mcp_proxy_definitions,
+            )));
+        Ok(())
+    }
+
+    /// Validate a candidate managed-MCP lane for `connection_id` exactly
+    /// the way [`ToolRegistry::replace_mcp_connection_catalog`] would
+    /// (provenance, semantic checks, and the registered validator hook
+    /// over the merged set) without installing anything.
+    ///
+    /// This is the read half of the validate/commit/install split the
+    /// catalog services use once the persist step is asynchronous: a
+    /// `persist` closure cannot await, and the registry's write lock is a
+    /// `std` mutex that must not be held across one. The commit happens
+    /// between this call and
+    /// [`ToolRegistry::install_mcp_connection_catalog`], which re-validates
+    /// against the lanes current at install time. It is the same shape
+    /// [`ToolRegistry::validate_local_definitions`] and
+    /// [`ToolRegistry::install_local_definitions`] already use for the
+    /// document-owned lane.
+    pub fn validate_mcp_connection_catalog(
+        &self,
+        connection_id: &str,
+        definitions: &[ToolDefinition],
+    ) -> Result<(), ToolRegistryError> {
+        let provenance = mcp_catalog_provenance_problems(connection_id, definitions);
+        if !provenance.is_empty() {
+            return Err(ToolRegistryError::invalid(provenance));
+        }
+        let (local, managed_openapi, mcp_proxy) =
+            self.mcp_lanes_after(connection_id, definitions.to_vec());
+        self.validate_merged_lanes(&local, &managed_openapi, &mcp_proxy)
+    }
+
+    /// Install a managed-MCP lane that was validated and committed to the
+    /// authority. Re-validates against the lanes current at install time
+    /// (another lane may have moved since validation) and swaps. A
+    /// rejected install keeps the existing registry active -- fail closed,
+    /// exactly like a rejected file reload.
+    pub fn install_mcp_connection_catalog(
+        &self,
+        connection_id: &str,
+        definitions: Vec<ToolDefinition>,
+    ) -> Result<(), ToolRegistryError> {
+        self.install_mcp_connection_catalog_with(connection_id, definitions, LaneConflicts::Refuse)
+    }
+
+    pub fn install_mcp_connection_catalog_with(
+        &self,
+        connection_id: &str,
+        definitions: Vec<ToolDefinition>,
+        conflicts: LaneConflicts,
+    ) -> Result<(), ToolRegistryError> {
+        let provenance = mcp_catalog_provenance_problems(connection_id, &definitions);
+        if !provenance.is_empty() {
+            return Err(ToolRegistryError::invalid(provenance));
+        }
+        let _guard = self.write_guard();
+        let (mut local, mut managed_openapi, mut mcp_proxy) =
+            self.mcp_lanes_after(connection_id, definitions);
+        if conflicts == LaneConflicts::EvictStale {
+            let is_incoming =
+                |definition: &ToolDefinition| mcp_source_is(definition, connection_id);
+            let incoming = incoming_names(&mcp_proxy, is_incoming);
+            evict_stale_holders(
+                "mcp",
+                connection_id,
+                &incoming,
+                [&mut local, &mut managed_openapi, &mut mcp_proxy],
+                is_incoming,
+            );
+        }
+        self.validate_merged_lanes(&local, &managed_openapi, &mcp_proxy)?;
+        self.state
+            .store(Arc::new(ToolRegistryState::from_definition_sources(
+                local,
+                managed_openapi,
+                mcp_proxy,
+            )));
+        Ok(())
+    }
+
+    /// The managed-OpenAPI counterpart of
+    /// [`ToolRegistry::validate_mcp_connection_catalog`].
+    pub fn validate_openapi_connection_catalog(
+        &self,
+        connection_id: &str,
+        definitions: &[ToolDefinition],
+    ) -> Result<(), ToolRegistryError> {
+        let provenance = openapi_catalog_provenance_problems(connection_id, definitions);
+        if !provenance.is_empty() {
+            return Err(ToolRegistryError::invalid(provenance));
+        }
+        let (local, managed_openapi, mcp_proxy) =
+            self.openapi_lanes_after(connection_id, definitions.to_vec());
+        self.validate_merged_lanes(&local, &managed_openapi, &mcp_proxy)
+    }
+
+    /// The managed-OpenAPI counterpart of
+    /// [`ToolRegistry::install_mcp_connection_catalog`].
+    pub fn install_openapi_connection_catalog(
+        &self,
+        connection_id: &str,
+        definitions: Vec<ToolDefinition>,
+    ) -> Result<(), ToolRegistryError> {
+        self.install_openapi_connection_catalog_with(
+            connection_id,
+            definitions,
+            LaneConflicts::Refuse,
+        )
+    }
+
+    pub fn install_openapi_connection_catalog_with(
+        &self,
+        connection_id: &str,
+        definitions: Vec<ToolDefinition>,
+        conflicts: LaneConflicts,
+    ) -> Result<(), ToolRegistryError> {
+        let provenance = openapi_catalog_provenance_problems(connection_id, &definitions);
+        if !provenance.is_empty() {
+            return Err(ToolRegistryError::invalid(provenance));
+        }
+        let _guard = self.write_guard();
+        let (mut local, mut managed_openapi, mut mcp_proxy) =
+            self.openapi_lanes_after(connection_id, definitions);
+        if conflicts == LaneConflicts::EvictStale {
+            let is_incoming =
+                |definition: &ToolDefinition| openapi_source_is(definition, connection_id);
+            let incoming = incoming_names(&managed_openapi, is_incoming);
+            evict_stale_holders(
+                "openapi",
+                connection_id,
+                &incoming,
+                [&mut local, &mut managed_openapi, &mut mcp_proxy],
+                is_incoming,
+            );
+        }
+        self.validate_merged_lanes(&local, &managed_openapi, &mcp_proxy)?;
+        self.state
+            .store(Arc::new(ToolRegistryState::from_definition_sources(
+                local,
+                managed_openapi,
+                mcp_proxy,
+            )));
+        Ok(())
+    }
+
+    /// The three lanes as they would stand after `connection_id`'s
+    /// managed-MCP lane is replaced by `definitions`, in
+    /// (local, managed OpenAPI, MCP proxy) order.
+    fn mcp_lanes_after(
+        &self,
+        connection_id: &str,
+        definitions: Vec<ToolDefinition>,
+    ) -> (
+        Vec<ToolDefinition>,
+        Vec<ToolDefinition>,
+        Vec<ToolDefinition>,
+    ) {
         let state = self.state.load();
         let local_definitions = state.local_definitions.clone();
         let managed_openapi_definitions = state.managed_openapi_definitions.clone();
@@ -498,63 +774,23 @@ impl ToolRegistry {
             .collect::<Vec<_>>();
         drop(state);
         mcp_proxy_definitions.extend(definitions);
-
-        let merged = combined_definitions(
-            &local_definitions,
-            &managed_openapi_definitions,
-            &mcp_proxy_definitions,
-        );
-        let semantic_problems = tool_definition_problems(&merged);
-        if !semantic_problems.is_empty() {
-            return Err(McpCatalogPublishError::Registry(
-                ToolRegistryError::invalid(semantic_problems),
-            ));
-        }
-        self.validate_definitions(&merged)
-            .map_err(McpCatalogPublishError::Registry)?;
-        persist().map_err(McpCatalogPublishError::Persist)?;
-        self.state
-            .store(Arc::new(ToolRegistryState::from_definition_sources(
-                local_definitions,
-                managed_openapi_definitions,
-                mcp_proxy_definitions,
-            )));
-        Ok(())
+        (
+            local_definitions,
+            managed_openapi_definitions,
+            mcp_proxy_definitions,
+        )
     }
 
-    pub fn replace_openapi_connection_catalog<E>(
+    /// The managed-OpenAPI counterpart of [`ToolRegistry::mcp_lanes_after`].
+    fn openapi_lanes_after(
         &self,
         connection_id: &str,
         definitions: Vec<ToolDefinition>,
-        persist: impl FnOnce() -> Result<(), E>,
-    ) -> Result<(), OpenApiCatalogPublishError<E>> {
-        if definitions.iter().any(|definition| {
-            !matches!(
-                &definition.source,
-                ToolSource::OpenApi {
-                    connection_id: source_connection_id,
-                    catalog_revision: Some(_),
-                    ..
-                } if source_connection_id == connection_id
-            ) || !matches!(
-                &definition.target,
-                Some(ToolTarget::Http {
-                    connection_id: target_connection_id,
-                    ..
-                }) if target_connection_id == connection_id
-            )
-        }) {
-            return Err(McpCatalogPublishError::Registry(
-                ToolRegistryError::invalid(vec![
-                    "managed OpenAPI catalog contains a definition for a different connection or without a catalog revision".to_owned(),
-                ]),
-            ));
-        }
-
-        let _guard = match self.write_lock.lock() {
-            Ok(guard) => guard,
-            Err(poisoned) => poisoned.into_inner(),
-        };
+    ) -> (
+        Vec<ToolDefinition>,
+        Vec<ToolDefinition>,
+        Vec<ToolDefinition>,
+    ) {
         let state = self.state.load();
         let local_definitions = state.local_definitions.clone();
         let mut managed_openapi_definitions = state
@@ -574,28 +810,37 @@ impl ToolRegistry {
         let mcp_proxy_definitions = state.mcp_proxy_definitions.clone();
         drop(state);
         managed_openapi_definitions.extend(definitions);
+        (
+            local_definitions,
+            managed_openapi_definitions,
+            mcp_proxy_definitions,
+        )
+    }
 
-        let merged = combined_definitions(
-            &local_definitions,
-            &managed_openapi_definitions,
-            &mcp_proxy_definitions,
-        );
+    /// The semantic checks plus the registered validator hook over the
+    /// merged set of three lanes.
+    fn validate_merged_lanes(
+        &self,
+        local: &[ToolDefinition],
+        managed_openapi: &[ToolDefinition],
+        mcp_proxy: &[ToolDefinition],
+    ) -> Result<(), ToolRegistryError> {
+        let merged = combined_definitions(local, managed_openapi, mcp_proxy);
         let semantic_problems = tool_definition_problems(&merged);
         if !semantic_problems.is_empty() {
-            return Err(McpCatalogPublishError::Registry(
-                ToolRegistryError::invalid(semantic_problems),
-            ));
+            return Err(ToolRegistryError::invalid(semantic_problems));
         }
         self.validate_definitions(&merged)
-            .map_err(McpCatalogPublishError::Registry)?;
-        persist().map_err(McpCatalogPublishError::Persist)?;
-        self.state
-            .store(Arc::new(ToolRegistryState::from_definition_sources(
-                local_definitions,
-                managed_openapi_definitions,
-                mcp_proxy_definitions,
-            )));
-        Ok(())
+    }
+
+    /// The registry write lock, recovering a poisoned guard: poisoning
+    /// means a writer panicked mid-swap, which leaves the `ArcSwap`
+    /// structurally valid (it is swapped, never mutated in place).
+    fn write_guard(&self) -> std::sync::MutexGuard<'_, ()> {
+        match self.write_lock.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        }
     }
 
     pub fn replace_local_definitions_with_persist<E>(
@@ -642,7 +887,61 @@ impl ToolRegistry {
         Ok(())
     }
 
-    fn from_definitions_with_audit(
+    /// Validate a candidate local lane exactly the way an install would
+    /// (provenance, semantic checks, and the registered validator hook
+    /// over the merged set) without installing anything. Cluster mode
+    /// commits the candidate to the authority between this validation and
+    /// [`ToolRegistry::install_local_definitions`]; the install
+    /// re-validates against the lanes current at install time.
+    #[cfg_attr(not(feature = "postgres"), allow(dead_code))] // Only the
+                                                             // cluster-mode register path calls it; the file path validates inside
+                                                             // `replace_local_definitions_with_persist`.
+    pub fn validate_local_definitions(
+        &self,
+        local_definitions: &[ToolDefinition],
+    ) -> Result<(), ToolRegistryError> {
+        let provenance_problems = local_definition_provenance_problems(local_definitions);
+        if !provenance_problems.is_empty() {
+            return Err(ToolRegistryError::invalid(provenance_problems));
+        }
+        let state = self.state.load();
+        let merged = combined_definitions(
+            local_definitions,
+            &state.managed_openapi_definitions,
+            &state.mcp_proxy_definitions,
+        );
+        drop(state);
+        let semantic_problems = tool_definition_problems(&merged);
+        if !semantic_problems.is_empty() {
+            return Err(ToolRegistryError::invalid(semantic_problems));
+        }
+        self.validate_definitions(&merged)
+    }
+
+    /// Install a local lane that was validated and committed to the
+    /// authority (cluster mode): re-validates against the current lanes
+    /// (managed lanes may have moved since validation) and swaps. A
+    /// rejected install keeps the existing registry active -- fail
+    /// closed, exactly like a rejected file reload.
+    #[cfg_attr(not(feature = "postgres"), allow(dead_code))] // Only the
+                                                             // cluster-mode register path and the tools reconciler call it.
+    pub fn install_local_definitions(
+        &self,
+        local_definitions: Vec<ToolDefinition>,
+    ) -> Result<(), ToolRegistryError> {
+        self.replace_local_definitions_with(local_definitions, LaneConflicts::Refuse)
+    }
+
+    #[cfg_attr(not(feature = "postgres"), allow(dead_code))] // The cluster reconciler's install.
+    pub fn install_local_definitions_with(
+        &self,
+        local_definitions: Vec<ToolDefinition>,
+        conflicts: LaneConflicts,
+    ) -> Result<(), ToolRegistryError> {
+        self.replace_local_definitions_with(local_definitions, conflicts)
+    }
+
+    pub(crate) fn from_definitions_with_audit(
         definitions: Vec<ToolDefinition>,
         audit: Option<AuditLog>,
     ) -> Self {
@@ -679,9 +978,26 @@ impl ToolRegistry {
         Ok(())
     }
 
+    /// The currently installed local lane (the document-owned tools), in
+    /// document order. Tests and cluster wiring observe reconciliation
+    /// through this; serving paths use the merged snapshot.
+    #[allow(dead_code)] // Read by the cluster-mode tests; a production
+                        // consumer (cluster status) arrives with #241 PR 14.
+    pub fn current_local_definitions(&self) -> Vec<ToolDefinition> {
+        self.state.load().local_definitions.clone()
+    }
+
     fn replace_local_definitions(
         &self,
         local_definitions: Vec<ToolDefinition>,
+    ) -> Result<(), ToolRegistryError> {
+        self.replace_local_definitions_with(local_definitions, LaneConflicts::Refuse)
+    }
+
+    fn replace_local_definitions_with(
+        &self,
+        local_definitions: Vec<ToolDefinition>,
+        conflicts: LaneConflicts,
     ) -> Result<(), ToolRegistryError> {
         let _guard = match self.write_lock.lock() {
             Ok(guard) => guard,
@@ -689,9 +1005,22 @@ impl ToolRegistry {
         };
 
         let state = self.state.load();
-        let managed_openapi_definitions = state.managed_openapi_definitions.clone();
-        let mcp_proxy_definitions = state.mcp_proxy_definitions.clone();
+        let mut managed_openapi_definitions = state.managed_openapi_definitions.clone();
+        let mut mcp_proxy_definitions = state.mcp_proxy_definitions.clone();
         drop(state);
+        if conflicts == LaneConflicts::EvictStale {
+            let incoming = local_definitions
+                .iter()
+                .map(|definition| definition.name.clone())
+                .collect::<BTreeSet<_>>();
+            evict_stale_holders(
+                "local",
+                "tools",
+                &incoming,
+                [&mut managed_openapi_definitions, &mut mcp_proxy_definitions],
+                |_| false,
+            );
+        }
 
         self.replace_definition_sources_locked(
             local_definitions,
@@ -879,6 +1208,148 @@ fn local_definition_provenance_problems(definitions: &[ToolDefinition]) -> Vec<S
             ToolSource::Manual | ToolSource::Legacy => None,
         })
         .collect()
+}
+
+/// Every definition in a managed-MCP catalog must claim -- in both its
+/// source and its target -- the connection whose lane it is being
+/// installed into. A catalog that names another connection would let one
+/// connection's refresh publish tools attributed to another.
+fn mcp_catalog_provenance_problems(
+    connection_id: &str,
+    definitions: &[ToolDefinition],
+) -> Vec<String> {
+    if definitions.iter().any(|definition| {
+        !matches!(
+            &definition.source,
+            ToolSource::Mcp {
+                connection_id: source_connection_id,
+                ..
+            } if source_connection_id == connection_id
+        ) || !matches!(
+            &definition.target,
+            Some(ToolTarget::Mcp {
+                connection_id: target_connection_id,
+                ..
+            }) if target_connection_id == connection_id
+        )
+    }) {
+        vec!["managed MCP catalog contains a definition for a different connection".to_owned()]
+    } else {
+        Vec::new()
+    }
+}
+
+/// The managed-OpenAPI counterpart of [`mcp_catalog_provenance_problems`],
+/// which additionally requires the catalog revision the definition was
+/// derived from: an OpenAPI tool without one cannot be matched back to the
+/// specification revision that authorized it.
+fn openapi_source_is(definition: &ToolDefinition, connection_id: &str) -> bool {
+    matches!(
+        &definition.source,
+        ToolSource::OpenApi { connection_id: source, .. } if source == connection_id
+    )
+}
+
+fn mcp_source_is(definition: &ToolDefinition, connection_id: &str) -> bool {
+    matches!(
+        &definition.source,
+        ToolSource::Mcp { connection_id: source, .. } if source == connection_id
+    )
+}
+
+/// The names a lane install brings in: the entries of `lane` that belong
+/// to the installing owner.
+fn incoming_names(
+    lane: &[ToolDefinition],
+    is_incoming: impl Fn(&ToolDefinition) -> bool,
+) -> BTreeSet<String> {
+    lane.iter()
+        .filter(|definition| is_incoming(definition))
+        .map(|definition| definition.name.clone())
+        .collect()
+}
+
+/// Remove from `lanes` every entry that holds one of `incoming`'s names and
+/// is not the incoming owner's own: under [`LaneConflicts::EvictStale`] such
+/// a holder is provably stale (the authority reserved the name for the
+/// installing owner), and its own authoritative content follows.
+///
+/// Provably -- which is why a holder the authority never reserved is not
+/// evicted: a legacy projection's MCP proxy (a `Legacy` source in the MCP
+/// lane) comes from this replica's static configuration, not from the
+/// authority, so an authoritative name colliding with it is a real
+/// collision, not staleness. It stays, the merged validation refuses the
+/// install, and the gate fails closed rather than silently rebinding what
+/// an existing policy name invokes.
+fn evict_stale_holders<const N: usize>(
+    lane: &'static str,
+    owner: &str,
+    incoming: &BTreeSet<String>,
+    lanes: [&mut Vec<ToolDefinition>; N],
+    is_incoming: impl Fn(&ToolDefinition) -> bool,
+) {
+    let mut evicted = Vec::new();
+    let mut unreserved = Vec::new();
+    for entries in lanes {
+        entries.retain(|definition| {
+            if !incoming.contains(&definition.name) || is_incoming(definition) {
+                return true;
+            }
+            if definition.upstream.is_mcp_proxy()
+                && !matches!(definition.source, ToolSource::Mcp { .. })
+            {
+                unreserved.push(definition.name.clone());
+                return true;
+            }
+            evicted.push(definition.name.clone());
+            false
+        });
+    }
+    if !unreserved.is_empty() {
+        tracing::error!(
+            lane,
+            owner,
+            names = ?unreserved,
+            "authoritative install collides with tool names this replica's static \
+             configuration holds; the install is refused rather than rebinding them"
+        );
+    }
+    if !evicted.is_empty() {
+        tracing::info!(
+            lane,
+            owner,
+            evicted = ?evicted,
+            "authoritative install evicted stale holders of names the authority reassigned"
+        );
+    }
+}
+
+fn openapi_catalog_provenance_problems(
+    connection_id: &str,
+    definitions: &[ToolDefinition],
+) -> Vec<String> {
+    if definitions.iter().any(|definition| {
+        !matches!(
+            &definition.source,
+            ToolSource::OpenApi {
+                connection_id: source_connection_id,
+                catalog_revision: Some(_),
+                ..
+            } if source_connection_id == connection_id
+        ) || !matches!(
+            &definition.target,
+            Some(ToolTarget::Http {
+                connection_id: target_connection_id,
+                ..
+            }) if target_connection_id == connection_id
+        )
+    }) {
+        vec![
+            "managed OpenAPI catalog contains a definition for a different connection or without a catalog revision".to_owned(),
+        ]
+    } else {
+        Vec::new()
+    }
 }
 
 #[allow(dead_code)] // Retained for callers that only reload local tool definitions.
@@ -1233,7 +1704,7 @@ fn tools_file_too_large(path: &Path) -> ToolRegistryError {
     }
 }
 
-fn definitions_from_json_value(
+pub(crate) fn definitions_from_json_value(
     value: Value,
     path: Option<&Path>,
 ) -> Result<Vec<ToolDefinition>, ToolRegistryError> {
@@ -1868,6 +2339,240 @@ mod tests {
             .map(|tool| tool.name.clone())
             .collect();
         assert_eq!(listed, vec!["echo".to_owned(), "get_widget".to_owned()]);
+    }
+
+    fn openapi_definition(connection_id: &str, name: &str) -> ToolDefinition {
+        let mapping = json!({
+            "method": "GET",
+            "path_template": format!("/v1/{name}"),
+            "body": { "mode": "whole_args_json" }
+        });
+        serde_json::from_value(json!({
+            "name": name,
+            "description": "A managed operation.",
+            "input_json_schema": {
+                "type": "object",
+                "properties": {},
+                "additionalProperties": false
+            },
+            "target": { "type": "http", "connection_id": connection_id, "mapping": mapping },
+            "source": {
+                "type": "open_api",
+                "connection_id": connection_id,
+                "catalog_revision": 1
+            },
+            "upstream": mapping
+        }))
+        .expect("managed OpenAPI definition should deserialize")
+    }
+
+    /// Inside a pinned request, lookups read the registry state the gate
+    /// pinned at admission; a lane installed afterwards is invisible to it
+    /// and visible outside the pin.
+    #[cfg(feature = "postgres")]
+    #[tokio::test]
+    async fn dispatch_reads_the_pinned_registry_state_not_the_live_lane() {
+        let registry = ToolRegistry::from_config(&crate::config::Config::test_defaults())
+            .expect("an empty registry");
+        registry
+            .install_local_definitions_with(vec![local_definition("alpha")], LaneConflicts::Refuse)
+            .expect("the live lane installs alpha");
+        let pinned = registry.state_handle().load_full();
+        registry
+            .install_local_definitions_with(
+                vec![local_definition("alpha"), local_definition("beta")],
+                LaneConflicts::Refuse,
+            )
+            .expect("the live lane installs beta");
+        assert!(registry.get("beta").is_some(), "the live lane has beta");
+        let (alpha_inside, beta_inside, listed_inside) = with_pinned_tools(pinned, async {
+            (
+                registry.get("alpha").is_some(),
+                registry.get("beta").is_some(),
+                registry.list().len(),
+            )
+        })
+        .await;
+        assert!(alpha_inside);
+        assert!(
+            !beta_inside,
+            "a pinned request never sees a lane installed after its admission"
+        );
+        assert_eq!(listed_inside, 1);
+        assert!(
+            registry.get("beta").is_some(),
+            "outside the pin the live lane is read"
+        );
+    }
+
+    fn local_definition(name: &str) -> ToolDefinition {
+        serde_json::from_value(json!({
+            "name": name,
+            "description": "A local tool.",
+            "input_json_schema": {
+                "type": "object",
+                "properties": {},
+                "additionalProperties": false
+            },
+            "upstream": {
+                "method": "POST",
+                "path_template": "/v1/echo",
+                "body": { "mode": "whole_args_json" }
+            }
+        }))
+        .expect("local definition should deserialize")
+    }
+
+    /// An authoritative install evicts a stale holder of a name the
+    /// authority reassigned; a request-path install still refuses it.
+    #[test]
+    fn an_authoritative_install_evicts_the_stale_holder_of_a_moved_name() {
+        let registry = ToolRegistry::disabled();
+        registry
+            .install_local_definitions(vec![local_definition("shared_tool")])
+            .expect("the local lane installs");
+
+        registry
+            .install_openapi_connection_catalog(
+                "conn-a",
+                vec![openapi_definition("conn-a", "shared_tool")],
+            )
+            .expect_err("a request-path install refuses a name another lane holds");
+
+        registry
+            .install_openapi_connection_catalog_with(
+                "conn-a",
+                vec![openapi_definition("conn-a", "shared_tool")],
+                LaneConflicts::EvictStale,
+            )
+            .expect("the authoritative install evicts the stale local holder");
+        let served = registry.get("shared_tool").expect("the name is served");
+        assert!(
+            matches!(&served.source, ToolSource::OpenApi { connection_id, .. } if connection_id == "conn-a"),
+            "the authority's owner serves the name: {:?}",
+            served.source
+        );
+        assert!(
+            registry
+                .current_local_definitions()
+                .iter()
+                .all(|definition| definition.name != "shared_tool"),
+            "the stale local entry is gone"
+        );
+    }
+
+    /// A legacy projection's MCP proxy is not reserved at the authority, so
+    /// an authoritative catalog claiming its name is a collision, not
+    /// staleness: the install is refused and the legacy holder stays.
+    #[test]
+    fn an_unreserved_legacy_holder_is_never_evicted() {
+        let registry = ToolRegistry::disabled();
+        registry
+            .replace_local_and_legacy_mcp_definitions(
+                Vec::new(),
+                vec![mcp_proxy_tool(
+                    "weather:get_forecast",
+                    "weather",
+                    "get_forecast",
+                )],
+            )
+            .expect("the legacy proxy installs");
+        let managed = ToolDefinition::mcp_connection(
+            "weather".to_owned(),
+            "An authoritative catalog claiming the legacy name.".to_owned(),
+            json!({"type": "object", "properties": {}, "additionalProperties": false}),
+            "get_forecast".to_owned(),
+        );
+        registry
+            .install_mcp_connection_catalog_with(
+                "weather",
+                vec![managed],
+                LaneConflicts::EvictStale,
+            )
+            .expect_err("a name this replica's static configuration holds is refused");
+        let served = registry
+            .get("weather:get_forecast")
+            .expect("the legacy proxy is still served");
+        assert!(
+            matches!(served.source, ToolSource::Legacy),
+            "the legacy holder was not rebound: {:?}",
+            served.source
+        );
+    }
+
+    /// A cluster-mode boot merge evicts a stale holder the same way a
+    /// reconcile does, so seeds read at different revisions cannot abort
+    /// startup on a name that moved between them; a standalone merge still
+    /// refuses.
+    #[test]
+    fn a_boot_merge_can_evict_a_stale_holder_when_asked() {
+        let registry = ToolRegistry::disabled();
+        registry
+            .install_local_definitions(vec![local_definition("moved_tool")])
+            .expect("the local seed installs");
+        registry
+            .merge_definitions(vec![openapi_definition("conn-a", "moved_tool")])
+            .expect_err("a standalone merge refuses the collision");
+        registry
+            .merge_definitions_with(
+                vec![openapi_definition("conn-a", "moved_tool")],
+                LaneConflicts::EvictStale,
+            )
+            .expect("a cluster boot merge evicts the stale local holder");
+        assert!(matches!(
+            registry.get("moved_tool").expect("served").source,
+            ToolSource::OpenApi { .. }
+        ));
+    }
+
+    /// Two catalogs that swapped names converge on a lagging replica in
+    /// either order: each authoritative install evicts the other's stale
+    /// entry, and the other's authoritative content then installs cleanly.
+    #[test]
+    fn swapped_names_converge_in_either_reconcile_order() {
+        for first in ["conn-a", "conn-b"] {
+            let registry = ToolRegistry::disabled();
+            registry
+                .install_openapi_connection_catalog(
+                    "conn-a",
+                    vec![openapi_definition("conn-a", "x")],
+                )
+                .expect("A holds x");
+            registry
+                .install_openapi_connection_catalog(
+                    "conn-b",
+                    vec![openapi_definition("conn-b", "y")],
+                )
+                .expect("B holds y");
+            // At the authority the names swapped: A now holds y, B holds x.
+            let (second, second_name, first_name) = if first == "conn-a" {
+                ("conn-b", "x", "y")
+            } else {
+                ("conn-a", "y", "x")
+            };
+            registry
+                .install_openapi_connection_catalog_with(
+                    first,
+                    vec![openapi_definition(first, first_name)],
+                    LaneConflicts::EvictStale,
+                )
+                .unwrap_or_else(|error| panic!("{first} installs its new name first: {error}"));
+            registry
+                .install_openapi_connection_catalog_with(
+                    second,
+                    vec![openapi_definition(second, second_name)],
+                    LaneConflicts::EvictStale,
+                )
+                .unwrap_or_else(|error| panic!("{second} installs after {first}: {error}"));
+            for (name, owner) in [("x", "conn-b"), ("y", "conn-a")] {
+                let served = registry.get(name).expect("both names are served");
+                assert!(
+                    matches!(&served.source, ToolSource::OpenApi { connection_id, .. } if connection_id == owner),
+                    "{name} is served by {owner} after starting with {first}: {:?}",
+                    served.source
+                );
+            }
+        }
     }
 
     #[test]

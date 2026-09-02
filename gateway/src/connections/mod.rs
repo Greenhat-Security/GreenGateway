@@ -17,11 +17,14 @@ pub mod gcp_secret;
 pub mod http;
 pub mod kubernetes_secret;
 pub mod local_secret;
+pub mod managed_store;
 pub mod mcp;
 pub mod model;
 pub mod oauth;
 pub mod openapi;
 pub mod permissions;
+#[cfg(feature = "postgres")]
+pub mod pg_store;
 pub mod projection;
 pub mod secret;
 pub mod status;

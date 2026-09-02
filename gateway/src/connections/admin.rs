@@ -385,9 +385,31 @@ struct ConnectionCursor {
 
 pub struct ConnectionListRuntimeData<'a> {
     pub statuses: &'a BTreeMap<ConnectionId, SafeConnectionStatus>,
+    /// The authority's status revisions (cluster mode), which override the
+    /// runtime record's so the view's `revisions.status` matches the status
+    /// it shows; empty in standalone mode.
+    pub status_revisions: &'a BTreeMap<ConnectionId, u64>,
     pub dependency_counts: &'a BTreeMap<ConnectionId, usize>,
     pub capability_counts: &'a BTreeMap<ConnectionId, usize>,
     pub activity_times: &'a BTreeMap<ConnectionId, ConnectionActivityTimes>,
+}
+
+/// The record as the view should show it: with the authority's status
+/// revision when it is newer than the runtime record's (a status write on
+/// another replica moves no security revision, so the record here can lag
+/// until an unrelated reconcile). Borrowed when nothing changes.
+pub fn with_authoritative_status_revision(
+    record: &StoredConnection,
+    status_revision: Option<u64>,
+) -> std::borrow::Cow<'_, StoredConnection> {
+    match status_revision {
+        Some(revision) if revision != record.revisions.status => {
+            let mut record = record.clone();
+            record.revisions.status = revision;
+            std::borrow::Cow::Owned(record)
+        }
+        _ => std::borrow::Cow::Borrowed(record),
+    }
 }
 
 pub fn build_connection_list_page(
@@ -432,6 +454,8 @@ pub fn build_connection_list_page(
     }
     for (id, record) in snapshot.managed() {
         let activity = runtime.activity_times.get(id).cloned().unwrap_or_default();
+        let record =
+            with_authoritative_status_revision(record, runtime.status_revisions.get(id).copied());
         views.push(ConnectionSummaryView {
             summary: record.safe_summary(runtime.statuses.get(id).cloned()),
             sanitized_origin: Some(record.write.endpoint.base_url.clone()),
@@ -444,7 +468,7 @@ pub fn build_connection_list_page(
             last_refresh_at: activity.last_refresh_at,
             actions: ConnectionActions::managed(
                 permissions,
-                record,
+                &record,
                 runtime
                     .dependency_counts
                     .get(id)
@@ -707,6 +731,41 @@ mod tests {
         let serialized = value.to_string();
         assert!(!serialized.contains("replacement.example.test"));
         assert!(!serialized.contains("billing-secret-id-canary"));
+    }
+
+    #[test]
+    fn the_view_takes_the_authoritys_status_revision_over_the_runtime_records() {
+        let record = StoredConnection {
+            id: ConnectionId::parse("00000000-0000-0000-0000-000000000001")
+                .expect("ID should parse"),
+            write: credentialed_write(),
+            revisions: crate::connections::status::ConnectionRevisions {
+                connection: 1,
+                credential: 1,
+                tls: 1,
+                discovery: 0,
+                status: 2,
+            },
+            created_at: "2026-01-01T00:00:00Z".to_owned(),
+            updated_at: "2026-01-01T00:00:00Z".to_owned(),
+        };
+        let newer = with_authoritative_status_revision(&record, Some(7));
+        assert!(matches!(newer, std::borrow::Cow::Owned(_)));
+        assert_eq!(newer.revisions.status, 7);
+        assert_eq!(newer.safe_summary(None).revisions.status, 7);
+        assert_eq!(
+            newer.etag(),
+            record.etag(),
+            "status is not part of the etag"
+        );
+        assert!(matches!(
+            with_authoritative_status_revision(&record, Some(2)),
+            std::borrow::Cow::Borrowed(_)
+        ));
+        assert!(matches!(
+            with_authoritative_status_revision(&record, None),
+            std::borrow::Cow::Borrowed(_)
+        ));
     }
 
     #[test]

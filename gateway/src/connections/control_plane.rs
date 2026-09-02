@@ -2,14 +2,16 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     error::Error,
     fmt,
-    sync::{Arc, Mutex, MutexGuard, OnceLock, TryLockError},
+    sync::{Arc, Mutex, MutexGuard, OnceLock},
     time::Instant,
 };
 
 use arc_swap::ArcSwap;
 use async_trait::async_trait;
 use sha2::{Digest, Sha256};
-use tokio::sync::{OwnedSemaphorePermit, Semaphore};
+use tokio::sync::{
+    Mutex as AsyncMutex, MutexGuard as AsyncMutexGuard, OwnedSemaphorePermit, Semaphore,
+};
 
 use crate::config::Config;
 
@@ -34,6 +36,7 @@ use super::{
         LocalSecretError, LocalSecretKeyring, LocalSecretKeyringConfigError, LocalSecretManager,
         LocalSecretProvider, MasterKeyRotationProgress,
     },
+    managed_store::ManagedConnectionStore,
     model::{
         ConnectionAuthentication, ConnectionId, ConnectionWrite, MAX_CONCURRENT_REFRESHES,
         MAX_CONNECTIONS,
@@ -46,8 +49,8 @@ use super::{
     },
     status::SafeConnectionStatus,
     store::{
-        ConnectionDependencyKind, ConnectionEtag, ConnectionStatusUpdate, ConnectionStore,
-        ConnectionStoreError, SqliteConnectionStore, StoredConnection,
+        CollectionCheck, ConnectionDependencyKind, ConnectionEtag, ConnectionStatusUpdate,
+        ConnectionStore, ConnectionStoreError, SqliteConnectionStore, StoredConnection,
     },
     vault_secret::{
         EgressVaultTransport, VaultKvV2SecretProvider, VaultProviderConfig,
@@ -55,13 +58,42 @@ use super::{
     },
 };
 
+/// Dependency rows waiting to be written, keyed by the consumer kind whose
+/// whole set they replace. One entry per kind: a later derivation for the
+/// same kind supersedes the earlier one rather than adding to it, which is
+/// what makes a flush idempotent and a missed flush harmless.
+/// Dependency sets a synchronous caller queued for the flush task, each
+/// stamped with the security revision of the document that derived it (0
+/// when none did), so the store can refuse a stale replica's flush.
+type PendingDependencies = BTreeMap<ConnectionDependencyKind, (i64, Vec<(ConnectionId, String)>)>;
+
+#[cfg(test)]
+type FlushHook = Arc<dyn Fn() + Send + Sync>;
+
 #[derive(Clone)]
 pub struct ConnectionControlPlane {
-    managed: Option<SqliteConnectionStore>,
+    managed: Option<ManagedConnectionStore>,
     legacy: Arc<[LegacyConnectionProjection]>,
     omitted_legacy_projection_count: usize,
     runtime: Arc<ArcSwap<ConnectionRuntimeSnapshot>>,
-    mutation_lock: Arc<Mutex<()>>,
+    /// Serializes control-plane mutations against each other and against
+    /// local-secret mutations. A Tokio mutex, not a `std` one: a mutation
+    /// now awaits its store (the PostgreSQL authority in cluster mode, the
+    /// blocking pool in standalone mode) while holding this, and a `std`
+    /// guard held across an await is neither `Send` nor safe on a
+    /// multi-threaded executor.
+    mutation_lock: Arc<AsyncMutex<()>>,
+    /// Runtime dependency sets whose owner could not write them where it
+    /// computed them. See `replace_runtime_dependencies`.
+    pending_dependencies: Arc<Mutex<PendingDependencies>>,
+    /// The security revision of the tools document whose manual-tool
+    /// dependency set is being derived (cluster mode): stamped on the
+    /// queued set so a stale replica's flush cannot replace a newer one.
+    manual_tool_source_revision: Arc<std::sync::atomic::AtomicI64>,
+    /// Test seam: runs inside a flush after the batch is taken and before
+    /// it is written, while the mutation lock is held.
+    #[cfg(test)]
+    flush_hook: Arc<Mutex<Option<FlushHook>>>,
     catalog_lifecycle: Arc<CatalogLifecycleCoordinator>,
     secret_resolver: Arc<ConnectionSecretResolver>,
     local_secret_versions: Arc<ArcSwap<BTreeMap<String, u64>>>,
@@ -142,6 +174,11 @@ impl fmt::Debug for ConnectionRuntimeSnapshot {
 }
 
 impl ConnectionRuntimeSnapshot {
+    #[cfg(test)]
+    pub(crate) fn empty_for_test() -> Self {
+        Self::new(BTreeMap::new(), Arc::from(Vec::new()), 0)
+    }
+
     fn new(
         managed: BTreeMap<ConnectionId, StoredConnection>,
         legacy: Arc<[LegacyConnectionProjection]>,
@@ -173,8 +210,85 @@ impl ConnectionRuntimeSnapshot {
     }
 }
 
+/// Publish queued dependency rows in the background (issue #241, PR 8,
+/// cluster mode only).
+///
+/// [`ConnectionControlPlane::replace_runtime_dependencies`] explains why
+/// they are queued: both callers are synchronous by construction and have
+/// no async context to write from. The Connections reconciler flushes on
+/// every pass, but a reconcile only runs when the security revision moves,
+/// and a registry write that queues a new set does not move it -- so a
+/// deployment could sit with an incomplete delete guard indefinitely
+/// waiting for an unrelated commit. This task is what closes that: it
+/// flushes on the same interval the reconciler polls on, and does its first
+/// flush immediately so a boot-time set lands before the first admin
+/// request could act on it.
+///
+/// A flush failure is logged and retried on the next tick. It is not fatal
+/// and must not be: these rows authorize nothing. They refuse an admin
+/// delete that would orphan a live reference, and while they are missing
+/// the store still refuses it referentially (PostgreSQL holds
+/// `ON DELETE RESTRICT` on the dependency's owner).
+#[cfg(feature = "postgres")]
+pub fn spawn_dependency_flush_task(
+    control_plane: ConnectionControlPlane,
+    lifecycle: &crate::lifecycle::GatewayLifecycle,
+) {
+    let cancellation = lifecycle.background_cancellation();
+    let handle = tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(crate::security_cluster::RECONCILE_POLL_INTERVAL);
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            tokio::select! {
+                _ = ticker.tick() => {}
+                () = cancellation.cancelled() => return,
+            }
+            if let Err(error) = control_plane.flush_pending_dependencies().await {
+                tracing::warn!(
+                    error = %error,
+                    "connection dependency rows could not be published; retrying on the next tick"
+                );
+            }
+        }
+    });
+    lifecycle.register_background_task(handle);
+}
+
+/// How many legacy projections this replica's static configuration
+/// contributes to the bounded collection. Cluster mode reserves them out
+/// of the managed capacity it hands the PostgreSQL store, exactly as
+/// `from_config` reserves them out of the SQLite store's: the collection
+/// bound covers both, and a store given the full bound would accept a
+/// create that the next reconcile then refuses to publish.
+pub fn legacy_projection_count(config: &Config) -> Result<usize, ConnectionControlPlaneError> {
+    Ok(project_legacy_connections(config)?.connections.len())
+}
+
+/// What the PostgreSQL authority held when this replica started: the
+/// dispatch to serve every later read and write through, and the records
+/// `run()` already fetched so the synchronous app builder does not have to
+/// await. Cluster mode's replacement for opening a local SQLite file --
+/// which cluster mode rejects outright (`CONNECTIONS_SQLITE_PATH` is a
+/// writable local authority, see `docs/configuration.md`).
+pub struct ClusterConnectionStoreSeed {
+    pub store: ManagedConnectionStore,
+    pub records: Vec<StoredConnection>,
+}
+
 impl ConnectionControlPlane {
     pub fn from_config(config: &Config) -> Result<Self, ConnectionControlPlaneError> {
+        Self::from_config_with_cluster_seed(config, None)
+    }
+
+    /// Build the control plane over the cluster authority instead of a
+    /// local SQLite file. Everything downstream of the store -- legacy
+    /// projections, secret resolution, binding validation, the runtime
+    /// snapshot, the capacity bounds -- is mode-independent and runs
+    /// exactly as it does standalone.
+    pub fn from_config_with_cluster_seed(
+        config: &Config,
+        cluster: Option<ClusterConnectionStoreSeed>,
+    ) -> Result<Self, ConnectionControlPlaneError> {
         let secret_resolver = Arc::new(OperatorAliasResolver::from_config(
             &config.connection_secret_aliases,
             config.connection_secrets_root.as_ref(),
@@ -208,21 +322,34 @@ impl ConnectionControlPlane {
         }
         let omitted_legacy_projection_count = projection.omitted_count;
         let legacy = projection.connections;
-        let managed = config
-            .connections_sqlite_path
-            .as_deref()
-            .map(|path| {
-                SqliteConnectionStore::open_with_maximum(
-                    path,
-                    MAX_CONNECTIONS.saturating_sub(legacy.len()),
-                )
-            })
-            .transpose()?;
-        let managed_count = managed
-            .as_ref()
-            .map(ConnectionStore::count)
-            .transpose()?
-            .unwrap_or_default();
+        // Standalone mode opens the local file; cluster mode was handed a
+        // dispatch onto the authority and must not open one at all. The
+        // SQLite handle stays in scope past this point because two things
+        // are SQLite-only by design: the local-secret provider, and the
+        // local-secret row count that decides whether a keyring is
+        // required.
+        let sqlite_store = if cluster.is_some() {
+            None
+        } else {
+            config
+                .connections_sqlite_path
+                .as_deref()
+                .map(|path| {
+                    SqliteConnectionStore::open_with_maximum(
+                        path,
+                        MAX_CONNECTIONS.saturating_sub(legacy.len()),
+                    )
+                })
+                .transpose()?
+        };
+        let managed_count = match cluster.as_ref() {
+            Some(seed) => seed.records.len(),
+            None => sqlite_store
+                .as_ref()
+                .map(ConnectionStore::count)
+                .transpose()?
+                .unwrap_or_default(),
+        };
         let total = managed_count.checked_add(legacy.len()).ok_or(
             ConnectionControlPlaneError::LimitExceeded {
                 count: usize::MAX,
@@ -236,12 +363,15 @@ impl ConnectionControlPlane {
             });
         }
 
-        let managed_records = managed
-            .as_ref()
-            .map(ConnectionStore::list)
-            .transpose()?
-            .unwrap_or_default();
-        if managed.is_some() {
+        let managed_records = match cluster.as_ref() {
+            Some(seed) => seed.records.clone(),
+            None => sqlite_store
+                .as_ref()
+                .map(ConnectionStore::list)
+                .transpose()?
+                .unwrap_or_default(),
+        };
+        if cluster.is_some() || sqlite_store.is_some() {
             let legacy_ids = legacy
                 .iter()
                 .map(|projection| projection.id().as_str())
@@ -256,7 +386,12 @@ impl ConnectionControlPlane {
             }
         }
 
-        let local_secret_count = managed
+        // Cluster mode has no `connection_local_secrets` table -- the
+        // deliberate omission in migration 0006 -- so the count is zero and
+        // a keyring is never required by stored state. A keyring that IS
+        // configured in cluster mode is refused below, where the provider
+        // asks for the SQLite handle it cannot have.
+        let local_secret_count = sqlite_store
             .as_ref()
             .map(SqliteConnectionStore::local_secret_count)
             .transpose()?
@@ -372,7 +507,7 @@ impl ConnectionControlPlane {
             },
         ));
         let local_secret_provider = if let Some(keyring) = local_secret_keyring {
-            let store = managed
+            let store = sqlite_store
                 .as_ref()
                 .ok_or(LocalSecretKeyringConfigError::ManagedStoreRequired)?;
             let reserved_ids = config
@@ -421,6 +556,10 @@ impl ConnectionControlPlane {
                 });
             }
         }
+        let managed = match cluster {
+            Some(seed) => Some(seed.store),
+            None => sqlite_store.map(ManagedConnectionStore::Sqlite),
+        };
         let legacy: Arc<[LegacyConnectionProjection]> = legacy.into();
         let managed_runtime = managed_records
             .into_iter()
@@ -431,7 +570,8 @@ impl ConnectionControlPlane {
             legacy.clone(),
             omitted_legacy_projection_count,
         )));
-        let mutation_lock = Arc::new(Mutex::new(()));
+        let mutation_lock = Arc::new(AsyncMutex::new(()));
+        let pending_dependencies = Arc::new(Mutex::new(BTreeMap::new()));
         let catalog_lifecycle = Arc::new(CatalogLifecycleCoordinator {
             active_connections: Mutex::new(BTreeSet::new()),
             refresh_permits: Arc::new(Semaphore::new(MAX_CONCURRENT_REFRESHES)),
@@ -466,6 +606,10 @@ impl ConnectionControlPlane {
             omitted_legacy_projection_count,
             runtime,
             mutation_lock,
+            pending_dependencies,
+            manual_tool_source_revision: Arc::new(std::sync::atomic::AtomicI64::new(0)),
+            #[cfg(test)]
+            flush_hook: Arc::new(Mutex::new(None)),
             catalog_lifecycle,
             secret_resolver,
             local_secret_versions,
@@ -480,7 +624,7 @@ impl ConnectionControlPlane {
 
     pub fn managed_store(
         &self,
-    ) -> Result<&SqliteConnectionStore, ManagedConnectionMutationUnavailable> {
+    ) -> Result<&ManagedConnectionStore, ManagedConnectionMutationUnavailable> {
         self.managed
             .as_ref()
             .ok_or(ManagedConnectionMutationUnavailable)
@@ -629,6 +773,13 @@ impl ConnectionControlPlane {
         self.local_secret_manager.is_some()
     }
 
+    /// The live runtime lane, for the security runtime to capture bundles
+    /// from.
+    #[cfg(feature = "postgres")]
+    pub(crate) fn runtime_handle(&self) -> Arc<ArcSwap<ConnectionRuntimeSnapshot>> {
+        Arc::clone(&self.runtime)
+    }
+
     pub fn runtime_snapshot(&self) -> Arc<ConnectionRuntimeSnapshot> {
         self.runtime.load_full()
     }
@@ -662,31 +813,180 @@ impl ConnectionControlPlane {
         })
     }
 
+    /// Reconcile the dependency rows for one consumer kind against the
+    /// set the runtime currently derives.
+    ///
+    /// Both callers are synchronous by construction and must stay that
+    /// way: the proxy state is built by the synchronous app builder, and
+    /// manual-tool dependencies are derived inside the tool registry's
+    /// definition validator, which runs under the registry's `std` write
+    /// lock. Neither can await.
+    ///
+    /// Standalone mode therefore writes here and now, exactly as it always
+    /// did -- SQLite is local and the call is a single transaction. Cluster
+    /// mode records the set instead and
+    /// [`ConnectionControlPlane::flush_pending_dependencies`] writes it
+    /// from an async context: `run()` awaits a flush before any listener
+    /// binds, and a background task flushes anything a later registry write
+    /// queues.
+    ///
+    /// These rows are derived state. They exist to refuse a delete that
+    /// would orphan a live reference, and the store enforces that
+    /// referentially on its own (SQLite checks the owner exists;
+    /// PostgreSQL has `ON DELETE RESTRICT`). A bounded delay in publishing
+    /// them cannot authorize a request -- it can only let a delete through
+    /// that a moment later would have been refused, and that delete is
+    /// itself an authorized admin mutation.
+    ///
+    /// This is also the one control-plane write that does not take the
+    /// mutation lock: it cannot (the synchronous callers have no async
+    /// context to await it in), and it does not need it. It never touches
+    /// the runtime snapshot -- the invariant the lock exists to protect --
+    /// and the store serializes it against every other writer on its own.
+    /// Cluster mode: the tools lane records the security revision of the
+    /// document it is about to install, so the manual-tool dependency set
+    /// that install derives is stamped with it and a stale replica's flush
+    /// can be refused by the store.
+    pub(crate) fn note_manual_tool_revision(&self, security_revision: i64) {
+        self.manual_tool_source_revision
+            .fetch_max(security_revision, std::sync::atomic::Ordering::AcqRel);
+    }
+
     pub fn replace_runtime_dependencies(
         &self,
         kind: ConnectionDependencyKind,
         desired: &[(ConnectionId, String)],
     ) -> Result<(), ConnectionMutationError> {
-        let _guard = self.mutation_guard();
-        if desired.is_empty() && self.managed.is_none() {
-            return Ok(());
+        let Some(store) = self.managed.as_ref() else {
+            if desired.is_empty() {
+                return Ok(());
+            }
+            return Err(ConnectionMutationError::Unavailable(
+                ManagedConnectionMutationUnavailable,
+            ));
+        };
+        match store.sqlite() {
+            Some(sqlite) => {
+                sqlite.replace_dependencies_for_kind(kind, desired)?;
+                Ok(())
+            }
+            None => {
+                let source_revision = match kind {
+                    ConnectionDependencyKind::ManualTool => self
+                        .manual_tool_source_revision
+                        .load(std::sync::atomic::Ordering::Acquire),
+                    _ => 0,
+                };
+                self.pending_dependencies_guard()
+                    .insert(kind, (source_revision, desired.to_vec()));
+                Ok(())
+            }
         }
-        self.managed_store()?
-            .replace_dependencies_for_kind(kind, desired)?;
-        Ok(())
     }
 
-    pub fn append_status(
+    /// Write every dependency set `replace_runtime_dependencies` could not
+    /// write itself. Idempotent, and safe to call when nothing is pending.
+    ///
+    /// A set that fails to apply is put back so the next flush retries it,
+    /// unless a newer set for that kind was queued in the meantime -- the
+    /// newer set is the one the runtime actually derives, and replaying a
+    /// superseded one would undo it.
+    pub async fn flush_pending_dependencies(&self) -> Result<(), ConnectionMutationError> {
+        // Under the mutation lock: a delete that runs between a flush
+        // taking its batch and writing it would find nothing to refuse it,
+        // and the batch would then be requeued for an owner that no longer
+        // exists. Serializing flushes with mutations closes that window.
+        let _guard = self.mutation_guard().await;
+        self.flush_pending_dependencies_locked().await
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_flush_hook_for_test(&self, hook: FlushHook) {
+        *self
+            .flush_hook
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(hook);
+    }
+
+    /// The flush body; the caller holds the mutation lock.
+    async fn flush_pending_dependencies_locked(&self) -> Result<(), ConnectionMutationError> {
+        let pending = {
+            let mut guard = self.pending_dependencies_guard();
+            if guard.is_empty() {
+                return Ok(());
+            }
+            std::mem::take(&mut *guard)
+        };
+        #[cfg(test)]
+        {
+            let hook = self
+                .flush_hook
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .clone();
+            if let Some(hook) = hook {
+                hook();
+            }
+        }
+        let store = match self.managed_store() {
+            Ok(store) => store,
+            Err(error) => {
+                self.requeue_dependencies(pending);
+                return Err(ConnectionMutationError::Unavailable(error));
+            }
+        };
+        let mut outcome = Ok(());
+        let mut unapplied = BTreeMap::new();
+        for (kind, (source_revision, desired)) in pending {
+            if outcome.is_err() {
+                unapplied.insert(kind, (source_revision, desired));
+                continue;
+            }
+            if let Err(error) = store
+                .replace_dependencies_for_kind(kind, &desired, source_revision)
+                .await
+            {
+                unapplied.insert(kind, (source_revision, desired));
+                outcome = Err(ConnectionMutationError::Store(error));
+            }
+        }
+        if !unapplied.is_empty() {
+            self.requeue_dependencies(unapplied);
+        }
+        outcome
+    }
+
+    fn requeue_dependencies(&self, unapplied: PendingDependencies) {
+        let mut guard = self.pending_dependencies_guard();
+        for (kind, desired) in unapplied {
+            guard.entry(kind).or_insert(desired);
+        }
+    }
+
+    fn pending_dependencies_guard(&self) -> MutexGuard<'_, PendingDependencies> {
+        match self.pending_dependencies.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => {
+                tracing::error!(
+                    "Connection dependency queue lock poisoned; recovering bounded fail-closed state"
+                );
+                poisoned.into_inner()
+            }
+        }
+    }
+
+    pub async fn append_status(
         &self,
         id: &ConnectionId,
         expected: &ConnectionEtag,
         update: ConnectionStatusUpdate,
     ) -> Result<SafeConnectionStatus, ConnectionMutationError> {
-        let _guard = self.mutation_guard();
+        let _guard = self.mutation_guard().await;
         let store = self.managed_store()?;
-        let status = store.append_status(id, expected, update)?;
+        let status = store.append_status(id, expected, update).await?;
         let updated = store
-            .get(id)?
+            .get(id)
+            .await?
             .ok_or_else(|| ConnectionStoreError::NotFound { id: id.to_string() })?;
         let current = self.runtime.load_full();
         let mut managed = current.managed().clone();
@@ -695,7 +995,7 @@ impl ConnectionControlPlane {
         Ok(status)
     }
 
-    pub fn append_status_before(
+    pub async fn append_status_before(
         &self,
         id: &ConnectionId,
         expected: &ConnectionEtag,
@@ -704,7 +1004,9 @@ impl ConnectionControlPlane {
     ) -> Result<SafeConnectionStatus, ConnectionMutationError> {
         let _guard = self.try_mutation_guard_before(deadline)?;
         let store = self.managed_store()?;
-        let (status, updated) = store.append_status_before(id, expected, update, deadline)?;
+        let (status, updated) = store
+            .append_status_before(id, expected, update, deadline)
+            .await?;
         let current = self.runtime.load_full();
         let mut managed = current.managed().clone();
         managed.insert(id.clone(), updated);
@@ -712,12 +1014,13 @@ impl ConnectionControlPlane {
         Ok(status)
     }
 
-    pub fn create_managed(
+    pub async fn create_managed(
         &self,
         expected_collection_etag: &str,
         candidate: ConnectionWrite,
+        actor: &str,
     ) -> Result<StoredConnection, ConnectionMutationError> {
-        let _guard = self.mutation_guard();
+        let _guard = self.mutation_guard().await;
         let current = self.runtime.load_full();
         if current.collection_etag() != expected_collection_etag {
             return Err(ConnectionMutationError::CollectionConflict {
@@ -725,22 +1028,52 @@ impl ConnectionControlPlane {
             });
         }
         self.ensure_activatable(&candidate)?;
-        let created = self.managed_store()?.create(candidate)?;
+        // The local check above is authoritative in standalone mode. In
+        // cluster mode the store re-derives the collection ETag from the
+        // authority's records under its own lock and refuses the create if
+        // another replica moved the collection after this one read it; the
+        // derivation is this control plane's, so the two checks agree.
+        let legacy = Arc::clone(&self.legacy);
+        let omitted = self.omitted_legacy_projection_count;
+        let compute = move |managed: &BTreeMap<ConnectionId, StoredConnection>| {
+            collection_etag(managed, &legacy, omitted)
+        };
+        let created = self
+            .managed_store()?
+            .create(
+                candidate,
+                actor,
+                Some(CollectionCheck {
+                    expected_etag: expected_collection_etag,
+                    compute: &compute,
+                }),
+            )
+            .await
+            .map_err(|error| match error {
+                ConnectionStoreError::CollectionConflict { current } => {
+                    ConnectionMutationError::CollectionConflict { current }
+                }
+                other => ConnectionMutationError::Store(other),
+            })?;
         let mut managed = current.managed().clone();
         managed.insert(created.id.clone(), created.clone());
         self.publish_runtime(managed);
         Ok(created)
     }
 
-    pub fn replace_managed(
+    pub async fn replace_managed(
         &self,
         id: &ConnectionId,
         expected: &ConnectionEtag,
         candidate: ConnectionWrite,
+        actor: &str,
     ) -> Result<StoredConnection, ConnectionMutationError> {
-        let _guard = self.mutation_guard();
+        let _guard = self.mutation_guard().await;
         self.ensure_activatable(&candidate)?;
-        let replaced = self.managed_store()?.replace(id, expected, candidate)?;
+        let replaced = self
+            .managed_store()?
+            .replace(id, expected, candidate, actor)
+            .await?;
         let current = self.runtime.load_full();
         let mut managed = current.managed().clone();
         managed.insert(id.clone(), replaced.clone());
@@ -748,17 +1081,105 @@ impl ConnectionControlPlane {
         Ok(replaced)
     }
 
-    pub fn delete_managed(
+    pub async fn delete_managed(
         &self,
         id: &ConnectionId,
         expected: &ConnectionEtag,
+        actor: &str,
     ) -> Result<(), ConnectionMutationError> {
-        let _guard = self.mutation_guard();
-        self.managed_store()?.delete(id, expected)?;
+        let _guard = self.mutation_guard().await;
+        // Cluster mode queues dependency guard rows for a background flush;
+        // a delete must not outrun them, or ON DELETE RESTRICT has no child
+        // row to protect and a live route or tool is orphaned. Flush first,
+        // under the same lock every flush takes, so a batch the background
+        // flusher has already taken is written before this delete is
+        // judged; a flush that fails refuses the delete rather than risk
+        // that.
+        self.flush_pending_dependencies_locked().await?;
+        self.managed_store()?.delete(id, expected, actor).await?;
         let current = self.runtime.load_full();
         let mut managed = current.managed().clone();
         managed.remove(id);
         self.publish_runtime(managed);
+        Ok(())
+    }
+
+    /// Replace the whole managed map with what the authority currently
+    /// holds (issue #241, PR 8, cluster mode only).
+    ///
+    /// This is the install half of the Connections reconciler. It applies
+    /// the two admission checks `from_config` applies at startup, for the
+    /// same reason: a record whose credential binding this replica cannot
+    /// resolve is not enforceable here, and a managed record that collides
+    /// with a legacy projection is ambiguous. Either one fails the
+    /// reconcile, which fails the gate closed -- a replica that cannot
+    /// enforce the current revision stops serving rather than serving the
+    /// previous one.
+    ///
+    /// It takes the mutation lock so a concurrent local mutation cannot
+    /// publish a snapshot derived from the map this call is replacing. The
+    /// gate bounds the wait and turns a lock it cannot get into a `503`.
+    pub async fn publish_authoritative_records(
+        &self,
+        records: Vec<StoredConnection>,
+    ) -> Result<(), ConnectionMutationError> {
+        let _guard = self.mutation_guard().await;
+        let total = records.len().saturating_add(self.legacy.len());
+        if total > MAX_CONNECTIONS {
+            tracing::error!(
+                count = total,
+                maximum = MAX_CONNECTIONS,
+                "the authority holds more Connections than this binary bounds"
+            );
+            return Err(ConnectionMutationError::Store(
+                ConnectionStoreError::LimitExceeded {
+                    resource: "managed connections",
+                    maximum: MAX_CONNECTIONS,
+                },
+            ));
+        }
+        let legacy_ids = self
+            .legacy
+            .iter()
+            .map(|projection| projection.id().as_str())
+            .collect::<BTreeSet<_>>();
+        for record in &records {
+            if legacy_ids.contains(record.id.as_str()) {
+                tracing::error!(
+                    connection_id = %record.id,
+                    "an authoritative Connection collides with a legacy projection on this replica"
+                );
+                return Err(ConnectionMutationError::Store(
+                    ConnectionStoreError::Validation {
+                        problems: vec![
+                            "authoritative Connection collides with a legacy projection".to_owned(),
+                        ],
+                    },
+                ));
+            }
+            if let Err(error) = self
+                .secret_resolver
+                .validate_enabled_candidate(&record.write)
+            {
+                let (fields, reason) = match error {
+                    BindingActivationError::Invalid { fields } => (fields, "invalid material"),
+                    BindingActivationError::Unavailable => (Vec::new(), "source unavailable"),
+                };
+                tracing::error!(
+                    connection_id = %record.id,
+                    fields = ?fields,
+                    reason,
+                    "an enabled authoritative Connection has a binding this replica cannot resolve"
+                );
+                return Err(ConnectionMutationError::UnresolvableBindings { fields });
+            }
+        }
+        self.publish_runtime(
+            records
+                .into_iter()
+                .map(|record| (record.id.clone(), record))
+                .collect(),
+        );
         Ok(())
     }
 
@@ -974,34 +1395,34 @@ impl ConnectionControlPlane {
         }
     }
 
-    fn mutation_guard(&self) -> MutexGuard<'_, ()> {
-        match self.mutation_lock.lock() {
-            Ok(guard) => guard,
-            Err(poisoned) => {
-                tracing::error!(
-                    "Connection control-plane mutation lock poisoned; recovering fail-closed state"
-                );
-                poisoned.into_inner()
-            }
-        }
+    /// Serialize this mutation against every other control-plane and
+    /// local-secret mutation. A Tokio guard: the caller awaits its store
+    /// while holding it.
+    ///
+    /// Unlike the `std` mutex this replaced, a Tokio mutex does not poison.
+    /// That is a behavioral improvement here rather than a loss: poisoning
+    /// only ever told us a mutation panicked mid-flight, and the recovery
+    /// in both former arms was to carry on with the guard anyway, because
+    /// the state this lock protects is an `ArcSwap` (swapped, never mutated
+    /// in place) plus a store that is transactional on its own.
+    async fn mutation_guard(&self) -> AsyncMutexGuard<'_, ()> {
+        self.mutation_lock.lock().await
     }
 
+    /// The bounded-wait variant: never blocks. A caller that has already
+    /// run out of budget gets `DeadlineExceeded`; one that finds the lock
+    /// held gets `Busy`. Both are the fail-closed answers -- neither ever
+    /// dispatches under an unserialized mutation.
     fn try_mutation_guard_before(
         &self,
         deadline: Instant,
-    ) -> Result<MutexGuard<'_, ()>, ConnectionMutationError> {
+    ) -> Result<AsyncMutexGuard<'_, ()>, ConnectionMutationError> {
         if Instant::now() >= deadline {
             return Err(ConnectionMutationError::DeadlineExceeded);
         }
         match self.mutation_lock.try_lock() {
             Ok(guard) => Ok(guard),
-            Err(TryLockError::WouldBlock) => Err(ConnectionMutationError::Busy),
-            Err(TryLockError::Poisoned(poisoned)) => {
-                tracing::error!(
-                    "Connection control-plane mutation lock poisoned; recovering bounded fail-closed state"
-                );
-                Ok(poisoned.into_inner())
-            }
+            Err(_contended) => Err(ConnectionMutationError::Busy),
         }
     }
 }
@@ -1514,23 +1935,26 @@ impl SecretResolver for ConnectionSecretResolver {
 #[derive(Clone)]
 struct CoordinatedLocalSecretManager {
     provider: Arc<LocalSecretProvider>,
-    mutation_lock: Arc<Mutex<()>>,
+    mutation_lock: Arc<AsyncMutex<()>>,
     runtime: Arc<ArcSwap<ConnectionRuntimeSnapshot>>,
     secret_resolver: Arc<ConnectionSecretResolver>,
     local_secret_versions: Arc<ArcSwap<BTreeMap<String, u64>>>,
 }
 
 impl CoordinatedLocalSecretManager {
-    fn mutation_guard(&self) -> MutexGuard<'_, ()> {
-        match self.mutation_lock.lock() {
-            Ok(guard) => guard,
-            Err(poisoned) => {
-                tracing::error!(
-                    "Connection/local-secret mutation lock poisoned; recovering fail-closed state"
-                );
-                poisoned.into_inner()
-            }
-        }
+    /// The same lock the control plane's mutations take, acquired from a
+    /// synchronous context.
+    ///
+    /// `LocalSecretManager` is a synchronous trait and stays one: local
+    /// secrets are a standalone-mode facility (cluster mode requires an
+    /// external secret provider, so `local_secret_manager()` is `None`
+    /// there), and every caller already runs off the request executor --
+    /// the admin handlers wrap these calls in `spawn_blocking`, and the
+    /// `connection-secret-maintenance` subcommand has no runtime at all.
+    /// `blocking_lock` is exactly the tool for that shape; it panics only
+    /// if called from inside an async context, which none of those are.
+    fn mutation_guard(&self) -> AsyncMutexGuard<'_, ()> {
+        self.mutation_lock.blocking_lock()
     }
 
     fn publish_version(&self, metadata: &SecretAliasMetadata) {
@@ -1801,6 +2225,21 @@ mod tests {
         Config::test_defaults()
     }
 
+    /// Runs one synchronous `LocalSecretManager` mutation from a test that is
+    /// itself async.
+    ///
+    /// `LocalSecretManager` stays a synchronous trait, and its mutations take
+    /// the shared control-plane lock with `blocking_lock`, which panics if it
+    /// is called on a thread that is driving the runtime. Production reaches
+    /// these methods from `spawn_blocking`; a test that must also `.await` a
+    /// control-plane mutation uses the in-place equivalent instead, so the
+    /// borrowed manager reference stays usable. Tests calling this need the
+    /// multi-threaded runtime flavor -- `block_in_place` has no meaning on a
+    /// current-thread runtime.
+    fn blocking_secret_mutation<T>(operation: impl FnOnce() -> T) -> T {
+        tokio::task::block_in_place(operation)
+    }
+
     /// Network provider whose material is produced at runtime, for fixtures
     /// that need real PEM rather than a literal.
     struct OwnedNetworkProvider {
@@ -1874,7 +2313,7 @@ mod tests {
         .expect("test vault provider config should deserialize")
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread")]
     async fn rotating_one_half_matches_it_against_a_counterpart_behind_a_network_provider() {
         let temporary = TemporaryLocalControlPlane::new("tls-rotation-network-pair");
         let mut config = temporary.config();
@@ -1898,8 +2337,8 @@ mod tests {
         let manager = control_plane
             .local_secret_manager()
             .expect("local manager should exist");
-        let private_key_secret = manager
-            .create(
+        let private_key_secret = blocking_secret_mutation(|| {
+            manager.create(
                 "Client private key",
                 ResolvedSecret::new(
                     SecretPurpose::TlsPrivateKey,
@@ -1907,14 +2346,16 @@ mod tests {
                 )
                 .expect("private-key secret should validate"),
             )
-            .expect("private-key secret should create");
+        })
+        .expect("private-key secret should create");
 
         let before = control_plane.runtime_snapshot();
         let mut candidate = managed_candidate();
         candidate.tls.client_certificate_id = Some("vault-client-cert".to_owned());
         candidate.tls.client_private_key_id = Some(private_key_secret.id.clone());
         control_plane
-            .create_managed(before.collection_etag(), candidate)
+            .create_managed(before.collection_etag(), candidate, "test-admin")
+            .await
             .expect("a split mTLS pair should activate");
 
         // A key that does not belong to the network-held certificate is refused
@@ -2441,8 +2882,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn configured_store_is_migrated_during_control_plane_construction() {
+    #[tokio::test]
+    async fn configured_store_is_migrated_during_control_plane_construction() {
         let path = std::env::temp_dir().join(format!(
             "greengateway-control-plane-{}.sqlite",
             uuid::Uuid::new_v4()
@@ -2461,6 +2902,7 @@ mod tests {
                 .managed_store()
                 .expect("store should exist")
                 .count()
+                .await
                 .expect("count should work"),
             0
         );
@@ -2477,7 +2919,7 @@ mod tests {
         let _ = std::fs::remove_file(format!("{}-shm", path.display()));
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread")]
     async fn configured_local_provider_exposes_mutation_only_manager_and_combined_resolution() {
         let temporary = TemporaryLocalControlPlane::new("combined");
         let mut config = temporary.config();
@@ -2495,13 +2937,14 @@ mod tests {
             .local_secret_manager()
             .expect("local secret manager should be enabled");
         let canary = b"control-plane-local-secret-canary";
-        let created = manager
-            .create(
+        let created = blocking_secret_mutation(|| {
+            manager.create(
                 "Local token",
                 ResolvedSecret::new(SecretPurpose::StaticBearer, canary.to_vec())
                     .expect("test secret should validate"),
             )
-            .expect("local secret should create");
+        })
+        .expect("local secret should create");
 
         let aliases = control_plane.secret_resolver().aliases();
         assert_eq!(aliases.len(), 2);
@@ -2690,20 +3133,22 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn enabled_mutation_resolves_material_and_rejects_wrong_local_purpose() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn enabled_mutation_resolves_material_and_rejects_wrong_local_purpose() {
         let temporary = TemporaryLocalControlPlane::new("binding-purpose");
         let control_plane = ConnectionControlPlane::from_config(&temporary.config())
             .expect("control plane should build");
-        let secret = control_plane
-            .local_secret_manager()
-            .expect("local manager should exist")
-            .create(
-                "Header-only secret",
-                ResolvedSecret::new(SecretPurpose::HeaderApiKey, b"header-canary".to_vec())
-                    .expect("fixture secret should validate"),
-            )
-            .expect("fixture secret should create");
+        let secret = blocking_secret_mutation(|| {
+            control_plane
+                .local_secret_manager()
+                .expect("local manager should exist")
+                .create(
+                    "Header-only secret",
+                    ResolvedSecret::new(SecretPurpose::HeaderApiKey, b"header-canary".to_vec())
+                        .expect("fixture secret should validate"),
+                )
+        })
+        .expect("fixture secret should create");
         let before = control_plane.runtime_snapshot();
         let mut candidate = managed_candidate();
         candidate.authentication = ConnectionAuthentication::StaticBearer {
@@ -2711,7 +3156,9 @@ mod tests {
         };
 
         assert!(matches!(
-            control_plane.create_managed(before.collection_etag(), candidate),
+            control_plane
+                .create_managed(before.collection_etag(), candidate, "test-admin")
+                .await,
             Err(ConnectionMutationError::UnresolvableBindings { fields })
                 if fields == vec!["authentication.secret_id"]
         ));
@@ -2721,13 +3168,14 @@ mod tests {
                 .managed_store()
                 .expect("store should exist")
                 .count()
+                .await
                 .expect("count should load"),
             0
         );
     }
 
-    #[test]
-    fn unavailable_operator_material_preserves_previous_persisted_and_runtime_state() {
+    #[tokio::test]
+    async fn unavailable_operator_material_preserves_previous_persisted_and_runtime_state() {
         let temporary = TemporaryLocalControlPlane::new("binding-unavailable");
         let mut config = temporary.config();
         let alias_id = format!("missing-alias-{}", uuid::Uuid::new_v4());
@@ -2747,7 +3195,9 @@ mod tests {
             secret_id: Some(alias_id.clone()),
         };
         assert!(matches!(
-            control_plane.create_managed(initial.collection_etag(), unavailable_create),
+            control_plane
+                .create_managed(initial.collection_etag(), unavailable_create, "test-admin")
+                .await,
             Err(ConnectionMutationError::BindingUnavailable)
         ));
         assert!(control_plane.runtime_snapshot().managed().is_empty());
@@ -2756,11 +3206,13 @@ mod tests {
                 .managed_store()
                 .expect("store should exist")
                 .count()
+                .await
                 .expect("count should load"),
             0
         );
         let created = control_plane
-            .create_managed(initial.collection_etag(), managed_candidate())
+            .create_managed(initial.collection_etag(), managed_candidate(), "test-admin")
+            .await
             .expect("plain connection should create");
         let before = control_plane.runtime_snapshot();
         let mut replacement = created.write.clone();
@@ -2769,7 +3221,9 @@ mod tests {
         };
 
         assert!(matches!(
-            control_plane.replace_managed(&created.id, &created.etag(), replacement),
+            control_plane
+                .replace_managed(&created.id, &created.etag(), replacement, "test-admin")
+                .await,
             Err(ConnectionMutationError::BindingUnavailable)
         ));
         let after = control_plane.runtime_snapshot();
@@ -2780,34 +3234,40 @@ mod tests {
                 .managed_store()
                 .expect("store should exist")
                 .get(&created.id)
+                .await
                 .expect("stored connection should load")
                 .expect("stored connection should remain"),
             created
         );
     }
 
-    #[test]
-    fn invalid_der_ca_is_rejected_before_persistence_and_publication() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn invalid_der_ca_is_rejected_before_persistence_and_publication() {
         let temporary = TemporaryLocalControlPlane::new("invalid-der-ca");
         let control_plane = ConnectionControlPlane::from_config(&temporary.config())
             .expect("control plane should build");
-        let secret = control_plane
-            .local_secret_manager()
-            .expect("local manager should exist")
-            .create(
-                "Invalid DER CA",
-                ResolvedSecret::new(
-                    SecretPurpose::TlsCaBundle,
-                    b"-----BEGIN CERTIFICATE-----\nAQIDBA==\n-----END CERTIFICATE-----\n".to_vec(),
+        let secret = blocking_secret_mutation(|| {
+            control_plane
+                .local_secret_manager()
+                .expect("local manager should exist")
+                .create(
+                    "Invalid DER CA",
+                    ResolvedSecret::new(
+                        SecretPurpose::TlsCaBundle,
+                        b"-----BEGIN CERTIFICATE-----\nAQIDBA==\n-----END CERTIFICATE-----\n"
+                            .to_vec(),
+                    )
+                    .expect("bounded invalid-DER PEM fixture should validate"),
                 )
-                .expect("bounded invalid-DER PEM fixture should validate"),
-            )
-            .expect("fixture secret should create");
+        })
+        .expect("fixture secret should create");
         let before = control_plane.runtime_snapshot();
         let mut candidate = managed_candidate();
         candidate.tls.ca_bundle_alias = Some(secret.id);
 
-        let result = control_plane.create_managed(before.collection_etag(), candidate);
+        let result = control_plane
+            .create_managed(before.collection_etag(), candidate, "test-admin")
+            .await;
         match result {
             Err(ConnectionMutationError::UnresolvableBindings { fields }) => {
                 assert_eq!(fields, vec!["tls.ca_bundle_alias"]);
@@ -2820,12 +3280,13 @@ mod tests {
                 .managed_store()
                 .expect("store should exist")
                 .count()
+                .await
                 .expect("count should load"),
             0
         );
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread")]
     async fn mixed_valid_and_invalid_ca_rotation_preserves_previous_material() {
         let temporary = TemporaryLocalControlPlane::new("mixed-ca-rotation");
         let config = temporary.config();
@@ -2840,18 +3301,20 @@ mod tests {
         let manager = control_plane
             .local_secret_manager()
             .expect("local manager should exist");
-        let ca_secret = manager
-            .create(
+        let ca_secret = blocking_secret_mutation(|| {
+            manager.create(
                 "CA bundle",
                 ResolvedSecret::new(SecretPurpose::TlsCaBundle, valid_ca_pem.clone())
                     .expect("valid CA secret should construct"),
             )
-            .expect("valid CA secret should create");
+        })
+        .expect("valid CA secret should create");
         let before = control_plane.runtime_snapshot();
         let mut candidate = managed_candidate();
         candidate.tls.ca_bundle_alias = Some(ca_secret.id.clone());
         let created = control_plane
-            .create_managed(before.collection_etag(), candidate)
+            .create_managed(before.collection_etag(), candidate, "test-admin")
+            .await
             .expect("valid CA connection should activate");
 
         let mut mixed_bundle = valid_ca_pem.clone();
@@ -2859,11 +3322,11 @@ mod tests {
             b"\n-----BEGIN CERTIFICATE-----\nAQIDBA==\n-----END CERTIFICATE-----\n",
         );
         assert_eq!(
-            manager.rotate(
+            blocking_secret_mutation(|| manager.rotate(
                 &ca_secret.id,
                 ResolvedSecret::new(SecretPurpose::TlsCaBundle, mixed_bundle)
                     .expect("bounded mixed CA fixture should construct"),
-            ),
+            )),
             Err(LocalSecretError::InvalidSecret)
         );
         assert_eq!(
@@ -2884,7 +3347,7 @@ mod tests {
             .expect("rejected CA rotation must leave restartable state");
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread")]
     async fn in_use_local_tls_rotation_is_preflighted_and_preserves_previous_material() {
         let temporary = TemporaryLocalControlPlane::new("tls-rotation-preflight");
         let config = temporary.config();
@@ -2900,50 +3363,53 @@ mod tests {
         let manager = control_plane
             .local_secret_manager()
             .expect("local manager should exist");
-        let certificate_secret = manager
-            .create(
+        let certificate_secret = blocking_secret_mutation(|| {
+            manager.create(
                 "Client certificate",
                 ResolvedSecret::new(SecretPurpose::TlsCertificate, certificate_pem.clone())
                     .expect("certificate secret should validate"),
             )
-            .expect("certificate secret should create");
-        let private_key_secret = manager
-            .create(
+        })
+        .expect("certificate secret should create");
+        let private_key_secret = blocking_secret_mutation(|| {
+            manager.create(
                 "Client private key",
                 ResolvedSecret::new(SecretPurpose::TlsPrivateKey, private_key_pem.clone())
                     .expect("private-key secret should validate"),
             )
-            .expect("private-key secret should create");
+        })
+        .expect("private-key secret should create");
         let before = control_plane.runtime_snapshot();
         let mut candidate = managed_candidate();
         candidate.tls.client_certificate_id = Some(certificate_secret.id.clone());
         candidate.tls.client_private_key_id = Some(private_key_secret.id.clone());
         let created = control_plane
-            .create_managed(before.collection_etag(), candidate)
+            .create_managed(before.collection_etag(), candidate, "test-admin")
+            .await
             .expect("valid mTLS connection should activate");
 
         assert_eq!(
-            manager.rotate(
+            blocking_secret_mutation(|| manager.rotate(
                 &certificate_secret.id,
                 ResolvedSecret::new(
                     SecretPurpose::TlsCertificate,
                     b"malformed-certificate-canary".to_vec(),
                 )
                 .expect("bounded malformed fixture should construct"),
-            ),
+            )),
             Err(LocalSecretError::InvalidSecret)
         );
         let mismatched_key =
             rcgen::KeyPair::generate().expect("mismatched identity key should generate");
         assert_eq!(
-            manager.rotate(
+            blocking_secret_mutation(|| manager.rotate(
                 &private_key_secret.id,
                 ResolvedSecret::new(
                     SecretPurpose::TlsPrivateKey,
                     mismatched_key.serialize_pem().into_bytes(),
                 )
                 .expect("mismatched key fixture should construct"),
-            ),
+            )),
             Err(LocalSecretError::InvalidSecret)
         );
 
@@ -3010,25 +3476,31 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn local_secret_delete_and_connection_activation_are_serialized() {
+    // Multi-threaded on purpose: the delete half has to run on a thread that
+    // is not driving the runtime (`LocalSecretManager` is synchronous and
+    // takes the shared lock with `blocking_lock`) while the create half is
+    // awaited here, so the two really do contend for the same lock.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn local_secret_delete_and_connection_activation_are_serialized() {
         let temporary = TemporaryLocalControlPlane::new("delete-activation-race");
         let control_plane = ConnectionControlPlane::from_config(&temporary.config())
             .expect("control plane should build");
 
         for iteration in 0..16 {
-            let secret = control_plane
-                .local_secret_manager()
-                .expect("local manager should exist")
-                .create(
-                    &format!("Race token {iteration}"),
-                    ResolvedSecret::new(
-                        SecretPurpose::StaticBearer,
-                        format!("race-token-{iteration}").into_bytes(),
+            let secret = blocking_secret_mutation(|| {
+                control_plane
+                    .local_secret_manager()
+                    .expect("local manager should exist")
+                    .create(
+                        &format!("Race token {iteration}"),
+                        ResolvedSecret::new(
+                            SecretPurpose::StaticBearer,
+                            format!("race-token-{iteration}").into_bytes(),
+                        )
+                        .expect("fixture secret should validate"),
                     )
-                    .expect("fixture secret should validate"),
-                )
-                .expect("fixture secret should create");
+            })
+            .expect("fixture secret should create");
             let mut candidate = managed_candidate();
             candidate.display_name = format!("Race connection {iteration}");
             candidate.authentication = ConnectionAuthentication::StaticBearer {
@@ -3045,35 +3517,33 @@ mod tests {
             let delete_barrier = Arc::clone(&barrier);
             let secret_id = secret.id.clone();
 
-            let (create_result, delete_result) = std::thread::scope(|scope| {
-                let create = scope.spawn(|| {
-                    create_barrier.wait();
-                    create_control_plane.create_managed(&expected_collection_etag, candidate)
-                });
-                let delete = scope.spawn(|| {
-                    delete_barrier.wait();
-                    delete_control_plane
-                        .local_secret_manager()
-                        .expect("local manager should exist")
-                        .delete(&secret_id)
-                });
-                (
-                    create.join().expect("create thread should not panic"),
-                    delete.join().expect("delete thread should not panic"),
-                )
+            let delete = std::thread::spawn(move || {
+                delete_barrier.wait();
+                delete_control_plane
+                    .local_secret_manager()
+                    .expect("local manager should exist")
+                    .delete(&secret_id)
             });
+            create_barrier.wait();
+            let create_result = create_control_plane
+                .create_managed(&expected_collection_etag, candidate, "test-admin")
+                .await;
+            let delete_result = delete.join().expect("delete thread should not panic");
 
             match (create_result, delete_result) {
                 (Ok(created), Err(LocalSecretError::DependencyConflict { connection_ids, .. })) => {
                     assert_eq!(connection_ids, vec![created.id.to_string()]);
                     control_plane
-                        .delete_managed(&created.id, &created.etag())
+                        .delete_managed(&created.id, &created.etag(), "test-admin")
+                        .await
                         .expect("fixture connection should delete");
-                    control_plane
-                        .local_secret_manager()
-                        .expect("local manager should exist")
-                        .delete(&secret.id)
-                        .expect("fixture secret should delete after dependency removal");
+                    blocking_secret_mutation(|| {
+                        control_plane
+                            .local_secret_manager()
+                            .expect("local manager should exist")
+                            .delete(&secret.id)
+                    })
+                    .expect("fixture secret should delete after dependency removal");
                 }
                 (Err(ConnectionMutationError::UnresolvableBindings { .. }), Ok(())) => {
                     assert!(control_plane
@@ -3112,8 +3582,8 @@ mod tests {
         .expect("managed candidate should deserialize")
     }
 
-    #[test]
-    fn successful_mutations_publish_one_atomic_runtime_snapshot() {
+    #[tokio::test]
+    async fn successful_mutations_publish_one_atomic_runtime_snapshot() {
         let temporary = TemporaryLocalControlPlane::new("runtime-mutations");
         let control_plane = ConnectionControlPlane::from_config(&temporary.config())
             .expect("control plane should build");
@@ -3121,7 +3591,8 @@ mod tests {
         assert!(initial.managed().is_empty());
 
         let created = control_plane
-            .create_managed(initial.collection_etag(), managed_candidate())
+            .create_managed(initial.collection_etag(), managed_candidate(), "test-admin")
+            .await
             .expect("create should succeed");
         let after_create = control_plane.runtime_snapshot();
         assert!(
@@ -3132,7 +3603,9 @@ mod tests {
         assert_ne!(initial.collection_etag(), after_create.collection_etag());
 
         assert!(matches!(
-            control_plane.create_managed(initial.collection_etag(), managed_candidate()),
+            control_plane
+                .create_managed(initial.collection_etag(), managed_candidate(), "test-admin")
+                .await,
             Err(ConnectionMutationError::CollectionConflict { .. })
         ));
         assert_eq!(
@@ -3140,6 +3613,7 @@ mod tests {
                 .managed_store()
                 .expect("store should exist")
                 .count()
+                .await
                 .expect("count should load"),
             1,
             "stale collection mutation must not reach storage"
@@ -3148,14 +3622,16 @@ mod tests {
         let mut replacement = created.write.clone();
         replacement.display_name = "Billing API v2".to_owned();
         let replaced = control_plane
-            .replace_managed(&created.id, &created.etag(), replacement)
+            .replace_managed(&created.id, &created.etag(), replacement, "test-admin")
+            .await
             .expect("replace should succeed");
         let after_replace = control_plane.runtime_snapshot();
         assert_eq!(after_create.managed().get(&created.id), Some(&created));
         assert_eq!(after_replace.managed().get(&created.id), Some(&replaced));
 
         control_plane
-            .delete_managed(&created.id, &replaced.etag())
+            .delete_managed(&created.id, &replaced.etag(), "test-admin")
+            .await
             .expect("delete should succeed");
         let after_delete = control_plane.runtime_snapshot();
         assert!(!after_delete.managed().contains_key(&created.id));
@@ -3164,13 +3640,14 @@ mod tests {
                 .managed_store()
                 .expect("store should exist")
                 .count()
+                .await
                 .expect("count should load"),
             0
         );
     }
 
-    #[test]
-    fn failed_mutation_preserves_runtime_and_persisted_state() {
+    #[tokio::test]
+    async fn failed_mutation_preserves_runtime_and_persisted_state() {
         let temporary = TemporaryLocalControlPlane::new("runtime-failure");
         let control_plane = ConnectionControlPlane::from_config(&temporary.config())
             .expect("control plane should build");
@@ -3179,7 +3656,9 @@ mod tests {
         invalid.endpoint.base_url = "https://billing.example.test?secret=forbidden".to_owned();
 
         assert!(matches!(
-            control_plane.create_managed(before.collection_etag(), invalid),
+            control_plane
+                .create_managed(before.collection_etag(), invalid, "test-admin")
+                .await,
             Err(ConnectionMutationError::Store(
                 ConnectionStoreError::Validation { .. }
             ))
@@ -3192,13 +3671,17 @@ mod tests {
                 .managed_store()
                 .expect("store should exist")
                 .count()
+                .await
                 .expect("count should load"),
             0
         );
     }
 
-    #[test]
-    fn concurrent_creates_with_one_collection_etag_have_exactly_one_winner() {
+    // Multi-threaded on purpose: the two creates have to contend for the
+    // mutation lock at the same instant, not merely interleave at await
+    // points on one thread.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn concurrent_creates_with_one_collection_etag_have_exactly_one_winner() {
         let temporary = TemporaryLocalControlPlane::new("runtime-one-winner");
         let control_plane = Arc::new(
             ConnectionControlPlane::from_config(&temporary.config())
@@ -3208,24 +3691,26 @@ mod tests {
             .runtime_snapshot()
             .collection_etag()
             .to_owned();
-        let barrier = Arc::new(std::sync::Barrier::new(3));
+        let barrier = Arc::new(tokio::sync::Barrier::new(3));
         let mut workers = Vec::new();
         for index in 0..2 {
             let control_plane = Arc::clone(&control_plane);
             let barrier = Arc::clone(&barrier);
             let expected = expected.clone();
-            workers.push(std::thread::spawn(move || {
+            workers.push(tokio::spawn(async move {
                 let mut candidate = managed_candidate();
                 candidate.display_name = format!("Concurrent API {index}");
-                barrier.wait();
-                control_plane.create_managed(&expected, candidate)
+                barrier.wait().await;
+                control_plane
+                    .create_managed(&expected, candidate, "test-admin")
+                    .await
             }));
         }
-        barrier.wait();
-        let results = workers
-            .into_iter()
-            .map(|worker| worker.join().expect("worker should join"))
-            .collect::<Vec<_>>();
+        barrier.wait().await;
+        let mut results = Vec::new();
+        for worker in workers {
+            results.push(worker.await.expect("worker should join"));
+        }
         assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 1);
         assert_eq!(
             results
@@ -3245,6 +3730,7 @@ mod tests {
                 .managed_store()
                 .expect("store should exist")
                 .count()
+                .await
                 .expect("count should load"),
             1
         );

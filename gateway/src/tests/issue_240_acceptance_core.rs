@@ -18,6 +18,7 @@ const TLS_CA_FILE: &str = "acceptance-tls-ca.pem";
 const MASTER_KEY_ID: &str = "acceptance-primary-key";
 const MASTER_KEY_FILE: &str = "local-master-key";
 const OPERATOR_API_KEY_HEADER: &str = "x-acceptance-api-key";
+const ACCEPTANCE_ACTOR: &str = "test-admin";
 
 struct CoreSecretFixture {
     root: PathBuf,
@@ -1132,16 +1133,18 @@ async fn e2e_03_oauth_single_flight_expiry_and_secret_rotation_workflow() {
     let manager = control_plane
         .local_secret_manager()
         .expect("OAuth acceptance local manager should exist");
-    let secret = manager
-        .create(
-            "OAuth acceptance secret",
-            connections::secret::ResolvedSecret::new(
-                connections::secret::SecretPurpose::OAuthClientSecret,
-                FIRST_SECRET.as_bytes().to_vec(),
+    let secret = blocking_secret_mutation(|| {
+        manager
+            .create(
+                "OAuth acceptance secret",
+                connections::secret::ResolvedSecret::new(
+                    connections::secret::SecretPurpose::OAuthClientSecret,
+                    FIRST_SECRET.as_bytes().to_vec(),
+                )
+                .expect("first OAuth secret should validate"),
             )
-            .expect("first OAuth secret should validate"),
-        )
-        .expect("first OAuth secret should create");
+            .expect("first OAuth secret should create")
+    });
     let snapshot = control_plane.runtime_snapshot();
     let candidate: connections::model::ConnectionWrite = serde_json::from_value(json!({
         "display_name": "OAuth acceptance",
@@ -1165,7 +1168,8 @@ async fn e2e_03_oauth_single_flight_expiry_and_secret_rotation_workflow() {
     }))
     .expect("OAuth acceptance connection should deserialize");
     let record = control_plane
-        .create_managed(snapshot.collection_etag(), candidate)
+        .create_managed(snapshot.collection_etag(), candidate, ACCEPTANCE_ACTOR)
+        .await
         .expect("OAuth acceptance connection should create");
     let capture = audit::sink::tests::CaptureSink::new();
     let egress_config = egress::EgressConfig::from_config(&config);
@@ -1206,16 +1210,18 @@ async fn e2e_03_oauth_single_flight_expiry_and_secret_rotation_workflow() {
     assert!(refreshed.iter().all(|body| body == br#"{"ok":true}"#));
     assert_eq!(mint_count.load(Ordering::SeqCst), 2);
 
-    manager
-        .rotate(
-            &secret.id,
-            connections::secret::ResolvedSecret::new(
-                connections::secret::SecretPurpose::OAuthClientSecret,
-                ROTATED_SECRET.as_bytes().to_vec(),
+    blocking_secret_mutation(|| {
+        manager
+            .rotate(
+                &secret.id,
+                connections::secret::ResolvedSecret::new(
+                    connections::secret::SecretPurpose::OAuthClientSecret,
+                    ROTATED_SECRET.as_bytes().to_vec(),
+                )
+                .expect("rotated OAuth secret should validate"),
             )
-            .expect("rotated OAuth secret should validate"),
-        )
-        .expect("OAuth client secret should rotate");
+            .expect("OAuth client secret should rotate");
+    });
     let rotated = execute_oauth_batch(&runtime, target).await;
     assert!(rotated.iter().all(|body| body == br#"{"ok":true}"#));
     assert_eq!(mint_count.load(Ordering::SeqCst), 3);
@@ -1423,7 +1429,8 @@ async fn e2e_04_authenticated_mcp_stream_refresh_lkg_and_delete_workflow() {
     }))
     .expect("managed MCP acceptance connection should deserialize");
     let record = control_plane
-        .create_managed(snapshot.collection_etag(), candidate)
+        .create_managed(snapshot.collection_etag(), candidate, ACCEPTANCE_ACTOR)
+        .await
         .expect("managed MCP acceptance connection should create");
     let egress_config = egress::EgressConfig::from_config(&config);
     let egress_client = Arc::new(
@@ -1444,7 +1451,7 @@ async fn e2e_04_authenticated_mcp_stream_refresh_lkg_and_delete_workflow() {
     .expect("managed MCP acceptance service should load");
 
     let refreshed = service
-        .refresh(record.id.as_str(), record.etag().as_str())
+        .refresh(record.id.as_str(), record.etag().as_str(), ACCEPTANCE_ACTOR)
         .await
         .expect("managed MCP discovery should initialize and list");
     assert_eq!(refreshed.total_count, 1);
@@ -1494,7 +1501,7 @@ async fn e2e_04_authenticated_mcp_stream_refresh_lkg_and_delete_workflow() {
     upstream.shutdown();
     tokio::task::yield_now().await;
     let failed_refresh = service
-        .refresh(record.id.as_str(), record.etag().as_str())
+        .refresh(record.id.as_str(), record.etag().as_str(), ACCEPTANCE_ACTOR)
         .await
         .expect_err("failed refresh must preserve last-known-good catalog");
     assert!(matches!(
@@ -1507,6 +1514,7 @@ async fn e2e_04_authenticated_mcp_stream_refresh_lkg_and_delete_workflow() {
         .managed_store()
         .expect("managed store should exist")
         .mcp_catalog(&record.id)
+        .await
         .expect("last-known-good catalog read should succeed")
         .is_some());
 
@@ -1514,14 +1522,31 @@ async fn e2e_04_authenticated_mcp_stream_refresh_lkg_and_delete_workflow() {
         .managed_store()
         .expect("managed store should exist");
     registry
-        .replace_mcp_connection_catalog(record.id.as_str(), Vec::new(), || {
-            store
-                .replace_mcp_catalog(&record.id, &record.etag(), &[], &[], &[])
-                .map(|_| ())
-        })
+        .validate_mcp_connection_catalog(record.id.as_str(), &[])
+        .expect("cleared managed MCP catalog should validate before the authority write");
+    let prior_catalog_revision = store
+        .mcp_catalog(&record.id)
+        .await
+        .expect("prior catalog read should succeed")
+        .map_or(0, |catalog| catalog.catalog_revision);
+    store
+        .replace_mcp_catalog(
+            &record.id,
+            &record.etag(),
+            &[],
+            &[],
+            &[],
+            prior_catalog_revision,
+            ACCEPTANCE_ACTOR,
+        )
+        .await
         .expect("managed MCP catalog should clear before delete");
+    registry
+        .install_mcp_connection_catalog(record.id.as_str(), Vec::new())
+        .expect("cleared managed MCP catalog should install");
     control_plane
-        .delete_managed(&record.id, &record.etag())
+        .delete_managed(&record.id, &record.etag(), ACCEPTANCE_ACTOR)
+        .await
         .expect("managed MCP connection should delete");
     service.remove_connection(&record.id);
     let after_delete = tools::mcp_upstream::call_connection_tool(
@@ -1720,6 +1745,19 @@ async fn e2e_05_secret_authority_denial_and_atomic_writer_revision_workflow() {
         serde_json::to_string(&capture.events()).expect("authority audit should serialize");
     assert!(!serialized.contains(OPERATOR_VALUE));
     assert!(!serialized.contains(OPERATOR_ALIAS_FILE));
+}
+
+/// Runs one synchronous `LocalSecretManager` mutation from a test that is
+/// itself async.
+///
+/// `LocalSecretManager` stays a synchronous trait and its mutations take the
+/// shared control-plane lock with `blocking_lock`, which panics on a thread
+/// that is driving the runtime. Production reaches these methods from
+/// `spawn_blocking`; a test that also has to `.await` control-plane mutations
+/// uses the in-place equivalent so the borrowed manager reference stays
+/// usable. Callers need the multi-threaded runtime flavor.
+fn blocking_secret_mutation<T>(operation: impl FnOnce() -> T) -> T {
+    tokio::task::block_in_place(operation)
 }
 
 fn write_secret_file(path: &FsPath, contents: &[u8]) {

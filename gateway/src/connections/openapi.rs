@@ -58,6 +58,10 @@ pub struct OpenApiConnectionCatalogService {
     http: ConnectionHttpRuntime,
     registry: ToolRegistry,
     runtime: OpenApiConnectionCatalogRuntime,
+    /// Test seam: runs between the authority commit and the registry
+    /// install, where another lane can move underneath a publish.
+    #[cfg(test)]
+    install_hook: Option<Arc<dyn Fn() + Send + Sync>>,
 }
 
 struct OpenApiPublishCandidate<'a> {
@@ -68,14 +72,11 @@ struct OpenApiPublishCandidate<'a> {
     digest: &'a str,
     binding: OpenApiToolBinding,
     started: Instant,
+    /// Who is publishing. The authority records it on the immutable
+    /// specification version; standalone mode has no version table and
+    /// ignores it.
+    actor: &'a str,
 }
-
-/// Result of the blocking-pool publish: change counts plus the persisted
-/// catalog when the registry publish succeeded.
-type OpenApiPublishOutcome = Result<
-    ((usize, usize, usize), Option<StoredOpenApiCatalog>),
-    McpCatalogPublishError<ConnectionStoreError>,
->;
 
 #[derive(Debug)]
 pub struct OpenApiCatalogPreview {
@@ -226,6 +227,19 @@ impl OpenApiConnectionCatalogRuntime {
         self.publish(catalog)
     }
 
+    /// The Connections whose catalogs this replica is currently serving.
+    fn connection_ids(&self) -> Vec<ConnectionId> {
+        self.state.load().keys().cloned().collect()
+    }
+
+    /// The catalog revision this replica currently serves for a Connection.
+    fn current_revision(&self, connection_id: &ConnectionId) -> Option<u64> {
+        self.state
+            .load()
+            .get(connection_id)
+            .map(|catalog| catalog.catalog_revision)
+    }
+
     fn remove(&self, connection_id: &ConnectionId) {
         self.state.rcu(|current| {
             if !current.contains_key(connection_id) {
@@ -310,13 +324,31 @@ impl OpenApiConnectionCatalogService {
         http: ConnectionHttpRuntime,
         registry: ToolRegistry,
     ) -> Result<Self, ConnectionStoreError> {
+        Self::load_with(
+            control_plane,
+            http,
+            registry,
+            crate::tools::definitions::LaneConflicts::Refuse,
+        )
+    }
+
+    /// `load` with the boot merge's conflict policy: cluster mode passes
+    /// [`crate::tools::definitions::LaneConflicts::EvictStale`], because its
+    /// boot seeds are read one resource at a time and the gate's first pass
+    /// reconciles them before a request is served.
+    pub fn load_with(
+        control_plane: ConnectionControlPlane,
+        http: ConnectionHttpRuntime,
+        registry: ToolRegistry,
+        conflicts: crate::tools::definitions::LaneConflicts,
+    ) -> Result<Self, ConnectionStoreError> {
         let catalogs = if control_plane.is_managed_store_configured() {
             control_plane
                 .managed_store()
                 .map_err(|_| ConnectionStoreError::Validation {
                     problems: vec!["managed Connection store is unavailable".to_owned()],
                 })?
-                .openapi_catalogs()?
+                .boot_openapi_catalogs()?
         } else {
             Vec::new()
         };
@@ -340,7 +372,7 @@ impl OpenApiConnectionCatalogService {
             .flatten()
             .collect::<Vec<_>>();
         registry
-            .merge_definitions(definitions)
+            .merge_definitions_with(definitions, conflicts)
             .map_err(tool_registry_store_error)?;
         let runtime = OpenApiConnectionCatalogRuntime::new(&active_catalogs)?;
         Ok(Self {
@@ -348,11 +380,98 @@ impl OpenApiConnectionCatalogService {
             http,
             registry,
             runtime,
+            #[cfg(test)]
+            install_hook: None,
         })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_install_hook_for_test(mut self, hook: Arc<dyn Fn() + Send + Sync>) -> Self {
+        self.install_hook = Some(hook);
+        self
     }
 
     pub fn runtime(&self) -> OpenApiConnectionCatalogRuntime {
         self.runtime.clone()
+    }
+
+    /// Rebuild the managed-OpenAPI lane from the authority (issue #241,
+    /// PR 8).
+    ///
+    /// The Connections reconciler calls this after the records have been
+    /// republished, so the "is this catalog still active" filter sees the
+    /// records the authority does -- filtering against the previous
+    /// snapshot would keep serving a catalog whose Connection was disabled
+    /// on another replica. It is the computation
+    /// [`OpenApiConnectionCatalogService::load`] performs at startup, done
+    /// against the authority, and it installs through the registry's
+    /// re-validating install so a catalog this binary cannot enforce fails
+    /// closed instead of becoming live.
+    pub async fn reconcile_from_authority(&self) -> Result<(), ConnectionStoreError> {
+        let catalogs = self
+            .control_plane
+            .managed_store()
+            .map_err(|_| ConnectionStoreError::Validation {
+                problems: vec!["managed Connection store is unavailable".to_owned()],
+            })?
+            .openapi_catalogs()
+            .await?;
+        let snapshot = self.control_plane.runtime_snapshot();
+        let active = catalogs
+            .into_iter()
+            .filter(|catalog| {
+                snapshot
+                    .managed()
+                    .get(&catalog.connection_id)
+                    .is_some_and(|record| {
+                        record.write.enabled && supports_managed_openapi_catalog(record)
+                    })
+            })
+            .collect::<Vec<_>>();
+        let active_ids = active
+            .iter()
+            .map(|catalog| catalog.connection_id.clone())
+            .collect::<BTreeSet<_>>();
+        for catalog in &active {
+            // See the MCP reconciler: the per-Connection guard a publish
+            // holds, and a monotonic revision check under it.
+            let _guard = self
+                .control_plane
+                .begin_catalog_mutation(&catalog.connection_id)
+                .map_err(|_| ConnectionStoreError::Busy {
+                    resource: "connection catalog lifecycle",
+                })?;
+            if self
+                .runtime
+                .current_revision(&catalog.connection_id)
+                .is_some_and(|live| live >= catalog.catalog_revision)
+            {
+                continue;
+            }
+            let definitions = catalog_definitions(catalog)?;
+            // Authoritative content: a conflicting holder is stale by the
+            // authority's reservation, and evicting it is what lets a name
+            // that moved between catalogs converge in any order.
+            self.registry
+                .install_openapi_connection_catalog_with(
+                    catalog.connection_id.as_str(),
+                    definitions,
+                    crate::tools::definitions::LaneConflicts::EvictStale,
+                )
+                .map_err(tool_registry_store_error)?;
+            // `publish` recomputes the definition digests from the stored
+            // entries and rejects a catalog whose entries do not agree with
+            // them, which is what the boot path does too.
+            self.runtime.publish(catalog)?;
+        }
+        // A catalog the authority no longer holds as active must stop
+        // being served here too. Withdrawing is the fail-closed direction.
+        for connection_id in self.runtime.connection_ids() {
+            if !active_ids.contains(&connection_id) {
+                self.discard_runtime_catalog(&connection_id);
+            }
+        }
+        Ok(())
     }
 
     pub(crate) fn begin_connection_mutation(
@@ -383,7 +502,7 @@ impl OpenApiConnectionCatalogService {
         stored.or_else(|| self.runtime.catalog_status(connection_id, current_etag))
     }
 
-    pub fn preview(
+    pub async fn preview(
         &self,
         raw_connection_id: &str,
         spec: &str,
@@ -395,6 +514,7 @@ impl OpenApiConnectionCatalogService {
             .managed_store()
             .map_err(|_| OpenApiCatalogError::StoreUnavailable)?
             .openapi_catalog(&connection_id)
+            .await
             .map_err(|_| OpenApiCatalogError::StorageUnavailable)?;
         let generation = openapi::generate_tools_from_openapi_str("managed-openapi-preview", spec)
             .map_err(|_| OpenApiCatalogError::InvalidSpec)?;
@@ -427,6 +547,7 @@ impl OpenApiConnectionCatalogService {
         spec: &str,
         selected_tool_names: &[String],
         confirmations: &[OpenApiToolSecuritySelection],
+        actor: &str,
     ) -> Result<OpenApiCatalogPublishResult, OpenApiCatalogError> {
         validate_spec_size(spec)?;
         if spec_digest(spec) != expected_spec_digest {
@@ -460,6 +581,7 @@ impl OpenApiConnectionCatalogService {
             digest: expected_spec_digest,
             binding,
             started: Instant::now(),
+            actor,
         })
         .await
     }
@@ -468,6 +590,7 @@ impl OpenApiConnectionCatalogService {
         &self,
         raw_connection_id: &str,
         expected_connection_etag: &str,
+        actor: &str,
     ) -> Result<OpenApiCatalogPublishResult, OpenApiCatalogError> {
         let connection_id = ConnectionId::parse(raw_connection_id.to_owned())
             .map_err(|_| OpenApiCatalogError::InvalidConnectionId)?;
@@ -482,20 +605,13 @@ impl OpenApiConnectionCatalogService {
             .managed_store()
             .map_err(|_| OpenApiCatalogError::StoreUnavailable)?
             .clone();
-        // The prior-catalog read is a SQLite query; it runs on the blocking
-        // pool off the request executor.
-        let prior = {
-            let store = store.clone();
-            let connection_id_for_prior = connection_id.clone();
-            match tokio::task::spawn_blocking(move || {
-                store.openapi_catalog(&connection_id_for_prior)
-            })
-            .await
-            {
-                Ok(Ok(Some(prior))) => prior,
-                Ok(Ok(None)) => return Err(OpenApiCatalogError::CatalogNotRegistered),
-                Ok(Err(_)) | Err(_) => return Err(OpenApiCatalogError::StorageUnavailable),
-            }
+        // The store dispatch keeps standalone mode's SQLite query on the
+        // blocking pool and awaits the authority in cluster mode; either
+        // way the request executor stays free.
+        let prior = match store.openapi_catalog(&connection_id).await {
+            Ok(Some(prior)) => prior,
+            Ok(None) => return Err(OpenApiCatalogError::CatalogNotRegistered),
+            Err(_) => return Err(OpenApiCatalogError::StorageUnavailable),
         };
         let started = Instant::now();
         let spec = match &record.write.discovery {
@@ -578,6 +694,7 @@ impl OpenApiConnectionCatalogService {
                 digest: &digest,
                 binding,
                 started,
+                actor,
             })
             .await;
         match published {
@@ -673,6 +790,7 @@ impl OpenApiConnectionCatalogService {
             digest,
             mut binding,
             started,
+            actor,
         } = candidate;
         if !binding.incompatibilities.is_empty() {
             return Err(OpenApiCatalogError::AuthenticationMismatch);
@@ -716,122 +834,107 @@ impl OpenApiConnectionCatalogService {
                 ConnectionStatusReason::Disabled,
             )
         };
-        // The prior read, the registry publish with its SQLite catalog
-        // persist, and the status append are SQLite transactions; they run
-        // on the blocking pool off the request executor. The runtime
-        // publish stays inside the persist callback so the registry lane
-        // and the runtime map keep publishing together.
-        let (counts, catalog, status) = {
-            let registry = self.registry.clone();
-            let runtime = self.runtime.clone();
-            let store_for_persist = store.clone();
-            let record_for_persist = record.clone();
-            let expected_connection_etag_for_persist = expected_connection_etag.clone();
-            let spec_for_persist = spec.to_owned();
-            let digest_for_persist = digest.to_owned();
-            let publish = tokio::task::spawn_blocking(move || -> OpenApiPublishOutcome {
-                let prior = store_for_persist
-                    .openapi_catalog(&record_for_persist.id)
-                    .map_err(McpCatalogPublishError::Persist)?;
-                let counts = catalog_change_counts(prior.as_ref(), &entries);
-                let mut persisted = None;
-                let publish = registry.replace_openapi_connection_catalog(
-                    record_for_persist.id.as_str(),
-                    binding_definitions,
-                    || {
-                        let catalog = store_for_persist.replace_openapi_catalog(
-                            &record_for_persist.id,
-                            &expected_connection_etag_for_persist,
-                            expected_spec_revision,
-                            expected_catalog_revision,
-                            &spec_for_persist,
-                            &digest_for_persist,
-                            &entries,
-                        )?;
-                        runtime.publish_prevalidated(&catalog, definition_digests);
-                        persisted = Some(catalog);
-                        Ok::<(), ConnectionStoreError>(())
+        // Validate, commit, install -- the same split the MCP catalog and
+        // the tools document use, for the same reason: the commit awaits
+        // the store, and the registry write lock is a `std` mutex that
+        // cannot be held across an await. The install re-validates against
+        // the lanes current at install time and fails closed.
+        let registry = self.registry.clone();
+        let prior = store
+            .openapi_catalog(&record.id)
+            .await
+            .map_err(|error| openapi_store_error(&error))?;
+        let counts = catalog_change_counts(prior.as_ref(), &entries);
+        registry
+            .validate_openapi_connection_catalog(record.id.as_str(), &binding_definitions)
+            .map_err(|_| OpenApiCatalogError::ToolConflict)?;
+        let catalog = store
+            .replace_openapi_catalog(
+                &record.id,
+                &expected_connection_etag,
+                expected_spec_revision,
+                expected_catalog_revision,
+                spec,
+                digest,
+                &entries,
+                actor,
+            )
+            .await
+            .map_err(|error| openapi_store_error(&error))?;
+        // Publication is revision-monotonic: this publish holds the
+        // per-Connection lifecycle guard, but reconciliation may already
+        // have published a NEWER catalog another replica committed while
+        // this one was between its commit and here. Installing over it
+        // would roll the live lane back with no revision left to repair
+        // it; the committed catalog is durable at the authority.
+        if self
+            .runtime
+            .current_revision(&record.id)
+            .is_some_and(|live| live > catalog.catalog_revision)
+        {
+            tracing::info!(
+                connection_id = %record.id,
+                committed = catalog.catalog_revision,
+                "a newer OpenAPI catalog is already live on this replica; the committed one is durable and not installed"
+            );
+            return Err(OpenApiCatalogError::ToolConflict);
+        }
+        // Registry first, runtime marker second. The marker is what
+        // `reconcile_from_authority` compares against: publishing it before
+        // a registry install that then fails would leave this replica
+        // treating the catalog as live while the registry lacks its tools,
+        // and nothing would ever retry. With the registry installed first a
+        // failed install publishes nothing locally, and the reconciler
+        // installs the durable catalog on its next pass -- the same order
+        // the reconciler itself uses.
+        #[cfg(test)]
+        if let Some(hook) = self.install_hook.as_ref() {
+            hook();
+        }
+        if let Err(error) =
+            registry.install_openapi_connection_catalog(record.id.as_str(), binding_definitions)
+        {
+            tracing::error!(
+                connection_id = %record.id,
+                error = %error,
+                "OpenAPI catalog is durable but could not be installed into the tool registry; reconciliation will retry"
+            );
+            return Err(OpenApiCatalogError::ToolConflict);
+        }
+        self.runtime
+            .publish_prevalidated(&catalog, definition_digests);
+        let status = {
+            let latency = duration_millis(started.elapsed());
+            match self
+                .control_plane
+                .append_status(
+                    &record.id,
+                    &expected_connection_etag,
+                    ConnectionStatusUpdate {
+                        state: published_state,
+                        reason: published_reason,
+                        latency_ms: Some(latency),
+                        catalog_age_secs: Some(0),
+                        catalog_entry_count: Some(catalog.entries.len()),
                     },
-                );
-                publish
-                    .map(|()| persisted)
-                    .map(|persisted| (counts, persisted))
-            })
-            .await;
-            match publish {
-                Ok(Ok((counts, persisted))) => {
-                    let catalog = persisted.ok_or(OpenApiCatalogError::StorageUnavailable)?;
-                    // The catalog was published; record its success status
-                    // on the blocking pool as well.
-                    let status = {
-                        let control_plane = self.control_plane.clone();
-                        let connection_id_for_status = record.id.clone();
-                        let connection_etag_for_status = expected_connection_etag.clone();
-                        let entry_count = catalog.entries.len();
-                        let latency = duration_millis(started.elapsed());
-                        match tokio::task::spawn_blocking(move || {
-                            control_plane.append_status(
-                                &connection_id_for_status,
-                                &connection_etag_for_status,
-                                ConnectionStatusUpdate {
-                                    state: published_state,
-                                    reason: published_reason,
-                                    latency_ms: Some(latency),
-                                    catalog_age_secs: Some(0),
-                                    catalog_entry_count: Some(entry_count),
-                                },
-                            )
-                        })
-                        .await
-                        {
-                            Ok(Ok(status)) => status,
-                            Ok(Err(error)) => {
-                                tracing::error!(
-                                    connection_id = %record.id,
-                                    error = %error,
-                                    "OpenAPI catalog was published but its safe status could not be recorded"
-                                );
-                                SafeConnectionStatus {
-                                    state: published_state,
-                                    reason: published_reason,
-                                    observed_at: Some(catalog.refreshed_at.clone()),
-                                    latency_ms: Some(duration_millis(started.elapsed())),
-                                    catalog_age_secs: Some(0),
-                                    catalog_entry_count: Some(catalog.entries.len()),
-                                }
-                            }
-                            Err(join_error) => {
-                                tracing::error!(
-                                    connection_id = %record.id,
-                                    error = %join_error,
-                                    "OpenAPI catalog status persistence task failed"
-                                );
-                                SafeConnectionStatus {
-                                    state: published_state,
-                                    reason: published_reason,
-                                    observed_at: Some(catalog.refreshed_at.clone()),
-                                    latency_ms: Some(duration_millis(started.elapsed())),
-                                    catalog_age_secs: Some(0),
-                                    catalog_entry_count: Some(catalog.entries.len()),
-                                }
-                            }
-                        }
-                    };
-                    (counts, catalog, status)
-                }
-                Ok(Err(error)) => {
-                    return Err(match error {
-                        McpCatalogPublishError::Registry(_) => OpenApiCatalogError::ToolConflict,
-                        McpCatalogPublishError::Persist(error) => openapi_store_error(&error),
-                    });
-                }
-                Err(join_error) => {
+                )
+                .await
+            {
+                Ok(status) => status,
+                Err(error) => {
                     tracing::error!(
                         connection_id = %record.id,
-                        error = %join_error,
-                        "OpenAPI catalog publish task failed"
+                        error = %error,
+                        "OpenAPI catalog was published but its safe status could not be recorded"
                     );
-                    return Err(OpenApiCatalogError::StorageUnavailable);
+                    SafeConnectionStatus {
+                        state: published_state,
+                        reason: published_reason,
+                        observed_at: Some(catalog.refreshed_at.clone()),
+                        latency_ms: Some(duration_millis(started.elapsed())),
+                        catalog_age_secs: Some(0),
+                        catalog_entry_count: Some(catalog.entries.len()),
+                    }
                 }
             }
         };
@@ -967,17 +1070,15 @@ impl OpenApiConnectionCatalogService {
                 Some(0),
             )
         };
-        // Failure-status persistence is a small SQLite transaction; it runs
-        // on the blocking pool off the request executor. Both a failed
-        // statement and a failed task only log, exactly as before.
-        let control_plane = self.control_plane.clone();
-        let connection_id_for_status = connection_id.to_owned();
-        let expected_for_status = expected.clone();
+        // A failed status write only logs, exactly as before: the publish
+        // failure it describes is already being returned to the caller, and
+        // losing the breadcrumb must not turn one failure into two.
         let latency = duration_millis(elapsed);
-        let append = tokio::task::spawn_blocking(move || {
-            control_plane.append_status(
-                &connection_id_for_status,
-                &expected_for_status,
+        if let Err(error) = self
+            .control_plane
+            .append_status(
+                connection_id,
+                expected,
                 ConnectionStatusUpdate {
                     state,
                     reason,
@@ -986,24 +1087,13 @@ impl OpenApiConnectionCatalogService {
                     catalog_entry_count: count,
                 },
             )
-        })
-        .await;
-        match append {
-            Ok(Ok(_)) => {}
-            Ok(Err(error)) => {
-                tracing::error!(
-                    connection_id = %connection_id,
-                    error = %error,
-                    "failed to persist bounded OpenAPI refresh failure status"
-                );
-            }
-            Err(join_error) => {
-                tracing::error!(
-                    connection_id = %connection_id,
-                    error = %join_error,
-                    "OpenAPI refresh failure-status task failed"
-                );
-            }
+            .await
+        {
+            tracing::error!(
+                connection_id = %connection_id,
+                error = %error,
+                "failed to persist bounded OpenAPI refresh failure status"
+            );
         }
     }
 }
@@ -1356,6 +1446,7 @@ fn egress_error(error: EgressError) -> OpenApiCatalogError {
 
 fn openapi_store_error(error: &ConnectionStoreError) -> OpenApiCatalogError {
     match error {
+        ConnectionStoreError::ToolNameConflict { .. } => OpenApiCatalogError::ToolConflict,
         ConnectionStoreError::Conflict { .. } => OpenApiCatalogError::StalePreview,
         ConnectionStoreError::Validation { .. } | ConnectionStoreError::LimitExceeded { .. } => {
             OpenApiCatalogError::InvalidSpec
@@ -1550,6 +1641,210 @@ mod tests {
         ));
     }
 
+    /// A request admitted by the gate dispatches under the Connection
+    /// snapshot pinned at admission, not under whatever a later reconcile
+    /// installed while it was in flight: the runtime resolves targets from
+    /// the pinned snapshot, and only from the live one outside a request.
+    #[tokio::test]
+    async fn targets_resolve_from_the_pinned_snapshot_inside_a_request() {
+        let database = TemporaryDatabase::new();
+        let mut config = Config::test_defaults();
+        config.connections_sqlite_path = Some(database.0.display().to_string());
+        let control_plane =
+            ConnectionControlPlane::from_config(&config).expect("control plane should build");
+        let snapshot = control_plane.runtime_snapshot();
+        let candidate: ConnectionWrite = serde_json::from_value(json!({
+            "display_name": "Pinned API",
+            "enabled": true,
+            "kind": "http_api",
+            "endpoint": {
+                "base_url": "https://pinned.example.test",
+                "base_path": "/v1"
+            },
+            "authentication": {"type": "none"},
+            "tls": {},
+            "timeouts": {
+                "connect_timeout_ms": 1000,
+                "request_timeout_ms": 3000,
+                "response_idle_timeout_ms": 1000
+            }
+        }))
+        .expect("HTTP Connection should deserialize");
+        let record = control_plane
+            .create_managed(snapshot.collection_etag(), candidate, "test-admin")
+            .await
+            .expect("HTTP Connection should create");
+        let egress_config = EgressConfig::from_config(&config);
+        let egress_client =
+            Arc::new(EgressClient::new(egress_config.clone()).expect("egress should build"));
+        let http = ConnectionHttpRuntime::new(control_plane.clone(), egress_config, egress_client);
+        let pinned = control_plane.runtime_snapshot();
+
+        // The Connection disappears from the live state after admission.
+        control_plane
+            .delete_managed(&record.id, &record.etag(), "test-admin")
+            .await
+            .expect("delete");
+        assert!(
+            http.target(record.id.as_str(), "/invoices").is_err(),
+            "outside a request the live snapshot no longer has it"
+        );
+        let target = crate::connections::http::with_pinned_connections(pinned, async {
+            http.target(record.id.as_str(), "/invoices")
+        })
+        .await
+        .expect("inside the admitted request the pinned snapshot still has it");
+        assert_eq!(target.connection_id(), &record.id);
+    }
+
+    /// A registry install that fails after the authority commit -- another
+    /// lane moved underneath the publish -- publishes no runtime marker,
+    /// so `reconcile_from_authority` still sees the durable catalog as
+    /// newer than what is live and installs it on its next pass. Publishing
+    /// the marker first would have left this replica believing the catalog
+    /// was live with its tools absent from the registry, forever.
+    #[tokio::test]
+    async fn a_failed_registry_install_publishes_no_runtime_marker() {
+        let database = TemporaryDatabase::new();
+        let mut config = Config::test_defaults();
+        config.connections_sqlite_path = Some(database.0.display().to_string());
+        let control_plane =
+            ConnectionControlPlane::from_config(&config).expect("control plane should build");
+        let snapshot = control_plane.runtime_snapshot();
+        let candidate: ConnectionWrite = serde_json::from_value(json!({
+            "display_name": "Managed Billing OpenAPI",
+            "enabled": true,
+            "kind": "http_api",
+            "endpoint": {
+                "base_url": "https://billing.example.test",
+                "base_path": "/v1"
+            },
+            "authentication": {"type": "none"},
+            "tls": {},
+            "timeouts": {
+                "connect_timeout_ms": 1000,
+                "request_timeout_ms": 3000,
+                "response_idle_timeout_ms": 1000
+            },
+            "discovery": {
+                "type": "managed_openapi",
+                "use_connection_authentication": false
+            }
+        }))
+        .expect("managed OpenAPI Connection should deserialize");
+        let record = control_plane
+            .create_managed(snapshot.collection_etag(), candidate, "test-admin")
+            .await
+            .expect("managed OpenAPI Connection should create");
+        let egress_config = EgressConfig::from_config(&config);
+        let egress_client =
+            Arc::new(EgressClient::new(egress_config.clone()).expect("egress should build"));
+        let http = ConnectionHttpRuntime::new(control_plane.clone(), egress_config, egress_client);
+        let registry = ToolRegistry::disabled();
+        // Between the commit and the install, the local lane takes the
+        // name the catalog is about to publish.
+        let racing_registry = registry.clone();
+        let service = OpenApiConnectionCatalogService::load(
+            control_plane.clone(),
+            http.clone(),
+            registry.clone(),
+        )
+        .expect("managed OpenAPI service should load")
+        .with_install_hook_for_test(Arc::new(move || {
+            let local = crate::tools::definitions::definitions_from_json_value(
+                json!({
+                    "schema_version": "0.1.0",
+                    "tools": [{
+                        "name": "get_invoice",
+                        "description": "A local tool that takes the name first.",
+                        "input_json_schema": {
+                            "type": "object",
+                            "properties": {},
+                            "additionalProperties": false
+                        },
+                        "upstream": {
+                            "method": "POST",
+                            "path_template": "/v1/echo",
+                            "body": { "mode": "whole_args_json" }
+                        }
+                    }]
+                }),
+                None,
+            )
+            .expect("local definitions should parse");
+            racing_registry
+                .install_local_definitions(local)
+                .expect("the local lane installs against the old registry");
+        }));
+        let spec = r#"
+openapi: 3.0.3
+info:
+  title: Billing
+  version: 1.0.0
+paths:
+  /invoices/{invoice_id}:
+    get:
+      operationId: get_invoice
+      summary: Read one invoice
+      parameters:
+        - in: path
+          name: invoice_id
+          required: true
+          schema:
+            type: string
+"#;
+        let preview = service
+            .preview(record.id.as_str(), spec)
+            .await
+            .expect("bounded managed spec should preview");
+        let selected_tool_names = preview
+            .binding
+            .definitions
+            .iter()
+            .map(|definition| definition.name.clone())
+            .collect::<Vec<_>>();
+        let confirmations = preview.binding.security_selections.clone();
+
+        let refused = service
+            .register(
+                record.id.as_str(),
+                record.etag().as_str(),
+                preview.spec_revision,
+                preview.catalog_revision,
+                &preview.spec_digest,
+                spec,
+                &selected_tool_names,
+                &confirmations,
+                "test-admin",
+            )
+            .await
+            .expect_err("the registry install must be refused");
+        assert_eq!(refused, OpenApiCatalogError::ToolConflict);
+        assert_eq!(
+            service.runtime().current_revision(&record.id),
+            None,
+            "no runtime marker is published for a catalog the registry does not serve"
+        );
+        // The catalog is durable at the authority: the next preview sees
+        // its revision, which is what reconciliation will install once the
+        // conflict is resolved.
+        let next = service
+            .preview(record.id.as_str(), spec)
+            .await
+            .expect("the durable catalog previews");
+        assert_eq!(next.catalog_revision, 1);
+        assert!(
+            registry.get("get_invoice").is_some_and(|definition| {
+                !matches!(
+                    definition.source,
+                    crate::tools::definitions::ToolSource::OpenApi { .. }
+                        | crate::tools::definitions::ToolSource::Mcp { .. }
+                )
+            }),
+            "the local lane keeps the name it took"
+        );
+    }
+
     #[tokio::test]
     async fn register_is_revision_bound_and_restart_reconstructs_last_known_good_catalog() {
         let database = TemporaryDatabase::new();
@@ -1580,7 +1875,8 @@ mod tests {
         }))
         .expect("managed OpenAPI Connection should deserialize");
         let record = control_plane
-            .create_managed(snapshot.collection_etag(), candidate)
+            .create_managed(snapshot.collection_etag(), candidate, "test-admin")
+            .await
             .expect("managed OpenAPI Connection should create");
         let egress_config = EgressConfig::from_config(&config);
         let egress_client =
@@ -1613,6 +1909,7 @@ paths:
 
         let preview = service
             .preview(record.id.as_str(), spec)
+            .await
             .expect("bounded managed spec should preview");
         assert_eq!(preview.connection_etag, record.etag());
         assert_eq!(preview.spec_revision, 0);
@@ -1636,6 +1933,7 @@ paths:
                 spec,
                 &selected_tool_names,
                 &confirmations,
+                "test-admin",
             )
             .await
             .expect("exact preview should publish");
@@ -1660,6 +1958,7 @@ paths:
                     spec,
                     &selected_tool_names,
                     &confirmations,
+                    "test-admin",
                 )
                 .await
                 .err(),
@@ -1680,6 +1979,7 @@ paths:
                     spec,
                     &selected_tool_names,
                     &confirmations,
+                    "test-admin",
                 )
                 .await
                 .err(),
@@ -1691,6 +1991,7 @@ paths:
             .managed_store()
             .expect("managed store should exist")
             .openapi_catalog(&record.id)
+            .await
             .expect("catalog should load")
             .expect("last-known-good catalog should remain");
         assert_eq!(retained.spec_revision, 1);
@@ -1717,7 +2018,8 @@ paths:
         let mut disabled_write = record.write.clone();
         disabled_write.enabled = false;
         let disabled = control_plane
-            .replace_managed(&record.id, &record.etag(), disabled_write)
+            .replace_managed(&record.id, &record.etag(), disabled_write, "test-admin")
+            .await
             .expect("registered Connection should be disableable");
         let disabled_registry = ToolRegistry::disabled();
         let disabled_service = OpenApiConnectionCatalogService::load(
@@ -1753,6 +2055,7 @@ paths:
                 spec,
                 &[],
                 &[],
+                "test-admin",
             )
             .await
             .expect("an exact empty registration should clear a disabled catalog");
@@ -1768,10 +2071,12 @@ paths:
             .managed_store()
             .expect("managed store should exist")
             .dependencies(&disabled.id)
+            .await
             .expect("dependencies should load")
             .is_empty());
         control_plane
-            .delete_managed(&disabled.id, &disabled.etag())
+            .delete_managed(&disabled.id, &disabled.etag(), "test-admin")
+            .await
             .expect("cleared disabled Connection should be deleteable");
     }
 
@@ -1814,7 +2119,8 @@ paths:
         }))
         .expect("refreshable OpenAPI Connection should deserialize");
         let record = control_plane
-            .create_managed(snapshot.collection_etag(), candidate)
+            .create_managed(snapshot.collection_etag(), candidate, "test-admin")
+            .await
             .expect("refreshable OpenAPI Connection should create");
         let egress_config = EgressConfig::from_config(&config);
         let egress_client =
@@ -1847,6 +2153,7 @@ paths:
 "#;
         let preview = service
             .preview(record.id.as_str(), initial_spec)
+            .await
             .expect("initial spec should preview");
         let selected = preview
             .binding
@@ -1864,6 +2171,7 @@ paths:
                 initial_spec,
                 &selected,
                 &preview.binding.security_selections,
+                "test-admin",
             )
             .await
             .expect("initial A+B catalog should publish");
@@ -1871,6 +2179,7 @@ paths:
             .managed_store()
             .expect("managed store should exist")
             .openapi_catalog(&record.id)
+            .await
             .expect("initial catalog should load")
             .expect("initial catalog should exist");
         let reassigned_name = openapi::generate_tools_from_openapi_str(
@@ -1896,7 +2205,7 @@ paths:
         let server = tokio::spawn(serve_openapi_once(listener, refreshed_spec.to_owned()));
 
         let refreshed = service
-            .refresh(record.id.as_str(), record.etag().as_str())
+            .refresh(record.id.as_str(), record.etag().as_str(), "test-admin")
             .await
             .expect("refresh should successfully prune a deleted operation");
         server
@@ -1913,6 +2222,7 @@ paths:
             .managed_store()
             .expect("managed store should exist")
             .openapi_catalog(&record.id)
+            .await
             .expect("catalog should load")
             .expect("refreshed catalog should remain");
         assert_eq!(
@@ -1927,6 +2237,7 @@ paths:
             .managed_store()
             .expect("managed store should exist")
             .dependencies(&record.id)
+            .await
             .expect("dependencies should load");
         assert_eq!(dependencies.len(), 1);
         assert_eq!(

@@ -576,11 +576,11 @@ const MIGRATIONS: &[Migration] = &[
     },
 ];
 
-const SOURCE_MANAGED: &str = "managed";
+pub(crate) const SOURCE_MANAGED: &str = "managed";
 const MAX_DEPENDENCY_FIELD_BYTES: usize = 256;
 pub const MAX_CONNECTION_DEPENDENCIES: usize = 4_096;
 const MAX_MCP_CATALOG_ENTRY_BYTES: usize = 262_144;
-const MAX_MANAGED_MCP_CATALOG_BYTES: usize = 16 * 1024 * 1024;
+pub(crate) const MAX_MANAGED_MCP_CATALOG_BYTES: usize = 16 * 1024 * 1024;
 const MAX_MCP_TOOL_NAME_CHARS: usize = 128;
 const MAX_MCP_TOOL_DESCRIPTION_CHARS: usize = 1_024;
 const MAX_MCP_RESOURCE_URI_BYTES: usize = 2_048;
@@ -638,7 +638,14 @@ impl ConnectionEtag {
         &self.0
     }
 
-    fn for_record(id: &ConnectionId, revisions: &ConnectionRevisions) -> Self {
+    /// Rebuild an etag read back from a store, verbatim. Stores persist the
+    /// canonical string; no parsing or validation happens here, matching
+    /// the SQLite store's opaque round-trip.
+    pub(crate) fn from_stored(value: String) -> Self {
+        Self(value)
+    }
+
+    pub(crate) fn for_record(id: &ConnectionId, revisions: &ConnectionRevisions) -> Self {
         Self(format!(
             "\"connection:{}:c{}:k{}:t{}:d{}\"",
             id.as_str(),
@@ -713,7 +720,7 @@ impl StoredConnection {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ConnectionDependencyKind {
     ProxyRoute,
@@ -723,7 +730,7 @@ pub enum ConnectionDependencyKind {
 }
 
 impl ConnectionDependencyKind {
-    fn as_str(self) -> &'static str {
+    pub(crate) fn as_str(self) -> &'static str {
         match self {
             Self::ProxyRoute => "proxy_route",
             Self::ManualTool => "manual_tool",
@@ -732,7 +739,7 @@ impl ConnectionDependencyKind {
         }
     }
 
-    fn parse(value: &str) -> Option<Self> {
+    pub(crate) fn parse(value: &str) -> Option<Self> {
         match value {
             "proxy_route" => Some(Self::ProxyRoute),
             "manual_tool" => Some(Self::ManualTool),
@@ -866,6 +873,14 @@ pub enum ConnectionStoreError {
         id: String,
         current: ConnectionEtag,
     },
+    /// A catalog tool name is already published by another lane at the
+    /// authority (cluster mode). The caller surfaces `409`.
+    ToolNameConflict {
+        id: String,
+        tool_name: String,
+        lane: String,
+        owner_id: String,
+    },
     DependencyConflict {
         id: String,
         count: usize,
@@ -879,6 +894,45 @@ pub enum ConnectionStoreError {
     DeadlineExceeded {
         operation: &'static str,
     },
+    /// The PostgreSQL authority could not be consulted or rejected the
+    /// operation (cluster mode's store). Carries a stable operation label
+    /// only -- no SQL text, no query values, no DSN material; the detail
+    /// is logged where the failure occurs.
+    Postgres {
+        operation: &'static str,
+    },
+    /// The store could not be consulted at all: the blocking worker that
+    /// runs the standalone store's synchronous body did not complete
+    /// (runtime shutdown, or a panic inside it). Fail closed -- this is
+    /// never a "not found" and never a success.
+    Unavailable {
+        operation: &'static str,
+    },
+    /// A create's collection precondition (the `If-Match` over the whole
+    /// managed collection) no longer holds at the authority: another
+    /// replica changed the collection after the caller read it. Carries
+    /// the authority's current collection ETag so the response can name
+    /// it, exactly as the process-local check does.
+    CollectionConflict {
+        current: String,
+    },
+}
+
+/// The cross-replica half of a create's `If-Match` (issue #241, PR 8).
+///
+/// The control plane checks the collection ETag against its own runtime
+/// snapshot before calling the store, which is authoritative in standalone
+/// mode -- one process, one snapshot. In cluster mode two replicas can
+/// each pass that local check with the same `If-Match` and both insert, so
+/// the PostgreSQL store re-derives the collection ETag from the authority's
+/// records inside the create transaction, under the same lock every other
+/// mutation takes, and refuses the create if it moved. `compute` is the
+/// control plane's own derivation (it captures the replica's legacy
+/// projections, which the store does not know about), so the two checks
+/// cannot disagree about what the ETag means.
+pub struct CollectionCheck<'a> {
+    pub expected_etag: &'a str,
+    pub compute: &'a (dyn Fn(&BTreeMap<ConnectionId, StoredConnection>) -> String + Send + Sync),
 }
 
 impl fmt::Display for ConnectionStoreError {
@@ -931,6 +985,15 @@ impl fmt::Display for ConnectionStoreError {
                 formatter,
                 "connection '{id}' is referenced by {count} retained control-plane records"
             ),
+            Self::ToolNameConflict {
+                id,
+                tool_name,
+                lane,
+                owner_id,
+            } => write!(
+                formatter,
+                "connection '{id}' cannot publish tool '{tool_name}': it is already published by the {lane} lane ({owner_id})"
+            ),
             Self::RevisionOverflow { id } => {
                 write!(
                     formatter,
@@ -943,6 +1006,16 @@ impl fmt::Display for ConnectionStoreError {
             Self::DeadlineExceeded { operation } => {
                 write!(formatter, "{operation} exceeded its deadline")
             }
+            Self::Postgres { operation } => {
+                write!(formatter, "connection PostgreSQL {operation} failed")
+            }
+            Self::Unavailable { operation } => {
+                write!(formatter, "{operation} could not be executed")
+            }
+            Self::CollectionConflict { current } => write!(
+                formatter,
+                "connection collection changed at the authority; current ETag is {current}"
+            ),
         }
     }
 }
@@ -1358,6 +1431,35 @@ impl SqliteConnectionStore {
         resources: &[StoredMcpResource],
         resource_templates: &[StoredMcpResourceTemplate],
     ) -> Result<StoredMcpCatalog, ConnectionStoreError> {
+        self.replace_mcp_catalog_expecting(
+            id,
+            expected,
+            entries,
+            resources,
+            resource_templates,
+            None,
+        )
+    }
+
+    /// [`SqliteConnectionStore::replace_mcp_catalog`] with the catalog's
+    /// own compare-and-swap: `Some(revision)` requires the stored catalog
+    /// revision to equal it (`0` = no catalog yet) and refuses with
+    /// `Conflict` otherwise; `None` skips the check. The connection ETag
+    /// does not move on a catalog replacement, so this is the only
+    /// precondition that can tell two refreshes of the same prior catalog
+    /// apart. Standalone mode serializes refreshes per Connection inside
+    /// the process, so the check is redundant here -- it exists so both
+    /// stores enforce exactly what the cluster path asks for.
+    #[allow(clippy::too_many_arguments)]
+    pub fn replace_mcp_catalog_expecting(
+        &self,
+        id: &ConnectionId,
+        expected: &ConnectionEtag,
+        entries: &[StoredMcpCatalogEntry],
+        resources: &[StoredMcpResource],
+        resource_templates: &[StoredMcpResourceTemplate],
+        expected_catalog_revision: Option<u64>,
+    ) -> Result<StoredMcpCatalog, ConnectionStoreError> {
         let validated = validate_mcp_catalog(id, entries, resources, resource_templates)?;
         let now = utc_timestamp()?;
         let mut connection = self.connection_guard();
@@ -1445,6 +1547,14 @@ impl SqliteConnectionStore {
             })
             .transpose()?
             .unwrap_or_default();
+        if let Some(expected_catalog_revision) = expected_catalog_revision {
+            if previous_revision != expected_catalog_revision {
+                return Err(ConnectionStoreError::Conflict {
+                    id: id.to_string(),
+                    current: current.etag(),
+                });
+            }
+        }
         let catalog_revision = increment_revision(id, previous_revision)?;
 
         transaction
@@ -2123,6 +2233,38 @@ impl SqliteConnectionStore {
             .map_err(|source| sqlite_error(&self.path, "status query", source))?
             .map(|raw| raw.into_safe_status(id))
             .transpose()
+    }
+
+    /// The latest safe status of each listed Connection in one pass under
+    /// one lock. The collection listing and the capability inventory both
+    /// need every status; asking per Connection costs a lock (here) or a
+    /// pool checkout and a round trip (PostgreSQL) each.
+    pub fn latest_statuses(
+        &self,
+        ids: &[ConnectionId],
+    ) -> Result<BTreeMap<ConnectionId, SafeConnectionStatus>, ConnectionStoreError> {
+        let connection = self.connection_guard();
+        let mut statement = connection
+            .prepare(
+                r#"
+                SELECT state, reason, observed_at, latency_ms, catalog_age_secs,
+                       catalog_entry_count
+                FROM connection_current_status
+                WHERE connection_id = ?1
+                "#,
+            )
+            .map_err(|source| sqlite_error(&self.path, "status prepare", source))?;
+        let mut statuses = BTreeMap::new();
+        for id in ids {
+            let raw = statement
+                .query_row(params![id.as_str()], raw_status_from_row)
+                .optional()
+                .map_err(|source| sqlite_error(&self.path, "status query", source))?;
+            if let Some(raw) = raw {
+                statuses.insert(id.clone(), raw.into_safe_status(id)?);
+            }
+        }
+        Ok(statuses)
     }
 
     pub fn status_history(
@@ -2818,12 +2960,12 @@ fn validate_persisted_state(
         .map_err(|source| sqlite_error(path, "startup validation commit", source))
 }
 
-struct ValidatedMcpCatalog {
-    encoded_tool_schemas: Vec<String>,
-    stored_bytes: usize,
+pub(crate) struct ValidatedMcpCatalog {
+    pub(crate) encoded_tool_schemas: Vec<String>,
+    pub(crate) stored_bytes: usize,
 }
 
-fn validate_mcp_catalog(
+pub(crate) fn validate_mcp_catalog(
     id: &ConnectionId,
     entries: &[StoredMcpCatalogEntry],
     resources: &[StoredMcpResource],
@@ -3194,13 +3336,16 @@ fn validate_optional_mcp_metadata(
 }
 
 #[derive(Clone)]
-struct EncodedOpenApiCatalogEntry {
-    entry: StoredOpenApiCatalogEntry,
-    selected_scheme_names_json: String,
-    definition_json: String,
+pub(crate) struct EncodedOpenApiCatalogEntry {
+    pub(crate) entry: StoredOpenApiCatalogEntry,
+    pub(crate) selected_scheme_names_json: String,
+    pub(crate) definition_json: String,
 }
 
-fn validate_openapi_spec(spec: &str, spec_digest: &str) -> Result<(), ConnectionStoreError> {
+pub(crate) fn validate_openapi_spec(
+    spec: &str,
+    spec_digest: &str,
+) -> Result<(), ConnectionStoreError> {
     let mut problems = Vec::new();
     if spec.is_empty() || spec.len() > MAX_MANAGED_SPEC_BYTES {
         problems.push(format!(
@@ -3226,7 +3371,7 @@ fn validate_openapi_spec(spec: &str, spec_digest: &str) -> Result<(), Connection
     }
 }
 
-fn validate_openapi_catalog_entries(
+pub(crate) fn validate_openapi_catalog_entries(
     entries: &[StoredOpenApiCatalogEntry],
 ) -> Result<Vec<EncodedOpenApiCatalogEntry>, ConnectionStoreError> {
     if entries.len() > MAX_CATALOG_ENTRIES {
@@ -4250,7 +4395,7 @@ fn ensure_no_invalid_rows(
     }
 }
 
-fn validate_activity_timestamp(
+pub(crate) fn validate_activity_timestamp(
     id: &ConnectionId,
     value: Option<&str>,
 ) -> Result<(), ConnectionStoreError> {
@@ -4598,7 +4743,7 @@ fn validate_record_bindings(
     Ok(())
 }
 
-fn expected_bindings<'a>(
+pub(crate) fn expected_bindings<'a>(
     write: &'a ConnectionWrite,
     revisions: &ConnectionRevisions,
 ) -> Vec<(&'static str, &'a str, u64)> {
@@ -4645,7 +4790,7 @@ fn expected_bindings<'a>(
     bindings
 }
 
-fn binding_count(write: &ConnectionWrite) -> usize {
+pub(crate) fn binding_count(write: &ConnectionWrite) -> usize {
     let authentication = match &write.authentication {
         ConnectionAuthentication::None
         | ConnectionAuthentication::HeaderApiKey {
@@ -4671,12 +4816,12 @@ fn binding_count(write: &ConnectionWrite) -> usize {
         + usize::from(write.tls.client_private_key_id.is_some())
 }
 
-fn supports_managed_mcp_catalog(write: &ConnectionWrite) -> bool {
+pub(crate) fn supports_managed_mcp_catalog(write: &ConnectionWrite) -> bool {
     write.kind == ConnectionKind::McpStreamableHttp
         && matches!(&write.discovery, Some(DiscoveryConfig::ManagedMcp { .. }))
 }
 
-fn supports_managed_openapi_catalog(write: &ConnectionWrite) -> bool {
+pub(crate) fn supports_managed_openapi_catalog(write: &ConnectionWrite) -> bool {
     write.kind == ConnectionKind::HttpApi
         && matches!(
             &write.discovery,
@@ -4751,7 +4896,9 @@ fn ensure_binding_capacity(
     Ok(())
 }
 
-fn validate_candidate(candidate: ConnectionWrite) -> Result<ConnectionWrite, ConnectionStoreError> {
+pub(crate) fn validate_candidate(
+    candidate: ConnectionWrite,
+) -> Result<ConnectionWrite, ConnectionStoreError> {
     candidate
         .validated()
         .map_err(|errors| ConnectionStoreError::Validation {
@@ -4762,7 +4909,7 @@ fn validate_candidate(candidate: ConnectionWrite) -> Result<ConnectionWrite, Con
         })
 }
 
-fn initial_revisions(write: &ConnectionWrite) -> ConnectionRevisions {
+pub(crate) fn initial_revisions(write: &ConnectionWrite) -> ConnectionRevisions {
     ConnectionRevisions {
         connection: 1,
         credential: u64::from(has_credential_binding(write)),
@@ -4772,7 +4919,7 @@ fn initial_revisions(write: &ConnectionWrite) -> ConnectionRevisions {
     }
 }
 
-fn replacement_revisions(
+pub(crate) fn replacement_revisions(
     id: &ConnectionId,
     current: &StoredConnection,
     candidate: &ConnectionWrite,
@@ -4814,7 +4961,7 @@ fn safe_authentication_kind(authentication: &ConnectionAuthentication) -> SafeAu
     }
 }
 
-fn ensure_etag(
+pub(crate) fn ensure_etag(
     id: &ConnectionId,
     expected: &ConnectionEtag,
     current: &StoredConnection,
@@ -4834,11 +4981,11 @@ fn ensure_etag(
 ///
 /// Validation and insertion must agree on the exact string, so both go through
 /// here rather than formatting it independently.
-fn managed_tool_dependency_id(id: &ConnectionId, remote_tool_name: &str) -> String {
+pub(crate) fn managed_tool_dependency_id(id: &ConnectionId, remote_tool_name: &str) -> String {
     format!("{}:{remote_tool_name}", id.as_str())
 }
 
-fn validate_dependency_id(value: &str) -> Result<(), ConnectionStoreError> {
+pub(crate) fn validate_dependency_id(value: &str) -> Result<(), ConnectionStoreError> {
     if value.is_empty() || value.len() > MAX_DEPENDENCY_FIELD_BYTES || value.contains('\0') {
         Err(ConnectionStoreError::Validation {
             problems: vec![format!(
@@ -4850,13 +4997,16 @@ fn validate_dependency_id(value: &str) -> Result<(), ConnectionStoreError> {
     }
 }
 
-fn increment_revision(id: &ConnectionId, revision: u64) -> Result<u64, ConnectionStoreError> {
+pub(crate) fn increment_revision(
+    id: &ConnectionId,
+    revision: u64,
+) -> Result<u64, ConnectionStoreError> {
     revision
         .checked_add(1)
         .ok_or_else(|| ConnectionStoreError::RevisionOverflow { id: id.to_string() })
 }
 
-fn revision_from_i64(
+pub(crate) fn revision_from_i64(
     id: &ConnectionId,
     value: i64,
     zero_allowed: bool,
@@ -4874,7 +5024,7 @@ fn revision_from_i64(
     Ok(value)
 }
 
-fn persisted_revision(
+pub(crate) fn persisted_revision(
     id: &ConnectionId,
     value: i64,
     reason: &'static str,
@@ -4892,11 +5042,11 @@ fn persisted_revision(
     Ok(value)
 }
 
-fn u64_to_i64(id: &ConnectionId, value: u64) -> Result<i64, ConnectionStoreError> {
+pub(crate) fn u64_to_i64(id: &ConnectionId, value: u64) -> Result<i64, ConnectionStoreError> {
     i64::try_from(value).map_err(|_| ConnectionStoreError::RevisionOverflow { id: id.to_string() })
 }
 
-fn optional_u64_to_i64(
+pub(crate) fn optional_u64_to_i64(
     value: Option<u64>,
     field: &'static str,
 ) -> Result<Option<i64>, ConnectionStoreError> {
@@ -4923,7 +5073,7 @@ fn optional_i64_to_u64(
         .transpose()
 }
 
-fn state_as_str(state: ConnectionOperationalState) -> &'static str {
+pub(crate) fn state_as_str(state: ConnectionOperationalState) -> &'static str {
     match state {
         ConnectionOperationalState::Unknown => "unknown",
         ConnectionOperationalState::Configured => "configured",
@@ -4934,7 +5084,7 @@ fn state_as_str(state: ConnectionOperationalState) -> &'static str {
     }
 }
 
-fn parse_state(value: &str) -> Option<ConnectionOperationalState> {
+pub(crate) fn parse_state(value: &str) -> Option<ConnectionOperationalState> {
     match value {
         "unknown" => Some(ConnectionOperationalState::Unknown),
         "configured" => Some(ConnectionOperationalState::Configured),
@@ -4946,7 +5096,7 @@ fn parse_state(value: &str) -> Option<ConnectionOperationalState> {
     }
 }
 
-fn reason_as_str(reason: ConnectionStatusReason) -> &'static str {
+pub(crate) fn reason_as_str(reason: ConnectionStatusReason) -> &'static str {
     match reason {
         ConnectionStatusReason::NotTested => "not_tested",
         ConnectionStatusReason::LegacyConfigured => "legacy_configured",
@@ -4961,7 +5111,7 @@ fn reason_as_str(reason: ConnectionStatusReason) -> &'static str {
     }
 }
 
-fn parse_reason(value: &str) -> Option<ConnectionStatusReason> {
+pub(crate) fn parse_reason(value: &str) -> Option<ConnectionStatusReason> {
     match value {
         "not_tested" => Some(ConnectionStatusReason::NotTested),
         "legacy_configured" => Some(ConnectionStatusReason::LegacyConfigured),
@@ -4977,7 +5127,7 @@ fn parse_reason(value: &str) -> Option<ConnectionStatusReason> {
     }
 }
 
-fn utc_timestamp() -> Result<String, ConnectionStoreError> {
+pub(crate) fn utc_timestamp() -> Result<String, ConnectionStoreError> {
     OffsetDateTime::now_utc()
         .format(&Rfc3339)
         .map_err(|_| ConnectionStoreError::CorruptRecord {
@@ -4986,7 +5136,7 @@ fn utc_timestamp() -> Result<String, ConnectionStoreError> {
         })
 }
 
-fn remaining_before(
+pub(crate) fn remaining_before(
     deadline: Instant,
     operation: &'static str,
 ) -> Result<Duration, ConnectionStoreError> {

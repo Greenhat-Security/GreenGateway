@@ -55,10 +55,10 @@ mod mcp;
 mod metrics;
 mod middleware;
 mod path_match;
-#[cfg(feature = "postgres")]
-mod policy_cluster;
 mod proxy;
 mod rbac;
+#[cfg(feature = "postgres")]
+mod security_cluster;
 mod storage;
 mod tools;
 mod upstream_route;
@@ -70,7 +70,10 @@ use lifecycle::{
 };
 use proxy::{ProxyClassifier, ProxyState};
 #[cfg(feature = "postgres")]
+#[cfg(feature = "postgres")]
 use storage::PolicyControlPlane as _;
+#[cfg(feature = "postgres")]
+use storage::ToolControlPlane;
 use storage::{AuditEventStore as _, PrincipalDirectoryStore};
 
 const REQUEST_COUNTER: &str = "gateway_http_requests";
@@ -479,6 +482,16 @@ struct ToolAdminState {
     client_ip_policy: client_ip::ClientIpPolicy,
     max_body_size: usize,
     write_lock: Arc<Mutex<()>>,
+    /// Cluster mode's authoritative tools control plane. Present exactly
+    /// when `tools_file` is absent-but-cluster: register commits through
+    /// its CAS transaction instead of the file.
+    #[cfg(feature = "postgres")]
+    tool_control_plane: Option<Arc<dyn storage::ToolControlPlane>>,
+    /// The gate's tools adapter, so a register installs through the same
+    /// revision-guarded step the reconciler uses and can never roll the
+    /// live lane back to an older commit.
+    #[cfg(feature = "postgres")]
+    tools_resource: Option<Arc<security_cluster::ToolsResource>>,
 }
 
 #[derive(Clone)]
@@ -1393,6 +1406,18 @@ struct GatewayAppBuildOverrides {
     /// to hand to the app builder. None in standalone mode.
     #[cfg(feature = "postgres")]
     pg_policy: Option<ClusterPolicySeed>,
+    /// The cluster-mode tools control plane seed: the store plus the
+    /// authoritative local lane `run()` seeded and loaded. None in
+    /// standalone mode.
+    #[cfg(feature = "postgres")]
+    pg_tools: Option<ClusterToolsSeed>,
+    /// The cluster-mode Connection control plane seed: the store, the
+    /// records the runtime snapshot starts from, and the catalogs the
+    /// (synchronous) catalog services read at boot. None in standalone
+    /// mode, where the control plane opens `CONNECTIONS_SQLITE_PATH`
+    /// itself.
+    #[cfg(feature = "postgres")]
+    pg_connections: Option<ClusterConnectionsSeed>,
     #[cfg(test)]
     egress_resolver: Option<Arc<dyn egress::DnsResolver>>,
     #[cfg(test)]
@@ -1411,6 +1436,59 @@ struct ClusterPolicySeed {
     store: Arc<storage::PostgresPolicyStore>,
     active: storage::ActivePolicy,
 }
+
+/// The tools control plane's equivalent: the store, and the authoritative
+/// local lane the registry installs at boot.
+#[cfg(feature = "postgres")]
+struct ClusterToolsSeed {
+    store: Arc<storage::PostgresToolStore>,
+    active: storage::ActiveToolDocument,
+}
+
+/// Why cluster mode refused to start on the tools control plane. Fail
+/// closed, like the policy plane's startup errors.
+#[cfg(feature = "postgres")]
+#[derive(Debug)]
+enum ClusterToolsStartupError {
+    /// Seeding (or loading) the empty document failed.
+    Seeding(storage::PolicyCommitError),
+    /// The authority could not be read at startup.
+    Store(storage::RepositoryError),
+    /// Unreachable after a successful seed; defensive fail closed.
+    NotSeeded,
+    /// The active document failed validation: this binary refuses to
+    /// activate a tools document it cannot fully parse and enforce.
+    InvalidDocument(String),
+}
+
+#[cfg(feature = "postgres")]
+impl std::fmt::Display for ClusterToolsStartupError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Seeding(error) => write!(
+                formatter,
+                "the cluster-mode tools control plane could not seed its initial \
+                 document: {error}"
+            ),
+            Self::Store(error) => write!(
+                formatter,
+                "the cluster-mode tools control plane could not be read at startup: {error}"
+            ),
+            Self::NotSeeded => write!(
+                formatter,
+                "the cluster-mode tools control plane has no active document after \
+                 seeding; this is an internal validation gap -- please report it"
+            ),
+            Self::InvalidDocument(reason) => write!(
+                formatter,
+                "the active tools document failed validation and will not be served: {reason}"
+            ),
+        }
+    }
+}
+
+#[cfg(feature = "postgres")]
+impl std::error::Error for ClusterToolsStartupError {}
 
 /// Why cluster mode refused to start on the policy control plane. Every
 /// variant is fail-closed: an uninitialized deployment, an unreadable
@@ -1456,6 +1534,46 @@ impl std::fmt::Display for ClusterPolicyStartupError {
 
 #[cfg(feature = "postgres")]
 impl std::error::Error for ClusterPolicyStartupError {}
+
+/// What `run()` proves about the Connection authority before the app is
+/// built: the store to serve from, the records the first runtime snapshot
+/// is published from, the catalogs the synchronous catalog services need,
+/// and the revision the reconciler starts its watermark at.
+#[cfg(feature = "postgres")]
+struct ClusterConnectionsSeed {
+    store: Arc<connections::pg_store::PostgresConnectionStore>,
+    records: Vec<connections::store::StoredConnection>,
+    boot: Arc<connections::managed_store::ClusterConnectionsBoot>,
+    revision: i64,
+}
+
+/// Why a cluster-mode boot refused to serve Connections.
+#[cfg(feature = "postgres")]
+#[derive(Debug)]
+enum ClusterConnectionsStartupError {
+    Store(connections::store::ConnectionStoreError),
+    Corrupt(connections::store::ConnectionStoreError),
+}
+
+#[cfg(feature = "postgres")]
+impl std::fmt::Display for ClusterConnectionsStartupError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Store(error) => write!(
+                formatter,
+                "the cluster-mode Connection control plane could not be read at startup: {error}"
+            ),
+            Self::Corrupt(error) => write!(
+                formatter,
+                "the Connection tables failed their integrity preflight and will not be served: \
+                 {error}"
+            ),
+        }
+    }
+}
+
+#[cfg(feature = "postgres")]
+impl std::error::Error for ClusterConnectionsStartupError {}
 
 fn egress_client_for_build(
     config: egress::EgressConfig,
@@ -1536,10 +1654,30 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 .into(),
         );
     }
-    if let Some(output) = connection_secret_maintenance::run_if_requested(
-        std::env::args_os().skip(1),
-        config::Config::from_env,
-    )? {
+    // `gateway connection-secret ...`: a one-shot command that opens the
+    // connections SQLite database, does its work, prints one line, and
+    // exits. It runs on a blocking thread rather than on this one.
+    //
+    // That is not an optimization. The local-secret manager serializes
+    // against connection mutations on the control plane's mutation lock,
+    // which is a Tokio mutex acquired synchronously (see
+    // `CoordinatedLocalSecretManager::mutation_guard`) -- and acquiring it
+    // synchronously is only legal off a runtime thread. `run()` is async,
+    // so calling straight into the command here panicked the process with
+    // "Cannot block the current thread from within a runtime". This is the
+    // same shape the admin handlers already use for the same manager.
+    let maintenance_arguments = std::env::args_os().skip(1).collect::<Vec<_>>();
+    let maintenance = tokio::task::spawn_blocking(move || {
+        connection_secret_maintenance::run_if_requested(
+            maintenance_arguments,
+            config::Config::from_env,
+        )
+    })
+    .await
+    .map_err(|error| -> Box<dyn std::error::Error> {
+        format!("the connection-secret maintenance command did not complete: {error}").into()
+    })??;
+    if let Some(output) = maintenance {
         println!("{output}");
         return Ok(());
     }
@@ -1608,6 +1746,97 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         }
         None => None,
     };
+    // The tools control plane rides the same pool. Unlike policy, an empty
+    // tools document is a valid state (it is exactly what standalone mode
+    // serves without TOOLS_FILE), so a first boot seeds one idempotently:
+    // racing replicas produce exactly one seeded document, later boots
+    // no-op. The seed loads the authoritative local lane for the builder.
+    #[cfg(feature = "postgres")]
+    let pg_tools_seed = match &_database_foundation {
+        Some(foundation) => {
+            let store = Arc::new(storage::PostgresToolStore::new(foundation.pool().clone()));
+            if let Err(error) = store.seed_empty_document().await {
+                return Err(Box::new(ClusterToolsStartupError::Seeding(error))
+                    as Box<dyn std::error::Error>);
+            }
+            match ToolControlPlane::active_tools(&*store).await {
+                Ok(Some(active)) => Some(ClusterToolsSeed { store, active }),
+                // Unreachable after a successful seed (ours or a racing
+                // replica's): the pointer exists. Defensive fail closed.
+                Ok(None) => {
+                    return Err(
+                        Box::new(ClusterToolsStartupError::NotSeeded) as Box<dyn std::error::Error>
+                    )
+                }
+                Err(error) => {
+                    return Err(Box::new(ClusterToolsStartupError::Store(error))
+                        as Box<dyn std::error::Error>)
+                }
+            }
+        }
+        None => None,
+    };
+    // The Connection control plane rides the same pool. Unlike policy and
+    // tools there is no document to seed: an empty deployment simply has no
+    // Connections, which is exactly what standalone mode serves without
+    // `CONNECTIONS_SQLITE_PATH`. What this does do before serving is run
+    // the integrity preflight the SQLite store runs on every `open` -- the
+    // bounds, the counter agreement, the managed-tool dependency
+    // invariant -- because a replica that starts on tables it cannot vouch
+    // for is a replica serving unbounded state. The records and catalogs
+    // are fetched here, in an async context, because the app builder that
+    // needs them is synchronous.
+    #[cfg(feature = "postgres")]
+    let pg_connections_seed = match &_database_foundation {
+        Some(foundation) => {
+            // The bound covers managed records AND this replica's legacy
+            // projections (static configuration, so the same on every
+            // replica); the store gets the remainder, as the SQLite path
+            // gives its store the remainder.
+            let legacy_projection_count =
+                connections::control_plane::legacy_projection_count(&config)?;
+            let store = Arc::new(
+                connections::pg_store::PostgresConnectionStore::new(
+                    foundation.pool().clone(),
+                    connections::model::MAX_CONNECTIONS.saturating_sub(legacy_projection_count),
+                )
+                .map_err(|error| {
+                    Box::new(ClusterConnectionsStartupError::Store(error))
+                        as Box<dyn std::error::Error>
+                })?,
+            );
+            store.validate_persisted_state().await.map_err(|error| {
+                Box::new(ClusterConnectionsStartupError::Corrupt(error))
+                    as Box<dyn std::error::Error>
+            })?;
+            let to_startup_error = |error| {
+                Box::new(ClusterConnectionsStartupError::Store(error)) as Box<dyn std::error::Error>
+            };
+            // The revision is read BEFORE the content it labels. These are
+            // separate reads, and a commit can land between them; reading
+            // the revision first means such a commit leaves the authority's
+            // activation revision above the seed's, so the gate's first
+            // pass reconciles rather than trusting the older content under
+            // the newer number.
+            let revision = store.state_revision().await.map_err(to_startup_error)?;
+            let records = store.list().await.map_err(to_startup_error)?;
+            let boot = connections::managed_store::ClusterConnectionsBoot {
+                mcp_catalogs: store.mcp_catalogs().await.map_err(to_startup_error)?,
+                openapi_catalogs: store.openapi_catalogs().await.map_err(to_startup_error)?,
+                openapi_inventory_catalogs: store
+                    .openapi_inventory_catalogs()
+                    .await
+                    .map_err(to_startup_error)?,
+            };
+            Some(ClusterConnectionsSeed {
+                store,
+                records,
+                boot: Arc::new(boot),
+                revision,
+            })
+        }
+        None => None,
+    };
     // The durable audit store rides the foundation's pool; the SSE
     // endpoint reads committed events through it in cluster mode. Built
     // here, where both the pool and the replica identity exist, and handed
@@ -1653,6 +1882,10 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             pg_audit: pg_audit_store,
             #[cfg(feature = "postgres")]
             pg_policy: pg_policy_seed,
+            #[cfg(feature = "postgres")]
+            pg_tools: pg_tools_seed,
+            #[cfg(feature = "postgres")]
+            pg_connections: pg_connections_seed,
             #[cfg(test)]
             egress_resolver: None,
             #[cfg(test)]
@@ -1793,6 +2026,25 @@ fn gateway_app_with_process_started_at_and_overrides(
         .map(discovery::query::DiscoveryQueryStore::open)
         .transpose()?
         .map(Arc::new);
+    // Cluster mode serves Connections from the authority; standalone mode
+    // opens the local file. `CONNECTIONS_SQLITE_PATH` is rejected outright
+    // in postgres mode (config.rs), so the two are never both present.
+    #[cfg(feature = "postgres")]
+    let connection_control_plane = {
+        let cluster = build_overrides.pg_connections.as_ref().map(|seed| {
+            connections::control_plane::ClusterConnectionStoreSeed {
+                store: connections::managed_store::ManagedConnectionStore::Postgres {
+                    store: seed.store.clone(),
+                    boot: seed.boot.clone(),
+                },
+                records: seed.records.clone(),
+            }
+        });
+        connections::control_plane::ConnectionControlPlane::from_config_with_cluster_seed(
+            &config, cluster,
+        )?
+    };
+    #[cfg(not(feature = "postgres"))]
     let connection_control_plane =
         connections::control_plane::ConnectionControlPlane::from_config(&config)?;
     let mut configured_suggestion_routes = config
@@ -2036,7 +2288,7 @@ fn gateway_app_with_process_started_at_and_overrides(
     #[cfg(feature = "postgres")]
     let mut policy_control_plane: Option<Arc<dyn storage::PolicyControlPlane>> = None;
     #[cfg(feature = "postgres")]
-    let mut cluster_revision_gate: Option<Arc<dyn middleware::rbac::SecurityRevisionGate>> = None;
+    let mut cluster_security_runtime: Option<Arc<security_cluster::ClusterSecurityRuntime>> = None;
     #[cfg(feature = "postgres")]
     let rbac_state = match (build_overrides.pg_policy.as_ref(), rbac_state) {
         (Some(seed), Some(state)) => {
@@ -2044,13 +2296,19 @@ fn gateway_app_with_process_started_at_and_overrides(
                 seed.active.policy.clone(),
                 seed.active.security_revision,
             );
-            let runtime =
-                policy_cluster::ClusterPolicyRuntime::new(seed.store.clone(), state.clone());
-            runtime.spawn_poller(&lifecycle);
+            let policy_resource =
+                security_cluster::PolicyResource::new(seed.store.clone(), state.clone());
+            let runtime = security_cluster::ClusterSecurityRuntime::new(
+                seed.store.revision_source(),
+                policy_resource,
+            );
             policy_control_plane = Some(seed.store.clone());
-            cluster_revision_gate =
-                Some(runtime.clone() as Arc<dyn middleware::rbac::SecurityRevisionGate>);
-            Some(state.with_revision_gate(runtime))
+            cluster_security_runtime = Some(runtime.clone());
+            Some(
+                state
+                    .with_revision_gate(runtime as Arc<dyn middleware::rbac::SecurityRevisionGate>)
+                    .with_connection_control_plane(connection_control_plane.clone()),
+            )
         }
         (_, state) => state,
     };
@@ -2072,16 +2330,116 @@ fn gateway_app_with_process_started_at_and_overrides(
     let mcp_upstream_definitions =
         tools::mcp_upstream::discover_upstream_tools_blocking(&config, Arc::clone(&egress_client))?;
     tool_registry.merge_definitions(mcp_upstream_definitions)?;
-    let mcp_catalog_service = connections::mcp::McpConnectionCatalogService::load(
+    // Cluster mode: the registry's local lane belongs to the authoritative
+    // tools document (not TOOLS_FILE, which cluster mode rejects). Install
+    // the boot document -- validating it exactly as a file load would, and
+    // failing startup on a document this binary cannot enforce -- and
+    // register the document with the security runtime so every commit
+    // reconciles here.
+    #[cfg(feature = "postgres")]
+    let mut tool_control_plane: Option<Arc<dyn storage::ToolControlPlane>> = None;
+    #[cfg(feature = "postgres")]
+    let mut tools_resource: Option<Arc<security_cluster::ToolsResource>> = None;
+    #[cfg(feature = "postgres")]
+    if let (Some(seed), Some(runtime)) = (
+        build_overrides.pg_tools.as_ref(),
+        cluster_security_runtime.as_ref(),
+    ) {
+        let definitions =
+            tools::definitions::definitions_from_json_value(seed.active.document.clone(), None)
+                .map_err(|error| {
+                    Box::new(ClusterToolsStartupError::InvalidDocument(error.to_string()))
+                        as Box<dyn std::error::Error>
+                })?;
+        // Authoritative content read at boot: a name a legacy lane holds is
+        // refused as a collision, while a stale managed holder (the seeds
+        // are read one resource at a time) is evicted and reconciled on the
+        // gate's first pass.
+        connection_control_plane.note_manual_tool_revision(seed.active.security_revision);
+        tool_registry
+            .install_local_definitions_with(
+                definitions,
+                tools::definitions::LaneConflicts::EvictStale,
+            )
+            .map_err(|error| {
+                Box::new(ClusterToolsStartupError::InvalidDocument(error.to_string()))
+                    as Box<dyn std::error::Error>
+            })?;
+        let resource = security_cluster::ToolsResource::new_with_connection_control_plane(
+            seed.store.clone(),
+            tool_registry.clone(),
+            Some(connection_control_plane.clone()),
+            seed.active.security_revision,
+        );
+        runtime.register_resource(resource.clone());
+        tools_resource = Some(resource);
+        tool_control_plane = Some(seed.store.clone());
+    }
+    // Cluster mode's boot seeds are read one resource at a time; a name that
+    // moved between two seeds' revisions must not abort startup, because
+    // the gate's first pass reconciles every resource before a request is
+    // served. Standalone mode's single store is consistent by construction
+    // and keeps refusing.
+    #[cfg(feature = "postgres")]
+    let boot_conflicts = if build_overrides.pg_connections.is_some() {
+        tools::definitions::LaneConflicts::EvictStale
+    } else {
+        tools::definitions::LaneConflicts::Refuse
+    };
+    #[cfg(not(feature = "postgres"))]
+    let boot_conflicts = tools::definitions::LaneConflicts::Refuse;
+    let mcp_catalog_service = connections::mcp::McpConnectionCatalogService::load_with(
         connection_control_plane.clone(),
         connection_http_runtime.clone(),
         tool_registry.clone(),
+        boot_conflicts,
     )?;
-    let openapi_catalog_service = connections::openapi::OpenApiConnectionCatalogService::load(
+    let openapi_catalog_service = connections::openapi::OpenApiConnectionCatalogService::load_with(
         connection_control_plane.clone(),
         connection_http_runtime.clone(),
         tool_registry.clone(),
+        boot_conflicts,
     )?;
+    // Cluster mode: register the Connection control plane with the security
+    // runtime so every committed record or catalog change reconciles here
+    // before the next protected request is served, and start the task that
+    // publishes the dependency rows the synchronous callers had to queue.
+    #[cfg(feature = "postgres")]
+    if let (Some(seed), Some(runtime)) = (
+        build_overrides.pg_connections.as_ref(),
+        cluster_security_runtime.as_ref(),
+    ) {
+        runtime.register_resource(security_cluster::ConnectionsResource::new(
+            seed.store.clone(),
+            connection_control_plane.clone(),
+            mcp_catalog_service.clone(),
+            openapi_catalog_service.clone(),
+            seed.revision,
+        ));
+        connections::control_plane::spawn_dependency_flush_task(
+            connection_control_plane.clone(),
+            &lifecycle,
+        );
+        // Every lane is registered: wire the bundle sources so the first
+        // pass publishes one consistent cut of policy, tools, and
+        // Connections with its watermark, and every admitted request is
+        // served from exactly that cut.
+        runtime.set_bundle_sources(
+            tool_registry.state_handle(),
+            connection_control_plane.runtime_handle(),
+        );
+    }
+    // Every resource is registered; only now may the background reconciler
+    // start. A pass that ran before tools or Connections registered would
+    // confirm policy alone and advance the watermark past any commit those
+    // resources took during startup -- and a later gate check would return
+    // early on that watermark with the late resource still stale.
+    // Registration also resets the watermark, so the order is belt and
+    // braces rather than a single point of failure.
+    #[cfg(feature = "postgres")]
+    if let Some(runtime) = cluster_security_runtime.as_ref() {
+        runtime.spawn_poller(&lifecycle);
+    }
     let mcp_catalog_runtime = connection_control_plane
         .is_managed_store_configured()
         .then(|| mcp_catalog_service.runtime());
@@ -2189,6 +2547,10 @@ fn gateway_app_with_process_started_at_and_overrides(
         client_ip_policy: client_ip_policy.clone(),
         max_body_size: config.max_body_size,
         write_lock: Arc::new(Mutex::new(())),
+        #[cfg(feature = "postgres")]
+        tool_control_plane,
+        #[cfg(feature = "postgres")]
+        tools_resource,
     };
     let schema_admin_state = SchemaAdminState {
         coverage: schema_coverage,
@@ -2285,7 +2647,8 @@ fn gateway_app_with_process_started_at_and_overrides(
         traffic: traffic_admin_state,
         principals: principal_admin_state,
         #[cfg(feature = "postgres")]
-        revision_gate: cluster_revision_gate,
+        revision_gate: cluster_security_runtime
+            .map(|runtime| runtime as Arc<dyn middleware::rbac::SecurityRevisionGate>),
     };
 
     let grpc = grpc_app(&config, &app_state, &middleware_stack);
@@ -4354,6 +4717,7 @@ async fn connection_list_endpoint(
         &snapshot,
         connections::admin::ConnectionListRuntimeData {
             statuses: &runtime.statuses,
+            status_revisions: &runtime.status_revisions,
             dependency_counts: &runtime.dependency_counts,
             capability_counts: &runtime.capability_counts,
             activity_times: &runtime.activity_times,
@@ -4422,10 +4786,13 @@ async fn connection_get_endpoint(
     let snapshot = state.control_plane.runtime_snapshot();
 
     if let Some(record) = snapshot.managed().get(&id) {
-        let (status, dependencies) = match connection_detail_runtime_data(&state, &id).await {
-            Ok(data) => data,
-            Err(response) => return *response,
-        };
+        let (status, dependencies, status_revision) =
+            match connection_detail_runtime_data(&state, &id).await {
+                Ok(data) => data,
+                Err(response) => return *response,
+            };
+        let record =
+            connections::admin::with_authoritative_status_revision(record, status_revision);
         let etag = record.etag();
         return (
             StatusCode::OK,
@@ -4434,7 +4801,7 @@ async fn connection_get_endpoint(
                 (header::CACHE_CONTROL, HeaderValue::from_static("no-store")),
             ],
             Json(connections::admin::managed_detail_view(
-                record,
+                &record,
                 status,
                 dependencies,
                 permissions,
@@ -4537,22 +4904,17 @@ async fn connection_create_endpoint(
     {
         return connection_mutation_error_response(error);
     }
-    // Managed mutations transact against SQLite inside the control plane;
-    // the transaction runs on the blocking pool off the request executor.
-    let created = {
-        let control_plane = state.control_plane.clone();
-        match tokio::task::spawn_blocking(move || {
-            control_plane.create_managed(snapshot.collection_etag(), candidate)
-        })
+    // Managed mutations transact inside the control plane. The store
+    // dispatch owns keeping that work off the request executor: standalone
+    // mode runs its SQLite transaction on the blocking pool, cluster mode
+    // awaits the PostgreSQL authority.
+    let created = match state
+        .control_plane
+        .create_managed(snapshot.collection_etag(), candidate, &principal.user_id)
         .await
-        {
-            Ok(Ok(created)) => created,
-            Ok(Err(error)) => return connection_mutation_error_response(error),
-            Err(error) => {
-                tracing::error!(error = %error, "connection mutation task failed");
-                return internal_server_error("connection mutation failed");
-            }
-        }
+    {
+        Ok(created) => created,
+        Err(error) => return connection_mutation_error_response(error),
     };
     let permissions = connection_permissions(rbac_state, &principal);
     let changed_fields = connections::admin::changed_connection_fields(None, Some(&created.write));
@@ -4674,10 +5036,11 @@ async fn connection_put_endpoint(
 
     let changed_fields =
         connections::admin::changed_connection_fields(Some(&current.write), Some(&candidate));
-    let (current_status, dependencies) = match connection_detail_runtime_data(&state, &id).await {
-        Ok(data) => data,
-        Err(response) => return *response,
-    };
+    let (current_status, dependencies, _status_revision) =
+        match connection_detail_runtime_data(&state, &id).await {
+            Ok(data) => data,
+            Err(response) => return *response,
+        };
     // See the create handler: deferred bindings are resolved before the lock.
     if let Err(error) = state
         .control_plane
@@ -4686,20 +5049,13 @@ async fn connection_put_endpoint(
     {
         return connection_mutation_error_response(error);
     }
-    let updated = {
-        let control_plane = state.control_plane.clone();
-        match tokio::task::spawn_blocking(move || {
-            control_plane.replace_managed(&id, &current_etag, candidate)
-        })
+    let updated = match state
+        .control_plane
+        .replace_managed(&id, &current_etag, candidate, &principal.user_id)
         .await
-        {
-            Ok(Ok(updated)) => updated,
-            Ok(Err(error)) => return connection_mutation_error_response(error),
-            Err(error) => {
-                tracing::error!(error = %error, "connection mutation task failed");
-                return internal_server_error("connection mutation failed");
-            }
-        }
+    {
+        Ok(updated) => updated,
+        Err(error) => return connection_mutation_error_response(error),
     };
     state.mcp_catalogs.reconcile_connection(&updated);
     state.openapi_catalogs.reconcile_connection(&updated);
@@ -4812,25 +5168,13 @@ async fn connection_delete_endpoint(
         Err(error) => return connection_catalog_lifecycle_error_response(error),
     };
 
-    // The managed delete is a SQLite transaction; it runs on the blocking
-    // pool off the request executor, with the catalog-lifecycle guard still
-    // covering the deletion.
-    let deletion = {
-        let control_plane = state.control_plane.clone();
-        let id_for_delete = id.clone();
-        let etag_for_delete = current_etag.clone();
-        tokio::task::spawn_blocking(move || {
-            control_plane.delete_managed(&id_for_delete, &etag_for_delete)
-        })
+    // The catalog-lifecycle guard stays held across the delete.
+    if let Err(error) = state
+        .control_plane
+        .delete_managed(&id, &current_etag, &principal.user_id)
         .await
-    };
-    match deletion {
-        Ok(Ok(())) => {}
-        Ok(Err(error)) => return connection_mutation_error_response(error),
-        Err(error) => {
-            tracing::error!(error = %error, "connection delete task failed");
-            return internal_server_error("connection delete failed");
-        }
+    {
+        return connection_mutation_error_response(error);
     }
     state.mcp_catalogs.remove_connection(&id);
     state.openapi_catalogs.remove_connection(&id);
@@ -4914,7 +5258,7 @@ async fn connection_refresh_endpoint(
     let refreshed = match &record.write.discovery {
         Some(connections::model::DiscoveryConfig::ManagedMcp { .. }) => state
             .mcp_catalogs
-            .refresh(id.as_str(), current_etag.as_str())
+            .refresh(id.as_str(), current_etag.as_str(), &principal.user_id)
             .await
             .map(ConnectionCatalogRefreshResponse::Mcp)
             .map_err(|error| {
@@ -4925,7 +5269,7 @@ async fn connection_refresh_endpoint(
             }),
         Some(connections::model::DiscoveryConfig::ManagedOpenapi { .. }) => state
             .openapi_catalogs
-            .refresh(id.as_str(), current_etag.as_str())
+            .refresh(id.as_str(), current_etag.as_str(), &principal.user_id)
             .await
             .map(ConnectionCatalogRefreshResponse::OpenApi)
             .map_err(|error| {
@@ -5138,34 +5482,15 @@ async fn connection_test_endpoint(
         .tests
         .execute_before(record, current_etag.as_str(), probe_deadline)
         .await;
-    // Status persistence is a small SQLite transaction; it runs on the
-    // blocking pool off the request executor.
-    let persistence = {
-        let control_plane = state.control_plane.clone();
-        let id_for_status = id.clone();
-        let etag_for_status = current_etag.clone();
-        let status_update = execution.status_update();
-        let deadline = probe_deadline.into_std();
-        match tokio::task::spawn_blocking(move || {
-            control_plane.append_status_before(
-                &id_for_status,
-                &etag_for_status,
-                status_update,
-                deadline,
-            )
-        })
-        .await
-        {
-            Ok(result) => result,
-            Err(error) => {
-                tracing::error!(error = %error, "connection status persistence task failed");
-                return with_etag(
-                    internal_server_error("connection status persistence failed"),
-                    current_etag.as_str(),
-                );
-            }
-        }
-    };
+    let persistence = state
+        .control_plane
+        .append_status_before(
+            &id,
+            &current_etag,
+            execution.status_update(),
+            probe_deadline.into_std(),
+        )
+        .await;
     drop(permit);
 
     if let Err(error) = persistence {
@@ -5267,17 +5592,12 @@ async fn connection_openapi_preview_endpoint(
 
     // Preview validates the candidate spec against the stored catalog; the
     // SQLite read and spec binding run on the blocking pool.
-    let preview = {
-        let catalogs = state.openapi_catalogs.clone();
-        let raw_id_for_preview = raw_id.clone();
-        let spec_for_preview = requested.spec.clone();
-        tokio::task::spawn_blocking(move || {
-            catalogs.preview(&raw_id_for_preview, &spec_for_preview)
-        })
+    match state
+        .openapi_catalogs
+        .preview(&raw_id, &requested.spec)
         .await
-    };
-    match preview {
-        Ok(Ok(preview)) => {
+    {
+        Ok(preview) => {
             let connection_etag = preview.connection_etag.as_str().to_owned();
             (
                 StatusCode::OK,
@@ -5289,11 +5609,7 @@ async fn connection_openapi_preview_endpoint(
             )
                 .into_response()
         }
-        Ok(Err(error)) => openapi_catalog_error_response(error, "preview"),
-        Err(join_error) => {
-            tracing::error!(error = %join_error, "OpenAPI preview task failed");
-            internal_server_error("OpenAPI preview failed")
-        }
+        Err(error) => openapi_catalog_error_response(error, "preview"),
     }
 }
 
@@ -5372,6 +5688,7 @@ async fn connection_openapi_register_endpoint(
             &requested.spec,
             &requested.selected_tool_names,
             &confirmations,
+            &principal.user_id,
         )
         .await
     {
@@ -6163,7 +6480,7 @@ async fn tool_inventory_list_endpoint(
         Err(_) => return bad_request("capability inventory query is invalid"),
     };
 
-    let page = match state.inventory.list(rbac_state, principal, &params) {
+    let page = match state.inventory.list(rbac_state, principal, &params).await {
         Ok(page) => page,
         Err(error) => return capability_inventory_error_response(error),
     };
@@ -6204,13 +6521,17 @@ async fn tool_inventory_detail_endpoint(
             Ok(rbac_state) => rbac_state,
             Err(error) => return tool_admin_authz_error_response(error),
         };
-    let detail = match state.inventory.detail(
-        rbac_state,
-        principal,
-        &raw_id,
-        rbac_state.principal_has_permission(principal, ADMIN_TOOLS_EXECUTE_PERMISSION),
-        true,
-    ) {
+    let detail = match state
+        .inventory
+        .detail(
+            rbac_state,
+            principal,
+            &raw_id,
+            rbac_state.principal_has_permission(principal, ADMIN_TOOLS_EXECUTE_PERMISSION),
+            true,
+        )
+        .await
+    {
         Ok(Some(detail)) => detail,
         Ok(None) => return not_found("capability was not found"),
         Err(error) => return capability_inventory_error_response(error),
@@ -6282,22 +6603,30 @@ async fn tool_playground_execute_endpoint(
     let precondition_rbac_state = rbac_state.clone();
     let precondition_principal = principal.clone();
     let expected_etag = supplied_etag.clone();
-    let precondition = tools::executor::ToolExecutionPrecondition::new(move |current_definition| {
-        if !precondition_rbac_state
-            .principal_has_permission(&precondition_principal, ADMIN_TOOLS_EXECUTE_PERMISSION)
-        {
-            return Err(tools::executor::ToolExecutionPreconditionError::Failed);
-        }
-        match inventory.execution_etag_for_definition(
-            &precondition_rbac_state,
-            &precondition_principal,
-            current_definition,
-        ) {
-            Ok(Some(current_etag)) if current_etag == expected_etag => Ok(()),
-            Ok(_) => Err(tools::executor::ToolExecutionPreconditionError::Failed),
-            Err(_) => Err(tools::executor::ToolExecutionPreconditionError::Unavailable),
-        }
-    });
+    // The inventory read behind this precondition awaits the Connection
+    // store, so the checker is registered as an asynchronous one; the
+    // executor awaits it in place rather than blocking an executor thread.
+    let precondition =
+        tools::executor::ToolExecutionPrecondition::new_async(move |current_definition| {
+            let inventory = inventory.clone();
+            let rbac_state = precondition_rbac_state.clone();
+            let principal = precondition_principal.clone();
+            let expected_etag = expected_etag.clone();
+            Box::pin(async move {
+                if !rbac_state.principal_has_permission(&principal, ADMIN_TOOLS_EXECUTE_PERMISSION)
+                {
+                    return Err(tools::executor::ToolExecutionPreconditionError::Failed);
+                }
+                match inventory
+                    .execution_etag_for_definition(&rbac_state, &principal, &current_definition)
+                    .await
+                {
+                    Ok(Some(current_etag)) if current_etag == expected_etag => Ok(()),
+                    Ok(_) => Err(tools::executor::ToolExecutionPreconditionError::Failed),
+                    Err(_) => Err(tools::executor::ToolExecutionPreconditionError::Unavailable),
+                }
+            })
+        });
     let context = tools::runtime::ToolInvocationContext {
         request_id: client_ip::request_id(&parts.headers, &parts.extensions),
         source_ip: client_ip::canonical_client_ip(
@@ -6370,24 +6699,18 @@ async fn tools_openapi_preview_endpoint(
     let Some(principal) = parts.extensions.get::<auth::Principal>() else {
         return unauthorized();
     };
-    let tools_file = match authorized_tools_file(&state, principal, ADMIN_TOOLS_READ_PERMISSION) {
-        Ok(tools_file) => tools_file,
-        Err(error) => return tool_admin_authz_error_response(error),
+    if let Err(error) = authorized_tool_rbac_state(&state, principal, ADMIN_TOOLS_READ_PERMISSION) {
+        return tool_admin_authz_error_response(error);
+    }
+    let authority = match tools_authority(&state) {
+        Ok(authority) => authority,
+        Err(response) => return *response,
     };
-    let tools_file_value = match read_valid_tools_file_value(tools_file) {
-        Ok(value) => value,
-        Err(error) => {
-            tracing::error!(tools_file = %tools_file.display(), error = %error, "failed to read current tools file for OpenAPI preview");
-            return internal_server_error("tools file read failed");
-        }
-    };
-    let current_etag = match tools_file_etag(&tools_file_value) {
-        Ok(etag) => etag,
-        Err(err) => {
-            tracing::error!(error = %err, "failed to compute tools file ETag");
-            return internal_server_error("tools file ETag computation failed");
-        }
-    };
+    let (_tools_file_value, _current_document, current_etag) =
+        match current_tools_document(&authority).await {
+            Ok(current) => current,
+            Err(response) => return *response,
+        };
 
     let body = match read_request_body(body, state.max_body_size).await {
         Ok(body) => body,
@@ -6421,9 +6744,13 @@ async fn tools_openapi_register_endpoint(
     let Some(principal) = parts.extensions.get::<auth::Principal>().cloned() else {
         return unauthorized();
     };
-    let tools_file = match authorized_tools_file(&state, &principal, ADMIN_TOOLS_WRITE_PERMISSION) {
-        Ok(tools_file) => tools_file,
-        Err(error) => return tool_admin_authz_error_response(error),
+    if let Err(error) = authorized_tool_rbac_state(&state, &principal, ADMIN_TOOLS_WRITE_PERMISSION)
+    {
+        return tool_admin_authz_error_response(error);
+    }
+    let authority = match tools_authority(&state) {
+        Ok(authority) => authority,
+        Err(response) => return *response,
     };
 
     let body = match read_request_body(body, state.max_body_size).await {
@@ -6450,42 +6777,266 @@ async fn tools_openapi_register_endpoint(
         Err(response) => return *response,
     };
 
-    let _tools_write_guard = match state.write_lock.lock() {
-        Ok(guard) => guard,
-        Err(poisoned) => poisoned.into_inner(),
-    };
-    let (current_value, mut current_document) = match read_tools_file_document(tools_file) {
-        Ok(document) => document,
-        Err(error) => {
-            tracing::error!(tools_file = %tools_file.display(), error = %error, "failed to read current tools file for OpenAPI registration");
-            return internal_server_error("tools file read failed");
+    // Each authority owns its whole flow. Standalone holds the write guard
+    // across its local read-modify-write (nothing else serializes it);
+    // cluster mode serializes at the authority's compare-and-swap and holds
+    // no process-local lock across its awaits.
+    match &authority {
+        ToolsAuthority::File(tools_file) => {
+            // Standalone: the write guard spans the local read-modify-write
+            // (there is no authority to serialize it). Validate, write the
+            // file, swap; the restore-on-reject path re-installs the
+            // previous lane so the connection dependency validator sees the
+            // pre-rejection state again.
+            let _tools_write_guard = match state.write_lock.lock() {
+                Ok(guard) => guard,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            // Sync read under the guard: the file branch never awaits
+            // between its read and its write.
+            let (current_value, current_document) = match read_tools_file_document(tools_file) {
+                Ok(document) => document,
+                Err(error) => {
+                    tracing::error!(tools_file = %tools_file.display(), error = %error, "failed to read current tools file for OpenAPI registration");
+                    return internal_server_error("tools file read failed");
+                }
+            };
+            let current_etag = match tools_file_etag(&current_value) {
+                Ok(etag) => etag,
+                Err(err) => {
+                    tracing::error!(error = %err, "failed to compute current tools file ETag");
+                    return internal_server_error("tools file ETag computation failed");
+                }
+            };
+            let merged = match merge_tools_candidate(
+                &parts.headers,
+                &current_etag,
+                current_document,
+                selected,
+            ) {
+                Ok(merged) => merged,
+                Err(response) => return *response,
+            };
+            if let Err(error) = state.registry.replace_local_definitions_with_persist(
+                merged.candidate_local_tools.clone(),
+                || fs::write(tools_file, &merged.candidate_contents),
+            ) {
+                if let Err(restore_error) = state
+                    .registry
+                    .replace_local_definitions_with_persist(merged.previous_local_tools, || {
+                        Ok::<(), Infallible>(())
+                    })
+                {
+                    tracing::error!(
+                        tools_file = %tools_file.display(),
+                        error = ?restore_error,
+                        "failed to restore Connection dependency validation after rejected tools update"
+                    );
+                }
+                return match error {
+                    tools::definitions::McpCatalogPublishError::Registry(error) => {
+                        tracing::warn!(
+                            tools_file = %tools_file.display(),
+                            error = %error,
+                            "merged OpenAPI tools conflicted with the active tool registry"
+                        );
+                        conflict("OpenAPI tools conflict with the active tool registry")
+                    }
+                    tools::definitions::McpCatalogPublishError::Persist(error) => {
+                        tracing::error!(
+                            tools_file = %tools_file.display(),
+                            error = %error,
+                            "failed to persist merged tools file"
+                        );
+                        internal_server_error("tools file persist failed")
+                    }
+                };
+            }
+            tools_register_response(
+                &state,
+                &parts,
+                &principal,
+                &authority.audit_source_label(),
+                merged,
+            )
         }
-    };
-    let current_etag = match tools_file_etag(&current_value) {
-        Ok(etag) => etag,
-        Err(err) => {
-            tracing::error!(error = %err, "failed to compute current tools file ETag");
-            return internal_server_error("tools file ETag computation failed");
+        #[cfg(feature = "postgres")]
+        ToolsAuthority::Postgres(control_plane) => {
+            let (_current_value, current_document, current_etag) =
+                match current_tools_document(&authority).await {
+                    Ok(current) => current,
+                    Err(response) => return *response,
+                };
+            let merged = match merge_tools_candidate(
+                &parts.headers,
+                &current_etag,
+                current_document,
+                selected,
+            ) {
+                Ok(merged) => merged,
+                Err(response) => return *response,
+            };
+            match register_tools_via_control_plane(
+                control_plane,
+                state.tools_resource.as_ref(),
+                &state.registry,
+                &current_etag,
+                &principal,
+                merged,
+            )
+            .await
+            {
+                Ok(merged) => tools_register_response(
+                    &state,
+                    &parts,
+                    &principal,
+                    &authority.audit_source_label(),
+                    merged,
+                ),
+                Err(response) => *response,
+            }
         }
-    };
-    match if_match_matches(&parts.headers, &current_etag) {
+    }
+}
+
+/// The cluster-mode register flow: validate the merged candidate against
+/// the current lanes, commit the new immutable version through the
+/// authority's compare-and-swap (advancing the shared security revision
+/// and writing the outbox row in one transaction), then install the local
+/// lane. A racing writer loses at the CAS with `412` and writes nothing.
+#[cfg(feature = "postgres")]
+async fn register_tools_via_control_plane(
+    control_plane: &Arc<dyn storage::ToolControlPlane>,
+    tools_resource: Option<&Arc<security_cluster::ToolsResource>>,
+    registry: &tools::definitions::ToolRegistry,
+    current_etag: &str,
+    principal: &auth::Principal,
+    merged: MergedToolsCandidate,
+) -> Result<MergedToolsCandidate, Box<Response>> {
+    if let Err(error) = registry.validate_local_definitions(&merged.candidate_local_tools) {
+        tracing::warn!(
+            error = %error,
+            "merged OpenAPI tools conflicted with the active tool registry"
+        );
+        return Err(Box::new(conflict(
+            "OpenAPI tools conflict with the active tool registry",
+        )));
+    }
+    let diff_summary = json!({
+        "action": "openapi_tools_registered",
+        "registered_tool_names": merged.registered_tool_names,
+    });
+    match control_plane
+        .commit_tools(
+            storage::PolicyCommitPrecondition::Expected {
+                etag: current_etag.to_owned(),
+            },
+            &merged.candidate_value,
+            &principal.user_id,
+            &diff_summary,
+        )
+        .await
+    {
+        Ok(committed) => {
+            // Through the gate's adapter when there is one: the install is
+            // then a compare-and-swap on the security revision, so a
+            // commit that paused here while another replica's newer commit
+            // was reconciled cannot roll the live lane back. A skipped
+            // install is success -- the document is durable and the lane
+            // already serves something newer.
+            let installed = match tools_resource {
+                Some(resource) => resource
+                    .install_committed(
+                        merged.candidate_local_tools.clone(),
+                        committed.security_revision,
+                    )
+                    .await
+                    .map(|_| ()),
+                None => registry.install_local_definitions(merged.candidate_local_tools.clone()),
+            };
+            if let Err(error) = installed {
+                // The mutation is durable at the authority; this replica's
+                // managed lanes moved under it and the local compile
+                // failed. Fail closed for this response and let
+                // reconciliation converge (or surface the conflict through
+                // the revision gate).
+                tracing::error!(
+                    error = %error,
+                    revision = committed.security_revision,
+                    "committed tools document could not be activated locally; \
+                     reconciliation will retry"
+                );
+                return Err(Box::new(service_unavailable(
+                    "tools document committed but not activated locally",
+                )));
+            }
+            Ok(merged)
+        }
+        Err(storage::PolicyCommitError::PreconditionFailed) => Err(Box::new(precondition_failed(
+            "If-Match does not match the current tools ETag",
+        ))),
+        // The authority refused a name another lane holds: a verdict on
+        // this document, not a storage failure, and nothing was written.
+        Err(storage::PolicyCommitError::ToolNameTaken {
+            tool_name,
+            lane,
+            owner_id,
+        }) => Err(Box::new(conflict(&format!(
+            "tool name '{tool_name}' is already published by the {lane} lane ({owner_id})"
+        )))),
+        Err(storage::PolicyCommitError::Store(error)) => {
+            tracing::error!(
+                error = %error,
+                "tools control-plane commit failed; nothing was written"
+            );
+            Err(Box::new(service_unavailable(
+                "tools mutation could not be committed",
+            )))
+        }
+    }
+}
+
+/// The merged candidate shared by both register authorities: the selected
+/// tools appended to the current document, plus everything the persist and
+/// response paths need.
+#[derive(Debug)]
+struct MergedToolsCandidate {
+    registered_tool_names: Vec<String>,
+    previous_local_tools: Vec<tools::definitions::ToolDefinition>,
+    candidate_value: Value,
+    candidate_contents: String,
+    candidate_local_tools: Vec<tools::definitions::ToolDefinition>,
+    tool_count: usize,
+}
+
+fn merge_tools_candidate(
+    headers: &HeaderMap,
+    current_etag: &str,
+    mut current_document: ToolsFileAdminDocument,
+    selected: Vec<tools::definitions::ToolDefinition>,
+) -> Result<MergedToolsCandidate, Box<Response>> {
+    match if_match_matches(headers, current_etag) {
         Ok(true) => {}
         Ok(false) => {
-            return precondition_failed("If-Match does not match the current tools ETag");
+            return Err(Box::new(precondition_failed(
+                "If-Match does not match the current tools ETag",
+            )));
         }
-        Err(error) => return if_match_error_response(error),
+        Err(error) => return Err(Box::new(if_match_error_response(error))),
     }
 
     let conflicts = conflicting_tool_names(&current_document.tools, &selected);
     if !conflicts.is_empty() {
-        return (
-            StatusCode::CONFLICT,
-            Json(ToolNameConflictResponse {
-                error: "tool name collision",
-                conflicts,
-            }),
-        )
-            .into_response();
+        return Err(Box::new(
+            (
+                StatusCode::CONFLICT,
+                Json(ToolNameConflictResponse {
+                    error: "tool name collision",
+                    conflicts,
+                }),
+            )
+                .into_response(),
+        ));
     }
 
     let registered_tool_names = selected
@@ -6498,64 +7049,43 @@ async fn tools_openapi_register_endpoint(
         Ok(value) => value,
         Err(err) => {
             tracing::error!(error = %err, "failed to serialize merged tools file");
-            return internal_server_error("tools file merge failed");
+            return Err(Box::new(internal_server_error("tools file merge failed")));
         }
     };
     let candidate_contents = match serde_json::to_string_pretty(&candidate_value) {
         Ok(contents) => contents,
         Err(err) => {
             tracing::error!(error = %err, "failed to render merged tools file");
-            return internal_server_error("tools file merge failed");
+            return Err(Box::new(internal_server_error("tools file merge failed")));
         }
     };
-    let candidate_local_tools = current_document.tools.clone();
-    if let Err(error) = state
-        .registry
-        .replace_local_definitions_with_persist(candidate_local_tools, || {
-            fs::write(tools_file, &candidate_contents)
-        })
-    {
-        if let Err(restore_error) = state
-            .registry
-            .replace_local_definitions_with_persist(previous_local_tools, || {
-                Ok::<(), Infallible>(())
-            })
-        {
-            tracing::error!(
-                tools_file = %tools_file.display(),
-                error = ?restore_error,
-                "failed to restore Connection dependency validation after rejected tools update"
-            );
-        }
-        return match error {
-            tools::definitions::McpCatalogPublishError::Registry(error) => {
-                tracing::warn!(
-                    tools_file = %tools_file.display(),
-                    error = %error,
-                    "merged OpenAPI tools conflicted with the active tool registry"
-                );
-                conflict("OpenAPI tools conflict with the active tool registry")
-            }
-            tools::definitions::McpCatalogPublishError::Persist(error) => {
-                tracing::error!(
-                    tools_file = %tools_file.display(),
-                    error = %error,
-                    "failed to persist merged tools file"
-                );
-                internal_server_error("tools file persist failed")
-            }
-        };
-    }
+    let tool_count = current_document.tools.len();
+    Ok(MergedToolsCandidate {
+        registered_tool_names,
+        previous_local_tools,
+        candidate_value,
+        candidate_contents,
+        candidate_local_tools: current_document.tools,
+        tool_count,
+    })
+}
 
+fn tools_register_response(
+    state: &ToolAdminState,
+    parts: &http::request::Parts,
+    principal: &auth::Principal,
+    source_label: &str,
+    merged: MergedToolsCandidate,
+) -> Response {
     emit_tool_registry_changed(
-        &state,
-        &parts,
-        &principal,
-        tools_file,
-        &registered_tool_names,
-        current_document.tools.len(),
+        state,
+        parts,
+        principal,
+        source_label,
+        &merged.registered_tool_names,
+        merged.tool_count,
     );
-    let new_etag = match tools_file_etag(&candidate_value) {
+    let new_etag = match tools_file_etag(&merged.candidate_value) {
         Ok(etag) => etag,
         Err(err) => {
             tracing::error!(error = %err, "failed to compute updated tools file ETag");
@@ -6567,11 +7097,104 @@ async fn tools_openapi_register_endpoint(
         StatusCode::CREATED,
         [(header::ETAG, etag_header_value(&new_etag))],
         Json(OpenApiToolsRegisterResponse {
-            registered_tool_names,
-            tool_count: current_document.tools.len(),
+            registered_tool_names: merged.registered_tool_names,
+            tool_count: merged.tool_count,
         }),
     )
         .into_response()
+}
+
+/// Which authority owns the tools document for this deployment: the
+/// standalone TOOLS_FILE, or (cluster mode) the PostgreSQL control plane.
+enum ToolsAuthority<'a> {
+    File(&'a FsPath),
+    #[cfg(feature = "postgres")]
+    Postgres(&'a Arc<dyn storage::ToolControlPlane>),
+}
+
+impl ToolsAuthority<'_> {
+    fn audit_source_label(&self) -> String {
+        match self {
+            Self::File(path) => path.display().to_string(),
+            #[cfg(feature = "postgres")]
+            Self::Postgres(_) => "postgres-authority".to_owned(),
+        }
+    }
+}
+
+/// Resolve the configured tools authority, or the not-configured response
+/// when neither the file nor the control plane is wired.
+fn tools_authority(state: &ToolAdminState) -> Result<ToolsAuthority<'_>, Box<Response>> {
+    if let Some(tools_file) = state.tools_file.as_deref() {
+        return Ok(ToolsAuthority::File(tools_file));
+    }
+    #[cfg(feature = "postgres")]
+    if let Some(control_plane) = state.tool_control_plane.as_ref() {
+        return Ok(ToolsAuthority::Postgres(control_plane));
+    }
+    Err(Box::new(tool_admin_authz_error_response(
+        ToolAdminAuthzError::ToolsFileNotConfigured,
+    )))
+}
+
+/// The current tools document plus its verified ETag from the authority:
+/// the file (re-read and re-validated) or the active cluster document.
+async fn current_tools_document(
+    authority: &ToolsAuthority<'_>,
+) -> Result<(Value, ToolsFileAdminDocument, String), Box<Response>> {
+    match authority {
+        ToolsAuthority::File(tools_file) => {
+            let (current_value, current_document) = match read_tools_file_document(tools_file) {
+                Ok(document) => document,
+                Err(error) => {
+                    tracing::error!(tools_file = %tools_file.display(), error = %error, "failed to read current tools file");
+                    return Err(Box::new(internal_server_error("tools file read failed")));
+                }
+            };
+            let current_etag = match tools_file_etag(&current_value) {
+                Ok(etag) => etag,
+                Err(err) => {
+                    tracing::error!(error = %err, "failed to compute current tools file ETag");
+                    return Err(Box::new(internal_server_error(
+                        "tools file ETag computation failed",
+                    )));
+                }
+            };
+            Ok((current_value, current_document, current_etag))
+        }
+        #[cfg(feature = "postgres")]
+        ToolsAuthority::Postgres(control_plane) => {
+            let active = match control_plane.active_tools().await {
+                Ok(Some(active)) => active,
+                Ok(None) => {
+                    tracing::error!("tools control plane has no active document");
+                    return Err(Box::new(service_unavailable(
+                        "tools control plane unavailable",
+                    )));
+                }
+                Err(error) => {
+                    tracing::error!(error = %error, "tools control plane read failed");
+                    return Err(Box::new(service_unavailable(
+                        "tools control plane unavailable",
+                    )));
+                }
+            };
+            let document =
+                match serde_json::from_value::<ToolsFileAdminDocument>(active.document.clone()) {
+                    Ok(document) => document,
+                    Err(error) => {
+                        tracing::error!(
+                            error = %error,
+                            "the active tools document does not match the admin schema"
+                        );
+                        return Err(Box::new(service_unavailable(
+                            "tools control plane unavailable",
+                        )));
+                    }
+                };
+            Ok((active.document, document, active.etag))
+        }
+    }
 }
 
 async fn policy_rule_preview_endpoint(
@@ -8765,19 +9388,6 @@ fn authorize_requested_scopes(
     }
 }
 
-fn authorized_tools_file<'a>(
-    state: &'a ToolAdminState,
-    principal: &auth::Principal,
-    permission: &str,
-) -> Result<&'a FsPath, ToolAdminAuthzError> {
-    authorized_tool_rbac_state(state, principal, permission)?;
-
-    state
-        .tools_file
-        .as_deref()
-        .ok_or(ToolAdminAuthzError::ToolsFileNotConfigured)
-}
-
 fn authorized_tool_rbac_state<'a>(
     state: &'a ToolAdminState,
     principal: &auth::Principal,
@@ -9562,7 +10172,7 @@ fn connection_secret_error_response(
     }
 }
 
-fn connection_capability_counts(
+async fn connection_capability_counts(
     state: &ConnectionAdminState,
     rbac_state: &middleware::rbac::RbacState,
     principal: &auth::Principal,
@@ -9570,6 +10180,7 @@ fn connection_capability_counts(
     state
         .inventory
         .connection_counts(rbac_state, principal)
+        .await
         .map_err(|error| {
             tracing::error!(
                 reason = ?error,
@@ -9583,6 +10194,7 @@ fn connection_capability_counts(
 
 struct ConnectionCollectionRuntimeData {
     statuses: BTreeMap<connections::model::ConnectionId, connections::status::SafeConnectionStatus>,
+    status_revisions: BTreeMap<connections::model::ConnectionId, u64>,
     dependency_counts: BTreeMap<connections::model::ConnectionId, usize>,
     capability_counts: BTreeMap<connections::model::ConnectionId, usize>,
     activity_times:
@@ -9595,10 +10207,11 @@ async fn connection_collection_runtime_data(
     rbac_state: &middleware::rbac::RbacState,
     principal: &auth::Principal,
 ) -> ResponseResult<ConnectionCollectionRuntimeData> {
-    let capability_counts = connection_capability_counts(state, rbac_state, principal)?;
+    let capability_counts = connection_capability_counts(state, rbac_state, principal).await?;
     if snapshot.managed().is_empty() {
         return Ok(ConnectionCollectionRuntimeData {
             statuses: BTreeMap::new(),
+            status_revisions: BTreeMap::new(),
             dependency_counts: BTreeMap::new(),
             capability_counts,
             activity_times: BTreeMap::new(),
@@ -9614,48 +10227,47 @@ async fn connection_collection_runtime_data(
         })?
         .clone();
     let ids = snapshot.managed().keys().cloned().collect::<Vec<_>>();
-    // The dependency, activity, and status reads are SQLite queries; they
-    // run together on the blocking pool off the request executor.
-    let (dependency_counts, activity_times, stored_statuses) =
-        match tokio::task::spawn_blocking(move || -> ResponseResult<_> {
-            let dependency_counts = store.dependency_counts().map_err(|error| {
-                tracing::error!(error = %error, "failed to load connection dependency counts");
-                Box::new(service_unavailable(
-                    "managed connection state is unavailable",
-                ))
-            })?;
-            let activity_times = store.activity_times().map_err(|error| {
-                tracing::error!(error = %error, "failed to load connection activity timestamps");
-                Box::new(service_unavailable(
-                    "managed connection state is unavailable",
-                ))
-            })?;
-            let mut stored_statuses = BTreeMap::new();
-            for id in &ids {
-                let stored_status = store.latest_status(id).map_err(|error| {
-                    tracing::error!(connection_id = %id, error = %error, "failed to load connection status");
-                    Box::new(service_unavailable(
-                        "managed connection state is unavailable",
-                    ))
-                })?;
-                stored_statuses.insert(id.clone(), stored_status);
-            }
-            Ok((dependency_counts, activity_times, stored_statuses))
-        })
-        .await
-        {
-            Ok(Ok(queries)) => queries,
-            Ok(Err(response)) => return Err(response),
-            Err(error) => {
-                tracing::error!(error = %error, "connection collection query task failed");
-                return Err(Box::new(service_unavailable(
-                    "managed connection state is unavailable",
-                )));
-            }
-        };
+    // The store dispatch keeps these reads off the request executor.
+    let (dependency_counts, activity_times, stored_statuses, status_revisions) = {
+        let dependency_counts = store.dependency_counts().await.map_err(|error| {
+            tracing::error!(error = %error, "failed to load connection dependency counts");
+            Box::new(service_unavailable(
+                "managed connection state is unavailable",
+            ))
+        })?;
+        let activity_times = store.activity_times().await.map_err(|error| {
+            tracing::error!(error = %error, "failed to load connection activity timestamps");
+            Box::new(service_unavailable(
+                "managed connection state is unavailable",
+            ))
+        })?;
+        // One read for every status rather than one per Connection: in
+        // cluster mode each call is a pool checkout and a round trip.
+        let stored_statuses = store.latest_statuses(&ids).await.map_err(|error| {
+            tracing::error!(error = %error, "failed to load connection statuses");
+            Box::new(service_unavailable(
+                "managed connection state is unavailable",
+            ))
+        })?;
+        // The authority's status revisions: a status write on another
+        // replica moves no security revision, so the runtime records here
+        // may still carry the revision they last reconciled.
+        let status_revisions = store.status_revisions(&ids).await.map_err(|error| {
+            tracing::error!(error = %error, "failed to load connection status revisions");
+            Box::new(service_unavailable(
+                "managed connection state is unavailable",
+            ))
+        })?;
+        (
+            dependency_counts,
+            activity_times,
+            stored_statuses,
+            status_revisions,
+        )
+    };
     let mut statuses = BTreeMap::new();
     for (id, record) in snapshot.managed() {
-        let stored_status = stored_statuses.get(id).cloned().flatten();
+        let stored_status = stored_statuses.get(id).cloned();
         let status = state
             .mcp_catalogs
             .status_fallback(id, &record.etag(), stored_status);
@@ -9668,6 +10280,7 @@ async fn connection_collection_runtime_data(
     }
     Ok(ConnectionCollectionRuntimeData {
         statuses,
+        status_revisions,
         dependency_counts,
         capability_counts,
         activity_times,
@@ -9680,6 +10293,7 @@ async fn connection_detail_runtime_data(
 ) -> ResponseResult<(
     Option<connections::status::SafeConnectionStatus>,
     Vec<connections::store::ConnectionDependency>,
+    Option<u64>,
 )> {
     let store = state
         .control_plane
@@ -9690,22 +10304,12 @@ async fn connection_detail_runtime_data(
             ))
         })?
         .clone();
-    let status_store = store.clone();
-    let status_id = id.clone();
-    let stored_status = tokio::task::spawn_blocking(move || status_store.latest_status(&status_id))
-        .await
-        .map_err(|error| {
-            tracing::error!(error = %error, "connection status query task failed");
-            Box::new(service_unavailable(
-                "managed connection state is unavailable",
-            ))
-        })?
-        .map_err(|error| {
-            tracing::error!(connection_id = %id, error = %error, "failed to load connection status");
-            Box::new(service_unavailable(
-                "managed connection state is unavailable",
-            ))
-        })?;
+    let stored_status = store.latest_status(id).await.map_err(|error| {
+        tracing::error!(connection_id = %id, error = %error, "failed to load connection status");
+        Box::new(service_unavailable(
+            "managed connection state is unavailable",
+        ))
+    })?;
     let snapshot = state.control_plane.runtime_snapshot();
     let status = snapshot.managed().get(id).and_then(|record| {
         let status = state
@@ -9715,21 +10319,22 @@ async fn connection_detail_runtime_data(
             .openapi_catalogs
             .status_fallback(id, &record.etag(), status)
     });
-    let dependency_store = store;
-    let dependency_id = id.clone();
-    let dependencies = tokio::task::spawn_blocking(move || dependency_store.dependencies(&dependency_id))
+    let dependencies = store.dependencies(id).await.map_err(|error| {
+        tracing::error!(connection_id = %id, error = %error, "failed to load connection dependencies");
+        Box::new(connection_store_error_response(error))
+    })?;
+    let status_revision = store
+        .status_revisions(std::slice::from_ref(id))
         .await
         .map_err(|error| {
-            tracing::error!(connection_id = %id, error = %error, "connection dependency query task failed");
-            Box::new(internal_server_error(
-                "connection dependency query failed",
+            tracing::error!(connection_id = %id, error = %error, "failed to load connection status revision");
+            Box::new(service_unavailable(
+                "managed connection state is unavailable",
             ))
         })?
-        .map_err(|error| {
-            tracing::error!(connection_id = %id, error = %error, "failed to load connection dependencies");
-            Box::new(connection_store_error_response(error))
-        })?;
-    Ok((status, dependencies))
+        .get(id)
+        .copied();
+    Ok((status, dependencies, status_revision))
 }
 
 fn connection_mutation_error_response(
@@ -9798,6 +10403,14 @@ fn connection_store_error_response(error: connections::store::ConnectionStoreErr
             precondition_failed("connection changed during the mutation"),
             current.as_str(),
         ),
+        connections::store::ConnectionStoreError::ToolNameConflict {
+            tool_name,
+            lane,
+            owner_id,
+            ..
+        } => conflict(&format!(
+            "tool name '{tool_name}' is already published by the {lane} lane ({owner_id})"
+        )),
         connections::store::ConnectionStoreError::DependencyConflict { count, .. } => conflict(
             &format!("connection is referenced by {count} retained control-plane records"),
         ),
@@ -11061,6 +11674,13 @@ async fn persist_policy_mutation(
             Err(storage::PolicyCommitError::PreconditionFailed) => Err(Box::new(
                 precondition_failed("If-Match does not match the current policy ETag"),
             )),
+            // Policies publish no tool names; the variant is unreachable
+            // here and answered as the conflict it would be.
+            Err(storage::PolicyCommitError::ToolNameTaken { tool_name, .. }) => {
+                Err(Box::new(conflict(&format!(
+                    "policy commit reported a reserved tool name '{tool_name}'"
+                ))))
+            }
             Err(storage::PolicyCommitError::Store(error)) => {
                 tracing::error!(
                     error = %error,
@@ -11314,11 +11934,6 @@ fn serialized_response_etag<T: Serialize>(response: &T) -> Result<String, serde_
     let digest = Sha256::digest(&bytes);
 
     Ok(format!("\"sha256:{}\"", hex::encode(digest)))
-}
-
-fn read_valid_tools_file_value(path: &FsPath) -> Result<Value, String> {
-    let (value, _) = read_tools_file_document(path)?;
-    Ok(value)
 }
 
 fn read_tools_file_document(path: &FsPath) -> Result<(Value, ToolsFileAdminDocument), String> {
@@ -11800,7 +12415,7 @@ fn emit_tool_registry_changed(
     state: &ToolAdminState,
     parts: &http::request::Parts,
     principal: &auth::Principal,
-    tools_file: &FsPath,
+    tools_source: &str,
     registered_tool_names: &[String],
     tool_count: usize,
 ) {
@@ -11808,9 +12423,12 @@ fn emit_tool_registry_changed(
     let source_ip =
         client_ip::canonical_client_ip(&parts.headers, &parts.extensions, &state.client_ip_policy);
     let actor = Some(auth::actor_from_principal(principal));
+    // The payload key keeps its historical name ("tools_file") so the
+    // standalone audit shape is unchanged; in cluster mode the value
+    // names the authority instead of a path.
     let payload = json!({
         "action": "openapi_tools_registered",
-        "tools_file": tools_file.display().to_string(),
+        "tools_file": tools_source,
         "registered_tool_names": registered_tool_names,
         "registered_tool_count": registered_tool_names.len(),
         "tool_count": tool_count,
@@ -12369,7 +12987,8 @@ fn connection_refresh_error_response(error: connections::mcp::McpCatalogRefreshE
         connections::mcp::McpCatalogRefreshError::PreconditionFailed => {
             StatusCode::PRECONDITION_FAILED
         }
-        connections::mcp::McpCatalogRefreshError::RefreshInProgress
+        connections::mcp::McpCatalogRefreshError::ToolNameConflict
+        | connections::mcp::McpCatalogRefreshError::RefreshInProgress
         | connections::mcp::McpCatalogRefreshError::ConnectionDisabled
         | connections::mcp::McpCatalogRefreshError::ConnectionKindMismatch
         | connections::mcp::McpCatalogRefreshError::DiscoveryNotConfigured => StatusCode::CONFLICT,
@@ -15824,7 +16443,9 @@ mod tests {
                     }
                 }))
                 .expect("test Connection should deserialize"),
+                "test-admin",
             )
+            .await
             .expect("test Connection should create");
         let mut route = path_route("/billing", upstream_addr);
         route.id = Some("billing-route".to_owned());
@@ -15866,8 +16487,11 @@ mod tests {
             Some(&HeaderValue::from_static("preserved"))
         );
 
+        let dependency_protected = control_plane
+            .delete_managed(&created.id, &created.etag(), "test-admin")
+            .await;
         assert!(matches!(
-            control_plane.delete_managed(&created.id, &created.etag()),
+            dependency_protected,
             Err(connections::control_plane::ConnectionMutationError::Store(
                 connections::store::ConnectionStoreError::DependencyConflict { count: 1, .. }
             ))
@@ -29371,12 +29995,28 @@ paths:
             }
         }
 
+        /// The segment that names this test process's run in every
+        /// database it creates, so the sweep can tell an earlier run's
+        /// leftovers from a sibling test's fresh database.
+        fn run_epoch() -> &'static str {
+            static RUN_EPOCH: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
+                let seconds = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|elapsed| elapsed.as_secs())
+                    .unwrap_or(0);
+                format!("{seconds:x}p{:x}", std::process::id())
+            });
+            RUN_EPOCH.as_str()
+        }
+
         /// Drop any databases leaked by earlier runs of these tests, so a
         /// long-lived development database server does not accumulate them.
-        /// Only databases with NO active connections are swept: under
-        /// parallel test execution a sibling test's in-flight database has
-        /// live connections, and dropping it out from under the sibling
-        /// (WITH FORCE) is exactly the flake this guard prevents.
+        /// Only databases from OTHER runs are swept, never this run's: a
+        /// sibling test that has just created its database and not yet
+        /// connected has no active connections either, and dropping it out
+        /// from under the sibling (WITH FORCE) was exactly the flake this
+        /// guard exists to prevent -- "database does not exist; it seems
+        /// to have just been dropped" at the sibling's first checkout.
         async fn sweep_stale_test_databases(admin_dsn: &str) {
             let Ok((client, connection)) =
                 tokio_postgres::connect(admin_dsn, tokio_postgres::NoTls).await
@@ -29389,12 +30029,13 @@ paths:
                     r#"
                     SELECT datname FROM pg_database
                     WHERE datname LIKE 'ggw_sse_test_%'
+                      AND datname NOT LIKE $1
                       AND NOT EXISTS (
                           SELECT 1 FROM pg_stat_activity
                           WHERE pg_stat_activity.datname = pg_database.datname
                       )
                     "#,
-                    &[],
+                    &[&format!("ggw_sse_test_{}_%", run_epoch())],
                 )
                 .await;
             if let Ok(rows) = rows {
@@ -29412,7 +30053,11 @@ paths:
         async fn create_test_database(admin_dsn: &str) -> TestDatabase {
             use std::str::FromStr as _;
             sweep_stale_test_databases(admin_dsn).await;
-            let name = format!("ggw_sse_test_{}", uuid::Uuid::new_v4().simple());
+            let name = format!(
+                "ggw_sse_test_{}_{}",
+                run_epoch(),
+                uuid::Uuid::new_v4().simple()
+            );
             let parsed =
                 tokio_postgres::Config::from_str(admin_dsn).expect("admin DSN should parse");
             let admin_pool = deadpool_postgres::Pool::builder(deadpool_postgres::Manager::new(
@@ -40211,8 +40856,8 @@ O2gecI9QwDJNpm29J9wJB2F8
     #[cfg(feature = "postgres")]
     mod cluster_policy_tests {
         use super::*;
-        use crate::policy_cluster::ClusterPolicyRuntime;
         use crate::rbac::PolicyHistoryListFilters;
+        use crate::security_cluster::{ClusterSecurityRuntime, PolicyResource};
         use crate::storage::postgres::PostgresFoundation;
         use crate::storage::postgres_policy::PostgresPolicyStore;
         use crate::storage::{
@@ -40394,7 +41039,10 @@ O2gecI9QwDJNpm29J9wJB2F8
                 false,
                 test_audit_log(),
             );
-            let runtime = ClusterPolicyRuntime::new(store.clone(), rbac_state.clone());
+            let runtime = ClusterSecurityRuntime::new(
+                store.revision_source(),
+                PolicyResource::new(store.clone(), rbac_state.clone()),
+            );
             let gate: Arc<dyn middleware::rbac::SecurityRevisionGate> = runtime;
             let router = Router::new()
                 .route(
@@ -40629,6 +41277,91 @@ O2gecI9QwDJNpm29J9wJB2F8
             }
         }
 
+        async fn commit_policy(store: &PostgresPolicyStore, id: &str) -> storage::ActivePolicy {
+            let candidate = rbac::Policy::validate_json_value(json!({
+                "schema_version": "0.1.0",
+                "id": id,
+                "default_action": "deny",
+                "roles": {
+                    "admin": { "permissions": ["data:read", "policy:write"] }
+                }
+            }))
+            .expect("policy should validate");
+            let current = PolicyControlPlane::active(store)
+                .await
+                .expect("active read")
+                .expect("active row");
+            PolicyControlPlane::commit(
+                store,
+                PolicyCommitRequest {
+                    precondition: PolicyCommitPrecondition::Expected { etag: current.etag },
+                    candidate: &candidate,
+                    actor_user_id: "other-replica",
+                    diff_summary: &DIFF,
+                },
+            )
+            .await
+            .expect("policy should commit")
+        }
+
+        /// A commit that lands after a pass reconciled its resources but
+        /// before the watermark is published must move the watermark, not
+        /// just the content: the pass re-reads the counter and goes again,
+        /// so the published watermark never trails what is installed.
+        #[tokio::test]
+        async fn a_commit_that_lands_mid_pass_moves_the_watermark_not_just_the_content() {
+            let Some(admin_dsn) = locator() else {
+                eprintln!("skipping: no test database locator; CI runs this test");
+                return;
+            };
+            let database = create_test_database(&admin_dsn).await;
+            let (store, _pool) = migrated_policy_foundation(&database.dsn).await;
+            let active = initialize(&store, "mid-pass-init").await;
+            let rbac_state = middleware::rbac::RbacState::new(
+                active.policy.clone(),
+                Vec::new(),
+                false,
+                test_audit_log(),
+            );
+            rbac_state.install_revision_snapshot(active.policy.clone(), active.security_revision);
+            let runtime = ClusterSecurityRuntime::new(
+                store.revision_source(),
+                PolicyResource::new(store.clone(), rbac_state.clone()),
+            );
+            middleware::rbac::SecurityRevisionGate::ensure_current_revision(&*runtime)
+                .await
+                .expect("the first pass compiles the initial revision");
+
+            // One commit moves the counter; the pass that reconciles it is
+            // interrupted by a second commit after the content fetch.
+            let first = commit_policy(&store, "mid-pass-first").await;
+            let hook_store = store.clone();
+            runtime.set_before_publish_hook_for_test(Arc::new(move || {
+                let store = hook_store.clone();
+                Box::pin(async move {
+                    commit_policy(&store, "mid-pass-second").await;
+                })
+            }));
+            let published =
+                middleware::rbac::SecurityRevisionGate::ensure_current_revision(&*runtime)
+                    .await
+                    .expect("the pass settles");
+            let latest = PolicyControlPlane::active(&*store)
+                .await
+                .expect("active read")
+                .expect("active row");
+            assert!(latest.security_revision > first.security_revision);
+            assert_eq!(
+                published, latest.security_revision,
+                "the watermark is the counter after the pass settled, not the one read before the mid-pass commit"
+            );
+            assert_eq!(
+                rbac_state.current_policy().id.as_deref(),
+                Some("mid-pass-second"),
+                "the content installed is the one the published watermark describes"
+            );
+        }
+
         #[tokio::test]
         async fn admin_authorization_never_serves_under_a_stale_revision() {
             let Some(admin_dsn) = locator() else {
@@ -40735,7 +41468,10 @@ O2gecI9QwDJNpm29J9wJB2F8
                 test_audit_log(),
             );
             rbac_state.install_revision_snapshot(active.policy.clone(), active.security_revision);
-            let runtime = ClusterPolicyRuntime::new(store.clone(), rbac_state.clone());
+            let runtime = ClusterSecurityRuntime::new(
+                store.revision_source(),
+                PolicyResource::new(store.clone(), rbac_state.clone()),
+            );
 
             // Current: the gate passes and reports the served revision.
             let served = middleware::rbac::SecurityRevisionGate::ensure_current_revision(&*runtime)
@@ -40809,6 +41545,1045 @@ O2gecI9QwDJNpm29J9wJB2F8
                 Some("gate-updated"),
                 "the last valid snapshot remains installed; nothing regressed"
             );
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // Cluster-mode tools control plane (issue #241, PR 8): seeding, CAS,
+    // the multi-resource gate, and reconciliation against a real
+    // PostgreSQL. Docker-gated on the same locator as the storage suites.
+    // ------------------------------------------------------------------
+
+    #[cfg(feature = "postgres")]
+    mod cluster_tools_tests {
+        use super::*;
+        use crate::security_cluster::{ClusterSecurityRuntime, PolicyResource, ToolsResource};
+        use crate::storage::postgres::PostgresFoundation;
+        use crate::storage::postgres_policy::PostgresPolicyStore;
+        use crate::storage::postgres_tools::PostgresToolStore;
+        use crate::storage::{
+            self, migrations, PolicyCommitPrecondition, PolicyCommitRequest, PolicyControlPlane,
+        };
+        use crate::tools::definitions::ToolRegistry;
+
+        fn locator() -> Option<String> {
+            let key = "GATEWAY_TEST_POSTGRES_URL_FILE".to_owned();
+            let file = std::env::var(&key).ok()?;
+            if file.trim().is_empty() {
+                return None;
+            }
+            let contents = std::fs::read_to_string(file).ok()?;
+            let trimmed = contents.trim();
+            (!trimmed.is_empty()).then(|| trimmed.to_owned())
+        }
+
+        struct DsnFile {
+            path: String,
+            directory: std::path::PathBuf,
+        }
+
+        impl Drop for DsnFile {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.directory);
+            }
+        }
+
+        fn write_dsn_file(dsn: &str) -> DsnFile {
+            let directory = std::env::temp_dir().join(format!(
+                "greengateway-cluster-tools-{}",
+                uuid::Uuid::new_v4()
+            ));
+            std::fs::create_dir_all(&directory).expect("temp directory should create");
+            let path = directory.join("database-url");
+            std::fs::write(&path, format!("{dsn}\n")).expect("DSN file should write");
+            // The foundation's permission check is part of the contract:
+            // credential material grants group/other nothing. On Unix CI
+            // the default mode would be 0644, which the check (correctly)
+            // refuses.
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
+                    .expect("DSN permissions should set");
+            }
+            DsnFile {
+                path: path.display().to_string(),
+                directory,
+            }
+        }
+
+        struct TestDatabase {
+            dsn: String,
+            admin_dsn: String,
+            name: String,
+        }
+
+        impl Drop for TestDatabase {
+            fn drop(&mut self) {
+                let admin_dsn = self.admin_dsn.clone();
+                let name = self.name.clone();
+                std::thread::spawn(move || {
+                    let Ok(runtime) = tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()
+                    else {
+                        return;
+                    };
+                    runtime.block_on(async move {
+                        let Ok((client, connection)) =
+                            tokio_postgres::connect(&admin_dsn, tokio_postgres::NoTls).await
+                        else {
+                            return;
+                        };
+                        let connection = tokio::spawn(connection);
+                        let _ = client
+                            .batch_execute(&format!("DROP DATABASE IF EXISTS {name} WITH (FORCE)"))
+                            .await;
+                        let _ = connection.await;
+                    });
+                });
+            }
+        }
+
+        async fn create_test_database(admin_dsn: &str) -> TestDatabase {
+            let name = format!("ggw_tools_test_{}", uuid::Uuid::new_v4().simple());
+            let (client, connection) = tokio_postgres::connect(admin_dsn, tokio_postgres::NoTls)
+                .await
+                .expect("admin connection");
+            let connection_task = tokio::spawn(connection);
+            client
+                .batch_execute(&format!("CREATE DATABASE {name}"))
+                .await
+                .expect("test database should create");
+            drop(client);
+            let _ = connection_task.await;
+            let database_start = admin_dsn
+                .rfind('/')
+                .expect("locator DSN has a database path segment");
+            let dsn = format!("{}/{}", &admin_dsn[..database_start], name);
+            TestDatabase {
+                dsn,
+                admin_dsn: admin_dsn.to_owned(),
+                name,
+            }
+        }
+
+        async fn migrated_stores(
+            dsn: &str,
+        ) -> (
+            Arc<PostgresPolicyStore>,
+            Arc<PostgresToolStore>,
+            deadpool_postgres::Pool,
+        ) {
+            let dsn_file = write_dsn_file(dsn);
+            let mut config = test_config(Vec::new());
+            config.state_backend = config::StateBackend::Postgres;
+            config.deployment_id = Some("deploy-cluster-tools".to_owned());
+            config.database.url_file = Some(dsn_file.path.clone());
+            config.database.tls_mode = config::DatabaseTlsMode::LoopbackDev;
+            let foundation = PostgresFoundation::establish(&config)
+                .await
+                .expect("test database should establish");
+            migrations::apply_missing_for_startup(foundation.pool(), &config.database)
+                .await
+                .expect("schema should migrate");
+            let pool = foundation.pool().clone();
+            (
+                Arc::new(PostgresPolicyStore::new(pool.clone())),
+                Arc::new(PostgresToolStore::new(pool.clone())),
+                pool,
+            )
+        }
+
+        fn tools_document_with(tool_name: &str) -> Value {
+            json!({
+                "schema_version": "0.1.0",
+                "tools": [{
+                    "name": tool_name,
+                    "description": "Echoes the provided message.",
+                    "input_json_schema": {
+                        "type": "object",
+                        "required": ["message"],
+                        "properties": {
+                            "message": { "type": "string" }
+                        },
+                        "additionalProperties": false
+                    },
+                    "upstream": {
+                        "method": "POST",
+                        "path_template": "/v1/echo",
+                        "body": { "mode": "whole_args_json" }
+                    }
+                }]
+            })
+        }
+
+        static DIFF: std::sync::LazyLock<Value> =
+            std::sync::LazyLock::new(|| json!({ "action": "test" }));
+
+        fn cluster_policy(id: &str) -> rbac::Policy {
+            parse_policy_body(&Bytes::from(format!(
+                r#"{{
+                    "schema_version": "0.1.0",
+                    "id": "{id}",
+                    "default_action": "deny",
+                    "roles": {{
+                        "admin": {{ "permissions": ["admin:policy:read", "admin:policy:write", "admin:tools:write"] }}
+                    }}
+                }}"#
+            )))
+            .expect("cluster policy should parse")
+        }
+
+        #[tokio::test]
+        async fn tools_control_plane_seeds_once_and_commits_with_cas() {
+            let Some(admin_dsn) = locator() else {
+                eprintln!("skipping: no test database locator; CI runs this test");
+                return;
+            };
+            let database = create_test_database(&admin_dsn).await;
+            let (policy_store, tools_store, pool) = migrated_stores(&database.dsn).await;
+
+            // The policy plane initializes first (its startup contract).
+            PolicyControlPlane::commit(
+                &*policy_store,
+                PolicyCommitRequest {
+                    precondition: PolicyCommitPrecondition::Initialize,
+                    candidate: &cluster_policy("tools-cas"),
+                    actor_user_id: "seed",
+                    diff_summary: &DIFF,
+                },
+            )
+            .await
+            .expect("policy should initialize");
+
+            // Two replicas' first boots seed concurrently: exactly one
+            // seeded document exists afterwards.
+            let (seed_a, seed_b) = tokio::join!(
+                tools_store.seed_empty_document(),
+                tools_store.seed_empty_document()
+            );
+            seed_a.expect("replica A seed");
+            seed_b.expect("replica B seed");
+            let active = tools_store
+                .active_tools()
+                .await
+                .expect("active tools read")
+                .expect("seeded document exists");
+            assert_eq!(
+                active.document["tools"]
+                    .as_array()
+                    .expect("tools array")
+                    .len(),
+                0,
+                "the seeded document is the empty local lane"
+            );
+
+            // A commit with the current ETag wins and advances the shared
+            // revision; the same ETag loses afterwards with 412 semantics
+            // and writes nothing.
+            let winner = tools_store
+                .commit_tools(
+                    PolicyCommitPrecondition::Expected {
+                        etag: active.etag.clone(),
+                    },
+                    &tools_document_with("cluster_echo"),
+                    "op-1",
+                    &DIFF,
+                )
+                .await
+                .expect("tools commit should win");
+            assert!(winner.security_revision > active.security_revision);
+            let loser = tools_store
+                .commit_tools(
+                    PolicyCommitPrecondition::Expected {
+                        etag: active.etag.clone(),
+                    },
+                    &tools_document_with("cluster_other"),
+                    "op-2",
+                    &DIFF,
+                )
+                .await
+                .expect_err("the stale ETag must lose");
+            assert_eq!(
+                loser,
+                storage::PolicyCommitError::PreconditionFailed,
+                "{loser}"
+            );
+
+            // One seeded version plus one committed version; the outbox
+            // rows carry the tools resource type.
+            let client = pool.get().await.expect("count checkout");
+            let documents: i64 = client
+                .query_one("SELECT count(*) FROM greengateway.tool_documents", &[])
+                .await
+                .expect("count")
+                .get(0);
+            assert_eq!(documents, 2, "seeding and the winning commit only");
+            let outbox_tools: i64 = client
+                .query_one(
+                    "SELECT count(*) FROM greengateway.security_outbox WHERE resource_type = 'tools'",
+                    &[],
+                )
+                .await
+                .expect("count")
+                .get(0);
+            assert_eq!(outbox_tools, 2, "seed + commit each wrote one record");
+        }
+
+        #[tokio::test]
+        async fn a_tools_revision_does_not_livelock_the_security_gate() {
+            let Some(admin_dsn) = locator() else {
+                eprintln!("skipping: no test database locator; CI runs this test");
+                return;
+            };
+            let database = create_test_database(&admin_dsn).await;
+            let (policy_store, tools_store, _pool) = migrated_stores(&database.dsn).await;
+
+            let active_policy = PolicyControlPlane::commit(
+                &*policy_store,
+                PolicyCommitRequest {
+                    precondition: PolicyCommitPrecondition::Initialize,
+                    candidate: &cluster_policy("gate-tools"),
+                    actor_user_id: "seed",
+                    diff_summary: &DIFF,
+                },
+            )
+            .await
+            .expect("policy should initialize");
+            tools_store
+                .seed_empty_document()
+                .await
+                .expect("tools should seed");
+
+            // A replica boots with both resources registered.
+            let rbac_state = middleware::rbac::RbacState::new(
+                active_policy.policy.clone(),
+                Vec::new(),
+                false,
+                test_audit_log(),
+            );
+            rbac_state.install_revision_snapshot(
+                active_policy.policy.clone(),
+                active_policy.security_revision,
+            );
+            let registry =
+                ToolRegistry::from_definitions_with_audit(Vec::new(), Some(test_audit_log()));
+            let boot_tools = tools_store
+                .active_tools()
+                .await
+                .expect("active tools read")
+                .expect("seeded");
+            let runtime = ClusterSecurityRuntime::new(
+                policy_store.revision_source(),
+                PolicyResource::new(policy_store.clone(), rbac_state.clone()),
+            );
+            runtime.register_resource(ToolsResource::new(
+                tools_store.clone(),
+                registry.clone(),
+                boot_tools.security_revision,
+            ));
+
+            // The pin: with the PR 7 policy-only gate, any revision the
+            // POLICY did not produce (the tools seeding above already
+            // bumped the counter past the policy activation) sent every
+            // replica into a reconcile loop it could not win until the
+            // 250ms deadline, failing closed on healthy state. The
+            // multi-resource gate must reconcile the tools resource (a
+            // no-op at the boot revision) and return Ok.
+            let served = middleware::rbac::SecurityRevisionGate::ensure_current_revision(&*runtime)
+                .await
+                .expect("a tools-only revision must not livelock the gate");
+            assert!(
+                served >= boot_tools.security_revision,
+                "the compiled watermark covers the tools revision ({served} < {})",
+                boot_tools.security_revision
+            );
+
+            // A tools COMMIT after boot: the gate must observe it, install
+            // the new local lane, and stay current -- still no loop.
+            let committed = tools_store
+                .commit_tools(
+                    PolicyCommitPrecondition::Expected {
+                        etag: boot_tools.etag.clone(),
+                    },
+                    &tools_document_with("post_boot_tool"),
+                    "op",
+                    &DIFF,
+                )
+                .await
+                .expect("tools commit should win");
+            let served = middleware::rbac::SecurityRevisionGate::ensure_current_revision(&*runtime)
+                .await
+                .expect("the gate must reconcile a tools commit, not loop");
+            assert_eq!(served, committed.security_revision);
+            assert!(
+                registry
+                    .current_local_definitions()
+                    .iter()
+                    .any(|tool| tool.name == "post_boot_tool"),
+                "reconciliation must install the committed local lane"
+            );
+            // The policy snapshot is untouched: a tools revision re-reads
+            // the policy authority but must not change the active policy.
+            assert_eq!(
+                rbac_state.current_policy().id.as_deref(),
+                Some("gate-tools")
+            );
+        }
+
+        /// A register that paused between its commit and its install must
+        /// not roll the live lane back over a newer commit the reconciler
+        /// already installed. Pinned at the adapter: install N+1, then try
+        /// to install N.
+        #[tokio::test]
+        async fn a_stale_tools_install_never_rolls_the_live_lane_back() {
+            let Some(admin_dsn) = locator() else {
+                eprintln!("skipping: no test database locator; CI runs this test");
+                return;
+            };
+            let database = create_test_database(&admin_dsn).await;
+            let (_policy_store, tools_store, _pool) = migrated_stores(&database.dsn).await;
+            tools_store
+                .seed_empty_document()
+                .await
+                .expect("tools should seed");
+            let registry =
+                ToolRegistry::from_definitions_with_audit(Vec::new(), Some(test_audit_log()));
+            let resource = ToolsResource::new(tools_store.clone(), registry.clone(), 0);
+
+            let older = tools_document_with("older_tool");
+            let newer = tools_document_with("newer_tool");
+            let older_definitions =
+                tools::definitions::definitions_from_json_value(older, None).expect("older");
+            let newer_definitions =
+                tools::definitions::definitions_from_json_value(newer, None).expect("newer");
+
+            // Revision 11 is live; a register committed at 10 resumes late.
+            assert!(resource
+                .install_committed(newer_definitions, 11)
+                .await
+                .expect("the newer lane installs"));
+            assert!(
+                !resource
+                    .install_committed(older_definitions, 10)
+                    .await
+                    .expect("the older install is refused, not failed"),
+                "an older commit must not install over a newer live lane"
+            );
+            let live = registry.current_local_definitions();
+            assert!(live.iter().any(|tool| tool.name == "newer_tool"));
+            assert!(
+                !live.iter().any(|tool| tool.name == "older_tool"),
+                "the live lane is still revision 11's"
+            );
+        }
+
+        /// A resource registered after the gate already confirmed a
+        /// watermark must be reconciled on the next check. Without the
+        /// reset on registration, the watermark would already cover the
+        /// resource's commits and every later check would return early
+        /// with the resource stale.
+        #[tokio::test]
+        async fn a_resource_registered_after_the_watermark_advanced_is_reconciled() {
+            let Some(admin_dsn) = locator() else {
+                eprintln!("skipping: no test database locator; CI runs this test");
+                return;
+            };
+            let database = create_test_database(&admin_dsn).await;
+            let (policy_store, _tools_store, pool) = migrated_stores(&database.dsn).await;
+            let connection_store = Arc::new(
+                connections::pg_store::PostgresConnectionStore::new(
+                    pool.clone(),
+                    connections::model::MAX_CONNECTIONS,
+                )
+                .expect("connection store should build"),
+            );
+            let active_policy = PolicyControlPlane::commit(
+                &*policy_store,
+                PolicyCommitRequest {
+                    precondition: PolicyCommitPrecondition::Initialize,
+                    candidate: &cluster_policy("gate-late-register"),
+                    actor_user_id: "seed",
+                    diff_summary: &DIFF,
+                },
+            )
+            .await
+            .expect("policy should initialize");
+            // A connection commit lands BEFORE the connections resource is
+            // registered -- the startup window the poller could observe.
+            connection_store
+                .create(cluster_connection_candidate(), "op", None)
+                .await
+                .expect("connection create should commit");
+            let committed_at = connection_store
+                .state_revision()
+                .await
+                .expect("connections state revision should read");
+
+            let rbac_state = middleware::rbac::RbacState::new(
+                active_policy.policy.clone(),
+                Vec::new(),
+                false,
+                test_audit_log(),
+            );
+            rbac_state.install_revision_snapshot(
+                active_policy.policy.clone(),
+                active_policy.security_revision,
+            );
+            let runtime = ClusterSecurityRuntime::new(
+                policy_store.revision_source(),
+                PolicyResource::new(policy_store.clone(), rbac_state.clone()),
+            );
+            // Policy alone confirms a watermark past the connection commit.
+            let served = middleware::rbac::SecurityRevisionGate::ensure_current_revision(&*runtime)
+                .await
+                .expect("policy-only pass serves");
+            assert!(served >= committed_at);
+
+            // Late registration, then the next check.
+            let reconciled = Arc::new(std::sync::atomic::AtomicI64::new(0));
+            runtime.register_resource(Arc::new(RecordingConnectionsResource {
+                store: connection_store.clone(),
+                reconciled: reconciled.clone(),
+            }));
+            middleware::rbac::SecurityRevisionGate::ensure_current_revision(&*runtime)
+                .await
+                .expect("the check after registration serves");
+            assert_eq!(
+                reconciled.load(std::sync::atomic::Ordering::Acquire),
+                committed_at,
+                "the late-registered resource must be reconciled by the next check"
+            );
+        }
+
+        /// The background pass has its own budget. A resource whose
+        /// reconcile takes longer than the request deadline fails a
+        /// request closed, but the background pass -- the one that does the
+        /// work -- must be allowed to finish, or the replica never becomes
+        /// current.
+        #[tokio::test]
+        async fn the_background_pass_outlives_the_request_deadline() {
+            let Some(admin_dsn) = locator() else {
+                eprintln!("skipping: no test database locator; CI runs this test");
+                return;
+            };
+            let database = create_test_database(&admin_dsn).await;
+            let (policy_store, _tools_store, pool) = migrated_stores(&database.dsn).await;
+            let connection_store = Arc::new(
+                connections::pg_store::PostgresConnectionStore::new(
+                    pool.clone(),
+                    connections::model::MAX_CONNECTIONS,
+                )
+                .expect("connection store should build"),
+            );
+            let active_policy = PolicyControlPlane::commit(
+                &*policy_store,
+                PolicyCommitRequest {
+                    precondition: PolicyCommitPrecondition::Initialize,
+                    candidate: &cluster_policy("gate-budget"),
+                    actor_user_id: "seed",
+                    diff_summary: &DIFF,
+                },
+            )
+            .await
+            .expect("policy should initialize");
+            connection_store
+                .create(cluster_connection_candidate(), "op", None)
+                .await
+                .expect("connection create should commit");
+
+            let rbac_state = middleware::rbac::RbacState::new(
+                active_policy.policy.clone(),
+                Vec::new(),
+                false,
+                test_audit_log(),
+            );
+            rbac_state.install_revision_snapshot(
+                active_policy.policy.clone(),
+                active_policy.security_revision,
+            );
+            let runtime = ClusterSecurityRuntime::new(
+                policy_store.revision_source(),
+                PolicyResource::new(policy_store.clone(), rbac_state.clone()),
+            );
+            runtime.register_resource(Arc::new(SlowConnectionsResource {
+                store: connection_store.clone(),
+                delay: Duration::from_millis(600),
+            }));
+
+            let request =
+                middleware::rbac::SecurityRevisionGate::ensure_current_revision(&*runtime).await;
+            assert_eq!(
+                request.err(),
+                Some(middleware::rbac::SecurityRevisionCheckError::ReconcileDeadlineExceeded),
+                "a request cannot wait out a slow reconcile"
+            );
+            runtime
+                .ensure_current_revision_within(security_cluster::RECONCILE_BACKGROUND_DEADLINE)
+                .await
+                .expect("the background budget lets the slow reconcile finish");
+            middleware::rbac::SecurityRevisionGate::ensure_current_revision(&*runtime)
+                .await
+                .expect("once reconciled, requests serve inside their own deadline");
+        }
+
+        /// A resource whose reconcile is deliberately slower than the
+        /// request deadline.
+        struct SlowConnectionsResource {
+            store: Arc<connections::pg_store::PostgresConnectionStore>,
+            delay: Duration,
+        }
+
+        #[async_trait::async_trait]
+        impl security_cluster::ReconciledResource for SlowConnectionsResource {
+            fn name(&self) -> &'static str {
+                "slow-connections"
+            }
+
+            async fn activation_revision(
+                &self,
+            ) -> Result<i64, middleware::rbac::SecurityRevisionCheckError> {
+                self.store
+                    .state_revision()
+                    .await
+                    .map_err(|_| middleware::rbac::SecurityRevisionCheckError::Unavailable)
+            }
+
+            async fn reconcile(
+                &self,
+                _compiled_revision: i64,
+            ) -> Result<(), middleware::rbac::SecurityRevisionCheckError> {
+                tokio::time::sleep(self.delay).await;
+                Ok(())
+            }
+        }
+
+        /// The connections resource must keep reconciling after an
+        /// unrelated resource has moved the shared counter.
+        ///
+        /// This pins a defect that compiled, passed every other test, and
+        /// would have silently disabled cluster-mode Connection
+        /// reconciliation in production. `connection_state_revision` was
+        /// being incremented on its own (`last_revision + 1`) rather than
+        /// set to the shared security revision the committing transaction
+        /// had just taken. The gate compares a resource's activation
+        /// revision against a watermark of the SHARED counter, which policy
+        /// and tools commits also advance -- so a private counter drifts
+        /// permanently below the watermark, `activation > compiled` stops
+        /// being true, and connection commits stop triggering
+        /// `ConnectionsResource::reconcile` on every replica. Replicas
+        /// would keep serving withdrawn upstreams and stale credential
+        /// bindings, which is exactly the stale-allow the gate exists to
+        /// prevent.
+        ///
+        /// The shape below is what makes it visible: commit tools FIRST so
+        /// the shared counter runs ahead of anything connections has ever
+        /// written, and only then commit a connection.
+        #[tokio::test]
+        async fn a_connection_commit_reconciles_after_another_resource_moved_the_counter() {
+            let Some(admin_dsn) = locator() else {
+                eprintln!("skipping: no test database locator; CI runs this test");
+                return;
+            };
+            let database = create_test_database(&admin_dsn).await;
+            let (policy_store, tools_store, pool) = migrated_stores(&database.dsn).await;
+            let connection_store = Arc::new(
+                connections::pg_store::PostgresConnectionStore::new(
+                    pool.clone(),
+                    connections::model::MAX_CONNECTIONS,
+                )
+                .expect("connection store should build"),
+            );
+
+            let active_policy = PolicyControlPlane::commit(
+                &*policy_store,
+                PolicyCommitRequest {
+                    precondition: PolicyCommitPrecondition::Initialize,
+                    candidate: &cluster_policy("gate-connections"),
+                    actor_user_id: "seed",
+                    diff_summary: &DIFF,
+                },
+            )
+            .await
+            .expect("policy should initialize");
+            tools_store
+                .seed_empty_document()
+                .await
+                .expect("tools should seed");
+
+            // Push the shared counter well ahead of the connections
+            // high-water mark. On the defective code the connections
+            // counter is still 0 here while the shared counter is 4+, and
+            // no connection commit can ever catch up.
+            let mut tools_etag = tools_store
+                .active_tools()
+                .await
+                .expect("active tools read")
+                .expect("seeded")
+                .etag;
+            for index in 0..3 {
+                tools_etag = tools_store
+                    .commit_tools(
+                        PolicyCommitPrecondition::Expected { etag: tools_etag },
+                        &tools_document_with(&format!("counter_mover_{index}")),
+                        "op",
+                        &DIFF,
+                    )
+                    .await
+                    .expect("tools commit should win")
+                    .etag;
+            }
+
+            let boot_revision = connection_store
+                .state_revision()
+                .await
+                .expect("connections state revision should read");
+            let created = connection_store
+                .create(cluster_connection_candidate(), "op", None)
+                .await
+                .expect("connection create should commit");
+            let after_commit = connection_store
+                .state_revision()
+                .await
+                .expect("connections state revision should read");
+
+            // The property, stated directly against the store: a committed
+            // connection mutation must leave the connections high-water
+            // mark at the shared revision it took, not one above whatever
+            // it happened to be before. Under the defect this was
+            // `boot_revision + 1` -- far below the shared counter.
+            let shared_now = policy_store
+                .revision_source()
+                .current()
+                .await
+                .expect("shared revision should read");
+            assert_eq!(
+                after_commit, shared_now,
+                "a connection commit must record the SHARED security revision \
+                 ({shared_now}), not a private commit count ({after_commit}); \
+                 the gate compares this against a watermark of the shared counter"
+            );
+            assert!(
+                after_commit > boot_revision + 1,
+                "the tools commits above moved the shared counter, so the \
+                 connections mark must jump past a private increment \
+                 ({after_commit} vs {})",
+                boot_revision + 1
+            );
+
+            // And the consequence, stated through the gate: a replica whose
+            // watermark was compiled before the connection commit must
+            // reconcile it. `ensure_current_revision` returns the watermark
+            // it served under; it must cover the connection commit.
+            let rbac_state = middleware::rbac::RbacState::new(
+                active_policy.policy.clone(),
+                Vec::new(),
+                false,
+                test_audit_log(),
+            );
+            rbac_state.install_revision_snapshot(
+                active_policy.policy.clone(),
+                active_policy.security_revision,
+            );
+            let runtime = ClusterSecurityRuntime::new(
+                policy_store.revision_source(),
+                PolicyResource::new(policy_store.clone(), rbac_state.clone()),
+            );
+            let reconciled = Arc::new(std::sync::atomic::AtomicI64::new(0));
+            runtime.register_resource(Arc::new(RecordingConnectionsResource {
+                store: connection_store.clone(),
+                reconciled: reconciled.clone(),
+            }));
+
+            let served = middleware::rbac::SecurityRevisionGate::ensure_current_revision(&*runtime)
+                .await
+                .expect("the gate must reconcile a connection commit, not loop");
+            assert!(
+                served >= after_commit,
+                "the compiled watermark must cover the connection commit \
+                 ({served} < {after_commit})"
+            );
+            assert_eq!(
+                reconciled.load(std::sync::atomic::Ordering::Acquire),
+                after_commit,
+                "the connections resource must have been asked to reconcile at \
+                 the revision the commit recorded; under the defect its \
+                 activation revision stayed below the watermark and reconcile \
+                 was never called"
+            );
+            assert!(
+                connection_store
+                    .get(&created.id)
+                    .await
+                    .expect("record read")
+                    .is_some(),
+                "the committed connection is readable from the authority"
+            );
+        }
+
+        fn cluster_connection_candidate() -> connections::model::ConnectionWrite {
+            serde_json::from_value(json!({
+                "display_name": "Gate fixture",
+                "enabled": true,
+                "kind": "http_api",
+                "endpoint": {
+                    "base_url": "https://gate.example.test",
+                    "base_path": "/v1"
+                },
+                "authentication": { "type": "none" }
+            }))
+            .expect("gate connection candidate should deserialize")
+        }
+
+        /// A `ReconciledResource` with the real activation-revision read but
+        /// a recording install, so the test can assert that reconciliation
+        /// was actually reached rather than inferring it.
+        struct RecordingConnectionsResource {
+            store: Arc<connections::pg_store::PostgresConnectionStore>,
+            reconciled: Arc<std::sync::atomic::AtomicI64>,
+        }
+
+        #[async_trait::async_trait]
+        impl security_cluster::ReconciledResource for RecordingConnectionsResource {
+            fn name(&self) -> &'static str {
+                "connections"
+            }
+
+            async fn activation_revision(
+                &self,
+            ) -> Result<i64, middleware::rbac::SecurityRevisionCheckError> {
+                self.store
+                    .state_revision()
+                    .await
+                    .map_err(|_| middleware::rbac::SecurityRevisionCheckError::Unavailable)
+            }
+
+            async fn reconcile(
+                &self,
+                _compiled_revision: i64,
+            ) -> Result<(), middleware::rbac::SecurityRevisionCheckError> {
+                let revision = self
+                    .store
+                    .state_revision()
+                    .await
+                    .map_err(|_| middleware::rbac::SecurityRevisionCheckError::Unavailable)?;
+                self.reconciled
+                    .store(revision, std::sync::atomic::Ordering::Release);
+                Ok(())
+            }
+        }
+
+        #[tokio::test]
+        async fn tools_reconciliation_installs_and_fails_closed() {
+            let Some(admin_dsn) = locator() else {
+                eprintln!("skipping: no test database locator; CI runs this test");
+                return;
+            };
+            let database = create_test_database(&admin_dsn).await;
+            let (policy_store, tools_store, _pool) = migrated_stores(&database.dsn).await;
+
+            let active_policy = PolicyControlPlane::commit(
+                &*policy_store,
+                PolicyCommitRequest {
+                    precondition: PolicyCommitPrecondition::Initialize,
+                    candidate: &cluster_policy("gate-invalid"),
+                    actor_user_id: "seed",
+                    diff_summary: &DIFF,
+                },
+            )
+            .await
+            .expect("policy should initialize");
+            tools_store
+                .seed_empty_document()
+                .await
+                .expect("tools should seed");
+
+            let rbac_state = middleware::rbac::RbacState::new(
+                active_policy.policy.clone(),
+                Vec::new(),
+                false,
+                test_audit_log(),
+            );
+            rbac_state.install_revision_snapshot(
+                active_policy.policy.clone(),
+                active_policy.security_revision,
+            );
+            let registry =
+                ToolRegistry::from_definitions_with_audit(Vec::new(), Some(test_audit_log()));
+            let boot_tools = tools_store
+                .active_tools()
+                .await
+                .expect("active tools read")
+                .expect("seeded");
+            let tools_resource = ToolsResource::new(tools_store.clone(), registry.clone(), 0);
+            let runtime = ClusterSecurityRuntime::new(
+                policy_store.revision_source(),
+                PolicyResource::new(policy_store.clone(), rbac_state.clone()),
+            );
+            runtime.register_resource(tools_resource.clone());
+
+            // Commit a new tools document; the gate reconciles it in.
+            tools_store
+                .commit_tools(
+                    PolicyCommitPrecondition::Expected {
+                        etag: boot_tools.etag.clone(),
+                    },
+                    &tools_document_with("reconciled_tool"),
+                    "op",
+                    &DIFF,
+                )
+                .await
+                .expect("tools commit should win");
+            middleware::rbac::SecurityRevisionGate::ensure_current_revision(&*runtime)
+                .await
+                .expect("reconcile should succeed");
+            assert!(
+                registry
+                    .current_local_definitions()
+                    .iter()
+                    .any(|tool| tool.name == "reconciled_tool"),
+                "the reconciled lane must contain the committed tool"
+            );
+
+            // A document the registry cannot validate (an unknown field
+            // the tools schema rejects) fails closed: the gate refuses and
+            // the installed lane does not regress.
+            let active = tools_store
+                .active_tools()
+                .await
+                .expect("active read")
+                .expect("active");
+            let mut invalid = tools_document_with("never_installs");
+            invalid["not_a_tools_file_field"] = json!(true);
+            tools_store
+                .commit_tools(
+                    PolicyCommitPrecondition::Expected {
+                        etag: active.etag.clone(),
+                    },
+                    &invalid,
+                    "op",
+                    &DIFF,
+                )
+                .await
+                .expect("the authority accepts the commit; validation is replica-side");
+            let probe =
+                middleware::rbac::SecurityRevisionGate::ensure_current_revision(&*runtime).await;
+            assert!(
+                probe.is_err(),
+                "an invalid tools document must fail closed, not install"
+            );
+            assert!(
+                registry
+                    .current_local_definitions()
+                    .iter()
+                    .any(|tool| tool.name == "reconciled_tool"),
+                "the last valid lane remains installed; nothing regressed"
+            );
+        }
+
+        #[tokio::test]
+        async fn register_via_control_plane_commits_and_rejects_stale_etags() {
+            let Some(admin_dsn) = locator() else {
+                eprintln!("skipping: no test database locator; CI runs this test");
+                return;
+            };
+            let database = create_test_database(&admin_dsn).await;
+            let (policy_store, tools_store, _pool) = migrated_stores(&database.dsn).await;
+
+            PolicyControlPlane::commit(
+                &*policy_store,
+                PolicyCommitRequest {
+                    precondition: PolicyCommitPrecondition::Initialize,
+                    candidate: &cluster_policy("register-tools"),
+                    actor_user_id: "seed",
+                    diff_summary: &DIFF,
+                },
+            )
+            .await
+            .expect("policy should initialize");
+            tools_store
+                .seed_empty_document()
+                .await
+                .expect("tools should seed");
+
+            // The endpoint's cluster arm, exercised directly: a registry
+            // with the validator hook unset (no connections configured),
+            // a principal, and the merged candidate.
+            let registry =
+                ToolRegistry::from_definitions_with_audit(Vec::new(), Some(test_audit_log()));
+            let control_plane: Arc<dyn storage::ToolControlPlane> = tools_store.clone();
+            let principal = test_principal(&["admin"]);
+
+            let active = control_plane
+                .active_tools()
+                .await
+                .expect("active read")
+                .expect("seeded");
+            let mut headers_with_etag = HeaderMap::new();
+            headers_with_etag.insert(
+                header::IF_MATCH,
+                header::HeaderValue::from_str(&active.etag).expect("etag is a valid header value"),
+            );
+            let merged = merge_tools_candidate(
+                &headers_with_etag,
+                &active.etag,
+                ToolsFileAdminDocument {
+                    schema_version: "0.1.0".to_owned(),
+                    tools: Vec::new(),
+                },
+                crate::tools::definitions::definitions_from_json_value(
+                    tools_document_with("registered_tool"),
+                    None,
+                )
+                .expect("candidate should parse"),
+            )
+            .expect("merge should pass with a fresh If-Match");
+            let committed = register_tools_via_control_plane(
+                &control_plane,
+                None,
+                &registry,
+                &active.etag,
+                &principal,
+                merged,
+            )
+            .await
+            .expect("register should commit");
+            assert_eq!(committed.tool_count, 1);
+            assert!(
+                registry
+                    .current_local_definitions()
+                    .iter()
+                    .any(|tool| tool.name == "registered_tool"),
+                "the committed lane must be installed locally"
+            );
+
+            // The stale ETag now loses with 412.
+            let stale = merge_tools_candidate(
+                &headers_with_etag,
+                &active.etag,
+                ToolsFileAdminDocument {
+                    schema_version: "0.1.0".to_owned(),
+                    tools: Vec::new(),
+                },
+                crate::tools::definitions::definitions_from_json_value(
+                    tools_document_with("second_tool"),
+                    None,
+                )
+                .expect("candidate should parse"),
+            )
+            .expect("merge should pass with the stale If-Match");
+            let response = register_tools_via_control_plane(
+                &control_plane,
+                None,
+                &registry,
+                &active.etag,
+                &principal,
+                stale,
+            )
+            .await
+            .expect_err("the stale ETag must lose");
+            assert_eq!(response.status(), StatusCode::PRECONDITION_FAILED);
         }
     }
 }
