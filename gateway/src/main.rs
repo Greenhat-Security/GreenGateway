@@ -29928,12 +29928,28 @@ paths:
             }
         }
 
+        /// The segment that names this test process's run in every
+        /// database it creates, so the sweep can tell an earlier run's
+        /// leftovers from a sibling test's fresh database.
+        fn run_epoch() -> &'static str {
+            static RUN_EPOCH: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
+                let seconds = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|elapsed| elapsed.as_secs())
+                    .unwrap_or(0);
+                format!("{seconds:x}p{:x}", std::process::id())
+            });
+            RUN_EPOCH.as_str()
+        }
+
         /// Drop any databases leaked by earlier runs of these tests, so a
         /// long-lived development database server does not accumulate them.
-        /// Only databases with NO active connections are swept: under
-        /// parallel test execution a sibling test's in-flight database has
-        /// live connections, and dropping it out from under the sibling
-        /// (WITH FORCE) is exactly the flake this guard prevents.
+        /// Only databases from OTHER runs are swept, never this run's: a
+        /// sibling test that has just created its database and not yet
+        /// connected has no active connections either, and dropping it out
+        /// from under the sibling (WITH FORCE) was exactly the flake this
+        /// guard exists to prevent -- "database does not exist; it seems
+        /// to have just been dropped" at the sibling's first checkout.
         async fn sweep_stale_test_databases(admin_dsn: &str) {
             let Ok((client, connection)) =
                 tokio_postgres::connect(admin_dsn, tokio_postgres::NoTls).await
@@ -29946,12 +29962,13 @@ paths:
                     r#"
                     SELECT datname FROM pg_database
                     WHERE datname LIKE 'ggw_sse_test_%'
+                      AND datname NOT LIKE $1
                       AND NOT EXISTS (
                           SELECT 1 FROM pg_stat_activity
                           WHERE pg_stat_activity.datname = pg_database.datname
                       )
                     "#,
-                    &[],
+                    &[&format!("ggw_sse_test_{}_%", run_epoch())],
                 )
                 .await;
             if let Ok(rows) = rows {
@@ -29969,7 +29986,11 @@ paths:
         async fn create_test_database(admin_dsn: &str) -> TestDatabase {
             use std::str::FromStr as _;
             sweep_stale_test_databases(admin_dsn).await;
-            let name = format!("ggw_sse_test_{}", uuid::Uuid::new_v4().simple());
+            let name = format!(
+                "ggw_sse_test_{}_{}",
+                run_epoch(),
+                uuid::Uuid::new_v4().simple()
+            );
             let parsed =
                 tokio_postgres::Config::from_str(admin_dsn).expect("admin DSN should parse");
             let admin_pool = deadpool_postgres::Pool::builder(deadpool_postgres::Manager::new(
