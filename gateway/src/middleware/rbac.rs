@@ -103,6 +103,44 @@ pub trait SecurityRevisionGate: Send + Sync {
     /// revision it is keyed by. The snapshot in `RbacState` is only valid
     /// for serving once this has returned `Ok` for the request at hand.
     async fn ensure_current_revision(&self) -> Result<i64, SecurityRevisionCheckError>;
+
+    /// Prove the replica current and hand out the bundle of lanes
+    /// published at the admitted watermark. The default (gates that do
+    /// not publish bundles) admits on the revision alone, and the request
+    /// then reads the live lanes.
+    async fn admit(&self) -> Result<Admission, SecurityRevisionCheckError> {
+        Ok(Admission {
+            revision: self.ensure_current_revision().await?,
+            bundle: None,
+        })
+    }
+}
+
+/// What the gate admitted a request under: the revision, and the
+/// consistent bundle of lanes published at it (None when the gate has no
+/// bundle sources, as in tests).
+#[cfg(feature = "postgres")]
+pub struct Admission {
+    pub revision: i64,
+    pub bundle: Option<Arc<crate::security_cluster::SecurityBundle>>,
+}
+
+#[cfg(feature = "postgres")]
+tokio::task_local! {
+    /// The policy snapshot pinned for the request being served, set when
+    /// the gate admits it. Every policy read inside the request -- the
+    /// middleware's own, and the tool runtime's authorization -- goes
+    /// through it, so one admitted request is judged by one policy.
+    static PINNED_POLICY: Arc<RbacPolicyState>;
+}
+
+/// Run `future` with `policy` pinned as the request's policy snapshot.
+#[cfg(feature = "postgres")]
+pub(crate) async fn with_pinned_policy<F: std::future::Future>(
+    policy: Arc<RbacPolicyState>,
+    future: F,
+) -> F::Output {
+    PINNED_POLICY.scope(policy, future).await
 }
 
 #[derive(Clone)]
@@ -240,7 +278,7 @@ pub(crate) fn validate_policy_proxy_dispatch_config(
     ProxyDispatchInventory::from_config(config).validate(policy)
 }
 
-struct RbacPolicyState {
+pub(crate) struct RbacPolicyState {
     engine: PolicyEngine,
     rule_matcher: RuleMatcher,
     rule_ids: Vec<String>,
@@ -388,6 +426,23 @@ impl RbacState {
         self
     }
 
+    /// The policy snapshot this request is judged by: the one the gate
+    /// pinned at admission (cluster mode), else the live lane.
+    fn effective_policy(&self) -> Arc<RbacPolicyState> {
+        #[cfg(feature = "postgres")]
+        if let Ok(pinned) = PINNED_POLICY.try_with(Arc::clone) {
+            return pinned;
+        }
+        self.policy.load_full()
+    }
+
+    /// The live policy lane, for the security runtime to capture bundles
+    /// from.
+    #[cfg(feature = "postgres")]
+    pub(crate) fn policy_handle(&self) -> Arc<ArcSwap<RbacPolicyState>> {
+        Arc::clone(&self.policy)
+    }
+
     fn replace_policy(&self, policy: Policy) {
         if let Some(rate_limit) = &self.rate_limit {
             rate_limit.replace_policy(&policy);
@@ -437,7 +492,7 @@ impl RbacState {
     /// `0` in standalone mode, where snapshots are not revisioned.
     #[cfg(feature = "postgres")]
     pub(crate) fn snapshot_security_revision(&self) -> i64 {
-        self.policy.load().security_revision
+        self.effective_policy().security_revision
     }
 
     pub fn current_policy(&self) -> Policy {
@@ -474,7 +529,7 @@ impl RbacState {
         principal: &auth::Principal,
         requested_roles: &[String],
     ) -> Vec<String> {
-        let policy = self.policy.load();
+        let policy = self.effective_policy();
         if policy.engine.principal_has_wildcard(principal) {
             return Vec::new();
         }
@@ -506,7 +561,7 @@ impl RbacState {
         principal: Option<&auth::Principal>,
         evaluate: impl FnOnce(ToolAuthorizationSnapshot<'_>) -> R,
     ) -> R {
-        let policy = self.policy.load();
+        let policy = self.effective_policy();
         let tool = policy.tool_policy(tool_name);
         let rule_decision = policy.evaluate_tool_rule(tool_name, principal);
 
@@ -538,7 +593,7 @@ impl RbacState {
         tool_name: &str,
         principal: &auth::Principal,
     ) -> ToolPolicyEligibility {
-        let policy = self.policy.load();
+        let policy = self.effective_policy();
         let Some(tool) = policy.tool_policy(tool_name) else {
             return ToolPolicyEligibility {
                 eligible: false,
@@ -900,19 +955,39 @@ fn spawn_sighup_reload_task(
 #[cfg(feature = "postgres")]
 async fn run_pinned(
     pinned: Option<Arc<crate::connections::control_plane::ConnectionRuntimeSnapshot>>,
+    bundle: Option<Arc<crate::security_cluster::SecurityBundle>>,
     next: Next,
     req: Request,
 ) -> Response {
-    match pinned {
-        Some(snapshot) => {
-            crate::connections::http::with_pinned_connections(snapshot, next.run(req)).await
+    let run = async move {
+        match pinned {
+            Some(snapshot) => {
+                crate::connections::http::with_pinned_connections(snapshot, next.run(req)).await
+            }
+            None => next.run(req).await,
         }
-        None => next.run(req).await,
+    };
+    match bundle {
+        Some(bundle) => {
+            let policy = Arc::clone(&bundle.policy);
+            let tools = Arc::clone(&bundle.tools);
+            with_pinned_policy(
+                policy,
+                crate::tools::definitions::with_pinned_tools(tools, run),
+            )
+            .await
+        }
+        None => run.await,
     }
 }
 
 #[cfg(not(feature = "postgres"))]
-async fn run_pinned(_pinned: Option<Arc<()>>, next: Next, req: Request) -> Response {
+async fn run_pinned(
+    _pinned: Option<Arc<()>>,
+    _bundle: Option<Arc<()>>,
+    next: Next,
+    req: Request,
+) -> Response {
     next.run(req).await
 }
 
@@ -920,6 +995,11 @@ pub async fn rbac_middleware(State(state): State<RbacState>, req: Request, next:
     // Pinned for the whole request once the gate admits it (cluster mode):
     // the proxy and the tool executor resolve every Connection target from
     // this snapshot, never from one a later reconcile installed mid-flight.
+    #[cfg(feature = "postgres")]
+    #[cfg(feature = "postgres")]
+    let mut admitted_bundle: Option<Arc<crate::security_cluster::SecurityBundle>> = None;
+    #[cfg(not(feature = "postgres"))]
+    let admitted_bundle: Option<Arc<()>> = None;
     #[cfg(feature = "postgres")]
     let mut pinned_connections: Option<
         Arc<crate::connections::control_plane::ConnectionRuntimeSnapshot>,
@@ -999,8 +1079,11 @@ pub async fn rbac_middleware(State(state): State<RbacState>, req: Request, next:
     let mut served_security_revision: Option<i64> = None;
     #[cfg(feature = "postgres")]
     if let Some(gate) = state.revision_gate.as_ref() {
-        match gate.ensure_current_revision().await {
-            Ok(revision) => served_security_revision = Some(revision),
+        match gate.admit().await {
+            Ok(admission) => {
+                served_security_revision = Some(admission.revision);
+                admitted_bundle = admission.bundle;
+            }
             Err(error) => {
                 emit_revision_check_failed(&state, &context, principal.as_ref(), error);
                 return with_policy_decision(
@@ -1019,11 +1102,28 @@ pub async fn rbac_middleware(State(state): State<RbacState>, req: Request, next:
 
     #[cfg(feature = "postgres")]
     if served_security_revision.is_some() {
-        pinned_connections = state
-            .connections
+        // The bundle's Connection snapshot when the gate published one:
+        // the same cut the policy below comes from. A gate without
+        // bundle sources pins the live snapshot, as before.
+        pinned_connections = admitted_bundle
             .as_ref()
-            .map(|control_plane| control_plane.runtime_snapshot());
+            .map(|bundle| Arc::clone(&bundle.connections))
+            .or_else(|| {
+                state
+                    .connections
+                    .as_ref()
+                    .map(|control_plane| control_plane.runtime_snapshot())
+            });
     }
+    // The policy this request is judged by: the bundle's, published with
+    // the watermark the gate admitted at -- never a lane a concurrent
+    // reconcile may have swapped since.
+    #[cfg(feature = "postgres")]
+    let policy: Arc<RbacPolicyState> = match admitted_bundle.as_ref() {
+        Some(bundle) => Arc::clone(&bundle.policy),
+        None => state.policy.load_full(),
+    };
+    #[cfg(not(feature = "postgres"))]
     let policy = state.policy.load();
     // Record the revision this request actually serves under: the compiled
     // watermark the gate proved current for this request, covering every
@@ -1080,7 +1180,13 @@ pub async fn rbac_middleware(State(state): State<RbacState>, req: Request, next:
                     matched_rule_id,
                 );
                 drop(policy);
-                let response = run_pinned(pinned_connections.clone(), next, req).await;
+                let response = run_pinned(
+                    pinned_connections.clone(),
+                    admitted_bundle.clone(),
+                    next,
+                    req,
+                )
+                .await;
                 with_policy_decision(response, decision)
             }
             RuleAction::Deny => {
@@ -1102,7 +1208,13 @@ pub async fn rbac_middleware(State(state): State<RbacState>, req: Request, next:
                     matched_rule_id,
                 );
                 drop(policy);
-                let response = run_pinned(pinned_connections.clone(), next, req).await;
+                let response = run_pinned(
+                    pinned_connections.clone(),
+                    admitted_bundle.clone(),
+                    next,
+                    req,
+                )
+                .await;
                 with_policy_decision(response, decision)
             }
         };
@@ -1126,7 +1238,13 @@ pub async fn rbac_middleware(State(state): State<RbacState>, req: Request, next:
             emit_allowed(&state, &context, principal.as_ref(), Some(rule), None);
             let decision = decision_for_rule(PolicyDecisionOutcome::Allowed, "matched_rule", rule);
             drop(policy);
-            let response = run_pinned(pinned_connections.clone(), next, req).await;
+            let response = run_pinned(
+                pinned_connections.clone(),
+                admitted_bundle.clone(),
+                next,
+                req,
+            )
+            .await;
             return with_policy_decision(response, decision);
         }
 
@@ -1147,7 +1265,13 @@ pub async fn rbac_middleware(State(state): State<RbacState>, req: Request, next:
                 emit_would_deny(&state, &context, principal.as_ref(), reason, Some(rule));
                 let decision = decision_for_rule(PolicyDecisionOutcome::WouldDeny, reason, rule);
                 drop(policy);
-                let response = run_pinned(pinned_connections.clone(), next, req).await;
+                let response = run_pinned(
+                    pinned_connections.clone(),
+                    admitted_bundle.clone(),
+                    next,
+                    req,
+                )
+                .await;
                 with_policy_decision(response, decision)
             }
         };
@@ -1194,7 +1318,13 @@ pub async fn rbac_middleware(State(state): State<RbacState>, req: Request, next:
                 None,
                 Some("default_allow"),
             );
-            let response = run_pinned(pinned_connections.clone(), next, req).await;
+            let response = run_pinned(
+                pinned_connections.clone(),
+                admitted_bundle.clone(),
+                next,
+                req,
+            )
+            .await;
             with_policy_decision(response, decision)
         }
         DefaultAction::Deny => match enforcement_mode {
@@ -1213,7 +1343,13 @@ pub async fn rbac_middleware(State(state): State<RbacState>, req: Request, next:
             }
             EnforcementMode::Shadow => {
                 emit_would_deny(&state, &context, principal.as_ref(), "default_deny", None);
-                let response = run_pinned(pinned_connections.clone(), next, req).await;
+                let response = run_pinned(
+                    pinned_connections.clone(),
+                    admitted_bundle.clone(),
+                    next,
+                    req,
+                )
+                .await;
                 with_policy_decision(
                     response,
                     PolicyDecision {
@@ -3689,6 +3825,90 @@ mod tests {
             state.with_revision_gate(Arc::new(MockRevisionGate(gate))),
             Arc::new(capture),
         )
+    }
+
+    /// A gate that publishes bundles: admits at the bundle's revision and
+    /// hands the bundle out, exactly as the cluster runtime does.
+    #[cfg(feature = "postgres")]
+    struct BundleGate(Arc<crate::security_cluster::SecurityBundle>);
+
+    #[cfg(feature = "postgres")]
+    #[async_trait]
+    impl SecurityRevisionGate for BundleGate {
+        async fn ensure_current_revision(&self) -> Result<i64, SecurityRevisionCheckError> {
+            Ok(self.0.revision)
+        }
+
+        async fn admit(&self) -> Result<Admission, SecurityRevisionCheckError> {
+            Ok(Admission {
+                revision: self.0.revision,
+                bundle: Some(Arc::clone(&self.0)),
+            })
+        }
+    }
+
+    #[cfg(feature = "postgres")]
+    fn bundle_with_policy(
+        policy: Policy,
+        revision: i64,
+    ) -> Arc<crate::security_cluster::SecurityBundle> {
+        let registry = crate::tools::definitions::ToolRegistry::from_config(
+            &crate::config::Config::test_defaults(),
+        )
+        .expect("an empty registry");
+        Arc::new(crate::security_cluster::SecurityBundle {
+            revision,
+            policy: Arc::new(RbacPolicyState::from_policy(policy)),
+            tools: registry.state_handle().load_full(),
+            connections: Arc::new(
+                crate::connections::control_plane::ConnectionRuntimeSnapshot::empty_for_test(),
+            ),
+        })
+    }
+
+    /// An admitted request is judged by the policy in the bundle the gate
+    /// published at its watermark, never by the live lane -- which a
+    /// concurrent reconcile may have swapped since admission.
+    #[cfg(feature = "postgres")]
+    #[tokio::test]
+    async fn an_admitted_request_is_judged_by_the_bundles_policy_not_the_live_lane() {
+        let allowing = test_policy(
+            DefaultAction::Deny,
+            &[("reader", &["data:read"])],
+            &[route(&[], "/data", "data:read")],
+        );
+        let denying = test_policy(DefaultAction::Deny, &[("reader", &["data:read"])], &[]);
+
+        // The live lane denies (swapped after admission); the bundle allows.
+        let (state, _capture) = test_state(denying.clone(), &[]);
+        state.install_revision_snapshot(denying.clone(), 7);
+        let state = state.with_revision_gate(Arc::new(BundleGate(bundle_with_policy(
+            allowing.clone(),
+            7,
+        ))));
+        let response = test_router(state, Some(test_principal(&["reader"])))
+            .oneshot(request(Method::GET, "/data/items"))
+            .await
+            .expect("request should complete");
+        assert_eq!(
+            response.status(),
+            StatusCode::OK,
+            "the bundle's policy authorizes the admitted request"
+        );
+
+        // The inverse: the live lane allows, the bundle denies.
+        let (state, _capture) = test_state(allowing.clone(), &[]);
+        state.install_revision_snapshot(allowing, 7);
+        let state = state.with_revision_gate(Arc::new(BundleGate(bundle_with_policy(denying, 7))));
+        let response = test_router(state, Some(test_principal(&["reader"])))
+            .oneshot(request(Method::GET, "/data/items"))
+            .await
+            .expect("request should complete");
+        assert_eq!(
+            response.status(),
+            StatusCode::FORBIDDEN,
+            "the bundle's policy denies even though the live lane would allow"
+        );
     }
 
     #[cfg(feature = "postgres")]

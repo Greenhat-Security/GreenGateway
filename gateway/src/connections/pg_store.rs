@@ -1649,6 +1649,51 @@ impl PostgresConnectionStore {
         Ok(statuses)
     }
 
+    /// The authority's status revision for each of `ids`: a status write on
+    /// another replica advances no security revision, so this replica's
+    /// runtime record keeps the revision it last reconciled; the views read
+    /// this instead, so `revisions.status` agrees with the status row they
+    /// show (issue #241, PR 8 review round 6).
+    pub async fn status_revisions(
+        &self,
+        ids: &[ConnectionId],
+    ) -> Result<BTreeMap<ConnectionId, u64>, ConnectionStoreError> {
+        let mut revisions = BTreeMap::new();
+        if ids.is_empty() {
+            return Ok(revisions);
+        }
+        let client = self
+            .pool
+            .get()
+            .await
+            .map_err(|_| pg_unavailable(OPERATION_STATUS_READ))?;
+        let id_texts = ids.iter().map(ConnectionId::as_str).collect::<Vec<_>>();
+        let rows = client
+            .query(
+                "SELECT id::text, status_revision FROM greengateway.connection_records WHERE id = ANY($1::text[]::uuid[])",
+                &[&id_texts],
+            )
+            .await
+            .map_err(|error| pg_error(OPERATION_STATUS_READ, error))?;
+        for row in &rows {
+            let id_text: String = column(row, 0, "<status>", "status owner id does not decode")?;
+            let id = ConnectionId::parse(id_text.clone()).map_err(|_| {
+                ConnectionStoreError::CorruptRecord {
+                    id: id_text.clone(),
+                    reason: "invalid status owner ID",
+                }
+            })?;
+            let revision: i64 = column(row, 1, &id_text, "status revision does not decode")?;
+            let revision =
+                u64::try_from(revision).map_err(|_| ConnectionStoreError::CorruptRecord {
+                    id: id_text,
+                    reason: "negative status revision",
+                })?;
+            revisions.insert(id, revision);
+        }
+        Ok(revisions)
+    }
+
     pub async fn status_history(
         &self,
         id: &ConnectionId,
@@ -1781,6 +1826,7 @@ impl PostgresConnectionStore {
         &self,
         kind: ConnectionDependencyKind,
         desired: &[(ConnectionId, String)],
+        source_revision: i64,
     ) -> Result<(), ConnectionStoreError> {
         if desired.len() > MAX_CONNECTION_DEPENDENCIES {
             return Err(ConnectionStoreError::LimitExceeded {
@@ -1807,6 +1853,28 @@ impl PostgresConnectionStore {
             .map_err(|_| pg_unavailable(OPERATION_DEPS))?;
         begin_mutation(&client, OPERATION_DEPS).await?;
         let outcome: Result<(), ConnectionStoreError> = async {
+            // Replicas flush their derived sets independently. A set derived
+            // from an older tools document than the one whose guards are
+            // already here is stale, and replacing them would let an admin
+            // delete remove a Connection the authoritative document still
+            // references. Ties replace (a re-flush of the same document).
+            let newest_row = client
+                .query_one(
+                    "SELECT COALESCE(MAX(source_revision), 0) FROM greengateway.connection_dependencies WHERE consumer_kind = $1",
+                    &[&kind.as_str()],
+                )
+                .await
+                .map_err(|error| pg_error(OPERATION_DEPS, error))?;
+            let newest: i64 = scalar(&newest_row, 0, OPERATION_DEPS)?;
+            if newest > source_revision {
+                tracing::debug!(
+                    consumer_kind = kind.as_str(),
+                    newest,
+                    source_revision,
+                    "connection dependency flush is stale; keeping the newer document's guards"
+                );
+                return Ok(());
+            }
             client
                 .execute(
                     "DELETE FROM greengateway.connection_dependencies WHERE consumer_kind = $1",
@@ -1848,10 +1916,16 @@ impl PostgresConnectionStore {
                     .execute(
                         r#"
                         INSERT INTO greengateway.connection_dependencies (
-                            connection_id, consumer_kind, consumer_id, created_at
-                        ) VALUES ($1::text::uuid, $2, $3, $4)
+                            connection_id, consumer_kind, consumer_id, created_at, source_revision
+                        ) VALUES ($1::text::uuid, $2, $3, $4, $5)
                         "#,
-                        &[&connection_id.as_str(), &kind.as_str(), &consumer_id, &now],
+                        &[
+                            &connection_id.as_str(),
+                            &kind.as_str(),
+                            &consumer_id,
+                            &now,
+                            &source_revision,
+                        ],
                     )
                     .await
                     .map_err(|error| pg_error(OPERATION_DEPS, error))?;
@@ -5658,6 +5732,7 @@ mod tests {
             .replace_dependencies_for_kind(
                 ConnectionDependencyKind::ManualTool,
                 &[(created.id.clone(), "manual.echo".to_owned())],
+                0,
             )
             .await
             .expect("manual-tool dependencies should replace");
@@ -5674,6 +5749,7 @@ mod tests {
                     ConnectionId::parse("11111111-1111-1111-1111-111111111111").expect("id"),
                     "ghost".to_owned(),
                 )],
+                0,
             )
             .await
             .expect_err("an unknown owner must be refused");
@@ -5681,6 +5757,191 @@ mod tests {
             matches!(missing, ConnectionStoreError::NotFound { .. }),
             "{missing}"
         );
+    }
+
+    /// Replicas flush derived dependency sets independently: a set from an
+    /// older tools document never replaces the guards a newer document
+    /// derived; a re-flush of the same document and a newer document do,
+    /// and unfenced kinds (revision 0) keep replacing as before.
+    #[tokio::test]
+    async fn a_stale_dependency_flush_never_replaces_a_newer_documents_guards() {
+        let Some(admin_dsn) = locator() else {
+            eprintln!("skipping: no test database locator; CI runs this test");
+            return;
+        };
+        let database = create_test_database(&admin_dsn).await;
+        let (store, _pool) = migrated_store(&database.dsn, 64).await;
+        let created = store
+            .create(http_candidate("Billing API"), "op-1", None)
+            .await
+            .expect("connection should create");
+        let manual_tools = |deps: Vec<ConnectionDependency>| {
+            let mut names = deps
+                .into_iter()
+                .filter(|dep| dep.kind == ConnectionDependencyKind::ManualTool)
+                .map(|dep| dep.consumer_id)
+                .collect::<Vec<_>>();
+            names.sort();
+            names
+        };
+        let dep = |name: &str| (created.id.clone(), name.to_owned());
+        store
+            .replace_dependencies_for_kind(
+                ConnectionDependencyKind::ManualTool,
+                &[dep("tool-at-11")],
+                11,
+            )
+            .await
+            .expect("flush at 11");
+        assert_eq!(
+            manual_tools(store.dependencies(&created.id).await.expect("deps")),
+            vec!["tool-at-11".to_owned()]
+        );
+        store
+            .replace_dependencies_for_kind(ConnectionDependencyKind::ManualTool, &[], 10)
+            .await
+            .expect("a stale flush is accepted and ignored");
+        assert_eq!(
+            manual_tools(store.dependencies(&created.id).await.expect("deps")),
+            vec!["tool-at-11".to_owned()],
+            "the older document's empty set did not erase the guard"
+        );
+        store
+            .replace_dependencies_for_kind(
+                ConnectionDependencyKind::ManualTool,
+                &[dep("tool-at-11"), dep("tool-at-11-b")],
+                11,
+            )
+            .await
+            .expect("a re-flush of the same document replaces");
+        assert_eq!(
+            manual_tools(store.dependencies(&created.id).await.expect("deps")),
+            vec!["tool-at-11".to_owned(), "tool-at-11-b".to_owned()]
+        );
+        store
+            .replace_dependencies_for_kind(
+                ConnectionDependencyKind::ManualTool,
+                &[dep("tool-at-12")],
+                12,
+            )
+            .await
+            .expect("flush at 12");
+        assert_eq!(
+            manual_tools(store.dependencies(&created.id).await.expect("deps")),
+            vec!["tool-at-12".to_owned()]
+        );
+        store
+            .replace_dependencies_for_kind(
+                ConnectionDependencyKind::ProxyRoute,
+                &[dep("route-a")],
+                0,
+            )
+            .await
+            .expect("unfenced flush");
+        store
+            .replace_dependencies_for_kind(ConnectionDependencyKind::ProxyRoute, &[], 0)
+            .await
+            .expect("unfenced flush replaces");
+        let routes = store
+            .dependencies(&created.id)
+            .await
+            .expect("deps")
+            .into_iter()
+            .filter(|dep| dep.kind == ConnectionDependencyKind::ProxyRoute)
+            .count();
+        assert_eq!(
+            routes, 0,
+            "revision 0 sets replace unconditionally, as before"
+        );
+    }
+
+    /// The durable bound on an operation ID counts characters, as the
+    /// validator and the SQLite backend do: 100 non-ASCII characters (400
+    /// bytes) publish in cluster mode too.
+    #[tokio::test]
+    async fn operation_ids_are_bounded_by_characters_not_bytes() {
+        let Some(admin_dsn) = locator() else {
+            eprintln!("skipping: no test database locator; CI runs this test");
+            return;
+        };
+        let database = create_test_database(&admin_dsn).await;
+        let (store, _pool) = migrated_store(&database.dsn, 64).await;
+        let api = store
+            .create(http_candidate("Billing API"), "op-1", None)
+            .await
+            .expect("connection should create");
+        let mut entry = openapi_entry("billing.list");
+        entry.operation_id = Some("\u{1F600}".repeat(100));
+        store
+            .replace_openapi_catalog(
+                &api.id,
+                &api.etag(),
+                0,
+                0,
+                RESERVATION_SPEC,
+                &reservation_spec_digest(),
+                &[entry],
+                "op-2",
+            )
+            .await
+            .expect("a 100-character non-ASCII operation id publishes");
+    }
+
+    /// A status write moves the authority's status revision and no security
+    /// revision, so another replica's runtime record keeps its old one; the
+    /// views read the revision from the authority instead.
+    #[tokio::test]
+    async fn status_revisions_are_read_from_the_authority() {
+        let Some(admin_dsn) = locator() else {
+            eprintln!("skipping: no test database locator; CI runs this test");
+            return;
+        };
+        let database = create_test_database(&admin_dsn).await;
+        let (store, _pool) = migrated_store(&database.dsn, 64).await;
+        let created = store
+            .create(http_candidate("Billing API"), "op-1", None)
+            .await
+            .expect("connection should create");
+        let before = store
+            .status_revisions(std::slice::from_ref(&created.id))
+            .await
+            .expect("revisions");
+        assert_eq!(
+            before.get(&created.id).copied(),
+            Some(created.revisions.status)
+        );
+        let etag = store
+            .get(&created.id)
+            .await
+            .expect("get")
+            .expect("exists")
+            .etag();
+        store
+            .append_status(
+                &created.id,
+                &etag,
+                ConnectionStatusUpdate {
+                    state: ConnectionOperationalState::Healthy,
+                    reason: ConnectionStatusReason::TestSucceeded,
+                    latency_ms: Some(42),
+                    catalog_age_secs: None,
+                    catalog_entry_count: Some(1),
+                },
+            )
+            .await
+            .expect("status should append");
+        let after = store
+            .status_revisions(std::slice::from_ref(&created.id))
+            .await
+            .expect("revisions");
+        assert_eq!(
+            after.get(&created.id).copied(),
+            Some(created.revisions.status + 1),
+            "the authority's status revision moved with the write"
+        );
+        let unknown = ConnectionId::parse("11111111-1111-1111-1111-111111111111").expect("id");
+        assert!(!after.contains_key(&unknown));
+        assert!(store.status_revisions(&[]).await.expect("empty").is_empty());
     }
 
     /// The global status-history bound covers every persisted status row,

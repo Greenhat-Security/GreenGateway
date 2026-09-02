@@ -366,6 +366,22 @@ impl ManagedConnectionStore {
         }
     }
 
+    /// The authority's status revision per Connection (cluster mode); empty
+    /// in standalone mode, where the runtime record is the authority.
+    pub async fn status_revisions(
+        &self,
+        ids: &[ConnectionId],
+    ) -> Result<BTreeMap<ConnectionId, u64>, ConnectionStoreError> {
+        match self {
+            Self::Sqlite(_) => {
+                let _ = ids;
+                Ok(BTreeMap::new())
+            }
+            #[cfg(feature = "postgres")]
+            Self::Postgres { store, .. } => store.status_revisions(ids).await,
+        }
+    }
+
     pub async fn status_history(
         &self,
         id: &ConnectionId,
@@ -450,9 +466,13 @@ impl ManagedConnectionStore {
         &self,
         kind: ConnectionDependencyKind,
         desired: &[(ConnectionId, String)],
+        source_revision: i64,
     ) -> Result<(), ConnectionStoreError> {
         match self {
             Self::Sqlite(store) => {
+                // Standalone mode has one process deriving the set: nothing
+                // can flush a stale one, so the fence is not needed there.
+                let _ = source_revision;
                 let store = store.clone();
                 let desired = desired.to_vec();
                 blocking("connection dependency replace", move || {
@@ -462,7 +482,9 @@ impl ManagedConnectionStore {
             }
             #[cfg(feature = "postgres")]
             Self::Postgres { store, .. } => {
-                store.replace_dependencies_for_kind(kind, desired).await
+                store
+                    .replace_dependencies_for_kind(kind, desired, source_revision)
+                    .await
             }
         }
     }

@@ -35,6 +35,9 @@ use std::{
     time::{Duration, Instant},
 };
 
+use arc_swap::{ArcSwap, ArcSwapOption};
+
+use crate::connections::control_plane::ConnectionRuntimeSnapshot;
 use async_trait::async_trait;
 use tokio::sync::Mutex;
 
@@ -105,6 +108,27 @@ pub(crate) trait ReconciledResource: Send + Sync {
     async fn reconcile(&self, observed_activation: i64) -> Result<(), SecurityRevisionCheckError>;
 }
 
+/// One consistent cut of the shared-security lanes, captured when the
+/// watermark is published: the policy, tools, and Connection snapshots
+/// that were all confirmed current at `revision`, together. A request
+/// admitted at `revision` is served from this bundle and nothing else,
+/// so it can never authorize with one lane's newer content while
+/// executing another lane's older content -- a combination the
+/// authority never held.
+pub(crate) struct SecurityBundle {
+    pub(crate) revision: i64,
+    pub(crate) policy: Arc<crate::middleware::rbac::RbacPolicyState>,
+    pub(crate) tools: Arc<crate::tools::definitions::ToolRegistryState>,
+    pub(crate) connections: Arc<ConnectionRuntimeSnapshot>,
+}
+
+/// The live lanes a bundle is captured from.
+struct BundleSources {
+    policy: Arc<ArcSwap<crate::middleware::rbac::RbacPolicyState>>,
+    tools: Arc<ArcSwap<crate::tools::definitions::ToolRegistryState>>,
+    connections: Arc<ArcSwap<ConnectionRuntimeSnapshot>>,
+}
+
 pub(crate) struct ClusterSecurityRuntime {
     revisions: SecurityRevisionSource,
     /// The reconciled resources. Registered at startup as the builder
@@ -119,6 +143,15 @@ pub(crate) struct ClusterSecurityRuntime {
     /// Serializes reconciles so a burst of requests behind the revision
     /// frontier produces one fetch-and-compile, not one per waiter.
     reconcile_lock: Mutex<()>,
+    /// The policy lane, from the resource the runtime is built with.
+    policy_lane: Arc<ArcSwap<crate::middleware::rbac::RbacPolicyState>>,
+    /// The lanes bundles are captured from; set once at wiring, after
+    /// every resource is registered and before the first pass.
+    sources: std::sync::Mutex<Option<BundleSources>>,
+    /// The bundle published with the current watermark. Swapped as one
+    /// value, after every lane was confirmed at the watermark, so a reader
+    /// never sees lanes from two passes.
+    published: ArcSwapOption<SecurityBundle>,
     /// Test seam: runs once, after a pass reconciled its resources and
     /// before the watermark is published -- where a commit can land after
     /// a resource's activation read but before its content fetch.
@@ -132,13 +165,88 @@ type BeforePublishHook =
 
 impl ClusterSecurityRuntime {
     pub(crate) fn new(revisions: SecurityRevisionSource, policy: Arc<PolicyResource>) -> Arc<Self> {
+        let policy_lane = policy.rbac_state.policy_handle();
         Arc::new(Self {
             revisions,
+            policy_lane,
             resources: RwLock::new(vec![policy as Arc<dyn ReconciledResource>]),
             compiled_revision: AtomicI64::new(0),
             reconcile_lock: Mutex::new(()),
+            sources: std::sync::Mutex::new(None),
+            published: ArcSwapOption::from(None),
             #[cfg(test)]
             before_publish: std::sync::Mutex::new(None),
+        })
+    }
+
+    /// Wire the lanes bundles are captured from. Called once, after every
+    /// resource is registered and before the poller starts.
+    pub(crate) fn set_bundle_sources(
+        &self,
+        tools: Arc<ArcSwap<crate::tools::definitions::ToolRegistryState>>,
+        connections: Arc<ArcSwap<ConnectionRuntimeSnapshot>>,
+    ) {
+        *self
+            .sources
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(BundleSources {
+            policy: Arc::clone(&self.policy_lane),
+            tools,
+            connections,
+        });
+    }
+
+    /// Capture the lanes as one bundle at `revision` and publish it with
+    /// the watermark. Called only with the reconcile lock held and every
+    /// lane confirmed at or below `revision`, so the capture is a
+    /// consistent cut. The bundle is stored before the watermark: a reader
+    /// that sees the new watermark then finds a bundle at least that new.
+    fn publish(&self, revision: i64) {
+        let bundle = {
+            let sources = self
+                .sources
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            sources.as_ref().map(|sources| {
+                Arc::new(SecurityBundle {
+                    revision,
+                    policy: sources.policy.load_full(),
+                    tools: sources.tools.load_full(),
+                    connections: sources.connections.load_full(),
+                })
+            })
+        };
+        if let Some(bundle) = bundle {
+            self.published.store(Some(bundle));
+        }
+        self.compiled_revision.store(revision, Ordering::Release);
+    }
+
+    /// The admission a fast-path check can hand out at `compiled` for an
+    /// authority at `current`: the published bundle when it is at least
+    /// as new as the authority (no sources wired means no bundle, and the
+    /// revision alone), or None when the bundle lags the watermark and
+    /// the caller must republish under the lock.
+    fn admission_at(
+        &self,
+        compiled: i64,
+        current: i64,
+    ) -> Option<crate::middleware::rbac::Admission> {
+        let wired = self
+            .sources
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .is_some();
+        if !wired {
+            return Some(crate::middleware::rbac::Admission {
+                revision: compiled,
+                bundle: None,
+            });
+        }
+        let bundle = self.published.load_full()?;
+        (bundle.revision >= current).then(|| crate::middleware::rbac::Admission {
+            revision: bundle.revision,
+            bundle: Some(bundle),
         })
     }
 
@@ -386,6 +494,11 @@ impl ReconciledResource for PolicyResource {
 pub(crate) struct ToolsResource {
     store: Arc<PostgresToolStore>,
     registry: crate::tools::definitions::ToolRegistry,
+    /// Cluster mode's Connection control plane, told the revision of every
+    /// document this lane installs so the manual-tool dependency set the
+    /// install derives carries it (a stale replica's flush is then refused
+    /// by the store). None in tests that install without Connections.
+    control_plane: Option<ConnectionControlPlane>,
     /// The tools-document revision currently installed in the registry's
     /// local lane. Installs are monotonic: a reconcile for a revision at
     /// or below this is a no-op, so a slow reconcile can never overwrite a
@@ -400,14 +513,27 @@ pub(crate) struct ToolsResource {
 }
 
 impl ToolsResource {
+    /// A resource with no Connection control plane: tests that exercise
+    /// the tools lane alone.
+    #[cfg(test)]
     pub(crate) fn new(
         store: Arc<PostgresToolStore>,
         registry: crate::tools::definitions::ToolRegistry,
         boot_revision: i64,
     ) -> Arc<Self> {
+        Self::new_with_connection_control_plane(store, registry, None, boot_revision)
+    }
+
+    pub(crate) fn new_with_connection_control_plane(
+        store: Arc<PostgresToolStore>,
+        registry: crate::tools::definitions::ToolRegistry,
+        control_plane: Option<ConnectionControlPlane>,
+        boot_revision: i64,
+    ) -> Arc<Self> {
         Arc::new(Self {
             store,
             registry,
+            control_plane,
             installed_revision: AtomicI64::new(boot_revision),
             install_lock: Mutex::new(()),
         })
@@ -437,6 +563,9 @@ impl ToolsResource {
         // provably stale (the authority reserved it for this document), so
         // the install evicts it rather than depending on the order lanes
         // reconcile in.
+        if let Some(control_plane) = &self.control_plane {
+            control_plane.note_manual_tool_revision(security_revision);
+        }
         self.registry.install_local_definitions_with(
             definitions,
             crate::tools::definitions::LaneConflicts::EvictStale,
@@ -671,6 +800,17 @@ impl ClusterSecurityRuntime {
         &self,
         budget: Duration,
     ) -> Result<i64, SecurityRevisionCheckError> {
+        self.admit_within(budget)
+            .await
+            .map(|admission| admission.revision)
+    }
+
+    /// The gate's body: prove the replica current and hand out the bundle
+    /// published at the watermark the request is admitted under.
+    pub(crate) async fn admit_within(
+        &self,
+        budget: Duration,
+    ) -> Result<crate::middleware::rbac::Admission, SecurityRevisionCheckError> {
         let deadline = Instant::now() + budget;
         loop {
             // The one authoritative read the strict rule requires. A
@@ -678,7 +818,12 @@ impl ClusterSecurityRuntime {
             let current = self.current_revision(deadline).await?;
             let compiled = self.compiled_revision.load(Ordering::Acquire);
             if compiled >= current {
-                return Ok(compiled);
+                if let Some(admission) = self.admission_at(compiled, current) {
+                    return Ok(admission);
+                }
+                // Watermark current but no bundle at it yet (first pass
+                // before the sources were wired): republish under the
+                // lock, where no pass is mid-way.
             }
 
             // Behind: reconcile inside the remaining deadline. The lock
@@ -693,7 +838,19 @@ impl ClusterSecurityRuntime {
             // already; re-check before fetching.
             let compiled = self.compiled_revision.load(Ordering::Acquire);
             if compiled >= current {
-                return Ok(compiled);
+                if let Some(admission) = self.admission_at(compiled, current) {
+                    return Ok(admission);
+                }
+                // Under the lock every lane is at rest at `compiled`;
+                // capture them as the bundle the watermark lacked.
+                self.publish(compiled);
+                if let Some(admission) = self.admission_at(compiled, current) {
+                    return Ok(admission);
+                }
+                return Ok(crate::middleware::rbac::Admission {
+                    revision: compiled,
+                    bundle: None,
+                });
             }
             let moved_past = self
                 .reconcile_resources(current, compiled, deadline)
@@ -727,10 +884,16 @@ impl ClusterSecurityRuntime {
                 continue;
             }
             // Confirmed: every registered resource's authoritative state at
-            // or below `current` is compiled locally. Publish the watermark
-            // and serve this request under it.
-            self.compiled_revision.store(current, Ordering::Release);
-            return Ok(current);
+            // or below `current` is compiled locally. Capture the lanes as
+            // one bundle, publish the watermark, and serve this request
+            // under exactly that bundle.
+            self.publish(current);
+            return Ok(self.admission_at(current, current).unwrap_or(
+                crate::middleware::rbac::Admission {
+                    revision: current,
+                    bundle: None,
+                },
+            ));
         }
     }
 }
@@ -740,5 +903,11 @@ impl SecurityRevisionGate for ClusterSecurityRuntime {
     async fn ensure_current_revision(&self) -> Result<i64, SecurityRevisionCheckError> {
         self.ensure_current_revision_within(RECONCILE_DEADLINE)
             .await
+    }
+
+    async fn admit(
+        &self,
+    ) -> Result<crate::middleware::rbac::Admission, SecurityRevisionCheckError> {
+        self.admit_within(RECONCILE_DEADLINE).await
     }
 }

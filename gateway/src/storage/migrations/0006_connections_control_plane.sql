@@ -144,6 +144,12 @@ CREATE TABLE greengateway.connection_dependencies (
         octet_length(consumer_id) BETWEEN 1 AND 256
     ),
     created_at text NOT NULL,
+    -- The security revision of the document that derived this set (0 for
+    -- sets no revision produces, such as proxy routes from static
+    -- configuration). Replicas flush their derived sets independently, and
+    -- a flush from an older tools document must never replace the guards a
+    -- newer document derived: the store keeps the newest source's rows.
+    source_revision bigint NOT NULL DEFAULT 0 CHECK (source_revision >= 0),
     PRIMARY KEY (connection_id, consumer_kind, consumer_id),
     FOREIGN KEY (connection_id)
         REFERENCES greengateway.connection_records(id) ON DELETE RESTRICT
@@ -361,7 +367,7 @@ CREATE TABLE greengateway.connection_openapi_catalog_entries (
         char_length(tool_name) BETWEEN 1 AND 128
     ),
     operation_id text CHECK (
-        operation_id IS NULL OR octet_length(operation_id) BETWEEN 1 AND 256
+        operation_id IS NULL OR char_length(operation_id) BETWEEN 1 AND 256
     ),
     -- Verbatim bytes, NOT jsonb, for the reason input_schema_json above
     -- carries: these bounds are exactly the Rust ones

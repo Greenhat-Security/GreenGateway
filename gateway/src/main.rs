@@ -2355,6 +2355,7 @@ fn gateway_app_with_process_started_at_and_overrides(
         // refused as a collision, while a stale managed holder (the seeds
         // are read one resource at a time) is evicted and reconciled on the
         // gate's first pass.
+        connection_control_plane.note_manual_tool_revision(seed.active.security_revision);
         tool_registry
             .install_local_definitions_with(
                 definitions,
@@ -2364,9 +2365,10 @@ fn gateway_app_with_process_started_at_and_overrides(
                 Box::new(ClusterToolsStartupError::InvalidDocument(error.to_string()))
                     as Box<dyn std::error::Error>
             })?;
-        let resource = security_cluster::ToolsResource::new(
+        let resource = security_cluster::ToolsResource::new_with_connection_control_plane(
             seed.store.clone(),
             tool_registry.clone(),
+            Some(connection_control_plane.clone()),
             seed.active.security_revision,
         );
         runtime.register_resource(resource.clone());
@@ -2417,6 +2419,14 @@ fn gateway_app_with_process_started_at_and_overrides(
         connections::control_plane::spawn_dependency_flush_task(
             connection_control_plane.clone(),
             &lifecycle,
+        );
+        // Every lane is registered: wire the bundle sources so the first
+        // pass publishes one consistent cut of policy, tools, and
+        // Connections with its watermark, and every admitted request is
+        // served from exactly that cut.
+        runtime.set_bundle_sources(
+            tool_registry.state_handle(),
+            connection_control_plane.runtime_handle(),
         );
     }
     // Every resource is registered; only now may the background reconciler
@@ -4707,6 +4717,7 @@ async fn connection_list_endpoint(
         &snapshot,
         connections::admin::ConnectionListRuntimeData {
             statuses: &runtime.statuses,
+            status_revisions: &runtime.status_revisions,
             dependency_counts: &runtime.dependency_counts,
             capability_counts: &runtime.capability_counts,
             activity_times: &runtime.activity_times,
@@ -4775,10 +4786,13 @@ async fn connection_get_endpoint(
     let snapshot = state.control_plane.runtime_snapshot();
 
     if let Some(record) = snapshot.managed().get(&id) {
-        let (status, dependencies) = match connection_detail_runtime_data(&state, &id).await {
-            Ok(data) => data,
-            Err(response) => return *response,
-        };
+        let (status, dependencies, status_revision) =
+            match connection_detail_runtime_data(&state, &id).await {
+                Ok(data) => data,
+                Err(response) => return *response,
+            };
+        let record =
+            connections::admin::with_authoritative_status_revision(record, status_revision);
         let etag = record.etag();
         return (
             StatusCode::OK,
@@ -4787,7 +4801,7 @@ async fn connection_get_endpoint(
                 (header::CACHE_CONTROL, HeaderValue::from_static("no-store")),
             ],
             Json(connections::admin::managed_detail_view(
-                record,
+                &record,
                 status,
                 dependencies,
                 permissions,
@@ -5022,10 +5036,11 @@ async fn connection_put_endpoint(
 
     let changed_fields =
         connections::admin::changed_connection_fields(Some(&current.write), Some(&candidate));
-    let (current_status, dependencies) = match connection_detail_runtime_data(&state, &id).await {
-        Ok(data) => data,
-        Err(response) => return *response,
-    };
+    let (current_status, dependencies, _status_revision) =
+        match connection_detail_runtime_data(&state, &id).await {
+            Ok(data) => data,
+            Err(response) => return *response,
+        };
     // See the create handler: deferred bindings are resolved before the lock.
     if let Err(error) = state
         .control_plane
@@ -10179,6 +10194,7 @@ async fn connection_capability_counts(
 
 struct ConnectionCollectionRuntimeData {
     statuses: BTreeMap<connections::model::ConnectionId, connections::status::SafeConnectionStatus>,
+    status_revisions: BTreeMap<connections::model::ConnectionId, u64>,
     dependency_counts: BTreeMap<connections::model::ConnectionId, usize>,
     capability_counts: BTreeMap<connections::model::ConnectionId, usize>,
     activity_times:
@@ -10195,6 +10211,7 @@ async fn connection_collection_runtime_data(
     if snapshot.managed().is_empty() {
         return Ok(ConnectionCollectionRuntimeData {
             statuses: BTreeMap::new(),
+            status_revisions: BTreeMap::new(),
             dependency_counts: BTreeMap::new(),
             capability_counts,
             activity_times: BTreeMap::new(),
@@ -10211,7 +10228,7 @@ async fn connection_collection_runtime_data(
         .clone();
     let ids = snapshot.managed().keys().cloned().collect::<Vec<_>>();
     // The store dispatch keeps these reads off the request executor.
-    let (dependency_counts, activity_times, stored_statuses) = {
+    let (dependency_counts, activity_times, stored_statuses, status_revisions) = {
         let dependency_counts = store.dependency_counts().await.map_err(|error| {
             tracing::error!(error = %error, "failed to load connection dependency counts");
             Box::new(service_unavailable(
@@ -10232,7 +10249,21 @@ async fn connection_collection_runtime_data(
                 "managed connection state is unavailable",
             ))
         })?;
-        (dependency_counts, activity_times, stored_statuses)
+        // The authority's status revisions: a status write on another
+        // replica moves no security revision, so the runtime records here
+        // may still carry the revision they last reconciled.
+        let status_revisions = store.status_revisions(&ids).await.map_err(|error| {
+            tracing::error!(error = %error, "failed to load connection status revisions");
+            Box::new(service_unavailable(
+                "managed connection state is unavailable",
+            ))
+        })?;
+        (
+            dependency_counts,
+            activity_times,
+            stored_statuses,
+            status_revisions,
+        )
     };
     let mut statuses = BTreeMap::new();
     for (id, record) in snapshot.managed() {
@@ -10249,6 +10280,7 @@ async fn connection_collection_runtime_data(
     }
     Ok(ConnectionCollectionRuntimeData {
         statuses,
+        status_revisions,
         dependency_counts,
         capability_counts,
         activity_times,
@@ -10261,6 +10293,7 @@ async fn connection_detail_runtime_data(
 ) -> ResponseResult<(
     Option<connections::status::SafeConnectionStatus>,
     Vec<connections::store::ConnectionDependency>,
+    Option<u64>,
 )> {
     let store = state
         .control_plane
@@ -10290,7 +10323,18 @@ async fn connection_detail_runtime_data(
         tracing::error!(connection_id = %id, error = %error, "failed to load connection dependencies");
         Box::new(connection_store_error_response(error))
     })?;
-    Ok((status, dependencies))
+    let status_revision = store
+        .status_revisions(std::slice::from_ref(id))
+        .await
+        .map_err(|error| {
+            tracing::error!(connection_id = %id, error = %error, "failed to load connection status revision");
+            Box::new(service_unavailable(
+                "managed connection state is unavailable",
+            ))
+        })?
+        .get(id)
+        .copied();
+    Ok((status, dependencies, status_revision))
 }
 
 fn connection_mutation_error_response(

@@ -62,7 +62,10 @@ use super::{
 /// whole set they replace. One entry per kind: a later derivation for the
 /// same kind supersedes the earlier one rather than adding to it, which is
 /// what makes a flush idempotent and a missed flush harmless.
-type PendingDependencies = BTreeMap<ConnectionDependencyKind, Vec<(ConnectionId, String)>>;
+/// Dependency sets a synchronous caller queued for the flush task, each
+/// stamped with the security revision of the document that derived it (0
+/// when none did), so the store can refuse a stale replica's flush.
+type PendingDependencies = BTreeMap<ConnectionDependencyKind, (i64, Vec<(ConnectionId, String)>)>;
 
 #[cfg(test)]
 type FlushHook = Arc<dyn Fn() + Send + Sync>;
@@ -83,6 +86,10 @@ pub struct ConnectionControlPlane {
     /// Runtime dependency sets whose owner could not write them where it
     /// computed them. See `replace_runtime_dependencies`.
     pending_dependencies: Arc<Mutex<PendingDependencies>>,
+    /// The security revision of the tools document whose manual-tool
+    /// dependency set is being derived (cluster mode): stamped on the
+    /// queued set so a stale replica's flush cannot replace a newer one.
+    manual_tool_source_revision: Arc<std::sync::atomic::AtomicI64>,
     /// Test seam: runs inside a flush after the batch is taken and before
     /// it is written, while the mutation lock is held.
     #[cfg(test)]
@@ -167,6 +174,11 @@ impl fmt::Debug for ConnectionRuntimeSnapshot {
 }
 
 impl ConnectionRuntimeSnapshot {
+    #[cfg(test)]
+    pub(crate) fn empty_for_test() -> Self {
+        Self::new(BTreeMap::new(), Arc::from(Vec::new()), 0)
+    }
+
     fn new(
         managed: BTreeMap<ConnectionId, StoredConnection>,
         legacy: Arc<[LegacyConnectionProjection]>,
@@ -595,6 +607,7 @@ impl ConnectionControlPlane {
             runtime,
             mutation_lock,
             pending_dependencies,
+            manual_tool_source_revision: Arc::new(std::sync::atomic::AtomicI64::new(0)),
             #[cfg(test)]
             flush_hook: Arc::new(Mutex::new(None)),
             catalog_lifecycle,
@@ -760,6 +773,13 @@ impl ConnectionControlPlane {
         self.local_secret_manager.is_some()
     }
 
+    /// The live runtime lane, for the security runtime to capture bundles
+    /// from.
+    #[cfg(feature = "postgres")]
+    pub(crate) fn runtime_handle(&self) -> Arc<ArcSwap<ConnectionRuntimeSnapshot>> {
+        Arc::clone(&self.runtime)
+    }
+
     pub fn runtime_snapshot(&self) -> Arc<ConnectionRuntimeSnapshot> {
         self.runtime.load_full()
     }
@@ -823,6 +843,15 @@ impl ConnectionControlPlane {
     /// context to await it in), and it does not need it. It never touches
     /// the runtime snapshot -- the invariant the lock exists to protect --
     /// and the store serializes it against every other writer on its own.
+    /// Cluster mode: the tools lane records the security revision of the
+    /// document it is about to install, so the manual-tool dependency set
+    /// that install derives is stamped with it and a stale replica's flush
+    /// can be refused by the store.
+    pub(crate) fn note_manual_tool_revision(&self, security_revision: i64) {
+        self.manual_tool_source_revision
+            .fetch_max(security_revision, std::sync::atomic::Ordering::AcqRel);
+    }
+
     pub fn replace_runtime_dependencies(
         &self,
         kind: ConnectionDependencyKind,
@@ -842,8 +871,14 @@ impl ConnectionControlPlane {
                 Ok(())
             }
             None => {
+                let source_revision = match kind {
+                    ConnectionDependencyKind::ManualTool => self
+                        .manual_tool_source_revision
+                        .load(std::sync::atomic::Ordering::Acquire),
+                    _ => 0,
+                };
                 self.pending_dependencies_guard()
-                    .insert(kind, desired.to_vec());
+                    .insert(kind, (source_revision, desired.to_vec()));
                 Ok(())
             }
         }
@@ -902,13 +937,16 @@ impl ConnectionControlPlane {
         };
         let mut outcome = Ok(());
         let mut unapplied = BTreeMap::new();
-        for (kind, desired) in pending {
+        for (kind, (source_revision, desired)) in pending {
             if outcome.is_err() {
-                unapplied.insert(kind, desired);
+                unapplied.insert(kind, (source_revision, desired));
                 continue;
             }
-            if let Err(error) = store.replace_dependencies_for_kind(kind, &desired).await {
-                unapplied.insert(kind, desired);
+            if let Err(error) = store
+                .replace_dependencies_for_kind(kind, &desired, source_revision)
+                .await
+            {
+                unapplied.insert(kind, (source_revision, desired));
                 outcome = Err(ConnectionMutationError::Store(error));
             }
         }

@@ -320,8 +320,25 @@ impl fmt::Debug for ToolRegistry {
     }
 }
 
+#[cfg(feature = "postgres")]
+tokio::task_local! {
+    /// The registry state pinned for the request being served, set when
+    /// the gate admits it, so every tool lookup inside the request sees
+    /// the lane the request was admitted with.
+    static PINNED_TOOLS: Arc<ToolRegistryState>;
+}
+
+/// Run `future` with `state` pinned as the request's registry state.
+#[cfg(feature = "postgres")]
+pub(crate) async fn with_pinned_tools<F: std::future::Future>(
+    state: Arc<ToolRegistryState>,
+    future: F,
+) -> F::Output {
+    PINNED_TOOLS.scope(state, future).await
+}
+
 #[allow(dead_code)] // Future MCP executor and admin surfaces will query this registry state.
-struct ToolRegistryState {
+pub(crate) struct ToolRegistryState {
     tools: BTreeMap<String, Arc<ToolDefinition>>,
     local_definitions: Vec<ToolDefinition>,
     managed_openapi_definitions: Vec<ToolDefinition>,
@@ -401,19 +418,36 @@ impl ToolRegistry {
         Ok(Self::from_definitions_with_audit(definitions, None))
     }
 
+    /// The registry state this request reads: the one the gate pinned at
+    /// admission (cluster mode), else the live lane. Dispatch reads go
+    /// through it; install paths read the live lane directly.
+    fn effective_state(&self) -> Arc<ToolRegistryState> {
+        #[cfg(feature = "postgres")]
+        if let Ok(pinned) = PINNED_TOOLS.try_with(Arc::clone) {
+            return pinned;
+        }
+        self.state.load_full()
+    }
+
+    /// The live registry lane, for the security runtime to capture
+    /// bundles from.
+    #[cfg(feature = "postgres")]
+    pub(crate) fn state_handle(&self) -> Arc<ArcSwap<ToolRegistryState>> {
+        Arc::clone(&self.state)
+    }
+
     #[allow(dead_code)] // Future MCP call handling will query by tool name.
     pub fn get(&self, name: &str) -> Option<Arc<ToolDefinition>> {
-        self.state.load().tools.get(name).cloned()
+        self.effective_state().tools.get(name).cloned()
     }
 
     #[allow(dead_code)] // Future MCP list-tools handling will expose registry contents.
     pub fn list(&self) -> Vec<Arc<ToolDefinition>> {
-        self.state.load().tools.values().cloned().collect()
+        self.effective_state().tools.values().cloned().collect()
     }
 
     pub fn has_legacy_http_tools(&self) -> bool {
-        self.state
-            .load()
+        self.effective_state()
             .tools
             .values()
             .any(|definition| definition.target.is_none() && !definition.upstream.is_mcp_proxy())
@@ -2330,6 +2364,45 @@ mod tests {
             "upstream": mapping
         }))
         .expect("managed OpenAPI definition should deserialize")
+    }
+
+    /// Inside a pinned request, lookups read the registry state the gate
+    /// pinned at admission; a lane installed afterwards is invisible to it
+    /// and visible outside the pin.
+    #[cfg(feature = "postgres")]
+    #[tokio::test]
+    async fn dispatch_reads_the_pinned_registry_state_not_the_live_lane() {
+        let registry = ToolRegistry::from_config(&crate::config::Config::test_defaults())
+            .expect("an empty registry");
+        registry
+            .install_local_definitions_with(vec![local_definition("alpha")], LaneConflicts::Refuse)
+            .expect("the live lane installs alpha");
+        let pinned = registry.state_handle().load_full();
+        registry
+            .install_local_definitions_with(
+                vec![local_definition("alpha"), local_definition("beta")],
+                LaneConflicts::Refuse,
+            )
+            .expect("the live lane installs beta");
+        assert!(registry.get("beta").is_some(), "the live lane has beta");
+        let (alpha_inside, beta_inside, listed_inside) = with_pinned_tools(pinned, async {
+            (
+                registry.get("alpha").is_some(),
+                registry.get("beta").is_some(),
+                registry.list().len(),
+            )
+        })
+        .await;
+        assert!(alpha_inside);
+        assert!(
+            !beta_inside,
+            "a pinned request never sees a lane installed after its admission"
+        );
+        assert_eq!(listed_inside, 1);
+        assert!(
+            registry.get("beta").is_some(),
+            "outside the pin the live lane is read"
+        );
     }
 
     fn local_definition(name: &str) -> ToolDefinition {
