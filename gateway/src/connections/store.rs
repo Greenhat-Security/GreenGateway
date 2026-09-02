@@ -7858,9 +7858,11 @@ mod tests {
         std::thread::sleep(Duration::from_millis(350));
         refresh_status_busy_timeout(&transaction, &path, Some(deadline))
             .expect("commit timeout should use only the fresh remaining budget");
+        let commit_started = Instant::now();
         let commit_error = transaction
             .commit()
             .expect_err("the blocked commit must not persist after its deadline");
+        let commit_elapsed = commit_started.elapsed();
         // Assert the raw lock failure rather than the mapped variant. SQLite's
         // busy handler returns at approximately -- not strictly after -- the
         // deadline it was given, so mapping against `deadline` here is a coin
@@ -7874,9 +7876,16 @@ mod tests {
             ),
             "the blocked commit must fail on the reader's lock"
         );
+        // Time the commit itself, not everything since `started`: the stale
+        // timeout would block it for the full initial 500ms budget, the
+        // refreshed one for whatever is left of the deadline (~150ms). The
+        // total-elapsed form folded in the sleep's overshoot and every
+        // scheduling delay before the commit, which made it fail under a
+        // loaded suite for reasons that had nothing to do with the budget.
         assert!(
-            started.elapsed() < Duration::from_millis(700),
-            "commit must not reuse the stale initial 500ms busy timeout"
+            commit_elapsed < Duration::from_millis(400),
+            "commit must not reuse the stale initial 500ms busy timeout; \
+             it blocked for {commit_elapsed:?}"
         );
 
         drop(blocking_read);
