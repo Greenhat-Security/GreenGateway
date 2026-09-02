@@ -27,6 +27,15 @@
 //! 6. One `security_outbox` row records the change with identifiers and
 //!    revisions only.
 //! 7. `COMMIT` -- once; every step rolls back together.
+//!
+//! Steps 1-6 are [`commit_in`], over a client whose transaction the caller
+//! has already opened; [`commit`] wraps them in `BEGIN`/`COMMIT` for the
+//! plain control-plane endpoints. A workflow that must commit a document
+//! together with rows of its own (issue #241, PR 12: accepting a rule
+//! suggestion transitions the suggestion in the same transaction as the
+//! policy commit) opens the transaction itself, runs `commit_in` between
+//! its own statements, and commits once -- so the seven steps still exist
+//! exactly once and a failure anywhere rolls the whole workflow back.
 
 use super::{
     log_classified, policy_history::PolicyCommitError, postgres::classify_pool_error,
@@ -119,6 +128,50 @@ pub(crate) async fn read_active(
     Ok(row.map(|row| (row.get(0), row.get(1), row.get(2), row.get(3), row.get(4))))
 }
 
+/// Open a transaction on `client`.
+///
+/// The transaction is driven explicitly over the simple protocol (the
+/// audit store's and the migrator's pattern). A request abandoned between
+/// BEGIN and COMMIT returns its connection to the pool with the transaction
+/// open; the row locks it holds are reclaimed by the session's server-side
+/// bounds (`lock_timeout` bounds other writers' waits,
+/// `idle_in_transaction_session_timeout` closes the session), so the
+/// failure mode is bounded 503s, never corruption. A drop-guarded
+/// interactive transaction can harden this and the audit append together
+/// if abandonment proves real.
+pub(crate) async fn begin(
+    client: &deadpool_postgres::Object,
+    operation: &'static str,
+) -> Result<(), RepositoryError> {
+    client
+        .batch_execute("BEGIN")
+        .await
+        .map_err(|error| classify_query(error, operation))
+}
+
+/// Close the transaction `begin` opened: `COMMIT` on `Ok`, `ROLLBACK` on
+/// `Err` (a failed rollback is not reported; the session's bounds reclaim
+/// the connection and the caller's error is the one that matters).
+/// `store_error` lifts a failed COMMIT into the caller's error type.
+pub(crate) async fn end_transaction<T, E>(
+    client: &deadpool_postgres::Object,
+    operation: &'static str,
+    outcome: Result<T, E>,
+    store_error: impl FnOnce(RepositoryError) -> E,
+) -> Result<T, E> {
+    match outcome {
+        Ok(value) => client
+            .batch_execute("COMMIT")
+            .await
+            .map_err(|error| store_error(classify_query(error, operation)))
+            .map(|_| value),
+        Err(error) => {
+            let _ = client.batch_execute("ROLLBACK").await;
+            Err(error)
+        }
+    }
+}
+
 /// Run the section-2 transaction for one document resource. See the module
 /// documentation for the step-by-step contract.
 pub(crate) async fn commit(
@@ -132,22 +185,24 @@ pub(crate) async fn commit(
         .await
         .map_err(classify_pool_error)
         .map_err(store_error)?;
-
-    // The transaction is driven explicitly over the simple protocol (the
-    // audit store's and the migrator's pattern). A request abandoned
-    // between BEGIN and COMMIT returns its connection to the pool with the
-    // transaction open; the row locks it holds are reclaimed by the
-    // session's server-side bounds (`lock_timeout` bounds other writers'
-    // waits, `idle_in_transaction_session_timeout` closes the session), so
-    // the failure mode is bounded 503s, never corruption. A drop-guarded
-    // interactive transaction can harden this and the audit append
-    // together if abandonment proves real.
-    client
-        .batch_execute("BEGIN")
+    begin(&client, resource.operation)
         .await
-        .map_err(|error| classify_query(error, resource.operation))
         .map_err(store_error)?;
-    let outcome: Result<DocumentCommitted, PolicyCommitError> = async {
+    let outcome = commit_in(&client, resource, precondition, commit).await;
+    end_transaction(&client, resource.operation, outcome, store_error).await
+}
+
+/// Steps 1-6 of the section-2 transaction, over a client whose transaction
+/// the caller opened and will close. Returns `Err` with nothing to undo on
+/// the caller's side beyond `ROLLBACK`: every write is inside the
+/// transaction.
+pub(crate) async fn commit_in(
+    client: &deadpool_postgres::Object,
+    resource: DocumentResource,
+    precondition: DocumentPrecondition,
+    commit: DocumentCommit<'_>,
+) -> Result<DocumentCommitted, PolicyCommitError> {
+    {
         // 1. Lock the pointer and verify its self-consistency.
         let lock_sql = format!(
             r#"
@@ -220,7 +275,7 @@ pub(crate) async fn commit(
         // other lane can commit one of them while this document holds it.
         if let Some(names) = commit.tool_names {
             super::postgres_tool_names::reserve_tool_names(
-                &client,
+                client,
                 super::postgres_tool_names::LANE_LOCAL,
                 super::postgres_tool_names::LOCAL_OWNER,
                 names.iter().cloned(),
@@ -346,18 +401,5 @@ pub(crate) async fn commit(
             version: new_version,
             security_revision: new_revision,
         })
-    }
-    .await;
-    match outcome {
-        Ok(committed) => client
-            .batch_execute("COMMIT")
-            .await
-            .map_err(|error| classify_query(error, resource.operation))
-            .map_err(store_error)
-            .map(|_| committed),
-        Err(error) => {
-            let _ = client.batch_execute("ROLLBACK").await;
-            Err(error)
-        }
     }
 }

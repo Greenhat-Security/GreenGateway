@@ -109,6 +109,184 @@ pub struct RoleEndpointObservationMatrix {
     pub skipped_unknown_routing_context_observations: u64,
 }
 
+/// One observed-endpoint identity: method, template, and the routing
+/// context the observation was classified under.
+type EndpointRoutingKey = (
+    String,
+    String,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+);
+
+/// One matrix cell's identity: the endpoint routing key plus the principal
+/// facet (issuer, auth method, role) the observation is attributed to.
+type RoleEndpointKey = (
+    String,
+    String,
+    Option<String>,
+    String,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    String,
+);
+
+/// Folds `http.request_observed` events, newest first, into a
+/// [`RoleEndpointObservationMatrix`]. Backend-neutral (issue #241, PR 12):
+/// the SQLite query store feeds it from its visitor scan and the PostgreSQL
+/// audit store from a row stream, and both stop at the same scan budget
+/// with the same skip counters, so the baseline suggestions generated in
+/// standalone and cluster mode come from one derivation.
+pub(crate) struct RoleEndpointMatrixAccumulator {
+    endpoint_keys: BTreeSet<EndpointRoutingKey>,
+    max_scan_rows: u64,
+    aggregates: BTreeMap<RoleEndpointKey, RoleEndpointObservation>,
+    result: RoleEndpointObservationMatrix,
+}
+
+impl RoleEndpointMatrixAccumulator {
+    pub(crate) fn new(endpoints: &[ObservedEndpoint], max_scan_rows: usize) -> Self {
+        Self {
+            endpoint_keys: endpoints
+                .iter()
+                .map(|endpoint| {
+                    (
+                        endpoint.method.clone(),
+                        endpoint.endpoint_template.clone(),
+                        endpoint.route_host.clone(),
+                        endpoint.route_path_prefix.clone(),
+                        endpoint.upstream_origin.clone(),
+                    )
+                })
+                .collect(),
+            max_scan_rows: u64::try_from(max_scan_rows).unwrap_or(u64::MAX),
+            aggregates: BTreeMap::new(),
+            result: RoleEndpointObservationMatrix::default(),
+        }
+    }
+
+    /// Fold one observation. Returns `false` once the scan budget is spent:
+    /// that observation is NOT counted, the matrix is marked truncated, and
+    /// the caller stops scanning.
+    pub(crate) fn observe(&mut self, observation: &RequestObservation) -> bool {
+        let result = &mut self.result;
+        if result.scanned_event_count >= self.max_scan_rows {
+            result.scan_truncated = true;
+            return false;
+        }
+        result.scanned_event_count = result.scanned_event_count.saturating_add(1);
+
+        let endpoint_template = template_stateless(&observation.path);
+        let (route_host, route_path_prefix, upstream_origin) =
+            observation_routing_context(&observation.payload_json);
+        let endpoint_key = (
+            observation.method.clone(),
+            endpoint_template.clone(),
+            route_host.clone(),
+            route_path_prefix.clone(),
+            upstream_origin.clone(),
+        );
+        if !self.endpoint_keys.contains(&endpoint_key) {
+            return true;
+        }
+        if !observation_routing_context_known(&observation.payload_json) {
+            result.skipped_unknown_routing_context_observations = result
+                .skipped_unknown_routing_context_observations
+                .saturating_add(1);
+            return true;
+        }
+
+        if baseline_policy_decision(&observation.payload_json).as_deref() == Some("denied") {
+            result.skipped_denied_observations =
+                result.skipped_denied_observations.saturating_add(1);
+            return true;
+        }
+
+        let Some(actor) = observation.actor.as_ref() else {
+            result.skipped_unauthenticated_observations = result
+                .skipped_unauthenticated_observations
+                .saturating_add(1);
+            return true;
+        };
+        let auth_method = actor.auth_mode.trim().to_owned();
+        if !matches!(
+            auth_method.as_str(),
+            AUTH_METHOD_BEARER_TOKEN | AUTH_METHOD_SESSION_COOKIE | AUTH_METHOD_SERVICE_TOKEN
+        ) {
+            result.skipped_unsupported_auth_method_observations = result
+                .skipped_unsupported_auth_method_observations
+                .saturating_add(1);
+            return true;
+        }
+        let issuer = actor.issuer.as_deref().and_then(canonical_issuer);
+        if issuer.is_none() && auth_method != AUTH_METHOD_SERVICE_TOKEN {
+            result.skipped_without_issuer_observations =
+                result.skipped_without_issuer_observations.saturating_add(1);
+            return true;
+        }
+        let roles = actor
+            .roles
+            .iter()
+            .flatten()
+            .filter(|role| !role.is_empty())
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        if roles.is_empty() {
+            result.skipped_without_roles_observations =
+                result.skipped_without_roles_observations.saturating_add(1);
+            return true;
+        }
+
+        for role in roles {
+            let key = (
+                observation.method.clone(),
+                endpoint_template.clone(),
+                issuer.clone(),
+                auth_method.clone(),
+                route_host.clone(),
+                route_path_prefix.clone(),
+                upstream_origin.clone(),
+                role.clone(),
+            );
+            let entry = self
+                .aggregates
+                .entry(key)
+                .or_insert_with(|| RoleEndpointObservation {
+                    method: observation.method.clone(),
+                    endpoint_template: endpoint_template.clone(),
+                    issuer: issuer.clone(),
+                    auth_method: auth_method.clone(),
+                    route_host: route_host.clone(),
+                    route_path_prefix: route_path_prefix.clone(),
+                    upstream_origin: upstream_origin.clone(),
+                    role,
+                    observation_count: 0,
+                    error_count: 0,
+                    first_seen: observation.timestamp.clone(),
+                    last_seen: observation.timestamp.clone(),
+                });
+            entry.observation_count = entry.observation_count.saturating_add(1);
+            if observation.status.is_some_and(is_error_status) {
+                entry.error_count = entry.error_count.saturating_add(1);
+            }
+            if timestamp_before(&observation.timestamp, &entry.first_seen) {
+                entry.first_seen = observation.timestamp.clone();
+            }
+            if timestamp_after(&observation.timestamp, &entry.last_seen) {
+                entry.last_seen = observation.timestamp.clone();
+            }
+        }
+
+        true
+    }
+
+    pub(crate) fn finish(mut self) -> RoleEndpointObservationMatrix {
+        self.result.observations = self.aggregates.into_values().collect();
+        self.result
+    }
+}
+
 #[derive(Clone, Debug, Default, Serialize)]
 pub struct ShadowRuleWouldDenySummarySet {
     pub summaries: HashMap<String, ShadowRuleWouldDenySummary>,
@@ -433,6 +611,12 @@ impl AuditQueryStore {
         Ok(())
     }
 
+    /// The role/endpoint matrix the baseline suggestion generator reads:
+    /// which (role, issuer, auth method) called which observed endpoint,
+    /// how often, and with how many errors. The scan is newest-first and
+    /// bounded by `max_scan_rows`; the aggregation itself is
+    /// [`RoleEndpointMatrixAccumulator`], shared with the PostgreSQL audit
+    /// store so both backends derive the same matrix from the same events.
     pub fn observed_role_endpoint_matrix(
         &self,
         filters: &RoleEndpointObservationFilters,
@@ -440,35 +624,8 @@ impl AuditQueryStore {
         if filters.endpoints.is_empty() {
             return Ok(RoleEndpointObservationMatrix::default());
         }
-
-        let endpoint_keys = filters
-            .endpoints
-            .iter()
-            .map(|endpoint| {
-                (
-                    endpoint.method.clone(),
-                    endpoint.endpoint_template.clone(),
-                    endpoint.route_host.clone(),
-                    endpoint.route_path_prefix.clone(),
-                    endpoint.upstream_origin.clone(),
-                )
-            })
-            .collect::<BTreeSet<_>>();
-        let mut aggregates = BTreeMap::<
-            (
-                String,
-                String,
-                Option<String>,
-                String,
-                Option<String>,
-                Option<String>,
-                Option<String>,
-                String,
-            ),
-            RoleEndpointObservation,
-        >::new();
-        let mut result = RoleEndpointObservationMatrix::default();
-
+        let mut accumulator =
+            RoleEndpointMatrixAccumulator::new(&filters.endpoints, filters.max_scan_rows);
         self.scan_request_observations(
             &RequestObservationFilters {
                 from: filters.from.clone(),
@@ -478,123 +635,9 @@ impl AuditQueryStore {
                 path_prefix: None,
                 before_id: None,
             },
-            |observation| {
-                if result.scanned_event_count
-                    >= u64::try_from(filters.max_scan_rows).unwrap_or(u64::MAX)
-                {
-                    result.scan_truncated = true;
-                    return false;
-                }
-                result.scanned_event_count = result.scanned_event_count.saturating_add(1);
-
-                let endpoint_template = template_stateless(&observation.path);
-                let (route_host, route_path_prefix, upstream_origin) =
-                    observation_routing_context(&observation.payload_json);
-                let endpoint_key = (
-                    observation.method.clone(),
-                    endpoint_template.clone(),
-                    route_host.clone(),
-                    route_path_prefix.clone(),
-                    upstream_origin.clone(),
-                );
-                if !endpoint_keys.contains(&endpoint_key) {
-                    return true;
-                }
-                if !observation_routing_context_known(&observation.payload_json) {
-                    result.skipped_unknown_routing_context_observations = result
-                        .skipped_unknown_routing_context_observations
-                        .saturating_add(1);
-                    return true;
-                }
-
-                if baseline_policy_decision(&observation.payload_json).as_deref() == Some("denied")
-                {
-                    result.skipped_denied_observations =
-                        result.skipped_denied_observations.saturating_add(1);
-                    return true;
-                }
-
-                let Some(actor) = observation.actor else {
-                    result.skipped_unauthenticated_observations = result
-                        .skipped_unauthenticated_observations
-                        .saturating_add(1);
-                    return true;
-                };
-                let auth_method = actor.auth_mode.trim().to_owned();
-                if !matches!(
-                    auth_method.as_str(),
-                    AUTH_METHOD_BEARER_TOKEN
-                        | AUTH_METHOD_SESSION_COOKIE
-                        | AUTH_METHOD_SERVICE_TOKEN
-                ) {
-                    result.skipped_unsupported_auth_method_observations = result
-                        .skipped_unsupported_auth_method_observations
-                        .saturating_add(1);
-                    return true;
-                }
-                let issuer = actor.issuer.as_deref().and_then(canonical_issuer);
-                if issuer.is_none() && auth_method != AUTH_METHOD_SERVICE_TOKEN {
-                    result.skipped_without_issuer_observations =
-                        result.skipped_without_issuer_observations.saturating_add(1);
-                    return true;
-                }
-                let roles = actor
-                    .roles
-                    .unwrap_or_default()
-                    .into_iter()
-                    .filter(|role| !role.is_empty())
-                    .collect::<BTreeSet<_>>();
-                if roles.is_empty() {
-                    result.skipped_without_roles_observations =
-                        result.skipped_without_roles_observations.saturating_add(1);
-                    return true;
-                }
-
-                for role in roles {
-                    let key = (
-                        observation.method.clone(),
-                        endpoint_template.clone(),
-                        issuer.clone(),
-                        auth_method.clone(),
-                        route_host.clone(),
-                        route_path_prefix.clone(),
-                        upstream_origin.clone(),
-                        role.clone(),
-                    );
-                    let entry = aggregates
-                        .entry(key)
-                        .or_insert_with(|| RoleEndpointObservation {
-                            method: observation.method.clone(),
-                            endpoint_template: endpoint_template.clone(),
-                            issuer: issuer.clone(),
-                            auth_method: auth_method.clone(),
-                            route_host: route_host.clone(),
-                            route_path_prefix: route_path_prefix.clone(),
-                            upstream_origin: upstream_origin.clone(),
-                            role: role.clone(),
-                            observation_count: 0,
-                            error_count: 0,
-                            first_seen: observation.timestamp.clone(),
-                            last_seen: observation.timestamp.clone(),
-                        });
-                    entry.observation_count = entry.observation_count.saturating_add(1);
-                    if observation.status.is_some_and(is_error_status) {
-                        entry.error_count = entry.error_count.saturating_add(1);
-                    }
-                    if timestamp_before(&observation.timestamp, &entry.first_seen) {
-                        entry.first_seen = observation.timestamp.clone();
-                    }
-                    if timestamp_after(&observation.timestamp, &entry.last_seen) {
-                        entry.last_seen = observation.timestamp.clone();
-                    }
-                }
-
-                true
-            },
+            |observation| accumulator.observe(&observation),
         )?;
-
-        result.observations = aggregates.into_values().collect();
-        Ok(result)
+        Ok(accumulator.finish())
     }
 
     pub fn rule_hit_counts(&self) -> Result<HashMap<String, u64>, AuditQueryError> {

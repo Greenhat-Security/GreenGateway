@@ -1502,6 +1502,7 @@ mod tests {
         audit::{sink::tests::CaptureSink, AuditSink},
         auth::{AuthError, AuthMethod, Principal, SessionCredential, SessionValidator},
         discovery::{
+            lifecycle::{TransitionOutcome, TransitionPrecondition},
             openapi::{OpenApiSpec, SchemaCoverage},
             query::{
                 DiscoveryQueryStore, EndpointAggregateDetail, EndpointListFilters,
@@ -2222,7 +2223,8 @@ paths:
             _endpoint_template: &str,
             _reviewed: bool,
             _reviewed_by: Option<&str>,
-        ) -> Result<Option<EndpointReviewState>, DiscoveryQueryError> {
+            _expected_revision: Option<i64>,
+        ) -> Result<TransitionOutcome<EndpointReviewState>, DiscoveryQueryError> {
             unreachable!("the conformance path never writes reviews")
         }
 
@@ -2248,7 +2250,8 @@ paths:
             _signal_id: &str,
             _state: SignalLifecycleState,
             _transitioned_by: Option<&str>,
-        ) -> Result<Option<Signal>, DiscoveryQueryError> {
+            _expected: TransitionPrecondition<SignalLifecycleState>,
+        ) -> Result<TransitionOutcome<Signal>, DiscoveryQueryError> {
             unreachable!("the conformance path never transitions signals")
         }
 

@@ -29,10 +29,14 @@
 use std::sync::LazyLock;
 
 use async_trait::async_trait;
+use futures_util::TryStreamExt;
 use sha2::{Digest, Sha256};
 
 use crate::audit::{
-    query::{AuditQueryFilters, AuditQueryPage},
+    query::{
+        AuditQueryFilters, AuditQueryPage, RequestObservation, RoleEndpointMatrixAccumulator,
+        RoleEndpointObservationFilters, RoleEndpointObservationMatrix,
+    },
     Actor, AuditEvent,
 };
 
@@ -318,6 +322,145 @@ impl PostgresAuditEventStore {
             .map_err(|error| classify_query(error, OPERATION))?;
         Ok(streamed + unstreamed)
     }
+    /// The role/endpoint matrix cluster mode's rule-suggestion generation
+    /// reads (issue #241, PR 12): the SQLite `AuditQueryStore`'s
+    /// `observed_role_endpoint_matrix`, ported statement for statement.
+    /// The scan is the same newest-first `http.request_observed` scan over
+    /// the same window, bounded by the same `max_scan_rows` (one row past
+    /// it decides truncation exactly as the visitor scan does), and the
+    /// rows are folded by the SAME `RoleEndpointMatrixAccumulator`, so a
+    /// given set of events yields one matrix whichever store holds them.
+    /// Rows stream through the accumulator rather than buffering the whole
+    /// scan: the budget is 100k events with their payloads.
+    pub async fn observed_role_endpoint_matrix(
+        &self,
+        filters: &RoleEndpointObservationFilters,
+    ) -> Result<RoleEndpointObservationMatrix, RepositoryError> {
+        const OPERATION: &str = "audit_role_endpoint_matrix";
+        if filters.endpoints.is_empty() {
+            return Ok(RoleEndpointObservationMatrix::default());
+        }
+        let client = self.pool.get().await.map_err(classify_pool_error)?;
+
+        let mut clauses = vec![
+            "event_type = 'http.request_observed'".to_owned(),
+            "payload_method IS NOT NULL".to_owned(),
+            "payload_path IS NOT NULL".to_owned(),
+        ];
+        let mut params: Vec<Box<dyn tokio_postgres::types::ToSql + Sync + Send>> = Vec::new();
+        // The bounds bind as text and cast in SQL (`::text::timestamptz`),
+        // so the driver sends the RFC 3339 string rather than being asked
+        // for a `timestamptz` it cannot encode a `String` as.
+        if let Some(from) = filters.from.as_deref() {
+            params.push(Box::new(from.to_owned()));
+            clauses.push(format!(
+                "occurred_at >= ${}::text::timestamptz",
+                params.len()
+            ));
+        }
+        if let Some(to) = filters.to.as_deref() {
+            params.push(Box::new(to.to_owned()));
+            clauses.push(format!(
+                "occurred_at <= ${}::text::timestamptz",
+                params.len()
+            ));
+        }
+        // One row past the budget: the accumulator refuses it and reports
+        // the scan as truncated, exactly as the SQLite visitor scan does.
+        let fetch_limit =
+            i64::try_from(filters.max_scan_rows.saturating_add(1)).unwrap_or(i64::MAX);
+        params.push(Box::new(fetch_limit));
+        let sql = format!(
+            r#"
+            SELECT
+                id,
+                event_id,
+                to_char(occurred_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"'),
+                request_id,
+                source_ip,
+                user_agent,
+                actor_json::text,
+                payload_method,
+                payload_path,
+                payload_status,
+                payload_matched_rule_id,
+                payload_json::text
+            FROM greengateway.audit_events
+            WHERE {}
+            ORDER BY id DESC
+            LIMIT ${}
+            "#,
+            clauses.join(" AND "),
+            params.len()
+        );
+        let params: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> = params
+            .iter()
+            .map(|value| value.as_ref() as &(dyn tokio_postgres::types::ToSql + Sync))
+            .collect();
+
+        let mut accumulator =
+            RoleEndpointMatrixAccumulator::new(&filters.endpoints, filters.max_scan_rows);
+        let stream = client
+            .query_raw(sql.as_str(), params)
+            .await
+            .map_err(|error| classify_query(error, OPERATION))?;
+        let mut stream = std::pin::pin!(stream);
+        while let Some(row) = stream
+            .try_next()
+            .await
+            .map_err(|error| classify_query(error, OPERATION))?
+        {
+            let observation = request_observation_from_row(&row, OPERATION)?;
+            if !accumulator.observe(&observation) {
+                break;
+            }
+        }
+        Ok(accumulator.finish())
+    }
+}
+
+/// Decode one scanned `http.request_observed` row into the shape the
+/// SQLite scan hands its visitor. An actor JSON that does not decode is
+/// `InvalidData`, the SQLite scan's `ActorJson` failure.
+fn request_observation_from_row(
+    row: &tokio_postgres::Row,
+    operation: &'static str,
+) -> Result<RequestObservation, RepositoryError> {
+    let event_id: String = observation_column(row, 1, operation)?;
+    let actor = observation_column::<Option<String>>(row, 6, operation)?
+        .map(|json| serde_json::from_str::<Actor>(&json))
+        .transpose()
+        .map_err(|error| {
+            tracing::error!(operation, event_id, error = %error, "audit actor JSON failed to decode");
+            RepositoryError::new(RepositoryErrorKind::InvalidData, operation)
+        })?;
+    Ok(RequestObservation {
+        id: observation_column(row, 0, operation)?,
+        event_id,
+        timestamp: observation_column(row, 2, operation)?,
+        request_id: observation_column(row, 3, operation)?,
+        source_ip: observation_column(row, 4, operation)?,
+        user_agent: observation_column(row, 5, operation)?,
+        actor,
+        method: observation_column(row, 7, operation)?,
+        path: observation_column(row, 8, operation)?,
+        status: observation_column::<Option<i32>>(row, 9, operation)?.map(i64::from),
+        matched_rule_id: observation_column(row, 10, operation)?,
+        payload_json: observation_column(row, 11, operation)?,
+    })
+}
+
+/// Read one column of a scanned row; a row that does not decode is data
+/// this binary cannot use (`InvalidData`), never a panic.
+fn observation_column<'a, T: tokio_postgres::types::FromSql<'a>>(
+    row: &'a tokio_postgres::Row,
+    index: usize,
+    operation: &'static str,
+) -> Result<T, RepositoryError> {
+    row.try_get(index).map_err(|error| {
+        tracing::error!(operation, column = index, error = %error, "audit row failed to decode");
+        RepositoryError::new(RepositoryErrorKind::InvalidData, operation)
+    })
 }
 
 /// The bound on one retention step, so the singleton's delete stays a short

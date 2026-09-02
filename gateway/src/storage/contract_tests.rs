@@ -5186,9 +5186,11 @@ mod postgres_audit_tests {
     use crate::audit::AuditSink;
     use crate::discovery::{
         aggregator::{EndpointAggregatorSink, EndpointAggregatorSinkConfig},
+        lifecycle::TransitionPrecondition,
         query::{
             DiscoveryQueryError, DiscoveryQueryStore, DiscoveryReadStore, EndpointListFilters,
-            EndpointSort, PrincipalPageFilters, DEFAULT_NEW_SINCE_HOURS, MAX_NEW_SINCE_HOURS,
+            EndpointReviewState, EndpointSort, PrincipalPageFilters, DEFAULT_NEW_SINCE_HOURS,
+            MAX_NEW_SINCE_HOURS,
         },
         signals::SignalListFilters,
     };
@@ -5914,20 +5916,21 @@ mod postgres_audit_tests {
         // clear, and the unknown endpoint. `reviewed_at` is each backend's
         // own clock.
         let left = sqlite
-            .set_endpoint_review("GET", "/orders", true, Some("reviewer"))
+            .set_endpoint_review("GET", "/orders", true, Some("reviewer"), None)
             .await
             .expect("SQLite review")
-            .expect("the endpoint exists");
+            .expect_applied("the endpoint exists");
         let right = postgres
-            .set_endpoint_review("GET", "/orders", true, Some("reviewer"))
+            .set_endpoint_review("GET", "/orders", true, Some("reviewer"), None)
             .await
             .expect("PostgreSQL review")
-            .expect("the endpoint exists");
+            .expect_applied("the endpoint exists");
         assert_eq!(
             comparable(&left, &["reviewed_at"]),
             comparable(&right, &["reviewed_at"])
         );
         assert!(left.reviewed && left.reviewed_at.is_some());
+        assert_eq!(left.revision, 1);
         for store in [sqlite, postgres] {
             let detail = store
                 .get_endpoint_with_open_signal_summaries("GET", "/orders", 24, true)
@@ -5949,17 +5952,18 @@ mod postgres_audit_tests {
             assert_eq!(reviewed.endpoints.len(), 1);
             assert_eq!(reviewed.endpoints[0].endpoint_template, "/orders");
             assert_eq!(reviewed.endpoints[0].method, "GET");
+            assert_eq!(detail.review_revision, 1);
             let cleared = store
-                .set_endpoint_review("GET", "/orders", false, Some("reviewer"))
+                .set_endpoint_review("GET", "/orders", false, Some("reviewer"), None)
                 .await
                 .expect("clear review")
-                .expect("exists");
+                .expect_applied("exists");
             assert!(!cleared.reviewed && cleared.reviewed_at.is_none());
             assert!(store
-                .set_endpoint_review("GET", "/nope", true, Some("reviewer"))
+                .set_endpoint_review("GET", "/nope", true, Some("reviewer"), None)
                 .await
                 .expect("unknown review")
-                .is_none());
+                .is_not_found());
         }
 
         // Signal lifecycle: the same logical signal on each side, moved to
@@ -5977,24 +5981,27 @@ mod postgres_audit_tests {
         };
         let left_id = new_endpoint_signal("SQLite", &left_signals(sqlite).await);
         let right_id = new_endpoint_signal("PostgreSQL", &left_signals(postgres).await);
+        let from_open = TransitionPrecondition::from_state(SignalLifecycleState::Open);
         let left = sqlite
             .transition_signal(
                 &left_id,
                 SignalLifecycleState::Acknowledged,
                 Some("reviewer"),
+                from_open,
             )
             .await
             .expect("SQLite transition")
-            .expect("the signal exists");
+            .expect_applied("the signal exists");
         let right = postgres
             .transition_signal(
                 &right_id,
                 SignalLifecycleState::Acknowledged,
                 Some("reviewer"),
+                from_open,
             )
             .await
             .expect("PostgreSQL transition")
-            .expect("the signal exists");
+            .expect_applied("the signal exists");
         assert_eq!(
             signal_set(std::slice::from_ref(&left)),
             signal_set(std::slice::from_ref(&right))
@@ -6002,6 +6009,8 @@ mod postgres_audit_tests {
         assert_eq!(left.state, SignalLifecycleState::Acknowledged);
         assert_eq!(left.transitioned_by.as_deref(), Some("reviewer"));
         assert!(left.transitioned_at.is_some());
+        assert_eq!(left.revision, 2);
+        assert_eq!(right.revision, 2);
         for store in [sqlite, postgres] {
             let acknowledged = all_signal_pages(
                 store,
@@ -6013,10 +6022,15 @@ mod postgres_audit_tests {
             .await;
             assert_eq!(acknowledged.len(), 1);
             assert!(store
-                .transition_signal("no-such-signal", SignalLifecycleState::Dismissed, None)
+                .transition_signal(
+                    "no-such-signal",
+                    SignalLifecycleState::Dismissed,
+                    None,
+                    from_open
+                )
                 .await
                 .expect("unknown transition")
-                .is_none());
+                .is_not_found());
         }
 
         // Cursor validation on the signal and principal pages.
@@ -8074,6 +8088,1410 @@ mod postgres_audit_tests {
             LeaseAttempt::Acquired(_)
         ));
         assert_eq!(step(&eager, &pool).await, 0);
+    }
+
+    // ------------------------------------------------------------------
+    // Conditional lifecycle transitions (issue #241, PR 12): two replicas
+    // are two stores over two pools, racing for real (`tokio::join!`), and
+    // exactly one wins; the loser is handed the winner's row.
+    // ------------------------------------------------------------------
+
+    use crate::discovery::{
+        lifecycle::{TransitionOutcome, UNREVIEWED_REVISION},
+        suggestions::{RuleSuggestionError, RuleSuggestionLifecycleState},
+    };
+    use crate::storage::postgres_discovery_lifecycle::PostgresDiscoveryLifecycleStore;
+
+    async fn seed_open_signal(pool: &deadpool_postgres::Pool, id: &str, endpoint_template: &str) {
+        let client = pool.get().await.expect("client");
+        client
+            .execute(
+                "INSERT INTO greengateway.discovery_signals
+                     (id, signal_type, target_kind, target_key, target_identity_json,
+                      explanation, evidence_json, state, created_at, updated_at)
+                 VALUES ($1, 'new_endpoint_seen', 'endpoint', $2, $3, 'seeded', '{}', 'open',
+                         '2024-06-01T00:00:00Z', '2024-06-01T00:00:00Z')",
+                &[
+                    &id,
+                    &signals::endpoint_target_key("GET", endpoint_template),
+                    &json!({"method": "GET", "endpoint_template": endpoint_template}).to_string(),
+                ],
+            )
+            .await
+            .expect("the open signal seeds");
+    }
+
+    async fn seed_open_suggestion(pool: &deadpool_postgres::Pool, id: &str, identity_bound: bool) {
+        use crate::rbac::{PrincipalMatcher, Rule, RuleAction, RuleDispatchMatcher};
+        let rule = Rule {
+            id: None,
+            enabled: true,
+            methods: vec!["GET".to_owned()],
+            path: format!("/raced/{id}"),
+            tool_name: None,
+            dispatch: Some(RuleDispatchMatcher::contextless()),
+            principal: PrincipalMatcher {
+                roles: vec!["reader".to_owned()],
+                issuers: if identity_bound {
+                    vec!["provider:test".to_owned()]
+                } else {
+                    Vec::new()
+                },
+                auth_methods: vec!["bearer_token".to_owned()],
+                principal_ids: Vec::new(),
+            },
+            action: RuleAction::Allow,
+        };
+        let client = pool.get().await.expect("client");
+        client
+            .execute(
+                "INSERT INTO greengateway.discovery_rule_suggestions
+                     (id, suggestion_type, method, path_pattern, principal_key,
+                      proposed_rule_json, rationale, evidence_json, state, created_at,
+                      updated_at)
+                 VALUES ($1, 'baseline_allow', 'GET', $2, $3, $4, 'seeded', '{}', 'open',
+                         '2024-06-01T00:00:00Z', '2024-06-01T00:00:00Z')",
+                &[
+                    &id,
+                    &rule.path,
+                    &format!("seed:{id}"),
+                    &serde_json::to_string(&rule).expect("the rule serializes"),
+                ],
+            )
+            .await
+            .expect("the open suggestion seeds");
+    }
+
+    async fn seed_aggregate(pool: &deadpool_postgres::Pool, method: &str, endpoint_template: &str) {
+        let client = pool.get().await.expect("client");
+        client
+            .execute(
+                "INSERT INTO greengateway.discovery_endpoint_aggregates
+                     (method, endpoint_template, first_seen, last_seen, call_count,
+                      latency_count, latency_p50_ms, latency_p95_ms, latency_p99_ms,
+                      latency_samples_json, distinct_principal_count, updated_at)
+                 VALUES ($1, $2, '2024-06-01T12:00:00Z', '2024-06-01T12:00:00Z', 1, 1, 1, 1, 1,
+                         '[]', 0, '2024-06-01T12:00:00Z')",
+                &[&method, &endpoint_template],
+            )
+            .await
+            .expect("the aggregate seeds");
+    }
+
+    /// Exactly one of two racing outcomes applied; returns
+    /// `(winner, loser's view of the current row)`.
+    fn exactly_one_winner<T: Clone + std::fmt::Debug>(
+        left: TransitionOutcome<T>,
+        right: TransitionOutcome<T>,
+    ) -> (T, T) {
+        match (left, right) {
+            (TransitionOutcome::Applied(winner), TransitionOutcome::Refused(refused))
+            | (TransitionOutcome::Refused(refused), TransitionOutcome::Applied(winner)) => {
+                (winner, refused.current)
+            }
+            (left, right) => panic!("exactly one replica must win, got {left:?} and {right:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn two_replicas_transitioning_one_signal_get_exactly_one_winner() {
+        let Some(admin_dsn) = locator() else {
+            eprintln!("skipping: no test database locator; CI runs this test");
+            return;
+        };
+        let _guard = DATABASE.lock().await;
+        let database = create_test_database(&admin_dsn).await;
+        let pool_a = migrated_discovery_pool(&database).await;
+        let pool_b = migrated_discovery_pool(&database).await;
+        let replica_a = PostgresDiscoveryReadStore::new(pool_a.clone());
+        let replica_b = PostgresDiscoveryReadStore::new(pool_b.clone());
+        let from_open = TransitionPrecondition::from_state(SignalLifecycleState::Open);
+
+        for (id, target) in [
+            ("sig-ack", SignalLifecycleState::Acknowledged),
+            ("sig-dismiss", SignalLifecycleState::Dismissed),
+        ] {
+            seed_open_signal(&pool_a, id, &format!("/{id}")).await;
+            let (left, right) = tokio::join!(
+                replica_a.transition_signal(id, target, Some("admin-a"), from_open),
+                replica_b.transition_signal(id, target, Some("admin-b"), from_open),
+            );
+            let (winner, seen_by_loser) =
+                exactly_one_winner(left.expect("replica a"), right.expect("replica b"));
+            assert_eq!(winner.state, target);
+            assert_eq!(winner.revision, 2);
+            assert_eq!(seen_by_loser.state, target);
+            assert_eq!(seen_by_loser.revision, 2);
+            assert_eq!(
+                seen_by_loser.transitioned_by, winner.transitioned_by,
+                "the refusal carries the winner's row; nothing was overwritten"
+            );
+            let stored = replica_b
+                .list_signals(&SignalListFilters {
+                    state: Some(target),
+                    target_key: Some(signals::endpoint_target_key("GET", &format!("/{id}"))),
+                    ..signal_filters(10)
+                })
+                .await
+                .expect("signals list")
+                .signals;
+            assert_eq!(stored.len(), 1);
+            assert_eq!(stored[0].transitioned_by, winner.transitioned_by);
+            assert_eq!(stored[0].revision, 2);
+
+            // The revision predicate alone: stale refused, exact applied.
+            let stale = replica_b
+                .transition_signal(
+                    id,
+                    SignalLifecycleState::Dismissed,
+                    Some("admin-b"),
+                    TransitionPrecondition::from_state(target).with_revision(Some(1)),
+                )
+                .await
+                .expect("stale transition")
+                .expect_refused("a stale revision is refused");
+            assert_eq!(stale.revision, 2);
+            let moved = replica_b
+                .transition_signal(
+                    id,
+                    SignalLifecycleState::Dismissed,
+                    Some("admin-b"),
+                    TransitionPrecondition::from_state(target).with_revision(Some(2)),
+                )
+                .await
+                .expect("exact transition")
+                .expect_applied("the exact revision applies");
+            assert_eq!(moved.revision, 3);
+            assert_eq!(moved.transitioned_by.as_deref(), Some("admin-b"));
+        }
+        assert!(replica_a
+            .transition_signal(
+                "sig-missing",
+                SignalLifecycleState::Dismissed,
+                None,
+                from_open
+            )
+            .await
+            .expect("unknown transition")
+            .is_not_found());
+    }
+
+    #[tokio::test]
+    async fn two_replicas_dismissing_one_suggestion_get_exactly_one_winner() {
+        let Some(admin_dsn) = locator() else {
+            eprintln!("skipping: no test database locator; CI runs this test");
+            return;
+        };
+        let _guard = DATABASE.lock().await;
+        let database = create_test_database(&admin_dsn).await;
+        let pool_a = migrated_discovery_pool(&database).await;
+        let pool_b = migrated_discovery_pool(&database).await;
+        let replica_a = PostgresDiscoveryLifecycleStore::new(pool_a.clone());
+        let replica_b = PostgresDiscoveryLifecycleStore::new(pool_b.clone());
+        let from_open = TransitionPrecondition::from_state(RuleSuggestionLifecycleState::Open);
+
+        seed_open_suggestion(&pool_a, "raced", true).await;
+        let seeded = replica_b
+            .get_suggestion("raced")
+            .await
+            .expect("seeded suggestion loads")
+            .expect("seeded suggestion exists");
+        assert_eq!(seeded.state, RuleSuggestionLifecycleState::Open);
+        assert_eq!(seeded.revision, 1);
+
+        let (left, right) = tokio::join!(
+            replica_a.transition_suggestion(
+                "raced",
+                RuleSuggestionLifecycleState::Dismissed,
+                Some("admin-a"),
+                from_open,
+            ),
+            replica_b.transition_suggestion(
+                "raced",
+                RuleSuggestionLifecycleState::Dismissed,
+                Some("admin-b"),
+                from_open,
+            ),
+        );
+        let (winner, seen_by_loser) =
+            exactly_one_winner(left.expect("replica a"), right.expect("replica b"));
+        assert_eq!(winner.state, RuleSuggestionLifecycleState::Dismissed);
+        assert_eq!(winner.revision, 2);
+        assert_eq!(seen_by_loser.state, RuleSuggestionLifecycleState::Dismissed);
+        assert_eq!(seen_by_loser.revision, 2);
+        assert_eq!(seen_by_loser.transitioned_by, winner.transitioned_by);
+        assert_eq!(
+            replica_a
+                .get_suggestion("raced")
+                .await
+                .expect("reload")
+                .expect("exists")
+                .transitioned_by,
+            winner.transitioned_by
+        );
+
+        // Acceptance: the revision predicate, then the from-state one.
+        seed_open_suggestion(&pool_a, "accepted", true).await;
+        let stale = replica_b
+            .transition_suggestion(
+                "accepted",
+                RuleSuggestionLifecycleState::Accepted,
+                Some("admin-b"),
+                from_open.with_revision(Some(9)),
+            )
+            .await
+            .expect("stale accept")
+            .expect_refused("a stale revision is refused");
+        assert_eq!(stale.state, RuleSuggestionLifecycleState::Open);
+        let accepted = replica_a
+            .transition_suggestion(
+                "accepted",
+                RuleSuggestionLifecycleState::Accepted,
+                Some("admin-a"),
+                from_open.with_revision(Some(1)),
+            )
+            .await
+            .expect("exact accept")
+            .expect_applied("the exact revision applies");
+        assert_eq!(accepted.state, RuleSuggestionLifecycleState::Accepted);
+        assert_eq!(accepted.revision, 2);
+        let too_late = replica_b
+            .transition_suggestion(
+                "accepted",
+                RuleSuggestionLifecycleState::Accepted,
+                Some("admin-b"),
+                from_open,
+            )
+            .await
+            .expect("late accept")
+            .expect_refused("an accepted suggestion is not Open");
+        assert_eq!(too_late.transitioned_by.as_deref(), Some("admin-a"));
+
+        // The identity-bound rule fails closed here as it does in SQLite.
+        seed_open_suggestion(&pool_a, "unbound", false).await;
+        assert!(matches!(
+            replica_a
+                .transition_suggestion(
+                    "unbound",
+                    RuleSuggestionLifecycleState::Accepted,
+                    Some("admin-a"),
+                    from_open,
+                )
+                .await,
+            Err(RuleSuggestionError::UnsafeBaselineSuggestion { ref id }) if id == "unbound"
+        ));
+        assert_eq!(
+            replica_a
+                .get_suggestion("unbound")
+                .await
+                .expect("reload")
+                .expect("exists")
+                .state,
+            RuleSuggestionLifecycleState::Open
+        );
+        assert!(replica_a
+            .transition_suggestion(
+                "missing",
+                RuleSuggestionLifecycleState::Dismissed,
+                None,
+                from_open
+            )
+            .await
+            .expect("unknown transition")
+            .is_not_found());
+    }
+
+    #[tokio::test]
+    async fn two_replicas_marking_and_clearing_one_review_get_exactly_one_winner() {
+        let Some(admin_dsn) = locator() else {
+            eprintln!("skipping: no test database locator; CI runs this test");
+            return;
+        };
+        let _guard = DATABASE.lock().await;
+        let database = create_test_database(&admin_dsn).await;
+        let pool_a = migrated_discovery_pool(&database).await;
+        let pool_b = migrated_discovery_pool(&database).await;
+        let replica_a = PostgresDiscoveryReadStore::new(pool_a.clone());
+        let replica_b = PostgresDiscoveryReadStore::new(pool_b.clone());
+        seed_aggregate(&pool_a, "GET", "/reviewed").await;
+        let expect_unreviewed = Some(UNREVIEWED_REVISION);
+
+        // Two first marks, racing: one row, one winner.
+        let (left, right) = tokio::join!(
+            replica_a.set_endpoint_review(
+                "GET",
+                "/reviewed",
+                true,
+                Some("admin-a"),
+                expect_unreviewed
+            ),
+            replica_b.set_endpoint_review(
+                "GET",
+                "/reviewed",
+                true,
+                Some("admin-b"),
+                expect_unreviewed
+            ),
+        );
+        let (winner, seen_by_loser) =
+            exactly_one_winner(left.expect("replica a"), right.expect("replica b"));
+        assert!(winner.reviewed);
+        assert_eq!(winner.revision, 1);
+        assert_eq!(seen_by_loser.reviewed_by, winner.reviewed_by);
+        assert_eq!(seen_by_loser.revision, 1);
+        let detail = replica_b
+            .get_endpoint_with_open_signal_summaries("GET", "/reviewed", 24, false)
+            .await
+            .expect("detail")
+            .expect("exists");
+        assert_eq!(detail.reviewed_by, winner.reviewed_by);
+        assert_eq!(detail.review_revision, 1);
+
+        // Two clears of revision 1, racing: one deletes, the other is
+        // refused and sees no review.
+        let (left, right) = tokio::join!(
+            replica_a.set_endpoint_review("GET", "/reviewed", false, Some("admin-a"), Some(1)),
+            replica_b.set_endpoint_review("GET", "/reviewed", false, Some("admin-b"), Some(1)),
+        );
+        let (cleared, seen_by_loser) =
+            exactly_one_winner(left.expect("replica a"), right.expect("replica b"));
+        assert_eq!(cleared, EndpointReviewState::unreviewed());
+        assert_eq!(seen_by_loser, EndpointReviewState::unreviewed());
+        assert_eq!(
+            scalar_i64(
+                &pool_a,
+                "SELECT count(*) FROM greengateway.discovery_endpoint_reviews"
+            )
+            .await,
+            0
+        );
+
+        // Stale, exact, and unconditional re-marks.
+        let remarked = replica_a
+            .set_endpoint_review("GET", "/reviewed", true, Some("admin-a"), None)
+            .await
+            .expect("unconditional mark")
+            .expect_applied("unconditional");
+        assert_eq!(remarked.revision, 1);
+        let stale = replica_b
+            .set_endpoint_review("GET", "/reviewed", true, Some("admin-b"), Some(7))
+            .await
+            .expect("stale mark")
+            .expect_refused("stale");
+        assert_eq!(stale.reviewed_by.as_deref(), Some("admin-a"));
+        let exact = replica_b
+            .set_endpoint_review("GET", "/reviewed", true, Some("admin-b"), Some(1))
+            .await
+            .expect("exact mark")
+            .expect_applied("exact");
+        assert_eq!(exact.revision, 2);
+        assert_eq!(exact.reviewed_by.as_deref(), Some("admin-b"));
+        let replaced = replica_a
+            .set_endpoint_review("GET", "/reviewed", true, Some("admin-a"), None)
+            .await
+            .expect("unconditional replace")
+            .expect_applied("unconditional");
+        assert_eq!(replaced.revision, 3);
+
+        // Clearing nothing while expecting nothing applies; an unknown
+        // endpoint is not found.
+        replica_a
+            .set_endpoint_review("GET", "/reviewed", false, None, None)
+            .await
+            .expect("clear")
+            .expect_applied("clear");
+        let noop = replica_b
+            .set_endpoint_review("GET", "/reviewed", false, None, expect_unreviewed)
+            .await
+            .expect("no-op clear")
+            .expect_applied("clearing nothing, expecting nothing, applies");
+        assert_eq!(noop, EndpointReviewState::unreviewed());
+        assert!(replica_a
+            .set_endpoint_review("GET", "/missing", true, None, None)
+            .await
+            .expect("unknown endpoint")
+            .is_not_found());
+    }
+
+    // ------------------------------------------------------------------
+    // Atomic suggestion acceptance (issue #241, PR 12, design section 3):
+    // the policy commit and the suggestion transition share one
+    // transaction, so neither ever lands without the other.
+    // ------------------------------------------------------------------
+
+    use crate::storage::postgres_discovery_lifecycle::{AcceptRefused, AcceptSuggestionRequest};
+
+    /// The policy-side facts an acceptance must leave untouched when it
+    /// does not commit: active version/ETag/revision, history rows,
+    /// outbox rows.
+    #[derive(Debug, PartialEq)]
+    struct PolicyFootprint {
+        active_version: i64,
+        active_etag: String,
+        security_revision: i64,
+        document_rows: i64,
+        outbox_rows: i64,
+    }
+
+    async fn policy_footprint(
+        store: &PostgresPolicyStore,
+        pool: &deadpool_postgres::Pool,
+    ) -> PolicyFootprint {
+        let active = PolicyControlPlane::active(store)
+            .await
+            .expect("active policy reads")
+            .expect("a policy is active");
+        PolicyFootprint {
+            active_version: active.version,
+            active_etag: active.etag,
+            security_revision: active.security_revision,
+            document_rows: count_rows(pool, "policy_documents").await,
+            outbox_rows: count_rows(pool, "security_outbox").await,
+        }
+    }
+
+    /// Initialize the policy control plane with `contract_policy_variant
+    /// ("accept-initial", "reader")` and return its ETag.
+    async fn initialize_policy(store: &PostgresPolicyStore) -> String {
+        PolicyControlPlane::commit(
+            store,
+            commit_request(
+                PolicyCommitPrecondition::Initialize,
+                &INITIAL_ACCEPT_POLICY,
+                "installer",
+            ),
+        )
+        .await
+        .expect("the initial policy commits")
+        .etag
+    }
+
+    static INITIAL_ACCEPT_POLICY: std::sync::LazyLock<Policy> =
+        std::sync::LazyLock::new(|| contract_policy_variant("accept-initial", "reader"));
+
+    #[tokio::test]
+    async fn accepting_with_a_stale_policy_etag_leaves_suggestion_and_policy_untouched() {
+        let Some(admin_dsn) = locator() else {
+            eprintln!("skipping: no test database locator; CI runs this test");
+            return;
+        };
+        let _guard = DATABASE.lock().await;
+        let database = create_test_database(&admin_dsn).await;
+        let pool = migrated_discovery_pool(&database).await;
+        let policy_store = PostgresPolicyStore::new(pool.clone());
+        let lifecycle = PostgresDiscoveryLifecycleStore::new(pool.clone());
+        let current_etag = initialize_policy(&policy_store).await;
+        seed_open_suggestion(&pool, "stale-etag", true).await;
+        let before = policy_footprint(&policy_store, &pool).await;
+        assert_eq!(before.document_rows, 1);
+        assert_eq!(before.outbox_rows, 1);
+
+        let candidate = contract_policy_variant("accept-candidate", "reader");
+        let refused = lifecycle
+            .accept_suggestion(AcceptSuggestionRequest {
+                suggestion_id: "stale-etag",
+                expected_revision: Some(1),
+                actor: "admin-a",
+                policy_commit: commit_request(
+                    PolicyCommitPrecondition::Expected {
+                        etag: format!("{current_etag}-stale"),
+                    },
+                    &candidate,
+                    "admin-a",
+                ),
+            })
+            .await
+            .expect_err("a stale policy ETag refuses the acceptance");
+        assert!(
+            matches!(
+                refused,
+                AcceptRefused::Policy(PolicyCommitError::PreconditionFailed)
+            ),
+            "got {refused:?}"
+        );
+
+        // The suggestion did not move and the policy side wrote nothing:
+        // no version, no history row, no outbox row, no revision advance.
+        let suggestion = lifecycle
+            .get_suggestion("stale-etag")
+            .await
+            .expect("reload")
+            .expect("exists");
+        assert_eq!(suggestion.state, RuleSuggestionLifecycleState::Open);
+        assert_eq!(suggestion.revision, 1);
+        assert!(suggestion.transitioned_at.is_none());
+        assert_eq!(policy_footprint(&policy_store, &pool).await, before);
+
+        // The other refusals also write nothing: a stale suggestion
+        // revision, an unknown id, and an unbound baseline.
+        let stale_revision = lifecycle
+            .accept_suggestion(AcceptSuggestionRequest {
+                suggestion_id: "stale-etag",
+                expected_revision: Some(7),
+                actor: "admin-a",
+                policy_commit: commit_request(
+                    PolicyCommitPrecondition::Expected {
+                        etag: current_etag.clone(),
+                    },
+                    &candidate,
+                    "admin-a",
+                ),
+            })
+            .await
+            .expect_err("a stale suggestion revision refuses");
+        match stale_revision {
+            AcceptRefused::Suggestion(refused) => {
+                assert_eq!(refused.current.revision, 1);
+                assert_eq!(refused.current.state, RuleSuggestionLifecycleState::Open);
+            }
+            other => panic!("expected the current row, got {other:?}"),
+        }
+        assert!(matches!(
+            lifecycle
+                .accept_suggestion(AcceptSuggestionRequest {
+                    suggestion_id: "missing",
+                    expected_revision: None,
+                    actor: "admin-a",
+                    policy_commit: commit_request(
+                        PolicyCommitPrecondition::Expected {
+                            etag: current_etag.clone(),
+                        },
+                        &candidate,
+                        "admin-a",
+                    ),
+                })
+                .await,
+            Err(AcceptRefused::NotFound)
+        ));
+        seed_open_suggestion(&pool, "unbound", false).await;
+        assert!(matches!(
+            lifecycle
+                .accept_suggestion(AcceptSuggestionRequest {
+                    suggestion_id: "unbound",
+                    expected_revision: None,
+                    actor: "admin-a",
+                    policy_commit: commit_request(
+                        PolicyCommitPrecondition::Expected {
+                            etag: current_etag.clone(),
+                        },
+                        &candidate,
+                        "admin-a",
+                    ),
+                })
+                .await,
+            Err(AcceptRefused::UnsafeBaselineSuggestion { ref id }) if id == "unbound"
+        ));
+        assert_eq!(policy_footprint(&policy_store, &pool).await, before);
+
+        // With the right ETag the same request commits both halves.
+        let accepted = lifecycle
+            .accept_suggestion(AcceptSuggestionRequest {
+                suggestion_id: "stale-etag",
+                expected_revision: Some(1),
+                actor: "admin-a",
+                policy_commit: commit_request(
+                    PolicyCommitPrecondition::Expected {
+                        etag: current_etag.clone(),
+                    },
+                    &candidate,
+                    "admin-a",
+                ),
+            })
+            .await
+            .expect("the current ETag accepts");
+        assert_eq!(
+            accepted.suggestion.state,
+            RuleSuggestionLifecycleState::Accepted
+        );
+        assert_eq!(accepted.suggestion.revision, 2);
+        assert_eq!(
+            accepted.suggestion.transitioned_by.as_deref(),
+            Some("admin-a")
+        );
+        assert_eq!(accepted.policy.version, 2);
+        assert_eq!(accepted.policy.policy.id, candidate.id);
+        let after = policy_footprint(&policy_store, &pool).await;
+        assert_eq!(
+            after,
+            PolicyFootprint {
+                active_version: 2,
+                active_etag: accepted.policy.etag.clone(),
+                security_revision: before.security_revision + 1,
+                document_rows: 2,
+                outbox_rows: 2,
+            }
+        );
+        let stored = lifecycle
+            .get_suggestion("stale-etag")
+            .await
+            .expect("reload")
+            .expect("exists");
+        assert_eq!(stored.state, RuleSuggestionLifecycleState::Accepted);
+        assert_eq!(stored.revision, 2);
+    }
+
+    #[tokio::test]
+    async fn two_replicas_accepting_one_suggestion_commit_exactly_one_policy() {
+        let Some(admin_dsn) = locator() else {
+            eprintln!("skipping: no test database locator; CI runs this test");
+            return;
+        };
+        let _guard = DATABASE.lock().await;
+        let database = create_test_database(&admin_dsn).await;
+        let pool_a = migrated_discovery_pool(&database).await;
+        let pool_b = migrated_discovery_pool(&database).await;
+        let policy_store = PostgresPolicyStore::new(pool_a.clone());
+        let replica_a = PostgresDiscoveryLifecycleStore::new(pool_a.clone());
+        let replica_b = PostgresDiscoveryLifecycleStore::new(pool_b.clone());
+        let current_etag = initialize_policy(&policy_store).await;
+        seed_open_suggestion(&pool_a, "raced-accept", true).await;
+        let before = policy_footprint(&policy_store, &pool_a).await;
+
+        // Both replicas read the same suggestion revision and the same
+        // policy ETag, and each proposes its own candidate.
+        let candidate_a = contract_policy_variant("accepted-by-a", "reader");
+        let candidate_b = contract_policy_variant("accepted-by-b", "reader");
+        let request_for =
+            |candidate: &'static Policy, actor: &'static str| AcceptSuggestionRequest {
+                suggestion_id: "raced-accept",
+                expected_revision: Some(1),
+                actor,
+                policy_commit: commit_request(
+                    PolicyCommitPrecondition::Expected {
+                        etag: current_etag.clone(),
+                    },
+                    candidate,
+                    actor,
+                ),
+            };
+        let candidate_a: &'static Policy = Box::leak(Box::new(candidate_a));
+        let candidate_b: &'static Policy = Box::leak(Box::new(candidate_b));
+        let (left, right) = tokio::join!(
+            replica_a.accept_suggestion(request_for(candidate_a, "admin-a")),
+            replica_b.accept_suggestion(request_for(candidate_b, "admin-b")),
+        );
+
+        let (winner, loser) = match (left, right) {
+            (Ok(winner), Err(loser)) | (Err(loser), Ok(winner)) => (winner, loser),
+            (left, right) => panic!("exactly one replica must win, got {left:?} and {right:?}"),
+        };
+        let winner_actor = winner
+            .suggestion
+            .transitioned_by
+            .clone()
+            .expect("the winner recorded its actor");
+        let winner_candidate = if winner_actor == "admin-a" {
+            candidate_a
+        } else {
+            candidate_b
+        };
+        assert_eq!(
+            winner.suggestion.state,
+            RuleSuggestionLifecycleState::Accepted
+        );
+        assert_eq!(winner.suggestion.revision, 2);
+        assert_eq!(winner.policy.policy.id, winner_candidate.id);
+
+        // The loser was refused by the SUGGESTION (it saw the winner's
+        // committed row after the lock), not by the policy ETag, and its
+        // policy commit never ran: one new version, one outbox row, and
+        // the active policy is the winner's candidate.
+        match loser {
+            AcceptRefused::Suggestion(refused) => {
+                assert_eq!(
+                    refused.current.state,
+                    RuleSuggestionLifecycleState::Accepted
+                );
+                assert_eq!(refused.current.revision, 2);
+                assert_eq!(
+                    refused.current.transitioned_by.as_deref(),
+                    Some(winner_actor.as_str())
+                );
+            }
+            other => panic!("the loser must be refused by the suggestion, got {other:?}"),
+        }
+        let after = policy_footprint(&policy_store, &pool_a).await;
+        assert_eq!(
+            after,
+            PolicyFootprint {
+                active_version: 2,
+                active_etag: winner.policy.etag.clone(),
+                security_revision: before.security_revision + 1,
+                document_rows: 2,
+                outbox_rows: 2,
+            }
+        );
+        assert_eq!(
+            PolicyControlPlane::active(&policy_store)
+                .await
+                .expect("active")
+                .expect("exists")
+                .policy
+                .id,
+            winner_candidate.id
+        );
+        let stored = replica_b
+            .get_suggestion("raced-accept")
+            .await
+            .expect("reload")
+            .expect("exists");
+        assert_eq!(
+            stored.transitioned_by.as_deref(),
+            Some(winner_actor.as_str())
+        );
+        assert_eq!(stored.revision, 2);
+    }
+
+    /// The deterministic form of the race above: replica A is mid-acceptance
+    /// (an external transaction holds the suggestion row `FOR UPDATE`),
+    /// so replica B must block at the lock BEFORE running its policy
+    /// commit, and once A's transition commits B is refused by the
+    /// suggestion with its (valid-ETag) policy commit never applied.
+    /// Without the row lock B would run to completion inside the wait
+    /// window and both assertions below would fail.
+    #[tokio::test]
+    async fn an_acceptance_waiting_on_the_suggestion_lock_never_commits_its_policy() {
+        use crate::storage::postgres_discovery_lifecycle::transition_suggestion_with;
+
+        let Some(admin_dsn) = locator() else {
+            eprintln!("skipping: no test database locator; CI runs this test");
+            return;
+        };
+        let _guard = DATABASE.lock().await;
+        let database = create_test_database(&admin_dsn).await;
+        let pool_a = migrated_discovery_pool(&database).await;
+        let pool_b = migrated_discovery_pool(&database).await;
+        let policy_store = PostgresPolicyStore::new(pool_a.clone());
+        let replica_b = PostgresDiscoveryLifecycleStore::new(pool_b.clone());
+        let current_etag = initialize_policy(&policy_store).await;
+        seed_open_suggestion(&pool_a, "held", true).await;
+        let before = policy_footprint(&policy_store, &pool_a).await;
+
+        // Replica A: mid-acceptance, holding the row lock.
+        let replica_a = pool_a.get().await.expect("replica a's connection");
+        replica_a.batch_execute("BEGIN").await.expect("begin");
+        replica_a
+            .query_one(
+                "SELECT id FROM greengateway.discovery_rule_suggestions WHERE id = $1 FOR UPDATE",
+                &[&"held"],
+            )
+            .await
+            .expect("replica a locks the row");
+
+        // Replica B: the same suggestion revision, a valid policy ETag.
+        let candidate_b = contract_policy_variant("accepted-by-b", "reader");
+        let pending = replica_b.accept_suggestion(AcceptSuggestionRequest {
+            suggestion_id: "held",
+            expected_revision: Some(1),
+            actor: "admin-b",
+            policy_commit: commit_request(
+                PolicyCommitPrecondition::Expected {
+                    etag: current_etag.clone(),
+                },
+                &candidate_b,
+                "admin-b",
+            ),
+        });
+        tokio::pin!(pending);
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(250), &mut pending)
+                .await
+                .is_err(),
+            "replica b must block on the suggestion row lock"
+        );
+        assert_eq!(
+            policy_footprint(&policy_store, &pool_a).await,
+            before,
+            "a blocked acceptance has not touched the policy"
+        );
+
+        // Replica A finishes: transition, commit.
+        transition_suggestion_with(
+            &replica_a,
+            "held",
+            RuleSuggestionLifecycleState::Accepted,
+            Some("admin-a"),
+            TransitionPrecondition::from_state(RuleSuggestionLifecycleState::Open),
+        )
+        .await
+        .expect("replica a transitions")
+        .expect_applied("replica a holds the lock");
+        replica_a.batch_execute("COMMIT").await.expect("commit");
+
+        let refused = pending
+            .await
+            .expect_err("replica b is refused once it sees the committed row");
+        match refused {
+            AcceptRefused::Suggestion(refused) => {
+                assert_eq!(
+                    refused.current.state,
+                    RuleSuggestionLifecycleState::Accepted
+                );
+                assert_eq!(refused.current.revision, 2);
+                assert_eq!(refused.current.transitioned_by.as_deref(), Some("admin-a"));
+            }
+            other => panic!("the loser must be refused by the suggestion, got {other:?}"),
+        }
+        assert_eq!(
+            policy_footprint(&policy_store, &pool_a).await,
+            before,
+            "the loser's policy commit was never applied"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_crash_between_policy_write_and_transition_applies_neither() {
+        let Some(admin_dsn) = locator() else {
+            eprintln!("skipping: no test database locator; CI runs this test");
+            return;
+        };
+        let _guard = DATABASE.lock().await;
+        let database = create_test_database(&admin_dsn).await;
+        let pool = migrated_discovery_pool(&database).await;
+        let policy_store = PostgresPolicyStore::new(pool.clone());
+        let lifecycle = PostgresDiscoveryLifecycleStore::new(pool.clone());
+        let current_etag = initialize_policy(&policy_store).await;
+        seed_open_suggestion(&pool, "crashed", true).await;
+        let before = policy_footprint(&policy_store, &pool).await;
+        let candidate = contract_policy_variant("accept-crashed", "reader");
+        let request = || AcceptSuggestionRequest {
+            suggestion_id: "crashed",
+            expected_revision: Some(1),
+            actor: "admin-a",
+            policy_commit: commit_request(
+                PolicyCommitPrecondition::Expected {
+                    etag: current_etag.clone(),
+                },
+                &candidate,
+                "admin-a",
+            ),
+        };
+
+        // The process dies after the policy's steps ran and before the
+        // suggestion transitioned: the connection goes away with the
+        // transaction open.
+        lifecycle.crash_before_transition_for_tests();
+        let crashed = lifecycle
+            .accept_suggestion(request())
+            .await
+            .expect_err("the crash hook fails the acceptance");
+        assert!(
+            matches!(
+                crashed,
+                AcceptRefused::Store(RuleSuggestionError::Repository(_))
+            ),
+            "got {crashed:?}"
+        );
+
+        // BOTH halves are unapplied: the policy has no new version,
+        // history row, outbox row, or revision, and the suggestion is
+        // still Open at revision 1.
+        assert_eq!(policy_footprint(&policy_store, &pool).await, before);
+        let suggestion = lifecycle
+            .get_suggestion("crashed")
+            .await
+            .expect("reload")
+            .expect("exists");
+        assert_eq!(suggestion.state, RuleSuggestionLifecycleState::Open);
+        assert_eq!(suggestion.revision, 1);
+
+        // The same request, retried after the "restart", commits both.
+        let accepted = lifecycle
+            .accept_suggestion(request())
+            .await
+            .expect("the retry accepts");
+        assert_eq!(
+            accepted.suggestion.state,
+            RuleSuggestionLifecycleState::Accepted
+        );
+        assert_eq!(accepted.suggestion.revision, 2);
+        // The aborted transaction consumed identity value 2 (sequences
+        // never roll back), so the retry's version is 3 with two rows
+        // stored: a gap, never a phantom row. The security revision is a
+        // counter row updated inside the transaction, so it has no gap.
+        assert_eq!(accepted.policy.version, 3);
+        let after = policy_footprint(&policy_store, &pool).await;
+        assert_eq!(
+            after,
+            PolicyFootprint {
+                active_version: 3,
+                active_etag: accepted.policy.etag.clone(),
+                security_revision: before.security_revision + 1,
+                document_rows: 2,
+                outbox_rows: 2,
+            }
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // Generation parity (issue #241, PR 12): the PostgreSQL engine and the
+    // SQLite engine, fed the SAME audit events and the SAME discovery
+    // inventory, produce the same suggestion set and the same run
+    // counters; re-running against PostgreSQL changes nothing.
+    // ------------------------------------------------------------------
+
+    use crate::discovery::{
+        cluster_suggestions::ClusterRuleSuggestionEngine,
+        suggestions::{
+            RuleSuggestion, RuleSuggestionConfig, RuleSuggestionEngine, RuleSuggestionListFilters,
+            RuleSuggestionRun,
+        },
+    };
+
+    const PARITY_CLASSIFIED_AT: &str = "2024-05-31T00:00:00Z";
+    const PARITY_SIGNAL_CREATED_AT: &str = "2024-06-02T00:00:00Z";
+
+    /// The actor of one generation-fixture observation: user, issuer,
+    /// roles, and auth mode -- the facets the baseline keys on.
+    struct FixtureActor<'a> {
+        user_id: &'a str,
+        issuer: Option<&'a str>,
+        roles: &'a [&'a str],
+        auth_mode: &'a str,
+    }
+
+    /// One observation as the middleware emits it; the payload carries the
+    /// routing flag and the policy decision the matrix filters on.
+    fn generation_event(
+        index: usize,
+        method: &str,
+        path: &str,
+        status: u16,
+        actor: Option<FixtureActor<'_>>,
+        policy_decision: &str,
+        routing_context_known: bool,
+    ) -> AuditEvent {
+        let actor = actor.map(|actor| Actor {
+            user_id: actor.user_id.to_owned(),
+            issuer: actor.issuer.map(str::to_owned),
+            email: None,
+            roles: Some(actor.roles.iter().map(|role| (*role).to_owned()).collect()),
+            auth_mode: actor.auth_mode.to_owned(),
+        });
+        let mut event = AuditEvent::new(
+            "http.request_observed",
+            format!("generation-request-{index}"),
+            "203.0.113.10",
+            actor,
+            json!({
+                "method": method,
+                "path": path,
+                "status": status,
+                "latency_ms": 5,
+                "policy_decision": policy_decision,
+                "routing_context_known": routing_context_known,
+            }),
+        );
+        event.event_id = format!("generation-{index:03}");
+        event.timestamp = format!("2024-06-01T12:00:{:02}Z", index % 60);
+        event
+    }
+
+    /// The fixture: two observed endpoints, and observations that exercise
+    /// every matrix branch -- counted (two roles on one call, an error
+    /// response, a service token without an issuer), and each skip reason
+    /// (denied, unauthenticated, no roles, no issuer, unsupported auth
+    /// method, unknown routing context, an endpoint never observed).
+    fn generation_events() -> Vec<AuditEvent> {
+        let bearer = "bearer_token";
+        let issuer = Some("provider:test");
+        let actor = |user_id, issuer, roles, auth_mode| {
+            Some(FixtureActor {
+                user_id,
+                issuer,
+                roles,
+                auth_mode,
+            })
+        };
+        let reader: &[&str] = &["billing-reader"];
+        vec![
+            generation_event(
+                1,
+                "GET",
+                "/invoices/123",
+                200,
+                actor("alice", issuer, reader, bearer),
+                "allowed",
+                true,
+            ),
+            generation_event(
+                2,
+                "GET",
+                "/invoices/456",
+                500,
+                actor("bob", issuer, reader, bearer),
+                "allowed",
+                true,
+            ),
+            generation_event(
+                3,
+                "POST",
+                "/refunds",
+                201,
+                actor("carol", issuer, &["billing-writer", "auditor"], bearer),
+                "allowed",
+                true,
+            ),
+            generation_event(
+                4,
+                "GET",
+                "/invoices/789",
+                403,
+                actor("dave", issuer, reader, bearer),
+                "denied",
+                true,
+            ),
+            generation_event(5, "GET", "/invoices/1", 401, None, "allowed", true),
+            generation_event(
+                6,
+                "GET",
+                "/invoices/2",
+                200,
+                actor("erin", issuer, &[], bearer),
+                "allowed",
+                true,
+            ),
+            generation_event(
+                7,
+                "GET",
+                "/invoices/3",
+                200,
+                actor("frank", None, reader, bearer),
+                "allowed",
+                true,
+            ),
+            generation_event(
+                8,
+                "POST",
+                "/refunds",
+                200,
+                actor("svc-batch", None, &["batch"], "service_token"),
+                "allowed",
+                true,
+            ),
+            generation_event(
+                9,
+                "GET",
+                "/invoices/4",
+                200,
+                actor("grace", issuer, reader, "mtls"),
+                "allowed",
+                true,
+            ),
+            generation_event(
+                10,
+                "GET",
+                "/unobserved/1",
+                200,
+                actor("alice", issuer, reader, bearer),
+                "allowed",
+                true,
+            ),
+            generation_event(
+                11,
+                "GET",
+                "/invoices/5",
+                200,
+                actor("alice", issuer, reader, bearer),
+                "allowed",
+                false,
+            ),
+        ]
+    }
+
+    const PARITY_ENDPOINTS: [(&str, &str); 2] = [("GET", "/invoices/{id}"), ("POST", "/refunds")];
+
+    /// The SQLite half of the fixture: the aggregator's tables as the sink
+    /// leaves them, plus one open signal.
+    fn seed_sqlite_discovery_fixture(path: &PathBuf) {
+        DiscoveryQueryStore::open(path).expect("the SQLite discovery schema creates");
+        let connection = rusqlite::Connection::open(path).expect("the discovery file opens");
+        connection
+            .execute_batch(
+                r#"
+                CREATE TABLE IF NOT EXISTS discovery_endpoint_aggregates (
+                    method TEXT NOT NULL,
+                    endpoint_template TEXT NOT NULL,
+                    first_seen TEXT NOT NULL,
+                    last_seen TEXT NOT NULL,
+                    call_count INTEGER NOT NULL,
+                    schema_mismatch_count INTEGER NOT NULL DEFAULT 0,
+                    latency_count INTEGER NOT NULL,
+                    latency_p50_ms INTEGER NOT NULL,
+                    latency_p95_ms INTEGER NOT NULL,
+                    latency_p99_ms INTEGER NOT NULL,
+                    latency_samples_json TEXT NOT NULL,
+                    distinct_principal_count INTEGER NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    PRIMARY KEY (method, endpoint_template)
+                );
+                "#,
+            )
+            .expect("the aggregate table creates");
+        for (method, endpoint_template) in PARITY_ENDPOINTS {
+            connection
+                .execute(
+                    "INSERT INTO discovery_endpoint_aggregates (
+                         method, endpoint_template, first_seen, last_seen, call_count,
+                         schema_mismatch_count, latency_count, latency_p50_ms, latency_p95_ms,
+                         latency_p99_ms, latency_samples_json, distinct_principal_count, updated_at
+                     ) VALUES (?1, ?2, '2024-06-01T12:00:00Z', '2024-06-01T12:00:00Z', 1, 0, 1, 1,
+                               1, 1, '[]', 0, '2024-06-01T12:00:00Z')",
+                    rusqlite::params![method, endpoint_template],
+                )
+                .expect("the aggregate seeds");
+            connection
+                .execute(
+                    "INSERT INTO discovery_endpoint_routing_classifications
+                         (method, endpoint_template, first_classified_at)
+                     VALUES (?1, ?2, ?3)",
+                    rusqlite::params![method, endpoint_template, PARITY_CLASSIFIED_AT],
+                )
+                .expect("the classification seeds");
+        }
+        connection
+            .execute(
+                "INSERT INTO discovery_signals
+                     (id, signal_type, target_kind, target_key, target_identity_json,
+                      explanation, evidence_json, state, created_at, updated_at)
+                 VALUES (?1, 'new_endpoint_seen', 'endpoint', ?2, ?3, 'seeded', '{}', 'open',
+                         ?4, ?4)",
+                rusqlite::params![
+                    "sig-parity",
+                    signals::endpoint_target_key("GET", "/invoices/{id}"),
+                    json!({"method": "GET", "endpoint_template": "/invoices/{id}"}).to_string(),
+                    PARITY_SIGNAL_CREATED_AT,
+                ],
+            )
+            .expect("the signal seeds");
+    }
+
+    /// The PostgreSQL half: the projector's tables with the same rows.
+    async fn seed_postgres_discovery_fixture(pool: &deadpool_postgres::Pool) {
+        let client = pool.get().await.expect("client");
+        for (method, endpoint_template) in PARITY_ENDPOINTS {
+            seed_aggregate(pool, method, endpoint_template).await;
+            client
+                .execute(
+                    "INSERT INTO greengateway.discovery_endpoint_routing_classifications
+                         (method, endpoint_template, first_classified_at)
+                     VALUES ($1, $2, $3)",
+                    &[&method, &endpoint_template, &PARITY_CLASSIFIED_AT],
+                )
+                .await
+                .expect("the classification seeds");
+        }
+        client
+            .execute(
+                "INSERT INTO greengateway.discovery_signals
+                     (id, signal_type, target_kind, target_key, target_identity_json,
+                      explanation, evidence_json, state, created_at, updated_at)
+                 VALUES ($1, 'new_endpoint_seen', 'endpoint', $2, $3, 'seeded', '{}', 'open',
+                         $4, $4)",
+                &[
+                    &"sig-parity",
+                    &signals::endpoint_target_key("GET", "/invoices/{id}"),
+                    &json!({"method": "GET", "endpoint_template": "/invoices/{id}"}).to_string(),
+                    &PARITY_SIGNAL_CREATED_AT,
+                ],
+            )
+            .await
+            .expect("the signal seeds");
+    }
+
+    /// A suggestion reduced to what parity means: everything except the
+    /// generated id, the run's own timestamps (`created_at`, the window
+    /// bounds), and the backend's name in `evidence.source`. The audit
+    /// timestamps in the evidence compare as instants, because the durable
+    /// stream renders them with fixed microseconds and SQLite keeps the
+    /// event's own text.
+    fn comparable_suggestion(suggestion: &RuleSuggestion) -> Value {
+        let mut evidence = suggestion.evidence.clone();
+        if let Some(object) = evidence.as_object_mut() {
+            for volatile in ["source", "from", "to"] {
+                object.remove(volatile);
+            }
+            for instant in ["first_seen", "last_seen"] {
+                if let Some(text) = object.get(instant).and_then(Value::as_str) {
+                    let parsed = OffsetDateTime::parse(text, &Rfc3339)
+                        .unwrap_or_else(|_| panic!("{instant} is RFC 3339: {text}"));
+                    object.insert(instant.to_owned(), json!(parsed.unix_timestamp_nanos()));
+                }
+            }
+        }
+        json!({
+            "suggestion_type": suggestion.suggestion_type,
+            "method": suggestion.method,
+            "path_pattern": suggestion.path_pattern,
+            "principal_key": suggestion.principal_key,
+            "proposed_rule": suggestion.proposed_rule,
+            "rationale": suggestion.rationale,
+            "evidence": evidence,
+            "state": suggestion.state,
+            "source_signal_id": suggestion.source_signal_id,
+            "revision": suggestion.revision,
+        })
+    }
+
+    fn comparable_suggestion_set(suggestions: &[RuleSuggestion]) -> Vec<Value> {
+        let mut set = suggestions
+            .iter()
+            .map(comparable_suggestion)
+            .collect::<Vec<_>>();
+        set.sort_by_key(|value| value.to_string());
+        set
+    }
+
+    #[tokio::test]
+    async fn postgres_generation_matches_sqlite_for_the_same_fixture_and_is_idempotent() {
+        let Some(admin_dsn) = locator() else {
+            eprintln!("skipping: no test database locator; CI runs this test");
+            return;
+        };
+        let _guard = DATABASE.lock().await;
+        let events = generation_events();
+        let policy = contract_policy("parity");
+        let config = RuleSuggestionConfig {
+            baseline_window_hours: 876_000,
+        };
+
+        // Standalone: the SQLite audit adapter and the SQLite discovery file.
+        let audit_db = TempDb::new("parity-audit");
+        let discovery_db = TempDb::new("parity-discovery");
+        SqliteAuditEventStore::open(&audit_db.path)
+            .expect("the SQLite audit store opens")
+            .insert_events(&events)
+            .await
+            .expect("the SQLite audit store ingests");
+        seed_sqlite_discovery_fixture(&discovery_db.path);
+        let sqlite_engine =
+            RuleSuggestionEngine::open(&discovery_db.path, Some(&audit_db.path), config)
+                .expect("the SQLite engine opens");
+        let sqlite_run = sqlite_engine
+            .generate(&policy)
+            .expect("the SQLite engine generates");
+        let sqlite_suggestions = sqlite_engine
+            .list_suggestions()
+            .expect("the SQLite suggestions list");
+
+        // Cluster: the same events through the durable audit store, the
+        // same inventory in the projector's tables.
+        let database = create_test_database(&admin_dsn).await;
+        let pool = migrated_discovery_pool(&database).await;
+        let audit_store = Arc::new(PostgresAuditEventStore::new(
+            pool.clone(),
+            Some(ingest_identity()),
+        ));
+        audit_store
+            .insert_events(&events)
+            .await
+            .expect("the PostgreSQL audit store ingests");
+        seed_postgres_discovery_fixture(&pool).await;
+        let postgres_engine = ClusterRuleSuggestionEngine::new(
+            Arc::new(PostgresDiscoveryReadStore::new(pool.clone())),
+            audit_store,
+            PostgresDiscoveryLifecycleStore::new(pool.clone()),
+            config,
+        );
+        let postgres_run = postgres_engine
+            .generate(&policy)
+            .await
+            .expect("the PostgreSQL engine generates");
+        let postgres_suggestions = postgres_engine
+            .list_suggestions()
+            .await
+            .expect("the PostgreSQL suggestions list");
+
+        // The fixture is not trivial: four baseline candidates (two roles
+        // on one call, the reader with one error, the service token
+        // without an issuer) and the signal's shadow candidate.
+        assert_eq!(sqlite_run.inserted_count, 5, "{sqlite_run:?}");
+        assert_eq!(sqlite_run.baseline.observed_role_endpoint_count, 4);
+        assert_eq!(sqlite_run.baseline.scanned_event_count, events.len() as u64);
+        assert_eq!(sqlite_run.baseline.skipped_denied_observations, 1);
+        assert_eq!(sqlite_run.baseline.skipped_unauthenticated_observations, 1);
+        assert_eq!(sqlite_run.baseline.skipped_without_roles_observations, 1);
+        assert_eq!(sqlite_run.baseline.skipped_without_issuer_observations, 1);
+        assert_eq!(
+            sqlite_run
+                .baseline
+                .skipped_unsupported_auth_method_observations,
+            1
+        );
+        assert_eq!(
+            sqlite_run
+                .baseline
+                .skipped_unknown_routing_context_observations,
+            1
+        );
+        assert_eq!(sqlite_run.anomaly.open_signal_count, 1);
+
+        // Parity: the run counters and the suggestion set are the same.
+        assert_eq!(postgres_run, sqlite_run);
+        assert_eq!(
+            comparable_suggestion_set(&postgres_suggestions),
+            comparable_suggestion_set(&sqlite_suggestions)
+        );
+        assert!(postgres_suggestions
+            .iter()
+            .all(|suggestion| suggestion.evidence["source"] != json!("audit_sqlite")));
+        let reader = postgres_suggestions
+            .iter()
+            .find(|suggestion| {
+                suggestion.method == "GET"
+                    && suggestion.proposed_rule.principal.roles == vec!["billing-reader".to_owned()]
+            })
+            .expect("the reader baseline exists");
+        assert_eq!(reader.evidence["observation_count"], json!(2));
+        assert_eq!(reader.evidence["error_count"], json!(1));
+
+        // Idempotent: a second run inserts nothing and changes nothing,
+        // exactly as the SQLite engine's second run does.
+        let second = postgres_engine
+            .generate(&policy)
+            .await
+            .expect("the second PostgreSQL run generates");
+        assert_eq!(
+            second,
+            RuleSuggestionRun {
+                inserted_count: 0,
+                ..postgres_run.clone()
+            }
+        );
+        let after = postgres_engine
+            .list_suggestions()
+            .await
+            .expect("the PostgreSQL suggestions list again");
+        assert_eq!(after, postgres_suggestions);
+        assert_eq!(
+            sqlite_engine
+                .generate(&policy)
+                .expect("the second SQLite run generates")
+                .inserted_count,
+            0
+        );
+
+        // Paging walks the same set one row at a time through the shared
+        // cursor format, newest first.
+        let mut paged = Vec::new();
+        let mut cursor = None;
+        loop {
+            let page = postgres_engine
+                .list_suggestion_page(&RuleSuggestionListFilters {
+                    state: None,
+                    suggestion_type: None,
+                    limit: 2,
+                    cursor,
+                })
+                .await
+                .expect("a page lists");
+            paged.extend(page.suggestions);
+            let Some(next) = page.next_cursor else {
+                break;
+            };
+            cursor = Some(next);
+        }
+        assert_eq!(paged, postgres_suggestions);
     }
 }
 

@@ -49,10 +49,12 @@
 //!   per endpoint per table.
 //!
 //! Writes here are the two admin transitions the SQLite store also owns:
-//! endpoint review and signal lifecycle. Both keep the SQLite semantics
-//! (last writer wins, no expected-state predicate); PR 12 adds the
-//! predicates. Errors classify into the repository vocabulary and carry an
-//! operation label only: no SQL text, no values.
+//! endpoint review and signal lifecycle. Both are the conditional writes of
+//! [`crate::discovery::lifecycle`] (issue #241, PR 12): one statement whose
+//! predicate is the expected state and revision, refused with the current
+//! row when it no longer holds, so two replicas transitioning the same row
+//! get exactly one winner. Errors classify into the repository vocabulary
+//! and carry an operation label only: no SQL text, no values.
 
 use std::collections::HashMap;
 
@@ -63,6 +65,9 @@ use tokio_postgres::{
 };
 
 use crate::discovery::{
+    lifecycle::{
+        TransitionOutcome, TransitionPrecondition, TransitionRefused, UNREVIEWED_REVISION,
+    },
     query::{
         decode_cursor, encode_cursor, endpoint_cursor, infer_request_schema, like_escape,
         new_since_cutoff, non_negative_i64_to_u64, query_limit, utc_timestamp_rfc3339,
@@ -71,7 +76,7 @@ use crate::discovery::{
         EndpointListPage, EndpointPrincipal, EndpointReviewState, EndpointRoutingContext,
         EndpointSort, InferredRequestSchema, ObservedEndpoint, OpenSignalSummary, PrincipalCursor,
         PrincipalPage, PrincipalPageFilters, RawEndpointAggregate, RawSignal, SignalCursor,
-        StatusCount,
+        StatusCount, SIGNAL_COLUMNS,
     },
     signals::{self, Signal, SignalLifecycleState, SignalListFilters},
 };
@@ -87,9 +92,6 @@ const OPERATION_LIST_SIGNALS: &str = "discovery_read_list_signals";
 const OPERATION_PRINCIPAL_SIGNALS: &str = "discovery_read_principal_signals";
 const OPERATION_TRANSITION_SIGNAL: &str = "discovery_transition_signal";
 const OPERATION_LIST_PRINCIPALS: &str = "discovery_read_list_principals";
-
-const SIGNAL_COLUMNS: &str = "id, signal_type, target_kind, target_key, target_identity_json, \
-     explanation, evidence_json, state, created_at, updated_at, transitioned_at, transitioned_by";
 
 /// The discovery read store over one PostgreSQL pool. Cheap to construct;
 /// holds no per-instance state.
@@ -434,7 +436,8 @@ impl DiscoveryReadStore for PostgresDiscoveryReadStore {
         endpoint_template: &str,
         reviewed: bool,
         reviewed_by: Option<&str>,
-    ) -> Result<Option<EndpointReviewState>, DiscoveryQueryError> {
+        expected_revision: Option<i64>,
+    ) -> Result<TransitionOutcome<EndpointReviewState>, DiscoveryQueryError> {
         let operation = OPERATION_SET_REVIEW;
         let client = self.client().await?;
         client
@@ -447,6 +450,7 @@ impl DiscoveryReadStore for PostgresDiscoveryReadStore {
             endpoint_template,
             reviewed,
             reviewed_by,
+            expected_revision,
         )
         .await;
         match result {
@@ -560,12 +564,16 @@ impl DiscoveryReadStore for PostgresDiscoveryReadStore {
             .collect()
     }
 
+    /// One conditional statement: the predicate is the id, the expected
+    /// state, and (when given) the expected revision. Zero rows is a
+    /// refusal carrying the row as it is now, or `NotFound`.
     async fn transition_signal(
         &self,
         signal_id: &str,
         state: SignalLifecycleState,
         transitioned_by: Option<&str>,
-    ) -> Result<Option<Signal>, DiscoveryQueryError> {
+        expected: TransitionPrecondition<SignalLifecycleState>,
+    ) -> Result<TransitionOutcome<Signal>, DiscoveryQueryError> {
         let operation = OPERATION_TRANSITION_SIGNAL;
         let transitioned_at = utc_timestamp_rfc3339();
         let client = self.client().await?;
@@ -576,8 +584,11 @@ impl DiscoveryReadStore for PostgresDiscoveryReadStore {
                      SET state = $2,
                          updated_at = $3,
                          transitioned_at = $3,
-                         transitioned_by = $4
+                         transitioned_by = $4,
+                         revision = revision + 1
                      WHERE id = $1
+                       AND state = $5
+                       AND ($6::bigint IS NULL OR revision = $6::bigint)
                      RETURNING {SIGNAL_COLUMNS}"
                 ),
                 &[
@@ -585,12 +596,32 @@ impl DiscoveryReadStore for PostgresDiscoveryReadStore {
                     &state.as_str(),
                     &transitioned_at,
                     &transitioned_by,
+                    &expected.from_state.as_str(),
+                    &expected.revision,
                 ],
             )
             .await
             .map_err(|error| classify_query(error, operation))?;
-        row.map(|row| raw_signal(&row, operation)?.into_signal())
-            .transpose()
+        if let Some(row) = row {
+            return Ok(TransitionOutcome::Applied(
+                raw_signal(&row, operation)?.into_signal()?,
+            ));
+        }
+        let current = client
+            .query_opt(
+                &format!(
+                    "SELECT {SIGNAL_COLUMNS} FROM greengateway.discovery_signals WHERE id = $1"
+                ),
+                &[&signal_id],
+            )
+            .await
+            .map_err(|error| classify_query(error, operation))?;
+        Ok(match current {
+            Some(row) => TransitionOutcome::Refused(TransitionRefused {
+                current: raw_signal(&row, operation)?.into_signal()?,
+            }),
+            None => TransitionOutcome::NotFound,
+        })
     }
 
     async fn list_principals(
@@ -657,16 +688,23 @@ impl DiscoveryReadStore for PostgresDiscoveryReadStore {
 const AGGREGATE_COLUMNS: &str = "a.method, a.endpoint_template, a.first_seen, a.last_seen, \
      a.call_count, a.schema_mismatch_count, a.latency_count, a.latency_p50_ms, \
      a.latency_p95_ms, a.latency_p99_ms, a.latency_samples_json, a.distinct_principal_count, \
-     a.updated_at, r.reviewed_at, r.reviewed_by";
+     a.updated_at, r.reviewed_at, r.reviewed_by, r.revision";
 
-/// The statements between BEGIN and COMMIT of one review change.
+/// The statements between BEGIN and COMMIT of one review change: the
+/// SQLite store's conditional write, statement for statement. A mark is an
+/// upsert whose predicate is the expected revision (`None` replaces at
+/// revision + 1, `UNREVIEWED_REVISION` inserts only when no row exists, any
+/// other value updates only the row at that revision); a clear deletes only
+/// the row at the expected revision. Zero rows is a refusal carrying the
+/// review as stored now.
 async fn set_endpoint_review_transaction(
     client: &deadpool_postgres::Object,
     method: &str,
     endpoint_template: &str,
     reviewed: bool,
     reviewed_by: Option<&str>,
-) -> Result<Option<EndpointReviewState>, DiscoveryQueryError> {
+    expected_revision: Option<i64>,
+) -> Result<TransitionOutcome<EndpointReviewState>, DiscoveryQueryError> {
     let operation = OPERATION_SET_REVIEW;
     let exists = client
         .query_opt(
@@ -678,59 +716,140 @@ async fn set_endpoint_review_transaction(
         .map_err(|error| classify_query(error, operation))?
         .is_some();
     if !exists {
-        return Ok(None);
+        return Ok(TransitionOutcome::NotFound);
     }
 
     if reviewed {
         let reviewed_at = utc_timestamp_rfc3339();
-        client
-            .execute(
-                "INSERT INTO greengateway.discovery_endpoint_reviews
-                     (method, endpoint_template, reviewed_at, reviewed_by)
-                 VALUES ($1, $2, $3, $4)
-                 ON CONFLICT (method, endpoint_template) DO UPDATE SET
-                     reviewed_at = EXCLUDED.reviewed_at,
-                     reviewed_by = EXCLUDED.reviewed_by",
-                &[&method, &endpoint_template, &reviewed_at, &reviewed_by],
-            )
-            .await
-            .map_err(|error| classify_query(error, operation))?;
-        Ok(Some(EndpointReviewState {
-            reviewed: true,
-            reviewed_at: Some(reviewed_at),
-            reviewed_by: reviewed_by.map(str::to_owned),
-        }))
+        let written = match expected_revision {
+            None => client
+                .query_opt(
+                    "INSERT INTO greengateway.discovery_endpoint_reviews AS r
+                         (method, endpoint_template, reviewed_at, reviewed_by, revision)
+                     VALUES ($1, $2, $3, $4, 1)
+                     ON CONFLICT (method, endpoint_template) DO UPDATE SET
+                         reviewed_at = EXCLUDED.reviewed_at,
+                         reviewed_by = EXCLUDED.reviewed_by,
+                         revision = r.revision + 1
+                     RETURNING revision",
+                    &[&method, &endpoint_template, &reviewed_at, &reviewed_by],
+                )
+                .await
+                .map_err(|error| classify_query(error, operation))?,
+            Some(UNREVIEWED_REVISION) => client
+                .query_opt(
+                    "INSERT INTO greengateway.discovery_endpoint_reviews
+                         (method, endpoint_template, reviewed_at, reviewed_by, revision)
+                     VALUES ($1, $2, $3, $4, 1)
+                     ON CONFLICT (method, endpoint_template) DO NOTHING
+                     RETURNING revision",
+                    &[&method, &endpoint_template, &reviewed_at, &reviewed_by],
+                )
+                .await
+                .map_err(|error| classify_query(error, operation))?,
+            Some(expected) => client
+                .query_opt(
+                    "UPDATE greengateway.discovery_endpoint_reviews
+                     SET reviewed_at = $3,
+                         reviewed_by = $4,
+                         revision = revision + 1
+                     WHERE method = $1 AND endpoint_template = $2 AND revision = $5
+                     RETURNING revision",
+                    &[
+                        &method,
+                        &endpoint_template,
+                        &reviewed_at,
+                        &reviewed_by,
+                        &expected,
+                    ],
+                )
+                .await
+                .map_err(|error| classify_query(error, operation))?,
+        };
+        match written {
+            Some(row) => Ok(TransitionOutcome::Applied(EndpointReviewState {
+                reviewed: true,
+                reviewed_at: Some(reviewed_at),
+                reviewed_by: reviewed_by.map(str::to_owned),
+                revision: column(&row, 0, operation)?,
+            })),
+            None => Ok(TransitionOutcome::Refused(TransitionRefused {
+                current: load_review(client, method, endpoint_template, operation).await?,
+            })),
+        }
     } else {
-        client
-            .execute(
-                "DELETE FROM greengateway.discovery_endpoint_reviews
-                 WHERE method = $1 AND endpoint_template = $2",
-                &[&method, &endpoint_template],
-            )
-            .await
-            .map_err(|error| classify_query(error, operation))?;
-        Ok(Some(EndpointReviewState {
-            reviewed: false,
-            reviewed_at: None,
-            reviewed_by: None,
-        }))
+        let deleted = match expected_revision {
+            None => client
+                .execute(
+                    "DELETE FROM greengateway.discovery_endpoint_reviews
+                     WHERE method = $1 AND endpoint_template = $2",
+                    &[&method, &endpoint_template],
+                )
+                .await
+                .map_err(|error| classify_query(error, operation))?,
+            Some(expected) => client
+                .execute(
+                    "DELETE FROM greengateway.discovery_endpoint_reviews
+                     WHERE method = $1 AND endpoint_template = $2 AND revision = $3",
+                    &[&method, &endpoint_template, &expected],
+                )
+                .await
+                .map_err(|error| classify_query(error, operation))?,
+        };
+        if deleted > 0 {
+            return Ok(TransitionOutcome::Applied(EndpointReviewState::unreviewed()));
+        }
+        let current = load_review(client, method, endpoint_template, operation).await?;
+        if !current.reviewed && matches!(expected_revision, None | Some(UNREVIEWED_REVISION)) {
+            return Ok(TransitionOutcome::Applied(current));
+        }
+        Ok(TransitionOutcome::Refused(TransitionRefused { current }))
     }
 }
 
-/// Positional parameters for a dynamically assembled statement.
+/// The review row as stored (not the effective, reclassification-aware
+/// state): what a refused conditional write hands back.
+async fn load_review(
+    client: &deadpool_postgres::Object,
+    method: &str,
+    endpoint_template: &str,
+    operation: &'static str,
+) -> Result<EndpointReviewState, DiscoveryQueryError> {
+    let row = client
+        .query_opt(
+            "SELECT reviewed_at, reviewed_by, revision
+             FROM greengateway.discovery_endpoint_reviews
+             WHERE method = $1 AND endpoint_template = $2",
+            &[&method, &endpoint_template],
+        )
+        .await
+        .map_err(|error| classify_query(error, operation))?;
+    match row {
+        Some(row) => Ok(EndpointReviewState {
+            reviewed: true,
+            reviewed_at: Some(column(&row, 0, operation)?),
+            reviewed_by: column(&row, 1, operation)?,
+            revision: column(&row, 2, operation)?,
+        }),
+        None => Ok(EndpointReviewState::unreviewed()),
+    }
+}
+
+/// Positional parameters for a dynamically assembled statement; shared
+/// with the lifecycle store's suggestion list.
 #[derive(Default)]
-struct SqlParams {
+pub(crate) struct SqlParams {
     values: Vec<Box<dyn ToSql + Sync + Send>>,
 }
 
 impl SqlParams {
     /// Bind `value` and return its `$n` placeholder.
-    fn bind<T: ToSql + Sync + Send + 'static>(&mut self, value: T) -> String {
+    pub(crate) fn bind<T: ToSql + Sync + Send + 'static>(&mut self, value: T) -> String {
         self.values.push(Box::new(value));
         format!("${}", self.values.len())
     }
 
-    fn refs(&self) -> Vec<&(dyn ToSql + Sync)> {
+    pub(crate) fn refs(&self) -> Vec<&(dyn ToSql + Sync)> {
         self.values
             .iter()
             .map(|value| value.as_ref() as &(dyn ToSql + Sync))
@@ -742,7 +861,7 @@ impl SqlParams {
 /// parse: the `julianday` behaviour, so a bad filter or a tampered cursor
 /// excludes rows instead of failing the query. `placeholder` is text-typed
 /// by the caller (`$n`), and is referenced twice on purpose.
-fn caller_timestamp(placeholder: &str) -> String {
+pub(crate) fn caller_timestamp(placeholder: &str) -> String {
     format!(
         "(CASE WHEN pg_input_is_valid({placeholder}::text, 'timestamptz') \
          THEN {placeholder}::text::timestamptz END)"
@@ -1159,6 +1278,7 @@ fn raw_endpoint_aggregate(
         updated_at: column(row, 12, operation)?,
         reviewed_at: column(row, 13, operation)?,
         reviewed_by: column(row, 14, operation)?,
+        review_revision: column(row, 15, operation)?,
     })
 }
 
@@ -1176,6 +1296,7 @@ fn raw_signal(row: &Row, operation: &'static str) -> Result<RawSignal, Discovery
         updated_at: column(row, 9, operation)?,
         transitioned_at: column(row, 10, operation)?,
         transitioned_by: column(row, 11, operation)?,
+        revision: column(row, 12, operation)?,
     })
 }
 
