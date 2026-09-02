@@ -64,6 +64,9 @@ use super::{
 /// what makes a flush idempotent and a missed flush harmless.
 type PendingDependencies = BTreeMap<ConnectionDependencyKind, Vec<(ConnectionId, String)>>;
 
+#[cfg(test)]
+type FlushHook = Arc<dyn Fn() + Send + Sync>;
+
 #[derive(Clone)]
 pub struct ConnectionControlPlane {
     managed: Option<ManagedConnectionStore>,
@@ -80,6 +83,10 @@ pub struct ConnectionControlPlane {
     /// Runtime dependency sets whose owner could not write them where it
     /// computed them. See `replace_runtime_dependencies`.
     pending_dependencies: Arc<Mutex<PendingDependencies>>,
+    /// Test seam: runs inside a flush after the batch is taken and before
+    /// it is written, while the mutation lock is held.
+    #[cfg(test)]
+    flush_hook: Arc<Mutex<Option<FlushHook>>>,
     catalog_lifecycle: Arc<CatalogLifecycleCoordinator>,
     secret_resolver: Arc<ConnectionSecretResolver>,
     local_secret_versions: Arc<ArcSwap<BTreeMap<String, u64>>>,
@@ -588,6 +595,8 @@ impl ConnectionControlPlane {
             runtime,
             mutation_lock,
             pending_dependencies,
+            #[cfg(test)]
+            flush_hook: Arc::new(Mutex::new(None)),
             catalog_lifecycle,
             secret_resolver,
             local_secret_versions,
@@ -848,6 +857,24 @@ impl ConnectionControlPlane {
     /// newer set is the one the runtime actually derives, and replaying a
     /// superseded one would undo it.
     pub async fn flush_pending_dependencies(&self) -> Result<(), ConnectionMutationError> {
+        // Under the mutation lock: a delete that runs between a flush
+        // taking its batch and writing it would find nothing to refuse it,
+        // and the batch would then be requeued for an owner that no longer
+        // exists. Serializing flushes with mutations closes that window.
+        let _guard = self.mutation_guard().await;
+        self.flush_pending_dependencies_locked().await
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_flush_hook_for_test(&self, hook: FlushHook) {
+        *self
+            .flush_hook
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(hook);
+    }
+
+    /// The flush body; the caller holds the mutation lock.
+    async fn flush_pending_dependencies_locked(&self) -> Result<(), ConnectionMutationError> {
         let pending = {
             let mut guard = self.pending_dependencies_guard();
             if guard.is_empty() {
@@ -855,6 +882,17 @@ impl ConnectionControlPlane {
             }
             std::mem::take(&mut *guard)
         };
+        #[cfg(test)]
+        {
+            let hook = self
+                .flush_hook
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .clone();
+            if let Some(hook) = hook {
+                hook();
+            }
+        }
         let store = match self.managed_store() {
             Ok(store) => store,
             Err(error) => {
@@ -1014,9 +1052,12 @@ impl ConnectionControlPlane {
         let _guard = self.mutation_guard().await;
         // Cluster mode queues dependency guard rows for a background flush;
         // a delete must not outrun them, or ON DELETE RESTRICT has no child
-        // row to protect and a live route or tool is orphaned. Flush first;
-        // a flush that fails refuses the delete rather than risk that.
-        self.flush_pending_dependencies().await?;
+        // row to protect and a live route or tool is orphaned. Flush first,
+        // under the same lock every flush takes, so a batch the background
+        // flusher has already taken is written before this delete is
+        // judged; a flush that fails refuses the delete rather than risk
+        // that.
+        self.flush_pending_dependencies_locked().await?;
         self.managed_store()?.delete(id, expected, actor).await?;
         let current = self.runtime.load_full();
         let mut managed = current.managed().clone();

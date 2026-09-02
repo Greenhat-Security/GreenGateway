@@ -115,7 +115,13 @@ pub(crate) enum PostgresFoundationError {
     TlsRejected { reason: &'static str },
     /// The pool could be built but the database never answered the
     /// connectivity check within the bounded startup retry budget.
-    StartupExhausted { attempts: u64 },
+    StartupExhausted {
+        attempts: u64,
+        /// The last connectivity failure, classified, so an exhausted
+        /// startup names its cause (refused, too many clients, a role that
+        /// cannot log in) instead of only its count.
+        last_error: String,
+    },
     /// The pool itself could not be constructed.
     PoolUnbuildable,
     /// The database answers but the schema is not one this process may run
@@ -157,11 +163,15 @@ impl fmt::Display for PostgresFoundationError {
             Self::TlsRejected { reason } => {
                 write!(formatter, "DATABASE_TLS_MODE is unusable: {reason}")
             }
-            Self::StartupExhausted { attempts } => write!(
+            Self::StartupExhausted {
+                attempts,
+                last_error,
+            } => write!(
                 formatter,
                 "the PostgreSQL database did not answer the connectivity check in {attempts} \
-                 attempts; STATE_BACKEND=postgres requires the database at startup, and the \
-                 bounded retry policy is governed by DATABASE_STARTUP_RETRY_LIMIT"
+                 attempts (last error: {last_error}); STATE_BACKEND=postgres requires the \
+                 database at startup, and the bounded retry policy is governed by \
+                 DATABASE_STARTUP_RETRY_LIMIT"
             ),
             Self::PoolUnbuildable => {
                 write!(
@@ -768,6 +778,7 @@ async fn establish_with_bounded_backoff(
     settings: &DatabaseSettings,
 ) -> Result<(), PostgresFoundationError> {
     let attempts = settings.startup_retry_limit.saturating_add(1);
+    let mut last_error = String::new();
     for attempt in 1..=attempts {
         match validate_connectivity(pool).await {
             Ok(()) => return Ok(()),
@@ -778,8 +789,12 @@ async fn establish_with_bounded_backoff(
                     error = %error,
                     "PostgreSQL connectivity check failed"
                 );
+                last_error = error.to_string();
                 if attempt == attempts {
-                    return Err(PostgresFoundationError::StartupExhausted { attempts });
+                    return Err(PostgresFoundationError::StartupExhausted {
+                        attempts,
+                        last_error,
+                    });
                 }
                 let shift = (attempt - 1).min(5);
                 let delay = STARTUP_RETRY_INITIAL_DELAY
@@ -789,7 +804,10 @@ async fn establish_with_bounded_backoff(
             }
         }
     }
-    Err(PostgresFoundationError::StartupExhausted { attempts })
+    Err(PostgresFoundationError::StartupExhausted {
+        attempts,
+        last_error,
+    })
 }
 
 /// One minimal round statement, classified with the repository error kinds
@@ -1231,11 +1249,18 @@ mod tests {
 
     #[test]
     fn startup_error_display_names_the_bounded_policy() {
-        let error = PostgresFoundationError::StartupExhausted { attempts: 6 };
+        let error = PostgresFoundationError::StartupExhausted {
+            attempts: 6,
+            last_error: "unavailable: connection refused".to_owned(),
+        };
         let rendered = error.to_string();
         assert!(
             rendered.contains("DATABASE_STARTUP_RETRY_LIMIT"),
             "{rendered}"
+        );
+        assert!(
+            rendered.contains("last error: unavailable: connection refused"),
+            "an exhausted startup names its cause: {rendered}"
         );
         assert!(rendered.contains("STATE_BACKEND=postgres"), "{rendered}");
         assert_no_dsn_material(&rendered);

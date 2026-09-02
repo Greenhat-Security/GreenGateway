@@ -336,7 +336,11 @@ impl McpConnectionCatalogService {
             }
             let definitions = catalog_definitions(catalog).collect::<Vec<_>>();
             self.registry
-                .install_mcp_connection_catalog(catalog.connection_id.as_str(), definitions)
+                .install_mcp_connection_catalog_with(
+                    catalog.connection_id.as_str(),
+                    definitions,
+                    crate::tools::definitions::LaneConflicts::EvictStale,
+                )
                 .map_err(tool_registry_store_error)?;
             self.runtime.publish(catalog);
         }

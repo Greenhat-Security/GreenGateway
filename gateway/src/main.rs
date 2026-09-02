@@ -41189,6 +41189,91 @@ O2gecI9QwDJNpm29J9wJB2F8
             }
         }
 
+        async fn commit_policy(store: &PostgresPolicyStore, id: &str) -> storage::ActivePolicy {
+            let candidate = rbac::Policy::validate_json_value(json!({
+                "schema_version": "0.1.0",
+                "id": id,
+                "default_action": "deny",
+                "roles": {
+                    "admin": { "permissions": ["data:read", "policy:write"] }
+                }
+            }))
+            .expect("policy should validate");
+            let current = PolicyControlPlane::active(store)
+                .await
+                .expect("active read")
+                .expect("active row");
+            PolicyControlPlane::commit(
+                store,
+                PolicyCommitRequest {
+                    precondition: PolicyCommitPrecondition::Expected { etag: current.etag },
+                    candidate: &candidate,
+                    actor_user_id: "other-replica",
+                    diff_summary: &DIFF,
+                },
+            )
+            .await
+            .expect("policy should commit")
+        }
+
+        /// A commit that lands after a pass reconciled its resources but
+        /// before the watermark is published must move the watermark, not
+        /// just the content: the pass re-reads the counter and goes again,
+        /// so the published watermark never trails what is installed.
+        #[tokio::test]
+        async fn a_commit_that_lands_mid_pass_moves_the_watermark_not_just_the_content() {
+            let Some(admin_dsn) = locator() else {
+                eprintln!("skipping: no test database locator; CI runs this test");
+                return;
+            };
+            let database = create_test_database(&admin_dsn).await;
+            let (store, _pool) = migrated_policy_foundation(&database.dsn).await;
+            let active = initialize(&store, "mid-pass-init").await;
+            let rbac_state = middleware::rbac::RbacState::new(
+                active.policy.clone(),
+                Vec::new(),
+                false,
+                test_audit_log(),
+            );
+            rbac_state.install_revision_snapshot(active.policy.clone(), active.security_revision);
+            let runtime = ClusterSecurityRuntime::new(
+                store.revision_source(),
+                PolicyResource::new(store.clone(), rbac_state.clone()),
+            );
+            middleware::rbac::SecurityRevisionGate::ensure_current_revision(&*runtime)
+                .await
+                .expect("the first pass compiles the initial revision");
+
+            // One commit moves the counter; the pass that reconciles it is
+            // interrupted by a second commit after the content fetch.
+            let first = commit_policy(&store, "mid-pass-first").await;
+            let hook_store = store.clone();
+            runtime.set_before_publish_hook_for_test(Arc::new(move || {
+                let store = hook_store.clone();
+                Box::pin(async move {
+                    commit_policy(&store, "mid-pass-second").await;
+                })
+            }));
+            let published =
+                middleware::rbac::SecurityRevisionGate::ensure_current_revision(&*runtime)
+                    .await
+                    .expect("the pass settles");
+            let latest = PolicyControlPlane::active(&*store)
+                .await
+                .expect("active read")
+                .expect("active row");
+            assert!(latest.security_revision > first.security_revision);
+            assert_eq!(
+                published, latest.security_revision,
+                "the watermark is the counter after the pass settled, not the one read before the mid-pass commit"
+            );
+            assert_eq!(
+                rbac_state.current_policy().id.as_deref(),
+                Some("mid-pass-second"),
+                "the content installed is the one the published watermark describes"
+            );
+        }
+
         #[tokio::test]
         async fn admin_authorization_never_serves_under_a_stale_revision() {
             let Some(admin_dsn) = locator() else {

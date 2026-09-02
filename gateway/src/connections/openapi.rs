@@ -431,8 +431,15 @@ impl OpenApiConnectionCatalogService {
                 continue;
             }
             let definitions = catalog_definitions(catalog)?;
+            // Authoritative content: a conflicting holder is stale by the
+            // authority's reservation, and evicting it is what lets a name
+            // that moved between catalogs converge in any order.
             self.registry
-                .install_openapi_connection_catalog(catalog.connection_id.as_str(), definitions)
+                .install_openapi_connection_catalog_with(
+                    catalog.connection_id.as_str(),
+                    definitions,
+                    crate::tools::definitions::LaneConflicts::EvictStale,
+                )
                 .map_err(tool_registry_store_error)?;
             // `publish` recomputes the definition digests from the stored
             // entries and rejects a catalog whose entries do not agree with

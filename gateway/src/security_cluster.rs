@@ -91,11 +91,18 @@ pub(crate) trait ReconciledResource: Send + Sync {
     /// be consulted).
     async fn activation_revision(&self) -> Result<i64, SecurityRevisionCheckError>;
 
-    /// Fetch, validate, and install the authoritative state when the
-    /// replica compiled at `compiled_revision` is behind it. Implementations
-    /// install monotonically (a stale reconcile must never overwrite a
-    /// newer install) and fail closed on any document they cannot enforce.
-    async fn reconcile(&self, compiled_revision: i64) -> Result<(), SecurityRevisionCheckError>;
+    /// Fetch, validate, and install the authoritative state, which the
+    /// gate observed at `observed_activation`. An implementation that has
+    /// already installed that activation (or a newer one) returns without
+    /// fetching; one behind it fetches the current content. The comparison
+    /// is against the activation the gate observed, never against the
+    /// replica's old watermark: a commit that lands mid-pass moves the
+    /// activation past what a resource installed a moment ago, and the next
+    /// pass must reinstall it rather than skip it as "already ahead of the
+    /// watermark". Implementations install monotonically (a stale reconcile
+    /// must never overwrite a newer install) and fail closed on any document
+    /// they cannot enforce.
+    async fn reconcile(&self, observed_activation: i64) -> Result<(), SecurityRevisionCheckError>;
 }
 
 pub(crate) struct ClusterSecurityRuntime {
@@ -112,7 +119,16 @@ pub(crate) struct ClusterSecurityRuntime {
     /// Serializes reconciles so a burst of requests behind the revision
     /// frontier produces one fetch-and-compile, not one per waiter.
     reconcile_lock: Mutex<()>,
+    /// Test seam: runs once, after a pass reconciled its resources and
+    /// before the watermark is published -- where a commit can land after
+    /// a resource's activation read but before its content fetch.
+    #[cfg(test)]
+    before_publish: std::sync::Mutex<Option<BeforePublishHook>>,
 }
+
+#[cfg(test)]
+type BeforePublishHook =
+    Arc<dyn Fn() -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> + Send + Sync>;
 
 impl ClusterSecurityRuntime {
     pub(crate) fn new(revisions: SecurityRevisionSource, policy: Arc<PolicyResource>) -> Arc<Self> {
@@ -121,7 +137,17 @@ impl ClusterSecurityRuntime {
             resources: RwLock::new(vec![policy as Arc<dyn ReconciledResource>]),
             compiled_revision: AtomicI64::new(0),
             reconcile_lock: Mutex::new(()),
+            #[cfg(test)]
+            before_publish: std::sync::Mutex::new(None),
         })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_before_publish_hook_for_test(&self, hook: BeforePublishHook) {
+        *self
+            .before_publish
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(hook);
     }
 
     /// Register a resource's reconciler. Startup-only in practice: called
@@ -230,7 +256,7 @@ impl ClusterSecurityRuntime {
                         activation,
                         "reconciling a security resource behind the compiled revision"
                     );
-                    resource.reconcile(compiled_revision).await?;
+                    resource.reconcile(activation).await?;
                 }
                 Ok(None)
             };
@@ -342,10 +368,10 @@ impl ReconciledResource for PolicyResource {
         }
     }
 
-    async fn reconcile(&self, compiled_revision: i64) -> Result<(), SecurityRevisionCheckError> {
-        // The rbac snapshot's own key already covers this compiled
-        // revision's policy state: per-resource installs are monotonic.
-        if self.rbac_state.snapshot_security_revision() > compiled_revision {
+    async fn reconcile(&self, observed_activation: i64) -> Result<(), SecurityRevisionCheckError> {
+        // The rbac snapshot already carries the activation the gate
+        // observed (or a newer one): per-resource installs are monotonic.
+        if self.rbac_state.snapshot_security_revision() >= observed_activation {
             return Ok(());
         }
         self.reconcile().await
@@ -407,7 +433,14 @@ impl ToolsResource {
         if self.installed_revision.load(Ordering::Acquire) >= security_revision {
             return Ok(false);
         }
-        self.registry.install_local_definitions(definitions)?;
+        // Authoritative content: a name another lane still holds here is
+        // provably stale (the authority reserved it for this document), so
+        // the install evicts it rather than depending on the order lanes
+        // reconcile in.
+        self.registry.install_local_definitions_with(
+            definitions,
+            crate::tools::definitions::LaneConflicts::EvictStale,
+        )?;
         self.installed_revision
             .store(security_revision, Ordering::Release);
         Ok(true)
@@ -442,8 +475,8 @@ impl ReconciledResource for ToolsResource {
         }
     }
 
-    async fn reconcile(&self, compiled_revision: i64) -> Result<(), SecurityRevisionCheckError> {
-        if self.installed_revision.load(Ordering::Acquire) > compiled_revision {
+    async fn reconcile(&self, observed_activation: i64) -> Result<(), SecurityRevisionCheckError> {
+        if self.installed_revision.load(Ordering::Acquire) >= observed_activation {
             return Ok(());
         }
         let active = self
@@ -622,8 +655,8 @@ impl ReconciledResource for ConnectionsResource {
         })
     }
 
-    async fn reconcile(&self, compiled_revision: i64) -> Result<(), SecurityRevisionCheckError> {
-        if self.installed_revision.load(Ordering::Acquire) > compiled_revision {
+    async fn reconcile(&self, observed_activation: i64) -> Result<(), SecurityRevisionCheckError> {
+        if self.installed_revision.load(Ordering::Acquire) >= observed_activation {
             return Ok(());
         }
         self.reconcile().await
@@ -668,6 +701,29 @@ impl ClusterSecurityRuntime {
             if moved_past.is_some() {
                 // A resource committed during the pass; re-read the counter
                 // and confirm against the new frontier.
+                continue;
+            }
+            #[cfg(test)]
+            {
+                let hook = self
+                    .before_publish
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .take();
+                if let Some(hook) = hook {
+                    hook().await;
+                }
+            }
+            // A commit that landed after a resource's activation read but
+            // before its content fetch installed content newer than
+            // `current`; publishing `current` would then admit requests
+            // under a watermark older than what they are served with -- a
+            // combination the authority never held. Re-read the counter
+            // and go again if it moved: the next pass installs whatever the
+            // commit touched, and the watermark published is the counter
+            // that every installed lane is at or below.
+            let settled = self.current_revision(deadline).await?;
+            if settled != current {
                 continue;
             }
             // Confirmed: every registered resource's authoritative state at

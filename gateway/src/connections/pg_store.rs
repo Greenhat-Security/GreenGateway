@@ -4847,6 +4847,99 @@ mod tests {
         hex::encode(sha2::Sha256::digest(RESERVATION_SPEC.as_bytes()))
     }
 
+    /// A delete waits for a dependency batch the background flusher has
+    /// already taken but not yet written: flushes and mutations share one
+    /// lock, so the batch lands before the delete is judged -- and refuses
+    /// it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 3)]
+    async fn a_delete_waits_for_an_in_flight_dependency_flush() {
+        use crate::connections::control_plane::{
+            ClusterConnectionStoreSeed, ConnectionControlPlane, ConnectionMutationError,
+        };
+        use crate::connections::managed_store::{ClusterConnectionsBoot, ManagedConnectionStore};
+        use crate::connections::store::ConnectionDependencyKind;
+        let Some(admin_dsn) = locator() else {
+            eprintln!("skipping: no test database locator; CI runs this test");
+            return;
+        };
+        let database = create_test_database(&admin_dsn).await;
+        let (store, _pool) = migrated_store(&database.dsn, 64).await;
+        let config = crate::config::Config::test_defaults();
+        let control_plane = ConnectionControlPlane::from_config_with_cluster_seed(
+            &config,
+            Some(ClusterConnectionStoreSeed {
+                store: ManagedConnectionStore::Postgres {
+                    store: std::sync::Arc::new(store),
+                    boot: std::sync::Arc::new(ClusterConnectionsBoot {
+                        mcp_catalogs: Vec::new(),
+                        openapi_catalogs: Vec::new(),
+                        openapi_inventory_catalogs: Vec::new(),
+                    }),
+                },
+                records: Vec::new(),
+            }),
+        )
+        .expect("cluster control plane should build");
+        let snapshot = control_plane.runtime_snapshot();
+        let record = control_plane
+            .create_managed(
+                snapshot.collection_etag(),
+                http_candidate("Referenced API"),
+                "op-1",
+            )
+            .await
+            .expect("create");
+        control_plane
+            .replace_runtime_dependencies(
+                ConnectionDependencyKind::ProxyRoute,
+                &[(record.id.clone(), "route-1".to_owned())],
+            )
+            .expect("the dependency set queues");
+
+        // The background flush takes the batch and stalls before writing.
+        let (release, released) = std::sync::mpsc::channel::<()>();
+        let released = std::sync::Mutex::new(released);
+        control_plane.set_flush_hook_for_test(std::sync::Arc::new(move || {
+            let _ = released
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .recv();
+        }));
+        let flusher = {
+            let control_plane = control_plane.clone();
+            tokio::spawn(async move { control_plane.flush_pending_dependencies().await })
+        };
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+
+        let mut deleter = {
+            let control_plane = control_plane.clone();
+            let (id, etag) = (record.id.clone(), record.etag());
+            tokio::spawn(async move { control_plane.delete_managed(&id, &etag, "op-2").await })
+        };
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(300), &mut deleter)
+                .await
+                .is_err(),
+            "the delete waits for the in-flight flush"
+        );
+        release.send(()).expect("the flush is waiting");
+        flusher
+            .await
+            .expect("task")
+            .expect("the flush writes its batch");
+        let refused = deleter
+            .await
+            .expect("task")
+            .expect_err("the flushed guard refuses the delete");
+        assert!(
+            matches!(
+                refused,
+                ConnectionMutationError::Store(ConnectionStoreError::DependencyConflict { .. })
+            ),
+            "{refused}"
+        );
+    }
+
     /// Cluster mode queues dependency guard rows for a background flush.
     /// An admin delete flushes them first, so a Connection a live route
     /// references is refused even before the background task has run --
