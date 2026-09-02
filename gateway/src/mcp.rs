@@ -525,6 +525,16 @@ fn runtime_error_to_mcp_error(error: ToolRuntimeError) -> ErrorData {
         ToolRuntimeError::Cancelled { tool_name } => {
             runtime_unavailable_error(tool_name, "tool invocation was cancelled", "cancelled")
         }
+        ToolRuntimeError::AuthorityUnavailable { tool_name } => runtime_unavailable_error(
+            tool_name,
+            "tool invocation could not be admitted: the execution lease authority is unavailable",
+            "authority_unavailable",
+        ),
+        ToolRuntimeError::LeaseLost { tool_name } => runtime_unavailable_error(
+            tool_name,
+            "tool invocation lost its execution lease",
+            "lease_lost",
+        ),
         ToolRuntimeError::WorkFailed {
             tool_name,
             message,
@@ -968,6 +978,7 @@ mod tests {
             admin_login_pending_max_entries: config::DEFAULT_ADMIN_LOGIN_PENDING_MAX_ENTRIES,
             admin_login_pending_max_per_ip: config::DEFAULT_ADMIN_LOGIN_PENDING_MAX_PER_IP,
             admin_login_keyring: Vec::new(),
+            rate_limit_keyring: Vec::new(),
             gateway_public_url: None,
             audit_log_file: None,
             audit_sqlite_path: None,
@@ -1044,6 +1055,7 @@ mod tests {
             tool_runtime_queue_depth: config::DEFAULT_TOOL_RUNTIME_QUEUE_DEPTH,
             tool_runtime_global_concurrency: config::DEFAULT_TOOL_RUNTIME_GLOBAL_CONCURRENCY,
             tool_runtime_queue_timeout_ms: config::DEFAULT_TOOL_RUNTIME_QUEUE_TIMEOUT_MS,
+            tool_lease_ttl_ms: config::DEFAULT_TOOL_LEASE_TTL_MS,
             tool_runtime_default_timeout_ms: config::DEFAULT_TOOL_RUNTIME_DEFAULT_TIMEOUT_MS,
             csrf_enabled: true,
             csrf_cookie_name: "csrf_token".to_owned(),

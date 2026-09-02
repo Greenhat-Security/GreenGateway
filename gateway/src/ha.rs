@@ -750,11 +750,29 @@ mod tests {
     use std::env::VarError;
 
     fn config_from(vars: &[(&str, &str)]) -> Config {
+        // Postgres mode requires the rate-limit keyring (PR 10); a test that
+        // selects the mode without setting one gets the static default so
+        // the fingerprint tests keep exercising what they are about.
+        let postgres = vars
+            .iter()
+            .any(|(key, value)| *key == "STATE_BACKEND" && *value == "postgres");
         Config::from_env_vars(|name| {
-            vars.iter()
-                .find(|(key, _)| *key == name)
-                .map(|(_, value)| Ok(value.to_string()))
-                .unwrap_or(Err(VarError::NotPresent))
+            if let Some((_, value)) = vars.iter().find(|(key, _)| *key == name) {
+                return Ok(value.to_string());
+            }
+            if postgres {
+                match name {
+                    "CONNECTION_SECRETS_ROOT" => return Ok("/run/secrets/greengateway".to_owned()),
+                    "RATE_LIMIT_KEYRING" => {
+                        return Ok(
+                            r#"[{"id":"rl-primary","file":"rate-limit-key","role":"primary"}]"#
+                                .to_owned(),
+                        )
+                    }
+                    _ => {}
+                }
+            }
+            Err(VarError::NotPresent)
         })
         .expect("test configuration should validate")
     }

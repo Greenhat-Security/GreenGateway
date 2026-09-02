@@ -19,6 +19,7 @@ use axum::{
 };
 use http::{Method, StatusCode};
 use serde::Serialize;
+use sha2::{Digest, Sha256};
 
 use crate::{
     auth,
@@ -41,6 +42,38 @@ pub struct RateLimitState {
     client_ip_policy: ClientIpPolicy,
     bucket_capacity: usize,
     bucket_idle_ttl: Duration,
+    /// Cluster mode's shared limiter (issue #241, PR 10). When set, every
+    /// request the local buckets allow is then decided by the authority,
+    /// so one configured burst permits that many requests across the
+    /// cluster; the local buckets remain the per-replica emergency bound
+    /// and never replace shared enforcement. None in standalone mode.
+    #[cfg(feature = "postgres")]
+    shared: Option<Arc<crate::storage::PostgresRateLimitStore>>,
+    #[cfg_attr(not(feature = "postgres"), allow(dead_code))]
+    read_limit: LaneLimit,
+    #[cfg_attr(not(feature = "postgres"), allow(dead_code))]
+    write_limit: LaneLimit,
+}
+
+/// A configured limit as the shared store decides it.
+#[derive(Clone, Copy, Debug)]
+#[cfg_attr(not(feature = "postgres"), allow(dead_code))]
+struct LaneLimit {
+    requests_per_second: f64,
+    burst: u32,
+}
+
+/// The shared decision a request still needs after the local buckets
+/// allowed it: none in standalone mode, the authority's in cluster mode.
+enum SharedGate {
+    None,
+    #[cfg(feature = "postgres")]
+    Authority {
+        store: Arc<crate::storage::PostgresRateLimitStore>,
+        lane: crate::storage::SharedLane,
+        key: String,
+        limit: LaneLimit,
+    },
 }
 
 /// One rate limiter's bucket storage: bounded, and biased towards keeping the
@@ -100,6 +133,18 @@ struct RateLimitPolicyState {
 struct RateLimitOverride {
     rule: RateLimitRule,
     limiter: RateLimiter,
+    /// SHA-256 of the rule's canonical JSON: the shared store keys the
+    /// rule's buckets by it, so editing a rule retires its buckets.
+    fingerprint: Arc<str>,
+}
+
+/// The policy rule a request matched: its local limiter, and what the
+/// shared store needs to decide the same request.
+#[cfg_attr(not(feature = "postgres"), allow(dead_code))]
+struct PolicyMatch {
+    limiter: RateLimiter,
+    fingerprint: Arc<str>,
+    limit: LaneLimit,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -140,7 +185,66 @@ impl RateLimitState {
             client_ip_policy: ClientIpPolicy::from_config(config),
             bucket_capacity: config.rate_limit_max_buckets,
             bucket_idle_ttl: config.rate_limit_bucket_idle_ttl(),
+            #[cfg(feature = "postgres")]
+            shared: None,
+            read_limit: LaneLimit {
+                requests_per_second: config.rate_limit_read_rps,
+                burst: config.rate_limit_read_burst,
+            },
+            write_limit: LaneLimit {
+                requests_per_second: config.rate_limit_write_rps,
+                burst: config.rate_limit_write_burst,
+            },
         }
+    }
+
+    /// Cluster mode: decide every locally-allowed request at the shared
+    /// store as well.
+    #[cfg(feature = "postgres")]
+    pub(crate) fn with_shared_store(
+        mut self,
+        store: Arc<crate::storage::PostgresRateLimitStore>,
+    ) -> Self {
+        self.shared = Some(store);
+        self
+    }
+
+    /// The shared gate for a global lane, when the store is configured.
+    fn shared_global_gate(&self, lane: Lane, key: &str) -> SharedGate {
+        #[cfg(feature = "postgres")]
+        if let Some(store) = &self.shared {
+            return SharedGate::Authority {
+                store: Arc::clone(store),
+                lane: match lane {
+                    Lane::Read => crate::storage::SharedLane::Read,
+                    Lane::Write => crate::storage::SharedLane::Write,
+                },
+                key: key.to_owned(),
+                limit: match lane {
+                    Lane::Read => self.read_limit,
+                    Lane::Write => self.write_limit,
+                },
+            };
+        }
+        let _ = (lane, key);
+        SharedGate::None
+    }
+
+    /// The shared gate for a matched policy rule: keyed by the rule's
+    /// fingerprint and the principal, so an edited rule starts fresh
+    /// buckets and two rules never share one.
+    fn shared_policy_gate(&self, matched: &PolicyMatch, principal_key: &str) -> SharedGate {
+        #[cfg(feature = "postgres")]
+        if let Some(store) = &self.shared {
+            return SharedGate::Authority {
+                store: Arc::clone(store),
+                lane: crate::storage::SharedLane::Policy,
+                key: format!("rule:{}:{principal_key}", matched.fingerprint),
+                limit: matched.limit,
+            };
+        }
+        let _ = (matched, principal_key);
+        SharedGate::None
     }
 
     pub(crate) fn replace_policy(&self, policy: &Policy) {
@@ -164,7 +268,7 @@ impl RateLimitState {
         method: &Method,
         path: &str,
         principal: Option<&auth::Principal>,
-    ) -> Option<RateLimiter> {
+    ) -> Option<PolicyMatch> {
         let policy = self.policy.load();
         policy.matching_limiter(method.as_str(), path, principal)
     }
@@ -383,11 +487,18 @@ impl RateLimitPolicyState {
         method: &str,
         path: &str,
         principal: Option<&auth::Principal>,
-    ) -> Option<RateLimiter> {
+    ) -> Option<PolicyMatch> {
         self.overrides
             .iter()
             .find(|override_rule| override_rule.matches(method, path, principal))
-            .map(|override_rule| override_rule.limiter.clone())
+            .map(|override_rule| PolicyMatch {
+                limiter: override_rule.limiter.clone(),
+                fingerprint: Arc::clone(&override_rule.fingerprint),
+                limit: LaneLimit {
+                    requests_per_second: override_rule.rule.requests_per_second,
+                    burst: override_rule.rule.burst,
+                },
+            })
     }
 }
 
@@ -411,7 +522,12 @@ impl RateLimitOverride {
             live_buckets,
         );
 
-        Self { rule, limiter }
+        let fingerprint = Arc::<str>::from(rule_fingerprint(&rule));
+        Self {
+            rule,
+            limiter,
+            fingerprint,
+        }
     }
 
     fn matches(&self, method: &str, path: &str, principal: Option<&auth::Principal>) -> bool {
@@ -435,8 +551,9 @@ pub async fn rate_limit_request(
     let client_ip = canonical_client_ip(req.headers(), req.extensions(), &state.client_ip_policy);
     let key = format!("ip:{client_ip}");
     let limiter = state.global_limiter(lane);
+    let shared = state.shared_global_gate(lane, &key);
 
-    check_rate_limit(limiter, &key, &client_ip, lane, &path, req, next).await
+    check_rate_limit(limiter, &key, &client_ip, lane, &path, shared, req, next).await
 }
 
 pub async fn policy_rate_limit_request(
@@ -451,23 +568,38 @@ pub async fn policy_rate_limit_request(
     let Some(principal) = req.extensions().get::<auth::Principal>() else {
         return next.run(req).await;
     };
-    let Some(limiter) = state.policy_limiter(&method, &path, Some(principal)) else {
+    let Some(matched) = state.policy_limiter(&method, &path, Some(principal)) else {
         return next.run(req).await;
     };
     let key = principal_rate_limit_key(principal);
+    let shared = state.shared_policy_gate(&matched, &key);
 
-    check_rate_limit(limiter, &key, &client_ip, lane, &path, req, next).await
+    check_rate_limit(
+        matched.limiter,
+        &key,
+        &client_ip,
+        lane,
+        &path,
+        shared,
+        req,
+        next,
+    )
+    .await
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn check_rate_limit(
     limiter: RateLimiter,
     key: &str,
     client_ip: &str,
     lane: Lane,
     path: &str,
+    shared: SharedGate,
     req: Request,
     next: Next,
 ) -> Response {
+    // The local buckets first: the per-replica emergency bound, and a
+    // denial here spends no authority round trip.
     if !limiter.check(key) {
         tracing::warn!(
             client_ip = %client_ip,
@@ -477,8 +609,97 @@ async fn check_rate_limit(
         );
         return too_many_requests();
     }
+    match shared {
+        SharedGate::None => {}
+        #[cfg(feature = "postgres")]
+        SharedGate::Authority {
+            store,
+            lane: shared_lane,
+            key: shared_key,
+            limit,
+        } => {
+            use crate::metrics::RATE_LIMIT_SHARED_DECISIONS_TOTAL;
+            use crate::storage::{SharedDecision, SharedLimit};
+            let decision = store
+                .decide(
+                    shared_lane,
+                    &shared_key,
+                    SharedLimit {
+                        requests_per_second: limit.requests_per_second,
+                        burst: limit.burst,
+                    },
+                )
+                .await;
+            match decision {
+                Ok(SharedDecision::Allowed) => {
+                    ::metrics::counter!(
+                        RATE_LIMIT_SHARED_DECISIONS_TOTAL,
+                        "lane" => shared_lane.as_str(),
+                        "outcome" => "allowed"
+                    )
+                    .increment(1);
+                }
+                Ok(SharedDecision::Denied) => {
+                    ::metrics::counter!(
+                        RATE_LIMIT_SHARED_DECISIONS_TOTAL,
+                        "lane" => shared_lane.as_str(),
+                        "outcome" => "denied"
+                    )
+                    .increment(1);
+                    tracing::warn!(
+                        client_ip = %client_ip,
+                        lane = shared_lane.as_str(),
+                        path,
+                        "shared rate limit exceeded"
+                    );
+                    return too_many_requests();
+                }
+                Err(error) => {
+                    // Fail closed: an authority that cannot be consulted is
+                    // a 503 with zero upstream attempts, never a silent
+                    // allow and never a 429.
+                    ::metrics::counter!(
+                        RATE_LIMIT_SHARED_DECISIONS_TOTAL,
+                        "lane" => shared_lane.as_str(),
+                        "outcome" => "unavailable"
+                    )
+                    .increment(1);
+                    tracing::error!(
+                        lane = shared_lane.as_str(),
+                        path,
+                        error = %error,
+                        "shared rate limiter unavailable; refusing the request"
+                    );
+                    return limiter_unavailable();
+                }
+            }
+        }
+    }
 
     next.run(req).await
+}
+
+/// The shared store's key for a policy rule: SHA-256 of its canonical
+/// JSON, so any edit -- matcher, rate, or burst -- retires its buckets.
+fn rule_fingerprint(rule: &RateLimitRule) -> String {
+    let canonical = serde_json::to_vec(rule).unwrap_or_default();
+    hex::encode(Sha256::digest(canonical))
+}
+
+#[derive(Serialize)]
+struct LimiterUnavailableBody {
+    error: &'static str,
+}
+
+#[cfg_attr(not(feature = "postgres"), allow(dead_code))]
+fn limiter_unavailable() -> Response {
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        Json(LimiterUnavailableBody {
+            error: "rate limiter unavailable",
+        }),
+    )
+        .into_response()
 }
 
 fn principal_rate_limit_key(principal: &auth::Principal) -> String {
@@ -590,6 +811,16 @@ mod tests {
             client_ip_policy: ClientIpPolicy::default(),
             bucket_capacity: TEST_BUCKET_CAPACITY,
             bucket_idle_ttl: TEST_BUCKET_TTL,
+            #[cfg(feature = "postgres")]
+            shared: None,
+            read_limit: LaneLimit {
+                requests_per_second: read_rps,
+                burst: read_burst,
+            },
+            write_limit: LaneLimit {
+                requests_per_second: write_rps,
+                burst: write_burst,
+            },
         }
     }
 

@@ -174,6 +174,13 @@ static MANIFEST: LazyLock<Vec<Migration>> = LazyLock::new(|| {
         )
         .finalize()
         .with_pinned_checksum("ea451758adee74af5f71a842c4ea6b11bb6485a259dc3a8dcdcb778b37afb2ad"),
+        Migration::new(
+            8,
+            "limits_and_leases",
+            include_str!("migrations/0008_limits_and_leases.sql"),
+        )
+        .finalize()
+        .with_pinned_checksum("5b7050a2e85f32a0f183dc2bd1ca2307e1377245452fd05566bfa0844d8453b5"),
     ]
 });
 

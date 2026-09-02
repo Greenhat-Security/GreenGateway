@@ -10,6 +10,7 @@ use std::{
 use serde_json::{json, Value};
 use tokio::{
     sync::{Notify, OwnedSemaphorePermit, Semaphore},
+    task::JoinHandle,
     time,
 };
 use tokio_util::sync::CancellationToken;
@@ -28,6 +29,7 @@ use crate::{
         policy, rule::principal_identity_matches, Policy, Rule, RuleAction, RuleDispatchContext,
         RuleMatcher,
     },
+    tools::lease::{self, ExecutionLease, ExecutionLeaseStore, LeaseAttempt},
 };
 
 const AUTHZ_ALLOWED: &str = "authz.allowed";
@@ -188,6 +190,17 @@ pub enum ToolRuntimeError {
     Cancelled {
         tool_name: String,
     },
+    /// The cluster's lease authority could not be consulted for admission:
+    /// the invocation was refused before any work started (fail closed).
+    AuthorityUnavailable {
+        tool_name: String,
+    },
+    /// The invocation's execution lease was lost (it could not be renewed
+    /// in time, or the authority became unreachable), so the local work was
+    /// cancelled before the slot could be reclaimed by another replica.
+    LeaseLost {
+        tool_name: String,
+    },
     WorkFailed {
         tool_name: String,
         message: String,
@@ -230,6 +243,13 @@ impl fmt::Display for ToolRuntimeError {
             Self::Cancelled { tool_name } => {
                 write!(formatter, "tool '{tool_name}' invocation was cancelled")
             }
+            Self::AuthorityUnavailable { tool_name } => write!(
+                formatter,
+                "tool '{tool_name}' could not be admitted: the execution lease authority is unavailable"
+            ),
+            Self::LeaseLost { tool_name } => {
+                write!(formatter, "tool '{tool_name}' invocation lost its execution lease")
+            }
             Self::WorkFailed {
                 tool_name, message, ..
             } => {
@@ -256,6 +276,10 @@ struct ToolRuntimeInner {
     rbac_state: Option<RbacState>,
     rule_matcher: RuleMatcher,
     rule_ids: Vec<String>,
+    /// Cluster mode's lease authority: the global and per-tool limits are
+    /// slots leased here, so they bound the whole cluster, not one replica.
+    /// None in standalone mode, where the semaphores alone bound them.
+    leases: Option<Arc<dyn ExecutionLeaseStore>>,
 }
 
 struct ToolExecutionState {
@@ -266,6 +290,19 @@ struct ToolExecutionState {
 struct AdmittedInvocation {
     config: ToolRuntimeToolConfig,
     _permits: ExecutionPermits,
+    /// Cancelled by a lease's renewal task when the lease is lost; None
+    /// when no lease is held (standalone mode).
+    lease_lost: Option<CancellationToken>,
+}
+
+impl AdmittedInvocation {
+    /// Resolves when a held lease is lost; never, when none is held.
+    async fn lease_lost(&self) {
+        match &self.lease_lost {
+            Some(token) => token.cancelled().await,
+            None => std::future::pending().await,
+        }
+    }
 }
 
 struct AuthorizedToolInvocation {
@@ -284,6 +321,112 @@ struct ExecutionPermits {
     _queue: OwnedSemaphorePermit,
     _global: OwnedSemaphorePermit,
     _tool: Option<ToolPermit>,
+    /// Held cluster leases (global, then per-tool); released on drop.
+    _leases: Vec<LeaseGuard>,
+}
+
+/// What the cluster asks of one admission: the authority, the two
+/// capacities (per-tool only when the tool has a limit), the invocation
+/// the slots are held for, and the token its renewal tasks cancel.
+struct LeasePlan {
+    store: Arc<dyn ExecutionLeaseStore>,
+    global_capacity: u32,
+    tool_capacity: Option<u32>,
+    invocation: String,
+    lost: CancellationToken,
+}
+
+/// One held lease and the task renewing it. Dropping the guard stops
+/// renewal and releases the slot at once; if the release cannot be sent
+/// the slot lapses by database-time expiry instead.
+struct LeaseGuard {
+    store: Arc<dyn ExecutionLeaseStore>,
+    lease: ExecutionLease,
+    renewal: JoinHandle<()>,
+}
+
+impl LeaseGuard {
+    fn start(
+        store: Arc<dyn ExecutionLeaseStore>,
+        lease: ExecutionLease,
+        lost: CancellationToken,
+    ) -> Self {
+        let renewal = tokio::spawn(renew_until_lost(Arc::clone(&store), lease.clone(), lost));
+        Self {
+            store,
+            lease,
+            renewal,
+        }
+    }
+}
+
+impl Drop for LeaseGuard {
+    fn drop(&mut self) {
+        self.renewal.abort();
+        let store = Arc::clone(&self.store);
+        let lease = self.lease.clone();
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            handle.spawn(async move {
+                if let Err(error) = store.release(&lease).await {
+                    tracing::warn!(
+                        scope = %lease.scope,
+                        slot = lease.slot,
+                        error = %error,
+                        "execution lease release failed; the slot lapses by expiry"
+                    );
+                }
+            });
+        }
+    }
+}
+
+/// Renew `lease` at a third of its TTL until it is lost. A renewal that
+/// reports the lease gone cancels `lost` at once; a renewal the authority
+/// cannot answer is retried briefly, and `lost` is cancelled once half the
+/// TTL has passed since the last successful renewal -- always before the
+/// slot can be reclaimed at the TTL.
+async fn renew_until_lost(
+    store: Arc<dyn ExecutionLeaseStore>,
+    lease: ExecutionLease,
+    lost: CancellationToken,
+) {
+    let ttl = store.ttl();
+    let interval = lease::renewal_interval(ttl);
+    let retry = (interval / 4).max(Duration::from_millis(5));
+    let mut last_renewed = time::Instant::now();
+    loop {
+        time::sleep(interval).await;
+        loop {
+            match store.renew(&lease).await {
+                Ok(true) => {
+                    last_renewed = time::Instant::now();
+                    break;
+                }
+                Ok(false) => {
+                    tracing::warn!(
+                        scope = %lease.scope,
+                        slot = lease.slot,
+                        "execution lease lost; cancelling the invocation"
+                    );
+                    lost.cancel();
+                    return;
+                }
+                Err(error) => {
+                    if last_renewed.elapsed() >= ttl / 2 {
+                        tracing::warn!(
+                            scope = %lease.scope,
+                            slot = lease.slot,
+                            error = %error,
+                            "execution lease could not be renewed in time; cancelling the invocation"
+                        );
+                        lost.cancel();
+                        return;
+                    }
+                    time::sleep(retry).await;
+                }
+            }
+        }
+    }
 }
 
 struct ToolLimiter {
@@ -387,6 +530,18 @@ impl ToolRuntime {
         audit: AuditLog,
         rbac_state: Option<RbacState>,
     ) -> Self {
+        Self::new_with_rbac_state_and_leases(config, audit, rbac_state, None)
+    }
+
+    /// Cluster mode: the global and per-tool limits are leased from
+    /// `leases`, so they bound the cluster; the local semaphores stay as the
+    /// per-replica bound.
+    pub(crate) fn new_with_rbac_state_and_leases(
+        config: ToolRuntimeConfig,
+        audit: AuditLog,
+        rbac_state: Option<RbacState>,
+        leases: Option<Arc<dyn ExecutionLeaseStore>>,
+    ) -> Self {
         let per_tool = config
             .tools
             .iter()
@@ -415,6 +570,7 @@ impl ToolRuntime {
                 rbac_state,
                 rule_matcher,
                 rule_ids,
+                leases,
             }),
         }
     }
@@ -459,6 +615,18 @@ impl ToolRuntime {
         );
 
         tokio::select! {
+            _ = admitted.lease_lost() => {
+                self.emit(
+                    audit::event::TOOL_INVOKE_FAILURE,
+                    &context,
+                    tool_name,
+                    "failure",
+                    Some("lease_lost"),
+                );
+                Err(ToolRuntimeError::LeaseLost {
+                    tool_name: tool_name.to_owned(),
+                })
+            }
             _ = cancel.cancelled() => {
                 self.emit(
                     audit::event::TOOL_INVOKE_FAILURE,
@@ -562,6 +730,18 @@ impl ToolRuntime {
         );
 
         tokio::select! {
+            _ = admitted.lease_lost() => {
+                self.emit(
+                    audit::event::TOOL_INVOKE_FAILURE,
+                    &context,
+                    tool_name,
+                    "failure",
+                    Some("lease_lost"),
+                );
+                Err(ToolRuntimeError::LeaseLost {
+                    tool_name: tool_name.to_owned(),
+                })
+            }
             _ = cancel.cancelled() => {
                 self.emit(
                     audit::event::TOOL_INVOKE_FAILURE,
@@ -694,11 +874,24 @@ impl ToolRuntime {
             }
         };
 
+        let lease_lost = self.inner.leases.as_ref().map(|_| CancellationToken::new());
+        let lease_plan = self.inner.leases.as_ref().map(|store| LeasePlan {
+            store: Arc::clone(store),
+            global_capacity: u32::try_from(self.inner.config.max_concurrent_global.max(1))
+                .unwrap_or(u32::MAX),
+            tool_capacity: state.limiter.as_ref().map(|_| {
+                u32::try_from(normalized_tool_limit(state.config.max_concurrent))
+                    .unwrap_or(u32::MAX)
+            }),
+            invocation: context.request_id.clone(),
+            lost: lease_lost.clone().unwrap_or_default(),
+        });
         let acquire = Self::acquire_execution_permits(
             queue_permit,
             Arc::clone(&self.inner.global),
             state.limiter.clone(),
             tool_name.to_owned(),
+            lease_plan,
         );
 
         let permits = tokio::select! {
@@ -728,6 +921,7 @@ impl ToolRuntime {
         Ok(AdmittedInvocation {
             config: state.config,
             _permits: permits,
+            lease_lost,
         })
     }
 
@@ -892,6 +1086,7 @@ impl ToolRuntime {
         global: Arc<Semaphore>,
         tool: Option<Arc<ToolLimiter>>,
         tool_name: String,
+        lease_plan: Option<LeasePlan>,
     ) -> Result<ExecutionPermits, ToolRuntimeError> {
         let global = global
             .acquire_owned()
@@ -904,12 +1099,78 @@ impl ToolRuntime {
             Some(tool) => Some(tool.acquire().await),
             None => None,
         };
-
+        // Cluster bound last, once the replica's own permits are held, so a
+        // slot is never leased for an invocation this replica would queue.
+        let mut leases = Vec::new();
+        if let Some(plan) = lease_plan {
+            leases.push(
+                Self::lease_slot(
+                    &plan,
+                    lease::GLOBAL_SCOPE.to_owned(),
+                    plan.global_capacity,
+                    &tool_name,
+                )
+                .await?,
+            );
+            if let Some(capacity) = plan.tool_capacity {
+                leases.push(
+                    Self::lease_slot(&plan, lease::tool_scope(&tool_name), capacity, &tool_name)
+                        .await?,
+                );
+            }
+        }
         Ok(ExecutionPermits {
             _queue: queue,
             _global: global,
             _tool: tool,
+            _leases: leases,
         })
+    }
+
+    /// Take one slot in `scope`, waiting with jittered backoff while the
+    /// scope is full. The caller's queue timeout bounds the wait; an
+    /// authority that cannot be consulted refuses the invocation.
+    async fn lease_slot(
+        plan: &LeasePlan,
+        scope: String,
+        capacity: u32,
+        tool_name: &str,
+    ) -> Result<LeaseGuard, ToolRuntimeError> {
+        use std::hash::BuildHasher;
+        let mut backoff = Duration::from_millis(10);
+        loop {
+            match plan
+                .store
+                .try_acquire(&scope, capacity, &plan.invocation)
+                .await
+            {
+                Ok(LeaseAttempt::Acquired(lease)) => {
+                    return Ok(LeaseGuard::start(
+                        Arc::clone(&plan.store),
+                        lease,
+                        plan.lost.clone(),
+                    ));
+                }
+                Ok(LeaseAttempt::Full) => {
+                    let jitter = Duration::from_millis(
+                        std::collections::hash_map::RandomState::new().hash_one(0u8) % 16,
+                    );
+                    time::sleep(backoff + jitter).await;
+                    backoff = (backoff * 2).min(Duration::from_millis(200));
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        tool = tool_name,
+                        scope = %scope,
+                        error = %error,
+                        "execution lease authority unavailable; refusing admission"
+                    );
+                    return Err(ToolRuntimeError::AuthorityUnavailable {
+                        tool_name: tool_name.to_owned(),
+                    });
+                }
+            }
+        }
     }
 
     fn lookup_tool(&self, tool_name: &str) -> Result<ToolExecutionState, ToolRuntimeError> {
@@ -978,6 +1239,8 @@ impl ToolRuntime {
             ToolRuntimeError::QueueTimeout { .. } => "queue_timeout",
             ToolRuntimeError::Timeout { .. } => "timeout",
             ToolRuntimeError::Cancelled { .. } => "cancelled",
+            ToolRuntimeError::AuthorityUnavailable { .. } => "authority_unavailable",
+            ToolRuntimeError::LeaseLost { .. } => "lease_lost",
             ToolRuntimeError::WorkFailed { .. } => "work_error",
         };
         self.emit_rejected(context, tool_name, reason);
@@ -2512,6 +2775,264 @@ mod tests {
         );
     }
 
+    // ------------------------------------------------------------------
+    // Execution leases (issue #241, PR 10)
+    // ------------------------------------------------------------------
+
+    /// Two runtimes (two replicas) sharing one lease authority: the global
+    /// limit each was configured with bounds the pair together, not each.
+    #[tokio::test]
+    async fn leases_bound_the_global_limit_across_runtimes() {
+        use crate::tools::lease::memory::MemoryLeaseStore;
+        let store = MemoryLeaseStore::new(Duration::from_secs(5));
+        let leases: Arc<dyn ExecutionLeaseStore> = Arc::new(store.clone());
+        let (replica_a, _capture_a) = runtime_with_leases(
+            [("alpha", enabled_tool(2_000, 4))],
+            8,
+            2,
+            2_000,
+            leases.clone(),
+        );
+        let (replica_b, _capture_b) =
+            runtime_with_leases([("alpha", enabled_tool(2_000, 4))], 8, 2, 2_000, leases);
+        let tracker = Arc::new(ConcurrencyTracker::default());
+        let release = ReleaseGate::new();
+        let mut handles = Vec::new();
+        for runtime in [&replica_a, &replica_b, &replica_a, &replica_b] {
+            handles.push(spawn_tracked_invocation(
+                runtime.clone(),
+                "alpha",
+                Arc::clone(&tracker),
+                release.clone(),
+            ));
+        }
+        tracker.wait_for_started(2).await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(
+            tracker.started.load(Ordering::SeqCst),
+            2,
+            "each replica allows two locally, but the cluster bound is two in total"
+        );
+        assert_eq!(store.held(lease::GLOBAL_SCOPE), 2);
+        release.release();
+        for handle in handles {
+            handle
+                .await
+                .expect("invocation task should join")
+                .expect("invocation should succeed");
+        }
+        assert_eq!(tracker.started.load(Ordering::SeqCst), 4);
+        assert!(tracker.max_running.load(Ordering::SeqCst) <= 2);
+        wait_for_held(&store, lease::GLOBAL_SCOPE, 0).await;
+    }
+
+    /// A per-tool limit is leased in the tool's own scope, so two tools
+    /// with a limit of one each run concurrently while a second invocation
+    /// of either waits.
+    #[tokio::test]
+    async fn per_tool_leases_are_scoped_by_tool() {
+        use crate::tools::lease::memory::MemoryLeaseStore;
+        let store = MemoryLeaseStore::new(Duration::from_secs(5));
+        let leases: Arc<dyn ExecutionLeaseStore> = Arc::new(store.clone());
+        let (runtime, _capture) = runtime_with_leases(
+            [
+                ("alpha", enabled_tool(2_000, 1)),
+                ("beta", enabled_tool(2_000, 1)),
+            ],
+            8,
+            4,
+            2_000,
+            leases,
+        );
+        let tracker = Arc::new(ConcurrencyTracker::default());
+        let release = ReleaseGate::new();
+        let mut handles = Vec::new();
+        for tool_name in ["alpha", "alpha", "beta"] {
+            handles.push(spawn_tracked_invocation(
+                runtime.clone(),
+                tool_name,
+                Arc::clone(&tracker),
+                release.clone(),
+            ));
+        }
+        tracker.wait_for_started(2).await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(tracker.started.load(Ordering::SeqCst), 2);
+        assert_eq!(store.held(&lease::tool_scope("alpha")), 1);
+        assert_eq!(store.held(&lease::tool_scope("beta")), 1);
+        assert_eq!(store.held(lease::GLOBAL_SCOPE), 2);
+        release.release();
+        for handle in handles {
+            handle
+                .await
+                .expect("invocation task should join")
+                .expect("invocation should succeed");
+        }
+        wait_for_held(&store, &lease::tool_scope("alpha"), 0).await;
+        wait_for_held(&store, lease::GLOBAL_SCOPE, 0).await;
+    }
+
+    /// A lease that cannot be renewed cancels the running work: the
+    /// invocation ends as LeaseLost well before the slot's TTL, so a
+    /// successor can never run alongside it.
+    #[tokio::test]
+    async fn a_lost_lease_cancels_the_running_invocation() {
+        use crate::tools::lease::memory::MemoryLeaseStore;
+        let store = MemoryLeaseStore::new(Duration::from_millis(300));
+        let leases: Arc<dyn ExecutionLeaseStore> = Arc::new(store.clone());
+        let (runtime, capture) =
+            runtime_with_leases([("alpha", enabled_tool(5_000, 1))], 8, 4, 1_000, leases);
+        let tracker = Arc::new(ConcurrencyTracker::default());
+        let release = ReleaseGate::new();
+        let handle = spawn_tracked_invocation(
+            runtime.clone(),
+            "alpha",
+            Arc::clone(&tracker),
+            release.clone(),
+        );
+        tracker.wait_for_started(1).await;
+        // The authority's clock jumps past the TTL: the next renewal finds
+        // the lease gone.
+        store.advance(Duration::from_secs(2));
+        let result = tokio::time::timeout(Duration::from_secs(2), handle)
+            .await
+            .expect("the invocation ends once its lease is lost")
+            .expect("invocation task should join");
+        assert!(
+            matches!(result, Err(ToolRuntimeError::LeaseLost { ref tool_name }) if tool_name == "alpha"),
+            "expected LeaseLost, got {result:?}"
+        );
+        assert_eq!(
+            tracker.running.load(Ordering::SeqCst),
+            0,
+            "the work future was dropped with the invocation"
+        );
+        let failures = capture
+            .events()
+            .into_iter()
+            .filter(|event| event.event_type == audit::event::TOOL_INVOKE_FAILURE)
+            .count();
+        assert_eq!(failures, 1, "one failure event for the lost lease");
+        release.release();
+    }
+
+    /// An authority that cannot be consulted refuses admission before any
+    /// work starts, as AuthorityUnavailable (a 503 at the API), never as a
+    /// silent local-only admission.
+    #[tokio::test]
+    async fn an_unavailable_authority_refuses_admission_before_work_starts() {
+        use crate::tools::lease::memory::MemoryLeaseStore;
+        let store = MemoryLeaseStore::new(Duration::from_secs(5));
+        store.set_unavailable(true);
+        let leases: Arc<dyn ExecutionLeaseStore> = Arc::new(store.clone());
+        let (runtime, _capture) =
+            runtime_with_leases([("alpha", enabled_tool(1_000, 1))], 8, 4, 1_000, leases);
+        let started = Arc::new(AtomicBool::new(false));
+        let started_flag = Arc::clone(&started);
+        let result = runtime
+            .execute_with_context(
+                "alpha",
+                context(),
+                CancellationToken::new(),
+                || async move {
+                    started_flag.store(true, Ordering::SeqCst);
+                },
+            )
+            .await;
+        assert!(
+            matches!(result, Err(ToolRuntimeError::AuthorityUnavailable { ref tool_name }) if tool_name == "alpha"),
+            "expected AuthorityUnavailable, got {result:?}"
+        );
+        assert!(
+            !started.load(Ordering::SeqCst),
+            "no work may start without a lease"
+        );
+        assert_eq!(store.held(lease::GLOBAL_SCOPE), 0);
+    }
+
+    /// Waiting for a slot is bounded by the queue timeout, and the slot
+    /// frees the moment the holder finishes.
+    #[tokio::test]
+    async fn a_full_scope_waits_only_for_the_queue_timeout() {
+        use crate::tools::lease::memory::MemoryLeaseStore;
+        let store = MemoryLeaseStore::new(Duration::from_secs(5));
+        let leases: Arc<dyn ExecutionLeaseStore> = Arc::new(store.clone());
+        let (runtime, _capture) =
+            runtime_with_leases([("alpha", enabled_tool(5_000, 4))], 8, 1, 200, leases);
+        let tracker = Arc::new(ConcurrencyTracker::default());
+        let release = ReleaseGate::new();
+        let holder = spawn_tracked_invocation(
+            runtime.clone(),
+            "alpha",
+            Arc::clone(&tracker),
+            release.clone(),
+        );
+        tracker.wait_for_started(1).await;
+        let started_wait = std::time::Instant::now();
+        let waiter = runtime
+            .execute_with_context("alpha", context(), CancellationToken::new(), || async {})
+            .await;
+        assert!(
+            matches!(waiter, Err(ToolRuntimeError::QueueTimeout { .. })),
+            "expected QueueTimeout, got {waiter:?}"
+        );
+        assert!(started_wait.elapsed() >= Duration::from_millis(180));
+        release.release();
+        holder
+            .await
+            .expect("holder task should join")
+            .expect("holder should succeed");
+        wait_for_held(&store, lease::GLOBAL_SCOPE, 0).await;
+        runtime
+            .execute_with_context("alpha", context(), CancellationToken::new(), || async {})
+            .await
+            .expect("a freed slot admits the next invocation");
+    }
+
+    /// The in-memory authority keeps the fencing contract the PostgreSQL
+    /// one is tested against: a successor's fence supersedes a lapsed
+    /// holder, and the lapsed holder can neither renew nor release it.
+    #[tokio::test]
+    async fn a_lapsed_holder_cannot_renew_or_release_a_successors_slot() {
+        use crate::tools::lease::memory::MemoryLeaseStore;
+        let store = MemoryLeaseStore::new(Duration::from_millis(100));
+        let first = match store
+            .try_acquire("global", 1, "req-1")
+            .await
+            .expect("acquire")
+        {
+            LeaseAttempt::Acquired(lease) => lease,
+            LeaseAttempt::Full => panic!("an empty scope has a free slot"),
+        };
+        assert!(matches!(
+            store
+                .try_acquire("global", 1, "req-2")
+                .await
+                .expect("acquire"),
+            LeaseAttempt::Full
+        ));
+        store.advance(Duration::from_millis(150));
+        let successor = match store
+            .try_acquire("global", 1, "req-3")
+            .await
+            .expect("acquire")
+        {
+            LeaseAttempt::Acquired(lease) => lease,
+            LeaseAttempt::Full => panic!("an expired slot is reclaimable"),
+        };
+        assert_eq!(successor.slot, first.slot);
+        assert!(successor.fence > first.fence, "fences strictly increase");
+        assert!(!store.renew(&first).await.expect("renew"));
+        assert!(!store.is_current(&first).await.expect("check"));
+        assert!(store.is_current(&successor).await.expect("check"));
+        store.release(&first).await.expect("release");
+        assert!(
+            store.is_current(&successor).await.expect("check"),
+            "a stale holder's release must not free the successor's slot"
+        );
+        assert_eq!(store.held("global"), 1);
+    }
+
     #[tokio::test]
     async fn per_tool_concurrency_is_independent_between_tools() {
         let (runtime, _capture) = runtime_with_tools(
@@ -2704,6 +3225,47 @@ mod tests {
         );
 
         (runtime, capture)
+    }
+
+    fn runtime_with_leases<const N: usize>(
+        tools: [(&str, ToolRuntimeToolConfig); N],
+        max_queue: usize,
+        max_concurrent_global: usize,
+        queue_timeout_ms: u64,
+        leases: Arc<dyn ExecutionLeaseStore>,
+    ) -> (ToolRuntime, CaptureSink) {
+        let capture = CaptureSink::new();
+        let audit = AuditLog::new(Arc::new(capture.clone()) as Arc<dyn AuditSink>);
+        let runtime = ToolRuntime::new_with_rbac_state_and_leases(
+            ToolRuntimeConfig {
+                max_queue,
+                queue_timeout: Duration::from_millis(queue_timeout_ms),
+                max_concurrent_global,
+                default_policy: DefaultToolPolicy::Deny,
+                default_timeout: Duration::from_millis(100),
+                rules: Vec::new(),
+                tools: tools
+                    .into_iter()
+                    .map(|(name, config)| (name.to_owned(), config))
+                    .collect::<HashMap<_, _>>(),
+            },
+            audit,
+            None,
+            Some(leases),
+        );
+
+        (runtime, capture)
+    }
+
+    /// Wait until `held` reports `expected` for `scope`, so a release that
+    /// runs on a spawned task can be observed without a fixed sleep.
+    async fn wait_for_held(
+        store: &crate::tools::lease::memory::MemoryLeaseStore,
+        scope: &str,
+        expected: usize,
+    ) {
+        wait_until(Duration::from_secs(1), || store.held(scope) == expected).await;
+        assert_eq!(store.held(scope), expected, "held leases in {scope}");
     }
 
     fn enabled_tool(timeout_ms: u64, max_concurrent: usize) -> ToolRuntimeToolConfig {
