@@ -238,6 +238,9 @@ fn cloudflare_forwarding_matches_supported_gateway_env_vars() {
         // PostgreSQL. It is rejected outright when STATE_BACKEND is sqlite,
         // so with STATE_BACKEND excluded it can never be honoured here.
         "ADMIN_LOGIN_KEYRING",
+        // Likewise the keyring the shared rate limiter keys its buckets
+        // under: cluster mode only, rejected in standalone mode.
+        "RATE_LIMIT_KEYRING",
     ] {
         assert!(
             expected.remove(excluded),

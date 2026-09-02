@@ -2907,12 +2907,15 @@ mod tests {
             0,
             "the work future was dropped with the invocation"
         );
-        let failures = capture
-            .events()
-            .into_iter()
-            .filter(|event| event.event_type == audit::event::TOOL_INVOKE_FAILURE)
-            .count();
-        assert_eq!(failures, 1, "one failure event for the lost lease");
+        let failure_events = || {
+            capture
+                .events()
+                .into_iter()
+                .filter(|event| event.event_type == audit::event::TOOL_INVOKE_FAILURE)
+                .count()
+        };
+        wait_until(Duration::from_secs(2), || failure_events() == 1).await;
+        assert_eq!(failure_events(), 1, "one failure event for the lost lease");
         release.release();
     }
 
