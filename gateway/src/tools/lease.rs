@@ -1,0 +1,256 @@
+//! Execution leases: the cluster-wide bound on running tool invocations
+//! (issue #241, PR 10).
+//!
+//! Standalone mode bounds concurrency with process-local semaphores. With
+//! N replicas that is N times the configured global and per-tool limits,
+//! so cluster mode makes each permitted concurrent invocation a *slot* in
+//! a scope (`global`, or `tool:<name>`) and a running invocation the
+//! holder of one slot's lease:
+//!
+//! - **Acquire** takes a free or expired slot with a fresh, strictly
+//!   increasing fencing token. A scope with no free slot answers
+//!   [`LeaseAttempt::Full`]; the runtime waits with jittered backoff inside
+//!   its existing queue timeout.
+//! - **Renew** extends the lease only while the holder still owns the slot
+//!   at its fence. The runtime renews well inside the TTL and cancels the
+//!   local work on the first failed renewal, so the work stops *before* the
+//!   slot can be reclaimed by database-time expiry, never after.
+//! - **Release** frees the slot at once on normal completion; a crashed
+//!   holder's slot is reclaimed only after the lease expires by the
+//!   database clock.
+//! - **Fencing**: a stale holder's late write of shared follow-up state is
+//!   refused by [`ExecutionLeaseStore::is_current`] once a successor holds
+//!   the slot at a newer fence, so two holders can never both commit.
+//!
+//! The trait is what the runtime depends on; PostgreSQL implements it in
+//! cluster mode and the in-memory store here stands in for tests of the
+//! runtime's own behaviour (renewal, cancellation, release).
+
+use std::time::Duration;
+
+use async_trait::async_trait;
+
+use crate::storage::RepositoryError;
+
+/// A held slot: the scope, which slot, and the fence it was taken at.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ExecutionLease {
+    pub scope: String,
+    pub slot: i32,
+    pub fence: i64,
+}
+
+/// What an acquisition attempt found.
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[cfg_attr(not(feature = "postgres"), allow(dead_code))] // constructed by the PostgreSQL store and the test authority
+pub enum LeaseAttempt {
+    Acquired(ExecutionLease),
+    /// Every slot is held by a live lease (or a race took the one that
+    /// looked free); try again after a short wait.
+    Full,
+}
+
+/// The lease authority the runtime consults in cluster mode.
+#[async_trait]
+pub trait ExecutionLeaseStore: Send + Sync {
+    /// Try once to take a slot in `scope`, which has `capacity` slots.
+    async fn try_acquire(
+        &self,
+        scope: &str,
+        capacity: u32,
+        invocation: &str,
+    ) -> Result<LeaseAttempt, RepositoryError>;
+
+    /// Extend the lease; `false` means it was lost (expired and possibly
+    /// reclaimed), and the holder must stop its work.
+    async fn renew(&self, lease: &ExecutionLease) -> Result<bool, RepositoryError>;
+
+    /// Free the slot if this holder still owns it at this fence.
+    async fn release(&self, lease: &ExecutionLease) -> Result<(), RepositoryError>;
+
+    /// Whether the lease is still held at this fence and unexpired: the
+    /// check a fenced write of shared follow-up state makes.
+    #[allow(dead_code)] // PR 11's durable observation writes are the first fenced follow-up state.
+    async fn is_current(&self, lease: &ExecutionLease) -> Result<bool, RepositoryError>;
+
+    /// The lease's time to live on the authority's clock.
+    fn ttl(&self) -> Duration;
+}
+
+/// The renewal cadence for a lease of `ttl`: a third of the TTL, so two
+/// renewals can fail transiently before the lease is at risk, and never
+/// less than a short floor so a tiny test TTL does not spin.
+pub fn renewal_interval(ttl: Duration) -> Duration {
+    (ttl / 3).max(Duration::from_millis(20))
+}
+
+/// The scope a tool's per-tool limit is leased in.
+pub fn tool_scope(tool_name: &str) -> String {
+    format!("tool:{tool_name}")
+}
+
+/// The scope the global limit is leased in.
+pub const GLOBAL_SCOPE: &str = "global";
+
+#[cfg(test)]
+pub(crate) mod memory {
+    //! An in-memory lease store with a controllable clock for runtime tests:
+    //! the same acquire/renew/release/fence semantics as PostgreSQL, judged
+    //! on a test-owned instant instead of database time.
+
+    use std::{
+        collections::HashMap,
+        sync::{Arc, Mutex},
+        time::{Duration, Instant},
+    };
+
+    use async_trait::async_trait;
+
+    use super::{ExecutionLease, ExecutionLeaseStore, LeaseAttempt};
+    use crate::storage::{RepositoryError, RepositoryErrorKind};
+
+    #[derive(Clone)]
+    struct Held {
+        fence: i64,
+        expires_at: Instant,
+    }
+
+    #[derive(Default)]
+    struct State {
+        slots: HashMap<(String, i32), Held>,
+        next_fence: i64,
+        /// When set, every call fails as an unavailable authority.
+        unavailable: bool,
+        /// Time offset applied to "now" so a test can expire leases.
+        skew: Duration,
+    }
+
+    #[derive(Clone)]
+    pub(crate) struct MemoryLeaseStore {
+        state: Arc<Mutex<State>>,
+        ttl: Duration,
+    }
+
+    impl MemoryLeaseStore {
+        pub(crate) fn new(ttl: Duration) -> Self {
+            Self {
+                state: Arc::new(Mutex::new(State {
+                    next_fence: 1,
+                    ..State::default()
+                })),
+                ttl,
+            }
+        }
+
+        pub(crate) fn set_unavailable(&self, unavailable: bool) {
+            self.state.lock().expect("lease state").unavailable = unavailable;
+        }
+
+        /// Advance the store's clock so held leases expire.
+        pub(crate) fn advance(&self, by: Duration) {
+            self.state.lock().expect("lease state").skew += by;
+        }
+
+        pub(crate) fn held(&self, scope: &str) -> usize {
+            let state = self.state.lock().expect("lease state");
+            let now = Instant::now() + state.skew;
+            state
+                .slots
+                .iter()
+                .filter(|((held_scope, _), held)| held_scope == scope && held.expires_at > now)
+                .count()
+        }
+
+        fn guard(state: &State) -> Result<(), RepositoryError> {
+            if state.unavailable {
+                Err(RepositoryError::new(
+                    RepositoryErrorKind::Unavailable,
+                    "lease_memory",
+                ))
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    #[async_trait]
+    impl ExecutionLeaseStore for MemoryLeaseStore {
+        async fn try_acquire(
+            &self,
+            scope: &str,
+            capacity: u32,
+            _invocation: &str,
+        ) -> Result<LeaseAttempt, RepositoryError> {
+            let mut state = self.state.lock().expect("lease state");
+            Self::guard(&state)?;
+            let now = Instant::now() + state.skew;
+            for slot in 0..i32::try_from(capacity).unwrap_or(i32::MAX) {
+                let key = (scope.to_owned(), slot);
+                let free = state
+                    .slots
+                    .get(&key)
+                    .is_none_or(|held| held.expires_at <= now);
+                if free {
+                    let fence = state.next_fence;
+                    state.next_fence += 1;
+                    state.slots.insert(
+                        key,
+                        Held {
+                            fence,
+                            expires_at: now + self.ttl,
+                        },
+                    );
+                    return Ok(LeaseAttempt::Acquired(ExecutionLease {
+                        scope: scope.to_owned(),
+                        slot,
+                        fence,
+                    }));
+                }
+            }
+            Ok(LeaseAttempt::Full)
+        }
+
+        async fn renew(&self, lease: &ExecutionLease) -> Result<bool, RepositoryError> {
+            let mut state = self.state.lock().expect("lease state");
+            Self::guard(&state)?;
+            let now = Instant::now() + state.skew;
+            let ttl = self.ttl;
+            let key = (lease.scope.clone(), lease.slot);
+            match state.slots.get_mut(&key) {
+                Some(held) if held.fence == lease.fence && held.expires_at > now => {
+                    held.expires_at = now + ttl;
+                    Ok(true)
+                }
+                _ => Ok(false),
+            }
+        }
+
+        async fn release(&self, lease: &ExecutionLease) -> Result<(), RepositoryError> {
+            let mut state = self.state.lock().expect("lease state");
+            Self::guard(&state)?;
+            let key = (lease.scope.clone(), lease.slot);
+            if state
+                .slots
+                .get(&key)
+                .is_some_and(|held| held.fence == lease.fence)
+            {
+                state.slots.remove(&key);
+            }
+            Ok(())
+        }
+
+        async fn is_current(&self, lease: &ExecutionLease) -> Result<bool, RepositoryError> {
+            let state = self.state.lock().expect("lease state");
+            Self::guard(&state)?;
+            let now = Instant::now() + state.skew;
+            Ok(state
+                .slots
+                .get(&(lease.scope.clone(), lease.slot))
+                .is_some_and(|held| held.fence == lease.fence && held.expires_at > now))
+        }
+
+        fn ttl(&self) -> Duration {
+            self.ttl
+        }
+    }
+}

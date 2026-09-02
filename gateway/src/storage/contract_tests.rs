@@ -1316,6 +1316,554 @@ mod postgres_audit_tests {
     }
 
     // ------------------------------------------------------------------
+    // Shared rate limits and execution leases (issue #241, PR 10)
+    // ------------------------------------------------------------------
+
+    use crate::storage::{
+        PostgresExecutionLeaseStore, PostgresRateLimitStore, SharedDecision, SharedLane,
+        SharedLimit,
+    };
+    use crate::tools::lease::{ExecutionLeaseStore, LeaseAttempt};
+    use std::time::Duration;
+
+    fn limits_keyring() -> LocalSecretKeyring {
+        LocalSecretKeyring::from_material_for_test(
+            "rl-key-1",
+            vec![("rl-key-1".to_owned(), [9u8; 32])],
+        )
+    }
+
+    async fn migrated_limits_pool(database: &TestDatabase) -> deadpool_postgres::Pool {
+        let test_dsn_file = write_dsn_file(&database.dsn);
+        let mut config = crate::config::Config::test_defaults();
+        config.state_backend = crate::config::StateBackend::Postgres;
+        config.deployment_id = Some("deploy-limits-contract".to_owned());
+        config.database.url_file = Some(test_dsn_file.path.clone());
+        config.database.tls_mode = crate::config::DatabaseTlsMode::LoopbackDev;
+        let foundation = PostgresFoundation::establish(&config)
+            .await
+            .expect("the test database should establish");
+        migrations::apply_missing_for_startup(foundation.pool(), &config.database)
+            .await
+            .expect("the limits schema should migrate");
+        foundation.pool().clone()
+    }
+
+    async fn decide(
+        store: &PostgresRateLimitStore,
+        lane: SharedLane,
+        key: &str,
+        limit: SharedLimit,
+    ) -> SharedDecision {
+        store
+            .decide(lane, key, limit)
+            .await
+            .expect("the shared limiter decides")
+    }
+
+    /// The cluster contract: one configured burst permits that many
+    /// requests across every replica together, refills on the database
+    /// clock, and keeps lanes and callers apart.
+    #[tokio::test]
+    async fn one_burst_permits_that_many_requests_across_replicas() {
+        let Some(admin_dsn) = locator() else {
+            eprintln!("skipping: no test database locator; CI runs this test");
+            return;
+        };
+        let _guard = DATABASE.lock().await;
+        let database = create_test_database(&admin_dsn).await;
+        let pool = migrated_limits_pool(&database).await;
+        let replica_a =
+            PostgresRateLimitStore::new(pool.clone(), "deploy-limits", limits_keyring(), 1_000);
+        let replica_b =
+            PostgresRateLimitStore::new(pool.clone(), "deploy-limits", limits_keyring(), 1_000);
+        let limit = SharedLimit {
+            requests_per_second: 1.0,
+            burst: 3,
+        };
+        let caller = "ip:203.0.113.7";
+        let mut allowed = 0;
+        for (index, replica) in [&replica_a, &replica_b, &replica_a, &replica_b]
+            .into_iter()
+            .enumerate()
+        {
+            match decide(replica, SharedLane::Read, caller, limit).await {
+                SharedDecision::Allowed => allowed += 1,
+                SharedDecision::Denied => assert_eq!(index, 3, "only the fourth request is denied"),
+            }
+        }
+        assert_eq!(
+            allowed, 3,
+            "a burst of three permits three across both replicas"
+        );
+        assert_eq!(
+            decide(&replica_a, SharedLane::Read, caller, limit).await,
+            SharedDecision::Denied
+        );
+        // Another caller, and the other lane, are separate buckets.
+        assert_eq!(
+            decide(&replica_b, SharedLane::Read, "ip:203.0.113.8", limit).await,
+            SharedDecision::Allowed
+        );
+        assert_eq!(
+            decide(&replica_b, SharedLane::Write, caller, limit).await,
+            SharedDecision::Allowed
+        );
+        // Refill on database time: at one request per second, one permit
+        // has returned after a second, and only one.
+        tokio::time::sleep(Duration::from_millis(1_200)).await;
+        assert_eq!(
+            decide(&replica_b, SharedLane::Read, caller, limit).await,
+            SharedDecision::Allowed
+        );
+        assert_eq!(
+            decide(&replica_a, SharedLane::Read, caller, limit).await,
+            SharedDecision::Denied
+        );
+        // A zero burst denies the very first request, as the local store does.
+        let zero = SharedLimit {
+            requests_per_second: 1.0,
+            burst: 0,
+        };
+        assert_eq!(
+            decide(&replica_a, SharedLane::Read, "ip:203.0.113.9", zero).await,
+            SharedDecision::Denied
+        );
+        assert_eq!(replica_a.live_buckets().await.expect("count"), 4);
+    }
+
+    /// The policy lane keys buckets by rule as well as principal, and what
+    /// the table holds is a keyed digest: never the caller key, and never
+    /// the plain hash of it that a table reader could precompute.
+    #[tokio::test]
+    async fn policy_buckets_are_per_rule_and_digests_hide_the_caller() {
+        use sha2::{Digest, Sha256};
+        let Some(admin_dsn) = locator() else {
+            eprintln!("skipping: no test database locator; CI runs this test");
+            return;
+        };
+        let _guard = DATABASE.lock().await;
+        let database = create_test_database(&admin_dsn).await;
+        let pool = migrated_limits_pool(&database).await;
+        let store =
+            PostgresRateLimitStore::new(pool.clone(), "deploy-limits", limits_keyring(), 1_000);
+        let one = SharedLimit {
+            requests_per_second: 1.0,
+            burst: 1,
+        };
+        let principal = "principal:0::jwt:alice";
+        let under_rule_a = format!("rule:aaaa:{principal}");
+        let under_rule_b = format!("rule:bbbb:{principal}");
+        assert_eq!(
+            decide(&store, SharedLane::Policy, &under_rule_a, one).await,
+            SharedDecision::Allowed
+        );
+        assert_eq!(
+            decide(&store, SharedLane::Policy, &under_rule_b, one).await,
+            SharedDecision::Allowed,
+            "a second rule is a second bucket"
+        );
+        assert_eq!(
+            decide(&store, SharedLane::Policy, &under_rule_a, one).await,
+            SharedDecision::Denied
+        );
+
+        let client = pool.get().await.expect("client");
+        let rows = client
+            .query(
+                "SELECT lane, encode(key_digest, 'hex') AS digest FROM greengateway.rate_limit_buckets WHERE deployment_id = $1",
+                &[&"deploy-limits"],
+            )
+            .await
+            .expect("query");
+        assert_eq!(rows.len(), 2);
+        for row in rows {
+            let lane: String = row.get("lane");
+            let digest: String = row.get("digest");
+            assert_eq!(lane, "policy");
+            assert_eq!(digest.len(), 64);
+            for raw in [&under_rule_a, &under_rule_b] {
+                assert!(
+                    !digest.contains(&hex::encode(raw.as_bytes())),
+                    "the caller key is not stored"
+                );
+                let plain = hex::encode(Sha256::digest(raw.as_bytes()));
+                assert_ne!(
+                    digest, plain,
+                    "the digest is keyed, not a plain hash of the caller key"
+                );
+            }
+        }
+        // A different deployment over the same key is a different digest.
+        let other =
+            PostgresRateLimitStore::new(pool.clone(), "deploy-other", limits_keyring(), 1_000);
+        assert_eq!(
+            decide(&other, SharedLane::Policy, &under_rule_a, one).await,
+            SharedDecision::Allowed
+        );
+        let distinct: i64 = client
+            .query_one(
+                "SELECT count(DISTINCT key_digest) FROM greengateway.rate_limit_buckets",
+                &[],
+            )
+            .await
+            .expect("count")
+            .get(0);
+        assert_eq!(distinct, 3);
+    }
+
+    /// The hard cardinality bound: a spray of fresh identities evicts the
+    /// oldest buckets rather than growing the table, the counter stays
+    /// exact, and the idle sweep reclaims what nobody touches.
+    #[tokio::test]
+    async fn the_cardinality_bound_evicts_the_oldest_and_the_count_stays_exact() {
+        let Some(admin_dsn) = locator() else {
+            eprintln!("skipping: no test database locator; CI runs this test");
+            return;
+        };
+        let _guard = DATABASE.lock().await;
+        let database = create_test_database(&admin_dsn).await;
+        let pool = migrated_limits_pool(&database).await;
+        let store = PostgresRateLimitStore::new(pool.clone(), "deploy-limits", limits_keyring(), 5);
+        let one = SharedLimit {
+            requests_per_second: 0.0,
+            burst: 1,
+        };
+        for index in 0..8 {
+            assert_eq!(
+                decide(
+                    &store,
+                    SharedLane::Read,
+                    &format!("ip:198.51.100.{index}"),
+                    one
+                )
+                .await,
+                SharedDecision::Allowed
+            );
+            tokio::time::sleep(Duration::from_millis(15)).await;
+        }
+        let client = pool.get().await.expect("client");
+        let rows: i64 = client
+            .query_one(
+                "SELECT count(*) FROM greengateway.rate_limit_buckets WHERE deployment_id = $1",
+                &[&"deploy-limits"],
+            )
+            .await
+            .expect("count")
+            .get(0);
+        assert_eq!(rows, 5, "the table never exceeds the bound");
+        assert_eq!(
+            store.live_buckets().await.expect("counter"),
+            5,
+            "the counter is exact"
+        );
+        // The oldest were evicted: the first caller starts a fresh bucket
+        // (and is allowed again), while the newest still has its spent one.
+        assert_eq!(
+            decide(&store, SharedLane::Read, "ip:198.51.100.0", one).await,
+            SharedDecision::Allowed
+        );
+        assert_eq!(
+            decide(&store, SharedLane::Read, "ip:198.51.100.7", one).await,
+            SharedDecision::Denied
+        );
+        assert_eq!(store.live_buckets().await.expect("counter"), 5);
+        // The idle sweep, on database time, with a bound per call.
+        assert_eq!(store.cleanup_idle(0.0, 2).await.expect("sweep"), 2);
+        assert_eq!(store.live_buckets().await.expect("counter"), 3);
+        assert_eq!(store.cleanup_idle(0.0, 100).await.expect("sweep"), 3);
+        assert_eq!(store.live_buckets().await.expect("counter"), 0);
+        assert_eq!(store.cleanup_idle(3_600.0, 100).await.expect("sweep"), 0);
+    }
+
+    /// Fail closed: a shared limiter that cannot be consulted answers 503
+    /// with zero upstream attempts; it is never a silent allow and never a
+    /// 429. Then, with the authority back, two replicas' middleware share
+    /// one burst: the configured two requests are allowed across both, and
+    /// the third is denied by the shared store while each replica's own
+    /// bucket would still have allowed it.
+    #[tokio::test]
+    async fn an_unavailable_shared_limiter_is_a_503_with_no_upstream_attempt() {
+        use axum::{
+            body::Body, http::Request, middleware::from_fn_with_state, routing::get, Router,
+        };
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tower::ServiceExt;
+        let Some(admin_dsn) = locator() else {
+            eprintln!("skipping: no test database locator; CI runs this test");
+            return;
+        };
+        let _guard = DATABASE.lock().await;
+        let database = create_test_database(&admin_dsn).await;
+        let pool = migrated_limits_pool(&database).await;
+        let store = Arc::new(PostgresRateLimitStore::new(
+            pool.clone(),
+            "deploy-limits",
+            limits_keyring(),
+            1_000,
+        ));
+        let mut config = crate::config::Config::test_defaults();
+        config.rate_limit_read_rps = 1.0;
+        config.rate_limit_read_burst = 2;
+        let upstream_attempts = Arc::new(AtomicUsize::new(0));
+        let replica = |store: &Arc<PostgresRateLimitStore>| {
+            let state = crate::middleware::rate_limit::RateLimitState::from_config_and_policy(
+                &config, None,
+            )
+            .with_shared_store(Arc::clone(store));
+            let counter = Arc::clone(&upstream_attempts);
+            Router::new()
+                .route(
+                    "/echo",
+                    get(move || {
+                        let counter = Arc::clone(&counter);
+                        async move {
+                            counter.fetch_add(1, Ordering::SeqCst);
+                            "ok"
+                        }
+                    }),
+                )
+                .layer(from_fn_with_state(
+                    state,
+                    crate::middleware::rate_limit::rate_limit_request,
+                ))
+        };
+        let replica_a = replica(&store);
+        let replica_b = replica(&store);
+        let request = || {
+            Request::builder()
+                .uri("/echo")
+                .body(Body::empty())
+                .expect("request")
+        };
+
+        // The authority's table is gone: the decision fails and the request
+        // is refused with no upstream attempt (the local bucket still spent
+        // a token on it: local first, then the authority).
+        let client = pool.get().await.expect("client");
+        client
+            .batch_execute(
+                "ALTER TABLE greengateway.rate_limit_buckets RENAME TO rate_limit_buckets_gone",
+            )
+            .await
+            .expect("hide the table");
+        let response = replica_a
+            .clone()
+            .oneshot(request())
+            .await
+            .expect("response");
+        assert_eq!(
+            response.status(),
+            axum::http::StatusCode::SERVICE_UNAVAILABLE
+        );
+        assert_eq!(
+            upstream_attempts.load(Ordering::SeqCst),
+            0,
+            "no upstream attempt behind a 503"
+        );
+        client
+            .batch_execute(
+                "ALTER TABLE greengateway.rate_limit_buckets_gone RENAME TO rate_limit_buckets",
+            )
+            .await
+            .expect("restore the table");
+
+        // The authority is back. Replica A has one local token left and the
+        // shared burst is untouched (the failed decision spent nothing):
+        // A allows one; B, with a fresh local bucket, allows the second;
+        // B's third is denied by the shared store, not by B's own bucket.
+        let response = replica_a
+            .clone()
+            .oneshot(request())
+            .await
+            .expect("response");
+        assert_eq!(response.status(), axum::http::StatusCode::OK);
+        let response = replica_b
+            .clone()
+            .oneshot(request())
+            .await
+            .expect("response");
+        assert_eq!(response.status(), axum::http::StatusCode::OK);
+        let response = replica_b
+            .clone()
+            .oneshot(request())
+            .await
+            .expect("response");
+        assert_eq!(
+            response.status(),
+            axum::http::StatusCode::TOO_MANY_REQUESTS,
+            "one configured burst is shared across both replicas"
+        );
+        assert_eq!(upstream_attempts.load(Ordering::SeqCst), 2);
+    }
+
+    /// Two acquirers that both saw the same slot free race on the row: the
+    /// conflict predicate lets only an expired lease be taken over, so the
+    /// loser sees no row and the winner's fence is never overwritten.
+    #[tokio::test]
+    async fn concurrent_acquirers_never_share_a_slot() {
+        let Some(admin_dsn) = locator() else {
+            eprintln!("skipping: no test database locator; CI runs this test");
+            return;
+        };
+        let _guard = DATABASE.lock().await;
+        let database = create_test_database(&admin_dsn).await;
+        let pool = migrated_limits_pool(&database).await;
+        let store = Arc::new(PostgresExecutionLeaseStore::new(
+            pool.clone(),
+            "deploy-limits",
+            uuid::Uuid::new_v4(),
+            Duration::from_secs(5),
+        ));
+        let mut attempts = Vec::new();
+        for index in 0..12 {
+            let store = Arc::clone(&store);
+            attempts.push(tokio::spawn(async move {
+                store
+                    .try_acquire("global", 1, &format!("req-{index}"))
+                    .await
+                    .expect("acquire")
+            }));
+        }
+        let mut winners = Vec::new();
+        for attempt in attempts {
+            if let LeaseAttempt::Acquired(lease) = attempt.await.expect("task") {
+                winners.push(lease);
+            }
+        }
+        assert_eq!(
+            winners.len(),
+            1,
+            "exactly one acquirer holds the single slot"
+        );
+        assert!(
+            store.is_current(&winners[0]).await.expect("check"),
+            "the winner's fence was not overwritten by a losing acquirer"
+        );
+        let client = pool.get().await.expect("client");
+        let fence: i64 = client
+            .query_one(
+                "SELECT fence FROM greengateway.execution_leases WHERE deployment_id = $1 AND scope = 'global' AND slot = 0",
+                &[&"deploy-limits"],
+            )
+            .await
+            .expect("row")
+            .get(0);
+        assert_eq!(fence, winners[0].fence);
+    }
+
+    /// The lease contract on PostgreSQL: slots are bounded across holders,
+    /// fences strictly increase, a lapsed holder can neither renew nor
+    /// release a successor's slot, and a crashed holder's slot returns only
+    /// by database-time expiry.
+    #[tokio::test]
+    async fn leases_bound_slots_across_holders_and_fence_lapsed_holders() {
+        let Some(admin_dsn) = locator() else {
+            eprintln!("skipping: no test database locator; CI runs this test");
+            return;
+        };
+        let _guard = DATABASE.lock().await;
+        let database = create_test_database(&admin_dsn).await;
+        let pool = migrated_limits_pool(&database).await;
+        let ttl = Duration::from_millis(600);
+        let holder_a = PostgresExecutionLeaseStore::new(
+            pool.clone(),
+            "deploy-limits",
+            uuid::Uuid::new_v4(),
+            ttl,
+        );
+        let holder_b = PostgresExecutionLeaseStore::new(
+            pool.clone(),
+            "deploy-limits",
+            uuid::Uuid::new_v4(),
+            ttl,
+        );
+        let acquired = |attempt: LeaseAttempt| match attempt {
+            LeaseAttempt::Acquired(lease) => lease,
+            LeaseAttempt::Full => panic!("expected a free slot"),
+        };
+        let first = acquired(
+            holder_a
+                .try_acquire("global", 2, "req-1")
+                .await
+                .expect("acquire"),
+        );
+        let second = acquired(
+            holder_b
+                .try_acquire("global", 2, "x".repeat(300).as_str())
+                .await
+                .expect("acquire"),
+        );
+        assert_ne!(first.slot, second.slot);
+        assert!(second.fence > first.fence, "fences strictly increase");
+        assert!(matches!(
+            holder_a
+                .try_acquire("global", 2, "req-3")
+                .await
+                .expect("acquire"),
+            LeaseAttempt::Full
+        ));
+        assert!(matches!(
+            holder_b
+                .try_acquire("global", 2, "req-3")
+                .await
+                .expect("acquire"),
+            LeaseAttempt::Full
+        ));
+        // Another scope is another set of slots.
+        let tool_slot = acquired(
+            holder_a
+                .try_acquire("tool:alpha", 1, "req-4")
+                .await
+                .expect("acquire"),
+        );
+        assert!(tool_slot.fence > second.fence);
+
+        assert!(holder_a.renew(&first).await.expect("renew"));
+        assert!(holder_a.is_current(&first).await.expect("check"));
+        assert!(
+            !holder_b.is_current(&first).await.expect("check"),
+            "a lease is current only for its holder"
+        );
+        holder_b.release(&second).await.expect("release");
+        assert!(!holder_b.is_current(&second).await.expect("check"));
+        let third = acquired(
+            holder_b
+                .try_acquire("global", 2, "req-5")
+                .await
+                .expect("acquire"),
+        );
+        assert_eq!(third.slot, second.slot, "a released slot is free at once");
+        assert!(third.fence > tool_slot.fence);
+
+        // Nobody renews: after the TTL on the database clock, both slots are
+        // reclaimable, and the lapsed holders are fenced out.
+        tokio::time::sleep(ttl + Duration::from_millis(300)).await;
+        let successor = acquired(
+            holder_b
+                .try_acquire("global", 2, "req-6")
+                .await
+                .expect("acquire"),
+        );
+        assert_eq!(
+            successor.slot, first.slot,
+            "the lowest expired slot is taken first"
+        );
+        assert!(successor.fence > third.fence);
+        assert!(
+            !holder_a.renew(&first).await.expect("renew"),
+            "a lapsed lease cannot be renewed"
+        );
+        assert!(!holder_a.is_current(&first).await.expect("check"));
+        holder_a.release(&first).await.expect("release");
+        assert!(
+            holder_b.is_current(&successor).await.expect("check"),
+            "a lapsed holder's release does not free the successor's slot"
+        );
+        assert!(holder_b.renew(&successor).await.expect("renew"));
+    }
+
+    // ------------------------------------------------------------------
     // Shared admin pending-login store (issue #241, PR 9)
     // ------------------------------------------------------------------
 

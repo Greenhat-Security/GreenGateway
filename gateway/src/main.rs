@@ -1428,6 +1428,11 @@ struct GatewayAppBuildOverrides {
     /// None in standalone mode, or when no admin login provider is set.
     #[cfg(feature = "postgres")]
     pg_pending_logins: Option<ClusterPendingLoginSeed>,
+    /// The cluster-mode rate-limit and execution-lease stores' seed: the
+    /// pool, the deployment ID, the loaded rate-limit keyring, and the
+    /// replica's instance identity. None in standalone mode.
+    #[cfg(feature = "postgres")]
+    pg_limits: Option<ClusterLimitsSeed>,
     #[cfg(test)]
     egress_resolver: Option<Arc<dyn egress::DnsResolver>>,
     /// Test seam: the pending-login backend the admin login flow uses,
@@ -1600,6 +1605,18 @@ struct ClusterPendingLoginSeed {
     pool: deadpool_postgres::Pool,
     deployment_id: String,
     keyring: connections::local_secret::LocalSecretKeyring,
+}
+
+/// What `run()` loads for cluster-mode rate limiting and execution
+/// leases (issue #241, PR 10): the pool, the deployment ID, the loaded
+/// rate-limit keyring, and this replica's instance identity (the lease
+/// holder).
+#[cfg(feature = "postgres")]
+struct ClusterLimitsSeed {
+    pool: deadpool_postgres::Pool,
+    deployment_id: String,
+    keyring: connections::local_secret::LocalSecretKeyring,
+    instance_id: uuid::Uuid,
 }
 
 /// Why a cluster-mode boot refused to serve Connections.
@@ -1810,14 +1827,81 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         println!("deleted expired JWT revocations: {deleted}");
         return Ok(());
     }
-    #[cfg(not(feature = "postgres"))]
+    // `gateway rate-limit-buckets-cleanup [limit]`: reclaim shared rate-limit
+    // buckets idle for at least RATE_LIMIT_BUCKET_TTL_MS by the database
+    // clock, at most `limit` (default 1000) per run, keeping the live-bucket
+    // count exact. Idempotent and bounded, so an operator can schedule it
+    // until the membership PR makes it fenced singleton work; the bound on
+    // live buckets is enforced on the request path regardless.
+    #[cfg(feature = "postgres")]
     if std::env::args_os()
         .nth(1)
-        .is_some_and(|word| word == *"revoke-jwt" || word == *"jwt-revocations-cleanup")
+        .is_some_and(|word| word == *"rate-limit-buckets-cleanup")
     {
+        initialize_tracing_for_one_shot_commands();
+        let limit = match std::env::args_os().nth(2) {
+            None => 1_000,
+            Some(raw) => raw
+                .to_string_lossy()
+                .parse::<u32>()
+                .ok()
+                .filter(|limit| (1..=100_000).contains(limit))
+                .ok_or("usage: gateway rate-limit-buckets-cleanup [limit 1-100000]")?,
+        };
+        let config = config::Config::from_env()
+            .map_err(|error| Box::<dyn std::error::Error>::from(error.to_string()))?;
+        let Some(foundation) =
+            storage::postgres::PostgresFoundation::start_if_selected(&config).await?
+        else {
+            return Err(
+                "gateway rate-limit-buckets-cleanup requires STATE_BACKEND=postgres".into(),
+            );
+        };
+        let deployment_id = config
+            .deployment_id
+            .clone()
+            .ok_or("STATE_BACKEND=postgres requires DEPLOYMENT_ID")?;
+        let root = config
+            .connection_secrets_root
+            .as_ref()
+            .ok_or("RATE_LIMIT_KEYRING requires CONNECTION_SECRETS_ROOT for its key files")?;
+        let keyring =
+            connections::local_secret::LocalSecretKeyring::load(&config.rate_limit_keyring, root)
+                .map_err(|error| {
+                Box::<dyn std::error::Error>::from(format!(
+                    "the rate-limit keyring could not be loaded: {error}"
+                ))
+            })?;
+        let store = storage::PostgresRateLimitStore::new(
+            foundation.pool().clone(),
+            &deployment_id,
+            keyring,
+            config.rate_limit_max_buckets,
+        );
+        let idle_secs = config.rate_limit_bucket_idle_ttl().as_secs_f64();
+        let removed = store
+            .cleanup_idle(idle_secs, limit)
+            .await
+            .map_err(|error| {
+                Box::<dyn std::error::Error>::from(format!(
+                    "rate-limit bucket cleanup failed: {error}"
+                ))
+            })?;
+        let live = store.live_buckets().await.map_err(|error| {
+            Box::<dyn std::error::Error>::from(format!("rate-limit bucket count failed: {error}"))
+        })?;
+        println!("removed idle rate-limit buckets: {removed} (live: {live})");
+        return Ok(());
+    }
+    #[cfg(not(feature = "postgres"))]
+    if std::env::args_os().nth(1).is_some_and(|word| {
+        word == *"revoke-jwt"
+            || word == *"jwt-revocations-cleanup"
+            || word == *"rate-limit-buckets-cleanup"
+    }) {
         return Err(
             "this gateway binary was built without the `postgres` cargo feature and \
-                    cannot run the JWT revocation commands; build with default features"
+                    cannot run the JWT revocation or rate-limit maintenance commands; build with default features"
                 .into(),
         );
     }
@@ -2080,6 +2164,42 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         }
         _ => None,
     };
+    // Cluster-mode rate limiting and execution leases ride the same pool
+    // (issue #241, PR 10). The rate-limit keyring is required in postgres
+    // mode (config validation), loaded from files beneath the secrets root
+    // with the connections keyring's reader; the replica's instance
+    // identity is the lease holder.
+    #[cfg(feature = "postgres")]
+    let pg_limits_seed = match (&_database_foundation, &_ha_foundation) {
+        (Some(foundation), Some(ha_foundation)) => {
+            let root = config.connection_secrets_root.as_ref().ok_or_else(|| {
+                Box::<dyn std::error::Error>::from(
+                    "RATE_LIMIT_KEYRING requires CONNECTION_SECRETS_ROOT for its key files",
+                )
+            })?;
+            let keyring = connections::local_secret::LocalSecretKeyring::load(
+                &config.rate_limit_keyring,
+                root,
+            )
+            .map_err(|error| {
+                Box::<dyn std::error::Error>::from(format!(
+                    "the rate-limit keyring could not be loaded: {error}"
+                ))
+            })?;
+            let deployment_id = config.deployment_id.clone().ok_or_else(|| {
+                Box::<dyn std::error::Error>::from(
+                    "STATE_BACKEND=postgres requires DEPLOYMENT_ID for the rate-limit and lease stores",
+                )
+            })?;
+            Some(ClusterLimitsSeed {
+                pool: foundation.pool().clone(),
+                deployment_id,
+                keyring,
+                instance_id: ha_foundation.identity().instance_id(),
+            })
+        }
+        _ => None,
+    };
     // The durable audit store rides the foundation's pool; the SSE
     // endpoint reads committed events through it in cluster mode. Built
     // here, where both the pool and the replica identity exist, and handed
@@ -2133,6 +2253,8 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             pg_service_tokens: pg_service_tokens_seed,
             #[cfg(feature = "postgres")]
             pg_pending_logins: pg_pending_logins_seed,
+            #[cfg(feature = "postgres")]
+            pg_limits: pg_limits_seed,
             #[cfg(test)]
             egress_resolver: None,
             #[cfg(test)]
@@ -2408,6 +2530,21 @@ fn gateway_app_with_process_started_at_and_overrides(
         &config,
         loaded_policy.as_ref(),
     );
+    // Cluster mode: every locally-allowed request is also decided at the
+    // shared store, so one configured burst permits that many requests
+    // across the cluster (issue #241, PR 10).
+    #[cfg(feature = "postgres")]
+    let rate_limit_state = match build_overrides.pg_limits.as_ref() {
+        Some(seed) => {
+            rate_limit_state.with_shared_store(Arc::new(storage::PostgresRateLimitStore::new(
+                seed.pool.clone(),
+                &seed.deployment_id,
+                seed.keyring.clone(),
+                config.rate_limit_max_buckets,
+            )))
+        }
+        None => rate_limit_state,
+    };
     let mut egress_config = match loaded_policy.as_ref() {
         Some(policy) => {
             egress::EgressConfig::from_config_and_policy(&config, Some(&policy.egress))?
@@ -2782,10 +2919,26 @@ fn gateway_app_with_process_started_at_and_overrides(
             &lifecycle,
         )?;
     }
-    let tool_runtime = tools::runtime::ToolRuntime::new_with_rbac_state(
+    // Cluster mode: the global and per-tool concurrency limits are slots
+    // leased from the authority, so they bound the cluster rather than each
+    // replica (issue #241, PR 10).
+    #[cfg(feature = "postgres")]
+    let execution_leases: Option<Arc<dyn tools::lease::ExecutionLeaseStore>> =
+        build_overrides.pg_limits.as_ref().map(|seed| {
+            Arc::new(storage::PostgresExecutionLeaseStore::new(
+                seed.pool.clone(),
+                &seed.deployment_id,
+                seed.instance_id,
+                config.tool_lease_ttl(),
+            )) as Arc<dyn tools::lease::ExecutionLeaseStore>
+        });
+    #[cfg(not(feature = "postgres"))]
+    let execution_leases: Option<Arc<dyn tools::lease::ExecutionLeaseStore>> = None;
+    let tool_runtime = tools::runtime::ToolRuntime::new_with_rbac_state_and_leases(
         tool_runtime_config,
         audit_log.clone(),
         rbac_state.clone(),
+        execution_leases,
     );
     let tool_connection_runtimes = tools::executor::ToolConnectionRuntimes {
         http: Some(connection_http_runtime.clone()),
@@ -10076,6 +10229,16 @@ fn tool_playground_runtime_error_response(error: tools::runtime::ToolRuntimeErro
             "tool execution was cancelled",
             "cancelled",
         ),
+        ToolRuntimeError::AuthorityUnavailable { .. } => tool_playground_error_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "tool execution admission authority is unavailable",
+            "authority_unavailable",
+        ),
+        ToolRuntimeError::LeaseLost { .. } => tool_playground_error_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "tool execution lost its execution lease",
+            "lease_lost",
+        ),
         ToolRuntimeError::WorkFailed { reason, .. } => match reason.as_deref() {
             Some("invalid_params") => tool_playground_error_response(
                 StatusCode::UNPROCESSABLE_ENTITY,
@@ -13626,6 +13789,7 @@ mod tests {
             admin_login_pending_max_entries: config::DEFAULT_ADMIN_LOGIN_PENDING_MAX_ENTRIES,
             admin_login_pending_max_per_ip: config::DEFAULT_ADMIN_LOGIN_PENDING_MAX_PER_IP,
             admin_login_keyring: Vec::new(),
+            rate_limit_keyring: Vec::new(),
             gateway_public_url: None,
             audit_log_file: None,
             audit_sqlite_path: None,
@@ -13709,6 +13873,7 @@ mod tests {
             tool_runtime_queue_depth: config::DEFAULT_TOOL_RUNTIME_QUEUE_DEPTH,
             tool_runtime_global_concurrency: config::DEFAULT_TOOL_RUNTIME_GLOBAL_CONCURRENCY,
             tool_runtime_queue_timeout_ms: config::DEFAULT_TOOL_RUNTIME_QUEUE_TIMEOUT_MS,
+            tool_lease_ttl_ms: config::DEFAULT_TOOL_LEASE_TTL_MS,
             tool_runtime_default_timeout_ms: config::DEFAULT_TOOL_RUNTIME_DEFAULT_TIMEOUT_MS,
             csrf_enabled: true,
             csrf_cookie_name: "csrf_token".to_owned(),

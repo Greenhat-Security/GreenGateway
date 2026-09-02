@@ -111,6 +111,11 @@ pub const DEFAULT_SERVICE_TOKEN_CACHE_TTL_MS: u64 = 5_000;
 pub const DEFAULT_TOOL_RUNTIME_QUEUE_DEPTH: usize = 1_024;
 pub const DEFAULT_TOOL_RUNTIME_GLOBAL_CONCURRENCY: usize = 64;
 pub const DEFAULT_TOOL_RUNTIME_QUEUE_TIMEOUT_MS: u64 = 1_000;
+/// How long a cluster-mode execution lease lives on the database clock
+/// before an unrenewed slot is reclaimable (issue #241, PR 10). Renewed at
+/// a third of this, so the floor keeps renewal from becoming a busy loop.
+pub const DEFAULT_TOOL_LEASE_TTL_MS: u64 = 15_000;
+pub const MIN_TOOL_LEASE_TTL_MS: u64 = 1_000;
 pub const DEFAULT_TOOL_RUNTIME_DEFAULT_TIMEOUT_MS: u64 = 30_000;
 /// TLS 1.2 rather than 1.3, because raising a floor is an operator decision
 /// with a compatibility cost attached, and a default that silently refuses a
@@ -220,6 +225,7 @@ const CONNECTION_AWS_PROVIDER: &str = "CONNECTION_AWS_PROVIDER";
 const CONNECTION_KUBERNETES_PROVIDER: &str = "CONNECTION_KUBERNETES_PROVIDER";
 const CONNECTION_LOCAL_SECRET_KEYRING: &str = "CONNECTION_LOCAL_SECRET_KEYRING";
 const ADMIN_LOGIN_KEYRING: &str = "ADMIN_LOGIN_KEYRING";
+const RATE_LIMIT_KEYRING: &str = "RATE_LIMIT_KEYRING";
 const CONNECTION_SECRET_ALIASES: &str = "CONNECTION_SECRET_ALIASES";
 const CONNECTION_VAULT_PROVIDER: &str = "CONNECTION_VAULT_PROVIDER";
 const CONNECTION_SECRETS_ROOT: &str = "CONNECTION_SECRETS_ROOT";
@@ -283,6 +289,7 @@ const TOOL_RUNTIME_DEFAULT_TIMEOUT_MS: &str = "TOOL_RUNTIME_DEFAULT_TIMEOUT_MS";
 const TOOL_RUNTIME_GLOBAL_CONCURRENCY: &str = "TOOL_RUNTIME_GLOBAL_CONCURRENCY";
 const TOOL_RUNTIME_QUEUE_DEPTH: &str = "TOOL_RUNTIME_QUEUE_DEPTH";
 const TOOL_RUNTIME_QUEUE_TIMEOUT_MS: &str = "TOOL_RUNTIME_QUEUE_TIMEOUT_MS";
+const TOOL_LEASE_TTL_MS: &str = "TOOL_LEASE_TTL_MS";
 const TOOLS_FILE: &str = "TOOLS_FILE";
 const CLIENT_CERT_CA_FILE: &str = "CLIENT_CERT_CA_FILE";
 const CLIENT_CERT_CRL_FILE: &str = "CLIENT_CERT_CRL_FILE";
@@ -361,6 +368,11 @@ pub struct Config {
     /// beneath `CONNECTION_SECRETS_ROOT`. Required in postgres mode when an
     /// admin login provider is set; rejected in standalone mode.
     pub admin_login_keyring: Vec<LocalSecretKeyConfig>,
+    /// Keys the shared rate limiter's bucket digests are HMAC'd under in
+    /// cluster mode (issue #241, PR 10): the same key-file shape as the
+    /// connections keyring, with files beneath `CONNECTION_SECRETS_ROOT`.
+    /// Required in postgres mode; rejected in standalone mode.
+    pub rate_limit_keyring: Vec<LocalSecretKeyConfig>,
     pub gateway_public_url: Option<String>,
     pub audit_log_file: Option<String>,
     pub audit_sqlite_path: Option<String>,
@@ -429,6 +441,7 @@ pub struct Config {
     pub tool_runtime_queue_depth: usize,
     pub tool_runtime_global_concurrency: usize,
     pub tool_runtime_queue_timeout_ms: u64,
+    pub tool_lease_ttl_ms: u64,
     pub tool_runtime_default_timeout_ms: u64,
     pub csrf_enabled: bool,
     pub csrf_cookie_name: String,
@@ -1814,6 +1827,20 @@ impl Config {
         ) {
             problems.push(format!("{ADMIN_LOGIN_KEYRING}: {error}"));
         }
+        let rate_limit_keyring = parse_local_secret_keyring(
+            RATE_LIMIT_KEYRING,
+            get_var(RATE_LIMIT_KEYRING),
+            &mut problems,
+        );
+        // The rate-limit keyring signs bucket keys stored in PostgreSQL, so
+        // it needs the secrets root for its key files but no local store.
+        if let Err(error) = validate_local_secret_keyring_config(
+            &rate_limit_keyring,
+            connection_secrets_root.is_some(),
+            true,
+        ) {
+            problems.push(format!("{RATE_LIMIT_KEYRING}: {error}"));
+        }
         let connection_vault_provider = parse_vault_provider_config(
             CONNECTION_VAULT_PROVIDER,
             get_var(CONNECTION_VAULT_PROVIDER),
@@ -2210,6 +2237,26 @@ impl Config {
             DEFAULT_TOOL_RUNTIME_QUEUE_TIMEOUT_MS,
             &mut problems,
         );
+        let tool_lease_ttl_ms = validate_positive_u64(
+            TOOL_LEASE_TTL_MS,
+            parse_var(
+                TOOL_LEASE_TTL_MS,
+                get_var(TOOL_LEASE_TTL_MS),
+                DEFAULT_TOOL_LEASE_TTL_MS,
+                "millisecond duration",
+                &mut problems,
+            ),
+            DEFAULT_TOOL_LEASE_TTL_MS,
+            &mut problems,
+        );
+        let tool_lease_ttl_ms = if tool_lease_ttl_ms < MIN_TOOL_LEASE_TTL_MS {
+            problems.push(format!(
+                "{TOOL_LEASE_TTL_MS} must be at least {MIN_TOOL_LEASE_TTL_MS} milliseconds (a lease is renewed at a third of its TTL), got '{tool_lease_ttl_ms}'"
+            ));
+            DEFAULT_TOOL_LEASE_TTL_MS
+        } else {
+            tool_lease_ttl_ms
+        };
         let tool_runtime_default_timeout_ms = validate_positive_u64(
             TOOL_RUNTIME_DEFAULT_TIMEOUT_MS,
             parse_var(
@@ -2593,11 +2640,21 @@ impl Config {
                         "{ADMIN_LOGIN_KEYRING} is required when {STATE_BACKEND}=postgres and {ADMIN_LOGIN_PROVIDER} is set; pending admin logins are sealed in the database under it"
                     ));
                 }
+                if rate_limit_keyring.is_empty() {
+                    problems.push(format!(
+                        "{RATE_LIMIT_KEYRING} is required when {STATE_BACKEND}=postgres; shared rate-limit buckets are keyed by an HMAC under it"
+                    ));
+                }
             }
             StateBackend::Sqlite => {
                 if !admin_login_keyring.is_empty() {
                     problems.push(format!(
                         "{ADMIN_LOGIN_KEYRING} is set while {STATE_BACKEND} is sqlite; standalone mode keeps pending admin logins in memory and never reads it"
+                    ));
+                }
+                if !rate_limit_keyring.is_empty() {
+                    problems.push(format!(
+                        "{RATE_LIMIT_KEYRING} is set while {STATE_BACKEND} is sqlite; standalone mode keeps rate-limit buckets in memory and never reads it"
                     ));
                 }
             }
@@ -2647,6 +2704,7 @@ impl Config {
                 admin_login_pending_max_entries,
                 admin_login_pending_max_per_ip,
                 admin_login_keyring,
+                rate_limit_keyring,
                 gateway_public_url,
                 audit_log_file,
                 audit_sqlite_path,
@@ -2706,6 +2764,7 @@ impl Config {
                 tool_runtime_queue_depth,
                 tool_runtime_global_concurrency,
                 tool_runtime_queue_timeout_ms,
+                tool_lease_ttl_ms,
                 tool_runtime_default_timeout_ms,
                 csrf_enabled,
                 csrf_cookie_name,
@@ -2752,6 +2811,12 @@ impl Config {
     }
 
     /// The bucket idle TTL as a duration, for the rate limiter's stores.
+    /// The cluster-mode execution lease TTL (issue #241, PR 10).
+    #[cfg_attr(not(feature = "postgres"), allow(dead_code))] // read by the cluster wiring only
+    pub fn tool_lease_ttl(&self) -> std::time::Duration {
+        std::time::Duration::from_millis(self.tool_lease_ttl_ms)
+    }
+
     pub(crate) fn rate_limit_bucket_idle_ttl(&self) -> std::time::Duration {
         std::time::Duration::from_millis(self.rate_limit_bucket_ttl_ms)
     }
@@ -10322,6 +10387,13 @@ mod tests {
                     "DATABASE_URL_FILE",
                     "/run/secrets/greengateway/database-url",
                 ),
+                // PR 10: cluster mode keys its shared rate-limit buckets
+                // under a keyring whose files live beneath the secrets root.
+                ("CONNECTION_SECRETS_ROOT", "/run/secrets/greengateway"),
+                (
+                    "RATE_LIMIT_KEYRING",
+                    r#"[{"id":"rl-primary","file":"rate-limit-key","role":"primary"}]"#,
+                ),
             ];
             // Extra entries come first so a test can override a base value.
             for (key, value) in extra.iter().chain(base.iter()) {
@@ -10373,6 +10445,61 @@ mod tests {
             config.database.startup_retry_limit,
             DEFAULT_DATABASE_STARTUP_RETRY_LIMIT
         );
+    }
+
+    #[test]
+    fn postgres_mode_requires_a_rate_limit_keyring() {
+        let error = Config::from_env_vars(|name| match name {
+            "STATE_BACKEND" => Ok("postgres".to_owned()),
+            "DEPLOYMENT_ID" => Ok("deploy-prod-eu".to_owned()),
+            "DATABASE_URL_FILE" => Ok("/run/secrets/greengateway/database-url".to_owned()),
+            _ => Err(VarError::NotPresent),
+        })
+        .expect_err("postgres mode without a rate-limit keyring must not start");
+        assert!(
+            error
+                .to_string()
+                .contains("RATE_LIMIT_KEYRING is required when STATE_BACKEND=postgres"),
+            "{}",
+            error
+        );
+    }
+
+    #[test]
+    fn standalone_mode_refuses_a_rate_limit_keyring() {
+        let error = Config::from_env_vars(|name| match name {
+            "CONNECTION_SECRETS_ROOT" => Ok("/run/secrets/greengateway".to_owned()),
+            "RATE_LIMIT_KEYRING" => {
+                Ok(r#"[{"id":"rl-primary","file":"rate-limit-key","role":"primary"}]"#.to_owned())
+            }
+            _ => Err(VarError::NotPresent),
+        })
+        .expect_err("a rate-limit keyring in standalone mode must not start");
+        assert!(
+            error
+                .to_string()
+                .contains("RATE_LIMIT_KEYRING is set while STATE_BACKEND is sqlite"),
+            "{}",
+            error
+        );
+    }
+
+    #[test]
+    fn the_lease_ttl_has_a_floor_and_a_default() {
+        let config = Config::from_env_vars(postgres_mode_vars(&[])).expect("postgres mode config");
+        assert_eq!(config.tool_lease_ttl_ms, DEFAULT_TOOL_LEASE_TTL_MS);
+        let error = Config::from_env_vars(postgres_mode_vars(&[("TOOL_LEASE_TTL_MS", "500")]))
+            .expect_err("a lease TTL below the floor must not start");
+        assert!(
+            error
+                .to_string()
+                .contains("TOOL_LEASE_TTL_MS must be at least 1000 milliseconds"),
+            "{}",
+            error
+        );
+        let config = Config::from_env_vars(postgres_mode_vars(&[("TOOL_LEASE_TTL_MS", "4000")]))
+            .expect("a lease TTL above the floor is accepted");
+        assert_eq!(config.tool_lease_ttl(), std::time::Duration::from_secs(4));
     }
 
     #[test]

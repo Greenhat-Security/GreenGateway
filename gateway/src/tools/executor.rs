@@ -77,6 +77,8 @@ const TOOL_QUEUE_FULL_REASON: &str = "queue_full";
 const TOOL_QUEUE_TIMEOUT_REASON: &str = "queue_timeout";
 const TOOL_TIMEOUT_REASON: &str = "timeout";
 const TOOL_CANCELLED_REASON: &str = "cancelled";
+const TOOL_AUTHORITY_UNAVAILABLE_REASON: &str = "authority_unavailable";
+const TOOL_LEASE_LOST_REASON: &str = "lease_lost";
 const TOOL_RUNTIME_CLOSED_REASON: &str = "runtime_closed";
 const TOOL_RUNTIME_REJECTED_REASON: &str = "runtime_rejected";
 const TOOL_PRECONDITION_FAILED_REASON: &str = "precondition_failed";
@@ -2241,6 +2243,18 @@ fn runtime_admission_failure_observation_outcome(
             latency_ms,
             schema_mismatch: false,
             reason: Some(TOOL_CANCELLED_REASON),
+        }),
+        ToolRuntimeError::AuthorityUnavailable { .. } => Some(ToolObservationOutcome {
+            status: StatusCode::SERVICE_UNAVAILABLE.as_u16(),
+            latency_ms,
+            schema_mismatch: false,
+            reason: Some(TOOL_AUTHORITY_UNAVAILABLE_REASON),
+        }),
+        ToolRuntimeError::LeaseLost { .. } => Some(ToolObservationOutcome {
+            status: StatusCode::SERVICE_UNAVAILABLE.as_u16(),
+            latency_ms,
+            schema_mismatch: false,
+            reason: Some(TOOL_LEASE_LOST_REASON),
         }),
         ToolRuntimeError::UnknownTool { .. }
         | ToolRuntimeError::Timeout { .. }

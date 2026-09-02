@@ -1206,6 +1206,14 @@ Default: `20`
 
 Format and validation: must parse as a `u32`. A fresh write-lane bucket starts full.
 
+### RATE_LIMIT_KEYRING
+
+Cluster mode's keyring for the shared rate limiter's bucket keys.
+
+Default: empty
+
+Format and validation: the same JSON array of `{ "id", "file", "role" }` objects as `CONNECTION_LOCAL_SECRET_KEYRING`, with key files beneath `CONNECTION_SECRETS_ROOT` and exactly one `primary`. Required when `STATE_BACKEND=postgres`; rejected when `STATE_BACKEND=sqlite`, where nothing reads it. In cluster mode every request the local buckets allow is also decided at `greengateway.rate_limit_buckets`, so one configured burst permits that many requests across the whole cluster rather than per replica; the row for a caller is keyed by an HMAC-SHA-256 under the primary key over the deployment ID, the lane, and the caller key (a client IP for the global lanes; the issuer- and method-qualified principal, prefixed by the matched rule's fingerprint, for the policy lane), so neither the address nor the principal reaches the database and a reader of the table or of a backup cannot enumerate the IPv4 space against it. Rotating the primary key retires every bucket at once (their digests change), which grants each caller one fresh burst; the bound on live buckets and the idle sweep reclaim the old rows. See [PostgreSQL deployment](deployment/postgres.md).
+
 ### RATE_LIMIT_MAX_BUCKETS
 
 Hard ceiling on the number of distinct rate-limit keys each limiter tracks -- the read lane, the write lane, and each policy `rate_limits` rule each have their own store with this ceiling.
@@ -1441,6 +1449,14 @@ Maximum time an admitted tool invocation waits for global and per-tool execution
 Default: `1000`
 
 Format and validation: must parse as a `u64` millisecond duration greater than `0`. A queue timeout is reported distinctly from a tool execution timeout so operators can tell runtime congestion apart from slow tool work.
+
+### TOOL_LEASE_TTL_MS
+
+How long a cluster-mode execution lease lives on the database clock before an unrenewed slot can be reclaimed, in milliseconds.
+
+Default: `15000`
+
+Format and validation: must parse as a `u64` millisecond duration of at least `1000`. In cluster mode (`STATE_BACKEND=postgres`) the global and per-tool concurrency limits are slots leased from `greengateway.execution_leases`, so `TOOL_RUNTIME_GLOBAL_CONCURRENCY` and each tool's `max_concurrent` bound the whole cluster rather than each replica; the local semaphores remain a per-replica bound underneath. A running invocation renews its lease at a third of this TTL and is cancelled locally (reported as `lease_lost`) on the first renewal that finds the lease gone, or once half the TTL has passed without a renewal the authority could answer -- always before the slot can be reclaimed at the TTL. A crashed replica's slots return only after this TTL elapses on the database clock, so a longer value tolerates slower authorities at the cost of slower recovery of a crashed holder's slots. Standalone mode never reads it.
 
 ### TOOL_RUNTIME_DEFAULT_TIMEOUT_MS
 

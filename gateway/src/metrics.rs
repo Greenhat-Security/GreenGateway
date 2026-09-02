@@ -41,6 +41,11 @@ pub const RATE_LIMIT_BUCKETS: &str = "rate_limit_buckets";
 /// `ttl` evictions on a full store are the healthy steady state: newcomers
 /// arriving, idlers naturally recycled, active callers protected.
 pub const RATE_LIMIT_BUCKET_EVICTIONS_TOTAL: &str = "rate_limit_bucket_evictions_total";
+/// Shared (cluster) rate-limit decisions by lane and outcome
+/// (`allowed`, `denied`, `unavailable`); issue #241, PR 10.
+#[cfg(feature = "postgres")]
+pub const RATE_LIMIT_SHARED_DECISIONS_TOTAL: &str =
+    "greengateway_rate_limit_shared_decisions_total";
 /// Client-certificate outcomes, per listener.
 ///
 /// Every label value is a compile-time constant. The identity a rejected
