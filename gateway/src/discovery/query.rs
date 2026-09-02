@@ -68,6 +68,24 @@ pub trait DiscoveryReadStore: Send + Sync {
         endpoint_template: &str,
     ) -> Result<Option<InferredRequestSchema>, DiscoveryQueryError>;
 
+    /// `inferred_request_schema` for many endpoints at once, one entry per
+    /// requested `(method, endpoint_template)` in the same order. The
+    /// default asks one endpoint at a time; a backend a network away
+    /// answers the whole set in one round trip.
+    async fn inferred_request_schemas(
+        &self,
+        endpoints: &[(String, String)],
+    ) -> Result<Vec<Option<InferredRequestSchema>>, DiscoveryQueryError> {
+        let mut schemas = Vec::with_capacity(endpoints.len());
+        for (method, endpoint_template) in endpoints {
+            schemas.push(
+                self.inferred_request_schema(method, endpoint_template)
+                    .await?,
+            );
+        }
+        Ok(schemas)
+    }
+
     /// Mark or clear an endpoint's review. `None` when the endpoint was
     /// never observed.
     async fn set_endpoint_review(

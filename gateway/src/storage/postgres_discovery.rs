@@ -31,6 +31,16 @@
 //!   transaction as the aggregates, so a crash anywhere before COMMIT
 //!   leaves both untouched and the successor resumes from the committed
 //!   checkpoint; positions are never applied twice or skipped.
+//! - **A retry of an ambiguously committed flush changes nothing.** The
+//!   client cannot tell a COMMIT the server applied but never acknowledged
+//!   (the connection dropped) from one that rolled back, so the projector
+//!   retries the identical batch at the identical checkpoint. Every write
+//!   is absolute or conflict-suppressed, and the one additive write --
+//!   `projected_events` -- is guarded by the checkpoint the row already
+//!   carries, so the retry re-applies the same values and counts nothing
+//!   twice; the signals that batch opened are found by their ids and
+//!   announced by the retry, since the lost acknowledgement meant the
+//!   first attempt never announced them.
 //! - **Signals insert once cluster-wide.** `discovery_signals` keeps the
 //!   SQLite UNIQUE identity and inserts `ON CONFLICT DO NOTHING`; a
 //!   crossing already recorded (by this leader, a predecessor, or a
@@ -64,14 +74,21 @@ const OPERATION_CLAIM: &str = "discovery_claim_leadership";
 const OPERATION_FLUSH: &str = "discovery_flush";
 const OPERATION_CHECKPOINT: &str = "discovery_checkpoint";
 
-/// The schema's bound on a serialized detector state. A state past it is
-/// not written (and any stale row is removed) so the flush never fails on
-/// the CHECK; the successor then rebuilds that endpoint's windows from the
-/// counters, which is the SQLite restart behaviour.
+/// The schema's bound on a serialized detector state. The serialized form
+/// is the counters and the two rolling windows -- a few hundred bytes for
+/// any endpoint, since the unbounded principal set is deliberately not
+/// part of it (see `ClassifiedSignalState`) -- so the bound is not reached
+/// in practice. Should it ever be, the state is not written (and any stale
+/// row is removed) so the flush never fails on the CHECK; the successor
+/// then rebuilds that endpoint's windows from the counters, which is the
+/// SQLite restart behaviour.
 pub(crate) const DETECTOR_STATE_MAX_BYTES: usize = 65_536;
 
-/// The schema's bound on the learner's serialized groups; past it the
-/// previous groups are kept rather than the flush failing.
+/// The schema's bound on the learner's serialized groups. The projector
+/// exports the groups within this bound (dropping the least recently used
+/// from the working set when they do not fit), so a write here is always
+/// within it; an export past it is a bug and fails the flush rather than
+/// leaving a stale snapshot a successor would template differently from.
 pub(crate) const TEMPLATE_GROUPS_MAX_BYTES: usize = 4_194_304;
 
 /// Where a flush's checkpoint lands and under which fence it is written.
@@ -517,11 +534,18 @@ async fn flush_transaction(
     let pending_signals = batch.signals_surviving_deletions();
     let opened = insert_signals(client, &pending_signals).await?;
 
+    // Every write above is absolute (or conflict-suppressed), so a retry
+    // of a flush whose COMMIT the server applied but the client never
+    // heard about (the connection dropped on the acknowledgement) applies
+    // nothing new. The counter is the one additive write, so it is guarded
+    // by the checkpoint: a batch whose position the row already carries
+    // was counted when it was first committed.
     let advanced = client
         .execute(
             "UPDATE greengateway.discovery_projector_state
-             SET checkpoint_position = $1,
-                 projected_events = projected_events + $2,
+             SET checkpoint_position = $1::bigint,
+                 projected_events = projected_events
+                     + CASE WHEN checkpoint_position < $1::bigint THEN $2::bigint ELSE 0 END,
                  updated_at = now()
              WHERE singleton AND fence = $3",
             &[
@@ -1121,11 +1145,14 @@ async fn upsert_template_groups(
     groups_json: &str,
 ) -> Result<(), RepositoryError> {
     if groups_json.len() > TEMPLATE_GROUPS_MAX_BYTES {
-        tracing::warn!(
+        // Unreachable: the projector exports within the bound. Refusing is
+        // right because a stale persisted snapshot would make a successor
+        // template paths differently from the leader, permanently.
+        tracing::error!(
             bytes = groups_json.len(),
-            "discovery template groups exceed their persisted bound; keeping the previous groups"
+            "discovery template groups exceed their persisted bound; refusing the flush"
         );
-        return Ok(());
+        return Err(invalid_data(OPERATION_FLUSH));
     }
     client
         .execute(
@@ -1142,8 +1169,16 @@ async fn upsert_template_groups(
 }
 
 /// Insert the queued signals, one row per identity cluster-wide: an
-/// identity already present (this leader's earlier flush, a predecessor's,
-/// or a replayed batch) inserts nothing and is not reported as opened.
+/// identity already present under another id (this leader's earlier
+/// flush, a predecessor's, or a replayed batch) inserts nothing and is
+/// not reported as opened.
+///
+/// What is reported as opened is every queued signal whose own id is in
+/// the table after the insert, not only the rows this statement inserted:
+/// the ids are minted by the leader when the signals are queued and stay
+/// the same across retries of the same batch, so a signal committed by an
+/// attempt whose COMMIT acknowledgement was lost (and therefore never
+/// announced) is found and announced by the retry, once.
 async fn insert_signals(
     client: &deadpool_postgres::ClientWrapper,
     pending: &[NewSignal],
@@ -1177,8 +1212,8 @@ async fn insert_signals(
         states.push(signal.state.as_str().to_owned());
         created_at.push(signal.created_at.clone());
     }
-    let rows = client
-        .query(
+    client
+        .execute(
             "INSERT INTO greengateway.discovery_signals
                  (id, signal_type, target_kind, target_key, target_identity_json, explanation,
                   evidence_json, state, created_at, updated_at, transitioned_at, transitioned_by)
@@ -1188,8 +1223,7 @@ async fn insert_signals(
                          $7::text[], $8::text[], $9::text[])
                   AS s(id, signal_type, target_kind, target_key, target_identity_json,
                        explanation, evidence_json, state, created_at)
-             ON CONFLICT (signal_type, target_kind, target_key) DO NOTHING
-             RETURNING id",
+             ON CONFLICT (signal_type, target_kind, target_key) DO NOTHING",
             &[
                 &ids,
                 &types,
@@ -1204,13 +1238,19 @@ async fn insert_signals(
         )
         .await
         .map_err(|error| classify_query(error, OPERATION_FLUSH))?;
-    let inserted = rows
+    let present = client
+        .query(
+            "SELECT id FROM greengateway.discovery_signals WHERE id = ANY($1::text[])",
+            &[&ids],
+        )
+        .await
+        .map_err(|error| classify_query(error, OPERATION_FLUSH))?
         .iter()
         .map(|row| row.get::<_, String>(0))
         .collect::<HashSet<_>>();
     Ok(pending
         .iter()
-        .filter(|signal| inserted.contains(&signal.id))
+        .filter(|signal| present.contains(&signal.id))
         .map(NewSignal::as_signal)
         .collect())
 }

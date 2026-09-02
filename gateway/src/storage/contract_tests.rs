@@ -4826,6 +4826,137 @@ mod postgres_audit_tests {
         );
     }
 
+    /// A flush retried with the identical batch and checkpoint -- what the
+    /// projector does after a COMMIT the server applied but the client
+    /// never heard about -- changes nothing: the aggregates and child rows
+    /// are the same, `projected_events` is not counted twice, and the
+    /// signals the batch opened (never announced, since the first attempt
+    /// errored) are reported again so the retry announces them once.
+    #[tokio::test]
+    async fn a_retried_flush_of_a_committed_checkpoint_counts_nothing_twice_and_reports_its_signals(
+    ) {
+        let Some(admin_dsn) = locator() else {
+            eprintln!("skipping: no test database locator; CI runs this test");
+            return;
+        };
+        let _guard = DATABASE.lock().await;
+        let database = create_test_database(&admin_dsn).await;
+        let pool = migrated_discovery_pool(&database).await;
+        let store = Arc::new(PostgresDiscoveryStore::new(pool.clone()));
+        store
+            .claim_leadership(1, uuid::Uuid::new_v4())
+            .await
+            .expect("claim");
+
+        let events = (0..6)
+            .map(|index| {
+                projector_event(
+                    index,
+                    "GET",
+                    if index % 2 == 0 { "/orders" } else { "/users" },
+                    200,
+                    5,
+                    Some("alice"),
+                )
+            })
+            .collect::<Vec<_>>();
+        ingest(&pool, &events).await;
+        let mut state = reference_state(&pool).await;
+        let batch = state.pending_flush();
+        assert_eq!(batch.dirty_aggregates.len(), 2);
+        assert_eq!(
+            batch.pending_signals.len(),
+            2,
+            "one new_endpoint_seen per endpoint is queued"
+        );
+        let detector_states = AggregatorState::detector_states_for(&batch);
+        let groups = state.template_groups_json_within(usize::MAX);
+        let checkpoint = crate::storage::postgres_discovery::FlushCheckpoint {
+            position: 6,
+            fence: 1,
+            projected_events: 6,
+        };
+
+        let opened = store
+            .flush(&batch, &detector_states, Some(&groups), checkpoint, false)
+            .await
+            .expect("first flush");
+        let mut opened_ids = opened.iter().map(|s| s.id.clone()).collect::<Vec<_>>();
+        opened_ids.sort();
+        assert_eq!(opened_ids.len(), 2);
+        let committed = store.checkpoint().await.expect("checkpoint");
+        assert_eq!(committed.checkpoint_position, 6);
+        assert_eq!(committed.projected_events, 6);
+        let inventory_after = |pool: deadpool_postgres::Pool| async move {
+            (
+                scalar_i64(
+                    &pool,
+                    "SELECT sum(call_count)::bigint FROM greengateway.discovery_endpoint_aggregates",
+                )
+                .await,
+                scalar_i64(
+                    &pool,
+                    "SELECT count(*) FROM greengateway.discovery_endpoint_principals",
+                )
+                .await,
+                scalar_i64(
+                    &pool,
+                    "SELECT count(*) FROM greengateway.discovery_endpoint_status_counts",
+                )
+                .await,
+                scalar_i64(&pool, "SELECT count(*) FROM greengateway.discovery_signals").await,
+            )
+        };
+        let first = inventory_after(pool.clone()).await;
+        assert_eq!(first, (6, 2, 2, 2));
+
+        // The retry: the same batch, the same checkpoint, the same fence.
+        let reopened = store
+            .flush(&batch, &detector_states, Some(&groups), checkpoint, false)
+            .await
+            .expect("the retry commits");
+        let mut reopened_ids = reopened.iter().map(|s| s.id.clone()).collect::<Vec<_>>();
+        reopened_ids.sort();
+        assert_eq!(
+            reopened_ids, opened_ids,
+            "the retry reports the signals the batch opened, by their ids"
+        );
+        let retried = store.checkpoint().await.expect("checkpoint");
+        assert_eq!(retried.checkpoint_position, 6);
+        assert_eq!(
+            retried.projected_events, 6,
+            "an already-counted checkpoint is not counted again"
+        );
+        assert_eq!(inventory_after(pool.clone()).await, first);
+
+        // The next real flush still counts: the checkpoint advances.
+        ingest(
+            &pool,
+            &[projector_event(6, "GET", "/orders", 200, 5, Some("bob"))],
+        )
+        .await;
+        let state = reference_state(&pool).await;
+        let next = state.pending_flush();
+        let next_states = AggregatorState::detector_states_for(&next);
+        store
+            .flush(
+                &next,
+                &next_states,
+                None,
+                crate::storage::postgres_discovery::FlushCheckpoint {
+                    position: 7,
+                    fence: 1,
+                    projected_events: 1,
+                },
+                false,
+            )
+            .await
+            .expect("the next flush commits");
+        let advanced = store.checkpoint().await.expect("checkpoint");
+        assert_eq!(advanced.checkpoint_position, 7);
+        assert_eq!(advanced.projected_events, 7);
+    }
+
     /// Contract test 4: the endpoint bound is applied by the one leader
     /// over the global stream order, so what is evicted is the least
     /// recently seen endpoint across every replica's traffic, never the
@@ -5921,6 +6052,73 @@ mod postgres_audit_tests {
 
     async fn left_signals(store: &dyn DiscoveryReadStore) -> Vec<signals::Signal> {
         all_signal_pages(store, signal_filters(50)).await
+    }
+
+    /// The bulk schema read the cluster conformance refresher uses answers
+    /// every requested endpoint in order, exactly as the single-endpoint
+    /// read would, in one query; an endpoint whose samples are corrupt is
+    /// answered with no schema instead of failing the whole set.
+    #[tokio::test]
+    async fn read_store_infers_schemas_in_bulk_and_skips_a_corrupt_endpoint() {
+        let Some(admin_dsn) = locator() else {
+            eprintln!("skipping: no test database locator; CI runs this test");
+            return;
+        };
+        let _guard = DATABASE.lock().await;
+        let database = create_test_database(&admin_dsn).await;
+        let pool = migrated_discovery_pool(&database).await;
+        let postgres = postgres_inventory(&pool, &parity_events()).await;
+        let postgres: &dyn DiscoveryReadStore = &postgres;
+
+        {
+            let client = pool.get().await.expect("client");
+            client
+                .execute(
+                    "INSERT INTO greengateway.discovery_payload_shape_samples
+                         (method, endpoint_template, sample_slot, observed_at, shape_hash,
+                          shape_json)
+                     VALUES ('PUT', '/corrupt', 0, '2024-06-01T12:00:00Z', 'h', $1)",
+                    &[&r#"{"json_body": 5}"#],
+                )
+                .await
+                .expect("a corrupt sample row inserts");
+        }
+
+        let requested = [
+            ("POST".to_owned(), "/orders".to_owned()),
+            ("PUT".to_owned(), "/corrupt".to_owned()),
+            ("GET".to_owned(), "/orders".to_owned()),
+            ("GET".to_owned(), "/never-observed".to_owned()),
+        ];
+        let schemas = postgres
+            .inferred_request_schemas(&requested)
+            .await
+            .expect("the bulk read answers");
+        assert_eq!(schemas.len(), requested.len());
+        let single = postgres
+            .inferred_request_schema("POST", "/orders")
+            .await
+            .expect("single read")
+            .expect("POST /orders has samples");
+        assert_eq!(schemas[0].as_ref(), Some(&single));
+        assert!(
+            schemas[1].is_none(),
+            "the corrupt endpoint is answered with no schema"
+        );
+        assert!(schemas[2].is_none(), "GET /orders captured nothing");
+        assert!(schemas[3].is_none(), "an unknown endpoint has no schema");
+        assert!(
+            postgres
+                .inferred_request_schema("PUT", "/corrupt")
+                .await
+                .is_err(),
+            "the single-endpoint read still reports the corruption"
+        );
+        assert!(postgres
+            .inferred_request_schemas(&[])
+            .await
+            .expect("an empty request answers")
+            .is_empty());
     }
 }
 

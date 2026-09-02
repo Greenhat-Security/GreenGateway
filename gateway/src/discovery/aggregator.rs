@@ -23,7 +23,9 @@
 //! are computed from a bounded deterministic reservoir sample, which keeps
 //! memory bounded while making percentiles approximate once an endpoint has more than
 //! `LATENCY_SAMPLE_LIMIT` observations. The number of distinct endpoint aggregates
-//! is also bounded by configuration with approximate-LRU eviction.
+//! is also bounded by configuration, evicting the least recently seen endpoints
+//! (by the persisted `last_seen`, ties by key), so a process rebuilt from the
+//! rows evicts exactly what the uninterrupted process would have.
 //!
 //! Known limitation: exact distinct-principal tracking is unbounded. Each
 //! distinct identity tuple observed for a `(method, endpoint_template)` is kept
@@ -660,7 +662,6 @@ impl EndpointKey {
 #[derive(Clone, Debug)]
 pub(crate) struct EndpointAggregate {
     pub(crate) key: EndpointKey,
-    pub(crate) last_access_seq: u64,
     pub(crate) first_seen: String,
     pub(crate) last_seen: String,
     pub(crate) call_count: u64,
@@ -687,7 +688,6 @@ impl EndpointAggregate {
     fn new(key: EndpointKey, timestamp: &str) -> Self {
         Self {
             key,
-            last_access_seq: 0,
             first_seen: timestamp.to_owned(),
             last_seen: timestamp.to_owned(),
             call_count: 0,
@@ -764,7 +764,6 @@ impl EndpointAggregate {
     }
 
     fn merge_from(&mut self, other: EndpointAggregate) {
-        self.last_access_seq = self.last_access_seq.max(other.last_access_seq);
         if timestamp_before(&other.first_seen, &self.first_seen) {
             self.first_seen = other.first_seen;
         }
@@ -974,14 +973,24 @@ struct EndpointAggregateObservation {
 }
 
 /// Counters and rolling windows the signal detectors evaluate against. The
-/// counters are persisted by every backend; the windows are transient for the
-/// SQLite sink (rebuilt empty after a restart) and serialized whole by the
-/// cluster projector so a successor continues from the same history.
+/// counters and the principal set are persisted by every backend in their
+/// own tables; the windows are transient for the SQLite sink (rebuilt empty
+/// after a restart) and serialized by the cluster projector so a successor
+/// continues from the same history.
+///
+/// The serialized form carries the counters and the windows only. The
+/// principal set is deliberately skipped: it is unbounded (one entry per
+/// distinct identity ever seen on the endpoint) and already persisted row
+/// by row, so serializing it would grow the detector row without bound and
+/// past its schema limit on exactly the busiest endpoints -- the ones whose
+/// windows matter most. Without it the form is a few hundred bytes whatever
+/// the endpoint's traffic.
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 pub(crate) struct ClassifiedSignalState {
     pub(crate) call_count: u64,
     pub(crate) schema_mismatch_count: u64,
     pub(crate) error_count: u64,
+    #[serde(skip)]
     pub(crate) principals: HashSet<PrincipalIdentity>,
     pub(crate) recent_error_window: RecentErrorWindow,
     pub(crate) volume_window: VolumeWindow,
@@ -1297,7 +1306,6 @@ pub(crate) struct AggregatorState {
     /// Maximum number of endpoint aggregates retained. Zero is reserved for
     /// internal callers and tests that explicitly need unbounded behavior.
     endpoint_limit: usize,
-    access_seq: u64,
     signal_evaluator: SignalEvaluator,
     learner: PathTemplateLearner,
     aggregates: HashMap<EndpointKey, EndpointAggregate>,
@@ -1330,8 +1338,9 @@ impl AggregatorState {
     /// (latency samples, payload shapes, detector state, learner groups), which
     /// is reported rather than silently dropped so a corrupt store is noticed.
     ///
-    /// Rows for endpoints missing from `rows.aggregates` are ignored, the
-    /// access order is reseeded from `last_seen`, and a store holding more
+    /// Rows for endpoints missing from `rows.aggregates` are ignored, a
+    /// detector row restores only the rolling windows (counters and
+    /// principals come from their own tables), and a store holding more
     /// endpoints than `endpoint_limit` is trimmed with the excess queued for
     /// deletion on the first flush.
     pub(crate) fn from_rows(
@@ -1358,7 +1367,6 @@ impl AggregatorState {
                 key.clone(),
                 EndpointAggregate {
                     key,
-                    last_access_seq: 0,
                     first_seen: row.first_seen,
                     last_seen: row.last_seen,
                     call_count: non_negative_i64_to_u64(row.call_count),
@@ -1513,52 +1521,27 @@ impl AggregatorState {
             }
         }
 
+        // The persisted detector row restores the rolling windows only. The
+        // counters and the principal set were rebuilt from their own tables
+        // above, which are the single source of truth for them (the row's
+        // serialized form does not carry the principals at all).
         for row in rows.detector_states {
             let key = EndpointKey::new(row.method, row.endpoint_template);
             let Some(aggregate) = state.aggregates.get_mut(&key) else {
                 continue;
             };
-            aggregate.classified_signal_state =
-                serde_json::from_str::<ClassifiedSignalState>(&row.state_json)?;
+            let restored = serde_json::from_str::<ClassifiedSignalState>(&row.state_json)?;
+            aggregate.classified_signal_state.recent_error_window = restored.recent_error_window;
+            aggregate.classified_signal_state.volume_window = restored.volume_window;
         }
 
         if let Some(groups_json) = rows.template_groups_json.as_deref() {
             state.learner.import_groups_json(groups_json)?;
         }
 
-        state.reseed_access_order_by_last_seen();
         state.evict_over_capacity();
 
         Ok(state)
-    }
-
-    /// Reconstruct an approximate access order after restart from persisted
-    /// `last_seen` timestamps. Ties are resolved by endpoint key so trimming is
-    /// deterministic even when several rows share a timestamp.
-    fn reseed_access_order_by_last_seen(&mut self) {
-        let mut access_order = self
-            .aggregates
-            .values()
-            .map(|aggregate| (aggregate.last_seen.clone(), aggregate.key.clone()))
-            .collect::<Vec<_>>();
-        access_order.sort_by(|(left_seen, left_key), (right_seen, right_key)| {
-            compare_timestamps(left_seen, right_seen)
-                .then_with(|| left_key.method.cmp(&right_key.method))
-                .then_with(|| left_key.endpoint_template.cmp(&right_key.endpoint_template))
-        });
-
-        self.access_seq = 0;
-        for (_, key) in access_order {
-            let access_seq = self.next_access_seq();
-            if let Some(aggregate) = self.aggregates.get_mut(&key) {
-                aggregate.last_access_seq = access_seq;
-            }
-        }
-    }
-
-    fn next_access_seq(&mut self) -> u64 {
-        self.access_seq = self.access_seq.saturating_add(1);
-        self.access_seq
     }
 
     /// Trim a pre-existing database all the way down to the configured cap.
@@ -1589,20 +1572,31 @@ impl AggregatorState {
         self.evict_least_recent(batch_size.max(required));
     }
 
+    /// Evict the `count` least recently seen endpoints. The order is the
+    /// persisted `last_seen` (the event timestamps, not the order the events
+    /// arrived in), ties broken by endpoint key, so a process that rebuilds
+    /// this state from the rows evicts exactly what the uninterrupted
+    /// process would have: event timestamps are not monotone in arrival
+    /// order across replicas' clocks or late-committed batches, and an
+    /// order keyed on arrival could not be reconstructed by a successor.
     fn evict_least_recent(&mut self, count: usize) {
-        let mut by_access = self
+        let mut by_last_seen = self
             .aggregates
             .values()
-            .map(|aggregate| (aggregate.last_access_seq, aggregate.key.clone()))
+            .map(|aggregate| (aggregate.last_seen.as_str(), &aggregate.key))
             .collect::<Vec<_>>();
-        by_access.sort_unstable_by(|(left_seq, left_key), (right_seq, right_key)| {
-            left_seq
-                .cmp(right_seq)
+        by_last_seen.sort_unstable_by(|(left_seen, left_key), (right_seen, right_key)| {
+            compare_timestamps(left_seen, right_seen)
                 .then_with(|| left_key.method.cmp(&right_key.method))
                 .then_with(|| left_key.endpoint_template.cmp(&right_key.endpoint_template))
         });
+        let evicted = by_last_seen
+            .into_iter()
+            .take(count)
+            .map(|(_, key)| key.clone())
+            .collect::<Vec<_>>();
 
-        for (_, key) in by_access.into_iter().take(count) {
+        for key in evicted {
             self.aggregates.remove(&key);
             self.dirty_keys.remove(&key);
             self.forget_queued_signals(&key);
@@ -1633,16 +1627,12 @@ impl AggregatorState {
         if is_new_endpoint {
             self.evict_for_admission();
         }
-        let access_seq = self.next_access_seq();
         let principal = observation.principal.as_ref();
-        let observation_effects = {
-            let aggregate = self
-                .aggregates
-                .entry(key.clone())
-                .or_insert_with(|| EndpointAggregate::new(key.clone(), &observation.timestamp));
-            aggregate.last_access_seq = access_seq;
-            aggregate.observe(&observation)
-        };
+        let observation_effects = self
+            .aggregates
+            .entry(key.clone())
+            .or_insert_with(|| EndpointAggregate::new(key.clone(), &observation.timestamp))
+            .observe(&observation);
 
         let mut signals = Vec::new();
         if let Some(classified) = observation_effects.classified_signal {
@@ -1839,9 +1829,13 @@ impl AggregatorState {
             .collect()
     }
 
-    /// The learner's groups as JSON, for a backend that persists them.
-    pub(crate) fn template_groups_json(&self) -> String {
-        self.learner.export_groups_json()
+    /// The learner's groups as JSON within `max_bytes`, for a backend that
+    /// persists them under a bound. Groups that do not fit are dropped from
+    /// the learner itself (least recently used first), so what is persisted
+    /// is always exactly what this state templates with; see
+    /// [`PathTemplateLearner::export_groups_json_within`].
+    pub(crate) fn template_groups_json_within(&mut self, max_bytes: usize) -> String {
+        self.learner.export_groups_json_within(max_bytes)
     }
 
     /// Clear exactly the work in `batch` now that it is committed. Keys that
@@ -4424,8 +4418,13 @@ mod tests {
         );
     }
 
+    /// The serialized detector state carries the counters and the windows
+    /// and never the principal set: that set is unbounded and persisted in
+    /// its own table, and carrying it would push the busiest endpoints'
+    /// rows past the persisted bound, which is exactly where the windows
+    /// matter.
     #[test]
-    fn detector_state_json_round_trips_windows_and_principals() {
+    fn detector_state_json_carries_the_windows_and_never_the_principals() {
         let mut state = ClassifiedSignalState::default();
         for index in 0..5 {
             state.observe(&observation(&observed_event(
@@ -4437,14 +4436,19 @@ mod tests {
                 timestamp_at(index),
             )));
         }
+        assert_eq!(state.principals.len(), 2);
 
         let json = serde_json::to_string(&state).expect("state should serialize");
+        assert!(
+            !json.contains("principals"),
+            "the principal set must not be serialized: {json}"
+        );
         let restored: ClassifiedSignalState =
             serde_json::from_str(&json).expect("state should deserialize");
 
         assert_eq!(restored.call_count, 5);
         assert_eq!(restored.error_count, 3);
-        assert_eq!(restored.principals, state.principals);
+        assert!(restored.principals.is_empty());
         assert_eq!(
             restored.recent_error_window.samples,
             VecDeque::from(vec![true, false, true, false, true])
@@ -4463,6 +4467,136 @@ mod tests {
             current.last_timestamp_seconds,
             timestamp_seconds(&timestamp_at(4)).unwrap()
         );
+
+        // Whatever the endpoint's principal cardinality, the serialized
+        // state stays a few hundred bytes, far under the persisted bound
+        // (65,536 bytes) the projector's detector row is checked against.
+        for index in 0..5_000 {
+            state.observe(&observation(&observed_event(
+                "GET",
+                "/w",
+                200,
+                10,
+                Some(&format!("user-{index:05}-with-a-long-identifier-suffix")),
+                timestamp_at(index),
+            )));
+        }
+        assert_eq!(state.principals.len(), 5_002);
+        let json = serde_json::to_string(&state).expect("state should serialize");
+        assert!(
+            json.len() < 1_024,
+            "the detector state must stay bounded regardless of principals: {} bytes",
+            json.len()
+        );
+    }
+
+    /// A successor rebuilds the principal set from its own rows and takes
+    /// only the windows from the detector row, so a detector state that
+    /// no longer carries principals loses none of them.
+    #[test]
+    fn from_rows_takes_windows_from_the_detector_row_and_principals_from_their_rows() {
+        let mut leader = in_memory_state(SignalDetectorConfig::default());
+        for (index, user) in ["alice", "bob", "carol"].iter().enumerate() {
+            leader.observe(observation(&observed_event(
+                "GET",
+                "/p",
+                if index == 1 { 500 } else { 200 },
+                10,
+                Some(user),
+                timestamp_at(index),
+            )));
+        }
+        let batch = leader.pending_flush();
+        let aggregate = &batch.dirty_aggregates[0];
+        let detector_states = AggregatorState::detector_states_for(&batch);
+        let principal_rows = aggregate
+            .classified_signal_state
+            .principals
+            .iter()
+            .map(|principal| ClassifiedSignalPrincipalRow {
+                method: aggregate.key.method.clone(),
+                endpoint_template: aggregate.key.endpoint_template.clone(),
+                user_id: principal.user_id.clone(),
+                issuer: principal.issuer.clone(),
+                auth_method: principal.auth_method.clone(),
+            })
+            .collect::<Vec<_>>();
+
+        let successor = AggregatorState::from_rows(
+            LoadedRows {
+                aggregates: vec![aggregate_row(aggregate)],
+                classified_stats: vec![classified_stat_row(aggregate)],
+                classified_principals: principal_rows,
+                detector_states: vec![DetectorStateRow {
+                    method: aggregate.key.method.clone(),
+                    endpoint_template: aggregate.key.endpoint_template.clone(),
+                    state_json: detector_states[0].1.clone(),
+                }],
+                ..LoadedRows::default()
+            },
+            false,
+            0,
+            SignalDetectorConfig::default(),
+        )
+        .expect("rows should load");
+        let restored = &successor.aggregates()[&aggregate.key].classified_signal_state;
+        let expected = &aggregate.classified_signal_state;
+        assert_eq!(restored.principals, expected.principals);
+        assert_eq!(restored.call_count, expected.call_count);
+        assert_eq!(restored.error_count, expected.error_count);
+        assert_eq!(
+            restored.recent_error_window.samples,
+            expected.recent_error_window.samples
+        );
+        assert_eq!(
+            serde_json::to_value(&restored.volume_window).expect("window"),
+            serde_json::to_value(&expected.volume_window).expect("window")
+        );
+    }
+
+    /// Eviction is keyed on `last_seen`, the only order a successor can
+    /// rebuild from the rows. Event timestamps are not monotone in arrival
+    /// order (replicas' clocks differ, batches commit late), so an order
+    /// keyed on arrival would make the leader and its successor evict
+    /// different endpoints.
+    #[test]
+    fn eviction_follows_last_seen_not_arrival_order_so_a_successor_evicts_the_same_endpoint() {
+        let config = SignalDetectorConfig::default();
+        // /a arrives first but carries the later timestamp; /b arrives
+        // second with the earlier one (a slow-clock replica). The names
+        // sort the other way round from the timestamps, so neither arrival
+        // order nor key order alone would pick the same endpoint.
+        let late = observation(&observed_event("GET", "/a", 200, 1, None, timestamp_at(10)));
+        let early = observation(&observed_event("GET", "/b", 200, 1, None, timestamp_at(5)));
+        let next = observation(&observed_event("GET", "/c", 200, 1, None, timestamp_at(20)));
+
+        let mut leader =
+            AggregatorState::from_rows(LoadedRows::default(), false, 2, config).expect("state");
+        leader.observe(late.clone());
+        leader.observe(early.clone());
+        let batch = leader.pending_flush();
+        assert_eq!(batch.dirty_aggregates.len(), 2);
+
+        // The uninterrupted leader admits /c and evicts the endpoint least
+        // recently SEEN, /b, not the one least recently touched.
+        leader.observe(next.clone());
+        let evicted_by_leader = leader.pending_flush().deleted_keys;
+        assert_eq!(evicted_by_leader, vec![EndpointKey::new("GET", "/b")]);
+
+        // A successor rebuilt from the committed rows makes the same call.
+        let mut successor = AggregatorState::from_rows(
+            LoadedRows {
+                aggregates: batch.dirty_aggregates.iter().map(aggregate_row).collect(),
+                ..LoadedRows::default()
+            },
+            false,
+            2,
+            config,
+        )
+        .expect("rows should load");
+        successor.observe(next);
+        let evicted_by_successor = successor.pending_flush().deleted_keys;
+        assert_eq!(evicted_by_successor, evicted_by_leader);
     }
 
     #[test]
@@ -4485,7 +4619,7 @@ mod tests {
 
         let successor = AggregatorState::from_rows(
             LoadedRows {
-                template_groups_json: Some(leader.template_groups_json()),
+                template_groups_json: Some(leader.template_groups_json_within(usize::MAX)),
                 ..LoadedRows::default()
             },
             false,

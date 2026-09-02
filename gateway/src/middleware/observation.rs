@@ -54,7 +54,11 @@ const INFERRED_SCHEMA_CACHE_TTL: Duration = Duration::from_secs(5);
 pub(crate) const CLUSTER_CONFORMANCE_REFRESH_INTERVAL: Duration = INFERRED_SCHEMA_CACHE_TTL;
 /// How many endpoints a replica tracks inferred schemas for in cluster
 /// mode: the endpoints its own traffic has asked about, bounded so one
-/// replica's refresh is at most this many schema reads per interval.
+/// replica's refresh reads (in one query) at most this many endpoints'
+/// samples per interval. Past the bound the endpoint asked about least
+/// recently makes room, so an endpoint is never locked out for good: a
+/// request for it misses the snapshot, asks again, and the next refresh
+/// loads it.
 const MAX_TRACKED_INFERRED_ENDPOINTS: usize = 4096;
 /// A captured payload shape carries one entry per distinct query parameter and
 /// per top-level JSON body key, and every retained sample of it is stored whole.
@@ -124,7 +128,56 @@ enum InferredSchemaSource {
 /// refresh loads inferred schemas for.
 pub struct ClusterConformanceCache {
     snapshot: Arc<ArcSwap<ObservedSnapshot>>,
-    wanted: Mutex<BTreeSet<EndpointSchemaCacheKey>>,
+    wanted: Mutex<WantedEndpoints>,
+}
+
+/// The endpoints a replica's traffic has asked about and found no schema
+/// for in the snapshot, each with the sequence of its latest ask. Bounded:
+/// at capacity a new endpoint replaces the one asked about least recently,
+/// so the set follows the traffic instead of freezing on the first
+/// endpoints seen.
+struct WantedEndpoints {
+    capacity: usize,
+    next_seq: u64,
+    by_key: BTreeMap<EndpointSchemaCacheKey, u64>,
+}
+
+impl WantedEndpoints {
+    fn with_capacity(capacity: usize) -> Self {
+        Self {
+            capacity: capacity.max(1),
+            next_seq: 0,
+            by_key: BTreeMap::new(),
+        }
+    }
+
+    fn note(&mut self, key: EndpointSchemaCacheKey) {
+        self.next_seq = self.next_seq.wrapping_add(1);
+        let seq = self.next_seq;
+        if let Some(existing) = self.by_key.get_mut(&key) {
+            *existing = seq;
+            return;
+        }
+        if self.by_key.len() >= self.capacity {
+            let least_recent = self
+                .by_key
+                .iter()
+                .min_by_key(|(_, seq)| **seq)
+                .map(|(key, _)| key.clone());
+            if let Some(least_recent) = least_recent {
+                self.by_key.remove(&least_recent);
+            }
+        }
+        self.by_key.insert(key, seq);
+    }
+
+    fn retain(&mut self, mut keep: impl FnMut(&EndpointSchemaCacheKey) -> bool) {
+        self.by_key.retain(|key, _| keep(key));
+    }
+
+    fn keys(&self) -> Vec<EndpointSchemaCacheKey> {
+        self.by_key.keys().cloned().collect()
+    }
 }
 
 /// What the cluster hot path reads: the observed endpoints (for template
@@ -778,9 +831,15 @@ impl Default for ClusterConformanceCache {
 
 impl ClusterConformanceCache {
     pub fn new() -> Self {
+        Self::with_tracking_capacity(MAX_TRACKED_INFERRED_ENDPOINTS)
+    }
+
+    /// A cache tracking at most `capacity` wanted endpoints (the
+    /// production value is `MAX_TRACKED_INFERRED_ENDPOINTS`).
+    pub(crate) fn with_tracking_capacity(capacity: usize) -> Self {
         Self {
             snapshot: Arc::new(ArcSwap::from_pointee(ObservedSnapshot::default())),
-            wanted: Mutex::new(BTreeSet::new()),
+            wanted: Mutex::new(WantedEndpoints::with_capacity(capacity)),
         }
     }
 
@@ -805,16 +864,14 @@ impl ClusterConformanceCache {
     }
 
     fn note_wanted(&self, key: EndpointSchemaCacheKey) {
-        let mut wanted = self.wanted_guard();
-        if wanted.len() < MAX_TRACKED_INFERRED_ENDPOINTS || wanted.contains(&key) {
-            wanted.insert(key);
-        }
+        self.wanted_guard().note(key);
     }
 
     /// Load a fresh snapshot from `store`: every observed endpoint, and the
-    /// inferred schema of every wanted endpoint that is still observed
-    /// (endpoints that are gone are dropped from the wanted set). On a
-    /// failure the previous snapshot stays in service.
+    /// inferred schemas of the wanted endpoints that are still observed
+    /// (endpoints that are gone are dropped from the wanted set), read in
+    /// one round trip for the whole set. On a failure the previous snapshot
+    /// stays in service.
     pub(crate) async fn refresh(
         &self,
         store: &dyn DiscoveryReadStore,
@@ -830,17 +887,19 @@ impl ClusterConformanceCache {
         let wanted = {
             let mut wanted = self.wanted_guard();
             wanted.retain(|key| observed.contains(key));
-            wanted.clone()
+            wanted.keys()
         };
-        let mut schemas = BTreeMap::new();
-        for key in wanted {
-            if let Some(schema) = store
-                .inferred_request_schema(&key.method, &key.endpoint_template)
-                .await?
-            {
-                schemas.insert(key, Arc::new(schema));
-            }
-        }
+        let requested = wanted
+            .iter()
+            .map(|key| (key.method.clone(), key.endpoint_template.clone()))
+            .collect::<Vec<_>>();
+        let schemas = store
+            .inferred_request_schemas(&requested)
+            .await?
+            .into_iter()
+            .zip(wanted)
+            .filter_map(|(schema, key)| schema.map(|schema| (key, Arc::new(schema))))
+            .collect::<BTreeMap<_, _>>();
         self.snapshot.store(Arc::new(ObservedSnapshot {
             endpoints: Arc::new(endpoints),
             schemas,
@@ -854,7 +913,7 @@ impl ClusterConformanceCache {
         self.snapshot.load()
     }
 
-    fn wanted_guard(&self) -> std::sync::MutexGuard<'_, BTreeSet<EndpointSchemaCacheKey>> {
+    fn wanted_guard(&self) -> std::sync::MutexGuard<'_, WantedEndpoints> {
         match self.wanted.lock() {
             Ok(guard) => guard,
             Err(poisoned) => poisoned.into_inner(),
@@ -2358,6 +2417,53 @@ paths:
             inferred_before,
             "an endpoint the authority no longer lists is no longer asked about"
         );
+    }
+
+    /// The tracked set is bounded, and at the bound the endpoint asked
+    /// about least recently makes room: an endpoint first seen after the
+    /// bound is reached still gets its schema on the next refresh, instead
+    /// of being locked out for the life of the replica.
+    #[tokio::test]
+    async fn cluster_conformance_tracks_endpoints_past_the_bound_by_replacing_the_least_recent() {
+        let schema = |template: &str| {
+            inferred_schema_with_required_body_key(
+                "POST",
+                template,
+                "display_name",
+                MIN_INFERRED_CONFORMANCE_SAMPLE_COUNT,
+            )
+        };
+        let store = Arc::new(CountingReadStore::new(
+            vec![
+                observed("POST", "/a"),
+                observed("POST", "/b"),
+                observed("POST", "/c"),
+            ],
+            vec![schema("/a"), schema("/b"), schema("/c")],
+        ));
+        let cache = Arc::new(ClusterConformanceCache::with_tracking_capacity(2));
+        let conformance = cluster_conformance(&cache);
+        cache.refresh(store.as_ref()).await.expect("refresh");
+
+        // /a then /b fill the set; /c arrives at the bound and replaces
+        // /a, the least recently asked about.
+        for path in ["/a", "/b", "/c"] {
+            assert!(conformance.prepare_check("POST", path, None).is_none());
+        }
+        cache.refresh(store.as_ref()).await.expect("refresh");
+        assert_eq!(cache.snapshot().schema_count(), 2);
+        assert!(conformance.prepare_check("POST", "/b", None).is_some());
+        assert!(
+            conformance.prepare_check("POST", "/c", None).is_some(),
+            "the endpoint seen after the bound was reached is served"
+        );
+        // Asking for /a again (a miss) replaces /b, the least recent ask,
+        // and the next refresh serves /a.
+        assert!(conformance.prepare_check("POST", "/a", None).is_none());
+        cache.refresh(store.as_ref()).await.expect("refresh");
+        assert!(conformance.prepare_check("POST", "/a", None).is_some());
+        assert!(conformance.prepare_check("POST", "/c", None).is_some());
+        assert!(conformance.prepare_check("POST", "/b", None).is_none());
     }
 
     #[tokio::test]

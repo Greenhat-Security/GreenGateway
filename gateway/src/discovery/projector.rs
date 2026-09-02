@@ -32,7 +32,12 @@
 //!    fence moved (`Conflict`) ends the term at once: the state is dropped
 //!    and the replica goes back to step 1. Any other flush failure keeps
 //!    the state and retries the same flush without re-reading the stream,
-//!    so no observation is ever applied twice.
+//!    so no observation is ever applied twice. That includes a COMMIT the
+//!    server applied but the client never heard about: the store's flush
+//!    is idempotent for an identical retry (absolute writes, a
+//!    checkpoint-guarded counter, opened signals re-found by id), so the
+//!    retry commits the same values and announces the batch's signals
+//!    exactly once.
 //!
 //! Observations are bounded before they reach the working set (see
 //! [`observation_within_bounds`]) so the tables' CHECK constraints can
@@ -51,7 +56,7 @@ use crate::{
     lifecycle::GatewayLifecycle,
     storage::{
         postgres_audit::PostgresAuditEventStore,
-        postgres_discovery::{FlushCheckpoint, PostgresDiscoveryStore},
+        postgres_discovery::{FlushCheckpoint, PostgresDiscoveryStore, TEMPLATE_GROUPS_MAX_BYTES},
         RepositoryError, RepositoryErrorKind,
     },
     tools::{
@@ -307,9 +312,14 @@ impl ProjectorTerm {
         }
         let batch = self.state.pending_flush();
         let detector_states = AggregatorState::detector_states_for(&batch);
-        let template_groups_json = (!batch.dirty_aggregates.is_empty()
-            || !batch.deleted_keys.is_empty())
-        .then(|| self.state.template_groups_json());
+        // Bounded by construction to the persisted column's limit: a set of
+        // groups that would not fit is trimmed in the working set too, so
+        // the persisted groups never fall behind the live learner.
+        let template_groups_json =
+            (!batch.dirty_aggregates.is_empty() || !batch.deleted_keys.is_empty()).then(|| {
+                self.state
+                    .template_groups_json_within(TEMPLATE_GROUPS_MAX_BYTES)
+            });
         let checkpoint = FlushCheckpoint {
             position: self.consumed,
             fence: self.fence,

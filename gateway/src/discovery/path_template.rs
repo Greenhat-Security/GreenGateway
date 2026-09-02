@@ -67,6 +67,9 @@ impl PathTemplateConfig {
 pub struct PathTemplateLearner {
     config: PathTemplateConfig,
     groups: Vec<ShapeGroup>,
+    /// Counts observations that matched a group, so each group knows when
+    /// it was last used; exported with the groups and restored on import.
+    use_seq: u64,
 }
 
 impl PathTemplateLearner {
@@ -78,6 +81,7 @@ impl PathTemplateLearner {
         Self {
             config,
             groups: Vec::new(),
+            use_seq: 0,
         }
     }
 
@@ -98,7 +102,9 @@ impl PathTemplateLearner {
             }
         };
 
+        self.use_seq = self.use_seq.saturating_add(1);
         let group = &mut self.groups[group_index];
+        group.last_used = self.use_seq;
         group.observe(&segments, self.config);
         group.template(&segments)
     }
@@ -125,6 +131,60 @@ impl PathTemplateLearner {
             .expect("path template groups are plain data and always serialize")
     }
 
+    /// `export_groups_json` bounded to `max_bytes`: when the groups do not
+    /// fit, the least recently used ones are dropped -- from THIS learner,
+    /// not only from the export -- until they do, so the export always
+    /// describes exactly the groups this learner goes on templating with.
+    /// A backend with a hard bound on the persisted groups therefore never
+    /// has to choose between failing a write and keeping a stale snapshot
+    /// that would template paths differently from the live learner.
+    ///
+    /// A dropped group costs its shape's learning (the next observation of
+    /// that shape starts a fresh group), the same as never having seen it;
+    /// the groups' relative order is kept, so match tie-breaks are unchanged
+    /// for the survivors. Sizes are computed per group so the whole set is
+    /// serialized once.
+    pub fn export_groups_json_within(&mut self, max_bytes: usize) -> String {
+        let sizes = self
+            .groups
+            .iter()
+            .map(|group| {
+                serde_json::to_string(group)
+                    .expect("path template groups are plain data and always serialize")
+                    .len()
+            })
+            .collect::<Vec<_>>();
+        // The array is the elements, one separator between each pair, and
+        // the brackets.
+        let mut remaining = self.groups.len();
+        let mut element_bytes = sizes.iter().sum::<usize>();
+        let array_bytes = |remaining: usize, element_bytes: usize| {
+            2 + element_bytes + remaining.saturating_sub(1)
+        };
+
+        if array_bytes(remaining, element_bytes) > max_bytes {
+            let mut by_use = (0..self.groups.len()).collect::<Vec<_>>();
+            by_use.sort_by_key(|&index| (self.groups[index].last_used, index));
+            let mut dropped = vec![false; self.groups.len()];
+            for index in by_use {
+                if array_bytes(remaining, element_bytes) <= max_bytes {
+                    break;
+                }
+                dropped[index] = true;
+                remaining -= 1;
+                element_bytes -= sizes[index];
+            }
+            let mut index = 0;
+            self.groups.retain(|_| {
+                let keep = !dropped[index];
+                index += 1;
+                keep
+            });
+        }
+
+        self.export_groups_json()
+    }
+
     /// Replace the learned shape groups with a previously exported set. The
     /// configured group cap is applied on import so a snapshot taken under a
     /// larger cap cannot exceed this learner's memory bound; groups past the
@@ -134,6 +194,11 @@ impl PathTemplateLearner {
         if self.config.max_groups != 0 {
             groups.truncate(self.config.max_groups);
         }
+        self.use_seq = groups
+            .iter()
+            .map(|group| group.last_used)
+            .max()
+            .unwrap_or(0);
         self.groups = groups;
         Ok(())
     }
@@ -165,6 +230,10 @@ pub fn template_stateless(path: &str) -> String {
 #[derive(Clone, Debug, Deserialize, Serialize)]
 struct ShapeGroup {
     positions: Vec<SegmentPosition>,
+    /// The learner's `use_seq` when a path last matched this group; the
+    /// order a byte-bounded export drops groups in (lowest first).
+    #[serde(default)]
+    last_used: u64,
 }
 
 impl ShapeGroup {
@@ -174,6 +243,7 @@ impl ShapeGroup {
                 .iter()
                 .map(|segment| SegmentPosition::from_segment(segment))
                 .collect(),
+            last_used: 0,
         }
     }
 
@@ -597,6 +667,66 @@ mod tests {
         assert_eq!(restored.observe("/status/closed"), "/status/closed");
         assert_eq!(restored.observe("/status/archived"), "/status/{param}");
         assert_eq!(restored.template("/users/456"), "/users/{id}");
+    }
+
+    /// A byte-bounded export drops the least recently used groups from the
+    /// learner itself, so the export and the learner keep templating the
+    /// same way, and the survivors keep their relative order.
+    #[test]
+    fn export_within_a_byte_budget_drops_least_recently_used_groups_from_the_learner() {
+        let mut learner = PathTemplateLearner::new();
+        // Four shapes that share no literal (so each is its own group),
+        // then /alpha is used again so it is the most recently used despite
+        // being learned first; /bravo is the least recent.
+        for path in ["/alpha", "/bravo", "/charlie", "/delta", "/alpha"] {
+            learner.observe(path);
+        }
+        assert_eq!(learner.groups.len(), 4);
+        let unbounded = learner.export_groups_json();
+        assert_eq!(
+            learner.export_groups_json_within(unbounded.len()),
+            unbounded,
+            "a budget the groups fit in drops nothing"
+        );
+        assert_eq!(learner.groups.len(), 4);
+
+        let one_group = serde_json::to_string(&learner.groups[0])
+            .expect("group serializes")
+            .len();
+        // Room for two groups and their separator, not three.
+        let budget = 2 + 2 * one_group + 1;
+        let bounded = learner.export_groups_json_within(budget);
+        assert!(bounded.len() <= budget, "{} > {budget}", bounded.len());
+        assert_eq!(
+            learner.groups.len(),
+            2,
+            "the learner dropped what it exported without"
+        );
+        let leading = |learner: &PathTemplateLearner| {
+            learner
+                .groups
+                .iter()
+                .map(|group| match &group.positions[0] {
+                    SegmentPosition::Literal(value) => value.clone(),
+                    other => panic!("unexpected leading position {other:?}"),
+                })
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            leading(&learner),
+            vec!["alpha".to_owned(), "delta".to_owned()],
+            "the least recently used groups go first and the order of the rest is kept"
+        );
+        let mut restored = PathTemplateLearner::new();
+        restored
+            .import_groups_json(&bounded)
+            .expect("the bounded export imports");
+        assert_eq!(leading(&restored), leading(&learner));
+        assert_eq!(restored.use_seq, learner.use_seq);
+
+        // A budget nothing fits in leaves an empty, still valid, export.
+        assert_eq!(learner.export_groups_json_within(2), "[]");
+        assert!(learner.groups.is_empty());
     }
 
     #[test]

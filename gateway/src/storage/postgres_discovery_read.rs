@@ -30,6 +30,19 @@
 //!   filter or a cursor -- is guarded with `pg_input_is_valid`, so an
 //!   unparsable value compares as NULL and excludes rows, exactly as
 //!   `julianday` of unparsable text does, instead of failing the query.
+//!   One deliberate difference: `timestamptz` keeps microseconds where
+//!   `julianday` rounds to the millisecond, so two rows within the same
+//!   millisecond tie under SQLite (and fall to the key tiebreak) but order
+//!   by their instants here. Each backend's cursors are consistent with
+//!   its own order, and the full-precision order is the one the Rust-side
+//!   comparisons (`timestamp_after`, `new_since`) already use, so it is
+//!   not degraded to match SQLite's rounding.
+//! - **Timestamp text is the stream's rendering.** The projector stores
+//!   `first_seen`/`last_seen` and the routing-context times as the durable
+//!   audit stream renders them (fixed microseconds, `...:26.000000Z`),
+//!   where the standalone sink keeps the event's own text (`...:26Z`).
+//!   The instants are the same and both are RFC 3339; response bodies and
+//!   page cursors differ in that text only.
 //! - **No request-path fan-out.** A page's child rows (status counts,
 //!   routing contexts, classification, open-signal summaries) load with
 //!   one `UNNEST`-keyed query per table for the whole page, not one query
@@ -342,6 +355,77 @@ impl DiscoveryReadStore for PostgresDiscoveryReadStore {
             endpoint_template,
             &shapes,
         )))
+    }
+
+    /// One `UNNEST`-keyed query for the whole set (the cluster conformance
+    /// refresher asks for every endpoint a replica tracks, every interval).
+    /// An endpoint whose samples do not parse is reported as having no
+    /// schema, with the corruption logged, rather than failing every other
+    /// endpoint's answer with it; the single-endpoint read still surfaces
+    /// the error to the admin surface that asks about that endpoint.
+    async fn inferred_request_schemas(
+        &self,
+        endpoints: &[(String, String)],
+    ) -> Result<Vec<Option<InferredRequestSchema>>, DiscoveryQueryError> {
+        if endpoints.is_empty() {
+            return Ok(Vec::new());
+        }
+        let operation = OPERATION_INFERRED_SCHEMA;
+        let methods = endpoints
+            .iter()
+            .map(|(method, _)| method.as_str())
+            .collect::<Vec<_>>();
+        let templates = endpoints
+            .iter()
+            .map(|(_, endpoint_template)| endpoint_template.as_str())
+            .collect::<Vec<_>>();
+        let client = self.client().await?;
+        let rows = client
+            .query(
+                "SELECT s.method, s.endpoint_template, s.shape_json
+                 FROM greengateway.discovery_payload_shape_samples AS s
+                 JOIN UNNEST($1::text[], $2::text[]) AS wanted(method, endpoint_template)
+                   ON wanted.method = s.method
+                  AND wanted.endpoint_template = s.endpoint_template
+                 ORDER BY s.method, s.endpoint_template, s.sample_slot",
+                &[&methods, &templates],
+            )
+            .await
+            .map_err(|error| classify_query(error, operation))?;
+        let mut shape_jsons = HashMap::<(String, String), Vec<String>>::new();
+        for row in &rows {
+            let method = column::<String>(row, 0, operation)?;
+            let endpoint_template = column::<String>(row, 1, operation)?;
+            let shape_json = column::<String>(row, 2, operation)?;
+            shape_jsons
+                .entry((method, endpoint_template))
+                .or_default()
+                .push(shape_json);
+        }
+        Ok(endpoints
+            .iter()
+            .map(|key| {
+                let (method, endpoint_template) = key;
+                let shape_jsons = shape_jsons.get(key)?;
+                let shapes = shape_jsons
+                    .iter()
+                    .map(|shape_json| serde_json::from_str::<CapturedPayloadShapeSample>(shape_json))
+                    .collect::<Result<Vec<_>, _>>();
+                match shapes {
+                    Ok(shapes) => Some(infer_request_schema(method, endpoint_template, &shapes)),
+                    Err(error) => {
+                        tracing::error!(
+                            operation,
+                            method,
+                            endpoint_template,
+                            error = %error,
+                            "payload shape sample failed to parse; the endpoint is served without an inferred schema"
+                        );
+                        None
+                    }
+                }
+            })
+            .collect())
     }
 
     async fn set_endpoint_review(
