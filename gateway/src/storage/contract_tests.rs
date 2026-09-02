@@ -1911,6 +1911,109 @@ mod postgres_audit_tests {
         assert_eq!(refused.invalid_parameter_name(), Some("cursor"));
     }
 
+    /// A revoke whose expiry passes the retention cutoff while the
+    /// transaction waits for the revision lock is refused under the lock,
+    /// spends no revision, and records nothing -- never a `Revoked` that
+    /// `is_revoked` immediately contradicts.
+    #[tokio::test]
+    async fn a_revoke_that_lapses_during_the_lock_wait_is_refused() {
+        let Some(admin_dsn) = locator() else {
+            eprintln!("skipping: no test database locator; CI runs this test");
+            return;
+        };
+        let _guard = DATABASE.lock().await;
+        let database = create_test_database(&admin_dsn).await;
+        let (_tokens, pool) = migrated_service_token_store(&database).await;
+        let store = crate::storage::PostgresJwtRevocationStore::new(
+            pool.clone(),
+            "deploy-jwt-lockwait",
+            "https://issuer-a.example",
+        )
+        .with_retention_leeway_for_test(1.0)
+        .with_after_lock_delay_for_test(std::time::Duration::from_millis(1_500));
+        let revision_before: i64 = pool
+            .get()
+            .await
+            .expect("client")
+            .query_one(
+                "SELECT last_revision FROM greengateway.security_revision_state WHERE singleton",
+                &[],
+            )
+            .await
+            .expect("revision")
+            .get(0);
+        let soon = (time::OffsetDateTime::now_utc() + std::time::Duration::from_millis(300))
+            .format(&time::format_description::well_known::Rfc3339)
+            .expect("rfc3339");
+        let refused = store
+            .revoke("jti-lockwait", Some(&soon), "operator")
+            .await
+            .expect_err("an expiry that lapsed during the lock wait is refused");
+        assert_eq!(refused.invalid_parameter_name(), Some("expires_at"));
+        assert!(!store.is_revoked("jti-lockwait").await.expect("lookup"));
+        let revision_after: i64 = pool
+            .get()
+            .await
+            .expect("client")
+            .query_one(
+                "SELECT last_revision FROM greengateway.security_revision_state WHERE singleton",
+                &[],
+            )
+            .await
+            .expect("revision")
+            .get(0);
+        assert_eq!(
+            revision_after, revision_before,
+            "the refused revoke spent no revision"
+        );
+    }
+
+    /// A login admitted after waiting for the admission lock gets its full
+    /// TTL from the moment it is written, not from the transaction's start
+    /// before the wait.
+    #[tokio::test]
+    async fn a_pending_login_admitted_after_a_lock_wait_keeps_its_full_ttl() {
+        let Some(admin_dsn) = locator() else {
+            eprintln!("skipping: no test database locator; CI runs this test");
+            return;
+        };
+        let _guard = DATABASE.lock().await;
+        let database = create_test_database(&admin_dsn).await;
+        let (store, pool) = pending_store(
+            &database,
+            PendingLoginLimits {
+                ttl: std::time::Duration::from_secs(1),
+                max_entries: 10,
+                max_per_ip: 10,
+            },
+        )
+        .await;
+        let store = store.with_after_lock_delay_for_test(std::time::Duration::from_millis(1_500));
+        assert!(store
+            .insert("state-lockwait", pending("203.0.113.5"))
+            .await
+            .expect("insert"));
+        let still_valid: bool = pool
+            .get()
+            .await
+            .expect("client")
+            .query_one(
+                "SELECT bool_and(expires_at > clock_timestamp()) FROM greengateway.admin_pending_logins",
+                &[],
+            )
+            .await
+            .expect("query")
+            .get(0);
+        assert!(
+            still_valid,
+            "the TTL starts when the login is written, after the lock wait"
+        );
+        assert!(
+            store.take("state-lockwait").await.expect("take").is_some(),
+            "the callback still finds the login"
+        );
+    }
+
     /// A replica whose keyring cannot open a pending login rolls its
     /// consumption back, so a replica that can still completes it.
     #[tokio::test]

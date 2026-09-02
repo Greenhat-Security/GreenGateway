@@ -83,6 +83,11 @@ pub struct PostgresJwtRevocationStore {
     /// revocation keyed on the token's own `exp` covers the whole window in
     /// which some validator may still accept the token.
     retention_leeway_secs: f64,
+    /// Test seam: a pause after the revision lock is taken and before the
+    /// cutoff is judged again, standing in for a wait behind another
+    /// commit.
+    #[cfg(test)]
+    after_lock_delay: Option<std::time::Duration>,
 }
 
 impl PostgresJwtRevocationStore {
@@ -93,7 +98,15 @@ impl PostgresJwtRevocationStore {
             issuer: Arc::from(issuer),
             retention_leeway_secs: (crate::auth::jwt::JWT_EXP_LEEWAY_SECS
                 + REVOCATION_RETENTION_MARGIN_SECS) as f64,
+            #[cfg(test)]
+            after_lock_delay: None,
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_after_lock_delay_for_test(mut self, delay: std::time::Duration) -> Self {
+        self.after_lock_delay = Some(delay);
+        self
     }
 
     #[cfg(test)]
@@ -181,6 +194,33 @@ impl PostgresJwtRevocationStore {
             let security_revision: i64 = revision_row
                 .try_get(0)
                 .map_err(|_| invalid_data(OPERATION_REVOKE))?;
+            #[cfg(test)]
+            if let Some(delay) = self.after_lock_delay {
+                tokio::time::sleep(delay).await;
+            }
+            // The precheck ran before this transaction waited for the
+            // revision lock, and `now()` is fixed at transaction start:
+            // an expiry within one lock-wait of the cutoff could pass the
+            // precheck and still be ineffective by the time the row is
+            // written. Judge it again here, under the lock, on the
+            // statement clock; a refusal rolls the reservation back.
+            if let Some(expires_at) = expires_at.as_deref() {
+                let still_effective: bool = client
+                    .query_one(
+                        "SELECT $1::text::timestamptz > clock_timestamp() - make_interval(secs => $2)",
+                        &[&expires_at, &self.retention_leeway_secs],
+                    )
+                    .await
+                    .map_err(|error| classify_query(error, OPERATION_REVOKE))?
+                    .try_get(0)
+                    .map_err(|_| invalid_data(OPERATION_REVOKE))?;
+                if !still_effective {
+                    return Err(RepositoryError::invalid_parameter(
+                        OPERATION_REVOKE,
+                        "expires_at",
+                    ));
+                }
+            }
             let inserted = client
                 .execute(
                     r#"

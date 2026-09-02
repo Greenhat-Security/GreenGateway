@@ -226,6 +226,14 @@ impl OidcLoginState {
         })
     }
 
+    /// Register the ID-token validator's scheduled JWKS refresh with the
+    /// lifecycle, exactly as the bearer validators are: a key removed from
+    /// the issuer's JWKS then stops being accepted at the half-age
+    /// refresh, not only when the cache reaches its maximum age.
+    pub fn spawn_background_refresh(&self, lifecycle: &crate::lifecycle::GatewayLifecycle) {
+        self.id_token_validator.spawn_background_refresh(lifecycle);
+    }
+
     pub async fn begin_login(&self, client_ip: &str) -> Result<LoginStart, OidcLoginError> {
         let state = Uuid::new_v4().to_string();
         let nonce = Uuid::new_v4().to_string();
@@ -554,6 +562,40 @@ mod tests {
         assert!(!output.contains(secret));
         assert!(output.contains("<redacted>"));
         assert!(output.contains("client_secret"));
+    }
+
+    /// The admin login's ID-token validator is registered for scheduled
+    /// JWKS refresh like the bearer validators, so a retired signing key
+    /// stops being accepted at the half-age refresh.
+    #[tokio::test]
+    async fn the_id_token_validator_registers_its_background_refresh() {
+        let config = OidcLoginConfig {
+            client_id: "admin-ui".to_owned(),
+            client_secret: "oidc-client-secret-value".to_owned(),
+            redirect_uri: "https://gateway.example.test/v1/admin/auth/callback".to_owned(),
+            issuer: "https://issuer.example.test".to_owned(),
+            jwks_url: "https://issuer.example.test/jwks.json".to_owned(),
+            authorization_endpoint: "https://issuer.example.test/oauth2/authorize".to_owned(),
+            token_endpoint: "https://issuer.example.test/oauth2/token".to_owned(),
+            http_timeout: Duration::from_secs(2),
+            jwks_max_key_age: Duration::from_secs(300),
+        };
+        let egress_client = Arc::new(
+            crate::egress::EgressClient::new(crate::egress::EgressConfig::from_config(
+                &crate::config::Config::test_defaults(),
+            ))
+            .expect("egress client"),
+        );
+        let state = OidcLoginState::new(config, egress_client, PendingLoginLimits::default())
+            .expect("login state");
+        let lifecycle = crate::lifecycle::GatewayLifecycle::new();
+        assert_eq!(lifecycle.background_task_count(), 0);
+        state.spawn_background_refresh(&lifecycle);
+        assert_eq!(
+            lifecycle.background_task_count(),
+            1,
+            "the ID-token validator's JWKS refresh is a registered background task"
+        );
     }
 
     #[test]

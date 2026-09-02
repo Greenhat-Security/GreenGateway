@@ -118,6 +118,15 @@ impl GatewayLifecycle {
             .push(handle);
     }
 
+    #[cfg(test)]
+    pub(crate) fn background_task_count(&self) -> usize {
+        self.inner
+            .background_tasks
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .len()
+    }
+
     pub(crate) fn response_stream_cancellation(&self) -> CancellationToken {
         self.inner.response_stream_cancellation.clone()
     }

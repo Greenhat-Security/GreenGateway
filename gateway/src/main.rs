@@ -2571,6 +2571,7 @@ fn gateway_app_with_process_started_at_and_overrides(
         &discovered_oidc,
         Arc::clone(&egress_client),
         pending_login_backend,
+        Some(&lifecycle),
     )?;
     let principal_directory = auth::PrincipalDirectory::from_config(&config)?;
     let rbac_status = RbacStatus {
@@ -3262,6 +3263,7 @@ fn admin_auth_state_from_config(
     discovered_oidc: &DiscoveredOidcConfig,
     egress_client: Arc<egress::EgressClient>,
     pending_login_backend: Option<Arc<dyn auth::oidc_login::PendingLoginBackend>>,
+    lifecycle: Option<&GatewayLifecycle>,
 ) -> Result<Option<AdminAuthState>, auth::AuthError> {
     let Some(admin_login_provider) = config.admin_login_provider.as_deref() else {
         return Ok(None);
@@ -3319,6 +3321,12 @@ fn admin_auth_state_from_config(
         }
         None => auth::OidcLoginState::new(login_config, egress_client, pending_limits)?,
     };
+    // The ID-token validator refreshes its JWKS on the same schedule as the
+    // bearer validators, so a retired signing key stops being accepted at
+    // the half-age refresh rather than only at the cache's maximum age.
+    if let Some(lifecycle) = lifecycle {
+        login.spawn_background_refresh(lifecycle);
+    }
 
     Ok(Some(AdminAuthState {
         login,

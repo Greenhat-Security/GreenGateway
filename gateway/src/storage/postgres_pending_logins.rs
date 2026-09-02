@@ -80,6 +80,10 @@ pub struct PostgresPendingLoginStore {
     deployment_id: Arc<str>,
     keyring: LocalSecretKeyring,
     limits: PendingLoginLimits,
+    /// Test seam: a pause after the admission lock is taken, standing in
+    /// for a wait behind other admissions.
+    #[cfg(test)]
+    after_lock_delay: Option<std::time::Duration>,
 }
 
 impl PostgresPendingLoginStore {
@@ -94,7 +98,15 @@ impl PostgresPendingLoginStore {
             deployment_id: Arc::from(deployment_id),
             keyring,
             limits,
+            #[cfg(test)]
+            after_lock_delay: None,
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_after_lock_delay_for_test(mut self, delay: std::time::Duration) -> Self {
+        self.after_lock_delay = Some(delay);
+        self
     }
 
     fn digest(&self, kind: &str, value: &str) -> String {
@@ -245,13 +257,23 @@ impl PendingLoginBackend for PostgresPendingLoginStore {
                 .execute("SELECT pg_advisory_xact_lock($1)", &[&ADMISSION_LOCK_KEY])
                 .await
                 .map_err(|error| classify_query(error, OPERATION_INSERT))?;
+            #[cfg(test)]
+            if let Some(delay) = self.after_lock_delay {
+                tokio::time::sleep(delay).await;
+            }
+            // Every clock below is the statement clock, not `now()`: `now()`
+            // is fixed at transaction start, before the admission lock was
+            // waited for, and a TTL measured from there could already have
+            // lapsed by the time the row is written -- an admitted login
+            // whose callback is guaranteed to fail. Pruning and the quota
+            // count use the same basis so they agree with the expiry.
             client
                 .execute(
                     r#"
                     DELETE FROM greengateway.admin_pending_logins
                     WHERE ctid IN (
                         SELECT ctid FROM greengateway.admin_pending_logins
-                        WHERE expires_at <= now() LIMIT $1
+                        WHERE expires_at <= clock_timestamp() LIMIT $1
                     )
                     "#,
                     &[&PRUNE_BATCH],
@@ -263,7 +285,7 @@ impl PendingLoginBackend for PostgresPendingLoginStore {
                     r#"
                     SELECT COUNT(*) FILTER (WHERE client_key = $1), COUNT(*)
                     FROM greengateway.admin_pending_logins
-                    WHERE expires_at > now()
+                    WHERE expires_at > clock_timestamp()
                     "#,
                     &[&client_key],
                 )
@@ -286,7 +308,7 @@ impl PendingLoginBackend for PostgresPendingLoginStore {
                         verifier_nonce, verifier_ct, nonce_nonce, nonce_ct, expires_at
                     ) VALUES (
                         $1::text::uuid, $2, $3, $4, $5, $6, $7, $8,
-                        now() + make_interval(secs => $9)
+                        clock_timestamp() + make_interval(secs => $9)
                     )
                     "#,
                     &[
