@@ -201,7 +201,7 @@ static MANIFEST: LazyLock<Vec<Migration>> = LazyLock::new(|| {
             include_str!("migrations/0011_discovery_lifecycle.sql"),
         )
         .finalize()
-        .with_pinned_checksum("5af36cb9d6908ecebc6d58dc0b115e20762f67a2bfd3e713dbe8adff5b4b67b5"),
+        .with_pinned_checksum("62867cfebe55b9a31f2aa010add3c6b71ba3adaabb84d356936ead2836583787"),
     ]
 });
 

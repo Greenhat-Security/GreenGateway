@@ -302,11 +302,19 @@ pub const MAX_NEW_SINCE_HOURS: u64 = 876_000;
 /// fraction of the payload-shape reservoir samples for an endpoint.
 pub const INFERRED_SCHEMA_REQUIRED_THRESHOLD: f64 = 0.95;
 
+/// The review row outlives the review: clearing one sets `reviewed_at` to
+/// NULL and bumps the revision rather than deleting the row, so an
+/// endpoint's review revision only ever increases (issue #241, PR 12).
+/// Deleting it made revisions restart at 1, and a stale `If-Match: 1` held
+/// against a long-gone review then matched an unrelated newer one -- the
+/// ABA overwrite the precondition exists to refuse. A row whose
+/// `reviewed_at` is NULL reads exactly as no row at all, which every read
+/// already expresses as `reviewed_at IS NULL`.
 const CREATE_REVIEW_SCHEMA_SQL: &str = r#"
 CREATE TABLE IF NOT EXISTS discovery_endpoint_reviews (
     method TEXT NOT NULL,
     endpoint_template TEXT NOT NULL,
-    reviewed_at TEXT NOT NULL,
+    reviewed_at TEXT,
     reviewed_by TEXT,
     revision INTEGER NOT NULL DEFAULT 1,
     PRIMARY KEY (method, endpoint_template)
@@ -1105,10 +1113,13 @@ impl DiscoveryQueryStore {
     /// upsert whose predicate is the expected revision: `None` replaces
     /// whatever is there (revision + 1), `UNREVIEWED_REVISION` inserts only
     /// when no row exists, and any other value updates only the row at that
-    /// revision. A clear deletes only the row at the expected revision (or
-    /// any row, for `None`); clearing an unreviewed endpoint that was
-    /// expected unreviewed is a no-op that applies. Zero rows is a refusal
-    /// carrying the review as stored now.
+    /// revision. A clear does not delete the row -- it nulls `reviewed_at`
+    /// and bumps the revision, so the endpoint's review revision never
+    /// restarts and a stale `If-Match` from an earlier review cannot match
+    /// a later one. Clearing an endpoint that is already unreviewed at the
+    /// revision the caller expected (including "never reviewed", revision
+    /// `UNREVIEWED_REVISION`) is a no-op that applies. Zero rows is a
+    /// refusal carrying the review as stored now.
     pub fn set_endpoint_review(
         &self,
         method: &str,
@@ -1220,31 +1231,30 @@ impl DiscoveryQueryStore {
                 })),
             }
         } else {
-            let deleted = match expected_revision {
-                None => connection
-                    .execute(
-                        r#"
-                        DELETE FROM discovery_endpoint_reviews
-                        WHERE method = ?1 AND endpoint_template = ?2
-                        "#,
-                        params![method, endpoint_template],
-                    )
-                    .map_err(sqlite_error)?,
-                Some(expected) => connection
-                    .execute(
-                        r#"
-                        DELETE FROM discovery_endpoint_reviews
-                        WHERE method = ?1 AND endpoint_template = ?2 AND revision = ?3
-                        "#,
-                        params![method, endpoint_template, expected],
-                    )
-                    .map_err(sqlite_error)?,
-            };
-            if deleted > 0 {
-                return Ok(TransitionOutcome::Applied(EndpointReviewState::unreviewed()));
-            }
+            let cleared = connection
+                .execute(
+                    r#"
+                    UPDATE discovery_endpoint_reviews
+                    SET reviewed_at = NULL,
+                        reviewed_by = NULL,
+                        revision = revision + 1
+                    WHERE method = ?1 AND endpoint_template = ?2
+                      AND reviewed_at IS NOT NULL
+                      AND (?3 IS NULL OR revision = ?3)
+                    "#,
+                    params![method, endpoint_template, expected_revision],
+                )
+                .map_err(sqlite_error)?;
             let current = load_review_by_key(&connection, &self.path, method, endpoint_template)?;
-            if !current.reviewed && matches!(expected_revision, None | Some(UNREVIEWED_REVISION)) {
+            if cleared > 0 {
+                return Ok(TransitionOutcome::Applied(current));
+            }
+            // Nothing to clear: applying only when the endpoint is
+            // unreviewed AT the revision the caller expected keeps a stale
+            // expectation from passing as an idempotent no-op.
+            if !current.reviewed
+                && expected_revision.unwrap_or(current.revision) == current.revision
+            {
                 return Ok(TransitionOutcome::Applied(current));
             }
             Ok(TransitionOutcome::Refused(TransitionRefused { current }))
@@ -1378,7 +1388,7 @@ impl DiscoveryQueryStore {
     }
 
     /// The conditional transition (issue #241, PR 12): one statement whose
-    /// predicate is the id, the expected state, and (when given) the
+    /// predicate is the id, the expected state(s), and (when given) the
     /// expected revision. Zero rows is a refusal carrying the row as it is
     /// now, or `NotFound` when there is no such row.
     pub fn transition_signal(
@@ -1389,6 +1399,7 @@ impl DiscoveryQueryStore {
         expected: TransitionPrecondition<SignalLifecycleState>,
     ) -> Result<TransitionOutcome<Signal>, DiscoveryQueryError> {
         let transitioned_at = utc_timestamp_rfc3339();
+        let (from_state, also_from_state) = expected.bound_states();
         let connection = self.connection_guard();
         let updated = connection
             .execute(
@@ -1400,7 +1411,7 @@ impl DiscoveryQueryStore {
                     transitioned_by = ?4,
                     revision = revision + 1
                 WHERE id = ?1
-                  AND state = ?5
+                  AND (state = ?5 OR state = ?7)
                   AND (?6 IS NULL OR revision = ?6)
                 "#,
                 params![
@@ -1408,8 +1419,9 @@ impl DiscoveryQueryStore {
                     state.as_str(),
                     transitioned_at,
                     transitioned_by,
-                    expected.from_state.as_str(),
+                    from_state.as_str(),
                     expected.revision,
+                    also_from_state.as_str(),
                 ],
             )
             .map_err(|source| DiscoveryQueryError::Sqlite {
@@ -2364,10 +2376,14 @@ fn load_review_by_key(
             "#,
             params![method, endpoint_template],
             |row| {
+                // A row whose review was cleared keeps its revision and
+                // reads as unreviewed.
+                let reviewed_at: Option<String> = row.get(0)?;
+                let reviewed_by: Option<String> = row.get(1)?;
                 Ok(EndpointReviewState {
-                    reviewed: true,
-                    reviewed_at: Some(row.get(0)?),
-                    reviewed_by: row.get(1)?,
+                    reviewed: reviewed_at.is_some(),
+                    reviewed_by: reviewed_at.as_ref().and(reviewed_by),
+                    reviewed_at,
                     revision: row.get(2)?,
                 })
             },
@@ -2585,6 +2601,7 @@ fn configure_connection(connection: &Connection) -> rusqlite::Result<()> {
         "revision",
         "INTEGER NOT NULL DEFAULT 1",
     )?;
+    ensure_review_reviewed_at_is_nullable(connection)?;
     super::aggregator::ensure_discovery_endpoint_principal_identity_schema(connection)?;
     connection.execute_batch(CREATE_ROUTING_CONTEXT_SCHEMA_SQL)?;
     ensure_discovery_endpoint_aggregate_column(
@@ -2594,6 +2611,52 @@ fn configure_connection(connection: &Connection) -> rusqlite::Result<()> {
     )?;
     signals::configure_connection(connection)?;
     suggestions::configure_connection(connection)
+}
+
+/// Rebuild a review table created before clearing kept the row (issue
+/// #241, PR 12): `reviewed_at` was `NOT NULL` there, so the clear's
+/// `SET reviewed_at = NULL` would fail. SQLite cannot drop a column
+/// constraint in place, so this is the table rebuild the aggregator uses
+/// for the same kind of change -- create, copy, drop, rename, in one
+/// transaction. A no-op once the column is nullable, and on a database
+/// that has no review table yet.
+fn ensure_review_reviewed_at_is_nullable(connection: &Connection) -> rusqlite::Result<()> {
+    let not_null = {
+        let mut statement = connection.prepare("PRAGMA table_info(discovery_endpoint_reviews)")?;
+        let columns = statement
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(1)?, row.get::<_, i64>(3)?))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        columns
+            .iter()
+            .any(|(name, not_null)| name == "reviewed_at" && *not_null != 0)
+    };
+    if !not_null {
+        return Ok(());
+    }
+
+    let transaction = connection.unchecked_transaction()?;
+    transaction.execute_batch(
+        r#"
+        DROP TABLE IF EXISTS discovery_endpoint_reviews_v2;
+        CREATE TABLE discovery_endpoint_reviews_v2 (
+            method TEXT NOT NULL,
+            endpoint_template TEXT NOT NULL,
+            reviewed_at TEXT,
+            reviewed_by TEXT,
+            revision INTEGER NOT NULL DEFAULT 1,
+            PRIMARY KEY (method, endpoint_template)
+        );
+        INSERT OR IGNORE INTO discovery_endpoint_reviews_v2
+            (method, endpoint_template, reviewed_at, reviewed_by, revision)
+        SELECT method, endpoint_template, reviewed_at, reviewed_by, revision
+        FROM discovery_endpoint_reviews;
+        DROP TABLE discovery_endpoint_reviews;
+        ALTER TABLE discovery_endpoint_reviews_v2 RENAME TO discovery_endpoint_reviews;
+        "#,
+    )?;
+    transaction.commit()
 }
 
 fn ensure_discovery_endpoint_aggregate_column(
@@ -3202,6 +3265,53 @@ mod tests {
         assert_eq!(page.signals[0].revision, 1);
     }
 
+    /// A review table created before clearing kept the row has
+    /// `reviewed_at NOT NULL`, which a clear would violate. Opening the
+    /// store rebuilds it, keeping the rows and their revisions (issue
+    /// #241, PR 12).
+    #[test]
+    fn a_legacy_review_table_is_rebuilt_so_a_clear_can_keep_the_row() {
+        let db = TempDb::new("legacy-review-table");
+        seed_endpoint(&db.path, "GET", "/legacy-review");
+        let connection = Connection::open(&db.path).expect("test database should open");
+        connection
+            .execute_batch(
+                "CREATE TABLE discovery_endpoint_reviews (
+                    method TEXT NOT NULL,
+                    endpoint_template TEXT NOT NULL,
+                    reviewed_at TEXT NOT NULL,
+                    reviewed_by TEXT,
+                    PRIMARY KEY (method, endpoint_template)
+                );
+                INSERT INTO discovery_endpoint_reviews
+                    (method, endpoint_template, reviewed_at, reviewed_by)
+                VALUES ('GET', '/legacy-review', '2024-06-01T00:00:00Z', 'admin-legacy');",
+            )
+            .expect("legacy review table should create");
+        drop(connection);
+
+        let store = DiscoveryQueryStore::open(&db.path).expect("store opens");
+        let cleared = store
+            .set_endpoint_review("GET", "/legacy-review", false, Some("admin-a"), Some(1))
+            .expect("clear")
+            .expect_applied("the migrated row clears");
+        assert!(!cleared.reviewed);
+        assert_eq!(cleared.revision, 2);
+        // The row is still there, so the next mark cannot reuse revision 1.
+        assert!(store
+            .set_endpoint_review(
+                "GET",
+                "/legacy-review",
+                true,
+                Some("admin-b"),
+                Some(UNREVIEWED_REVISION)
+            )
+            .expect("first-mark after the clear")
+            .expect_refused("the endpoint has a review history")
+            .revision
+            .eq(&2));
+    }
+
     #[test]
     fn two_handles_acknowledging_one_signal_get_exactly_one_winner() {
         for target in [
@@ -3300,17 +3410,44 @@ mod tests {
         assert_eq!(detail.reviewed_by.as_deref(), Some("admin-a"));
         assert_eq!(detail.review_revision, 1);
 
-        // Two clears of revision 1: one wins, the other finds no review.
+        // Two clears of revision 1: one wins, the other is refused. The
+        // cleared endpoint is unreviewed at a HIGHER revision -- the row
+        // survives the clear so revisions never restart.
         let cleared = replica_b
             .set_endpoint_review("GET", "/reviewed", false, Some("admin-b"), Some(1))
             .expect("first clear")
             .expect_applied("the first clear wins");
-        assert_eq!(cleared, EndpointReviewState::unreviewed());
+        assert!(!cleared.reviewed);
+        assert_eq!(cleared.reviewed_at, None);
+        assert_eq!(cleared.reviewed_by, None);
+        assert_eq!(cleared.revision, 2);
         let refused = replica_a
             .set_endpoint_review("GET", "/reviewed", false, Some("admin-a"), Some(1))
             .expect("second clear")
             .expect_refused("the second clear is refused");
-        assert_eq!(refused, EndpointReviewState::unreviewed());
+        assert!(!refused.reviewed);
+        assert_eq!(refused.revision, 2);
+        let detail = replica_a
+            .get_endpoint_with_open_signal_summaries("GET", "/reviewed", 24, false)
+            .expect("detail")
+            .expect("exists");
+        assert!(!detail.reviewed);
+        assert_eq!(detail.reviewed_by, None);
+        assert_eq!(detail.review_revision, 2);
+
+        // The generation that mattered: an admin still holding the FIRST
+        // review's revision cannot mark or clear the endpoint. Expecting
+        // "never reviewed" is refused for the same reason.
+        let aba_mark = replica_b
+            .set_endpoint_review("GET", "/reviewed", true, Some("admin-b"), Some(1))
+            .expect("stale-generation mark")
+            .expect_refused("a revision from a cleared review is stale, not a match");
+        assert_eq!(aba_mark.revision, 2);
+        let aba_first_mark = replica_b
+            .set_endpoint_review("GET", "/reviewed", true, Some("admin-b"), expect_unreviewed)
+            .expect("first-mark after a clear")
+            .expect_refused("the endpoint has a review history, so it is not unreviewed at 0");
+        assert_eq!(aba_first_mark.revision, 2);
 
         // A re-mark against a stale revision is refused; against the row's
         // revision it applies; unconditional always applies.
@@ -3318,47 +3455,65 @@ mod tests {
             .set_endpoint_review("GET", "/reviewed", true, Some("admin-a"), None)
             .expect("unconditional mark")
             .expect_applied("unconditional");
-        assert_eq!(remarked.revision, 1);
+        assert_eq!(remarked.revision, 3);
         let stale = replica_b
             .set_endpoint_review("GET", "/reviewed", true, Some("admin-b"), Some(7))
             .expect("stale mark")
             .expect_refused("stale");
         assert_eq!(stale.reviewed_by.as_deref(), Some("admin-a"));
         let exact = replica_b
-            .set_endpoint_review("GET", "/reviewed", true, Some("admin-b"), Some(1))
+            .set_endpoint_review("GET", "/reviewed", true, Some("admin-b"), Some(3))
             .expect("exact mark")
             .expect_applied("exact");
-        assert_eq!(exact.revision, 2);
+        assert_eq!(exact.revision, 4);
         assert_eq!(exact.reviewed_by.as_deref(), Some("admin-b"));
         let replaced = replica_a
             .set_endpoint_review("GET", "/reviewed", true, Some("admin-a"), None)
             .expect("unconditional replace")
             .expect_applied("unconditional");
-        assert_eq!(replaced.revision, 3);
+        assert_eq!(replaced.revision, 5);
 
-        // A clear names a revision too: a stale one deletes nothing.
+        // A clear names a revision too: a stale one clears nothing.
         let stale_clear = replica_b
             .set_endpoint_review("GET", "/reviewed", false, Some("admin-b"), Some(9))
             .expect("stale clear")
             .expect_refused("a stale clear is refused");
         assert!(stale_clear.reviewed);
-        assert_eq!(stale_clear.revision, 3);
+        assert_eq!(stale_clear.revision, 5);
 
-        // Clearing an unreviewed endpoint expecting it unreviewed is a
-        // no-op that applies; an unknown endpoint is not found.
-        replica_a
+        // Clearing an already-unreviewed endpoint at the revision it
+        // actually carries is a no-op that applies; an unknown endpoint is
+        // not found.
+        let cleared = replica_a
             .set_endpoint_review("GET", "/reviewed", false, None, None)
             .expect("clear")
             .expect_applied("clear");
+        assert_eq!(cleared.revision, 6);
         let noop = replica_b
-            .set_endpoint_review("GET", "/reviewed", false, None, expect_unreviewed)
+            .set_endpoint_review("GET", "/reviewed", false, None, Some(6))
             .expect("no-op clear")
-            .expect_applied("clearing nothing, expecting nothing, applies");
-        assert_eq!(noop, EndpointReviewState::unreviewed());
+            .expect_applied("clearing nothing, expecting exactly that, applies");
+        assert!(!noop.reviewed);
+        assert_eq!(noop.revision, 6);
+        let stale_noop = replica_b
+            .set_endpoint_review("GET", "/reviewed", false, None, Some(1))
+            .expect("stale clear of an already-cleared review")
+            .expect_refused("a stale expectation is not an idempotent no-op");
+        assert!(!stale_noop.reviewed);
+        assert_eq!(stale_noop.revision, 6);
         assert!(replica_a
             .set_endpoint_review("GET", "/missing", true, None, None)
             .expect("unknown endpoint")
             .is_not_found());
+
+        // An endpoint that never had a review is unreviewed at revision 0,
+        // and clearing it while expecting exactly that still applies.
+        seed_endpoint(&db.path, "GET", "/never-reviewed");
+        let never = replica_a
+            .set_endpoint_review("GET", "/never-reviewed", false, None, expect_unreviewed)
+            .expect("clear of a never-reviewed endpoint")
+            .expect_applied("nothing to clear, and nothing was expected");
+        assert_eq!(never, EndpointReviewState::unreviewed());
     }
 
     struct TempDb {

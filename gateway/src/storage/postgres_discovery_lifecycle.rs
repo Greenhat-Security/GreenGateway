@@ -41,7 +41,12 @@
 //!   are the caller's to emit AFTER this returns, that is after COMMIT:
 //!   audit is at-least-once by design, so an event for a rolled-back
 //!   acceptance must be impossible while an acceptance whose events were
-//!   lost to a crash is tolerable.
+//!   lost to a crash is tolerable. The one outcome that is neither a
+//!   commit nor a rollback from the caller's side is a `COMMIT` whose
+//!   acknowledgement is lost: the acceptance may in fact be durable, with
+//!   no events emitted for it. The transaction still moved both halves or
+//!   neither, so the outbox row -- not the event -- is the durable record
+//!   ([`AcceptRefused`] says the same about its `Store` variant).
 //!
 //! Errors classify into the repository vocabulary and carry an operation
 //! label only: no SQL text, no values.
@@ -119,9 +124,22 @@ pub struct SuggestionAccepted {
     pub policy: ActivePolicy,
 }
 
-/// Why an acceptance did not commit. Every variant means nothing was
-/// written: not the rule, not the history row, not the outbox row, not
-/// the transition.
+/// Why an acceptance did not commit. Every variant except one means
+/// nothing was written: not the rule, not the history row, not the outbox
+/// row, not the transition -- the transaction refused before or during its
+/// work and rolled back, so the two halves stay together.
+///
+/// The exception is a [`AcceptRefused::Store`] (or
+/// [`PolicyCommitError::Store`]) raised by the `COMMIT` itself: a commit
+/// whose acknowledgement is lost to a connection reset, a terminated
+/// backend, or a timeout is *indeterminate*, not negative. The server may
+/// have committed everything. What still holds is that the halves never
+/// separate -- either all of the rule, the history row, the outbox row and
+/// the transition are durable, or none of them are -- so a caller that
+/// reads the suggestion back learns which happened. The audit events are
+/// not emitted in that case, which is why the outbox row committed inside
+/// the transaction, not the event, is the durable record (HA state model
+/// rule 2).
 #[derive(Debug)]
 pub enum AcceptRefused {
     /// The suggestion is not Open, or is not at the expected revision;
@@ -476,6 +494,7 @@ pub(crate) async fn transition_suggestion_with(
         }
     }
     let transitioned_at = utc_timestamp_rfc3339();
+    let (from_state, also_from_state) = expected.bound_states();
     let row = client
         .query_opt(
             &format!(
@@ -486,7 +505,7 @@ pub(crate) async fn transition_suggestion_with(
                      transitioned_by = $4,
                      revision = revision + 1
                  WHERE id = $1
-                   AND state = $5
+                   AND (state = $5 OR state = $7)
                    AND ($6::bigint IS NULL OR revision = $6::bigint)
                  RETURNING {RULE_SUGGESTION_COLUMNS}"
             ),
@@ -495,8 +514,9 @@ pub(crate) async fn transition_suggestion_with(
                 &state.as_str(),
                 &transitioned_at,
                 &transitioned_by,
-                &expected.from_state.as_str(),
+                &from_state.as_str(),
                 &expected.revision,
+                &also_from_state.as_str(),
             ],
         )
         .await

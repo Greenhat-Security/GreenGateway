@@ -565,7 +565,7 @@ impl DiscoveryReadStore for PostgresDiscoveryReadStore {
     }
 
     /// One conditional statement: the predicate is the id, the expected
-    /// state, and (when given) the expected revision. Zero rows is a
+    /// state(s), and (when given) the expected revision. Zero rows is a
     /// refusal carrying the row as it is now, or `NotFound`.
     async fn transition_signal(
         &self,
@@ -576,6 +576,7 @@ impl DiscoveryReadStore for PostgresDiscoveryReadStore {
     ) -> Result<TransitionOutcome<Signal>, DiscoveryQueryError> {
         let operation = OPERATION_TRANSITION_SIGNAL;
         let transitioned_at = utc_timestamp_rfc3339();
+        let (from_state, also_from_state) = expected.bound_states();
         let client = self.client().await?;
         let row = client
             .query_opt(
@@ -587,7 +588,7 @@ impl DiscoveryReadStore for PostgresDiscoveryReadStore {
                          transitioned_by = $4,
                          revision = revision + 1
                      WHERE id = $1
-                       AND state = $5
+                       AND (state = $5 OR state = $7)
                        AND ($6::bigint IS NULL OR revision = $6::bigint)
                      RETURNING {SIGNAL_COLUMNS}"
                 ),
@@ -596,8 +597,9 @@ impl DiscoveryReadStore for PostgresDiscoveryReadStore {
                     &state.as_str(),
                     &transitioned_at,
                     &transitioned_by,
-                    &expected.from_state.as_str(),
+                    &from_state.as_str(),
                     &expected.revision,
+                    &also_from_state.as_str(),
                 ],
             )
             .await
@@ -694,9 +696,11 @@ const AGGREGATE_COLUMNS: &str = "a.method, a.endpoint_template, a.first_seen, a.
 /// SQLite store's conditional write, statement for statement. A mark is an
 /// upsert whose predicate is the expected revision (`None` replaces at
 /// revision + 1, `UNREVIEWED_REVISION` inserts only when no row exists, any
-/// other value updates only the row at that revision); a clear deletes only
-/// the row at the expected revision. Zero rows is a refusal carrying the
-/// review as stored now.
+/// other value updates only the row at that revision); a clear nulls
+/// `reviewed_at` on the row at the expected revision instead of deleting
+/// it, so the endpoint's review revision only ever increases and a stale
+/// `If-Match` from an earlier review cannot match a later one. Zero rows
+/// is a refusal carrying the review as stored now.
 async fn set_endpoint_review_transaction(
     client: &deadpool_postgres::Object,
     method: &str,
@@ -778,29 +782,27 @@ async fn set_endpoint_review_transaction(
             })),
         }
     } else {
-        let deleted = match expected_revision {
-            None => client
-                .execute(
-                    "DELETE FROM greengateway.discovery_endpoint_reviews
-                     WHERE method = $1 AND endpoint_template = $2",
-                    &[&method, &endpoint_template],
-                )
-                .await
-                .map_err(|error| classify_query(error, operation))?,
-            Some(expected) => client
-                .execute(
-                    "DELETE FROM greengateway.discovery_endpoint_reviews
-                     WHERE method = $1 AND endpoint_template = $2 AND revision = $3",
-                    &[&method, &endpoint_template, &expected],
-                )
-                .await
-                .map_err(|error| classify_query(error, operation))?,
-        };
-        if deleted > 0 {
-            return Ok(TransitionOutcome::Applied(EndpointReviewState::unreviewed()));
-        }
+        let cleared = client
+            .execute(
+                "UPDATE greengateway.discovery_endpoint_reviews
+                 SET reviewed_at = NULL,
+                     reviewed_by = NULL,
+                     revision = revision + 1
+                 WHERE method = $1 AND endpoint_template = $2
+                   AND reviewed_at IS NOT NULL
+                   AND ($3::bigint IS NULL OR revision = $3::bigint)",
+                &[&method, &endpoint_template, &expected_revision],
+            )
+            .await
+            .map_err(|error| classify_query(error, operation))?;
         let current = load_review(client, method, endpoint_template, operation).await?;
-        if !current.reviewed && matches!(expected_revision, None | Some(UNREVIEWED_REVISION)) {
+        if cleared > 0 {
+            return Ok(TransitionOutcome::Applied(current));
+        }
+        // Nothing to clear: applying only when the endpoint is unreviewed
+        // AT the revision the caller expected keeps a stale expectation
+        // from passing as an idempotent no-op.
+        if !current.reviewed && expected_revision.unwrap_or(current.revision) == current.revision {
             return Ok(TransitionOutcome::Applied(current));
         }
         Ok(TransitionOutcome::Refused(TransitionRefused { current }))
@@ -825,12 +827,18 @@ async fn load_review(
         .await
         .map_err(|error| classify_query(error, operation))?;
     match row {
-        Some(row) => Ok(EndpointReviewState {
-            reviewed: true,
-            reviewed_at: Some(column(&row, 0, operation)?),
-            reviewed_by: column(&row, 1, operation)?,
-            revision: column(&row, 2, operation)?,
-        }),
+        // A row whose review was cleared keeps its revision and reads as
+        // unreviewed.
+        Some(row) => {
+            let reviewed_at: Option<String> = column(&row, 0, operation)?;
+            let reviewed_by: Option<String> = column(&row, 1, operation)?;
+            Ok(EndpointReviewState {
+                reviewed: reviewed_at.is_some(),
+                reviewed_by: reviewed_at.as_ref().and(reviewed_by),
+                reviewed_at,
+                revision: column(&row, 2, operation)?,
+            })
+        }
         None => Ok(EndpointReviewState::unreviewed()),
     }
 }

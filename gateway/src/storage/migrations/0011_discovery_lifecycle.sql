@@ -20,13 +20,23 @@
 --   value the admin API exposes as the row's ETag-style `revision` and
 --   accepts back as the expected value; it is per row, never a shared
 --   counter, so it says nothing about ordering across rows.
--- - An endpoint review's revision lives with the review row: clearing a
---   review deletes the row (the migration 9 shape the reads depend on),
---   and a later mark starts a new row at 1. The unreviewed state is
---   reported as revision 0, so "expect 0" is the precondition for the
---   first mark and two first marks get exactly one winner.
+-- - An endpoint review's revision lives with the review row, and that row
+--   outlives the review: clearing one nulls reviewed_at and bumps the
+--   revision instead of deleting the row, so an endpoint's review revision
+--   only ever increases. Deleting it would restart revisions at 1, and a
+--   stale "If-Match: 1" held against a review that has since been cleared
+--   would then match an unrelated later one and overwrite it -- the ABA the
+--   precondition exists to refuse. A row with a NULL reviewed_at reads
+--   exactly as no row at all: every read already spells "unreviewed"
+--   "reviewed_at IS NULL". An endpoint that was never reviewed has no row
+--   and reports revision 0, so "expect 0" is the precondition for the very
+--   first mark and two first marks get exactly one winner; after a clear
+--   the endpoint is unreviewed at a non-zero revision, and re-marking it
+--   expects THAT revision.
 --
--- Standalone SQLite adds the same columns in place on open.
+-- Standalone SQLite adds the same columns in place on open, and rebuilds a
+-- review table that predates the nullable reviewed_at (SQLite cannot drop a
+-- column constraint in place).
 
 ALTER TABLE greengateway.discovery_signals
     ADD COLUMN revision bigint NOT NULL DEFAULT 1 CHECK (revision >= 1);
@@ -36,3 +46,7 @@ ALTER TABLE greengateway.discovery_rule_suggestions
 
 ALTER TABLE greengateway.discovery_endpoint_reviews
     ADD COLUMN revision bigint NOT NULL DEFAULT 1 CHECK (revision >= 1);
+
+-- A cleared review keeps its row (and its revision) with no reviewed_at.
+ALTER TABLE greengateway.discovery_endpoint_reviews
+    ALTER COLUMN reviewed_at DROP NOT NULL;

@@ -19,10 +19,20 @@
 use serde::Serialize;
 
 /// What a transition requires of the row before it applies: the lifecycle
-/// state it must be in, and optionally the exact revision it must carry.
+/// state(s) it may be in, and optionally the exact revision it must carry.
+///
+/// Most transitions leave exactly one state, but dismissal is reachable
+/// from more than one (an operator who acknowledged a signal must still be
+/// able to clear it), so the predicate accepts an optional second
+/// from-state. Two accepted states still give exactly one winner: the
+/// statement moves the row out of both of them, so the loser's predicate
+/// matches nothing.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct TransitionPrecondition<S> {
     pub from_state: S,
+    /// A second state the transition also applies from; `None` means only
+    /// `from_state`.
+    pub also_from_state: Option<S>,
     pub revision: Option<i64>,
 }
 
@@ -30,13 +40,39 @@ impl<S> TransitionPrecondition<S> {
     pub fn from_state(from_state: S) -> Self {
         Self {
             from_state,
+            also_from_state: None,
             revision: None,
         }
+    }
+
+    /// Also apply from `state`; the transition still refuses every other
+    /// state.
+    pub fn or_from_state(mut self, state: S) -> Self {
+        self.also_from_state = Some(state);
+        self
     }
 
     pub fn with_revision(mut self, revision: Option<i64>) -> Self {
         self.revision = revision;
         self
+    }
+}
+
+impl<S: Copy + PartialEq> TransitionPrecondition<S> {
+    /// Whether `state` satisfies the from-state half of the predicate; the
+    /// revision half is the statement's own business.
+    pub fn accepts(&self, state: S) -> bool {
+        self.from_state == state || self.also_from_state == Some(state)
+    }
+
+    /// The two states the SQL predicate binds. Without a second one the
+    /// first is repeated, so `state = $a OR state = $b` is always well
+    /// formed and always references both parameters.
+    pub fn bound_states(&self) -> (S, S) {
+        (
+            self.from_state,
+            self.also_from_state.unwrap_or(self.from_state),
+        )
     }
 }
 
@@ -159,5 +195,20 @@ mod tests {
         assert_eq!(precondition.from_state, "open");
         assert_eq!(precondition.revision, Some(3));
         assert_eq!(TransitionPrecondition::from_state("open").revision, None);
+    }
+
+    #[test]
+    fn a_second_from_state_is_accepted_and_bound_and_no_others_are() {
+        let one = TransitionPrecondition::from_state("open");
+        assert!(one.accepts("open"));
+        assert!(!one.accepts("acknowledged"));
+        assert_eq!(one.bound_states(), ("open", "open"));
+
+        let two = TransitionPrecondition::from_state("open").or_from_state("acknowledged");
+        assert!(two.accepts("open"));
+        assert!(two.accepts("acknowledged"));
+        assert!(!two.accepts("dismissed"));
+        assert_eq!(two.bound_states(), ("open", "acknowledged"));
+        assert_eq!(two.with_revision(Some(4)).revision, Some(4));
     }
 }

@@ -1360,6 +1360,7 @@ impl RuleSuggestionStore {
                 return Err(RuleSuggestionError::UnsafeBaselineSuggestion { id: suggestion.id });
             }
         }
+        let (from_state, also_from_state) = expected.bound_states();
         let updated = connection
             .execute(
                 r#"
@@ -1370,7 +1371,7 @@ impl RuleSuggestionStore {
                     transitioned_by = ?4,
                     revision = revision + 1
                 WHERE id = ?1
-                  AND state = ?5
+                  AND (state = ?5 OR state = ?7)
                   AND (?6 IS NULL OR revision = ?6)
                 "#,
                 params![
@@ -1378,8 +1379,9 @@ impl RuleSuggestionStore {
                     state.as_str(),
                     transitioned_at,
                     transitioned_by,
-                    expected.from_state.as_str(),
+                    from_state.as_str(),
                     expected.revision,
+                    also_from_state.as_str(),
                 ],
             )
             .map_err(|source| RuleSuggestionError::Sqlite {

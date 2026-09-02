@@ -544,6 +544,19 @@ struct SignalsAdminState {
 struct SuggestionsAdminState {
     suggestion_engine: Option<discovery::suggestions::SuggestionEngineHandle>,
     policy: PolicyAdminState,
+    /// Serializes suggestion lifecycle writes within this process (issue
+    /// #241, PR 12). Standalone acceptance is three steps -- read the
+    /// suggestion, write the policy, transition -- and the policy write is
+    /// long (file, history, audit). Without this lock a dismissal arriving
+    /// mid-acceptance moves the row, the acceptance's conditional
+    /// transition is then refused, and the deployment is left with the
+    /// rule installed for a dismissed suggestion: the partial success the
+    /// HA state model's rule 7 forbids. One process serves many concurrent
+    /// requests, so "one process cannot race itself" is only true when
+    /// something makes it true; this is that something. Cluster mode does
+    /// not depend on it -- its authority is the acceptance transaction's
+    /// `FOR UPDATE` lock, which also excludes the other replicas.
+    lifecycle_guard: Arc<tokio::sync::Mutex<()>>,
 }
 
 #[derive(Clone)]
@@ -3634,6 +3647,7 @@ fn gateway_app_with_process_started_at_and_overrides(
     let suggestions_admin_state = SuggestionsAdminState {
         suggestion_engine: rule_suggestion_engine,
         policy: policy_admin_state.clone(),
+        lifecycle_guard: Arc::new(tokio::sync::Mutex::new(())),
     };
     let principal_admin_state = PrincipalAdminState {
         directory: principal_directory,
@@ -8838,12 +8852,19 @@ async fn signal_transition_endpoint(
         Ok(expected_revision) => expected_revision,
         Err(response) => return *response,
     };
-    // Acknowledge and dismiss are transitions out of Open: a signal another
-    // admin already moved (on this replica or any other) is refused with
-    // its current row, never overwritten.
+    // Acknowledge leaves Open; dismiss also leaves Acknowledged, so an
+    // operator who acknowledged a signal can still clear it (the state it
+    // cannot leave is Dismissed). Either way a signal another admin
+    // already moved out of the accepted states -- on this replica or any
+    // other -- is refused with its current row, never overwritten.
     let expected = discovery::lifecycle::TransitionPrecondition::from_state(
         discovery::signals::SignalLifecycleState::Open,
-    )
+    );
+    let expected = if lifecycle_state == discovery::signals::SignalLifecycleState::Dismissed {
+        expected.or_from_state(discovery::signals::SignalLifecycleState::Acknowledged)
+    } else {
+        expected
+    }
     .with_revision(expected_revision);
     let signal = match discovery_store
         .transition_signal(&id, lifecycle_state, Some(&principal.user_id), expected)
@@ -8852,13 +8873,13 @@ async fn signal_transition_endpoint(
         Ok(discovery::lifecycle::TransitionOutcome::Applied(signal)) => signal,
         Ok(discovery::lifecycle::TransitionOutcome::Refused(refused)) => {
             let current = refused.current;
-            let reason = if current.state == discovery::signals::SignalLifecycleState::Open {
+            let reason = if expected.accepts(current.state) {
                 "signal_revision_mismatch"
             } else {
                 "signal_not_open"
             };
             return lifecycle_transition_refused(
-                "signal is not open at the expected revision",
+                "signal is not in a state this transition leaves, or not at the expected revision",
                 reason,
                 "signal",
                 &current,
@@ -9039,7 +9060,14 @@ async fn rule_suggestions_generate_endpoint(
     let Some(suggestion_engine) = state.suggestion_engine.as_ref() else {
         return suggestions_discovery_not_configured();
     };
-    let policy = rbac_state.current_policy();
+    // The authority's policy, not this replica's snapshot: generation
+    // filters candidates the policy already covers, and a suggestion minted
+    // against a stale snapshot is never re-evaluated (see
+    // [`authoritative_policy`]).
+    let policy = match authoritative_policy(&state.policy, rbac_state).await {
+        Ok(policy) => policy,
+        Err(response) => return *response,
+    };
 
     // Suggestion generation scans the audit and discovery stores: the
     // standalone handle runs that on the blocking pool, the cluster handle
@@ -9091,6 +9119,12 @@ async fn rule_suggestion_accept_endpoint(
         Ok(expected_revision) => expected_revision,
         Err(response) => return *response,
     };
+    // Held until this request has both written the policy and moved the
+    // suggestion (issue #241, PR 12). Every other suggestion lifecycle
+    // write in this process takes the same lock, so a concurrent dismissal
+    // cannot land between the two halves of an acceptance and leave the
+    // rule installed for a suggestion that reads `dismissed`.
+    let _lifecycle_guard = state.lifecycle_guard.lock().await;
     let suggestion = match suggestion_engine.get_suggestion(id.to_owned()).await {
         Ok(Some(suggestion)) => suggestion,
         Ok(None) => return not_found("suggestion was not found"),
@@ -9187,8 +9221,12 @@ async fn rule_suggestion_accept_endpoint(
 
     // Standalone acceptance is policy write, then the conditional
     // transition against the revision this handler validated (issue #241,
-    // PR 12). One process cannot actually lose that race; if it ever did,
-    // the rule stays and the caller learns the suggestion moved.
+    // PR 12). Both steps run under `lifecycle_guard`, taken above and by
+    // every other suggestion lifecycle write in this process, so nothing
+    // can move the row in between: the transition below is refused only if
+    // the row moved before this request read it, which the check above
+    // already answered. If it is ever refused anyway the rule stays and
+    // the caller learns the suggestion moved.
     let expected = discovery::lifecycle::TransitionPrecondition::from_state(
         discovery::suggestions::RuleSuggestionLifecycleState::Open,
     )
@@ -9348,8 +9386,12 @@ async fn accept_suggestion_in_cluster(
 }
 
 /// Every way an atomic acceptance can decline, answered as the standalone
-/// path answers the same condition. Each variant means nothing was
-/// written -- no rule, no history row, no outbox row, no transition.
+/// path answers the same condition. Each variant means the rule, the
+/// history row, the outbox row and the transition were all rolled back
+/// together -- with one caveat carried by the store's `AcceptRefused`
+/// documentation: a store failure raised by the `COMMIT` itself leaves the
+/// outcome indeterminate rather than negative (the halves still never
+/// separate), and the audit events are not emitted for it.
 #[cfg(feature = "postgres")]
 fn suggestion_acceptance_refused_response(
     refused: storage::postgres_discovery_lifecycle::AcceptRefused,
@@ -9377,14 +9419,14 @@ fn suggestion_acceptance_refused_response(
         AcceptRefused::Policy(storage::PolicyCommitError::Store(error)) => {
             tracing::error!(
                 error = %error,
-                "policy commit inside suggestion acceptance failed; nothing was written"
+                "policy commit inside suggestion acceptance failed; both halves rolled back, unless the COMMIT acknowledgement itself was lost"
             );
             service_unavailable("policy mutation could not be committed")
         }
         AcceptRefused::Store(error) => {
             tracing::error!(
                 error = %error,
-                "rule suggestion acceptance failed; nothing was written"
+                "rule suggestion acceptance failed; both halves rolled back, unless the COMMIT acknowledgement itself was lost"
             );
             internal_server_error("suggestion acceptance failed")
         }
@@ -9438,11 +9480,17 @@ async fn rule_suggestion_transition_endpoint(
         Err(response) => return *response,
     };
     // The "must be Open" check is the transition's own predicate (issue
-    // #241, PR 12), so two replicas cannot both pass it.
+    // #241, PR 12), so two replicas cannot both pass it. The lock is the
+    // one an in-flight acceptance holds across its policy write and its
+    // own transition, so this dismissal either happens entirely before
+    // that acceptance reads the row (which then loses on the state
+    // predicate, having written nothing) or entirely after it (and is
+    // refused, the rule already installed).
     let expected = discovery::lifecycle::TransitionPrecondition::from_state(
         discovery::suggestions::RuleSuggestionLifecycleState::Open,
     )
     .with_revision(expected_revision);
+    let _lifecycle_guard = state.lifecycle_guard.lock().await;
     let suggestion = match suggestion_engine
         .transition_suggestion(
             id.to_owned(),
@@ -12832,6 +12880,47 @@ fn require_matching_if_match(
         ))),
         Err(error) => Err(Box::new(if_match_error_response(error))),
     }
+}
+
+/// The current policy as its authority sees it, with no precondition:
+/// cluster mode reads the active document from the control plane,
+/// standalone reads the compiled snapshot, which IS the authority there.
+///
+/// Suggestion generation needs this rather than the local snapshot (issue
+/// #241, PR 12). Generation suppresses candidates the policy already
+/// covers, and a replica's snapshot converges only when the security
+/// revision reconciler installs it; generating from a stale one mints
+/// suggestions for rules another replica has already committed. Those
+/// suggestions are stored by identity and never re-evaluated against a
+/// later policy, so they would stay open until an admin dismisses them,
+/// and accepting one would append a duplicate rule.
+async fn authoritative_policy(
+    state: &PolicyAdminState,
+    rbac_state: &middleware::rbac::RbacState,
+) -> ResponseResult<rbac::Policy> {
+    #[cfg(feature = "postgres")]
+    if let Some(control_plane) = state.control_plane.as_ref() {
+        return match control_plane.active().await {
+            Ok(Some(active)) => Ok(active.policy),
+            // Startup refuses an uninitialized deployment and the pointer
+            // is append-only, so both arms are defensive fail-closed paths.
+            Ok(None) => {
+                tracing::error!("policy control plane has no active document");
+                Err(Box::new(service_unavailable(
+                    "policy control plane unavailable",
+                )))
+            }
+            Err(error) => {
+                tracing::error!(error = %error, "policy control plane read failed");
+                Err(Box::new(service_unavailable(
+                    "policy control plane unavailable",
+                )))
+            }
+        };
+    }
+    #[cfg(not(feature = "postgres"))]
+    let _ = state;
+    Ok(rbac_state.current_policy())
 }
 
 /// The current policy as its authority sees it, behind the request's
@@ -33563,6 +33652,118 @@ paths:
         assert_eq!(signal_ids(&dismissed_page), vec!["sig-dismiss".to_owned()]);
     }
 
+    /// Dismissal is reachable from `acknowledged`, not only from `open`
+    /// (issue #241, PR 12): an operator who acknowledged a signal and then
+    /// decides to clear it must not be told the signal is not open, which
+    /// would strand it in `acknowledged` forever. The conditional
+    /// transition still gives exactly one winner -- the second dismiss is
+    /// refused -- and a stale `If-Match` is still refused.
+    #[tokio::test]
+    async fn an_acknowledged_signal_can_still_be_dismissed_and_only_once() {
+        let discovery_db = TempDb::new("signals-ack-then-dismiss");
+        create_signal_schema(&discovery_db.path);
+        insert_signal(
+            &discovery_db.path,
+            SignalSeed {
+                id: "sig-ack",
+                signal_type: "new_endpoint_seen",
+                method: "GET",
+                endpoint_template: "/ack/{id}",
+                explanation:
+                    "New endpoint observed: GET /ack/{id} was first seen at 2024-06-01T00:00:00Z.",
+                evidence: json!({
+                    "first_seen": "2024-06-01T00:00:00Z",
+                    "initial_call_count": 1
+                }),
+                state: "open",
+                created_at: "2024-06-01T00:00:00Z",
+                transitioned_at: None,
+                transitioned_by: None,
+            },
+        );
+        let (router, _policy) = signals_admin_router(Some(&discovery_db.path));
+        let request = |uri: &str, if_match: Option<&str>| {
+            let mut builder = Request::builder()
+                .method(Method::POST)
+                .uri(uri)
+                .header(header::CONTENT_TYPE, "application/json")
+                .header(header::AUTHORIZATION, "Bearer test-token");
+            if let Some(if_match) = if_match {
+                builder = builder.header(header::IF_MATCH, if_match);
+            }
+            let mut request = builder.body(Body::empty()).expect("request should build");
+            request
+                .extensions_mut()
+                .insert(test_principal(&["signals-writer"]));
+            request
+        };
+
+        let acknowledged = router
+            .clone()
+            .oneshot(request("/v1/admin/signals/sig-ack/acknowledge", Some("1")))
+            .await
+            .expect("acknowledge should complete");
+        assert_eq!(acknowledged.status(), StatusCode::OK);
+        let acknowledged = json_body(acknowledged).await;
+        assert_eq!(acknowledged["state"], json!("acknowledged"));
+        assert_eq!(acknowledged["revision"], json!(2));
+
+        // The revision predicate still holds over the second from-state.
+        let stale = router
+            .clone()
+            .oneshot(request("/v1/admin/signals/sig-ack/dismiss", Some("1")))
+            .await
+            .expect("stale dismiss should complete");
+        assert_eq!(stale.status(), StatusCode::CONFLICT);
+        let stale = json_body(stale).await;
+        assert_eq!(stale["reason"], json!("signal_revision_mismatch"));
+        assert_eq!(stale["signal"]["state"], json!("acknowledged"));
+        assert_eq!(stale["signal"]["revision"], json!(2));
+
+        let dismissed = router
+            .clone()
+            .oneshot(request("/v1/admin/signals/sig-ack/dismiss", Some("2")))
+            .await
+            .expect("dismiss should complete");
+        assert_eq!(dismissed.status(), StatusCode::OK);
+        let dismissed = json_body(dismissed).await;
+        assert_eq!(dismissed["state"], json!("dismissed"));
+        assert_eq!(dismissed["revision"], json!(3));
+        assert_eq!(dismissed["transitioned_by"], json!("user-123"));
+
+        // Dismissed is terminal: the predicate accepts open and
+        // acknowledged, and nothing else.
+        let repeat = router
+            .clone()
+            .oneshot(request("/v1/admin/signals/sig-ack/dismiss", None))
+            .await
+            .expect("repeat dismiss should complete");
+        assert_eq!(repeat.status(), StatusCode::CONFLICT);
+        let repeat = json_body(repeat).await;
+        assert_eq!(repeat["reason"], json!("signal_not_open"));
+        assert_eq!(repeat["signal"]["revision"], json!(3));
+
+        // Acknowledge still leaves only `open`.
+        let reacknowledge = router
+            .clone()
+            .oneshot(request("/v1/admin/signals/sig-ack/acknowledge", None))
+            .await
+            .expect("acknowledge of a dismissed signal should complete");
+        assert_eq!(reacknowledge.status(), StatusCode::CONFLICT);
+        assert_eq!(
+            json_body(reacknowledge).await["reason"],
+            json!("signal_not_open")
+        );
+
+        let dismissed_page = signals_json(
+            &router,
+            "/v1/admin/signals?state=dismissed",
+            Some(test_principal(&["signals-reader"])),
+        )
+        .await;
+        assert_eq!(signal_ids(&dismissed_page), vec!["sig-ack".to_owned()]);
+    }
+
     #[tokio::test]
     async fn suggestions_admin_list_filters_paginates_and_requires_read_permission() {
         let discovery_db = TempDb::new("suggestions-list");
@@ -33743,6 +33944,7 @@ paths:
                     client_ip_policy: client_ip::ClientIpPolicy::default(),
                     max_body_size: 1024 * 1024,
                 },
+                lifecycle_guard: Arc::new(tokio::sync::Mutex::new(())),
             });
         let not_configured_error =
             "suggestions API requires DISCOVERY_SQLITE_PATH to be configured";
@@ -34707,6 +34909,115 @@ paths:
         .await;
         assert_eq!(suggestion_ids(&open_page), vec!["sug-stale".to_owned()]);
         assert!(open_page["suggestions"][0]["transitioned_at"].is_null());
+    }
+
+    /// Standalone acceptance and a concurrent dismissal of the same
+    /// suggestion cannot produce a partial success (issue #241, PR 12; the
+    /// HA state model's rule 7). One process serves both requests at once,
+    /// and acceptance is a read, a long policy write, and a transition, so
+    /// without a lock the dismissal lands in the middle and the deployment
+    /// keeps an access-granting rule whose suggestion reads `dismissed`.
+    /// Whichever request wins, the rule and the suggestion agree.
+    #[tokio::test]
+    async fn a_concurrent_dismiss_never_leaves_the_rule_installed_for_a_dismissed_suggestion() {
+        let discovery_db = TempDb::new("suggestions-accept-dismiss-race");
+        create_rule_suggestion_schema(&discovery_db.path);
+        insert_rule_suggestion(
+            &discovery_db.path,
+            RuleSuggestionSeed {
+                id: "sug-race",
+                suggestion_type: "baseline_allow",
+                method: "GET",
+                path_pattern: "/raced/{id}",
+                role: Some("raced-reader"),
+                action: "allow",
+                rationale: "Observed raced-reader calls to GET /raced/{id}.",
+                evidence: json!({ "observation_count": 4 }),
+                state: "open",
+                created_at: "2024-06-01T00:00:00Z",
+                transitioned_at: None,
+                transitioned_by: None,
+                source_signal_id: None,
+            },
+        );
+        let policy = TempPolicyFile::new(&suggestions_policy_document_string());
+        let router = suggestions_admin_router_with_policy(
+            Some(&discovery_db.path),
+            None,
+            &policy,
+            test_audit_log(),
+        );
+        let current_etag = suggestions_policy_etag(&router).await;
+
+        let accept = router.clone().oneshot(suggestions_admin_request(
+            Method::POST,
+            "/v1/admin/suggestions/sug-race/accept",
+            Some(test_principal(&["suggestions-policy-writer"])),
+            None,
+            Some(&current_etag),
+        ));
+        let dismiss = router.clone().oneshot(suggestions_admin_request(
+            Method::POST,
+            "/v1/admin/suggestions/sug-race/dismiss",
+            Some(test_principal(&["suggestions-writer"])),
+            None,
+            None,
+        ));
+        let (accept, dismiss) = tokio::join!(accept, dismiss);
+        let accept = accept.expect("accept request should complete");
+        let dismiss = dismiss.expect("dismiss request should complete");
+        let accept_status = accept.status();
+        let dismiss_status = dismiss.status();
+        assert!(
+            accept_status == StatusCode::CREATED || dismiss_status == StatusCode::OK,
+            "one of the two must win: accept={accept_status} dismiss={dismiss_status}"
+        );
+        assert!(
+            accept_status != StatusCode::CREATED || dismiss_status != StatusCode::OK,
+            "both cannot win: accept={accept_status} dismiss={dismiss_status}"
+        );
+
+        let policy_body = json_body(
+            router
+                .clone()
+                .oneshot(suggestions_admin_request(
+                    Method::GET,
+                    POLICY_ADMIN_ROUTE,
+                    Some(test_principal(&["policy-reader"])),
+                    None,
+                    None,
+                ))
+                .await
+                .expect("policy GET should complete"),
+        )
+        .await;
+        let rules = policy_body["rules"]
+            .as_array()
+            .expect("rules should be an array");
+        let listed = suggestions_json(
+            &router,
+            "/v1/admin/suggestions",
+            Some(test_principal(&["suggestions-reader"])),
+        )
+        .await;
+        let state = listed["suggestions"][0]["state"]
+            .as_str()
+            .expect("the suggestion should still be listed")
+            .to_owned();
+
+        if accept_status == StatusCode::CREATED {
+            assert_eq!(state, "accepted");
+            assert_eq!(rules.len(), 1, "{policy_body}");
+            assert_eq!(rules[0]["path"], json!("/raced/{id}"));
+            assert_eq!(dismiss_status, StatusCode::CONFLICT);
+        } else {
+            assert_eq!(state, "dismissed");
+            assert!(
+                rules.is_empty(),
+                "a dismissed suggestion must not leave its rule installed: {policy_body}"
+            );
+            assert_eq!(accept_status, StatusCode::CONFLICT);
+        }
     }
 
     #[tokio::test]
@@ -44869,6 +45180,7 @@ O2gecI9QwDJNpm29J9wJB2F8
                             client_ip_policy: client_ip::ClientIpPolicy::default(),
                             max_body_size: 1024 * 1024,
                         },
+                        lifecycle_guard: Arc::new(tokio::sync::Mutex::new(())),
                     });
 
             ClusterSuggestionsHarness {
@@ -45155,6 +45467,38 @@ O2gecI9QwDJNpm29J9wJB2F8
             assert_eq!(repeat["reason"], json!("signal_not_open"));
             assert_eq!(repeat["signal"]["revision"], json!(2));
 
+            // Dismissal leaves `acknowledged` too, so an acknowledged
+            // signal is not stranded; it is still refused a second time.
+            let dismissed_after_acknowledge = router
+                .clone()
+                .oneshot(signal_request(
+                    Method::POST,
+                    "/v1/admin/signals/sig-ack/dismiss",
+                    "signals-writer",
+                    Some("2"),
+                ))
+                .await
+                .expect("dismiss after acknowledge should complete");
+            assert_eq!(dismissed_after_acknowledge.status(), StatusCode::OK);
+            let dismissed_after_acknowledge = json_body(dismissed_after_acknowledge).await;
+            assert_eq!(dismissed_after_acknowledge["state"], json!("dismissed"));
+            assert_eq!(dismissed_after_acknowledge["revision"], json!(3));
+            let repeat_dismiss = router
+                .clone()
+                .oneshot(signal_request(
+                    Method::POST,
+                    "/v1/admin/signals/sig-ack/dismiss",
+                    "signals-writer",
+                    None,
+                ))
+                .await
+                .expect("repeat dismiss should complete");
+            assert_eq!(repeat_dismiss.status(), StatusCode::CONFLICT);
+            assert_eq!(
+                json_body(repeat_dismiss).await["reason"],
+                json!("signal_not_open")
+            );
+
             let dismissed = router
                 .clone()
                 .oneshot(signal_request(
@@ -45384,11 +45728,48 @@ O2gecI9QwDJNpm29J9wJB2F8
             assert_eq!(cleared.status(), StatusCode::OK);
             let cleared = json_body(cleared).await;
             assert_eq!(cleared["reviewed"], json!(false));
-            assert_eq!(cleared["revision"], json!(0));
+            // The review row outlives the review, so the revision goes UP;
+            // it never returns to 1 for a later review of this endpoint.
+            assert_eq!(cleared["revision"], json!(2));
 
             let endpoint = listed_endpoint(router.clone()).await;
             assert_eq!(endpoint["reviewed"], json!(false));
-            assert_eq!(endpoint["review_revision"], json!(0));
+            assert_eq!(endpoint["review_revision"], json!(2));
+
+            // An admin still holding the cleared review's revision -- or
+            // one that believes the endpoint was never reviewed -- cannot
+            // mark it: the conditional write refuses the stale generation
+            // instead of silently overwriting the next one.
+            for stale_expectation in ["1", "0"] {
+                let stale_remark = router
+                    .clone()
+                    .oneshot(review_request(
+                        "traffic-writer",
+                        "/reviewed/{id}",
+                        true,
+                        Some(stale_expectation),
+                    ))
+                    .await
+                    .expect("stale re-mark should complete");
+                assert_eq!(stale_remark.status(), StatusCode::CONFLICT);
+                let stale_remark = json_body(stale_remark).await;
+                assert_eq!(stale_remark["reason"], json!("review_revision_mismatch"));
+                assert_eq!(stale_remark["review"]["revision"], json!(2));
+            }
+            let remarked = router
+                .clone()
+                .oneshot(review_request(
+                    "traffic-writer",
+                    "/reviewed/{id}",
+                    true,
+                    Some("2"),
+                ))
+                .await
+                .expect("re-mark should complete");
+            assert_eq!(remarked.status(), StatusCode::OK);
+            let remarked = json_body(remarked).await;
+            assert_eq!(remarked["reviewed"], json!(true));
+            assert_eq!(remarked["revision"], json!(3));
 
             let missing = router
                 .clone()
@@ -45405,7 +45786,7 @@ O2gecI9QwDJNpm29J9wJB2F8
                         event.event_type == audit::event::TRAFFIC_ENDPOINT_REVIEW_CHANGED
                     })
                     .count()
-                    == 2
+                    == 3
             });
         }
 
@@ -45549,6 +45930,95 @@ O2gecI9QwDJNpm29J9wJB2F8
             let not_open = json_body(not_open).await;
             assert_eq!(not_open["reason"], json!("suggestion_not_open"));
             assert_eq!(not_open["suggestion"]["revision"], json!(2));
+        }
+
+        /// Generation filters against the policy AUTHORITY, not this
+        /// replica's snapshot (issue #241, PR 12). Another replica commits
+        /// a rule that covers the observed traffic; this replica has not
+        /// installed that revision yet. Generating here must still see the
+        /// endpoint as covered -- a suggestion minted from the stale
+        /// snapshot is stored by identity and never re-evaluated, so it
+        /// would stay open forever and accepting it would append a
+        /// duplicate rule.
+        #[tokio::test]
+        async fn cluster_generation_filters_against_the_authority_not_the_replica_snapshot() {
+            let Some(admin_dsn) = locator() else {
+                eprintln!("skipping: no test database locator; CI runs this test");
+                return;
+            };
+            let database = create_test_database(&admin_dsn).await;
+            let pool = migrated_pool(&database.dsn).await;
+            let audit_store = cluster_audit_store(&pool).await;
+            seed_baseline_generation_fixture(&pool, &audit_store).await;
+            let harness = cluster_suggestions_harness(&pool, audit_store).await;
+
+            // Another replica commits the covering rule. Nothing installs
+            // it here: this replica's snapshot still has no rules, exactly
+            // as it stands between a commit elsewhere and the security
+            // revision reconciler catching up.
+            let mut document: Value = serde_json::from_str(&suggestions_policy_document_string())
+                .expect("the seed policy should parse as JSON");
+            document["rules"] = json!([{
+                "methods": ["GET"],
+                "path": "/orders/{id}",
+                "principal": { "roles": ["orders-reader"] },
+                "action": "allow"
+            }]);
+            let covering = parse_policy_body(&axum::body::Bytes::from(document.to_string()))
+                .expect("the covering policy should parse");
+            let active = PolicyControlPlane::active(harness.policy_store.as_ref())
+                .await
+                .expect("active reads")
+                .expect("a policy is active");
+            let diff_summary = json!({ "action": "rule_created" });
+            PolicyControlPlane::commit(
+                harness.policy_store.as_ref(),
+                storage::PolicyCommitRequest {
+                    precondition: storage::PolicyCommitPrecondition::Expected {
+                        etag: active.etag.clone(),
+                    },
+                    candidate: &covering,
+                    actor_user_id: "other-replica",
+                    diff_summary: &diff_summary,
+                },
+            )
+            .await
+            .expect("the other replica's commit should apply");
+            assert!(
+                harness.rbac_state.current_policy().rules.is_empty(),
+                "this replica must still be on the pre-commit snapshot"
+            );
+
+            let generated = harness
+                .router
+                .clone()
+                .oneshot(suggestions_admin_request(
+                    Method::POST,
+                    SUGGESTIONS_GENERATE_ADMIN_ROUTE,
+                    Some(test_principal(&["suggestions-writer"])),
+                    None,
+                    None,
+                ))
+                .await
+                .expect("generate request should complete");
+            assert_eq!(generated.status(), StatusCode::OK);
+            let generated = json_body(generated).await;
+            assert_eq!(
+                generated["inserted_count"],
+                json!(0),
+                "the authority already covers this endpoint: {generated}"
+            );
+
+            let listed = suggestions_json(
+                &harness.router,
+                "/v1/admin/suggestions?state=open",
+                Some(test_principal(&["suggestions-reader"])),
+            )
+            .await;
+            assert!(
+                suggestion_ids(&listed).is_empty(),
+                "no suggestion may be stored for covered traffic: {listed}"
+            );
         }
 
         /// Cluster-mode acceptance end to end (issue #241, PR 12): one

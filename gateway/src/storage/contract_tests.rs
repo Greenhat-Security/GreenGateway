@@ -7021,7 +7021,11 @@ mod postgres_audit_tests {
         let database = create_test_database(&admin_dsn).await;
         let pool = migrated_limits_pool(&database).await;
         let ledger = Arc::new(member_store(&pool));
+        // Only the leader that must lapse gets a short TTL. The
+        // successor's lease has to outlive several round trips on a loaded
+        // box, and nothing here waits for IT to expire.
         let ttl = Duration::from_millis(500);
+        let successor_ttl = Duration::from_secs(60);
         let interval = Duration::from_secs(60);
         let runs_a = Arc::new(AtomicU64::new(0));
         let runs_b = Arc::new(AtomicU64::new(0));
@@ -7043,7 +7047,7 @@ mod postgres_audit_tests {
                 fail: true,
             })],
             interval,
-            ttl,
+            successor_ttl,
         );
         let acquired = |attempt: LeaseAttempt| match attempt {
             LeaseAttempt::Acquired(lease) => lease,
@@ -7172,7 +7176,12 @@ mod postgres_audit_tests {
         let database = create_test_database(&admin_dsn).await;
         let pool = migrated_limits_pool(&database).await;
         let ledger = Arc::new(member_store(&pool));
-        let ttl = Duration::from_millis(900);
+        // Long enough that no assertion here depends on wall-clock speed:
+        // nothing in this test waits for a lease to expire (the release is
+        // explicit), while the pass between acquisition and the ledger
+        // write is several round trips, so a short TTL made the second
+        // pass report `Stale` on a loaded box.
+        let ttl = Duration::from_secs(60);
         let interval = Duration::from_secs(60);
         let runs = Arc::new(AtomicU64::new(0));
         let (one_shot, one_shot_leases) = runner_with(
@@ -8447,24 +8456,54 @@ mod postgres_audit_tests {
         assert_eq!(detail.reviewed_by, winner.reviewed_by);
         assert_eq!(detail.review_revision, 1);
 
-        // Two clears of revision 1, racing: one deletes, the other is
-        // refused and sees no review.
+        // Two clears of revision 1, racing: one clears, the other is
+        // refused. The row survives the clear, carrying a HIGHER revision,
+        // so an endpoint's review revision never restarts.
         let (left, right) = tokio::join!(
             replica_a.set_endpoint_review("GET", "/reviewed", false, Some("admin-a"), Some(1)),
             replica_b.set_endpoint_review("GET", "/reviewed", false, Some("admin-b"), Some(1)),
         );
         let (cleared, seen_by_loser) =
             exactly_one_winner(left.expect("replica a"), right.expect("replica b"));
-        assert_eq!(cleared, EndpointReviewState::unreviewed());
-        assert_eq!(seen_by_loser, EndpointReviewState::unreviewed());
+        assert!(!cleared.reviewed);
+        assert_eq!(cleared.reviewed_at, None);
+        assert_eq!(cleared.reviewed_by, None);
+        assert_eq!(cleared.revision, 2);
+        assert!(!seen_by_loser.reviewed);
+        assert_eq!(seen_by_loser.revision, 2);
         assert_eq!(
             scalar_i64(
                 &pool_a,
-                "SELECT count(*) FROM greengateway.discovery_endpoint_reviews"
+                "SELECT count(*) FROM greengateway.discovery_endpoint_reviews
+                 WHERE reviewed_at IS NULL"
             )
             .await,
-            0
+            1
         );
+        let detail = replica_a
+            .get_endpoint_with_open_signal_summaries("GET", "/reviewed", 24, false)
+            .await
+            .expect("detail")
+            .expect("exists");
+        assert!(!detail.reviewed);
+        assert_eq!(detail.reviewed_by, None);
+        assert_eq!(detail.review_revision, 2);
+
+        // The generation that mattered: an admin still holding the FIRST
+        // review's revision cannot mark or clear the endpoint, and neither
+        // can one expecting it never to have been reviewed.
+        let aba_mark = replica_b
+            .set_endpoint_review("GET", "/reviewed", true, Some("admin-b"), Some(1))
+            .await
+            .expect("stale-generation mark")
+            .expect_refused("a revision from a cleared review is stale, not a match");
+        assert_eq!(aba_mark.revision, 2);
+        let aba_first_mark = replica_b
+            .set_endpoint_review("GET", "/reviewed", true, Some("admin-b"), expect_unreviewed)
+            .await
+            .expect("first-mark after a clear")
+            .expect_refused("the endpoint has a review history, so it is not unreviewed at 0");
+        assert_eq!(aba_first_mark.revision, 2);
 
         // Stale, exact, and unconditional re-marks.
         let remarked = replica_a
@@ -8472,7 +8511,7 @@ mod postgres_audit_tests {
             .await
             .expect("unconditional mark")
             .expect_applied("unconditional");
-        assert_eq!(remarked.revision, 1);
+        assert_eq!(remarked.revision, 3);
         let stale = replica_b
             .set_endpoint_review("GET", "/reviewed", true, Some("admin-b"), Some(7))
             .await
@@ -8480,46 +8519,66 @@ mod postgres_audit_tests {
             .expect_refused("stale");
         assert_eq!(stale.reviewed_by.as_deref(), Some("admin-a"));
         let exact = replica_b
-            .set_endpoint_review("GET", "/reviewed", true, Some("admin-b"), Some(1))
+            .set_endpoint_review("GET", "/reviewed", true, Some("admin-b"), Some(3))
             .await
             .expect("exact mark")
             .expect_applied("exact");
-        assert_eq!(exact.revision, 2);
+        assert_eq!(exact.revision, 4);
         assert_eq!(exact.reviewed_by.as_deref(), Some("admin-b"));
         let replaced = replica_a
             .set_endpoint_review("GET", "/reviewed", true, Some("admin-a"), None)
             .await
             .expect("unconditional replace")
             .expect_applied("unconditional");
-        assert_eq!(replaced.revision, 3);
+        assert_eq!(replaced.revision, 5);
 
-        // A clear names a revision too: a stale one deletes nothing.
+        // A clear names a revision too: a stale one clears nothing.
         let stale_clear = replica_b
             .set_endpoint_review("GET", "/reviewed", false, Some("admin-b"), Some(9))
             .await
             .expect("stale clear")
             .expect_refused("a stale clear is refused");
         assert!(stale_clear.reviewed);
-        assert_eq!(stale_clear.revision, 3);
+        assert_eq!(stale_clear.revision, 5);
 
-        // Clearing nothing while expecting nothing applies; an unknown
-        // endpoint is not found.
-        replica_a
+        // Clearing an already-unreviewed endpoint at the revision it
+        // actually carries is a no-op that applies; an unknown endpoint is
+        // not found.
+        let cleared = replica_a
             .set_endpoint_review("GET", "/reviewed", false, None, None)
             .await
             .expect("clear")
             .expect_applied("clear");
+        assert_eq!(cleared.revision, 6);
         let noop = replica_b
-            .set_endpoint_review("GET", "/reviewed", false, None, expect_unreviewed)
+            .set_endpoint_review("GET", "/reviewed", false, None, Some(6))
             .await
             .expect("no-op clear")
-            .expect_applied("clearing nothing, expecting nothing, applies");
-        assert_eq!(noop, EndpointReviewState::unreviewed());
+            .expect_applied("clearing nothing, expecting exactly that, applies");
+        assert!(!noop.reviewed);
+        assert_eq!(noop.revision, 6);
+        let stale_noop = replica_b
+            .set_endpoint_review("GET", "/reviewed", false, None, Some(1))
+            .await
+            .expect("stale clear of an already-cleared review")
+            .expect_refused("a stale expectation is not an idempotent no-op");
+        assert!(!stale_noop.reviewed);
+        assert_eq!(stale_noop.revision, 6);
         assert!(replica_a
             .set_endpoint_review("GET", "/missing", true, None, None)
             .await
             .expect("unknown endpoint")
             .is_not_found());
+
+        // An endpoint that never had a review is unreviewed at revision 0,
+        // and clearing it while expecting exactly that still applies.
+        seed_aggregate(&pool_a, "GET", "/never-reviewed").await;
+        let never = replica_a
+            .set_endpoint_review("GET", "/never-reviewed", false, None, expect_unreviewed)
+            .await
+            .expect("clear of a never-reviewed endpoint")
+            .expect_applied("nothing to clear, and nothing was expected");
+        assert_eq!(never, EndpointReviewState::unreviewed());
     }
 
     // ------------------------------------------------------------------
