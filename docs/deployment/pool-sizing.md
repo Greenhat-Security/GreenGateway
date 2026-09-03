@@ -1,6 +1,6 @@
 # Runbook: pool sizing and timeouts
 
-Companion to [the PostgreSQL deployment guide](postgres.md). Cluster mode is experimental and is not a supported HA configuration until the #241 release gate passes.
+Companion to [the PostgreSQL deployment guide](postgres.md). Cluster mode is a supported multi-replica configuration within the boundary [Supported cluster operation](postgres.md#supported-cluster-operation) draws, which names the release-gate suite behind each guarantee and states the non-goals just as explicitly.
 
 **The rule: the deployment must not be able to ask the database for more connections than it has.** Every replica opens its own pool against the one primary, so the ceiling is a property of the deployment, not of any replica, and a replica added without redoing this arithmetic is the one that exhausts `max_connections` for everybody.
 

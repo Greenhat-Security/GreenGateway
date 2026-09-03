@@ -38,27 +38,24 @@
 //!
 //! ## What the gate covers, and what it does not yet
 //!
-//! The #241 verification matrix names eight suite files. Four are here —
-//! `security_two_replica.rs`, `events_discovery_leader.rs`, `saturation.rs`
-//! and `secret_leak.rs` — plus `smoke.rs`, which is the harness's proof of
-//! itself. The rest, and the individual matrix rows that are not yet
-//! asserted, are listed here rather than left to be inferred from absence:
+//! The #241 verification matrix names eight suite files, and all eight are
+//! here — `security_two_replica.rs`, `events_discovery_leader.rs`,
+//! `saturation.rs`, `secret_leak.rs`, `failure_matrix.rs`,
+//! `import_drill.rs`, `rolling_upgrade.rs` and `performance.rs` — plus
+//! `smoke.rs`, which is the harness's proof of itself. The individual
+//! matrix rows that are *not* asserted are listed here rather than left to
+//! be inferred from absence:
 //!
-//! * `failure_matrix.rs` — needs the `/readyz` reasons and cluster status
-//!   API of #241 PR 14, which is not on `main`. Its rows are the reason
-//!   [`database::Database::set_read_only`],
-//!   [`database::Database::set_role_statement_timeout`],
-//!   [`replica::Replica::pause`] and [`replica::Replica::resume`] exist
-//!   here with no caller yet: the faults are built and proven to compile,
-//!   the assertions they feed are PR 14's.
-//! * `import_drill.rs` — drives the standalone import command of #241
-//!   PR 15, which is not on `main` either.
-//! * `rolling_upgrade.rs` and `performance.rs` — deferred to a later part
-//!   of this PR. The first has to build a previous release tag's binary and
-//!   run mixed-version replicas; the second is a nightly, ignored-by-default
-//!   benchmark with a JSON artifact. Neither is blocked on another PR;
-//!   both are simply not written yet, and the gate is not complete until
-//!   they are.
+//! * The mixed-version half of `rolling_upgrade.rs` — no released
+//!   GreenGateway binary supports cluster mode (v1.0.1 has no `postgres`
+//!   feature at all), so no pair of binaries can form one deployment.
+//!   That suite substitutes the *states* a newer version produces, names
+//!   each substitution, and carries a tripwire that fails the day a
+//!   cluster-capable release is tagged.
+//! * `performance.rs` is `#[ignore]`d by default and belongs to the
+//!   nightly workflow, not to the merge gate; the exception is its
+//!   documentation-coverage test, which needs no database and runs
+//!   everywhere.
 //! * The clock-skew row of `events_discovery_leader.rs` — the matrix asks
 //!   for a replica whose *wall clock* is skewed "via a test hook". No such
 //!   hook exists in the product, and adding one is a production change this
@@ -373,6 +370,41 @@ pub struct ClusterOptions {
     /// this: elsewhere a passwordless loopback DSN is one less thing to
     /// go wrong.
     pub database_password: Option<String>,
+    /// Attach the replicas to a database the caller created, migrated and
+    /// populated itself, instead of creating and seeding one.
+    ///
+    /// The import drill's target. `import-standalone` refuses a namespace
+    /// that already holds authoritative state, so a deployment the harness
+    /// had seeded a policy document into could never *be* an import
+    /// target; and the state the drill's replicas have to serve is the
+    /// state the import wrote, not the state a seed would have written.
+    /// With this set the harness creates no database, runs no migration
+    /// and seeds nothing — it grants the runtime role its privileges (the
+    /// caller's migration created the tables) and reads
+    /// [`Cluster::seed_policy_etag`] back out of the database.
+    pub adopt_database: Option<Database>,
+    /// The `DEPLOYMENT_ID` the replicas run with, when the caller needs it
+    /// to be a particular one. Required with [`Self::adopt_database`]: the
+    /// database is already bound to the id the import claimed it for, and
+    /// a replica carrying any other id is refused at boot.
+    pub deployment_id: Option<String>,
+    /// Give the `/echo` route an active health check marked
+    /// `required_for_readiness`, so the upstream's health is a rung of the
+    /// readiness chain.
+    ///
+    /// Off by default, and deliberately: with it on, every replica polls
+    /// the fake upstream on a timer, a suite that stops the upstream loses
+    /// readiness as a side effect, and the recorded-request log carries
+    /// probe traffic no other suite wants to filter. On, it is the only way
+    /// to reach `readiness_blocked_reason`'s **last** arm — the proxy rung
+    /// that answers `required_upstream_unavailable` — from an integration
+    /// test, because nothing else in the chain can produce that word.
+    /// `ProxyShape::LegacyUpstream` ignores it: `UPSTREAM_URL` carries no
+    /// health-check configuration.
+    ///
+    /// The block is identical on every replica, so the static-configuration
+    /// fingerprint still agrees.
+    pub upstream_required_for_readiness: bool,
 }
 
 impl Default for ClusterOptions {
@@ -391,6 +423,9 @@ impl Default for ClusterOptions {
             jwks_max_key_age_secs: 300,
             secondary_issuer: false,
             database_password: None,
+            adopt_database: None,
+            deployment_id: None,
+            upstream_required_for_readiness: false,
         }
     }
 }
@@ -419,6 +454,15 @@ pub struct Cluster {
     /// shared settings plus the runtime DSN, so it reaches this cluster's
     /// deployment and no other.
     one_shot_env: Vec<(String, String)>,
+    /// The settings every replica shares, kept so [`Cluster::add_replica`]
+    /// can build a new member's environment from the same fingerprint
+    /// inputs the existing ones agreed on.
+    shared: Vec<(String, String)>,
+    /// The DSN file the replicas read, for the same reason.
+    runtime_dsn_file: PathBuf,
+    /// The options this cluster was started with, minus the adopted
+    /// database (which was moved into [`Self::database`]).
+    options: ClusterOptions,
     secrets: TempDir,
     files: TempDir,
     binary: PathBuf,
@@ -431,7 +475,7 @@ impl Cluster {
     /// `None` is the skip path every PostgreSQL-backed suite in this
     /// repository takes without the `GATEWAY_TEST_POSTGRES_URL_FILE`
     /// locator; CI sets it, a bare checkout does not.
-    pub async fn start(options: ClusterOptions) -> Option<Self> {
+    pub async fn start(mut options: ClusterOptions) -> Option<Self> {
         let admin_dsn = locator()?;
         assert!(
             options.replicas >= 1,
@@ -439,7 +483,19 @@ impl Cluster {
         );
 
         let binary = gateway_binary();
-        let deployment_id = format!("ha-{}", uuid::Uuid::new_v4().simple());
+        // An adopted database is already bound to a deployment; a fresh
+        // one is named per run so two clusters on one server never share
+        // a namespace.
+        let adopted = options.adopt_database.take();
+        assert!(
+            adopted.is_none() || options.deployment_id.is_some(),
+            "an adopted database is bound to a deployment already; name it with \
+             ClusterOptions::deployment_id"
+        );
+        let deployment_id = options
+            .deployment_id
+            .clone()
+            .unwrap_or_else(|| format!("ha-{}", uuid::Uuid::new_v4().simple()));
 
         // The balancer first: its address is the deployment's public URL,
         // which both replicas' fingerprints cover, so it must exist before
@@ -452,8 +508,16 @@ impl Cluster {
             false => None,
         };
 
-        let database =
-            Database::create_with_password(&admin_dsn, options.database_password.as_deref()).await;
+        // Whether this harness must migrate and seed is decided here, by
+        // whether it is the thing that created the database.
+        let harness_created_the_database = adopted.is_none();
+        let database = match adopted {
+            Some(database) => database,
+            None => {
+                Database::create_with_password(&admin_dsn, options.database_password.as_deref())
+                    .await
+            }
+        };
 
         let secrets = TempDir::new("secrets");
         // Exactly 32 bytes, which the local-secret keyring reader
@@ -482,22 +546,38 @@ impl Cluster {
             &options,
         );
 
-        // The schema is applied by a one-shot command as the migration
-        // role, exactly as `docs/deployment/postgres.md` prescribes;
-        // serving replicas validate only and never migrate.
-        run_migrate_up(&binary, &shared, &migrator_dsn_file);
-        // Cluster mode refuses to serve an uninitialized deployment, so the
-        // policy control plane gets its first active document before any
-        // replica boots.
-        let policy_document = options
-            .seed_policy
-            .clone()
-            .unwrap_or_else(|| database::SEED_POLICY_DOCUMENT.to_owned());
-        let policy_etag = database.seed_policy_document(&policy_document).await;
-        let seed_tools_etag = match options.seed_tools.as_deref() {
-            Some(document) => Some(database.seed_tools_document(document).await),
-            None => None,
+        let (policy_etag, seed_tools_etag) = if harness_created_the_database {
+            // The schema is applied by a one-shot command as the migration
+            // role, exactly as `docs/deployment/postgres.md` prescribes;
+            // serving replicas validate only and never migrate.
+            run_migrate_up(&binary, &shared, &migrator_dsn_file);
+            // Cluster mode refuses to serve an uninitialized deployment, so
+            // the policy control plane gets its first active document
+            // before any replica boots.
+            let policy_document = options
+                .seed_policy
+                .clone()
+                .unwrap_or_else(|| database::SEED_POLICY_DOCUMENT.to_owned());
+            let policy_etag = database.seed_policy_document(&policy_document).await;
+            let seed_tools_etag = match options.seed_tools.as_deref() {
+                Some(document) => Some(database.seed_tools_document(document).await),
+                None => None,
+            };
+            (policy_etag, seed_tools_etag)
+        } else {
+            // An adopted database was migrated and initialized by whoever
+            // created it (the import drill's `import-standalone --apply`).
+            // The document the deployment serves is therefore a fact to be
+            // read, not one the harness knows.
+            assert!(
+                options.seed_policy.is_none() && options.seed_tools.is_none(),
+                "an adopted database carries its own documents; seeding one over them would \
+                 be writing to a namespace the caller populated deliberately"
+            );
+            (database.active_policy_etag().await, None)
         };
+        // Either way the runtime role needs its grants: the tables exist
+        // only after a migration, whoever ran it.
         database.grant_runtime_privileges().await;
 
         let mut one_shot_env = shared.clone();
@@ -545,10 +625,41 @@ impl Cluster {
             seed_tools_etag,
             member_stale_ms: options.member_stale_ms,
             one_shot_env,
+            shared,
+            runtime_dsn_file,
+            options,
             secrets,
             files,
             binary,
         })
+    }
+
+    /// Start one more replica against the same deployment, with the same
+    /// shared configuration, and put it in the balancer's rotation.
+    ///
+    /// Scale-out. The new member gets the next letter, the same
+    /// fingerprint inputs as its siblings (anything else would be refused
+    /// readiness by PR 13's gate), its own ephemeral port and its own
+    /// audit file. It is not waited for here beyond binding a listener:
+    /// whether a replica joining an already-serving deployment reaches
+    /// `ready` — and how fast — is the caller's assertion, not the
+    /// harness's precondition.
+    pub async fn add_replica(&mut self) -> String {
+        let name = replica_name(self.replicas.len());
+        let audit_path = self.files.path().join(format!("audit-{name}.jsonl"));
+        let env = replica_environment(
+            &self.shared,
+            &name,
+            &self.runtime_dsn_file,
+            &audit_path,
+            &self.upstream,
+            &self.options,
+        );
+        let mut replica = Replica::spawn(&name, &self.binary, env, audit_path);
+        replica.wait_until_listening(LISTEN_BUDGET).await;
+        self.replicas.push(replica);
+        self.refresh_balancer_targets();
+        name
     }
 
     /// Run a one-shot gateway command (`revoke-jwt`, `migrate check`)
@@ -955,15 +1066,38 @@ fn replica_environment(
         // `upstream_url` are identical on every replica (the fingerprint
         // reads both); only the injected header's VALUE differs, which the
         // fingerprint deliberately does not read.
-        ProxyShape::Routes => env.push((
-            "UPSTREAM_ROUTES".to_owned(),
-            serde_json::json!([{
+        ProxyShape::Routes => {
+            let mut route = serde_json::json!({
                 "path_prefix": "/echo",
                 "upstream_url": upstream.base_url,
                 "add_request_headers": { REPLICA_HEADER: name },
-            }])
-            .to_string(),
-        )),
+            });
+            if options.upstream_required_for_readiness {
+                // Thresholds of one and a sub-second interval: the row that
+                // wants this is waiting for a readiness TRANSITION, and a
+                // default three-strike streak on a ten-second timer would
+                // make the row's budget a measure of the health checker's
+                // cadence rather than of the chain's last arm. Identical on
+                // every replica, so the fingerprint still agrees.
+                route["health_check"] = serde_json::json!({
+                    "method": "GET",
+                    "path": "/",
+                    // `timeout_ms` may not exceed `interval_ms` (the
+                    // validator says so), so both are set together.
+                    "interval_ms": 500,
+                    "timeout_ms": 400,
+                    "healthy_threshold": 1,
+                    "unhealthy_threshold": 1,
+                    "expected_statuses": [200],
+                    "required_for_readiness": true,
+                    "minimum_healthy": 1,
+                });
+            }
+            env.push((
+                "UPSTREAM_ROUTES".to_owned(),
+                serde_json::json!([route]).to_string(),
+            ))
+        }
         // `UPSTREAM_URL` and `UPSTREAM_ROUTES` are mutually exclusive, and
         // a legacy HTTP tool definition needs the former. Identical on
         // both replicas, so nothing here tells them apart — a suite on

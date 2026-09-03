@@ -406,6 +406,15 @@ jobs:
   # it they skip, which is what stops `postgres-foundation` -- which runs
   # `cargo test -p gateway` with the same locator -- from paying for this
   # gate a second time inside a budget sized for the unit suites.
+  #
+  # `ha_performance` is deliberately NOT in this matrix. Its five benchmarks
+  # are `#[ignore]`d and belong to `nightly-performance.yml`, which runs them
+  # `--release` and single-threaded because a debug build measures the wrong
+  # thing and a parallel run measures contention the budgets do not describe.
+  # Its one always-on test reads `docs/architecture/ha-state-model.md` and
+  # needs no database, so `cargo test --workspace` in the `test` job already
+  # runs it on every pull request -- adding a matrix leg here would buy a
+  # cold build to re-run one filesystem read.
   ha-release-gate:
     name: ha-release-gate (${{ matrix.suite }})
     runs-on: ubuntu-latest
@@ -420,6 +429,9 @@ jobs:
           - ha_events_discovery_leader
           - ha_saturation
           - ha_secret_leak
+          - ha_failure_matrix
+          - ha_import_drill
+          - ha_rolling_upgrade
     services:
       postgres:
         image: postgres:16
@@ -437,6 +449,15 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          # `ha_rolling_upgrade` carries a tripwire that reads the newest
+          # reachable `v*` tag's own `gateway/Cargo.toml` and fails once a
+          # released binary declares the PostgreSQL dependency -- the moment
+          # a mixed-version cluster becomes buildable and its documented
+          # substitution expires. `actions/checkout@v4` fetches no tags at
+          # its default depth, so without this the tripwire takes its (loud)
+          # skip path and the substitution never expires.
+          fetch-depth: 0
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -456,14 +477,39 @@ jobs:
             > "${RUNNER_TEMP}/pg/database-url"
           chmod 0600 "${RUNNER_TEMP}/pg/database-url"
 
+      - name: Check the locator resolves before trusting a pass
+        # The `0 passed` check below is necessary and no longer sufficient.
+        # Two suites carry always-on tests that need no database --
+        # `ha_rolling_upgrade`'s release-tag tripwire and `ha_performance`'s
+        # documentation gate -- so a locator that failed to resolve would
+        # leave them reporting "7 passed" and "1 passed" rather than "0
+        # passed", and the gate would go green having exercised nothing.
+        # The locator is therefore asserted directly, here, where a failure
+        # names the cause instead of hiding behind a count.
+        env:
+          GATEWAY_TEST_POSTGRES_URL_FILE: ${{ runner.temp }}/pg/database-url
+        run: |
+          set -euo pipefail
+          test -s "${GATEWAY_TEST_POSTGRES_URL_FILE}"
+          PG_CONTAINER="$(docker ps --filter 'name=postgres' --format '{{.Names}}' | head -n 1)"
+          test -n "$PG_CONTAINER"
+          docker exec "$PG_CONTAINER" pg_isready -U greengateway_ci -d greengateway_ci
+
       - name: Run the release-gate suite
         env:
           GATEWAY_TEST_POSTGRES_URL_FILE: ${{ runner.temp }}/pg/database-url
           GATEWAY_TEST_HA_GATE: "1"
-        # `tee` and the `0 passed` check are the guard against the failure
-        # this gate is most exposed to: a suite that skipped -- a mistyped
-        # variable, a locator that did not resolve -- reports success and
-        # is indistinguishable from a suite that passed.
+          RUST_BACKTRACE: "1"
+        # The failure this gate is most exposed to is a suite that SKIPPED:
+        # a mistyped variable, a locator that did not resolve, a missing
+        # `GATEWAY_TEST_HA_GATE`. Each test's skip path returns normally, so
+        # a fully skipped suite reports its whole pass count -- "12 passed"
+        # -- and is indistinguishable from a suite that passed on the count
+        # alone. What separates them is the clock: a skipped suite finishes
+        # in 0.0Xs and the cheapest real one takes tens of seconds, because
+        # every one of them starts two gateway processes and a database. So
+        # the count check stays (it catches an empty target) and the elapsed
+        # time is what actually guards the gate.
         run: |
           set -euo pipefail
           cargo test -p gateway --test ${{ matrix.suite }} 2>&1 | tee gate.log
@@ -471,6 +517,16 @@ jobs:
             echo "::error::${{ matrix.suite }} ran no tests; the gate would be vacuous"
             exit 1
           fi
+          elapsed="$(sed -n 's/^test result:.*finished in \([0-9.]*\)s.*/\1/p' gate.log | tail -n 1)"
+          if [ -z "${elapsed}" ]; then
+            echo "::error::${{ matrix.suite }} printed no test-result line; the run did not complete"
+            exit 1
+          fi
+          if awk -v e="${elapsed}" 'BEGIN { exit (e < 1.0) ? 0 : 1 }'; then
+            echo "::error::${{ matrix.suite }} finished in ${elapsed}s, which is the silent-skip path, not a run. Check GATEWAY_TEST_POSTGRES_URL_FILE and GATEWAY_TEST_HA_GATE."
+            exit 1
+          fi
+          echo "${{ matrix.suite }} did real work: ${elapsed}s"
 
   connections-acceptance:
     name: connections-acceptance

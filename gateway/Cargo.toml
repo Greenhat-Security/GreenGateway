@@ -102,3 +102,19 @@ path = "tests/ha/saturation.rs"
 [[test]]
 name = "ha_secret_leak"
 path = "tests/ha/secret_leak.rs"
+
+[[test]]
+name = "ha_failure_matrix"
+path = "tests/ha/failure_matrix.rs"
+
+[[test]]
+name = "ha_import_drill"
+path = "tests/ha/import_drill.rs"
+
+[[test]]
+name = "ha_rolling_upgrade"
+path = "tests/ha/rolling_upgrade.rs"
+
+[[test]]
+name = "ha_performance"
+path = "tests/ha/performance.rs"

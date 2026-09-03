@@ -1,6 +1,6 @@
 # Runbook: the rollback boundary
 
-Companion to [the cutover runbook](cutover.md) and [the PostgreSQL deployment guide](postgres.md). Cluster mode is experimental and is not a supported HA configuration until the #241 release gate passes.
+Companion to [the cutover runbook](cutover.md) and [the PostgreSQL deployment guide](postgres.md). Cluster mode is a supported multi-replica configuration within the boundary [Supported cluster operation](postgres.md#supported-cluster-operation) draws, which names the release-gate suite behind each guarantee and states the non-goals just as explicitly.
 
 **The rule: rollback means restoring the pre-cutover standalone backup and starting the standalone gateway against it. It is safe only until the cluster's first control-plane write, first admitted login, or first service-token mutation.** After that, rolling back is not a rollback — it is a restore that discards whatever the cluster decided in the meantime.
 

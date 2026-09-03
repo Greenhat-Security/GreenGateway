@@ -1421,14 +1421,20 @@ async fn a_partitioned_replica_does_not_dispatch_under_the_allow_it_last_saw() {
     // deployment: the grant back, both replicas ready, and the path now
     // refused on its merits under the new revision rather than for want of
     // an authority.
+    //
+    // Settled, not sampled once. Readiness is not a promise about the very
+    // next request: the revision gate re-reads the authority per request
+    // within its own bounded budget, so a replica that has just regained
+    // its grant can still answer `503` for a moment while the pool replaces
+    // the backends the partition killed. `send_settled` is what the rest of
+    // this file uses for exactly that, and it does not weaken the claim --
+    // a `503` is a refusal that dispatches nothing, and the assertion below
+    // still requires the answer to settle on `403` on the merits.
     cluster.database.restore_connect().await;
     cluster.wait_until_all_ready().await;
     for replica in ["a", "b"] {
-        let (status, body) = cluster
-            .get(replica, PROXIED_PATH)
-            .bearer(&admin)
-            .send()
-            .await;
+        let (status, _, body) =
+            send_settled(|| cluster.get(replica, PROXIED_PATH).bearer(&admin)).await;
         assert_eq!(
             status, 403,
             "replica {replica} should refuse the withdrawn path under the new revision \

@@ -1,6 +1,6 @@
 # Runbook: standalone to cluster cutover
 
-Companion to [the PostgreSQL deployment guide](postgres.md). Cluster mode is experimental and is not a supported HA configuration until the #241 release gate passes.
+Companion to [the PostgreSQL deployment guide](postgres.md). Cluster mode is a supported multi-replica configuration within the boundary [Supported cluster operation](postgres.md#supported-cluster-operation) draws, which names the release-gate suite behind each guarantee and states the non-goals just as explicitly.
 
 **The rule: the cutover is offline, one-way, and verified.** There is no live switch, no dual-write window, and no automatic reverse migration. The standalone deployment stops being the authority at a moment you choose, and the cluster becomes the authority at a moment you choose, and those two moments must not overlap.
 
