@@ -77,3 +77,28 @@ postgres = [
     "dep:tokio-postgres",
     "dep:tokio-postgres-rustls",
 ]
+
+# The multi-replica release-gate suites (issue #241 PR 16) live under
+# `tests/ha/` so they can share one harness module. Cargo only
+# auto-discovers `tests/*.rs`, so each suite is named here explicitly --
+# one target per file, which is also what lets the CI gate parallelise
+# them. `tests/ha/harness/` is a module of each, never a target of its own.
+[[test]]
+name = "ha_smoke"
+path = "tests/ha/smoke.rs"
+
+[[test]]
+name = "ha_security_two_replica"
+path = "tests/ha/security_two_replica.rs"
+
+[[test]]
+name = "ha_events_discovery_leader"
+path = "tests/ha/events_discovery_leader.rs"
+
+[[test]]
+name = "ha_saturation"
+path = "tests/ha/saturation.rs"
+
+[[test]]
+name = "ha_secret_leak"
+path = "tests/ha/secret_leak.rs"

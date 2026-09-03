@@ -66,6 +66,32 @@ matches="$(
                 "$EGRESS_FILE" | gateway/src/egress/*.rs)
                     continue
                     ;;
+                # The #241 multi-replica release gate (`gateway/tests/ha/`).
+                #
+                # This check is about the SHIPPED binary: every request the
+                # gateway makes on a caller's behalf must be built inside
+                # the egress boundary, where the destination has been
+                # checked and pinned. The files exempted here are the
+                # opposite direction. They are a test harness acting as a
+                # CLIENT of two gateway processes it started itself, on
+                # loopback ports those processes chose -- traffic the
+                # boundary exists to protect, not traffic it governs. None
+                # of this code is compiled into the binary.
+                #
+                # Narrow on purpose: one directory, and only that
+                # directory. `gateway/src/**` and every other test are
+                # still enforced, so a client that crept into a handler --
+                # or into an ordinary integration test, where it would be a
+                # sign the handler had grown one -- still fails here. The
+                # other integration tests hand-roll HTTP over `TcpStream`
+                # and can afford to; a harness that has to speak
+                # Server-Sent Events with `Last-Event-ID` resumption,
+                # conditional writes and a proxying balancer cannot, and a
+                # gate that could not be written is not a stricter
+                # invariant -- it is no gate at all.
+                gateway/tests/ha/*)
+                    continue
+                    ;;
             esac
 
             allowed=no

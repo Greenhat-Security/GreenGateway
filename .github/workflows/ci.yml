@@ -353,6 +353,89 @@ jobs:
       - name: Audit dependencies
         run: cargo audit
 
+  # The #241 multi-replica release gate. Each suite under `gateway/tests/ha/`
+  # stands up two REAL gateway processes in cluster mode against this job's
+  # PostgreSQL service, so the work is minutes per file rather than seconds:
+  # the matrix runs one target per job, which is what keeps the gate inside
+  # its budget.
+  #
+  # The service and DSN-file setup is `postgres-foundation`'s, deliberately.
+  # The one difference is the runtime role: that job creates a shared
+  # `ggw_runtime_noddl`, while this harness creates a disposable database
+  # AND a disposable no-DDL role per test and drops both, so a fault it
+  # injects (a revoked CONNECT, a read-only default) can never reach a
+  # sibling.
+  #
+  # `GATEWAY_TEST_HA_GATE` is the opt-in these suites also require. Without
+  # it they skip, which is what stops `postgres-foundation` -- which runs
+  # `cargo test -p gateway` with the same locator -- from paying for this
+  # gate a second time inside a budget sized for the unit suites.
+  ha-release-gate:
+    name: ha-release-gate (${{ matrix.suite }})
+    runs-on: ubuntu-latest
+    # 25 minutes is the gate's own budget; the rest is the cold build.
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        suite:
+          - ha_smoke
+          - ha_security_two_replica
+          - ha_events_discovery_leader
+          - ha_saturation
+          - ha_secret_leak
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: greengateway_ci
+          POSTGRES_DB: greengateway_ci
+          POSTGRES_HOST_AUTH_METHOD: trust
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U greengateway_ci"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@v2
+
+      - name: Write the test DSN file
+        # The harness connects as this role to CREATE DATABASE and CREATE
+        # ROLE per test, and hands its replicas a DSN for the disposable
+        # role it made. Trust auth means no password anywhere for gitleaks
+        # to flag.
+        run: |
+          set -eu
+          mkdir -p "${RUNNER_TEMP}/pg"
+          printf 'postgres://greengateway_ci@127.0.0.1:5432/greengateway_ci\n' \
+            > "${RUNNER_TEMP}/pg/database-url"
+          chmod 0600 "${RUNNER_TEMP}/pg/database-url"
+
+      - name: Run the release-gate suite
+        env:
+          GATEWAY_TEST_POSTGRES_URL_FILE: ${{ runner.temp }}/pg/database-url
+          GATEWAY_TEST_HA_GATE: "1"
+        # `tee` and the `0 passed` check are the guard against the failure
+        # this gate is most exposed to: a suite that skipped -- a mistyped
+        # variable, a locator that did not resolve -- reports success and
+        # is indistinguishable from a suite that passed.
+        run: |
+          set -euo pipefail
+          cargo test -p gateway --test ${{ matrix.suite }} 2>&1 | tee gate.log
+          if grep -q 'test result: ok. 0 passed' gate.log; then
+            echo "::error::${{ matrix.suite }} ran no tests; the gate would be vacuous"
+            exit 1
+          fi
+
   connections-acceptance:
     name: connections-acceptance
     needs:
