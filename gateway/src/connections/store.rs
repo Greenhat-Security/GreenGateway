@@ -7848,6 +7848,26 @@ mod tests {
         let deadline = started + Duration::from_millis(500);
         refresh_status_busy_timeout(&connection, &path, Some(deadline))
             .expect("initial timeout should configure");
+        // What the connection was actually told to wait, read back from
+        // SQLite. `busy_timeout` sets the value `PRAGMA busy_timeout`
+        // reports, so the budget in force is directly observable and does
+        // not have to be inferred from how long a blocked commit happened
+        // to take.
+        let configured_busy_timeout = |connection: &Connection| -> i64 {
+            connection
+                .query_row("PRAGMA busy_timeout", [], |row| row.get(0))
+                .expect("SQLite reports the busy timeout in force")
+        };
+        // Essentially the whole 500ms budget: the refresh spends a sliver
+        // of it computing `deadline - now`, and SQLite stores whole
+        // milliseconds, so 499 is as legitimate as 500. The distinction
+        // this test rests on is 500-ish versus 150-or-less, which no
+        // rounding blurs.
+        let initial_budget_ms = configured_busy_timeout(&connection);
+        assert!(
+            (450..=500).contains(&initial_budget_ms),
+            "the first refresh configures the whole 500ms budget, got {initial_budget_ms}ms"
+        );
         let transaction = connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .expect("writer transaction should begin");
@@ -7858,11 +7878,34 @@ mod tests {
         std::thread::sleep(Duration::from_millis(350));
         refresh_status_busy_timeout(&transaction, &path, Some(deadline))
             .expect("commit timeout should use only the fresh remaining budget");
-        let commit_started = Instant::now();
+        // The property, measured directly: the budget the commit will wait
+        // under is what is LEFT of the deadline, not the full initial one.
+        // At least 350ms of the 500ms deadline is gone, so a refreshed
+        // budget cannot exceed 150ms however loaded the machine is -- an
+        // over-running sleep only makes it smaller -- while a commit that
+        // reused the stale timeout would still report 500.
+        //
+        // This replaces timing the commit itself. That measurement was
+        // still load-sensitive after b62bed9 narrowed it to the commit:
+        // SQLite's busy handler returns at approximately, not exactly, the
+        // budget it was given, and under a loaded suite one of its sleep
+        // increments overruns -- a 150ms budget was observed blocking for
+        // 441ms against a 400ms bound. The overshoot is the scheduler's,
+        // not the budget's, and the budget is what this test guards.
+        let refreshed_budget_ms = configured_busy_timeout(&transaction);
+        assert!(
+            refreshed_budget_ms <= 150,
+            "commit must not reuse the stale initial 500ms busy timeout; \
+             it was configured with {refreshed_budget_ms}ms"
+        );
+        assert!(
+            refreshed_budget_ms < initial_budget_ms,
+            "the refreshed budget must be smaller than the initial one \
+             ({refreshed_budget_ms}ms is not below {initial_budget_ms}ms)"
+        );
         let commit_error = transaction
             .commit()
             .expect_err("the blocked commit must not persist after its deadline");
-        let commit_elapsed = commit_started.elapsed();
         // Assert the raw lock failure rather than the mapped variant. SQLite's
         // busy handler returns at approximately -- not strictly after -- the
         // deadline it was given, so mapping against `deadline` here is a coin
@@ -7876,18 +7919,6 @@ mod tests {
             ),
             "the blocked commit must fail on the reader's lock"
         );
-        // Time the commit itself, not everything since `started`: the stale
-        // timeout would block it for the full initial 500ms budget, the
-        // refreshed one for whatever is left of the deadline (~150ms). The
-        // total-elapsed form folded in the sleep's overshoot and every
-        // scheduling delay before the commit, which made it fail under a
-        // loaded suite for reasons that had nothing to do with the budget.
-        assert!(
-            commit_elapsed < Duration::from_millis(400),
-            "commit must not reuse the stale initial 500ms busy timeout; \
-             it blocked for {commit_elapsed:?}"
-        );
-
         drop(blocking_read);
         drop(connection);
         let persisted: i64 = store

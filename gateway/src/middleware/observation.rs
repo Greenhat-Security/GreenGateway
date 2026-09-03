@@ -191,7 +191,59 @@ pub struct ObservedSnapshot {
 
 struct InferredSchemaCache {
     ttl: Duration,
+    clock: CacheClock,
     inner: Mutex<InferredSchemaCacheInner>,
+}
+
+/// The clock a cache ages its entries against. Production reads the real
+/// monotonic clock. A test can drive one it advances itself, so the TTL
+/// boundary is asserted exactly -- without sleeping, and without unrelated
+/// setup work on a loaded machine silently spending the window under test.
+enum CacheClock {
+    System,
+    #[cfg(test)]
+    Manual(Arc<ManualClock>),
+}
+
+impl CacheClock {
+    fn now(&self) -> Instant {
+        match self {
+            Self::System => Instant::now(),
+            #[cfg(test)]
+            Self::Manual(clock) => clock.now(),
+        }
+    }
+}
+
+/// A monotonic clock a test moves by hand.
+#[cfg(test)]
+struct ManualClock {
+    base: Instant,
+    advanced_nanos: std::sync::atomic::AtomicU64,
+}
+
+#[cfg(test)]
+impl ManualClock {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            base: Instant::now(),
+            advanced_nanos: std::sync::atomic::AtomicU64::new(0),
+        })
+    }
+
+    fn now(&self) -> Instant {
+        self.base
+            + Duration::from_nanos(
+                self.advanced_nanos
+                    .load(std::sync::atomic::Ordering::Relaxed),
+            )
+    }
+
+    fn advance(&self, by: Duration) {
+        let nanos = u64::try_from(by.as_nanos()).expect("test clock advance should fit u64 nanos");
+        self.advanced_nanos
+            .fetch_add(nanos, std::sync::atomic::Ordering::Relaxed);
+    }
 }
 
 #[derive(Default)]
@@ -622,6 +674,30 @@ impl SchemaConformanceState {
         )
     }
 
+    /// Like `new_for_test_with_cache_ttl`, but the cache ages its entries
+    /// against a clock the test advances, so TTL expiry is a step the test
+    /// takes rather than wall-clock time it has to wait for.
+    #[cfg(test)]
+    fn new_for_test_with_cache_clock(
+        coverage: SchemaCoverage,
+        query_store: Option<Arc<DiscoveryQueryStore>>,
+        payload_capture_enabled: bool,
+        inferred_cache_ttl: Duration,
+        clock: Arc<ManualClock>,
+    ) -> Self {
+        Self::new_for_test_with_source(
+            coverage,
+            query_store.map(|store| InferredSchemaSource::Sqlite {
+                store,
+                cache: Arc::new(InferredSchemaCache::with_clock(
+                    inferred_cache_ttl,
+                    CacheClock::Manual(Arc::clone(&clock)),
+                )),
+            }),
+            payload_capture_enabled,
+        )
+    }
+
     #[cfg(test)]
     fn new_for_test_with_source(
         coverage: SchemaCoverage,
@@ -697,8 +773,13 @@ impl SchemaConformanceState {
 
 impl InferredSchemaCache {
     fn new(ttl: Duration) -> Self {
+        Self::with_clock(ttl, CacheClock::System)
+    }
+
+    fn with_clock(ttl: Duration, clock: CacheClock) -> Self {
         Self {
             ttl,
+            clock,
             inner: Mutex::new(InferredSchemaCacheInner::default()),
         }
     }
@@ -716,13 +797,13 @@ impl InferredSchemaCache {
     }
 
     fn observed_endpoints(&self, query_store: &DiscoveryQueryStore) -> Arc<Vec<ObservedEndpoint>> {
-        let now = Instant::now();
+        let now = self.clock.now();
         if let Some(endpoints) = self.cached_observed_endpoints(now) {
             return endpoints;
         }
 
         let endpoints = Arc::new(query_store.observed_endpoints().unwrap_or_default());
-        self.store_observed_endpoints(Arc::clone(&endpoints), Instant::now());
+        self.store_observed_endpoints(Arc::clone(&endpoints), self.clock.now());
         endpoints
     }
 
@@ -749,7 +830,7 @@ impl InferredSchemaCache {
             method: method.to_owned(),
             endpoint_template: endpoint_template.to_owned(),
         };
-        let now = Instant::now();
+        let now = self.clock.now();
         if let Some(schema) = self.cached_schema(&key, now) {
             return schema;
         }
@@ -759,7 +840,7 @@ impl InferredSchemaCache {
             .ok()
             .flatten()
             .map(Arc::new);
-        self.store_schema(key, schema.clone(), Instant::now());
+        self.store_schema(key, schema.clone(), self.clock.now());
         schema
     }
 
@@ -2060,17 +2141,22 @@ paths:
             ],
         );
         let store = Arc::new(DiscoveryQueryStore::open(&db.path).expect("query store should open"));
-        // A generous TTL keeps this test reliable under parallel workspace test
-        // execution: the DB churn between the "still cached" and "refreshed"
-        // checks below (deleting and reseeding samples) can itself take tens of
-        // milliseconds under CPU contention, so a tight TTL risks the window
-        // expiring before the "still cached" assertion runs.
-        let ttl = Duration::from_millis(300);
-        let conformance = SchemaConformanceState::new_for_test_with_cache_ttl(
+        // The cache ages against a clock this test advances, not the wall
+        // clock: the reseed between the "still cached" and "refreshed" checks
+        // below is several SQLite transactions, and on a loaded machine it (or
+        // a scheduling stall) can outlast any TTL short enough to sleep on,
+        // expiring the entry before the "still cached" assertion runs. Driving
+        // the clock keeps the boundary exact -- the entry is fresh right up to
+        // the TTL and stale the instant it is reached -- no matter how long the
+        // setup around it actually takes.
+        let ttl = Duration::from_secs(5);
+        let clock = ManualClock::new();
+        let conformance = SchemaConformanceState::new_for_test_with_cache_clock(
             SchemaCoverage::default(),
             Some(Arc::clone(&store)),
             true,
             ttl,
+            Arc::clone(&clock),
         );
         let display_name_shape = captured_payload_shape(
             None,
@@ -2103,7 +2189,9 @@ paths:
                 MIN_INFERRED_CONFORMANCE_SAMPLE_COUNT as usize
             ],
         );
-
+        // One tick short of the TTL the cached schema is still the one served,
+        // and the store has not been read again.
+        clock.advance(ttl - Duration::from_nanos(1));
         let cached = conformance
             .prepare_check("POST", "/users", None)
             .expect("cached inferred conformance check should be prepared");
@@ -2113,7 +2201,8 @@ paths:
         );
         assert_eq!(store.query_counts_for_test(), (1, 1));
 
-        std::thread::sleep(ttl + Duration::from_millis(150));
+        // At the TTL the entry has expired, so the reseeded schema is read.
+        clock.advance(Duration::from_nanos(1));
 
         let refreshed = conformance
             .prepare_check("POST", "/users", None)
