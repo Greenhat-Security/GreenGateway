@@ -2,7 +2,7 @@
 
 ## Status
 
-Proposed (implements the design required by issue #241; cluster operation remains experimental and unsupported until the final release-gate PR lands)
+Accepted (implements the design required by issue #241; the release gate that proves it is `ha-release-gate` in `.github/workflows/ci.yml`, and the boundary of what it proves is "Supported cluster operation" in `docs/deployment/postgres.md`)
 
 ## Context
 

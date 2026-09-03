@@ -1,6 +1,6 @@
 # Runbook: disaster recovery
 
-Companion to [the PostgreSQL deployment guide](postgres.md). Cluster mode is experimental and is not a supported HA configuration until the #241 release gate passes.
+Companion to [the PostgreSQL deployment guide](postgres.md). Cluster mode is a supported multi-replica configuration within the boundary [Supported cluster operation](postgres.md#supported-cluster-operation) draws, which names the release-gate suite behind each guarantee and states the non-goals just as explicitly.
 
 **The rule: the deployment is the database plus the secret store plus the static configuration. Rebuild all three or you have not rebuilt the deployment.** Gateway replicas are disposable and hold nothing durable; they are the easy part and they are not the part that fails.
 

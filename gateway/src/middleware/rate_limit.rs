@@ -541,11 +541,11 @@ impl RateLimitOverride {
     }
 }
 
-/// The liveness, readiness, startup and metrics endpoints, which are
-/// decided by the LOCAL limiter only and never by the shared one.
+/// The health, liveness, readiness, startup and metrics endpoints, which
+/// are decided by the LOCAL limiter only and never by the shared one.
 ///
 /// The shared gate fails closed, which is right for traffic and wrong for
-/// these four: `/readyz` exists to report that the authority is
+/// these five: `/readyz` exists to report that the authority is
 /// unreachable, and a `/readyz` that consults the authority first answers
 /// `503 {"error":"rate limiter unavailable"}` in exactly the outage whose
 /// reason it was written to publish (issue #241, PR 14). An orchestrator

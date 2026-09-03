@@ -52,7 +52,7 @@ Both are supported product shapes, chosen at startup, one at a time. Standalone 
 | Principal directory | local SQLite | none — cluster mode has no principal directory |
 | Behaviour when the authority cannot be reached | not applicable | fail closed: `503`, never a stale allow, never `401`/`403` |
 | Schema migrations | not applicable | checksummed ledger, applied by a migration job under a DDL-capable role; serving replicas validate only |
-| Support status | fully supported | experimental until the #241 release gate passes |
+| Support status | fully supported | supported within the boundary `docs/deployment/postgres.md` draws under "Supported cluster operation", which names the release-gate suite behind each guarantee and the non-goals it does not cover |
 
 Moving between them is an operator workflow, not a runtime toggle. Standalone to cluster is a deliberate, one-way, offline, verified import (`gateway import-standalone`). Cluster back to standalone has no automatic reverse migration on purpose: reconstructing local authority from shared state would have to decide which replica's view wins, and every such decision is an opportunity for a stale allow. The rollback path is to restore the pre-cutover standalone snapshot, and the point after which that stops being free is documented in `docs/deployment/rollback-boundary.md`.
 

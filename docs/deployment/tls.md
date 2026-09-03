@@ -1,6 +1,6 @@
 # Runbook: TLS to the database and the certificate authority
 
-Companion to [the PostgreSQL deployment guide](postgres.md). Cluster mode is experimental and is not a supported HA configuration until the #241 release gate passes.
+Companion to [the PostgreSQL deployment guide](postgres.md). Cluster mode is a supported multi-replica configuration within the boundary [Supported cluster operation](postgres.md#supported-cluster-operation) draws, which names the release-gate suite behind each guarantee and states the non-goals just as explicitly.
 
 **The rule: every production connection to the authority is TLS with certificate and hostname verification, and there is no plaintext fallback.** A server that will not speak TLS fails the connection at startup. The gateway does not degrade, retry in the clear, or warn and continue.
 

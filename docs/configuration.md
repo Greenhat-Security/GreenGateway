@@ -1980,7 +1980,7 @@ Default: `sqlite`
 
 Format and validation: exactly `sqlite` or `postgres`; anything else fails startup. Selecting `postgres` requires `DEPLOYMENT_ID` and `DATABASE_URL_FILE`, and rejects every writable local authority (`POLICY_FILE`, `TOOLS_FILE`, `CONNECTION_LOCAL_SECRET_KEYRING`, and every `*_SQLITE_PATH`) by naming the setting. Selecting `sqlite` rejects `DEPLOYMENT_ID`, `DATABASE_URL_FILE`, `DATABASE_TLS_CA_FILE`, the cluster-only keyrings (`ADMIN_LOGIN_KEYRING`, `RATE_LIMIT_KEYRING`), and the discovery projector's settings (`DISCOVERY_PROJECTOR_LEASE_TTL_MS`, `DISCOVERY_PROJECTOR_POLL_MS`, `DISCOVERY_PROJECTOR_BATCH`) for the inverse reason: material a mode will never read invites an operator to believe something is configured that nothing consults. Mode is a startup-time setting, deliberately not hot-swappable: it participates in the security-configuration fingerprint two replicas must agree on, and moving from sqlite to postgres is a one-way verified import, not a live switch.
 
-Cluster mode is experimental and is not a supported HA configuration until the #241 release gate passes.
+Cluster mode is a supported multi-replica configuration within the boundary [Supported cluster operation](deployment/postgres.md#supported-cluster-operation) draws, which names the release-gate suite behind each guarantee and states the non-goals just as explicitly.
 
 ### DEPLOYMENT_ID
 

@@ -1,6 +1,6 @@
 # Runbook: backup, point-in-time recovery, and restore verification
 
-Companion to [the PostgreSQL deployment guide](postgres.md). Cluster mode is experimental and is not a supported HA configuration until the #241 release gate passes.
+Companion to [the PostgreSQL deployment guide](postgres.md). Cluster mode is a supported multi-replica configuration within the boundary [Supported cluster operation](postgres.md#supported-cluster-operation) draws, which names the release-gate suite behind each guarantee and states the non-goals just as explicitly.
 
 **The rule: in cluster mode the gateway replicas hold nothing durable.** Every policy version, tools document, Connection record, credential binding reference, audit event, discovery aggregate, signal, suggestion and service-token hash lives in the one PostgreSQL deployment namespace. A replica is a cache with a process attached. **The database is the deployment.** Back it up as if losing it means losing the product, because it does.
 

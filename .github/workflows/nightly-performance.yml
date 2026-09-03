@@ -1,0 +1,169 @@
+# The #241 blocking-budget measurement (PR 16).
+#
+# Separate from `ci.yml` on purpose. These are benchmarks: they are scheduled
+# rather than pushed, they need a `--release` build and a single test thread to
+# mean anything, and a night on which the runner was noisy must not read as a
+# broken pull request. `gateway/tests/ha/performance.rs`'s five measurement
+# tests are `#[ignore]`d for exactly that reason and run nowhere else; its one
+# always-on test -- the assertion that every budget row in
+# `docs/architecture/ha-state-model.md` §6 is covered by a measurement here --
+# runs on every pull request through `cargo test --workspace`.
+#
+# The budgets are absolute and come from the document, not from last night:
+# "a PR that cannot meet its budget redesigns, not re-baselines"
+# (`ha-state-model.md` §6). The downloaded baseline only drives the secondary
+# regression rule, which fires when a p99 has grown by more than 25 % AND has
+# reached 80 % of its budget -- a slide toward a ceiling, caught before it hits
+# one. A missing baseline is a pass, and the suite says so in the log.
+name: nightly-performance
+
+on:
+  schedule:
+    # 03:17 UTC. Off the hour, because the hour is when every other
+    # repository's nightly starts and hosted-runner contention is the one
+    # thing these numbers must not measure.
+    - cron: "17 3 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  # Reading the previous run's artifact through the API, for the baseline.
+  actions: read
+
+jobs:
+  ha-performance:
+    name: ha-performance
+    runs-on: ubuntu-latest
+    # A `--release` build of the gateway dominates this; the measurements
+    # themselves are minutes, most of them the million-row audit fixture.
+    timeout-minutes: 90
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: greengateway_ci
+          POSTGRES_DB: greengateway_ci
+          POSTGRES_HOST_AUTH_METHOD: trust
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U greengateway_ci"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@v2
+
+      - name: Write the test DSN file
+        # The same shape as `ha-release-gate`: the harness connects as this
+        # role to CREATE DATABASE and CREATE ROLE per test and hands its
+        # replicas the disposable role it made. Trust auth means no password
+        # anywhere for gitleaks to flag.
+        run: |
+          set -eu
+          mkdir -p "${RUNNER_TEMP}/pg" "${RUNNER_TEMP}/ha"
+          printf 'postgres://greengateway_ci@127.0.0.1:5432/greengateway_ci\n' \
+            > "${RUNNER_TEMP}/pg/database-url"
+          chmod 0600 "${RUNNER_TEMP}/pg/database-url"
+
+      - name: Check the locator resolves before trusting a pass
+        # Each measurement test takes its own silent-skip path when the
+        # locator does not resolve, so a broken locator leaves this run
+        # reporting "5 passed" in 0.00s rather than "0 passed": the check
+        # below would not fire, and the nightly would publish an artifact
+        # with no measurements in it. Asserted here, where a failure names
+        # the cause.
+        env:
+          GATEWAY_TEST_POSTGRES_URL_FILE: ${{ runner.temp }}/pg/database-url
+        run: |
+          set -euo pipefail
+          test -s "${GATEWAY_TEST_POSTGRES_URL_FILE}"
+          PG_CONTAINER="$(docker ps --filter 'name=postgres' --format '{{.Names}}' | head -n 1)"
+          test -n "$PG_CONTAINER"
+          docker exec "$PG_CONTAINER" pg_isready -U greengateway_ci -d greengateway_ci
+
+      - name: Fetch the previous night's report
+        # Best effort, and never fatal: the first run of this workflow has no
+        # baseline, and neither does the run after a retention lapse or a
+        # rename. The suite treats a missing baseline as a pass and logs it,
+        # so a silent failure here degrades to "absolute budgets only" rather
+        # than to a false green.
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -u
+          mkdir -p "${RUNNER_TEMP}/baseline"
+          run_id="$(gh api \
+            "repos/${GITHUB_REPOSITORY}/actions/workflows/nightly-performance.yml/runs?status=success&per_page=1" \
+            --jq '.workflow_runs[0].id' 2>/dev/null || true)"
+          if [ -z "${run_id}" ] || [ "${run_id}" = "null" ]; then
+            echo "no previous successful run; the regression rule is a pass on this run"
+            exit 0
+          fi
+          if gh run download "${run_id}" --name ha-performance \
+              --dir "${RUNNER_TEMP}/baseline" 2>/dev/null; then
+            echo "baseline taken from run ${run_id}"
+            ls -l "${RUNNER_TEMP}/baseline"
+          else
+            echo "run ${run_id} has no ha-performance artifact; the regression rule is a pass"
+          fi
+
+      - name: Measure the blocking budgets
+        env:
+          GATEWAY_TEST_POSTGRES_URL_FILE: ${{ runner.temp }}/pg/database-url
+          GATEWAY_TEST_HA_GATE: "1"
+          GATEWAY_TEST_PERF_REPORT: ${{ runner.temp }}/ha/ha-performance.json
+          RUST_BACKTRACE: 1
+        # `--release` and `--test-threads 1` are both load-bearing: a debug
+        # build measures the wrong thing, and a parallel run measures
+        # contention the budgets do not describe.
+        #
+        # The same anti-vacuity guard the release gate carries, and for the
+        # same reason: each measurement's skip path returns normally, so a
+        # skipped run reports "5 passed" in 0.00s and is indistinguishable
+        # from one that met every budget on the count alone. The clock is
+        # what separates them -- the audit fixture alone loads a million
+        # rows -- so elapsed time is the real check and the count check just
+        # catches an empty target.
+        run: |
+          set -euo pipefail
+          baseline="${RUNNER_TEMP}/baseline/ha-performance.json"
+          if [ -f "${baseline}" ]; then
+            export GATEWAY_TEST_PERF_BASELINE="${baseline}"
+          fi
+          cargo test -p gateway --test ha_performance --release \
+            -- --ignored --test-threads 1 2>&1 | tee performance.log
+          if grep -q 'test result: ok. 0 passed' performance.log; then
+            echo "::error::the performance suite ran no measurements; the nightly would be vacuous"
+            exit 1
+          fi
+          elapsed="$(sed -n 's/^test result:.*finished in \([0-9.]*\)s.*/\1/p' performance.log | tail -n 1)"
+          if [ -z "${elapsed}" ]; then
+            echo "::error::the performance suite printed no test-result line; the run did not complete"
+            exit 1
+          fi
+          if awk -v e="${elapsed}" 'BEGIN { exit (e < 10.0) ? 0 : 1 }'; then
+            echo "::error::the performance suite finished in ${elapsed}s, which is the silent-skip path, not a measurement run. Check GATEWAY_TEST_POSTGRES_URL_FILE and GATEWAY_TEST_HA_GATE."
+            exit 1
+          fi
+          echo "measured for ${elapsed}s"
+
+      - name: Publish the performance report
+        # `always()` because the artifact is most useful on the run that
+        # failed: `performance.rs` rewrites the file after every measurement
+        # and before it asserts that measurement's budget, so the number that
+        # failed is in the file.
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: ha-performance
+          path: ${{ runner.temp }}/ha/ha-performance.json
+          if-no-files-found: error
+          retention-days: 90

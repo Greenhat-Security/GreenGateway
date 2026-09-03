@@ -1,6 +1,6 @@
 # Runbook: failover
 
-Companion to [the PostgreSQL deployment guide](postgres.md). Cluster mode is experimental and is not a supported HA configuration until the #241 release gate passes.
+Companion to [the PostgreSQL deployment guide](postgres.md). Cluster mode is a supported multi-replica configuration within the boundary [Supported cluster operation](postgres.md#supported-cluster-operation) draws, which names the release-gate suite behind each guarantee and states the non-goals just as explicitly — including that GreenGateway never elects a primary itself.
 
 **The rule: exactly one writable PostgreSQL primary is the authority, and no security decision is ever read from a lagging replica.** Cluster mode makes the *gateway* replicas replaceable. It does not make the database replaceable, and it does not spread authority across more than one node. Every revision check, revocation lookup, token verification, distributed limit, execution lease, and control-plane mutation reads and writes the primary.
 

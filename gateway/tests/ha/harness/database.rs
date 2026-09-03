@@ -1031,6 +1031,20 @@ impl Database {
         self.query_one(sql).await.get::<_, i64>(0)
     }
 
+    /// The ETag of the document the deployment is serving right now, read
+    /// from the authority rather than computed.
+    ///
+    /// For a database this harness did not seed — the import drill's
+    /// target, whose active document is whatever `import-standalone`
+    /// activated. Panics when the policy control plane was never
+    /// initialized, which is the state cluster mode refuses to serve
+    /// anyway.
+    pub async fn active_policy_etag(&self) -> String {
+        self.query_one("SELECT document_etag FROM greengateway.policy_active WHERE singleton")
+            .await
+            .get::<_, String>(0)
+    }
+
     // ------------------------------------------------------------------
     // Database time. Never the wall clock.
     // ------------------------------------------------------------------

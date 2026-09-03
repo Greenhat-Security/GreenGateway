@@ -339,7 +339,7 @@ You should not assume GreenGateway is production-ready for:
 - High-scale production traffic
 - Regulated production environments
 - Mission-critical enforcement
-- Multi-instance production deployments
+- Multi-instance production deployments beyond the boundary in [`docs/deployment/postgres.md`](docs/deployment/postgres.md#supported-cluster-operation) — cluster mode on PostgreSQL is proved by a release gate that runs real replicas against a real database, and that document states both what the gate proves and the non-goals it does not
 - Environments requiring formal vendor support
 
 The current project is best suited for evaluation, demos, development environments, guided self-hosting, and early adopters who can review and test the code.
@@ -376,6 +376,8 @@ Current status:
 | Egress firewall | Implemented |
 | Anomaly signals | Implemented |
 | Cloudflare deploy path | Implemented |
+| Multi-instance cluster mode (PostgreSQL) | Implemented; see [docs/deployment/postgres.md](docs/deployment/postgres.md#supported-cluster-operation) for the proved guarantees and the non-goals |
+| Durable audit event store and cross-replica SSE stream | Implemented as a store, a stream and a projector source; a serving replica's own audit still goes to stdout and the optional log file, not to PostgreSQL |
 | Postgres audit sink for multi-instance deployments | Planned |
 | Additional MCP follow-ups | Planned |
 
@@ -695,8 +697,7 @@ The project is moving toward a stronger v1 control plane for API and MCP securit
 Planned focus areas include:
 
 - Production hardening
-- Multi-instance deployment support
-- Postgres audit sink
+- A PostgreSQL audit sink on the request path, so a cluster deployment's own traffic reaches the durable event store the stream and the discovery projector already read
 - More MCP deployment patterns
 - More rule templates
 - More identity-provider recipes
