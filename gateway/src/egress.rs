@@ -3197,13 +3197,24 @@ mod tests {
         let client = EgressClient::new(EgressConfig::default())
             .expect("scheme log test client should build");
 
-        // Touch the rejection callsite once while our subscriber is installed.
+        // Touch the rejection callsite once while our subscriber is installed,
+        // then re-evaluate the interest cache.
+        //
         // `rebuild_interest_cache` only revisits callsites that have already
-        // registered, and this one is reached by many other egress tests -- if
-        // one of them registers it first with no subscriber in place, tracing
-        // caches `Interest::never` for every thread and the assertion below
-        // fails for reasons that have nothing to do with the rejection path.
+        // registered, and this one is reached by many other egress tests. Those
+        // tests do not take `TRACING_TEST_LOCK`, so one of them can register the
+        // callsite -- on its own subscriber-less thread, which caches
+        // `Interest::never` process-wide -- at any point, including after the
+        // rebuild `tracing_test_guard` performs on entry. The warmup alone does
+        // not repair that: registration happens once per process, so a callsite
+        // another thread already stamped `never` stays `never` and the warmup is
+        // a no-op. Warming up first *and then* rebuilding covers both orders:
+        // the warmup guarantees the callsite is registered, and the rebuild --
+        // still under the lock, with our subscriber installed on this thread --
+        // guarantees its cached interest reflects our subscriber rather than
+        // whichever thread happened to reach it first.
         let _ = client.checked_url("warmup-scheme://warmup.invalid/warmup");
+        tracing::callsite::rebuild_interest_cache();
         logs.clear();
 
         let error = client

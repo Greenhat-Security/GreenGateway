@@ -164,6 +164,14 @@ pub(crate) struct ClusterSecurityRuntime {
     /// a resource's activation read but before its content fetch.
     #[cfg(test)]
     before_publish: std::sync::Mutex<Option<BeforePublishHook>>,
+    /// Test seam: how many times `admit_within`'s loop has been entered.
+    /// A gate that cannot converge on a revision spins this loop until its
+    /// budget runs out, so counting the passes measures livelock directly
+    /// -- a test can assert convergence in a bounded number of passes
+    /// rather than inferring it from how long a pass took on a machine it
+    /// does not control.
+    #[cfg(test)]
+    admit_passes: std::sync::atomic::AtomicU64,
 }
 
 #[cfg(test)]
@@ -184,7 +192,16 @@ impl ClusterSecurityRuntime {
             published: ArcSwapOption::from(None),
             #[cfg(test)]
             before_publish: std::sync::Mutex::new(None),
+            #[cfg(test)]
+            admit_passes: std::sync::atomic::AtomicU64::new(0),
         })
+    }
+
+    /// How many passes `admit_within` has taken since this runtime was
+    /// built.
+    #[cfg(test)]
+    pub(crate) fn admit_passes_for_test(&self) -> u64 {
+        self.admit_passes.load(Ordering::Acquire)
     }
 
     /// Wire the lanes bundles are captured from. Called once, after every
@@ -837,6 +854,9 @@ impl ClusterSecurityRuntime {
     ) -> Result<crate::middleware::rbac::Admission, SecurityRevisionCheckError> {
         let deadline = Instant::now() + budget;
         loop {
+            #[cfg(test)]
+            self.admit_passes
+                .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
             // The one authoritative read the strict rule requires. A
             // revision is only visible here once its transaction committed.
             let current = self.current_revision(deadline).await?;

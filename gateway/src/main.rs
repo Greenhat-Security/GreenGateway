@@ -31334,6 +31334,14 @@ paths:
         let recorder = PrometheusBuilder::new().build_recorder();
         let (audit_log, audit_event_sender) =
             audit::AuditLog::from_config(&config).expect("audit log should build");
+        // Keep a handle on the audit pipeline so the observation can be driven
+        // to the discovery aggregator on demand instead of by racing it. The
+        // request's `http.request_observed` event only reaches the aggregator
+        // once the audit writer thread dequeues it, and the aggregator only
+        // announces the signal when it flushes -- on a 250ms batch tick.
+        // Neither the writer thread's turn nor that tick is the property under
+        // test, so neither belongs inside the stream read budget.
+        let audit_pipeline = audit_log.clone();
         let router = app(config, recorder.handle(), audit_log, audit_event_sender)
             .expect("app should build");
 
@@ -31357,6 +31365,19 @@ paths:
             .await
             .expect("data request should complete");
         assert_eq!(response.status(), StatusCode::CREATED);
+
+        // Draining is the observable condition the read below used to wait on
+        // by hope: it closes admission and joins the audit writer, which emits
+        // every queued event and then flushes every sink. When it returns, the
+        // discovery flush has happened, so `signal.opened` has already been
+        // published to the broadcast channel and the read observes a delivered
+        // event rather than the scheduler. A gateway that stops announcing
+        // opened signals -- or announces the wrong ones -- still fails this
+        // test: the stream then ends with no matching event at all.
+        audit_pipeline
+            .close_and_drain(Duration::from_secs(10))
+            .await
+            .expect("audit pipeline should drain");
 
         let body = read_sse_until(stream_response.into_body(), |body| {
             body.contains(r#""event_type":"signal.opened""#)
@@ -43089,6 +43110,49 @@ O2gecI9QwDJNpm29J9wJB2F8
         /// no policy file, the PostgreSQL control plane as the authority,
         /// the PG store as the history store, and the revision gate layered
         /// over the admin routes exactly as `add_admin_api_routes` does.
+        /// The revision gate these admin-route tests put in front of their
+        /// routers: the production gate, on the background budget instead
+        /// of the 250 ms request deadline.
+        ///
+        /// That deadline is a fail-closed LATENCY policy, and none of the
+        /// tests using this router asserts on it -- they assert the status
+        /// the admin plane returns (200, 412, 403) and what the authority
+        /// ends up holding. But a router built here starts cold, so the
+        /// first request through it pays a full fetch-validate-compile
+        /// pass, and against an authority shared with the rest of the
+        /// suite that pass alone can spend a request's budget and turn the
+        /// asserted status into a 503 -- a failure that says nothing about
+        /// the property under test. Production replicas do not serve cold:
+        /// the builder registers every resource and the reconciler primes
+        /// the watermark before the listener accepts.
+        ///
+        /// The gate stays on the request path, so nothing is given up: a
+        /// gate that served a stale snapshot, or refused one it should
+        /// have served, still changes every status asserted below. Only
+        /// the budget differs, and the budget has its own dedicated guard
+        /// in `the_background_pass_outlives_the_request_deadline`.
+        struct BackgroundBudgetGate(Arc<ClusterSecurityRuntime>);
+
+        #[async_trait::async_trait]
+        impl middleware::rbac::SecurityRevisionGate for BackgroundBudgetGate {
+            async fn ensure_current_revision(
+                &self,
+            ) -> Result<i64, middleware::rbac::SecurityRevisionCheckError> {
+                self.0
+                    .ensure_current_revision_within(security_cluster::RECONCILE_BACKGROUND_DEADLINE)
+                    .await
+            }
+
+            async fn admit(
+                &self,
+            ) -> Result<middleware::rbac::Admission, middleware::rbac::SecurityRevisionCheckError>
+            {
+                self.0
+                    .admit_within(security_cluster::RECONCILE_BACKGROUND_DEADLINE)
+                    .await
+            }
+        }
+
         fn cluster_policy_router(
             store: Arc<PostgresPolicyStore>,
         ) -> (Router, middleware::rbac::RbacState) {
@@ -43102,7 +43166,8 @@ O2gecI9QwDJNpm29J9wJB2F8
                 store.revision_source(),
                 PolicyResource::new(store.clone(), rbac_state.clone()),
             );
-            let gate: Arc<dyn middleware::rbac::SecurityRevisionGate> = runtime;
+            let gate: Arc<dyn middleware::rbac::SecurityRevisionGate> =
+                Arc::new(BackgroundBudgetGate(runtime));
             let router = Router::new()
                 .route(
                     POLICY_ADMIN_ROUTE,
@@ -43426,7 +43491,21 @@ O2gecI9QwDJNpm29J9wJB2F8
                 store.revision_source(),
                 PolicyResource::new(store.clone(), rbac_state.clone()),
             );
-            middleware::rbac::SecurityRevisionGate::ensure_current_revision(&*runtime)
+            // The background budget, not the 250 ms request deadline: what
+            // is under test is which watermark a pass publishes, not how
+            // fast a pass runs. This test is the most round-trip-hungry in
+            // the module by construction -- the hook commits a whole new
+            // policy mid-pass, so the pass re-reads the counter and goes
+            // again -- and against a shared authority those round trips
+            // alone can spend a request's budget. A
+            // `ReconcileDeadlineExceeded` here would say nothing about the
+            // watermark. The assertions below are budget-independent: a
+            // pass that published the counter it read before the mid-pass
+            // commit fails them however long it is given. The 250 ms
+            // request deadline keeps its own dedicated guard in
+            // `the_background_pass_outlives_the_request_deadline`.
+            runtime
+                .ensure_current_revision_within(security_cluster::RECONCILE_BACKGROUND_DEADLINE)
                 .await
                 .expect("the first pass compiles the initial revision");
 
@@ -43440,10 +43519,10 @@ O2gecI9QwDJNpm29J9wJB2F8
                     commit_policy(&store, "mid-pass-second").await;
                 })
             }));
-            let published =
-                middleware::rbac::SecurityRevisionGate::ensure_current_revision(&*runtime)
-                    .await
-                    .expect("the pass settles");
+            let published = runtime
+                .ensure_current_revision_within(security_cluster::RECONCILE_BACKGROUND_DEADLINE)
+                .await
+                .expect("the pass settles");
             let latest = PolicyControlPlane::active(&*store)
                 .await
                 .expect("active read")
@@ -43572,7 +43651,16 @@ O2gecI9QwDJNpm29J9wJB2F8
             );
 
             // Current: the gate passes and reports the served revision.
-            let served = middleware::rbac::SecurityRevisionGate::ensure_current_revision(&*runtime)
+            // On the background budget, not the request deadline: what is
+            // under test is the revision a pass serves and the content it
+            // installs, and both assertions hold or fail regardless of how
+            // long the pass is given. Against a shared authority the round
+            // trips a healthy pass makes can spend a request's 250 ms on
+            // their own, which would fail this test for a reason it does
+            // not guard. The request deadline keeps its own dedicated guard
+            // in `the_background_pass_outlives_the_request_deadline`.
+            let served = runtime
+                .ensure_current_revision_within(security_cluster::RECONCILE_BACKGROUND_DEADLINE)
                 .await
                 .expect("gate should pass when current");
             assert_eq!(served, active.security_revision);
@@ -43595,7 +43683,8 @@ O2gecI9QwDJNpm29J9wJB2F8
             )
             .await
             .expect("other replica's commit should win");
-            let served = middleware::rbac::SecurityRevisionGate::ensure_current_revision(&*runtime)
+            let served = runtime
+                .ensure_current_revision_within(security_cluster::RECONCILE_BACKGROUND_DEADLINE)
                 .await
                 .expect("gate should reconcile");
             assert!(served > active.security_revision);
@@ -43989,9 +44078,31 @@ O2gecI9QwDJNpm29J9wJB2F8
             // 250ms deadline, failing closed on healthy state. The
             // multi-resource gate must reconcile the tools resource (a
             // no-op at the boot revision) and return Ok.
-            let served = middleware::rbac::SecurityRevisionGate::ensure_current_revision(&*runtime)
+            //
+            // Livelock is counted, not timed. Each pass is a handful of
+            // round trips to the shared authority, so on a loaded machine
+            // a healthy pass can spend the 250ms request budget and fail
+            // closed for reasons that have nothing to do with looping --
+            // whereas a gate that truly cannot converge spins the loop
+            // until whatever budget it is given expires. The passes the
+            // gate takes are therefore what distinguishes the two, and the
+            // budget is not: these calls run on the background budget so
+            // load cannot fail them, and the assertions below pin
+            // convergence to a bounded number of passes. That is strictly
+            // sharper than the deadline was -- a regression that looped a
+            // few times and then converged used to pass and now does not.
+            // The 250ms request deadline keeps its own dedicated guard in
+            // `the_background_pass_outlives_the_request_deadline`.
+            let before = runtime.admit_passes_for_test();
+            let served = runtime
+                .ensure_current_revision_within(security_cluster::RECONCILE_BACKGROUND_DEADLINE)
                 .await
                 .expect("a tools-only revision must not livelock the gate");
+            assert!(
+                runtime.admit_passes_for_test() - before <= 2,
+                "a tools-only revision must converge in a bounded number of gate passes, took {}",
+                runtime.admit_passes_for_test() - before
+            );
             assert!(
                 served >= boot_tools.security_revision,
                 "the compiled watermark covers the tools revision ({served} < {})",
@@ -44011,9 +44122,16 @@ O2gecI9QwDJNpm29J9wJB2F8
                 )
                 .await
                 .expect("tools commit should win");
-            let served = middleware::rbac::SecurityRevisionGate::ensure_current_revision(&*runtime)
+            let before = runtime.admit_passes_for_test();
+            let served = runtime
+                .ensure_current_revision_within(security_cluster::RECONCILE_BACKGROUND_DEADLINE)
                 .await
                 .expect("the gate must reconcile a tools commit, not loop");
+            assert!(
+                runtime.admit_passes_for_test() - before <= 2,
+                "a tools commit must converge in a bounded number of gate passes, took {}",
+                runtime.admit_passes_for_test() - before
+            );
             assert_eq!(served, committed.security_revision);
             assert!(
                 registry
@@ -44193,8 +44311,20 @@ O2gecI9QwDJNpm29J9wJB2F8
                 policy_store.revision_source(),
                 PolicyResource::new(policy_store.clone(), rbac_state.clone()),
             );
+            // Both passes run on the background budget, not the 250 ms
+            // request deadline: what is under test is *which* resources a
+            // pass confirms, not how fast a pass runs. Each pass is a
+            // handful of round trips to the authority, and on a loaded
+            // machine those alone can spend the request budget -- a
+            // `ReconcileDeadlineExceeded` here says nothing about the
+            // watermark reset. The assertions below are budget-independent:
+            // without the reset on registration the second pass returns
+            // early on a watermark that already covers `committed_at`, the
+            // recording resource is never reconciled, and `reconciled`
+            // stays 0 however long the pass is given.
             // Policy alone confirms a watermark past the connection commit.
-            let served = middleware::rbac::SecurityRevisionGate::ensure_current_revision(&*runtime)
+            let served = runtime
+                .ensure_current_revision_within(security_cluster::RECONCILE_BACKGROUND_DEADLINE)
                 .await
                 .expect("policy-only pass serves");
             assert!(served >= committed_at);
@@ -44205,7 +44335,8 @@ O2gecI9QwDJNpm29J9wJB2F8
                 store: connection_store.clone(),
                 reconciled: reconciled.clone(),
             }));
-            middleware::rbac::SecurityRevisionGate::ensure_current_revision(&*runtime)
+            runtime
+                .ensure_current_revision_within(security_cluster::RECONCILE_BACKGROUND_DEADLINE)
                 .await
                 .expect("the check after registration serves");
             assert_eq!(
@@ -44454,7 +44585,12 @@ O2gecI9QwDJNpm29J9wJB2F8
                 reconciled: reconciled.clone(),
             }));
 
-            let served = middleware::rbac::SecurityRevisionGate::ensure_current_revision(&*runtime)
+            // The background budget: the assertion is which revision the
+            // watermark covers, not how fast the pass reaching it ran. See
+            // `the_background_pass_outlives_the_request_deadline` for the
+            // 250 ms request deadline's own guard.
+            let served = runtime
+                .ensure_current_revision_within(security_cluster::RECONCILE_BACKGROUND_DEADLINE)
                 .await
                 .expect("the gate must reconcile a connection commit, not loop");
             assert!(
@@ -44593,7 +44729,12 @@ O2gecI9QwDJNpm29J9wJB2F8
                 )
                 .await
                 .expect("tools commit should win");
-            middleware::rbac::SecurityRevisionGate::ensure_current_revision(&*runtime)
+            // The background budget: the assertion is that the committed
+            // lane is installed, not how fast the pass installing it ran.
+            // See `the_background_pass_outlives_the_request_deadline` for
+            // the 250 ms request deadline's own guard.
+            runtime
+                .ensure_current_revision_within(security_cluster::RECONCILE_BACKGROUND_DEADLINE)
                 .await
                 .expect("reconcile should succeed");
             assert!(
