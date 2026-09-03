@@ -28,6 +28,11 @@
     },
     {
       "methods": ["GET"],
+      "path_prefix": "/v1/admin/cluster",
+      "permission": "admin:cluster:read"
+    },
+    {
+      "methods": ["GET"],
       "path_prefix": "/v1/admin/connections",
       "permission": "admin:connections:read"
     },

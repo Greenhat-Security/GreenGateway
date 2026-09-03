@@ -18,6 +18,7 @@ import {
   CapabilityDetail,
   CapabilityInventoryView,
 } from './views/CapabilityInventoryView';
+import { ClusterView } from './views/ClusterView';
 import { ConnectionDetail } from './views/ConnectionDetail';
 import { ConnectionEditor } from './views/ConnectionEditor';
 import { ConnectionsView } from './views/ConnectionsView';
@@ -132,6 +133,9 @@ export function AdminShell() {
           <NavLink to="/live" className={navItemClassName}>
             Live
           </NavLink>
+          <NavLink to="/cluster" className={navItemClassName}>
+            Cluster
+          </NavLink>
           <NavLink to="/status" className={navItemClassName}>
             Status
           </NavLink>
@@ -189,6 +193,7 @@ export function AdminShell() {
           <Route path="/signals" element={<SignalsView />} />
           <Route path="/policy/rules/editor" element={<RuleEditor />} />
           <Route path="/live" element={<LiveTail />} />
+          <Route path="/cluster" element={<ClusterView />} />
           <Route path="/status" element={<StatusPage />} />
           <Route path="*" element={<NotFoundPage />} />
         </Routes>
@@ -268,6 +273,10 @@ function Dashboard({
           <Link to="/live">
             <span>Live tail</span>
             <small>Streaming audit events</small>
+          </Link>
+          <Link to="/cluster">
+            <span>Cluster</span>
+            <small>Readiness, replicas, and background task health</small>
           </Link>
           <Link to="/status">
             <span>Status</span>
@@ -556,6 +565,9 @@ function pageTitleForPath(pathname: string): string {
   }
   if (pathname === '/live') {
     return 'Live tail';
+  }
+  if (pathname === '/cluster') {
+    return 'Cluster';
   }
   if (pathname === '/status') {
     return 'Status';

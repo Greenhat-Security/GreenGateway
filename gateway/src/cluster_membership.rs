@@ -130,7 +130,13 @@ impl ClusterMembership {
         self.store
             .heartbeat(&self.registration, MemberRevisions::default(), None)
             .await?;
-        self.check_fingerprint_agreement().await
+        let agreement = self.check_fingerprint_agreement().await;
+        // From the boot row on, so a replica that never gets past the
+        // fingerprint door still has a series saying so rather than no
+        // series at all -- "held at the door" and "not scraped" must not
+        // look the same.
+        self.publish_membership_gauges();
+        agreement
     }
 
     /// Compare the live roster with this replica's fingerprint, granting
@@ -207,6 +213,20 @@ impl ClusterMembership {
     }
 
     async fn tick(&self, lifecycle: &GatewayLifecycle, revisions: Option<&ClusterSecurityRuntime>) {
+        self.tick_once(lifecycle, revisions).await;
+        // Published after every tick, however it ended. The failure paths
+        // are the ones that matter: a heartbeat that cannot be written is
+        // precisely when the age has to keep climbing in the series an
+        // operator is watching, and an early return that skipped the
+        // publication would freeze it at its last healthy value.
+        self.publish_membership_gauges();
+    }
+
+    async fn tick_once(
+        &self,
+        lifecycle: &GatewayLifecycle,
+        revisions: Option<&ClusterSecurityRuntime>,
+    ) {
         let revisions = revisions
             .map(|runtime| MemberRevisions {
                 compiled: runtime.compiled_revision(),
@@ -269,6 +289,10 @@ impl ClusterMembership {
             .last_error_code
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+        // The readiness probe (issue #241, PR 14) refuses readiness once
+        // this replica's row has not been refreshed inside the stale
+        // window, which is the moment the roster stops counting it live.
+        self.readiness.record_heartbeat_success();
     }
 
     fn note_failure(&self, error: &RepositoryError) {
@@ -277,6 +301,33 @@ impl ClusterMembership {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(error.kind().as_str());
     }
+
+    /// Publish this replica's two membership facts as gauges (issue #241,
+    /// PR 14): how old its roster row is, and whether it is still held at
+    /// the fingerprint door.
+    ///
+    /// Neither carries a label. The instance the age belongs to is *this*
+    /// process, which the scrape target already identifies; putting the
+    /// instance id in a label would mint a series per boot, and a replica
+    /// set that rolls weekly would accumulate them forever.
+    pub(crate) fn publish_membership_gauges(&self) {
+        record_membership_gauges(
+            self.readiness.heartbeat_age(),
+            self.readiness.fingerprint_agreed(),
+        );
+    }
+}
+
+/// The emission itself, split from the task that owns the values so the
+/// registry label audit can drive it (`metrics.rs`) without a database.
+pub(crate) fn record_membership_gauges(heartbeat_age: Duration, fingerprint_agreed: bool) {
+    ::metrics::gauge!(crate::metrics::CLUSTER_HEARTBEAT_AGE_SECONDS)
+        .set(heartbeat_age.as_secs_f64());
+    ::metrics::gauge!(crate::metrics::CLUSTER_CONFIG_MISMATCH).set(if fingerprint_agreed {
+        0.0
+    } else {
+        1.0
+    });
 }
 
 /// The live, non-draining members other than `own_instance` whose

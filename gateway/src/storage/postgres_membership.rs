@@ -56,8 +56,20 @@ use uuid::Uuid;
 
 use crate::ha::InstanceIdentity;
 
-use super::{log_classified, postgres::classify_pool_error, RepositoryError, RepositoryErrorKind};
+use super::{
+    log_classified,
+    postgres::{classify_pool_error, timed_operation},
+    RepositoryError, RepositoryErrorKind,
+};
 
+// Every operation below is timed into
+// `greengateway_database_operation_seconds` (issue #241, PR 14). The
+// roster and the job ledger are the HA control plane's own store: when a
+// deployment is deciding whether it is healthy, the latency of the
+// statements it decides with is the first thing an operator needs, and it
+// is the store whose slowness turns directly into `instance_lease_invalid`
+// and a stale roster. The label is the `OPERATION_*` constant -- what was
+// asked of the store -- never the statement, its parameters, or its rows.
 const OPERATION_HEARTBEAT: &str = "cluster_member_heartbeat";
 const OPERATION_MARK_READY: &str = "cluster_member_mark_ready";
 const OPERATION_MARK_DRAINING: &str = "cluster_member_mark_draining";
@@ -145,13 +157,18 @@ pub struct ClusterMember {
 }
 
 /// One singleton job's ledger row.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct MaintenanceJobRecord {
     pub job: String,
     /// The lease fence the rows were last adopted at.
     pub fence: i64,
     pub last_started_at: Option<String>,
     pub last_success_at: Option<String>,
+    /// Seconds since `last_success_at`, on the database clock, so a reader
+    /// judging whether a job is still running never subtracts its own wall
+    /// clock from another machine's timestamp. `None` while the job has
+    /// never succeeded.
+    pub last_success_age_secs: Option<f64>,
     pub last_failure_code: Option<String>,
     pub last_duration_ms: Option<i64>,
 }
@@ -210,6 +227,19 @@ impl PostgresMembershipStore {
     /// replica's real `started_at` and `ready_at` instead of a fresh,
     /// unready boot; an existing row keeps its own.
     pub async fn heartbeat(
+        &self,
+        registration: &MemberRegistration,
+        revisions: MemberRevisions,
+        last_error_code: Option<&str>,
+    ) -> Result<(), RepositoryError> {
+        timed_operation(
+            OPERATION_HEARTBEAT,
+            self.heartbeat_inner(registration, revisions, last_error_code),
+        )
+        .await
+    }
+
+    async fn heartbeat_inner(
         &self,
         registration: &MemberRegistration,
         revisions: MemberRevisions,
@@ -304,6 +334,10 @@ impl PostgresMembershipStore {
     /// replica can be in, so the caller heartbeats first. The instant is
     /// remembered so a later heartbeat can re-create a swept row with it.
     pub async fn mark_ready(&self) -> Result<(), RepositoryError> {
+        timed_operation(OPERATION_MARK_READY, self.mark_ready_inner()).await
+    }
+
+    async fn mark_ready_inner(&self) -> Result<(), RepositoryError> {
         let instance_id = self.identity.instance_id().to_string();
         let client = self.pool.get().await.map_err(classify_pool_error)?;
         let row = client
@@ -342,13 +376,16 @@ impl PostgresMembershipStore {
     }
 
     async fn stamp(&self, statement: &str, operation: &'static str) -> Result<(), RepositoryError> {
-        let instance_id = self.identity.instance_id().to_string();
-        let client = self.pool.get().await.map_err(classify_pool_error)?;
-        client
-            .execute(statement, &[&self.deployment_id, &instance_id])
-            .await
-            .map_err(|error| classify_query(error, operation))?;
-        Ok(())
+        timed_operation(operation, async {
+            let instance_id = self.identity.instance_id().to_string();
+            let client = self.pool.get().await.map_err(classify_pool_error)?;
+            client
+                .execute(statement, &[&self.deployment_id, &instance_id])
+                .await
+                .map_err(|error| classify_query(error, operation))?;
+            Ok(())
+        })
+        .await
     }
 
     /// Every member row of this deployment, oldest boot first, with
@@ -364,6 +401,18 @@ impl PostgresMembershipStore {
     /// [`Self::members`] over a connection the caller holds (the
     /// maintenance singleton's dedicated session).
     pub(crate) async fn members_with(
+        &self,
+        client: &tokio_postgres::Client,
+        stale_window: Duration,
+    ) -> Result<Vec<ClusterMember>, RepositoryError> {
+        timed_operation(
+            OPERATION_LIST,
+            self.members_with_inner(client, stale_window),
+        )
+        .await
+    }
+
+    async fn members_with_inner(
         &self,
         client: &tokio_postgres::Client,
         stale_window: Duration,
@@ -424,6 +473,19 @@ impl PostgresMembershipStore {
         stale_window: Duration,
         limit: u32,
     ) -> Result<u64, RepositoryError> {
+        timed_operation(
+            OPERATION_SWEEP,
+            self.sweep_stale_with_inner(client, stale_window, limit),
+        )
+        .await
+    }
+
+    async fn sweep_stale_with_inner(
+        &self,
+        client: &tokio_postgres::Client,
+        stale_window: Duration,
+        limit: u32,
+    ) -> Result<u64, RepositoryError> {
         let window_secs = stale_window.as_secs_f64();
         let limit = i64::from(limit.clamp(1, MAX_SWEEP_BATCH));
         let removed = client
@@ -451,6 +513,10 @@ impl PostgresMembershipStore {
     /// fence by a successor, in which case this leader is stale and must
     /// run nothing.
     pub async fn adopt_jobs(&self, jobs: &[&str], fence: i64) -> Result<bool, RepositoryError> {
+        timed_operation(OPERATION_JOB_ADOPT, self.adopt_jobs_inner(jobs, fence)).await
+    }
+
+    async fn adopt_jobs_inner(&self, jobs: &[&str], fence: i64) -> Result<bool, RepositoryError> {
         if jobs.is_empty() {
             return Ok(true);
         }
@@ -485,6 +551,18 @@ impl PostgresMembershipStore {
     /// database clock. `false` means the write was refused: the writer's
     /// lease lapsed or a successor took over, and this leader is stale.
     pub async fn record_job_started(&self, job: &str, fence: i64) -> Result<bool, RepositoryError> {
+        timed_operation(
+            OPERATION_JOB_START,
+            self.record_job_started_inner(job, fence),
+        )
+        .await
+    }
+
+    async fn record_job_started_inner(
+        &self,
+        job: &str,
+        fence: i64,
+    ) -> Result<bool, RepositoryError> {
         let job = bounded_short_text(job);
         let client = self.pool.get().await.map_err(classify_pool_error)?;
         let updated = client
@@ -506,6 +584,19 @@ impl PostgresMembershipStore {
     /// and the maintenance lease at `fence` is still live; `false` means
     /// the write was refused by the predicate.
     pub async fn record_job_outcome(
+        &self,
+        job: &str,
+        fence: i64,
+        outcome: &JobOutcome,
+    ) -> Result<bool, RepositoryError> {
+        timed_operation(
+            OPERATION_JOB_OUTCOME,
+            self.record_job_outcome_inner(job, fence, outcome),
+        )
+        .await
+    }
+
+    async fn record_job_outcome_inner(
         &self,
         job: &str,
         fence: i64,
@@ -547,6 +638,10 @@ impl PostgresMembershipStore {
 
     /// Every job row of this deployment, by name.
     pub async fn maintenance_jobs(&self) -> Result<Vec<MaintenanceJobRecord>, RepositoryError> {
+        timed_operation(OPERATION_JOB_LIST, self.maintenance_jobs_inner()).await
+    }
+
+    async fn maintenance_jobs_inner(&self) -> Result<Vec<MaintenanceJobRecord>, RepositoryError> {
         let client = self.pool.get().await.map_err(classify_pool_error)?;
         let rows = client
             .query(
@@ -554,6 +649,14 @@ impl PostgresMembershipStore {
                     "SELECT job, fence,
                             to_char(last_started_at AT TIME ZONE 'UTC', {f}) AS last_started_at,
                             to_char(last_success_at AT TIME ZONE 'UTC', {f}) AS last_success_at,
+                            -- The CASE is not redundant: GREATEST ignores
+                            -- NULL arguments in PostgreSQL, so a job that
+                            -- has never succeeded would otherwise report
+                            -- an age of zero -- \"succeeded just now\" --
+                            -- instead of no age at all.
+                            CASE WHEN last_success_at IS NULL THEN NULL
+                                 ELSE GREATEST(EXTRACT(EPOCH FROM (now() - last_success_at)), 0)
+                            END::double precision AS last_success_age_secs,
                             last_failure_code, last_duration_ms
                      FROM greengateway.maintenance_jobs
                      WHERE deployment_id = $1
@@ -571,6 +674,11 @@ impl PostgresMembershipStore {
                     fence: column(row, "fence", OPERATION_JOB_LIST)?,
                     last_started_at: column(row, "last_started_at", OPERATION_JOB_LIST)?,
                     last_success_at: column(row, "last_success_at", OPERATION_JOB_LIST)?,
+                    last_success_age_secs: column(
+                        row,
+                        "last_success_age_secs",
+                        OPERATION_JOB_LIST,
+                    )?,
                     last_failure_code: column(row, "last_failure_code", OPERATION_JOB_LIST)?,
                     last_duration_ms: column(row, "last_duration_ms", OPERATION_JOB_LIST)?,
                 })

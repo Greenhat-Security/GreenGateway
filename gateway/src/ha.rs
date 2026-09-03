@@ -168,9 +168,29 @@ impl HaFoundation {
 ///
 /// Standalone mode has no membership and never constructs one; a `None`
 /// gate in the app state is "always agreed".
-#[derive(Debug, Default)]
+///
+/// From PR 14 the gate is also where the heartbeat's own health is
+/// carried: the readiness probe (`ha_status.rs`) needs to know when this
+/// replica's roster row last landed, and the heartbeat task already owns
+/// the gate. Nothing else about the roster is kept here — the probe asks
+/// the authority for the rest.
+#[derive(Debug)]
 pub struct ClusterReadiness {
     fingerprint_agreed: std::sync::atomic::AtomicBool,
+    /// When the membership heartbeat last wrote this replica's row.
+    /// Seeded at construction, which is a truthful starting point: the
+    /// boot row is written before the heartbeat task starts, and a boot
+    /// row that cannot be written fails startup.
+    last_heartbeat_success: std::sync::Mutex<std::time::Instant>,
+}
+
+impl Default for ClusterReadiness {
+    fn default() -> Self {
+        Self {
+            fingerprint_agreed: std::sync::atomic::AtomicBool::new(false),
+            last_heartbeat_success: std::sync::Mutex::new(std::time::Instant::now()),
+        }
+    }
 }
 
 impl ClusterReadiness {
@@ -197,6 +217,30 @@ impl ClusterReadiness {
     /// Why this gate refuses readiness, or `None` when it does not.
     pub fn blocked_reason(&self) -> Option<&'static str> {
         (!self.fingerprint_agreed()).then_some(Self::FINGERPRINT_MISMATCH)
+    }
+
+    /// Record that the membership heartbeat wrote this replica's roster
+    /// row (issue #241, PR 14). Called by the heartbeat task on every
+    /// successful write; a failed write records nothing, so the age
+    /// below simply keeps growing until one lands.
+    #[cfg_attr(not(feature = "postgres"), allow(dead_code))] // called by the membership heartbeat only
+    pub fn record_heartbeat_success(&self) {
+        *self
+            .last_heartbeat_success
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = std::time::Instant::now();
+    }
+
+    /// How long ago the membership heartbeat last landed. The readiness
+    /// probe compares this with the stale window: once it exceeds the
+    /// window the deployment's roster has stopped counting this replica
+    /// as live, whatever the replica itself believes.
+    pub fn heartbeat_age(&self) -> std::time::Duration {
+        let last = *self
+            .last_heartbeat_success
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        std::time::Instant::now().saturating_duration_since(last)
     }
 }
 

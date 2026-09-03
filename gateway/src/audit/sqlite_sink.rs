@@ -304,6 +304,7 @@ impl SqliteSinkShared {
         let result = write_events(&mut connection, &events);
         drop(connection);
 
+        crate::audit::record_flush_outcome(result.is_ok());
         if let Err(err) = result {
             let mut failure = self
                 .flush_failure

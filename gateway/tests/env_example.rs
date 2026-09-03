@@ -259,6 +259,18 @@ fn cloudflare_forwarding_matches_supported_gateway_env_vars() {
         "CLUSTER_MAINTENANCE_INTERVAL_MS",
         "CLUSTER_MAINTENANCE_LEASE_TTL_MS",
         "AUDIT_POSTGRES_RETENTION_DAYS",
+        // The readiness probe's cache window (issue #241, PR 14): it
+        // bounds how often `/readyz` consults the shared authority, and
+        // standalone readiness consults none, so the setting is rejected
+        // in sqlite mode and could never be honoured here.
+        "READINESS_PROBE_CACHE_MS",
+        // Whether the cluster status API may name this replica's own host
+        // (issue #241, PR 14). Unlike the settings above, the gateway honours
+        // this in BOTH modes, because standalone serves the same status
+        // shapes for its single instance. It is excluded here for a different
+        // reason: the Cloudflare worker serves no cluster status endpoint at
+        // all, so there is nothing there for the setting to affect.
+        "CLUSTER_STATUS_EXPOSE_HOSTNAMES",
     ] {
         assert!(
             expected.remove(excluded),

@@ -144,6 +144,13 @@ pub const DEFAULT_CLUSTER_MAINTENANCE_LEASE_TTL_MS: u64 = 15_000;
 pub const MIN_CLUSTER_MAINTENANCE_LEASE_TTL_MS: u64 = 1_000;
 /// The stale window is at least this many heartbeat intervals.
 pub const MIN_CLUSTER_STALE_HEARTBEATS: u64 = 3;
+/// How long `/readyz` reuses one authority observation (issue #241,
+/// PR 14). One second keeps a probe storm off the database while still
+/// telling an orchestrator the truth within a single probe interval; `0`
+/// means every probe consults the authority. The ceiling exists because a
+/// probe answer older than a minute is not a readiness answer any more.
+pub const DEFAULT_READINESS_PROBE_CACHE_MS: u64 = 1_000;
+pub const MAX_READINESS_PROBE_CACHE_MS: u64 = 60_000;
 pub const DEFAULT_TOOL_RUNTIME_DEFAULT_TIMEOUT_MS: u64 = 30_000;
 /// TLS 1.2 rather than 1.3, because raising a floor is an operator decision
 /// with a compatibility cost attached, and a default that silently refuses a
@@ -325,6 +332,8 @@ const CLUSTER_HEARTBEAT_MS: &str = "CLUSTER_HEARTBEAT_MS";
 const CLUSTER_MEMBER_STALE_MS: &str = "CLUSTER_MEMBER_STALE_MS";
 const CLUSTER_MAINTENANCE_INTERVAL_MS: &str = "CLUSTER_MAINTENANCE_INTERVAL_MS";
 const CLUSTER_MAINTENANCE_LEASE_TTL_MS: &str = "CLUSTER_MAINTENANCE_LEASE_TTL_MS";
+const READINESS_PROBE_CACHE_MS: &str = "READINESS_PROBE_CACHE_MS";
+const CLUSTER_STATUS_EXPOSE_HOSTNAMES: &str = "CLUSTER_STATUS_EXPOSE_HOSTNAMES";
 const AUDIT_POSTGRES_RETENTION_DAYS: &str = "AUDIT_POSTGRES_RETENTION_DAYS";
 const TOOLS_FILE: &str = "TOOLS_FILE";
 const CLIENT_CERT_CA_FILE: &str = "CLIENT_CERT_CA_FILE";
@@ -497,6 +506,16 @@ pub struct Config {
     /// The maintenance lease's TTL on the database clock (renewed at a
     /// third of it); cluster mode only.
     pub cluster_maintenance_lease_ttl_ms: u64,
+    /// How long `/readyz` reuses one authority observation (issue #241,
+    /// PR 14); cluster mode only, rejected in standalone mode.
+    pub readiness_probe_cache_ms: u64,
+    /// Whether the cluster status API may report this replica's own
+    /// hostname (issue #241, PR 14). Default `false`: everything else on
+    /// that surface is a number, a UUID, or a value recognized against a
+    /// fixed shape, so a hostname is the one piece of deployment topology
+    /// an operator has to ask for. Honoured in both modes, because both
+    /// serve `GET /v1{ADMIN_PREFIX}/cluster`.
+    pub cluster_status_expose_hostnames: bool,
     /// PostgreSQL audit retention in days, pruned by the maintenance
     /// singleton; `None` (or `0`) keeps everything. Cluster mode only.
     pub audit_postgres_retention_days: Option<u32>,
@@ -2466,6 +2485,37 @@ impl Config {
         } else {
             cluster_maintenance_lease_ttl_ms
         };
+        // The readiness probe's cache window (issue #241, PR 14). Cluster
+        // mode only: standalone `/readyz` consults no authority, so a
+        // value there would configure a check that never runs.
+        let readiness_probe_cache_raw = blank_as_unset(get_var(READINESS_PROBE_CACHE_MS));
+        let readiness_probe_cache_set = readiness_probe_cache_raw.is_ok();
+        let readiness_probe_cache_ms = parse_var(
+            READINESS_PROBE_CACHE_MS,
+            readiness_probe_cache_raw,
+            DEFAULT_READINESS_PROBE_CACHE_MS,
+            "millisecond duration",
+            &mut problems,
+        );
+        let readiness_probe_cache_ms = if readiness_probe_cache_ms > MAX_READINESS_PROBE_CACHE_MS {
+            problems.push(format!(
+                "{READINESS_PROBE_CACHE_MS} must be at most {MAX_READINESS_PROBE_CACHE_MS} milliseconds so a readiness answer is never older than the probe interval that asked for it, got '{readiness_probe_cache_ms}'"
+            ));
+            DEFAULT_READINESS_PROBE_CACHE_MS
+        } else {
+            readiness_probe_cache_ms
+        };
+        // Whether the cluster status API reports this replica's hostname
+        // (issue #241, PR 14). Unlike the probe's cache window this is not
+        // cluster-only: standalone serves the same endpoint and has the
+        // same hostname to report, so a value is honoured in both modes.
+        let cluster_status_expose_hostnames = parse_var(
+            CLUSTER_STATUS_EXPOSE_HOSTNAMES,
+            blank_as_unset(get_var(CLUSTER_STATUS_EXPOSE_HOSTNAMES)),
+            false,
+            "boolean",
+            &mut problems,
+        );
         let audit_postgres_retention_raw = blank_as_unset(get_var(AUDIT_POSTGRES_RETENTION_DAYS));
         let audit_postgres_retention_set = audit_postgres_retention_raw.is_ok();
         let audit_postgres_retention_days = normalize_audit_retention_days(
@@ -2921,6 +2971,11 @@ impl Config {
                         "{AUDIT_POSTGRES_RETENTION_DAYS} is set while {STATE_BACKEND} is sqlite; standalone mode has no PostgreSQL audit store and never reads it (use {AUDIT_SQLITE_RETENTION_DAYS})"
                     ));
                 }
+                if readiness_probe_cache_set {
+                    problems.push(format!(
+                        "{READINESS_PROBE_CACHE_MS} is set while {STATE_BACKEND} is sqlite; standalone readiness consults no shared authority and never reads it"
+                    ));
+                }
             }
         }
         // Payload-shape capture needs a destination. Standalone mode's is the
@@ -3047,6 +3102,8 @@ impl Config {
                 cluster_member_stale_ms,
                 cluster_maintenance_interval_ms,
                 cluster_maintenance_lease_ttl_ms,
+                readiness_probe_cache_ms,
+                cluster_status_expose_hostnames,
                 audit_postgres_retention_days,
                 tool_runtime_default_timeout_ms,
                 csrf_enabled,
@@ -3123,6 +3180,13 @@ impl Config {
     #[cfg_attr(not(feature = "postgres"), allow(dead_code))] // read by the cluster wiring only
     pub fn cluster_member_stale_window(&self) -> std::time::Duration {
         std::time::Duration::from_millis(self.cluster_member_stale_ms)
+    }
+
+    /// How long `/readyz` reuses one authority observation (issue #241,
+    /// PR 14).
+    #[cfg_attr(not(feature = "postgres"), allow(dead_code))] // read by the cluster wiring only
+    pub fn readiness_probe_cache(&self) -> std::time::Duration {
+        std::time::Duration::from_millis(self.readiness_probe_cache_ms)
     }
 
     /// How often the maintenance leader runs one pass (issue #241, PR 13).
@@ -10939,6 +11003,7 @@ mod tests {
             "CLUSTER_MAINTENANCE_INTERVAL_MS",
             "CLUSTER_MAINTENANCE_LEASE_TTL_MS",
             "AUDIT_POSTGRES_RETENTION_DAYS",
+            "READINESS_PROBE_CACHE_MS",
         ];
         for name in names {
             for blank in ["", "  "] {
@@ -10996,6 +11061,7 @@ mod tests {
             "CLUSTER_MAINTENANCE_INTERVAL_MS",
             "CLUSTER_MAINTENANCE_LEASE_TTL_MS",
             "AUDIT_POSTGRES_RETENTION_DAYS",
+            "READINESS_PROBE_CACHE_MS",
         ] {
             assert_eq!(
                 vars.get(name).map(String::as_str),
@@ -11121,6 +11187,103 @@ mod tests {
                 "{error}"
             );
         }
+    }
+
+    /// The readiness probe's cache window (issue #241, PR 14): a default
+    /// of one second, `0` accepted as "consult the authority on every
+    /// probe", a ceiling so a readiness answer cannot outlive the probe
+    /// interval that asked for it, and standalone mode refusing it
+    /// outright because it consults no shared authority.
+    #[test]
+    fn the_readiness_probe_cache_has_a_default_a_ceiling_and_a_standalone_rejection() {
+        let config = Config::from_env_vars(postgres_mode_vars(&[])).expect("postgres mode config");
+        assert_eq!(
+            config.readiness_probe_cache_ms,
+            DEFAULT_READINESS_PROBE_CACHE_MS
+        );
+        assert_eq!(
+            config.readiness_probe_cache(),
+            std::time::Duration::from_millis(DEFAULT_READINESS_PROBE_CACHE_MS)
+        );
+
+        let config =
+            Config::from_env_vars(postgres_mode_vars(&[("READINESS_PROBE_CACHE_MS", "0")]))
+                .expect("a zero cache window is a supported setting, not a rejection");
+        assert_eq!(config.readiness_probe_cache(), std::time::Duration::ZERO);
+
+        let error =
+            Config::from_env_vars(postgres_mode_vars(&[("READINESS_PROBE_CACHE_MS", "60001")]))
+                .expect_err("a cache window past the ceiling must not start");
+        assert!(
+            error.to_string().contains(&format!(
+                "READINESS_PROBE_CACHE_MS must be at most {MAX_READINESS_PROBE_CACHE_MS} milliseconds"
+            )),
+            "{error}"
+        );
+
+        let error = Config::from_env_vars(|key| {
+            if key == "READINESS_PROBE_CACHE_MS" {
+                Ok("2000".to_owned())
+            } else {
+                Err(VarError::NotPresent)
+            }
+        })
+        .expect_err("the probe cache in standalone mode must not start");
+        assert!(
+            error
+                .to_string()
+                .contains("READINESS_PROBE_CACHE_MS is set while STATE_BACKEND is sqlite"),
+            "{error}"
+        );
+    }
+
+    /// The hostname opt-in (issue #241, PR 14): off by default, honoured
+    /// in *both* modes -- unlike the probe's cache window, which is
+    /// cluster-only -- because standalone serves the same cluster status
+    /// endpoint and has the same hostname to report. Blank is unset, so
+    /// `.env.example`'s own line boots.
+    #[test]
+    fn the_hostname_opt_in_defaults_off_and_is_honoured_in_both_modes() {
+        for vars in [
+            postgres_mode_vars(&[]),
+            postgres_mode_vars(&[("CLUSTER_STATUS_EXPOSE_HOSTNAMES", "")]),
+            postgres_mode_vars(&[("CLUSTER_STATUS_EXPOSE_HOSTNAMES", "  ")]),
+        ] {
+            let config = Config::from_env_vars(vars).expect("postgres mode config");
+            assert!(!config.cluster_status_expose_hostnames);
+        }
+
+        let config = Config::from_env_vars(postgres_mode_vars(&[(
+            "CLUSTER_STATUS_EXPOSE_HOSTNAMES",
+            "true",
+        )]))
+        .expect("the opt-in is a supported cluster-mode setting");
+        assert!(config.cluster_status_expose_hostnames);
+
+        // Standalone accepts it rather than refusing it, because
+        // standalone serves `GET /v1{ADMIN_PREFIX}/cluster` too.
+        let config = Config::from_env_vars(|key| {
+            if key == "CLUSTER_STATUS_EXPOSE_HOSTNAMES" {
+                Ok("true".to_owned())
+            } else {
+                Err(VarError::NotPresent)
+            }
+        })
+        .expect("the opt-in is honoured in standalone mode, not refused");
+        assert_eq!(config.state_backend, StateBackend::Sqlite);
+        assert!(config.cluster_status_expose_hostnames);
+
+        let error = Config::from_env_vars(postgres_mode_vars(&[(
+            "CLUSTER_STATUS_EXPOSE_HOSTNAMES",
+            "yes",
+        )]))
+        .expect_err("a non-boolean must not start");
+        assert!(
+            error
+                .to_string()
+                .contains("CLUSTER_STATUS_EXPOSE_HOSTNAMES"),
+            "{error}"
+        );
     }
 
     #[test]

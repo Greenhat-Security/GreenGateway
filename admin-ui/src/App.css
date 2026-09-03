@@ -2914,3 +2914,105 @@ textarea:focus-visible {
   }
 
 }
+
+/* Cluster status view (issue #241, PR 14) */
+
+.cluster-summary {
+  display: grid;
+  gap: 18px;
+}
+
+.cluster-state {
+  display: flex;
+  align-items: flex-start;
+  gap: var(--gh-ref-space-3);
+  border: 1px solid var(--gh-sys-border);
+  border-radius: var(--gh-comp-card-radius);
+  padding: 14px 16px;
+  background: var(--gh-sys-bg-raised);
+}
+
+.cluster-state-body {
+  min-width: 0;
+}
+
+.cluster-state-text {
+  margin: 0;
+  color: var(--gh-sys-fg);
+  font-size: 14px;
+  font-weight: 700;
+  overflow-wrap: anywhere;
+}
+
+.cluster-state-reason {
+  margin: 6px 0 0;
+  color: var(--gh-sys-fg-muted);
+  font-size: 13px;
+  line-height: 1.5;
+  overflow-wrap: anywhere;
+}
+
+.cluster-section-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 18px;
+}
+
+.cluster-section {
+  display: grid;
+  align-content: start;
+  gap: 12px;
+}
+
+.cluster-section h3 {
+  margin-bottom: 0;
+  font-size: var(--gh-type-h5);
+}
+
+.cluster-grid {
+  display: grid;
+  margin: 0;
+}
+
+.cluster-item {
+  min-width: 0;
+}
+
+.cluster-table {
+  min-width: 640px;
+}
+
+.cluster-doc-link {
+  color: var(--gh-sys-primary-text);
+  font-weight: 650;
+  text-decoration: underline;
+}
+
+.cluster-doc-link:hover {
+  text-decoration: none;
+}
+
+.cluster-doc-link:focus-visible,
+.cluster-table-scroll:focus-visible {
+  outline: 2px solid var(--gh-sys-focus-ring);
+  outline-offset: 2px;
+}
+
+@media (max-width: 980px) {
+  .cluster-section-grid {
+    grid-template-columns: 1fr;
+  }
+}
+
+@media (max-width: 760px) {
+  .cluster-state {
+    flex-direction: column;
+    align-items: flex-start;
+  }
+
+  .cluster-item.spec-row {
+    display: grid;
+    gap: 4px;
+    justify-content: stretch;
+  }
+}

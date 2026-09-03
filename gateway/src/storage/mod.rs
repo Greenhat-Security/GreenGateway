@@ -77,7 +77,8 @@ pub use postgres_jwt_revocations::{JwtRevocationOutcome, PostgresJwtRevocationSt
 pub use postgres_membership::JobOutcome;
 #[cfg(feature = "postgres")]
 pub use postgres_membership::{
-    ClusterMember, MemberRegistration, MemberRevisions, PostgresMembershipStore,
+    ClusterMember, MaintenanceJobRecord, MemberRegistration, MemberRevisions,
+    PostgresMembershipStore,
 };
 #[cfg(feature = "postgres")]
 pub use postgres_pending_logins::PostgresPendingLoginStore;
@@ -119,6 +120,21 @@ pub enum RepositoryErrorKind {
 }
 
 impl RepositoryErrorKind {
+    /// Every kind, so a surface that has to decide whether a string is one
+    /// of them can ask rather than guess. The cluster status API redacts
+    /// against this list: an error code on a member or job row that is not
+    /// a kind here was not written by a gateway classifier, and is
+    /// reported as `unknown` instead of echoed
+    /// (`cluster_status::safe_error_code`).
+    pub const KNOWN: [Self; 6] = [
+        Self::Unavailable,
+        Self::Timeout,
+        Self::Conflict,
+        Self::InvalidData,
+        Self::IncompatibleSchema,
+        Self::Internal,
+    ];
+
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Unavailable => "unavailable",
@@ -126,6 +142,34 @@ impl RepositoryErrorKind {
             Self::Conflict => "conflict",
             Self::InvalidData => "invalid data",
             Self::IncompatibleSchema => "incompatible schema",
+            Self::Internal => "internal",
+        }
+    }
+
+    /// The same classification as a metric label value (issue #241,
+    /// PR 14).
+    ///
+    /// A second rendering rather than a reuse of [`Self::as_str`], for the
+    /// same reason the lease scopes have their own label constants:
+    /// `as_str` is a *stored* value -- it is what a member row's
+    /// `last_error_code` and a job row's `last_failure_code` carry, and
+    /// what the cluster status view recognises them by -- so it cannot be
+    /// respelled without rewriting rows other replicas wrote. A label is a
+    /// published interface with its own convention (bare lowercase words
+    /// joined by underscores, like every other label in this registry),
+    /// and `"invalid data"` with a space in it is not that.
+    /// `every_error_kind_has_a_bare_label_and_a_stored_name` keeps the two
+    /// in step.
+    // The only emitter is the cluster-mode store histogram; a
+    // `--no-default-features` build has no store to time.
+    #[cfg_attr(not(feature = "postgres"), allow(dead_code))]
+    pub fn metric_label(self) -> &'static str {
+        match self {
+            Self::Unavailable => "unavailable",
+            Self::Timeout => "timeout",
+            Self::Conflict => "conflict",
+            Self::InvalidData => "invalid_data",
+            Self::IncompatibleSchema => "incompatible_schema",
             Self::Internal => "internal",
         }
     }
@@ -274,4 +318,69 @@ pub(crate) fn log_classified(
         tracing::error!(operation, error = %detail, "repository operation failed");
     }
     classified
+}
+
+#[cfg(test)]
+mod error_kind_tests {
+    use super::RepositoryErrorKind;
+
+    /// The stored name and the metric label are two renderings of one
+    /// classification, and both have to stay usable as what they are
+    /// (issue #241, PR 14).
+    ///
+    /// The label must be bare lowercase words joined by underscores --
+    /// the convention every other label in the registry follows -- and
+    /// each kind must still be distinguishable under both renderings. The
+    /// pair is checked together because the temptation, next time a kind
+    /// is added, is to give it one and let the other fall back.
+    #[test]
+    fn every_error_kind_has_a_bare_label_and_a_stored_name() {
+        let mut labels = std::collections::BTreeSet::new();
+        for kind in RepositoryErrorKind::KNOWN {
+            let label = kind.metric_label();
+            assert!(
+                labels.insert(label),
+                "two kinds share the metric label {label}, which merges their series"
+            );
+            assert!(
+                !label.is_empty()
+                    && label
+                        .bytes()
+                        .all(|byte| byte.is_ascii_lowercase() || byte == b'_'),
+                "a metric label must be bare lowercase text: {label:?}"
+            );
+            // The stored name is free to have spaces (it is prose in a
+            // column and in a Display), but it must name the same thing.
+            assert_eq!(
+                kind.as_str().replace(' ', "_"),
+                label,
+                "the metric label must be the stored name with spaces closed up"
+            );
+        }
+        assert_eq!(labels.len(), RepositoryErrorKind::KNOWN.len());
+    }
+
+    /// `KNOWN` is a redaction vocabulary: a kind missing from it would be
+    /// reported as `unknown` wherever a classified code is echoed back.
+    #[test]
+    fn every_error_kind_is_listed_exactly_once_with_a_distinct_name() {
+        let names: std::collections::BTreeSet<&str> = RepositoryErrorKind::KNOWN
+            .iter()
+            .map(|kind| kind.as_str())
+            .collect();
+        assert_eq!(names.len(), RepositoryErrorKind::KNOWN.len());
+        // A new variant added without extending KNOWN fails to compile
+        // here rather than silently redacting itself away.
+        for kind in RepositoryErrorKind::KNOWN {
+            let covered = match kind {
+                RepositoryErrorKind::Unavailable
+                | RepositoryErrorKind::Timeout
+                | RepositoryErrorKind::Conflict
+                | RepositoryErrorKind::InvalidData
+                | RepositoryErrorKind::IncompatibleSchema
+                | RepositoryErrorKind::Internal => true,
+            };
+            assert!(covered);
+        }
+    }
 }

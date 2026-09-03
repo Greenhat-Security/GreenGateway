@@ -579,9 +579,29 @@ pub mod tests {
     pub struct CountingRecorder {
         counts: Arc<Mutex<Vec<(String, u64)>>>,
         gauges: Arc<Mutex<Vec<(String, f64)>>>,
+        histograms: Arc<Mutex<Vec<(String, f64)>>>,
     }
 
     impl CountingRecorder {
+        /// Every value recorded into one histogram, in order.
+        ///
+        /// Histograms were a noop here until issue #241's PR 14 needed to
+        /// assert that a store operation is timed under its classified
+        /// outcome; a noop would have made that assertion a tautology.
+        // The store histogram is cluster-mode only, so a
+        // `--no-default-features` test build has no caller for this yet.
+        #[cfg_attr(not(feature = "postgres"), allow(dead_code))]
+        pub fn histogram_values(&self, name: &str, labels: &[(&str, &str)]) -> Vec<f64> {
+            let key = render_counter_key(name, labels);
+            self.histograms
+                .lock()
+                .expect("histograms lock")
+                .iter()
+                .filter(|(recorded, _)| recorded == &key)
+                .map(|(_, value)| *value)
+                .collect()
+        }
+
         pub fn count(&self, name: &str, labels: &[(&str, &str)]) -> u64 {
             let key = render_counter_key(name, labels);
             self.counts
@@ -726,10 +746,35 @@ pub mod tests {
 
         fn register_histogram(
             &self,
-            _key: &::metrics::Key,
+            key: &::metrics::Key,
             _metadata: &::metrics::Metadata<'_>,
         ) -> ::metrics::Histogram {
-            ::metrics::Histogram::noop()
+            let labels = key
+                .labels()
+                .map(|label| (label.key().to_owned(), label.value().to_owned()))
+                .collect::<Vec<_>>();
+            let borrowed = labels
+                .iter()
+                .map(|(name, value)| (name.as_str(), value.as_str()))
+                .collect::<Vec<_>>();
+            ::metrics::Histogram::from_arc(Arc::new(RecordedHistogram {
+                key: render_counter_key(key.name(), &borrowed),
+                histograms: Arc::clone(&self.histograms),
+            }))
+        }
+    }
+
+    struct RecordedHistogram {
+        key: String,
+        histograms: Arc<Mutex<Vec<(String, f64)>>>,
+    }
+
+    impl ::metrics::HistogramFn for RecordedHistogram {
+        fn record(&self, value: f64) {
+            self.histograms
+                .lock()
+                .expect("histograms lock")
+                .push((self.key.clone(), value));
         }
     }
 

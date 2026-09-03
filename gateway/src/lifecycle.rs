@@ -59,7 +59,7 @@ impl Default for GatewayLifecycle {
 
 impl GatewayLifecycle {
     pub(crate) fn new() -> Self {
-        Self {
+        let lifecycle = Self {
             inner: Arc::new(GatewayLifecycleInner {
                 phase: AtomicU8::new(STARTING),
                 background_cancellation: CancellationToken::new(),
@@ -68,7 +68,9 @@ impl GatewayLifecycle {
                 response_stream_tasks: TaskTracker::new(),
                 response_stream_registration_open: Mutex::new(true),
             }),
-        }
+        };
+        lifecycle.publish_phase_gauges();
+        lifecycle
     }
 
     pub(crate) fn mark_ready(&self) {
@@ -76,13 +78,45 @@ impl GatewayLifecycle {
             self.inner
                 .phase
                 .compare_exchange(STARTING, READY, Ordering::AcqRel, Ordering::Acquire);
+        self.publish_phase_gauges();
     }
 
     pub(crate) fn begin_draining(&self) -> bool {
         let was_draining = self.inner.phase.swap(DRAINING, Ordering::AcqRel) == DRAINING;
         self.inner.background_cancellation.cancel();
         self.close_response_stream_registration();
+        self.publish_phase_gauges();
         !was_draining
+    }
+
+    /// Publish the phase as the pair of gauges an alerting rule reads
+    /// (issue #241, PR 14).
+    ///
+    /// Two gauges rather than one enum-labelled series: a phase label
+    /// would leave `greengateway_gateway_ready{phase="starting"}` and
+    /// `{phase="ready"}` both present forever, one of them stale, and a
+    /// rule would have to know which. `ready` and `draining` are
+    /// independent facts an operator alerts on independently -- unready
+    /// for too long, and draining for too long -- and the pair
+    /// distinguishes all three phases (`0,0` starting; `1,0` ready;
+    /// `0,1` draining).
+    ///
+    /// Called on every transition *and* at construction, so the series
+    /// exist from boot: a gauge that only appears once a replica becomes
+    /// ready cannot express "this replica never became ready", which is
+    /// the condition worth alerting on.
+    pub(crate) fn publish_phase_gauges(&self) {
+        let phase = self.inner.phase.load(Ordering::Acquire);
+        ::metrics::gauge!(crate::metrics::GATEWAY_READY).set(if phase == READY {
+            1.0
+        } else {
+            0.0
+        });
+        ::metrics::gauge!(crate::metrics::GATEWAY_DRAINING).set(if phase == DRAINING {
+            1.0
+        } else {
+            0.0
+        });
     }
 
     pub(crate) fn startup_complete(&self) -> bool {
@@ -826,6 +860,44 @@ mod tests {
 
     use super::*;
     use crate::audit::{self, sink::tests::CaptureSink};
+
+    /// The two phase gauges distinguish all three phases, and both series
+    /// exist from construction (issue #241, PR 14).
+    ///
+    /// A gauge that only appears once a replica becomes ready cannot
+    /// express "this replica never became ready", which is the condition
+    /// most worth alerting on -- so `starting` has to be a published
+    /// `0, 0`, not an absence.
+    #[test]
+    fn the_phase_gauges_distinguish_starting_ready_and_draining() {
+        let recorder = crate::audit::sink::tests::CountingRecorder::default();
+        let phases = ::metrics::with_local_recorder(&recorder, || {
+            let lifecycle = GatewayLifecycle::new();
+            let starting = (
+                recorder.gauge_value(crate::metrics::GATEWAY_READY, &[]),
+                recorder.gauge_value(crate::metrics::GATEWAY_DRAINING, &[]),
+            );
+            lifecycle.mark_ready();
+            let ready = (
+                recorder.gauge_value(crate::metrics::GATEWAY_READY, &[]),
+                recorder.gauge_value(crate::metrics::GATEWAY_DRAINING, &[]),
+            );
+            lifecycle.begin_draining();
+            let draining = (
+                recorder.gauge_value(crate::metrics::GATEWAY_READY, &[]),
+                recorder.gauge_value(crate::metrics::GATEWAY_DRAINING, &[]),
+            );
+            (starting, ready, draining)
+        });
+
+        assert_eq!(
+            phases.0,
+            (Some(0.0), Some(0.0)),
+            "a starting replica publishes both gauges as zero, not neither"
+        );
+        assert_eq!(phases.1, (Some(1.0), Some(0.0)), "ready");
+        assert_eq!(phases.2, (Some(0.0), Some(1.0)), "draining");
+    }
 
     #[tokio::test]
     async fn bind_failure_does_not_emit_startup_event() {

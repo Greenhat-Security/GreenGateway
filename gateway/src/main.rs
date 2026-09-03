@@ -47,12 +47,14 @@ mod client_ip;
 mod cluster_maintenance;
 #[cfg(feature = "postgres")]
 mod cluster_membership;
+mod cluster_status;
 mod config;
 mod connection_secret_maintenance;
 mod connections;
 mod discovery;
 mod egress;
 mod ha;
+mod ha_status;
 mod inbound_tls;
 mod lifecycle;
 mod mcp;
@@ -95,6 +97,8 @@ const AUDIT_EVENTS_STREAM_ROUTE: &str = "/v1/admin/events/stream";
 const ADMIN_AUTH_LOGIN_ROUTE: &str = "/v1/admin/auth/login";
 const ADMIN_AUTH_CALLBACK_ROUTE: &str = "/v1/admin/auth/callback";
 const STATUS_ADMIN_ROUTE: &str = "/v1/admin/status";
+const CLUSTER_ADMIN_ROUTE: &str = "/v1/admin/cluster";
+const CLUSTER_REPLICAS_ADMIN_ROUTE: &str = "/v1/admin/cluster/replicas";
 const POLICY_ADMIN_ROUTE: &str = "/v1/admin/policy";
 const POLICY_HISTORY_ADMIN_ROUTE: &str = "/v1/admin/policy/history";
 const POLICY_HISTORY_WARNING_HEADER: &str = "x-greengateway-policy-history-warning";
@@ -152,6 +156,7 @@ const PRINCIPAL_ADMIN_ROUTE: &str = "/v1/admin/principal";
 const ADMIN_AUDIT_READ_PERMISSION: &str = "admin:audit:read";
 const ADMIN_AUDIT_STREAM_PERMISSION: &str = "admin:audit:stream";
 const ADMIN_STATUS_READ_PERMISSION: &str = "admin:status:read";
+const ADMIN_CLUSTER_READ_PERMISSION: &str = connections::permissions::ADMIN_CLUSTER_READ;
 const ADMIN_POLICY_READ_PERMISSION: &str = "admin:policy:read";
 const ADMIN_POLICY_WRITE_PERMISSION: &str = "admin:policy:write";
 const ADMIN_TOKENS_READ_PERMISSION: &str = "admin:tokens:read";
@@ -209,6 +214,22 @@ struct AppState {
     /// Cluster mode's fingerprint-agreement gate for `/readyz` (issue
     /// #241, PR 13); None in standalone mode, which is always agreed.
     cluster_readiness: Option<Arc<ha::ClusterReadiness>>,
+    /// Cluster mode's authority-backed readiness reasons for `/readyz`
+    /// (issue #241, PR 14): storage, schema, this replica's membership
+    /// lease, and its security watermark. None in standalone mode,
+    /// which has no shared authority and so none of these states.
+    readiness_probe: Option<Arc<ha_status::ReadinessProbe>>,
+    /// The audit writer, so a scrape can sample its queue (issue #241,
+    /// PR 14). The queue has no periodic owner -- the writer is a
+    /// blocking consumer -- so publishing from the writer would sample
+    /// only the instants it is awake, which are exactly the instants a
+    /// backlog is draining rather than accumulating.
+    audit_log: audit::AuditLog,
+    /// Cluster mode's database pool, sampled at scrape for the same
+    /// reason: `Pool::status()` describes the pool right now and keeps no
+    /// history, so it has to be read when somebody asks.
+    #[cfg(feature = "postgres")]
+    database_pool: Option<deadpool_postgres::Pool>,
     _connections: connections::control_plane::ConnectionControlPlane,
 }
 
@@ -237,6 +258,8 @@ struct AdminRoutes {
     auth_login_route: String,
     auth_callback_route: String,
     status_route: String,
+    cluster_route: String,
+    cluster_replicas_route: String,
     policy_route: String,
     policy_history_route: String,
     policy_rollback_route: String,
@@ -369,6 +392,8 @@ impl AdminRoutes {
             auth_login_route: format!("{api_prefix}/auth/login"),
             auth_callback_route: format!("{api_prefix}/auth/callback"),
             status_route: format!("{api_prefix}/status"),
+            cluster_route: format!("{api_prefix}/cluster"),
+            cluster_replicas_route: format!("{api_prefix}/cluster/replicas"),
             policy_route: format!("{api_prefix}/policy"),
             policy_history_route: format!("{api_prefix}/policy/history"),
             policy_rollback_route: format!("{api_prefix}/policy/rollback/{{version}}"),
@@ -440,6 +465,38 @@ struct StatusAdminState {
     process_started_at: Instant,
     proxy: Option<ProxyState>,
     lifecycle: GatewayLifecycle,
+}
+
+/// The cluster status API's state (issue #241, PR 14).
+///
+/// Read-only by construction: it holds the readiness chain's own inputs,
+/// one seam that reads the shared authority, and process-local counters.
+/// There is nothing here a request could write through.
+#[derive(Clone)]
+struct ClusterAdminState {
+    rbac_state: Option<middleware::rbac::RbacState>,
+    /// The authority-backed readout. `None` in standalone mode, which has
+    /// no authority: the endpoints then report this process alone.
+    source: Option<Arc<dyn cluster_status::ClusterStatusSource>>,
+    /// The same four inputs `/readyz` consults, in the same order, so
+    /// `state` and `reason` can never disagree with the probe.
+    lifecycle: GatewayLifecycle,
+    cluster_readiness: Option<Arc<ha::ClusterReadiness>>,
+    readiness_probe: Option<Arc<ha_status::ReadinessProbe>>,
+    proxy: Option<ProxyState>,
+    /// The cluster security runtime, absent in standalone mode.
+    security: Option<Arc<dyn cluster_status::SecurityStatus>>,
+    audit: audit::AuditLog,
+    /// This replica's identity: the roster row's in cluster mode, and a
+    /// per-process one in standalone mode, where there is no roster.
+    identity: ha::InstanceIdentity,
+    fingerprint: String,
+    cluster_mode: bool,
+    /// This process's hostname, resolved once at startup and only when
+    /// `CLUSTER_STATUS_EXPOSE_HOSTNAMES=true`. `None` otherwise, which is
+    /// the default: see `cluster_status`'s module docs.
+    hostname: Option<String>,
+    process_started_at: Instant,
 }
 
 #[derive(Clone)]
@@ -582,6 +639,7 @@ struct AdminApiStates {
     audit: AuditAdminState,
     auth: Option<AdminAuthState>,
     status: StatusAdminState,
+    cluster: ClusterAdminState,
     policy: PolicyAdminState,
     tokens: TokenAdminState,
     connections: ConnectionAdminState,
@@ -1432,6 +1490,11 @@ struct ManagedAdminCacheControlState {
 #[derive(Default)]
 struct GatewayAppBuildOverrides {
     lifecycle: Option<GatewayLifecycle>,
+    /// This replica's cluster identity, so the status API names the same
+    /// instance the roster row does. `None` in standalone mode, where the
+    /// builder generates a per-process identity for its self-report --
+    /// there is no roster for it to have to agree with.
+    ha_identity: Option<ha::InstanceIdentity>,
     /// The durable PostgreSQL audit store for cluster mode's SSE endpoint;
     /// None in standalone mode and in tests that exercise the broadcast
     /// path.
@@ -1486,6 +1549,18 @@ struct GatewayAppBuildOverrides {
     /// testable without PostgreSQL.
     #[cfg(test)]
     cluster_readiness: Option<Arc<ha::ClusterReadiness>>,
+    /// Test seam: the PR 14 readiness probe with a scripted authority
+    /// behind it, so every failure-matrix reason is reachable from a
+    /// handler test without PostgreSQL.
+    #[cfg(test)]
+    readiness_probe: Option<Arc<ha_status::ReadinessProbe>>,
+    /// Test seam: a scripted readout for the PR 14 cluster status API, so
+    /// the cluster shape of both routes -- a roster, a job ledger, a
+    /// projector -- is reachable from a handler test without PostgreSQL.
+    /// Supplying one also puts the state in cluster mode, exactly as
+    /// having a real authority to read does.
+    #[cfg(test)]
+    cluster_status_source: Option<Arc<dyn cluster_status::ClusterStatusSource>>,
     #[cfg(test)]
     egress_resolver: Option<Arc<dyn egress::DnsResolver>>,
     /// Test seam: the pending-login backend the admin login flow uses,
@@ -2609,6 +2684,9 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         process_started_at,
         GatewayAppBuildOverrides {
             lifecycle: Some(lifecycle.clone()),
+            ha_identity: _ha_foundation
+                .as_ref()
+                .map(|foundation| *foundation.identity()),
             #[cfg(feature = "postgres")]
             pg_audit: pg_audit_store,
             #[cfg(feature = "postgres")]
@@ -2629,6 +2707,10 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             pg_membership: pg_membership_seed,
             #[cfg(test)]
             cluster_readiness: None,
+            #[cfg(test)]
+            readiness_probe: None,
+            #[cfg(test)]
+            cluster_status_source: None,
             #[cfg(test)]
             egress_resolver: None,
             #[cfg(test)]
@@ -3410,10 +3492,46 @@ fn gateway_app_with_process_started_at_and_overrides(
         .cluster_readiness
         .clone()
         .or(cluster_readiness);
+    // The readiness probe (issue #241, PR 14): the authority-backed half
+    // of `/readyz`, evaluated between the fingerprint gate above and the
+    // proxy's upstream check. It reads the same gate the heartbeat
+    // stamps, runs its one bounded check on the deployment's pool, and
+    // compares the security runtime's watermarks. Standalone mode has
+    // none of the three and never builds one.
+    #[cfg(feature = "postgres")]
+    let readiness_probe: Option<Arc<ha_status::ReadinessProbe>> = match (
+        cluster_readiness.as_ref(),
+        build_overrides.pg_limits.as_ref(),
+    ) {
+        (Some(readiness), Some(seed)) => Some(ha_status::ReadinessProbe::new(
+            Arc::clone(readiness),
+            ha_status::PostgresReadinessAuthority::new(seed.pool.clone()),
+            cluster_security_runtime
+                .clone()
+                .map(|runtime| runtime as Arc<dyn ha_status::SecurityRevisionHealth>),
+            ha_status::ReadinessProbeSettings {
+                cache_ttl: config.readiness_probe_cache(),
+                accepted_schema_versions: storage::migrations::schema_version_range(),
+                member_stale_window: config.cluster_member_stale_window(),
+                // A gate refusing for longer than one background
+                // reconcile pass is a stuck reconciler, not a slow one.
+                revision_reconcile_grace: security_cluster::RECONCILE_BACKGROUND_DEADLINE,
+            },
+        )),
+        _ => None,
+    };
+    #[cfg(not(feature = "postgres"))]
+    let readiness_probe: Option<Arc<ha_status::ReadinessProbe>> = None;
+    #[cfg(test)]
+    let readiness_probe = build_overrides.readiness_probe.clone().or(readiness_probe);
     // The maintenance singleton (issue #241, PR 13): every cluster-mode
     // replica runs the runner, and the one holding the `maintenance` lease
     // runs the bounded housekeeping jobs under its fence. The lease store
-    // here carries the maintenance TTL, not the tool lease TTL.
+    // here carries the maintenance TTL, not the tool lease TTL. The handle
+    // is kept so the cluster status API can report whether this replica is
+    // the leader (issue #241, PR 14).
+    #[cfg(feature = "postgres")]
+    let mut maintenance_runner: Option<Arc<cluster_maintenance::MaintenanceRunner>> = None;
     #[cfg(feature = "postgres")]
     if let (Some(membership), Some(seed)) = (
         build_overrides.pg_membership.as_ref(),
@@ -3451,6 +3569,7 @@ fn gateway_app_with_process_started_at_and_overrides(
             seed.instance_id,
         );
         runner.spawn(&lifecycle);
+        maintenance_runner = Some(runner);
     }
     let mcp_catalog_runtime = connection_control_plane
         .is_managed_store_configured()
@@ -3529,6 +3648,61 @@ fn gateway_app_with_process_started_at_and_overrides(
         process_started_at,
         proxy: proxy_state.clone(),
         lifecycle: lifecycle.clone(),
+    };
+    // The cluster status API (issue #241, PR 14). Both modes serve it:
+    // standalone has no authority to read, so it gets no source and
+    // reports this process as the whole deployment.
+    #[cfg(feature = "postgres")]
+    let cluster_status_source: Option<Arc<dyn cluster_status::ClusterStatusSource>> = match (
+        build_overrides.pg_membership.as_ref(),
+        build_overrides.pg_limits.as_ref(),
+    ) {
+        (Some(membership), Some(seed)) => Some(cluster_status::PostgresClusterStatusSource::new(
+            membership.store(),
+            build_overrides.pg_audit.clone(),
+            maintenance_runner,
+            seed.pool.clone(),
+            config.cluster_member_stale_window(),
+        )),
+        _ => None,
+    };
+    #[cfg(not(feature = "postgres"))]
+    let cluster_status_source: Option<Arc<dyn cluster_status::ClusterStatusSource>> = None;
+    #[cfg(test)]
+    let cluster_status_source = build_overrides
+        .cluster_status_source
+        .clone()
+        .or(cluster_status_source);
+    #[cfg(feature = "postgres")]
+    let cluster_security_status: Option<Arc<dyn cluster_status::SecurityStatus>> =
+        cluster_security_runtime
+            .clone()
+            .map(|runtime| runtime as Arc<dyn cluster_status::SecurityStatus>);
+    #[cfg(not(feature = "postgres"))]
+    let cluster_security_status: Option<Arc<dyn cluster_status::SecurityStatus>> = None;
+    let cluster_admin_state = ClusterAdminState {
+        rbac_state: rbac_state.clone(),
+        // Having an authority to read *is* cluster mode here: both seeds
+        // the source is built from are present exactly when
+        // `STATE_BACKEND=postgres` started successfully, and startup fails
+        // rather than proceeding with one of them missing.
+        cluster_mode: cluster_status_source.is_some(),
+        source: cluster_status_source,
+        lifecycle: lifecycle.clone(),
+        cluster_readiness: cluster_readiness.clone(),
+        readiness_probe: readiness_probe.clone(),
+        proxy: proxy_state.clone(),
+        security: cluster_security_status,
+        audit: audit_log.clone(),
+        identity: build_overrides
+            .ha_identity
+            .unwrap_or_else(ha::InstanceIdentity::generate),
+        fingerprint: ha::static_config_fingerprint(&config).hex(),
+        hostname: config
+            .cluster_status_expose_hostnames
+            .then(local_hostname)
+            .flatten(),
+        process_started_at,
     };
     let policy_admin_state = PolicyAdminState {
         policy_file: config.policy_file.as_ref().map(PathBuf::from),
@@ -3629,6 +3803,13 @@ fn gateway_app_with_process_started_at_and_overrides(
         protected_resource_metadata,
         lifecycle,
         cluster_readiness,
+        readiness_probe,
+        audit_log: audit_log.clone(),
+        #[cfg(feature = "postgres")]
+        database_pool: build_overrides
+            .pg_limits
+            .as_ref()
+            .map(|seed| seed.pool.clone()),
         _connections: connection_control_plane,
     };
     let audit_admin_state = AuditAdminState {
@@ -3667,6 +3848,7 @@ fn gateway_app_with_process_started_at_and_overrides(
         audit: audit_admin_state,
         auth: admin_auth_state,
         status: status_state,
+        cluster: cluster_admin_state,
         policy: policy_admin_state,
         tokens: token_admin_state,
         connections: connection_admin_state,
@@ -4414,6 +4596,15 @@ fn add_admin_api_routes(
         )
         .merge(
             Router::new()
+                .route(routes.admin.cluster_route.as_str(), get(cluster_endpoint))
+                .route(
+                    routes.admin.cluster_replicas_route.as_str(),
+                    get(cluster_replicas_endpoint),
+                )
+                .with_state(admin_api_states.cluster),
+        )
+        .merge(
+            Router::new()
                 .route(
                     routes.admin.schema_coverage_route.as_str(),
                     get(schema_coverage_endpoint),
@@ -5013,33 +5204,58 @@ async fn startupz(State(state): State<AppState>) -> Response {
     }
 }
 
-async fn readyz(State(state): State<AppState>) -> Response {
-    record_request("/readyz");
-    let reason = if !state.lifecycle.accepting_work() {
-        Some(if state.lifecycle.draining() {
+/// Why this replica refuses readiness, or `None` when it does not.
+///
+/// The one definition of the reason chain, in the failure matrix's order.
+/// `/readyz` is its caller of record; the cluster status API calls it too,
+/// which is what makes that view's `state` and `reason` incapable of
+/// disagreeing with the probe an orchestrator is acting on.
+async fn readiness_blocked_reason(
+    lifecycle: &GatewayLifecycle,
+    cluster_readiness: Option<&Arc<ha::ClusterReadiness>>,
+    readiness_probe: Option<&Arc<ha_status::ReadinessProbe>>,
+    proxy: Option<&ProxyState>,
+) -> Option<&'static str> {
+    if !lifecycle.accepting_work() {
+        return Some(if lifecycle.draining() {
             "draining"
         } else {
             "starting"
-        })
-    } else if let Some(reason) = state
-        .cluster_readiness
-        .as_ref()
-        .and_then(|readiness| readiness.blocked_reason())
-    {
-        // Cluster mode: a replica whose static configuration disagrees
-        // with a live member's is not ready however healthy it is locally
-        // (HA state model invariant 14). The membership heartbeat
-        // re-evaluates the gate and opens it once the members agree.
-        Some(reason)
-    } else if state
-        .proxy
-        .as_ref()
-        .is_some_and(|proxy| !proxy.required_pools_ready())
-    {
-        Some("required_upstream_unavailable")
-    } else {
-        None
-    };
+        });
+    }
+    // Cluster mode: a replica whose static configuration disagrees
+    // with a live member's is not ready however healthy it is locally
+    // (HA state model invariant 14). The membership heartbeat
+    // re-evaluates the gate and opens it once the members agree.
+    if let Some(reason) = cluster_readiness.and_then(|readiness| readiness.blocked_reason()) {
+        return Some(reason);
+    }
+    // Cluster mode's authority-backed reasons (issue #241, PR 14):
+    // storage, schema, this replica's membership lease, and its
+    // security watermark, in the failure matrix's order. The one
+    // authority round trip is cached for READINESS_PROBE_CACHE_MS,
+    // so a probe storm costs one check per window. Standalone mode
+    // holds no probe and skips this arm entirely.
+    if let Some(probe) = readiness_probe {
+        if let Some(reason) = probe.blocked_reason().await {
+            return Some(reason);
+        }
+    }
+    if proxy.is_some_and(|proxy| !proxy.required_pools_ready()) {
+        return Some("required_upstream_unavailable");
+    }
+    None
+}
+
+async fn readyz(State(state): State<AppState>) -> Response {
+    record_request("/readyz");
+    let reason = readiness_blocked_reason(
+        &state.lifecycle,
+        state.cluster_readiness.as_ref(),
+        state.readiness_probe.as_ref(),
+        state.proxy.as_ref(),
+    )
+    .await;
     match reason {
         Some(reason) => (
             StatusCode::SERVICE_UNAVAILABLE,
@@ -5070,6 +5286,7 @@ async fn version(State(state): State<AppState>) -> Json<VersionResponse> {
 
 async fn metrics_endpoint(State(state): State<AppState>) -> impl IntoResponse {
     record_request("/metrics");
+    publish_scrape_gauges(&state);
     (
         [(
             header::CONTENT_TYPE,
@@ -5077,6 +5294,33 @@ async fn metrics_endpoint(State(state): State<AppState>) -> impl IntoResponse {
         )],
         state.metrics_handle.render(),
     )
+}
+
+/// Sample the process state that has no periodic owner, just before
+/// rendering (issue #241, PR 14).
+///
+/// Two kinds of value need this. The audit writer's queue is drained by a
+/// blocking thread, so a gauge published from the writer would only ever
+/// record the moments it was awake -- the moments a backlog is shrinking.
+/// The database pool's `Pool::status()` is a snapshot with no history, so
+/// there is no event at which to publish it. Both are cheap reads of
+/// atomics and a mutex, taken once per scrape; observing at scrape is
+/// exactly the semantics a Prometheus gauge has anyway.
+///
+/// Everything else is published where it changes, by the task that owns
+/// it, so a value that stops changing keeps its last true reading rather
+/// than silently tracking whether anyone is scraping.
+fn publish_scrape_gauges(state: &AppState) {
+    state.audit_log.publish_queue_gauges();
+    // The lifecycle phase is republished here too: it is set on every
+    // transition, but a process that boots and never becomes ready makes
+    // no transition at all, and "never became ready" is the condition
+    // most worth alerting on.
+    state.lifecycle.publish_phase_gauges();
+    #[cfg(feature = "postgres")]
+    if let Some(pool) = state.database_pool.as_ref() {
+        storage::postgres::publish_pool_gauges(pool);
+    }
 }
 
 async fn oauth_protected_resource_metadata_endpoint(State(state): State<AppState>) -> Response {
@@ -5246,6 +5490,172 @@ async fn status_endpoint(
     }
 
     Json(StatusResponse::from_state(&state).await).into_response()
+}
+
+/// `GET /v1{ADMIN_PREFIX}/cluster` (issue #241, PR 14).
+async fn cluster_endpoint(
+    State(state): State<ClusterAdminState>,
+    principal: Option<Extension<auth::Principal>>,
+) -> Response {
+    record_request(CLUSTER_ADMIN_ROUTE);
+
+    let Some(Extension(principal)) = principal else {
+        return unauthorized();
+    };
+    if let Err(error) = authorized_cluster_state(&state, &principal) {
+        return cluster_admin_authz_error_response(error);
+    }
+
+    let (local, readout) = state.read_facts().await;
+    Json(cluster_status::cluster_status(&local, &readout)).into_response()
+}
+
+/// `GET /v1{ADMIN_PREFIX}/cluster/replicas` (issue #241, PR 14).
+async fn cluster_replicas_endpoint(
+    State(state): State<ClusterAdminState>,
+    principal: Option<Extension<auth::Principal>>,
+) -> Response {
+    record_request(CLUSTER_REPLICAS_ADMIN_ROUTE);
+
+    let Some(Extension(principal)) = principal else {
+        return unauthorized();
+    };
+    if let Err(error) = authorized_cluster_state(&state, &principal) {
+        return cluster_admin_authz_error_response(error);
+    }
+
+    let (local, readout) = state.read_facts().await;
+    Json(cluster_status::cluster_replicas(&local, &readout)).into_response()
+}
+
+impl ClusterAdminState {
+    /// Gather everything the two endpoints report: what this process
+    /// knows about itself, and one read of the shared authority.
+    ///
+    /// The two are gathered together because the assembly compares them --
+    /// the projector's leader is judged against the roster, the ledger's
+    /// extent against this binary's manifest range -- and a view built
+    /// from two reads taken minutes apart would invent disagreements that
+    /// never existed.
+    async fn read_facts(&self) -> (cluster_status::LocalFacts, cluster_status::ClusterReadout) {
+        let blocked_reason = readiness_blocked_reason(
+            &self.lifecycle,
+            self.cluster_readiness.as_ref(),
+            self.readiness_probe.as_ref(),
+            self.proxy.as_ref(),
+        )
+        .await;
+        let mut readout = match self.source.as_ref() {
+            Some(source) => source.read().await,
+            None => cluster_status::ClusterReadout::default(),
+        };
+        // The ledger's extent comes from the readiness probe's cached
+        // observation, so this endpoint reports the number `/readyz`
+        // judged `schema_incompatible` on rather than a second, possibly
+        // different, read.
+        readout.schema_ledger_version = match self.readiness_probe.as_ref() {
+            Some(probe) => probe.observed_schema_version().await,
+            None => None,
+        };
+        let local = cluster_status::LocalFacts {
+            cluster_mode: self.cluster_mode,
+            instance_id: self.identity.instance_id(),
+            boot_id: self.identity.boot_id(),
+            binary_version: env!("CARGO_PKG_VERSION").to_owned(),
+            fingerprint: self.fingerprint.clone(),
+            schema_versions: schema_version_range_for_status(),
+            document_versions: document_version_range_for_status(),
+            boot_age_secs: self.process_started_at.elapsed().as_secs(),
+            hostname: self.hostname.clone(),
+            instance_ready: self.lifecycle.accepting_work() && blocked_reason.is_none(),
+            draining: self.lifecycle.draining(),
+            blocked_reason,
+            compiled_security_revision: self
+                .security
+                .as_ref()
+                .map_or(0, |security| security.compiled()),
+            observed_security_revision: self
+                .security
+                .as_ref()
+                .map_or(0, |security| security.observed()),
+            reconcile_last_pass_age: self
+                .security
+                .as_ref()
+                .and_then(|security| security.last_reconcile_pass_age()),
+            reconcile_failures_total: self
+                .security
+                .as_ref()
+                .map_or(0, |security| security.reconcile_failures_total()),
+            audit: cluster_status::AuditQueueFacts {
+                queue_depth: self.audit.queue_depth(),
+                queue_capacity: self.audit.queue_capacity(),
+                oldest_age_secs: self.audit.oldest_queued_age().as_secs_f64(),
+                dropped_total: self.audit.dropped_total(),
+            },
+        };
+        (local, readout)
+    }
+}
+
+/// The migration-manifest range this binary serves on. A build without
+/// the PostgreSQL client carries no manifest, and reports the empty range
+/// it can honestly claim.
+fn schema_version_range_for_status() -> (i32, i32) {
+    #[cfg(feature = "postgres")]
+    {
+        storage::migrations::schema_version_range()
+    }
+    #[cfg(not(feature = "postgres"))]
+    {
+        (0, 0)
+    }
+}
+
+/// The policy/tools document major range this binary enforces, which is
+/// the same constant the membership registration advertises.
+fn document_version_range_for_status() -> (i32, i32) {
+    #[cfg(feature = "postgres")]
+    {
+        cluster_membership::DOCUMENT_VERSION_RANGE
+    }
+    #[cfg(not(feature = "postgres"))]
+    {
+        (0, 0)
+    }
+}
+
+/// This process's hostname, for `local.hostname` when
+/// `CLUSTER_STATUS_EXPOSE_HOSTNAMES=true`.
+///
+/// Read from the environment rather than through a syscall crate because
+/// the deployments this field exists for already publish it there: a
+/// Kubernetes pod and a Docker container both get `HOSTNAME` set to the
+/// name the operator is trying to match a roster UUID against, which is
+/// more useful than whatever `gethostname(2)` would return inside the
+/// container anyway. `COMPUTERNAME` is the Windows spelling. Neither set
+/// means no hostname is reported, which is the same answer as the flag
+/// being off -- this never guesses.
+///
+/// Called once at startup; the value is then stored on the state, so a
+/// status request performs no environment read of its own.
+fn local_hostname() -> Option<String> {
+    ["HOSTNAME", "COMPUTERNAME"]
+        .into_iter()
+        .find_map(|name| std::env::var(name).ok())
+        .filter(|value| !value.trim().is_empty())
+}
+
+/// The cluster status API's one authorization check, applied identically
+/// on both routes: the same shape `admin:audit:read` is enforced with.
+fn authorized_cluster_state<'a>(
+    state: &'a ClusterAdminState,
+    principal: &auth::Principal,
+) -> Result<&'a middleware::rbac::RbacState, AdminReadAuthzError> {
+    authorized_admin_rbac_state(
+        state.rbac_state.as_ref(),
+        principal,
+        ADMIN_CLUSTER_READ_PERMISSION,
+    )
 }
 
 async fn connection_secret_list_endpoint(
@@ -10026,6 +10436,64 @@ const DURABLE_STREAM_BATCH: usize = 64;
 #[cfg(feature = "postgres")]
 const DURABLE_STREAM_IDLE_POLL: std::time::Duration = std::time::Duration::from_millis(500);
 
+// The `outcome` vocabulary of
+// `greengateway_audit_stream_connections_total` (issue #241, PR 14): how a
+// durable audit-stream connection attempt ended, one compile-time constant
+// each. The `Last-Event-ID` value itself is caller-controlled and is never
+// a label -- a client could otherwise mint a time series per reconnect by
+// varying its header.
+/// A live tail from the committed head: no `Last-Event-ID`.
+#[cfg(feature = "postgres")]
+const AUDIT_STREAM_OUTCOME_LIVE: &str = "live";
+/// A gapless replay resuming after the client's cursor.
+#[cfg(feature = "postgres")]
+const AUDIT_STREAM_OUTCOME_REPLAY: &str = "replay";
+/// The header was present but not a stream position.
+#[cfg(feature = "postgres")]
+const AUDIT_STREAM_OUTCOME_CURSOR_INVALID: &str = "cursor_invalid";
+/// The cursor predates the retained window; events the client never saw
+/// have been pruned, so the replay it asked for cannot be gapless.
+#[cfg(feature = "postgres")]
+const AUDIT_STREAM_OUTCOME_CURSOR_EXPIRED: &str = "cursor_expired";
+/// The store could not be consulted; the stream fails closed rather than
+/// falling back to the broadcast-only tail.
+#[cfg(feature = "postgres")]
+const AUDIT_STREAM_OUTCOME_UNAVAILABLE: &str = "unavailable";
+
+/// The whole vocabulary of the `outcome` label. Read by the registry
+/// label audit; the five call sites pass their own constant.
+#[cfg(feature = "postgres")]
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) const AUDIT_STREAM_OUTCOMES: [&str; 5] = [
+    AUDIT_STREAM_OUTCOME_LIVE,
+    AUDIT_STREAM_OUTCOME_REPLAY,
+    AUDIT_STREAM_OUTCOME_CURSOR_INVALID,
+    AUDIT_STREAM_OUTCOME_CURSOR_EXPIRED,
+    AUDIT_STREAM_OUTCOME_UNAVAILABLE,
+];
+
+#[cfg(feature = "postgres")]
+fn record_audit_stream_outcome(outcome: &'static str) {
+    ::metrics::counter!(metrics::AUDIT_STREAM_CONNECTIONS_TOTAL, "outcome" => outcome).increment(1);
+}
+
+/// How far behind a resuming client reconnected: the distribution the
+/// audit retention window has to cover, since a backlog approaching the
+/// retained span is a consumer about to start getting `410 Gone` instead
+/// of a gapless resume.
+#[cfg(feature = "postgres")]
+fn record_audit_stream_replay_backlog(events: i64) {
+    ::metrics::histogram!(metrics::AUDIT_STREAM_REPLAY_BACKLOG_EVENTS).record(events.max(0) as f64);
+}
+
+/// Count stream positions delivered at or below the cursor already
+/// served. An invariant violation, not a workload measure -- see
+/// [`metrics::AUDIT_STREAM_DUPLICATE_POSITIONS_TOTAL`].
+#[cfg(feature = "postgres")]
+fn record_audit_stream_duplicates(positions: u64) {
+    ::metrics::counter!(metrics::AUDIT_STREAM_DUPLICATE_POSITIONS_TOTAL).increment(positions);
+}
+
 #[cfg(feature = "postgres")]
 enum DurableStreamStartError {
     /// The Last-Event-ID header was present but not an integer position.
@@ -10053,26 +10521,44 @@ async fn durable_audit_stream_start(
         None => None,
         Some(Ok(value)) => match value.trim().parse::<i64>() {
             Ok(position) => Some(position),
-            Err(_) => return Err(DurableStreamStartError::BadCursor),
+            Err(_) => {
+                record_audit_stream_outcome(AUDIT_STREAM_OUTCOME_CURSOR_INVALID);
+                return Err(DurableStreamStartError::BadCursor);
+            }
         },
-        Some(Err(_)) => return Err(DurableStreamStartError::BadCursor),
+        Some(Err(_)) => {
+            record_audit_stream_outcome(AUDIT_STREAM_OUTCOME_CURSOR_INVALID);
+            return Err(DurableStreamStartError::BadCursor);
+        }
     };
 
     match cursor {
         Some(last_seen) => {
-            let first_available = store
-                .stream_first_available()
-                .await
-                .map_err(|_| DurableStreamStartError::Unavailable)?;
+            let first_available = store.stream_first_available().await.map_err(|_| {
+                record_audit_stream_outcome(AUDIT_STREAM_OUTCOME_UNAVAILABLE);
+                DurableStreamStartError::Unavailable
+            })?;
             // Overflow-safe form of `last_seen + 1 < first_available`:
             // subtracting from first_available (always >= 1) cannot
             // underflow, while adding to last_seen could overflow at
             // i64::MAX -- a caller-reachable value via the header.
             if last_seen < first_available - 1 {
+                record_audit_stream_outcome(AUDIT_STREAM_OUTCOME_CURSOR_EXPIRED);
                 return Err(DurableStreamStartError::ExpiredCursor {
                     cursor: last_seen,
                     first_available,
                 });
+            }
+            record_audit_stream_outcome(AUDIT_STREAM_OUTCOME_REPLAY);
+            // How far behind this client reconnected, which is the
+            // distribution the audit retention window has to cover: a
+            // backlog approaching the retained span is a consumer about to
+            // start getting `410 Gone` instead of a gapless resume. A head
+            // that cannot be read is not worth failing the replay over --
+            // the stream is about to poll for it anyway -- so the
+            // observation is simply skipped.
+            if let Ok(head) = store.stream_head().await {
+                record_audit_stream_replay_backlog(head.saturating_sub(last_seen));
             }
             Ok(durable_audit_stream(store, last_seen, params, wake))
         }
@@ -10080,10 +10566,11 @@ async fn durable_audit_stream_start(
             // No resume cursor: start at the committed head. The stream
             // delivers events that commit from now on, matching the
             // broadcast path's live-tail semantics.
-            let head = store
-                .stream_head()
-                .await
-                .map_err(|_| DurableStreamStartError::Unavailable)?;
+            let head = store.stream_head().await.map_err(|_| {
+                record_audit_stream_outcome(AUDIT_STREAM_OUTCOME_UNAVAILABLE);
+                DurableStreamStartError::Unavailable
+            })?;
+            record_audit_stream_outcome(AUDIT_STREAM_OUTCOME_LIVE);
             Ok(durable_audit_stream(store, head, params, wake))
         }
     }
@@ -10161,6 +10648,23 @@ fn durable_audit_stream(
                         continue;
                     }
                     Ok(batch) => {
+                        // An invariant check, not a workload measure: the
+                        // store reads strictly after the cursor, so a
+                        // position at or below it would mean re-delivering
+                        // a frame under an `id:` the client has already
+                        // seen -- silently corrupting a reconnecting
+                        // consumer's idea of what it has processed. It is
+                        // counted rather than asserted because ending the
+                        // stream would turn a store-side bug into an
+                        // outage, and the count is what makes the bug
+                        // visible either way.
+                        let duplicates = batch
+                            .iter()
+                            .filter(|(position, _)| *position <= cursor)
+                            .count();
+                        if duplicates > 0 {
+                            record_audit_stream_duplicates(duplicates as u64);
+                        }
                         // The batch is ordered by position; the cursor
                         // advances past everything fetched, whether or not
                         // the filters emit it -- otherwise a fully
@@ -10888,6 +11392,13 @@ fn audit_admin_authz_error_response(error: AdminReadAuthzError) -> Response {
 fn status_admin_authz_error_response(error: AdminReadAuthzError) -> Response {
     match error {
         AdminReadAuthzError::NotConfigured => status_rbac_not_configured(),
+        AdminReadAuthzError::Forbidden => forbidden(),
+    }
+}
+
+fn cluster_admin_authz_error_response(error: AdminReadAuthzError) -> Response {
+    match error {
+        AdminReadAuthzError::NotConfigured => cluster_rbac_not_configured(),
         AdminReadAuthzError::Forbidden => forbidden(),
     }
 }
@@ -14223,6 +14734,16 @@ fn status_rbac_not_configured() -> Response {
         .into_response()
 }
 
+fn cluster_rbac_not_configured() -> Response {
+    (
+        StatusCode::NOT_FOUND,
+        Json(ErrorResponse {
+            error: "cluster status API requires POLICY_FILE to be configured".to_owned(),
+        }),
+    )
+        .into_response()
+}
+
 fn token_store_not_configured() -> Response {
     (
         StatusCode::NOT_FOUND,
@@ -14835,6 +15356,8 @@ mod tests {
             cluster_member_stale_ms: config::DEFAULT_CLUSTER_MEMBER_STALE_MS,
             cluster_maintenance_interval_ms: config::DEFAULT_CLUSTER_MAINTENANCE_INTERVAL_MS,
             cluster_maintenance_lease_ttl_ms: config::DEFAULT_CLUSTER_MAINTENANCE_LEASE_TTL_MS,
+            readiness_probe_cache_ms: config::DEFAULT_READINESS_PROBE_CACHE_MS,
+            cluster_status_expose_hostnames: false,
             audit_postgres_retention_days: None,
             tool_runtime_default_timeout_ms: config::DEFAULT_TOOL_RUNTIME_DEFAULT_TIMEOUT_MS,
             csrf_enabled: true,
@@ -16291,6 +16814,11 @@ mod tests {
             AUDIT_EVENTS_STREAM_ROUTE
         );
         assert_eq!(default_routes.status_route, STATUS_ADMIN_ROUTE);
+        assert_eq!(default_routes.cluster_route, CLUSTER_ADMIN_ROUTE);
+        assert_eq!(
+            default_routes.cluster_replicas_route,
+            CLUSTER_REPLICAS_ADMIN_ROUTE
+        );
         assert_eq!(default_routes.policy_route, POLICY_ADMIN_ROUTE);
         assert_eq!(
             default_routes.policy_history_route,
@@ -16396,6 +16924,11 @@ mod tests {
         assert_eq!(custom_routes.audit_route, "/v1/ops/audit");
         assert_eq!(custom_routes.events_stream_route, "/v1/ops/events/stream");
         assert_eq!(custom_routes.status_route, "/v1/ops/status");
+        assert_eq!(custom_routes.cluster_route, "/v1/ops/cluster");
+        assert_eq!(
+            custom_routes.cluster_replicas_route,
+            "/v1/ops/cluster/replicas"
+        );
         assert_eq!(custom_routes.policy_route, "/v1/ops/policy");
         assert_eq!(custom_routes.policy_history_route, "/v1/ops/policy/history");
         assert_eq!(
@@ -22200,6 +22733,1032 @@ mod tests {
             .expect("readiness request should complete");
         assert_eq!(response.status(), StatusCode::OK);
         assert_eq!(json_body(response).await["status"], "ready");
+    }
+
+    /// A cluster-shaped app whose `/readyz` consults `readiness` for the
+    /// fingerprint gate and `probe` for the authority-backed reasons.
+    /// Standalone configuration otherwise: the two seams are what the
+    /// readiness chain is being tested through, so nothing else has to
+    /// pretend to be a cluster.
+    fn cluster_readiness_app(
+        lifecycle: &GatewayLifecycle,
+        readiness: Arc<ha::ClusterReadiness>,
+        probe: Option<Arc<ha_status::ReadinessProbe>>,
+    ) -> axum::Router {
+        let recorder = PrometheusBuilder::new().build_recorder();
+        let app = gateway_app_with_process_started_at_and_overrides(
+            test_config(Vec::new()),
+            recorder.handle(),
+            test_audit_log(),
+            test_audit_event_sender(),
+            Instant::now(),
+            GatewayAppBuildOverrides {
+                lifecycle: Some(lifecycle.clone()),
+                cluster_readiness: Some(readiness),
+                readiness_probe: probe,
+                disable_proxy_health_checks: true,
+                ..GatewayAppBuildOverrides::default()
+            },
+        )
+        .expect("gateway app should build");
+        match app.http {
+            GatewayApp::Unified(router) => router,
+            GatewayApp::Split { .. } => panic!("test app should be unified"),
+        }
+    }
+
+    async fn readyz_answer(router: &axum::Router) -> (StatusCode, String) {
+        let response = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/readyz")
+                    .body(Body::empty())
+                    .expect("request should build"),
+            )
+            .await
+            .expect("readiness request should complete");
+        let status = response.status();
+        (status, body_string(response).await)
+    }
+
+    /// A policy granting `admin:cluster:read` to one role and nothing to
+    /// another, which is what the permission test needs on both sides.
+    fn cluster_status_policy() -> TempPolicyFile {
+        TempPolicyFile::new(
+            &serde_json::to_string(&json!({
+                "schema_version": "0.1.0",
+                "default_action": "deny",
+                "enforcement_mode": "enforce",
+                "roles": {
+                    "cluster-reader": { "permissions": [ADMIN_CLUSTER_READ_PERMISSION] },
+                    "status-reader": { "permissions": [ADMIN_STATUS_READ_PERMISSION] }
+                },
+                "rules": []
+            }))
+            .expect("cluster policy should serialize"),
+        )
+    }
+
+    /// An app serving the cluster status API. `source` is the scripted
+    /// readout: `Some` puts the state in cluster mode, `None` leaves it in
+    /// standalone, which is what a deployment with no authority is.
+    fn cluster_status_app(
+        policy: Option<&TempPolicyFile>,
+        source: Option<Arc<dyn cluster_status::ClusterStatusSource>>,
+        identity: ha::InstanceIdentity,
+    ) -> axum::Router {
+        let mut config = test_config(Vec::new());
+        config.auth_enabled = false;
+        if let Some(policy) = policy {
+            config.policy_file = Some(policy.path.to_string_lossy().into_owned());
+            // The handler's own permission check is what these tests are
+            // about, so the routes bypass the RBAC layer and the injected
+            // principal reaches the handler, exactly as the audit and
+            // status admin tests do it.
+            config
+                .rbac_exempt_paths
+                .push(CLUSTER_ADMIN_ROUTE.to_owned());
+            config
+                .rbac_exempt_paths
+                .push(CLUSTER_REPLICAS_ADMIN_ROUTE.to_owned());
+        }
+        // A serving replica: the lifecycle is what `/readyz` (and so this
+        // view's `state`) reads first, and an unmarked one is `starting`.
+        let lifecycle = GatewayLifecycle::default();
+        lifecycle.mark_ready();
+        let recorder = PrometheusBuilder::new().build_recorder();
+        let app = gateway_app_with_process_started_at_and_overrides(
+            config,
+            recorder.handle(),
+            test_audit_log(),
+            test_audit_event_sender(),
+            Instant::now(),
+            GatewayAppBuildOverrides {
+                lifecycle: Some(lifecycle),
+                ha_identity: Some(identity),
+                cluster_status_source: source,
+                disable_proxy_health_checks: true,
+                ..GatewayAppBuildOverrides::default()
+            },
+        )
+        .expect("gateway app should build");
+        match app.http {
+            GatewayApp::Unified(router) => router,
+            GatewayApp::Split { .. } => panic!("test app should be unified"),
+        }
+    }
+
+    async fn cluster_status_response(
+        router: &axum::Router,
+        uri: &str,
+        principal: Option<auth::Principal>,
+    ) -> Response {
+        router
+            .clone()
+            .oneshot(audit_query_request(uri, principal))
+            .await
+            .expect("cluster status request should complete")
+    }
+
+    /// Both cluster routes are gated on `admin:cluster:read` alone, in the
+    /// same shape `admin:audit:read` is enforced with: no principal is
+    /// `401`, a principal holding some other admin permission is `403`,
+    /// and an unconfigured RBAC is `404` rather than an open door.
+    #[tokio::test]
+    async fn the_cluster_routes_require_the_cluster_read_permission() {
+        let policy = cluster_status_policy();
+        let router = cluster_status_app(Some(&policy), None, ha::InstanceIdentity::generate());
+
+        for uri in [CLUSTER_ADMIN_ROUTE, CLUSTER_REPLICAS_ADMIN_ROUTE] {
+            let unauthenticated = cluster_status_response(&router, uri, None).await;
+            assert_eq!(unauthenticated.status(), StatusCode::UNAUTHORIZED, "{uri}");
+
+            let wrong_permission =
+                cluster_status_response(&router, uri, Some(test_principal(&["status-reader"])))
+                    .await;
+            assert_eq!(
+                wrong_permission.status(),
+                StatusCode::FORBIDDEN,
+                "{uri}: admin:status:read is not admin:cluster:read"
+            );
+
+            let unknown_role =
+                cluster_status_response(&router, uri, Some(test_principal(&["nobody"]))).await;
+            assert_eq!(unknown_role.status(), StatusCode::FORBIDDEN, "{uri}");
+
+            let permitted =
+                cluster_status_response(&router, uri, Some(test_principal(&["cluster-reader"])))
+                    .await;
+            assert_eq!(permitted.status(), StatusCode::OK, "{uri}");
+        }
+
+        // No policy file: RBAC is not configured, so the routes are not
+        // reachable at all rather than reachable without a check.
+        let unconfigured = cluster_status_app(None, None, ha::InstanceIdentity::generate());
+        for uri in [CLUSTER_ADMIN_ROUTE, CLUSTER_REPLICAS_ADMIN_ROUTE] {
+            let response =
+                cluster_status_response(&unconfigured, uri, Some(test_principal(&["admin"]))).await;
+            assert_eq!(response.status(), StatusCode::NOT_FOUND, "{uri}");
+            assert_eq!(
+                json_body(response).await["error"],
+                json!("cluster status API requires POLICY_FILE to be configured")
+            );
+        }
+    }
+
+    /// Standalone mode serves both shapes: it is the deployment, so it
+    /// reports itself as the only replica and leaves every section that
+    /// describes a cluster null.
+    #[tokio::test]
+    async fn standalone_cluster_status_reports_this_process_as_the_whole_deployment() {
+        let policy = cluster_status_policy();
+        let identity = ha::InstanceIdentity::generate();
+        let router = cluster_status_app(Some(&policy), None, identity);
+        let principal = test_principal(&["cluster-reader"]);
+
+        let status = json_body(
+            cluster_status_response(&router, CLUSTER_ADMIN_ROUTE, Some(principal.clone())).await,
+        )
+        .await;
+        assert_eq!(status["mode"], json!("standalone"));
+        assert_eq!(status["ready"], json!(true));
+        assert_eq!(status["state"], json!("ready"));
+        assert_eq!(status["reason"], json!(null));
+        assert_eq!(status["replicas"]["ready"], json!(1));
+        assert_eq!(status["replicas"]["total"], json!(1));
+        assert_eq!(status["binary_versions"][0]["count"], json!(1));
+        assert_eq!(
+            status["binary_versions"][0]["version"],
+            json!(env!("CARGO_PKG_VERSION"))
+        );
+        assert_eq!(status["projector"], json!(null));
+        assert_eq!(status["leader_tasks"], json!(null));
+        assert_eq!(status["pools"]["database"], json!(null));
+        assert_eq!(status["schema"]["current_version"], json!(null));
+        assert_eq!(status["schema"]["compatible"], json!(true));
+        assert_eq!(
+            status["local"]["instance_id"],
+            json!(identity.instance_id().to_string())
+        );
+        assert_eq!(status["local"]["revision_lag"], json!(0));
+        assert_eq!(status["reconcile"]["failures_total"], json!(0));
+        assert!(status["audit"]["queue_capacity"].as_u64().unwrap_or(0) > 0);
+
+        let replicas = json_body(
+            cluster_status_response(&router, CLUSTER_REPLICAS_ADMIN_ROUTE, Some(principal)).await,
+        )
+        .await;
+        let listed = replicas["replicas"]
+            .as_array()
+            .expect("replicas should be an array");
+        assert_eq!(listed.len(), 1);
+        assert_eq!(
+            listed[0]["instance_id"],
+            json!(identity.instance_id().to_string())
+        );
+        assert_eq!(listed[0]["boot_id"], json!(identity.boot_id().to_string()));
+        assert_eq!(listed[0]["live"], json!(true));
+        assert_eq!(listed[0]["started_at"], json!(null));
+    }
+
+    /// Cluster mode with two live members: the roster, the version
+    /// grouping, the projector's lag and leader, the singleton's ledger,
+    /// and the pool all reach the response.
+    #[tokio::test]
+    async fn cluster_status_reports_a_two_member_roster_from_the_authority() {
+        use cluster_status::test_support::{two_ready_members, ScriptedClusterStatusSource};
+
+        let policy = cluster_status_policy();
+        let identity = ha::InstanceIdentity::generate();
+        let second = uuid::Uuid::new_v4();
+        let source =
+            ScriptedClusterStatusSource::new(two_ready_members(identity.instance_id(), second));
+        let router = cluster_status_app(Some(&policy), Some(source), identity);
+        let principal = test_principal(&["cluster-reader"]);
+
+        let status = json_body(
+            cluster_status_response(&router, CLUSTER_ADMIN_ROUTE, Some(principal.clone())).await,
+        )
+        .await;
+        assert_eq!(status["mode"], json!("cluster"));
+        assert_eq!(status["state"], json!("ready"));
+        assert_eq!(status["replicas"]["ready"], json!(2));
+        assert_eq!(status["replicas"]["total"], json!(2));
+        assert_eq!(status["binary_versions"][0]["version"], json!("1.0.1"));
+        assert_eq!(status["binary_versions"][0]["count"], json!(2));
+        assert_eq!(status["projector"]["fence"], json!(3));
+        assert_eq!(status["projector"]["checkpoint_position"], json!(40));
+        assert_eq!(status["projector"]["stream_head"], json!(42));
+        assert_eq!(status["projector"]["lag_events"], json!(2));
+        assert_eq!(status["projector"]["leader_present"], json!(true));
+        assert_eq!(
+            status["leader_tasks"][0]["name"],
+            json!("stale_member_sweep")
+        );
+        assert_eq!(
+            status["leader_tasks"][0]["held_by_this_instance"],
+            json!(false)
+        );
+        assert_eq!(status["pools"]["database"]["size"], json!(4));
+        assert_eq!(status["pools"]["database"]["available"], json!(4));
+        assert_eq!(status["pools"]["database"]["timeouts_total"], json!(0));
+
+        let replicas = json_body(
+            cluster_status_response(&router, CLUSTER_REPLICAS_ADMIN_ROUTE, Some(principal)).await,
+        )
+        .await;
+        let listed = replicas["replicas"]
+            .as_array()
+            .expect("replicas should be an array");
+        assert_eq!(listed.len(), 2);
+        assert_eq!(
+            listed[0]["instance_id"],
+            json!(identity.instance_id().to_string())
+        );
+        assert_eq!(listed[1]["instance_id"], json!(second.to_string()));
+        assert_eq!(listed[0]["fingerprint"], json!("b".repeat(64)));
+        assert_eq!(
+            listed[0]["last_heartbeat_at"],
+            json!("2026-09-01T10:00:05.000000Z")
+        );
+    }
+
+    /// The redaction boundary holds over the wire, not just over the
+    /// assembly: a roster full of DSNs and addresses reaches the client
+    /// with none of it, on both routes.
+    #[tokio::test]
+    async fn hostile_roster_values_never_reach_the_cluster_endpoints() {
+        use cluster_status::test_support::{two_ready_members, ScriptedClusterStatusSource};
+
+        let hostile = "postgres://gateway:hunter2@db.internal.example:5432/greengateway";
+        let policy = cluster_status_policy();
+        let identity = ha::InstanceIdentity::generate();
+        let mut readout = two_ready_members(identity.instance_id(), uuid::Uuid::new_v4());
+        readout.members = readout.members.map(|members| {
+            members
+                .into_iter()
+                .map(|member| cluster_status::ReplicaFacts {
+                    binary_version: hostile.to_owned(),
+                    fingerprint: hostile.to_owned(),
+                    started_at: Some(hostile.to_owned()),
+                    last_heartbeat_at: Some(hostile.to_owned()),
+                    ready_at: Some(hostile.to_owned()),
+                    last_error_code: Some(hostile.to_owned()),
+                    ..member
+                })
+                .collect()
+        });
+        readout.leader_tasks = Some(vec![cluster_status::LeaderTaskFacts {
+            job: hostile.to_owned(),
+            fence: 1,
+            last_success_age_secs: None,
+            last_failure_code: Some(hostile.to_owned()),
+        }]);
+        let router = cluster_status_app(
+            Some(&policy),
+            Some(ScriptedClusterStatusSource::new(readout)),
+            identity,
+        );
+        let principal = test_principal(&["cluster-reader"]);
+
+        for uri in [CLUSTER_ADMIN_ROUTE, CLUSTER_REPLICAS_ADMIN_ROUTE] {
+            let response = cluster_status_response(&router, uri, Some(principal.clone())).await;
+            assert_eq!(response.status(), StatusCode::OK, "{uri}");
+            let body = body_string(response).await;
+            assert!(!body.contains(hostile), "{uri} leaked the hostile value");
+            assert!(!body.contains("postgres://"), "{uri} leaked a DSN scheme");
+            assert!(!body.contains('@'), "{uri} leaked an `@`");
+            assert!(
+                !body.contains("db.internal.example"),
+                "{uri} leaked a hostname"
+            );
+        }
+    }
+
+    /// One case per row of the HA failure matrix (issue #241, PR 14):
+    /// each authority-backed condition, fault-injected through the
+    /// probe's seams, reaches `/readyz` as its own stable reason.
+    #[tokio::test]
+    async fn readiness_reports_every_authority_backed_failure_matrix_reason() {
+        use ha_status::test_support::{healthy_settings, ScriptedAuthority, ScriptedRevisions};
+        use ha_status::{AuthorityObservation, ReadinessProbe, ReadinessProbeSettings};
+
+        let agreed = || {
+            let readiness = ha::ClusterReadiness::new();
+            readiness.record_fingerprint_agreement();
+            readiness
+        };
+        // (what the deployment looks like, what `/readyz` must answer).
+        let cases: Vec<(Arc<ha_status::ReadinessProbe>, Option<&str>)> = vec![
+            // The pool cannot be checked out: the database is gone, or
+            // every connection is in use past the acquire timeout.
+            (
+                ReadinessProbe::new(
+                    agreed(),
+                    ScriptedAuthority::new(AuthorityObservation::Unavailable),
+                    None,
+                    healthy_settings(),
+                ),
+                Some("storage_unavailable"),
+            ),
+            // The session reached a standby, or the primary was made
+            // read-only: a replica that cannot write cannot serve.
+            (
+                ReadinessProbe::new(
+                    agreed(),
+                    ScriptedAuthority::new(AuthorityObservation::ReadOnly),
+                    None,
+                    healthy_settings(),
+                ),
+                Some("storage_unavailable"),
+            ),
+            // The ledger no longer covers this binary's manifest.
+            (
+                ReadinessProbe::new(
+                    agreed(),
+                    ScriptedAuthority::healthy(3),
+                    None,
+                    healthy_settings(),
+                ),
+                Some("schema_incompatible"),
+            ),
+            // The membership heartbeat has not landed inside the stale
+            // window, so the roster no longer counts this replica live.
+            (
+                ReadinessProbe::new(
+                    agreed(),
+                    ScriptedAuthority::healthy(9),
+                    None,
+                    ReadinessProbeSettings {
+                        member_stale_window: Duration::ZERO,
+                        ..healthy_settings()
+                    },
+                ),
+                Some("instance_lease_invalid"),
+            ),
+            // The security gate has been failing protected traffic
+            // closed past the reconcile deadline.
+            (
+                ReadinessProbe::new(
+                    agreed(),
+                    ScriptedAuthority::healthy(9),
+                    Some(ScriptedRevisions::refusing_for(Duration::ZERO)),
+                    ReadinessProbeSettings {
+                        revision_reconcile_grace: Duration::ZERO,
+                        ..healthy_settings()
+                    },
+                ),
+                Some("security_revision_not_compiled"),
+            ),
+            // Everything the authority can tell us is healthy.
+            (
+                ReadinessProbe::new(
+                    agreed(),
+                    ScriptedAuthority::healthy(9),
+                    Some(ScriptedRevisions::new(5, 5)),
+                    healthy_settings(),
+                ),
+                None,
+            ),
+        ];
+
+        for (probe, expected) in cases {
+            let lifecycle = GatewayLifecycle::new();
+            let readiness = agreed();
+            let router = cluster_readiness_app(&lifecycle, readiness, Some(probe));
+            lifecycle.mark_ready();
+            let (status, body) = readyz_answer(&router).await;
+            match expected {
+                Some(reason) => {
+                    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{reason}: {body}");
+                    assert_eq!(
+                        body,
+                        format!(r#"{{"status":"not_ready","reason":"{reason}"}}"#),
+                        "the probe's reason must reach /readyz verbatim"
+                    );
+                }
+                None => {
+                    assert_eq!(status, StatusCode::OK, "{body}");
+                    assert_eq!(body, r#"{"status":"ready"}"#);
+                }
+            }
+        }
+    }
+
+    /// The reason chain's order: the lifecycle answers before the
+    /// fingerprint gate, which answers before the probe. A replica that
+    /// is draining, disagreeing, *and* cut off from its authority all at
+    /// once reports the condition an operator has to look at first, and
+    /// the two pre-existing reasons keep their exact strings.
+    #[tokio::test]
+    async fn the_probe_is_consulted_after_the_lifecycle_and_the_fingerprint_gate() {
+        use ha_status::test_support::{healthy_settings, ScriptedAuthority};
+        use ha_status::{AuthorityObservation, ReadinessProbe};
+
+        let lifecycle = GatewayLifecycle::new();
+        let readiness = ha::ClusterReadiness::new();
+        let probe = ReadinessProbe::new(
+            Arc::clone(&readiness),
+            ScriptedAuthority::new(AuthorityObservation::Unavailable),
+            None,
+            healthy_settings(),
+        );
+        let router = cluster_readiness_app(&lifecycle, Arc::clone(&readiness), Some(probe));
+
+        // Not serving yet: the lifecycle answers first.
+        assert_eq!(
+            readyz_answer(&router).await,
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                r#"{"status":"not_ready","reason":"starting"}"#.to_owned()
+            )
+        );
+
+        // Serving, but the fingerprint gate is still closed: PR 13's
+        // reason outranks the probe's.
+        lifecycle.mark_ready();
+        assert_eq!(
+            readyz_answer(&router).await,
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                r#"{"status":"not_ready","reason":"config_fingerprint_mismatch"}"#.to_owned()
+            )
+        );
+
+        // Agreed: now the probe's reason is what is left.
+        readiness.record_fingerprint_agreement();
+        assert_eq!(
+            readyz_answer(&router).await,
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                r#"{"status":"not_ready","reason":"storage_unavailable"}"#.to_owned()
+            )
+        );
+
+        // Draining outranks everything below it, probe included.
+        assert!(lifecycle.begin_draining());
+        assert_eq!(
+            readyz_answer(&router).await,
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                r#"{"status":"not_ready","reason":"draining"}"#.to_owned()
+            )
+        );
+    }
+
+    /// Standalone mode has no shared authority, so it builds no probe and
+    /// `/readyz` answers exactly what it answered before this PR --
+    /// asserted on the response bytes, not on a parsed field, because
+    /// orchestrator configurations match on them.
+    #[tokio::test]
+    async fn standalone_readiness_is_byte_for_byte_unchanged() {
+        let lifecycle = GatewayLifecycle::new();
+        let recorder = PrometheusBuilder::new().build_recorder();
+        let app = gateway_app_with_process_started_at_and_overrides(
+            test_config(Vec::new()),
+            recorder.handle(),
+            test_audit_log(),
+            test_audit_event_sender(),
+            Instant::now(),
+            GatewayAppBuildOverrides {
+                lifecycle: Some(lifecycle.clone()),
+                disable_proxy_health_checks: true,
+                ..GatewayAppBuildOverrides::default()
+            },
+        )
+        .expect("gateway app should build");
+        let router = match app.http {
+            GatewayApp::Unified(router) => router,
+            GatewayApp::Split { .. } => panic!("test app should be unified"),
+        };
+
+        assert_eq!(
+            readyz_answer(&router).await,
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                r#"{"status":"not_ready","reason":"starting"}"#.to_owned()
+            )
+        );
+        lifecycle.mark_ready();
+        assert_eq!(
+            readyz_answer(&router).await,
+            (StatusCode::OK, r#"{"status":"ready"}"#.to_owned())
+        );
+        assert!(lifecycle.begin_draining());
+        assert_eq!(
+            readyz_answer(&router).await,
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                r#"{"status":"not_ready","reason":"draining"}"#.to_owned()
+            )
+        );
+    }
+
+    // ---------------------------------------------------------------------
+    // The registry label audit (issue #241, PR 14, section 3)
+    // ---------------------------------------------------------------------
+
+    /// Values that must never become a metric label, one per kind of
+    /// caller-influenced or deployment-identifying string the issue names.
+    /// Each is distinctive enough that a substring search over the whole
+    /// render is a real test rather than a coincidence.
+    const CANARY_INSTANCE_ID: &str = "3f8c1d2e-9b47-4a6f-8e51-c07d2b93a4e6";
+    const CANARY_PRINCIPAL: &str = "canary-principal-7d31@example.test";
+    const CANARY_ROUTE: &str = "/canary-route-3f9a/orders/9182";
+    const CANARY_HOST: &str = "canary-host-9d27.example.test";
+    const CANARY_URL: &str = "postgres://canary-user:canary-pass@10.11.12.13:5432/canary-db";
+    const CANARY_TOKEN_ID: &str = "tok_canary_5b2e_never_a_label";
+    const CANARY_QUERY: &str = "secret=canary-query-8c41";
+    const CANARY_ERROR: &str =
+        "FATAL: password authentication failed for user \"canary-user\" at 10.11.12.13";
+
+    const CANARIES: [(&str, &str); 8] = [
+        ("an instance id", CANARY_INSTANCE_ID),
+        ("a principal", CANARY_PRINCIPAL),
+        ("a proxied route", CANARY_ROUTE),
+        ("a host", CANARY_HOST),
+        ("a URL", CANARY_URL),
+        ("a token id", CANARY_TOKEN_ID),
+        ("a query string", CANARY_QUERY),
+        ("an error string", CANARY_ERROR),
+    ];
+
+    /// The only label *names* an HA metric may carry. The exporter adds
+    /// `quantile` to summaries itself, so it is allowed here without being
+    /// something the gateway chose.
+    const ALLOWED_HA_LABEL_NAMES: [&str; 9] = [
+        "job",
+        "outcome",
+        "task",
+        "kind",
+        "reason",
+        "scope",
+        "operation",
+        "error_class",
+        "quantile",
+    ];
+
+    /// Every metric name section 3 adds. Asserting each one is present
+    /// keeps the audit from passing vacuously against a render that
+    /// happens to contain nothing.
+    fn expected_ha_metric_names() -> Vec<&'static str> {
+        // A `--no-default-features` build has no cluster metrics to add,
+        // so the list below is already complete there.
+        #[cfg_attr(not(feature = "postgres"), allow(unused_mut))]
+        let mut names = vec![
+            metrics::GATEWAY_READY,
+            metrics::GATEWAY_DRAINING,
+            metrics::INFLIGHT_REQUESTS,
+            metrics::AUDIT_QUEUE_DEPTH,
+            metrics::AUDIT_QUEUE_CAPACITY,
+            metrics::AUDIT_QUEUE_OLDEST_AGE_SECONDS,
+            metrics::AUDIT_FLUSH_TOTAL,
+            metrics::EXECUTION_LEASE_FAILURES_TOTAL,
+        ];
+        #[cfg(feature = "postgres")]
+        names.extend_from_slice(&[
+            metrics::SCHEMA_COMPATIBLE,
+            metrics::MIGRATION_LOCK_WAIT_SECONDS,
+            metrics::DATABASE_POOL_SIZE,
+            metrics::DATABASE_POOL_AVAILABLE,
+            metrics::DATABASE_POOL_WAITING,
+            metrics::DATABASE_POOL_TIMEOUTS_TOTAL,
+            metrics::DATABASE_OPERATION_SECONDS,
+            metrics::SECURITY_REVISION_COMPILED,
+            metrics::SECURITY_REVISION_CURRENT,
+            metrics::SECURITY_REVISION_LAG,
+            metrics::RECONCILE_FAILURES_TOTAL,
+            metrics::CLUSTER_HEARTBEAT_AGE_SECONDS,
+            metrics::CLUSTER_CONFIG_MISMATCH,
+            metrics::CLUSTER_LEASE_AGE_SECONDS,
+            metrics::LEADER_TASK_LAST_SUCCESS_AGE_SECONDS,
+            metrics::DISCOVERY_PROJECTOR_CHECKPOINT,
+            metrics::DISCOVERY_PROJECTOR_LAG_EVENTS,
+            metrics::DISCOVERY_PROJECTOR_ERRORS_TOTAL,
+            metrics::AUDIT_STREAM_CONNECTIONS_TOTAL,
+            metrics::AUDIT_STREAM_REPLAY_BACKLOG_EVENTS,
+            metrics::AUDIT_STREAM_DUPLICATE_POSITIONS_TOTAL,
+        ]);
+        names
+    }
+
+    /// The declared vocabulary of every labelled HA metric: a label value
+    /// outside its family's list is a cardinality leak, whatever it says.
+    fn ha_label_vocabularies() -> Vec<(&'static str, &'static str, Vec<&'static str>)> {
+        #[cfg_attr(not(feature = "postgres"), allow(unused_mut))]
+        let mut rules: Vec<(&'static str, &'static str, Vec<&'static str>)> = vec![
+            (
+                metrics::AUDIT_FLUSH_TOTAL,
+                "outcome",
+                audit::AUDIT_FLUSH_OUTCOMES.to_vec(),
+            ),
+            (
+                metrics::EXECUTION_LEASE_FAILURES_TOTAL,
+                "kind",
+                tools::lease::LEASE_FAILURE_KINDS.to_vec(),
+            ),
+        ];
+        #[cfg(feature = "postgres")]
+        rules.extend([
+            (
+                metrics::RECONCILE_FAILURES_TOTAL,
+                "reason",
+                vec![
+                    middleware::rbac::SecurityRevisionCheckError::Unavailable.as_str(),
+                    middleware::rbac::SecurityRevisionCheckError::ReconcileDeadlineExceeded
+                        .as_str(),
+                    middleware::rbac::SecurityRevisionCheckError::InvalidDocument.as_str(),
+                ],
+            ),
+            (
+                metrics::CLUSTER_LEASE_AGE_SECONDS,
+                "scope",
+                tools::lease::LEASE_SCOPE_LABELS.to_vec(),
+            ),
+            (
+                metrics::LEADER_TASK_LAST_SUCCESS_AGE_SECONDS,
+                "task",
+                cluster_maintenance::JOB_NAMES.to_vec(),
+            ),
+            (
+                metrics::DISCOVERY_PROJECTOR_ERRORS_TOTAL,
+                "kind",
+                discovery::projector::PROJECTOR_ERROR_KINDS.to_vec(),
+            ),
+            (
+                metrics::AUDIT_STREAM_CONNECTIONS_TOTAL,
+                "outcome",
+                AUDIT_STREAM_OUTCOMES.to_vec(),
+            ),
+            (
+                metrics::CLUSTER_MAINTENANCE_JOB_RUNS_TOTAL,
+                "job",
+                cluster_maintenance::JOB_NAMES.to_vec(),
+            ),
+            // `error_class` is the one label on this surface whose value
+            // is chosen at runtime rather than passed in as a `&'static
+            // str`, so the type system is not the guard here and the
+            // vocabulary has to be declared. It is the classifier's
+            // *label* spelling plus the success sentinel -- deliberately
+            // not `as_str()`, whose spellings are the ones stored in
+            // member and job rows and carry spaces.
+            (
+                metrics::DATABASE_OPERATION_SECONDS,
+                "error_class",
+                storage::RepositoryErrorKind::KNOWN
+                    .iter()
+                    .map(|kind| kind.metric_label())
+                    .chain(std::iter::once(
+                        storage::postgres::OPERATION_ERROR_CLASS_NONE,
+                    ))
+                    .collect(),
+            ),
+        ]);
+        rules
+    }
+
+    /// The metric name of a rendered sample line, without labels.
+    fn rendered_metric_name(line: &str) -> &str {
+        let head = line.split_once(' ').map_or(line, |(head, _)| head);
+        head.split_once('{').map_or(head, |(name, _)| name)
+    }
+
+    /// The `(name, value)` label pairs of a rendered sample line, with the
+    /// exporter's quoting removed.
+    fn rendered_labels(line: &str) -> Vec<(String, String)> {
+        let Some(start) = line.find('{') else {
+            return Vec::new();
+        };
+        let Some(end) = line.rfind('}') else {
+            return Vec::new();
+        };
+        line[start + 1..end]
+            .split(',')
+            .filter_map(|pair| pair.split_once('='))
+            .map(|(name, value)| {
+                (
+                    name.trim().to_owned(),
+                    value.trim().trim_matches('"').to_owned(),
+                )
+            })
+            .collect()
+    }
+
+    /// Whether `value` looks like a dotted quad, which is how an address
+    /// gets into a label that was only ever meant to hold a version.
+    fn looks_like_an_address(value: &str) -> bool {
+        let parts: Vec<&str> = value.split('.').collect();
+        parts.len() == 4
+            && parts
+                .iter()
+                .all(|part| !part.is_empty() && part.bytes().all(|byte| byte.is_ascii_digit()))
+    }
+
+    /// Whether `value` looks like a UUID, which is how an instance id or a
+    /// boot id gets into a label.
+    fn looks_like_a_uuid(value: &str) -> bool {
+        let groups: Vec<&str> = value.split('-').collect();
+        groups.len() == 5
+            && [8, 4, 4, 4, 12].iter().zip(&groups).all(|(width, group)| {
+                group.len() == *width && group.bytes().all(|byte| byte.is_ascii_hexdigit())
+            })
+    }
+
+    /// Drive every HA metric this PR adds, with every canary in the
+    /// process while it happens.
+    ///
+    /// The request leg is a real one through a real router carrying the
+    /// hostile host, path, query and bearer token, so the request path's
+    /// own metrics are recorded against exactly the input an attacker
+    /// controls. The rest calls the production emitters directly -- the
+    /// same functions the heartbeat task, the reconciler, the projector
+    /// and the maintenance leader call -- because standing up a cluster
+    /// would prove nothing extra about the labels they pass.
+    async fn synthetic_ha_run() {
+        let lifecycle = GatewayLifecycle::new();
+        let recorder = PrometheusBuilder::new().build_recorder();
+        let app = gateway_app_with_process_started_at_and_overrides(
+            test_config(Vec::new()),
+            recorder.handle(),
+            test_audit_log(),
+            test_audit_event_sender(),
+            Instant::now(),
+            GatewayAppBuildOverrides {
+                lifecycle: Some(lifecycle.clone()),
+                disable_proxy_health_checks: true,
+                ..GatewayAppBuildOverrides::default()
+            },
+        )
+        .expect("gateway app should build");
+        let router = match app.http {
+            GatewayApp::Unified(router) => router,
+            GatewayApp::Split { .. } => panic!("test app should be unified"),
+        };
+        lifecycle.mark_ready();
+
+        // A hostile request: the route, the host, the query and the token
+        // are all caller-chosen, and all four are on the wire together.
+        let hostile = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri(format!("{CANARY_ROUTE}?{CANARY_QUERY}"))
+                    .header(header::HOST, CANARY_HOST)
+                    .header(header::AUTHORIZATION, format!("Bearer {CANARY_TOKEN_ID}"))
+                    .header("x-forwarded-for", "10.11.12.13")
+                    .body(Body::empty())
+                    .expect("hostile request should build"),
+            )
+            .await
+            .expect("hostile request should complete");
+        // What it answered does not matter; that it was *observed* does.
+        let _ = hostile.status();
+
+        // A scrape, which is what publishes the sampled gauges.
+        let scrape = router
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri("/metrics")
+                    .body(Body::empty())
+                    .expect("scrape request should build"),
+            )
+            .await
+            .expect("scrape should complete");
+        assert_eq!(scrape.status(), StatusCode::OK);
+
+        lifecycle.begin_draining();
+
+        // The audit writer's queue and its flushes.
+        audit::record_queue_gauges(3, 8192, Duration::from_millis(250));
+        audit::record_flush_outcome(true);
+        audit::record_flush_outcome(false);
+
+        // Execution leases: every failure kind, none of them carrying the
+        // scope (which is `tool:<name>` and would be a series per tool).
+        for kind in tools::lease::LEASE_FAILURE_KINDS {
+            tools::lease::record_lease_failure(kind);
+        }
+
+        #[cfg(feature = "postgres")]
+        {
+            storage::migrations::record_schema_compatible(false);
+            storage::migrations::record_schema_compatible(true);
+            storage::migrations::record_migration_lock_wait(Duration::from_millis(120));
+
+            storage::postgres::record_pool_gauges(10, 2, 1);
+            storage::postgres::record_pool_timeout();
+            // One store operation per classified outcome, including the
+            // success class, so the family can be summed across both.
+            storage::postgres::observe_operation(
+                storage::postgres::OPERATION_CONNECTIVITY_CHECK,
+                Duration::from_millis(4),
+                None,
+            );
+            for kind in storage::RepositoryErrorKind::KNOWN {
+                storage::postgres::observe_operation(
+                    storage::postgres::OPERATION_CONNECTIVITY_CHECK,
+                    Duration::from_millis(9),
+                    Some(kind),
+                );
+            }
+
+            security_cluster::record_revision_gauges(41, 44);
+            for reason in [
+                middleware::rbac::SecurityRevisionCheckError::Unavailable,
+                middleware::rbac::SecurityRevisionCheckError::ReconcileDeadlineExceeded,
+                middleware::rbac::SecurityRevisionCheckError::InvalidDocument,
+            ] {
+                security_cluster::record_reconcile_failure(reason);
+            }
+
+            cluster_membership::record_membership_gauges(Duration::from_secs(7), false);
+            for scope in tools::lease::LEASE_SCOPE_LABELS {
+                tools::lease::record_lease_age(scope, Duration::from_secs(93));
+            }
+
+            // The ledger's `job` column is database data. A row naming a
+            // job this binary does not run must produce no series at all,
+            // and a canary in that column is the adversarial case.
+            assert!(
+                cluster_maintenance::known_job_name(CANARY_ROUTE).is_none(),
+                "an unrecognised ledger job name must never be turned into a label"
+            );
+            for job in cluster_maintenance::JOB_NAMES {
+                let name = cluster_maintenance::known_job_name(job)
+                    .expect("every job this binary runs is recognised by name");
+                cluster_maintenance::record_leader_task_age(name, 61.5);
+            }
+
+            discovery::projector::record_projector_progress(1_204, 1_311);
+            for kind in discovery::projector::PROJECTOR_ERROR_KINDS {
+                discovery::projector::record_projector_error(kind);
+            }
+
+            for outcome in AUDIT_STREAM_OUTCOMES {
+                record_audit_stream_outcome(outcome);
+            }
+            record_audit_stream_replay_backlog(512);
+            record_audit_stream_duplicates(1);
+        }
+    }
+
+    /// Section 3's cardinality rule, enforced rather than documented.
+    ///
+    /// A metric label is unbounded state the process keeps for the life of
+    /// the registry and hands to every scrape, so a label value derived
+    /// from an instance id, a principal, a proxied route, a host, a URL, a
+    /// token id, a query or an error string is two defects at once: a
+    /// cardinality bomb a caller can detonate, and a disclosure on an
+    /// endpoint that is routinely less protected than the admin API.
+    ///
+    /// The test walks the rendered registry after a synthetic run that
+    /// drives every HA emitter *and* a real request carrying all eight
+    /// canaries, and asserts three things: no canary appears anywhere in
+    /// the render; no label value anywhere has the shape of an address, a
+    /// UUID, a URL, or an email; and every HA metric's labels come from
+    /// its declared, compile-time vocabulary.
+    #[test]
+    fn the_ha_metric_registry_never_labels_by_a_caller_influenced_value() {
+        let recorder = PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        // A current-thread runtime inside the local-recorder scope: the
+        // recorder is installed per thread, and a current-thread runtime
+        // polls every task it owns on this one, so the synthetic run's
+        // emissions land in this registry rather than the global one.
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("test runtime should build");
+        ::metrics::with_local_recorder(&recorder, || {
+            runtime.block_on(synthetic_ha_run());
+        });
+        let rendered = handle.render();
+
+        // 1. Not vacuous: every metric section 3 adds is actually here.
+        for name in expected_ha_metric_names() {
+            assert!(
+                rendered
+                    .lines()
+                    .any(|line| rendered_metric_name(line) == name),
+                "the audit is only meaningful if {name} was recorded:\n{rendered}"
+            );
+        }
+
+        // 1b. The in-flight gauge exists *because* the hostile request
+        //     passed through the observation layer, and it is back at zero
+        //     because the guard took its increment back down. A gauge that
+        //     only climbs is the failure this guard exists to prevent, and
+        //     it would be invisible without asserting the resting value.
+        assert!(
+            rendered
+                .lines()
+                .any(|line| line == format!("{} 0", metrics::INFLIGHT_REQUESTS)),
+            "the in-flight gauge must return to zero once every request has left:\n{rendered}"
+        );
+
+        // 2. No canary reached the registry at all -- not as a label, not
+        //    as a metric name, not in a comment.
+        for (what, canary) in CANARIES {
+            assert!(
+                !rendered.contains(canary),
+                "{what} must never reach the metrics registry ({canary}):\n{rendered}"
+            );
+        }
+
+        // 3. No label value anywhere has the shape of something
+        //    caller-influenced, whatever metric it is on.
+        for line in rendered.lines().filter(|line| !line.starts_with('#')) {
+            for (label, value) in rendered_labels(line) {
+                assert!(
+                    !value.contains('@') && !value.contains("://"),
+                    "a label value that is a URL or an address is never allowed: {line}"
+                );
+                assert!(
+                    !looks_like_an_address(&value),
+                    "a label value shaped like an IP address is never allowed: {line}"
+                );
+                assert!(
+                    !looks_like_a_uuid(&value),
+                    "an instance or boot id must never be a label: {line}"
+                );
+                assert!(
+                    value.len() <= 64,
+                    "a label value longer than any enum member is unbounded text: {line}"
+                );
+                assert!(
+                    !label.is_empty(),
+                    "a rendered label must have a name: {line}"
+                );
+            }
+        }
+
+        // 4. Every HA metric's labels come from its declared vocabulary.
+        let vocabularies = ha_label_vocabularies();
+        for line in rendered
+            .lines()
+            .filter(|line| !line.starts_with('#') && line.starts_with("greengateway_"))
+        {
+            let name = rendered_metric_name(line);
+            for (label, value) in rendered_labels(line) {
+                assert!(
+                    ALLOWED_HA_LABEL_NAMES.contains(&label.as_str()),
+                    "{name} carries an undeclared label name {label}: {line}"
+                );
+                if let Some((_, _, vocabulary)) = vocabularies
+                    .iter()
+                    .find(|(metric, declared, _)| *metric == name && *declared == label)
+                {
+                    assert!(
+                        vocabulary.contains(&value.as_str()),
+                        "{name}'s {label} label must come from its fixed vocabulary \
+                         {vocabulary:?}, not {value:?}: {line}"
+                    );
+                }
+            }
+        }
     }
 
     #[tokio::test]
@@ -44408,6 +45967,34 @@ O2gecI9QwDJNpm29J9wJB2F8
                 Some(middleware::rbac::SecurityRevisionCheckError::ReconcileDeadlineExceeded),
                 "a request cannot wait out a slow reconcile"
             );
+
+            // The refusal that request just took is the fact readiness
+            // reads. It is recorded by the gate as it happens, so a
+            // probe sees a replica failing protected traffic closed
+            // even though this failure moved neither watermark -- the
+            // counter read succeeded, the reconcile is what ran out of
+            // budget.
+            assert!(
+                runtime.admission_failing_for().is_some(),
+                "a refused admission starts the failing streak the probe reads"
+            );
+            let readiness = ha::ClusterReadiness::new();
+            readiness.record_fingerprint_agreement();
+            let probe = ha_status::ReadinessProbe::new(
+                readiness,
+                ha_status::test_support::ScriptedAuthority::healthy(9),
+                Some(runtime.clone()),
+                ha_status::ReadinessProbeSettings {
+                    revision_reconcile_grace: Duration::ZERO,
+                    ..ha_status::test_support::healthy_settings()
+                },
+            );
+            assert_eq!(
+                probe.blocked_reason().await,
+                Some(ha_status::SECURITY_REVISION_NOT_COMPILED),
+                "a gate refusing past its grace is not ready, whatever the watermarks read"
+            );
+
             runtime
                 .ensure_current_revision_within(security_cluster::RECONCILE_BACKGROUND_DEADLINE)
                 .await
@@ -44415,6 +46002,16 @@ O2gecI9QwDJNpm29J9wJB2F8
             middleware::rbac::SecurityRevisionGate::ensure_current_revision(&*runtime)
                 .await
                 .expect("once reconciled, requests serve inside their own deadline");
+            assert_eq!(
+                runtime.admission_failing_for(),
+                None,
+                "one admission clears the streak"
+            );
+            assert_eq!(
+                probe.blocked_reason().await,
+                None,
+                "a replica admitting requests is ready again on the next probe"
+            );
         }
 
         /// A resource whose reconcile is deliberately slower than the

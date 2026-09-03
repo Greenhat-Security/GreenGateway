@@ -69,6 +69,57 @@ use crate::{
 pub(crate) const PROJECTOR_LEASE_SCOPE: &str = "discovery-projector";
 const PROJECTOR_LEASE_INVOCATION: &str = "projector";
 
+// The `kind` vocabulary of `greengateway_discovery_projector_errors_total`
+// (issue #241, PR 14): the steps of a leader's term that can fail, one
+// label value each. They name *which step* failed, never why -- the
+// store's error text and the observation that was dropped both carry
+// caller-influenced material (paths, principals, upstream origins) and a
+// metric label is unbounded, published state.
+/// The lease could not be tried at all.
+pub(crate) const PROJECTOR_ERROR_LEASE: &str = "lease_acquire";
+/// The lease was taken but the leadership claim was refused or failed.
+pub(crate) const PROJECTOR_ERROR_CLAIM: &str = "leadership_claim";
+/// The persisted working set could not be loaded, so the term never began.
+pub(crate) const PROJECTOR_ERROR_STATE_LOAD: &str = "state_load";
+/// A newer fence holds the checkpoint: this leader was fenced out
+/// mid-term and its uncommitted work is dropped.
+pub(crate) const PROJECTOR_ERROR_FENCED: &str = "fenced";
+/// A batch could not be read or flushed; the term retries the same flush.
+pub(crate) const PROJECTOR_ERROR_BATCH: &str = "batch";
+/// An observation exceeded the persisted column bounds and was dropped
+/// rather than admitted (a CHECK failure would wedge the whole batch).
+pub(crate) const PROJECTOR_ERROR_OBSERVATION_DROPPED: &str = "observation_dropped";
+
+/// The whole vocabulary of the `kind` label.
+pub(crate) const PROJECTOR_ERROR_KINDS: [&str; 6] = [
+    PROJECTOR_ERROR_LEASE,
+    PROJECTOR_ERROR_CLAIM,
+    PROJECTOR_ERROR_STATE_LOAD,
+    PROJECTOR_ERROR_FENCED,
+    PROJECTOR_ERROR_BATCH,
+    PROJECTOR_ERROR_OBSERVATION_DROPPED,
+];
+
+/// Count one projector failure by which step of the term it was.
+pub(crate) fn record_projector_error(kind: &'static str) {
+    ::metrics::counter!(crate::metrics::DISCOVERY_PROJECTOR_ERRORS_TOTAL, "kind" => kind)
+        .increment(1);
+}
+
+/// Publish the committed checkpoint and how far it is behind the audit
+/// stream's head (issue #241, PR 14).
+///
+/// Both, not just the lag: a checkpoint that stops advancing while the lag
+/// grows is a wedged projector, and a checkpoint that advances while the
+/// lag grows is one that simply cannot keep up with observation volume.
+/// The two failures need different answers, and the lag alone cannot tell
+/// them apart.
+pub(crate) fn record_projector_progress(checkpoint: i64, head: i64) {
+    ::metrics::gauge!(crate::metrics::DISCOVERY_PROJECTOR_CHECKPOINT).set(checkpoint as f64);
+    ::metrics::gauge!(crate::metrics::DISCOVERY_PROJECTOR_LAG_EVENTS)
+        .set(head.saturating_sub(checkpoint).max(0) as f64);
+}
+
 /// The event type the projector applies; every other event only moves the
 /// checkpoint.
 const HTTP_REQUEST_OBSERVED: &str = "http.request_observed";
@@ -264,6 +315,9 @@ impl ProjectorTerm {
             }
         }
         if dropped > 0 {
+            for _ in 0..dropped {
+                record_projector_error(PROJECTOR_ERROR_OBSERVATION_DROPPED);
+            }
             tracing::warn!(
                 dropped,
                 "discovery projector dropped observations exceeding the persisted column bounds"
@@ -344,6 +398,7 @@ impl ProjectorTerm {
                 Ok(FlushOutcome::Committed)
             }
             Err(error) if error.kind() == RepositoryErrorKind::Conflict => {
+                record_projector_error(PROJECTOR_ERROR_FENCED);
                 tracing::warn!(
                     fence = self.fence,
                     "discovery projector fenced out; a newer leader holds the checkpoint"
@@ -410,6 +465,7 @@ async fn run_projector(
                 continue;
             }
             Err(error) => {
+                record_projector_error(PROJECTOR_ERROR_LEASE);
                 tracing::warn!(error = %error, "discovery projector lease acquisition failed");
                 sleep_or_shutdown(&shutdown, contention_backoff(poll)).await;
                 continue;
@@ -419,6 +475,7 @@ async fn run_projector(
         let checkpoint = match store.claim_leadership(lease.fence, holder).await {
             Ok(checkpoint) => checkpoint,
             Err(error) => {
+                record_projector_error(PROJECTOR_ERROR_CLAIM);
                 if error.kind() == RepositoryErrorKind::Conflict {
                     tracing::warn!(
                         fence = lease.fence,
@@ -445,12 +502,22 @@ async fn run_projector(
         {
             Ok(term) => term,
             Err(error) => {
+                record_projector_error(PROJECTOR_ERROR_STATE_LOAD);
                 tracing::error!(error = %error, "discovery projector could not load its state");
                 release_lease(&leases, &lease).await;
                 sleep_or_shutdown(&shutdown, contention_backoff(poll)).await;
                 continue;
             }
         };
+        // This replica's own term clock, and the checkpoint it inherited.
+        // Published before the first batch so a leader that immediately
+        // wedges still shows where it started.
+        let held_since = std::time::Instant::now();
+        crate::tools::lease::record_lease_age(
+            crate::tools::lease::LEASE_SCOPE_DISCOVERY_PROJECTOR,
+            Duration::ZERO,
+        );
+        publish_projector_progress(&audit, &term).await;
         tracing::info!(
             fence = lease.fence,
             checkpoint,
@@ -484,6 +551,7 @@ async fn run_projector(
                 Err(error) => {
                     // Nothing was committed: the working set keeps what it
                     // applied and the next call retries the same flush.
+                    record_projector_error(PROJECTOR_ERROR_BATCH);
                     tracing::warn!(
                         error = %error,
                         "discovery projector flush failed; retrying without re-reading"
@@ -491,6 +559,11 @@ async fn run_projector(
                     sleep_or_stop(&stop, poll).await;
                 }
             }
+            crate::tools::lease::record_lease_age(
+                crate::tools::lease::LEASE_SCOPE_DISCOVERY_PROJECTOR,
+                held_since.elapsed(),
+            );
+            publish_projector_progress(&audit, &term).await;
             if stop.is_cancelled() {
                 break;
             }
@@ -499,6 +572,12 @@ async fn run_projector(
         renewal.abort();
         shutdown_watch.abort();
         drop(term);
+        // The term is over; the age goes back to zero so a replica that
+        // has handed leadership on does not read as still holding it.
+        crate::tools::lease::record_lease_age(
+            crate::tools::lease::LEASE_SCOPE_DISCOVERY_PROJECTOR,
+            Duration::ZERO,
+        );
         release_lease(&leases, &lease).await;
         tracing::info!(fence = lease.fence, "discovery projector term ended");
         if !shutdown.is_cancelled() {
@@ -512,10 +591,23 @@ async fn release_lease(
     lease: &crate::tools::lease::ExecutionLease,
 ) {
     if let Err(error) = leases.release(lease).await {
+        crate::tools::lease::record_lease_failure(
+            crate::tools::lease::LEASE_FAILURE_RELEASE_FAILED,
+        );
         tracing::warn!(
             error = %error,
             "discovery projector lease release failed; the slot lapses by expiry"
         );
+    }
+}
+
+/// Publish the term's committed checkpoint against the audit stream's
+/// head. The head costs one bounded read per batch on the leader only; a
+/// head that cannot be read leaves the last published pair standing rather
+/// than reporting a lag computed against a number nobody has.
+async fn publish_projector_progress(audit: &Arc<PostgresAuditEventStore>, term: &ProjectorTerm) {
+    if let Ok(head) = audit.stream_head().await {
+        record_projector_progress(term.committed_position(), head);
     }
 }
 
@@ -537,6 +629,63 @@ async fn sleep_or_stop(stop: &CancellationToken, duration: Duration) {
     tokio::select! {
         () = stop.cancelled() => {}
         () = tokio::time::sleep(duration) => {}
+    }
+}
+
+#[cfg(test)]
+mod metric_tests {
+    use super::*;
+    use crate::audit::sink::tests::CountingRecorder;
+
+    /// The projector's lag is the distance to the stream head, and it
+    /// never goes negative.
+    ///
+    /// A checkpoint ahead of the head is not a real state, but the head
+    /// and the checkpoint are read at different instants from different
+    /// tables: a batch that commits between the two reads makes the pair
+    /// momentarily inconsistent, and a negative lag would break every
+    /// `lag > N` rule for exactly as long as it lasted.
+    #[test]
+    fn the_projector_lag_is_the_distance_to_the_head_and_never_negative() {
+        let recorder = CountingRecorder::default();
+        ::metrics::with_local_recorder(&recorder, || {
+            record_projector_progress(1_204, 1_311);
+        });
+        assert_eq!(
+            recorder.gauge_value(crate::metrics::DISCOVERY_PROJECTOR_CHECKPOINT, &[]),
+            Some(1_204.0)
+        );
+        assert_eq!(
+            recorder.gauge_value(crate::metrics::DISCOVERY_PROJECTOR_LAG_EVENTS, &[]),
+            Some(107.0)
+        );
+
+        let raced = CountingRecorder::default();
+        ::metrics::with_local_recorder(&raced, || {
+            record_projector_progress(1_311, 1_204);
+        });
+        assert_eq!(
+            raced.gauge_value(crate::metrics::DISCOVERY_PROJECTOR_LAG_EVENTS, &[]),
+            Some(0.0),
+            "a checkpoint read after the head must report no lag, never negative lag"
+        );
+    }
+
+    /// Every error kind is a distinct bare label value naming a step of a
+    /// leader's term, not a store error.
+    #[test]
+    fn every_projector_error_kind_is_a_distinct_bare_label_value() {
+        let mut seen = std::collections::BTreeSet::new();
+        for kind in PROJECTOR_ERROR_KINDS {
+            assert!(seen.insert(kind), "duplicate projector error kind {kind}");
+            assert!(
+                !kind.is_empty()
+                    && kind
+                        .bytes()
+                        .all(|byte| byte.is_ascii_lowercase() || byte == b'_'),
+                "a label value must be bare lowercase text: {kind}"
+            );
+        }
     }
 }
 

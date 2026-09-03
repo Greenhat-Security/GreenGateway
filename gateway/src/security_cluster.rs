@@ -29,7 +29,7 @@
 
 use std::{
     sync::{
-        atomic::{AtomicI64, Ordering},
+        atomic::{AtomicI64, AtomicU64, Ordering},
         Arc, RwLock,
     },
     time::{Duration, Instant},
@@ -80,6 +80,36 @@ pub(crate) const RECONCILE_POLL_INTERVAL: Duration = Duration::from_millis(250);
 /// deadline and fail closed; the pass completes and the next request
 /// serves.
 pub(crate) const RECONCILE_BACKGROUND_DEADLINE: Duration = Duration::from_secs(30);
+
+/// Count one failed background reconcile pass by its classified reason
+/// (issue #241, PR 14).
+///
+/// Split from the runtime that owns the counter so the registry label
+/// audit (`metrics.rs`) can drive the real emitter without a database.
+/// The reason is one of three compile-time variants; which document
+/// failed, and why, is in the log line beside the call.
+pub(crate) fn record_reconcile_failure(reason: SecurityRevisionCheckError) {
+    ::metrics::counter!(
+        crate::metrics::RECONCILE_FAILURES_TOTAL,
+        "reason" => reason.as_str()
+    )
+    .increment(1);
+}
+
+/// Publish the two security-revision watermarks and their difference.
+/// Split from the runtime for the same reason as
+/// [`record_reconcile_failure`].
+///
+/// The lag is clamped at zero: a compiled watermark ahead of the last
+/// observed counter is the ordinary result of this replica having just
+/// compiled a revision it read after the last observation, not negative
+/// lag.
+pub(crate) fn record_revision_gauges(compiled: i64, observed: i64) {
+    ::metrics::gauge!(crate::metrics::SECURITY_REVISION_COMPILED).set(compiled as f64);
+    ::metrics::gauge!(crate::metrics::SECURITY_REVISION_CURRENT).set(observed as f64);
+    ::metrics::gauge!(crate::metrics::SECURITY_REVISION_LAG)
+        .set(observed.saturating_sub(compiled).max(0) as f64);
+}
 
 /// One authority-backed resource of the security snapshot. The runtime
 /// owns one adapter per resource; each adapter knows how to read its
@@ -150,6 +180,28 @@ pub(crate) struct ClusterSecurityRuntime {
     /// Serializes reconciles so a burst of requests behind the revision
     /// frontier produces one fetch-and-compile, not one per waiter.
     reconcile_lock: Mutex<()>,
+    /// When the background reconciler last completed a pass, and how many
+    /// of its passes have failed since boot. Read by the cluster status
+    /// view (issue #241, PR 14): a replica whose watermark is current
+    /// tells an operator nothing about whether the reconciler is alive,
+    /// because a deployment that has committed nothing looks identical to
+    /// one whose poller died. The pass age is what distinguishes them.
+    last_reconcile_pass: std::sync::Mutex<Option<Instant>>,
+    reconcile_failures: AtomicU64,
+    /// When the gate last started refusing admissions, cleared by the
+    /// next one that succeeds. This is the event-time fact readiness is
+    /// decided on (issue #241, PR 14): every caller of `admit_within` --
+    /// the per-request gate and the background poller alike -- records
+    /// its outcome here as it happens, so "protected traffic has been
+    /// failing closed for longer than the reconcile deadline" is a fact
+    /// the runtime observed rather than one `/readyz` infers from a pair
+    /// of watermarks it samples whenever a probe arrives. The watermarks
+    /// cannot answer it: a read that times out inside the request budget
+    /// fails the gate without moving either of them, and a healthy
+    /// deployment that commits constantly has the compiled watermark
+    /// behind the observed one at almost every instant while admitting
+    /// every request.
+    admission_failing_since: std::sync::Mutex<Option<Instant>>,
     /// The policy lane, from the resource the runtime is built with.
     policy_lane: Arc<ArcSwap<crate::middleware::rbac::RbacPolicyState>>,
     /// The lanes bundles are captured from; set once at wiring, after
@@ -188,6 +240,9 @@ impl ClusterSecurityRuntime {
             compiled_revision: AtomicI64::new(0),
             observed_revision: AtomicI64::new(0),
             reconcile_lock: Mutex::new(()),
+            last_reconcile_pass: std::sync::Mutex::new(None),
+            reconcile_failures: AtomicU64::new(0),
+            admission_failing_since: std::sync::Mutex::new(None),
             sources: std::sync::Mutex::new(None),
             published: ArcSwapOption::from(None),
             #[cfg(test)]
@@ -316,15 +371,24 @@ impl ClusterSecurityRuntime {
                     _ = ticker.tick() => {}
                     () = cancellation.cancelled() => return,
                 }
-                if let Err(error) = runtime
+                match runtime
                     .ensure_current_revision_within(RECONCILE_BACKGROUND_DEADLINE)
                     .await
                 {
-                    tracing::warn!(
-                        reason = error.as_str(),
-                        "background security reconciliation failed; the per-request gate refuses protected traffic while behind"
-                    );
+                    Ok(_) => runtime.note_reconcile_pass(),
+                    Err(error) => {
+                        runtime.note_reconcile_failure(error);
+                        tracing::warn!(
+                            reason = error.as_str(),
+                            "background security reconciliation failed; the per-request gate refuses protected traffic while behind"
+                        );
+                    }
                 }
+                // Published on every tick, pass or failure, so the
+                // watermarks are current even while reconciliation is
+                // failing -- which is exactly when an operator is looking
+                // at them.
+                runtime.publish_revision_gauges();
             }
         });
         lifecycle.register_background_task(handle);
@@ -340,6 +404,82 @@ impl ClusterSecurityRuntime {
     /// poller tick on this replica; `0` before the first read.
     pub(crate) fn observed_revision(&self) -> i64 {
         self.observed_revision.load(Ordering::Acquire)
+    }
+
+    fn note_reconcile_pass(&self) {
+        *self
+            .last_reconcile_pass
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(Instant::now());
+    }
+
+    fn note_reconcile_failure(&self, reason: SecurityRevisionCheckError) {
+        self.reconcile_failures.fetch_add(1, Ordering::AcqRel);
+        // The classified reason is the label; which document failed to
+        // compile, and why, is in the log line beside this call. There are
+        // three reasons and they are a compile-time enum, so the series
+        // cannot grow with traffic.
+        record_reconcile_failure(reason);
+    }
+
+    /// Publish the two watermarks and their difference (issue #241,
+    /// PR 14).
+    ///
+    /// All three rather than the lag alone: a lag of 3 against an
+    /// authority at 4 is a replica that has seen almost nothing, and a lag
+    /// of 3 against an authority at 4000 is a replica that is one policy
+    /// edit behind. The lag is clamped at zero -- a compiled watermark
+    /// ahead of the last observed counter is the ordinary result of this
+    /// replica having just compiled a revision it read after the last
+    /// observation, not negative lag.
+    pub(crate) fn publish_revision_gauges(&self) {
+        record_revision_gauges(self.compiled_revision(), self.observed_revision());
+    }
+
+    /// How long ago the background reconciler last completed a pass, or
+    /// `None` before the first one completes.
+    pub(crate) fn last_reconcile_pass_age(&self) -> Option<Duration> {
+        self.last_reconcile_pass
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .map(|at| Instant::now().saturating_duration_since(at))
+    }
+
+    /// Background reconcile passes that failed since boot.
+    pub(crate) fn reconcile_failures_total(&self) -> u64 {
+        self.reconcile_failures.load(Ordering::Acquire)
+    }
+
+    /// Record what the gate just decided, as it decided it.
+    ///
+    /// One success clears the streak: a replica that admitted a request
+    /// is a replica whose protected traffic is being served, whatever
+    /// the watermarks read a moment later.
+    fn note_admission(&self, admitted: bool) {
+        let mut failing_since = self
+            .admission_failing_since
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if admitted {
+            *failing_since = None;
+        } else {
+            failing_since.get_or_insert_with(Instant::now);
+        }
+    }
+
+    /// How long the gate has been failing protected traffic closed, or
+    /// `None` when the last admission attempt succeeded (and before the
+    /// first one, where nothing has been refused yet).
+    ///
+    /// The readiness probe's input: a gate that has been refusing for
+    /// longer than the reconcile deadline is a replica serving `503` to
+    /// every protected request, and there is no point routing more of
+    /// them here.
+    pub(crate) fn admission_failing_for(&self) -> Option<Duration> {
+        self.admission_failing_since
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .map(|since| Instant::now().saturating_duration_since(since))
     }
 
     /// Read the current security revision from the authority, bounded by
@@ -846,9 +986,25 @@ impl ClusterSecurityRuntime {
             .map(|admission| admission.revision)
     }
 
-    /// The gate's body: prove the replica current and hand out the bundle
+    /// The gate: prove the replica current and hand out the bundle
     /// published at the watermark the request is admitted under.
+    ///
+    /// Every outcome is recorded on the way out, because this is the one
+    /// place that knows whether protected traffic is being served. The
+    /// readiness probe reads the streak that recording keeps
+    /// (`admission_failing_for`), so `/readyz` reports the condition the
+    /// gate is actually in rather than one inferred from watermarks.
     pub(crate) async fn admit_within(
+        &self,
+        budget: Duration,
+    ) -> Result<crate::middleware::rbac::Admission, SecurityRevisionCheckError> {
+        let outcome = self.admit_bounded(budget).await;
+        self.note_admission(outcome.is_ok());
+        outcome
+    }
+
+    /// The gate's body, with no bookkeeping in it.
+    async fn admit_bounded(
         &self,
         budget: Duration,
     ) -> Result<crate::middleware::rbac::Admission, SecurityRevisionCheckError> {
@@ -1015,5 +1171,87 @@ impl SecurityRevisionGate for ClusterSecurityRuntime {
         &self,
     ) -> Result<crate::middleware::rbac::Admission, SecurityRevisionCheckError> {
         self.admit_within(RECONCILE_DEADLINE).await
+    }
+}
+
+#[cfg(test)]
+mod metric_tests {
+    use super::*;
+    use crate::audit::sink::tests::CountingRecorder;
+
+    /// The lag is the difference, and it never goes negative.
+    ///
+    /// A compiled watermark ahead of the last observed counter is ordinary
+    /// -- this replica compiled a revision it read after the last
+    /// observation -- and reporting that as negative lag would make every
+    /// `lag > 0` alerting rule read backwards on a healthy replica.
+    #[test]
+    fn the_revision_lag_is_the_difference_and_never_negative() {
+        let recorder = CountingRecorder::default();
+        ::metrics::with_local_recorder(&recorder, || {
+            record_revision_gauges(41, 44);
+        });
+        assert_eq!(
+            recorder.gauge_value(crate::metrics::SECURITY_REVISION_COMPILED, &[]),
+            Some(41.0)
+        );
+        assert_eq!(
+            recorder.gauge_value(crate::metrics::SECURITY_REVISION_CURRENT, &[]),
+            Some(44.0)
+        );
+        assert_eq!(
+            recorder.gauge_value(crate::metrics::SECURITY_REVISION_LAG, &[]),
+            Some(3.0)
+        );
+
+        let ahead = CountingRecorder::default();
+        ::metrics::with_local_recorder(&ahead, || {
+            record_revision_gauges(44, 41);
+        });
+        assert_eq!(
+            ahead.gauge_value(crate::metrics::SECURITY_REVISION_LAG, &[]),
+            Some(0.0),
+            "a compiled watermark ahead of the observed counter is zero lag, not negative"
+        );
+    }
+
+    /// Every reconcile failure is counted under its own classified
+    /// reason, and the three reasons are the whole vocabulary.
+    #[test]
+    fn reconcile_failures_are_counted_by_classified_reason() {
+        let recorder = CountingRecorder::default();
+        ::metrics::with_local_recorder(&recorder, || {
+            record_reconcile_failure(SecurityRevisionCheckError::Unavailable);
+            record_reconcile_failure(SecurityRevisionCheckError::Unavailable);
+            record_reconcile_failure(SecurityRevisionCheckError::InvalidDocument);
+        });
+        assert_eq!(
+            recorder.count(
+                crate::metrics::RECONCILE_FAILURES_TOTAL,
+                &[("reason", SecurityRevisionCheckError::Unavailable.as_str())]
+            ),
+            2
+        );
+        assert_eq!(
+            recorder.count(
+                crate::metrics::RECONCILE_FAILURES_TOTAL,
+                &[(
+                    "reason",
+                    SecurityRevisionCheckError::InvalidDocument.as_str()
+                )]
+            ),
+            1
+        );
+        assert_eq!(
+            recorder.count(
+                crate::metrics::RECONCILE_FAILURES_TOTAL,
+                &[(
+                    "reason",
+                    SecurityRevisionCheckError::ReconcileDeadlineExceeded.as_str()
+                )]
+            ),
+            0,
+            "a reason that did not happen must not be counted"
+        );
     }
 }

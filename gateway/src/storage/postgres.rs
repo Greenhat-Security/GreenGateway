@@ -945,24 +945,137 @@ async fn establish_with_bounded_backoff(
     })
 }
 
+/// The connectivity check's `operation` name, shared by its classified
+/// error and its `greengateway_database_operation_seconds` label so the
+/// two can never drift apart.
+pub(crate) const OPERATION_CONNECTIVITY_CHECK: &str = "database_connectivity_check";
+
 /// One minimal round statement, classified with the repository error kinds
 /// PR 2 established so later PRs reuse one failure vocabulary.
 pub(crate) async fn validate_connectivity(pool: &Pool) -> Result<(), RepositoryError> {
-    let client = pool.get().await.map_err(classify_pool_error)?;
-    client
-        .simple_query(CONNECTIVITY_CHECK_STATEMENT)
-        .await
-        .map_err(|error| {
-            log_classified(
-                "database_connectivity_check",
-                &error,
-                RepositoryError::new(
-                    classify_postgres_error(&error),
-                    "database_connectivity_check",
-                ),
-            )
-        })?;
-    Ok(())
+    timed_operation(OPERATION_CONNECTIVITY_CHECK, async {
+        let client = pool.get().await.map_err(classify_pool_error)?;
+        client
+            .simple_query(CONNECTIVITY_CHECK_STATEMENT)
+            .await
+            .map_err(|error| {
+                log_classified(
+                    OPERATION_CONNECTIVITY_CHECK,
+                    &error,
+                    RepositoryError::new(
+                        classify_postgres_error(&error),
+                        OPERATION_CONNECTIVITY_CHECK,
+                    ),
+                )
+            })?;
+        Ok(())
+    })
+    .await
+}
+
+/// Pool checkouts that timed out since boot, across every store on every
+/// pool in the process.
+///
+/// deadpool's `Pool::status()` reports the pool's shape right now (size,
+/// available, waiting) but keeps no history, so a burst of checkout
+/// timeouts that has already cleared leaves no trace in it. Counting here
+/// costs one relaxed increment on a path that has already failed, and it
+/// is the only choke point every checkout failure passes through -- which
+/// is what makes the count complete rather than a sample of the callers
+/// somebody remembered to instrument.
+static POOL_TIMEOUTS_TOTAL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// [`POOL_TIMEOUTS_TOTAL`], for the cluster status view.
+pub(crate) fn pool_timeouts_total() -> u64 {
+    POOL_TIMEOUTS_TOTAL.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// The `error_class` label a store operation that succeeded carries
+/// (issue #241, PR 14).
+///
+/// A distinguished value rather than an absent label: a histogram whose
+/// label set changes between success and failure cannot be summed across
+/// both in one query, which is exactly the query -- "what fraction of
+/// this operation fails" -- the series exists to answer.
+pub(crate) const OPERATION_ERROR_CLASS_NONE: &str = "none";
+
+/// Record how long one store operation took and how it ended
+/// (issue #241, PR 14).
+///
+/// `operation` is one of the stores' `OPERATION_*` constants: a
+/// compile-time name for *what was asked of the store*. The statement
+/// text, its parameters and its rows never appear -- a statement is
+/// caller-influenced through the values it binds, and a metric label is
+/// forever. The outcome is reduced to a [`RepositoryErrorKind`] name for
+/// the same reason: a driver's message can quote a value.
+///
+/// The one emission point for [`crate::metrics::DATABASE_OPERATION_SECONDS`],
+/// so a store adopts the series by timing its call and handing the result
+/// here, and cannot invent a second label vocabulary while doing it.
+pub(crate) fn observe_operation(
+    operation: &'static str,
+    elapsed: std::time::Duration,
+    error_class: Option<RepositoryErrorKind>,
+) {
+    ::metrics::histogram!(
+        crate::metrics::DATABASE_OPERATION_SECONDS,
+        "operation" => operation,
+        "error_class" => error_class
+            .map_or(OPERATION_ERROR_CLASS_NONE, RepositoryErrorKind::metric_label)
+    )
+    .record(elapsed.as_secs_f64());
+}
+
+/// Time one store operation and record it with [`observe_operation`].
+///
+/// Takes the future rather than a guard so the timing cannot outlive or
+/// undershoot the call: a guard would have to be dropped in the right
+/// place on every path, and the paths that matter are the error ones.
+pub(crate) async fn timed_operation<T, F>(
+    operation: &'static str,
+    call: F,
+) -> Result<T, RepositoryError>
+where
+    F: std::future::Future<Output = Result<T, RepositoryError>>,
+{
+    let started = std::time::Instant::now();
+    let result = call.await;
+    observe_operation(
+        operation,
+        started.elapsed(),
+        result.as_ref().err().map(RepositoryError::kind),
+    );
+    result
+}
+
+/// Publish the pool's shape as gauges (issue #241, PR 14), sampled when
+/// `/metrics` is scraped.
+///
+/// deadpool keeps no history in `Pool::status()`, so these three say what
+/// the pool looks like *now*; the checkout timeouts that have already
+/// happened are in
+/// [`crate::metrics::DATABASE_POOL_TIMEOUTS_TOTAL`], counted where they
+/// are classified.
+pub(crate) fn publish_pool_gauges(pool: &Pool) {
+    let status = pool.status();
+    record_pool_gauges(status.size, status.available, status.waiting);
+}
+
+/// The pool gauges, split from the pool that owns them so the registry
+/// label audit (`metrics.rs`) can drive the real emitter without a
+/// database. None carries a label: a process has one database pool, and
+/// the scrape target already identifies the process.
+pub(crate) fn record_pool_gauges(size: usize, available: usize, waiting: usize) {
+    ::metrics::gauge!(crate::metrics::DATABASE_POOL_SIZE).set(size as f64);
+    ::metrics::gauge!(crate::metrics::DATABASE_POOL_AVAILABLE).set(available as f64);
+    ::metrics::gauge!(crate::metrics::DATABASE_POOL_WAITING).set(waiting as f64);
+}
+
+/// Count one pool checkout that timed out. Called only from
+/// [`classify_pool_error`], which is the choke point every checkout
+/// failure passes through.
+pub(crate) fn record_pool_timeout() {
+    ::metrics::counter!(crate::metrics::DATABASE_POOL_TIMEOUTS_TOTAL).increment(1);
 }
 
 pub(crate) fn classify_pool_error(error: deadpool_postgres::PoolError) -> RepositoryError {
@@ -971,6 +1084,11 @@ pub(crate) fn classify_pool_error(error: deadpool_postgres::PoolError) -> Reposi
     let kind = match &error {
         deadpool_postgres::PoolError::Timeout(timeout) => match timeout {
             TimeoutType::Create | TimeoutType::Wait | TimeoutType::Recycle => {
+                POOL_TIMEOUTS_TOTAL.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                // The in-process counter and the metric are incremented in
+                // one place so the cluster status view and a scrape can
+                // never disagree about how many checkouts timed out.
+                record_pool_timeout();
                 RepositoryErrorKind::Timeout
             }
         },
@@ -1040,6 +1158,96 @@ mod tests {
 
     fn canary_dsn() -> String {
         format!("postgres://{CANARY_USER}:{CANARY_PASSWORD}@{CANARY_HOST}:5432/{CANARY_DB}")
+    }
+
+    /// A store operation is timed under its own name and its classified
+    /// outcome, and a success is a *value* of `error_class` rather than an
+    /// absent label (issue #241, PR 14).
+    ///
+    /// The absent-label alternative is the tempting one and it is wrong:
+    /// a histogram whose label set differs between success and failure
+    /// cannot be summed across both, which is exactly the query -- what
+    /// fraction of this operation fails -- the series exists to answer.
+    #[test]
+    fn a_store_operation_is_timed_by_name_and_classified_outcome() {
+        let recorder = crate::audit::sink::tests::CountingRecorder::default();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("test runtime should build");
+        let failed = ::metrics::with_local_recorder(&recorder, || {
+            runtime.block_on(async {
+                let succeeded: Result<(), RepositoryError> =
+                    timed_operation(OPERATION_CONNECTIVITY_CHECK, async { Ok(()) }).await;
+                assert!(succeeded.is_ok());
+                timed_operation(OPERATION_CONNECTIVITY_CHECK, async {
+                    Err::<(), _>(RepositoryError::new(
+                        RepositoryErrorKind::Timeout,
+                        OPERATION_CONNECTIVITY_CHECK,
+                    ))
+                })
+                .await
+            })
+        });
+        assert_eq!(
+            failed.expect_err("the failing call must propagate").kind(),
+            RepositoryErrorKind::Timeout
+        );
+
+        assert_eq!(
+            recorder
+                .histogram_values(
+                    crate::metrics::DATABASE_OPERATION_SECONDS,
+                    &[
+                        ("operation", OPERATION_CONNECTIVITY_CHECK),
+                        ("error_class", OPERATION_ERROR_CLASS_NONE),
+                    ],
+                )
+                .len(),
+            1,
+            "a successful operation is recorded under error_class=none"
+        );
+        assert_eq!(
+            recorder
+                .histogram_values(
+                    crate::metrics::DATABASE_OPERATION_SECONDS,
+                    &[
+                        ("operation", OPERATION_CONNECTIVITY_CHECK),
+                        ("error_class", RepositoryErrorKind::Timeout.metric_label()),
+                    ],
+                )
+                .len(),
+            1,
+            "a failed operation is recorded under its classified kind"
+        );
+    }
+
+    /// Every `error_class` value the histogram can carry is a classified
+    /// kind or the success sentinel -- never a SQLSTATE and never a
+    /// driver message.
+    #[test]
+    fn the_error_class_vocabulary_is_the_classified_kinds_plus_none() {
+        let mut vocabulary: Vec<&str> = RepositoryErrorKind::KNOWN
+            .iter()
+            .map(|kind| kind.metric_label())
+            .collect();
+        vocabulary.push(OPERATION_ERROR_CLASS_NONE);
+        assert!(
+            !vocabulary.contains(&"57014"),
+            "a SQLSTATE is not an error class"
+        );
+        for value in &vocabulary {
+            assert!(
+                value
+                    .bytes()
+                    .all(|byte| byte.is_ascii_lowercase() || byte == b'_'),
+                "an error class must be bare lowercase text: {value}"
+            );
+        }
+        assert_eq!(
+            vocabulary.len(),
+            std::collections::BTreeSet::from_iter(vocabulary.iter().copied()).len(),
+            "the success sentinel must not collide with a classified kind"
+        );
     }
 
     fn tls_settings(tls_mode: DatabaseTlsMode) -> DatabaseSettings {
