@@ -1093,6 +1093,242 @@ mod postgres_audit_tests {
         super::audit_event_store_contract(&store).await;
     }
 
+    /// The readiness probe's one bounded authority check against a real
+    /// PostgreSQL (issue #241, PR 14). The statement is the only piece of
+    /// SQL `/readyz` runs, so what it reports on a migrated database, on
+    /// a ledger that no longer matches the manifest, on a ledger that is
+    /// not there at all, and on a session that cannot write is worth
+    /// proving rather than assuming.
+    #[tokio::test]
+    async fn postgres_readiness_authority_reports_storage_and_schema_state() {
+        use crate::ha::ClusterReadiness;
+        use crate::ha_status::test_support::healthy_settings;
+        use crate::ha_status::{
+            AuthorityObservation, PostgresReadinessAuthority, ReadinessAuthority as _,
+            ReadinessProbe, ReadinessProbeSettings, SCHEMA_INCOMPATIBLE, STORAGE_UNAVAILABLE,
+        };
+
+        let Some(admin_dsn) = locator() else {
+            eprintln!("skipping: no test database locator; CI runs this test");
+            return;
+        };
+        let _guard = DATABASE.lock().await;
+        let database = create_test_database(&admin_dsn).await;
+
+        let mut config = crate::config::Config::test_defaults();
+        config.state_backend = crate::config::StateBackend::Postgres;
+        config.deployment_id = Some("deploy-readiness-contract".to_owned());
+        let test_dsn_file = write_dsn_file(&database.dsn);
+        config.database.url_file = Some(test_dsn_file.path.clone());
+        config.database.tls_mode = crate::config::DatabaseTlsMode::LoopbackDev;
+        let foundation = PostgresFoundation::establish(&config)
+            .await
+            .expect("the test database should establish");
+        migrations::apply_missing_for_startup(foundation.pool(), &config.database)
+            .await
+            .expect("the schema should migrate");
+        let pool = foundation.pool().clone();
+        let (schema_minimum, schema_maximum) = migrations::schema_version_range();
+        let authority = PostgresReadinessAuthority::new(pool.clone());
+
+        // A migrated database on a writable session: the ledger covers
+        // exactly this binary's manifest.
+        assert_eq!(
+            authority.observe().await,
+            AuthorityObservation::Writable {
+                schema_version: schema_maximum
+            }
+        );
+        let readiness = ClusterReadiness::new();
+        readiness.record_fingerprint_agreement();
+        let probe = ReadinessProbe::new(
+            readiness,
+            PostgresReadinessAuthority::new(pool.clone()),
+            None,
+            ReadinessProbeSettings {
+                accepted_schema_versions: (schema_minimum, schema_maximum),
+                ..healthy_settings()
+            },
+        );
+        assert_eq!(probe.blocked_reason().await, None);
+
+        // A ledger short of the manifest: the database was not migrated
+        // for this binary, and the probe refuses readiness for it.
+        let client = pool.get().await.expect("client checkout");
+        // The ledger's `version` column is bigint; the manifest range is
+        // the i32 a member row advertises.
+        let newest_migration = i64::from(schema_maximum);
+        client
+            .execute(
+                "DELETE FROM greengateway.schema_migrations WHERE version = $1",
+                &[&newest_migration],
+            )
+            .await
+            .expect("the ledger row should delete");
+        assert_eq!(
+            authority.observe().await,
+            AuthorityObservation::Writable {
+                schema_version: schema_maximum - 1
+            }
+        );
+        assert_eq!(probe.blocked_reason().await, Some(SCHEMA_INCOMPATIBLE));
+
+        // A session that cannot write is storage_unavailable, not a
+        // schema problem: the setting is applied to the database, so the
+        // fresh pool below picks it up on connect.
+        client
+            .batch_execute(&format!(
+                "ALTER DATABASE {name} SET default_transaction_read_only = on",
+                name = database.name
+            ))
+            .await
+            .expect("the database should be made read-only");
+        drop(client);
+        let read_only_foundation = PostgresFoundation::establish(&config)
+            .await
+            .expect("a read-only database should still establish");
+        let read_only_authority =
+            PostgresReadinessAuthority::new(read_only_foundation.pool().clone());
+        assert_eq!(
+            read_only_authority.observe().await,
+            AuthorityObservation::ReadOnly
+        );
+        let read_only_readiness = ClusterReadiness::new();
+        read_only_readiness.record_fingerprint_agreement();
+        let read_only_probe = ReadinessProbe::new(
+            read_only_readiness,
+            PostgresReadinessAuthority::new(read_only_foundation.pool().clone()),
+            None,
+            ReadinessProbeSettings {
+                accepted_schema_versions: (schema_minimum, schema_maximum),
+                ..healthy_settings()
+            },
+        );
+        assert_eq!(
+            read_only_probe.blocked_reason().await,
+            Some(STORAGE_UNAVAILABLE)
+        );
+
+        // No ledger at all: reported as a ledger covering nothing, which
+        // no accepted range contains, rather than as an outage.
+        let client = pool.get().await.expect("client checkout");
+        client
+            .batch_execute(&format!(
+                "ALTER DATABASE {name} RESET default_transaction_read_only",
+                name = database.name
+            ))
+            .await
+            .expect("the read-only setting should reset");
+        client
+            .batch_execute("DROP TABLE greengateway.schema_migrations")
+            .await
+            .expect("the ledger should drop");
+        assert_eq!(
+            authority.observe().await,
+            AuthorityObservation::Writable { schema_version: 0 }
+        );
+        assert_eq!(probe.blocked_reason().await, Some(SCHEMA_INCOMPATIBLE));
+
+        // No ledger *and* a session that cannot write: storage answers
+        // before the schema does, so this is storage_unavailable. The
+        // one statement carries both answers and failed before returning
+        // either, so a standby whose role cannot see the ledger would
+        // otherwise be reported as a database migrated by the wrong
+        // gateway -- which is the reason chain's order inverted, and
+        // sends an operator to the wrong runbook.
+        client
+            .batch_execute(&format!(
+                "ALTER DATABASE {name} SET default_transaction_read_only = on",
+                name = database.name
+            ))
+            .await
+            .expect("the database should be made read-only again");
+        drop(client);
+        let unmigrated_read_only = PostgresFoundation::establish(&config)
+            .await
+            .expect("an unmigrated read-only database should still establish");
+        let unmigrated_read_only_authority =
+            PostgresReadinessAuthority::new(unmigrated_read_only.pool().clone());
+        assert_eq!(
+            unmigrated_read_only_authority.observe().await,
+            AuthorityObservation::ReadOnly
+        );
+        let unmigrated_readiness = ClusterReadiness::new();
+        unmigrated_readiness.record_fingerprint_agreement();
+        let unmigrated_probe = ReadinessProbe::new(
+            unmigrated_readiness,
+            PostgresReadinessAuthority::new(unmigrated_read_only.pool().clone()),
+            None,
+            ReadinessProbeSettings {
+                accepted_schema_versions: (schema_minimum, schema_maximum),
+                ..healthy_settings()
+            },
+        );
+        assert_eq!(
+            unmigrated_probe.blocked_reason().await,
+            Some(STORAGE_UNAVAILABLE)
+        );
+
+        // A pool with nothing free answers `storage_unavailable` like any
+        // other checkout failure -- a replica that cannot check out a
+        // connection cannot serve a protected request either -- but the
+        // operation timing must carry the kind the failure actually had.
+        // An operator watching
+        // `greengateway_database_operation_seconds{operation="readiness_probe"}`
+        // during an incident has to be able to tell a saturated pool
+        // (`timeout`, alongside `database_pool_timeouts_total` climbing)
+        // from a database that is gone (`unavailable`); stamping every
+        // failure `unavailable` sends them to the wrong runbook.
+        let mut saturated_config = config.clone();
+        saturated_config.database.pool_max = 1;
+        saturated_config.database.acquire_timeout_ms = 50;
+        let saturated = PostgresFoundation::establish(&saturated_config)
+            .await
+            .expect("a one-connection pool should establish");
+        let held = saturated
+            .pool()
+            .get()
+            .await
+            .expect("the pool's only connection");
+        let saturated_authority = PostgresReadinessAuthority::new(saturated.pool().clone());
+        let recorder = crate::audit::sink::tests::CountingRecorder::default();
+        // The recorder is a thread-local, so the observation runs on a
+        // thread of its own with its own runtime rather than across this
+        // test's awaits.
+        let observation = std::thread::scope(|scope| {
+            scope
+                .spawn(|| {
+                    let runtime = tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()
+                        .expect("a runtime for the recording thread");
+                    ::metrics::with_local_recorder(&recorder, || {
+                        runtime.block_on(saturated_authority.observe())
+                    })
+                })
+                .join()
+                .expect("the recording thread")
+        });
+        drop(held);
+        assert_eq!(observation, AuthorityObservation::Unavailable);
+        assert_eq!(
+            recorder
+                .histogram_values(
+                    crate::metrics::DATABASE_OPERATION_SECONDS,
+                    &[
+                        ("operation", "readiness_probe"),
+                        (
+                            "error_class",
+                            crate::storage::RepositoryErrorKind::Timeout.metric_label()
+                        ),
+                    ],
+                )
+                .len(),
+            1,
+            "a saturated pool is timed as a timeout, not as an outage"
+        );
+    }
+
     // ------------------------------------------------------------------
     // Versioned policy control plane (issue #241, PR 7)
     // ------------------------------------------------------------------
@@ -6296,6 +6532,108 @@ mod postgres_audit_tests {
         assert_eq!(error.kind(), RepositoryErrorKind::InvalidData);
     }
 
+    /// PR 14's cluster status source over a real deployment: it reads the
+    /// roster, the singleton's job ledger, the projector's singleton row
+    /// (including the two columns PR 14 added to `checkpoint()`) and the
+    /// audit stream head through the stores that own them, and reports the
+    /// pool it was handed. A section whose read fails is absent rather
+    /// than fatal, which is why every field is an `Option`.
+    #[tokio::test]
+    async fn the_cluster_status_source_reads_the_roster_projector_and_pool() {
+        use crate::cluster_status::{ClusterStatusSource, PostgresClusterStatusSource};
+        use crate::storage::postgres_discovery::PostgresDiscoveryStore;
+
+        let Some(admin_dsn) = locator() else {
+            eprintln!("skipping: no test database locator; CI runs this test");
+            return;
+        };
+        let _guard = DATABASE.lock().await;
+        let database = create_test_database(&admin_dsn).await;
+        let pool = migrated_limits_pool(&database).await;
+
+        let leader = Arc::new(member_store(&pool));
+        let follower = member_store(&pool);
+        leader
+            .heartbeat(
+                &registration('a'),
+                MemberRevisions {
+                    compiled: 5,
+                    observed: 5,
+                },
+                None,
+            )
+            .await
+            .expect("the leader's boot row writes");
+        leader.mark_ready().await.expect("the leader stamps ready");
+        follower
+            .heartbeat(&registration('a'), MemberRevisions::default(), None)
+            .await
+            .expect("the follower's boot row writes");
+
+        // A claimed projector: the row now names a leader and carries a
+        // fence, which is what the status view reports and judges against
+        // the roster.
+        let discovery = PostgresDiscoveryStore::new(pool.clone());
+        discovery
+            .claim_leadership(4, leader.instance_id())
+            .await
+            .expect("the projector claim succeeds");
+
+        let source = PostgresClusterStatusSource::new(
+            Arc::clone(&leader),
+            Some(Arc::new(PostgresAuditEventStore::new(pool.clone(), None))),
+            None,
+            pool.clone(),
+            Duration::from_secs(30),
+        );
+        let readout = source.read().await;
+
+        let members = readout.members.expect("the roster reads");
+        assert_eq!(members.len(), 2);
+        assert!(members.iter().all(|member| member.live));
+        assert!(
+            members
+                .iter()
+                .any(|member| member.instance_id == leader.instance_id()
+                    && member.ready_at.is_some()),
+            "the stamped replica is reported ready"
+        );
+        assert!(
+            members
+                .iter()
+                .all(|member| member.fingerprint == "a".repeat(64)),
+            "the roster's fingerprints reach the readout unchanged; redaction is the API's layer"
+        );
+
+        assert_eq!(
+            readout.leader_tasks.as_ref().map(Vec::len),
+            Some(0),
+            "no job has been adopted, which is an empty ledger and not a failed read"
+        );
+
+        let projector = readout.projector.expect("the projector row reads");
+        assert_eq!(projector.fence, 4);
+        assert_eq!(projector.leader_instance, Some(leader.instance_id()));
+        assert!(
+            (0.0..60.0).contains(&projector.updated_age_secs),
+            "a claim taken a moment ago is seconds old, not {}",
+            projector.updated_age_secs
+        );
+
+        assert_eq!(
+            readout.audit_stream_head,
+            Some(0),
+            "an empty stream has a head of zero, not an unread section"
+        );
+        assert!(
+            !readout.leading,
+            "no maintenance runner was supplied, so this replica leads nothing"
+        );
+        let pool_facts = readout.pool.expect("the pool always reports");
+        assert!(pool_facts.size >= 1);
+        assert_eq!(pool_facts.waiting, 0);
+    }
+
     /// A member that stops heartbeating is live until the window passes
     /// on the database clock, reported stale after it, and swept only by
     /// the singleton's sweep -- bounded per call, oldest first, and never
@@ -6596,11 +6934,22 @@ mod postgres_audit_tests {
         assert_eq!(records[0].fence, fence_a);
         assert!(records[0].last_started_at.is_some());
         assert!(records[0].last_success_at.is_some());
+        // The age is the database's own arithmetic (PR 14's status view
+        // reads it), so a job that just succeeded is seconds old and one
+        // that never has carries no age at all.
+        assert!(
+            records[0]
+                .last_success_age_secs
+                .is_some_and(|age| (0.0..60.0).contains(&age)),
+            "a success recorded a moment ago should be seconds old, not {:?}",
+            records[0].last_success_age_secs
+        );
         assert_eq!(records[0].last_failure_code, None);
         assert_eq!(records[0].last_duration_ms, Some(12));
         assert_eq!(records[1].job, "beta");
         assert_eq!(records[1].fence, fence_a);
         assert!(records[1].last_started_at.is_none());
+        assert_eq!(records[1].last_success_age_secs, None);
 
         // The holder's lease lapses on the database clock (it stopped
         // renewing) while the rows still carry its fence and nobody has

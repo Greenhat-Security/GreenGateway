@@ -92,6 +92,79 @@ pub fn tool_scope(tool_name: &str) -> String {
 /// The scope the global limit is leased in.
 pub const GLOBAL_SCOPE: &str = "global";
 
+/// The maintenance singleton's lease scope, as a metric label.
+///
+/// It is spelled here rather than reused from `cluster_maintenance`'s
+/// `MAINTENANCE_SCOPE` on purpose: the *lease* scope string is a database
+/// value with its own compatibility rules, and a label is a published
+/// interface. Keeping them separate means renaming one cannot silently
+/// rewrite the other, and
+/// `the_singleton_lease_scope_labels_match_their_scopes` asserts they
+/// still agree.
+pub(crate) const LEASE_SCOPE_MAINTENANCE: &str = "maintenance";
+
+/// The discovery projector's lease scope, as a metric label. See
+/// [`LEASE_SCOPE_MAINTENANCE`].
+pub(crate) const LEASE_SCOPE_DISCOVERY_PROJECTOR: &str = "discovery_projector";
+
+/// The whole vocabulary of `greengateway_cluster_lease_age_seconds`'s
+/// `scope` label: the two *singleton* scopes and nothing else.
+///
+/// Per-tool leases are scoped `tool:<name>`, and a tool name is
+/// control-plane data an operator adds and removes -- labelling by it
+/// would mint and abandon a time series per tool. The singletons are two,
+/// fixed, and the ones an operator alerts on ("nobody is leading").
+///
+/// Read by the registry label audit
+/// (`the_ha_metric_registry_never_labels_by_a_caller_influenced_value`);
+/// the two callers pass their own constant directly.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) const LEASE_SCOPE_LABELS: [&str; 2] =
+    [LEASE_SCOPE_MAINTENANCE, LEASE_SCOPE_DISCOVERY_PROJECTOR];
+
+/// The renewal reported the lease gone; the holder must stop its work.
+pub(crate) const LEASE_FAILURE_LOST: &str = "lost";
+/// The authority could not answer a renewal for half the TTL, so the
+/// holder gave up before the slot could be reclaimed.
+pub(crate) const LEASE_FAILURE_RENEW_EXPIRED: &str = "renew_expired";
+/// A normal completion could not free its slot; it lapses by expiry
+/// instead, which costs the next caller up to one TTL of the concurrency
+/// this lease exists to grant.
+pub(crate) const LEASE_FAILURE_RELEASE_FAILED: &str = "release_failed";
+
+/// The whole vocabulary of `greengateway_execution_lease_failures_total`'s
+/// `kind` label. Read by the registry label audit; the call sites pass
+/// their own constant.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) const LEASE_FAILURE_KINDS: [&str; 3] = [
+    LEASE_FAILURE_LOST,
+    LEASE_FAILURE_RENEW_EXPIRED,
+    LEASE_FAILURE_RELEASE_FAILED,
+];
+
+/// Count one lease failure by classified kind (issue #241, PR 14).
+///
+/// The scope is not a label (see [`LEASE_SCOPE_LABELS`]) and neither is
+/// the store error: both go to the log line beside the call, which is
+/// bounded and access-controlled in a way a metric label is not.
+pub(crate) fn record_lease_failure(kind: &'static str) {
+    ::metrics::counter!(crate::metrics::EXECUTION_LEASE_FAILURES_TOTAL, "kind" => kind)
+        .increment(1);
+}
+
+/// Publish how long this replica has held a singleton lease (issue #241,
+/// PR 14). `scope` must be one of [`LEASE_SCOPE_LABELS`].
+///
+/// Reported by the holder, so summing across a deployment gives the age of
+/// the deployment's single leader; an age that resets repeatedly is a
+/// leadership that keeps changing hands, which is the shape of a lease TTL
+/// too short for the authority's latency.
+#[cfg(feature = "postgres")] // the two singletons exist only in cluster mode
+pub(crate) fn record_lease_age(scope: &'static str, age: Duration) {
+    ::metrics::gauge!(crate::metrics::CLUSTER_LEASE_AGE_SECONDS, "scope" => scope)
+        .set(age.as_secs_f64());
+}
+
 #[cfg(test)]
 pub(crate) mod memory {
     //! An in-memory lease store with a controllable clock for runtime tests:
@@ -251,6 +324,72 @@ pub(crate) mod memory {
 
         fn ttl(&self) -> Duration {
             self.ttl
+        }
+    }
+}
+
+#[cfg(test)]
+mod metric_label_tests {
+    use super::*;
+
+    /// The two singleton scope *labels* are the scope strings with
+    /// hyphens normalized to underscores, and nothing else.
+    ///
+    /// They are separate constants because a lease scope is a database
+    /// value with its own compatibility rules and a metric label is a
+    /// published interface; this test is what keeps "separate" from
+    /// becoming "silently divergent" the next time either is renamed.
+    #[test]
+    fn the_singleton_lease_scope_labels_match_their_scopes() {
+        #[cfg(feature = "postgres")]
+        assert_eq!(
+            LEASE_SCOPE_MAINTENANCE,
+            crate::storage::postgres_membership::MAINTENANCE_LEASE_SCOPE.replace('-', "_"),
+            "the maintenance label must name the maintenance lease scope"
+        );
+        #[cfg(feature = "postgres")]
+        assert_eq!(
+            LEASE_SCOPE_DISCOVERY_PROJECTOR,
+            crate::discovery::projector::PROJECTOR_LEASE_SCOPE.replace('-', "_"),
+            "the projector label must name the projector lease scope"
+        );
+        assert_eq!(
+            LEASE_SCOPE_LABELS.len(),
+            2,
+            "a third singleton scope must be added to the label vocabulary too"
+        );
+    }
+
+    /// A per-tool scope must never be mistaken for a singleton one: the
+    /// vocabulary is the guard that keeps a tool name -- control-plane
+    /// data an operator adds and removes -- out of the registry.
+    #[test]
+    fn a_per_tool_scope_is_not_in_the_singleton_label_vocabulary() {
+        let scope = tool_scope("weather-lookup");
+        assert!(
+            !LEASE_SCOPE_LABELS.contains(&scope.as_str()),
+            "a tool scope must never be a lease-age label: {scope}"
+        );
+        assert!(
+            !LEASE_SCOPE_LABELS.contains(&GLOBAL_SCOPE),
+            "the global tool scope is not a singleton lease"
+        );
+    }
+
+    /// Every failure kind is distinct and spelled as a label may be:
+    /// lowercase, underscores, nothing that needs quoting.
+    #[test]
+    fn every_lease_failure_kind_is_a_distinct_bare_label_value() {
+        let mut seen = std::collections::BTreeSet::new();
+        for kind in LEASE_FAILURE_KINDS {
+            assert!(seen.insert(kind), "duplicate lease failure kind {kind}");
+            assert!(
+                !kind.is_empty()
+                    && kind
+                        .bytes()
+                        .all(|byte| byte.is_ascii_lowercase() || byte == b'_'),
+                "a label value must be bare lowercase text: {kind}"
+            );
         }
     }
 }

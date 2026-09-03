@@ -103,11 +103,22 @@ pub(crate) struct FlushCheckpoint {
 }
 
 /// The projector's committed position and the fence it was committed under.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub struct ProjectorCheckpoint {
     pub checkpoint_position: i64,
     pub fence: i64,
     pub projected_events: i64,
+    /// The instance the singleton row names as leader, from the last
+    /// claim. A claim is only ever overwritten by a successor, so this
+    /// naming a replica does not by itself prove one is leading now --
+    /// PR 14's status view decides that by looking the instance up in the
+    /// membership roster.
+    pub leader_instance: Option<uuid::Uuid>,
+    /// Seconds since the row was last claimed or flushed, on the database
+    /// clock: the age of the projector's last progress, for the status
+    /// view. Computed in SQL, like the roster's heartbeat age, so no
+    /// reader subtracts its own wall clock from a database timestamp.
+    pub updated_age_secs: f64,
 }
 
 /// The discovery write store over one PostgreSQL pool. Cheap to construct;
@@ -370,21 +381,37 @@ impl PostgresDiscoveryStore {
         let client = self.pool.get().await.map_err(classify_pool_error)?;
         let row = client
             .query_one(
-                "SELECT checkpoint_position, fence, projected_events
+                "SELECT checkpoint_position, fence, projected_events,
+                        leader_instance::text AS leader_instance,
+                        GREATEST(EXTRACT(EPOCH FROM (now() - updated_at)), 0)::double precision
+                            AS updated_age_secs
                  FROM greengateway.discovery_projector_state WHERE singleton",
                 &[],
             )
             .await
             .map_err(|error| classify_query(error, OPERATION_CHECKPOINT))?;
+        let leader_instance: Option<String> = row
+            .try_get("leader_instance")
+            .map_err(|_| invalid_data(OPERATION_CHECKPOINT))?;
+        let leader_instance = match leader_instance {
+            Some(leader) => Some(
+                uuid::Uuid::parse_str(&leader).map_err(|_| invalid_data(OPERATION_CHECKPOINT))?,
+            ),
+            None => None,
+        };
         Ok(ProjectorCheckpoint {
             checkpoint_position: row
-                .try_get(0)
+                .try_get("checkpoint_position")
                 .map_err(|_| invalid_data(OPERATION_CHECKPOINT))?,
             fence: row
-                .try_get(1)
+                .try_get("fence")
                 .map_err(|_| invalid_data(OPERATION_CHECKPOINT))?,
             projected_events: row
-                .try_get(2)
+                .try_get("projected_events")
+                .map_err(|_| invalid_data(OPERATION_CHECKPOINT))?,
+            leader_instance,
+            updated_age_secs: row
+                .try_get("updated_age_secs")
                 .map_err(|_| invalid_data(OPERATION_CHECKPOINT))?,
         })
     }

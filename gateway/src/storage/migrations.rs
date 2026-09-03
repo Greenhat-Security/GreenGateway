@@ -57,8 +57,9 @@ pub const SCHEMA_NAME: &str = "greengateway";
 
 /// The ledger: one row per applied migration. Created by the migrator's
 /// bootstrap (which runs as the DDL-capable migration role), read by every
-/// replica's validate-only startup check.
-const LEDGER_TABLE: &str = "greengateway.schema_migrations";
+/// replica's validate-only startup check and by PR 14's readiness probe
+/// (`ha_status.rs`), which re-reads its extent while the replica serves.
+pub(crate) const LEDGER_TABLE: &str = "greengateway.schema_migrations";
 
 /// The advisory-lock key, derived once from the lock's name so two binaries
 /// of different versions still agree on it. The top bit is cleared to keep
@@ -553,12 +554,44 @@ pub(crate) async fn read_and_validate(
     pool: &deadpool_postgres::Pool,
 ) -> Result<SchemaStatus, MigrateError> {
     let client = acquire(pool).await?;
-    match read_ledger(&client).await? {
+    let outcome = match read_ledger(&client).await? {
         LedgerRead::Table(rows) => {
             validate_ledger(&rows, &MANIFEST).map_err(MigrateError::LedgerInvalid)
         }
         LedgerRead::TableMissing => Ok(SchemaStatus::NotInitialized),
+    };
+    // A ledger that was read and judged publishes the verdict; a ledger
+    // that could not be read publishes nothing, because "the authority is
+    // unreachable" is not "the schema is incompatible" and overwriting the
+    // gauge with `0` would make an outage look like a bad deployment.
+    match &outcome {
+        Ok(status) => record_schema_compatible(*status == SchemaStatus::Current),
+        Err(MigrateError::LedgerInvalid(_)) => record_schema_compatible(false),
+        Err(_) => {}
     }
+    outcome
+}
+
+/// Publish whether the ledger is one this binary can serve on
+/// (issue #241, PR 14).
+///
+/// Set at startup validation and again by the readiness probe on every
+/// re-read, because the fact can change under a serving replica: another
+/// gateway migrating the database is what turns a `1` into a `0` without
+/// this process doing anything. Both writers compare the same thing --
+/// the ledger against this binary's manifest -- so they cannot disagree.
+#[cfg(feature = "postgres")]
+pub(crate) fn record_schema_compatible(compatible: bool) {
+    ::metrics::gauge!(crate::metrics::SCHEMA_COMPATIBLE).set(if compatible { 1.0 } else { 0.0 });
+}
+
+/// Record how long the migrator waited for the schema advisory lock.
+///
+/// A failed wait is recorded too: an operator sizing the migration budget
+/// needs the attempts that hit `lock_timeout` most of all.
+#[cfg(feature = "postgres")]
+pub(crate) fn record_migration_lock_wait(waited: std::time::Duration) {
+    ::metrics::histogram!(crate::metrics::MIGRATION_LOCK_WAIT_SECONDS).record(waited.as_secs_f64());
 }
 
 enum LedgerRead {
@@ -639,13 +672,19 @@ async fn apply_missing(
             tracing::error!(error = %error, "migration session budget setup failed");
             MigrateError::ApplyFailed
         })?;
-    connection
+    // `pg_advisory_lock` blocks until the lock is granted or the session's
+    // `lock_timeout` fires, so the call's own duration *is* the wait. A
+    // failed wait is recorded too: an operator sizing the migration budget
+    // needs the attempts that hit the timeout most of all.
+    let lock_wait = std::time::Instant::now();
+    let locked = connection
         .simple_query(&format!("SELECT pg_advisory_lock({})", *MIGRATION_LOCK_KEY))
-        .await
-        .map_err(|error| {
-            tracing::error!(error = %error, "migration advisory lock failed");
-            MigrateError::ApplyFailed
-        })?;
+        .await;
+    record_migration_lock_wait(lock_wait.elapsed());
+    locked.map_err(|error| {
+        tracing::error!(error = %error, "migration advisory lock failed");
+        MigrateError::ApplyFailed
+    })?;
     // Detach the connection from the pool: `take` consumes the wrapper and
     // returns the client itself, marked so the pool will never recycle it.
     // When `client` drops -- at every return below, success or error -- the

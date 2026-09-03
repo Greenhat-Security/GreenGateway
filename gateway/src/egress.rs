@@ -5438,6 +5438,8 @@ mod tests {
             cluster_maintenance_interval_ms: crate::config::DEFAULT_CLUSTER_MAINTENANCE_INTERVAL_MS,
             cluster_maintenance_lease_ttl_ms:
                 crate::config::DEFAULT_CLUSTER_MAINTENANCE_LEASE_TTL_MS,
+            readiness_probe_cache_ms: crate::config::DEFAULT_READINESS_PROBE_CACHE_MS,
+            cluster_status_expose_hostnames: false,
             audit_postgres_retention_days: None,
             tool_runtime_default_timeout_ms: crate::config::DEFAULT_TOOL_RUNTIME_DEFAULT_TIMEOUT_MS,
             csrf_enabled: true,

@@ -368,6 +368,7 @@ impl Drop for LeaseGuard {
         if let Ok(handle) = tokio::runtime::Handle::try_current() {
             handle.spawn(async move {
                 if let Err(error) = store.release(&lease).await {
+                    lease::record_lease_failure(lease::LEASE_FAILURE_RELEASE_FAILED);
                     tracing::warn!(
                         scope = %lease.scope,
                         slot = lease.slot,
@@ -405,6 +406,7 @@ pub(crate) async fn renew_until_lost(
                     break;
                 }
                 Ok(false) => {
+                    lease::record_lease_failure(lease::LEASE_FAILURE_LOST);
                     tracing::warn!(
                         scope = %lease.scope,
                         slot = lease.slot,
@@ -415,6 +417,7 @@ pub(crate) async fn renew_until_lost(
                 }
                 Err(error) => {
                     if last_renewed.elapsed() >= ttl / 2 {
+                        lease::record_lease_failure(lease::LEASE_FAILURE_RENEW_EXPIRED);
                         tracing::warn!(
                             scope = %lease.scope,
                             slot = lease.slot,

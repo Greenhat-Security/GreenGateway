@@ -114,6 +114,46 @@ pub(crate) const JOB_STALE_MEMBER_SWEEP: &str = "stale_member_sweep";
 pub(crate) const JOB_AUDIT_RETENTION: &str = "audit_retention";
 pub(crate) const JOB_EXECUTION_LEASE_REAPER: &str = "execution_lease_reaper";
 
+/// Every singleton job name, which is the whole vocabulary of the `job`
+/// label on `greengateway_cluster_maintenance_job_runs_total` and of the
+/// `task` label on `greengateway_leader_task_last_success_age_seconds`.
+///
+/// `the_leader_task_vocabulary_is_the_singletons_job_names` in
+/// `cluster_status.rs` already keeps the status view's copy of this list
+/// in step; the registry label audit uses this one.
+pub(crate) const JOB_NAMES: [&str; 6] = [
+    JOB_JWT_REVOCATION_CLEANUP,
+    JOB_RATE_LIMIT_IDLE_SWEEP,
+    JOB_PENDING_LOGIN_PRUNE,
+    JOB_STALE_MEMBER_SWEEP,
+    JOB_AUDIT_RETENTION,
+    JOB_EXECUTION_LEASE_REAPER,
+];
+
+/// The `&'static str` this binary knows a ledger row's job name by, or
+/// `None` when it does not know it.
+///
+/// The whole point of the round trip through a fixed list: the ledger's
+/// `job` column is *database data*, and a database this gateway shares
+/// with a newer one -- or that somebody edited -- can carry a name it has
+/// never heard of. Recognising the name and using the *recognised
+/// constant* as the label means the label can only ever be one of six
+/// values, whatever the row said.
+pub(crate) fn known_job_name(job: &str) -> Option<&'static str> {
+    JOB_NAMES.into_iter().find(|name| *name == job)
+}
+
+/// Publish how long ago one singleton job last succeeded. `task` is a
+/// [`JOB_NAMES`] entry; a ledger row naming anything else is data and is
+/// dropped by [`known_job_name`] rather than turned into a label.
+pub(crate) fn record_leader_task_age(task: &'static str, age_secs: f64) {
+    ::metrics::gauge!(
+        crate::metrics::LEADER_TASK_LAST_SUCCESS_AGE_SECONDS,
+        "task" => task
+    )
+    .set(age_secs);
+}
+
 /// The acquisition backoff for a replica: `interval/4 +/- up to
 /// interval/8`, the offset fixed by the instance ID so every replica waits
 /// a different, stable amount and a leader's crash is followed by one
@@ -575,6 +615,16 @@ impl MaintenanceRunner {
             lost.clone(),
         )));
         self.set_leading(true);
+        // The term's own clock. The lease row's age lives in the database
+        // and is the authority's; what an operator wants from a metric is
+        // "how long has *this* replica been leading", which resets on
+        // every handover and is exactly what a leadership flapping between
+        // replicas looks like.
+        let held_since = Instant::now();
+        crate::tools::lease::record_lease_age(
+            crate::tools::lease::LEASE_SCOPE_MAINTENANCE,
+            Duration::ZERO,
+        );
         tracing::info!(
             fence = lease.fence,
             "maintenance lease acquired; this replica runs the singleton jobs"
@@ -593,6 +643,10 @@ impl MaintenanceRunner {
                         () = cancellation.cancelled() => break,
                         _ = ticker.tick() => {}
                     }
+                    crate::tools::lease::record_lease_age(
+                        crate::tools::lease::LEASE_SCOPE_MAINTENANCE,
+                        held_since.elapsed(),
+                    );
                     let outcome = tokio::select! {
                         () = lost.cancelled() => {
                             tracing::warn!(fence = lease.fence, "maintenance lease lost mid-pass; the pass is cancelled");
@@ -601,6 +655,7 @@ impl MaintenanceRunner {
                         () = cancellation.cancelled() => break,
                         outcome = self.run_pass(lease.fence) => outcome,
                     };
+                    self.publish_leader_task_ages().await;
                     if outcome == PassOutcome::Stale {
                         tracing::warn!(
                             fence = lease.fence,
@@ -625,13 +680,56 @@ impl MaintenanceRunner {
         }
         drop(renewal);
         self.set_leading(false);
+        // The term is over: the age goes back to zero rather than being
+        // left at its last value, which would read as "still leading" on
+        // a replica that has handed the lease on.
+        crate::tools::lease::record_lease_age(
+            crate::tools::lease::LEASE_SCOPE_MAINTENANCE,
+            Duration::ZERO,
+        );
         if let Err(error) = self.leases.release(&lease).await {
+            crate::tools::lease::record_lease_failure(
+                crate::tools::lease::LEASE_FAILURE_RELEASE_FAILED,
+            );
             tracing::warn!(
                 error = %error,
                 "maintenance lease release failed; the slot lapses by expiry"
             );
         }
         tracing::info!(fence = lease.fence, "maintenance lease released");
+    }
+
+    /// Publish how long ago each singleton job last succeeded, read back
+    /// from the fenced ledger (issue #241, PR 14).
+    ///
+    /// From the ledger rather than from this leader's own memory: a job
+    /// that has been failing across several leader terms must still show
+    /// its true age, and a leader that has just taken over has no memory
+    /// of the previous one's successes. The `task` label is the job's
+    /// name, which is one of the `JOB_*` constants and cannot be anything
+    /// else. A job that has never succeeded gets no series -- there is no
+    /// age for a success that never happened, and `0` would claim the
+    /// opposite of the truth.
+    ///
+    /// One read per pass on the leader only; a read that fails leaves the
+    /// last published ages standing and is not worth a log line of its
+    /// own beside the pass's.
+    async fn publish_leader_task_ages(&self) {
+        let Ok(jobs) = self.ledger.maintenance_jobs().await else {
+            return;
+        };
+        for job in jobs {
+            let Some(age) = job.last_success_age_secs else {
+                continue;
+            };
+            // A ledger row naming a job this binary does not run -- one a
+            // newer gateway added, or one written by hand -- is data, so
+            // it never becomes a label.
+            let Some(name) = known_job_name(&job.job) else {
+                continue;
+            };
+            record_leader_task_age(name, age);
+        }
     }
 
     /// One pass over every job under `fence`: open the dedicated session,
@@ -768,6 +866,60 @@ impl Drop for AbortOnDrop {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The ledger's `job` column is database data, so only a name this
+    /// binary recognises may become a `task` label (issue #241, PR 14).
+    ///
+    /// The adversarial cases are not hypothetical: a shared database gets
+    /// rows from a newer gateway running jobs this one has never heard of,
+    /// and a row can be edited by hand. Both must produce no series rather
+    /// than a series named after whatever the row said.
+    #[test]
+    fn only_a_recognised_ledger_job_name_can_become_a_task_label() {
+        for job in JOB_NAMES {
+            assert_eq!(
+                known_job_name(job),
+                Some(job),
+                "a job this binary runs must be recognised by name"
+            );
+        }
+        for hostile in [
+            "a_job_a_newer_gateway_runs",
+            "stale_member_sweep\", instance=\"3f8c1d2e-9b47-4a6f-8e51-c07d2b93a4e6",
+            "postgres://user:pass@10.0.0.5:5432/db",
+            "",
+        ] {
+            assert_eq!(
+                known_job_name(hostile),
+                None,
+                "an unrecognised ledger job name must never become a label: {hostile}"
+            );
+        }
+        assert_eq!(
+            JOB_NAMES.len(),
+            std::collections::BTreeSet::from(JOB_NAMES).len(),
+            "every job name must be distinct, or two jobs share one series"
+        );
+    }
+
+    /// The runner's job list and the label vocabulary are the same set: a
+    /// job added to one without the other would either be unreportable or
+    /// report under a name nothing runs.
+    #[test]
+    fn the_label_vocabulary_is_exactly_the_jobs_the_runner_can_run() {
+        let declared: std::collections::BTreeSet<&str> = JOB_NAMES.into_iter().collect();
+        let known: std::collections::BTreeSet<&str> = [
+            JOB_JWT_REVOCATION_CLEANUP,
+            JOB_RATE_LIMIT_IDLE_SWEEP,
+            JOB_PENDING_LOGIN_PRUNE,
+            JOB_STALE_MEMBER_SWEEP,
+            JOB_AUDIT_RETENTION,
+            JOB_EXECUTION_LEASE_REAPER,
+        ]
+        .into_iter()
+        .collect();
+        assert_eq!(declared, known);
+    }
 
     #[test]
     fn the_acquisition_backoff_is_jittered_within_bounds_and_stable_per_instance() {

@@ -328,11 +328,39 @@ pub struct CapturedFieldName {
     redacted: bool,
 }
 
+/// Counts one request as in flight for as long as it is held, and takes
+/// the count back down when it drops (issue #241, PR 14).
+///
+/// A guard rather than a matched pair of increments: a request can leave
+/// this middleware by returning, by being cancelled when the client hangs
+/// up, or by unwinding, and only a `Drop` covers all three. A leaked
+/// increment would make the gauge climb monotonically and turn the
+/// "requests are piling up" alarm into noise, which is worse than not
+/// having the series at all.
+pub(crate) struct InFlightRequestGuard;
+
+impl InFlightRequestGuard {
+    pub(crate) fn enter() -> Self {
+        ::metrics::gauge!(crate::metrics::INFLIGHT_REQUESTS).increment(1.0);
+        Self
+    }
+}
+
+impl Drop for InFlightRequestGuard {
+    fn drop(&mut self) {
+        ::metrics::gauge!(crate::metrics::INFLIGHT_REQUESTS).decrement(1.0);
+    }
+}
+
 pub async fn observation_middleware(
     State(state): State<ObservationState>,
     mut req: Request,
     next: Next,
 ) -> Response {
+    // Held for the whole of `next.run`, including the handler and every
+    // inner layer, so the gauge is "requests the gateway is currently
+    // working on" rather than "requests that reached a handler".
+    let _in_flight = InFlightRequestGuard::enter();
     let start = Instant::now();
     let method = req.method().to_string();
     let path = req.uri().path().to_owned();
