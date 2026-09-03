@@ -59,8 +59,10 @@ pub mod postgres_tools;
 mod principal;
 mod service_token;
 
+// `pub(crate)`: the PostgreSQL sink's tests (`audit::postgres_sink`) reuse
+// its per-test database helpers rather than carrying a second copy.
 #[cfg(test)]
-mod contract_tests;
+pub(crate) mod contract_tests;
 
 pub use audit::{AuditEventStore, SqliteAuditEventStore};
 pub use policy_history::PolicyHistory;

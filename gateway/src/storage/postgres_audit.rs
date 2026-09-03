@@ -170,10 +170,11 @@ pub struct IngestIdentity {
 }
 
 impl PostgresAuditEventStore {
-    /// Unused by production yet: the runtime ingestion sink and PR 6's SSE
-    /// transport construct this against the serving pool. Exercised today
-    /// by the contract and stream tests.
-    #[allow(dead_code)]
+    /// Built once per replica against the serving pool with the replica's
+    /// identity (`main.rs`); the request-path sink (`audit::postgres_sink`),
+    /// the SSE transport, the discovery projector and suggestion generation
+    /// share that one instance. The import builds its own without an
+    /// identity.
     pub fn new(pool: deadpool_postgres::Pool, identity: Option<IngestIdentity>) -> Self {
         Self { pool, identity }
     }
@@ -541,7 +542,7 @@ impl AuditEventStore for PostgresAuditEventStore {
         if events.is_empty() {
             return Ok(());
         }
-        let client = self.pool.get().await.map_err(classify_pool_error)?;
+        let mut client = self.pool.get().await.map_err(classify_pool_error)?;
 
         let mut event_ids: Vec<String> = Vec::with_capacity(events.len());
         let mut event_types: Vec<String> = Vec::with_capacity(events.len());
@@ -618,15 +619,29 @@ impl AuditEventStore for PostgresAuditEventStore {
         // One transaction: the advisory lock (released at commit or
         // rollback) serializes stream-position assignment so position order
         // is commit order; both statements roll back together, so an
-        // aborted batch leaves no event rows and no stream rows. The
-        // transaction is driven explicitly over the simple protocol, like
-        // the migrator's, so no &mut borrow of the pooled client is needed.
-        client
-            .batch_execute("BEGIN")
+        // aborted batch leaves no event rows and no stream rows.
+        //
+        // It is a `tokio_postgres` transaction rather than a hand-driven
+        // `BEGIN`/`COMMIT`, and the difference is cancellation. Every
+        // `await` below is a point the caller may drop this future at: the
+        // request-path sink bounds each store call with a timeout, and a
+        // runtime tearing down drops whatever is in flight. A dropped
+        // future runs no code of its own, so a transaction opened with a
+        // bare `BEGIN` would go back to the pool still open, holding the
+        // stream lock until the pool happened to recycle that connection
+        // (checkouts are FIFO, so behind up to `pool_max - 1` others), and
+        // every writer on every replica would queue behind it -- the wedge
+        // #359 closed for the maintenance session. `Transaction`'s `Drop`
+        // queues a `ROLLBACK` on the connection the instant the future is
+        // dropped; the server runs it as soon as the abandoned statement
+        // finishes, and the lock goes with it. Pinned by
+        // `postgres_audit_a_cancelled_batch_releases_the_stream_lock_and_leaves_no_rows`.
+        let transaction = client
+            .transaction()
             .await
             .map_err(|error| classify_query(error, "audit_event_insert"))?;
         let result: Result<(), RepositoryError> = async {
-            client
+            transaction
                 .execute(
                     INSERT_EVENTS_SQL,
                     &[
@@ -652,11 +667,11 @@ impl AuditEventStore for PostgresAuditEventStore {
                 )
                 .await
                 .map_err(|error| classify_query(error, "audit_event_insert"))?;
-            client
+            transaction
                 .execute(LOCK_STREAM_SQL, &[&*AUDIT_STREAM_LOCK_KEY])
                 .await
                 .map_err(|error| classify_query(error, "audit_event_insert"))?;
-            client
+            transaction
                 .execute(APPEND_STREAM_SQL, &[&event_ids])
                 .await
                 .map_err(|error| classify_query(error, "audit_event_insert"))?;
@@ -664,12 +679,15 @@ impl AuditEventStore for PostgresAuditEventStore {
         }
         .await;
         match result {
-            Ok(()) => client
-                .batch_execute("COMMIT")
+            Ok(()) => transaction
+                .commit()
                 .await
                 .map_err(|error| classify_query(error, "audit_event_insert")),
             Err(error) => {
-                let _ = client.batch_execute("ROLLBACK").await;
+                // Awaited, so the connection is clean before it is returned
+                // on the ordinary failure path; a cancellation anywhere in
+                // between gets `Drop`'s queued rollback instead.
+                let _ = transaction.rollback().await;
                 Err(error)
             }
         }

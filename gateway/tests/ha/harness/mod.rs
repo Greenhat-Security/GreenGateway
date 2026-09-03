@@ -831,6 +831,16 @@ impl Cluster {
         response.text().await.unwrap_or_default()
     }
 
+    /// Every replica's value of the Prometheus sample `name`, added up
+    /// across all label sets: the deployment's total.
+    pub async fn metric_total(&self, name: &str) -> f64 {
+        let mut total = 0.0;
+        for replica in &self.replicas {
+            total += metric_sum(&self.metrics(&replica.name).await, name);
+        }
+        total
+    }
+
     /// Every audit record every replica has written to its own file sink.
     pub fn audit_records(&self) -> Vec<serde_json::Value> {
         self.replicas
@@ -1108,6 +1118,35 @@ fn replica_environment(
         }
     }
     env
+}
+
+/// The sum of every Prometheus sample whose name is `name`, across all
+/// label sets.
+///
+/// Written against the exposition rather than against a particular label
+/// set on purpose: `audit_events_dropped_total` is emitted with a `reason`
+/// label whose values are the drop causes, and a test that named one
+/// reason would miss a drop for another. Here rather than in one suite
+/// because the audit accounting is read by two of them (saturation, and
+/// the smoke leg's request-path audit row).
+pub fn metric_sum(exposition: &str, name: &str) -> f64 {
+    exposition
+        .lines()
+        .filter(|line| !line.starts_with('#'))
+        .filter_map(|line| {
+            let rest = line.strip_prefix(name)?;
+            // Either `name value` or `name{labels} value`, and either of
+            // those with the exposition's `_total` suffix already on it —
+            // anything else is a different metric that merely starts with
+            // these bytes.
+            let rest = rest.strip_prefix("_total").unwrap_or(rest);
+            if !(rest.starts_with(' ') || rest.starts_with('{')) {
+                return None;
+            }
+            rest.rsplit_once(char::is_whitespace)
+                .and_then(|(_, value)| value.parse::<f64>().ok())
+        })
+        .sum()
 }
 
 /// The admin OIDC callback the deployment publishes, which is also the

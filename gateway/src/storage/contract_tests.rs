@@ -882,8 +882,11 @@ fn event_ids(page: &AuditQueryPage) -> Vec<String> {
 // harness locator (CI sets it; a checkout without a database skips).
 // ---------------------------------------------------------------------------
 
+// The database helpers are `pub(crate)` so the PostgreSQL sink's tests
+// (`audit::postgres_sink`) run against the same per-test databases under
+// the same serialization instead of carrying a second copy of them.
 #[cfg(all(test, feature = "postgres"))]
-mod postgres_audit_tests {
+pub(crate) mod postgres_audit_tests {
     use super::*;
     use crate::storage::{
         migrations,
@@ -900,9 +903,9 @@ mod postgres_audit_tests {
     /// one database makes every reset a cross-test race. A dedicated
     /// database per test (created from the locator's DSN, dropped on
     /// release) removes the interference entirely.
-    static DATABASE: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::const_new(()));
+    pub(crate) static DATABASE: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::const_new(()));
 
-    fn locator() -> Option<String> {
+    pub(crate) fn locator() -> Option<String> {
         let key = "GATEWAY_TEST_POSTGRES_URL_FILE".to_owned();
         let file = std::env::var(&key).ok()?;
         if file.trim().is_empty() {
@@ -916,8 +919,8 @@ mod postgres_audit_tests {
     /// One test's disposable database: created on acquisition, dropped
     /// (forced) on release. The `dsn` rewrites only the locator DSN's
     /// database path segment.
-    struct TestDatabase {
-        dsn: String,
+    pub(crate) struct TestDatabase {
+        pub(crate) dsn: String,
         name: String,
         admin_pool: deadpool_postgres::Pool,
     }
@@ -949,8 +952,8 @@ mod postgres_audit_tests {
         }
     }
 
-    struct DsnFile {
-        path: String,
+    pub(crate) struct DsnFile {
+        pub(crate) path: String,
         directory: std::path::PathBuf,
     }
 
@@ -960,7 +963,7 @@ mod postgres_audit_tests {
         }
     }
 
-    fn write_dsn_file(dsn: &str) -> DsnFile {
+    pub(crate) fn write_dsn_file(dsn: &str) -> DsnFile {
         let directory = std::env::temp_dir().join(format!(
             "greengateway-audit-contract-{}",
             uuid::Uuid::new_v4()
@@ -980,7 +983,7 @@ mod postgres_audit_tests {
         }
     }
 
-    async fn create_test_database(admin_dsn: &str) -> TestDatabase {
+    pub(crate) async fn create_test_database(admin_dsn: &str) -> TestDatabase {
         let name = format!("ggw_audit_test_{}", uuid::Uuid::new_v4().simple());
         let mut config = crate::config::Config::test_defaults();
         config.state_backend = crate::config::StateBackend::Postgres;
@@ -4020,6 +4023,148 @@ mod postgres_audit_tests {
 
     fn super_db_key() -> &'static i64 {
         &crate::storage::postgres_audit::AUDIT_STREAM_LOCK_KEY
+    }
+
+    /// A batch whose future is dropped mid-transaction -- the request-path
+    /// sink's per-attempt timeout is the caller that does it -- must not
+    /// return its connection to the pool inside an open transaction. Open,
+    /// it still holds the stream advisory lock, and the pool's `ROLLBACK`
+    /// recycle runs only when that connection is next checked out, which
+    /// with FIFO checkouts can be behind every other connection in the
+    /// pool: until then every writer on every replica queues behind a
+    /// session that is idle in transaction. This is the audit-store twin
+    /// of the maintenance wedge #359 closed.
+    ///
+    /// The shape of the wedge is reproduced exactly: a second session holds
+    /// `ACCESS EXCLUSIVE` on `audit_stream`, so the batch takes the advisory
+    /// lock and then blocks on the append; the caller gives up; the table
+    /// lock is released; and a second pool (another replica) must then write
+    /// within a bound far below the session `lock_timeout` the wedge would
+    /// make it hit. Nothing of the cancelled batch may remain.
+    #[tokio::test]
+    async fn postgres_audit_a_cancelled_batch_releases_the_stream_lock_and_leaves_no_rows() {
+        let Some(admin_dsn) = locator() else {
+            eprintln!("skipping: no test database locator; CI runs this test");
+            return;
+        };
+        let _guard = DATABASE.lock().await;
+        let database = create_test_database(&admin_dsn).await;
+        let replica_a = migrated_store(&database).await;
+        // A second pool, as a second replica has: the leaked connection, if
+        // there were one, would sit in replica a's pool where nothing this
+        // test does would recycle it.
+        let test_dsn_file = write_dsn_file(&database.dsn);
+        let mut config = crate::config::Config::test_defaults();
+        config.state_backend = crate::config::StateBackend::Postgres;
+        config.deployment_id = Some("deploy-audit-contract".to_owned());
+        config.database.url_file = Some(test_dsn_file.path.clone());
+        config.database.tls_mode = crate::config::DatabaseTlsMode::LoopbackDev;
+        let foundation_b = PostgresFoundation::establish(&config)
+            .await
+            .expect("the second pool should establish");
+        let replica_b = PostgresAuditEventStore::new(foundation_b.pool().clone(), None);
+
+        // The blocker: a raw session, outside both pools, holding the
+        // stream table so the batch wedges AFTER it has the advisory lock.
+        let (blocker, connection) = tokio_postgres::connect(&database.dsn, tokio_postgres::NoTls)
+            .await
+            .expect("the blocking session should establish");
+        let pump = tokio::spawn(async move {
+            let _ = connection.await;
+        });
+        blocker
+            .batch_execute("BEGIN; LOCK TABLE greengateway.audit_stream IN ACCESS EXCLUSIVE MODE")
+            .await
+            .expect("the stream table should lock");
+
+        let cancelled = tokio::time::timeout(
+            std::time::Duration::from_millis(500),
+            replica_a.insert_events(&[
+                contract_event("cancelled-1", "audit.cancelled", json!({})),
+                contract_event("cancelled-2", "audit.cancelled", json!({})),
+            ]),
+        )
+        .await;
+        assert!(
+            cancelled.is_err(),
+            "the batch should have been wedged behind the table lock, not answered: {cancelled:?}"
+        );
+        blocker
+            .batch_execute("ROLLBACK")
+            .await
+            .expect("the table lock should release");
+
+        // The other replica writes promptly. A leaked lock would hold this
+        // for the pooled session's `lock_timeout` (5 s by default) and then
+        // fail it; the bound here is well inside that.
+        let started = std::time::Instant::now();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(3),
+            replica_b.insert_events(&[contract_event("survivor", "audit.cancelled", json!({}))]),
+        )
+        .await
+        .unwrap_or_else(|_| {
+            panic!(
+                "replica b's batch waited more than 3 s for the stream lock after replica a's \
+                 batch was cancelled: the cancelled transaction was returned to the pool open"
+            )
+        })
+        .expect("replica b's batch should commit");
+        let took = started.elapsed();
+        eprintln!("replica b's batch committed {took:?} after the cancelled one was abandoned");
+
+        // The abandoned session ended its transaction, so nothing is idle
+        // in transaction holding an advisory lock, and the rollback took
+        // the cancelled batch's rows with it. The rollback is queued by
+        // `Drop` and run by the server, so it is polled for briefly.
+        let probe = foundation_b.pool().get().await.expect("probe checkout");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let leaked: i64 = probe
+                .query_one(
+                    "SELECT count(*)::bigint FROM pg_locks l \
+                     JOIN pg_stat_activity a ON a.pid = l.pid \
+                     WHERE l.locktype = 'advisory' AND l.granted \
+                       AND a.datname = current_database() \
+                       AND a.state = 'idle in transaction'",
+                    &[],
+                )
+                .await
+                .expect("the lock table should read")
+                .get(0);
+            if leaked == 0 {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "{leaked} session(s) still hold an advisory lock while idle in transaction: the \
+                 cancelled batch's transaction was never rolled back"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        let walked = replica_b
+            .stream_after(0, 100)
+            .await
+            .expect("stream should walk");
+        assert_eq!(
+            walked
+                .iter()
+                .map(|(position, event)| (*position, event.event_id.as_str()))
+                .collect::<Vec<_>>(),
+            vec![(1, "survivor")],
+            "the cancelled batch must leave no stream row and consume no position"
+        );
+        let events: i64 = probe
+            .query_one(
+                "SELECT count(*)::bigint FROM greengateway.audit_events",
+                &[],
+            )
+            .await
+            .expect("events should count")
+            .get(0);
+        assert_eq!(events, 1, "the cancelled batch must leave no event row");
+        drop(blocker);
+        let _ = pump.await;
     }
 
     #[tokio::test]

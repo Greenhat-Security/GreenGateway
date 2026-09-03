@@ -488,6 +488,10 @@ impl EndpointAggregatorSink {
 }
 
 impl AuditSink for EndpointAggregatorSink {
+    fn name(&self) -> &'static str {
+        "discovery_aggregator"
+    }
+
     fn emit(&self, event: &AuditEvent) {
         let Some(observation) = ObservedRequest::from_event(event) else {
             return;

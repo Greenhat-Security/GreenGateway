@@ -2700,6 +2700,23 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let inbound_tls = inbound_tls::InboundTlsBindings::load(&config)?;
     let shutdown_config = ShutdownConfig::from_config(&config);
     let lifecycle = GatewayLifecycle::new();
+    // Cluster mode's audit of record is the shared store (issue #11, PR 3):
+    // the durable sink writes through the same store instance the SSE and
+    // discovery readers were just handed, with this replica's identity on
+    // every row, and its drain gets the audit drain's own budget. Standalone
+    // builds the sinks exactly as before -- `from_config` is this call with
+    // no store.
+    #[cfg(feature = "postgres")]
+    let (audit_log, audit_event_sender) = audit::AuditLog::from_config_with_durable_store(
+        &config,
+        pg_audit_store
+            .as_ref()
+            .map(|store| audit::postgres_sink::PostgresSinkConfig {
+                store: Arc::clone(store),
+                flush_deadline: Duration::from_millis(config.audit_drain_timeout_ms),
+            }),
+    )?;
+    #[cfg(not(feature = "postgres"))]
     let (audit_log, audit_event_sender) = audit::AuditLog::from_config(&config)?;
     // Started once the audit log exists, so every reload outcome -- accepted
     // or rejected -- is observable from the first moment a listener serves.

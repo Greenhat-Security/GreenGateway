@@ -36,14 +36,14 @@
 //!   the `ROLLBACK` recycling statement that is most of what a checkout
 //!   costs. No product series isolates this: the stores time the checkout
 //!   together with the statement that follows it.
-//! * `structural` — `audit_enqueue` is budgeted at "0 ms on the request
-//!   path", which is a claim about where work happens rather than a
-//!   latency. The experiment that would settle it — stall the sink, show
-//!   request latency does not move — turns out not to be available in
-//!   cluster mode at all, for a reason worth reading:
-//!   [`the_audit_enqueue_stays_off_the_request_path`] explains it and
-//!   asserts what can be asserted, with a tripwire for the day the
-//!   experiment becomes possible.
+//! * `stall_experiment` — `audit_enqueue` is budgeted at "0 ms on the
+//!   request path", which is a claim about where work happens rather than
+//!   a latency. Since issue #11 every serving replica writes its audit
+//!   events to `greengateway.audit_events` through a sink of its own, so
+//!   the experiment that settles the claim is available:
+//!   [`the_audit_enqueue_stays_off_the_request_path`] stalls that sink with
+//!   a table lock, shows the request p99 does not move, and shows one row
+//!   per request lands once the lock goes.
 //!
 //! ## Why the product's own timing series is not the source
 //!
@@ -110,10 +110,11 @@ struct Budget {
 ///
 /// `audit_enqueue` is the ninth row of the document's table and is
 /// deliberately absent here: its budget is "0 ms on the request path",
-/// which is a structural claim rather than a latency, and
-/// [`the_audit_enqueue_stays_off_the_request_path`] asserts it as one.
-/// [`the_report_covers_every_budget_the_state_model_publishes`] is what
-/// keeps that from becoming a silent omission.
+/// which is a claim about where the work happens rather than a latency of
+/// its own, and [`the_audit_enqueue_stays_off_the_request_path`] tests it
+/// by stalling the sink under a measured run rather than by timing one
+/// operation. [`the_report_covers_every_budget_the_state_model_publishes`]
+/// is what keeps that from becoming a silent omission.
 const BUDGETS: &[Budget] = &[
     Budget {
         name: "security_revision_check",
@@ -1161,10 +1162,15 @@ impl Standalone {
     }
 }
 
+/// Requests [`measure_protected_requests`] issues and discards before it
+/// starts timing. Named because the audit-enqueue row counts the rows every
+/// request leaves, warm-up included.
+const PROTECTED_WARMUP: usize = 50;
+
 /// Time `count` protected proxied requests against one base URL.
 async fn measure_protected_requests(base_url: &str, token: &str, count: usize) -> Quantiles {
     let url = format!("{base_url}{PROXIED_PATH}");
-    measure(count, 50, |_| {
+    measure(count, PROTECTED_WARMUP, |_| {
         let url = url.clone();
         async move {
             let response = harness::http_client()
@@ -1199,18 +1205,17 @@ async fn measure_protected_requests(base_url: &str, token: &str, count: usize) -
 /// operator would actually use — an event type, a time window, a status —
 /// and the keyset `ORDER BY id DESC LIMIT n` the store always applies.
 ///
-/// Second, this benchmark measures a capability the product has and does
-/// not yet use, at either end. The admin audit route is backed by
-/// `storage::SqliteAuditEventStore` and answers `503 audit query store not
-/// configured` when the deployment is PostgreSQL-backed, so there is no
-/// HTTP surface that reaches this query; and no serving replica writes the
-/// rows it reads, because `PostgresAuditEventStore::insert_events` is
-/// called only by `import/sections.rs` (see
-/// [`the_audit_enqueue_stays_off_the_request_path`] for the whole of that
-/// finding). A million rows here are therefore a fixture, and the number
+/// Second, a note on the two ends of this query. The admin audit route is
+/// backed by `storage::SqliteAuditEventStore` and answers `503 audit query
+/// store not configured` when the deployment is PostgreSQL-backed, so there
+/// is still no HTTP surface that reaches this statement. The rows it reads
+/// ARE now written by serving replicas — issue #11's PostgreSQL audit sink,
+/// exercised by [`the_audit_enqueue_stays_off_the_request_path`] — but a
+/// million of them produced by traffic would be the night's whole budget,
+/// so the rows here are a fixture loaded in one statement, and the number
 /// this row publishes says what the query *would* cost an operator who
-/// could run it. Both halves belong in the deployment guide, and both are
-/// why this measurement is a statement rather than a request.
+/// could run it. The missing route belongs in the deployment guide, and it
+/// is why this measurement is a statement rather than a request.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "nightly benchmark; run by the nightly-performance workflow"]
 async fn the_audit_filtered_query_answers_a_million_rows_within_its_budget() {
@@ -1357,43 +1362,53 @@ WHERE event_type = $1 AND payload_status = $2 ORDER BY id DESC LIMIT $3"#,
 }
 
 // =====================================================================
-// The structural budget
+// The audit-enqueue budget, under a stalled sink
 // =====================================================================
 
-/// **`audit_enqueue`: 0 ms on the request path — and what stands behind
-/// that claim in this build, which is less than the state model implies.**
+/// How long the durable rows are given to land once the stall is lifted,
+/// and how long the sink is given to wedge behind the lock before it.
+const AUDIT_ROWS_BUDGET: Duration = Duration::from_secs(30);
+/// Timed requests in the primer run that gives the stalled sink a batch to
+/// get stuck on (plus its [`PROTECTED_WARMUP`]).
+const STALL_PRIMER: usize = 8;
+
+/// **`audit_enqueue`: 0 ms on the request path — measured, since issue
+/// #11's PostgreSQL audit sink gave cluster mode a durable writer to
+/// stall.**
 ///
 /// The document's ninth budget is not a latency, it is a claim about where
 /// the work happens: "Bounded queue; backpressure/strictness per the
-/// failure matrix." The experiment that would settle it is to stall the
-/// sink and show request latency does not move. **That experiment is not
-/// available in cluster mode**, and finding out why is the more useful
-/// half of this row.
+/// failure matrix." Before #11 no serving replica wrote a durable audit
+/// row, so there was no sink to stall and this row could only assert the
+/// claim structurally — it was a tripwire asserting `greengateway.audit_events`
+/// stayed EMPTY under traffic, to fail the day a sink arrived. It did, and
+/// this is the rewrite that tripwire asked for.
 ///
-/// `greengateway.audit_events` has no runtime writer. The audit sinks a
-/// serving replica composes are stdout, file, SQLite and broadcast
-/// (`audit/sink.rs`); `PostgresAuditEventStore` is constructed in cluster
-/// mode, but only to be *read* (the SSE endpoint), *projected* (discovery)
-/// and *pruned* (audit retention). Its `insert_events` is called by
-/// `import/sections.rs` and by in-crate tests, and by nothing else — which
-/// is why `events_discovery_leader.rs` seeds its events through the
-/// harness rather than producing them with traffic. So a replica serving
-/// production traffic writes no durable audit event at all, and no
-/// database-side fault can stall a sink that is not there.
+/// Every serving replica now composes `audit/postgres_sink.rs`: `emit`
+/// pushes onto a bounded buffer and returns, and a flusher task of the
+/// sink's own batches the buffer into `AuditEventStore::insert_events`. So
+/// the experiment is: hold `ACCESS EXCLUSIVE` on the table for the whole of
+/// a second measured run, so every batch the sink tries to land blocks,
+/// and show the request p99 does not move. Then release it and show the
+/// rows land — one per request served, none missing, none twice.
 ///
-/// What this row asserts instead, and all of it is observable:
+/// What this row asserts, all of it observable:
 ///
 /// 1. The queue is bounded and its bound is published — a queue whose
 ///    capacity nobody can see is not a bounded queue in any operational
 ///    sense.
-/// 2. Nothing is dropped under the load, and the queue drains: the
-///    enqueue hands off and the sink catches up.
-/// 3. `greengateway.audit_events` stays **empty** despite the traffic.
-///    That is a tripwire, not an endorsement: the day a PostgreSQL audit
-///    sink is wired in, this assertion fails, and the row must be
-///    rewritten to include the stall experiment that then becomes
-///    possible — which is exactly when the state model's `audit_enqueue`
-///    budget can finally be tested rather than described.
+/// 2. With the sink stalled, the request p99 stays within the aggregate
+///    budget of the unstalled p99 (or twice it, whichever is looser). A
+///    request path that waited for the sink would carry the stall itself:
+///    seconds, not milliseconds.
+/// 3. Nothing is dropped, on either counter: the stall is far shorter
+///    than the sink's retry budget, so the buffered batches land once the
+///    lock goes.
+/// 4. The queue drains, and `greengateway.audit_events` holds exactly one
+///    row per request served, warm-up included — the inverse of the old
+///    tripwire. The non-ignored twin of that assertion is
+///    `ha_smoke::every_served_request_leaves_exactly_one_durable_audit_row`,
+///    so a pull request fails on it rather than a nightly.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "nightly benchmark; run by the nightly-performance workflow"]
 async fn the_audit_enqueue_stays_off_the_request_path() {
@@ -1403,8 +1418,31 @@ async fn the_audit_enqueue_stays_off_the_request_path() {
     let admin = admin_token(&cluster.oidc, "admin@ha.test");
     let count = samples().min(500);
     let base_url = cluster.replica("a").base_url();
+    // The counter every shed event lands on, whichever sink shed it, read
+    // off `/metrics` the way an operator reads it. Baselined, because a
+    // replica may drop a handful of events during a cold start on a loaded
+    // machine, and those are not this row's.
+    let dropped_before =
+        harness::metric_sum(&cluster.metrics("a").await, "audit_events_dropped_total");
 
-    let observed = measure_protected_requests(&base_url, &admin, count).await;
+    // The unstalled run, then the same run with the sink's batch insert
+    // blocked for the duration. The stall is made real before it is
+    // measured — a short primer run gives the sink a batch, and the lock
+    // holder waits until that batch is observed wedged behind it — because
+    // a lock nobody is waiting on stalls nothing.
+    let unstalled = measure_protected_requests(&base_url, &admin, count).await;
+    let lock = cluster.database.hold_audit_events_exclusively().await;
+    let stalled_at = Instant::now();
+    let _primer = measure_protected_requests(&base_url, &admin, STALL_PRIMER).await;
+    cluster
+        .database
+        .wait_for_blocked_audit_writer(AUDIT_ROWS_BUDGET)
+        .await;
+    let blocked_writers = cluster.database.blocked_audit_writers().await;
+    let stalled = measure_protected_requests(&base_url, &admin, count).await;
+    let stall = stalled_at.elapsed();
+    lock.release().await;
+    let served = 3 * PROTECTED_WARMUP + 2 * count + STALL_PRIMER;
 
     // The queue's own account of itself, from the surface an operator
     // reads.
@@ -1417,14 +1455,14 @@ async fn the_audit_enqueue_stays_off_the_request_path() {
     let capacity = body["audit"]["queue_capacity"]
         .as_i64()
         .unwrap_or_else(|| panic!("the audit queue's capacity should be reported: {body}"));
-    let dropped = body["audit"]["dropped_total"]
+    let queue_dropped = body["audit"]["dropped_total"]
         .as_i64()
         .unwrap_or_else(|| panic!("the audit drop counter should be reported: {body}"));
 
     // Drained: depth back to zero and the oldest queued record young
     // again once the sink has caught up. Polled, because "has the sink
     // caught up" is an observable and not a duration to guess at.
-    let deadline = Instant::now() + Duration::from_secs(30);
+    let deadline = Instant::now() + AUDIT_ROWS_BUDGET;
     let drained = loop {
         let (_, body) = cluster
             .get("a", "/v1/admin/cluster")
@@ -1444,12 +1482,36 @@ async fn the_audit_enqueue_stays_off_the_request_path() {
         tokio::time::sleep(Duration::from_millis(200)).await;
     };
 
-    let durable_rows = cluster
-        .database
-        .count("SELECT count(*)::bigint FROM greengateway.audit_events")
-        .await;
+    // The rows: every request the measurement made, served `200`, as one
+    // observation row each. Polled up to the same budget, because the
+    // sink's last batch lands a flush interval after the last request.
+    let deadline = Instant::now() + AUDIT_ROWS_BUDGET;
+    let durable_rows = loop {
+        let rows = cluster
+            .database
+            .count(&format!(
+                "SELECT count(*)::bigint FROM greengateway.audit_events \
+                 WHERE event_type = 'http.request_observed' \
+                   AND payload_path = '{PROXIED_PATH}' AND payload_status = 200"
+            ))
+            .await;
+        if rows >= served as i64 || Instant::now() >= deadline {
+            break rows;
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    };
+    let sink_dropped =
+        harness::metric_sum(&cluster.metrics("a").await, "audit_events_dropped_total")
+            - dropped_before;
 
-    let within_budget = capacity > 0 && dropped == 0 && drained && durable_rows == 0;
+    let stalled_budget_ms = (2.0 * unstalled.p99_ms).max(unstalled.p99_ms + AGGREGATE_BUDGET_MS);
+    let latency_held = stalled.p99_ms <= stalled_budget_ms;
+    let within_budget = capacity > 0
+        && queue_dropped == 0
+        && sink_dropped < 1.0
+        && drained
+        && durable_rows == served as i64
+        && latency_held;
     {
         let mut report = report()
             .lock()
@@ -1461,28 +1523,38 @@ async fn the_audit_enqueue_stays_off_the_request_path() {
                 "name": "audit_enqueue",
                 "budget_source": BUDGET_SOURCE,
                 "budget_p99_ms": 0.0,
-                "method": "structural",
-                "source_anchor": "gateway/src/audit/sink.rs (the sinks a replica composes) \
-                                  and the audit block of GET /v1/admin/cluster",
-                "samples": observed.samples,
-                "request_p50_ms": rounded(observed.p50_ms),
-                "request_p95_ms": rounded(observed.p95_ms),
-                "request_p99_ms": rounded(observed.p99_ms),
-                "p99_ms": rounded(observed.p99_ms),
+                "method": "stall_experiment",
+                "source_anchor": "gateway/src/audit/postgres_sink.rs (emit and the flusher) \
+                                  under ACCESS EXCLUSIVE on greengateway.audit_events, and \
+                                  the audit block of GET /v1/admin/cluster",
+                "samples": stalled.samples,
+                "unstalled_p50_ms": rounded(unstalled.p50_ms),
+                "unstalled_p95_ms": rounded(unstalled.p95_ms),
+                "unstalled_p99_ms": rounded(unstalled.p99_ms),
+                "stalled_p50_ms": rounded(stalled.p50_ms),
+                "stalled_p95_ms": rounded(stalled.p95_ms),
+                "stalled_p99_ms": rounded(stalled.p99_ms),
+                "stall_ms": rounded(stall.as_secs_f64() * 1_000.0),
+                "blocked_batch_inserts_at_start": blocked_writers,
+                "stalled_budget_p99_ms": rounded(stalled_budget_ms),
+                "p99_ms": rounded(stalled.p99_ms),
                 "queue_capacity": capacity,
-                "dropped_total": dropped,
+                "dropped_total": queue_dropped,
+                "sink_dropped_total": sink_dropped,
                 "queue_drained": drained,
+                "requests_served": served,
                 "durable_audit_rows": durable_rows,
-                "durable_audit_sink_present": durable_rows > 0,
                 "within_budget": within_budget,
                 "regressed": false,
             }));
         write_report(&report);
     }
     eprintln!(
-        "audit_enqueue: {count} requests at p99 {:.3} ms; queue capacity {capacity}, dropped \
-         {dropped}, drained {drained}, durable rows {durable_rows}",
-        observed.p99_ms
+        "audit_enqueue: {count} requests at p99 {:.3} ms unstalled and {:.3} ms with the sink \
+         stalled for {stall:?} ({blocked_writers} batch insert(s) blocked when the stalled \
+         run began); queue capacity {capacity}, dropped {queue_dropped} (sink {sink_dropped}), \
+         drained {drained}, durable rows {durable_rows} for {served} served",
+        unstalled.p99_ms, stalled.p99_ms
     );
 
     assert!(
@@ -1490,22 +1562,30 @@ async fn the_audit_enqueue_stays_off_the_request_path() {
         "the audit queue must publish a bound; an unbounded queue is not the design the state \
          model budgets"
     );
+    assert!(
+        latency_held,
+        "with the audit sink stalled for {stall:?} the request p99 went from {:.3} ms to \
+         {:.3} ms against a bound of {stalled_budget_ms:.3} ms: the enqueue is on the request \
+         path",
+        unstalled.p99_ms, stalled.p99_ms
+    );
     assert_eq!(
-        dropped, 0,
-        "no audit record may be dropped at this load; {dropped} were"
+        queue_dropped, 0,
+        "no audit record may be dropped at this load; the writer queue dropped {queue_dropped}"
+    );
+    assert!(
+        sink_dropped < 1.0,
+        "no audit record may be dropped by a stall this short; the sinks dropped {sink_dropped}"
     );
     assert!(
         drained,
-        "the audit queue never drained after {count} requests, so the sink is not keeping up \
+        "the audit queue never drained after {served} requests, so the sink is not keeping up \
          with a load this small"
     );
     assert_eq!(
-        durable_rows, 0,
-        "greengateway.audit_events now holds {durable_rows} rows after ordinary traffic, so a \
-         PostgreSQL audit sink has been wired into the request path since this row was \
-         written. That is the change that makes the state model's audit_enqueue budget \
-         testable: rewrite this row to hold ACCESS EXCLUSIVE on the table and assert the \
-         request p99 does not move."
+        durable_rows, served as i64,
+        "greengateway.audit_events holds {durable_rows} observation rows for the {served} \
+         requests served: fewer is a lost batch, more is a duplicated one"
     );
 
     cluster.shutdown();
@@ -1579,21 +1659,23 @@ async fn the_report_covers_every_budget_the_state_model_publishes() {
         "the aggregate rule (25 ms p99) is no longer stated in §6; this file's \
          AGGREGATE_BUDGET_MS is now uncited"
     );
-    // Eight measured plus `audit_enqueue`, which is structural.
+    // Eight measured plus `audit_enqueue`, which is a stall experiment
+    // rather than a timed operation.
     assert_eq!(
         rows.len(),
         BUDGETS.len() + 1,
         "§6 of {} publishes {} budgets and this file covers {} plus audit_enqueue. The rows \
          it publishes are {rows:?}. Add the new one to BUDGETS with a measurement, or — if it \
-         cannot be measured — add it the way audit_enqueue is added, with a test that asserts \
-         it structurally and a comment saying why.",
+         is not a latency — add it the way audit_enqueue is added, with a test of its own \
+         and a comment saying why.",
         document.display(),
         rows.len(),
         BUDGETS.len()
     );
     assert!(
         rows.iter().any(|row| row.contains("Audit enqueue")),
-        "the audit-enqueue row is what this file covers structurally rather than by \
-         measurement; §6 no longer publishes it, so that coverage is now unattached: {rows:?}"
+        "the audit-enqueue row is what this file covers by a stall experiment rather than by \
+         a timed operation; §6 no longer publishes it, so that coverage is now unattached: \
+         {rows:?}"
     );
 }

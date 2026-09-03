@@ -5,6 +5,7 @@ use std::{
     io::{self, Write},
     path::PathBuf,
     sync::{Arc, Mutex, MutexGuard},
+    time::Instant,
 };
 
 use crate::{
@@ -21,6 +22,14 @@ use crate::{
 pub const AUDIT_BROADCAST_CAPACITY: usize = 512;
 
 pub trait AuditSink: Send + Sync {
+    /// A fixed, label-safe name for the sink. Read by the tests that pin
+    /// which sinks each mode constructs (standalone never the PostgreSQL
+    /// one, cluster never the SQLite one); never derived from runtime data.
+    #[cfg_attr(not(test), allow(dead_code))]
+    fn name(&self) -> &'static str {
+        "sink"
+    }
+
     fn emit(&self, event: &AuditEvent);
 
     /// Finish any sink-owned background work and durably flush accepted events.
@@ -30,6 +39,20 @@ pub trait AuditSink: Send + Sync {
     /// idempotent and return a bounded, display-safe error on failure.
     fn flush(&self) -> Result<(), String> {
         Ok(())
+    }
+
+    /// [`Self::flush`] with the caller's own deadline: the instant after
+    /// which nobody is waiting for the result. The audit writer passes the
+    /// deadline of the `close_and_drain` that closed its channel, whose
+    /// clock started before the writer emptied that channel, so a sink
+    /// whose flush is itself bounded can give up when the drain does rather
+    /// than on a clock of its own that started later -- and be torn down
+    /// mid-batch by the runtime the drain's caller then drops. The default
+    /// ignores it and flushes; only a sink that owns background work has
+    /// anything to bound.
+    fn flush_by(&self, deadline: Instant) -> Result<(), String> {
+        let _ = deadline;
+        self.flush()
     }
 }
 
@@ -128,6 +151,10 @@ impl fmt::Debug for StdoutSink {
 }
 
 impl AuditSink for StdoutSink {
+    fn name(&self) -> &'static str {
+        "stdout"
+    }
+
     fn emit(&self, event: &AuditEvent) {
         let line = match serde_json::to_string(event) {
             Ok(line) => line,
@@ -219,6 +246,10 @@ impl FileSink {
 }
 
 impl AuditSink for FileSink {
+    fn name(&self) -> &'static str {
+        "file"
+    }
+
     fn emit(&self, event: &AuditEvent) {
         let line = match serde_json::to_string(event) {
             Ok(line) => line,
@@ -285,6 +316,10 @@ impl BroadcastSink {
 }
 
 impl AuditSink for BroadcastSink {
+    fn name(&self) -> &'static str {
+        "broadcast"
+    }
+
     fn emit(&self, event: &AuditEvent) {
         if self.sender.send(event.clone()).is_err() {
             tracing::trace!("no active audit event stream subscribers");
@@ -301,9 +336,19 @@ impl CompositeSink {
     pub fn new(sinks: Vec<Arc<dyn AuditSink>>) -> Self {
         Self { sinks }
     }
+
+    /// The members' names, in fan-out order.
+    #[cfg(test)]
+    pub(crate) fn member_names(&self) -> Vec<&'static str> {
+        self.sinks.iter().map(|sink| sink.name()).collect()
+    }
 }
 
 impl AuditSink for CompositeSink {
+    fn name(&self) -> &'static str {
+        "composite"
+    }
+
     fn emit(&self, event: &AuditEvent) {
         for sink in &self.sinks {
             sink.emit(event);
@@ -321,32 +366,18 @@ impl AuditSink for CompositeSink {
         }
         first_error.map_or(Ok(()), Err)
     }
-}
 
-fn build_sink(
-    audit_log_file: Option<&str>,
-    audit_sqlite_path: Option<&str>,
-    audit_sqlite_retention_days: Option<u32>,
-    discovery: DiscoverySinkOptions<'_>,
-    signal_event_sender: Option<AuditEventSender>,
-    signal_detector_config: SignalDetectorConfig,
-) -> Result<Arc<dyn AuditSink>, Box<dyn Error>> {
-    let sinks = build_sink_members(
-        audit_log_file,
-        audit_sqlite_path,
-        audit_sqlite_retention_days,
-        discovery,
-        signal_event_sender,
-        signal_detector_config,
-    )?;
-
-    let sink = if sinks.len() == 1 {
-        Arc::clone(&sinks[0])
-    } else {
-        Arc::new(CompositeSink::new(sinks))
-    };
-
-    Ok(sink)
+    fn flush_by(&self, deadline: Instant) -> Result<(), String> {
+        let mut first_error = None;
+        for sink in &self.sinks {
+            if let Err(error) = sink.flush_by(deadline) {
+                if first_error.is_none() {
+                    first_error = Some(error);
+                }
+            }
+        }
+        first_error.map_or(Ok(()), Err)
+    }
 }
 
 fn build_sink_members(
@@ -402,17 +433,72 @@ fn build_sink_members(
     Ok(sinks)
 }
 
+/// Cluster mode's durable audit sink, as the builder receives it. The type
+/// only exists with the `postgres` feature; a feature-off build has no
+/// value of it to pass, which `Infallible` makes a type-level fact.
+#[cfg(feature = "postgres")]
+type DurableSinkConfig = crate::audit::postgres_sink::PostgresSinkConfig;
+#[cfg(not(feature = "postgres"))]
+type DurableSinkConfig = std::convert::Infallible;
+
+// The feature-off entry point (and the tests'); a `postgres` build's `main`
+// goes through `build_sink_from_config_with_durable_store`.
+#[cfg_attr(all(feature = "postgres", not(test)), allow(dead_code))]
 pub fn build_sink_from_config(config: &Config) -> Result<ConfiguredAuditSink, Box<dyn Error>> {
+    build_configured_sink(config, None)
+}
+
+/// [`build_sink_from_config`] with cluster mode's durable sink (issue #11,
+/// PR 3) registered beside the configured ones: `None` builds exactly what
+/// `build_sink_from_config` builds.
+#[cfg(feature = "postgres")]
+pub fn build_sink_from_config_with_durable_store(
+    config: &Config,
+    durable: Option<DurableSinkConfig>,
+) -> Result<ConfiguredAuditSink, Box<dyn Error>> {
+    build_configured_sink(config, durable)
+}
+
+fn build_configured_sink(
+    config: &Config,
+    durable: Option<DurableSinkConfig>,
+) -> Result<ConfiguredAuditSink, Box<dyn Error>> {
     let (broadcast_sender, _) = tokio::sync::broadcast::channel(AUDIT_BROADCAST_CAPACITY);
-    // Cluster mode has no SQLite aggregator sink: `DISCOVERY_SQLITE_PATH` is
-    // rejected there (config.rs), and captured payload shapes reach the
-    // fenced discovery projector through the durable audit stream instead
-    // of a local file, so the sink must not demand one (issue #241, PR 11).
+    let members = configured_sink_members(config, durable, &broadcast_sender)?;
+    let sink = Arc::new(CompositeSink::new(members)) as Arc<dyn AuditSink>;
+
+    Ok((sink, broadcast_sender))
+}
+
+/// Every sink a configuration gets, flat and in fan-out order: stdout, the
+/// optional file, the standalone SQLite sinks, cluster mode's durable sink,
+/// and the broadcast. Flat so the parity tests can read the members by
+/// name; the composite over it fans out and flushes in this order.
+fn configured_sink_members(
+    config: &Config,
+    durable: Option<DurableSinkConfig>,
+    broadcast_sender: &AuditEventSender,
+) -> Result<Vec<Arc<dyn AuditSink>>, Box<dyn Error>> {
+    // Cluster mode has no SQLite sinks. `DISCOVERY_SQLITE_PATH` and
+    // `AUDIT_SQLITE_PATH` are rejected there (config.rs): captured payload
+    // shapes reach the fenced discovery projector through the durable
+    // audit stream instead of a local file (issue #241, PR 11), and the
+    // audit of record is the shared store (issue #11, PR 3). The builder
+    // holds the same line itself, so a `Config` that bypassed validation
+    // still cannot put a local audit file on a cluster replica.
     let cluster_mode = config.state_backend == StateBackend::Postgres;
-    let base_sink = build_sink(
+    let mut members = build_sink_members(
         config.audit_log_file.as_deref(),
-        config.audit_sqlite_path.as_deref(),
-        config.audit_sqlite_retention_days,
+        if cluster_mode {
+            None
+        } else {
+            config.audit_sqlite_path.as_deref()
+        },
+        if cluster_mode {
+            None
+        } else {
+            config.audit_sqlite_retention_days
+        },
         DiscoverySinkOptions {
             sqlite_path: if cluster_mode {
                 None
@@ -425,12 +511,18 @@ pub fn build_sink_from_config(config: &Config) -> Result<ConfiguredAuditSink, Bo
         Some(broadcast_sender.clone()),
         config.signal_detector_config(),
     )?;
-    let sink = Arc::new(CompositeSink::new(vec![
-        base_sink,
-        Arc::new(BroadcastSink::new(broadcast_sender.clone())) as Arc<dyn AuditSink>,
-    ])) as Arc<dyn AuditSink>;
+    #[cfg(feature = "postgres")]
+    if let Some(durable) = durable {
+        members.push(
+            Arc::new(crate::audit::postgres_sink::PostgresSink::new(durable)?)
+                as Arc<dyn AuditSink>,
+        );
+    }
+    #[cfg(not(feature = "postgres"))]
+    let _: Option<DurableSinkConfig> = durable;
+    members.push(Arc::new(BroadcastSink::new(broadcast_sender.clone())) as Arc<dyn AuditSink>);
 
-    Ok((sink, broadcast_sender))
+    Ok(members)
 }
 
 #[cfg(test)]
@@ -947,5 +1039,134 @@ pub mod tests {
             None,
             json!({ "test": true }),
         )
+    }
+
+    /// The members a configuration's production sink is assembled from, by
+    /// name and in fan-out order.
+    fn configured_member_names(
+        config: &Config,
+        durable: Option<DurableSinkConfig>,
+    ) -> Vec<&'static str> {
+        let (broadcast_sender, _) = tokio::sync::broadcast::channel(AUDIT_BROADCAST_CAPACITY);
+        CompositeSink::new(
+            configured_sink_members(config, durable, &broadcast_sender)
+                .expect("configured sink members should build"),
+        )
+        .member_names()
+    }
+
+    fn temp_sqlite_path(label: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "greengateway-audit-sink-parity-{label}-{}.sqlite",
+            uuid::Uuid::new_v4()
+        ))
+    }
+
+    fn remove_sqlite(path: &std::path::Path) {
+        for suffix in ["", "-wal", "-shm"] {
+            let _ = fs::remove_file(PathBuf::from(format!("{}{}", path.display(), suffix)));
+        }
+    }
+
+    #[test]
+    fn standalone_mode_constructs_the_sqlite_sinks_and_never_the_postgres_one() {
+        let audit_db = temp_sqlite_path("standalone-audit");
+        let mut config = Config::test_defaults();
+        config.state_backend = StateBackend::Sqlite;
+        config.audit_sqlite_path = Some(
+            audit_db
+                .to_str()
+                .expect("test path should be valid UTF-8")
+                .to_owned(),
+        );
+
+        let names = configured_member_names(&config, None);
+        remove_sqlite(&audit_db);
+
+        assert_eq!(
+            names,
+            ["stdout", "sqlite", "broadcast"],
+            "standalone's audit of record is its SQLite file"
+        );
+        assert!(
+            !names.contains(&"postgres"),
+            "standalone must never construct the PostgreSQL sink"
+        );
+    }
+
+    #[test]
+    fn standalone_without_a_sqlite_path_is_stdout_and_broadcast_only() {
+        let mut config = Config::test_defaults();
+        config.state_backend = StateBackend::Sqlite;
+        config.audit_sqlite_path = None;
+
+        assert_eq!(
+            configured_member_names(&config, None),
+            ["stdout", "broadcast"]
+        );
+    }
+
+    /// Cluster mode's members with and without the durable store. A pool
+    /// that never connects stands in for the foundation's: the sink is
+    /// constructed, not exercised, and the flusher has nothing to write.
+    #[cfg(feature = "postgres")]
+    #[tokio::test]
+    async fn cluster_mode_constructs_the_postgres_sink_and_never_the_sqlite_one() {
+        use crate::storage::postgres_audit::{IngestIdentity, PostgresAuditEventStore};
+
+        let audit_db = temp_sqlite_path("cluster-audit");
+        let mut config = Config::test_defaults();
+        config.state_backend = StateBackend::Postgres;
+        // Config validation rejects this pairing; the builder must hold the
+        // line on its own for a `Config` that never went through it.
+        config.audit_sqlite_path = Some(
+            audit_db
+                .to_str()
+                .expect("test path should be valid UTF-8")
+                .to_owned(),
+        );
+        config.audit_sqlite_retention_days = Some(7);
+
+        let mut pg = tokio_postgres::Config::new();
+        pg.host("127.0.0.1")
+            .port(1)
+            .user("gateway_sink_parity")
+            .dbname("gateway_sink_parity");
+        let pool = deadpool_postgres::Pool::builder(deadpool_postgres::Manager::new(
+            pg,
+            tokio_postgres::NoTls,
+        ))
+        .runtime(deadpool_postgres::Runtime::Tokio1)
+        .build()
+        .expect("an unconnected pool should build");
+        let durable = DurableSinkConfig {
+            store: Arc::new(PostgresAuditEventStore::new(
+                pool,
+                Some(IngestIdentity {
+                    instance_id: uuid::Uuid::new_v4(),
+                    boot_id: uuid::Uuid::new_v4(),
+                }),
+            )),
+            flush_deadline: Duration::from_millis(100),
+        };
+
+        let with_store = configured_member_names(&config, Some(durable));
+        let without_store = configured_member_names(&config, None);
+        remove_sqlite(&audit_db);
+
+        assert_eq!(
+            with_store,
+            ["stdout", "postgres", "broadcast"],
+            "cluster mode's audit of record is the shared store, and no SQLite file is opened"
+        );
+        assert_eq!(
+            without_store,
+            ["stdout", "broadcast"],
+            "without a store there is still no SQLite sink"
+        );
+        assert!(
+            !audit_db.exists(),
+            "a cluster replica must not have created a local audit database"
+        );
     }
 }

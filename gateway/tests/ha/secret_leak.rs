@@ -29,12 +29,14 @@
 //! that login returns, a service token's one-time plaintext, a JWT and its
 //! `jti`.
 //!
-//! The haystack is everything an operator or an incident responder can
-//! read without the database: both replicas' stdout and stderr (the
-//! structured logs, and anything a panic or a library wrote past them),
-//! both `/metrics` scrapes, and both durable audit files. A needle found
-//! in any of them fails, and the failure names which haystack and which
-//! secret.
+//! The haystack is everything an operator or an incident responder reads:
+//! both replicas' stdout and stderr (the structured logs, and anything a
+//! panic or a library wrote past them), both `/metrics` scrapes, both
+//! durable audit files, and — since issue #11's PostgreSQL audit sink made
+//! `greengateway.audit_events` the audit of record in cluster mode — the
+//! rows both replicas wrote to it, every column a reader of the table or
+//! of a backup would see. A needle found in any of them fails, and the
+//! failure names which haystack and which secret.
 //!
 //! ## The second half: what it says when it is broken
 //!
@@ -169,6 +171,19 @@ impl Haystack {
                 cluster.metrics(replica).await,
             ));
         }
+        // The audit of record: the rows the PostgreSQL audit sink wrote.
+        // The sink batches behind the writer thread that fed the files
+        // above synchronously, so the table is given a bounded moment to
+        // catch up with them first — a search of a table that had not yet
+        // been told about the probe would be a search of nothing.
+        wait_for_durable_audit_rows(cluster).await;
+        let audit_rows = durable_audit_rows(cluster).await;
+        assert!(
+            audit_rows.contains(PROXIED_PATH),
+            "the proxied probe's observation never reached the shared audit table, so the \
+             assertions about what its rows must NOT carry would prove nothing"
+        );
+        sources.push(("the shared audit_events rows".to_owned(), audit_rows));
         Self { sources }
     }
 
@@ -367,6 +382,71 @@ impl Haystack {
             }
         }
     }
+}
+
+/// How long the shared audit table is given to catch up with the audit
+/// files. Every event reaches the file sink synchronously on the writer
+/// thread and the PostgreSQL sink a flush interval later, so "the table
+/// holds at least as many rows as the files" is the observable, polled.
+const AUDIT_ROWS_BUDGET: Duration = Duration::from_secs(30);
+
+/// Poll until `greengateway.audit_events` holds at least as many rows as
+/// both replicas' audit files hold records, or fail saying how far behind
+/// it is. The files are read before the table on every turn, so a row the
+/// table has is a record the file already had.
+async fn wait_for_durable_audit_rows(cluster: &Cluster) {
+    let deadline = std::time::Instant::now() + AUDIT_ROWS_BUDGET;
+    loop {
+        let filed = cluster.audit_records().len() as i64;
+        let stored = cluster
+            .database
+            .count("SELECT count(*)::bigint FROM greengateway.audit_events")
+            .await;
+        if stored >= filed {
+            return;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the shared audit table holds {stored} row(s) against {filed} record(s) in the \
+             replicas' audit files after {AUDIT_ROWS_BUDGET:?}; the PostgreSQL audit sink \
+             is behind or dropping"
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+}
+
+/// Every audit row the shared store keeps, rendered as one line per row
+/// with EVERY column of `greengateway.audit_events` (migration 0002) cast
+/// to text: the identifiers and timestamps, the writer's identity, the
+/// request's origin, the actor and the whole payload. The list is the
+/// table's, not a selection from it — a column the haystack skipped would
+/// be the one a secret hides in, and `actor_auth_mode` and
+/// `schema_version` are free text written straight from the event. The
+/// falsify script checks this list against the migration.
+async fn durable_audit_rows(cluster: &Cluster) -> String {
+    cluster
+        .database
+        .query_one(
+            "SELECT coalesce(string_agg( \
+                 id::text || ' ' || event_id || ' ' || event_type \
+                 || ' ' || occurred_at::text || ' ' || ingested_at::text \
+                 || ' ' || coalesce(instance_id::text, '') \
+                 || ' ' || coalesce(boot_id::text, '') \
+                 || ' ' || schema_version || ' ' || request_id || ' ' || source_ip \
+                 || ' ' || coalesce(user_agent, '') \
+                 || ' ' || coalesce(actor_user_id, '') \
+                 || ' ' || coalesce(actor_issuer, '') \
+                 || ' ' || coalesce(actor_auth_mode, '') \
+                 || ' ' || coalesce(actor_json::text, '') \
+                 || ' ' || coalesce(payload_method, '') \
+                 || ' ' || coalesce(payload_path, '') \
+                 || ' ' || coalesce(payload_status::text, '') \
+                 || ' ' || coalesce(payload_matched_rule_id, '') \
+                 || ' ' || payload_json::text, E'\\n' ORDER BY id), '') \
+             FROM greengateway.audit_events",
+        )
+        .await
+        .get::<_, String>(0)
 }
 
 /// How long a step re-asks a replica that answered "the authority is
