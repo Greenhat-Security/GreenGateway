@@ -269,6 +269,124 @@ pub(crate) async fn commit_policy_in(
     })
 }
 
+/// One standalone policy-history row as the import writes it (issue #241,
+/// PR 15). Every field is the source's own: the version number, the actor
+/// who made the change, the timestamp SQLite recorded, the diff summary,
+/// the snapshot, and the ETag recomputed from that snapshot by this
+/// binary's [`crate::policy_etag`].
+pub(crate) struct ImportedPolicyVersion {
+    pub version: i64,
+    pub actor_user_id: String,
+    /// RFC 3339, bound as text and cast (`$n::text::timestamptz`): the
+    /// driver carries no `time` feature.
+    pub created_at: String,
+    pub diff_summary_json: String,
+    pub document_json: String,
+    pub document_etag: String,
+}
+
+/// Append imported history versions verbatim inside the caller's
+/// transaction, then realign the identity sequence behind them.
+///
+/// This is the ONLY write path that names a `policy_documents` version
+/// instead of letting the identity assign one, and it exists for exactly
+/// one caller: the standalone-to-cluster import (issue #241, PR 15), which
+/// carries a standalone deployment's history into an empty namespace with
+/// its version numbers, actors and timestamps intact. It writes history
+/// only -- it never touches `policy_active`, the security-revision counter
+/// or the outbox, so no imported row is ever *activated* by this path; the
+/// import activates the operator's policy file afterwards through
+/// [`commit_policy_in`], the one reviewed section-2 sequence.
+///
+/// PRIVILEGE: `setval` needs UPDATE on the identity's sequence, which the
+/// documented runtime role (USAGE/SELECT on sequences) does not hold. The
+/// import is a cutover command run beside `gateway migrate up` with the
+/// MIGRATION role's DSN, which owns the sequence it created. A runtime
+/// role's connection fails this statement, the section's transaction rolls
+/// back with nothing written, and the classified failure is logged with
+/// the permission error PostgreSQL returned.
+///
+/// `ON CONFLICT (version) DO NOTHING` makes a re-run (`--resume`) write
+/// nothing a previous run already wrote, and the `setval` afterwards
+/// leaves the identity pointing past the highest imported version so the
+/// activation commit that follows gets the next number rather than
+/// colliding with an imported one.
+pub(crate) async fn insert_imported_policy_versions_in(
+    client: &deadpool_postgres::Object,
+    versions: &[ImportedPolicyVersion],
+) -> Result<u64, RepositoryError> {
+    const OPERATION: &str = "policy_history_import";
+    if versions.is_empty() {
+        return Ok(0);
+    }
+    let numbers: Vec<i64> = versions.iter().map(|version| version.version).collect();
+    let actors: Vec<&str> = versions
+        .iter()
+        .map(|version| version.actor_user_id.as_str())
+        .collect();
+    let created_at: Vec<&str> = versions
+        .iter()
+        .map(|version| version.created_at.as_str())
+        .collect();
+    let diff_summaries: Vec<&str> = versions
+        .iter()
+        .map(|version| version.diff_summary_json.as_str())
+        .collect();
+    let documents: Vec<&str> = versions
+        .iter()
+        .map(|version| version.document_json.as_str())
+        .collect();
+    let etags: Vec<&str> = versions
+        .iter()
+        .map(|version| version.document_etag.as_str())
+        .collect();
+    let inserted = client
+        .execute(
+            r#"
+            INSERT INTO greengateway.policy_documents (
+                version, actor_user_id, created_at, diff_summary, document, document_etag
+            )
+            OVERRIDING SYSTEM VALUE
+            SELECT * FROM unnest(
+                $1::bigint[],
+                $2::text[],
+                $3::text[]::timestamptz[],
+                $4::text[]::jsonb[],
+                $5::text[]::jsonb[],
+                $6::text[]
+            )
+            ON CONFLICT (version) DO NOTHING
+            "#,
+            &[
+                &numbers,
+                &actors,
+                &created_at,
+                &diff_summaries,
+                &documents,
+                &etags,
+            ],
+        )
+        .await
+        .map_err(|error| classify_query(error, OPERATION))?;
+    // The identity was bypassed above, so it still points at 1. Move it
+    // past every stored version; the next `commit_policy_in` then appends
+    // rather than colliding.
+    client
+        .execute(
+            r#"
+            SELECT setval(
+                pg_get_serial_sequence('greengateway.policy_documents', 'version'),
+                (SELECT max(version) FROM greengateway.policy_documents),
+                true
+            )
+            "#,
+            &[],
+        )
+        .await
+        .map_err(|error| classify_query(error, OPERATION))?;
+    Ok(inserted)
+}
+
 #[async_trait]
 impl PolicyHistory for PostgresPolicyStore {
     async fn append_version(

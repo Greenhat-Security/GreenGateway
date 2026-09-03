@@ -468,6 +468,20 @@ pub struct EndpointReviewState {
     pub revision: i64,
 }
 
+/// One `discovery_endpoint_reviews` row exactly as stored, for the
+/// standalone-to-cluster import (issue #241, PR 15). Unlike
+/// [`EndpointReviewState`] it keeps `reviewed_by` on a cleared row and
+/// reports the revision without collapsing a cleared review to
+/// `UNREVIEWED_REVISION`: an import writes rows, not effective states.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct ExportedEndpointReview {
+    pub(crate) method: String,
+    pub(crate) endpoint_template: String,
+    pub(crate) reviewed_at: Option<String>,
+    pub(crate) reviewed_by: Option<String>,
+    pub(crate) revision: i64,
+}
+
 impl EndpointReviewState {
     pub(crate) fn unreviewed() -> Self {
         Self {
@@ -1511,6 +1525,118 @@ impl DiscoveryQueryStore {
             principals,
             next_cursor,
         })
+    }
+
+    /// Every persisted aggregator row, through the reader the standalone
+    /// sink itself loads with ([`super::aggregator::load_rows_sqlite`]).
+    ///
+    /// For the standalone-to-cluster import (issue #241, PR 15): the
+    /// import rebuilds the aggregator's working set from these rows with
+    /// the same `AggregatorState::from_rows` a restart uses, so what it
+    /// writes to the cluster is what this deployment was actually holding
+    /// -- not a second reading of the same tables that could drift.
+    ///
+    /// A database with no aggregate tables at all (a discovery file
+    /// created by a reader before the sink ever ran) reads as no rows
+    /// rather than as a failure: there is nothing to import, which is not
+    /// the same thing as being unable to read it.
+    pub(crate) fn loaded_rows(
+        &self,
+        payload_capture_enabled: bool,
+    ) -> Result<super::aggregator::LoadedRows, DiscoveryQueryError> {
+        let connection = self.connection_guard();
+        match super::aggregator::load_rows_sqlite(&connection, payload_capture_enabled) {
+            Ok(rows) => Ok(rows),
+            Err(super::aggregator::EndpointAggregatorLoadError::Sqlite(source))
+                if is_missing_table(&source) =>
+            {
+                Ok(super::aggregator::LoadedRows::default())
+            }
+            Err(super::aggregator::EndpointAggregatorLoadError::Sqlite(source)) => {
+                Err(DiscoveryQueryError::Sqlite {
+                    path: self.path.clone(),
+                    source,
+                })
+            }
+            Err(super::aggregator::EndpointAggregatorLoadError::Json(source)) => {
+                Err(DiscoveryQueryError::Json {
+                    context: "persisted aggregator rows",
+                    source,
+                })
+            }
+        }
+    }
+
+    /// Every signal row as STORED, in id order.
+    ///
+    /// `list_signals` decodes into [`Signal`], which drops `target_key`
+    /// (a reader recomputes it from the identity). The import has to write
+    /// the column, and the cluster's UNIQUE identity index is built on it,
+    /// so the export keeps the row.
+    pub(crate) fn exported_signals(&self) -> Result<Vec<RawSignal>, DiscoveryQueryError> {
+        let connection = self.connection_guard();
+        let mut statement = connection
+            .prepare(&format!(
+                "SELECT {SIGNAL_COLUMNS} FROM discovery_signals ORDER BY id"
+            ))
+            .map_err(|source| DiscoveryQueryError::Sqlite {
+                path: self.path.clone(),
+                source,
+            })?;
+        let signals = statement
+            .query_map([], RawSignal::from_row)
+            .map_err(|source| DiscoveryQueryError::Sqlite {
+                path: self.path.clone(),
+                source,
+            })?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|source| DiscoveryQueryError::Sqlite {
+                path: self.path.clone(),
+                source,
+            });
+        signals
+    }
+
+    /// Every review row as STORED, in key order -- including a row whose
+    /// review was CLEARED, which keeps its revision and reads as
+    /// unreviewed (issue #241, PR 12). Dropping such a row on import would
+    /// restart that endpoint's review revisions at 1 and make a stale
+    /// `If-Match` match an unrelated later review, which is the ABA the
+    /// revision exists to refuse.
+    pub(crate) fn exported_reviews(
+        &self,
+    ) -> Result<Vec<ExportedEndpointReview>, DiscoveryQueryError> {
+        let connection = self.connection_guard();
+        let mut statement = connection
+            .prepare(
+                "SELECT method, endpoint_template, reviewed_at, reviewed_by, revision
+                 FROM discovery_endpoint_reviews
+                 ORDER BY method, endpoint_template",
+            )
+            .map_err(|source| DiscoveryQueryError::Sqlite {
+                path: self.path.clone(),
+                source,
+            })?;
+        let reviews = statement
+            .query_map([], |row| {
+                Ok(ExportedEndpointReview {
+                    method: row.get(0)?,
+                    endpoint_template: row.get(1)?,
+                    reviewed_at: row.get(2)?,
+                    reviewed_by: row.get(3)?,
+                    revision: row.get(4)?,
+                })
+            })
+            .map_err(|source| DiscoveryQueryError::Sqlite {
+                path: self.path.clone(),
+                source,
+            })?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|source| DiscoveryQueryError::Sqlite {
+                path: self.path.clone(),
+                source,
+            });
+        reviews
     }
 
     fn connection_guard(&self) -> MutexGuard<'_, Connection> {
@@ -2761,6 +2887,16 @@ pub(crate) fn query_limit(limit: usize) -> i64 {
 
 pub(crate) fn non_negative_i64_to_u64(value: i64) -> u64 {
     u64::try_from(value).unwrap_or(0)
+}
+
+/// Whether a failure is SQLite saying the table does not exist. Used by
+/// the import's row export, where "the sink never created these tables" is
+/// an empty source rather than an unreadable one.
+fn is_missing_table(error: &rusqlite::Error) -> bool {
+    match error {
+        rusqlite::Error::SqliteFailure(_, Some(message)) => message.contains("no such table: "),
+        _ => false,
+    }
 }
 
 fn is_missing_discovery_table(error: &rusqlite::Error) -> bool {

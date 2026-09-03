@@ -444,6 +444,35 @@ impl AuditQueryStore {
         })
     }
 
+    /// The same store over a connection that CANNOT write.
+    ///
+    /// For the standalone-to-cluster import (issue #241, PR 15), which
+    /// reads a live standalone deployment's log and must leave the file
+    /// exactly as it found it -- including not checkpointing its
+    /// write-ahead log on close, which an ordinary connection does when it
+    /// is the last one open. `SQLITE_OPEN_READ_ONLY` also never creates the
+    /// file, so a path that does not exist is a refusal rather than a new
+    /// empty log.
+    #[cfg_attr(not(feature = "postgres"), allow(dead_code))] // The import's only caller.
+    pub fn open_read_only(path: impl Into<PathBuf>) -> Result<Self, AuditQueryError> {
+        use rusqlite::OpenFlags;
+
+        let path = path.into();
+        let connection = Connection::open_with_flags(
+            &path,
+            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )
+        .map_err(|source| AuditQueryError::Open {
+            path: path.clone(),
+            source,
+        })?;
+
+        Ok(Self {
+            path,
+            connection: Mutex::new(connection),
+        })
+    }
+
     pub fn query(&self, filters: &AuditQueryFilters) -> Result<AuditQueryPage, AuditQueryError> {
         let (sql, params) = build_query(filters);
         let raw_rows = {
@@ -489,6 +518,83 @@ impl AuditQueryStore {
             events,
             next_cursor,
         })
+    }
+
+    /// One forward page of the log: the events with `id` strictly greater
+    /// than `after_id`, oldest first, with their row ids.
+    ///
+    /// [`Self::query`] is the admin API's reader and pages NEWEST-first,
+    /// because that is the order an operator reads a log in. The
+    /// standalone-to-cluster import (issue #241, PR 15 step 5) needs the
+    /// other direction: `id` is the sink's insertion order, the cluster's
+    /// durable stream assigns positions in the order it is handed events,
+    /// and a stream whose positions run backwards through the imported
+    /// history would make every cursor over it meaningless. Paging by the
+    /// primary key rather than reading the whole table keeps the import's
+    /// memory bounded by the page whatever the log's size.
+    ///
+    /// Its only caller is the import, which a build without the `postgres`
+    /// feature does not compile: there is no cluster for such a build to
+    /// import into. The reader itself is standalone-only code and stays
+    /// compiled in both, so the two builds cannot drift apart.
+    #[cfg_attr(not(feature = "postgres"), allow(dead_code))]
+    pub fn events_after(
+        &self,
+        after_id: i64,
+        limit: usize,
+    ) -> Result<Vec<(i64, AuditEvent)>, AuditQueryError> {
+        let raw_rows = {
+            let connection = self.connection_guard();
+            let mut statement = connection
+                .prepare(
+                    r#"
+                    SELECT
+                        id,
+                        event_id,
+                        event_type,
+                        timestamp,
+                        schema_version,
+                        request_id,
+                        source_ip,
+                        user_agent,
+                        actor_json,
+                        payload_json
+                    FROM audit_events
+                    WHERE id > ?1
+                    ORDER BY id ASC
+                    LIMIT ?2
+                    "#,
+                )
+                .map_err(|source| AuditQueryError::Sqlite {
+                    path: self.path.clone(),
+                    source,
+                })?;
+            let rows = statement
+                .query_map(
+                    params_from_iter([
+                        SqlValue::Integer(after_id),
+                        SqlValue::Integer(i64::try_from(limit).unwrap_or(i64::MAX)),
+                    ]),
+                    raw_event_row,
+                )
+                .map_err(|source| AuditQueryError::Sqlite {
+                    path: self.path.clone(),
+                    source,
+                })?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|source| AuditQueryError::Sqlite {
+                    path: self.path.clone(),
+                    source,
+                })?;
+            rows
+        };
+        raw_rows
+            .into_iter()
+            .map(|row| {
+                let id = row.id;
+                row.into_event().map(|event| (id, event))
+            })
+            .collect()
     }
 
     pub fn query_endpoint_activity(

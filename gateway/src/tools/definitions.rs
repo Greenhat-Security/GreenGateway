@@ -1666,6 +1666,26 @@ fn definitions_from_file(path: &Path) -> Result<Vec<ToolDefinition>, ToolRegistr
     definitions_from_json_value(value, Some(path))
 }
 
+/// The TOOLS_FILE document as a cluster's tools control plane stores it
+/// (issue #241, PR 15's standalone-to-cluster import).
+///
+/// The file is read through the same bounded reader and validated by the
+/// same loader `definitions_from_file` uses, so a document the import
+/// accepts is exactly a document this binary would serve; the JSON is then
+/// returned verbatim, so the imported document is the operator's own bytes
+/// rather than a re-serialization of the parsed definitions.
+#[cfg_attr(not(feature = "postgres"), allow(dead_code))]
+pub(crate) fn tools_document_from_file(path: &Path) -> Result<Value, ToolRegistryError> {
+    let contents = read_tools_file_to_string(path)?;
+    let value: Value =
+        serde_json::from_str(&contents).map_err(|source| ToolRegistryError::Parse {
+            path: Some(path.to_owned()),
+            source,
+        })?;
+    definitions_from_json_value(value.clone(), Some(path))?;
+    Ok(value)
+}
+
 fn read_tools_file_to_string(path: &Path) -> Result<String, ToolRegistryError> {
     let file = fs::File::open(path).map_err(|source| ToolRegistryError::Io {
         path: path.to_owned(),

@@ -35,13 +35,14 @@ use crate::storage::postgres_tool_names::{self, ToolNameReservationError};
 
 use super::store::{
     binding_count, ensure_etag, expected_bindings, increment_revision, initial_revisions,
-    managed_tool_dependency_id, optional_u64_to_i64, parse_reason, parse_state, persisted_revision,
-    reason_as_str, replacement_revisions, state_as_str, supports_managed_mcp_catalog,
-    supports_managed_openapi_catalog, u64_to_i64, utc_timestamp, validate_activity_timestamp,
-    validate_candidate, validate_dependency_id, validate_mcp_catalog,
-    validate_openapi_catalog_entries, validate_openapi_spec, ConnectionActivityTimes,
-    ConnectionDependency, ConnectionDependencyKind, ConnectionEtag, ConnectionStatusUpdate,
-    ConnectionStoreError, StoredConnection, StoredMcpCatalog, StoredMcpCatalogEntry,
+    managed_tool_dependency_id, optional_i64_to_u64, optional_u64_to_i64, parse_reason,
+    parse_state, persisted_revision, reason_as_str, replacement_revisions, revision_from_i64,
+    state_as_str, supports_managed_mcp_catalog, supports_managed_openapi_catalog, u64_to_i64,
+    utc_timestamp, validate_activity_timestamp, validate_candidate, validate_dependency_id,
+    validate_mcp_catalog, validate_openapi_catalog_entries, validate_openapi_spec,
+    ConnectionActivityTimes, ConnectionDependency, ConnectionDependencyKind, ConnectionEtag,
+    ConnectionStatusUpdate, ConnectionStoreError, ExportedConnectionStatuses,
+    PersistedConnectionStatus, StoredConnection, StoredMcpCatalog, StoredMcpCatalogEntry,
     StoredMcpResource, StoredMcpResourceTemplate, StoredOpenApiCatalog, StoredOpenApiCatalogEntry,
     StoredOpenApiInventoryCatalog, MAX_CONNECTION_DEPENDENCIES, SOURCE_MANAGED,
 };
@@ -2071,6 +2072,52 @@ impl PostgresConnectionStore {
             .collect()
     }
 
+    /// Both status tables as PERSISTED: the mirror of the SQLite store's
+    /// `exported_statuses`, for the standalone-to-cluster import's
+    /// validation pass (issue #241, PR 15, step 8).
+    ///
+    /// `latest_status`/`status_history` return the SAFE projection, which
+    /// drops the revision columns and ages `catalog_age_secs` forward on
+    /// every read. A checksum computed over that could never equal the
+    /// source's -- it changes with the clock. This returns the rows.
+    #[cfg_attr(not(feature = "postgres"), allow(dead_code))]
+    pub(crate) async fn exported_statuses(
+        &self,
+    ) -> Result<ExportedConnectionStatuses, ConnectionStoreError> {
+        let client = self
+            .pool
+            .get()
+            .await
+            .map_err(|_| pg_unavailable(OPERATION_STATUS_READ))?;
+        let current = exported_status_rows(
+            &client,
+            r#"
+            SELECT connection_id::text, status_revision, observed_connection_revision,
+                   observed_credential_revision, observed_tls_revision,
+                   observed_discovery_revision, state, reason, observed_at,
+                   latency_ms, catalog_age_secs, catalog_entry_count
+            FROM greengateway.connection_current_status
+            ORDER BY connection_id ASC
+            LIMIT $1
+            "#,
+        )
+        .await?;
+        let history = exported_status_rows(
+            &client,
+            r#"
+            SELECT connection_id::text, status_revision, observed_connection_revision,
+                   observed_credential_revision, observed_tls_revision,
+                   observed_discovery_revision, state, reason, observed_at,
+                   latency_ms, catalog_age_secs, catalog_entry_count
+            FROM greengateway.connection_status_history
+            ORDER BY connection_id ASC, status_revision ASC
+            LIMIT $1
+            "#,
+        )
+        .await?;
+        Ok(ExportedConnectionStatuses { current, history })
+    }
+
     /// The load-time integrity preflight: the async twin of the SQLite
     /// store's `validate_persisted_state`, which `open` runs on every
     /// open (store.rs). PostgreSQL had no equivalent, so a replica
@@ -2437,6 +2484,72 @@ async fn validate_activity_rows(
         validate_activity_timestamp(&id, last_refresh_at.as_deref())?;
     }
     Ok(())
+}
+
+/// One status table as PERSISTED, for `exported_statuses`. `query` is a
+/// literal from this module and takes the row bound as `$1`, exactly as
+/// the SQLite store's `exported_status_rows` does; the bound is the same
+/// ceiling, so a table past it refuses rather than being silently
+/// truncated into an export that would then digest to the wrong value.
+#[cfg_attr(not(feature = "postgres"), allow(dead_code))]
+async fn exported_status_rows(
+    client: &deadpool_postgres::Object,
+    query: &'static str,
+) -> Result<Vec<PersistedConnectionStatus>, ConnectionStoreError> {
+    const REASON: &str = "status export column does not decode as its schema type";
+    let rows = client
+        .query(
+            query,
+            &[&usize_to_i64(
+                super::model::MAX_STATUS_HISTORY_ROWS.saturating_add(1),
+            )],
+        )
+        .await
+        .map_err(|error| pg_error(OPERATION_STATUS_READ, error))?;
+    if rows.len() > super::model::MAX_STATUS_HISTORY_ROWS {
+        return Err(ConnectionStoreError::LimitExceeded {
+            resource: "safe connection status rows",
+            maximum: super::model::MAX_STATUS_HISTORY_ROWS,
+        });
+    }
+    rows.iter()
+        .map(|row| {
+            let raw: String = column(row, 0, "<connection-status>", REASON)?;
+            let id = ConnectionId::parse(raw.clone())
+                .map_err(|_| corrupt_id(&raw, "status row has an invalid connection ID"))?;
+            let status_revision: i64 = column(row, 1, &raw, REASON)?;
+            let observed_connection: i64 = column(row, 2, &raw, REASON)?;
+            let observed_credential: i64 = column(row, 3, &raw, REASON)?;
+            let observed_tls: i64 = column(row, 4, &raw, REASON)?;
+            let observed_discovery: i64 = column(row, 5, &raw, REASON)?;
+            let state: String = column(row, 6, &raw, REASON)?;
+            let reason: String = column(row, 7, &raw, REASON)?;
+            let observed_at: String = column(row, 8, &raw, REASON)?;
+            let latency_ms: Option<i64> = column(row, 9, &raw, REASON)?;
+            let catalog_age_secs: Option<i64> = column(row, 10, &raw, REASON)?;
+            let catalog_entry_count: Option<i64> = column(row, 11, &raw, REASON)?;
+            Ok(PersistedConnectionStatus {
+                status_revision: persisted_revision(
+                    &id,
+                    status_revision,
+                    "invalid status revision",
+                )?,
+                observed_connection_revision: revision_from_i64(&id, observed_connection, false)?,
+                observed_credential_revision: revision_from_i64(&id, observed_credential, true)?,
+                observed_tls_revision: revision_from_i64(&id, observed_tls, true)?,
+                observed_discovery_revision: revision_from_i64(&id, observed_discovery, true)?,
+                state: parse_state(&state)
+                    .ok_or_else(|| corrupt(&id, "unknown safe status state"))?,
+                reason: parse_reason(&reason)
+                    .ok_or_else(|| corrupt(&id, "unknown safe status reason"))?,
+                observed_at,
+                latency_ms: optional_i64_to_u64(&id, latency_ms)?,
+                catalog_age_secs: optional_i64_to_u64(&id, catalog_age_secs)?,
+                catalog_entry_count: optional_i64_to_u64(&id, catalog_entry_count)?,
+                connection_id: id,
+            })
+        })
+        .collect()
 }
 
 /// Every row of a status table decodes into a `SafeConnectionStatus` --
@@ -3400,14 +3513,7 @@ async fn append_version(
     // version row does not have them: it is already addressable by
     // (id, version). What the etag is for here is guarding the stored body
     // against an out-of-band edit, which the spec bytes alone answer.
-    let digest = {
-        use sha2::Digest;
-        let mut hasher = sha2::Sha256::new();
-        hasher.update(id.as_str().as_bytes());
-        hasher.update(u64_to_i64(id, version)?.to_be_bytes());
-        hasher.update(spec_json.as_bytes());
-        hex::encode(hasher.finalize())
-    };
+    let document_etag = version_document_etag(id, version, spec_json)?;
     client
         .execute(
             r#"
@@ -3419,13 +3525,30 @@ async fn append_version(
                 &id.as_str(),
                 &u64_to_i64(id, version)?,
                 &spec_json,
-                &format!("sha256:{digest}"),
+                &document_etag,
                 &actor_user_id,
             ],
         )
         .await
         .map_err(|error| pg_error(OPERATION_CREATE, error))?;
     Ok(())
+}
+
+/// `connection_documents.document_etag` for one version: SHA-256 over the
+/// id, the version and the stored spec bytes. Shared by the live write
+/// path and the import so a version row an import wrote is verifiable by
+/// exactly the derivation a version row a replica wrote is.
+fn version_document_etag(
+    id: &ConnectionId,
+    version: u64,
+    spec_json: &str,
+) -> Result<String, ConnectionStoreError> {
+    use sha2::Digest;
+    let mut hasher = sha2::Sha256::new();
+    hasher.update(id.as_str().as_bytes());
+    hasher.update(u64_to_i64(id, version)?.to_be_bytes());
+    hasher.update(spec_json.as_bytes());
+    Ok(format!("sha256:{}", hex::encode(hasher.finalize())))
 }
 
 /// The outbox `resource_type` for a specification-version transition:
@@ -3681,6 +3804,582 @@ async fn reserve_catalog_tool_names(
 fn pg_error(operation: &'static str, error: impl std::error::Error) -> ConnectionStoreError {
     tracing::error!(operation, error = %error, "connection PostgreSQL operation failed");
     ConnectionStoreError::Postgres { operation }
+}
+
+// ==== The standalone-to-cluster import (issue #241, PR 15, step 4) ====
+//
+// One Connection as a standalone deployment holds it, and the one write
+// path that carries it across. It lives here, beside the store that owns
+// these tables, for the reason `insert_imported_policy_versions_in` lives
+// beside the policy store: an import writes the same rows a replica
+// writes, and a second copy of that knowledge somewhere else would drift.
+//
+// What makes this path different from `create`/`replace`:
+//
+// - It NAMES the identifiers and the revisions. `create` mints a fresh
+//   `ConnectionId` and starts every axis at its initial value; an import
+//   must preserve both, because the `ConnectionEtag` an operator's
+//   automation holds is derived from them and a Connection that changed
+//   its ID is a different Connection.
+// - Every insert is `ON CONFLICT DO NOTHING` on the natural key, so the
+//   whole step is idempotent under `--resume`.
+// - It takes ONE shared security revision for the whole step rather than
+//   one per Connection, and writes NO outbox rows. The outbox is how a
+//   RUNNING replica learns of a change; the import runs before any
+//   replica serves this deployment, so there is nobody to notify, and a
+//   stream of outbox rows describing an import would be replayed as a
+//   change history the standalone deployment never had. The connections
+//   high-water mark is still SET to the shared revision the step took --
+//   the gate compares it against that same counter (see
+//   `bump_connection_state`), and leaving it at zero while the counter had
+//   moved would be a resource permanently behind its authority.
+// - Credential bindings are derived from the record exactly as
+//   `replace_bindings` derives them (`expected_bindings`): a purpose, a
+//   SECRET ID and a version. The secret's VALUE is not in the standalone
+//   database and is never read, moved or written by this path; the
+//   operator's secret store keeps it, and a local-secret keyring stays
+//   where it is (migration 0006 does not port `connection_local_secrets`,
+//   and cluster mode refuses the configuration that would use one).
+
+/// One standalone Connection and everything durable that hangs off it.
+pub(crate) struct ImportedConnection {
+    pub record: StoredConnection,
+    pub activity: ConnectionActivityTimes,
+    pub dependencies: Vec<ConnectionDependency>,
+    pub current_status: Option<PersistedConnectionStatus>,
+    /// Oldest first.
+    pub status_history: Vec<PersistedConnectionStatus>,
+    pub mcp_catalog: Option<StoredMcpCatalog>,
+    pub openapi_catalog: Option<StoredOpenApiCatalog>,
+}
+
+/// What one import step wrote, per table, for the section's report.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct ImportedConnectionCounts {
+    pub records: i64,
+    pub documents: i64,
+    pub credential_bindings: i64,
+    pub dependencies: i64,
+    pub current_statuses: i64,
+    pub status_history: i64,
+    pub mcp_catalogs: i64,
+    pub mcp_catalog_entries: i64,
+    pub mcp_catalog_resources: i64,
+    pub mcp_catalog_resource_templates: i64,
+    pub openapi_catalogs: i64,
+    pub openapi_catalog_entries: i64,
+    pub tool_name_reservations: i64,
+    /// The one shared security revision the step took, or 0 when it had
+    /// nothing to write.
+    pub security_revision: i64,
+}
+
+/// Write `connections` into the caller's open transaction.
+///
+/// The caller owns the `BEGIN`/`COMMIT`: the import's Connections section
+/// is one transaction, so a failure anywhere in it leaves the namespace
+/// exactly as it was and `--resume` starts the section again.
+pub(crate) async fn import_connections_in(
+    client: &deadpool_postgres::Object,
+    connections: &[ImportedConnection],
+    actor_user_id: &str,
+) -> Result<ImportedConnectionCounts, ConnectionStoreError> {
+    const OPERATION: &str = "record_import";
+    let mut counts = ImportedConnectionCounts::default();
+    if connections.is_empty() {
+        return Ok(counts);
+    }
+    // Lock order, identical to every other mutating path in this file:
+    // the singleton first, then the record rows, then the shared security
+    // counter (see `lock_connection_state`).
+    lock_connection_state(client, OPERATION).await?;
+
+    for connection in connections {
+        let record = &connection.record;
+        let id = &record.id;
+        // The PostgreSQL key column is `uuid` and the managed store only
+        // ever mints UUIDs (`ConnectionId::new_managed`). A source row
+        // that carries anything else is refused by name here rather than
+        // as an opaque cast failure three statements later.
+        id_uuid(id)?;
+        let spec_json =
+            serde_json::to_string(&record.write).map_err(|source| ConnectionStoreError::Json {
+                operation: "imported connection specification",
+                source,
+            })?;
+        counts.records += i64::try_from(
+            client
+                .execute(
+                    r#"
+                    INSERT INTO greengateway.connection_records (
+                        id, schema_version, source, spec_json, connection_revision,
+                        credential_revision, tls_revision, discovery_revision,
+                        status_revision, created_at, updated_at, last_test_at,
+                        last_refresh_at
+                    ) VALUES (
+                        $1::text::uuid, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13
+                    )
+                    ON CONFLICT (id) DO NOTHING
+                    "#,
+                    &[
+                        &id.as_str(),
+                        &super::model::CONNECTION_SCHEMA_VERSION,
+                        &SOURCE_MANAGED,
+                        &spec_json,
+                        &u64_to_i64(id, record.revisions.connection)?,
+                        &u64_to_i64(id, record.revisions.credential)?,
+                        &u64_to_i64(id, record.revisions.tls)?,
+                        &u64_to_i64(id, record.revisions.discovery)?,
+                        &u64_to_i64(id, record.revisions.status)?,
+                        &record.created_at,
+                        &record.updated_at,
+                        &connection.activity.last_test_at,
+                        &connection.activity.last_refresh_at,
+                    ],
+                )
+                .await
+                .map_err(|error| pg_error(OPERATION, error))?,
+        )
+        .unwrap_or(i64::MAX);
+
+        // One immutable specification version, numbered by the record's
+        // own connection revision, so the version chain a cluster reads
+        // back is the one the standalone deployment had reached. The
+        // versions BELOW it are not in the standalone database at all --
+        // the SQLite store keeps only the active specification -- so the
+        // chain begins where the source's history ends rather than being
+        // invented.
+        counts.documents += i64::try_from(
+            client
+                .execute(
+                    r#"
+                    INSERT INTO greengateway.connection_documents (
+                        connection_id, version, spec, document_etag, actor_user_id, diff_summary
+                    ) VALUES ($1::text::uuid, $2, $3, $4, $5, $6::text::jsonb)
+                    ON CONFLICT (connection_id, version) DO NOTHING
+                    "#,
+                    &[
+                        &id.as_str(),
+                        &u64_to_i64(id, record.revisions.connection)?,
+                        &spec_json,
+                        &version_document_etag(id, record.revisions.connection, &spec_json)?,
+                        &actor_user_id,
+                        &IMPORT_DIFF_SUMMARY,
+                    ],
+                )
+                .await
+                .map_err(|error| pg_error(OPERATION, error))?,
+        )
+        .unwrap_or(i64::MAX);
+
+        for (purpose, secret_id, version) in expected_bindings(&record.write, &record.revisions) {
+            counts.credential_bindings += i64::try_from(
+                client
+                    .execute(
+                        r#"
+                        INSERT INTO greengateway.connection_credential_bindings (
+                            connection_id, purpose, secret_id, binding_version, updated_at
+                        ) VALUES ($1::text::uuid, $2, $3, $4, $5)
+                        ON CONFLICT (connection_id, purpose) DO NOTHING
+                        "#,
+                        &[
+                            &id.as_str(),
+                            &purpose,
+                            &secret_id,
+                            &u64_to_i64(id, version.max(1))?,
+                            &record.updated_at,
+                        ],
+                    )
+                    .await
+                    .map_err(|error| pg_error(OPERATION, error))?,
+            )
+            .unwrap_or(i64::MAX);
+        }
+
+        for dependency in &connection.dependencies {
+            // `source_revision` 0, per the state model: a dependency set
+            // carried across is not one this deployment's tools or policy
+            // documents derived, so it claims no revision and the first
+            // replica flush that does derive one supersedes it. The
+            // `created_at` is the record's, because the source's own
+            // reader (`SqliteConnectionStore::dependencies`) does not
+            // expose the column and no reader anywhere reads it back.
+            counts.dependencies += i64::try_from(
+                client
+                    .execute(
+                        r#"
+                        INSERT INTO greengateway.connection_dependencies (
+                            connection_id, consumer_kind, consumer_id, created_at, source_revision
+                        ) VALUES ($1::text::uuid, $2, $3, $4, 0)
+                        ON CONFLICT (connection_id, consumer_kind, consumer_id) DO NOTHING
+                        "#,
+                        &[
+                            &id.as_str(),
+                            &dependency.kind.as_str(),
+                            &dependency.consumer_id,
+                            &record.updated_at,
+                        ],
+                    )
+                    .await
+                    .map_err(|error| pg_error(OPERATION, error))?,
+            )
+            .unwrap_or(i64::MAX);
+        }
+
+        if let Some(status) = connection.current_status.as_ref() {
+            counts.current_statuses += i64::try_from(
+                insert_status_row(
+                    client,
+                    INSERT_IMPORTED_CURRENT_STATUS_SQL,
+                    status,
+                    OPERATION,
+                )
+                .await?,
+            )
+            .unwrap_or(i64::MAX);
+        }
+
+        for status in &connection.status_history {
+            counts.status_history += i64::try_from(
+                insert_status_row(
+                    client,
+                    INSERT_IMPORTED_STATUS_HISTORY_SQL,
+                    status,
+                    OPERATION,
+                )
+                .await?,
+            )
+            .unwrap_or(i64::MAX);
+        }
+
+        if let Some(catalog) = connection.mcp_catalog.as_ref() {
+            import_mcp_catalog(client, id, catalog, actor_user_id, &mut counts, OPERATION).await?;
+        }
+        if let Some(catalog) = connection.openapi_catalog.as_ref() {
+            import_openapi_catalog(client, id, catalog, actor_user_id, &mut counts, OPERATION)
+                .await?;
+        }
+    }
+
+    // The catalog lanes' names at the authority. `reserve_tool_names`
+    // replaces the owner's own rows, so a resumed run re-reserves exactly
+    // what it reserved before; a name another lane already holds refuses
+    // the section rather than leaving a conflict no replica can install.
+    for connection in connections {
+        let id = &connection.record.id;
+        if let Some(catalog) = connection.mcp_catalog.as_ref() {
+            let names: Vec<String> = catalog
+                .entries
+                .iter()
+                .map(|entry| format!("{}:{}", id.as_str(), entry.remote_tool_name))
+                .collect();
+            counts.tool_name_reservations += i64::try_from(names.len()).unwrap_or(i64::MAX);
+            reserve_catalog_tool_names(client, postgres_tool_names::LANE_MCP, id, names, OPERATION)
+                .await?;
+        }
+        if let Some(catalog) = connection.openapi_catalog.as_ref() {
+            let names: Vec<String> = catalog
+                .entries
+                .iter()
+                .map(|entry| entry.tool_name.clone())
+                .collect();
+            counts.tool_name_reservations += i64::try_from(names.len()).unwrap_or(i64::MAX);
+            reserve_catalog_tool_names(
+                client,
+                postgres_tool_names::LANE_OPENAPI,
+                id,
+                names,
+                OPERATION,
+            )
+            .await?;
+        }
+    }
+
+    // One shared revision for the whole step; see the note above this
+    // function for why it is one and why no outbox row accompanies it.
+    let revision_row = client
+        .query_one(
+            r#"
+            UPDATE greengateway.security_revision_state
+            SET last_revision = last_revision + 1
+            WHERE singleton
+            RETURNING last_revision
+            "#,
+            &[],
+        )
+        .await
+        .map_err(|error| pg_error(OPERATION, error))?;
+    let security_revision: i64 = scalar(&revision_row, 0, OPERATION)?;
+    client
+        .execute(
+            "UPDATE greengateway.connection_state_revision SET last_revision = $1 WHERE singleton",
+            &[&security_revision],
+        )
+        .await
+        .map_err(|error| pg_error(OPERATION, error))?;
+    counts.security_revision = security_revision;
+    Ok(counts)
+}
+
+/// The diff summary every imported specification version carries. A
+/// history reader must be able to tell a version an import wrote from one
+/// an administrator committed; the actor says who, this says why.
+const IMPORT_DIFF_SUMMARY: &str = r#"{"action":"imported_from_standalone"}"#;
+
+const INSERT_IMPORTED_CURRENT_STATUS_SQL: &str = r#"
+INSERT INTO greengateway.connection_current_status (
+    connection_id, status_revision, observed_connection_revision,
+    observed_credential_revision, observed_tls_revision,
+    observed_discovery_revision, state, reason, observed_at,
+    latency_ms, catalog_age_secs, catalog_entry_count
+) VALUES ($1::text::uuid, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+ON CONFLICT (connection_id) DO NOTHING
+"#;
+
+/// `sequence` is generated, so a history row's natural key is
+/// (connection_id, status_revision) -- the unique index migration 0006
+/// creates for exactly that reason, and what makes a resumed import's
+/// second pass write nothing.
+const INSERT_IMPORTED_STATUS_HISTORY_SQL: &str = r#"
+INSERT INTO greengateway.connection_status_history (
+    connection_id, status_revision, observed_connection_revision,
+    observed_credential_revision, observed_tls_revision,
+    observed_discovery_revision, state, reason, observed_at,
+    latency_ms, catalog_age_secs, catalog_entry_count
+) VALUES ($1::text::uuid, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+ON CONFLICT (connection_id, status_revision) DO NOTHING
+"#;
+
+/// Write one status row verbatim. Both tables take the same twelve
+/// columns in the same order, so `sql` selects the table and nothing else.
+/// The observation's own `catalog_age_secs` is bound as persisted, NOT as
+/// the safe projection ages it (store.rs `RawStatus::into_safe_status`
+/// adds the time since the observation to every read).
+async fn insert_status_row(
+    client: &deadpool_postgres::Object,
+    sql: &'static str,
+    status: &PersistedConnectionStatus,
+    operation: &'static str,
+) -> Result<u64, ConnectionStoreError> {
+    let id = &status.connection_id;
+    let status_revision = u64_to_i64(id, status.status_revision)?;
+    let observed_connection = u64_to_i64(id, status.observed_connection_revision)?;
+    let observed_credential = u64_to_i64(id, status.observed_credential_revision)?;
+    let observed_tls = u64_to_i64(id, status.observed_tls_revision)?;
+    let observed_discovery = u64_to_i64(id, status.observed_discovery_revision)?;
+    let latency_ms = optional_u64_to_i64(status.latency_ms, "status latency")?;
+    let catalog_age_secs = optional_u64_to_i64(status.catalog_age_secs, "status catalog age")?;
+    let catalog_entry_count =
+        optional_u64_to_i64(status.catalog_entry_count, "status catalog entry count")?;
+    client
+        .execute(
+            sql,
+            &[
+                &id.as_str(),
+                &status_revision,
+                &observed_connection,
+                &observed_credential,
+                &observed_tls,
+                &observed_discovery,
+                &state_as_str(status.state),
+                &reason_as_str(status.reason),
+                &status.observed_at,
+                &latency_ms,
+                &catalog_age_secs,
+                &catalog_entry_count,
+            ],
+        )
+        .await
+        .map_err(|error| pg_error(operation, error))
+}
+
+async fn import_mcp_catalog(
+    client: &deadpool_postgres::Object,
+    id: &ConnectionId,
+    catalog: &StoredMcpCatalog,
+    actor_user_id: &str,
+    counts: &mut ImportedConnectionCounts,
+    operation: &'static str,
+) -> Result<(), ConnectionStoreError> {
+    // The catalog is re-validated on the way in, by the same validator the
+    // live replacement path runs: a catalog this build cannot validate is
+    // one no replica could serve, and it must refuse the import rather
+    // than land in the authority.
+    let validated = validate_mcp_catalog(
+        id,
+        &catalog.entries,
+        &catalog.resources,
+        &catalog.resource_templates,
+    )?;
+    counts.mcp_catalogs += i64::try_from(
+        client
+            .execute(
+                r#"
+                INSERT INTO greengateway.connection_mcp_catalogs (
+                    connection_id, catalog_revision, observed_etag, refreshed_at, entry_count,
+                    resource_count, resource_template_count, actor_user_id
+                ) VALUES ($1::text::uuid, $2, $3, $4, $5, $6, $7, $8)
+                ON CONFLICT (connection_id) DO NOTHING
+                "#,
+                &[
+                    &id.as_str(),
+                    &u64_to_i64(id, catalog.catalog_revision)?,
+                    &catalog.observed_etag.as_str(),
+                    &catalog.refreshed_at,
+                    &usize_to_i64(catalog.entries.len()),
+                    &usize_to_i64(catalog.resources.len()),
+                    &usize_to_i64(catalog.resource_templates.len()),
+                    &actor_user_id,
+                ],
+            )
+            .await
+            .map_err(|error| pg_error(operation, error))?,
+    )
+    .unwrap_or(i64::MAX);
+    for (ordinal, (entry, input_schema_json)) in catalog
+        .entries
+        .iter()
+        .zip(validated.encoded_tool_schemas.iter())
+        .enumerate()
+    {
+        counts.mcp_catalog_entries += i64::try_from(
+            client
+                .execute(
+                    r#"
+                    INSERT INTO greengateway.connection_mcp_catalog_entries (
+                        connection_id, remote_tool_name, description, input_schema_json, ordinal
+                    ) VALUES ($1::text::uuid, $2, $3, $4, $5)
+                    ON CONFLICT (connection_id, remote_tool_name) DO NOTHING
+                    "#,
+                    &[
+                        &id.as_str(),
+                        &entry.remote_tool_name,
+                        &entry.description,
+                        input_schema_json,
+                        &usize_to_i64(ordinal),
+                    ],
+                )
+                .await
+                .map_err(|error| pg_error(operation, error))?,
+        )
+        .unwrap_or(i64::MAX);
+    }
+    for (ordinal, resource) in catalog.resources.iter().enumerate() {
+        counts.mcp_catalog_resources += i64::try_from(
+            client
+                .execute(
+                    r#"
+                    INSERT INTO greengateway.connection_mcp_catalog_resources (
+                        connection_id, uri, name, title, description, mime_type, size, ordinal
+                    ) VALUES ($1::text::uuid, $2, $3, $4, $5, $6, $7, $8)
+                    ON CONFLICT (connection_id, uri) DO NOTHING
+                    "#,
+                    &[
+                        &id.as_str(),
+                        &resource.uri,
+                        &resource.name,
+                        &resource.title,
+                        &resource.description,
+                        &resource.mime_type,
+                        &optional_u64_to_i64(resource.size, "MCP resource size")?,
+                        &usize_to_i64(ordinal),
+                    ],
+                )
+                .await
+                .map_err(|error| pg_error(operation, error))?,
+        )
+        .unwrap_or(i64::MAX);
+    }
+    for (ordinal, template) in catalog.resource_templates.iter().enumerate() {
+        counts.mcp_catalog_resource_templates += i64::try_from(
+            client
+                .execute(
+                    r#"
+                    INSERT INTO greengateway.connection_mcp_catalog_resource_templates (
+                        connection_id, uri_template, name, title, description, mime_type, ordinal
+                    ) VALUES ($1::text::uuid, $2, $3, $4, $5, $6, $7)
+                    ON CONFLICT (connection_id, uri_template) DO NOTHING
+                    "#,
+                    &[
+                        &id.as_str(),
+                        &template.uri_template,
+                        &template.name,
+                        &template.title,
+                        &template.description,
+                        &template.mime_type,
+                        &usize_to_i64(ordinal),
+                    ],
+                )
+                .await
+                .map_err(|error| pg_error(operation, error))?,
+        )
+        .unwrap_or(i64::MAX);
+    }
+    Ok(())
+}
+
+async fn import_openapi_catalog(
+    client: &deadpool_postgres::Object,
+    id: &ConnectionId,
+    catalog: &StoredOpenApiCatalog,
+    actor_user_id: &str,
+    counts: &mut ImportedConnectionCounts,
+    operation: &'static str,
+) -> Result<(), ConnectionStoreError> {
+    validate_openapi_spec(&catalog.spec, &catalog.spec_digest)?;
+    let encoded_entries = validate_openapi_catalog_entries(&catalog.entries)?;
+    counts.openapi_catalogs += i64::try_from(
+        client
+            .execute(
+                r#"
+                INSERT INTO greengateway.connection_openapi_catalogs (
+                    connection_id, spec_revision, catalog_revision, observed_etag,
+                    spec_digest, spec, refreshed_at, entry_count, actor_user_id
+                ) VALUES ($1::text::uuid, $2, $3, $4, $5, $6, $7, $8, $9)
+                ON CONFLICT (connection_id) DO NOTHING
+                "#,
+                &[
+                    &id.as_str(),
+                    &u64_to_i64(id, catalog.spec_revision)?,
+                    &u64_to_i64(id, catalog.catalog_revision)?,
+                    &catalog.observed_etag.as_str(),
+                    &catalog.spec_digest,
+                    &catalog.spec,
+                    &catalog.refreshed_at,
+                    &usize_to_i64(catalog.entries.len()),
+                    &actor_user_id,
+                ],
+            )
+            .await
+            .map_err(|error| pg_error(operation, error))?,
+    )
+    .unwrap_or(i64::MAX);
+    for (ordinal, encoded) in encoded_entries.iter().enumerate() {
+        counts.openapi_catalog_entries += i64::try_from(
+            client
+                .execute(
+                    r#"
+                    INSERT INTO greengateway.connection_openapi_catalog_entries (
+                        connection_id, tool_name, operation_id,
+                        selected_scheme_names_json, definition_json, ordinal
+                    ) VALUES ($1::text::uuid, $2, $3, $4, $5, $6)
+                    ON CONFLICT (connection_id, tool_name) DO NOTHING
+                    "#,
+                    &[
+                        &id.as_str(),
+                        &encoded.entry.tool_name,
+                        &encoded.entry.operation_id,
+                        &encoded.selected_scheme_names_json,
+                        &encoded.definition_json,
+                        &usize_to_i64(ordinal),
+                    ],
+                )
+                .await
+                .map_err(|error| pg_error(operation, error))?,
+        )
+        .unwrap_or(i64::MAX);
+    }
+    Ok(())
 }
 
 // Referenced types kept for the future snapshot reconciler.

@@ -99,6 +99,29 @@ pub struct CreatedToken {
     pub plaintext_token: String,
 }
 
+/// One `service_tokens` row exactly as stored, for the standalone-to-cluster
+/// import (issue #241, PR 15).
+///
+/// [`TokenRecord`] is the ADMIN view and deliberately omits `token_hash`,
+/// because no API response may carry it. The import is not an API
+/// response: the hash is the whole reason an already-issued token keeps
+/// working after the cutover, so it is carried across verbatim. It is
+/// never serialized into the import's report -- that type derives no
+/// `Serialize` for exactly that reason.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ExportedServiceToken {
+    pub id: String,
+    /// SHA-256 of the plaintext, hex-encoded: a verifier, not a credential.
+    pub token_hash: String,
+    pub token_prefix: String,
+    pub scopes_json: String,
+    pub created_by: String,
+    pub created_at: String,
+    pub expires_at: Option<String>,
+    pub last_used_at: Option<String>,
+    pub revoked_at: Option<String>,
+}
+
 #[derive(Clone, Debug, Serialize)]
 pub struct TokenPage {
     pub tokens: Vec<TokenRecord>,
@@ -182,6 +205,58 @@ impl SqliteTokenStore {
             path,
             connection: Arc::new(Mutex::new(connection)),
         })
+    }
+
+    /// Every service token as STORED, in id order, INCLUDING its hash.
+    ///
+    /// For the standalone-to-cluster import (issue #241, PR 15). The hash
+    /// is the only thing that makes a token still work after the cutover:
+    /// verification hashes the presented plaintext and looks the digest up,
+    /// so an import that carried the display prefix but not the hash would
+    /// silently invalidate every issued token. The PLAINTEXT is not here
+    /// and never was -- it exists once, in the response to create or
+    /// rotate -- so nothing this returns can authenticate anything on its
+    /// own; it is the verifier, not the credential. It is still never
+    /// printed: the import writes it and reports counts.
+    pub(crate) fn exported_tokens(&self) -> Result<Vec<ExportedServiceToken>, TokenStoreError> {
+        let connection = self.connection_guard();
+        let mut statement = connection
+            .prepare(
+                r#"
+                SELECT id, token_hash, token_prefix, scopes_json, created_by, created_at,
+                       expires_at, last_used_at, revoked_at
+                FROM service_tokens
+                ORDER BY id
+                "#,
+            )
+            .map_err(|source| TokenStoreError::Sqlite {
+                path: self.path.clone(),
+                source,
+            })?;
+        let tokens = statement
+            .query_map([], |row| {
+                Ok(ExportedServiceToken {
+                    id: row.get(0)?,
+                    token_hash: row.get(1)?,
+                    token_prefix: row.get(2)?,
+                    scopes_json: row.get(3)?,
+                    created_by: row.get(4)?,
+                    created_at: row.get(5)?,
+                    expires_at: row.get(6)?,
+                    last_used_at: row.get(7)?,
+                    revoked_at: row.get(8)?,
+                })
+            })
+            .map_err(|source| TokenStoreError::Sqlite {
+                path: self.path.clone(),
+                source,
+            })?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|source| TokenStoreError::Sqlite {
+                path: self.path.clone(),
+                source,
+            });
+        tokens
     }
 
     fn connection_guard(&self) -> MutexGuard<'_, Connection> {

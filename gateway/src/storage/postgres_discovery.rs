@@ -1303,3 +1303,302 @@ fn classify_query(error: tokio_postgres::Error, operation: &'static str) -> Repo
 fn invalid_data(operation: &'static str) -> RepositoryError {
     RepositoryError::new(RepositoryErrorKind::InvalidData, operation)
 }
+
+// ---------------------------------------------------------------------------
+// The standalone-to-cluster import (issue #241, PR 15, step 6).
+//
+// This lives here, beside the store that owns these tables, for the reason
+// `insert_imported_policy_versions_in` and `import_connections_in` live
+// beside theirs: an import writes the same rows a projector writes, and a
+// second copy of that knowledge somewhere else would drift from this one.
+// Everything below reuses the flush path's own statements -- the same
+// `upsert_aggregates`, `insert_*`, `upsert_detector_states` and
+// `upsert_template_groups` a leader calls -- and adds only what a flush
+// never writes: the lifecycle rows (signals with their state and revision,
+// rule suggestions, endpoint reviews) and the checkpoint.
+//
+// What makes this path different from `flush`:
+//
+// - **It is not fenced; it requires that nothing ever has been.** A flush
+//   proves it still holds the fence it was given. The import instead
+//   requires the fence to be ZERO: no leader has ever claimed this
+//   projector, which is exactly what an empty deployment namespace means.
+//   A namespace whose fence has moved has a leader whose checkpoint this
+//   import would rewind, and rewinding a checkpoint re-projects history.
+// - **The checkpoint is SET to the imported stream head, not advanced by a
+//   batch.** The audit section put the standalone log on the durable
+//   stream; those positions describe traffic that has ALREADY been
+//   aggregated into the rows written here. Leaving the checkpoint at zero
+//   would make the first leader project the whole imported history a
+//   second time on top of the imported counters -- every call counted
+//   twice, every threshold crossed again. `projected_events` is left
+//   alone: it counts what THIS deployment's projector applied, and the
+//   import applied none of it.
+// - **Signals carry their lifecycle.** A flush only ever inserts OPEN
+//   signals it just raised. The import carries acknowledged and dismissed
+//   ones too, with their `transitioned_at`/`transitioned_by` and their
+//   revision, because an operator who dismissed a signal before the
+//   cutover must not meet it again afterwards.
+// - **Every revision is named, never defaulted.** Migration 11 defaults
+//   `revision` to 1 on all three lifecycle tables. The import binds the
+//   source's value explicitly so the number is a decision -- a signal an
+//   admin transitioned twice arrives at revision 3, and the `If-Match: 3`
+//   an operator's automation holds still matches.
+// - **Every write is idempotent.** The endpoint-keyed child tables are
+//   deleted for the keys being written and re-inserted (the flush's own
+//   absolute-rewrite shape); the lifecycle rows insert `ON CONFLICT DO
+//   NOTHING`; the checkpoint is set, not added. `--resume` therefore
+//   re-runs the section safely.
+
+/// What the discovery import is asked to write.
+pub(crate) struct ImportedDiscovery<'a> {
+    /// Every endpoint aggregate the source held, as one batch.
+    pub batch: &'a PendingFlush,
+    pub detector_states: &'a [(EndpointKey, String)],
+    /// The learner's exported groups, or `None` when it has none. The
+    /// SQLite sink never persisted them, so a standalone source normally
+    /// has none and the cluster's first leader relearns exactly as a
+    /// standalone restart would.
+    pub template_groups_json: Option<&'a str>,
+    pub signals: &'a [crate::discovery::query::RawSignal],
+    pub suggestions: &'a [crate::discovery::suggestions::RuleSuggestion],
+    pub reviews: &'a [crate::discovery::query::ExportedEndpointReview],
+    /// The durable stream head the audit section left behind.
+    pub checkpoint_position: i64,
+    pub payload_capture_enabled: bool,
+}
+
+/// What one import step wrote, per table, for the section's report.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct ImportedDiscoveryCounts {
+    pub aggregates: i64,
+    pub detector_states: i64,
+    pub template_groups: i64,
+    pub signals: i64,
+    pub suggestions: i64,
+    pub reviews: i64,
+    pub checkpoint_position: i64,
+}
+
+const OPERATION_IMPORT: &str = "discovery_import";
+
+/// Write the standalone deployment's discovery state into the caller's
+/// open transaction. See the note above for what is written and why.
+pub(crate) async fn import_discovery_in(
+    client: &deadpool_postgres::Object,
+    imported: &ImportedDiscovery<'_>,
+) -> Result<ImportedDiscoveryCounts, RepositoryError> {
+    // The row lock every flush takes, and the precondition that makes this
+    // path safe: an unclaimed projector.
+    let row = client
+        .query_one(
+            "SELECT fence FROM greengateway.discovery_projector_state WHERE singleton FOR UPDATE",
+            &[],
+        )
+        .await
+        .map_err(|error| classify_query(error, OPERATION_IMPORT))?;
+    let fence: i64 = row.try_get(0).map_err(|_| invalid_data(OPERATION_IMPORT))?;
+    if fence != 0 {
+        return Err(RepositoryError::new(
+            RepositoryErrorKind::Conflict,
+            OPERATION_IMPORT,
+        ));
+    }
+
+    let mut counts = ImportedDiscoveryCounts {
+        checkpoint_position: imported.checkpoint_position,
+        ..ImportedDiscoveryCounts::default()
+    };
+
+    let aggregates = &imported.batch.dirty_aggregates;
+    if !aggregates.is_empty() {
+        // Absolute rewrite per key, exactly as a flush rewrites a dirty
+        // aggregate's children: delete what is there for these keys, then
+        // insert. That, and not an ON CONFLICT clause, is what makes a
+        // resumed section idempotent on tables whose child rows have no
+        // single natural key of their own.
+        let keys = KeyColumns::from_keys(aggregates.iter().map(|aggregate| &aggregate.key));
+        for table in CHILD_TABLES {
+            delete_by_keys(client, table, &keys).await?;
+        }
+        delete_by_keys(client, "discovery_payload_shape_samples", &keys).await?;
+        delete_by_keys(client, "discovery_payload_shape_stats", &keys).await?;
+
+        let now = utc_timestamp_rfc3339();
+        upsert_aggregates(client, aggregates, &now).await?;
+        insert_status_counts(client, aggregates).await?;
+        insert_principals(client, aggregates).await?;
+        insert_routing_contexts(client, aggregates, &now).await?;
+        insert_routing_principals(client, aggregates).await?;
+        insert_routing_classifications(client, aggregates).await?;
+        insert_classified_signal_stats(client, aggregates).await?;
+        insert_classified_signal_principals(client, aggregates).await?;
+        if imported.payload_capture_enabled {
+            insert_payload_shapes(client, aggregates, &now).await?;
+        }
+        counts.aggregates = i64_from_usize(aggregates.len());
+    }
+
+    upsert_detector_states(client, imported.detector_states).await?;
+    counts.detector_states = i64_from_usize(imported.detector_states.len());
+
+    if let Some(groups_json) = imported.template_groups_json {
+        upsert_template_groups(client, groups_json).await?;
+        counts.template_groups = 1;
+    }
+
+    counts.signals = import_signals(client, imported.signals).await?;
+    counts.suggestions = import_suggestions(client, imported.suggestions).await?;
+    counts.reviews = import_reviews(client, imported.reviews).await?;
+
+    // The checkpoint. SET to the imported stream head under the fence the
+    // lock above proved is still zero.
+    let advanced = client
+        .execute(
+            "UPDATE greengateway.discovery_projector_state
+             SET checkpoint_position = $1::bigint, updated_at = now()
+             WHERE singleton AND fence = 0",
+            &[&imported.checkpoint_position],
+        )
+        .await
+        .map_err(|error| classify_query(error, OPERATION_IMPORT))?;
+    if advanced != 1 {
+        return Err(RepositoryError::new(
+            RepositoryErrorKind::Conflict,
+            OPERATION_IMPORT,
+        ));
+    }
+    Ok(counts)
+}
+
+/// Signals verbatim: state, transition and revision included. `ON CONFLICT
+/// DO NOTHING` with no target so BOTH unique keys -- the primary key on
+/// `id` and the identity index the projector inserts against -- suppress a
+/// re-run's second write.
+async fn import_signals(
+    client: &deadpool_postgres::Object,
+    signals: &[crate::discovery::query::RawSignal],
+) -> Result<i64, RepositoryError> {
+    let mut inserted = 0_i64;
+    for signal in signals {
+        inserted += i64::try_from(
+            client
+                .execute(
+                    r#"
+                    INSERT INTO greengateway.discovery_signals (
+                        id, signal_type, target_kind, target_key, target_identity_json,
+                        explanation, evidence_json, state, created_at, updated_at,
+                        transitioned_at, transitioned_by, revision
+                    ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
+                    ON CONFLICT DO NOTHING
+                    "#,
+                    &[
+                        &signal.id,
+                        &signal.signal_type,
+                        &signal.target_kind,
+                        &signal.target_key,
+                        &signal.target_identity_json,
+                        &signal.explanation,
+                        &signal.evidence_json,
+                        &signal.state,
+                        &signal.created_at,
+                        &signal.updated_at,
+                        &signal.transitioned_at,
+                        &signal.transitioned_by,
+                        &signal.revision.max(1),
+                    ],
+                )
+                .await
+                .map_err(|error| classify_query(error, OPERATION_IMPORT))?,
+        )
+        .unwrap_or(i64::MAX);
+    }
+    Ok(inserted)
+}
+
+/// Rule suggestions verbatim, including the signal each was derived from.
+/// The proposed rule is re-serialized from the decoded `Rule` rather than
+/// copied as text: the source's bytes were validated on the way out, and
+/// the cluster stores the form THIS build writes, so an accepted
+/// suggestion commits the rule this binary parsed.
+async fn import_suggestions(
+    client: &deadpool_postgres::Object,
+    suggestions: &[crate::discovery::suggestions::RuleSuggestion],
+) -> Result<i64, RepositoryError> {
+    let mut inserted = 0_i64;
+    for suggestion in suggestions {
+        let proposed_rule_json = serde_json::to_string(&suggestion.proposed_rule)
+            .map_err(|_| invalid_data(OPERATION_IMPORT))?;
+        let evidence_json = serde_json::to_string(&suggestion.evidence)
+            .map_err(|_| invalid_data(OPERATION_IMPORT))?;
+        inserted += i64::try_from(
+            client
+                .execute(
+                    r#"
+                    INSERT INTO greengateway.discovery_rule_suggestions (
+                        id, suggestion_type, method, path_pattern, principal_key,
+                        proposed_rule_json, rationale, evidence_json, state, created_at,
+                        updated_at, transitioned_at, transitioned_by, source_signal_id, revision
+                    ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
+                    ON CONFLICT DO NOTHING
+                    "#,
+                    &[
+                        &suggestion.id,
+                        &suggestion.suggestion_type,
+                        &suggestion.method,
+                        &suggestion.path_pattern,
+                        &suggestion.principal_key,
+                        &proposed_rule_json,
+                        &suggestion.rationale,
+                        &evidence_json,
+                        &suggestion.state.as_str(),
+                        &suggestion.created_at,
+                        &suggestion.updated_at,
+                        &suggestion.transitioned_at,
+                        &suggestion.transitioned_by,
+                        &suggestion.source_signal_id,
+                        &suggestion.revision.max(1),
+                    ],
+                )
+                .await
+                .map_err(|error| classify_query(error, OPERATION_IMPORT))?,
+        )
+        .unwrap_or(i64::MAX);
+    }
+    Ok(inserted)
+}
+
+/// Endpoint reviews verbatim, CLEARED ones included: a row with no
+/// `reviewed_at` still carries the revision a conditional write must
+/// expect, and dropping it would restart that endpoint's revisions at 1
+/// (migration 11's header explains the ABA that would open).
+async fn import_reviews(
+    client: &deadpool_postgres::Object,
+    reviews: &[crate::discovery::query::ExportedEndpointReview],
+) -> Result<i64, RepositoryError> {
+    let mut inserted = 0_i64;
+    for review in reviews {
+        inserted += i64::try_from(
+            client
+                .execute(
+                    r#"
+                    INSERT INTO greengateway.discovery_endpoint_reviews (
+                        method, endpoint_template, reviewed_at, reviewed_by, revision
+                    ) VALUES ($1, $2, $3, $4, $5)
+                    ON CONFLICT (method, endpoint_template) DO NOTHING
+                    "#,
+                    &[
+                        &review.method,
+                        &review.endpoint_template,
+                        &review.reviewed_at,
+                        &review.reviewed_by,
+                        &review.revision.max(1),
+                    ],
+                )
+                .await
+                .map_err(|error| classify_query(error, OPERATION_IMPORT))?,
+        )
+        .unwrap_or(i64::MAX);
+    }
+    Ok(inserted)
+}

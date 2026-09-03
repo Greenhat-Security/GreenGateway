@@ -74,9 +74,9 @@ use crate::discovery::{
         CapturedPayloadShapeSample, DiscoveryQueryError, DiscoveryReadStore,
         EndpointAggregateDetail, EndpointCoverageScope, EndpointCursor, EndpointListFilters,
         EndpointListPage, EndpointPrincipal, EndpointReviewState, EndpointRoutingContext,
-        EndpointSort, InferredRequestSchema, ObservedEndpoint, OpenSignalSummary, PrincipalCursor,
-        PrincipalPage, PrincipalPageFilters, RawEndpointAggregate, RawSignal, SignalCursor,
-        StatusCount, SIGNAL_COLUMNS,
+        EndpointSort, ExportedEndpointReview, InferredRequestSchema, ObservedEndpoint,
+        OpenSignalSummary, PrincipalCursor, PrincipalPage, PrincipalPageFilters,
+        RawEndpointAggregate, RawSignal, SignalCursor, StatusCount, SIGNAL_COLUMNS,
     },
     signals::{self, Signal, SignalLifecycleState, SignalListFilters},
 };
@@ -92,6 +92,8 @@ const OPERATION_LIST_SIGNALS: &str = "discovery_read_list_signals";
 const OPERATION_PRINCIPAL_SIGNALS: &str = "discovery_read_principal_signals";
 const OPERATION_TRANSITION_SIGNAL: &str = "discovery_transition_signal";
 const OPERATION_LIST_PRINCIPALS: &str = "discovery_read_list_principals";
+const OPERATION_EXPORT_REVIEWS: &str = "discovery_read_export_reviews";
+const OPERATION_EXPORT_SIGNALS: &str = "discovery_read_export_signals";
 
 /// The discovery read store over one PostgreSQL pool. Cheap to construct;
 /// holds no per-instance state.
@@ -110,6 +112,58 @@ impl PostgresDiscoveryReadStore {
             .get()
             .await
             .map_err(|error| DiscoveryQueryError::Repository(classify_pool_error(error)))
+    }
+
+    /// Every signal row as STORED, in id order: the mirror of
+    /// `DiscoveryQueryStore::exported_signals`. `list_signals` decodes into
+    /// [`Signal`], which drops `target_key`; the import's validation pass
+    /// (issue #241, PR 15, step 8) compares the rows.
+    #[cfg_attr(not(feature = "postgres"), allow(dead_code))]
+    pub(crate) async fn exported_signals(&self) -> Result<Vec<RawSignal>, DiscoveryQueryError> {
+        let operation = OPERATION_EXPORT_SIGNALS;
+        let client = self.client().await?;
+        client
+            .query(
+                &format!("SELECT {SIGNAL_COLUMNS} FROM greengateway.discovery_signals ORDER BY id"),
+                &[],
+            )
+            .await
+            .map_err(|error| classify_query(error, operation))?
+            .iter()
+            .map(|row| raw_signal(row, operation))
+            .collect()
+    }
+
+    /// Every review row as STORED, in key order: the mirror of
+    /// `DiscoveryQueryStore::exported_reviews`, so the standalone-to-cluster
+    /// import (issue #241, PR 15) can digest both sides of its validation
+    /// pass with one export shape. Cleared reviews are included -- a row
+    /// with no `reviewed_at` still carries the revision a conditional write
+    /// must expect.
+    #[cfg_attr(not(feature = "postgres"), allow(dead_code))]
+    pub(crate) async fn exported_reviews(
+        &self,
+    ) -> Result<Vec<ExportedEndpointReview>, DiscoveryQueryError> {
+        let operation = OPERATION_EXPORT_REVIEWS;
+        let client = self.client().await?;
+        Ok(client
+            .query(
+                "SELECT method, endpoint_template, reviewed_at, reviewed_by, revision
+                 FROM greengateway.discovery_endpoint_reviews
+                 ORDER BY method, endpoint_template",
+                &[],
+            )
+            .await
+            .map_err(|error| classify_query(error, operation))?
+            .iter()
+            .map(|row| ExportedEndpointReview {
+                method: row.get(0),
+                endpoint_template: row.get(1),
+                reviewed_at: row.get(2),
+                reviewed_by: row.get(3),
+                revision: row.get(4),
+            })
+            .collect())
     }
 }
 

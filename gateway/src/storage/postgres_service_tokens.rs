@@ -685,3 +685,131 @@ fn map_helper_error(operation: &'static str, error: TokenStoreError) -> Reposito
 // signatures.
 #[allow(dead_code)]
 fn _assert_to_sql(_: &dyn ToSql) {}
+
+/// The operation label the import's writes and read-backs classify under.
+const OPERATION_IMPORT: &str = "service_token_import";
+
+/// Write the standalone deployment's service tokens into the caller's open
+/// transaction (issue #241, PR 15, step 7).
+///
+/// This lives beside the store that owns the table for the reason
+/// `insert_imported_policy_versions_in` and `import_connections_in` do: an
+/// import writes the same rows a replica writes, and a second copy of that
+/// knowledge somewhere else would drift from this one.
+///
+/// What makes it different from `create`:
+///
+/// - It NAMES the id, the hash, the prefix and every timestamp. `create`
+///   mints all of them; an import must preserve them, because the hash is
+///   what makes an already-issued token still verify after the cutover and
+///   the id is what an operator's automation revokes by. The PLAINTEXT is
+///   not involved: it never existed on disk, and nothing here could
+///   reconstruct it.
+/// - `revision` is SET to 1 explicitly rather than left to the column
+///   default. The standalone table has no revision column at all, so there
+///   is no source value to carry: 1 is the decision that an imported token
+///   has been through no cluster-mode lifecycle write, which is exactly
+///   what a `create` would leave and what an `If-Match: 1` must match.
+/// - Every insert is `ON CONFLICT (id) DO NOTHING`, so a resumed import
+///   writes nothing twice. A row whose id is present but whose HASH
+///   differs is not repaired -- the caller's section-conflict check owns
+///   that decision.
+/// - It takes ONE shared security revision for the whole step and SETS the
+///   resource's high-water mark to it, writing NO outbox rows: the import
+///   runs before any replica serves this deployment, so there is nobody to
+///   notify, and an outbox stream describing an import would replay as a
+///   grant history the standalone deployment never had. Leaving the mark
+///   at zero while the shared counter moved would instead leave this
+///   resource permanently behind its authority.
+pub(crate) async fn import_service_tokens_in(
+    client: &deadpool_postgres::Object,
+    tokens: &[crate::auth::tokens::ExportedServiceToken],
+) -> Result<(i64, i64), RepositoryError> {
+    if tokens.is_empty() {
+        return Ok((0, 0));
+    }
+    let mut inserted = 0_i64;
+    let security_revision = reserve_shared_revision(client, OPERATION_IMPORT).await?;
+    for token in tokens {
+        let affected = client
+            .execute(
+                r#"
+                INSERT INTO greengateway.service_tokens (
+                    id, token_hash, token_prefix, scopes_json, created_by, created_at,
+                    expires_at, last_used_at, revoked_at, revision, security_revision
+                ) VALUES (
+                    $1, $2, $3, $4, $5,
+                    $6::text::timestamptz, $7::text::timestamptz,
+                    $8::text::timestamptz, $9::text::timestamptz, 1, $10
+                )
+                ON CONFLICT (id) DO NOTHING
+                "#,
+                &[
+                    &token.id,
+                    &token.token_hash,
+                    &token.token_prefix,
+                    &token.scopes_json,
+                    &token.created_by,
+                    &token.created_at,
+                    &token.expires_at,
+                    &token.last_used_at,
+                    &token.revoked_at,
+                    &security_revision,
+                ],
+            )
+            .await
+            .map_err(|error| classify_query(error, OPERATION_IMPORT))?;
+        inserted += i64::try_from(affected).unwrap_or(i64::MAX);
+    }
+    client
+        .execute(
+            "UPDATE greengateway.service_token_state_revision SET last_revision = $1 \
+             WHERE singleton",
+            &[&security_revision],
+        )
+        .await
+        .map_err(|error| classify_query(error, OPERATION_IMPORT))?;
+    Ok((inserted, security_revision))
+}
+
+/// Every stored token as the import's validation pass compares it: the
+/// same shape [`crate::auth::tokens::SqliteTokenStore::exported_tokens`]
+/// returns, so the two sides of "token hashes equal" are one export shape
+/// rather than two readings that could disagree.
+///
+/// Timestamps render exactly as [`select_columns`] renders them for the
+/// admin surfaces, which is the rendering a standalone RFC 3339 timestamp
+/// round-trips to; the validation compares INSTANTS through this rendering
+/// rather than the source's text, because `timestamptz` does not keep the
+/// source's offset spelling.
+pub(crate) async fn exported_tokens(
+    pool: &deadpool_postgres::Pool,
+) -> Result<Vec<crate::auth::tokens::ExportedServiceToken>, RepositoryError> {
+    let client = pool.get().await.map_err(classify_pool_error)?;
+    let sql = format!(
+        "SELECT id, token_hash, token_prefix, scopes_json, created_by, \
+         to_char(created_at AT TIME ZONE 'UTC', {f}), \
+         to_char(expires_at AT TIME ZONE 'UTC', {f}), \
+         to_char(last_used_at AT TIME ZONE 'UTC', {f}), \
+         to_char(revoked_at AT TIME ZONE 'UTC', {f}) \
+         FROM greengateway.service_tokens ORDER BY id",
+        f = TIMESTAMP_FORMAT
+    );
+    Ok(client
+        .query(sql.as_str(), &[])
+        .await
+        .map_err(|error| classify_query(error, OPERATION_IMPORT))?
+        .iter()
+        .map(|row| crate::auth::tokens::ExportedServiceToken {
+            id: row.get(0),
+            token_hash: row.get(1),
+            token_prefix: row.get(2),
+            scopes_json: row.get(3),
+            created_by: row.get(4),
+            created_at: row.get(5),
+            expires_at: row.get(6),
+            last_used_at: row.get(7),
+            revoked_at: row.get(8),
+        })
+        .collect())
+}
