@@ -541,6 +541,32 @@ impl RateLimitOverride {
     }
 }
 
+/// The liveness, readiness, startup and metrics endpoints, which are
+/// decided by the LOCAL limiter only and never by the shared one.
+///
+/// The shared gate fails closed, which is right for traffic and wrong for
+/// these four: `/readyz` exists to report that the authority is
+/// unreachable, and a `/readyz` that consults the authority first answers
+/// `503 {"error":"rate limiter unavailable"}` in exactly the outage whose
+/// reason it was written to publish (issue #241, PR 14). An orchestrator
+/// then cannot tell `storage_unavailable` from `schema_incompatible` from
+/// a limiter that is merely busy, and `/metrics` — the scrape an operator
+/// reaches for during that outage — is refused with it.
+///
+/// They are not unbounded: the per-replica local bucket above still
+/// applies, which is the emergency bound that spends no round trip. What
+/// is dropped is only the authority consultation, and only for the
+/// endpoints whose whole job is to be answerable when the authority is
+/// not. Both halves are pinned by
+/// `probe_and_metrics_paths_answer_when_the_authority_is_unreachable` in
+/// this module's tests.
+/// `/health` is the legacy compatibility status endpoint. New deployments
+/// are pointed at `/livez` and `/readyz`, but a container supervisor that
+/// still probes `/health` has exactly the same claim on an answer during
+/// an outage, so it is exempt for the same reason.
+const AUTHORITY_INDEPENDENT_PATHS: [&str; 5] =
+    ["/health", "/livez", "/readyz", "/startupz", "/metrics"];
+
 pub async fn rate_limit_request(
     State(state): State<RateLimitState>,
     req: Request,
@@ -551,7 +577,11 @@ pub async fn rate_limit_request(
     let client_ip = canonical_client_ip(req.headers(), req.extensions(), &state.client_ip_policy);
     let key = format!("ip:{client_ip}");
     let limiter = state.global_limiter(lane);
-    let shared = state.shared_global_gate(lane, &key);
+    let shared = if AUTHORITY_INDEPENDENT_PATHS.contains(&path.as_str()) {
+        SharedGate::None
+    } else {
+        state.shared_global_gate(lane, &key)
+    };
 
     check_rate_limit(limiter, &key, &client_ip, lane, &path, shared, req, next).await
 }
@@ -1291,6 +1321,118 @@ mod tests {
         let json: Value = serde_json::from_slice(&body).expect("body should be JSON");
 
         assert_eq!(json, serde_json::json!({ "error": "too many requests" }));
+    }
+
+    /// A shared store whose authority can never be consulted: the pool is
+    /// closed before its first checkout, so `decide` returns the same
+    /// `Unavailable` a lost primary produces -- deterministically, and
+    /// without dialling anything.
+    #[cfg(feature = "postgres")]
+    fn unreachable_shared_store() -> Arc<crate::storage::PostgresRateLimitStore> {
+        use deadpool_postgres::{Manager, ManagerConfig, Pool, RecyclingMethod};
+
+        let mut pg_config = tokio_postgres::Config::new();
+        pg_config
+            .host("127.0.0.1")
+            .port(1)
+            .dbname("greengateway-nowhere")
+            .user("nobody");
+        let manager = Manager::from_config(
+            pg_config,
+            tokio_postgres::NoTls,
+            ManagerConfig {
+                recycling_method: RecyclingMethod::Fast,
+            },
+        );
+        let pool = Pool::builder(manager)
+            .build()
+            .expect("the test pool should build");
+        pool.close();
+
+        Arc::new(crate::storage::PostgresRateLimitStore::new(
+            pool,
+            "deploy-probe-exemption",
+            crate::connections::local_secret::LocalSecretKeyring::from_material_for_test(
+                "rl-key-1",
+                vec![("rl-key-1".to_owned(), [7u8; 32])],
+            ),
+            1_000,
+        ))
+    }
+
+    /// `/livez`, `/readyz`, `/startupz` and `/metrics` are decided by the
+    /// local bucket alone, so an authority that cannot be reached cannot
+    /// silence them. That is the whole point of the exemption: `/readyz`
+    /// exists to publish *why* a replica is not ready, and it cannot publish
+    /// `storage_unavailable` if the limiter in front of it answered `503
+    /// {"error":"rate limiter unavailable"}` first, in exactly the outage the
+    /// reason was written for -- and `/metrics`, the scrape an operator
+    /// reaches for during that outage, would be refused with it.
+    ///
+    /// Ordinary traffic in the same run still fails closed, because dropping
+    /// the authority consultation everywhere would be a different (and wrong)
+    /// change. The last leg pins the other half of the property: these paths
+    /// are exempt from the *authority*, not from limiting, so once the local
+    /// burst is spent `/readyz` is a `429`.
+    #[cfg(feature = "postgres")]
+    #[tokio::test]
+    async fn probe_and_metrics_paths_answer_when_the_authority_is_unreachable() {
+        // One read token for each exempt path, plus one for the ordinary
+        // path that must reach the failing authority. The burst is sized
+        // from the list so adding a path cannot silently turn the ordinary
+        // leg into a local `429` and stop it testing the authority at all.
+        let burst = u32::try_from(AUTHORITY_INDEPENDENT_PATHS.len() + 1).expect("small burst");
+        let router =
+            test_router(test_state(burst, 1).with_shared_store(unreachable_shared_store()));
+        let get = |uri: &str| {
+            Request::builder()
+                .method(Method::GET)
+                .uri(uri)
+                .body(Body::empty())
+                .expect("request should build")
+        };
+
+        for path in ["/health", "/livez", "/readyz", "/startupz", "/metrics"] {
+            let response = router
+                .clone()
+                .oneshot(get(path))
+                .await
+                .expect("request should complete");
+            assert_eq!(
+                response.status(),
+                StatusCode::OK,
+                "{path} must stay answerable when the authority is not"
+            );
+        }
+
+        let response = router
+            .clone()
+            .oneshot(get("/v1/orders"))
+            .await
+            .expect("request should complete");
+        assert_eq!(
+            response.status(),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "ordinary traffic must still fail closed on an unreachable authority"
+        );
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body should read");
+        let json: Value = serde_json::from_slice(&body).expect("body should be JSON");
+        assert_eq!(
+            json,
+            serde_json::json!({ "error": "rate limiter unavailable" })
+        );
+
+        let response = router
+            .oneshot(get("/readyz"))
+            .await
+            .expect("request should complete");
+        assert_eq!(
+            response.status(),
+            StatusCode::TOO_MANY_REQUESTS,
+            "the exempt paths keep the local per-replica bound: five tokens, six requests"
+        );
     }
 
     #[tokio::test]
