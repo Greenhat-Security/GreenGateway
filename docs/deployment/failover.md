@@ -101,7 +101,7 @@ A running replica has no way to re-read its DSN file; the restart is the mechani
 
 ## Deliberate replica maintenance
 
-Draining is a supported operation and is not a failure. A replica that receives `SIGTERM` stops accepting new work, stamps `draining_at` on its member row (so peers stop counting its fingerprint against a newcomer's), finishes in-flight requests within `SHUTDOWN_DRAIN_DELAY_MS` and `SHUTDOWN_TIMEOUT_MS`, releases any lease it holds at once, and exits.
+Draining is a supported operation and is not a failure. A replica that receives `SIGTERM` (or, on Windows, Ctrl-Break — the console event a supervisor can address at one process; see [the shutdown signals](production-data-plane.md#shutdown-signals)) stops accepting new work, stamps `draining_at` on its member row (so peers stop counting its fingerprint against a newcomer's), finishes in-flight requests within `SHUTDOWN_DRAIN_DELAY_MS` and `SHUTDOWN_TIMEOUT_MS`, releases any lease it holds at once, and exits.
 
 To take one out:
 

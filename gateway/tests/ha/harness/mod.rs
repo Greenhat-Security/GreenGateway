@@ -865,11 +865,12 @@ impl Cluster {
     /// Poll until the deployment has no live member left.
     ///
     /// A replica that stopped cleanly stamps its row draining and leaves at
-    /// once; one that was killed (and, on Windows, one that was "stopped",
-    /// because there is no signal to send it) leaves a row that simply
-    /// stops being refreshed and ages out of the stale window. Both are
-    /// "gone" as far as the roster is concerned, and this waits for either
-    /// without caring which happened.
+    /// once (on every platform: `Replica::stop` is `SIGTERM` on unix and
+    /// `Ctrl+Break` on Windows); one that was killed leaves a row that
+    /// simply stops being refreshed and ages out of the stale window. Both
+    /// are "gone" as far as the roster is concerned, and this waits for
+    /// either without caring which happened — a row that cares asserts
+    /// the `draining_at` stamp itself, as the smoke suite's teardown does.
     pub async fn wait_until_no_live_members(&self, budget: Duration) {
         let deadline = std::time::Instant::now() + budget;
         loop {

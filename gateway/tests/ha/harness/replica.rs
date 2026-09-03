@@ -22,8 +22,20 @@
 //! address is then confirmed by connecting to it, so no wait here can
 //! return without the new listener having actually been observed.
 //!
+//! **Stopping.** [`Replica::stop`] is the drain path on every platform:
+//! `SIGTERM` on unix, `Ctrl+Break` on Windows, where each replica is
+//! spawned in its own process group so the console event can be addressed
+//! at it alone. A replica that does not exit within [`STOP_BUDGET`] fails
+//! the test rather than being quietly killed, because the rows that call
+//! `stop` are the rows about draining.
+//!
 //! **Cleanup.** `Drop` kills the process and reaps it, so a panicking test
-//! cannot leave a gateway holding a database connection or a port.
+//! cannot leave a gateway holding a database connection or a port. On
+//! Windows every replica is also placed in a kill-on-close job object the
+//! moment it is spawned, so a test *runner* that dies (and never runs
+//! `Drop`) cannot leave one behind either — the process group that makes
+//! Ctrl+Break addressable also stops the console's Ctrl+C from reaching
+//! the replicas, and the job is what stands in for it.
 
 use std::{
     collections::BTreeMap,
@@ -44,6 +56,11 @@ pub const LISTEN_BUDGET: Duration = Duration::from_secs(90);
 /// How long a replica may take to answer `/readyz` with `200` once it is
 /// listening. Covers at least one membership heartbeat.
 pub const READY_BUDGET: Duration = Duration::from_secs(90);
+/// How long a replica may take to exit once [`Replica::stop`] has asked
+/// it to. The harness pins `SHUTDOWN_DRAIN_DELAY_MS=0` and
+/// `SHUTDOWN_TIMEOUT_MS=5000`, so a clean shutdown is seconds; the rest is
+/// headroom for a machine running other builds, not for the product.
+pub const STOP_BUDGET: Duration = Duration::from_secs(30);
 
 pub struct Replica {
     /// `a`, `b`, ... — the value this replica injects as
@@ -115,12 +132,36 @@ impl Replica {
         for (key, value) in &self.env {
             command.env(key, value);
         }
+        #[cfg(windows)]
+        {
+            // Its own process group, so that `stop` can address a
+            // Ctrl+Break at this replica and nothing else (see
+            // `send_ctrl_break`). The console's own Ctrl+C no longer
+            // reaches a replica either: `Drop` takes it down when a test
+            // is interrupted, and the job object below takes it down when
+            // the runner itself dies and `Drop` never runs.
+            use std::os::windows::process::CommandExt;
+            command.creation_flags(windows_sys::Win32::System::Threading::CREATE_NEW_PROCESS_GROUP);
+        }
         let mut child = command
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
             .expect("the gateway binary should start");
+        #[cfg(windows)]
+        if let Err(error) = job::adopt(&child) {
+            // A replica the job will not own is a replica this runner
+            // cannot promise to clean up; kill it now rather than run a
+            // test whose failure could leave it holding the database.
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!(
+                "replica {} could not be assigned to the harness's job object, so a runner \
+                 that died would orphan it: {error}",
+                self.name
+            );
+        }
         if let Some(stream) = child.stdout.take() {
             self.pumps.push(pump(stream, Arc::clone(&self.output)));
         }
@@ -368,21 +409,59 @@ impl Replica {
 
     /// Ask the replica to shut down cleanly and wait for it to exit.
     ///
-    /// `SIGTERM` on unix, which is the drain path the lifecycle tests
-    /// pin. Windows has no equivalent a test can send to a console-less
-    /// child, so there it is a hard kill; a suite that is *about* draining
-    /// must therefore say `#[cfg(unix)]` for itself.
+    /// This is the drain path the lifecycle tests pin, on every platform:
+    /// `SIGTERM` on unix, `Ctrl+Break` on Windows. The gateway's
+    /// `SystemShutdownSignals` listens for both and takes the same
+    /// coordinated shutdown either way — readiness false, the shutdown
+    /// records, the `draining_at` stamp, exit — so a suite that is *about*
+    /// draining no longer needs to say `#[cfg(unix)]` for itself. Ctrl+Break
+    /// rather than Ctrl+C because it is the one console event
+    /// `GenerateConsoleCtrlEvent` can address at a single child, and the
+    /// child was launched in its own process group to make it addressable.
+    ///
+    /// A replica that has not exited [`STOP_BUDGET`] after being asked is
+    /// killed **and the test fails**. A hard kill leaves no draining stamp
+    /// and no terminal audit record, so a row that carried on after one
+    /// would be asserting a drain that never happened — and a drain that
+    /// did not happen must not read as one that did.
     pub fn stop(&mut self) {
+        let Some(child) = self.child.as_ref() else {
+            self.kill();
+            return;
+        };
         #[cfg(unix)]
-        if let Some(child) = self.child.as_ref() {
+        {
             let _ = Command::new("kill")
                 .arg("-TERM")
                 .arg(child.id().to_string())
                 .status();
-            self.wait_for_exit(Duration::from_secs(30));
-            return;
         }
-        self.kill();
+        #[cfg(windows)]
+        if let Err(error) = send_ctrl_break(child.id()) {
+            // ERROR_INVALID_HANDLE is what a process with no console gets:
+            // the event has nothing to travel through. Say so, because the
+            // fix is to run the suite from a terminal, not to change it.
+            let hint = if error.raw_os_error() == Some(6) {
+                " (this test process is not attached to a console, so there is nothing to \
+                 deliver the event through; run the suite from a terminal)"
+            } else {
+                ""
+            };
+            panic!(
+                "replica {} could not be sent Ctrl+Break, so it cannot be drained here: \
+                 {error}{hint}",
+                self.name
+            );
+        }
+        #[cfg(not(any(unix, windows)))]
+        {
+            panic!(
+                "replica {} cannot be asked to shut down on this platform: the harness has no \
+                 signal to send it",
+                self.name
+            );
+        }
+        self.wait_for_exit(STOP_BUDGET, "after being asked to shut down");
     }
 
     /// Kill the process outright — the crash the fencing rows need: no
@@ -396,7 +475,14 @@ impl Replica {
         self.addr = None;
     }
 
-    fn wait_for_exit(&mut self, budget: Duration) {
+    /// Reap the process, or fail the test.
+    ///
+    /// The failure is deliberate and loud: past `budget` the process is
+    /// killed so nothing leaks, and then the test panics with the
+    /// process's own output, because "still running" here means the
+    /// coordinated shutdown did not finish and no row may go on to claim
+    /// that it did.
+    fn wait_for_exit(&mut self, budget: Duration, context: &str) {
         let deadline = std::time::Instant::now() + budget;
         while let Some(child) = self.child.as_mut() {
             match child
@@ -413,7 +499,12 @@ impl Replica {
                     let _ = child.wait();
                     self.child = None;
                     self.addr = None;
-                    return;
+                    panic!(
+                        "replica {} was still running {budget:?} {context}; it has been killed, \
+                         which means it never drained\n--- output ---\n{}",
+                        self.name,
+                        self.output_since_launch()
+                    );
                 }
                 None => std::thread::sleep(Duration::from_millis(50)),
             }
@@ -525,6 +616,126 @@ impl Drop for Replica {
         for pump in self.pumps.drain(..) {
             let _ = pump.join();
         }
+    }
+}
+
+/// Deliver `CTRL_BREAK_EVENT` to the process group that `process_id` leads.
+///
+/// `GenerateConsoleCtrlEvent` addresses a process *group* on this console,
+/// never a process, and takes `CTRL_C_EVENT` only for group `0` — every
+/// process on the console, this test runner included. A child created with
+/// `CREATE_NEW_PROCESS_GROUP` leads a group whose id is its own pid, so
+/// `CTRL_BREAK_EVENT` addressed there reaches that replica and nothing
+/// else. The gateway's lifecycle takes it as the request `SIGTERM` is.
+///
+/// Fails, rather than returning quietly, when this process has no console
+/// to send it through: that is a harness that cannot drain, not a replica
+/// that did.
+#[cfg(windows)]
+fn send_ctrl_break(process_id: u32) -> std::io::Result<()> {
+    use windows_sys::Win32::System::Console::{GenerateConsoleCtrlEvent, CTRL_BREAK_EVENT};
+
+    // SAFETY: a kernel32 call taking two integers by value; it reads and
+    // writes no memory this process owns.
+    let sent = unsafe { GenerateConsoleCtrlEvent(CTRL_BREAK_EVENT, process_id) };
+    if sent == 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+/// The harness's kill-on-close job object: the Windows answer to "what
+/// takes the gateways down when the test runner dies".
+///
+/// A replica is spawned with `CREATE_NEW_PROCESS_GROUP` (so that
+/// [`send_ctrl_break`] can address it), and the price of that is the
+/// console's own Ctrl+C no longer reaching it. `Drop` covers every exit
+/// this process lives through — a panic, a failed assertion, a normal
+/// return — but not a runner that is itself killed, and a gateway that
+/// outlives its runner is a process holding a test database and a port
+/// that nothing will ever reap. So every replica is assigned, right after
+/// it is spawned, to one job object per test process whose only limit is
+/// `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`. The kernel closes that handle
+/// when this process ends for any reason at all, and closing it
+/// terminates every process still in the job.
+///
+/// One job per process rather than per cluster because the property
+/// wanted is "nothing outlives the runner", and the runner is the
+/// process. The handle is deliberately never closed by hand: its close
+/// is the runner's exit.
+#[cfg(windows)]
+mod job {
+    use std::{os::windows::io::AsRawHandle, process::Child, sync::OnceLock};
+
+    use windows_sys::Win32::{
+        Foundation::HANDLE,
+        System::JobObjects::{
+            AssignProcessToJobObject, CreateJobObjectW, JobObjectExtendedLimitInformation,
+            SetInformationJobObject, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+            JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+        },
+    };
+
+    /// The job's handle. A `HANDLE` is a raw pointer only in name — it is
+    /// a kernel object index the process owns for its whole life and every
+    /// thread may use — so the wrapper is `Send + Sync` for the `OnceLock`.
+    struct Job(HANDLE);
+
+    // SAFETY: see the type's documentation; the handle is an opaque
+    // kernel object identifier, not memory, and the calls made with it
+    // are all thread-safe by contract.
+    unsafe impl Send for Job {}
+    unsafe impl Sync for Job {}
+
+    /// Put `child` in the runner's job, creating the job on first use.
+    pub fn adopt(child: &Child) -> std::io::Result<()> {
+        static JOB: OnceLock<std::io::Result<Job>> = OnceLock::new();
+        let job = match JOB.get_or_init(create) {
+            Ok(job) => job,
+            Err(error) => {
+                return Err(std::io::Error::new(
+                    error.kind(),
+                    format!("the harness's job object could not be created: {error}"),
+                ))
+            }
+        };
+        // SAFETY: both handles are valid for the duration of the call —
+        // the job's for the life of the process, the child's for as long
+        // as `child` is borrowed — and the call touches no memory of ours.
+        let assigned = unsafe { AssignProcessToJobObject(job.0, child.as_raw_handle() as HANDLE) };
+        if assigned == 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(())
+    }
+
+    fn create() -> std::io::Result<Job> {
+        // SAFETY: an anonymous job with default security; both pointer
+        // arguments are documented as optional and are null here.
+        let handle = unsafe { CreateJobObjectW(std::ptr::null(), std::ptr::null()) };
+        if handle.is_null() {
+            return Err(std::io::Error::last_os_error());
+        }
+        // SAFETY: a zeroed `JOBOBJECT_EXTENDED_LIMIT_INFORMATION` is the
+        // "no limits" value the API documents; every field is an integer
+        // or a plain struct of integers.
+        let mut limits: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = unsafe { std::mem::zeroed() };
+        limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+        // SAFETY: the pointer and length describe exactly the struct the
+        // information class names, and the struct outlives the call.
+        let set = unsafe {
+            SetInformationJobObject(
+                handle,
+                JobObjectExtendedLimitInformation,
+                std::ptr::from_ref(&limits).cast(),
+                u32::try_from(std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>())
+                    .expect("a job limit struct is smaller than 4 GiB"),
+            )
+        };
+        if set == 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(Job(handle))
     }
 }
 

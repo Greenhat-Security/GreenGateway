@@ -243,6 +243,19 @@ trait ShutdownSignals: Send {
     async fn recv(&mut self);
 }
 
+/// The operating-system events that start (and, sent twice, force) the
+/// coordinated shutdown.
+///
+/// On unix they are `SIGINT` and `SIGTERM`. On Windows they are the console
+/// events `Ctrl+C` and `Ctrl+Break`, and both are listened for on purpose:
+/// a supervising process cannot deliver `CTRL_C_EVENT` to one child
+/// (`GenerateConsoleCtrlEvent` accepts it only for the whole console), but it
+/// can deliver `CTRL_BREAK_EVENT` to a child it created in its own process
+/// group. `Ctrl+Break` is therefore the Windows spelling of `SIGTERM` — the
+/// signal an orchestrator, a service wrapper, or the two-process test harness
+/// sends to drain exactly one gateway — and it takes the same path `Ctrl+C`
+/// does: readiness false, `gateway.shutdown_started`, drain, membership row
+/// stamped draining, `gateway.shutdown_completed`, exit.
 struct SystemShutdownSignals {
     #[cfg(unix)]
     interrupt: tokio::signal::unix::Signal,
@@ -250,6 +263,8 @@ struct SystemShutdownSignals {
     terminate: tokio::signal::unix::Signal,
     #[cfg(windows)]
     ctrl_c: tokio::signal::windows::CtrlC,
+    #[cfg(windows)]
+    ctrl_break: tokio::signal::windows::CtrlBreak,
 }
 
 impl SystemShutdownSignals {
@@ -261,6 +276,8 @@ impl SystemShutdownSignals {
             terminate: tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?,
             #[cfg(windows)]
             ctrl_c: tokio::signal::windows::ctrl_c()?,
+            #[cfg(windows)]
+            ctrl_break: tokio::signal::windows::ctrl_break()?,
         })
     }
 }
@@ -274,7 +291,10 @@ impl ShutdownSignals for SystemShutdownSignals {
             _ = self.terminate.recv() => {}
         }
         #[cfg(windows)]
-        let _ = self.ctrl_c.recv().await;
+        tokio::select! {
+            _ = self.ctrl_c.recv() => {}
+            _ = self.ctrl_break.recv() => {}
+        }
         #[cfg(not(any(unix, windows)))]
         let _ = tokio::signal::ctrl_c().await;
     }
