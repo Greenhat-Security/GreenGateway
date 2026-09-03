@@ -4,6 +4,23 @@ This guide covers the PostgreSQL foundation of issue #241's cluster mode: backen
 
 Read [the HA state model](../architecture/ha-state-model.md) and [ADR-0007](../adr/0007-shared-state-and-ha-modes.md) first: they define the single-primary trust boundary, the strict per-request revision discipline, and the failure matrix this deployment shape exists to serve. One cluster is one tenant and one trust domain (ADR-0002 still applies).
 
+## Runbooks
+
+This guide explains the mode. The runbooks beside it are the procedures — exact commands, expected output, and what to do when a step fails. Read them before you need them.
+
+| Runbook | Covers |
+| --- | --- |
+| [Database roles and grants](roles-and-grants.md) | the migration/runtime split, provisioning, the grants, verifying that the runtime role holds no DDL, and rotation |
+| [TLS and the certificate authority](tls.md) | verified TLS to the authority, private and provider CAs, generating material for the example, expiry and CA rotation |
+| [Pool sizing and timeouts](pool-sizing.md) | the connection arithmetic against `max_connections`, what each timeout bounds, and how to see pool pressure from the database side |
+| [Backup, PITR, and restore verification](backup-and-recovery.md) | what to back up, when, and the five checks that decide whether a restore is finished |
+| [Failover](failover.md) | replica failure versus primary failure, why no security read may come from a lagging replica, and `/readyz` reasons |
+| [Standalone to cluster cutover](cutover.md) | `gateway import-standalone` end to end: dry run, quiesce, back up, migrate, import, one replica, verify, scale out |
+| [The rollback boundary](rollback-boundary.md) | exactly when going back is still free, and the queries that tell you which side of the line you are on |
+| [Disaster recovery](disaster-recovery.md) | rebuilding a deployment from the database, the secret store and the static configuration |
+
+An example two-replica deployment is in [`docker-compose.ha.yml`](docker-compose.ha.yml) beside them. Its PostgreSQL service is a single container and is labelled as an example only — use a managed or HA PostgreSQL in production.
+
 ## The deployment shape
 
 ```
@@ -36,7 +53,7 @@ Startup fails closed, naming the setting, when:
 - the database does not answer the connectivity check within `DATABASE_STARTUP_RETRY_LIMIT` retries (backoff starts at 250 ms, doubles, and caps at 8 s; `0` fails on the first attempt) — an unreachable authority is a startup failure, never a silent fallback to local state;
 - `STATE_BACKEND=sqlite` is set with `DEPLOYMENT_ID`, `DATABASE_URL_FILE`, `DATABASE_TLS_CA_FILE`, a cluster-only keyring, or a `DISCOVERY_PROJECTOR_*` setting configured — material a mode will never read is rejected rather than ignored.
 
-Moving a deployment from sqlite to postgres is a one-way, verified, offline import (a later #241 PR); there is deliberately no live switch and no automatic reverse migration.
+Moving a deployment from sqlite to postgres is a one-way, verified, offline import — `gateway import-standalone`, in [the cutover runbook](cutover.md); there is deliberately no live switch and no automatic reverse migration.
 
 ## The connection string
 
@@ -66,9 +83,11 @@ Full TLS in practice:
 - Give the PostgreSQL server a certificate for the hostname in the DSN, from a CA the gateway's platform trust store already knows, or
 - put that CA in a PEM bundle at `DATABASE_TLS_CA_FILE` (public material: world-readable is fine, group/world-writable is refused).
 
+The commands to verify a chain, to generate material for a lab, and the CA-rotation order that avoids an outage are in [the TLS runbook](tls.md).
+
 ## Database roles: least privilege
 
-Provision two roles. The runtime role holds only what the gateway's operations need; the migration role holds DDL and exists for the migration job. Separating them means the credentials a replica runs with every day cannot change the schema.
+Provision two roles. The runtime role holds only what the gateway's operations need; the migration role holds DDL and exists for the migration job. Separating them means the credentials a replica runs with every day cannot change the schema. The full procedure — the grants in the order they can actually run, the two commands that prove the boundary holds, and password rotation — is [the roles and grants runbook](roles-and-grants.md).
 
 ```sql
 -- One-time, as a superuser or the database owner.
@@ -123,7 +142,7 @@ The rules, enforced by `check`, by `up`, and by every serving replica's startup:
 - **Rolling upgrades coexist.** Migrations are additive (expand first; destructive cleanup is a later, explicit step), so version N and N+1 binaries can serve against one schema during a rollout. A binary never activates a document version it cannot parse — those rules land with the control-plane PRs, on this ledger. A security resource a release introduces (the JWT revocation denylist, for instance) is enforced by replicas at that release: during the rollout an older replica keeps its pre-upgrade behaviour, so a withdrawal is deployment-wide once the rollout completes (`revoke-jwt` says so). The membership PR adds the minimum-version fence that makes the write path refuse while older replicas are still registered.
 - **One deployment per database.** Every authoritative pointer and revision counter in the schema is a singleton, so a database holds exactly one deployment's state. Establishing the foundation binds the database to its `DEPLOYMENT_ID` (`greengateway.deployment_binding`, from migration 0007) once the schema is current, and refuses a database bound to another deployment — at startup (before or after development auto-migration), in every one-shot command, in `gateway migrate up` once it has applied, and in `gateway migrate check` when the schema is current (an older schema reports the upgrade it needs first).
 
-Rollback boundary: there is no schema downgrade. Rolling back an application release means redeploying the previous binary against the still-compatible schema (additive migrations keep it readable); recovering a damaged ledger or an unwanted migration state means restoring the database from backup — PITR to a point before the migration, verified with `gateway migrate check` before replicas restart. Take a backup or snapshot before every `migrate up`; that snapshot is also the pre-cutover restore point for the standalone-to-cluster import workflow of a later #241 PR.
+Rollback boundary: there is no schema downgrade. Rolling back an application release means redeploying the previous binary against the still-compatible schema (additive migrations keep it readable); recovering a damaged ledger or an unwanted migration state means restoring the database from backup — PITR to a point before the migration, verified with `gateway migrate check` before replicas restart. Take a backup or snapshot before every `migrate up` ([the backup and recovery runbook](backup-and-recovery.md)); that snapshot is also the pre-cutover restore point for the standalone-to-cluster import below.
 
 ## Pool sizing and timeouts
 
@@ -144,6 +163,8 @@ Every pooled session carries server-side bounds set at connection time, so no st
 | `DATABASE_LOCK_TIMEOUT_MS` | 5000 | `lock_timeout` — waiting on a lock |
 
 Client-side bounds: `DATABASE_CONNECT_TIMEOUT_MS` (default 5000) caps establishing one connection, and `DATABASE_ACQUIRE_TIMEOUT_MS` (default 5000) caps checking one out of the pool.
+
+The headroom term itemized, worked examples at three and eight replicas, the session-pooling-only rule for connection poolers, and the `pg_stat_activity` queries to run when the pool is the suspect are in [the pool sizing runbook](pool-sizing.md).
 
 ## The policy control plane
 
@@ -392,7 +413,30 @@ Which replica a series belongs to is the scrape target's job, not a label's: eve
 
 Everything except the four sampled families -- the pool gauges, the audit queue gauges, and the lifecycle pair -- is published by the task that owns the value, at the moment it changes, so a value that stops changing keeps its last true reading rather than quietly tracking whether anybody is scraping. The sampled families are read when `/metrics` is served, which is what a Prometheus gauge means anyway: the audit writer is a blocking consumer, so publishing from it would record only the instants it is awake (exactly the instants a backlog is draining), and `Pool::status()` is a snapshot with no history and no event to hang a publication on.
 
+## The standalone-to-cluster import
 
-Provided so far: mode selection with fail-closed validation, the redacted secret-file DSN, the verified-TLS bounded pool, deployment/instance identity, the static-configuration fingerprint, least-privilege role guidance, the versioned migration system with its CLI and startup validation, CI against a real PostgreSQL 16 including the no-DDL privilege boundary, the durable audit event store and cross-replica SSE stream (PRs 5-6), the versioned policy control plane (PR 7, semantics above), the discovery lifecycle workflows (PR 12, above), cluster membership with the maintenance singleton (PR 13, above), and the readiness reasons, cluster status API, metrics and Cluster page (PR 14, above).
+A deployment that has been running standalone holds durable, operator-owned state in files and SQLite databases. `gateway import-standalone` carries it into one cluster deployment namespace: once, offline, in one direction, with the evidence needed to decide whether the cutover succeeded.
 
-Deliberately not yet present — arriving with the later PRs of #241: the import workflow (PR 15). The versioned policy control plane (PR 7), the versioned tools and Connection control planes (PR 8), the shared authentication state (PR 9), the shared rate limits and execution leases (PR 10), global discovery (PR 11), the conditional discovery lifecycle transitions, atomic suggestion acceptance, and cluster-mode suggestion generation (PR 12, above), membership, fingerprint-gated readiness, and the leased maintenance singleton (PR 13, above), and the readiness reasons, the cluster status API, the HA metrics and the Cluster page (PR 14, above) have landed: the admin policy, tools-registration, Connection, and discovery APIs serve from PostgreSQL in cluster mode under the semantics above, and the deployment's housekeeping is fenced singleton work. Until the release gate (PR 16) passes, do not deploy this mode expecting HA, and expect that a postgres-mode replica serves with its local-only features unconfigured (any `*_SQLITE_PATH` is rejected), with the shared features arriving as the PRs land.
+```
+gateway import-standalone --from <standalone-env-file> [--dry-run | --apply [--resume]]
+```
+
+Two configurations are involved and they cannot be one process environment, because `Config` refuses a configuration that names both a local authority and `STATE_BACKEND=postgres`. The process environment is the **target** cluster, as in every other one-shot command here; the **source** is the standalone deployment's own environment file, named by `--from` and validated through the same `Config` validator, so "both configurations valid" is a real check rather than a claim. Run it with the migration role's DSN, beside `gateway migrate up`: preserving a policy history's version numbers means naming an identity column's values and realigning the sequence afterwards, which the runtime role deliberately cannot do.
+
+`--dry-run` is the default and writes nothing at all — not even the deployment binding, since binding is a write and a rehearsal must leave the database exactly as it found it. `--apply` performs the import; `--apply --resume` continues one that was interrupted. Each section is its own transaction with its own counts and checksum, so an interrupted run leaves whole sections committed and nothing partial, and a resumed section recognizes its own completed work by the resource's natural key (the active document's ETag for policy and tools, the record IDs for Connections, `event_id` for audit) before writing anything. Every source read goes through the parser or store standalone mode itself uses; no ad-hoc SQL touches the source.
+
+The target must be an empty deployment namespace: the schema current, the database unbound or bound to this `DEPLOYMENT_ID`, every authoritative content table empty and every authoritative counter still where migration seeded it. Runtime state a replica rebuilds or elects — membership rows, the maintenance ledger, execution leases, rate-limit buckets, pending logins, JWT revocations — is deliberately not on that list, so a database a replica has merely connected to is still empty and a cutover rehearsal stays repeatable. Refusals print a stable machine-readable code (`target_namespace_not_empty`, `source_document_unparseable`, `standalone_config_invalid`, and the rest) that operators can script against; the prose after it may change between releases, the code does not.
+
+The report is pretty-printed JSON on stdout: counts, checksums, revisions and durations, and never a plaintext token, secret, login material or DSN. Standalone configuration problems are reported by setting name only, because the validator's own messages quote the offending value and some of those values are key material. Checksums are SHA-256 over canonical exports computed identically on both sides, which is what makes them evidence rather than decoration — and they are what [the rollback boundary runbook](rollback-boundary.md) compares against.
+
+All nine sections of issue #241 §9 are performed. The last of them is a verification pass, and it is the reason the command is worth running rather than a hand-written script: it re-reads the target through the cluster's own readers, compares per-table row counts and per-section SHA-256 checksums against the source, reads every foreign key and unique index in a read-only constraint pass, checks the active ETags and the projector checkpoint, boots the Connections graph through the same `validate_persisted_state` a replica runs at startup, and proves the excluded runtime tables empty. A failed check refuses the run with the code `validation_failed`, naming the check that failed. What the command deliberately leaves behind is listed in the report's `not_imported` field.
+
+The principal directory is never imported: cluster mode has no principal directory, so there is no destination for it — no migration creates the table, and `PRINCIPAL_SQLITE_PATH` is refused in cluster mode. It is a projection of authenticated traffic, and that traffic is imported with the audit log. The report names the file left behind rather than letting it go missing quietly.
+
+The full procedure — dry run, quiesce control-plane writes, back up both sides, migrate, import, start one replica, verify, scale out — is [the cutover runbook](cutover.md), and the point after which going back stops being free is [the rollback boundary runbook](rollback-boundary.md).
+
+
+
+Provided so far: mode selection with fail-closed validation, the redacted secret-file DSN, the verified-TLS bounded pool, deployment/instance identity, the static-configuration fingerprint, least-privilege role guidance, the versioned migration system with its CLI and startup validation, CI against a real PostgreSQL 16 including the no-DDL privilege boundary, the durable audit event store and cross-replica SSE stream (PRs 5-6), the versioned policy control plane (PR 7, semantics above), the discovery lifecycle workflows (PR 12, above), cluster membership with the maintenance singleton (PR 13, above), the readiness reasons, cluster status API, metrics and Cluster page (PR 14, above), and the standalone-to-cluster import with its operator runbooks (PR 15, above).
+
+Deliberately not yet present: nothing from the #241 sequence except the release gate (PR 16) that proves the whole of it. The versioned policy control plane (PR 7), the versioned tools and Connection control planes (PR 8), the shared authentication state (PR 9), the shared rate limits and execution leases (PR 10), global discovery (PR 11), the conditional discovery lifecycle transitions, atomic suggestion acceptance, and cluster-mode suggestion generation (PR 12, above), membership, fingerprint-gated readiness, and the leased maintenance singleton (PR 13, above), the readiness reasons, the cluster status API, the HA metrics and the Cluster page (PR 14, above), and the standalone-to-cluster import (PR 15, above) have landed: the admin policy, tools-registration, Connection, and discovery APIs serve from PostgreSQL in cluster mode under the semantics above, and the deployment's housekeeping is fenced singleton work. Until the release gate (PR 16) passes, do not deploy this mode expecting HA, and expect that a postgres-mode replica serves with its local-only features unconfigured (any `*_SQLITE_PATH` is rejected), with the shared features arriving as the PRs land.

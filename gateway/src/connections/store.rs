@@ -766,6 +766,46 @@ pub struct ConnectionStatusUpdate {
     pub catalog_entry_count: Option<usize>,
 }
 
+/// One status observation exactly as it is persisted.
+///
+/// [`SafeConnectionStatus`] is the SAFE PROJECTION of these rows: it drops
+/// the revision columns the row is keyed and validated by, and it ages
+/// `catalog_age_secs` forward to the moment of the read (store.rs
+/// `RawStatus::into_safe_status`) so a UI shows how stale a catalog is
+/// now. Neither is what a copy of the durable state may carry: an import
+/// that wrote the aged value would record a catalog age that grew every
+/// time the row was read, and one that could not carry the revisions
+/// could not write `connection_status_history` at all. This is the row.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PersistedConnectionStatus {
+    pub connection_id: ConnectionId,
+    pub status_revision: u64,
+    pub observed_connection_revision: u64,
+    pub observed_credential_revision: u64,
+    pub observed_tls_revision: u64,
+    pub observed_discovery_revision: u64,
+    pub state: ConnectionOperationalState,
+    pub reason: ConnectionStatusReason,
+    pub observed_at: String,
+    pub latency_ms: Option<u64>,
+    pub catalog_age_secs: Option<u64>,
+    pub catalog_entry_count: Option<u64>,
+}
+
+/// Both status tables of a standalone deployment, read together.
+///
+/// They are separate tables and not one derivable from the other: history
+/// is pruned against a global budget while a current-status row never is,
+/// so a Connection can hold a current status whose history row was pruned
+/// away (store.rs `append_status`).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ExportedConnectionStatuses {
+    /// One per Connection that has ever been observed, keyed by ID.
+    pub current: Vec<PersistedConnectionStatus>,
+    /// Oldest first, in the order the observations were appended.
+    pub history: Vec<PersistedConnectionStatus>,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct StoredMcpCatalogEntry {
     pub remote_tool_name: String,
@@ -2297,6 +2337,54 @@ impl SqliteConnectionStore {
         rows.into_iter()
             .map(|raw| raw.into_safe_status(id))
             .collect()
+    }
+
+    /// Both status tables, verbatim, in one transaction.
+    ///
+    /// The copy the standalone-to-cluster import carries across (issue
+    /// #241, PR 15 step 4). The other status readers on this store serve
+    /// the admin API and return the safe projection; this one returns the
+    /// rows, because the cluster's tables have the same columns and its
+    /// startup validation compares them against the record's revisions
+    /// (pg_store.rs `validate_persisted_state`). Both tables are read on
+    /// one transaction so the pair cannot be observed mid-append, and each
+    /// is bounded by the budget the writer prunes them against, so a
+    /// source that has overflowed it is refused rather than read.
+    pub fn exported_statuses(&self) -> Result<ExportedConnectionStatuses, ConnectionStoreError> {
+        let mut connection = self.connection_guard();
+        let transaction = connection
+            .transaction()
+            .map_err(|source| sqlite_error(&self.path, "status export transaction", source))?;
+        let current = exported_status_rows(
+            &transaction,
+            &self.path,
+            r#"
+            SELECT connection_id, status_revision, observed_connection_revision,
+                   observed_credential_revision, observed_tls_revision,
+                   observed_discovery_revision, state, reason, observed_at,
+                   latency_ms, catalog_age_secs, catalog_entry_count
+            FROM connection_current_status
+            ORDER BY connection_id ASC
+            LIMIT ?1
+            "#,
+        )?;
+        let history = exported_status_rows(
+            &transaction,
+            &self.path,
+            r#"
+            SELECT connection_id, status_revision, observed_connection_revision,
+                   observed_credential_revision, observed_tls_revision,
+                   observed_discovery_revision, state, reason, observed_at,
+                   latency_ms, catalog_age_secs, catalog_entry_count
+            FROM connection_status_history
+            ORDER BY sequence ASC
+            LIMIT ?1
+            "#,
+        )?;
+        transaction
+            .commit()
+            .map_err(|source| sqlite_error(&self.path, "status export commit", source))?;
+        Ok(ExportedConnectionStatuses { current, history })
     }
 
     fn connection_guard(&self) -> MutexGuard<'_, Connection> {
@@ -4661,6 +4749,114 @@ fn raw_status_from_row(row: &Row<'_>) -> rusqlite::Result<RawStatus> {
     })
 }
 
+/// Read one of the two status tables verbatim for
+/// [`SqliteConnectionStore::exported_statuses`]. `query` is a literal
+/// from this module and takes the row budget as its only parameter; one
+/// row past the budget refuses the read, because a source that has
+/// overflowed the bound the writer prunes against is one no destination
+/// can accept.
+fn exported_status_rows(
+    transaction: &Transaction<'_>,
+    path: &Path,
+    query: &'static str,
+) -> Result<Vec<PersistedConnectionStatus>, ConnectionStoreError> {
+    let mut statement = transaction
+        .prepare(query)
+        .map_err(|source| sqlite_error(path, "status export prepare", source))?;
+    let rows = statement
+        .query_map(
+            params![i64::try_from(MAX_STATUS_HISTORY_ROWS + 1).unwrap_or(i64::MAX)],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, i64>(3)?,
+                    row.get::<_, i64>(4)?,
+                    row.get::<_, i64>(5)?,
+                    row.get::<_, String>(6)?,
+                    row.get::<_, String>(7)?,
+                    row.get::<_, String>(8)?,
+                    row.get::<_, Option<i64>>(9)?,
+                    row.get::<_, Option<i64>>(10)?,
+                    row.get::<_, Option<i64>>(11)?,
+                ))
+            },
+        )
+        .map_err(|source| sqlite_error(path, "status export query", source))?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|source| sqlite_error(path, "status export read", source))?;
+    drop(statement);
+    if rows.len() > MAX_STATUS_HISTORY_ROWS {
+        return Err(ConnectionStoreError::LimitExceeded {
+            resource: "safe connection status rows",
+            maximum: MAX_STATUS_HISTORY_ROWS,
+        });
+    }
+    rows.into_iter()
+        .map(|raw| {
+            let (
+                raw_id,
+                status_revision,
+                observed_connection_revision,
+                observed_credential_revision,
+                observed_tls_revision,
+                observed_discovery_revision,
+                state,
+                reason,
+                observed_at,
+                latency_ms,
+                catalog_age_secs,
+                catalog_entry_count,
+            ) = raw;
+            let id = ConnectionId::parse(raw_id.clone()).map_err(|_| {
+                ConnectionStoreError::CorruptRecord {
+                    id: raw_id,
+                    reason: "status row has an invalid connection ID",
+                }
+            })?;
+            Ok(PersistedConnectionStatus {
+                status_revision: persisted_revision(
+                    &id,
+                    status_revision,
+                    "invalid status revision",
+                )?,
+                observed_connection_revision: revision_from_i64(
+                    &id,
+                    observed_connection_revision,
+                    false,
+                )?,
+                observed_credential_revision: revision_from_i64(
+                    &id,
+                    observed_credential_revision,
+                    true,
+                )?,
+                observed_tls_revision: revision_from_i64(&id, observed_tls_revision, true)?,
+                observed_discovery_revision: revision_from_i64(
+                    &id,
+                    observed_discovery_revision,
+                    true,
+                )?,
+                state: parse_state(&state).ok_or_else(|| ConnectionStoreError::CorruptRecord {
+                    id: id.to_string(),
+                    reason: "unknown safe status state",
+                })?,
+                reason: parse_reason(&reason).ok_or_else(|| {
+                    ConnectionStoreError::CorruptRecord {
+                        id: id.to_string(),
+                        reason: "unknown safe status reason",
+                    }
+                })?,
+                observed_at,
+                latency_ms: optional_i64_to_u64(&id, latency_ms)?,
+                catalog_age_secs: optional_i64_to_u64(&id, catalog_age_secs)?,
+                catalog_entry_count: optional_i64_to_u64(&id, catalog_entry_count)?,
+                connection_id: id,
+            })
+        })
+        .collect()
+}
+
 fn replace_bindings(
     transaction: &Transaction<'_>,
     path: &Path,
@@ -5059,7 +5255,7 @@ pub(crate) fn optional_u64_to_i64(
         .transpose()
 }
 
-fn optional_i64_to_u64(
+pub(crate) fn optional_i64_to_u64(
     id: &ConnectionId,
     value: Option<i64>,
 ) -> Result<Option<u64>, ConnectionStoreError> {

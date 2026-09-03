@@ -253,6 +253,42 @@ jobs:
       - name: Type-check Cloudflare wrapper
         run: npm run typecheck
 
+  ha-compose-example:
+    name: ha-compose-example
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # Validity only. This job never starts a container, never builds an
+      # image and never pulls one: `docker compose config` parses, interpolates
+      # and merges the file and prints the resolved model. The example is an
+      # operator-facing document, and a document that no longer parses is a
+      # broken document — but it describes a two-replica deployment against a
+      # PostgreSQL the runner does not have, so running it is not the check.
+      - name: Validate the HA compose example
+        shell: bash
+        run: |
+          set -eu
+
+          example=docs/deployment/docker-compose.ha.yml
+
+          # The default set: db, migrate, the two gateways and the load
+          # balancer.
+          docker compose -f "$example" config --quiet
+
+          # Services behind a profile are NOT included above, so they need
+          # their own pass or a typo in the bootstrap or import service ships
+          # unchecked.
+          docker compose -f "$example" \
+            --profile bootstrap --profile import config --quiet
+
+          # The single PostgreSQL container must stay labelled as an example.
+          # This is the one claim in the file an operator can be harmed by
+          # losing, so it is asserted rather than trusted to review.
+          grep -qi 'EXAMPLE ONLY' "$example"
+
   dev-traffic-smoke:
     name: dev-traffic-smoke
     runs-on: ubuntu-latest

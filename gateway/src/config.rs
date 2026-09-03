@@ -3470,6 +3470,22 @@ fn parse_material_file_list(
     Some(files)
 }
 
+impl ConfigError {
+    /// The individual validation problems, one per invalid setting.
+    ///
+    /// `Display` is the operator-facing form and quotes the offending
+    /// VALUES, which is right for a gateway reporting its own environment.
+    /// A caller validating somebody else's environment file -- the
+    /// standalone-to-cluster import of issue #241, PR 15 -- must report
+    /// which settings failed WITHOUT echoing values that may be key
+    /// material, so it reads the problems and keeps only their leading
+    /// setting names.
+    #[cfg_attr(not(feature = "postgres"), allow(dead_code))]
+    pub(crate) fn problems(&self) -> &[String] {
+        &self.problems
+    }
+}
+
 impl fmt::Display for ConfigError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "configuration is invalid:")?;

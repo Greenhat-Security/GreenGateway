@@ -1,0 +1,446 @@
+# GreenGateway cluster mode (issue #241): two replicas behind one load balancer.
+#
+# ============================================================================
+# EXAMPLE ONLY. The `db` service below is a single PostgreSQL container. Use a
+# managed or HA PostgreSQL in production; this single container is not itself
+# HA. It has one copy of the data, no standby, no automated failover, no
+# point-in-time recovery, and its volume dies with the host. Cluster mode
+# makes the gateway replicas replaceable; it does NOT make the database
+# replaceable, because the database is the single authority for every security
+# decision. Losing this container loses the deployment. See
+# `backup-and-recovery.md`, `failover.md`, and `disaster-recovery.md`.
+# ============================================================================
+#
+# Cluster mode is experimental and is not a supported HA configuration until
+# the #241 release gate passes. This file exists so an operator can rehearse
+# the shape and the cutover, not so it can be pointed at production.
+#
+# Prerequisites, in order, all documented in `postgres.md` and the runbooks
+# beside it. None of them are optional and none of them happen by themselves:
+#
+#   1. TLS material in ./tls (see `tls.md`). The gateway requires verified
+#      TLS to the database; there is no plaintext fallback, and
+#      DATABASE_TLS_MODE=loopback-dev is refused for any target that is not
+#      loopback, so the `db` service needs a real certificate for the name
+#      `db` signed by the CA at ./tls/ca.pem.
+#   2. DSN files in ./secrets (see `roles-and-grants.md`). Two roles, two
+#      files, mode 0400: the migration role holds DDL, the runtime role does
+#      not.
+#   3. `docker compose --profile bootstrap run --rm db-bootstrap` once, to
+#      create the roles.
+#   4. `docker compose run --rm migrate` to build the schema, then
+#      `docker compose --profile bootstrap run --rm db-grants` to grant the
+#      runtime role its table privileges (the grants can only run after the
+#      tables exist).
+#   5. An import (see `cutover.md`). The gateway services WILL NOT START until
+#      the deployment has an active policy document: cluster mode has no "no
+#      policy" state, and a replica that found none would either serve
+#      protected traffic with no authorization policy or fall back to local
+#      state the mode forbids. It exits naming
+#      "STATE_BACKEND=postgres requires an initialized deployment".
+#
+# The directories this file expects beside it - ./tls, ./secrets, ./standalone
+# and ./wal-archive - hold key material, DSNs and a copy of a real deployment's
+# state. They are working directories for a local example. Do not commit them;
+# add them to .gitignore before you create them.
+#
+# Validate this file without running anything (both profiles too, or the
+# profiled services are not checked):
+#
+#   docker compose -f docs/deployment/docker-compose.ha.yml config
+#   docker compose -f docs/deployment/docker-compose.ha.yml \
+#     --profile bootstrap --profile import config
+
+name: greengateway-ha
+
+# Every replica of one deployment must agree on the security-relevant static
+# configuration or it will not become ready: a replica whose fingerprint
+# differs from a live member's answers /readyz with 503 and the reason
+# `config_fingerprint_mismatch`. This anchor is how the two gateway services
+# below are kept byte-identical. Change it in one place or not at all.
+x-gateway-environment: &gateway-environment
+  LISTEN_ADDR: 0.0.0.0:8080
+  STATE_BACKEND: postgres
+  DEPLOYMENT_ID: deploy-compose-example
+  DATABASE_URL_FILE: /run/secrets/database-url-runtime
+  DATABASE_TLS_MODE: verify
+  DATABASE_TLS_CA_FILE: /etc/greengateway/tls/ca.pem
+  # Pool ceiling per replica. The sizing math is
+  # `replicas x DATABASE_POOL_MAX + migrator/leader headroom <= max_connections
+  # - superuser_reserved_connections`; see `pool-sizing.md`. Two replicas at 10
+  # plus headroom fits the `max_connections=100` this example's db starts with.
+  DATABASE_POOL_MAX: "10"
+  DATABASE_CONNECT_TIMEOUT_MS: "5000"
+  DATABASE_ACQUIRE_TIMEOUT_MS: "5000"
+  DATABASE_STATEMENT_TIMEOUT_MS: "15000"
+  DATABASE_IDLE_IN_TRANSACTION_TIMEOUT_MS: "30000"
+  DATABASE_LOCK_TIMEOUT_MS: "5000"
+  # Serving replicas validate the schema and never migrate. The migration job
+  # below owns DDL, under the migration role.
+  DATABASE_AUTO_MIGRATE: "false"
+  CLUSTER_HEARTBEAT_MS: "5000"
+  CLUSTER_MEMBER_STALE_MS: "30000"
+  CLUSTER_MAINTENANCE_INTERVAL_MS: "60000"
+  CLUSTER_MAINTENANCE_LEASE_TTL_MS: "15000"
+  SHUTDOWN_DRAIN_DELAY_MS: "5000"
+  SHUTDOWN_TIMEOUT_MS: "30000"
+  AUDIT_DRAIN_TIMEOUT_MS: "5000"
+
+x-gateway-service: &gateway-service
+  build:
+    context: ../..
+    dockerfile: Dockerfile
+  environment: *gateway-environment
+  # Mode 0400 and owned by the container's uid is not decoration: the gateway
+  # refuses a DSN file that grants any group or other permission, and refuses
+  # one it cannot read. The Dockerfile's runtime user is 10001:10001.
+  secrets:
+    - source: database-url-runtime
+      target: database-url-runtime
+      uid: "10001"
+      gid: "10001"
+      mode: 0400
+  volumes:
+    - ./tls/ca.pem:/etc/greengateway/tls/ca.pem:ro
+  stop_signal: SIGTERM
+  stop_grace_period: 45s
+  # /readyz is the only correct probe for a cluster-mode replica. /livez says
+  # the process is alive; /readyz additionally requires that the replica is
+  # accepting work, that its static-configuration fingerprint agrees with
+  # every live non-draining member, and that its required upstreams are up. A
+  # load balancer pointed at /livez will send traffic to a replica that is
+  # deliberately refusing it.
+  healthcheck:
+    test:
+      - CMD
+      - curl
+      - --fail
+      - --silent
+      - --show-error
+      - http://127.0.0.1:8080/readyz
+    interval: 5s
+    timeout: 3s
+    retries: 12
+    start_period: 15s
+  depends_on:
+    migrate:
+      condition: service_completed_successfully
+  restart: unless-stopped
+
+secrets:
+  database-url-runtime:
+    file: ./secrets/database-url-runtime
+  database-url-migration:
+    file: ./secrets/database-url-migration
+
+configs:
+  nginx-conf:
+    content: |
+      worker_processes 1;
+      events { worker_connections 1024; }
+      http {
+        access_log /dev/stdout;
+        error_log  /dev/stderr;
+
+        # nginx OSS has no active health checks. Passive ejection is what this
+        # buys: three consecutive failures take a replica out for 10 seconds,
+        # then one request is tried again. It is NOT a readiness gate. In a
+        # real orchestrator, let the platform's /readyz probe decide
+        # membership of the backend set and keep this as a backstop.
+        upstream greengateway {
+          least_conn;
+          server gateway-1:8080 max_fails=3 fail_timeout=10s;
+          server gateway-2:8080 max_fails=3 fail_timeout=10s;
+        }
+
+        server {
+          listen 80;
+
+          # The load balancer's own readiness: healthy while at least one
+          # replica answers /readyz. Do not expose this to callers as the
+          # deployment's health; it hides the count.
+          location = /__lb_ready {
+            proxy_pass http://greengateway/readyz;
+            proxy_next_upstream error timeout http_503;
+          }
+
+          location / {
+            proxy_pass http://greengateway;
+            proxy_http_version 1.1;
+            proxy_set_header Host $$host;
+            proxy_set_header X-Forwarded-For $$proxy_add_x_forwarded_for;
+            proxy_set_header X-Forwarded-Proto $$scheme;
+            proxy_set_header Connection "";
+            # Server-sent event streams (the admin audit stream) must not be
+            # buffered or they arrive in one lump at the end.
+            proxy_buffering off;
+            proxy_read_timeout 300s;
+            # A 503 from a replica is "cannot check authority", which is
+            # retryable on another replica. A 401/403 is a decision and is
+            # never retried.
+            proxy_next_upstream error timeout http_502 http_503 http_504;
+            proxy_next_upstream_tries 2;
+          }
+        }
+      }
+
+  # Roles only. The grants come later, because they need tables to exist.
+  bootstrap-roles-sql:
+    content: |
+      -- See `roles-and-grants.md` for what each grant is for and why the
+      -- runtime role must not hold DDL.
+      SELECT format('CREATE ROLE greengateway LOGIN PASSWORD %L', :'runtime_password')
+      WHERE NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'greengateway')
+      \gexec
+      SELECT format('CREATE ROLE greengateway_migrator LOGIN PASSWORD %L', :'migration_password')
+      WHERE NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'greengateway_migrator')
+      \gexec
+      GRANT CONNECT ON DATABASE greengateway TO greengateway;
+      GRANT CONNECT ON DATABASE greengateway TO greengateway_migrator;
+      GRANT greengateway TO greengateway_migrator;
+
+  # Run once, after the first `migrate up`. Re-running it is harmless.
+  bootstrap-grants-sql:
+    content: |
+      GRANT USAGE ON SCHEMA greengateway TO greengateway;
+      GRANT SELECT, INSERT, UPDATE, DELETE
+        ON ALL TABLES IN SCHEMA greengateway TO greengateway;
+      GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA greengateway TO greengateway;
+      -- Tables a later migration creates are covered by this default, applied
+      -- FOR the migration role because that is the role that will create them.
+      ALTER DEFAULT PRIVILEGES FOR ROLE greengateway_migrator IN SCHEMA greengateway
+        GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO greengateway;
+      ALTER DEFAULT PRIVILEGES FOR ROLE greengateway_migrator IN SCHEMA greengateway
+        GRANT USAGE, SELECT ON SEQUENCES TO greengateway;
+      -- The runtime role holds no DDL. This is the boundary the whole
+      -- two-role split exists for; do not "fix" a migration failure by
+      -- granting CREATE here.
+      REVOKE CREATE ON SCHEMA greengateway FROM greengateway;
+
+volumes:
+  db-data:
+
+services:
+  # ==========================================================================
+  # EXAMPLE ONLY - use a managed or HA PostgreSQL in production; this single
+  # container is not itself HA.
+  # ==========================================================================
+  db:
+    image: postgres:16
+    command:
+      - postgres
+      - -c
+      - ssl=on
+      - -c
+      - ssl_cert_file=/etc/postgresql/tls/server.crt
+      - -c
+      - ssl_key_file=/etc/postgresql/tls/server.key
+      - -c
+      - max_connections=100
+      # Enough WAL retained that a base backup plus WAL archive is a real
+      # recovery source rather than a snapshot. See `backup-and-recovery.md`.
+      - -c
+      - wal_level=replica
+      - -c
+      - archive_mode=on
+      - -c
+      - archive_command=test ! -f /var/lib/postgresql/wal-archive/%f && cp %p /var/lib/postgresql/wal-archive/%f
+    environment:
+      POSTGRES_DB: greengateway
+      POSTGRES_USER: postgres
+      # Example only. In production the database is not yours to hand a
+      # password to on a command line; it is a managed service with its own
+      # credential rotation.
+      POSTGRES_PASSWORD: ${GG_POSTGRES_PASSWORD:-postgres-example-only}
+      POSTGRES_INITDB_ARGS: --data-checksums
+    volumes:
+      - db-data:/var/lib/postgresql/data
+      # The server key must be 0600 and owned by the postgres user (uid 999 in
+      # this image) or the server refuses to start. `tls.md` has the commands.
+      - ./tls/server.crt:/etc/postgresql/tls/server.crt:ro
+      - ./tls/server.key:/etc/postgresql/tls/server.key:ro
+      - ./wal-archive:/var/lib/postgresql/wal-archive
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - pg_isready --username=postgres --dbname=greengateway
+      interval: 5s
+      timeout: 3s
+      retries: 20
+      start_period: 10s
+    restart: unless-stopped
+
+  # One-shot, profile `bootstrap`: create the two roles. Set GG_RUNTIME_PASSWORD
+  # and GG_MIGRATION_PASSWORD in the environment first; they must match the
+  # passwords in the two DSN files under ./secrets.
+  db-bootstrap:
+    profiles:
+      - bootstrap
+    image: postgres:16
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      PGHOST: db
+      PGUSER: postgres
+      PGDATABASE: greengateway
+      PGPASSWORD: ${GG_POSTGRES_PASSWORD:-postgres-example-only}
+      GG_RUNTIME_PASSWORD: ${GG_RUNTIME_PASSWORD:-}
+      GG_MIGRATION_PASSWORD: ${GG_MIGRATION_PASSWORD:-}
+    configs:
+      - source: bootstrap-roles-sql
+        target: /sql/roles.sql
+    entrypoint:
+      - /bin/sh
+      - -c
+      - |
+        set -eu
+        test -n "$${GG_RUNTIME_PASSWORD}" || { echo "GG_RUNTIME_PASSWORD is unset" >&2; exit 1; }
+        test -n "$${GG_MIGRATION_PASSWORD}" || { echo "GG_MIGRATION_PASSWORD is unset" >&2; exit 1; }
+        exec psql --set=ON_ERROR_STOP=1 \
+          --variable=runtime_password="$${GG_RUNTIME_PASSWORD}" \
+          --variable=migration_password="$${GG_MIGRATION_PASSWORD}" \
+          --file=/sql/roles.sql
+    restart: "no"
+
+  # One-shot, profile `bootstrap`: grant the runtime role its table privileges.
+  # Run AFTER the first successful `migrate`, and after any migration that adds
+  # tables if you have not set the default privileges above.
+  db-grants:
+    profiles:
+      - bootstrap
+    image: postgres:16
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      PGHOST: db
+      PGUSER: postgres
+      PGDATABASE: greengateway
+      PGPASSWORD: ${GG_POSTGRES_PASSWORD:-postgres-example-only}
+    configs:
+      - source: bootstrap-grants-sql
+        target: /sql/grants.sql
+    command:
+      - psql
+      - --set=ON_ERROR_STOP=1
+      - --file=/sql/grants.sql
+    restart: "no"
+
+  # The migration job. It is the ONLY service that holds DDL, and it is a job:
+  # it connects, applies pending migrations under an advisory lock, prints one
+  # line, and exits. `docker compose run --rm migrate` runs it on demand.
+  migrate:
+    build:
+      context: ../..
+      dockerfile: Dockerfile
+    environment:
+      STATE_BACKEND: postgres
+      DEPLOYMENT_ID: deploy-compose-example
+      DATABASE_URL_FILE: /run/secrets/database-url-migration
+      DATABASE_TLS_MODE: verify
+      DATABASE_TLS_CA_FILE: /etc/greengateway/tls/ca.pem
+      DATABASE_MIGRATION_STATEMENT_TIMEOUT_MS: "60000"
+    secrets:
+      - source: database-url-migration
+        target: database-url-migration
+        uid: "10001"
+        gid: "10001"
+        mode: 0400
+    volumes:
+      - ./tls/ca.pem:/etc/greengateway/tls/ca.pem:ro
+    depends_on:
+      db:
+        condition: service_healthy
+    command:
+      - migrate
+      - up
+    restart: "no"
+
+  # The standalone-to-cluster import (issue #241 PR 15). Profile `import`, so
+  # `docker compose up` never runs it by accident.
+  #
+  # It runs under the MIGRATION role, not the runtime role: importing a
+  # standalone deployment's policy history preserves its version numbers, which
+  # means naming an identity column's values and realigning the sequence
+  # afterwards, and the least-privilege runtime role deliberately does not hold
+  # that.
+  #
+  # The process environment here is the TARGET cluster. The SOURCE standalone
+  # deployment is named by `--from <env-file>`, because one Config cannot hold
+  # both: a configuration naming a local authority and STATE_BACKEND=postgres
+  # is refused at startup.
+  #
+  #   Dry run (the default, writes nothing):
+  #     docker compose --profile import run --rm import
+  #   Apply:
+  #     docker compose --profile import run --rm import \
+  #       import-standalone --from /standalone/standalone.env --apply
+  #   Resume an interrupted apply:
+  #     docker compose --profile import run --rm import \
+  #       import-standalone --from /standalone/standalone.env --apply --resume
+  #
+  # ./standalone must contain the standalone deployment's environment file and
+  # every path it names (POLICY_FILE, TOOLS_FILE, the *_SQLITE_PATH files),
+  # mounted read-only. The import never writes to the source.
+  import:
+    profiles:
+      - import
+    build:
+      context: ../..
+      dockerfile: Dockerfile
+    environment:
+      STATE_BACKEND: postgres
+      DEPLOYMENT_ID: deploy-compose-example
+      DATABASE_URL_FILE: /run/secrets/database-url-migration
+      DATABASE_TLS_MODE: verify
+      DATABASE_TLS_CA_FILE: /etc/greengateway/tls/ca.pem
+      DATABASE_STATEMENT_TIMEOUT_MS: "60000"
+    secrets:
+      - source: database-url-migration
+        target: database-url-migration
+        uid: "10001"
+        gid: "10001"
+        mode: 0400
+    volumes:
+      - ./tls/ca.pem:/etc/greengateway/tls/ca.pem:ro
+      - ./standalone:/standalone:ro
+    depends_on:
+      db:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    command:
+      - import-standalone
+      - --from
+      - /standalone/standalone.env
+      - --dry-run
+    restart: "no"
+
+  gateway-1:
+    <<: *gateway-service
+
+  gateway-2:
+    <<: *gateway-service
+
+  lb:
+    image: nginx:1.27-alpine
+    configs:
+      - source: nginx-conf
+        target: /etc/nginx/nginx.conf
+    ports:
+      - "8080:80"
+    depends_on:
+      gateway-1:
+        condition: service_healthy
+      gateway-2:
+        condition: service_healthy
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - wget --quiet --spider http://127.0.0.1/__lb_ready || exit 1
+      interval: 5s
+      timeout: 3s
+      retries: 12
+      start_period: 5s
+    restart: unless-stopped

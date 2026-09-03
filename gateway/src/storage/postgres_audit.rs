@@ -101,12 +101,23 @@ ON CONFLICT (event_id) DO NOTHING
 /// may carry ids whose stream rows already exist, and assigning
 /// `row_number()` over those ids before `ON CONFLICT` skipped them would
 /// reserve positions for rows that are never inserted.
+///
+/// **Within a batch, positions follow the ORDER THE CALLER PRESENTED THE
+/// EVENTS IN, not their ids.** `UNNEST ... WITH ORDINALITY` carries the
+/// array index through the anti-join and `row_number()` orders by it. The
+/// caller's order is the log's order -- the ingestion sink queues events as
+/// they happen, and the standalone-to-cluster import pages the source log in
+/// `id` order -- while an `event_id` is a random UUIDv4, whose lexicographic
+/// order is unrelated to anything. Ordering by the id would leave every
+/// batch internally shuffled, which contradicts the whole contract a durable
+/// cursor reads the stream under (`audit::query`: positions advance in
+/// commit order, and within a commit in event order).
 const LOCK_STREAM_SQL: &str = "SELECT pg_advisory_xact_lock($1)";
 
 const APPEND_STREAM_SQL: &str = r#"
 WITH pending AS (
-    SELECT batch.event_id
-    FROM UNNEST($1::text[]) AS batch(event_id)
+    SELECT batch.event_id, batch.offered
+    FROM UNNEST($1::text[]) WITH ORDINALITY AS batch(event_id, offered)
     WHERE NOT EXISTS (
         SELECT 1 FROM greengateway.audit_stream s WHERE s.event_id = batch.event_id
     )
@@ -119,7 +130,7 @@ reserved AS (
 ),
 assigned AS (
     SELECT reserved.base_position
-           + row_number() OVER (ORDER BY pending.event_id) AS position,
+           + row_number() OVER (ORDER BY pending.offered) AS position,
            pending.event_id
     FROM pending CROSS JOIN reserved
 )

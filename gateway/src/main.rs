@@ -55,6 +55,11 @@ mod discovery;
 mod egress;
 mod ha;
 mod ha_status;
+/// The one-way standalone-to-cluster import (issue #241, PR 15). Only a
+/// `postgres` build has a cluster to import into; a feature-off build
+/// refuses the subcommand in `run` with a clear message.
+#[cfg(feature = "postgres")]
+mod import;
 mod inbound_tls;
 mod lifecycle;
 mod mcp;
@@ -2276,6 +2281,30 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         }
         return Ok(());
     }
+    // `gateway import-standalone --from <standalone-env-file>`: the
+    // one-way, offline standalone-to-cluster import (issue #241, PR 15).
+    // The process environment is the TARGET cluster configuration, like
+    // every other one-shot command here; the SOURCE standalone
+    // configuration is the file `--from` names, because `Config` refuses
+    // to hold both at once. `--dry-run` is the default and writes
+    // nothing. The report goes to stdout as JSON: counts, checksums,
+    // revisions and durations, never a token, secret or DSN.
+    #[cfg(feature = "postgres")]
+    if std::env::args_os()
+        .nth(1)
+        .is_some_and(|word| word == *"import-standalone")
+    {
+        initialize_tracing_for_one_shot_commands();
+        let request = import::ImportRequest::parse(std::env::args_os().skip(2))
+            .map_err(|error| Box::<dyn std::error::Error>::from(error.to_string()))?;
+        let config = config::Config::from_env()
+            .map_err(|error| Box::<dyn std::error::Error>::from(error.to_string()))?;
+        let report = import::run(&request, &config)
+            .await
+            .map_err(|error| Box::<dyn std::error::Error>::from(error.to_string()))?;
+        println!("{report}");
+        return Ok(());
+    }
     #[cfg(not(feature = "postgres"))]
     if std::env::args_os().nth(1).is_some_and(|word| {
         word == *"revoke-jwt"
@@ -2283,10 +2312,12 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             || word == *"rate-limit-buckets-cleanup"
             || word == *"cluster-members"
             || word == *"maintenance-run"
+            || word == *"import-standalone"
     }) {
         return Err(
             "this gateway binary was built without the `postgres` cargo feature and \
-                    cannot run the JWT revocation, rate-limit, or cluster maintenance commands; build with default features"
+                    cannot run the JWT revocation, rate-limit, cluster maintenance, or \
+                    standalone-import commands; build with default features"
                 .into(),
         );
     }

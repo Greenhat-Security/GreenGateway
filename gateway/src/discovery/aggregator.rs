@@ -1819,6 +1819,32 @@ impl AggregatorState {
         }
     }
 
+    /// Every aggregate this state holds, as one batch, ordered by key.
+    ///
+    /// `pending_flush` snapshots what has changed since the last flush,
+    /// which is what a running projector owes its backend. The
+    /// standalone-to-cluster import (issue #241, PR 15) owes the opposite:
+    /// the target holds nothing, so every endpoint is "changed", and the
+    /// batch it writes must be the whole working set exactly as this state
+    /// rebuilt it from the source. No key is deleted and no signal is
+    /// queued -- an import carries the source's stored signals verbatim,
+    /// lifecycle state included, rather than re-raising them.
+    ///
+    /// The order is deterministic (the map's iteration order is not) so a
+    /// rehearsal and the apply that follows it digest to the same value.
+    pub(crate) fn full_flush(&self) -> PendingFlush {
+        let mut dirty_aggregates = self.aggregates.values().cloned().collect::<Vec<_>>();
+        dirty_aggregates.sort_by(|left, right| {
+            (&left.key.method, &left.key.endpoint_template)
+                .cmp(&(&right.key.method, &right.key.endpoint_template))
+        });
+        PendingFlush {
+            deleted_keys: Vec::new(),
+            dirty_aggregates,
+            pending_signals: Vec::new(),
+        }
+    }
+
     /// Serialized detector state for every aggregate in `batch`, for a backend
     /// that persists the rolling windows alongside the aggregates.
     pub(crate) fn detector_states_for(batch: &PendingFlush) -> Vec<(EndpointKey, String)> {
@@ -2438,7 +2464,11 @@ fn configure_payload_capture_connection(connection: &Connection) -> rusqlite::Re
 /// Read every persisted row from the SQLite tables. Payload tables are only
 /// read when capture is enabled because they only exist then. Detector
 /// windows and learner groups are never stored in SQLite.
-fn load_rows_sqlite(
+///
+/// Visible to the crate because the standalone-to-cluster import (issue
+/// #241, PR 15) reads the source through the reader the sink itself loads
+/// with, rather than a second set of statements that could drift from it.
+pub(crate) fn load_rows_sqlite(
     connection: &Connection,
     payload_capture_enabled: bool,
 ) -> Result<LoadedRows, EndpointAggregatorLoadError> {
