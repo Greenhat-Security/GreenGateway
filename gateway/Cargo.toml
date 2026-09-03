@@ -63,6 +63,15 @@ proptest.workspace = true
 rcgen.workspace = true
 rustix.workspace = true
 
+# `tests/ha/harness/replica.rs` drains a Windows replica by sending Ctrl+Break
+# to the process group it was spawned in, and parks every replica in a
+# kill-on-close job object so a runner that dies cannot orphan them; the
+# creation flag, the console call, and the job calls all come from here. The
+# production binary never links it: the lifecycle's Ctrl+Break listener is
+# tokio's.
+[target.'cfg(windows)'.dev-dependencies]
+windows-sys.workspace = true
+
 [features]
 default = ["postgres"]
 # PostgreSQL-backed cluster mode foundation (issue #241 PR 3). Feature-gated so

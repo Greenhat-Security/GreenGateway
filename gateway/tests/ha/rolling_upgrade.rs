@@ -416,10 +416,10 @@ async fn cluster_replicas(cluster: &Cluster, replica: &str, admin: &str) -> Vec<
 /// out of `expected` live.
 ///
 /// The roster's `ready_at` is written by a heartbeat, so it trails a
-/// replica's own `/readyz`; and a replica that was hard-killed (which is
-/// what `stop` is on Windows) leaves a row that ages out of the stale
-/// window rather than stamping itself draining. Both are the deployment
-/// converging, and this polls through both.
+/// replica's own `/readyz`; and a replica that was hard-killed (`kill`,
+/// the crash-shaped exit some rows choose) leaves a row that ages out of
+/// the stale window rather than stamping itself draining. Both are the
+/// deployment converging, and this polls through both.
 async fn wait_for_ready_replicas(
     cluster: &Cluster,
     replica: &str,
@@ -938,12 +938,11 @@ async fn roll_one(cluster: &mut Cluster, name: &str, completed: &Arc<AtomicUsize
     // once two more requests have completed anywhere, the at-most-one that
     // was in flight to this replica is among them.
     //
-    // On unix `stop` is `SIGTERM` and the gateway drains what it is
-    // holding, so this wait is belt and braces there. On Windows there is
-    // no signal a test can send a console-less child and `stop` is a hard
-    // kill, which severs an in-flight proxied request — an artefact of the
-    // harness, not of the product, and one that would otherwise show up
-    // here as a refusal the deployment never made.
+    // `stop` is the drain path on every platform (`SIGTERM` on unix,
+    // `Ctrl+Break` on Windows) and the gateway finishes what it is
+    // holding, so this wait is belt and braces: it keeps the row's subject
+    // the rollout discipline rather than the product's in-flight drain,
+    // which `tests/lifecycle_shutdown.rs` pins on its own.
     drain_in_flight(completed, 2).await;
 
     cluster.replica_mut(name).restart().await;

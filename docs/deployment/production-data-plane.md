@@ -140,6 +140,17 @@ The image-level Docker `HEALTHCHECK` uses `/livez`. The checked-in Compose
 service overrides it with `/readyz`, because Compose health is used as an
 admission dependency for the development stack.
 
+## Shutdown signals
+
+The coordinated shutdown — readiness false, `gateway.shutdown_started`, the drain delay, listeners and background work stopped within the shutdown timeout, the member row stamped `draining_at` in cluster mode, the audit flush, `gateway.shutdown_completed` — starts on the first of these and is forced by a second:
+
+| Platform | Signals |
+| --- | --- |
+| Unix | `SIGINT`, `SIGTERM` |
+| Windows | Ctrl-C (`CTRL_C_EVENT`), Ctrl-Break (`CTRL_BREAK_EVENT`) |
+
+Both Windows events take exactly the path `SIGTERM` does. Ctrl-Break is listened for because it is the one console event a supervising process can deliver to a *single* child: `GenerateConsoleCtrlEvent` accepts `CTRL_C_EVENT` only for the whole console, but accepts `CTRL_BREAK_EVENT` for any process group, so a supervisor that spawns the gateway with `CREATE_NEW_PROCESS_GROUP` can drain that one gateway and nothing else. A service wrapper or a test harness on Windows should send Ctrl-Break; `TerminateProcess` is the equivalent of `SIGKILL` and leaves no draining stamp and no terminal audit record.
+
 ## Graceful termination budget
 
 The maximum planned shutdown wall time is:

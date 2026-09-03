@@ -361,7 +361,7 @@ Delay between entering the draining phase and stopping the listeners, in millise
 
 Default: `1000`
 
-Format and validation: must parse as a `u64` no greater than `30000`; `0` is allowed. On the first Ctrl-C or Unix `SIGTERM`, GreenGateway immediately marks readiness false, emits `gateway.shutdown_started`, and cancels retry and health-check work. This delay gives external load balancers time to observe `/readyz` before the listeners stop accepting work.
+Format and validation: must parse as a `u64` no greater than `30000`; `0` is allowed. On the first shutdown signal (`SIGINT` or `SIGTERM` on Unix; Ctrl-C or Ctrl-Break on Windows), GreenGateway immediately marks readiness false, emits `gateway.shutdown_started`, and cancels retry and health-check work. This delay gives external load balancers time to observe `/readyz` before the listeners stop accepting work.
 
 ### SHUTDOWN_TIMEOUT_MS
 

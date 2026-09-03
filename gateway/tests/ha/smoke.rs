@@ -123,13 +123,17 @@ async fn two_replicas_serve_one_deployment_and_tear_down() {
         "the balancer's pin header must not reach the upstream"
     );
 
-    // 3. Everything tears down.
+    // 3. Everything tears down, and tears down CLEANLY.
     //
-    // Both processes exit, and the deployment's roster empties: a replica
-    // that drained stamps its row draining immediately, and one that was
-    // killed ages out of the stale window on database time. The wait is a
-    // bounded poll on that observable, generous enough for the slower of
-    // the two paths.
+    // `Cluster::shutdown` asks each replica to leave — `SIGTERM` on unix,
+    // `Ctrl+Break` on Windows — and `Replica::stop` fails the test if one
+    // does not exit within its budget. So by the time it returns, every
+    // replica took the coordinated shutdown: stamped its own row
+    // `draining_at` before it exited, and wrote both shutdown records to
+    // its audit file. Those are asserted here rather than waited for,
+    // because a stop that returned without them would be a kill wearing a
+    // stop's name, and every suite that calls `stop` is trusting this one
+    // to have checked.
     cluster.shutdown();
     for replica in &mut cluster.replicas {
         assert!(
@@ -138,6 +142,39 @@ async fn two_replicas_serve_one_deployment_and_tear_down() {
             replica.name
         );
     }
+    let stamped_draining = cluster
+        .database
+        .count(
+            "SELECT count(*)::bigint FROM greengateway.cluster_members \
+             WHERE draining_at IS NOT NULL",
+        )
+        .await;
+    assert_eq!(
+        stamped_draining,
+        i64::try_from(cluster.replicas.len()).expect("a replica count fits in i64"),
+        "every stopped replica should have stamped its membership row draining before it \
+         exited; a row without the stamp was killed, not drained"
+    );
+    for replica in &cluster.replicas {
+        let event_types: Vec<String> = replica
+            .audit_events()
+            .iter()
+            .filter_map(|event| event["event_type"].as_str().map(str::to_owned))
+            .collect();
+        for expected in ["gateway.shutdown_started", "gateway.shutdown_completed"] {
+            assert!(
+                event_types.iter().any(|event_type| event_type == expected),
+                "replica {} should have written {expected} on a clean stop; its audit file \
+                 holds {event_types:?}\n--- output ---\n{}",
+                replica.name,
+                replica.output_since_launch()
+            );
+        }
+    }
+    // And the roster agrees: a draining row is not a live one, so nothing
+    // is left to age out. The budget is the stale window's because that is
+    // what a killed replica would have needed, and this wait is shared with
+    // rows that kill.
     cluster
         .wait_until_no_live_members(Duration::from_millis(cluster.member_stale_ms * 4))
         .await;

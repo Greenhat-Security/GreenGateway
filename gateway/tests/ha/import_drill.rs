@@ -466,11 +466,13 @@ impl Standalone {
     ///
     /// Fixture preparation, and it happens BEFORE the state this drill
     /// compares against is recorded, so it can never hide a write the
-    /// import made. It exists because a gateway that was killed rather
-    /// than asked to exit (Windows has no signal a test can send) leaves a
-    /// hot `-wal`, and the import opens the source read-only: the point of
-    /// the drill is what the import does to a quiescent deployment, not
-    /// what SQLite does with a journal a crash left behind.
+    /// import made. It exists because a gateway that died rather than
+    /// exiting cleanly leaves a hot `-wal`, and the import opens the
+    /// source read-only: the point of the drill is what the import does to
+    /// a quiescent deployment, not what SQLite does with a journal a crash
+    /// left behind. `stop` drains on every platform now, so this is belt
+    /// and braces rather than a Windows workaround, and it stays because
+    /// the fixture's quiescence is a precondition, not an observation.
     fn quiesce(&self) {
         for path in self.sqlite_files() {
             if !path.exists() {

@@ -96,5 +96,21 @@ tracing = "0.1.44"
 tracing-subscriber = "0.3.23"
 url = "2.5.7"
 uuid = { version = "1.20.0", features = ["v4"] }
+# The two-process HA harness's Windows process control (`gateway/tests/ha/
+# harness/replica.rs`): a replica is spawned in its own process group and
+# stopped with `GenerateConsoleCtrlEvent(CTRL_BREAK_EVENT, <pid>)`, the one
+# console event a parent can address at a single child; and every replica is
+# assigned to a kill-on-close job object so a runner that dies takes its
+# gateways with it. Test-only and Windows-only (see the
+# `[target.'cfg(windows)'.dev-dependencies]` table in `gateway/Cargo.toml`), and
+# already in the graph transitively through tokio and mio. `Win32_Security` is
+# only there because `CreateJobObjectW` takes a `SECURITY_ATTRIBUTES` pointer.
+windows-sys = { version = "0.61.2", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_System_Console",
+    "Win32_System_JobObjects",
+    "Win32_System_Threading",
+] }
 yaml_serde = "0.10.4"
 zeroize = "1.8.2"
