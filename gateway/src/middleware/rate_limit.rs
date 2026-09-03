@@ -560,7 +560,12 @@ impl RateLimitOverride {
 /// not. Both halves are pinned by
 /// `probe_and_metrics_paths_answer_when_the_authority_is_unreachable` in
 /// this module's tests.
-const AUTHORITY_INDEPENDENT_PATHS: [&str; 4] = ["/livez", "/readyz", "/startupz", "/metrics"];
+/// `/health` is the legacy compatibility status endpoint. New deployments
+/// are pointed at `/livez` and `/readyz`, but a container supervisor that
+/// still probes `/health` has exactly the same claim on an answer during
+/// an outage, so it is exempt for the same reason.
+const AUTHORITY_INDEPENDENT_PATHS: [&str; 5] =
+    ["/health", "/livez", "/readyz", "/startupz", "/metrics"];
 
 pub async fn rate_limit_request(
     State(state): State<RateLimitState>,
@@ -1372,9 +1377,13 @@ mod tests {
     #[cfg(feature = "postgres")]
     #[tokio::test]
     async fn probe_and_metrics_paths_answer_when_the_authority_is_unreachable() {
-        // Five read tokens: one for each of the four exempt paths, and one
-        // for the ordinary path that must reach the failing authority.
-        let router = test_router(test_state(5, 1).with_shared_store(unreachable_shared_store()));
+        // One read token for each exempt path, plus one for the ordinary
+        // path that must reach the failing authority. The burst is sized
+        // from the list so adding a path cannot silently turn the ordinary
+        // leg into a local `429` and stop it testing the authority at all.
+        let burst = u32::try_from(AUTHORITY_INDEPENDENT_PATHS.len() + 1).expect("small burst");
+        let router =
+            test_router(test_state(burst, 1).with_shared_store(unreachable_shared_store()));
         let get = |uri: &str| {
             Request::builder()
                 .method(Method::GET)
@@ -1383,7 +1392,7 @@ mod tests {
                 .expect("request should build")
         };
 
-        for path in ["/livez", "/readyz", "/startupz", "/metrics"] {
+        for path in ["/health", "/livez", "/readyz", "/startupz", "/metrics"] {
             let response = router
                 .clone()
                 .oneshot(get(path))
