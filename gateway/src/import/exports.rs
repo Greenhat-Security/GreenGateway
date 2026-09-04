@@ -232,6 +232,7 @@ pub(super) fn connections_export(connections: &[ImportedConnection]) -> Result<V
             "openapi_catalog": connection.openapi_catalog.as_ref().map(|catalog| json!({
                 "spec_revision": catalog.spec_revision,
                 "catalog_revision": catalog.catalog_revision,
+                "overlay_revision": catalog.overlay_revision,
                 "observed_etag": catalog.observed_etag.as_str(),
                 // The digest stands for the specification body: it is a
                 // SHA-256 over exactly the bytes stored, re-verified on
@@ -249,6 +250,15 @@ pub(super) fn connections_export(connections: &[ImportedConnection]) -> Result<V
                         "definition": entry.definition,
                     }))
                     .collect::<Vec<_>>(),
+            })),
+            "openapi_overlay": connection.openapi_overlay.as_ref().map(|overlay| json!({
+                "schema_version": overlay.schema_version,
+                "overlay_revision": overlay.overlay_revision,
+                "overlay": serde_json::from_str::<Value>(&overlay.overlay_json)
+                    .unwrap_or(Value::Null),
+                "source_reports": overlay.source_reports_json.as_deref()
+                    .map(|reports| serde_json::from_str::<Value>(reports).unwrap_or(Value::Null)),
+                "updated_at": overlay.updated_at,
             })),
         }));
     }

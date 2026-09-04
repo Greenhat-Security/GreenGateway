@@ -1777,6 +1777,7 @@ mod tests {
 
         file.write(&tool_policy_document_with_deny_rule());
         crate::middleware::rbac::reload_policy_from_file(&rbac_state, file.path())
+            .await
             .expect("valid tool policy reload should succeed");
 
         let denied = runtime
@@ -1818,6 +1819,7 @@ mod tests {
 
         file.write(&tool_policy_document_with_http_deny_rule());
         crate::middleware::rbac::reload_policy_from_file(&rbac_state, file.path())
+            .await
             .expect("valid direct HTTP rule reload should succeed");
 
         assert!(!runtime.authorize_http_operation("echo", "POST", "/v1/echo", &context));
@@ -1954,6 +1956,7 @@ mod tests {
 
         file.write(&tool_policy_document_with_allowed_roles(&["admin"]));
         crate::middleware::rbac::reload_policy_from_file(&rbac_state, file.path())
+            .await
             .expect("valid tool policy reload should succeed");
 
         let denied = runtime
@@ -2015,6 +2018,7 @@ mod tests {
 
         file.write(&tool_policy_document_with_echo_enabled(false));
         crate::middleware::rbac::reload_policy_from_file(&rbac_state, file.path())
+            .await
             .expect("valid tool policy reload should succeed");
 
         let disabled = runtime
@@ -2060,6 +2064,7 @@ mod tests {
 
         file.write(&tool_policy_document_without_tools());
         crate::middleware::rbac::reload_policy_from_file(&rbac_state, file.path())
+            .await
             .expect("valid tool policy reload should succeed");
 
         let removed = runtime
@@ -2100,6 +2105,7 @@ mod tests {
 
         file.write(&tool_policy_document_with_echo_max_concurrent(2));
         crate::middleware::rbac::reload_policy_from_file(&rbac_state, file.path())
+            .await
             .expect("valid tool policy reload should succeed");
 
         let tracker = Arc::new(ConcurrencyTracker::default());
@@ -2176,6 +2182,7 @@ mod tests {
 
         file.write(&tool_policy_document_without_tools());
         crate::middleware::rbac::reload_policy_from_file(&rbac_state, file.path())
+            .await
             .expect("valid tool removal reload should succeed");
         let _ = runtime
             .execute_with_context("missing", context(), CancellationToken::new(), || async {
@@ -2190,6 +2197,7 @@ mod tests {
 
         file.write(&tool_policy_document_with_echo_max_concurrent(1));
         crate::middleware::rbac::reload_policy_from_file(&rbac_state, file.path())
+            .await
             .expect("valid tool re-add reload should succeed");
 
         let after_readd_release = ReleaseGate::new();
@@ -2253,6 +2261,7 @@ mod tests {
             2, 1,
         ));
         crate::middleware::rbac::reload_policy_from_file(&rbac_state, file.path())
+            .await
             .expect("valid tool policy reload should succeed");
 
         let tracker = Arc::new(ConcurrencyTracker::default());
@@ -2318,6 +2327,7 @@ mod tests {
             "admin",
         ));
         crate::middleware::rbac::reload_policy_from_file(&rbac_state, file.path())
+            .await
             .expect("valid tool policy reload should succeed");
 
         let denied = runtime

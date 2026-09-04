@@ -687,6 +687,7 @@ mod tests {
 
     const VISIBLE_TOOL: &str = "public_probe";
     const RESTRICTED_TOOL: &str = "payroll_export";
+    const COMPOSITE_ONLY_TOOL: &str = "composite_step";
     const PRIVILEGED_ROLE: &str = "payroll-admin";
 
     #[test]
@@ -735,6 +736,43 @@ mod tests {
         assert!(
             !listed.iter().any(|name| name == RESTRICTED_TOOL),
             "a tool restricted to '{PRIVILEGED_ROLE}' must not be advertised to a caller without that role: {listed:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn composite_only_tool_is_neither_listed_nor_callable_over_mcp() {
+        let (state, registry) = mcp_state_from_empty_registry();
+        registry
+            .merge_definitions(vec![composite_only_tool_definition()])
+            .expect("composite-only definition should register");
+
+        let list_body = mcp_json_rpc(&state, 10, "tools/list", None).await;
+        assert!(
+            !listed_tool_names(&list_body)
+                .iter()
+                .any(|name| name == COMPOSITE_ONLY_TOOL),
+            "tools/list must not disclose composite-only tool metadata: {list_body}"
+        );
+
+        let call_body = mcp_json_rpc(
+            &state,
+            11,
+            "tools/call",
+            Some(json!({ "name": COMPOSITE_ONLY_TOOL, "arguments": {} })),
+        )
+        .await;
+        assert_eq!(
+            call_body["error"]["code"],
+            json!(ErrorCode::METHOD_NOT_FOUND.0),
+            "a hidden tool must be indistinguishable from a missing tool: {call_body}"
+        );
+        assert_eq!(
+            call_body["error"]["message"],
+            json!(format!("tool '{COMPOSITE_ONLY_TOOL}' is not defined"))
+        );
+        assert_eq!(
+            call_body["error"]["data"]["tool_name"],
+            json!(COMPOSITE_ONLY_TOOL)
         );
     }
 
@@ -850,6 +888,7 @@ mod tests {
     fn tool_visibility_runtime() -> ToolRuntime {
         let tools = [
             (VISIBLE_TOOL.to_owned(), tool_policy(Vec::new())),
+            (COMPOSITE_ONLY_TOOL.to_owned(), tool_policy(Vec::new())),
             (
                 RESTRICTED_TOOL.to_owned(),
                 tool_policy(vec![PRIVILEGED_ROLE.to_owned()]),
@@ -891,7 +930,14 @@ mod tests {
                 query_params: Vec::new(),
                 body: None,
             },
+            visibility: crate::tools::definitions::ToolVisibility::Listed,
         }
+    }
+
+    fn composite_only_tool_definition() -> ToolDefinition {
+        let mut definition = legacy_tool_definition(COMPOSITE_ONLY_TOOL);
+        definition.visibility = crate::tools::definitions::ToolVisibility::CompositeOnly;
+        definition
     }
 
     fn listed_tool_names(body: &Value) -> Vec<String> {

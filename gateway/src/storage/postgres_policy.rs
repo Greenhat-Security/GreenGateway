@@ -38,6 +38,8 @@
 //! Redaction follows the foundation's rules: no SQL text, no query values,
 //! and no DSN-derived material cross the error boundary.
 
+use std::{collections::BTreeSet, sync::LazyLock};
+
 use async_trait::async_trait;
 use serde_json::Value;
 
@@ -73,6 +75,46 @@ const OPERATION_COMMIT: &str = "policy_commit";
 const OPERATION_HISTORY_LIST: &str = "policy_history_list";
 const OPERATION_HISTORY_GET: &str = "policy_history_get";
 const OPERATION_OUTBOX: &str = "policy_outbox_read";
+const OPERATION_POLICY_OVERLAY_LOCK: &str = "policy_overlay_advisory_lock";
+
+/// Serializes policy adoption with OpenAPI overlay name adoption across
+/// every PostgreSQL replica. A transaction-scoped lock is intentional:
+/// cancellation and rollback release it automatically, unlike a pooled
+/// session lock.
+pub(crate) static POLICY_OVERLAY_LOCK_KEY: LazyLock<i64> = LazyLock::new(|| {
+    super::postgres_session::advisory_lock_key("greengateway.policy-openapi-overlay")
+});
+
+pub(crate) async fn acquire_policy_overlay_lock(
+    client: &deadpool_postgres::Object,
+) -> Result<(), RepositoryError> {
+    client
+        .execute(
+            "SELECT pg_advisory_xact_lock($1)",
+            &[&*POLICY_OVERLAY_LOCK_KEY],
+        )
+        .await
+        .map_err(|error| classify_query(error, OPERATION_POLICY_OVERLAY_LOCK))?;
+    Ok(())
+}
+
+/// Read and self-verify the authoritative policy while the shared
+/// policy/overlay lock is held. Overlay writers use this instead of a
+/// replica-local RBAC snapshot, closing the cross-replica rename race.
+pub(crate) async fn active_policy_tool_names_in(
+    client: &deadpool_postgres::Object,
+) -> Result<BTreeSet<String>, RepositoryError> {
+    let row = postgres_documents::read_active(client, POLICY_DOCUMENT_RESOURCE).await?;
+    let Some((_version, stored_etag, _security_revision, _created_at, document_json)) = row else {
+        return Ok(BTreeSet::new());
+    };
+    let policy = policy_from_json(&document_json, OPERATION_ACTIVE)?;
+    let etag = crate::policy_etag(&policy).map_err(|_| invalid_data(OPERATION_ACTIVE))?;
+    if etag != stored_etag {
+        return Err(invalid_data(OPERATION_ACTIVE));
+    }
+    Ok(policy.tools.into_keys().collect())
+}
 
 /// One durable change record from `security_outbox`. Reconciliation and
 /// (later) notification consumers read these; the payload is identifiers
@@ -237,6 +279,9 @@ pub(crate) async fn commit_policy_in(
     client: &deadpool_postgres::Object,
     request: PolicyCommitRequest<'_>,
 ) -> Result<ActivePolicy, PolicyCommitError> {
+    acquire_policy_overlay_lock(client)
+        .await
+        .map_err(store_error)?;
     let document_json = serde_json::to_string(request.candidate)
         .map_err(|_| invalid_data(OPERATION_COMMIT))
         .map_err(store_error)?;

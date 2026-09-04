@@ -1710,7 +1710,9 @@ mod tests {
             2,
         )]);
         file.write(&policy_json(&updated_policy));
-        reload_policy_from_file(&rbac_state, file.path()).expect("valid reload should succeed");
+        reload_policy_from_file(&rbac_state, file.path())
+            .await
+            .expect("valid reload should succeed");
 
         assert_eq!(
             request_status(&router, Method::GET, "/reload", Some("user-a"), None).await,
@@ -1774,6 +1776,7 @@ mod tests {
                 fs::write(&reload_path, policy_json)
                     .unwrap_or_else(|err| panic!("failed to write reload policy: {err}"));
                 reload_policy_from_file(&reload_state, &reload_path)
+                    .await
                     .expect("valid reload policy should be accepted");
                 tokio::task::yield_now().await;
             }

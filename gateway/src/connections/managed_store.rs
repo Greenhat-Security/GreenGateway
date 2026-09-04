@@ -35,7 +35,7 @@ use super::store::{
     ConnectionStatusUpdate, ConnectionStore, ConnectionStoreError, SqliteConnectionStore,
     StoredConnection, StoredMcpCatalog, StoredMcpCatalogEntry, StoredMcpResource,
     StoredMcpResourceTemplate, StoredOpenApiCatalog, StoredOpenApiCatalogEntry,
-    StoredOpenApiInventoryCatalog,
+    StoredOpenApiInventoryCatalog, StoredOpenApiOverlay, StoredOverlayWrite,
 };
 
 /// What the authority held when this replica started, fetched by `run()`
@@ -48,6 +48,7 @@ pub struct ClusterConnectionsBoot {
     pub mcp_catalogs: Vec<StoredMcpCatalog>,
     pub openapi_catalogs: Vec<StoredOpenApiCatalog>,
     pub openapi_inventory_catalogs: Vec<StoredOpenApiInventoryCatalog>,
+    pub openapi_overlays: Vec<StoredOpenApiOverlay>,
 }
 
 /// Which authority owns the managed-connection store for this process.
@@ -138,6 +139,26 @@ impl ManagedConnectionStore {
             Self::Sqlite(store) => store.openapi_catalogs(),
             #[cfg(feature = "postgres")]
             Self::Postgres { boot, .. } => Ok(boot.openapi_catalogs.clone()),
+        }
+    }
+
+    pub fn boot_openapi_catalogs_with_overlays(
+        &self,
+    ) -> Result<(Vec<StoredOpenApiCatalog>, Vec<StoredOpenApiOverlay>), ConnectionStoreError> {
+        match self {
+            Self::Sqlite(store) => store.openapi_catalogs_with_overlays(),
+            #[cfg(feature = "postgres")]
+            Self::Postgres { boot, .. } => {
+                Ok((boot.openapi_catalogs.clone(), boot.openapi_overlays.clone()))
+            }
+        }
+    }
+
+    pub fn boot_openapi_overlays(&self) -> Result<Vec<StoredOpenApiOverlay>, ConnectionStoreError> {
+        match self {
+            Self::Sqlite(store) => store.openapi_overlays(),
+            #[cfg(feature = "postgres")]
+            Self::Postgres { boot, .. } => Ok(boot.openapi_overlays.clone()),
         }
     }
 
@@ -652,6 +673,69 @@ impl ManagedConnectionStore {
         }
     }
 
+    pub async fn openapi_catalogs_with_overlays(
+        &self,
+    ) -> Result<(Vec<StoredOpenApiCatalog>, Vec<StoredOpenApiOverlay>), ConnectionStoreError> {
+        match self {
+            Self::Sqlite(store) => {
+                let store = store.clone();
+                blocking("OpenAPI catalog/overlay snapshot", move || {
+                    store.openapi_catalogs_with_overlays()
+                })
+                .await
+            }
+            #[cfg(feature = "postgres")]
+            Self::Postgres { store, .. } => store.openapi_catalogs_with_overlays().await,
+        }
+    }
+
+    pub async fn openapi_catalog_with_overlay(
+        &self,
+        id: &ConnectionId,
+    ) -> Result<(Option<StoredOpenApiCatalog>, Option<StoredOpenApiOverlay>), ConnectionStoreError>
+    {
+        match self {
+            Self::Sqlite(store) => {
+                let store = store.clone();
+                let id = id.clone();
+                blocking("OpenAPI catalog/overlay read", move || {
+                    store.openapi_catalog_with_overlay(&id)
+                })
+                .await
+            }
+            #[cfg(feature = "postgres")]
+            Self::Postgres { store, .. } => store.openapi_catalog_with_overlay(id).await,
+        }
+    }
+
+    pub async fn openapi_overlays(
+        &self,
+    ) -> Result<Vec<StoredOpenApiOverlay>, ConnectionStoreError> {
+        match self {
+            Self::Sqlite(store) => {
+                let store = store.clone();
+                blocking("OpenAPI overlays read", move || store.openapi_overlays()).await
+            }
+            #[cfg(feature = "postgres")]
+            Self::Postgres { store, .. } => store.openapi_overlays().await,
+        }
+    }
+
+    pub async fn openapi_overlay(
+        &self,
+        id: &ConnectionId,
+    ) -> Result<Option<StoredOpenApiOverlay>, ConnectionStoreError> {
+        match self {
+            Self::Sqlite(store) => {
+                let store = store.clone();
+                let id = id.clone();
+                blocking("OpenAPI overlay read", move || store.openapi_overlay(&id)).await
+            }
+            #[cfg(feature = "postgres")]
+            Self::Postgres { store, .. } => store.openapi_overlay(id).await,
+        }
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub async fn replace_openapi_catalog(
         &self,
@@ -664,6 +748,37 @@ impl ManagedConnectionStore {
         entries: &[StoredOpenApiCatalogEntry],
         actor: &str,
     ) -> Result<StoredOpenApiCatalog, ConnectionStoreError> {
+        self.replace_openapi_catalog_with_overlay(
+            id,
+            expected_connection_etag,
+            expected_spec_revision,
+            expected_catalog_revision,
+            spec,
+            spec_digest,
+            entries,
+            None,
+            0,
+            actor,
+            &[],
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn replace_openapi_catalog_with_overlay(
+        &self,
+        id: &ConnectionId,
+        expected_connection_etag: &ConnectionEtag,
+        expected_spec_revision: u64,
+        expected_catalog_revision: u64,
+        spec: &str,
+        spec_digest: &str,
+        entries: &[StoredOpenApiCatalogEntry],
+        overlay: Option<&StoredOverlayWrite>,
+        compiled_overlay_revision: u64,
+        actor: &str,
+        policy_protected_names: &[String],
+    ) -> Result<StoredOpenApiCatalog, ConnectionStoreError> {
         match self {
             Self::Sqlite(store) => {
                 let _ = actor;
@@ -673,8 +788,11 @@ impl ManagedConnectionStore {
                 let spec = spec.to_owned();
                 let spec_digest = spec_digest.to_owned();
                 let entries = entries.to_vec();
+                let overlay = overlay.cloned();
+                let actor = actor.to_owned();
+                let policy_protected_names = policy_protected_names.to_vec();
                 blocking("openapi catalog replace", move || {
-                    store.replace_openapi_catalog(
+                    store.replace_openapi_catalog_with_overlay(
                         &id,
                         &expected_connection_etag,
                         expected_spec_revision,
@@ -682,6 +800,10 @@ impl ManagedConnectionStore {
                         &spec,
                         &spec_digest,
                         &entries,
+                        overlay.as_ref(),
+                        compiled_overlay_revision,
+                        &actor,
+                        &policy_protected_names,
                     )
                 })
                 .await
@@ -689,7 +811,7 @@ impl ManagedConnectionStore {
             #[cfg(feature = "postgres")]
             Self::Postgres { store, .. } => {
                 store
-                    .replace_openapi_catalog(
+                    .replace_openapi_catalog_with_overlay(
                         id,
                         expected_connection_etag,
                         expected_spec_revision,
@@ -697,7 +819,10 @@ impl ManagedConnectionStore {
                         spec,
                         spec_digest,
                         entries,
+                        overlay,
+                        compiled_overlay_revision,
                         actor,
+                        policy_protected_names,
                     )
                     .await
             }

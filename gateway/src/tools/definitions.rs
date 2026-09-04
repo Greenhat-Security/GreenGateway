@@ -54,6 +54,32 @@ pub struct ToolDefinition {
     #[serde(default, skip_serializing_if = "ToolSource::is_legacy")]
     pub source: ToolSource,
     pub upstream: UpstreamMapping,
+    /// Who may see and call this tool (issue #360, D2). `Listed` is the
+    /// default and is never serialised, so a definition that predates the
+    /// field keeps its exact stored bytes and digest.
+    #[serde(default, skip_serializing_if = "ToolVisibility::is_listed")]
+    pub visibility: ToolVisibility,
+}
+
+/// Where a tool is reachable from (issue #360).
+///
+/// `CompositeOnly` tools are compiled from a Connection overlay: they are
+/// not advertised by `tools/list` and not callable through `tools/call`,
+/// only as a step or compensation of a composite tool (PR 4) and from the
+/// admin playground. The registry keeps them so policy, inventory, and
+/// the catalog digest see one definition per operation.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolVisibility {
+    #[default]
+    Listed,
+    CompositeOnly,
+}
+
+impl ToolVisibility {
+    pub fn is_listed(&self) -> bool {
+        matches!(self, Self::Listed)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
@@ -138,6 +164,7 @@ impl ToolDefinition {
             target: None,
             source: ToolSource::Legacy,
             upstream: UpstreamMapping::mcp_proxy(server_name, tool_name),
+            visibility: ToolVisibility::Listed,
         }
     }
 
@@ -218,7 +245,14 @@ pub struct BodyMapping {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum BodyMappingMode {
+    /// The entire validated argument object is the JSON body, path and
+    /// query arguments included. Today's behaviour for every generated
+    /// tool that is not named under a Connection overlay.
     WholeArgsJson,
+    /// The argument object minus path placeholders and mapped query
+    /// arguments is the JSON body (issue #360). The overlay compiler sets
+    /// this on overlaid tools; a hand-written tools file may too.
+    BodyArgsJson,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -4152,6 +4186,7 @@ mod tests {
             target: None,
             source: ToolSource::Legacy,
             upstream: mapping,
+            visibility: ToolVisibility::Listed,
         }
     }
 
@@ -4184,6 +4219,7 @@ mod tests {
                 catalog_revision: Some(1),
             },
             upstream: mapping,
+            visibility: ToolVisibility::Listed,
         }
     }
 

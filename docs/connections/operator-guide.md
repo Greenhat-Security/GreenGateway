@@ -403,6 +403,116 @@ registration. Subsequent refreshes preserve a surviving public tool name only
 when it still represents the same operation and safe mapping; a document
 cannot silently move an existing name to a different request.
 
+## OpenAPI Overlays
+
+An OpenAPI overlay is one versioned document stored beside a managed
+Connection's generated catalog. It can narrow and clarify generated tools, but
+cannot add an upstream method, path, credential, or non-catalog write. The
+compiled definitions are stored in the catalog, so restart and replica replay
+use the same reviewed result. Editing an overlay does not change the Connection
+ETag; the overlay has its own quoted strong ETag
+`"overlay:{connection_id}:c{connection_revision}:r{catalog_revision}:o{overlay_revision}"`.
+Overlay revision `0` means no overlay is stored. The catalog component is
+monotonic across overlay mutations, while the Connection component also moves
+when a kind replacement removes and later recreates the OpenAPI catalog. Thus a
+pre-delete or pre-replacement ETag cannot become valid again. A full Connection
+DELETE followed by a new POST creates a replacement Connection resource and is
+governed by the Connection resource's own precondition contract.
+
+This release accepts tool rename, tool and parameter descriptions, parameter
+titles, visibility, document-label disambiguation, and body serialization.
+Source bindings, declarative shapes/codecs, response transforms, and composites
+are reserved in the schema and rejected until their implementation lands.
+
+Overlay keys always use the generated name shown by OpenAPI preview, even when
+the tool is renamed for agents. Operation IDs are case-sensitive. In
+particular, Twenty generates `UpdateOneCompany`, not `updateOneCompany`; using
+the latter returns an unknown-generated-tool problem with the correct name.
+Only generated tools named under `tools.*` are overlaid. Every other tool keeps
+its original definition and `whole_args_json` body byte-for-byte.
+
+Use this workflow:
+
+1. Preview the OpenAPI document with the candidate `overlay` field. Review the
+   compiled tool names, descriptions, schemas, body modes, warnings, and label
+   reports. Preview does not persist the overlay.
+2. `GET /v1/admin/connections/{id}/overlay` and retain its overlay ETag. A
+   Connection with no overlay reports revision `0` and an `o0` ETag.
+3. `PUT /v1/admin/connections/{id}/overlay` with that exact ETag in `If-Match`.
+   Missing and stale preconditions return `428` and `412`. Validation or
+   compilation failure returns `422` with every bounded `problems` entry and
+   writes neither the overlay nor a partial catalog.
+4. Review the returned overlay and catalog revisions, per-tool label reports,
+   warnings, and source status. Registration and later Refresh operations use
+   the stored overlay and rederive renamed tools from their generated names.
+5. To remove the overlay, send `DELETE` with its exact ETag. The gateway
+   republishes the bare generated catalog and deletes the overlay atomically.
+
+The gateway persists a bounded canonical snapshot of compile-time source
+reports with the overlay. Overlay GET projects that snapshot through `sources`,
+including after restart, and never performs source I/O merely to describe saved
+state. The list is empty in this release because source declarations remain
+reserved. Later dynamic value rows are also bound to both the overlay revision
+and a digest of the complete source declaration, so reusing a source ID with a
+different path or selector cannot resurrect values from its previous meaning.
+
+Reading requires `admin:connections:read`; PUT and DELETE require
+`admin:connections:write`. A future source declaration that supplies a raw
+`request.path` on an authenticated Connection also requires
+`admin:connections:secrets:write`, because it authorizes a credentialed GET
+that the OpenAPI document did not declare.
+
+`body_args_json` is the default body mode for a tool named in the overlay. It
+omits path placeholders and query arguments from the JSON body after using them
+to render the request. Set `whole_args_json` explicitly only when the upstream
+expects the legacy flattened object. Tools not named in the overlay always keep
+the legacy mode.
+
+Document-label disambiguation compares properties within one tool. It uses the
+first non-empty document `title` or first line of `description`, and qualifies
+only duplicate labels through the fixed template. A parameter description set
+explicitly by the overlay always wins. Static enum options may be shown in the
+qualified description, capped at 16 values. Unique and unlabelled properties
+are unchanged. Twenty normally exposes neither usable titles nor descriptions,
+so a document-only overlay can legitimately report **0 labels matched the
+configured document label sources**; this wording also covers documents whose
+available labels are excluded by `label_from`. Add explicit parameter
+descriptions until configured label sources are available.
+
+### JSON pointer bases
+
+The meaning of `/` is determined by the field containing the pointer. Reserved
+fields below become usable only with their corresponding later capability.
+
+| Field | `/` is the root of |
+| --- | --- |
+| `shape.wire."<pointer>"` | The wire value of the one parameter being shaped (`/amountMicros` inside `annualRecurringRevenue`). |
+| `shape.response.<agent>.from` | The wire value of that parameter inside each selected response-root object. |
+| `response.root`, `defaults.response_root` | The parsed JSON body of the upstream response. |
+| `enum_sources.*.select.items`, `label_sources.*.select.items` | The parsed JSON body of the source GET. |
+| `select.value`, `select.label`, `select.key` | One selected item. |
+| `$input.pointer` | The value of the named composite input. |
+| `$step.pointer` | The whole parsed JSON body of the named earlier step. Twenty pointers therefore begin with `/data/`, such as `/data/createNote/id`. |
+| `$item.pointer` | The current `for_each` element. |
+| `$self` | The whole parsed JSON body of the step being compensated. |
+
+### Codec behavior
+
+Codecs are reserved until declarative transforms land. When available, chains
+encode left to right and decode right to left; they reject inexact values
+rather than rounding, trimming, or normalizing them.
+
+| Codec | Encode (agent to wire) | Decode (wire to agent) | Type | Invertible |
+| --- | --- | --- | --- | --- |
+| `decimal_scale` | Shift the JSON number's exact decimal text by `scale`; reject excess fraction digits, a non-integer result, or an oversized result. | Accept only a canonical integer or integer string matching `^-?(0\|[1-9][0-9]*)$`; reject forms such as `"007"`, `"+5"`, `"-0"`, and `"5.0"`. | `number`/`integer` to integer or string | Yes |
+| `json_string` | Serialize the JSON value to one compact JSON string. | Parse the wire string as JSON; on failure retain the wire value and report a warning. | Any to `string` | Yes |
+| `markdown_blocks` | Convert the supported Markdown subset to a BlockNote block array. | No inverse conversion; a response binding is required. | `string` to `array` | No |
+
+Twenty's `bodyV2.blocknote` property is a JSON **string**, not an array. Its
+future rich-text shape must therefore chain `markdown_blocks` and then
+`json_string`. For exact currency values, `decimal_scale` operates on the JSON
+number token and never through floating-point multiplication.
+
 ## Observability and Alerts
 
 The audit stream records bounded, payload-free events for Connection and

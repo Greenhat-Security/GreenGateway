@@ -111,6 +111,10 @@ const ADMIN_CONNECTIONS: &str = "/v1/admin/connections";
 const ADMIN_SECRETS: &str = "/v1/admin/connection-secrets";
 const ADMIN_TOKENS: &str = "/v1/admin/tokens";
 
+const DRILL_OPENAPI_DISPLAY_NAME: &str = "drill overlay api";
+const DRILL_OPENAPI_GENERATED_NAME: &str = "drillGeneratedWidget";
+const DRILL_OPENAPI_SERVED_NAME: &str = "drill_overlay_widget";
+
 /// The collection preconditions a create carries: both resources publish
 /// their collection's own ETag beside the ordinary one.
 const CONNECTION_COLLECTION_ETAG: &str = "x-greengateway-connections-etag";
@@ -138,11 +142,12 @@ fn skipped() {
 // ---------------------------------------------------------------------
 
 /// A real standalone deployment: a policy file and its history, a tools
-/// document, a Connections database with a credential binding, an audit
-/// log, discovery aggregates and a service token — all written by a real
-/// gateway process serving real requests, because the import reads what a
-/// deployment leaves behind and a hand-written fixture would only prove
-/// the import can read the test's idea of one.
+/// document, a Connections database with a credential binding and a
+/// registered/overlaid managed OpenAPI tool, an audit log, discovery
+/// aggregates and a service token — all written by a real gateway process
+/// serving real requests, because the import reads what a deployment leaves
+/// behind and a hand-written fixture would only prove the import can read
+/// the test's idea of one.
 struct Standalone {
     /// Everything the import reads. Nothing else is written here, so the
     /// whole directory can be digested and compared.
@@ -181,6 +186,10 @@ struct SourceFacts {
     tools: i64,
     connections: i64,
     connection_local_secrets: i64,
+    openapi_catalogs: i64,
+    openapi_overlays: i64,
+    openapi_catalog_entries: i64,
+    enum_source_values: i64,
     audit_events: i64,
     service_tokens: i64,
     discovery_endpoints: i64,
@@ -266,6 +275,10 @@ impl Standalone {
                 tools: 0,
                 connections: 0,
                 connection_local_secrets: 0,
+                openapi_catalogs: 0,
+                openapi_overlays: 0,
+                openapi_catalog_entries: 0,
+                enum_source_values: 0,
                 audit_events: 0,
                 service_tokens: 0,
                 discovery_endpoints: 0,
@@ -279,6 +292,21 @@ impl Standalone {
         }
         standalone.quiesce();
         standalone.facts = standalone.read_facts();
+        assert!(
+            standalone.facts.openapi_catalogs > 0
+                && standalone.facts.openapi_overlays > 0
+                && standalone.facts.openapi_catalog_entries > 0,
+            "the standalone fixture must contain a real registered OpenAPI catalog and overlay: {:?}",
+            standalone.facts
+        );
+        assert_eq!(
+            sqlite_json(
+                &standalone.connections_file,
+                "SELECT source_reports_json FROM connection_openapi_overlays",
+            ),
+            empty_overlay_source_report(),
+            "overlay PUT must persist the typed empty source report the import carries"
+        );
         standalone
     }
 
@@ -377,11 +405,13 @@ impl Standalone {
             assert_eq!(status, 200, "policy commit {index} should succeed: {body}");
         }
 
-        // A Connection with no credential, and one whose credential is a
-        // reference into the local keyring: the import carries the second
-        // as a REFERENCE and leaves the key material behind, which is the
-        // property the report's `connection_local_secrets` count exists to
-        // make visible.
+        // A Connection with no credential, one whose credential is a
+        // reference into the local keyring, and an enabled managed OpenAPI
+        // Connection whose real preview/register/overlay path produces the
+        // durable catalog the import must carry. The import carries the
+        // credential as a REFERENCE and leaves the key material behind,
+        // which is the property the report's `connection_local_secrets`
+        // count exists to make visible.
         let collection = api.collection_etag().await;
         let (status, _, body) = api
             .send(
@@ -438,6 +468,114 @@ impl Standalone {
         assert_eq!(
             status, 201,
             "the credential-bound Connection should create: {body}"
+        );
+
+        let collection = api.collection_etag().await;
+        let (status, headers, body) = api
+            .send(
+                reqwest::Method::POST,
+                ADMIN_CONNECTIONS,
+                &[("if-match", collection.as_str())],
+                Some(&json!({
+                    "display_name": DRILL_OPENAPI_DISPLAY_NAME,
+                    "kind": "http_api",
+                    "endpoint": { "base_url": self.upstream.base_url, "base_path": "/" },
+                    "authentication": { "type": "none" },
+                    "enabled": true,
+                    "discovery": {
+                        "type": "managed_openapi",
+                        "use_connection_authentication": false
+                    }
+                })),
+            )
+            .await;
+        assert_eq!(
+            status, 201,
+            "the managed OpenAPI Connection should create: {body}"
+        );
+        let connection_etag = header(&headers, reqwest::header::ETAG.as_str());
+        let connection_id = body["id"]
+            .as_str()
+            .unwrap_or_else(|| panic!("the managed Connection should carry an id: {body}"))
+            .to_owned();
+        let preview_route = format!("{ADMIN_CONNECTIONS}/{connection_id}/openapi/preview");
+        let register_route = format!("{ADMIN_CONNECTIONS}/{connection_id}/openapi/register");
+        let overlay_route = format!("{ADMIN_CONNECTIONS}/{connection_id}/overlay");
+
+        let (status, _, preview) = api
+            .send(
+                reqwest::Method::POST,
+                &preview_route,
+                &[],
+                Some(&json!({ "spec": drill_openapi_spec() })),
+            )
+            .await;
+        assert_eq!(
+            status, 200,
+            "the OpenAPI document should preview: {preview}"
+        );
+        let generated_name = preview["tools"][0]["name"]
+            .as_str()
+            .unwrap_or_else(|| panic!("preview should contain a generated tool: {preview}"));
+        assert_eq!(generated_name, DRILL_OPENAPI_GENERATED_NAME);
+        let security_confirmation = preview["security_confirmations"]
+            .as_array()
+            .and_then(|confirmations| {
+                confirmations.iter().find(|confirmation| {
+                    confirmation["tool_name"].as_str() == Some(DRILL_OPENAPI_GENERATED_NAME)
+                })
+            })
+            .cloned()
+            .unwrap_or_else(|| {
+                panic!("preview should bind the selected tool's security: {preview}")
+            });
+        let register = json!({
+            "spec": drill_openapi_spec(),
+            "spec_digest": preview["spec_digest"].clone(),
+            "expected_spec_revision": preview["spec_revision"].clone(),
+            "expected_catalog_revision": preview["catalog_revision"].clone(),
+            "selected_tool_names": [DRILL_OPENAPI_GENERATED_NAME],
+            "security_confirmations": [security_confirmation],
+        });
+        let (status, _, registered) = api
+            .send(
+                reqwest::Method::POST,
+                &register_route,
+                &[("if-match", connection_etag.as_str())],
+                Some(&register),
+            )
+            .await;
+        assert_eq!(
+            status, 201,
+            "the previewed OpenAPI tool should register: {registered}"
+        );
+        assert_eq!(
+            registered["registered_tool_names"],
+            json!([DRILL_OPENAPI_GENERATED_NAME])
+        );
+
+        let (status, overlay_headers, initial_overlay) = api.get(&overlay_route).await;
+        assert_eq!(
+            status, 200,
+            "the unconfigured overlay state should read: {initial_overlay}"
+        );
+        assert_eq!(initial_overlay["overlay_revision"], json!(0));
+        let overlay_etag = header(&overlay_headers, reqwest::header::ETAG.as_str());
+        let document = drill_openapi_overlay();
+        let (status, _, stored) = api
+            .send(
+                reqwest::Method::PUT,
+                &overlay_route,
+                &[("if-match", overlay_etag.as_str())],
+                Some(&document),
+            )
+            .await;
+        assert_eq!(status, 200, "the rename overlay should publish: {stored}");
+        assert_eq!(stored["overlay_revision"], json!(1));
+        assert_eq!(stored["sources"], json!([]));
+        assert_eq!(
+            stored["tools"][0]["served_name"],
+            json!(DRILL_OPENAPI_SERVED_NAME)
         );
 
         // A service token, so the principals-and-service-tokens section has
@@ -524,6 +662,22 @@ impl Standalone {
                 &self.connections_file,
                 "SELECT count(*) FROM connection_local_secrets",
             ),
+            openapi_catalogs: sqlite_count(
+                &self.connections_file,
+                "SELECT count(*) FROM connection_openapi_catalogs",
+            ),
+            openapi_overlays: sqlite_count(
+                &self.connections_file,
+                "SELECT count(*) FROM connection_openapi_overlays",
+            ),
+            openapi_catalog_entries: sqlite_count(
+                &self.connections_file,
+                "SELECT count(*) FROM connection_openapi_catalog_entries",
+            ),
+            enum_source_values: sqlite_count(
+                &self.connections_file,
+                "SELECT count(*) FROM connection_enum_source_values",
+            ),
             audit_events: sqlite_count(&self.audit_file, "SELECT count(*) FROM audit_events"),
             service_tokens: sqlite_count(
                 &self.service_token_file,
@@ -608,6 +762,38 @@ fn tools_document() -> Value {
     })
 }
 
+fn drill_openapi_spec() -> &'static str {
+    r#"{
+        "openapi": "3.0.3",
+        "info": { "title": "Import drill overlay API", "version": "1.0.0" },
+        "paths": {
+            "/overlay-widget": {
+                "get": {
+                    "operationId": "drillGeneratedWidget",
+                    "summary": "Read the drill widget",
+                    "responses": { "200": { "description": "ok" } }
+                }
+            }
+        }
+    }"#
+}
+
+fn drill_openapi_overlay() -> Value {
+    json!({
+        "schema_version": "0.1.0",
+        "tools": {
+            "drillGeneratedWidget": {
+                "rename": DRILL_OPENAPI_SERVED_NAME,
+                "description": "The renamed OpenAPI tool carried through the import."
+            }
+        }
+    })
+}
+
+fn empty_overlay_source_report() -> Value {
+    json!({ "schema_version": "0.1.0", "sources": [] })
+}
+
 /// A credential-shaped canary. Never a real secret, and prefixed so a
 /// history scanner reads it as the fixture value it is.
 const FAKE_CONNECTION_SECRET: &str = "FAKE_DRILL_CONNECTION_SECRET_9f2a";
@@ -656,6 +842,20 @@ fn sqlite_count(path: &Path, sql: &str) -> i64 {
     connection
         .query_row(sql, [], |row| row.get::<_, i64>(0))
         .unwrap_or_else(|error| panic!("{sql} against {} failed: {error}", path.display()))
+}
+
+fn sqlite_json(path: &Path, sql: &str) -> Value {
+    let connection = rusqlite::Connection::open(path)
+        .unwrap_or_else(|error| panic!("{} should open: {error}", path.display()));
+    let encoded = connection
+        .query_row(sql, [], |row| row.get::<_, String>(0))
+        .unwrap_or_else(|error| panic!("{sql} against {} failed: {error}", path.display()));
+    serde_json::from_str(&encoded).unwrap_or_else(|error| {
+        panic!(
+            "{sql} returned invalid JSON from {}: {error}",
+            path.display()
+        )
+    })
 }
 
 fn json_file(path: &Path) -> Value {
@@ -856,6 +1056,17 @@ impl Target {
         self.database.count(sql).await
     }
 
+    async fn openapi_overlay_source_report(&self) -> Value {
+        let rows = self
+            .database
+            .query_all("SELECT source_reports_json FROM greengateway.connection_openapi_overlays")
+            .await;
+        assert_eq!(rows.len(), 1, "the fixture imports exactly one overlay");
+        let encoded: String = rows[0].get(0);
+        serde_json::from_str(&encoded)
+            .unwrap_or_else(|error| panic!("the imported overlay report should be JSON: {error}"))
+    }
+
     /// The deployment this database is bound to and when it was claimed,
     /// or `None` while it is unclaimed. The timestamp is part of the
     /// answer: a command that re-claimed an already-bound database would
@@ -997,7 +1208,7 @@ fn section_names(report: &Value) -> Vec<String> {
 /// checks against, and a drill that asked the import to define emptiness
 /// and then checked emptiness with the import's own definition would agree
 /// with itself no matter what fell off the list.
-const AUTHORITATIVE_TABLES: [&str; 36] = [
+const AUTHORITATIVE_TABLES: [&str; 38] = [
     "audit_events",
     "audit_stream",
     "policy_documents",
@@ -1018,6 +1229,8 @@ const AUTHORITATIVE_TABLES: [&str; 36] = [
     "connection_mcp_catalog_resource_templates",
     "connection_openapi_catalogs",
     "connection_openapi_catalog_entries",
+    "connection_openapi_overlays",
+    "connection_enum_source_values",
     "service_tokens",
     "discovery_endpoint_aggregates",
     "discovery_endpoint_status_counts",
@@ -1231,6 +1444,18 @@ async fn the_cutover_writes_what_the_rehearsal_planned() {
         facts.connections
     );
     assert_eq!(
+        section(&applied, "connections")["counts"]["openapi_catalogs"],
+        facts.openapi_catalogs
+    );
+    assert_eq!(
+        section(&applied, "connections")["counts"]["openapi_overlays"],
+        facts.openapi_overlays
+    );
+    assert_eq!(
+        section(&applied, "connections")["counts"]["catalog_entries"],
+        facts.openapi_catalog_entries
+    );
+    assert_eq!(
         section(&applied, "audit")["counts"]["audit_events_deduplicated"],
         facts.audit_events,
         "every event in the standalone log, deduplicated by event_id"
@@ -1248,6 +1473,27 @@ async fn the_cutover_writes_what_the_rehearsal_planned() {
             .await,
         history + 1,
         "the imported history plus the operator's live document"
+    );
+    assert_eq!(
+        target
+            .count("SELECT count(*)::bigint FROM greengateway.connection_openapi_overlays")
+            .await,
+        facts.openapi_overlays,
+        "the target's durable overlays match the standalone source"
+    );
+    assert_eq!(
+        target
+            .count("SELECT count(*)::bigint FROM greengateway.connection_openapi_catalog_entries",)
+            .await,
+        facts.openapi_catalog_entries,
+        "the registered OpenAPI tool is present rather than an empty catalog"
+    );
+    assert_eq!(
+        target
+            .count("SELECT count(*)::bigint FROM greengateway.connection_enum_source_values")
+            .await,
+        facts.enum_source_values,
+        "enum-source values are either transferred explicitly or proven absent"
     );
     assert_eq!(
         target
@@ -1344,6 +1590,11 @@ async fn the_imported_deployment_serves_across_a_restart_and_a_scale_out() {
     let stream_head = section(&applied, "audit")["counts"]["audit_stream_head"]
         .as_i64()
         .unwrap_or_else(|| panic!("the audit section reports its stream head: {applied}"));
+    assert_eq!(
+        target.openapi_overlay_source_report().await,
+        empty_overlay_source_report(),
+        "the import must preserve the versioned empty source report exactly"
+    );
 
     // What the standalone deployment served, computed from its own files.
     let expected_policy_etag = harness::database::policy_etag(
@@ -1564,20 +1815,27 @@ async fn assert_imported_state(
         "replica {replica} should serve the tools: {body}"
     );
     assert_eq!(
-        body["total_count"], facts.tools,
+        body["total_count"],
+        facts.tools + facts.openapi_catalog_entries,
         "replica {replica} served {body}"
     );
     let empty = Vec::new();
-    let served: Vec<String> = body["capabilities"]
+    let mut served: Vec<String> = body["capabilities"]
         .as_array()
         .unwrap_or(&empty)
         .iter()
         .filter_map(|entry| entry["name"].as_str().map(str::to_owned))
         .collect();
+    served.sort_unstable();
     assert_eq!(
         served,
-        vec!["drill_alpha".to_owned(), "drill_beta".to_owned()],
-        "replica {replica} should serve the standalone deployment's own tools"
+        vec![
+            "drill_alpha".to_owned(),
+            "drill_beta".to_owned(),
+            DRILL_OPENAPI_SERVED_NAME.to_owned(),
+        ],
+        "replica {replica} should serve the standalone deployment's document tools and its \
+         renamed managed OpenAPI tool"
     );
 
     let (status, body) = cluster
@@ -1611,7 +1869,7 @@ async fn assert_imported_state(
     names.sort_unstable();
     assert_eq!(
         names,
-        vec!["drill upstream", "drill vendor"],
+        vec!["drill overlay api", "drill upstream", "drill vendor",],
         "replica {replica} should serve the standalone deployment's own Connections"
     );
     assert!(
@@ -1626,6 +1884,31 @@ async fn assert_imported_state(
         !rendered.contains(FAKE_CONNECTION_SECRET),
         "a credential binding crosses as a reference; replica {replica} rendered the secret"
     );
+
+    let openapi_id = managed
+        .iter()
+        .find(|row| row["display_name"] == DRILL_OPENAPI_DISPLAY_NAME)
+        .and_then(|row| row["id"].as_str())
+        .unwrap_or_else(|| {
+            panic!("replica {replica} omitted the managed OpenAPI Connection: {body}")
+        });
+    let overlay_route = format!("{ADMIN_CONNECTIONS}/{openapi_id}/overlay");
+    let (status, _, overlay) = cluster
+        .get(replica, &overlay_route)
+        .bearer(admin)
+        .send_with_headers()
+        .await;
+    assert_eq!(
+        status, 200,
+        "replica {replica} should serve the imported overlay: {overlay}"
+    );
+    assert_eq!(overlay["document"], drill_openapi_overlay());
+    assert_eq!(overlay["overlay_revision"], json!(1));
+    assert!(
+        overlay["sources"].is_array(),
+        "replica {replica} must project typed source status: {overlay}"
+    );
+    assert_eq!(overlay["sources"], json!([]));
 
     // The audit log: every source event is durable, at a contiguous
     // position, and readable by a consumer through this replica.
