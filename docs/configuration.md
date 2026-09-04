@@ -1510,6 +1510,8 @@ Format and validation: must parse as a `u64` millisecond duration greater than `
 
 Enables double-submit-cookie CSRF checks on every state-changing request the gateway serves, proxied traffic included.
 
+MCP OAuth bootstrap is an exception: a request to `/mcp` or the configured public MCP route with no `Cookie` header and no verified client certificate proceeds to authentication. An unauthenticated initialize receives `401` with a bearer challenge, including `resource_metadata` when `GATEWAY_PUBLIC_URL` is configured. Any cookie header (including an empty or malformed one) or a verified client certificate keeps the CSRF check active unless a bearer credential is present. Cookie-authenticated admin mutations remain protected. OAuth clients do not need to disable `CSRF_ENABLED` to discover the authorization server.
+
 Default: `true`
 
 Format and validation: must parse as a Rust boolean, `true` or `false`. The check is layered over the whole router, not just the control plane, so with the default a `POST`, `PUT`, `PATCH`, or `DELETE` on any non-exempt path -- an admin API route, an MCP route, or a path handled by the reverse-proxy fallback -- must either carry an `Authorization: Bearer` credential or present a matching CSRF cookie/header token pair. A request that presents neither is answered `403 Forbidden` with `{"error":"csrf token missing or invalid"}` and never reaches the upstream. Bearer-authenticated requests bypass the check because CSRF is a browser cookie-auth concern. Safe-method responses on non-exempt paths also acquire a `Set-Cookie` for the CSRF token when the request did not already send one, so proxied `GET` responses carry that cookie too.

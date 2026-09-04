@@ -20566,6 +20566,119 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn mcp_cookieless_initialize_challenges_and_cookie_mutations_require_csrf() {
+        for public_url in [
+            None,
+            Some("https://gateway.example.test"),
+            Some("https://gateway.example.test/base"),
+        ] {
+            let mut config = test_config(Vec::new());
+            config.gateway_public_url = public_url.map(str::to_owned);
+            let cookie_name = config.auth_cookie_name.clone();
+            assert!(config.csrf_enabled);
+            let routes = auth::protected_resource::mcp_route_paths(&config);
+            let metadata =
+                auth::protected_resource::ProtectedResourceMetadataConfig::from_config(&config);
+            let recorder = PrometheusBuilder::new().build_recorder();
+            let router = app(
+                config,
+                recorder.handle(),
+                test_audit_log(),
+                test_audit_event_sender(),
+            )
+            .expect("app");
+            for route in routes {
+                let mut request = mcp_request_to(
+                    &route,
+                    None,
+                    1,
+                    "initialize",
+                    Some(mcp_initialize_params()),
+                    "oauth-bootstrap",
+                );
+                request.headers_mut().remove(header::COOKIE);
+                request.headers_mut().remove("x-csrf-token");
+                let response = router
+                    .clone()
+                    .oneshot(request)
+                    .await
+                    .expect("initialize response");
+                assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+                let expected = metadata.as_ref().map_or_else(
+                    || "Bearer".to_owned(),
+                    |metadata| {
+                        format!(
+                            "Bearer realm=\"mcp\", resource_metadata=\"{}\"",
+                            metadata.metadata_url()
+                        )
+                    },
+                );
+                assert_eq!(response.headers()[header::WWW_AUTHENTICATE], expected);
+                for csrf_header in [None, Some("wrong-token")] {
+                    let mut request = mcp_request_to(
+                        &route,
+                        None,
+                        2,
+                        "initialize",
+                        Some(mcp_initialize_params()),
+                        "cookie-csrf",
+                    );
+                    request.headers_mut().insert(
+                        header::COOKIE,
+                        HeaderValue::from_str(&format!(
+                            "{cookie_name}=test-session; csrf_token=expected-token"
+                        ))
+                        .expect("cookie"),
+                    );
+                    request.headers_mut().remove("x-csrf-token");
+                    if let Some(value) = csrf_header {
+                        request
+                            .headers_mut()
+                            .insert("x-csrf-token", HeaderValue::from_static(value));
+                    }
+                    let response = router
+                        .clone()
+                        .oneshot(request)
+                        .await
+                        .expect("cookie response");
+                    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+                    assert_eq!(
+                        json_body(response).await["error"],
+                        "csrf token missing or invalid"
+                    );
+                }
+            }
+            for csrf_header in [None, Some("wrong-token")] {
+                let mut request = Request::builder()
+                    .method(Method::POST)
+                    .uri(CONNECTIONS_ADMIN_ROUTE)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header(
+                        header::COOKIE,
+                        format!("{cookie_name}=test-session; csrf_token=expected-token"),
+                    )
+                    .body(Body::from("{}"))
+                    .expect("admin request");
+                if let Some(value) = csrf_header {
+                    request
+                        .headers_mut()
+                        .insert("x-csrf-token", HeaderValue::from_static(value));
+                }
+                let response = router
+                    .clone()
+                    .oneshot(request)
+                    .await
+                    .expect("admin response");
+                assert_eq!(response.status(), StatusCode::FORBIDDEN);
+                assert_eq!(
+                    json_body(response).await["error"],
+                    "csrf token missing or invalid"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn mcp_unauthorized_challenge_includes_resource_metadata_for_prefixed_route() {
         let mut config = test_config(Vec::new());
         config.gateway_public_url = Some("https://gateway.example.test/base".to_owned());
@@ -45806,6 +45919,9 @@ O2gecI9QwDJNpm29J9wJB2F8
 
     #[path = "issue_240_acceptance_core.rs"]
     mod issue_240_acceptance_core;
+
+    #[path = "issue_373_oauth_bootstrap.rs"]
+    mod issue_373_oauth_bootstrap;
 
     #[path = "issue_256_acceptance_websocket.rs"]
     mod issue_256_acceptance_websocket;
