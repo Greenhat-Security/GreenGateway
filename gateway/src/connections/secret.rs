@@ -16,6 +16,7 @@ use cap_std::{
     fs::{Dir, OpenOptions as CapabilityOpenOptions},
 };
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use tokio::sync::Semaphore;
 use zeroize::Zeroizing;
 
@@ -354,6 +355,68 @@ pub trait SecretResolver: Send + Sync {
     fn contains_alias(&self, alias_id: &str) -> bool {
         self.aliases().iter().any(|alias| alias.id == alias_id)
     }
+
+    /// Stable, non-secret generation for one immutable alias binding.
+    ///
+    /// `None` means the alias is volatile (environment/file content, a
+    /// provider's movable latest/stage selector, or a backend with no version
+    /// identity). Callers must not carry data derived under such an alias
+    /// across restart or use it as stale fallback after a failed refresh.
+    fn generation_digest(&self, alias_id: &str) -> Option<String> {
+        let alias = self
+            .aliases()
+            .into_iter()
+            .find(|alias| alias.id == alias_id && alias.configured)?;
+        let version = alias.version?;
+        Some(secret_generation_digest(
+            alias.provider,
+            alias_id,
+            version.to_string().as_bytes(),
+        ))
+    }
+}
+
+/// Hash only provider metadata (never resolved material) into an opaque
+/// generation suitable for durable cache provenance.
+pub(crate) fn secret_generation_digest(
+    provider: SecretProviderKind,
+    alias_id: &str,
+    generation: &[u8],
+) -> String {
+    let provider = match provider {
+        SecretProviderKind::OperatorEnvironment => b"operator_environment".as_slice(),
+        SecretProviderKind::OperatorFile => b"operator_file".as_slice(),
+        SecretProviderKind::LocalEncrypted => b"local_encrypted".as_slice(),
+        SecretProviderKind::VaultKvV2 => b"vault_kv_v2".as_slice(),
+        SecretProviderKind::GcpSecretManager => b"gcp_secret_manager".as_slice(),
+        SecretProviderKind::AzureKeyVault => b"azure_key_vault".as_slice(),
+        SecretProviderKind::AwsSecretsManager => b"aws_secrets_manager".as_slice(),
+        SecretProviderKind::KubernetesSecrets => b"kubernetes_secrets".as_slice(),
+    };
+    let mut digest = Sha256::new();
+    digest.update(b"greengateway-secret-generation-v1\0");
+    digest.update(provider);
+    digest.update([0]);
+    digest.update(alias_id.as_bytes());
+    digest.update([0]);
+    digest.update(generation);
+    hex::encode(digest.finalize())
+}
+
+/// Bind an immutable provider selector to the trusted provider configuration
+/// that gives the selector meaning. Both inputs are non-secret metadata.
+pub(crate) fn configured_secret_generation_digest(
+    provider: SecretProviderKind,
+    alias_id: &str,
+    provider_generation: &[u8; 32],
+    immutable_selector: &[u8],
+) -> String {
+    let mut generation =
+        Vec::with_capacity(provider_generation.len() + immutable_selector.len() + 1);
+    generation.extend_from_slice(provider_generation);
+    generation.push(0);
+    generation.extend_from_slice(immutable_selector);
+    secret_generation_digest(provider, alias_id, &generation)
 }
 
 type EnvironmentReader = dyn Fn(&str) -> Result<String, ()> + Send + Sync;
@@ -987,6 +1050,64 @@ mod tests {
             listed, expected,
             "docs/schemas/connection-admin.v1.schema.json SecretProvider enum must list exactly the serialized SecretProviderKind variants"
         );
+    }
+
+    #[test]
+    fn secret_generation_digests_are_stable_and_domain_separated() {
+        let first = secret_generation_digest(SecretProviderKind::LocalEncrypted, "billing", b"7");
+        assert_eq!(first.len(), 64);
+        assert_eq!(
+            first,
+            secret_generation_digest(SecretProviderKind::LocalEncrypted, "billing", b"7")
+        );
+        assert_ne!(
+            first,
+            secret_generation_digest(SecretProviderKind::LocalEncrypted, "billing", b"8")
+        );
+        assert_ne!(
+            first,
+            secret_generation_digest(SecretProviderKind::VaultKvV2, "billing", b"7")
+        );
+        assert_ne!(
+            first,
+            secret_generation_digest(SecretProviderKind::LocalEncrypted, "invoices", b"7")
+        );
+        let configured = configured_secret_generation_digest(
+            SecretProviderKind::VaultKvV2,
+            "billing",
+            &[1; 32],
+            b"7",
+        );
+        assert_eq!(
+            configured,
+            configured_secret_generation_digest(
+                SecretProviderKind::VaultKvV2,
+                "billing",
+                &[1; 32],
+                b"7",
+            )
+        );
+        assert_ne!(
+            configured,
+            configured_secret_generation_digest(
+                SecretProviderKind::VaultKvV2,
+                "billing",
+                &[2; 32],
+                b"7",
+            ),
+            "provider configuration is part of the stable generation"
+        );
+        assert_ne!(
+            configured,
+            configured_secret_generation_digest(
+                SecretProviderKind::VaultKvV2,
+                "billing",
+                &[1; 32],
+                b"8",
+            ),
+            "the immutable target version is part of the stable generation"
+        );
+        assert!(!first.contains("billing"));
     }
 
     const CANARY: &[u8] = b"greengateway-secret-canary";

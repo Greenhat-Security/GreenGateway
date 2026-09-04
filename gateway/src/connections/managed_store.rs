@@ -23,7 +23,7 @@
 
 use std::collections::BTreeMap;
 #[cfg(feature = "postgres")]
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use super::model::ConnectionId;
 use super::model::ConnectionWrite;
@@ -33,9 +33,10 @@ use super::status::SafeConnectionStatus;
 use super::store::{
     CollectionCheck, ConnectionDependency, ConnectionDependencyKind, ConnectionEtag,
     ConnectionStatusUpdate, ConnectionStore, ConnectionStoreError, SqliteConnectionStore,
-    StoredConnection, StoredMcpCatalog, StoredMcpCatalogEntry, StoredMcpResource,
-    StoredMcpResourceTemplate, StoredOpenApiCatalog, StoredOpenApiCatalogEntry,
-    StoredOpenApiInventoryCatalog, StoredOpenApiOverlay, StoredOverlayWrite,
+    StoredConnection, StoredEnumSourceRevision, StoredEnumSourceValue, StoredEnumSourceValueWrite,
+    StoredMcpCatalog, StoredMcpCatalogEntry, StoredMcpResource, StoredMcpResourceTemplate,
+    StoredOpenApiCatalog, StoredOpenApiCatalogEntry, StoredOpenApiInventoryCatalog,
+    StoredOpenApiOverlay, StoredOverlayWrite,
 };
 
 /// What the authority held when this replica started, fetched by `run()`
@@ -49,6 +50,10 @@ pub struct ClusterConnectionsBoot {
     pub openapi_catalogs: Vec<StoredOpenApiCatalog>,
     pub openapi_inventory_catalogs: Vec<StoredOpenApiInventoryCatalog>,
     pub openapi_overlays: Vec<StoredOpenApiOverlay>,
+    /// Full enum payloads may be large and have exactly one startup consumer.
+    /// Taking them prevents the cluster boot snapshot from retaining a second
+    /// copy for the lifetime of every ManagedConnectionStore clone.
+    pub enum_source_values: Mutex<Option<Vec<StoredEnumSourceValue>>>,
 }
 
 /// Which authority owns the managed-connection store for this process.
@@ -159,6 +164,21 @@ impl ManagedConnectionStore {
             Self::Sqlite(store) => store.openapi_overlays(),
             #[cfg(feature = "postgres")]
             Self::Postgres { boot, .. } => Ok(boot.openapi_overlays.clone()),
+        }
+    }
+
+    pub fn boot_enum_source_values(
+        &self,
+    ) -> Result<Vec<StoredEnumSourceValue>, ConnectionStoreError> {
+        match self {
+            Self::Sqlite(store) => store.enum_source_values(),
+            #[cfg(feature = "postgres")]
+            Self::Postgres { boot, .. } => Ok(boot
+                .enum_source_values
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .take()
+                .unwrap_or_default()),
         }
     }
 
@@ -736,6 +756,99 @@ impl ManagedConnectionStore {
         }
     }
 
+    pub async fn enum_source_values(
+        &self,
+    ) -> Result<Vec<StoredEnumSourceValue>, ConnectionStoreError> {
+        match self {
+            Self::Sqlite(store) => {
+                let store = store.clone();
+                blocking("enum source values read", move || {
+                    store.enum_source_values()
+                })
+                .await
+            }
+            #[cfg(feature = "postgres")]
+            Self::Postgres { store, .. } => store.enum_source_values().await,
+        }
+    }
+
+    pub async fn enum_source_values_for_connection(
+        &self,
+        id: &ConnectionId,
+    ) -> Result<Vec<StoredEnumSourceValue>, ConnectionStoreError> {
+        match self {
+            Self::Sqlite(store) => {
+                let store = store.clone();
+                let id = id.clone();
+                blocking("enum source values read", move || {
+                    store.enum_source_values_for_connection(&id)
+                })
+                .await
+            }
+            #[cfg(feature = "postgres")]
+            Self::Postgres { store, .. } => store.enum_source_values_for_connection(id).await,
+        }
+    }
+
+    pub async fn enum_source_revisions(
+        &self,
+    ) -> Result<Vec<StoredEnumSourceRevision>, ConnectionStoreError> {
+        match self {
+            Self::Sqlite(store) => {
+                let store = store.clone();
+                blocking("enum source revisions read", move || {
+                    store.enum_source_revisions()
+                })
+                .await
+            }
+            #[cfg(feature = "postgres")]
+            Self::Postgres { store, .. } => store.enum_source_revisions().await,
+        }
+    }
+
+    pub async fn enum_source_value(
+        &self,
+        id: &ConnectionId,
+        source_id: &str,
+    ) -> Result<Option<StoredEnumSourceValue>, ConnectionStoreError> {
+        match self {
+            Self::Sqlite(store) => {
+                let store = store.clone();
+                let id = id.clone();
+                let source_id = source_id.to_owned();
+                blocking("enum source value read", move || {
+                    store.enum_source_value(&id, &source_id)
+                })
+                .await
+            }
+            #[cfg(feature = "postgres")]
+            Self::Postgres { store, .. } => store.enum_source_value(id, source_id).await,
+        }
+    }
+
+    pub async fn replace_enum_source_value(
+        &self,
+        write: &StoredEnumSourceValueWrite,
+        expected_values_revision: u64,
+    ) -> Result<StoredEnumSourceValue, ConnectionStoreError> {
+        match self {
+            Self::Sqlite(store) => {
+                let store = store.clone();
+                let write = write.clone();
+                blocking("enum source value replace", move || {
+                    store.replace_enum_source_value(&write, expected_values_revision)
+                })
+                .await
+            }
+            #[cfg(feature = "postgres")]
+            Self::Postgres { store, .. } => {
+                store
+                    .replace_enum_source_value(write, expected_values_revision)
+                    .await
+            }
+        }
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub async fn replace_openapi_catalog(
         &self,
@@ -779,6 +892,39 @@ impl ManagedConnectionStore {
         actor: &str,
         policy_protected_names: &[String],
     ) -> Result<StoredOpenApiCatalog, ConnectionStoreError> {
+        self.replace_openapi_catalog_with_overlay_and_enum_values(
+            id,
+            expected_connection_etag,
+            expected_spec_revision,
+            expected_catalog_revision,
+            spec,
+            spec_digest,
+            entries,
+            overlay,
+            compiled_overlay_revision,
+            actor,
+            policy_protected_names,
+            &[],
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn replace_openapi_catalog_with_overlay_and_enum_values(
+        &self,
+        id: &ConnectionId,
+        expected_connection_etag: &ConnectionEtag,
+        expected_spec_revision: u64,
+        expected_catalog_revision: u64,
+        spec: &str,
+        spec_digest: &str,
+        entries: &[StoredOpenApiCatalogEntry],
+        overlay: Option<&StoredOverlayWrite>,
+        compiled_overlay_revision: u64,
+        actor: &str,
+        policy_protected_names: &[String],
+        enum_values: &[StoredEnumSourceValueWrite],
+    ) -> Result<StoredOpenApiCatalog, ConnectionStoreError> {
         match self {
             Self::Sqlite(store) => {
                 let _ = actor;
@@ -791,8 +937,9 @@ impl ManagedConnectionStore {
                 let overlay = overlay.cloned();
                 let actor = actor.to_owned();
                 let policy_protected_names = policy_protected_names.to_vec();
+                let enum_values = enum_values.to_vec();
                 blocking("openapi catalog replace", move || {
-                    store.replace_openapi_catalog_with_overlay(
+                    store.replace_openapi_catalog_with_overlay_and_enum_values(
                         &id,
                         &expected_connection_etag,
                         expected_spec_revision,
@@ -804,6 +951,7 @@ impl ManagedConnectionStore {
                         compiled_overlay_revision,
                         &actor,
                         &policy_protected_names,
+                        &enum_values,
                     )
                 })
                 .await
@@ -811,7 +959,7 @@ impl ManagedConnectionStore {
             #[cfg(feature = "postgres")]
             Self::Postgres { store, .. } => {
                 store
-                    .replace_openapi_catalog_with_overlay(
+                    .replace_openapi_catalog_with_overlay_and_enum_values(
                         id,
                         expected_connection_etag,
                         expected_spec_revision,
@@ -823,6 +971,7 @@ impl ManagedConnectionStore {
                         compiled_overlay_revision,
                         actor,
                         policy_protected_names,
+                        enum_values,
                     )
                     .await
             }

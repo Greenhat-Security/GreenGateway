@@ -437,6 +437,17 @@ async fn target_connections(
         .into_iter()
         .map(|overlay| (overlay.connection_id.clone(), overlay))
         .collect();
+    let mut enum_source_values: BTreeMap<_, Vec<_>> = BTreeMap::new();
+    for row in store
+        .enum_source_values()
+        .await
+        .map_err(connections_failure)?
+    {
+        enum_source_values
+            .entry(row.connection_id.clone())
+            .or_default()
+            .push(row);
+    }
 
     let mut connections = Vec::with_capacity(records.len());
     for record in records {
@@ -452,6 +463,7 @@ async fn target_connections(
             mcp_catalog: mcp.remove(&record.id),
             openapi_catalog: openapi.remove(&record.id),
             openapi_overlay: openapi_overlays.remove(&record.id),
+            enum_source_values: enum_source_values.remove(&record.id).unwrap_or_default(),
             record,
         });
     }
@@ -791,6 +803,7 @@ pub(super) fn expected_rows(
     let mut mcp_templates = 0_i64;
     let mut openapi_catalogs = 0_i64;
     let mut openapi_overlays = 0_i64;
+    let mut enum_source_values = 0_i64;
     let mut openapi_entries = 0_i64;
     let mut reservations =
         i64::try_from(super::exports::tool_names(&source.tools_document).len()).unwrap_or(i64::MAX);
@@ -822,6 +835,8 @@ pub(super) fn expected_rows(
         if connection.openapi_overlay.is_some() {
             openapi_overlays += 1;
         }
+        enum_source_values +=
+            i64::try_from(connection.enum_source_values.len()).unwrap_or(i64::MAX);
     }
 
     let discovery = source.discovery.as_ref();
@@ -864,7 +879,7 @@ pub(super) fn expected_rows(
     expected.insert("connection_openapi_catalogs", openapi_catalogs);
     expected.insert("connection_openapi_catalog_entries", openapi_entries);
     expected.insert("connection_openapi_overlays", openapi_overlays);
-    expected.insert("connection_enum_source_values", 0);
+    expected.insert("connection_enum_source_values", enum_source_values);
     expected.insert("audit_events", audit_events);
     expected.insert("audit_stream", audit_events);
     expected.insert("discovery_endpoint_aggregates", endpoints);

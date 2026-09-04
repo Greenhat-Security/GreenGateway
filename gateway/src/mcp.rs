@@ -124,7 +124,21 @@ impl ServerHandler for McpServer {
                     executor.can_list_tool(&definition.name, &invocation_context)
                 })
             })
-            .map(|definition| mcp_tool_from_definition(definition.as_ref()))
+            .map(|definition| {
+                let executor = self
+                    .executor
+                    .as_ref()
+                    .expect("the visibility filter retained a tool only with an executor");
+                let served = executor
+                    .served_definition(definition.as_ref())
+                    .map_err(|_| {
+                        ErrorData::internal_error(
+                            "tool input schema could not be prepared",
+                            Some(json!({ "tool_name": definition.name })),
+                        )
+                    })?;
+                mcp_tool_from_definition(served.definition.as_ref())
+            })
             .collect::<Result<Vec<_>, _>>()?;
 
         Ok(ListToolsResult::with_all_items(tools))
@@ -591,7 +605,7 @@ fn runtime_error_to_mcp_error(
                 ExecutorWorkFailure::UnknownTool => unknown_tool_error(&tool_name),
                 ExecutorWorkFailure::Internal { reason } => ErrorData::internal_error(
                     "tool invocation failed",
-                    details.or_else(|| Some(json!({ "tool_name": tool_name, "reason": reason }))),
+                    Some(work_failure_internal_data(tool_name, reason, details)),
                 ),
             }
         }
@@ -613,6 +627,15 @@ fn work_failure_data(tool_name: String, details: Option<Value>) -> Value {
         }
         None => {}
     }
+    Value::Object(data)
+}
+
+fn work_failure_internal_data(tool_name: String, reason: String, details: Option<Value>) -> Value {
+    let mut data = match work_failure_data(tool_name, details) {
+        Value::Object(data) => data,
+        _ => unreachable!("work failure data is always an object"),
+    };
+    data.insert("reason".to_owned(), Value::String(reason));
     Value::Object(data)
 }
 
@@ -961,6 +984,42 @@ mod tests {
         );
     }
 
+    #[test]
+    fn enum_validation_failure_preserves_exact_allowed_values_in_mcp_data() {
+        let error = runtime_error_to_mcp_error(
+            ToolRuntimeError::WorkFailed {
+                tool_name: "set_status".to_owned(),
+                message: "tool 'set_status' arguments failed input schema validation".to_owned(),
+                reason: Some("invalid_params".to_owned()),
+                details: Some(json!({
+                    "problems": [{
+                        "path": "/status",
+                        "keyword": "enum",
+                        "allowed": ["Active", "Paused"],
+                        "message": "value is not one of the allowed values"
+                    }]
+                })),
+            },
+            None,
+        );
+
+        assert_eq!(error.code, ErrorCode::INVALID_PARAMS);
+        assert_eq!(
+            error
+                .data
+                .as_ref()
+                .and_then(|data| data.pointer("/problems/0/path")),
+            Some(&json!("/status"))
+        );
+        assert_eq!(
+            error
+                .data
+                .as_ref()
+                .and_then(|data| data.pointer("/problems/0/allowed")),
+            Some(&json!(["Active", "Paused"]))
+        );
+    }
+
     #[tokio::test]
     async fn hot_reloaded_tools_are_still_filtered_by_visibility_policy() {
         let (state, registry) = mcp_state_from_empty_registry();
@@ -1240,6 +1299,7 @@ mod tests {
                 body: None,
             },
             composite: None,
+            enum_bindings: Vec::new(),
             visibility: crate::tools::definitions::ToolVisibility::Listed,
             transform: None,
         }

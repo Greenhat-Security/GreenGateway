@@ -1,4 +1,5 @@
 use std::{
+    borrow::Cow,
     collections::HashMap,
     error::Error,
     fmt,
@@ -14,6 +15,7 @@ use futures_util::StreamExt;
 use http::{header, HeaderMap, HeaderValue, Method, StatusCode};
 use percent_encoding::{utf8_percent_encode, AsciiSet, CONTROLS};
 use rmcp::model::CallToolResult;
+use serde::Serialize;
 use serde_json::{json, Map, Value};
 use sha2::{Digest, Sha256};
 use tokio_util::sync::CancellationToken;
@@ -42,7 +44,9 @@ use crate::{
         definitions::{
             BodyMappingMode, McpProxyMapping, ToolDefinition, ToolRegistry, ToolSource, ToolTarget,
         },
+        enum_source::{EnumSourceRuntime, EnumSourceState},
         mcp_upstream::{self, McpUpstreamRuntimeConfig},
+        overlay::{apply_enum_to_served_clone, mark_enum_unavailable_on_served_clone},
         runtime::{
             ToolInvocationContext, ToolInvocationSource, ToolRuntime, ToolRuntimeError,
             ToolWorkErrorDisposition,
@@ -84,6 +88,7 @@ const MCP_TOOL_OBSERVATION_METHOD: &str = "MCP";
 const UNKNOWN_TOOL_OBSERVATION_TEMPLATE: &str = "/mcp/tools/{tool}";
 const TOOL_INPUT_VALIDATION_STATUS: u16 = 400;
 const TOOL_INPUT_VALIDATION_REASON: &str = "input_validation";
+const TOOL_ENUM_VALUE_REJECTED_REASON: &str = "enum_value_rejected";
 const TOOL_EXECUTOR_CONFIGURATION_ERROR_STATUS: u16 = 520;
 const TOOL_EXECUTOR_CONFIGURATION_ERROR_REASON: &str = "internal_configuration_error";
 const TOOL_INVALID_PARAMS_REASON: &str = "invalid_params";
@@ -101,6 +106,7 @@ const TOOL_RUNTIME_CLOSED_REASON: &str = "runtime_closed";
 const TOOL_RUNTIME_REJECTED_REASON: &str = "runtime_rejected";
 const TOOL_PRECONDITION_FAILED_REASON: &str = "precondition_failed";
 const TOOL_EXECUTION_STATE_UNAVAILABLE_REASON: &str = "execution_state_unavailable";
+const TOOL_ENUM_SOURCE_UNAVAILABLE_REASON: &str = "enum_source_unavailable";
 const TOOL_TASK_UNSUPPORTED_STATUS: u16 = 400;
 const TOOL_TASK_UNSUPPORTED_REASON: &str = "task_unsupported";
 const STRICT_SCHEMA_INJECTION_SKIP_KEYWORDS: &[&str] =
@@ -113,6 +119,8 @@ const MAX_VALIDATOR_CACHE_ENTRIES: usize = 4_096;
 const MAX_AUDITED_TRANSFORM_WARNINGS: usize = MAX_TRANSFORM_WARNINGS;
 const MAX_TRANSFORM_WARNING_PATH_CHARS: usize = 256;
 const MAX_TRANSFORM_WARNING_REASON_CHARS: usize = 256;
+const MAX_VALIDATION_PROBLEMS: usize = 16;
+const MAX_VALIDATION_TEXT_CHARS: usize = 64;
 
 type ValidatorCache = HashMap<ValidatorCacheKey, Arc<jsonschema::Validator>>;
 
@@ -143,9 +151,15 @@ pub struct ToolExecutor {
     connection_http: Option<ConnectionHttpRuntime>,
     mcp_catalog_runtime: Option<McpConnectionCatalogRuntime>,
     openapi_catalog_runtime: Option<OpenApiConnectionCatalogRuntime>,
+    enum_source_runtime: Option<EnumSourceRuntime>,
     mcp_upstream_servers: Arc<HashMap<String, McpUpstreamServerConfig>>,
     mcp_upstream_runtime_config: Arc<McpUpstreamRuntimeConfig>,
     validator_cache: Arc<Mutex<ValidatorCache>>,
+}
+
+pub(crate) struct ServedToolDefinition<'a> {
+    pub(crate) definition: Cow<'a, ToolDefinition>,
+    enum_sources_available: bool,
 }
 
 #[allow(dead_code)] // Issue #33 will expose executor errors to callers.
@@ -168,7 +182,7 @@ pub enum ToolExecutorError {
     },
     InputValidation {
         tool_name: String,
-        problems: Vec<String>,
+        problems: Vec<ValidationProblem>,
     },
     TransformRejected {
         tool_name: String,
@@ -239,6 +253,21 @@ pub enum ToolExecutorError {
         compensation: CompositeCompensationState,
         orphans: Box<[CompositeOrphan]>,
     },
+}
+
+/// Bounded protocol-safe details for one input-schema validation failure.
+///
+/// `allowed` is populated only for the JSON Schema `enum` keyword. Dynamic
+/// enum sources are restricted to strings and booleans by the overlay
+/// compiler, so this preserves exact JSON equality without any coercion.
+#[derive(Clone, Debug, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ValidationProblem {
+    pub path: String,
+    pub keyword: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub allowed: Option<Vec<Value>>,
+    pub message: String,
 }
 
 #[derive(Debug)]
@@ -362,7 +391,11 @@ impl fmt::Display for ToolExecutorError {
             } => write!(
                 formatter,
                 "tool '{tool_name}' arguments failed input schema validation: {}",
-                problems.join("; ")
+                problems
+                    .iter()
+                    .map(|problem| format!("{}: {}", problem.path, problem.message))
+                    .collect::<Vec<_>>()
+                    .join("; ")
             ),
             Self::TransformRejected {
                 tool_name,
@@ -809,9 +842,83 @@ impl ToolExecutor {
             connection_http: backends.connection_http,
             mcp_catalog_runtime: backends.mcp_catalog_runtime,
             openapi_catalog_runtime: backends.openapi_catalog_runtime,
+            enum_source_runtime: None,
             mcp_upstream_servers: Arc::new(backends.mcp_upstream_servers),
             mcp_upstream_runtime_config: Arc::new(backends.mcp_upstream_runtime_config),
             validator_cache: Arc::new(Mutex::new(HashMap::new())),
+        })
+    }
+
+    pub(crate) fn with_enum_source_runtime(
+        mut self,
+        enum_source_runtime: Option<EnumSourceRuntime>,
+    ) -> Self {
+        self.enum_source_runtime = enum_source_runtime;
+        self
+    }
+
+    /// Return the immutable registry definition when it has no dynamic
+    /// bindings, and otherwise an owned serve-time clone populated only from
+    /// the in-memory enum cache. This path performs no durable or upstream I/O.
+    pub(crate) fn served_definition<'a>(
+        &self,
+        definition: &'a ToolDefinition,
+    ) -> Result<ServedToolDefinition<'a>, ToolExecutorError> {
+        if definition.enum_bindings.is_empty() {
+            return Ok(ServedToolDefinition {
+                definition: Cow::Borrowed(definition),
+                enum_sources_available: true,
+            });
+        }
+        let connection_id = match &definition.source {
+            ToolSource::OpenApi { connection_id, .. } => {
+                crate::connections::model::ConnectionId::parse(connection_id.clone()).map_err(
+                    |_| ToolExecutorError::SchemaCompile {
+                        tool_name: definition.name.clone(),
+                        message: "dynamic enum binding has an invalid Connection id".to_owned(),
+                    },
+                )?
+            }
+            _ => {
+                return Err(ToolExecutorError::SchemaCompile {
+                    tool_name: definition.name.clone(),
+                    message: "dynamic enum binding is not attached to an OpenAPI tool".to_owned(),
+                });
+            }
+        };
+        let mut served = definition.clone();
+        let mut enum_sources_available = true;
+        for binding in &definition.enum_bindings {
+            let snapshot = self.enum_source_runtime.as_ref().map(|runtime| {
+                runtime.snapshot(&connection_id, &binding.source_id, &binding.source_digest)
+            });
+            match snapshot {
+                Some(snapshot) if snapshot.state != EnumSourceState::Missing => {
+                    apply_enum_to_served_clone(
+                        &mut served,
+                        binding,
+                        &snapshot.values,
+                        snapshot.labels.as_deref(),
+                    )
+                    .map_err(|message| ToolExecutorError::SchemaCompile {
+                        tool_name: definition.name.clone(),
+                        message,
+                    })?;
+                }
+                _ => {
+                    enum_sources_available = false;
+                    mark_enum_unavailable_on_served_clone(&mut served, binding).map_err(
+                        |message| ToolExecutorError::SchemaCompile {
+                            tool_name: definition.name.clone(),
+                            message,
+                        },
+                    )?;
+                }
+            }
+        }
+        Ok(ServedToolDefinition {
+            definition: Cow::Owned(served),
+            enum_sources_available,
         })
     }
 
@@ -959,8 +1066,9 @@ impl ToolExecutor {
                 context.clone(),
                 CancellationToken::new(),
                 |_| async { Err(UnsupportedTaskInvocation) },
-                |_| {
-                    ToolWorkErrorDisposition::Failure(Some(TOOL_TASK_UNSUPPORTED_REASON.to_owned()))
+                |_| ToolWorkErrorDisposition::Failure {
+                    reason: Some(TOOL_TASK_UNSUPPORTED_REASON.to_owned()),
+                    details: None,
                 },
             )
             .await;
@@ -1020,7 +1128,32 @@ impl ToolExecutor {
             }
         };
         let validation_started = Instant::now();
-        let validator = match self.validator_for(&tool) {
+        let served = match self.served_definition(tool.as_ref()) {
+            Ok(served) => served,
+            Err(error) => {
+                self.emit_executor_failure_observation(
+                    context,
+                    &tool,
+                    duration_millis(validation_started.elapsed()),
+                    &error,
+                );
+                return Err(error);
+            }
+        };
+        if !served.enum_sources_available {
+            let error = ToolExecutorError::Connection {
+                tool_name: tool.name.clone(),
+                reason: TOOL_ENUM_SOURCE_UNAVAILABLE_REASON,
+            };
+            self.emit_executor_failure_observation(
+                context,
+                &tool,
+                duration_millis(validation_started.elapsed()),
+                &error,
+            );
+            return Err(error);
+        }
+        let validator = match self.validator_for(served.definition.as_ref()) {
             Ok(validator) => validator,
             Err(error) => {
                 self.emit_executor_failure_observation(
@@ -1032,12 +1165,13 @@ impl ToolExecutor {
                 return Err(error);
             }
         };
-        if let Err(error) = validate_args(&tool, &validator, &args) {
-            if matches!(error, ToolExecutorError::InputValidation { .. }) {
-                self.emit_schema_mismatch_observation(
+        if let Err(error) = validate_args(served.definition.as_ref(), &validator, &args) {
+            if let ToolExecutorError::InputValidation { problems, .. } = &error {
+                self.emit_input_validation_observation(
                     context,
                     &tool,
                     duration_millis(validation_started.elapsed()),
+                    problems,
                 );
             }
             return Err(error);
@@ -1504,10 +1638,15 @@ impl ToolExecutor {
             audit.finish("failed", Some(&first_step));
             return Err(ToolExecutorError::InputValidation {
                 tool_name: tool.name.clone(),
-                problems: vec![format!(
-                    "composite iteration count {known_iterations} exceeds the configured maximum {}",
-                    mapping.limits.max_iterations.min(MAX_COMPOSITE_ITERATIONS)
-                )],
+                problems: vec![ValidationProblem {
+                    path: String::new(),
+                    keyword: "max_iterations".to_owned(),
+                    allowed: None,
+                    message: format!(
+                        "composite iteration count {known_iterations} exceeds the configured maximum {}",
+                        mapping.limits.max_iterations.min(MAX_COMPOSITE_ITERATIONS)
+                    ),
+                }],
             });
         }
 
@@ -2074,18 +2213,25 @@ impl ToolExecutor {
         {
             return Err(fail("composite_limit_exceeded"));
         }
+        let served = self
+            .served_definition(tool.as_ref())
+            .map_err(|error| fail(executor_error_safe_reason(&error)))?;
+        if !served.enum_sources_available {
+            return Err(fail(TOOL_ENUM_SOURCE_UNAVAILABLE_REASON));
+        }
+        let served_definition = served.definition.as_ref();
         let validator = self
-            .validator_for(&tool)
+            .validator_for(served_definition)
             .map_err(|error| fail(executor_error_safe_reason(&error)))?;
-        validate_args(&tool, &validator, args)
+        validate_args(served_definition, &validator, args)
             .map_err(|error| fail(executor_error_safe_reason(&error)))?;
-        let wire_args =
-            apply_request_transform(tool.transform.as_ref(), args).map_err(|error| {
-                let error = transform_executor_error(&tool, error);
+        let wire_args = apply_request_transform(served_definition.transform.as_ref(), args)
+            .map_err(|error| {
+                let error = transform_executor_error(served_definition, error);
                 fail(executor_error_safe_reason(&error))
             })?;
         let request = self
-            .build_request(&tool, wire_args.as_ref())
+            .build_request(served_definition, wire_args.as_ref())
             .map_err(|error| fail(executor_error_safe_reason(&error)))?;
         if request
             .body
@@ -2996,12 +3142,18 @@ impl ToolExecutor {
         ));
     }
 
-    fn emit_schema_mismatch_observation(
+    fn emit_input_validation_observation(
         &self,
         context: &ToolInvocationContext,
         tool: &ToolDefinition,
         latency_ms: u64,
+        problems: &[ValidationProblem],
     ) {
+        let reason = if problems.iter().any(|problem| problem.keyword == "enum") {
+            TOOL_ENUM_VALUE_REJECTED_REASON
+        } else {
+            TOOL_INPUT_VALIDATION_REASON
+        };
         self.emit_tool_observation(
             context,
             tool,
@@ -3009,7 +3161,7 @@ impl ToolExecutor {
                 status: TOOL_INPUT_VALIDATION_STATUS,
                 latency_ms,
                 schema_mismatch: true,
-                reason: Some(TOOL_INPUT_VALIDATION_REASON),
+                reason: Some(reason),
             },
         );
     }
@@ -3183,7 +3335,24 @@ fn validate_args(
 ) -> Result<(), ToolExecutorError> {
     let problems: Vec<_> = validator
         .iter_errors(args)
-        .map(|error| format!("{}: {error}", error.instance_path()))
+        .take(MAX_VALIDATION_PROBLEMS)
+        .map(|error| {
+            let allowed = match error.kind() {
+                jsonschema::error::ValidationErrorKind::Enum { options } => {
+                    options.as_array().cloned()
+                }
+                _ => None,
+            };
+            ValidationProblem {
+                path: bounded_validation_text(
+                    &error.instance_path().to_string(),
+                    MAX_VALIDATION_TEXT_CHARS,
+                ),
+                keyword: bounded_validation_text(error.kind().keyword(), MAX_VALIDATION_TEXT_CHARS),
+                allowed,
+                message: safe_validation_message(error.kind()),
+            }
+        })
         .collect();
 
     if problems.is_empty() {
@@ -3194,6 +3363,96 @@ fn validate_args(
             problems,
         })
     }
+}
+
+fn safe_validation_message(kind: &jsonschema::error::ValidationErrorKind) -> String {
+    use jsonschema::error::ValidationErrorKind;
+
+    match kind {
+        ValidationErrorKind::Enum { .. } => "value is not one of the allowed values".to_owned(),
+        ValidationErrorKind::Required { property } => property.as_str().map_or_else(
+            || "a required argument is missing".to_owned(),
+            |property| {
+                format!(
+                    "required argument '{}' is missing",
+                    bounded_validation_text(property, MAX_VALIDATION_TEXT_CHARS)
+                )
+            },
+        ),
+        ValidationErrorKind::AdditionalProperties { unexpected }
+        | ValidationErrorKind::UnevaluatedProperties { unexpected } => {
+            safe_unexpected_arguments(unexpected)
+        }
+        ValidationErrorKind::Type { .. } => "value has the wrong JSON type".to_owned(),
+        ValidationErrorKind::MaxLength { limit } => {
+            format!("string exceeds the maximum length of {limit}")
+        }
+        ValidationErrorKind::MinLength { limit } => {
+            format!("string is shorter than the minimum length of {limit}")
+        }
+        ValidationErrorKind::MaxItems { limit } => {
+            format!("array exceeds the maximum item count of {limit}")
+        }
+        ValidationErrorKind::MinItems { limit } => {
+            format!("array has fewer than the minimum item count of {limit}")
+        }
+        ValidationErrorKind::MaxProperties { limit } => {
+            format!("object exceeds the maximum property count of {limit}")
+        }
+        ValidationErrorKind::MinProperties { limit } => {
+            format!("object has fewer than the minimum property count of {limit}")
+        }
+        ValidationErrorKind::AdditionalItems { limit } => {
+            format!("array has items beyond the allowed limit of {limit}")
+        }
+        _ => format!(
+            "value does not satisfy the '{}' constraint",
+            bounded_validation_text(kind.keyword(), MAX_VALIDATION_TEXT_CHARS)
+        ),
+    }
+}
+
+fn safe_unexpected_arguments(unexpected: &[String]) -> String {
+    if unexpected.is_empty() {
+        return "unexpected argument is not allowed".to_owned();
+    }
+    let names = unexpected
+        .iter()
+        .take(3)
+        .map(|name| {
+            format!(
+                "'{}'",
+                bounded_validation_text(name, MAX_VALIDATION_TEXT_CHARS)
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    if unexpected.len() > 3 {
+        format!("unexpected arguments {names}, … are not allowed")
+    } else if unexpected.len() == 1 {
+        format!("unexpected argument {names} is not allowed")
+    } else {
+        format!("unexpected arguments {names} are not allowed")
+    }
+}
+
+fn bounded_validation_text(value: &str, max_chars: usize) -> String {
+    let mut chars = value.chars();
+    let mut bounded = chars
+        .by_ref()
+        .take(max_chars)
+        .map(|character| {
+            if character.is_control() {
+                '\u{fffd}'
+            } else {
+                character
+            }
+        })
+        .collect::<String>();
+    if chars.next().is_some() {
+        bounded.push('…');
+    }
+    bounded
 }
 
 /// The `body_args_json` body (issue #360): the validated argument object
@@ -3564,6 +3823,7 @@ fn executor_failure_observation_outcome(
         ToolExecutorError::Connection { reason, .. } => ToolObservationOutcome {
             status: match *reason {
                 "connection_disabled"
+                | "enum_source_unavailable"
                 | "credential_unavailable"
                 | "transport_unavailable"
                 | "connection_runtime_unavailable" => StatusCode::SERVICE_UNAVAILABLE.as_u16(),
@@ -3713,9 +3973,9 @@ fn executor_work_error_disposition(error: &ToolExecutorError) -> ToolWorkErrorDi
         } else {
             "composite_failed_compensation_incomplete"
         };
-        return ToolWorkErrorDisposition::FailureWithDetails {
+        return ToolWorkErrorDisposition::Failure {
             reason: Some(failure_reason.to_owned()),
-            details: json!({
+            details: Some(json!({
                 "tool_name": tool_name,
                 "request_id": request_id,
                 "reason": failure_reason,
@@ -3724,20 +3984,20 @@ fn executor_work_error_disposition(error: &ToolExecutorError) -> ToolWorkErrorDi
                 "failure_reason": reason,
                 "compensation": compensation,
                 "orphans": orphans,
-            }),
+            })),
         };
     }
     match error {
         ToolExecutorError::TransformRejected { path, reason, .. } => {
-            return ToolWorkErrorDisposition::FailureWithDetails {
+            return ToolWorkErrorDisposition::Failure {
                 reason: Some(TOOL_INVALID_PARAMS_REASON.to_owned()),
-                details: json!({
+                details: Some(json!({
                     "problems": [{
                         "path": path,
                         "keyword": "codec",
                         "reason": reason,
                     }],
-                }),
+                })),
             };
         }
         ToolExecutorError::HttpRuleDenied { .. } => {
@@ -3749,34 +4009,43 @@ fn executor_work_error_disposition(error: &ToolExecutorError) -> ToolWorkErrorDi
         _ => {}
     }
 
-    ToolWorkErrorDisposition::Failure(Some(
-        match error {
-            ToolExecutorError::UnknownTool { .. } => TOOL_UNKNOWN_TOOL_REASON,
-            ToolExecutorError::InputValidation { .. }
-            | ToolExecutorError::MissingArgument { .. }
-            | ToolExecutorError::UnsupportedArgumentValue { .. }
-            | ToolExecutorError::PathSegmentIsDotSegment { .. } => TOOL_INVALID_PARAMS_REASON,
-            ToolExecutorError::Egress { source, .. } => egress_error_reason(source),
-            ToolExecutorError::McpUpstream { reason, .. } => reason,
-            ToolExecutorError::Connection { reason, .. } => reason,
-            ToolExecutorError::CompositeFailed { .. } => unreachable!("handled above"),
-            ToolExecutorError::ExecutionStateUnavailable { .. } => {
-                TOOL_EXECUTION_STATE_UNAVAILABLE_REASON
-            }
-            ToolExecutorError::MissingUpstreamUrl
-            | ToolExecutorError::InvalidUpstreamUrl { .. }
-            | ToolExecutorError::SchemaCacheKey { .. }
-            | ToolExecutorError::SchemaCompile { .. }
-            | ToolExecutorError::InvalidMapping { .. }
-            | ToolExecutorError::InvalidMethod { .. }
-            | ToolExecutorError::BodySerialize { .. }
-            | ToolExecutorError::UrlBuild { .. } => TOOL_EXECUTOR_CONFIGURATION_ERROR_REASON,
-            ToolExecutorError::HttpRuleDenied { .. }
-            | ToolExecutorError::PreconditionFailed { .. }
-            | ToolExecutorError::TransformRejected { .. } => unreachable!("handled above"),
+    let reason = match error {
+        ToolExecutorError::UnknownTool { .. } => TOOL_UNKNOWN_TOOL_REASON,
+        ToolExecutorError::InputValidation { .. }
+        | ToolExecutorError::MissingArgument { .. }
+        | ToolExecutorError::UnsupportedArgumentValue { .. }
+        | ToolExecutorError::PathSegmentIsDotSegment { .. } => TOOL_INVALID_PARAMS_REASON,
+        ToolExecutorError::Egress { source, .. } => egress_error_reason(source),
+        ToolExecutorError::McpUpstream { reason, .. } => reason,
+        ToolExecutorError::Connection { reason, .. } => reason,
+        ToolExecutorError::CompositeFailed { .. } => unreachable!("handled above"),
+        ToolExecutorError::ExecutionStateUnavailable { .. } => {
+            TOOL_EXECUTION_STATE_UNAVAILABLE_REASON
         }
-        .to_owned(),
-    ))
+        ToolExecutorError::MissingUpstreamUrl
+        | ToolExecutorError::InvalidUpstreamUrl { .. }
+        | ToolExecutorError::SchemaCacheKey { .. }
+        | ToolExecutorError::SchemaCompile { .. }
+        | ToolExecutorError::InvalidMapping { .. }
+        | ToolExecutorError::InvalidMethod { .. }
+        | ToolExecutorError::BodySerialize { .. }
+        | ToolExecutorError::UrlBuild { .. } => TOOL_EXECUTOR_CONFIGURATION_ERROR_REASON,
+        ToolExecutorError::HttpRuleDenied { .. }
+        | ToolExecutorError::PreconditionFailed { .. }
+        | ToolExecutorError::TransformRejected { .. } => {
+            unreachable!("handled above")
+        }
+    };
+    let details = match error {
+        ToolExecutorError::InputValidation { problems, .. } => {
+            Some(json!({ "problems": problems }))
+        }
+        _ => None,
+    };
+    ToolWorkErrorDisposition::Failure {
+        reason: Some(reason.to_owned()),
+        details,
+    }
 }
 
 fn duration_millis(duration: Duration) -> u64 {
@@ -3930,11 +4199,11 @@ mod tests {
             control_plane::ConnectionControlPlane,
             http::ConnectionHttpRuntime,
             model::{
-                AdditionalHeader, ConnectionAuthentication, ConnectionEndpoint, ConnectionKind,
-                ConnectionWrite, OAuthClientAuthMethod, TlsProfile,
+                AdditionalHeader, ConnectionAuthentication, ConnectionEndpoint, ConnectionId,
+                ConnectionKind, ConnectionWrite, OAuthClientAuthMethod, TlsProfile,
             },
             secret::{OperatorSecretAliasConfig, OperatorSecretAliasSource, SecretRootConfig},
-            store::{StoredOpenApiCatalog, StoredOpenApiCatalogEntry},
+            store::{StoredEnumSourceValue, StoredOpenApiCatalog, StoredOpenApiCatalogEntry},
         },
         discovery::{
             aggregator::{EndpointAggregatorSink, EndpointAggregatorSinkConfig},
@@ -3942,8 +4211,16 @@ mod tests {
         },
         egress::EgressConfig,
         rbac::{Policy, PrincipalMatcher, Rule, RuleAction},
-        tools::runtime::{
-            DefaultToolPolicy, ToolInvocationSource, ToolRuntimeConfig, ToolRuntimeToolConfig,
+        tools::{
+            definitions::{EnumBinding, HttpToolMapping, ToolVisibility},
+            overlay::{
+                EnumSourcePlan, EnumSourceSelectionPlan, OverlaySourcePlan, SourceCache,
+                SourceLimits, SourceRequestPlan,
+            },
+            runtime::{
+                DefaultToolPolicy, ToolInvocationSource, ToolRuntimeConfig, ToolRuntimeToolConfig,
+            },
+            selector::Selector,
         },
     };
 
@@ -4401,6 +4678,122 @@ mod tests {
                 && event.payload["status"] == json!(StatusCode::SERVICE_UNAVAILABLE.as_u16())
                 && event.payload["reason"] == json!(TOOL_EXECUTION_STATE_UNAVAILABLE_REASON)
         }));
+    }
+
+    #[tokio::test]
+    async fn composite_leaf_enforces_served_dynamic_enum_before_upstream_io() {
+        let (addr, ca_pem, server) = scripted_tls_server(Vec::new()).await;
+        let connection =
+            TemporaryStaticAuthRuntime::header_api_key(addr, &ca_pem, b"composite-key").await;
+        let connection_id = ConnectionId::parse(connection.connection_id.clone())
+            .expect("test Connection id should parse");
+        let record = connection
+            .control_plane
+            .runtime_snapshot()
+            .managed()
+            .get(&connection_id)
+            .cloned()
+            .expect("test Connection should exist");
+        let source = EnumSourcePlan {
+            id: "note_titles".to_owned(),
+            source_digest: "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+                .to_owned(),
+            request: SourceRequestPlan {
+                tool: None,
+                path_and_query: "/metadata/note-titles".to_owned(),
+                path_template: "/metadata/note-titles".to_owned(),
+                query: Default::default(),
+                query_params: Vec::new(),
+            },
+            select: EnumSourceSelectionPlan {
+                items: Selector::parse("/items/*").expect("selector should parse"),
+                value: "/value".to_owned(),
+                label: None,
+            },
+            cache: SourceCache::default(),
+            limits: SourceLimits::default(),
+        };
+        let mut definitions = composite_note_definitions(&connection.connection_id);
+        let first_leaf = definitions
+            .iter_mut()
+            .find(|definition| definition.name == "create_note")
+            .expect("first composite leaf should exist");
+        first_leaf.enum_bindings = vec![EnumBinding {
+            property: "title".to_owned(),
+            source_id: source.id.clone(),
+            source_digest: source.source_digest.clone(),
+        }];
+        let (executor, _capture) = executor_for_composite_definitions(
+            definitions,
+            &connection,
+            [
+                "create_note_for_records",
+                "create_note",
+                "attach_note",
+                "delete_attachment",
+                "delete_note",
+            ],
+        );
+        let audit = AuditLog::new(Arc::new(CaptureSink::new()) as Arc<dyn AuditSink>);
+        let enum_runtime = EnumSourceRuntime::new(
+            connection.control_plane.clone(),
+            connection.runtime.clone(),
+            audit,
+            Vec::new(),
+        );
+        let plan = OverlaySourcePlan {
+            enum_sources: [(source.id.clone(), source.clone())].into_iter().collect(),
+            label_sources: Default::default(),
+        };
+        enum_runtime.install_resolved_plan(
+            &connection_id,
+            1,
+            &plan,
+            &[StoredEnumSourceValue {
+                connection_id: connection_id.clone(),
+                source_id: source.id,
+                overlay_revision: 1,
+                source_digest: source.source_digest,
+                values_revision: 1,
+                connection_revision: record.revisions.connection,
+                credential_revision: record.revisions.credential,
+                credential_generation_digest: connection
+                    .control_plane
+                    .credential_generation_digest(&record),
+                values: vec![json!("Public note")],
+                labels: None,
+                resolved_at: "2099-01-01T00:00:00Z".to_owned(),
+            }],
+        );
+        let executor = executor.with_enum_source_runtime(Some(enum_runtime));
+
+        let error = executor
+            .execute(
+                "create_note_for_records",
+                json!({"title":"Private note","targets":[]}),
+                invocation_context(),
+                CancellationToken::new(),
+            )
+            .await
+            .expect_err("a composite leaf must enforce its current dynamic enum");
+        let ToolRuntimeError::WorkFailed {
+            reason,
+            details: Some(details),
+            ..
+        } = error
+        else {
+            panic!("dynamic enum rejection should remain a structured composite failure");
+        };
+        assert_eq!(reason.as_deref(), Some("composite_failed"));
+        assert_eq!(details["failed_step"], json!("note"));
+        assert_eq!(details["failure_reason"], json!(TOOL_INVALID_PARAMS_REASON));
+        assert!(
+            server
+                .await
+                .expect("zero-response test server should stop")
+                .is_empty(),
+            "dynamic enum rejection must happen before composite member I/O"
+        );
     }
 
     #[tokio::test]
@@ -5210,6 +5603,225 @@ mod tests {
         );
         assert!(Arc::ptr_eq(&returned, &uncached));
         assert_eq!(cache.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn dynamic_enum_values_are_served_and_enforced_without_changing_the_stored_definition() {
+        let (addr, ca_pem, server) = one_request_tls_server().await;
+        let connection =
+            TemporaryStaticAuthRuntime::header_api_key(addr, &ca_pem, b"unused-secret").await;
+        let connection_id = ConnectionId::parse(connection.connection_id.clone())
+            .expect("test Connection id should parse");
+        let record = connection
+            .control_plane
+            .runtime_snapshot()
+            .managed()
+            .get(&connection_id)
+            .cloned()
+            .expect("test Connection should exist");
+        let audit = AuditLog::new(Arc::new(CaptureSink::new()) as Arc<dyn AuditSink>);
+        let enum_runtime = EnumSourceRuntime::new(
+            connection.control_plane.clone(),
+            connection.runtime.clone(),
+            audit.clone(),
+            Vec::new(),
+        );
+        let source = EnumSourcePlan {
+            id: "statuses".to_owned(),
+            source_digest: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                .to_owned(),
+            request: SourceRequestPlan {
+                tool: None,
+                path_and_query: "/metadata/statuses".to_owned(),
+                path_template: "/metadata/statuses".to_owned(),
+                query: Default::default(),
+                query_params: Vec::new(),
+            },
+            select: EnumSourceSelectionPlan {
+                items: Selector::parse("/items/*").expect("selector should parse"),
+                value: "/value".to_owned(),
+                label: None,
+            },
+            cache: SourceCache::default(),
+            limits: SourceLimits::default(),
+        };
+        let plan = OverlaySourcePlan {
+            enum_sources: [(source.id.clone(), source.clone())].into_iter().collect(),
+            label_sources: Default::default(),
+        };
+        enum_runtime.install_resolved_plan(
+            &connection_id,
+            1,
+            &plan,
+            &[StoredEnumSourceValue {
+                connection_id: connection_id.clone(),
+                source_id: source.id.clone(),
+                overlay_revision: 1,
+                source_digest: source.source_digest.clone(),
+                values_revision: 1,
+                connection_revision: record.revisions.connection,
+                credential_revision: record.revisions.credential,
+                credential_generation_digest: connection
+                    .control_plane
+                    .credential_generation_digest(&record),
+                values: vec![json!("Active"), json!("Paused")],
+                labels: None,
+                resolved_at: "2099-01-01T00:00:00Z".to_owned(),
+            }],
+        );
+
+        let mapping = HttpToolMapping {
+            method: "POST".to_owned(),
+            path_template: "/statuses".to_owned(),
+            query_params: Vec::new(),
+            body: None,
+        };
+        let definition = ToolDefinition {
+            name: "set_status".to_owned(),
+            description: "Set an exact status".to_owned(),
+            input_schema: json!({
+                "type": "object",
+                "required": ["status"],
+                "properties": {
+                    "status": {"type": "string"}
+                },
+                "additionalProperties": false
+            }),
+            target: Some(ToolTarget::Http {
+                connection_id: connection.connection_id.clone(),
+                mapping: mapping.clone(),
+            }),
+            source: ToolSource::OpenApi {
+                connection_id: connection.connection_id.clone(),
+                operation_id: Some("setStatus".to_owned()),
+                catalog_revision: Some(1),
+            },
+            upstream: mapping,
+            composite: None,
+            visibility: ToolVisibility::Listed,
+            transform: None,
+            enum_bindings: vec![EnumBinding {
+                property: "status".to_owned(),
+                source_id: source.id,
+                source_digest: source.source_digest,
+            }],
+        };
+        let registry = ToolRegistry::disabled();
+        registry
+            .replace_openapi_connection_catalog(&connection.connection_id, vec![definition], || {
+                Ok::<(), ()>(())
+            })
+            .expect("dynamic OpenAPI tool should install");
+        let stored_before = serde_json::to_vec(
+            registry
+                .get("set_status")
+                .expect("stored definition should exist")
+                .as_ref(),
+        )
+        .expect("stored definition should serialize");
+        let runtime = ToolRuntime::new(
+            runtime_config([("set_status", enabled_tool(500, 1))], 2, 1, 100),
+            audit.clone(),
+        );
+        let executor = ToolExecutor::new_inner(
+            registry.clone(),
+            runtime,
+            Arc::clone(&connection.egress_client),
+            audit,
+            ToolExecutorBackends {
+                upstream_url: None,
+                connection_http: Some(connection.runtime.clone()),
+                mcp_catalog_runtime: None,
+                openapi_catalog_runtime: None,
+                mcp_upstream_servers: HashMap::new(),
+                mcp_upstream_runtime_config: McpUpstreamRuntimeConfig {
+                    timeout: Duration::from_secs(30),
+                    response_idle_timeout: Duration::from_secs(30),
+                    connect_timeout: Duration::from_secs(10),
+                    max_request_body_bytes: 1_048_576,
+                    max_response_bytes: 5_242_880,
+                },
+            },
+        )
+        .expect("executor should build")
+        .with_enum_source_runtime(Some(enum_runtime.clone()));
+
+        let stored = registry
+            .get("set_status")
+            .expect("stored definition should exist");
+        let served = executor
+            .served_definition(stored.as_ref())
+            .expect("served schema should build");
+        assert_eq!(
+            served
+                .definition
+                .input_schema
+                .pointer("/properties/status/enum"),
+            Some(&json!(["Active", "Paused"]))
+        );
+        assert_eq!(
+            serde_json::to_vec(stored.as_ref()).expect("stored definition should serialize"),
+            stored_before,
+            "serve-time injection must not mutate the registry definition"
+        );
+
+        let rejected = executor
+            .execute(
+                "set_status",
+                json!({"status": " active "}),
+                invocation_context(),
+                CancellationToken::new(),
+            )
+            .await
+            .expect_err("case and whitespace variants must not be coerced");
+        let ToolRuntimeError::WorkFailed {
+            reason,
+            details,
+            message,
+            ..
+        } = rejected
+        else {
+            panic!("dynamic enum rejection should be a work failure");
+        };
+        assert_eq!(reason.as_deref(), Some(TOOL_INVALID_PARAMS_REASON));
+        assert!(
+            !message.contains(" active "),
+            "validation errors must not echo rejected agent values"
+        );
+        assert!(
+            !serde_json::to_string(&details)
+                .expect("validation details should serialize")
+                .contains(" active "),
+            "structured validation details must not echo rejected agent values"
+        );
+        assert_eq!(
+            details
+                .as_ref()
+                .and_then(|details| details.pointer("/problems/0/allowed")),
+            Some(&json!(["Active", "Paused"]))
+        );
+
+        enum_runtime.remove_plan(&connection_id);
+        let unavailable = executor
+            .execute(
+                "set_status",
+                json!({"status": "Active"}),
+                invocation_context(),
+                CancellationToken::new(),
+            )
+            .await
+            .expect_err("missing dynamic values must fail closed");
+        assert!(matches!(
+            unavailable,
+            ToolRuntimeError::WorkFailed { ref reason, .. }
+                if reason.as_deref() == Some(TOOL_ENUM_SOURCE_UNAVAILABLE_REASON)
+        ));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), server)
+                .await
+                .is_err(),
+            "rejected dynamic enum calls must not reach the upstream"
+        );
     }
 
     #[test]
@@ -7863,6 +8475,7 @@ mod tests {
                 composite: None,
                 visibility,
                 transform: None,
+                enum_bindings: Vec::new(),
             }
         };
         let object_schema = |properties: Value, required: Value| {
@@ -8014,6 +8627,7 @@ mod tests {
             }),
             visibility: listed,
             transform: None,
+            enum_bindings: Vec::new(),
         };
         vec![
             create_note,

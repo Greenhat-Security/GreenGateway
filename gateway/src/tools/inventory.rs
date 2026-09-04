@@ -26,6 +26,7 @@ use super::definitions::{
     BodyMapping, HttpToolMapping, QueryParamMapping, ToolDefinition, ToolRegistry, ToolSource,
     ToolTarget, ToolVisibility,
 };
+use super::enum_source::{EnumSourceRuntime, EnumSourceState};
 use super::transforms::{ParameterShape, ToolTransform, WireSource};
 
 pub const DEFAULT_CAPABILITY_LIST_LIMIT: usize = 50;
@@ -46,6 +47,7 @@ const CAPABILITY_EXECUTION_ETAG_DOMAIN: &str = "greengateway-capability-executio
 pub struct CapabilityInventory {
     registry: ToolRegistry,
     control_plane: ConnectionControlPlane,
+    enum_source_runtime: Option<EnumSourceRuntime>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Deserialize, Serialize)]
@@ -232,7 +234,22 @@ pub struct CapabilityDetail {
     pub mapping: Option<CapabilityMapping>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub transform: Option<CapabilityTransformSummary>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub dynamic_enums: Vec<CapabilityDynamicEnum>,
     pub actions: CapabilityActions,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct CapabilityDynamicEnum {
+    pub property: String,
+    pub source_id: String,
+    pub state: EnumSourceState,
+    pub item_count: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub values_revision: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub resolved_at: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
@@ -302,6 +319,7 @@ struct BuiltCapability {
     input_schema: Option<Value>,
     mapping: Option<CapabilityMapping>,
     transform: Option<CapabilityTransformSummary>,
+    dynamic_enums: Vec<CapabilityDynamicEnum>,
     registered_definition: Option<ToolDefinition>,
     execution_revision: Option<CapabilityExecutionRevision>,
 }
@@ -375,7 +393,16 @@ impl CapabilityInventory {
         Self {
             registry,
             control_plane,
+            enum_source_runtime: None,
         }
+    }
+
+    pub fn with_enum_source_runtime(
+        mut self,
+        enum_source_runtime: Option<EnumSourceRuntime>,
+    ) -> Self {
+        self.enum_source_runtime = enum_source_runtime;
+        self
     }
 
     pub async fn list(
@@ -588,6 +615,7 @@ impl CapabilityInventory {
                 .map(|context| context.reference.clone());
             let policy = tool_policy(rbac_state, principal, &definition.name);
             let execution_revision = durable_execution_revision(&durable);
+            let dynamic_enums = self.dynamic_enum_details(&definition)?;
             let capability = tool_capability(
                 definition,
                 source,
@@ -597,6 +625,7 @@ impl CapabilityInventory {
                 policy,
                 (registered_definition, Some(execution_revision)),
                 &mapping_definitions,
+                dynamic_enums,
             )?;
             insert_capability(&mut built, capability)?;
         }
@@ -615,6 +644,7 @@ impl CapabilityInventory {
                 local_tool_context(&definition, &snapshot, &connections)?;
             let policy = tool_policy(rbac_state, principal, &definition.name);
             let execution_revision = local_execution_revision(&definition, &snapshot, &connections);
+            let dynamic_enums = self.dynamic_enum_details(definition.as_ref())?;
             let capability = tool_capability(
                 definition.as_ref().clone(),
                 source,
@@ -624,6 +654,7 @@ impl CapabilityInventory {
                 policy,
                 (Some(definition.as_ref().clone()), Some(execution_revision)),
                 &mapping_definitions,
+                dynamic_enums,
             )?;
             insert_capability(&mut built, capability)?;
         }
@@ -676,6 +707,7 @@ impl CapabilityInventory {
                         summary,
                         input_schema: None,
                         transform: None,
+                        dynamic_enums: Vec::new(),
                         registered_definition: None,
                         execution_revision: None,
                     },
@@ -719,6 +751,7 @@ impl CapabilityInventory {
                         summary,
                         input_schema: None,
                         transform: None,
+                        dynamic_enums: Vec::new(),
                         registered_definition: None,
                         execution_revision: None,
                     },
@@ -727,6 +760,43 @@ impl CapabilityInventory {
         }
 
         Ok(built.into_values().collect())
+    }
+
+    fn dynamic_enum_details(
+        &self,
+        definition: &ToolDefinition,
+    ) -> Result<Vec<CapabilityDynamicEnum>, CapabilityInventoryError> {
+        if definition.enum_bindings.is_empty() {
+            return Ok(Vec::new());
+        }
+        let connection_id = match &definition.source {
+            ToolSource::OpenApi { connection_id, .. } => ConnectionId::parse(connection_id.clone())
+                .map_err(|_| CapabilityInventoryError::CorruptState)?,
+            _ => return Err(CapabilityInventoryError::CorruptState),
+        };
+        Ok(definition
+            .enum_bindings
+            .iter()
+            .map(|binding| {
+                let snapshot = self.enum_source_runtime.as_ref().map(|runtime| {
+                    runtime.snapshot(&connection_id, &binding.source_id, &binding.source_digest)
+                });
+                CapabilityDynamicEnum {
+                    property: binding.property.clone(),
+                    source_id: binding.source_id.clone(),
+                    state: snapshot
+                        .as_ref()
+                        .map_or(EnumSourceState::Missing, |snapshot| snapshot.state),
+                    item_count: snapshot
+                        .as_ref()
+                        .map_or(0, |snapshot| snapshot.item_count()),
+                    values_revision: snapshot.as_ref().and_then(|snapshot| {
+                        (snapshot.values_revision > 0).then_some(snapshot.values_revision)
+                    }),
+                    resolved_at: snapshot.and_then(|snapshot| snapshot.resolved_at),
+                }
+            })
+            .collect())
     }
 
     async fn load_managed_inventory(
@@ -1200,6 +1270,7 @@ fn tool_capability(
     policy: CapabilityPolicyEligibility,
     execution_binding: (Option<ToolDefinition>, Option<CapabilityExecutionRevision>),
     mapping_definitions: &BTreeMap<String, ToolDefinition>,
+    dynamic_enums: Vec<CapabilityDynamicEnum>,
 ) -> Result<BuiltCapability, CapabilityInventoryError> {
     let (registered_definition, execution_revision) = execution_binding;
     let schema_digest = schema_digest(&definition.input_schema)?;
@@ -1251,6 +1322,7 @@ fn tool_capability(
         input_schema: Some(definition.input_schema),
         mapping,
         transform,
+        dynamic_enums,
         registered_definition,
         execution_revision,
     })
@@ -1475,6 +1547,7 @@ fn capability_detail_result(
         input_schema,
         mapping,
         transform,
+        dynamic_enums,
         registered_definition,
         execution_revision,
     } = capability;
@@ -1483,11 +1556,18 @@ fn capability_detail_result(
         input_schema,
         mapping,
         transform,
+        dynamic_enums,
         actions,
     };
+    // Dynamic values refresh independently of the stored catalog. Keep the
+    // playground precondition bound to durable definition/revision state so
+    // an enum refresh does not churn capability ETags.
     let binding = serde_json::to_vec(&(
         CAPABILITY_EXECUTION_ETAG_DOMAIN,
-        &detail,
+        &detail.summary,
+        &detail.input_schema,
+        &detail.mapping,
+        &detail.actions,
         &registered_definition,
         &execution_revision,
     ))
@@ -1802,6 +1882,7 @@ mod tests {
                 },
                 upstream: openapi_mapping,
                 composite: None,
+                enum_bindings: Vec::new(),
                 visibility: crate::tools::definitions::ToolVisibility::Listed,
                 transform: None,
             };
@@ -2060,6 +2141,7 @@ mod tests {
                 composite: None,
                 visibility: ToolVisibility::Listed,
                 transform: None,
+                enum_bindings: Vec::new(),
             },
         )]);
         let mapping = crate::tools::composite::CompositeMapping {
@@ -2115,6 +2197,7 @@ mod tests {
                 body: None,
             },
             composite: None,
+            enum_bindings: Vec::new(),
             visibility: crate::tools::definitions::ToolVisibility::Listed,
             transform: None,
         };
@@ -2148,6 +2231,7 @@ mod tests {
             input_schema: Some(definition.input_schema.clone()),
             mapping: None,
             transform: None,
+            dynamic_enums: Vec::new(),
             registered_definition: Some(definition),
             execution_revision: Some(CapabilityExecutionRevision::Manual {
                 connection_etag: None,
@@ -2161,6 +2245,33 @@ mod tests {
                 reason: "allowed",
             }
         );
+
+        capability.dynamic_enums = vec![CapabilityDynamicEnum {
+            property: "status".to_owned(),
+            source_id: "statuses".to_owned(),
+            state: EnumSourceState::Fresh,
+            item_count: 2,
+            values_revision: Some(7),
+            resolved_at: Some("2026-09-03T00:00:00Z".to_owned()),
+        }];
+        let fresh_detail = capability_detail_result(capability.clone(), true, true)
+            .expect("fresh dynamic enum detail should build");
+        capability.dynamic_enums[0].state = EnumSourceState::Stale;
+        capability.dynamic_enums[0].item_count = 3;
+        capability.dynamic_enums[0].values_revision = Some(8);
+        let refreshed_detail = capability_detail_result(capability.clone(), true, true)
+            .expect("refreshed dynamic enum detail should build");
+        assert_eq!(
+            refreshed_detail.detail.dynamic_enums[0].state,
+            EnumSourceState::Stale
+        );
+        assert_eq!(refreshed_detail.detail.dynamic_enums[0].item_count, 3);
+        assert_eq!(
+            fresh_detail.execution_etag(),
+            refreshed_detail.execution_etag(),
+            "serve-time enum refreshes must not churn the playground execution ETag"
+        );
+
         assert_eq!(
             capability_actions(&capability, false, true).reason,
             "permission_denied"
@@ -2544,6 +2655,7 @@ mod tests {
                 source: ToolSource::Manual,
                 upstream: manual_mapping,
                 composite: None,
+                enum_bindings: Vec::new(),
                 visibility: crate::tools::definitions::ToolVisibility::Listed,
                 transform: None,
             }])
@@ -2611,6 +2723,7 @@ mod tests {
                     input_schema: None,
                     mapping: None,
                     transform: None,
+                    dynamic_enums: Vec::new(),
                     registered_definition: None,
                     execution_revision: None,
                 },
@@ -2649,6 +2762,7 @@ mod tests {
                 input_schema: None,
                 mapping: None,
                 transform: None,
+                dynamic_enums: Vec::new(),
                 registered_definition: None,
                 execution_revision: None,
             },

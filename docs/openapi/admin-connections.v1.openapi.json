@@ -370,7 +370,7 @@
           "Connections"
         ],
         "summary": "Refresh a registered managed MCP or OpenAPI catalog",
-        "description": "Requires admin:connections:refresh, an exact resource ETag, and an empty body. Failure leaves the prior catalog as last-known-good.",
+        "description": "Requires admin:connections:refresh, an exact resource ETag, and an empty body. An OpenAPI refresh re-resolves the stored overlay's enum and label sources under the previously authorized source plan; failure leaves the prior catalog and enum values as last-known-good.",
         "parameters": [
           {
             "$ref": "#/components/parameters/IfMatch"
@@ -423,7 +423,7 @@
           "Managed OpenAPI"
         ],
         "summary": "Read the stored OpenAPI overlay and its applied revision",
-        "description": "Requires admin:connections:read. The overlay has its own strong ETag, whose Connection revision component prevents reuse across a compatible-ID kind replacement. Source status is projected from the canonical report snapshot stored with the overlay, including after restart; this read performs no source I/O.",
+        "description": "Requires admin:connections:read. The overlay has its own strong ETag, whose Connection revision component prevents reuse across a compatible-ID kind replacement. Compile-time label status comes from the canonical stored report, while enum status is projected from the exact in-memory state this replica serves after boot or timer refresh; this read performs no source or durable-write I/O.",
         "responses": {
           "200": {
             "description": "Stored overlay state. When no overlay exists, document is null, overlay_revision is 0, and the ETag ends in :o0.",
@@ -454,7 +454,7 @@
           "Managed OpenAPI"
         ],
         "summary": "Validate, compile, and atomically publish an OpenAPI overlay",
-        "description": "Requires admin:connections:write and the exact overlay ETag. Declarative request and response transforms are checked against the generated request-body properties and declared JSON 2xx response schemas before publication. A raw source request.path on an authenticated Connection additionally requires admin:connections:secrets:write. Validation, compilation, catalog publication, overlay persistence, and source-report persistence succeed as one mutation or leave the previous catalog and overlay unchanged.",
+        "description": "Requires admin:connections:write and the exact overlay ETag. Declarative request and response transforms are checked against the generated request-body properties and declared JSON 2xx response schemas before publication. Any raw source request.path additionally requires admin:connections:secrets:write; this remains true before or after the Connection gains HTTP, additional-header, or mTLS authority. Validation, source resolution, compilation, catalog publication, overlay persistence, enum last-known-good values, and source-report persistence succeed as one mutation or leave the previous state unchanged.",
         "parameters": [
           {
             "$ref": "#/components/parameters/OpenApiOverlayIfMatch"
@@ -463,7 +463,7 @@
             "name": "allow_unresolved_enum_sources",
             "in": "query",
             "required": false,
-            "description": "Permit an enum source with no initial value set to be stored unresolved. Label sources must still resolve. Source declarations are reserved and rejected by the current overlay schema revision.",
+            "description": "Permit an enum source with no initial value set to be stored in the fail-closed missing state. Label sources must still resolve, and calls stay rejected until the enum source resolves.",
             "schema": {
               "type": "boolean",
               "default": false
@@ -588,7 +588,7 @@
           "Managed OpenAPI"
         ],
         "summary": "Preview a bounded OpenAPI document without persistence",
-        "description": "Requires admin:tools:read. Preview performs no tool invocation or persistence and returns the current Connection ETag for a later register precondition. A candidate overlay is compiled against all named generated operations, including unselected operations; request shapes, codec chains, response roots, and response fields are therefore rejected before registration if the OpenAPI schemas prove them incompatible.",
+        "description": "Requires admin:tools:read. Any raw overlay source path additionally requires admin:connections:secrets:write, including when preview falls back to the stored overlay; this remains true before or after the Connection gains HTTP, additional-header, or mTLS authority. Preview performs no tool invocation or persistence and returns the current Connection ETag for a later register precondition. A candidate overlay is compiled against all named generated operations, including unselected operations; request shapes, codec chains, response roots, and response fields are therefore rejected before registration if the OpenAPI schemas prove them incompatible. When an optional overlay declares sources, preview performs the same bounded source resolution as overlay PUT so the operator sees compiled labels and values before storing anything.",
         "requestBody": {
           "required": true,
           "content": {
@@ -1097,6 +1097,9 @@
               }
             }
           },
+          "422": {
+            "$ref": "#/components/responses/ToolPlaygroundValidationError"
+          },
           "default": {
             "$ref": "#/components/responses/AdminError"
           }
@@ -1246,6 +1249,9 @@
             "$ref": "../schemas/connection-admin.v1.schema.json#/$defs/OpenApiOverlayValidationError"
           },
           {
+            "$ref": "../schemas/connection-admin.v1.schema.json#/$defs/ToolPlaygroundValidationError"
+          },
+          {
             "$ref": "../schemas/connection-admin.v1.schema.json#/$defs/DependencyConflict"
           }
         ]
@@ -1278,6 +1284,21 @@
           "application/json": {
             "schema": {
               "$ref": "../schemas/connection-admin.v1.schema.json#/$defs/OpenApiOverlayValidationError"
+            }
+          }
+        }
+      },
+      "ToolPlaygroundValidationError": {
+        "description": "The tool arguments failed input-schema validation. Problems are bounded and enum failures carry the exact allowed values without echoing the rejected value.",
+        "headers": {
+          "Cache-Control": {
+            "$ref": "#/components/headers/NoStore"
+          }
+        },
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "../schemas/connection-admin.v1.schema.json#/$defs/ToolPlaygroundValidationError"
             }
           }
         }

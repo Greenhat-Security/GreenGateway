@@ -556,22 +556,15 @@ fn read_connections(path: &Path) -> Result<(Vec<ImportedConnection>, i64), Impor
         .map(|overlay| (overlay.connection_id.clone(), overlay))
         .collect();
 
-    // Dynamic enum rows belong to a later importer revision. Their absence
-    // is not an overlay compatibility check: every durable overlay above is
-    // decoded and validated by this binary independently before this
-    // forward-version gate is considered.
-    let enum_source_values = store
-        .openapi_enum_source_value_count()
-        .map_err(connection_source_error)?;
-    if enum_source_values != 0 {
-        return Err(ImportError::SourceDocumentUnparseable {
-            kind: "Connection",
-            detail: format!(
-                "the Connections database contains {enum_source_values} dynamic OpenAPI enum \
-                 source value row(s), which this importer cannot preserve; run the import with \
-                 an enum-capable gateway version"
-            ),
-        });
+    let mut enum_source_values: BTreeMap<_, Vec<_>> = BTreeMap::new();
+    for row in store
+        .enum_source_values()
+        .map_err(connection_source_error)?
+    {
+        enum_source_values
+            .entry(row.connection_id.clone())
+            .or_default()
+            .push(row);
     }
 
     let mut current_statuses: BTreeMap<_, _> = statuses
@@ -600,6 +593,7 @@ fn read_connections(path: &Path) -> Result<(Vec<ImportedConnection>, i64), Impor
             mcp_catalog: mcp_catalogs.remove(&record.id),
             openapi_catalog: openapi_catalogs.remove(&record.id),
             openapi_overlay: openapi_overlays.remove(&record.id),
+            enum_source_values: enum_source_values.remove(&record.id).unwrap_or_default(),
             record,
         });
     }
@@ -611,12 +605,13 @@ fn read_connections(path: &Path) -> Result<(Vec<ImportedConnection>, i64), Impor
         || !mcp_catalogs.is_empty()
         || !openapi_catalogs.is_empty()
         || !openapi_overlays.is_empty()
+        || !enum_source_values.is_empty()
         || !activity.is_empty()
     {
         return Err(ImportError::SourceDocumentUnparseable {
             kind: "Connection",
             detail:
-                "the Connections database holds status, catalog, overlay, or activity rows for \
+                "the Connections database holds status, catalog, overlay, enum, or activity rows for \
                      Connections it has no record of"
                     .to_owned(),
         });

@@ -66,9 +66,10 @@ use crate::egress::{EgressClient, EgressError};
 use super::{
     model::{MAX_CREDENTIALS, MAX_DISPLAY_NAME_CHARS, MAX_SECRET_ID_BYTES},
     secret::{
-        is_valid_opaque_id, read_bounded_file_secret, safe_error_alias_id, FileSecretPermissions,
-        ResolvedSecret, SecretAliasMetadata, SecretProviderKind, SecretPurpose, SecretResolveError,
-        SecretResolveErrorKind, SecretResolver,
+        configured_secret_generation_digest, is_valid_opaque_id, read_bounded_file_secret,
+        safe_error_alias_id, FileSecretPermissions, ResolvedSecret, SecretAliasMetadata,
+        SecretProviderKind, SecretPurpose, SecretResolveError, SecretResolveErrorKind,
+        SecretResolver,
     },
 };
 
@@ -1836,6 +1837,16 @@ impl SecretResolver for AwsSecretsManagerProvider {
             })
             .collect()
     }
+
+    fn generation_digest(&self, alias_id: &str) -> Option<String> {
+        let version_id = self.aliases.get(alias_id)?.version_id.as_deref()?;
+        Some(configured_secret_generation_digest(
+            SecretProviderKind::AwsSecretsManager,
+            alias_id,
+            &self.generation,
+            version_id.as_bytes(),
+        ))
+    }
 }
 
 fn record_resolution(outcome: &Result<ResolvedSecret, AwsFailure>, elapsed: Duration) {
@@ -1901,7 +1912,7 @@ fn validate_token_root_permissions(
     Ok(())
 }
 
-fn provider_generation(config: &AwsProviderConfig) -> [u8; 32] {
+pub(crate) fn provider_generation(config: &AwsProviderConfig) -> [u8; 32] {
     let mut digest = Sha256::new();
     digest.update(b"aws-secrets-manager-provider-v1");
     for profile in &config.profiles {

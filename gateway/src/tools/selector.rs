@@ -64,8 +64,71 @@ pub struct Selector {
 }
 
 impl Selector {
+    /// Parse the metadata-source selector grammar. Its integer filter follows
+    /// the overlay schema (`-?[0-9]{1,18}`), including leading zeroes.
+    /// Serde/`FromStr` remains the stricter transform representation so its
+    /// persisted canonical selector contract is unchanged.
+    pub fn parse(value: &str) -> Result<Self, String> {
+        let segments = parse_enum_selector(value)?;
+        Ok(Self {
+            source: value.to_owned(),
+            segments,
+        })
+    }
+
     pub fn as_str(&self) -> &str {
         &self.source
+    }
+
+    #[cfg(test)]
+    pub fn depth(&self) -> usize {
+        self.segments.len()
+    }
+
+    /// Select borrowed values without recursion or expression evaluation.
+    /// Array order and the JSON map's deterministic iteration order are kept.
+    pub fn select<'a>(&self, root: &'a Value) -> Vec<&'a Value> {
+        let mut selected = vec![root];
+        for segment in &self.segments {
+            let mut next = Vec::new();
+            for value in selected {
+                match segment {
+                    SelectorSegment::Key(key) => {
+                        if let Some(child) = value.as_object().and_then(|object| object.get(key)) {
+                            next.push(child);
+                        }
+                    }
+                    SelectorSegment::Wildcard => match value {
+                        Value::Array(items) => next.extend(items),
+                        Value::Object(object) => next.extend(object.values()),
+                        _ => {}
+                    },
+                    SelectorSegment::Filter {
+                        key,
+                        field,
+                        value: expected,
+                    } => {
+                        let Some(items) = value
+                            .as_object()
+                            .and_then(|object| object.get(key))
+                            .and_then(Value::as_array)
+                        else {
+                            continue;
+                        };
+                        next.extend(items.iter().filter(|item| {
+                            item.as_object()
+                                .and_then(|object| object.get(field))
+                                .is_some_and(|candidate| candidate == expected)
+                        }));
+                    }
+                }
+            }
+            selected = next;
+            if selected.is_empty() {
+                break;
+            }
+        }
+        selected
     }
 }
 
@@ -590,6 +653,17 @@ fn validate_json_pointer(value: &str) -> Result<(), String> {
 }
 
 fn parse_selector(value: &str) -> Result<Vec<SelectorSegment>, String> {
+    parse_selector_with_integer_mode(value, false)
+}
+
+fn parse_enum_selector(value: &str) -> Result<Vec<SelectorSegment>, String> {
+    parse_selector_with_integer_mode(value, true)
+}
+
+fn parse_selector_with_integer_mode(
+    value: &str,
+    allow_noncanonical_integer: bool,
+) -> Result<Vec<SelectorSegment>, String> {
     if value.is_empty() || !value.starts_with('/') {
         return Err("selector must start with '/'".to_owned());
     }
@@ -599,16 +673,20 @@ fn parse_selector(value: &str) -> Result<Vec<SelectorSegment>, String> {
     let raw_segments = value[1..].split('/').collect::<Vec<_>>();
     if raw_segments.len() > MAX_SELECTOR_DEPTH {
         return Err(format!(
-            "selector exceeds maximum depth {MAX_SELECTOR_DEPTH}"
+            "contains {} segments; the limit is {MAX_SELECTOR_DEPTH}",
+            raw_segments.len()
         ));
     }
     raw_segments
         .into_iter()
-        .map(parse_selector_segment)
+        .map(|segment| parse_selector_segment(segment, allow_noncanonical_integer))
         .collect()
 }
 
-fn parse_selector_segment(segment: &str) -> Result<SelectorSegment, String> {
+fn parse_selector_segment(
+    segment: &str,
+    allow_noncanonical_integer: bool,
+) -> Result<SelectorSegment, String> {
     if segment == "*" {
         return Ok(SelectorSegment::Wildcard);
     }
@@ -625,9 +703,18 @@ fn parse_selector_segment(segment: &str) -> Result<SelectorSegment, String> {
         validate_selector_name(key)?;
         validate_selector_name(field)?;
         let value = if let Some(integer) = literal.strip_prefix("int:") {
-            validate_selector_integer(integer)?;
-            serde_json::from_str::<Value>(integer)
-                .map_err(|_| "selector int literal is invalid".to_owned())?
+            if allow_noncanonical_integer {
+                validate_enum_selector_integer(integer)?;
+                Value::from(
+                    integer
+                        .parse::<i64>()
+                        .map_err(|_| "selector int literal is invalid".to_owned())?,
+                )
+            } else {
+                validate_selector_integer(integer)?;
+                serde_json::from_str::<Value>(integer)
+                    .map_err(|_| "selector int literal is invalid".to_owned())?
+            }
         } else if let Some(boolean) = literal.strip_prefix("bool:") {
             match boolean {
                 "true" => Value::Bool(true),
@@ -653,6 +740,14 @@ fn parse_selector_segment(segment: &str) -> Result<SelectorSegment, String> {
     }
     validate_selector_name(segment)?;
     Ok(SelectorSegment::Key(segment.to_owned()))
+}
+
+fn validate_enum_selector_integer(value: &str) -> Result<(), String> {
+    let digits = value.strip_prefix('-').unwrap_or(value);
+    if digits.is_empty() || digits.len() > 18 || !digits.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Err("selector int literals must contain at most 18 digits".to_owned());
+    }
+    Ok(())
 }
 
 fn validate_selector_integer(value: &str) -> Result<(), String> {

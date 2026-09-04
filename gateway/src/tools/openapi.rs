@@ -841,6 +841,7 @@ pub fn generate_tools_from_openapi_str(
             composite: None,
             visibility: ToolVisibility::Listed,
             transform: None,
+            enum_bindings: Vec::new(),
         };
         let definition_bytes = serde_json::to_vec(&definition)
             .map_err(|source| OpenApiToolGenerationError::Json { source })?

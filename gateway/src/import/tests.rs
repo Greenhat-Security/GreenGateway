@@ -1092,12 +1092,10 @@ mod database {
         }
     }
 
-    /// PR 1 creates the enum LKG table for PR 2 but intentionally has no
-    /// row codec. A source already written by an enum-capable binary must
-    /// therefore be refused by this importer, not silently copied without
-    /// those rows while the remaining Connections checksum still matches.
+    /// Enum LKG rows are part of the Connections graph: import must preserve
+    /// them rather than silently dropping a cache replica boot can adopt.
     #[test]
-    fn enum_source_rows_from_a_newer_binary_are_refused_instead_of_dropped() {
+    fn enum_source_rows_are_loaded_for_import() {
         let fixture = build_fixture("enum-source-refusal", 1, 0);
         let connection = rusqlite::Connection::open(fixture.connections_file())
             .expect("the fixture Connections database should open");
@@ -1120,14 +1118,18 @@ mod database {
             .expect("the future enum row should seed");
         drop(connection);
 
-        let Err(error) = StandaloneSource::load(&fixture.env_file) else {
-            panic!("an importer without an enum codec must refuse a non-empty enum table");
-        };
-        assert_eq!(error.code(), "source_document_unparseable");
-        assert!(
-            error.to_string().contains("cannot preserve")
-                && error.to_string().contains("enum-capable gateway version"),
-            "{error}"
+        let source = StandaloneSource::load(&fixture.env_file)
+            .expect("an enum-capable importer should load the durable row");
+        let imported = source
+            .connections
+            .iter()
+            .find(|candidate| candidate.record.id == fixture.openapi_id)
+            .expect("the OpenAPI Connection should be loaded");
+        assert_eq!(imported.enum_source_values.len(), 1);
+        assert_eq!(imported.enum_source_values[0].source_id, "regions");
+        assert_eq!(
+            imported.enum_source_values[0].values,
+            vec![json!("na"), json!("eu")]
         );
     }
 

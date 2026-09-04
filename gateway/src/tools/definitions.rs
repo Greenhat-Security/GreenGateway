@@ -75,6 +75,23 @@ pub struct ToolDefinition {
     /// their serialized bytes exactly.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub transform: Option<ToolTransform>,
+    /// Stable dynamic-enum bindings compiled from a Connection overlay.
+    /// Current values are intentionally absent: they are applied only to an
+    /// owned serve/validation clone so the durable definition digest does not
+    /// churn when upstream metadata changes.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub enum_bindings: Vec<EnumBinding>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct EnumBinding {
+    /// Top-level agent-facing property whose `enum` is supplied at serve time.
+    pub property: String,
+    /// Overlay-local enum source identifier.
+    pub source_id: String,
+    /// SHA-256 of the normalized source plan, as lowercase hexadecimal.
+    pub source_digest: String,
 }
 
 /// Where a tool is reachable from (issue #360).
@@ -186,6 +203,7 @@ impl ToolDefinition {
             composite: None,
             visibility: ToolVisibility::Listed,
             transform: None,
+            enum_bindings: Vec::new(),
         }
     }
 
@@ -1859,6 +1877,7 @@ fn tool_definition_problems(definitions: &[ToolDefinition]) -> Vec<String> {
         }
 
         problems.extend(typed_tool_metadata_problems(index, definition));
+        problems.extend(enum_binding_problems(index, definition));
 
         if let Some(mapping) = definition.upstream.mcp_proxy_mapping() {
             if mapping.server_name.trim().is_empty() {
@@ -2148,6 +2167,120 @@ fn json_pointer_is_prefix(left: &str, right: &str) -> bool {
         || right
             .strip_prefix(left)
             .is_some_and(|suffix| suffix.starts_with('/'))
+}
+
+fn enum_binding_problems(index: usize, definition: &ToolDefinition) -> Vec<String> {
+    const MAX_ENUM_BINDINGS: usize = 256;
+
+    let mut problems = Vec::new();
+    if definition.enum_bindings.len() > MAX_ENUM_BINDINGS {
+        problems.push(format!(
+            "tools[{index}].enum_bindings contains {} entries; the limit is {MAX_ENUM_BINDINGS}",
+            definition.enum_bindings.len()
+        ));
+    }
+
+    let properties = definition
+        .input_schema
+        .get("properties")
+        .and_then(Value::as_object);
+    let mut seen = BTreeSet::new();
+    for (binding_index, binding) in definition.enum_bindings.iter().enumerate() {
+        let path = format!("tools[{index}].enum_bindings[{binding_index}]");
+        if binding.property.is_empty()
+            || binding.property.chars().count() > 256
+            || binding.property.chars().any(char::is_control)
+        {
+            problems.push(format!(
+                "{path}.property must contain 1-256 characters without controls"
+            ));
+        }
+        if !seen.insert(binding.property.as_str()) {
+            problems.push(format!(
+                "{path}.property duplicates dynamic enum property '{}'",
+                binding.property
+            ));
+        }
+        if !valid_overlay_local_name(&binding.source_id) {
+            problems.push(format!(
+                "{path}.source_id must match ^[A-Za-z][A-Za-z0-9_]{{0,63}}$"
+            ));
+        }
+        if binding.source_digest.len() != 64
+            || !binding
+                .source_digest
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        {
+            problems.push(format!(
+                "{path}.source_digest must be 64 lowercase hexadecimal characters"
+            ));
+        }
+
+        let Some(property_schema) = properties.and_then(|items| items.get(&binding.property))
+        else {
+            problems.push(format!(
+                "{path}.property '{}' must name input_json_schema.properties",
+                binding.property
+            ));
+            continue;
+        };
+        let Some(enum_schema) = dynamic_enum_schema(property_schema) else {
+            problems.push(format!(
+                "{path}.property '{}' must have type string or boolean, or be an array whose items have type string or boolean",
+                binding.property
+            ));
+            continue;
+        };
+        if enum_schema.get("enum").is_some() {
+            problems.push(format!(
+                "{path}.property '{}' must not persist enum values; values are injected only into a served clone",
+                binding.property
+            ));
+        }
+    }
+    problems
+}
+
+fn valid_overlay_local_name(value: &str) -> bool {
+    let mut bytes = value.bytes();
+    matches!(bytes.next(), Some(first) if first.is_ascii_alphabetic())
+        && bytes.clone().count() <= 63
+        && bytes.all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+}
+
+/// Return the schema node that receives the resolved enum. Arrays bind their
+/// item schema; scalar string/boolean properties bind the property itself.
+pub fn dynamic_enum_schema(schema: &Value) -> Option<&Value> {
+    match schema.get("type")?.as_str()? {
+        "string" | "boolean" => Some(schema),
+        "array" => {
+            let items = schema.get("items")?;
+            matches!(
+                items.get("type").and_then(Value::as_str),
+                Some("string" | "boolean")
+            )
+            .then_some(items)
+        }
+        _ => None,
+    }
+}
+
+/// Mutable twin of [`dynamic_enum_schema`], used only on owned served clones.
+pub fn dynamic_enum_schema_mut(schema: &mut Value) -> Option<&mut Value> {
+    let schema_type = schema.get("type")?.as_str()?.to_owned();
+    match schema_type.as_str() {
+        "string" | "boolean" => Some(schema),
+        "array" => {
+            let items = schema.get_mut("items")?;
+            matches!(
+                items.get("type").and_then(Value::as_str),
+                Some("string" | "boolean")
+            )
+            .then_some(items)
+        }
+        _ => None,
+    }
 }
 
 fn typed_tool_metadata_problems(index: usize, definition: &ToolDefinition) -> Vec<String> {
@@ -4426,6 +4559,7 @@ mod tests {
         assert!(serialized.get("source").is_none());
         assert!(serialized.get("upstream").is_some());
         assert!(serialized.get("composite").is_none());
+        assert!(serialized.get("enum_bindings").is_none());
     }
 
     #[test]
@@ -4488,6 +4622,59 @@ mod tests {
                 "unexpected problems: {problems:?}"
             );
         }
+    }
+
+    #[test]
+    fn dynamic_enum_binding_schema_and_stored_value_boundary_are_enforced() {
+        let digest = "a".repeat(64);
+        let mut tool = echo_tool("echo", "POST", "/v1/echo");
+        tool["input_json_schema"]["properties"]["status"] = json!({"type": "string"});
+        tool["enum_bindings"] = json!([{
+            "property": "status",
+            "source_id": "company_status",
+            "source_digest": digest
+        }]);
+        let document = json!({"schema_version": "0.1.0", "tools": [tool]});
+        assert_schema_accepts(&tools_schema_validator(), &document);
+        let registry = ToolRegistry::from_json_value(document)
+            .expect("a stable binding without current values should install");
+        assert_eq!(
+            registry.get("echo").expect("tool").enum_bindings,
+            vec![EnumBinding {
+                property: "status".to_owned(),
+                source_id: "company_status".to_owned(),
+                source_digest: "a".repeat(64),
+            }]
+        );
+
+        let mut with_values = echo_tool("echo", "POST", "/v1/echo");
+        with_values["input_json_schema"]["properties"]["status"] =
+            json!({"type": "string", "enum": ["CURRENT"]});
+        with_values["enum_bindings"] = json!([{
+            "property": "status",
+            "source_id": "company_status",
+            "source_digest": "b".repeat(64)
+        }]);
+        let error = ToolRegistry::from_json_value(json!({
+            "schema_version": "0.1.0",
+            "tools": [with_values]
+        }))
+        .expect_err("current values must not enter the stored definition");
+        assert!(error.to_string().contains("must not persist enum values"));
+
+        let mut numeric = echo_tool("echo", "POST", "/v1/echo");
+        numeric["input_json_schema"]["properties"]["status"] = json!({"type": "number"});
+        numeric["enum_bindings"] = json!([{
+            "property": "status",
+            "source_id": "company_status",
+            "source_digest": "c".repeat(64)
+        }]);
+        let error = ToolRegistry::from_json_value(json!({
+            "schema_version": "0.1.0",
+            "tools": [numeric]
+        }))
+        .expect_err("numeric dynamic enums are never accepted");
+        assert!(error.to_string().contains("type string or boolean"));
     }
 
     #[test]
@@ -4650,6 +4837,7 @@ mod tests {
             composite: None,
             visibility: ToolVisibility::Listed,
             transform: None,
+            enum_bindings: Vec::new(),
         }
     }
 
@@ -4685,6 +4873,7 @@ mod tests {
             composite: None,
             visibility: ToolVisibility::Listed,
             transform: None,
+            enum_bindings: Vec::new(),
         }
     }
 

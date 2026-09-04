@@ -1076,6 +1076,13 @@ struct ManagedOpenApiPreviewRequest {
     overlay: Option<Value>,
 }
 
+#[derive(Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct OpenApiOverlayPutParams {
+    #[serde(default)]
+    allow_unresolved_enum_sources: bool,
+}
+
 #[derive(Serialize)]
 struct ManagedOpenApiPreviewResponse {
     connection_id: connections::model::ConnectionId,
@@ -1096,7 +1103,7 @@ struct ManagedOpenApiOverlayReportResponse {
     applied: bool,
     problems: Vec<tools::overlay::OverlayProblem>,
     warnings: Vec<tools::overlay::OverlayWarning>,
-    sources: Vec<Value>,
+    sources: Vec<connections::store::StoredOpenApiSourceReport>,
     tools: Vec<tools::overlay::OverlayToolReport>,
     composites: Vec<tools::overlay::OverlayCompositeReport>,
 }
@@ -2564,6 +2571,9 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 openapi_catalogs,
                 openapi_inventory_catalogs,
                 openapi_overlays,
+                enum_source_values: std::sync::Mutex::new(Some(
+                    store.enum_source_values().await.map_err(to_startup_error)?,
+                )),
             };
             Some(ClusterConnectionsSeed {
                 store,
@@ -3521,13 +3531,28 @@ fn gateway_app_with_process_started_at_and_overrides(
         tool_registry.clone(),
         boot_conflicts,
     )?;
-    let openapi_catalog_service = connections::openapi::OpenApiConnectionCatalogService::load_with(
-        connection_control_plane.clone(),
-        connection_http_runtime.clone(),
-        tool_registry.clone(),
-        boot_conflicts,
-    )?
-    .with_rbac_state(rbac_state.clone());
+    let enum_source_runtime = if connection_control_plane.is_managed_store_configured() {
+        let boot_rows = connection_control_plane
+            .managed_store()?
+            .boot_enum_source_values()?;
+        Some(tools::enum_source::EnumSourceRuntime::new(
+            connection_control_plane.clone(),
+            connection_http_runtime.clone(),
+            audit_log.clone(),
+            boot_rows,
+        ))
+    } else {
+        None
+    };
+    let openapi_catalog_service =
+        connections::openapi::OpenApiConnectionCatalogService::load_with_enum_sources(
+            connection_control_plane.clone(),
+            connection_http_runtime.clone(),
+            tool_registry.clone(),
+            boot_conflicts,
+            enum_source_runtime.clone(),
+        )?
+        .with_rbac_state(rbac_state.clone());
     // Cluster mode: register the Connection control plane with the security
     // runtime so every committed record or catalog change reconciles here
     // before the next protected request is served, and start the task that
@@ -3713,6 +3738,10 @@ fn gateway_app_with_process_started_at_and_overrides(
         rbac_state.clone(),
         execution_leases,
     );
+    openapi_catalog_service.set_source_authorizer(Arc::new(tool_runtime.clone()));
+    if let Some(enum_runtime) = enum_source_runtime.as_ref() {
+        enum_runtime.spawn_refresher(&lifecycle, Arc::new(tool_runtime.clone()));
+    }
     let tool_connection_runtimes = tools::executor::ToolConnectionRuntimes {
         http: Some(connection_http_runtime.clone()),
         mcp_catalog: mcp_catalog_runtime,
@@ -3725,7 +3754,8 @@ fn gateway_app_with_process_started_at_and_overrides(
         Arc::clone(&egress_client),
         tool_connection_runtimes.clone(),
         audit_log.clone(),
-    )?;
+    )?
+    .map(|executor| executor.with_enum_source_runtime(enum_source_runtime.clone()));
     let tool_executor = match mcp_executor.as_ref() {
         Some(executor) => executor.clone(),
         None => tools::executor::ToolExecutor::from_config(
@@ -3735,7 +3765,8 @@ fn gateway_app_with_process_started_at_and_overrides(
             Arc::clone(&egress_client),
             tool_connection_runtimes,
             audit_log.clone(),
-        )?,
+        )?
+        .with_enum_source_runtime(enum_source_runtime.clone()),
     };
     let client_ip_policy = client_ip::ClientIpPolicy::from_config(&config);
     let mcp_state = mcp::McpState::new(
@@ -3831,7 +3862,8 @@ fn gateway_app_with_process_started_at_and_overrides(
     let capability_inventory = tools::inventory::CapabilityInventory::new(
         tool_registry.clone(),
         connection_control_plane.clone(),
-    );
+    )
+    .with_enum_source_runtime(enum_source_runtime);
     let connection_admin_state = ConnectionAdminState {
         control_plane: connection_control_plane.clone(),
         inventory: capability_inventory.clone(),
@@ -7193,10 +7225,11 @@ async fn connection_openapi_preview_endpoint(
     let Some(principal) = parts.extensions.get::<auth::Principal>() else {
         return unauthorized();
     };
-    if let Err(error) = authorized_connection_state(&state, principal, ADMIN_TOOLS_READ_PERMISSION)
-    {
-        return connection_admin_authz_error_response(error);
-    }
+    let rbac_state =
+        match authorized_connection_state(&state, principal, ADMIN_TOOLS_READ_PERMISSION) {
+            Ok(rbac_state) => rbac_state,
+            Err(error) => return connection_admin_authz_error_response(error),
+        };
     if !state.control_plane.is_managed_store_configured() {
         return connection_store_not_configured();
     }
@@ -7213,12 +7246,19 @@ async fn connection_openapi_preview_endpoint(
     if requested.spec.is_empty() {
         return bad_request("spec must not be empty");
     }
+    let secrets_write_authorized =
+        rbac_state.principal_has_permission(principal, ADMIN_CONNECTIONS_SECRETS_WRITE_PERMISSION);
 
     // Preview validates the candidate spec against the stored catalog; the
     // SQLite read and spec binding run on the blocking pool.
     match state
         .openapi_catalogs
-        .preview_with_overlay(&raw_id, &requested.spec, requested.overlay.as_ref())
+        .preview_with_overlay_authorization(
+            &raw_id,
+            &requested.spec,
+            requested.overlay.as_ref(),
+            secrets_write_authorized,
+        )
         .await
     {
         Ok(preview) => {
@@ -7307,6 +7347,7 @@ async fn connection_openapi_overlay_get_endpoint(
 async fn connection_openapi_overlay_put_endpoint(
     State(state): State<ConnectionAdminState>,
     Path(raw_id): Path<String>,
+    Query(params): Query<OpenApiOverlayPutParams>,
     request: AxumRequest,
 ) -> Response {
     record_request(CONNECTION_OPENAPI_OVERLAY_ADMIN_ROUTE);
@@ -7314,11 +7355,11 @@ async fn connection_openapi_overlay_put_endpoint(
     let Some(principal) = parts.extensions.get::<auth::Principal>().cloned() else {
         return unauthorized();
     };
-    if let Err(error) =
-        authorized_connection_state(&state, &principal, ADMIN_CONNECTIONS_WRITE_PERMISSION)
-    {
-        return connection_admin_authz_error_response(error);
-    }
+    let rbac_state =
+        match authorized_connection_state(&state, &principal, ADMIN_CONNECTIONS_WRITE_PERMISSION) {
+            Ok(rbac_state) => rbac_state,
+            Err(error) => return connection_admin_authz_error_response(error),
+        };
     if !state.control_plane.is_managed_store_configured() {
         return connection_store_not_configured();
     }
@@ -7339,9 +7380,18 @@ async fn connection_openapi_overlay_put_endpoint(
         Ok(document) => document,
         Err(error) => return bad_request(&format!("invalid OpenAPI overlay JSON: {error}")),
     };
+    let secrets_write_authorized =
+        rbac_state.principal_has_permission(&principal, ADMIN_CONNECTIONS_SECRETS_WRITE_PERMISSION);
     match state
         .openapi_catalogs
-        .put_overlay(&raw_id, &expected_etag, &document, &principal.user_id)
+        .put_overlay_with_authorization(
+            &raw_id,
+            &expected_etag,
+            &document,
+            params.allow_unresolved_enum_sources,
+            secrets_write_authorized,
+            &principal.user_id,
+        )
         .await
     {
         Ok(result) => {
@@ -11892,6 +11942,11 @@ fn tool_playground_runtime_error_response(
                 "tool execution state is unavailable",
                 "execution_state_unavailable",
             ),
+            Some("enum_source_unavailable") => tool_playground_error_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "allowed tool values are currently unavailable",
+                "enum_source_unavailable",
+            ),
             Some(
                 "connection_disabled"
                 | "connection_not_found"
@@ -13537,14 +13592,22 @@ fn managed_openapi_preview_response(
 fn managed_openapi_overlay_report_response(
     report: Option<connections::openapi::OpenApiOverlayCompileReport>,
 ) -> ManagedOpenApiOverlayReportResponse {
-    let (applied, warnings, tools, composites) = report
-        .map(|report| (true, report.warnings, report.tools, report.composites))
-        .unwrap_or_else(|| (false, Vec::new(), Vec::new(), Vec::new()));
+    let (applied, warnings, sources, tools, composites) = report
+        .map(|report| {
+            (
+                true,
+                report.warnings,
+                report.sources,
+                report.tools,
+                report.composites,
+            )
+        })
+        .unwrap_or_else(|| (false, Vec::new(), Vec::new(), Vec::new(), Vec::new()));
     ManagedOpenApiOverlayReportResponse {
         applied,
         problems: Vec::new(),
         warnings,
-        sources: Vec::new(),
+        sources,
         tools,
         composites,
     }
@@ -15601,6 +15664,7 @@ fn openapi_overlay_operation_error_response(
                 current.as_str(),
             )
         }
+        connections::openapi::OpenApiOverlayOperationError::SecretsWriteRequired => forbidden(),
     }
 }
 
@@ -31510,6 +31574,52 @@ mod tests {
             upstream_calls.load(Ordering::SeqCst),
             0,
             "stale validators must fail before upstream I/O"
+        );
+
+        let rejected_argument_canary = "Bearer rejected-playground-argument-must-not-be-reflected";
+        let rejected_argument = harness
+            .router
+            .clone()
+            .oneshot(tool_playground_request(
+                Some(&harness.admin_token),
+                &capability_id,
+                Some(&execution_etag),
+                Body::from(format!(
+                    r#"{{"arguments":{{"message":{{"token":"{rejected_argument_canary}"}}}}}}"#
+                )),
+            ))
+            .await
+            .expect("invalid-argument playground request should complete");
+        assert_eq!(rejected_argument.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        assert_capability_inventory_no_store(&rejected_argument);
+        let rejected_argument_body = json_body(rejected_argument).await;
+        assert_eq!(
+            rejected_argument_body["error"],
+            json!("tool arguments were rejected")
+        );
+        assert_eq!(rejected_argument_body["reason"], json!("invalid_params"));
+        assert_eq!(
+            rejected_argument_body["problems"][0]["path"],
+            json!("/message")
+        );
+        assert_eq!(
+            rejected_argument_body["problems"][0]["keyword"],
+            json!("type")
+        );
+        assert_eq!(
+            rejected_argument_body["problems"][0]["message"],
+            json!("value has the wrong JSON type")
+        );
+        assert!(rejected_argument_body["problems"][0]
+            .get("allowed")
+            .is_none());
+        assert!(!rejected_argument_body
+            .to_string()
+            .contains(rejected_argument_canary));
+        assert_eq!(
+            upstream_calls.load(Ordering::SeqCst),
+            0,
+            "invalid arguments must fail before upstream I/O"
         );
 
         let rejected_output = harness

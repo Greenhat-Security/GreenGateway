@@ -193,6 +193,26 @@ pub(super) fn connections_export(connections: &[ImportedConnection]) -> Result<V
             .map(status_export)
             .collect();
         history.sort_by_key(|value| value.to_string());
+        let mut enum_source_values: Vec<Value> = connection
+            .enum_source_values
+            .iter()
+            .map(|row| {
+                json!({
+                    "source_id": row.source_id,
+                    "overlay_revision": row.overlay_revision,
+                    "source_digest": row.source_digest,
+                    "values_revision": row.values_revision,
+                    "connection_revision": row.connection_revision,
+                    "credential_revision": row.credential_revision,
+                    "credential_generation_digest": row.credential_generation_digest,
+                    "values": row.values,
+                    "labels": row.labels,
+                    "resolved_at": normalized_instant(Some(&row.resolved_at)),
+                })
+            })
+            .collect();
+        enum_source_values
+            .sort_by_key(|value| value["source_id"].as_str().unwrap_or_default().to_owned());
 
         export.push(json!({
             "id": record.id.to_string(),
@@ -260,6 +280,7 @@ pub(super) fn connections_export(connections: &[ImportedConnection]) -> Result<V
                     .map(|reports| serde_json::from_str::<Value>(reports).unwrap_or(Value::Null)),
                 "updated_at": overlay.updated_at,
             })),
+            "enum_source_values": enum_source_values,
         }));
     }
     // Record order is the caller's read order, which differs between the
