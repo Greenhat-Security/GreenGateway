@@ -7,7 +7,9 @@
 ### Open-source security gateway for APIs, MCP servers, and AI-agent traffic
 
 [![License: Apache 2.0](https://img.shields.io/badge/License-Apache%202.0-blue.svg?style=flat-square)](LICENSE)
-[![Status](https://img.shields.io/badge/status-alpha-blue?style=flat-square)](#project-status)
+[![Status](https://img.shields.io/badge/status-pre--GA%20alpha-orange?style=flat-square)](#project-status)
+[![CI](https://github.com/Greenhat-Security/GreenGateway/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/Greenhat-Security/GreenGateway/actions/workflows/ci.yml?query=branch%3Amain)
+[![Nightly performance](https://github.com/Greenhat-Security/GreenGateway/actions/workflows/nightly-performance.yml/badge.svg?branch=main)](https://github.com/Greenhat-Security/GreenGateway/actions/workflows/nightly-performance.yml?query=branch%3Amain)
 [![Built with Rust](https://img.shields.io/badge/built%20with-Rust-DEA584?style=flat-square&logo=rust&logoColor=black)](gateway)
 [![MCP](https://img.shields.io/badge/MCP-ready-22c55e?style=flat-square)](#mcp-support)
 [![PRs Welcome](https://img.shields.io/badge/PRs-welcome-brightgreen.svg?style=flat-square)](CONTRIBUTING.md)
@@ -202,12 +204,13 @@ This gives security, engineering, platform, and compliance teams a clearer view 
 | Shadow mode | Test deny rules without blocking traffic, then promote them when ready |
 | Audit logs | Queryable audit trail for requests, identities, policy decisions, and outcomes |
 | Traffic discovery | Endpoint inventory, observed principals, traffic history, review state, and active rule coverage |
-| Connections | Shared, revisioned HTTP/MCP destinations with opaque credential bindings, independent TLS profiles, safe tests, and managed discovery |
+| Connections | Shared, revisioned HTTP/MCP destinations with opaque credential bindings, independent TLS profiles, multiple secret-backed request headers, safe tests, and managed discovery |
 | Capability inventory | Policy-filtered, read-only view of manual, legacy, OpenAPI, and MCP capabilities with provenance and availability |
 | Tool playground | Constrained execution of registered tools through the same policy, Connection, credential, TLS, egress, and audit path used at runtime |
 | Rule suggestions | Suggested allow, deny, and shadow rules based on observed traffic and anomaly signals |
 | Identity directory | Directory of humans, bots, and service accounts that have traversed the gateway |
 | MCP support | Native `/mcp` endpoint, tool registry, upstream MCP proxying, OpenAPI-to-tools, and MCP audit/discovery |
+| OpenAPI tool overlays | Versioned overlays, agent-facing request/response transforms, compensated composite tools, and runtime enum/label sources |
 | Egress firewall | Outbound host allowlists, private IP protections, and SSRF-focused controls |
 | Anomaly signals | Deterministic signals for new endpoints, schema mismatches, error spikes, new principal activity, and volume outliers |
 | Policy history | Versioned policy changes, rollback, and audit trail |
@@ -233,6 +236,10 @@ Current MCP capabilities include:
 - Audit coverage for MCP activity
 - Managed streamable-HTTP MCP Connections with last-known-good catalogs
 - Policy-filtered capability inventory and constrained playground execution
+- Versioned OpenAPI overlays for generated-tool visibility, naming, and descriptions
+- Bidirectional scalar/composite, exact decimal-micros, and Markdown/BlockNote transforms
+- Ordered and fan-out composite tools with reverse-order compensation
+- Runtime enum and label sources projected into `tools/list` with fail-closed call validation
 
 This lets you apply the same identity, policy, audit, and traffic-review model to MCP tools that you use for HTTP APIs.
 
@@ -267,6 +274,8 @@ Use shadow mode to:
 - Build confidence before blocking production traffic
 - Show security reviewers what enforcement would do before turning it on
 
+The current rule preview and shadow review are operational rollout aids, not an authoritative whole-policy safety proof. Preview evaluates retained observations for a candidate rule; unavailable, incomplete, or unobserved traffic does not prove that a policy is safe. [Issue #243](https://github.com/Greenhat-Security/GreenGateway/issues/243) tracks the shared evaluator, bounded replay, complete simulation, and signed evidence work.
+
 ## Audit and Discovery
 
 GreenGateway records security-relevant activity so teams can answer:
@@ -279,7 +288,7 @@ GreenGateway records security-relevant activity so teams can answer:
 - Which principals are touching which APIs?
 - Are there schema mismatches or unexpected calls?
 
-The audit and discovery features are designed to support security reviews, incident response, compliance evidence, and day-to-day operations.
+The audit and discovery features are designed to support security reviews, incident response, operator-defined evidence, and day-to-day operations. They do not by themselves provide compliance certification or prove that retained traffic is complete.
 
 ## Example Rollout
 
@@ -328,29 +337,31 @@ GreenGateway may be useful if you are:
 - Building a safer control plane for bots, agents, and service accounts
 - Looking for a lightweight self-hosted layer before adopting a broader API platform
 
-## When Not to Use GreenGateway Yet
+## Production Use and Current Limits
 
-GreenGateway is alpha software.
+GreenGateway is pre-GA alpha software with production-grade components. The core data plane, security boundaries, managed Connections, lifecycle controls, and bounded PostgreSQL cluster mode are implemented and extensively tested. The project does not yet publish a supported release line, SLA, or general-availability guarantee.
 
-Do not use it as your only production security control unless you have reviewed, tested, and hardened it for your own environment.
+A controlled design-partner or internal production pilot can be reasonable when:
 
-You should not assume GreenGateway is production-ready for:
+- GreenGateway is deployed as defense in depth rather than the only security control protecting mission-critical data.
+- The exact image digest is pinned, the selected revision passes required CI and performance gates, and customer-shaped load and failure tests are run before traffic cutover.
+- Multi-replica deployments follow the documented PostgreSQL boundary, use a managed or independently highly available database, and route only to readiness-approved replicas.
+- The operator owns identity-provider policy, TLS, secret custody, database and key backups, monitoring, rollback, and incident response.
+- Rollout begins with observe or shadow behavior, then moves through a canary before broader enforcement.
 
-- High-scale production traffic
-- Regulated production environments
-- Mission-critical enforcement
-- Multi-instance production deployments beyond the boundary in [`docs/deployment/postgres.md`](docs/deployment/postgres.md#supported-cluster-operation) — cluster mode on PostgreSQL is proved by a release gate that runs real replicas against a real database, and that document states both what the gate proves and the non-goals it does not
-- Environments requiring formal vendor support
+Do not currently treat GreenGateway as generally available for:
 
-The current project is best suited for evaluation, demos, development environments, guided self-hosting, and early adopters who can review and test the code.
+- Unreviewed high-scale or mission-critical enforcement.
+- Regulated deployments that require a certified control or formal vendor assurance.
+- Multi-instance operation outside the guarantees and non-goals in [`docs/deployment/postgres.md`](docs/deployment/postgres.md#supported-cluster-operation).
+- Durable production operation through the one-click Cloudflare path; its container filesystem is ephemeral and that path remains evaluation-oriented.
+- Environments requiring a maintained release line, contractual SLA, or formal vendor support.
+
+For now, the appropriate production audience is a guided early adopter that can review the deployment, validate its own performance envelope, and operate a safe fallback.
 
 ## Project Status
 
-GreenGateway is in alpha.
-
-The core gateway, admin UI, discovery, visual rule builder, native MCP support, identity/auth surface, and Cloudflare deployment path are implemented for evaluation and guided self-hosting.
-
-The project is not production-hardened yet.
+GreenGateway is pre-GA alpha. Its core runtime is implemented; release, operator, and advanced policy-analysis maturity are still in progress. The latest tagged release is [`v1.0.1`](https://github.com/Greenhat-Security/GreenGateway/releases/tag/v1.0.1), while `main` contains substantial newer work. Do not deploy a floating `latest` tag: pin and validate an exact image digest.
 
 Current status:
 
@@ -358,7 +369,8 @@ Current status:
 | --- | --- |
 | Core gateway | Implemented |
 | HTTP reverse proxy | Implemented |
-| Bounded production data plane | Implemented; deployment-specific performance thresholds remain an operator release gate |
+| Release and support maturity | Pre-GA; no maintained release line or SLA yet, and security fixes currently target `main` |
+| Bounded production data plane | Implemented; required CI, nightly performance, and customer-topology thresholds remain release gates |
 | Admin UI | Implemented |
 | JWT/OIDC-style auth | Implemented |
 | Service tokens | Implemented |
@@ -367,25 +379,26 @@ Current status:
 | Connection discovery and tests | Implemented for bounded stored tests plus last-known-good OpenAPI and MCP catalog refresh |
 | Capability inventory and playground | Implemented with policy-filtered read-only inventory, strong execution preconditions, bounded requests/results, and no arbitrary URL/header/TLS overrides |
 | RBAC and direct firewall rules | Implemented |
-| Visual rule builder | Implemented |
-| Shadow-mode review | Implemented |
+| Visual rule builder | Implemented; current preview is per-rule historical matching, not whole-policy simulation |
+| Shadow-mode review | Implemented; authoritative replay, completeness semantics, and evidence hardening remain in #243 |
 | SQLite audit sink | Implemented |
 | Traffic discovery | Implemented |
 | Native MCP endpoint | Implemented |
 | MCP tool registry and upstream proxying | Implemented |
+| OpenAPI generated-tool overlays | Implemented with versioned publication, transforms, compensated composites, dynamic enum/label sources, and no-overlay compatibility |
 | Egress firewall | Implemented |
 | Anomaly signals | Implemented |
-| Cloudflare deploy path | Implemented |
+| Cloudflare deploy path | Implemented for evaluation and guided self-hosting; durable production state is not provided by the ephemeral container filesystem |
 | Multi-instance cluster mode (PostgreSQL) | Implemented; see [docs/deployment/postgres.md](docs/deployment/postgres.md#supported-cluster-operation) for the proved guarantees and the non-goals |
 | Durable audit event store and cross-replica SSE stream | Implemented as a store, a stream and a projector source |
 | Postgres audit sink for multi-instance deployments | Implemented; in cluster mode every serving replica writes its audit events to `greengateway.audit_events` off the request path, and that table is the audit of record — see [the proved guarantee](docs/deployment/postgres.md#what-the-gate-proves) |
-| Additional MCP follow-ups | Planned |
+| Operator setup and configuration lifecycle | Environment-driven operation is implemented; secure setup, versioned bundles, semantic plan/apply, and `ggctl` are tracked in #242 |
+| Authoritative Policy Studio | Rulebase, builder, shadow review, history, and rollback are implemented; shared simulation, replay, optimizer, and signed evidence are tracked in #243 |
 
-Progress is tracked in the pinned roadmap issue:
+The original phases 1–7 roadmap is complete in [issue #44](https://github.com/Greenhat-Security/GreenGateway/issues/44). Current pre-GA work is tracked by the two remaining epics:
 
-```text
-https://github.com/Greenhat-Security/GreenGateway/issues/44
-```
+- [#242 — secure setup, operator CLI, and versioned configuration bundles](https://github.com/Greenhat-Security/GreenGateway/issues/242)
+- [#243 — authoritative Policy Studio simulation, replay, optimization, and evidence](https://github.com/Greenhat-Security/GreenGateway/issues/243)
 
 For setup, zero-trust rollout guidance, use cases, and operator reference docs, read the [GreenGateway wiki](https://greenhatsec.com/green-gateway/wiki).
 
@@ -610,7 +623,7 @@ npm run deploy
 
 - Cloudflare Containers use an ephemeral container filesystem by default. SQLite-backed evaluation settings can work for demos, but they are not durable storage across container replacement.
 - File-backed settings such as `POLICY_FILE`, `TOOLS_FILE`, and `OPENAPI_SPEC_PATH` must point at files that exist inside the image or are created at runtime.
-- Treat the one-click deploy path as a fast evaluation path for the current alpha, not a production hardening guide.
+- Treat the one-click deploy path as a fast evaluation path for the current pre-GA release, not a production hardening guide.
 - The first container deploy may return Worker errors for several minutes while Cloudflare finishes provisioning container capacity.
 
 Full guide: [docs/deployment/cloudflare.md](docs/deployment/cloudflare.md)
@@ -630,6 +643,7 @@ Common configuration areas include:
 | Proxy | `UPSTREAM_URL`, `UPSTREAM_ROUTES`, pool/health/retry/circuit/SSE/mTLS settings |
 | MCP | `GATEWAY_PUBLIC_URL`, `TOOLS_FILE`, `MCP_UPSTREAM_SERVERS`, `TOOL_RUNTIME_*` |
 | Connections | `CONNECTIONS_SQLITE_PATH`, `CONNECTION_SECRET_ALIASES`, `CONNECTION_SECRETS_ROOT`, `CONNECTION_LOCAL_SECRET_KEYRING` |
+| State and HA | `STATE_BACKEND`, `DEPLOYMENT_ID`, `DATABASE_URL_FILE`, `DATABASE_TLS_MODE`, database pool and cluster settings |
 | Audit | `AUDIT_LOG_FILE`, `AUDIT_SQLITE_PATH`, `AUDIT_SQLITE_RETENTION_DAYS` |
 | Discovery | `DISCOVERY_SQLITE_PATH`, schema and payload capture settings |
 | Egress | `EGRESS_ALLOWED_HOSTS`, `EGRESS_DENY_PRIVATE_IPS` |
@@ -692,22 +706,12 @@ Connection setup, safe migration, and control-plane operation are documented in:
 
 ## Roadmap
 
-The project is moving toward a stronger v1 control plane for API and MCP security.
+The original seven-phase product roadmap is complete. Current work is focused on the remaining pre-GA control-plane and operator guarantees:
 
-Planned focus areas include:
+- [Issue #242](https://github.com/Greenhat-Security/GreenGateway/issues/242): shared configuration compilation, secure initialization, `ggctl`, versioned bundles, semantic diff/risk, staging, activation, rollback, diagnostics, backup/restore, deployment rendering, and release packaging.
+- [Issue #243](https://github.com/Greenhat-Security/GreenGateway/issues/243): one authoritative policy evaluator, server-side drafts, simulation, tests, bounded replay, conservative analysis, complete Policy Studio workflows, and deterministic signed evidence.
 
-- Production hardening
-- More MCP deployment patterns
-- More rule templates
-- More identity-provider recipes
-- Better documentation and examples
-- More end-to-end demo environments
-
-See the pinned roadmap issue for active work:
-
-```text
-https://github.com/Greenhat-Security/GreenGateway/issues/44
-```
+General-availability promotion additionally requires a green release candidate, customer-shaped load and recovery testing, a documented supported deployment envelope, and security-review remediation. Until then, documentation and release notes must describe GreenGateway as pre-GA and must not imply unsupported production, compliance, or support guarantees.
 
 ## Contributing
 
@@ -763,6 +767,6 @@ If you are building with AI agents, MCP servers, internal APIs, or automation wo
 
 <div align="center">
 
-[Issues](https://github.com/Greenhat-Security/GreenGateway/issues) | [Roadmap](https://github.com/Greenhat-Security/GreenGateway/issues/44) | [Wiki](https://greenhatsec.com/green-gateway/wiki)
+[Current Work](https://github.com/Greenhat-Security/GreenGateway/issues?q=is%3Aissue%20is%3Aopen) | [Completed Roadmap](https://github.com/Greenhat-Security/GreenGateway/issues/44) | [Wiki](https://greenhatsec.com/green-gateway/wiki)
 
 </div>
