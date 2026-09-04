@@ -1587,6 +1587,22 @@
               "maxLength": 128
             }
           }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "type",
+            "connection_id"
+          ],
+          "properties": {
+            "type": {
+              "const": "composite"
+            },
+            "connection_id": {
+              "$ref": "#/$defs/StableId"
+            }
+          }
         }
       ]
     },
@@ -1661,9 +1677,300 @@
         }
       ]
     },
+    "CompositeSentinel": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "method",
+        "path_template"
+      ],
+      "properties": {
+        "method": {
+          "const": "COMPOSITE"
+        },
+        "path_template": {
+          "const": "/"
+        },
+        "query_params": {
+          "type": "array",
+          "maxItems": 0
+        }
+      }
+    },
+    "CompositeMapping": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "steps"
+      ],
+      "properties": {
+        "steps": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 16,
+          "items": {
+            "$ref": "#/$defs/CompositeStep"
+          }
+        },
+        "result": {
+          "type": "object",
+          "maxProperties": 32,
+          "additionalProperties": {
+            "$ref": "#/$defs/CompositeBinding"
+          }
+        },
+        "limits": {
+          "$ref": "#/$defs/CompositeLimits"
+        }
+      }
+    },
+    "CompositeStep": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "tool",
+        "arguments"
+      ],
+      "properties": {
+        "id": {
+          "type": "string",
+          "pattern": "^[A-Za-z][A-Za-z0-9_]{0,63}$"
+        },
+        "tool": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[A-Za-z0-9_.-]+$"
+        },
+        "arguments": {
+          "type": "object",
+          "maxProperties": 64,
+          "additionalProperties": {
+            "$ref": "#/$defs/CompositeBinding"
+          }
+        },
+        "for_each": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "over",
+            "as"
+          ],
+          "properties": {
+            "over": {
+              "$ref": "#/$defs/CompositeBinding"
+            },
+            "as": {
+              "type": "string",
+              "pattern": "^[A-Za-z][A-Za-z0-9_]{0,63}$"
+            }
+          }
+        },
+        "success_statuses": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 16,
+          "items": {
+            "type": "integer",
+            "minimum": 200,
+            "maximum": 299
+          }
+        },
+        "ambiguous_statuses": {
+          "type": "array",
+          "maxItems": 16,
+          "items": {
+            "type": "integer",
+            "minimum": 400,
+            "maximum": 599
+          }
+        },
+        "compensate": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "tool",
+            "arguments"
+          ],
+          "properties": {
+            "tool": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 128,
+              "pattern": "^[A-Za-z0-9_.-]+$"
+            },
+            "arguments": {
+              "type": "object",
+              "maxProperties": 64,
+              "additionalProperties": {
+                "$ref": "#/$defs/CompositeBinding"
+              }
+            }
+          }
+        }
+      }
+    },
+    "CompositeLimits": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "max_iterations": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 64,
+          "default": 32
+        },
+        "compensation_timeout_ms": {
+          "type": "integer",
+          "minimum": 100,
+          "maximum": 120000,
+          "default": 30000
+        }
+      }
+    },
+    "CompositeBinding": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "$input"
+          ],
+          "properties": {
+            "$input": {
+              "type": "string"
+            },
+            "pointer": {
+              "type": "string",
+              "pattern": "^(/([^/~]|~0|~1)*)*$",
+              "maxLength": 512
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "$step"
+          ],
+          "properties": {
+            "$step": {
+              "type": "string"
+            },
+            "pointer": {
+              "type": "string",
+              "pattern": "^(/([^/~]|~0|~1)*)*$",
+              "maxLength": 512
+            },
+            "collect": {
+              "type": "boolean"
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "$item"
+          ],
+          "properties": {
+            "$item": {
+              "type": "string"
+            },
+            "pointer": {
+              "type": "string",
+              "pattern": "^(/([^/~]|~0|~1)*)*$",
+              "maxLength": 512
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "$self"
+          ],
+          "properties": {
+            "$self": {
+              "type": "string",
+              "pattern": "^(/([^/~]|~0|~1)*)*$",
+              "maxLength": 512
+            }
+          }
+        },
+        {
+          "if": {
+            "type": "object"
+          },
+          "then": {
+            "propertyNames": {
+              "not": {
+                "pattern": "^\\$"
+              }
+            }
+          }
+        }
+      ]
+    },
     "ToolDefinition": {
       "type": "object",
       "additionalProperties": false,
+      "allOf": [
+        {
+          "if": {
+            "required": [
+              "target"
+            ],
+            "properties": {
+              "target": {
+                "required": [
+                  "type"
+                ],
+                "properties": {
+                  "type": {
+                    "const": "composite"
+                  }
+                }
+              }
+            }
+          },
+          "then": {
+            "required": [
+              "composite"
+            ],
+            "properties": {
+              "upstream": {
+                "$ref": "#/$defs/CompositeSentinel"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "required": [
+              "composite"
+            ]
+          },
+          "then": {
+            "required": [
+              "target"
+            ],
+            "properties": {
+              "target": {
+                "required": [
+                  "type"
+                ],
+                "properties": {
+                  "type": {
+                    "const": "composite"
+                  }
+                }
+              }
+            }
+          }
+        }
+      ],
       "required": [
         "name",
         "description",
@@ -1693,6 +2000,9 @@
         },
         "upstream": {
           "$ref": "#/$defs/HttpMapping"
+        },
+        "composite": {
+          "$ref": "#/$defs/CompositeMapping"
         },
         "visibility": {
           "enum": [
@@ -1920,10 +2230,14 @@
           "additionalProperties": {
             "$ref": "#/$defs/OpenApiOverlayTool"
           },
-          "description": "Keyed by generated operationId names, never rename targets. Dynamic source and composite branches remain reserved."
+          "description": "Per-tool overlays keyed by the generated tool name (the document's operationId, as the OpenAPI preview shows it), never by a rename target."
+        },
+        "composites": {
+          "$ref": "#/$defs/OpenApiOverlayComposites",
+          "description": "Synthetic saga tools keyed by the served composite tool name."
         }
       },
-      "description": "The per-Connection OpenAPI overlay request shape, including declarative request and response transforms."
+      "description": "The v0.1 per-Connection OpenAPI overlay request shape, including declarative request/response transforms and bounded composites, kept in lockstep with connection-overlay.v0.schema.json."
     },
     "OpenApiOverlayDisambiguation": {
       "type": "object",
@@ -2025,7 +2339,8 @@
     "OpenApiOverlayJsonPointer": {
       "type": "string",
       "pattern": "^(/([^/~]|~0|~1)*)*$",
-      "maxLength": 512
+      "maxLength": 512,
+      "description": "RFC 6901 pointer. Its base depends on the field: see the pointer-base table in the operator guide (wire pointers: the parameter's wire value; response bindings: the parameter's wire value inside a selected root object; $step/$self: the whole parsed body of that step; $input/$item: that value)."
     },
     "OpenApiOverlaySelector": {
       "type": "string",
@@ -2109,6 +2424,9 @@
         "type"
       ],
       "properties": {
+        "$schema": {
+          "const": "https://json-schema.org/draft/2020-12/schema"
+        },
         "type": {
           "enum": [
             "string",
@@ -2120,7 +2438,8 @@
           ]
         },
         "format": false
-      }
+      },
+      "description": "A JSON Schema 2020-12 fragment for one agent-facing property; validated against the 2020-12 meta-schema at PUT and compiled through jsonschema::validator_for. type is mandatory and format is refused because this build does not assert formats (use pattern)."
     },
     "OpenApiOverlayWireBinding": {
       "type": "object",
@@ -2261,6 +2580,278 @@
           }
         }
       }
+    },
+    "OpenApiOverlayToolName": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128,
+      "pattern": "^[A-Za-z0-9_.-]+$"
+    },
+    "OpenApiOverlayEnumSourceReference": {
+      "not": {},
+      "description": "Reserved: a parameter's reference to an enum_sources entry."
+    },
+    "OpenApiOverlayComposites": {
+      "type": "object",
+      "maxProperties": 256,
+      "propertyNames": {
+        "$ref": "#/$defs/OpenApiOverlayToolName"
+      },
+      "additionalProperties": {
+        "$ref": "#/$defs/OpenApiOverlayComposite"
+      }
+    },
+    "OpenApiOverlayComposite": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "description",
+        "input",
+        "steps"
+      ],
+      "properties": {
+        "description": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 4096
+        },
+        "input": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "properties"
+          ],
+          "properties": {
+            "properties": {
+              "type": "object",
+              "maxProperties": 64,
+              "propertyNames": {
+                "$ref": "#/$defs/OpenApiOverlayLocalName"
+              },
+              "additionalProperties": {
+                "$ref": "#/$defs/OpenApiOverlayAgentFragment"
+              }
+            },
+            "required": {
+              "type": "array",
+              "items": {
+                "$ref": "#/$defs/OpenApiOverlayLocalName"
+              },
+              "uniqueItems": true
+            }
+          }
+        },
+        "parameters": {
+          "type": "object",
+          "maxProperties": 64,
+          "propertyNames": {
+            "$ref": "#/$defs/OpenApiOverlayLocalName"
+          },
+          "additionalProperties": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "enum_source": {
+                "$ref": "#/$defs/OpenApiOverlayEnumSourceReference"
+              }
+            }
+          }
+        },
+        "steps": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 16,
+          "items": {
+            "$ref": "#/$defs/OpenApiOverlayStep"
+          }
+        },
+        "result": {
+          "type": "object",
+          "maxProperties": 32,
+          "propertyNames": {
+            "$ref": "#/$defs/OpenApiOverlayLocalName"
+          },
+          "additionalProperties": {
+            "$ref": "#/$defs/OpenApiOverlayBinding"
+          },
+          "description": "Body returned to the agent. Default: the last step's response body."
+        },
+        "limits": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "max_iterations": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 64,
+              "default": 32
+            },
+            "compensation_timeout_ms": {
+              "type": "integer",
+              "minimum": 100,
+              "maximum": 120000,
+              "default": 30000
+            }
+          }
+        }
+      }
+    },
+    "OpenApiOverlayStep": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "tool",
+        "arguments"
+      ],
+      "properties": {
+        "id": {
+          "$ref": "#/$defs/OpenApiOverlayLocalName"
+        },
+        "tool": {
+          "$ref": "#/$defs/OpenApiOverlayToolName"
+        },
+        "arguments": {
+          "type": "object",
+          "maxProperties": 64,
+          "additionalProperties": {
+            "$ref": "#/$defs/OpenApiOverlayBinding"
+          }
+        },
+        "for_each": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "over",
+            "as"
+          ],
+          "properties": {
+            "over": {
+              "$ref": "#/$defs/OpenApiOverlayBinding"
+            },
+            "as": {
+              "$ref": "#/$defs/OpenApiOverlayLocalName"
+            }
+          }
+        },
+        "success_statuses": {
+          "type": "array",
+          "items": {
+            "type": "integer",
+            "minimum": 200,
+            "maximum": 299
+          },
+          "minItems": 1,
+          "maxItems": 16
+        },
+        "ambiguous_statuses": {
+          "type": "array",
+          "items": {
+            "type": "integer",
+            "minimum": 400,
+            "maximum": 599
+          },
+          "maxItems": 16
+        },
+        "compensate": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "tool",
+            "arguments"
+          ],
+          "properties": {
+            "tool": {
+              "$ref": "#/$defs/OpenApiOverlayToolName"
+            },
+            "arguments": {
+              "type": "object",
+              "maxProperties": 64,
+              "additionalProperties": {
+                "$ref": "#/$defs/OpenApiOverlayBinding"
+              }
+            }
+          }
+        }
+      }
+    },
+    "OpenApiOverlayBinding": {
+      "description": "A literal JSON value, or exactly one reference object. Objects with any other $-prefixed key are rejected.",
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "$input"
+          ],
+          "properties": {
+            "$input": {
+              "$ref": "#/$defs/OpenApiOverlayLocalName"
+            },
+            "pointer": {
+              "$ref": "#/$defs/OpenApiOverlayJsonPointer"
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "$step"
+          ],
+          "properties": {
+            "$step": {
+              "$ref": "#/$defs/OpenApiOverlayLocalName"
+            },
+            "pointer": {
+              "$ref": "#/$defs/OpenApiOverlayJsonPointer"
+            },
+            "collect": {
+              "type": "boolean",
+              "default": false
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "$item"
+          ],
+          "properties": {
+            "$item": {
+              "$ref": "#/$defs/OpenApiOverlayLocalName"
+            },
+            "pointer": {
+              "$ref": "#/$defs/OpenApiOverlayJsonPointer"
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "$self"
+          ],
+          "properties": {
+            "$self": {
+              "$ref": "#/$defs/OpenApiOverlayJsonPointer"
+            }
+          }
+        },
+        {
+          "if": {
+            "type": "object"
+          },
+          "then": {
+            "propertyNames": {
+              "not": {
+                "pattern": "^\\$"
+              }
+            }
+          }
+        }
+      ]
     },
     "OpenApiOverlayEtag": {
       "type": "string",
@@ -2432,13 +3023,13 @@
         },
         "steps_max": {
           "type": "integer",
-          "minimum": 1
+          "minimum": 0
         },
         "policy_entry_present": {
           "type": "boolean"
         }
       },
-      "description": "Reserved response shape for composite overlays; the array is empty until composite support lands."
+      "description": "Compile-time report for a validated composite tool."
     },
     "OpenApiOverlayReport": {
       "type": "object",
@@ -3079,6 +3670,12 @@
         "last_success_at": {
           "$ref": "#/$defs/Timestamp"
         },
+        "visibility": {
+          "enum": [
+            "listed",
+            "composite_only"
+          ]
+        },
         "state": {
           "$ref": "#/$defs/CapabilityState"
         },
@@ -3161,6 +3758,59 @@
             },
             "remote_tool_name": {
               "type": "string"
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "type",
+            "steps"
+          ],
+          "properties": {
+            "type": {
+              "const": "composite"
+            },
+            "steps": {
+              "type": "array",
+              "maxItems": 16,
+              "items": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": [
+                  "id",
+                  "tool",
+                  "method",
+                  "path_template",
+                  "has_compensation",
+                  "for_each"
+                ],
+                "properties": {
+                  "id": {
+                    "type": "string",
+                    "minLength": 1
+                  },
+                  "tool": {
+                    "type": "string",
+                    "minLength": 1
+                  },
+                  "method": {
+                    "type": "string",
+                    "minLength": 1
+                  },
+                  "path_template": {
+                    "type": "string",
+                    "minLength": 1
+                  },
+                  "has_compensation": {
+                    "type": "boolean"
+                  },
+                  "for_each": {
+                    "type": "boolean"
+                  }
+                }
+              }
             }
           }
         },
@@ -3283,6 +3933,12 @@
         },
         "last_success_at": {
           "$ref": "#/$defs/Timestamp"
+        },
+        "visibility": {
+          "enum": [
+            "listed",
+            "composite_only"
+          ]
         },
         "state": {
           "$ref": "#/$defs/CapabilityState"
@@ -3671,6 +4327,93 @@
         }
       }
     },
+    "PlaygroundCompositeStepSummary": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "index",
+        "id",
+        "tool",
+        "method",
+        "path_template",
+        "outcome",
+        "latency_ms"
+      ],
+      "properties": {
+        "index": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 64
+        },
+        "iteration": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 63
+        },
+        "tool": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128
+        },
+        "method": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 16
+        },
+        "path_template": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 2048
+        },
+        "outcome": {
+          "enum": [
+            "succeeded",
+            "failed",
+            "ambiguous",
+            "skipped"
+          ]
+        },
+        "upstream_status": {
+          "type": "integer",
+          "minimum": 100,
+          "maximum": 599
+        },
+        "latency_ms": {
+          "type": "integer",
+          "minimum": 0
+        }
+      }
+    },
+    "PlaygroundCompositeResult": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "kind",
+        "status",
+        "body",
+        "steps_summary"
+      ],
+      "properties": {
+        "kind": {
+          "const": "composite"
+        },
+        "status": {
+          "const": 200
+        },
+        "body": true,
+        "steps_summary": {
+          "type": "array",
+          "maxItems": 80,
+          "items": {
+            "$ref": "#/$defs/PlaygroundCompositeStepSummary"
+          }
+        }
+      }
+    },
     "PlaygroundResult": {
       "oneOf": [
         {
@@ -3678,6 +4421,9 @@
         },
         {
           "$ref": "#/$defs/PlaygroundMcpResult"
+        },
+        {
+          "$ref": "#/$defs/PlaygroundCompositeResult"
         }
       ]
     },

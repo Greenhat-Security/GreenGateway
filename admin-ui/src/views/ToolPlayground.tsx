@@ -6,7 +6,11 @@ import {
 } from 'react';
 import { Link, useParams } from 'react-router-dom';
 
-import { AdminApiError } from '../lib/api';
+import {
+  AdminApiError,
+  type AdminApiErrorDetails,
+  type AdminTransformProblem,
+} from '../lib/api';
 import {
   CapabilityContractError,
   type CapabilityDetail,
@@ -28,6 +32,8 @@ type PlaygroundFeedback = {
   tone: 'success' | 'warning' | 'error';
   title: string;
   message: string;
+  compositeDetails?: AdminApiErrorDetails;
+  transformProblems?: readonly AdminTransformProblem[];
 };
 
 export function ToolPlayground() {
@@ -470,11 +476,29 @@ function ToolResult({
         <p>
           HTTP status <strong>{result.status}</strong>
         </p>
-      ) : (
+      ) : result.kind === 'mcp' ? (
         <p>
           MCP result {result.is_error ? 'reported an error' : 'completed'}.
         </p>
+      ) : (
+        <p>
+          Composite completed with{' '}
+          <strong>{result.steps_summary.length}</strong>{' '}
+          {result.steps_summary.length === 1 ? 'step' : 'steps'}.
+        </p>
       )}
+      {result.kind === 'http' && result.warnings?.length ? (
+        <section aria-label="Transform warnings">
+          <p>Response transform warnings:</p>
+          <ul>
+            {result.warnings.map((warning, index) => (
+              <li key={`${warning.path}:${index}`}>
+                <code>{warning.path}</code>: {warning.reason}
+              </li>
+            ))}
+          </ul>
+        </section>
+      ) : null}
       <pre className="signal-evidence tool-playground-output">{output}</pre>
     </section>
   );
@@ -499,6 +523,22 @@ function PlaygroundFeedbackPanel({
     >
       <h3>{feedback.title}</h3>
       <p>{feedback.message}</p>
+      {feedback.compositeDetails ? (
+        <CompositeFailureReport details={feedback.compositeDetails} />
+      ) : null}
+      {feedback.transformProblems?.length ? (
+        <section aria-label="Transform problems">
+          <p>Transform validation problems:</p>
+          <ul>
+            {feedback.transformProblems.map((problem, index) => (
+              <li key={`${problem.path}:${index}`}>
+                <code>{problem.path}</code> ({problem.keyword}):{' '}
+                {problem.reason}
+              </li>
+            ))}
+          </ul>
+        </section>
+      ) : null}
       {onReload ? (
         <button
           type="button"
@@ -509,6 +549,69 @@ function PlaygroundFeedbackPanel({
         </button>
       ) : null}
     </div>
+  );
+}
+
+function CompositeFailureReport({
+  details,
+}: {
+  details: AdminApiErrorDetails;
+}) {
+  if (details.request_id === undefined || details.reason === undefined) {
+    return null;
+  }
+
+  return (
+    <section aria-label="Composite failure details">
+      <p>
+        Request ID: <code>{details.request_id}</code>
+      </p>
+      <p>
+        Reason: <code>{details.reason}</code>
+      </p>
+      {details.composite === 'pending_compensation' ? (
+        <p>
+          Compensation state: <strong>pending review</strong>
+        </p>
+      ) : (
+        <>
+          <p>
+            Failed step: <code>{details.failed_step}</code>
+            {details.failed_iteration === undefined
+              ? ''
+              : ` (iteration ${details.failed_iteration})`}
+          </p>
+          <p>
+            Compensation: <strong>{details.compensation}</strong>
+          </p>
+          {details.orphans?.length ? (
+            <>
+              <p>Reported orphaned writes:</p>
+              <ul>
+                {details.orphans.map((orphan, index) => (
+                  <li key={`${orphan.step}:${orphan.iteration ?? 'single'}:${index}`}>
+                    <strong>{orphan.certainty}</strong>{' '}
+                    <code>{orphan.step}</code>
+                    {orphan.iteration === undefined
+                      ? ''
+                      : ` iteration ${orphan.iteration}`}{' '}
+                    via <code>{orphan.tool}</code>: <code>{orphan.reason}</code>
+                    {orphan.upstream_status === undefined
+                      ? ''
+                      : ` (HTTP ${orphan.upstream_status})`}
+                  </li>
+                ))}
+              </ul>
+            </>
+          ) : (
+            <p>No orphaned writes were reported.</p>
+          )}
+          {details.orphans_truncated ? (
+            <p>Additional orphan entries were omitted by the safety limit.</p>
+          ) : null}
+        </>
+      )}
+    </section>
   );
 }
 
@@ -567,6 +670,35 @@ function playgroundRunError(error: unknown): PlaygroundFeedback {
     };
   }
   if (error instanceof AdminApiError) {
+    if (
+      error.details.request_id !== undefined &&
+      error.details.reason !== undefined &&
+      error.details.composite === 'pending_compensation'
+    ) {
+      return {
+        tone: 'warning',
+        title: 'Composite outcome needs review',
+        message:
+          'Execution ended before compensation was settled. Inspect the composite audit event before retrying.',
+        compositeDetails: error.details,
+      };
+    }
+    if (
+      error.details.request_id !== undefined &&
+      (error.details.reason === 'composite_failed' ||
+        error.details.reason ===
+          'composite_failed_compensation_incomplete')
+    ) {
+      return {
+        tone: 'warning',
+        title: 'Composite execution failed',
+        message:
+          error.details.compensation === 'incomplete'
+            ? 'The logical action failed and compensation is incomplete. Review the reported orphaned writes before retrying.'
+            : 'The logical action failed after its completed work was compensated.',
+        compositeDetails: error.details,
+      };
+    }
     if (error.code === 'output_limit_exceeded') {
       return {
         tone: 'warning',
@@ -580,6 +712,9 @@ function playgroundRunError(error: unknown): PlaygroundFeedback {
         tone: 'warning',
         title: 'Arguments rejected',
         message: 'The gateway rejected these arguments. No result was retained.',
+        ...(error.transformProblems.length === 0
+          ? {}
+          : { transformProblems: error.transformProblems }),
       };
     }
     if (error.status === 401) {

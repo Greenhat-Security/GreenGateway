@@ -31,6 +31,7 @@ pub const TOOL_INVOKE_REJECTED: &str = "tool.invoke_rejected";
 pub const TOOL_PLAYGROUND_OUTPUT_REJECTED: &str = "tool.playground_output_rejected";
 pub const TOOL_TRANSFORM_WARNING: &str = "tool.transform_warning";
 pub const TOOL_UPSTREAM_REQUEST: &str = "tool.upstream_request";
+pub const TOOL_COMPOSITE_COMPLETED: &str = "tool.composite_completed";
 pub const TOOL_REGISTRY_CHANGED: &str = "tool_registry.changed";
 pub const TOOL_REGISTRY_LOADED: &str = "tool_registry.loaded";
 pub const TOOL_REGISTRY_RELOAD_FAILED: &str = "tool_registry.reload_failed";

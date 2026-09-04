@@ -26,6 +26,61 @@
     "tool_definition": {
       "type": "object",
       "additionalProperties": false,
+      "allOf": [
+        {
+          "if": {
+            "required": [
+              "target"
+            ],
+            "properties": {
+              "target": {
+                "required": [
+                  "type"
+                ],
+                "properties": {
+                  "type": {
+                    "const": "composite"
+                  }
+                }
+              }
+            }
+          },
+          "then": {
+            "required": [
+              "composite"
+            ],
+            "properties": {
+              "upstream": {
+                "$ref": "#/$defs/composite_sentinel"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "required": [
+              "composite"
+            ]
+          },
+          "then": {
+            "required": [
+              "target"
+            ],
+            "properties": {
+              "target": {
+                "required": [
+                  "type"
+                ],
+                "properties": {
+                  "type": {
+                    "const": "composite"
+                  }
+                }
+              }
+            }
+          }
+        }
+      ],
       "required": [
         "name",
         "description",
@@ -59,6 +114,9 @@
         },
         "upstream": {
           "$ref": "#/$defs/upstream_mapping"
+        },
+        "composite": {
+          "$ref": "#/$defs/composite_mapping"
         },
         "visibility": {
           "enum": [
@@ -123,6 +181,22 @@
               "maxLength": 128
             }
           }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "type",
+            "connection_id"
+          ],
+          "properties": {
+            "type": {
+              "const": "composite"
+            },
+            "connection_id": {
+              "$ref": "#/$defs/stable_connection_id"
+            }
+          }
         }
       ]
     },
@@ -158,6 +232,10 @@
               "type": "string",
               "minLength": 1,
               "maxLength": 256
+            },
+            "catalog_revision": {
+              "type": "integer",
+              "minimum": 1
             }
           }
         },
@@ -542,6 +620,242 @@
           "properties": {
             "kind": {
               "const": "json_string"
+            }
+          }
+        }
+      ]
+    },
+    "composite_sentinel": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "method",
+        "path_template"
+      ],
+      "properties": {
+        "method": {
+          "const": "COMPOSITE"
+        },
+        "path_template": {
+          "const": "/"
+        },
+        "query_params": {
+          "type": "array",
+          "maxItems": 0
+        }
+      }
+    },
+    "composite_mapping": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "steps"
+      ],
+      "properties": {
+        "steps": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 16,
+          "items": {
+            "$ref": "#/$defs/composite_step"
+          }
+        },
+        "result": {
+          "type": "object",
+          "maxProperties": 32,
+          "additionalProperties": {
+            "$ref": "#/$defs/composite_binding"
+          }
+        },
+        "limits": {
+          "$ref": "#/$defs/composite_limits"
+        }
+      }
+    },
+    "composite_step": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "tool",
+        "arguments"
+      ],
+      "properties": {
+        "id": {
+          "type": "string",
+          "pattern": "^[A-Za-z][A-Za-z0-9_]{0,63}$"
+        },
+        "tool": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[A-Za-z0-9_.-]+$"
+        },
+        "arguments": {
+          "type": "object",
+          "maxProperties": 64,
+          "additionalProperties": {
+            "$ref": "#/$defs/composite_binding"
+          }
+        },
+        "for_each": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "over",
+            "as"
+          ],
+          "properties": {
+            "over": {
+              "$ref": "#/$defs/composite_binding"
+            },
+            "as": {
+              "type": "string",
+              "pattern": "^[A-Za-z][A-Za-z0-9_]{0,63}$"
+            }
+          }
+        },
+        "success_statuses": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 16,
+          "items": {
+            "type": "integer",
+            "minimum": 200,
+            "maximum": 299
+          }
+        },
+        "ambiguous_statuses": {
+          "type": "array",
+          "maxItems": 16,
+          "items": {
+            "type": "integer",
+            "minimum": 400,
+            "maximum": 599
+          }
+        },
+        "compensate": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "tool",
+            "arguments"
+          ],
+          "properties": {
+            "tool": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 128,
+              "pattern": "^[A-Za-z0-9_.-]+$"
+            },
+            "arguments": {
+              "type": "object",
+              "maxProperties": 64,
+              "additionalProperties": {
+                "$ref": "#/$defs/composite_binding"
+              }
+            }
+          }
+        }
+      }
+    },
+    "composite_limits": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "max_iterations": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 64,
+          "default": 32
+        },
+        "compensation_timeout_ms": {
+          "type": "integer",
+          "minimum": 100,
+          "maximum": 120000,
+          "default": 30000
+        }
+      }
+    },
+    "composite_binding": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "$input"
+          ],
+          "properties": {
+            "$input": {
+              "type": "string"
+            },
+            "pointer": {
+              "type": "string",
+              "pattern": "^(/([^/~]|~0|~1)*)*$",
+              "maxLength": 512
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "$step"
+          ],
+          "properties": {
+            "$step": {
+              "type": "string"
+            },
+            "pointer": {
+              "type": "string",
+              "pattern": "^(/([^/~]|~0|~1)*)*$",
+              "maxLength": 512
+            },
+            "collect": {
+              "type": "boolean"
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "$item"
+          ],
+          "properties": {
+            "$item": {
+              "type": "string"
+            },
+            "pointer": {
+              "type": "string",
+              "pattern": "^(/([^/~]|~0|~1)*)*$",
+              "maxLength": 512
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "$self"
+          ],
+          "properties": {
+            "$self": {
+              "type": "string",
+              "pattern": "^(/([^/~]|~0|~1)*)*$",
+              "maxLength": 512
+            }
+          }
+        },
+        {
+          "if": {
+            "type": "object"
+          },
+          "then": {
+            "propertyNames": {
+              "not": {
+                "pattern": "^\\$"
+              }
             }
           }
         }

@@ -676,6 +676,8 @@ fn connection_admin_json_schema_is_strict_resolvable_and_secret_safe() {
         "CapabilityDetail",
         "PlaygroundHttpResult",
         "PlaygroundMcpResult",
+        "PlaygroundCompositeStepSummary",
+        "PlaygroundCompositeResult",
         "Error",
         "ReasonedError",
         "ValidationError",
@@ -1062,6 +1064,106 @@ fn connection_admin_closed_copies_accept_overlay_runtime_fields_and_exact_versio
                 "path": "/revenue_amount",
                 "keyword": "coercion",
                 "reason": "not part of the wire contract"
+            }]
+        })
+    ));
+
+    let composite_definition = json!({
+        "name": "create_note_for_records",
+        "description": "Create and attach a note.",
+        "input_json_schema": {
+            "type": "object",
+            "properties": { "title": { "type": "string" } },
+            "required": ["title"],
+            "additionalProperties": false
+        },
+        "target": { "type": "composite", "connection_id": "billing-api" },
+        "source": {
+            "type": "open_api",
+            "connection_id": "billing-api",
+            "catalog_revision": 2
+        },
+        "upstream": { "method": "COMPOSITE", "path_template": "/" },
+        "composite": {
+            "steps": [{
+                "id": "create",
+                "tool": "createOneNote",
+                "arguments": { "title": { "$input": "title" } }
+            }],
+            "result": {
+                "id": { "$step": "create", "pointer": "/data/createNote/id" }
+            }
+        }
+    });
+    assert!(
+        validates("ToolDefinition", &composite_definition),
+        "the stored-definition copy must accept the exact composite sentinel and mapping"
+    );
+    let mut malformed_sentinel = composite_definition.clone();
+    malformed_sentinel["upstream"]["path_template"] = json!("/network");
+    assert!(
+        !validates("ToolDefinition", &malformed_sentinel),
+        "a composite target must use the exact non-network sentinel"
+    );
+
+    let overlay_with_composite = json!({
+        "schema_version": "0.1.0",
+        "composites": {
+            "create_note_for_records": {
+                "description": "Create and attach a note.",
+                "input": {
+                    "properties": { "title": { "type": "string" } },
+                    "required": ["title"]
+                },
+                "steps": [{
+                    "id": "create",
+                    "tool": "createOneNote",
+                    "arguments": { "title": { "$input": "title" } }
+                }]
+            }
+        }
+    });
+    assert!(
+        validates("OpenApiOverlayDocument", &overlay_with_composite),
+        "the admin contract must accept the closed composite authoring model"
+    );
+    assert!(validates(
+        "OpenApiOverlayCompositeReport",
+        &json!({
+            "name": "create_note_for_records",
+            "steps_max": 0,
+            "policy_entry_present": false
+        })
+    ));
+    assert!(validates(
+        "CapabilityMapping",
+        &json!({
+            "type": "composite",
+            "steps": [{
+                "id": "create",
+                "tool": "createOneNote",
+                "method": "POST",
+                "path_template": "/notes",
+                "has_compensation": true,
+                "for_each": false
+            }]
+        })
+    ));
+    assert!(validates(
+        "PlaygroundResult",
+        &json!({
+            "kind": "composite",
+            "status": 200,
+            "body": { "note_id": "note-1" },
+            "steps_summary": [{
+                "index": 0,
+                "id": "create",
+                "tool": "createOneNote",
+                "method": "POST",
+                "path_template": "/notes",
+                "outcome": "succeeded",
+                "upstream_status": 201,
+                "latency_ms": 4
             }]
         })
     ));

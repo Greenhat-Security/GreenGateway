@@ -116,6 +116,200 @@ describe('admin API transport', () => {
     });
   });
 
+  it('preserves bounded transform problems without confusing legacy validation fields', async () => {
+    const canary = 'UNEXPECTED_TRANSFORM_PROBLEM_CANARY';
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(() =>
+        Promise.resolve(
+          jsonResponse(422, {
+            error: 'tool arguments were rejected',
+            reason: 'invalid_params',
+            problems: [
+              {
+                path: '/amount',
+                keyword: 'codec',
+                reason: 'value has 7 fraction digits, codec allows 6',
+                wire_value: canary,
+              },
+              { malformed: canary },
+            ],
+          }),
+        ),
+      ),
+    );
+
+    const error = await adminFetchJson('/transform').catch(
+      (caught: unknown) => caught,
+    );
+
+    expect(error).toBeInstanceOf(AdminApiError);
+    expect((error as AdminApiError).problems).toEqual([]);
+    expect((error as AdminApiError).transformProblems).toEqual([
+      {
+        path: '/amount',
+        keyword: 'codec',
+        reason: 'value has 7 fraction digits, codec allows 6',
+      },
+    ]);
+    expect(
+      JSON.stringify((error as AdminApiError).transformProblems),
+    ).not.toContain(canary);
+  });
+
+  it('projects only bounded composite failure details and safe orphan fields', async () => {
+    const canary = 'UNEXPECTED_COMPOSITE_ERROR_CANARY';
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(() =>
+        Promise.resolve(
+          jsonResponse(502, {
+            error: 'tool execution failed',
+            tool_name: 'create_note_for_records',
+            request_id: 'request-composite-1',
+            reason: 'composite_failed_compensation_incomplete',
+            failed_step: 'attach',
+            failed_iteration: 2,
+            failure_reason: canary,
+            compensation: 'incomplete',
+            orphans_truncated: true,
+            orphans: [
+              {
+                step: 'attach',
+                iteration: 1,
+                tool: 'attach_note',
+                certainty: 'possible',
+                reason: 'ambiguous_status:502',
+                upstream_status: 502,
+                response_body: canary,
+              },
+              {
+                step: 'note',
+                tool: 'create_note',
+                certainty: 'confirmed',
+                reason: 'compensation_timeout',
+                credential: canary,
+              },
+            ],
+            body: canary,
+          }),
+        ),
+      ),
+    );
+
+    const error = await adminFetchJson('/composite').catch(
+      (caught: unknown) => caught,
+    );
+
+    expect(error).toBeInstanceOf(AdminApiError);
+    expect((error as AdminApiError).details).toEqual({
+      request_id: 'request-composite-1',
+      reason: 'composite_failed_compensation_incomplete',
+      failed_step: 'attach',
+      failed_iteration: 2,
+      compensation: 'incomplete',
+      orphans_truncated: true,
+      orphans: [
+        {
+          step: 'attach',
+          iteration: 1,
+          tool: 'attach_note',
+          certainty: 'possible',
+          reason: 'ambiguous_status:502',
+          upstream_status: 502,
+        },
+        {
+          step: 'note',
+          tool: 'create_note',
+          certainty: 'confirmed',
+          reason: 'compensation_timeout',
+        },
+      ],
+    });
+    expect(JSON.stringify((error as AdminApiError).details)).not.toContain(
+      canary,
+    );
+  });
+
+  it('projects the bounded pending-compensation marker for interrupted composites', async () => {
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(() =>
+        Promise.resolve(
+          jsonResponse(504, {
+            error: 'tool execution timed out',
+            reason: 'timeout',
+            request_id: 'request-composite-timeout',
+            composite: 'pending_compensation',
+            untrusted: 'UNEXPECTED_PENDING_COMPOSITE_CANARY',
+          }),
+        ),
+      ),
+    );
+
+    const error = await adminFetchJson('/composite').catch(
+      (caught: unknown) => caught,
+    );
+
+    expect(error).toBeInstanceOf(AdminApiError);
+    expect((error as AdminApiError).details).toEqual({
+      request_id: 'request-composite-timeout',
+      reason: 'timeout',
+      composite: 'pending_compensation',
+    });
+  });
+
+  it.each([
+    {
+      label: 'too many orphans',
+      override: {
+        orphans: Array.from({ length: 81 }, () => ({
+          step: 'note',
+          tool: 'create_note',
+          certainty: 'confirmed',
+          reason: 'no_compensation',
+        })),
+      },
+    },
+    {
+      label: 'unbounded orphan reason',
+      override: {
+        orphans: [
+          {
+            step: 'note',
+            tool: 'create_note',
+            certainty: 'confirmed',
+            reason: 'upstream said credential=UNEXPECTED_ORPHAN_CANARY',
+          },
+        ],
+      },
+    },
+  ])('drops all composite details for $label', async ({ override }) => {
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(() =>
+        Promise.resolve(
+          jsonResponse(502, {
+            error: 'tool execution failed',
+            request_id: 'request-composite-invalid',
+            reason: 'composite_failed_compensation_incomplete',
+            failed_step: 'note',
+            failed_iteration: null,
+            compensation: 'incomplete',
+            ...override,
+          }),
+        ),
+      ),
+    );
+
+    const error = await adminFetchJson('/composite').catch(
+      (caught: unknown) => caught,
+    );
+
+    expect(error).toBeInstanceOf(AdminApiError);
+    expect((error as AdminApiError).details).toEqual({});
+  });
+
   it('reads dynamic CSRF names and sends the matching cookie on session mutations', async () => {
     appendMeta('greengateway-csrf-cookie-name', 'custom_csrf');
     appendMeta('greengateway-csrf-header-name', 'x-custom-csrf');

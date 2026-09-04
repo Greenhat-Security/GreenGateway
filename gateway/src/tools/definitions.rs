@@ -22,6 +22,7 @@ use crate::{
     config::Config,
     tools::{
         codecs::Codec,
+        composite::CompositeMapping,
         transforms::{ParameterShape, ToolTransform, WireSource},
     },
 };
@@ -39,6 +40,7 @@ const MAX_INPUT_SCHEMA_PRECHECK_NODES: usize = 4_096;
 const MAX_REGISTRY_INPUT_SCHEMA_PRECHECK_NODES: usize = 1_048_576;
 const TOOLS_FILE_SCHEMA_JSON: &str = include_str!("../../../docs/schemas/tools.v0.schema.json");
 const MCP_PROXY_METHOD: &str = "MCP_PROXY";
+pub const COMPOSITE_METHOD: &str = "COMPOSITE";
 
 static TOOLS_FILE_SCHEMA_VALIDATOR: LazyLock<jsonschema::Validator> = LazyLock::new(|| {
     let schema = serde_json::from_str(TOOLS_FILE_SCHEMA_JSON)
@@ -58,6 +60,11 @@ pub struct ToolDefinition {
     #[serde(default, skip_serializing_if = "ToolSource::is_legacy")]
     pub source: ToolSource,
     pub upstream: UpstreamMapping,
+    /// The compiled saga plan for a synthetic overlay-owned composite tool.
+    /// Omitted for every legacy, HTTP, and MCP definition so their stored
+    /// representation and digest remain byte-for-byte compatible.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub composite: Option<CompositeMapping>,
     /// Who may see and call this tool (issue #360, D2). `Listed` is the
     /// default and is never serialised, so a definition that predates the
     /// field keeps its exact stored bytes and digest.
@@ -119,6 +126,9 @@ pub enum ToolTarget {
         connection_id: String,
         remote_tool_name: String,
     },
+    Composite {
+        connection_id: String,
+    },
 }
 
 #[derive(Debug, Default, Clone, PartialEq, Eq, Deserialize, Serialize)]
@@ -173,6 +183,7 @@ impl ToolDefinition {
             target: None,
             source: ToolSource::Legacy,
             upstream: UpstreamMapping::mcp_proxy(server_name, tool_name),
+            composite: None,
             visibility: ToolVisibility::Listed,
             transform: None,
         }
@@ -204,6 +215,26 @@ impl ToolDefinition {
 }
 
 impl HttpToolMapping {
+    pub fn composite_sentinel() -> Self {
+        Self {
+            method: COMPOSITE_METHOD.to_owned(),
+            path_template: "/".to_owned(),
+            query_params: Vec::new(),
+            body: None,
+        }
+    }
+
+    pub fn is_composite_sentinel(&self) -> bool {
+        self.method == COMPOSITE_METHOD
+            && self.path_template == "/"
+            && self.query_params.is_empty()
+            && self.body.is_none()
+    }
+
+    pub fn uses_composite_method(&self) -> bool {
+        self.method == COMPOSITE_METHOD
+    }
+
     pub fn mcp_proxy(server_name: String, tool_name: String) -> Self {
         let path_template = serde_json::to_string(&SerializedMcpProxyMapping {
             server_name,
@@ -1385,6 +1416,8 @@ fn openapi_catalog_provenance_problems(
             Some(ToolTarget::Http {
                 connection_id: target_connection_id,
                 ..
+            }) | Some(ToolTarget::Composite {
+                connection_id: target_connection_id,
             }) if target_connection_id == connection_id
         )
     }) {
@@ -1815,7 +1848,8 @@ fn tool_definition_problems(definitions: &[ToolDefinition]) -> Vec<String> {
 
     for (index, definition) in definitions.iter().enumerate() {
         input_schema_precheck_budget.begin_definition();
-        let is_http_mapping = !definition.upstream.is_mcp_proxy();
+        let is_http_mapping =
+            !definition.upstream.is_mcp_proxy() && !definition.upstream.uses_composite_method();
 
         if let Some(first_index) = seen.insert(definition.name.as_str(), index) {
             problems.push(format!(
@@ -1841,6 +1875,12 @@ fn tool_definition_problems(definitions: &[ToolDefinition]) -> Vec<String> {
             problems.push(format!(
                 "tools[{index}].upstream MCP proxy mapping is invalid"
             ));
+        } else if definition.upstream.uses_composite_method() {
+            if !definition.upstream.is_composite_sentinel() {
+                problems.push(format!(
+                    "tools[{index}].upstream COMPOSITE sentinel must use path_template '/', no query_params, and no body"
+                ));
+            }
         } else if !is_known_http_method(&definition.upstream.method) {
             problems.push(format!(
                 "tools[{index}].upstream.method contains unknown HTTP method '{}'",
@@ -1881,7 +1921,9 @@ fn tool_transform_problems(index: usize, definition: &ToolDefinition) -> Vec<Str
         return Vec::new();
     };
     let mut problems = Vec::new();
-    if definition.upstream.is_mcp_proxy() {
+    if definition.upstream.is_mcp_proxy()
+        || matches!(&definition.target, Some(ToolTarget::Composite { .. }))
+    {
         problems.push(format!(
             "tools[{index}].transform is only supported for HTTP tools"
         ));
@@ -2157,6 +2199,11 @@ fn typed_tool_metadata_problems(index: usize, definition: &ToolDefinition) -> Ve
                         "tools[{index}].target HTTP mapping must not use the legacy MCP sentinel"
                     ));
                 }
+                if mapping.uses_composite_method() {
+                    problems.push(format!(
+                        "tools[{index}].target HTTP mapping must not use the COMPOSITE sentinel"
+                    ));
+                }
             }
             ToolTarget::Mcp {
                 connection_id,
@@ -2173,7 +2220,42 @@ fn typed_tool_metadata_problems(index: usize, definition: &ToolDefinition) -> Ve
                     )),
                 }
             }
+            ToolTarget::Composite { connection_id } => {
+                validate_connection_id("target.connection_id", connection_id, &mut problems);
+                if !definition.upstream.is_composite_sentinel() {
+                    problems.push(format!(
+                        "tools[{index}].target composite metadata requires the exact COMPOSITE upstream sentinel"
+                    ));
+                }
+                if definition.composite.is_none() {
+                    problems.push(format!(
+                        "tools[{index}].target composite metadata requires a compiled composite mapping"
+                    ));
+                }
+            }
         }
+    }
+
+    if definition.composite.is_some()
+        && !matches!(&definition.target, Some(ToolTarget::Composite { .. }))
+    {
+        problems.push(format!(
+            "tools[{index}].composite is only valid with a composite target"
+        ));
+    }
+    if definition.upstream.uses_composite_method()
+        && !matches!(&definition.target, Some(ToolTarget::Composite { .. }))
+    {
+        problems.push(format!(
+            "tools[{index}].upstream COMPOSITE sentinel is only valid with a composite target"
+        ));
+    }
+    if matches!(&definition.target, Some(ToolTarget::Composite { .. }))
+        && !matches!(&definition.source, ToolSource::OpenApi { .. })
+    {
+        problems.push(format!(
+            "tools[{index}].target composite metadata requires managed OpenAPI provenance"
+        ));
     }
 
     match &definition.source {
@@ -2189,10 +2271,12 @@ fn typed_tool_metadata_problems(index: usize, definition: &ToolDefinition) -> Ve
                 Some(ToolTarget::Http {
                     connection_id: target_connection_id,
                     ..
+                }) | Some(ToolTarget::Composite {
+                    connection_id: target_connection_id,
                 }) if target_connection_id == connection_id
             ) {
                 problems.push(format!(
-                    "tools[{index}].source OpenAPI connection must equal an HTTP target connection"
+                    "tools[{index}].source OpenAPI connection must equal an HTTP or composite target connection"
                 ));
             }
             if operation_id.as_ref().is_some_and(|operation_id| {
@@ -2200,6 +2284,13 @@ fn typed_tool_metadata_problems(index: usize, definition: &ToolDefinition) -> Ve
             }) {
                 problems.push(format!(
                     "tools[{index}].source.operation_id must contain 1-{MAX_OPERATION_ID_CHARS} characters when present"
+                ));
+            }
+            if matches!(&definition.target, Some(ToolTarget::Composite { .. }))
+                && operation_id.is_some()
+            {
+                problems.push(format!(
+                    "tools[{index}].source.operation_id must be absent for a composite tool"
                 ));
             }
         }
@@ -4334,6 +4425,69 @@ mod tests {
         assert!(serialized.get("target").is_none());
         assert!(serialized.get("source").is_none());
         assert!(serialized.get("upstream").is_some());
+        assert!(serialized.get("composite").is_none());
+    }
+
+    #[test]
+    fn composite_definition_requires_the_exact_non_network_sentinel() {
+        let value = json!({
+            "name": "create_note_for_records",
+            "description": "Create and attach a note.",
+            "input_json_schema": {
+                "type": "object",
+                "properties": { "title": { "type": "string" } },
+                "required": ["title"],
+                "additionalProperties": false
+            },
+            "target": { "type": "composite", "connection_id": "crm" },
+            "source": {
+                "type": "open_api",
+                "connection_id": "crm",
+                "catalog_revision": 1
+            },
+            "upstream": { "method": "COMPOSITE", "path_template": "/" },
+            "composite": {
+                "steps": [{
+                    "id": "create",
+                    "tool": "createOneNote",
+                    "arguments": { "title": { "$input": "title" } }
+                }]
+            }
+        });
+        let definition: ToolDefinition =
+            serde_json::from_value(value.clone()).expect("composite model deserializes");
+        assert!(tool_definition_problems(&[definition]).is_empty());
+        assert_schema_accepts(
+            &tools_schema_validator(),
+            &json!({ "schema_version": "0.1.0", "tools": [value.clone()] }),
+        );
+
+        for malformed in [
+            json!({ "method": "COMPOSITE", "path_template": "/network" }),
+            json!({
+                "method": "COMPOSITE",
+                "path_template": "/",
+                "query_params": [{ "arg_name": "x", "query_name": "x" }]
+            }),
+            json!({
+                "method": "COMPOSITE",
+                "path_template": "/",
+                "body": { "mode": "whole_args_json" }
+            }),
+        ] {
+            let mut candidate = value.clone();
+            candidate["upstream"] = malformed;
+            let definition: ToolDefinition =
+                serde_json::from_value(candidate).expect("typed model retains semantic checks");
+            let problems = tool_definition_problems(&[definition]);
+            assert!(
+                problems
+                    .iter()
+                    .any(|problem| problem.contains("exact COMPOSITE")
+                        || problem.contains("COMPOSITE sentinel")),
+                "unexpected problems: {problems:?}"
+            );
+        }
     }
 
     #[test]
@@ -4493,6 +4647,7 @@ mod tests {
             target: None,
             source: ToolSource::Legacy,
             upstream: mapping,
+            composite: None,
             visibility: ToolVisibility::Listed,
             transform: None,
         }
@@ -4527,6 +4682,7 @@ mod tests {
                 catalog_revision: Some(1),
             },
             upstream: mapping,
+            composite: None,
             visibility: ToolVisibility::Listed,
             transform: None,
         }

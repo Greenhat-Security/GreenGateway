@@ -9,10 +9,18 @@ const MAX_EXECUTION_OUTPUT_NODES = 32_768;
 const MAX_EXECUTION_OBJECT_KEYS = 4_096;
 const MAX_EXECUTION_KEY_BYTES = 4_096;
 const MAX_MCP_CONTENT_BLOCKS = 256;
+const MAX_COMPOSITE_STEP_SUMMARIES = 80;
+const MAX_TRANSFORM_WARNINGS = 32;
+const MAX_TRANSFORM_WARNING_FIELD_BYTES = 1_024;
 
 export type ToolHttpBody =
   | { type: 'json'; value: unknown }
   | { type: 'text'; value: string };
+
+export type ToolTransformWarning = Readonly<{
+  path: string;
+  reason: string;
+}>;
 
 export type ToolMcpContentBlock =
   | { type: 'text'; text: string }
@@ -34,17 +42,36 @@ export type ToolMcpContentBlock =
       size?: number;
     };
 
+export type ToolCompositeStepSummary = {
+  index: number;
+  id: string;
+  iteration?: number;
+  tool: string;
+  method: string;
+  path_template: string;
+  outcome: 'succeeded' | 'failed' | 'ambiguous' | 'skipped';
+  upstream_status?: number;
+  latency_ms: number;
+};
+
 export type ToolExecutionResult =
   | {
       kind: 'http';
       status: number;
       body: ToolHttpBody;
+      warnings?: ToolTransformWarning[];
     }
   | {
       kind: 'mcp';
       content: ToolMcpContentBlock[];
       structured_content?: unknown;
       is_error: boolean;
+    }
+  | {
+      kind: 'composite';
+      status: 200;
+      body: unknown;
+      steps_summary: ToolCompositeStepSummary[];
     };
 
 export class ToolExecutionContractError extends Error {
@@ -134,10 +161,12 @@ function projectToolExecutionResult(value: unknown): ToolExecutionResult {
     source.kind === 'http' &&
     isHttpStatus(source.status)
   ) {
+    const warnings = projectTransformWarnings(source.warnings);
     const result: Extract<ToolExecutionResult, { kind: 'http' }> = {
       kind: 'http',
       status: source.status,
       body: projectHttpBody(source.body),
+      ...(warnings === undefined ? {} : { warnings }),
     };
     ensureBoundedOutput(result, 'HTTP result');
     return result;
@@ -164,7 +193,79 @@ function projectToolExecutionResult(value: unknown): ToolExecutionResult {
     return result;
   }
 
+  if (
+    source.kind === 'composite' &&
+    source.status === 200 &&
+    Array.isArray(source.steps_summary) &&
+    source.steps_summary.length > 0 &&
+    source.steps_summary.length <= MAX_COMPOSITE_STEP_SUMMARIES
+  ) {
+    const result: Extract<ToolExecutionResult, { kind: 'composite' }> = {
+      kind: 'composite',
+      status: 200,
+      body: projectBoundedJsonOutput(source.body, 'composite result body'),
+      steps_summary: source.steps_summary.map(projectCompositeStepSummary),
+    };
+    ensureBoundedOutput(result, 'composite result');
+    return result;
+  }
+
   throw invalidExecutionResponse('execution result');
+}
+
+function projectTransformWarnings(
+  value: unknown,
+): ToolTransformWarning[] | undefined {
+  if (value === undefined) {
+    return undefined;
+  }
+  if (!Array.isArray(value) || value.length > MAX_TRANSFORM_WARNINGS) {
+    throw invalidExecutionResponse('HTTP transform warnings');
+  }
+  return value.map((warning) => {
+    const source = responseObject(warning, 'HTTP transform warning');
+    if (
+      !isTransformWarningField(source.path) ||
+      !isTransformWarningField(source.reason)
+    ) {
+      throw invalidExecutionResponse('HTTP transform warning');
+    }
+    return { path: source.path, reason: source.reason };
+  });
+}
+
+function projectCompositeStepSummary(value: unknown): ToolCompositeStepSummary {
+  const source = responseObject(value, 'composite step summary');
+  if (
+    !isNonNegativeInteger(source.index) ||
+    !isBoundedNonEmptyString(source.id) ||
+    !isOptionalNonNegativeInteger(source.iteration) ||
+    !isBoundedNonEmptyString(source.tool) ||
+    !isBoundedNonEmptyString(source.method) ||
+    !isBoundedString(source.path_template) ||
+    !isCompositeStepOutcome(source.outcome) ||
+    (source.upstream_status !== undefined &&
+      !isHttpStatus(source.upstream_status)) ||
+    !isNonNegativeInteger(source.latency_ms)
+  ) {
+    throw invalidExecutionResponse('composite step summary');
+  }
+
+  return {
+    index: source.index,
+    id: source.id,
+    ...(source.iteration === undefined
+      ? {}
+      : { iteration: source.iteration }),
+    tool: source.tool,
+    method: source.method,
+    path_template: source.path_template,
+    outcome: source.outcome,
+    ...(source.upstream_status === undefined
+      ? {}
+      : { upstream_status: source.upstream_status }),
+    latency_ms: source.latency_ms,
+  };
 }
 
 function projectHttpBody(value: unknown): ToolHttpBody {
@@ -386,6 +487,23 @@ function isNonNegativeInteger(value: unknown): value is number {
   );
 }
 
+function isOptionalNonNegativeInteger(
+  value: unknown,
+): value is number | undefined {
+  return value === undefined || isNonNegativeInteger(value);
+}
+
+function isCompositeStepOutcome(
+  value: unknown,
+): value is ToolCompositeStepSummary['outcome'] {
+  return (
+    value === 'succeeded' ||
+    value === 'failed' ||
+    value === 'ambiguous' ||
+    value === 'skipped'
+  );
+}
+
 function isBoundedString(value: unknown): value is string {
   return (
     typeof value === 'string' &&
@@ -395,6 +513,14 @@ function isBoundedString(value: unknown): value is string {
 
 function isBoundedNonEmptyString(value: unknown): value is string {
   return isBoundedString(value) && value.length > 0;
+}
+
+function isTransformWarningField(value: unknown): value is string {
+  return (
+    typeof value === 'string' &&
+    value.length > 0 &&
+    utf8Length(value) <= MAX_TRANSFORM_WARNING_FIELD_BYTES
+  );
 }
 
 function isOptionalBoundedString(

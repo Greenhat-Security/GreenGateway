@@ -1,4 +1,5 @@
 pub mod codecs;
+pub mod composite;
 pub mod definitions;
 pub mod executor;
 pub mod inventory;

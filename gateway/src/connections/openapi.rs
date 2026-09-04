@@ -24,8 +24,8 @@ use crate::{
         },
         openapi::{self, OpenApiToolBinding, OpenApiToolGeneration, OpenApiToolSecuritySelection},
         overlay::{
-            self, CompiledCatalog, OverlayCompileContext, OverlayDocument, OverlayError,
-            OverlayToolReport, OverlayWarning, OVERLAY_SCHEMA_VERSION,
+            self, CompiledCatalog, OverlayCompileContext, OverlayCompositeReport, OverlayDocument,
+            OverlayError, OverlayToolReport, OverlayWarning, OVERLAY_SCHEMA_VERSION,
         },
     },
 };
@@ -119,6 +119,7 @@ pub struct OpenApiCatalogPreview {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct OpenApiOverlayCompileReport {
     pub tools: Vec<OverlayToolReport>,
+    pub composites: Vec<OverlayCompositeReport>,
     pub warnings: Vec<OverlayWarning>,
 }
 
@@ -388,6 +389,9 @@ impl OpenApiConnectionCatalogRuntime {
             Some(ToolTarget::Http {
                 connection_id: target_connection_id,
                 ..
+            })
+            | Some(ToolTarget::Composite {
+                connection_id: target_connection_id,
             }),
         ) = (&definition.source, &definition.target)
         else {
@@ -804,6 +808,20 @@ impl OpenApiConnectionCatalogService {
                     != Some(*generated_name)
             })
             .map(|(_, served_name)| served_name.clone())
+            .chain(
+                document
+                    .composites
+                    .keys()
+                    .filter(|composite_name| {
+                        compile_context
+                            .prior_overlay_name_owners
+                            .get(composite_name.as_str())
+                            != Some(*composite_name)
+                    })
+                    .cloned(),
+            )
+            .collect::<BTreeSet<_>>()
+            .into_iter()
             .collect();
         let next_overlay_revision = current_overlay_revision
             .checked_add(1)
@@ -1340,11 +1358,24 @@ impl OpenApiConnectionCatalogService {
             .collect();
         let prior_overlay_name_owners = stored_overlay
             .into_iter()
-            .flat_map(|overlay| overlay.tools.iter())
-            .filter_map(|(generated_name, tool)| {
-                tool.rename
-                    .as_ref()
-                    .map(|served_name| (served_name.clone(), generated_name.clone()))
+            .flat_map(|overlay| {
+                let mut owners = overlay
+                    .tools
+                    .iter()
+                    .filter_map(|(generated_name, tool)| {
+                        tool.rename
+                            .as_ref()
+                            .map(|served_name| (served_name.clone(), generated_name.clone()))
+                    })
+                    .collect::<Vec<_>>();
+                owners.extend(
+                    overlay
+                        .composites
+                        .keys()
+                        .cloned()
+                        .map(|name| (name.clone(), name)),
+                );
+                owners
             })
             .collect();
         OverlayCompileContext {
@@ -1890,6 +1921,7 @@ fn require_overlay_precondition(
 fn compiled_report(compiled: &CompiledCatalog) -> OpenApiOverlayCompileReport {
     OpenApiOverlayCompileReport {
         tools: compiled.tools.clone(),
+        composites: compiled.composites.clone(),
         warnings: compiled.warnings.clone(),
     }
 }
@@ -2026,6 +2058,16 @@ fn surviving_refresh_selection(
 
     for entry in &prior.entries {
         let served_name = entry.tool_name.as_str();
+        if prior_definitions
+            .get(served_name)
+            .is_some_and(|definition| {
+                matches!(&definition.target, Some(ToolTarget::Composite { .. }))
+            })
+        {
+            // Synthetic composites are rederived from the stored overlay after
+            // their selected leaf operations are rebound to the new document.
+            continue;
+        }
         let generated_name = rename_inverse
             .get(served_name)
             .copied()
@@ -2146,8 +2188,11 @@ fn catalog_definitions(
                 && matches!(
                     &definition.target,
                     Some(ToolTarget::Http { connection_id, .. })
+                        | Some(ToolTarget::Composite { connection_id })
                         if connection_id == catalog.connection_id.as_str()
-                );
+                )
+                && (!matches!(&definition.target, Some(ToolTarget::Composite { .. }))
+                    || entry.selected_scheme_names.is_empty());
             if !valid {
                 return Err(ConnectionStoreError::CorruptRecord {
                     id: catalog.connection_id.to_string(),
@@ -2482,6 +2527,7 @@ mod tests {
                 catalog_revision: Some(catalog_revision),
             },
             upstream: mapping,
+            composite: None,
             visibility: ToolVisibility::Listed,
             transform: None,
         }
@@ -2493,6 +2539,43 @@ mod tests {
             ConnectionId::parse("billing-api").expect("test Connection ID should be valid");
         let definition = managed_definition(&connection_id, 7);
         let digest = definition_digest(&definition).expect("definition should serialize");
+        let composite_definition = ToolDefinition {
+            name: "read_invoice_composite".to_owned(),
+            description: "Read an invoice through a composite".to_owned(),
+            input_schema: definition.input_schema.clone(),
+            target: Some(ToolTarget::Composite {
+                connection_id: connection_id.to_string(),
+            }),
+            source: ToolSource::OpenApi {
+                connection_id: connection_id.to_string(),
+                operation_id: None,
+                catalog_revision: Some(7),
+            },
+            upstream: HttpToolMapping::composite_sentinel(),
+            composite: Some(crate::tools::composite::CompositeMapping {
+                steps: vec![crate::tools::composite::CompositeStep {
+                    id: "read".to_owned(),
+                    tool: "get_invoice".to_owned(),
+                    arguments: BTreeMap::from([(
+                        "invoice_id".to_owned(),
+                        crate::tools::composite::CompositeBinding::Input {
+                            input: "invoice_id".to_owned(),
+                            pointer: None,
+                        },
+                    )]),
+                    for_each: None,
+                    success_statuses: None,
+                    ambiguous_statuses: None,
+                    compensate: None,
+                }],
+                result: None,
+                limits: crate::tools::composite::CompositeLimits::default(),
+            }),
+            visibility: ToolVisibility::Listed,
+            transform: None,
+        };
+        let composite_digest =
+            definition_digest(&composite_definition).expect("composite should serialize");
         let runtime = OpenApiConnectionCatalogRuntime {
             state: Arc::new(ArcSwap::from_pointee(BTreeMap::from([(
                 connection_id.clone(),
@@ -2501,7 +2584,10 @@ mod tests {
                     observed_etag: "\"connection:billing-api:c1:k1:t1:d1\"".to_owned(),
                     catalog_revision: 7,
                     refreshed_at: "2026-07-28T00:00:00Z".to_owned(),
-                    definition_digests: BTreeMap::from([(definition.name.clone(), digest)]),
+                    definition_digests: BTreeMap::from([
+                        (definition.name.clone(), digest),
+                        (composite_definition.name.clone(), composite_digest),
+                    ]),
                 },
             )]))),
         };
@@ -2509,6 +2595,10 @@ mod tests {
         assert!(
             runtime.definition_is_current(&definition, "\"connection:billing-api:c1:k1:t1:d1\"")
         );
+        assert!(runtime.definition_is_current(
+            &composite_definition,
+            "\"connection:billing-api:c1:k1:t1:d1\""
+        ));
         assert!(
             !runtime.definition_is_current(&definition, "\"connection:billing-api:c2:k1:t1:d1\"")
         );
@@ -2527,6 +2617,103 @@ mod tests {
         let mut tampered = definition;
         tampered.upstream.path_template = "/admin/invoices/{invoice_id}".to_owned();
         assert!(!runtime.definition_is_current(&tampered, "\"connection:billing-api:c1:k1:t1:d1\""));
+    }
+
+    #[test]
+    fn refresh_selection_skips_synthetic_composites_and_rederives_them() {
+        let connection_id =
+            ConnectionId::parse("billing-api").expect("test Connection ID should be valid");
+        let mut leaf = managed_definition(&connection_id, 7);
+        let ToolSource::OpenApi { operation_id, .. } = &mut leaf.source else {
+            panic!("managed definition");
+        };
+        *operation_id = Some("get_invoice".to_owned());
+        let composite = ToolDefinition {
+            name: "read_invoice_composite".to_owned(),
+            description: "Read an invoice through a composite".to_owned(),
+            input_schema: leaf.input_schema.clone(),
+            target: Some(ToolTarget::Composite {
+                connection_id: connection_id.to_string(),
+            }),
+            source: ToolSource::OpenApi {
+                connection_id: connection_id.to_string(),
+                operation_id: None,
+                catalog_revision: Some(7),
+            },
+            upstream: HttpToolMapping::composite_sentinel(),
+            composite: Some(crate::tools::composite::CompositeMapping {
+                steps: vec![crate::tools::composite::CompositeStep {
+                    id: "read".to_owned(),
+                    tool: "get_invoice".to_owned(),
+                    arguments: BTreeMap::from([(
+                        "invoice_id".to_owned(),
+                        crate::tools::composite::CompositeBinding::Input {
+                            input: "invoice_id".to_owned(),
+                            pointer: None,
+                        },
+                    )]),
+                    for_each: None,
+                    success_statuses: None,
+                    ambiguous_statuses: None,
+                    compensate: None,
+                }],
+                result: None,
+                limits: crate::tools::composite::CompositeLimits::default(),
+            }),
+            visibility: ToolVisibility::Listed,
+            transform: None,
+        };
+        let binding = OpenApiToolBinding {
+            definitions: vec![leaf, composite],
+            security_selections: vec![
+                OpenApiToolSecuritySelection {
+                    tool_name: "get_invoice".to_owned(),
+                    selected_scheme_names: Vec::new(),
+                },
+                OpenApiToolSecuritySelection {
+                    tool_name: "read_invoice_composite".to_owned(),
+                    selected_scheme_names: Vec::new(),
+                },
+            ],
+            incompatibilities: Vec::new(),
+        };
+        let entries = stored_entries(&binding).expect("synthetic selection stores");
+        let prior = StoredOpenApiCatalog {
+            connection_id: connection_id.clone(),
+            spec_revision: 1,
+            catalog_revision: 7,
+            observed_etag: ConnectionEtag::from_stored(
+                "\"connection:billing-api:c1:k1:t1:d1\"".to_owned(),
+            ),
+            spec_digest: "digest".to_owned(),
+            spec: "spec".to_owned(),
+            refreshed_at: "2026-09-03T00:00:00Z".to_owned(),
+            entries,
+            overlay_revision: 1,
+        };
+        let generation = openapi::generate_tools_from_openapi_str(
+            "refresh-composite.yaml",
+            r#"
+openapi: 3.0.3
+info: {title: Billing, version: 1.0.0}
+paths:
+  /invoices/{invoice_id}:
+    get:
+      operationId: get_invoice
+      parameters:
+        - in: path
+          name: invoice_id
+          required: true
+          schema: {type: string}
+"#,
+        )
+        .expect("refresh generation");
+
+        let (selected, confirmations) =
+            surviving_refresh_selection(&prior, &generation, None).expect("selection survives");
+        assert_eq!(selected, vec!["get_invoice"]);
+        assert_eq!(confirmations.len(), 1);
+        assert_eq!(confirmations[0].tool_name, "get_invoice");
     }
 
     #[test]

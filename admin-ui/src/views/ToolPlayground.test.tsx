@@ -24,6 +24,7 @@ describe('ToolPlayground', () => {
     const argumentCanary = 'PLAYGROUND_ARGUMENT_CANARY';
     const resultCanary =
       '<img src=x onerror=PLAYGROUND_RESULT_CANARY><script>bad()</script>';
+    const warningCanary = 'UNEXPECTED_TRANSFORM_WARNING_CANARY';
     const consoleLog = vi.spyOn(console, 'log').mockImplementation(() => {});
     const consoleWarn = vi.spyOn(console, 'warn').mockImplementation(() => {});
     const argumentsJson =
@@ -50,6 +51,13 @@ describe('ToolPlayground', () => {
               kind: 'http',
               status: 200,
               body: { type: 'text', value: resultCanary },
+              warnings: [
+                {
+                  path: '/amount',
+                  reason: 'wire value was left unchanged',
+                  wire_value: warningCanary,
+                },
+              ],
             },
             { ETag: '"capability:v1"' },
           ),
@@ -72,6 +80,10 @@ describe('ToolPlayground', () => {
     expect(output.closest('pre')).toBeTruthy();
     const resultRegion = screen.getByRole('region', { name: 'Tool result' });
     await waitFor(() => expect(document.activeElement).toBe(resultRegion));
+    const warnings = screen.getByRole('region', { name: 'Transform warnings' });
+    expect(warnings.textContent).toContain('/amount');
+    expect(warnings.textContent).toContain('wire value was left unchanged');
+    expect(warnings.textContent).not.toContain(warningCanary);
     expect(document.querySelector('img')).toBeNull();
     expect(document.querySelector('script')).toBeNull();
     expect(requests).toHaveLength(1);
@@ -91,6 +103,65 @@ describe('ToolPlayground', () => {
     fireEvent.click(screen.getByRole('button', { name: 'Clear result' }));
     expect(screen.queryByText(resultCanary)).toBeNull();
     expect(document.body.textContent).not.toContain('PLAYGROUND_RESULT_CANARY');
+  });
+
+  it('renders a bounded composite body and step summary', async () => {
+    vi.stubGlobal(
+      'fetch',
+      vi.fn((_input: RequestInfo | URL, init?: RequestInit) => {
+        if (!init?.method) {
+          return Promise.resolve(
+            jsonResponse(200, capabilityDetail(), {
+              ETag: '"capability:v1"',
+            }),
+          );
+        }
+        return Promise.resolve(
+          jsonResponse(
+            200,
+            {
+              kind: 'composite',
+              status: 200,
+              body: { note_id: 'note-1' },
+              steps_summary: [
+                {
+                  index: 0,
+                  id: 'note',
+                  tool: 'create_note',
+                  method: 'POST',
+                  path_template: '/v1/notes',
+                  outcome: 'succeeded',
+                  upstream_status: 201,
+                  latency_ms: 7,
+                },
+                {
+                  index: 1,
+                  id: 'attach',
+                  iteration: 0,
+                  tool: 'attach_note',
+                  method: 'POST',
+                  path_template: '/v1/attachments/{target}',
+                  outcome: 'succeeded',
+                  upstream_status: 201,
+                  latency_ms: 5,
+                },
+              ],
+            },
+            { ETag: '"capability:v1"' },
+          ),
+        );
+      }),
+    );
+
+    renderPlayground('/tools/cap_abc/playground');
+    const editor = await screen.findByLabelText('Arguments (JSON)');
+    fireEvent.click(screen.getByRole('button', { name: 'Run tool' }));
+
+    expect(await screen.findByText(/Composite completed with/)).toBeTruthy();
+    expect(screen.getByText('2')).toBeTruthy();
+    const output = screen.getByText(/"note_id": "note-1"/);
+    expect(output.closest('pre')).toBeTruthy();
+    expect((editor as HTMLTextAreaElement).value).toBe('{}');
   });
 
   it('clears an old result and submitted text when local validation fails without sending another request', async () => {
@@ -206,6 +277,146 @@ describe('ToolPlayground', () => {
       }
     },
   );
+
+  it('renders bounded transform problems from rejected arguments', async () => {
+    const canary = 'UNEXPECTED_TRANSFORM_PROBLEM_CANARY';
+    vi.stubGlobal(
+      'fetch',
+      vi.fn((_input: RequestInfo | URL, init?: RequestInit) => {
+        if (!init?.method) {
+          return Promise.resolve(
+            jsonResponse(200, capabilityDetail(), {
+              ETag: '"capability:v1"',
+            }),
+          );
+        }
+        return Promise.resolve(
+          jsonResponse(422, {
+            error: 'tool arguments were rejected',
+            reason: 'invalid_params',
+            problems: [
+              {
+                path: '/amount',
+                keyword: 'codec',
+                reason: 'value has 7 fraction digits, codec allows 6',
+                wire_value: canary,
+              },
+            ],
+          }),
+        );
+      }),
+    );
+
+    renderPlayground('/tools/cap_abc/playground');
+    await screen.findByLabelText('Arguments (JSON)');
+    fireEvent.click(screen.getByRole('button', { name: 'Run tool' }));
+
+    expect(await screen.findByText('Arguments rejected')).toBeTruthy();
+    const report = screen.getByRole('region', { name: 'Transform problems' });
+    expect(report.textContent).toContain('/amount');
+    expect(report.textContent).toContain('codec');
+    expect(report.textContent).toContain(
+      'value has 7 fraction digits, codec allows 6',
+    );
+    expect(report.textContent).not.toContain(canary);
+    expect(screen.queryByRole('heading', { name: 'Tool result' })).toBeNull();
+  });
+
+  it('renders bounded composite failure and orphan details without retaining a result', async () => {
+    const canary = 'UNEXPECTED_COMPOSITE_FAILURE_BODY_CANARY';
+    vi.stubGlobal(
+      'fetch',
+      vi.fn((_input: RequestInfo | URL, init?: RequestInit) => {
+        if (!init?.method) {
+          return Promise.resolve(
+            jsonResponse(200, capabilityDetail(), {
+              ETag: '"capability:v1"',
+            }),
+          );
+        }
+        return Promise.resolve(
+          jsonResponse(502, {
+            error: 'tool execution failed',
+            request_id: 'request-composite-failure',
+            reason: 'composite_failed_compensation_incomplete',
+            failed_step: 'attach',
+            failed_iteration: 1,
+            compensation: 'incomplete',
+            orphans_truncated: true,
+            orphans: [
+              {
+                step: 'attach',
+                iteration: 0,
+                tool: 'attach_note',
+                certainty: 'possible',
+                reason: 'ambiguous_status:502',
+                upstream_status: 502,
+                response_body: canary,
+              },
+            ],
+            body: canary,
+          }),
+        );
+      }),
+    );
+
+    renderPlayground('/tools/cap_abc/playground');
+    await screen.findByLabelText('Arguments (JSON)');
+    fireEvent.click(screen.getByRole('button', { name: 'Run tool' }));
+
+    expect(await screen.findByText('Composite execution failed')).toBeTruthy();
+    const report = screen.getByRole('region', {
+      name: 'Composite failure details',
+    });
+    expect(report.textContent).toContain('request-composite-failure');
+    expect(report.textContent).toContain('attach');
+    expect(report.textContent).toContain('iteration 1');
+    expect(report.textContent).toContain('incomplete');
+    expect(report.textContent).toContain('possible');
+    expect(report.textContent).toContain('ambiguous_status:502');
+    expect(report.textContent).toContain('HTTP 502');
+    expect(report.textContent).toContain(
+      'Additional orphan entries were omitted by the safety limit.',
+    );
+    expect(report.textContent).not.toContain(canary);
+    expect(screen.queryByRole('heading', { name: 'Tool result' })).toBeNull();
+  });
+
+  it('renders the pending-compensation marker and request ID after an interrupted composite', async () => {
+    vi.stubGlobal(
+      'fetch',
+      vi.fn((_input: RequestInfo | URL, init?: RequestInit) => {
+        if (!init?.method) {
+          return Promise.resolve(
+            jsonResponse(200, capabilityDetail(), {
+              ETag: '"capability:v1"',
+            }),
+          );
+        }
+        return Promise.resolve(
+          jsonResponse(504, {
+            error: 'tool execution timed out',
+            reason: 'timeout',
+            request_id: 'request-composite-timeout',
+            composite: 'pending_compensation',
+          }),
+        );
+      }),
+    );
+
+    renderPlayground('/tools/cap_abc/playground');
+    await screen.findByLabelText('Arguments (JSON)');
+    fireEvent.click(screen.getByRole('button', { name: 'Run tool' }));
+
+    expect(await screen.findByText('Composite outcome needs review')).toBeTruthy();
+    const report = screen.getByRole('region', {
+      name: 'Composite failure details',
+    });
+    expect(report.textContent).toContain('request-composite-timeout');
+    expect(report.textContent).toContain('timeout');
+    expect(report.textContent).toContain('pending review');
+    expect(screen.queryByRole('heading', { name: 'Tool result' })).toBeNull();
+  });
 
   it('clears state on a network failure and does not retry', async () => {
     let executions = 0;

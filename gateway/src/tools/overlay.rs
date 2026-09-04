@@ -1,4 +1,4 @@
-//! Per-Connection OpenAPI overlays (issue #360, through PR 3).
+//! Per-Connection OpenAPI overlays (issue #360, through PR 4).
 //!
 //! An overlay is a declarative document stored beside a Connection's OpenAPI
 //! catalog. It is compiled into the same `ToolDefinition`s the catalog
@@ -23,8 +23,9 @@
 //!   descriptions are rewritten through a fixed template that names the
 //!   field and its static options.
 //!
-//! The `enum_sources`, `label_sources`, and `composites` branches remain
-//! reserved in the published schema and are refused until their PRs land.
+//! The `enum_sources` and `label_sources` branches remain reserved.
+//! Composite tools compile into synthetic catalog definitions whose step
+//! references retain generated-name authority.
 //!
 //! Two rules are load-bearing and pinned by tests below:
 //!
@@ -48,17 +49,25 @@ use std::{
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
-use crate::connections::model::MAX_MANAGED_OPENAPI_CATALOG_BYTES;
+use crate::connections::model::{MAX_CATALOG_ENTRIES, MAX_MANAGED_OPENAPI_CATALOG_BYTES};
 
 use super::{
     codecs::{Codec, DecimalWireEncoding},
-    definitions::{BodyMappingMode, ToolDefinition, ToolTarget, ToolVisibility},
-    openapi::{OpenApiToolBinding, OpenApiToolGeneration},
+    composite::{
+        CompositeBinding, CompositeLimits, CompositeMapping, CompositeStep,
+        MAX_COMPOSITE_ITERATIONS, MAX_COMPOSITE_JSON_DEPTH, MAX_COMPOSITE_RESULT_PROPERTIES,
+        MAX_COMPOSITE_STEPS,
+    },
+    definitions::{
+        BodyMappingMode, HttpToolMapping, ToolDefinition, ToolSource, ToolTarget, ToolVisibility,
+    },
+    openapi::{OpenApiToolBinding, OpenApiToolGeneration, OpenApiToolSecuritySelection},
     selector::{
         resolve_pointer_schemas, select_object_schemas, JsonPointer, SchemaResolution, Selector,
     },
     transforms::{
-        AgentProperty, ParameterShape, ResponseBinding, ToolTransform, WireBinding, WireSource,
+        self, AgentProperty, ParameterShape, ResponseBinding, ToolTransform, WireBinding,
+        WireSource,
     },
 };
 
@@ -78,6 +87,14 @@ const MAX_OPTIONS_SHOWN: usize = 16;
 /// with `…`. Document enum values are already served verbatim in the
 /// schema, so this bounds description growth rather than exposure.
 const MAX_OPTION_CHARS: usize = 64;
+/// Schema nodes inspected while proving that an agent fragment carries no
+/// unsupported `format` assertion, including nested applicator schemas.
+const MAX_AGENT_FRAGMENT_SCHEMA_NODES: usize = 4_096;
+const AGENT_FRAGMENT_DIALECT: &str = "https://json-schema.org/draft/2020-12/schema";
+/// Maximum schema nodes inspected while proving one JSON pointer. OpenAPI
+/// schemas are graphs: a small `anyOf`/`oneOf` DAG can otherwise duplicate
+/// the same `$ref` exponentially before the depth limit is reached.
+const MAX_SCHEMA_POINTER_VISITS: usize = 4_096;
 const DEFAULT_DISAMBIGUATION_TEMPLATE: &str = "{label} (field `{name}`{options})";
 const OVERLAY_SCHEMA_JSON: &str =
     include_str!("../../../docs/schemas/connection-overlay.v0.schema.json");
@@ -93,7 +110,7 @@ static OVERLAY_SCHEMA_VALIDATOR: LazyLock<jsonschema::Validator> = LazyLock::new
 // pinned in lockstep by the tests at the bottom of this file)
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct OverlayDocument {
     pub schema_version: String,
@@ -106,6 +123,38 @@ pub struct OverlayDocument {
     /// Keyed by the GENERATED tool name (the document's `operationId`).
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub tools: BTreeMap<String, ToolOverlay>,
+    /// Keyed by the served composite tool name.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub composites: BTreeMap<String, CompositeOverlay>,
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct CompositeOverlay {
+    pub description: String,
+    pub input: CompositeInput,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub parameters: BTreeMap<String, CompositeParameterOverlay>,
+    pub steps: Vec<CompositeStep>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub result: Option<BTreeMap<String, CompositeBinding>>,
+    #[serde(default, skip_serializing_if = "CompositeLimits::is_default")]
+    pub limits: CompositeLimits,
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct CompositeInput {
+    pub properties: BTreeMap<String, Value>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub required: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct CompositeParameterOverlay {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub enum_source: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default, Deserialize, Serialize)]
@@ -341,6 +390,13 @@ pub struct OverlayToolReport {
     pub label_summary: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct OverlayCompositeReport {
+    pub name: String,
+    pub steps_max: usize,
+    pub policy_entry_present: bool,
+}
+
 fn label_summary(
     labels_found: usize,
     labels_from_title: usize,
@@ -383,6 +439,7 @@ pub struct CompiledCatalog {
     /// generated name -> served name, for every renamed tool.
     pub renames: BTreeMap<String, String>,
     pub tools: Vec<OverlayToolReport>,
+    pub composites: Vec<OverlayCompositeReport>,
     pub warnings: Vec<OverlayWarning>,
 }
 
@@ -438,14 +495,13 @@ pub fn validate(document: &Value) -> Result<OverlayDocument, OverlayError> {
     Ok(overlay)
 }
 
-/// Sections and fields that later PRs own. They are `not: {}` in the
-/// schema so the schema itself refuses them, but the schema's wording for
-/// a `not` failure does not say why; this names the reservation.
+/// Sections and fields that later PRs own. The shape schema reserves them,
+/// while this pass provides the operator-facing feature name and also covers
+/// cross-PR seams (such as a composite parameter's future enum binding).
 fn reserved_section_problems(document: &Value) -> Vec<OverlayProblem> {
-    const TOP_LEVEL: [(&str, &str); 3] = [
+    const TOP_LEVEL: [(&str, &str); 2] = [
         ("enum_sources", "dynamic enum binding"),
         ("label_sources", "label sources"),
-        ("composites", "composite tools with compensation"),
     ];
     let mut problems = Vec::new();
     let Some(root) = document.as_object() else {
@@ -478,6 +534,24 @@ fn reserved_section_problems(document: &Value) -> Vec<OverlayProblem> {
                             "dynamic enum binding",
                         ));
                     }
+                }
+            }
+        }
+    }
+    if let Some(composites) = root.get("composites").and_then(Value::as_object) {
+        for (composite_name, composite) in composites {
+            let Some(parameters) = composite.get("parameters").and_then(Value::as_object) else {
+                continue;
+            };
+            for (property, parameter) in parameters {
+                if parameter
+                    .as_object()
+                    .is_some_and(|parameter| parameter.contains_key("enum_source"))
+                {
+                    problems.push(reserved(
+                        format!("/composites/{composite_name}/parameters/{property}/enum_source"),
+                        "dynamic enum binding",
+                    ));
                 }
             }
         }
@@ -696,6 +770,98 @@ fn document_problems(overlay: &OverlayDocument) -> Vec<OverlayProblem> {
             }
         }
     }
+    for (name, composite) in &overlay.composites {
+        let path = format!("/composites/{name}");
+        let required = composite.input.required.iter().collect::<BTreeSet<_>>();
+        if required.len() != composite.input.required.len() {
+            problems.push(OverlayProblem {
+                path: format!("{path}/input/required"),
+                message: "required property names must be unique".to_owned(),
+            });
+        }
+        for required_name in &composite.input.required {
+            if !composite.input.properties.contains_key(required_name) {
+                problems.push(OverlayProblem {
+                    path: format!("{path}/input/required"),
+                    message: format!(
+                        "required input '{required_name}' is not declared in input.properties"
+                    ),
+                });
+            }
+        }
+        for (property, fragment) in &composite.input.properties {
+            let fragment_path = format!("{path}/input/properties/{property}");
+            let Some(object) = fragment.as_object() else {
+                problems.push(OverlayProblem {
+                    path: fragment_path,
+                    message: "agent schema fragment must be an object".to_owned(),
+                });
+                continue;
+            };
+            if !object.get("type").is_some_and(Value::is_string) {
+                problems.push(OverlayProblem {
+                    path: fragment_path.clone(),
+                    message: "agent schema fragment must declare a string type".to_owned(),
+                });
+            }
+            let mut remaining_nodes = MAX_AGENT_FRAGMENT_SCHEMA_NODES;
+            let mut limit_reported = false;
+            reject_agent_fragment_formats(
+                fragment,
+                &fragment_path,
+                0,
+                &mut remaining_nodes,
+                &mut limit_reported,
+                &mut problems,
+            );
+            if let Err(error) = jsonschema::validator_for(fragment) {
+                problems.push(OverlayProblem {
+                    path: fragment_path,
+                    message: format!("agent schema fragment is not valid JSON Schema: {error}"),
+                });
+            }
+        }
+        for property in composite.parameters.keys() {
+            if !composite.input.properties.contains_key(property) {
+                problems.push(OverlayProblem {
+                    path: format!("{path}/parameters/{property}"),
+                    message: format!(
+                        "'{property}' is not declared in this composite's input.properties"
+                    ),
+                });
+            }
+        }
+        if composite.steps.is_empty() || composite.steps.len() > MAX_COMPOSITE_STEPS {
+            problems.push(OverlayProblem {
+                path: format!("{path}/steps"),
+                message: format!("a composite must contain 1-{MAX_COMPOSITE_STEPS} steps"),
+            });
+        }
+        if composite
+            .result
+            .as_ref()
+            .is_some_and(|result| result.len() > MAX_COMPOSITE_RESULT_PROPERTIES)
+        {
+            problems.push(OverlayProblem {
+                path: format!("{path}/result"),
+                message: format!(
+                    "a composite result may contain at most {MAX_COMPOSITE_RESULT_PROPERTIES} properties"
+                ),
+            });
+        }
+        if !(1..=MAX_COMPOSITE_ITERATIONS).contains(&composite.limits.max_iterations) {
+            problems.push(OverlayProblem {
+                path: format!("{path}/limits/max_iterations"),
+                message: format!("max_iterations must be between 1 and {MAX_COMPOSITE_ITERATIONS}"),
+            });
+        }
+        if !(100..=120_000).contains(&composite.limits.compensation_timeout_ms) {
+            problems.push(OverlayProblem {
+                path: format!("{path}/limits/compensation_timeout_ms"),
+                message: "compensation_timeout_ms must be between 100 and 120000".to_owned(),
+            });
+        }
+    }
     problems
 }
 
@@ -845,6 +1011,110 @@ fn pointer_is_prefix(prefix: &str, value: &str) -> bool {
         .is_some_and(|suffix| suffix.starts_with('/'))
 }
 
+fn reject_agent_fragment_formats(
+    schema: &Value,
+    path: &str,
+    depth: usize,
+    remaining_nodes: &mut usize,
+    limit_reported: &mut bool,
+    problems: &mut Vec<OverlayProblem>,
+) {
+    if depth >= MAX_COMPOSITE_JSON_DEPTH || *remaining_nodes == 0 {
+        if !*limit_reported {
+            problems.push(OverlayProblem {
+                path: path.to_owned(),
+                message: "agent schema fragment is too complex to verify that format is absent"
+                    .to_owned(),
+            });
+            *limit_reported = true;
+        }
+        return;
+    }
+    *remaining_nodes -= 1;
+    let Some(object) = schema.as_object() else {
+        return;
+    };
+    if object
+        .get("$schema")
+        .is_some_and(|dialect| dialect.as_str() != Some(AGENT_FRAGMENT_DIALECT))
+    {
+        problems.push(OverlayProblem {
+            path: format!("{path}/$schema"),
+            message: format!(
+                "agent schema fragments must use JSON Schema 2020-12 ('{AGENT_FRAGMENT_DIALECT}')"
+            ),
+        });
+    }
+    if object.contains_key("format") {
+        problems.push(OverlayProblem {
+            path: format!("{path}/format"),
+            message: "format is not accepted in agent schema fragments; use pattern".to_owned(),
+        });
+    }
+
+    for keyword in [
+        "additionalProperties",
+        "unevaluatedProperties",
+        "propertyNames",
+        "items",
+        "contains",
+        "not",
+        "if",
+        "then",
+        "else",
+        "contentSchema",
+        "unevaluatedItems",
+    ] {
+        if let Some(child) = object.get(keyword).filter(|child| child.is_object()) {
+            reject_agent_fragment_formats(
+                child,
+                &format!("{path}/{keyword}"),
+                depth + 1,
+                remaining_nodes,
+                limit_reported,
+                problems,
+            );
+        }
+    }
+    for keyword in [
+        "properties",
+        "patternProperties",
+        "$defs",
+        "definitions",
+        "dependentSchemas",
+    ] {
+        let Some(children) = object.get(keyword).and_then(Value::as_object) else {
+            continue;
+        };
+        for (name, child) in children {
+            let name = name.replace('~', "~0").replace('/', "~1");
+            reject_agent_fragment_formats(
+                child,
+                &format!("{path}/{keyword}/{name}"),
+                depth + 1,
+                remaining_nodes,
+                limit_reported,
+                problems,
+            );
+        }
+    }
+    for keyword in ["prefixItems", "allOf", "anyOf", "oneOf"] {
+        let Some(children) = object.get(keyword).and_then(Value::as_array) else {
+            continue;
+        };
+        for (index, child) in children.iter().enumerate() {
+            reject_agent_fragment_formats(
+                child,
+                &format!("{path}/{keyword}/{index}"),
+                depth + 1,
+                remaining_nodes,
+                limit_reported,
+                problems,
+            );
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // compile
 // ---------------------------------------------------------------------------
@@ -876,7 +1146,7 @@ pub fn compile(
         .definitions
         .iter()
         .enumerate()
-        .map(|(index, definition)| (definition.name.as_str(), index))
+        .map(|(index, definition)| (definition.name.clone(), index))
         .collect::<BTreeMap<_, _>>();
 
     let mut problems = Vec::new();
@@ -955,7 +1225,7 @@ pub fn compile(
                 transformed.insert(generated_name.clone(), compiled);
             }
         }
-        let Some(&index) = bound_index.get(generated_name.as_str()) else {
+        let Some(&index) = bound_index.get(generated_name) else {
             warnings.push(OverlayWarning {
                 path: format!("/tools/{generated_name}"),
                 message: format!(
@@ -966,6 +1236,50 @@ pub fn compile(
             continue;
         };
         active_tools.push((generated_name.as_str(), tool, index));
+    }
+    let rename_targets = renames
+        .values()
+        .map(String::as_str)
+        .collect::<BTreeSet<_>>();
+    for composite_name in overlay.composites.keys() {
+        let path = format!("/composites/{composite_name}");
+        if generated_names.contains(composite_name.as_str()) {
+            problems.push(OverlayProblem {
+                path: path.clone(),
+                message: format!(
+                    "composite name '{composite_name}' collides with a generated tool of this catalog"
+                ),
+            });
+        }
+        if rename_targets.contains(composite_name.as_str()) {
+            problems.push(OverlayProblem {
+                path: path.clone(),
+                message: format!(
+                    "composite name '{composite_name}' collides with an overlay rename target"
+                ),
+            });
+        }
+        if context.other_lane_tool_names.contains(composite_name) {
+            problems.push(OverlayProblem {
+                path: path.clone(),
+                message: format!(
+                    "composite name '{composite_name}' is already published by another registry lane"
+                ),
+            });
+        }
+        if context.policy_tool_names.contains(composite_name)
+            && context
+                .prior_overlay_name_owners
+                .get(composite_name)
+                .is_none_or(|owner| owner != composite_name)
+        {
+            problems.push(OverlayProblem {
+                path,
+                message: format!(
+                    "composite name '{composite_name}' would adopt the existing policy entry tools.{composite_name}; store the overlay before adding the policy entry"
+                ),
+            });
+        }
     }
     if !problems.is_empty() {
         return Err(OverlayError { problems });
@@ -1000,15 +1314,13 @@ pub fn compile(
         let visibility = tool.visibility.unwrap_or_default();
         definition.visibility = visibility;
         if visibility == ToolVisibility::CompositeOnly {
-            // Composites land in a later PR; until then nothing can reach a
-            // hidden tool except the admin playground, which is exactly
-            // what the operator asked for on a delete tool, so this is
-            // reported rather than refused.
+            // The tool remains present for composite steps and the admin
+            // playground, but direct agent discovery and calls are refused.
             warnings.push(OverlayWarning {
                 path: format!("{tool_path}/visibility"),
                 message: format!(
                     "'{generated_name}' is composite_only: hidden from tools/list and \
-                     tools/call, reachable only from the admin playground"
+                     direct tools/call, reachable only from composites and the admin playground"
                 ),
             });
         }
@@ -1104,6 +1416,33 @@ pub fn compile(
         });
     }
 
+    let (composite_reports, referenced_generated_tools) = compile_composites(
+        generation,
+        overlay,
+        context,
+        &bound_index,
+        &renames,
+        &transformed,
+        &mut definitions,
+        &mut security_selections,
+        &mut warnings,
+        &mut problems,
+    );
+
+    for (generated_name, tool) in &overlay.tools {
+        if tool.visibility == Some(ToolVisibility::CompositeOnly)
+            && bound_index.contains_key(generated_name)
+            && !referenced_generated_tools.contains(generated_name)
+        {
+            problems.push(OverlayProblem {
+                path: format!("/tools/{generated_name}/visibility"),
+                message: format!(
+                    "composite_only tool '{generated_name}' is not referenced by any composite step or compensation"
+                ),
+            });
+        }
+    }
+
     budget_problems(&definitions, &renames, &mut problems);
     if !problems.is_empty() {
         return Err(OverlayError { problems });
@@ -1117,6 +1456,7 @@ pub fn compile(
         },
         renames,
         tools: reports,
+        composites: composite_reports,
         warnings,
     })
 }
@@ -2108,6 +2448,1013 @@ fn collect_object_property_schemas(schema: &Value, token: &str, next: &mut Vec<V
     false
 }
 
+#[derive(Debug, Clone)]
+struct CompiledStepInfo {
+    generated_tool: String,
+    max_runs: usize,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn compile_composites(
+    generation: &OpenApiToolGeneration,
+    overlay: &OverlayDocument,
+    context: &OverlayCompileContext,
+    bound_index: &BTreeMap<String, usize>,
+    renames: &BTreeMap<String, String>,
+    transformed: &BTreeMap<String, CompiledToolTransform>,
+    definitions: &mut Vec<ToolDefinition>,
+    security_selections: &mut Vec<OpenApiToolSecuritySelection>,
+    warnings: &mut Vec<OverlayWarning>,
+    problems: &mut Vec<OverlayProblem>,
+) -> (Vec<OverlayCompositeReport>, BTreeSet<String>) {
+    let generated_names = generation
+        .definitions
+        .iter()
+        .map(|definition| definition.name.as_str())
+        .collect::<BTreeSet<_>>();
+    let mut reports = Vec::with_capacity(overlay.composites.len());
+    let mut referenced_generated_tools = BTreeSet::new();
+
+    for (composite_name, authored) in &overlay.composites {
+        let problem_count = problems.len();
+        let composite_path = format!("/composites/{composite_name}");
+        let mut prior_steps = BTreeMap::<String, CompiledStepInfo>::new();
+        let mut compiled_steps = authored.steps.clone();
+        let mut iteration_bound = 0_usize;
+        let mut steps_max = 0_usize;
+        let mut first_definition_index = None;
+
+        for (step_index, (step, compiled_step)) in authored
+            .steps
+            .iter()
+            .zip(compiled_steps.iter_mut())
+            .enumerate()
+        {
+            let step_path = format!("{composite_path}/steps/{step_index}");
+            if prior_steps.contains_key(&step.id) {
+                problems.push(OverlayProblem {
+                    path: format!("{step_path}/id"),
+                    message: format!("duplicate composite step id '{}'", step.id),
+                });
+            }
+
+            let target_index = composite_tool_index(
+                &step.tool,
+                &format!("{step_path}/tool"),
+                &generated_names,
+                bound_index,
+                renames,
+                overlay,
+                problems,
+            );
+            if let Some(index) = target_index {
+                first_definition_index.get_or_insert(index);
+                referenced_generated_tools.insert(step.tool.clone());
+                validate_bound_arguments(
+                    &step.arguments,
+                    &definitions[index],
+                    &format!("{step_path}/arguments"),
+                    problems,
+                );
+                compiled_step.tool = definitions[index].name.clone();
+            }
+
+            for (argument, binding) in &step.arguments {
+                validate_composite_binding(
+                    binding,
+                    &format!("{step_path}/arguments/{argument}"),
+                    &authored.input,
+                    &prior_steps,
+                    step.for_each.as_ref(),
+                    None,
+                    generation,
+                    transformed,
+                    warnings,
+                    problems,
+                );
+            }
+
+            let max_runs = if let Some(for_each) = &step.for_each {
+                validate_composite_binding(
+                    &for_each.over,
+                    &format!("{step_path}/for_each/over"),
+                    &authored.input,
+                    &prior_steps,
+                    None,
+                    None,
+                    generation,
+                    transformed,
+                    warnings,
+                    problems,
+                );
+                let bound = for_each_iteration_bound(
+                    &for_each.over,
+                    &authored.input,
+                    &prior_steps,
+                    &format!("{step_path}/for_each/over"),
+                    problems,
+                );
+                iteration_bound = iteration_bound.saturating_add(bound);
+                steps_max = steps_max.saturating_add(bound);
+                bound
+            } else {
+                steps_max = steps_max.saturating_add(1);
+                1
+            };
+
+            if let Some(compensation) = &step.compensate {
+                let compensation_path = format!("{step_path}/compensate");
+                let compensation_index = composite_tool_index(
+                    &compensation.tool,
+                    &format!("{compensation_path}/tool"),
+                    &generated_names,
+                    bound_index,
+                    renames,
+                    overlay,
+                    problems,
+                );
+                if let Some(index) = compensation_index {
+                    referenced_generated_tools.insert(compensation.tool.clone());
+                    validate_bound_arguments(
+                        &compensation.arguments,
+                        &definitions[index],
+                        &format!("{compensation_path}/arguments"),
+                        problems,
+                    );
+                    if let Some(compiled) = compiled_step.compensate.as_mut() {
+                        compiled.tool = definitions[index].name.clone();
+                    }
+                }
+                for (argument, binding) in &compensation.arguments {
+                    validate_composite_binding(
+                        binding,
+                        &format!("{compensation_path}/arguments/{argument}"),
+                        &authored.input,
+                        &prior_steps,
+                        step.for_each.as_ref(),
+                        Some(step.tool.as_str()),
+                        generation,
+                        transformed,
+                        warnings,
+                        problems,
+                    );
+                }
+            }
+
+            prior_steps.insert(
+                step.id.clone(),
+                CompiledStepInfo {
+                    generated_tool: step.tool.clone(),
+                    max_runs,
+                },
+            );
+        }
+
+        if iteration_bound > authored.limits.max_iterations {
+            problems.push(OverlayProblem {
+                path: format!("{composite_path}/limits/max_iterations"),
+                message: format!(
+                    "for_each bounds total {iteration_bound} iterations, exceeding max_iterations {}",
+                    authored.limits.max_iterations
+                ),
+            });
+        }
+
+        if let Some(result) = &authored.result {
+            for (property, binding) in result {
+                validate_composite_binding(
+                    binding,
+                    &format!("{composite_path}/result/{property}"),
+                    &authored.input,
+                    &prior_steps,
+                    None,
+                    None,
+                    generation,
+                    transformed,
+                    warnings,
+                    problems,
+                );
+            }
+        }
+
+        if problems.len() != problem_count {
+            continue;
+        }
+
+        let Some(first_definition_index) = first_definition_index else {
+            continue;
+        };
+        let (connection_id, catalog_revision) = match &definitions[first_definition_index].source {
+            ToolSource::OpenApi {
+                connection_id,
+                catalog_revision,
+                ..
+            } => (connection_id.clone(), *catalog_revision),
+            _ => {
+                problems.push(OverlayProblem {
+                    path: composite_path,
+                    message: "composite steps must resolve to an OpenAPI catalog".to_owned(),
+                });
+                continue;
+            }
+        };
+
+        let input_schema = Value::Object(Map::from_iter([
+            ("type".to_owned(), Value::String("object".to_owned())),
+            (
+                "properties".to_owned(),
+                Value::Object(Map::from_iter(authored.input.properties.clone())),
+            ),
+            (
+                "required".to_owned(),
+                Value::Array(
+                    authored
+                        .input
+                        .required
+                        .iter()
+                        .cloned()
+                        .map(Value::String)
+                        .collect(),
+                ),
+            ),
+            ("additionalProperties".to_owned(), Value::Bool(false)),
+        ]));
+        if let Err(error) = jsonschema::validator_for(&input_schema) {
+            problems.push(OverlayProblem {
+                path: format!("{composite_path}/input"),
+                message: format!("compiled composite input is not valid JSON Schema: {error}"),
+            });
+            continue;
+        }
+
+        let mapping = CompositeMapping {
+            steps: compiled_steps,
+            result: authored.result.clone(),
+            limits: authored.limits,
+        };
+        definitions.push(ToolDefinition {
+            name: composite_name.clone(),
+            description: authored.description.clone(),
+            input_schema,
+            target: Some(ToolTarget::Composite {
+                connection_id: connection_id.clone(),
+            }),
+            source: ToolSource::OpenApi {
+                connection_id,
+                operation_id: None,
+                catalog_revision,
+            },
+            upstream: HttpToolMapping::composite_sentinel(),
+            transform: None,
+            composite: Some(mapping),
+            visibility: ToolVisibility::Listed,
+        });
+        security_selections.push(OpenApiToolSecuritySelection {
+            tool_name: composite_name.clone(),
+            selected_scheme_names: Vec::new(),
+        });
+
+        let policy_entry_present = context.policy_tool_names.contains(composite_name);
+        if !policy_entry_present {
+            warnings.push(OverlayWarning {
+                path: composite_path,
+                message: format!(
+                    "no policy entry for '{composite_name}': under default-deny it is invisible; under default-allow it uses the runtime default timeout, which must cover steps_max = {steps_max}"
+                ),
+            });
+        }
+        reports.push(OverlayCompositeReport {
+            name: composite_name.clone(),
+            steps_max,
+            policy_entry_present,
+        });
+    }
+
+    (reports, referenced_generated_tools)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn composite_tool_index(
+    tool_name: &str,
+    path: &str,
+    generated_names: &BTreeSet<&str>,
+    bound_index: &BTreeMap<String, usize>,
+    renames: &BTreeMap<String, String>,
+    overlay: &OverlayDocument,
+    problems: &mut Vec<OverlayProblem>,
+) -> Option<usize> {
+    if let Some((generated, _)) = renames
+        .iter()
+        .find(|(_, served)| served.as_str() == tool_name)
+    {
+        problems.push(OverlayProblem {
+            path: path.to_owned(),
+            message: format!(
+                "'{tool_name}' is a served rename; overlay references use the generated name '{generated}'"
+            ),
+        });
+        return None;
+    }
+    if overlay.composites.contains_key(tool_name) {
+        problems.push(OverlayProblem {
+            path: path.to_owned(),
+            message: format!(
+                "'{tool_name}' is a composite; composite steps must name non-composite generated tools"
+            ),
+        });
+        return None;
+    }
+    if !generated_names.contains(tool_name) {
+        let hint = generated_names
+            .iter()
+            .find(|candidate| candidate.eq_ignore_ascii_case(tool_name))
+            .map(|candidate| format!("; did you mean '{candidate}'"))
+            .unwrap_or_default();
+        problems.push(OverlayProblem {
+            path: path.to_owned(),
+            message: format!("unknown generated tool '{tool_name}'{hint}"),
+        });
+        return None;
+    }
+    let Some(index) = bound_index.get(tool_name).copied() else {
+        problems.push(OverlayProblem {
+            path: path.to_owned(),
+            message: format!(
+                "generated tool '{tool_name}' is not selected in this catalog and cannot be used by a composite"
+            ),
+        });
+        return None;
+    };
+    Some(index)
+}
+
+fn validate_bound_arguments(
+    arguments: &BTreeMap<String, CompositeBinding>,
+    definition: &ToolDefinition,
+    path: &str,
+    problems: &mut Vec<OverlayProblem>,
+) {
+    let properties = definition
+        .input_schema
+        .get("properties")
+        .and_then(Value::as_object);
+    for required in definition
+        .input_schema
+        .get("required")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+    {
+        if !arguments.contains_key(required) {
+            problems.push(OverlayProblem {
+                path: path.to_owned(),
+                message: format!(
+                    "required argument '{required}' of tool '{}' is not bound",
+                    definition.name
+                ),
+            });
+        }
+    }
+    if definition.input_schema.get("additionalProperties") == Some(&Value::Bool(false)) {
+        for argument in arguments.keys() {
+            if properties.is_none_or(|properties| !properties.contains_key(argument)) {
+                problems.push(OverlayProblem {
+                    path: format!("{path}/{argument}"),
+                    message: format!(
+                        "'{argument}' is not an input property of tool '{}'",
+                        definition.name
+                    ),
+                });
+            }
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn validate_composite_binding(
+    binding: &CompositeBinding,
+    path: &str,
+    input: &CompositeInput,
+    visible_steps: &BTreeMap<String, CompiledStepInfo>,
+    item_scope: Option<&crate::tools::composite::CompositeForEach>,
+    self_tool: Option<&str>,
+    generation: &OpenApiToolGeneration,
+    transformed: &BTreeMap<String, CompiledToolTransform>,
+    warnings: &mut Vec<OverlayWarning>,
+    problems: &mut Vec<OverlayProblem>,
+) {
+    match binding {
+        CompositeBinding::Literal(_) => {}
+        CompositeBinding::Input {
+            input: input_name,
+            pointer,
+        } => {
+            let Some(fragment) = input.properties.get(input_name) else {
+                problems.push(OverlayProblem {
+                    path: path.to_owned(),
+                    message: format!("unknown composite input '{input_name}'"),
+                });
+                return;
+            };
+            if let Some(pointer) = pointer {
+                match schema_pointer_check(fragment, fragment, pointer, 0) {
+                    PointerCheck::Exists => {}
+                    PointerCheck::Unverifiable => warnings.push(OverlayWarning {
+                        path: path.to_owned(),
+                        message: format!(
+                            "input pointer '{pointer}' enters a free-form schema and cannot be verified"
+                        ),
+                    }),
+                    PointerCheck::Missing
+                    | PointerCheck::AlternativeForbidden
+                    | PointerCheck::Forbidden => {
+                        problems.push(OverlayProblem {
+                        path: path.to_owned(),
+                        message: format!(
+                            "input pointer '{pointer}' does not exist in input '{input_name}'"
+                        ),
+                        })
+                    }
+                }
+            }
+        }
+        CompositeBinding::Step {
+            step,
+            pointer,
+            collect,
+        } => {
+            let Some(info) = visible_steps.get(step) else {
+                problems.push(OverlayProblem {
+                    path: path.to_owned(),
+                    message: format!(
+                        "$step '{step}' must name an earlier step (forward and missing references are rejected)"
+                    ),
+                });
+                return;
+            };
+            if info.max_runs > 1 && !collect {
+                problems.push(OverlayProblem {
+                    path: path.to_owned(),
+                    message: format!("$step '{step}' may run more than once; set collect to true"),
+                });
+            }
+            validate_response_pointer(
+                generation,
+                transformed,
+                &info.generated_tool,
+                pointer.as_deref(),
+                path,
+                warnings,
+                problems,
+            );
+        }
+        CompositeBinding::Item { item, pointer } => {
+            let Some(item_scope) = item_scope.filter(|scope| scope.item_name == *item) else {
+                problems.push(OverlayProblem {
+                    path: path.to_owned(),
+                    message: format!(
+                        "$item '{item}' is only valid inside a for_each step whose 'as' value matches"
+                    ),
+                });
+                return;
+            };
+            if let Some(pointer) = pointer.as_deref().filter(|pointer| !pointer.is_empty()) {
+                validate_item_pointer(
+                    &item_scope.over,
+                    pointer,
+                    input,
+                    visible_steps,
+                    generation,
+                    transformed,
+                    path,
+                    warnings,
+                    problems,
+                );
+            }
+        }
+        CompositeBinding::SelfValue { pointer } => {
+            let Some(tool_name) = self_tool else {
+                problems.push(OverlayProblem {
+                    path: path.to_owned(),
+                    message: "$self is only valid inside compensate.arguments".to_owned(),
+                });
+                return;
+            };
+            validate_response_pointer(
+                generation,
+                transformed,
+                tool_name,
+                Some(pointer),
+                path,
+                warnings,
+                problems,
+            );
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn validate_item_pointer(
+    over: &CompositeBinding,
+    item_pointer: &str,
+    input: &CompositeInput,
+    visible_steps: &BTreeMap<String, CompiledStepInfo>,
+    generation: &OpenApiToolGeneration,
+    transformed: &BTreeMap<String, CompiledToolTransform>,
+    path: &str,
+    warnings: &mut Vec<OverlayWarning>,
+    problems: &mut Vec<OverlayProblem>,
+) {
+    match over {
+        CompositeBinding::Input {
+            input: input_name,
+            pointer: None,
+        } => {
+            let Some(fragment) = input.properties.get(input_name) else {
+                return;
+            };
+            let Some(items) = fragment.get("items") else {
+                warnings.push(OverlayWarning {
+                    path: path.to_owned(),
+                    message: format!(
+                        "$item pointer '{item_pointer}' enters the unconstrained items of input '{input_name}' and cannot be verified"
+                    ),
+                });
+                return;
+            };
+            match schema_pointer_check(fragment, items, item_pointer, 0) {
+                PointerCheck::Exists => {}
+                PointerCheck::Unverifiable => warnings.push(OverlayWarning {
+                    path: path.to_owned(),
+                    message: format!(
+                        "$item pointer '{item_pointer}' enters a free-form item schema and cannot be verified"
+                    ),
+                }),
+                PointerCheck::Missing
+                | PointerCheck::AlternativeForbidden
+                | PointerCheck::Forbidden => problems.push(OverlayProblem {
+                    path: path.to_owned(),
+                    message: format!(
+                        "$item pointer '{item_pointer}' does not exist in the items schema of input '{input_name}'"
+                    ),
+                }),
+            }
+        }
+        CompositeBinding::Step {
+            step,
+            pointer: over_pointer,
+            collect: true,
+        } => {
+            let Some(info) = visible_steps.get(step) else {
+                return;
+            };
+            let combined = match over_pointer.as_deref() {
+                Some(pointer) if !pointer.is_empty() => format!("{pointer}{item_pointer}"),
+                _ => item_pointer.to_owned(),
+            };
+            validate_response_pointer(
+                generation,
+                transformed,
+                &info.generated_tool,
+                Some(&combined),
+                path,
+                warnings,
+                problems,
+            );
+        }
+        _ => {}
+    }
+}
+
+fn for_each_iteration_bound(
+    binding: &CompositeBinding,
+    input: &CompositeInput,
+    prior_steps: &BTreeMap<String, CompiledStepInfo>,
+    path: &str,
+    problems: &mut Vec<OverlayProblem>,
+) -> usize {
+    match binding {
+        CompositeBinding::Input {
+            input: input_name,
+            pointer: None,
+        } => {
+            let Some(fragment) = input.properties.get(input_name) else {
+                return 0;
+            };
+            if fragment.get("type").and_then(Value::as_str) != Some("array") {
+                problems.push(OverlayProblem {
+                    path: path.to_owned(),
+                    message: format!("'{input_name}' must have type array for for_each"),
+                });
+                return 0;
+            }
+            let Some(max_items) = fragment.get("maxItems").and_then(Value::as_u64) else {
+                problems.push(OverlayProblem {
+                    path: path.to_owned(),
+                    message: format!(
+                        "{input_name} needs maxItems so the iteration bound is checkable"
+                    ),
+                });
+                return 0;
+            };
+            usize::try_from(max_items).unwrap_or(usize::MAX)
+        }
+        CompositeBinding::Step {
+            step,
+            collect: true,
+            ..
+        } => prior_steps.get(step).map_or(0, |info| info.max_runs),
+        _ => {
+            problems.push(OverlayProblem {
+                path: path.to_owned(),
+                message: "for_each.over must be an unpointed $input array or a $step binding with collect: true"
+                    .to_owned(),
+            });
+            0
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PointerCheck {
+    Exists,
+    Unverifiable,
+    Missing,
+    /// At least one `oneOf`/`anyOf` arm explicitly forbids the pointer. This
+    /// remains unsafe even when a sibling keyword declares it.
+    AlternativeForbidden,
+    /// The schema explicitly disallows the pointer. Unlike an ordinary
+    /// undeclared property, this vetoes a declaration from another `allOf`
+    /// member.
+    Forbidden,
+}
+
+fn validate_response_pointer(
+    generation: &OpenApiToolGeneration,
+    transformed: &BTreeMap<String, CompiledToolTransform>,
+    tool_name: &str,
+    pointer: Option<&str>,
+    path: &str,
+    warnings: &mut Vec<OverlayWarning>,
+    problems: &mut Vec<OverlayProblem>,
+) {
+    let declared = match generation.declared_success_response_schemas(tool_name) {
+        Ok(declared) => declared,
+        Err(error) => {
+            problems.push(OverlayProblem {
+                path: path.to_owned(),
+                message: format!(
+                    "declared success response schema for tool '{tool_name}' cannot be resolved: {error}"
+                ),
+            });
+            return;
+        }
+    };
+    if declared.is_empty() {
+        warnings.push(OverlayWarning {
+            path: path.to_owned(),
+            message: format!(
+                "tool '{tool_name}' declares no JSON 2xx response schema; the response pointer is unverified"
+            ),
+        });
+        return;
+    }
+    let Some(pointer) = pointer.filter(|pointer| !pointer.is_empty()) else {
+        return;
+    };
+    let schemas = match transforms::project_success_response_schemas(
+        &declared,
+        transformed
+            .get(tool_name)
+            .map(|compiled| &compiled.transform),
+    ) {
+        Ok(schemas) => schemas,
+        Err(error) => {
+            problems.push(OverlayProblem {
+                path: path.to_owned(),
+                message: format!(
+                    "response transform for tool '{tool_name}' cannot be projected: {error}"
+                ),
+            });
+            return;
+        }
+    };
+    let result = schemas
+        .iter()
+        .map(|schema| schema_pointer_check(schema, schema, pointer, 0))
+        .min_by_key(|result| match result {
+            PointerCheck::Missing
+            | PointerCheck::AlternativeForbidden
+            | PointerCheck::Forbidden => 0,
+            PointerCheck::Unverifiable => 1,
+            PointerCheck::Exists => 2,
+        })
+        .unwrap_or(PointerCheck::Missing);
+    match result {
+        PointerCheck::Exists => {}
+        PointerCheck::Unverifiable => warnings.push(OverlayWarning {
+            path: path.to_owned(),
+            message: format!(
+                "response pointer '{pointer}' for tool '{tool_name}' enters a free-form schema and cannot be verified"
+            ),
+        }),
+        PointerCheck::Missing | PointerCheck::AlternativeForbidden | PointerCheck::Forbidden => {
+            problems.push(OverlayProblem {
+                path: path.to_owned(),
+                message: format!(
+                    "response pointer '{pointer}' does not exist in a declared 2xx response schema of tool '{tool_name}'"
+                ),
+            });
+        }
+    }
+}
+
+fn schema_pointer_check(
+    document: &Value,
+    schema: &Value,
+    pointer: &str,
+    depth: usize,
+) -> PointerCheck {
+    if depth >= 64 {
+        return PointerCheck::Unverifiable;
+    }
+    let Some(tokens) = decode_json_pointer(pointer) else {
+        return PointerCheck::Missing;
+    };
+    let mut remaining_visits = MAX_SCHEMA_POINTER_VISITS;
+    schema_tokens_check(document, schema, &tokens, depth + 1, &mut remaining_visits)
+}
+
+fn schema_tokens_check(
+    document: &Value,
+    schema: &Value,
+    tokens: &[String],
+    depth: usize,
+    remaining_visits: &mut usize,
+) -> PointerCheck {
+    if schema == &Value::Bool(false) {
+        return PointerCheck::Forbidden;
+    }
+    if tokens.is_empty() && schema.get("$ref").is_none() {
+        return PointerCheck::Exists;
+    }
+    if depth >= 64 || *remaining_visits == 0 {
+        return PointerCheck::Unverifiable;
+    }
+    *remaining_visits -= 1;
+
+    // JSON Schema 2020-12 (and therefore OpenAPI 3.1) applies keywords beside
+    // `$ref`. Treat the target and every understood sibling as an
+    // intersection; an unsupported validation sibling makes the proof
+    // unverifiable instead of being silently discarded.
+    if let Some(reference) = schema.get("$ref") {
+        let Some(resolved) = reference
+            .as_str()
+            .and_then(|reference| reference.strip_prefix('#'))
+            .and_then(|pointer| document.pointer(pointer))
+        else {
+            return PointerCheck::Unverifiable;
+        };
+        let mut checks = vec![schema_tokens_check(
+            document,
+            resolved,
+            tokens,
+            depth + 1,
+            remaining_visits,
+        )];
+        let mut structural_siblings = Map::new();
+        let mut has_unsupported_validation_sibling = false;
+        if let Some(object) = schema.as_object() {
+            for (keyword, value) in object {
+                match keyword.as_str() {
+                    "$ref" | "$id" | "$schema" | "$anchor" | "$dynamicAnchor" | "$comment"
+                    | "$defs" | "definitions" | "title" | "description" | "default"
+                    | "deprecated" | "readOnly" | "writeOnly" | "examples" | "example"
+                    | "externalDocs" | "xml" | "discriminator" => {}
+                    "type"
+                    | "properties"
+                    | "additionalProperties"
+                    | "items"
+                    | "allOf"
+                    | "anyOf"
+                    | "oneOf" => {
+                        structural_siblings.insert(keyword.clone(), value.clone());
+                    }
+                    _ if keyword.starts_with("x-") => {}
+                    _ => has_unsupported_validation_sibling = true,
+                }
+            }
+        }
+        if !structural_siblings.is_empty() {
+            checks.push(schema_tokens_check(
+                document,
+                &Value::Object(structural_siblings),
+                tokens,
+                depth + 1,
+                remaining_visits,
+            ));
+        }
+        if has_unsupported_validation_sibling {
+            checks.push(PointerCheck::Unverifiable);
+        }
+        return all_of_pointer_check(&checks);
+    }
+    if tokens.is_empty() {
+        return PointerCheck::Exists;
+    }
+
+    let token = &tokens[0];
+    let property = schema
+        .get("properties")
+        .and_then(Value::as_object)
+        .and_then(|properties| properties.get(token));
+    let mut constraints = Vec::new();
+    let has_explicit_type = schema.get("type").is_some();
+    let is_array_only = schema_declares_only_type(schema, "array");
+    let is_object_only = schema_declares_only_type(schema, "object");
+    if is_array_only {
+        if is_json_pointer_array_index(token) {
+            constraints.push(
+                schema
+                    .get("items")
+                    .map_or(PointerCheck::Unverifiable, |items| {
+                        schema_tokens_check(
+                            document,
+                            items,
+                            &tokens[1..],
+                            depth + 1,
+                            remaining_visits,
+                        )
+                    }),
+            );
+        } else {
+            constraints.push(PointerCheck::Forbidden);
+        }
+    } else if has_explicit_type && !is_object_only {
+        constraints.push(PointerCheck::Forbidden);
+    } else if let Some(property) = property {
+        constraints.push(schema_tokens_check(
+            document,
+            property,
+            &tokens[1..],
+            depth + 1,
+            remaining_visits,
+        ));
+    } else if schema.get("properties").is_some()
+        || schema.get("additionalProperties").is_some()
+        || schema.get("type").is_some()
+    {
+        constraints.push(match schema.get("additionalProperties") {
+            Some(Value::Bool(true)) => PointerCheck::Unverifiable,
+            Some(value) if value.is_object() => PointerCheck::Unverifiable,
+            None if schema.get("properties").is_none()
+                && schema
+                    .get("type")
+                    .and_then(Value::as_str)
+                    .is_none_or(|kind| kind == "object") =>
+            {
+                PointerCheck::Unverifiable
+            }
+            None if schema.get("properties").is_some() => PointerCheck::Missing,
+            _ => PointerCheck::Forbidden,
+        });
+    }
+
+    // `allOf` is an intersection. A branch that definitively forbids the
+    // pointer vetoes a declaration in another branch (for example, a sibling
+    // closed object with `additionalProperties: false`). Unknown branches
+    // keep the overall proof conservative rather than letting a compile-clean
+    // composite fail later with `pointer_unresolved`.
+    if let Some(branches) = schema.get("allOf").and_then(Value::as_array) {
+        for branch in branches {
+            if *remaining_visits == 0 {
+                constraints.push(PointerCheck::Unverifiable);
+                break;
+            }
+            constraints.push(schema_tokens_check(
+                document,
+                branch,
+                tokens,
+                depth + 1,
+                remaining_visits,
+            ));
+        }
+    }
+
+    // A oneOf/anyOf pointer is statically safe only when every possible arm
+    // declares it. Each union keyword is itself another constraint on the
+    // enclosing schema, so combine it with direct properties and `allOf`.
+    for keyword in ["anyOf", "oneOf"] {
+        let Some(branches) = schema.get(keyword).and_then(Value::as_array) else {
+            continue;
+        };
+        if branches.is_empty() {
+            constraints.push(PointerCheck::Forbidden);
+            continue;
+        }
+        let mut union_checks = Vec::new();
+        for branch in branches {
+            if *remaining_visits == 0 {
+                union_checks.push(PointerCheck::Unverifiable);
+                break;
+            }
+            union_checks.push(schema_tokens_check(
+                document,
+                branch,
+                tokens,
+                depth + 1,
+                remaining_visits,
+            ));
+        }
+        constraints.push(union_pointer_check(&union_checks));
+    }
+
+    all_of_pointer_check(&constraints)
+}
+
+fn all_of_pointer_check(checks: &[PointerCheck]) -> PointerCheck {
+    if checks.contains(&PointerCheck::Forbidden) {
+        PointerCheck::Forbidden
+    } else if checks.contains(&PointerCheck::AlternativeForbidden) {
+        PointerCheck::AlternativeForbidden
+    } else if checks.contains(&PointerCheck::Unverifiable) || checks.is_empty() {
+        PointerCheck::Unverifiable
+    } else if checks.contains(&PointerCheck::Exists) {
+        PointerCheck::Exists
+    } else {
+        PointerCheck::Missing
+    }
+}
+
+fn union_pointer_check(checks: &[PointerCheck]) -> PointerCheck {
+    if checks.is_empty() || checks.iter().all(|check| *check == PointerCheck::Forbidden) {
+        PointerCheck::Forbidden
+    } else if checks.iter().all(|check| *check == PointerCheck::Exists) {
+        PointerCheck::Exists
+    } else if checks.iter().any(|check| {
+        matches!(
+            check,
+            PointerCheck::AlternativeForbidden | PointerCheck::Forbidden
+        )
+    }) {
+        PointerCheck::AlternativeForbidden
+    } else if checks.contains(&PointerCheck::Missing) {
+        PointerCheck::Missing
+    } else {
+        PointerCheck::Unverifiable
+    }
+}
+
+fn is_json_pointer_array_index(token: &str) -> bool {
+    let bytes = token.as_bytes();
+    match bytes {
+        [b'0'] => true,
+        [b'1'..=b'9', rest @ ..] => {
+            rest.iter().all(u8::is_ascii_digit) && token.parse::<usize>().is_ok()
+        }
+        _ => false,
+    }
+}
+
+fn schema_declares_only_type(schema: &Value, expected: &str) -> bool {
+    match schema.get("type") {
+        Some(Value::String(kind)) => kind == expected,
+        Some(Value::Array(kinds)) if !kinds.is_empty() => kinds
+            .iter()
+            .all(|kind| kind.as_str().is_some_and(|kind| kind == expected)),
+        _ => false,
+    }
+}
+
+fn decode_json_pointer(pointer: &str) -> Option<Vec<String>> {
+    if pointer.is_empty() {
+        return Some(Vec::new());
+    }
+    if !pointer.starts_with('/') {
+        return None;
+    }
+    pointer[1..]
+        .split('/')
+        .map(|token| {
+            let mut decoded = String::new();
+            let mut characters = token.chars();
+            while let Some(character) = characters.next() {
+                if character != '~' {
+                    decoded.push(character);
+                    continue;
+                }
+                match characters.next()? {
+                    '0' => decoded.push('~'),
+                    '1' => decoded.push('/'),
+                    _ => return None,
+                }
+            }
+            Some(decoded)
+        })
+        .collect()
+}
+
 /// Parameter overlays are validated against the generated catalog, not only
 /// the selected binding. Otherwise a typo on an unselected tool is accepted
 /// at PUT time and turns into a delayed failure when that tool is registered.
@@ -2189,6 +3536,15 @@ fn budget_problems(
     renames: &BTreeMap<String, String>,
     problems: &mut Vec<OverlayProblem>,
 ) {
+    if definitions.len() > MAX_CATALOG_ENTRIES {
+        problems.push(OverlayProblem {
+            path: "/composites".to_owned(),
+            message: format!(
+                "compiled catalog contains {} definitions; the limit is {MAX_CATALOG_ENTRIES}",
+                definitions.len()
+            ),
+        });
+    }
     let served_to_generated = renames
         .iter()
         .map(|(generated, served)| (served.as_str(), generated.as_str()))
@@ -2212,7 +3568,11 @@ fn budget_problems(
                 .copied()
                 .unwrap_or(definition.name.as_str());
             problems.push(OverlayProblem {
-                path: format!("/tools/{generated}"),
+                path: if definition.composite.is_some() {
+                    format!("/composites/{}", definition.name)
+                } else {
+                    format!("/tools/{generated}")
+                },
                 message: format!(
                     "compiled definition is {} bytes; the per-tool limit is \
                      {MAX_COMPILED_DEFINITION_BYTES}",
@@ -2674,6 +4034,171 @@ paths:
         })
     }
 
+    fn composite_spec() -> &'static str {
+        r#"
+openapi: 3.0.3
+info:
+  title: Composite CRM
+  version: 1.0.0
+paths:
+  /notes:
+    post:
+      operationId: createOneNote
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [title]
+              properties:
+                title: { type: string }
+      responses:
+        '201':
+          description: Created
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    type: object
+                    properties:
+                      createNote:
+                        type: object
+                        properties:
+                          id: { type: string }
+  /notes/{id}:
+    delete:
+      operationId: deleteOneNote
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema: { type: string }
+  /targets:
+    post:
+      operationId: createOneNoteTarget
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [note_id, company_id]
+              properties:
+                note_id: { type: string }
+                company_id: { type: string }
+      responses:
+        '201':
+          description: Created
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    type: object
+                    properties:
+                      createNoteTarget:
+                        type: object
+                        properties:
+                          id: { type: string }
+  /targets/{id}:
+    delete:
+      operationId: deleteOneNoteTarget
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema: { type: string }
+"#
+    }
+
+    fn composite_overlay() -> Value {
+        json!({
+            "schema_version": "0.1.0",
+            "tools": {
+                "createOneNoteTarget": { "rename": "attach_note_to_company" },
+                "deleteOneNote": { "visibility": "composite_only" },
+                "deleteOneNoteTarget": {
+                    "rename": "detach_note_from_company",
+                    "visibility": "composite_only"
+                }
+            },
+            "composites": {
+                "create_note_for_records": {
+                    "description": "Create a note and attach it to each company.",
+                    "input": {
+                        "properties": {
+                            "title": { "type": "string" },
+                            "company_ids": {
+                                "type": "array",
+                                "items": { "type": "string" },
+                                "maxItems": 3
+                            }
+                        },
+                        "required": ["title", "company_ids"]
+                    },
+                    "steps": [
+                        {
+                            "id": "note",
+                            "tool": "createOneNote",
+                            "arguments": { "title": { "$input": "title" } },
+                            "compensate": {
+                                "tool": "deleteOneNote",
+                                "arguments": {
+                                    "id": { "$self": "/data/createNote/id" }
+                                }
+                            }
+                        },
+                        {
+                            "id": "attach",
+                            "tool": "createOneNoteTarget",
+                            "for_each": {
+                                "over": { "$input": "company_ids" },
+                                "as": "company"
+                            },
+                            "arguments": {
+                                "note_id": {
+                                    "$step": "note",
+                                    "pointer": "/data/createNote/id"
+                                },
+                                "company_id": { "$item": "company" }
+                            },
+                            "compensate": {
+                                "tool": "deleteOneNoteTarget",
+                                "arguments": {
+                                    "id": { "$self": "/data/createNoteTarget/id" }
+                                }
+                            }
+                        }
+                    ],
+                    "result": {
+                        "note_id": {
+                            "$step": "note",
+                            "pointer": "/data/createNote/id"
+                        },
+                        "target_ids": {
+                            "$step": "attach",
+                            "pointer": "/data/createNoteTarget/id",
+                            "collect": true
+                        }
+                    },
+                    "limits": {
+                        "max_iterations": 3,
+                        "compensation_timeout_ms": 30000
+                    }
+                }
+            }
+        })
+    }
+
+    fn bound_document(document: &Value) -> (OpenApiToolGeneration, OpenApiToolBinding) {
+        let spec = serde_json::to_string(document).expect("OpenAPI document serialises");
+        bound(&spec)
+    }
+
     fn bound(spec: &str) -> (OpenApiToolGeneration, OpenApiToolBinding) {
         let generation =
             generate_tools_from_openapi_str("overlay-test.yaml", spec).expect("spec generates");
@@ -2737,6 +4262,20 @@ paths:
                     }
                 },
                 "deleteOneCompany": { "visibility": "composite_only" }
+            },
+            "composites": {
+                "delete_company": {
+                    "description": "Delete one company through a bounded composite.",
+                    "input": {
+                        "properties": { "id": { "type": "string" } },
+                        "required": ["id"]
+                    },
+                    "steps": [{
+                        "id": "delete",
+                        "tool": "deleteOneCompany",
+                        "arguments": { "id": { "$input": "id" } }
+                    }]
+                }
             }
         })
     }
@@ -2871,7 +4410,6 @@ paths:
     fn reserved_sections_are_refused_with_the_feature_named() {
         let mut document = example();
         document["enum_sources"] = json!({});
-        document["composites"] = json!({});
         document["tools"]["createOneCompany"]["parameters"]["accountStatus"]["enum_source"] =
             json!("company_account_status");
         let error = validate(&document).expect_err("reserved sections must fail");
@@ -2884,12 +4422,24 @@ paths:
             paths,
             vec![
                 "/enum_sources",
-                "/composites",
                 "/tools/createOneCompany/parameters/accountStatus/enum_source",
             ]
         );
         assert!(error.problems[0].message.contains("dynamic enum binding"));
-        assert!(error.problems[1].message.contains("composite tools"));
+
+        let mut document = example();
+        document["composites"] = json!({});
+        validate(&document).expect("the implemented composites section is accepted");
+
+        let mut document = composite_overlay();
+        document["composites"]["create_note_for_records"]["parameters"] =
+            json!({ "title": { "enum_source": "note_titles" } });
+        let error = validate(&document)
+            .expect_err("PR4 must not silently accept its future dynamic-enum seam");
+        assert!(error.problems.iter().any(|problem| {
+            problem.path == "/composites/create_note_for_records/parameters/title/enum_source"
+                && problem.message.contains("dynamic enum binding")
+        }));
     }
 
     #[test]
@@ -2961,6 +4511,7 @@ paths:
         assert_eq!(compiled.binding, expected);
         assert!(compiled.renames.is_empty());
         assert!(compiled.tools.is_empty());
+        assert!(compiled.composites.is_empty());
         assert!(compiled.warnings.is_empty());
 
         // This is deliberately a fixed serialization golden rather than a
@@ -2999,6 +4550,581 @@ paths:
                     "path_template": "/companies/{id}"
                 }
             })
+        );
+    }
+
+    #[test]
+    fn composite_worked_example_compiles_a_closed_synthetic_definition() {
+        let (generation, binding) = bound(composite_spec());
+        let overlay = validate(&composite_overlay()).expect("composite overlay validates");
+        let compiled = compile(
+            &generation,
+            binding,
+            &overlay,
+            &OverlayCompileContext::default(),
+        )
+        .expect("composite compiles");
+
+        let composite = definition(&compiled.binding, "create_note_for_records");
+        assert!(composite.upstream.is_composite_sentinel());
+        assert!(composite.transform.is_none());
+        assert!(matches!(
+            &composite.target,
+            Some(ToolTarget::Composite { connection_id }) if connection_id == "crm"
+        ));
+        assert!(matches!(
+            &composite.source,
+            ToolSource::OpenApi {
+                connection_id,
+                operation_id: None,
+                ..
+            } if connection_id == "crm"
+        ));
+        assert_eq!(
+            composite.input_schema,
+            json!({
+                "type": "object",
+                "properties": {
+                    "company_ids": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "maxItems": 3
+                    },
+                    "title": { "type": "string" }
+                },
+                "required": ["title", "company_ids"],
+                "additionalProperties": false
+            })
+        );
+        let mapping = composite.composite.as_ref().expect("compiled saga mapping");
+        assert_eq!(mapping.steps[0].tool, "createOneNote");
+        assert_eq!(mapping.steps[1].tool, "attach_note_to_company");
+        assert_eq!(
+            mapping.steps[1]
+                .compensate
+                .as_ref()
+                .expect("compensation")
+                .tool,
+            "detach_note_from_company"
+        );
+        assert!(compiled
+            .binding
+            .security_selections
+            .iter()
+            .any(|selection| selection.tool_name == "create_note_for_records"
+                && selection.selected_scheme_names.is_empty()));
+        assert_eq!(
+            compiled.composites,
+            vec![OverlayCompositeReport {
+                name: "create_note_for_records".to_owned(),
+                steps_max: 4,
+                policy_entry_present: false,
+            }]
+        );
+        assert!(compiled.warnings.iter().any(|warning| {
+            warning.path == "/composites/create_note_for_records"
+                && warning.message.contains("steps_max = 4")
+        }));
+        assert_registry_accepts(compiled.binding.definitions.clone());
+    }
+
+    #[test]
+    fn composite_response_pointers_follow_the_compiled_leaf_transform() {
+        let (generation, binding) = bound(composite_spec());
+        let mut document = composite_overlay();
+        document["tools"]["createOneNote"]["response"] = json!({
+            "root": "/data",
+            "fields": {
+                "createNote": {
+                    "agent": {
+                        "created_note_id": { "type": "string" }
+                    },
+                    "wire": {
+                        "/id": { "from": "created_note_id" }
+                    }
+                }
+            }
+        });
+        document["composites"]["create_note_for_records"]["steps"][0]["compensate"]["arguments"]
+            ["id"]["$self"] = json!("/data/created_note_id");
+        document["composites"]["create_note_for_records"]["steps"][1]["arguments"]["note_id"]
+            ["pointer"] = json!("/data/created_note_id");
+        document["composites"]["create_note_for_records"]["result"]["note_id"]["pointer"] =
+            json!("/data/created_note_id");
+
+        let overlay = validate(&document).expect("combined transform/composite overlay validates");
+        let compiled = compile(
+            &generation,
+            binding.clone(),
+            &overlay,
+            &OverlayCompileContext::default(),
+        )
+        .expect("post-transform pointers compile");
+        let leaf = definition(&compiled.binding, "createOneNote");
+        assert_eq!(
+            leaf.transform
+                .as_ref()
+                .and_then(|transform| transform.response_root.as_ref())
+                .map(ToString::to_string),
+            Some("/data".to_owned())
+        );
+
+        document["composites"]["create_note_for_records"]["result"]["note_id"]["pointer"] =
+            json!("/data/createNote/id");
+        let overlay = validate(&document).expect("raw pointer remains schema-valid");
+        let error = compile(
+            &generation,
+            binding,
+            &overlay,
+            &OverlayCompileContext::default(),
+        )
+        .expect_err("raw upstream pointer must not bypass the leaf response transform");
+        assert!(error
+            .problems
+            .iter()
+            .any(|problem| problem.message.contains("does not exist in a declared 2xx")));
+    }
+
+    #[test]
+    fn composite_result_preserves_absent_and_explicit_empty_forms() {
+        let mut explicit_empty = composite_overlay();
+        explicit_empty["composites"]["create_note_for_records"]["result"] = json!({});
+        let overlay = validate(&explicit_empty).expect("an explicit empty result is valid");
+        assert!(overlay.composites["create_note_for_records"]
+            .result
+            .as_ref()
+            .is_some_and(BTreeMap::is_empty));
+
+        let mut absent = composite_overlay();
+        absent["composites"]["create_note_for_records"]
+            .as_object_mut()
+            .expect("composite object")
+            .remove("result");
+        let overlay = validate(&absent).expect("an omitted result is valid");
+        assert!(overlay.composites["create_note_for_records"]
+            .result
+            .is_none());
+    }
+
+    #[test]
+    fn composite_semantics_reject_bad_references_arguments_and_fanout() {
+        let (generation, binding) = bound(composite_spec());
+
+        let mut document = composite_overlay();
+        document["composites"]["create_note_for_records"]["steps"][1]["id"] = json!("note");
+        document["composites"]["create_note_for_records"]["steps"][0]["arguments"]["title"] =
+            json!({ "$step": "attach", "pointer": "/data/createNoteTarget/id" });
+        document["composites"]["create_note_for_records"]["steps"][0]["arguments"]["bad"] =
+            json!({ "$self": "/data/createNote/id" });
+        document["composites"]["create_note_for_records"]["steps"][1]["arguments"]
+            .as_object_mut()
+            .expect("arguments")
+            .remove("note_id");
+        let overlay = validate(&document).expect("shape-valid invalid semantics");
+        let error = compile(
+            &generation,
+            binding.clone(),
+            &overlay,
+            &OverlayCompileContext::default(),
+        )
+        .expect_err("semantic errors reject the whole catalog");
+        let messages = error
+            .problems
+            .iter()
+            .map(|problem| problem.message.as_str())
+            .collect::<Vec<_>>();
+        assert!(messages
+            .iter()
+            .any(|message| message.contains("duplicate composite step id")));
+        assert!(messages
+            .iter()
+            .any(|message| message.contains("must name an earlier step")));
+        assert!(messages
+            .iter()
+            .any(|message| message.contains("only valid inside compensate")));
+        assert!(messages
+            .iter()
+            .any(|message| message.contains("required argument 'note_id'")));
+
+        let mut document = composite_overlay();
+        document["composites"]["create_note_for_records"]["input"]["properties"]["company_ids"]
+            .as_object_mut()
+            .expect("array schema")
+            .remove("maxItems");
+        let overlay = validate(&document).expect("schema permits a missing maxItems");
+        let error = compile(
+            &generation,
+            binding.clone(),
+            &overlay,
+            &OverlayCompileContext::default(),
+        )
+        .expect_err("unbounded fanout is rejected before I/O");
+        assert!(error
+            .problems
+            .iter()
+            .any(|problem| problem.message.contains("needs maxItems")));
+
+        let mut document = composite_overlay();
+        document["composites"]["create_note_for_records"]["steps"][1]["arguments"]["company_id"] =
+            json!({ "$item": "company", "pointer": "/missing" });
+        let overlay = validate(&document).expect("schema-valid item pointer");
+        let error = compile(
+            &generation,
+            binding.clone(),
+            &overlay,
+            &OverlayCompileContext::default(),
+        )
+        .expect_err("a statically impossible item pointer is rejected at PUT");
+        assert!(error.problems.iter().any(|problem| {
+            problem
+                .message
+                .contains("does not exist in the items schema")
+        }));
+
+        let mut document = composite_overlay();
+        document["composites"]["create_note_for_records"]["result"]["note_id"]["pointer"] =
+            json!("/data/createNote/missing");
+        let overlay = validate(&document).expect("schema-valid pointer");
+        let error = compile(
+            &generation,
+            binding,
+            &overlay,
+            &OverlayCompileContext::default(),
+        )
+        .expect_err("a missing declared response pointer is rejected");
+        assert!(error
+            .problems
+            .iter()
+            .any(|problem| problem.message.contains("does not exist in a declared 2xx")));
+    }
+
+    #[test]
+    fn composite_response_pointer_must_exist_in_every_union_branch() {
+        let mut document: Value =
+            yaml_serde::from_str(composite_spec()).expect("composite spec parses");
+        let response_schema = document
+            .pointer_mut("/paths/~1notes/post/responses/201/content/application~1json/schema")
+            .expect("worked-example response schema");
+        let branch_with_id = response_schema.clone();
+        *response_schema = json!({
+            "oneOf": [
+                branch_with_id,
+                {
+                    "type": "object",
+                    "properties": {
+                        "data": {
+                            "type": "object",
+                            "properties": {
+                                "createNote": {
+                                    "type": "object",
+                                    "properties": { "other": { "type": "string" } }
+                                }
+                            }
+                        }
+                    }
+                }
+            ]
+        });
+        let (generation, binding) = bound_document(&document);
+        let overlay = validate(&composite_overlay()).expect("composite overlay validates");
+        let error = compile(
+            &generation,
+            binding,
+            &overlay,
+            &OverlayCompileContext::default(),
+        )
+        .expect_err("a pointer absent from one possible response must be rejected");
+        assert!(error
+            .problems
+            .iter()
+            .any(|problem| problem.message.contains("does not exist in a declared 2xx")));
+    }
+
+    #[test]
+    fn composite_response_pointer_accepts_parameterized_json_media_types() {
+        let mut document: Value =
+            yaml_serde::from_str(composite_spec()).expect("composite spec parses");
+        let content = document
+            .pointer_mut("/paths/~1notes/post/responses/201/content")
+            .and_then(Value::as_object_mut)
+            .expect("worked-example response content");
+        let schema = content
+            .remove("application/json")
+            .expect("worked-example JSON media type");
+        content.insert("application/problem+json; charset=utf-8".to_owned(), schema);
+        let (generation, binding) = bound_document(&document);
+        let overlay = validate(&composite_overlay()).expect("composite overlay validates");
+        let compiled = compile(
+            &generation,
+            binding,
+            &overlay,
+            &OverlayCompileContext::default(),
+        )
+        .expect("a parameterized +json response is still statically checked");
+        assert!(!compiled.warnings.iter().any(|warning| {
+            warning
+                .message
+                .contains("createOneNote' declares no JSON 2xx response schema")
+        }));
+    }
+
+    #[test]
+    fn direct_property_does_not_mask_a_union_alternative_that_forbids_it() {
+        let schema = json!({
+            "type": "object",
+            "properties": { "foo": { "type": "string" } },
+            "anyOf": [
+                {
+                    "type": "object",
+                    "properties": { "foo": { "type": "string" } }
+                },
+                {
+                    "type": "object",
+                    "properties": { "bar": { "type": "string" } },
+                    "additionalProperties": false
+                }
+            ]
+        });
+        assert_eq!(
+            schema_pointer_check(&schema, &schema, "/foo", 0),
+            PointerCheck::AlternativeForbidden
+        );
+    }
+
+    #[test]
+    fn direct_property_applies_across_additive_union_alternatives() {
+        let schema = json!({
+            "type": "object",
+            "properties": { "foo": { "type": "string" } },
+            "anyOf": [
+                {
+                    "type": "object",
+                    "properties": { "a": { "type": "string" } }
+                },
+                {
+                    "type": "object",
+                    "properties": { "b": { "type": "string" } }
+                }
+            ]
+        });
+        assert_eq!(
+            schema_pointer_check(&schema, &schema, "/foo", 0),
+            PointerCheck::Exists
+        );
+    }
+
+    #[test]
+    fn composite_response_pointer_is_vetoed_by_a_closed_all_of_sibling() {
+        let mut document: Value =
+            yaml_serde::from_str(composite_spec()).expect("composite spec parses");
+        let response_schema = document
+            .pointer_mut("/paths/~1notes/post/responses/201/content/application~1json/schema")
+            .expect("worked-example response schema");
+        let branch_with_id = response_schema.clone();
+        *response_schema = json!({
+            "allOf": [
+                branch_with_id,
+                {
+                    "type": "object",
+                    "properties": {},
+                    "additionalProperties": false
+                }
+            ]
+        });
+        let (generation, binding) = bound_document(&document);
+        let overlay = validate(&composite_overlay()).expect("composite overlay validates");
+        let error = compile(
+            &generation,
+            binding,
+            &overlay,
+            &OverlayCompileContext::default(),
+        )
+        .expect_err("a closed allOf sibling that forbids the pointer must veto it");
+        assert!(error
+            .problems
+            .iter()
+            .any(|problem| problem.message.contains("does not exist in a declared 2xx")));
+    }
+
+    #[test]
+    fn response_pointer_accepts_a_declaration_from_an_additive_all_of_member() {
+        let schema = json!({
+            "allOf": [
+                {
+                    "type": "object",
+                    "properties": { "other": { "type": "string" } }
+                },
+                {
+                    "type": "object",
+                    "properties": { "id": { "type": "string" } }
+                }
+            ]
+        });
+        assert_eq!(
+            schema_pointer_check(&schema, &schema, "/id", 0),
+            PointerCheck::Exists
+        );
+    }
+
+    #[test]
+    fn response_pointer_applies_structural_keywords_beside_a_reference() {
+        let document = json!({
+            "$defs": {
+                "Base": {
+                    "type": "object",
+                    "properties": { "base": { "type": "string" } }
+                },
+                "WithId": {
+                    "type": "object",
+                    "properties": { "id": { "type": "string" } }
+                }
+            },
+            "adds_id": {
+                "$ref": "#/$defs/Base",
+                "properties": { "id": { "type": "string" } }
+            },
+            "closes_id": {
+                "$ref": "#/$defs/WithId",
+                "type": "object",
+                "properties": {},
+                "additionalProperties": false
+            }
+        });
+        assert_eq!(
+            schema_pointer_check(&document, &document["adds_id"], "/id", 0),
+            PointerCheck::Exists
+        );
+        assert_eq!(
+            schema_pointer_check(&document, &document["closes_id"], "/id", 0),
+            PointerCheck::Forbidden
+        );
+    }
+
+    #[test]
+    fn response_pointer_matches_runtime_array_indices_and_false_schemas() {
+        let array = json!({
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": { "id": { "type": "string" } }
+            }
+        });
+        assert_eq!(
+            schema_pointer_check(&array, &array, "/0/id", 0),
+            PointerCheck::Exists
+        );
+        assert_eq!(
+            schema_pointer_check(&array, &array, "/01/id", 0),
+            PointerCheck::Forbidden
+        );
+        assert_eq!(
+            schema_pointer_check(&array, &array, "/+1/id", 0),
+            PointerCheck::Forbidden
+        );
+
+        let object_with_impossible_property = json!({
+            "type": "object",
+            "properties": { "foo": false }
+        });
+        assert_eq!(
+            schema_pointer_check(
+                &object_with_impossible_property,
+                &object_with_impossible_property,
+                "/foo",
+                0,
+            ),
+            PointerCheck::Forbidden
+        );
+        let array_with_impossible_items = json!({ "type": "array", "items": false });
+        assert_eq!(
+            schema_pointer_check(
+                &array_with_impossible_items,
+                &array_with_impossible_items,
+                "/0",
+                0,
+            ),
+            PointerCheck::Forbidden
+        );
+    }
+
+    #[test]
+    fn inapplicable_properties_do_not_prove_a_pointer_on_non_objects() {
+        for kind in ["array", "string"] {
+            let schema = json!({
+                "type": kind,
+                "properties": { "foo": { "type": "string" } }
+            });
+            assert_eq!(
+                schema_pointer_check(&schema, &schema, "/foo", 0),
+                PointerCheck::Forbidden,
+                "properties must not apply to an explicit {kind} schema"
+            );
+        }
+    }
+
+    #[test]
+    fn response_pointer_traversal_is_bounded_for_duplicated_reference_dags() {
+        let mut definitions = Map::new();
+        definitions.insert(
+            "S0".to_owned(),
+            json!({ "type": "object", "properties": {} }),
+        );
+        for depth in 1..64 {
+            let reference = format!("#/$defs/S{}", depth - 1);
+            definitions.insert(
+                format!("S{depth}"),
+                json!({ "anyOf": [{ "$ref": reference }, { "$ref": reference }] }),
+            );
+        }
+        let document = json!({ "$defs": definitions });
+
+        assert_eq!(
+            schema_pointer_check(&document, &document["$defs"]["S63"], "/missing", 0),
+            PointerCheck::Unverifiable,
+            "the traversal budget must stop an exponentially expanding reference DAG"
+        );
+    }
+
+    #[test]
+    fn composite_agent_fragments_reject_nested_format_assertions() {
+        let mut document = composite_overlay();
+        document["composites"]["create_note_for_records"]["input"]["properties"]["title"] = json!({
+            "type": "object",
+            "properties": {
+                "email": { "type": "string", "format": "email" }
+            }
+        });
+        let error = validate(&document).expect_err("nested format must be rejected");
+        assert!(error.problems.iter().any(|problem| {
+            problem.path
+                == "/composites/create_note_for_records/input/properties/title/properties/email/format"
+                && problem.message.contains("format is not accepted")
+        }));
+    }
+
+    #[test]
+    fn composite_agent_fragments_refuse_legacy_schema_dialects() {
+        let mut document = composite_overlay();
+        document["composites"]["create_note_for_records"]["input"]["properties"]["title"] = json!({
+            "$schema": "http://json-schema.org/draft-07/schema#",
+            "type": "object",
+            "dependencies": {
+                "email": {
+                    "properties": {
+                        "nested": { "type": "string", "format": "email" }
+                    }
+                }
+            }
+        });
+        let overlay: OverlayDocument =
+            serde_json::from_value(document.clone()).expect("authoring model parses");
+        assert!(document_problems(&overlay).iter().any(|problem| {
+            problem.path.ends_with("/input/properties/title/$schema")
+                && problem.message.contains("JSON Schema 2020-12")
+        }));
+        assert!(
+            validate(&document).is_err(),
+            "the public contract also refuses draft-07"
         );
     }
 
