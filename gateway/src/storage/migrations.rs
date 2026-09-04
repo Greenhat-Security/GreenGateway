@@ -1313,7 +1313,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn migrations_twelve_through_fourteen_preserve_existing_connection_state() {
+    async fn migrations_twelve_through_fifteen_preserve_existing_connection_state() {
         let Some(dsn) = real_dsn() else {
             eprintln!("skipping: no test database locator; CI runs this test");
             return;
@@ -1488,7 +1488,7 @@ mod tests {
         drop(store);
 
         // Reconstruct the exact v12 shape while retaining populated v12
-        // rows, then let migrations 13 and 14 run.
+        // rows, then let migrations 13 through 15 run.
         foundation
             .pool()
             .get()
@@ -1509,8 +1509,8 @@ mod tests {
         assert_eq!(
             apply_missing(foundation.pool(), &test_settings())
                 .await
-                .expect("migrations 13 and 14 should apply"),
-            MigrateOutput::Applied { applied: 2 }
+                .expect("migrations 13 through 15 should apply"),
+            MigrateOutput::Applied { applied: 3 }
         );
         let reopened = crate::connections::pg_store::PostgresConnectionStore::new(
             foundation.pool().clone(),
