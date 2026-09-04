@@ -1384,13 +1384,29 @@ async fn the_imported_deployment_serves_across_a_restart_and_a_scale_out() {
     assert_eq!(body["state"], "ready", "the status said {body}");
     assert_eq!(body["reason"], Value::Null);
     assert_eq!(body["schema"]["compatible"], true);
+    // The imported prefix of the stream is intact: every position up to the
+    // head the import's report named still exists, and the head has only
+    // moved forward. It has moved, because the serving replica writes its
+    // own events to the same stream (issue #11's PostgreSQL audit sink) —
+    // its startup and this test's probes are already on it.
+    let row = cluster
+        .database
+        .query_one(&format!(
+            "SELECT count(*) FILTER (WHERE position <= {stream_head})::bigint, \
+                    coalesce(max(position), 0)::bigint \
+             FROM greengateway.audit_stream"
+        ))
+        .await;
+    let (imported_positions, live_head) = (row.get::<_, i64>(0), row.get::<_, i64>(1));
     assert_eq!(
-        cluster
-            .database
-            .count("SELECT coalesce(max(position), 0)::bigint FROM greengateway.audit_stream")
-            .await,
-        stream_head,
-        "the durable stream head is the one the import's report named"
+        imported_positions, stream_head,
+        "every position up to the head the import's report named ({stream_head}) must still \
+         be on the durable stream"
+    );
+    assert!(
+        live_head >= stream_head,
+        "the durable stream head ({live_head}) must not fall below the one the import's \
+         report named ({stream_head})"
     );
 
     // Phase 5: a restart changes nothing. A replica that only served
@@ -1621,20 +1637,32 @@ async fn assert_imported_state(
     // `503 audit query store not configured` on every replica. An
     // operator's post-cutover audit reader is the event stream, and that
     // is what this asserts.
+    //
+    // The imported rows are the ones with NO ingest identity: the import
+    // writes as a one-shot command with none (`import/sections.rs`), while
+    // every row a serving replica writes through its PostgreSQL audit sink
+    // (issue #11) carries that replica's instance and boot ids. The
+    // replicas have been writing since they booted — their startup records
+    // and this test's own probes — so the table holds more than the import
+    // put there, and the claim is about the imported population: all of
+    // it present once, at the contiguous positions 1 through N that were
+    // assigned before any replica existed.
+    let imported_rows = cluster
+        .database
+        .count("SELECT count(*)::bigint FROM greengateway.audit_events WHERE instance_id IS NULL")
+        .await;
     assert_eq!(
-        cluster
-            .database
-            .count("SELECT count(*)::bigint FROM greengateway.audit_events")
-            .await,
-        facts.audit_events,
+        imported_rows, facts.audit_events,
         "the imported audit log holds every source event, deduplicated by event_id"
     );
     let contiguous: i64 = cluster
         .database
-        .count(
-            "SELECT count(*)::bigint FROM greengateway.audit_stream \
-             WHERE position BETWEEN 1 AND (SELECT count(*) FROM greengateway.audit_stream)",
-        )
+        .count(&format!(
+            "SELECT count(*)::bigint FROM greengateway.audit_stream s \
+             JOIN greengateway.audit_events e ON e.event_id = s.event_id \
+             WHERE e.instance_id IS NULL AND s.position BETWEEN 1 AND {}",
+            facts.audit_events
+        ))
         .await;
     assert_eq!(
         contiguous, facts.audit_events,
@@ -1660,7 +1688,7 @@ async fn assert_imported_state(
         .count(
             "SELECT min(s.position)::bigint FROM greengateway.audit_stream s \
              JOIN greengateway.audit_events e ON e.event_id = s.event_id \
-             WHERE e.event_type = 'http.request_observed'",
+             WHERE e.event_type = 'http.request_observed' AND e.instance_id IS NULL",
         )
         .await;
     assert_eq!(

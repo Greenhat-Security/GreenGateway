@@ -939,6 +939,128 @@ impl Database {
             .await
     }
 
+    /// How many `http.request_observed` rows the REPLICAS wrote at stream
+    /// positions up to `position`, as opposed to the ones this harness
+    /// ingested.
+    ///
+    /// Since issue #11's PostgreSQL audit sink, every request a serving
+    /// replica answers — including this harness's own readiness probes and
+    /// pinned requests — lands on the durable stream alongside whatever a
+    /// suite ingested through [`Self::ingest_audit_events`]. A test that
+    /// asserts a projector ledger or a stream head *exactly* therefore has
+    /// two populations to account for, and this is the second one. The two
+    /// are told apart by the event id: the harness mints `ha-` prefixed ids
+    /// and the gateway mints bare UUIDs (`audit::AuditEvent::new`).
+    pub async fn replica_observations_through(&self, position: i64) -> i64 {
+        self.count(&format!(
+            "SELECT count(*)::bigint \
+             FROM greengateway.audit_stream s \
+             JOIN greengateway.audit_events e ON e.event_id = s.event_id \
+             WHERE s.position <= {position} \
+               AND e.event_type = '{HTTP_REQUEST_OBSERVED}' \
+               AND e.event_id NOT LIKE 'ha-%'"
+        ))
+        .await
+    }
+
+    /// Hold `ACCESS EXCLUSIVE` on `greengateway.audit_events` until the
+    /// returned guard is released or dropped.
+    ///
+    /// The stall the audit-enqueue rows inject: with this held, every
+    /// replica's PostgreSQL audit sink blocks on its batch insert and
+    /// nothing else in the deployment should notice — the request path
+    /// enqueues and returns, the sink's bounded buffer absorbs the events,
+    /// and the batch lands when the lock goes. The lock is taken as the
+    /// migration role, which owns the table; the runtime role could not
+    /// take it. It lives in its own transaction on its own connection so a
+    /// panicking test releases it by dropping the guard.
+    pub async fn hold_audit_events_exclusively(&self) -> AuditTableLock {
+        let (client, connection) = tokio_postgres::connect(&self.migrator_dsn, NoTls)
+            .await
+            .unwrap_or_else(|error| panic!("the locking session should establish: {error}"));
+        let pump = tokio::spawn(async move {
+            let _ = connection.await;
+        });
+        client
+            .batch_execute("BEGIN; LOCK TABLE greengateway.audit_events IN ACCESS EXCLUSIVE MODE")
+            .await
+            .unwrap_or_else(|error| panic!("the audit table should lock: {error}"));
+        AuditTableLock {
+            client: Some(client),
+            pump: Some(pump),
+        }
+    }
+
+    /// How many sessions are blocked on a lock inside a statement that
+    /// names `greengateway.audit_events`: the replicas' audit sinks, caught
+    /// mid-batch by [`Self::hold_audit_events_exclusively`].
+    ///
+    /// What makes the stall experiment honest. A lock nobody was waiting on
+    /// stalls nothing, so the rows that hold the lock poll this until a
+    /// batch insert is genuinely wedged behind it before they start the
+    /// traffic whose latency they assert.
+    pub async fn blocked_audit_writers(&self) -> i64 {
+        self.count(
+            "SELECT count(*)::bigint FROM pg_stat_activity \
+             WHERE datname = current_database() \
+               AND wait_event_type = 'Lock' \
+               AND query ILIKE '%greengateway.audit_events%'",
+        )
+        .await
+    }
+
+    /// Poll until at least one audit batch is blocked behind the held lock,
+    /// or fail: a stall experiment run before the sink was stalled would
+    /// prove nothing.
+    pub async fn wait_for_blocked_audit_writer(&self, budget: Duration) {
+        let deadline = std::time::Instant::now() + budget;
+        loop {
+            if self.blocked_audit_writers().await >= 1 {
+                return;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "no audit batch insert was blocked behind the held table lock within \
+                 {budget:?}; the sink is not writing, so a stall would test nothing"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+}
+
+/// An open transaction holding `ACCESS EXCLUSIVE` on the audit table; see
+/// [`Database::hold_audit_events_exclusively`].
+pub struct AuditTableLock {
+    client: Option<tokio_postgres::Client>,
+    pump: Option<tokio::task::JoinHandle<()>>,
+}
+
+impl AuditTableLock {
+    /// Let the stalled writers through: roll the transaction back and close
+    /// the session.
+    pub async fn release(mut self) {
+        if let Some(client) = self.client.take() {
+            client
+                .batch_execute("ROLLBACK")
+                .await
+                .unwrap_or_else(|error| panic!("the audit table lock should release: {error}"));
+        }
+    }
+}
+
+impl Drop for AuditTableLock {
+    fn drop(&mut self) {
+        // Dropping the client closes the session, which rolls back the
+        // transaction and with it the lock; the pump is aborted so a
+        // panicking test does not leave a driver behind.
+        self.client.take();
+        if let Some(pump) = self.pump.take() {
+            pump.abort();
+        }
+    }
+}
+
+impl Database {
     /// The identities of the deployment's live members, oldest boot
     /// first.
     ///

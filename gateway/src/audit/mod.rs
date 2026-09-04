@@ -14,6 +14,10 @@ use std::{
 use crate::config::Config;
 
 pub mod event;
+/// The cluster-mode audit of record (issue #11, PR 3), on the same
+/// `postgres` feature as the store it writes through.
+#[cfg(feature = "postgres")]
+pub mod postgres_sink;
 pub mod query;
 pub mod redact;
 pub mod sink;
@@ -27,7 +31,9 @@ pub type AuditEventSender = tokio::sync::broadcast::Sender<AuditEvent>;
 pub const AUDIT_EVENTS_DROPPED_TOTAL: &str = "audit_events_dropped_total";
 pub const AUDIT_SQLITE_FLUSH_ERRORS_TOTAL: &str = "audit_sqlite_flush_errors_total";
 
-const AUDIT_CHANNEL_CAPACITY: usize = 8192;
+/// The writer channel's bound; also the PostgreSQL sink's buffer bound, so
+/// the sink can hold at most what the queue feeding it can hold.
+pub(crate) const AUDIT_CHANNEL_CAPACITY: usize = 8192;
 const AUDIT_CONTROL_RESERVE: usize = 8;
 const AUDIT_NORMAL_CAPACITY: usize = AUDIT_CHANNEL_CAPACITY - AUDIT_CONTROL_RESERVE;
 
@@ -93,6 +99,12 @@ struct AuditLogInner {
     /// `queued` alone cannot tell you, because a sink stuck on a single
     /// event has an empty queue behind it.
     in_flight_since: Arc<Mutex<Option<Instant>>>,
+    /// The deadline of the drain that closed admission, stamped by
+    /// `close_and_drain` before it closes the channel so the writer finds
+    /// it when the channel runs dry and hands it to the sink's terminal
+    /// flush. `None` when the channel closed for any other reason (the log
+    /// was dropped), in which case the sink flushes under its own bound.
+    drain_deadline: Arc<Mutex<Option<Instant>>>,
 }
 
 /// One event on its way to the writer, stamped when it was admitted.
@@ -171,8 +183,10 @@ impl AuditLog {
         let (tx, rx) = mpsc::sync_channel::<QueuedEvent>(AUDIT_CHANNEL_CAPACITY);
         let queued = Arc::new(AtomicUsize::new(0));
         let in_flight_since = Arc::new(Mutex::new(None));
+        let drain_deadline = Arc::new(Mutex::new(None));
         let writer_queued = Arc::clone(&queued);
         let writer_in_flight = Arc::clone(&in_flight_since);
+        let writer_drain_deadline = Arc::clone(&drain_deadline);
         let writer = thread::Builder::new()
             .name("audit-log-writer".to_owned())
             .spawn(move || {
@@ -185,8 +199,17 @@ impl AuditLog {
                 // The terminal flush at shutdown, counted like every other
                 // one: a gateway whose last flush failed lost the tail of
                 // its audit record, and that is the run where knowing it
-                // matters most.
-                let flushed = sink.flush();
+                // matters most. It runs under the drain's own deadline when
+                // a drain closed the channel (`close_and_drain` stamps it
+                // before closing), so a sink that bounds its flush gives up
+                // when the drain does rather than after it.
+                let deadline = *writer_drain_deadline
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                let flushed = match deadline {
+                    Some(deadline) => sink.flush_by(deadline),
+                    None => sink.flush(),
+                };
                 record_flush_outcome(flushed.is_ok());
                 flushed
             })
@@ -205,6 +228,7 @@ impl AuditLog {
                 queued,
                 dropped: Arc::new(AtomicU64::new(0)),
                 in_flight_since,
+                drain_deadline,
             }),
         })
     }
@@ -259,10 +283,28 @@ impl AuditLog {
         ::metrics::counter!(AUDIT_EVENTS_DROPPED_TOTAL, "reason" => reason).increment(1);
     }
 
+    // A `postgres` build's `main` goes through `from_config_with_durable_store`;
+    // this is the feature-off entry point, and what the tests build with.
+    #[cfg_attr(all(feature = "postgres", not(test)), allow(dead_code))]
     pub fn from_config(
         config: &Config,
     ) -> Result<(Self, AuditEventSender), Box<dyn std::error::Error>> {
         let (sink, broadcast_sender) = sink::build_sink_from_config(config)?;
+        Ok((Self::try_new(sink)?, broadcast_sender))
+    }
+
+    /// [`Self::from_config`] with cluster mode's durable audit sink
+    /// (issue #11, PR 3): `Some` registers a [`postgres_sink::PostgresSink`]
+    /// over the given store beside the configured sinks, `None` builds
+    /// exactly what `from_config` builds. Production passes the store the
+    /// replica already built for its SSE and discovery readers.
+    #[cfg(feature = "postgres")]
+    pub fn from_config_with_durable_store(
+        config: &Config,
+        durable: Option<postgres_sink::PostgresSinkConfig>,
+    ) -> Result<(Self, AuditEventSender), Box<dyn std::error::Error>> {
+        let (sink, broadcast_sender) =
+            sink::build_sink_from_config_with_durable_store(config, durable)?;
         Ok((Self::try_new(sink)?, broadcast_sender))
     }
 
@@ -341,6 +383,22 @@ impl AuditLog {
     /// event in order. The timeout bounds slow or stuck sinks during process
     /// shutdown.
     pub async fn close_and_drain(&self, timeout: Duration) -> Result<(), AuditDrainError> {
+        // The deadline is stamped BEFORE the channel closes: the writer
+        // reads it only once `recv` fails, which cannot happen until the
+        // sender below is dropped, so it always sees the drain's deadline
+        // rather than a flush of its own. The first drain's deadline is the
+        // one that counts; a second call finds no writer and returns.
+        let deadline = Instant::now() + timeout;
+        {
+            let mut stamped = self
+                .inner
+                .drain_deadline
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if stamped.is_none() {
+                *stamped = Some(deadline);
+            }
+        }
         self.inner.closed.store(true, Ordering::Release);
         drop(self.inner.tx_guard().take());
         let writer = self.inner.writer_guard().take();
@@ -349,7 +407,6 @@ impl AuditLog {
         };
 
         tokio::task::spawn_blocking(move || {
-            let deadline = Instant::now() + timeout;
             while !writer.is_finished() {
                 if Instant::now() >= deadline {
                     return Err(AuditDrainError::Timeout);
@@ -594,6 +651,98 @@ mod tests {
         fn flush(&self) -> Result<(), String> {
             Err("injected durable flush failure".to_owned())
         }
+    }
+
+    /// Records the deadline the writer's terminal flush was given, and
+    /// whether it was given one at all.
+    #[derive(Default)]
+    struct DeadlineCaptureSink {
+        flushed_by: Mutex<Option<Instant>>,
+        flushed_bare: Mutex<bool>,
+    }
+
+    impl AuditSink for DeadlineCaptureSink {
+        fn emit(&self, _event: &AuditEvent) {}
+
+        fn flush(&self) -> Result<(), String> {
+            *self
+                .flushed_bare
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) = true;
+            Ok(())
+        }
+
+        fn flush_by(&self, deadline: Instant) -> Result<(), String> {
+            *self
+                .flushed_by
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(deadline);
+            Ok(())
+        }
+    }
+
+    /// The drain's deadline reaches the sink: the terminal flush runs
+    /// under the clock `close_and_drain` is itself waiting on, not one of
+    /// the sink's own that starts later. A sink with a bounded flush that
+    /// outlived the drain would be torn down mid-batch by the runtime the
+    /// drain's caller drops next.
+    #[tokio::test]
+    async fn close_and_drain_hands_the_terminal_flush_the_drains_own_deadline() {
+        let sink = Arc::new(DeadlineCaptureSink::default());
+        let audit_log = AuditLog::new(Arc::clone(&sink) as Arc<dyn AuditSink>);
+        audit_log.emit(test_event("audit.before-drain"));
+
+        let budget = Duration::from_secs(3);
+        let before = Instant::now();
+        audit_log
+            .close_and_drain(budget)
+            .await
+            .expect("the drain should complete");
+
+        let flushed_by = sink
+            .flushed_by
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .expect("the terminal flush must be given the drain's deadline");
+        assert!(
+            flushed_by >= before + budget,
+            "the deadline handed to the sink is earlier than the drain's own"
+        );
+        assert!(
+            flushed_by < before + budget + Duration::from_secs(1),
+            "the deadline handed to the sink is later than the drain's own"
+        );
+        assert!(
+            !*sink
+                .flushed_bare
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()),
+            "a drain must flush by its deadline, not bare"
+        );
+    }
+
+    /// Without a drain the channel closes when the log is dropped, and the
+    /// sink flushes under its own bound: there is no deadline to hand it.
+    #[test]
+    fn a_dropped_log_flushes_bare() {
+        let sink = Arc::new(DeadlineCaptureSink::default());
+        let audit_log = AuditLog::new(Arc::clone(&sink) as Arc<dyn AuditSink>);
+        audit_log.emit(test_event("audit.before-drop"));
+        drop(audit_log);
+
+        assert_eventually(Duration::from_secs(5), || {
+            *sink
+                .flushed_bare
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+        });
+        assert!(
+            sink.flushed_by
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .is_none(),
+            "a drop is not a drain and carries no deadline"
+        );
     }
 
     impl AuditSink for BlockingSink {

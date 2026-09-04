@@ -10,26 +10,32 @@
 //! is leading when the batch lands. One maintenance owner, whose successor
 //! is fenced past it rather than racing it.
 //!
-//! ## Where the events come from, and why the harness writes them
+//! ## Where the events come from, and why the harness still writes some
 //!
 //! Everything downstream of the durable audit stream is on this branch:
 //! the store and its commit-ordered positions (PR 5), the cross-replica SSE
 //! transport and its `Last-Event-ID` protocol (PR 6), the fenced discovery
 //! projector (PR 11), audit retention's position floor and the maintenance
-//! singleton (PR 13). The **runtime ingestion sink** that would feed the
-//! stream from live traffic is not: nothing in the binary calls
-//! `AuditEventStore::insert_events`, so a request a replica serves reaches
-//! its file and broadcast sinks and stops there.
+//! singleton (PR 13). So is the runtime writer, since issue #11: every
+//! serving replica composes `audit/postgres_sink.rs`, which batches its
+//! events into `AuditEventStore::insert_events`, so a request a replica
+//! serves — including this harness's own readiness probes — lands on the
+//! stream under that replica's identity. The smoke and saturation legs
+//! assert that path.
 //!
-//! So [`harness::Database::ingest_audit_events`] plays that one missing
-//! part — the production statements, verbatim, in the production
-//! transaction under the production advisory lock — and stamps each event
-//! with a real member's instance and boot IDs, so an event "from replica
-//! B" is genuinely provenanced to replica B's identity. Every consumer
-//! under test is the real binary: the replicas' stream endpoints, their
-//! projector, their leases, their fences. What is faked is the writer, and
-//! only the writer; that is called out on each test whose claim depends on
-//! it.
+//! This file's claims need events it can *choose*, though: an identical
+//! batch retried after an ambiguous commit, an event with a particular
+//! timestamp, an observation attributed to a replica that did not serve
+//! it. So [`harness::Database::ingest_audit_events`] writes those directly
+//! — the production statements, verbatim, in the production transaction
+//! under the production advisory lock — and stamps each event with a real
+//! member's instance and boot IDs, so an event "from replica B" is
+//! genuinely provenanced to replica B's identity. Every consumer under
+//! test is the real binary: the replicas' stream endpoints, their
+//! projector, their leases, their fences. And because the replicas' own
+//! rows share the stream, every ledger asserted exactly below accounts for
+//! both populations rather than assuming the harness's rows are the only
+//! ones ([`harness::Database::replica_observations_through`]).
 //!
 //! ## Two matrix rows this file does not assert
 //!
@@ -318,26 +324,35 @@ async fn an_ambiguously_retried_batch_is_stored_positioned_and_streamed_exactly_
         "exactly one stream row must exist per stored event"
     );
 
-    // Gapless: the positions these commits assigned are the contiguous
-    // run after the head we started from. A retry that reserved a
-    // position for an id it did not insert would show up here as a hole.
+    // Gapless, and nothing reserved for a retry: every position between
+    // the head we started from and the head we finished at is occupied,
+    // the harness's events hold exactly one each, and the rest belong to
+    // rows the replicas wrote themselves in the meantime (their sinks land
+    // this harness's own readiness probes a flush interval after the
+    // fact). A retry that reserved a position for an id it did not insert
+    // would show up here as a hole.
     let head_after = cluster.database.stream_head().await;
-    assert_eq!(
-        head_after - head_before,
-        expected.len() as i64,
-        "the retries must reserve no positions of their own"
-    );
-    let contiguous: i64 = cluster
+    let row = cluster
         .database
-        .count(&format!(
-            "SELECT count(*)::bigint FROM greengateway.audit_stream \
+        .query_one(&format!(
+            "SELECT count(*)::bigint, count(*) FILTER (WHERE event_id LIKE 'ha-%')::bigint \
+             FROM greengateway.audit_stream \
              WHERE position > {head_before} AND position <= {head_after}"
         ))
         .await;
+    let (occupied, ours) = (row.get::<_, i64>(0), row.get::<_, i64>(1));
     assert_eq!(
-        contiguous,
+        ours,
         expected.len() as i64,
-        "the committed stream must be gapless between {head_before} and {head_after}"
+        "each of the harness's events must hold exactly one position after {head_before}"
+    );
+    assert_eq!(
+        occupied,
+        head_after - head_before,
+        "the committed stream must be gapless between {head_before} and {head_after}: \
+         {occupied} positions are occupied of the {} assigned, {ours} of them by the \
+         harness's events — the retries must reserve no positions of their own",
+        head_after - head_before
     );
 
     let provenances: i64 = cluster
@@ -535,20 +550,44 @@ async fn a_stream_reconnects_through_the_other_replica_without_a_gap() {
         .await;
     let rest = on_b.next_frames(TOTAL - READ_ON_A, FRAME_BUDGET).await;
 
+    // The positions the batch actually holds, read from the stream: the
+    // replicas' own rows (their sinks land this harness's readiness probes
+    // a flush interval late) may sit between them, and the stream filter
+    // steps over those, so the contiguous run is the batch's positions in
+    // order rather than every integer after `head_before`.
+    let expected: Vec<i64> = cluster
+        .database
+        .query_all(&format!(
+            "SELECT s.position FROM greengateway.audit_stream s \
+             JOIN greengateway.audit_events e ON e.event_id = s.event_id \
+             WHERE e.event_type = '{EVENT_TYPE}' ORDER BY s.position"
+        ))
+        .await
+        .iter()
+        .map(|row| row.get::<_, i64>(0))
+        .collect();
+    assert_eq!(
+        expected.len(),
+        TOTAL,
+        "the batch should hold exactly one stream position per event"
+    );
+    assert!(
+        expected.iter().all(|position| *position > head_before),
+        "every position of the batch must be after the head it was committed at"
+    );
     assert_eq!(
         rest.first().map(sse::Frame::position),
-        Some(cursor + 1),
-        "the reconnect must resume at the position immediately after the cursor"
+        expected.get(READ_ON_A).copied(),
+        "the reconnect must resume at the batch's next position after the cursor ({cursor})"
     );
     let mut seen: Vec<i64> = first
         .iter()
         .chain(rest.iter())
         .map(sse::Frame::position)
         .collect();
-    let expected: Vec<i64> = (head_before + 1..=head_before + TOTAL as i64).collect();
     assert_eq!(
         seen, expected,
-        "the two halves must join into the contiguous run with no gap and no repeat"
+        "the two halves must join into the batch's run with no gap and no repeat"
     );
     seen.dedup();
     assert_eq!(seen.len(), TOTAL, "no event may be delivered twice");
@@ -786,11 +825,19 @@ async fn killing_the_projector_mid_backlog_leaves_the_successor_exactly_once() {
             "{template} must survive the failover with its count intact"
         );
     }
+    // The ledger, exactly: the harness's observations plus every one the
+    // replicas wrote themselves at or below the committed checkpoint.
     let total = (ENDPOINTS * EACH + BACKLOG_ENDPOINTS * BACKLOG_EACH) as i64;
+    let replica_observed = cluster
+        .database
+        .replica_observations_through(after.checkpoint)
+        .await;
     assert_eq!(
-        after.projected_events, total,
-        "the deployment's applied-observation counter must equal what was committed: \
-         a lower number is loss, a higher one is double application"
+        after.projected_events,
+        total + replica_observed,
+        "the deployment's applied-observation counter must equal what was committed \
+         ({total} from the harness, {replica_observed} from the replicas): a lower number \
+         is loss, a higher one is double application"
     );
 }
 
@@ -848,10 +895,15 @@ async fn killing_the_projector_after_it_committed_leaves_the_successor_exactly_o
             );
         }
     }
+    let replica_observed = cluster
+        .database
+        .replica_observations_through(after.checkpoint)
+        .await;
     assert_eq!(
         after.projected_events,
-        (ENDPOINTS * EACH * 2) as i64,
-        "a successor resuming from a committed checkpoint applies nothing twice"
+        (ENDPOINTS * EACH * 2) as i64 + replica_observed,
+        "a successor resuming from a committed checkpoint applies nothing twice \
+         ({replica_observed} of the applied observations are the replicas' own)"
     );
 }
 

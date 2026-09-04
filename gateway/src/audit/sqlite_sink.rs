@@ -237,6 +237,10 @@ impl SqliteSink {
 }
 
 impl AuditSink for SqliteSink {
+    fn name(&self) -> &'static str {
+        "sqlite"
+    }
+
     fn emit(&self, event: &AuditEvent) {
         if self.shared.push_event(event.clone()) {
             self.shared.flush_buffer();

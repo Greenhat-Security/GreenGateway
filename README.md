@@ -377,8 +377,8 @@ Current status:
 | Anomaly signals | Implemented |
 | Cloudflare deploy path | Implemented |
 | Multi-instance cluster mode (PostgreSQL) | Implemented; see [docs/deployment/postgres.md](docs/deployment/postgres.md#supported-cluster-operation) for the proved guarantees and the non-goals |
-| Durable audit event store and cross-replica SSE stream | Implemented as a store, a stream and a projector source; a serving replica's own audit still goes to stdout and the optional log file, not to PostgreSQL |
-| Postgres audit sink for multi-instance deployments | Planned |
+| Durable audit event store and cross-replica SSE stream | Implemented as a store, a stream and a projector source |
+| Postgres audit sink for multi-instance deployments | Implemented; in cluster mode every serving replica writes its audit events to `greengateway.audit_events` off the request path, and that table is the audit of record — see [the proved guarantee](docs/deployment/postgres.md#what-the-gate-proves) |
 | Additional MCP follow-ups | Planned |
 
 Progress is tracked in the pinned roadmap issue:
@@ -697,7 +697,6 @@ The project is moving toward a stronger v1 control plane for API and MCP securit
 Planned focus areas include:
 
 - Production hardening
-- A PostgreSQL audit sink on the request path, so a cluster deployment's own traffic reaches the durable event store the stream and the discovery projector already read
 - More MCP deployment patterns
 - More rule templates
 - More identity-provider recipes

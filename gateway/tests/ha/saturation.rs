@@ -114,42 +114,6 @@ where
     }
 }
 
-/// The sum of every Prometheus sample whose name is `name`, across all
-/// label sets.
-///
-/// Written against the exposition rather than against a particular label
-/// set on purpose: `audit_events_dropped_total` is emitted with a
-/// `reason` label whose values are the drop causes, and a test that named
-/// one reason would miss a drop for another.
-fn metric_sum(exposition: &str, name: &str) -> f64 {
-    exposition
-        .lines()
-        .filter(|line| !line.starts_with('#'))
-        .filter_map(|line| {
-            let rest = line.strip_prefix(name)?;
-            // Either `name value` or `name{labels} value`, and either of
-            // those with the exposition's `_total` suffix already on it —
-            // anything else is a different metric that merely starts with
-            // these bytes.
-            let rest = rest.strip_prefix("_total").unwrap_or(rest);
-            if !(rest.starts_with(' ') || rest.starts_with('{')) {
-                return None;
-            }
-            rest.rsplit_once(char::is_whitespace)
-                .and_then(|(_, value)| value.parse::<f64>().ok())
-        })
-        .sum()
-}
-
-/// Every replica's value of `name`, added up: the deployment's total.
-async fn cluster_metric_sum(cluster: &Cluster, name: &str) -> f64 {
-    let mut total = 0.0;
-    for replica in &cluster.replicas {
-        total += metric_sum(&cluster.metrics(&replica.name).await, name);
-    }
-    total
-}
-
 /// Issue `total` unauthenticated requests through the balancer, at most
 /// `concurrency` at a time, and answer the status of each.
 ///
@@ -230,20 +194,65 @@ const AUDIT_BURST: usize = 1_200;
 /// How many of them are in flight at once.
 const BURST_CONCURRENCY: usize = 32;
 
+/// What the shared store holds for the audit burst, read in one statement
+/// so the counts describe one instant.
+struct BurstRows {
+    /// Observation rows for [`AUDIT_BURST_PATH`], whatever their status.
+    written: i64,
+    /// Those whose recorded status is `200`: the served requests' rows.
+    written_ok: i64,
+    /// Distinct `event_id`s among them — the duplicate check, because the
+    /// column's uniqueness would hide a second copy only if the sink
+    /// re-minted an id, and that is exactly what this would catch.
+    distinct_ids: i64,
+    /// Distinct writing replicas (`instance_id`), which must be both.
+    writers: i64,
+    /// How many of the rows also hold a durable stream position.
+    streamed: i64,
+}
+
+async fn burst_rows(cluster: &Cluster) -> BurstRows {
+    let row = cluster
+        .database
+        .query_one(&format!(
+            "SELECT count(*)::bigint, \
+                    count(*) FILTER (WHERE e.payload_status = 200)::bigint, \
+                    count(DISTINCT e.event_id)::bigint, \
+                    count(DISTINCT e.instance_id)::bigint, \
+                    count(s.position)::bigint \
+             FROM greengateway.audit_events e \
+             LEFT JOIN greengateway.audit_stream s ON s.event_id = e.event_id \
+             WHERE e.event_type = '{}' AND e.payload_path = '{AUDIT_BURST_PATH}'",
+            harness::HTTP_REQUEST_OBSERVED
+        ))
+        .await;
+    BurstRows {
+        written: row.get(0),
+        written_ok: row.get(1),
+        distinct_ids: row.get(2),
+        writers: row.get(3),
+        streamed: row.get(4),
+    }
+}
+
 /// Sustained request load never loses an audit record *silently*.
 ///
 /// The audit queue is bounded by construction (`audit::AUDIT_CHANNEL_CAPACITY`,
 /// with a reserve the lifecycle events ride) and a request that finds it
-/// full drops its event rather than blocking the request path. That is a
-/// deliberate trade and it is the right one — but it is only defensible
-/// while every dropped event is *counted*, because an operator reading an
-/// audit trail has no other way to learn that the trail has a hole in it.
+/// full drops its event rather than blocking the request path. Behind it,
+/// in cluster mode, sits the PostgreSQL audit sink of issue #11: its own
+/// bounded buffer, and a batch the authority refuses is dropped and counted
+/// rather than retried forever. Both are deliberate trades and the right
+/// ones — but they are only defensible while every dropped event is
+/// *counted*, because an operator reading an audit trail has no other way
+/// to learn that the trail has a hole in it.
 ///
 /// So this test does not assert that nothing is dropped, which would be an
-/// assertion about how fast this machine's disk is. It asserts the
-/// contract: for every request the deployment served, there is either a
-/// durable record of it or a tick on `audit_events_dropped_total`. A
-/// silent loss fails here; a counted loss does not.
+/// assertion about how fast this machine's database is. It asserts the
+/// contract, against the audit of record: for every request the deployment
+/// served, there is either a row in `greengateway.audit_events` or a tick
+/// on `audit_events_dropped_total`, and never more rows than requests. A
+/// silent loss fails here; a counted loss does not; a duplicate does.
 #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
 async fn sustained_request_load_never_loses_an_audit_record_silently() {
     let Some(mut cluster) = Cluster::start(ClusterOptions {
@@ -268,7 +277,8 @@ async fn sustained_request_load_never_loses_an_audit_record_silently() {
     // The baseline matters: a replica drops a handful of events during a
     // cold start on a loaded machine, and counting those against the
     // burst would make this test's arithmetic a lie.
-    let dropped_before = cluster_metric_sum(&cluster, AUDIT_EVENTS_DROPPED_TOTAL).await;
+    let dropped_before = cluster.metric_total(AUDIT_EVENTS_DROPPED_TOTAL).await;
+    let members = cluster.member_identities().await;
 
     cluster.balancer.round_robin();
     cluster.upstream.clear();
@@ -308,65 +318,98 @@ async fn sustained_request_load_never_loses_an_audit_record_silently() {
         cluster.balancer.dispatches().len()
     );
 
-    // The writer thread is behind the requests by design, so the
-    // accounting is polled rather than read once. It settles the moment
-    // every served request is either on disk or counted as dropped.
-    // The accounting is on the requests the deployment actually *served*:
-    // a declined one is a decision the gateway is entitled to record or
-    // not, and requiring a record for it would be asserting about the
-    // decline path rather than the queue. Records are counted by the
-    // status they carry so the two populations never mix.
-    let (written, written_ok, dropped) = poll_for(CONVERGENCE_BUDGET, || {
+    // The writer thread and the sink's flusher are behind the requests by
+    // design, so the accounting is polled rather than read once. It
+    // settles the moment every served request is either a row in the
+    // shared store or counted as dropped. The accounting is on the
+    // requests the deployment actually *served*: a declined one is a
+    // decision the gateway is entitled to record or not, and requiring a
+    // record for it would be asserting about the decline path rather than
+    // the queue. Rows are counted by the status they carry so the two
+    // populations never mix.
+    let (rows, dropped) = poll_for(CONVERGENCE_BUDGET, || {
         let cluster = &cluster;
         async move {
-            let records = cluster.audit_records();
-            let observed: Vec<&Value> = records
-                .iter()
-                .filter(|record| {
-                    record["event_type"] == harness::HTTP_REQUEST_OBSERVED
-                        && record["payload"]["path"] == AUDIT_BURST_PATH
-                })
-                .collect();
-            let written = observed.len();
-            let written_ok = observed
-                .iter()
-                .filter(|record| record["payload"]["status"] == 200)
-                .count();
-            let dropped =
-                cluster_metric_sum(cluster, AUDIT_EVENTS_DROPPED_TOTAL).await - dropped_before;
-            let accounted = written_ok as f64 + dropped;
+            let rows = burst_rows(cluster).await;
+            let dropped = cluster.metric_total(AUDIT_EVENTS_DROPPED_TOTAL).await - dropped_before;
+            let accounted = rows.written_ok as f64 + dropped;
             if accounted >= served as f64 {
-                return Ok((written, written_ok, dropped));
+                return Ok((rows, dropped));
             }
             Err(format!(
-                "{written_ok} record(s) written for served requests and {dropped} counted \
-                 as dropped, which accounts for {accounted} of the {served} requests served"
+                "{} row(s) stored for served requests and {dropped} counted as dropped, \
+                 which accounts for {accounted} of the {served} requests served",
+                rows.written_ok
             ))
         }
     })
     .await;
 
-    // The queue is bounded, so it may shed. It may not invent: more
-    // records than requests would mean an event was emitted twice, which
-    // is its own audit-integrity failure.
+    // The queue is bounded, so it may shed. It may not invent: more rows
+    // than requests would mean an event was stored twice, which is its
+    // own audit-integrity failure — and with nothing dropped, the two
+    // bounds meet and the rows for served requests equal the requests
+    // served exactly.
     assert!(
-        written <= served + declined,
-        "the deployment wrote {written} observation records for {} requests; \
-         an audit trail must not duplicate",
+        rows.written_ok <= served as i64,
+        "the deployment stored {} rows for {served} served requests; an audit trail must \
+         not duplicate",
+        rows.written_ok
+    );
+    assert!(
+        rows.written <= (served + declined) as i64,
+        "the deployment stored {} observation rows for {} requests; an audit trail must \
+         not duplicate",
+        rows.written,
         served + declined
+    );
+    assert_eq!(
+        rows.distinct_ids, rows.written,
+        "every stored observation must carry its own event id"
+    );
+    assert_eq!(
+        rows.streamed, rows.written,
+        "every stored observation must hold a durable stream position, or a consumer \
+         following the stream would never see it"
     );
     assert!(
         dropped >= 0.0,
         "audit_events_dropped_total must not run backwards (it moved by {dropped})"
     );
+    // Written by both replicas, each under its own identity: the rows are
+    // the deployment's audit of record, not one process's.
+    assert_eq!(
+        rows.writers, 2,
+        "the burst crossed both replicas, so both must have written rows under their own \
+         instance id; {} distinct writer(s) were recorded",
+        rows.writers
+    );
+    let foreign_writers: i64 = cluster
+        .database
+        .count(&format!(
+            "SELECT count(*)::bigint FROM greengateway.audit_events \
+             WHERE payload_path = '{AUDIT_BURST_PATH}' \
+               AND (instance_id IS NULL OR instance_id::text NOT IN ({}))",
+            members
+                .iter()
+                .map(|member| format!("'{}'", member.instance_id))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ))
+        .await;
+    assert_eq!(
+        foreign_writers, 0,
+        "every row must carry the identity of a live member that wrote it"
+    );
     eprintln!(
-        "audit accounting: {served} served ({declined} declined), {written} durable \
-         ({written_ok} of them for served requests), {dropped} counted as dropped"
+        "audit accounting: {served} served ({declined} declined), {} durable ({} of them \
+         for served requests, from {} writers), {dropped} counted as dropped",
+        rows.written, rows.written_ok, rows.writers
     );
 
     // Recovery. Nothing about the burst may outlive it.
     assert_recovered(&mut cluster, "/echo/saturation-audit-recovered").await;
-    let after = cluster_metric_sum(&cluster, AUDIT_EVENTS_DROPPED_TOTAL).await;
+    let after = cluster.metric_total(AUDIT_EVENTS_DROPPED_TOTAL).await;
     let recovery_drops = after - dropped_before - dropped;
     assert!(
         recovery_drops < 1.0,
@@ -659,6 +702,21 @@ async fn projector_state(cluster: &Cluster) -> (i64, i64) {
     (row.get::<_, i64>(0), row.get::<_, i64>(1))
 }
 
+/// How many of the observations THIS HARNESS appended hold a stream
+/// position: the `/saturation/` paths, which no replica ever proxies.
+async fn harness_observations_streamed(cluster: &Cluster) -> i64 {
+    cluster
+        .database
+        .count(&format!(
+            "SELECT count(*)::bigint \
+             FROM greengateway.audit_stream s \
+             JOIN greengateway.audit_events e ON e.event_id = s.event_id \
+             WHERE e.event_type = '{}' AND e.payload_path LIKE '/saturation/%'",
+            harness::HTTP_REQUEST_OBSERVED
+        ))
+        .await
+}
+
 /// Append `count` observations to the durable stream, spread over
 /// `endpoints` distinct endpoint templates.
 async fn append_observations(cluster: &Cluster, count: usize, endpoints: usize) {
@@ -724,12 +782,23 @@ async fn a_backlogged_stream_drains_in_bounded_batches_exactly_once() {
 
     // A backlog many batches deep, appended while both replicas are up:
     // whichever of them holds the projector lease has to drain it, and
-    // the other must not also drain it.
+    // the other must not also drain it. The replicas are on the stream
+    // too — their own lifecycle events and the observations of this
+    // harness's probes, written by the PostgreSQL audit sink — so the
+    // claim about the harness's backlog is relative to the head it found,
+    // and the ledger assertions below account for both populations.
+    let head_before = cluster.database.stream_head().await;
     append_observations(&cluster, BACKLOG_EVENTS, BACKLOG_ENDPOINTS).await;
     let head = cluster.database.stream_head().await;
+    assert!(
+        head >= head_before + BACKLOG_EVENTS as i64,
+        "the harness should have appended {BACKLOG_EVENTS} positions to the stream after \
+         {head_before}, and the head is {head}"
+    );
+    let backlog_streamed = harness_observations_streamed(&cluster).await;
     assert_eq!(
-        head, BACKLOG_EVENTS as i64,
-        "the harness should have appended {BACKLOG_EVENTS} positions to the stream"
+        backlog_streamed, BACKLOG_EVENTS as i64,
+        "every one of the harness's {BACKLOG_EVENTS} observations should hold a stream position"
     );
 
     poll_for(CONVERGENCE_BUDGET, || {
@@ -747,15 +816,31 @@ async fn a_backlogged_stream_drains_in_bounded_batches_exactly_once() {
     .await;
 
     let (checkpoint, projected) = projector_state(&cluster).await;
-    assert_eq!(
-        checkpoint, head,
-        "the committed checkpoint must land exactly on the stream head, never past it"
+    assert!(
+        checkpoint >= head,
+        "the committed checkpoint must reach the stream head the backlog was read at"
     );
+    let live_head = cluster.database.stream_head().await;
+    assert!(
+        checkpoint <= live_head,
+        "the committed checkpoint ({checkpoint}) must never run past the stream head \
+         ({live_head})"
+    );
+    // The ledger is exact: the harness's backlog plus every observation
+    // the replicas themselves wrote at or below the checkpoint, each
+    // applied once. The replicas' rows are counted from the stream rather
+    // than assumed, because a probe this harness sent while the backlog
+    // drained is an observation like any other.
+    let replica_observed = cluster
+        .database
+        .replica_observations_through(checkpoint)
+        .await;
     assert_eq!(
-        projected, BACKLOG_EVENTS as i64,
-        "the projector applied {projected} observations for a backlog of {BACKLOG_EVENTS}: \
-         fewer means events were skipped over a batch boundary, more means a batch was \
-         applied twice"
+        projected,
+        BACKLOG_EVENTS as i64 + replica_observed,
+        "the projector applied {projected} observations for a backlog of {BACKLOG_EVENTS} \
+         plus {replica_observed} of the replicas' own: fewer means events were skipped over \
+         a batch boundary, more means a batch was applied twice"
     );
 
     // The endpoint ceiling. The backlog invented five times as many
@@ -791,11 +876,24 @@ async fn a_backlogged_stream_drains_in_bounded_batches_exactly_once() {
     })
     .await;
     let (checkpoint, projected) = projector_state(&cluster).await;
-    assert_eq!(checkpoint, second_head);
+    assert!(
+        checkpoint >= second_head,
+        "the committed checkpoint must reach the follow-up's head"
+    );
+    let replica_observed = cluster
+        .database
+        .replica_observations_through(checkpoint)
+        .await;
     assert_eq!(
         projected,
+        (BACKLOG_EVENTS + FOLLOW_UP_EVENTS) as i64 + replica_observed,
+        "a caught-up projector must apply each new observation once and re-apply none \
+         ({replica_observed} of the applied observations are the replicas' own)"
+    );
+    assert_eq!(
+        harness_observations_streamed(&cluster).await,
         (BACKLOG_EVENTS + FOLLOW_UP_EVENTS) as i64,
-        "a caught-up projector must apply each new observation once and re-apply none"
+        "every harness observation should still hold exactly one stream position"
     );
 
     // Exactly one replica ever led: the singleton the checkpoint lives in
@@ -1444,6 +1542,24 @@ async fn retention_bounds_the_replay_window_without_renumbering_or_hiding_a_gap(
     cluster.database.ingest_audit_events(&old).await;
     let old_head = cluster.database.stream_head().await;
 
+    // The replicas write their own rows to the same table (issue #11's
+    // PostgreSQL audit sink): their startup events, and the observations
+    // of this harness's readiness probes, sit at the positions BELOW the
+    // harness's old events and are minutes old. Retention is about the
+    // deployment a day later, when everything before this point is a day
+    // old — and this harness cannot wait a day. So every row at or below
+    // the marker is aged the way a day would have aged it, which leaves
+    // the rows the replicas write from here on as the young population the
+    // window keeps. Nothing about the stream's numbering is touched.
+    cluster
+        .database
+        .run_batch(&format!(
+            "UPDATE greengateway.audit_events e SET occurred_at = '2026-01-01T00:00:00Z' \
+             FROM greengateway.audit_stream s \
+             WHERE s.event_id = e.event_id AND s.position <= {old_head}"
+        ))
+        .await;
+
     poll_for(CONVERGENCE_BUDGET, || {
         let cluster = &cluster;
         async move {
@@ -1475,23 +1591,42 @@ async fn retention_bounds_the_replay_window_without_renumbering_or_hiding_a_gap(
                      WHERE event_type = '{RETENTION_EVENT_TYPE}'"
                 ))
                 .await;
-            if remaining == 0 {
+            let below_marker: i64 = cluster
+                .database
+                .count(&format!(
+                    "SELECT count(*)::bigint FROM greengateway.audit_stream \
+                     WHERE position <= {old_head}"
+                ))
+                .await;
+            if remaining == 0 && below_marker == 0 {
                 return Ok(());
             }
-            Err(format!("{remaining} old event(s) are still retained"))
+            Err(format!(
+                "{remaining} old event(s) are still retained, and {below_marker} stream \
+                 position(s) at or below {old_head} still exist"
+            ))
         }
     })
     .await;
 
     // The counter is not a `max(position)` read: it survived the delete.
-    let counter: i64 = cluster
+    // It is read beside the live maximum in one statement, because the
+    // replicas keep appending: the two must agree, and neither may have
+    // fallen below the marker.
+    let row = cluster
         .database
-        .count("SELECT last_position::bigint FROM greengateway.audit_stream_state WHERE singleton")
+        .query_one(
+            "SELECT last_position::bigint, \
+                    (SELECT coalesce(max(position), 0)::bigint FROM greengateway.audit_stream) \
+             FROM greengateway.audit_stream_state WHERE singleton",
+        )
         .await;
-    assert_eq!(
-        counter, old_head,
-        "retention must not move the position counter, which it does not own; a counter \
-         that fell back to {counter} would renumber every durable cursor in the fleet"
+    let (counter, live_max) = (row.get::<_, i64>(0), row.get::<_, i64>(1));
+    assert!(
+        counter >= old_head && counter == live_max,
+        "retention must not move the position counter, which it does not own; a counter at \
+         {counter} against a live maximum of {live_max} and a pre-retention head of \
+         {old_head} would renumber every durable cursor in the fleet"
     );
 
     // Events committed after retention continue the numbering rather than
@@ -1507,32 +1642,52 @@ async fn retention_bounds_the_replay_window_without_renumbering_or_hiding_a_gap(
             )
         })
         .collect();
+    let head_before_fresh = cluster.database.stream_head().await;
     cluster.database.ingest_audit_events(&recent).await;
     let head = cluster.database.stream_head().await;
+    assert!(
+        head >= head_before_fresh + RETAINED_NEW_EVENTS as i64,
+        "numbering must continue past every position retention freed: the head went from \
+         {head_before_fresh} to {head} for {RETAINED_NEW_EVENTS} fresh events"
+    );
+    let fresh_below_marker: i64 = cluster
+        .database
+        .count(&format!(
+            "SELECT count(*)::bigint FROM greengateway.audit_stream s \
+             JOIN greengateway.audit_events e ON e.event_id = s.event_id \
+             WHERE e.event_type = '{RETENTION_EVENT_TYPE}' AND s.position <= {old_head}"
+        ))
+        .await;
     assert_eq!(
-        head,
-        old_head + RETAINED_NEW_EVENTS as i64,
-        "numbering must continue past every position retention freed"
+        fresh_below_marker, 0,
+        "no fresh event may reuse a position retention freed"
     );
 
     // The retained window is contiguous: a reader inside it can follow it
-    // position by position without ever finding a hole.
+    // position by position without ever finding a hole. Its bounds and its
+    // size are read in one statement, because the replicas keep appending.
     let row = cluster
         .database
         .query_one(
-            "SELECT coalesce(min(position), 0)::bigint, count(*)::bigint \
+            "SELECT coalesce(min(position), 0)::bigint, count(*)::bigint, \
+                    coalesce(max(position), 0)::bigint \
              FROM greengateway.audit_stream",
         )
         .await;
-    let (first, retained) = (row.get::<_, i64>(0), row.get::<_, i64>(1));
+    let (first, retained, last) = (
+        row.get::<_, i64>(0),
+        row.get::<_, i64>(1),
+        row.get::<_, i64>(2),
+    );
     assert!(
-        first > 1,
-        "the window should have moved forward under retention, but still starts at {first}"
+        first > old_head,
+        "the window should have moved past every aged position ({old_head}), but still \
+         starts at {first}"
     );
     assert_eq!(
         retained,
-        head - first + 1,
-        "the retained window must have no holes between {first} and {head}"
+        last - first + 1,
+        "the retained window must have no holes between {first} and {last}"
     );
 
     // A cursor below the window is refused, not quietly reinterpreted.
