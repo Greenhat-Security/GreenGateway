@@ -1504,11 +1504,12 @@ async fn e2e_04_authenticated_mcp_stream_refresh_lkg_and_delete_workflow() {
         .refresh(record.id.as_str(), record.etag().as_str(), ACCEPTANCE_ACTOR)
         .await
         .expect_err("failed refresh must preserve last-known-good catalog");
-    assert!(matches!(
+    assert_eq!(
         failed_refresh,
-        connections::mcp::McpCatalogRefreshError::RequestFailed
-            | connections::mcp::McpCatalogRefreshError::InvalidResponse
-    ));
+        connections::mcp::McpCatalogRefreshError::UpstreamTransport {
+            method: "initialize"
+        }
+    );
     assert!(registry.get(&public_name).is_some());
     assert!(control_plane
         .managed_store()

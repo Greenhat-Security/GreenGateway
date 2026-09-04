@@ -80,6 +80,16 @@ pub enum McpCatalogRefreshError {
     EgressDenied,
     SecretUnavailable,
     AuthenticationFailed,
+    UpstreamMethodNotFound {
+        method: &'static str,
+    },
+    UpstreamError {
+        method: &'static str,
+        code: i32,
+    },
+    UpstreamTransport {
+        method: &'static str,
+    },
     RequestFailed,
     InvalidResponse,
     StorageUnavailable,
@@ -100,9 +110,29 @@ impl McpCatalogRefreshError {
             Self::EgressDenied => "egress_denied",
             Self::SecretUnavailable => "secret_unavailable",
             Self::AuthenticationFailed => "auth_failed",
+            Self::UpstreamMethodNotFound { .. } => "upstream_method_not_found",
+            Self::UpstreamError { .. } => "upstream_error",
+            Self::UpstreamTransport { .. } => "upstream_transport_failure",
             Self::RequestFailed => "request_failed",
             Self::InvalidResponse => "invalid_response",
             Self::StorageUnavailable => "storage_unavailable",
+        }
+    }
+
+    pub const fn upstream_method(self) -> Option<&'static str> {
+        match self {
+            Self::UpstreamMethodNotFound { method }
+            | Self::UpstreamError { method, .. }
+            | Self::UpstreamTransport { method } => Some(method),
+            _ => None,
+        }
+    }
+
+    pub const fn upstream_error_code(self) -> Option<i32> {
+        match self {
+            Self::UpstreamMethodNotFound { .. } => Some(-32601),
+            Self::UpstreamError { code, .. } => Some(code),
+            _ => None,
         }
     }
 }
@@ -725,10 +755,22 @@ impl McpConnectionCatalogService {
         failure: McpCatalogRefreshError,
         elapsed: Duration,
     ) {
+        let specific_upstream_reason = match failure {
+            McpCatalogRefreshError::UpstreamMethodNotFound { .. } => {
+                Some(ConnectionStatusReason::UpstreamMethodNotFound)
+            }
+            McpCatalogRefreshError::UpstreamError { .. } => {
+                Some(ConnectionStatusReason::UpstreamError)
+            }
+            McpCatalogRefreshError::UpstreamTransport { .. } => {
+                Some(ConnectionStatusReason::UpstreamTransportFailure)
+            }
+            _ => None,
+        };
         let (state, reason, age, count) = if let Some(prior) = prior {
             (
                 ConnectionOperationalState::Degraded,
-                ConnectionStatusReason::CatalogStale,
+                specific_upstream_reason.unwrap_or(ConnectionStatusReason::CatalogStale),
                 Some(timestamp_age_seconds(&prior.refreshed_at)),
                 Some(catalog_total_count(prior)),
             )
@@ -741,6 +783,15 @@ impl McpConnectionCatalogService {
                 McpCatalogRefreshError::InvalidResponse
                 | McpCatalogRefreshError::AuthenticationFailed => {
                     ConnectionStatusReason::InvalidResponse
+                }
+                McpCatalogRefreshError::UpstreamMethodNotFound { .. } => {
+                    ConnectionStatusReason::UpstreamMethodNotFound
+                }
+                McpCatalogRefreshError::UpstreamError { .. } => {
+                    ConnectionStatusReason::UpstreamError
+                }
+                McpCatalogRefreshError::UpstreamTransport { .. } => {
+                    ConnectionStatusReason::UpstreamTransportFailure
                 }
                 _ => ConnectionStatusReason::RequestFailed,
             };
@@ -916,6 +967,18 @@ fn refresh_transport_error(error: &McpUpstreamCallError) -> McpCatalogRefreshErr
         McpUpstreamCallError::AuthenticationRejected => {
             McpCatalogRefreshError::AuthenticationFailed
         }
+        McpUpstreamCallError::UpstreamMethodNotFound { method } => {
+            McpCatalogRefreshError::UpstreamMethodNotFound { method }
+        }
+        McpUpstreamCallError::UpstreamError { method, code } => {
+            McpCatalogRefreshError::UpstreamError {
+                method,
+                code: *code,
+            }
+        }
+        McpUpstreamCallError::UpstreamTransport { method } => {
+            McpCatalogRefreshError::UpstreamTransport { method }
+        }
         McpUpstreamCallError::Connection {
             reason: "connection_changed",
         } => McpCatalogRefreshError::PreconditionFailed,
@@ -941,8 +1004,10 @@ fn refresh_transport_error(error: &McpUpstreamCallError) -> McpCatalogRefreshErr
         | McpUpstreamCallError::InvalidDiscoveryMetadata
         | McpUpstreamCallError::RequestBodyTooLarge { .. }
         | McpUpstreamCallError::ResponseTooLarge { .. } => McpCatalogRefreshError::InvalidResponse,
+        McpUpstreamCallError::Connect => McpCatalogRefreshError::UpstreamTransport {
+            method: "initialize",
+        },
         McpUpstreamCallError::ClientBuild
-        | McpUpstreamCallError::Connect
         | McpUpstreamCallError::Call
         | McpUpstreamCallError::Connection { .. } => McpCatalogRefreshError::RequestFailed,
     }
@@ -1243,6 +1308,118 @@ mod tests {
                 reason: "catalog_stale"
             })
         ));
+
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn optional_discovery_method_not_found_publishes_the_rest_of_the_catalog() {
+        for optional_method in ["resources/list", "resources/templates/list"] {
+            let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+                .await
+                .expect("optional-method MCP test listener should bind");
+            let address = listener
+                .local_addr()
+                .expect("optional-method MCP test address should be available");
+            let rejected_method_count = Arc::new(AtomicUsize::new(0));
+            let server = tokio::spawn(run_mcp_method_error_server(
+                listener,
+                optional_method,
+                -32601,
+                Arc::clone(&rejected_method_count),
+            ));
+            let harness = issue_371_harness(address).await;
+
+            let refreshed = harness
+                .service
+                .refresh(
+                    harness.record.id.as_str(),
+                    harness.record.etag().as_str(),
+                    "test-admin",
+                )
+                .await
+                .expect("an absent optional discovery method should be treated as empty");
+
+            assert_eq!(refreshed.total_count, 1);
+            assert_eq!(refreshed.status.state, ConnectionOperationalState::Healthy);
+            assert_eq!(
+                refreshed.status.reason,
+                ConnectionStatusReason::CatalogRefreshed
+            );
+            assert!(
+                harness
+                    .registry
+                    .get(&format!("{}:alpha", harness.record.id))
+                    .is_some(),
+                "tools discovered before the optional method must be published"
+            );
+            let stored = harness
+                .control_plane
+                .managed_store()
+                .expect("managed store should exist")
+                .mcp_catalog(&harness.record.id)
+                .await
+                .expect("catalog should load")
+                .expect("catalog should be published");
+            assert!(stored.resources.is_empty());
+            assert!(stored.resource_templates.is_empty());
+            assert_eq!(rejected_method_count.load(Ordering::SeqCst), 1);
+
+            server.abort();
+        }
+    }
+
+    #[tokio::test]
+    async fn tools_method_not_found_is_fatal_and_records_the_specific_status_reason() {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .expect("required-method MCP test listener should bind");
+        let address = listener
+            .local_addr()
+            .expect("required-method MCP test address should be available");
+        let rejected_method_count = Arc::new(AtomicUsize::new(0));
+        let server = tokio::spawn(run_mcp_method_error_server(
+            listener,
+            "tools/list",
+            -32601,
+            Arc::clone(&rejected_method_count),
+        ));
+        let harness = issue_371_harness(address).await;
+
+        let failure = harness
+            .service
+            .refresh(
+                harness.record.id.as_str(),
+                harness.record.etag().as_str(),
+                "test-admin",
+            )
+            .await
+            .expect_err("tools/list remains required when tools are advertised");
+
+        assert_eq!(
+            failure,
+            McpCatalogRefreshError::UpstreamMethodNotFound {
+                method: "tools/list"
+            }
+        );
+        assert_eq!(rejected_method_count.load(Ordering::SeqCst), 1);
+        let status = harness
+            .control_plane
+            .managed_store()
+            .expect("managed store should exist")
+            .latest_status(&harness.record.id)
+            .await
+            .expect("status should load")
+            .expect("failed refresh should persist a status");
+        assert_eq!(status.state, ConnectionOperationalState::Unavailable);
+        assert_eq!(
+            status.reason,
+            ConnectionStatusReason::UpstreamMethodNotFound
+        );
+        assert!(harness
+            .registry
+            .get(&format!("{}:alpha", harness.record.id))
+            .is_none());
 
         server.abort();
     }
@@ -1663,6 +1840,201 @@ mod tests {
                     _ => {
                         write_empty_response(&mut stream, StatusCode::ACCEPTED).await;
                     }
+                }
+            });
+        }
+    }
+
+    struct Issue371Harness {
+        _database: TemporaryDatabase,
+        control_plane: ConnectionControlPlane,
+        service: McpConnectionCatalogService,
+        record: StoredConnection,
+        registry: ToolRegistry,
+    }
+
+    async fn issue_371_harness(address: std::net::SocketAddr) -> Issue371Harness {
+        let database = TemporaryDatabase::new();
+        let mut config = Config::test_defaults();
+        config.connections_sqlite_path = Some(database.0.display().to_string());
+        config.egress_allowed_hosts = vec![Ipv4Addr::LOCALHOST.to_string()];
+        config.egress_deny_private_ips = false;
+        let control_plane =
+            ConnectionControlPlane::from_config(&config).expect("control plane should build");
+        let candidate: ConnectionWrite = serde_json::from_value(json!({
+            "display_name": "Issue 371 MCP",
+            "enabled": true,
+            "kind": "mcp_streamable_http",
+            "endpoint": {
+                "base_url": format!("http://{address}"),
+                "base_path": "/mcp"
+            },
+            "authentication": { "type": "none" },
+            "tls": {},
+            "timeouts": {
+                "connect_timeout_ms": 1000,
+                "request_timeout_ms": 3000,
+                "response_idle_timeout_ms": 1000
+            },
+            "discovery": {
+                "type": "managed_mcp",
+                "use_connection_authentication": false
+            }
+        }))
+        .expect("issue 371 Connection should deserialize");
+        let record = control_plane
+            .create_managed(
+                control_plane.runtime_snapshot().collection_etag(),
+                candidate,
+                "test-admin",
+            )
+            .await
+            .expect("issue 371 Connection should create");
+        let egress_client = Arc::new(
+            EgressClient::new(EgressConfig::from_config(&config))
+                .expect("issue 371 egress client should build"),
+        );
+        let http = ConnectionHttpRuntime::new(
+            control_plane.clone(),
+            EgressConfig::from_config(&config),
+            egress_client,
+        );
+        let registry = ToolRegistry::disabled();
+        let service =
+            McpConnectionCatalogService::load(control_plane.clone(), http, registry.clone())
+                .expect("issue 371 catalog service should load");
+        Issue371Harness {
+            _database: database,
+            control_plane,
+            service,
+            record,
+            registry,
+        }
+    }
+
+    async fn run_mcp_method_error_server(
+        listener: TcpListener,
+        rejected_method: &'static str,
+        error_code: i32,
+        rejected_method_count: Arc<AtomicUsize>,
+    ) {
+        loop {
+            let Ok((mut stream, _)) = listener.accept().await else {
+                return;
+            };
+            let rejected_method_count = Arc::clone(&rejected_method_count);
+            tokio::spawn(async move {
+                let request = read_json_request(&mut stream).await;
+                let method = request
+                    .get("method")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                if method == rejected_method {
+                    rejected_method_count.fetch_add(1, Ordering::SeqCst);
+                    write_json_response(
+                        &mut stream,
+                        StatusCode::OK,
+                        json!({
+                            "jsonrpc": "2.0",
+                            "id": request["id"],
+                            "error": {
+                                "code": error_code,
+                                "message": format!("Method '{method}' not found")
+                            }
+                        }),
+                    )
+                    .await;
+                    return;
+                }
+                match method {
+                    "initialize" => {
+                        let protocol_version = request
+                            .pointer("/params/protocolVersion")
+                            .cloned()
+                            .unwrap_or_else(|| json!("2025-06-18"));
+                        write_json_response(
+                            &mut stream,
+                            StatusCode::OK,
+                            json!({
+                                "jsonrpc": "2.0",
+                                "id": request["id"],
+                                "result": {
+                                    "protocolVersion": protocol_version,
+                                    "capabilities": {
+                                        "tools": { "listChanged": false },
+                                        "resources": {
+                                            "subscribe": false,
+                                            "listChanged": false
+                                        },
+                                        "prompts": { "listChanged": false }
+                                    },
+                                    "serverInfo": {
+                                        "name": "issue-371-test",
+                                        "version": "1.0.0"
+                                    }
+                                }
+                            }),
+                        )
+                        .await;
+                    }
+                    "tools/list" => {
+                        write_json_response(
+                            &mut stream,
+                            StatusCode::OK,
+                            json!({
+                                "jsonrpc": "2.0",
+                                "id": request["id"],
+                                "result": {
+                                    "tools": [{
+                                        "name": "alpha",
+                                        "description": "Alpha tool",
+                                        "inputSchema": {
+                                            "type": "object",
+                                            "properties": {}
+                                        }
+                                    }]
+                                }
+                            }),
+                        )
+                        .await;
+                    }
+                    "resources/list" => {
+                        write_json_response(
+                            &mut stream,
+                            StatusCode::OK,
+                            json!({
+                                "jsonrpc": "2.0",
+                                "id": request["id"],
+                                "result": { "resources": [] }
+                            }),
+                        )
+                        .await;
+                    }
+                    "resources/templates/list" => {
+                        write_json_response(
+                            &mut stream,
+                            StatusCode::OK,
+                            json!({
+                                "jsonrpc": "2.0",
+                                "id": request["id"],
+                                "result": { "resourceTemplates": [] }
+                            }),
+                        )
+                        .await;
+                    }
+                    "prompts/list" => {
+                        write_json_response(
+                            &mut stream,
+                            StatusCode::OK,
+                            json!({
+                                "jsonrpc": "2.0",
+                                "id": request["id"],
+                                "result": { "prompts": [] }
+                            }),
+                        )
+                        .await;
+                    }
+                    _ => write_empty_response(&mut stream, StatusCode::ACCEPTED).await,
                 }
             });
         }
