@@ -11844,11 +11844,14 @@ fn tool_playground_runtime_error_response(error: tools::runtime::ToolRuntimeErro
             "tool execution lost its execution lease",
             "lease_lost",
         ),
-        ToolRuntimeError::WorkFailed { reason, .. } => match reason.as_deref() {
-            Some("invalid_params") => tool_playground_error_response(
+        ToolRuntimeError::WorkFailed {
+            reason, details, ..
+        } => match reason.as_deref() {
+            Some("invalid_params") => tool_playground_error_response_with_details(
                 StatusCode::UNPROCESSABLE_ENTITY,
                 "tool arguments were rejected",
                 "invalid_params",
+                details,
             ),
             Some("unknown_tool") => tool_playground_error_response(
                 StatusCode::NOT_FOUND,
@@ -11893,6 +11896,34 @@ fn tool_playground_error_response(
         })),
     )
         .into_response()
+}
+
+fn tool_playground_error_response_with_details(
+    status: StatusCode,
+    error: &'static str,
+    reason: &'static str,
+    details: Option<Value>,
+) -> Response {
+    let Some(details) = details else {
+        return tool_playground_error_response(status, error, reason);
+    };
+    let mut body = serde_json::Map::from_iter([
+        ("error".to_owned(), Value::String(error.to_owned())),
+        ("reason".to_owned(), Value::String(reason.to_owned())),
+    ]);
+    match details {
+        Value::Object(details) => {
+            for (key, value) in details {
+                if key != "error" && key != "reason" {
+                    body.insert(key, value);
+                }
+            }
+        }
+        details => {
+            body.insert("details".to_owned(), details);
+        }
+    }
+    (status, Json(Value::Object(body))).into_response()
 }
 
 fn traffic_admin_authz_error_response(error: TrafficAdminAuthzError) -> Response {
@@ -15672,6 +15703,39 @@ mod tests {
         TlsAcceptor,
     };
     use tower::ServiceExt;
+
+    #[tokio::test]
+    async fn playground_transform_rejection_is_422_with_structured_problems() {
+        let response =
+            tool_playground_runtime_error_response(tools::runtime::ToolRuntimeError::WorkFailed {
+                tool_name: "createCompany".to_owned(),
+                message: "tool 'createCompany' argument 'amount' could not be encoded".to_owned(),
+                reason: Some("invalid_params".to_owned()),
+                details: Some(json!({
+                    "problems": [{
+                        "path": "/amount",
+                        "keyword": "codec",
+                        "reason": "value has 7 fraction digits, codec allows 6",
+                    }],
+                })),
+            });
+        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("playground error body should collect");
+        assert_eq!(
+            serde_json::from_slice::<Value>(&body).expect("playground error should be JSON"),
+            json!({
+                "error": "tool arguments were rejected",
+                "reason": "invalid_params",
+                "problems": [{
+                    "path": "/amount",
+                    "keyword": "codec",
+                    "reason": "value has 7 fraction digits, codec allows 6",
+                }],
+            })
+        );
+    }
 
     fn test_config(cors_allow_origins: Vec<&str>) -> config::Config {
         config::Config {

@@ -454,7 +454,7 @@
           "Managed OpenAPI"
         ],
         "summary": "Validate, compile, and atomically publish an OpenAPI overlay",
-        "description": "Requires admin:connections:write and the exact overlay ETag. A raw source request.path on an authenticated Connection additionally requires admin:connections:secrets:write. Validation, source resolution, compilation, catalog publication, overlay persistence, and source-report persistence succeed as one mutation or leave the previous catalog and overlay unchanged.",
+        "description": "Requires admin:connections:write and the exact overlay ETag. Declarative request and response transforms are checked against the generated request-body properties and declared JSON 2xx response schemas before publication. A raw source request.path on an authenticated Connection additionally requires admin:connections:secrets:write. Validation, compilation, catalog publication, overlay persistence, and source-report persistence succeed as one mutation or leave the previous catalog and overlay unchanged.",
         "parameters": [
           {
             "$ref": "#/components/parameters/OpenApiOverlayIfMatch"
@@ -588,7 +588,7 @@
           "Managed OpenAPI"
         ],
         "summary": "Preview a bounded OpenAPI document without persistence",
-        "description": "Requires admin:tools:read. Preview performs no tool invocation or persistence and returns the current Connection ETag for a later register precondition. When an optional overlay declares supported sources, preview performs the same bounded source resolution as overlay PUT so the operator sees compiled labels and values before storing anything.",
+        "description": "Requires admin:tools:read. Preview performs no tool invocation or persistence and returns the current Connection ETag for a later register precondition. A candidate overlay is compiled against all named generated operations, including unselected operations; request shapes, codec chains, response roots, and response fields are therefore rejected before registration if the OpenAPI schemas prove them incompatible.",
         "requestBody": {
           "required": true,
           "content": {

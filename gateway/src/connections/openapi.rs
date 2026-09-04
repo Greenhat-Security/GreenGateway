@@ -2483,6 +2483,7 @@ mod tests {
             },
             upstream: mapping,
             visibility: ToolVisibility::Listed,
+            transform: None,
         }
     }
 
@@ -3241,7 +3242,7 @@ openapi: 3.0.3
 info: {title: Billing, version: 1.0.0}
 paths:
   /invoices/{invoice_id}:
-    get:
+    post:
       operationId: get_invoice
       summary: Read one invoice
       parameters:
@@ -3249,6 +3250,36 @@ paths:
           name: invoice_id
           required: true
           schema: {type: string}
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [total]
+              properties:
+                total:
+                  type: object
+                  required: [amountMicros, currencyCode]
+                  properties:
+                    amountMicros: {type: string}
+                    currencyCode: {type: string}
+      responses:
+        '200':
+          description: Invoice
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  invoice:
+                    type: object
+                    properties:
+                      total:
+                        type: object
+                        properties:
+                          amountMicros: {type: string}
+                          currencyCode: {type: string}
 "#;
         let preview = service
             .preview(record.id.as_str(), spec)
@@ -3277,10 +3308,36 @@ paths:
 
         let document = json!({
             "schema_version": "0.1.0",
+            "shapes": {
+                "money": {
+                    "agent": {
+                        "amount": {"type": "number"},
+                        "currency": {"type": "string"}
+                    },
+                    "required": ["amount", "currency"],
+                    "wire": {
+                        "/amountMicros": {
+                            "from": "amount",
+                            "codec": {
+                                "kind": "decimal_scale",
+                                "scale": 6,
+                                "wire_encoding": "integer_string"
+                            }
+                        },
+                        "/currencyCode": {"from": "currency"}
+                    }
+                }
+            },
             "tools": {
                 "get_invoice": {
                     "rename": "read_invoice",
-                    "description": "Read a billing invoice safely"
+                    "description": "Read a billing invoice safely",
+                    "parameters": {
+                        "total": {
+                            "shape": {"$use": "money", "prefix": "invoice"}
+                        }
+                    },
+                    "response": {"root": "/invoice"}
                 }
             }
         });
@@ -3303,6 +3360,17 @@ paths:
         assert_eq!(
             candidate_preview.binding.definitions[0].name,
             "read_invoice"
+        );
+        assert!(candidate_preview.binding.definitions[0].transform.is_some());
+        assert!(
+            candidate_preview.binding.definitions[0].input_schema["properties"]
+                .get("invoice_amount")
+                .is_some()
+        );
+        assert!(
+            candidate_preview.binding.definitions[0].input_schema["properties"]
+                .get("total")
+                .is_none()
         );
         assert_eq!(
             candidate_preview.registration_security_selections[0].tool_name,
@@ -3372,6 +3440,14 @@ paths:
             .get("read_invoice")
             .expect("renamed definition should be live");
         assert_eq!(served.description, "Read a billing invoice safely");
+        assert_eq!(
+            served
+                .transform
+                .as_ref()
+                .and_then(|transform| transform.response_root.as_ref())
+                .map(ToString::to_string),
+            Some("/invoice".to_owned())
+        );
 
         let store = control_plane
             .managed_store()
@@ -3409,7 +3485,11 @@ paths:
             restarted_registry.clone(),
         )
         .expect("paired overlay catalog should replay after restart");
-        assert!(restarted_registry.get("read_invoice").is_some());
+        let restarted_definition = restarted_registry
+            .get("read_invoice")
+            .expect("compiled transform should replay after restart");
+        assert_eq!(restarted_definition.transform, served.transform);
+        assert_eq!(restarted_definition.input_schema, served.input_schema);
         assert!(restarted
             .runtime()
             .definition_is_current(&served, record.etag().as_str()));
@@ -4170,7 +4250,15 @@ openapi: 3.0.3
 info: {title: Billing, version: 1.0.0}
 paths:
   /invoices:
-    get: {operationId: get_invoice}
+    post:
+      operationId: get_invoice
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                payload: {type: string}
 "#;
         let preview = service
             .preview(record.id.as_str(), spec)
@@ -4237,6 +4325,38 @@ paths:
             preview_rejected,
             OpenApiOverlayOperationError::Rejected(ref error)
                 if error.problems.iter().any(|problem| problem.path == "/tools/unknown_operation")
+        ));
+        let invalid_transform = json!({
+            "schema_version": "0.1.0",
+            "tools": {
+                "get_invoice": {
+                    "parameters": {
+                        "payload": {
+                            "shape": {
+                                "agent": {"value": {"type": "string"}},
+                                "wire": {"/value": {"from": "value"}}
+                            }
+                        }
+                    }
+                }
+            }
+        });
+        let transform_rejected = service
+            .put_overlay(
+                record.id.as_str(),
+                absent_overlay_etag.as_str(),
+                &invalid_transform,
+                "test-admin",
+            )
+            .await
+            .expect_err("a shape over a scalar body property must reject atomically");
+        assert!(matches!(
+            transform_rejected,
+            OpenApiOverlayOperationError::Rejected(ref error)
+                if error.problems.iter().any(|problem| {
+                    problem.path == "/tools/get_invoice/parameters/payload/shape"
+                        && problem.message.contains("must have type object")
+                })
         ));
         let catalog = control_plane
             .managed_store()

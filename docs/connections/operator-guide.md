@@ -420,9 +420,10 @@ DELETE followed by a new POST creates a replacement Connection resource and is
 governed by the Connection resource's own precondition contract.
 
 This release accepts tool rename, tool and parameter descriptions, parameter
-titles, visibility, document-label disambiguation, and body serialization.
-Source bindings, declarative shapes/codecs, response transforms, and composites
-are reserved in the schema and rejected until their implementation lands.
+titles, visibility, document-label disambiguation, body serialization, and
+declarative request/response transforms. Dynamic enum and label sources and
+composite tools remain reserved and are rejected until their implementation
+lands.
 
 Overlay keys always use the generated name shown by OpenAPI preview, even when
 the tool is renamed for agents. Operation IDs are case-sensitive. In
@@ -468,6 +469,89 @@ to render the request. Set `whole_args_json` explicitly only when the upstream
 expects the legacy flattened object. Tools not named in the overlay always keep
 the legacy mode.
 
+Request shapes replace one object-valued JSON body property with one or more
+agent-facing properties. They cannot reshape path or query arguments, and this
+schema revision does not flatten or reshape array request bodies. Put reusable
+shapes under `shapes.*` and reference them with `$use`; a reference prefixes
+its agent properties with the configured `prefix`, or with the wire property
+name by default. Inline shapes keep their declared agent property names. A
+shape's explicit `required` list makes exactly those agent properties required,
+even for an optional wire property. When it is omitted, all agent properties
+inherit a required wire property's requirement and none are required for an
+optional wire property.
+
+For example, this reusable shape exposes a plain decimal and currency code
+while retaining the upstream's integer-micros object. The same shape can be
+used on write parameters and as a decode-only field on reads:
+
+```json
+{
+  "schema_version": "0.1.0",
+  "shapes": {
+    "money": {
+      "agent": {
+        "amount": { "type": "number" },
+        "currency": { "type": "string" }
+      },
+      "required": ["amount", "currency"],
+      "wire": {
+        "/amountMicros": {
+          "from": "amount",
+          "codec": {
+            "kind": "decimal_scale",
+            "scale": 6,
+            "wire_encoding": "integer_string"
+          }
+        },
+        "/currencyCode": { "from": "currency" }
+      }
+    }
+  },
+  "tools": {
+    "UpdateOneCompany": {
+      "parameters": {
+        "annualRecurringRevenue": {
+          "shape": { "$use": "money", "prefix": "annual_revenue" }
+        }
+      },
+      "response": { "root": "/data/updateCompany" }
+    },
+    "findManyCompanies": {
+      "response": {
+        "root": "/data/companies/*",
+        "fields": {
+          "annualRecurringRevenue": {
+            "$use": "money",
+            "prefix": "annual_revenue"
+          }
+        }
+      }
+    }
+  }
+}
+```
+
+The compiler validates every named tool, including generated tools that are
+not currently selected. It rejects colliding agent property names, invalid
+agent JSON Schema fragments, `format` annotations, missing or overlapping wire
+pointers, ambiguous inverse mappings, and codec chains whose output type does
+not match the OpenAPI wire schema. The transformed agent schema is what
+`tools/list` advertises and what `tools/call` validates. Request wire pointers
+may traverse declared object properties only. A pointer that would construct a
+nested array is rejected in schema revision 0.1.0 because RFC 6901 text alone
+cannot distinguish an array index from an object key such as `"0"`.
+
+Responses are decoded inside the executor before either MCP or the admin
+playground projects the result. `response.root` overrides
+`defaults.response_root`; `response.fields` supplies decode-only shapes for
+read operations. When a JSON 2xx response schema is declared, overlay PUT
+rejects a root or field the schema proves impossible. A free-form or absent
+response schema is accepted with an explicit unverified warning. A field-level
+decode failure keeps that field's wire representation and returns a bounded
+warning instead of hiding a successful upstream write. At most 32 warnings are
+returned. When the warning set is truncated, the final entry is
+`{"path":"/","reason":"warnings_truncated"}`.
+
 Document-label disambiguation compares properties within one tool. It uses the
 first non-empty document `title` or first line of `description`, and qualifies
 only duplicate labels through the fixed template. A parameter description set
@@ -481,8 +565,8 @@ descriptions until configured label sources are available.
 
 ### JSON pointer bases
 
-The meaning of `/` is determined by the field containing the pointer. Reserved
-fields below become usable only with their corresponding later capability.
+The meaning of `/` is determined by the field containing the pointer. Source
+and composite fields below remain reserved until their later capability.
 
 | Field | `/` is the root of |
 | --- | --- |
@@ -498,9 +582,8 @@ fields below become usable only with their corresponding later capability.
 
 ### Codec behavior
 
-Codecs are reserved until declarative transforms land. When available, chains
-encode left to right and decode right to left; they reject inexact values
-rather than rounding, trimming, or normalizing them.
+Codec chains encode left to right and decode right to left; they reject inexact
+values rather than rounding, trimming, or normalizing them.
 
 | Codec | Encode (agent to wire) | Decode (wire to agent) | Type | Invertible |
 | --- | --- | --- | --- | --- |
@@ -508,10 +591,10 @@ rather than rounding, trimming, or normalizing them.
 | `json_string` | Serialize the JSON value to one compact JSON string. | Parse the wire string as JSON; on failure retain the wire value and report a warning. | Any to `string` | Yes |
 | `markdown_blocks` | Convert the supported Markdown subset to a BlockNote block array. | No inverse conversion; a response binding is required. | `string` to `array` | No |
 
-Twenty's `bodyV2.blocknote` property is a JSON **string**, not an array. Its
-future rich-text shape must therefore chain `markdown_blocks` and then
-`json_string`. For exact currency values, `decimal_scale` operates on the JSON
-number token and never through floating-point multiplication.
+Twenty's `bodyV2.blocknote` property is a JSON **string**, not an array. A
+rich-text shape must therefore chain `markdown_blocks` and then `json_string`.
+For exact currency values, `decimal_scale` operates on the JSON number token
+and never through floating-point multiplication.
 
 ## Observability and Alerts
 
@@ -527,6 +610,8 @@ playground operations:
 - `connection.secret_resolution_failed`
 - `tool.invoke_start`, `tool.invoke_success`, `tool.invoke_failure`, and
   `tool.invoke_rejected`
+- `tool.transform_warning` (one bounded summary event for a transformed
+  response that produced warnings)
 - `tool.playground_output_rejected`
 
 Events contain stable IDs, safe reason/outcome categories, revision or count

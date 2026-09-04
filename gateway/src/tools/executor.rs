@@ -36,6 +36,10 @@ use crate::{
             ToolInvocationContext, ToolInvocationSource, ToolRuntime, ToolRuntimeError,
             ToolWorkErrorDisposition,
         },
+        transforms::{
+            apply_request_transform, apply_response_transform, TransformError, TransformWarning,
+            MAX_TRANSFORM_WARNINGS,
+        },
     },
 };
 
@@ -95,6 +99,9 @@ const STRICT_SCHEMA_INJECTION_SKIP_KEYWORDS: &[&str] =
 // still bounding strict-default injection well below stack-overflow territory.
 const MAX_STRICT_SCHEMA_INJECTION_DEPTH: usize = 64;
 const MAX_VALIDATOR_CACHE_ENTRIES: usize = 4_096;
+const MAX_AUDITED_TRANSFORM_WARNINGS: usize = MAX_TRANSFORM_WARNINGS;
+const MAX_TRANSFORM_WARNING_PATH_CHARS: usize = 256;
+const MAX_TRANSFORM_WARNING_REASON_CHARS: usize = 256;
 
 type ValidatorCache = HashMap<ValidatorCacheKey, Arc<jsonschema::Validator>>;
 
@@ -151,6 +158,12 @@ pub enum ToolExecutorError {
     InputValidation {
         tool_name: String,
         problems: Vec<String>,
+    },
+    TransformRejected {
+        tool_name: String,
+        parameter: String,
+        path: String,
+        reason: String,
     },
     InvalidMapping {
         tool_name: String,
@@ -210,8 +223,14 @@ pub enum ToolExecutorError {
 
 #[derive(Debug)]
 pub enum ToolExecutionResult {
-    Http(EgressResponse),
+    Http(HttpToolExecutionResult),
     McpCallToolResult(CallToolResult),
+}
+
+#[derive(Debug)]
+pub struct HttpToolExecutionResult {
+    pub response: EgressResponse,
+    pub warnings: Vec<TransformWarning>,
 }
 
 type ToolExecutionPreconditionChecker =
@@ -323,6 +342,15 @@ impl fmt::Display for ToolExecutorError {
                 formatter,
                 "tool '{tool_name}' arguments failed input schema validation: {}",
                 problems.join("; ")
+            ),
+            Self::TransformRejected {
+                tool_name,
+                parameter,
+                reason,
+                ..
+            } => write!(
+                formatter,
+                "tool '{tool_name}' argument '{parameter}' could not be encoded: {reason}"
             ),
             Self::InvalidMapping { tool_name, message } => {
                 write!(formatter, "tool '{tool_name}' upstream mapping is invalid: {message}")
@@ -791,8 +819,22 @@ impl ToolExecutor {
                 .await;
         }
 
+        let wire_args = match apply_request_transform(tool.transform.as_ref(), &args) {
+            Ok(args) => args,
+            Err(error) => {
+                let error = transform_executor_error(&tool, error);
+                self.emit_executor_failure_observation(
+                    context,
+                    &tool,
+                    duration_millis(validation_started.elapsed()),
+                    &error,
+                );
+                return Err(error);
+            }
+        };
+
         let request_build_started = Instant::now();
-        let request = match self.build_request(&tool, &args) {
+        let request = match self.build_request(&tool, wire_args.as_ref()) {
             Ok(request) => request,
             Err(error) => {
                 self.emit_executor_failure_observation(
@@ -960,7 +1002,7 @@ impl ToolExecutor {
         let latency_ms = duration_millis(started.elapsed());
 
         match result {
-            Ok(response) => {
+            Ok(mut response) => {
                 let status = response.status.as_u16();
                 self.emit_upstream_audit(
                     context,
@@ -984,7 +1026,11 @@ impl ToolExecutor {
                         reason: None,
                     },
                 );
-                Ok(ToolExecutionResult::Http(response))
+                let warnings = self.apply_http_response_transform(context, &tool, &mut response);
+                Ok(ToolExecutionResult::Http(HttpToolExecutionResult {
+                    response,
+                    warnings,
+                }))
             }
             Err(error) => {
                 let outcome = executor_failure_observation_outcome(latency_ms, &error);
@@ -1004,6 +1050,79 @@ impl ToolExecutor {
                 Err(error)
             }
         }
+    }
+
+    fn apply_http_response_transform(
+        &self,
+        context: &ToolInvocationContext,
+        tool: &ToolDefinition,
+        response: &mut EgressResponse,
+    ) -> Vec<TransformWarning> {
+        let Some(transform) = tool.transform.as_ref() else {
+            return Vec::new();
+        };
+        if !response.status.is_success() || !response_has_json_content_type(response) {
+            return Vec::new();
+        }
+
+        let mut body = match serde_json::from_slice::<Value>(&response.body) {
+            Ok(body) => body,
+            Err(_) => {
+                let (warnings, warnings_truncated) =
+                    bounded_transform_warnings(vec![TransformWarning {
+                        path: "/".to_owned(),
+                        reason: "response_json_invalid".to_owned(),
+                    }]);
+                self.emit_transform_warnings(context, tool, &warnings, warnings_truncated);
+                return warnings;
+            }
+        };
+        let mut warnings = apply_response_transform(transform, &mut body);
+
+        match serde_json::to_vec(&body) {
+            Ok(body) => response.body = body,
+            Err(_) => warnings.push(TransformWarning {
+                path: "/".to_owned(),
+                reason: "response_json_serialize_failed".to_owned(),
+            }),
+        }
+        let (warnings, warnings_truncated) = bounded_transform_warnings(warnings);
+        if !warnings.is_empty() {
+            self.emit_transform_warnings(context, tool, &warnings, warnings_truncated);
+        }
+        warnings
+    }
+
+    fn emit_transform_warnings(
+        &self,
+        context: &ToolInvocationContext,
+        tool: &ToolDefinition,
+        warnings: &[TransformWarning],
+        warnings_truncated: bool,
+    ) {
+        let audited = warnings
+            .iter()
+            .take(MAX_AUDITED_TRANSFORM_WARNINGS)
+            .map(|warning| {
+                json!({
+                    "path": bounded_chars(&warning.path, MAX_TRANSFORM_WARNING_PATH_CHARS),
+                    "reason": bounded_chars(&warning.reason, MAX_TRANSFORM_WARNING_REASON_CHARS),
+                })
+            })
+            .collect::<Vec<_>>();
+        self.audit.emit(AuditEvent::new(
+            audit::event::TOOL_TRANSFORM_WARNING,
+            &context.request_id,
+            &context.source_ip,
+            context.actor.clone(),
+            json!({
+                "tool_name": tool.name,
+                "warning_count": warnings.len(),
+                "warnings": audited,
+                "warnings_truncated": warnings_truncated,
+                "invocation_source": context.source.as_str(),
+            }),
+        ));
     }
 
     async fn enforce_execution_precondition(
@@ -2184,12 +2303,75 @@ fn connection_egress_tool_error(tool: &ToolDefinition, error: &EgressError) -> T
     }
 }
 
+fn transform_executor_error(tool: &ToolDefinition, error: TransformError) -> ToolExecutorError {
+    ToolExecutorError::TransformRejected {
+        tool_name: tool.name.clone(),
+        parameter: bounded_chars(&error.parameter, 128),
+        path: bounded_chars(&error.path, MAX_TRANSFORM_WARNING_PATH_CHARS),
+        reason: bounded_chars(&error.reason, MAX_TRANSFORM_WARNING_REASON_CHARS),
+    }
+}
+
+fn response_has_json_content_type(response: &EgressResponse) -> bool {
+    response
+        .headers
+        .get(header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| {
+            let media_type = value.split(';').next().map(str::trim).unwrap_or_default();
+            media_type.eq_ignore_ascii_case("application/json")
+                || media_type
+                    .split_once('/')
+                    .is_some_and(|(_, subtype)| subtype.to_ascii_lowercase().ends_with("+json"))
+        })
+}
+
+fn bounded_chars(value: &str, max_chars: usize) -> String {
+    let mut chars = value.chars();
+    let mut bounded = chars.by_ref().take(max_chars).collect::<String>();
+    if chars.next().is_some() {
+        bounded.push_str("...[truncated]");
+    }
+    bounded
+}
+
+fn bounded_transform_warnings(warnings: Vec<TransformWarning>) -> (Vec<TransformWarning>, bool) {
+    let had_truncation_sentinel = warnings
+        .last()
+        .is_some_and(|warning| warning.reason == "warnings_truncated");
+    let raw_warning_count = warnings
+        .len()
+        .saturating_sub(usize::from(had_truncation_sentinel));
+    let was_truncated = had_truncation_sentinel || raw_warning_count > MAX_TRANSFORM_WARNINGS;
+    let retained = if was_truncated {
+        MAX_TRANSFORM_WARNINGS.saturating_sub(1)
+    } else {
+        MAX_TRANSFORM_WARNINGS
+    };
+    let mut bounded = warnings
+        .into_iter()
+        .take(raw_warning_count.min(retained))
+        .map(|warning| TransformWarning {
+            path: bounded_chars(&warning.path, MAX_TRANSFORM_WARNING_PATH_CHARS),
+            reason: bounded_chars(&warning.reason, MAX_TRANSFORM_WARNING_REASON_CHARS),
+        })
+        .collect::<Vec<_>>();
+    if was_truncated {
+        bounded.push(TransformWarning {
+            path: "/".to_owned(),
+            reason: "warnings_truncated".to_owned(),
+        });
+    }
+    (bounded, was_truncated)
+}
+
 fn executor_failure_observation_outcome(
     latency_ms: u64,
     error: &ToolExecutorError,
 ) -> ToolObservationOutcome {
     match error {
         ToolExecutorError::InputValidation { .. }
+        | ToolExecutorError::TransformRejected { .. }
         | ToolExecutorError::MissingArgument { .. }
         | ToolExecutorError::UnsupportedArgumentValue { .. }
         | ToolExecutorError::PathSegmentIsDotSegment { .. } => ToolObservationOutcome {
@@ -2348,6 +2530,18 @@ fn runtime_admission_failure_observation_outcome(
 
 fn executor_work_error_disposition(error: &ToolExecutorError) -> ToolWorkErrorDisposition {
     match error {
+        ToolExecutorError::TransformRejected { path, reason, .. } => {
+            return ToolWorkErrorDisposition::FailureWithDetails {
+                reason: Some(TOOL_INVALID_PARAMS_REASON.to_owned()),
+                details: json!({
+                    "problems": [{
+                        "path": path,
+                        "keyword": "codec",
+                        "reason": reason,
+                    }],
+                }),
+            };
+        }
         ToolExecutorError::HttpRuleDenied { .. } => {
             return ToolWorkErrorDisposition::Rejected(TOOL_MATCHED_RULE_REASON.to_owned());
         }
@@ -2379,7 +2573,8 @@ fn executor_work_error_disposition(error: &ToolExecutorError) -> ToolWorkErrorDi
             | ToolExecutorError::BodySerialize { .. }
             | ToolExecutorError::UrlBuild { .. } => TOOL_EXECUTOR_CONFIGURATION_ERROR_REASON,
             ToolExecutorError::HttpRuleDenied { .. }
-            | ToolExecutorError::PreconditionFailed { .. } => unreachable!("handled above"),
+            | ToolExecutorError::PreconditionFailed { .. }
+            | ToolExecutorError::TransformRejected { .. } => unreachable!("handled above"),
         }
         .to_owned(),
     ))
@@ -2466,6 +2661,37 @@ mod tests {
         assert_eq!(egress_error_reason(&error), "private_ip_blocked");
     }
 
+    #[test]
+    fn transform_warning_bound_preserves_the_real_truncation_state() {
+        let core_bounded = (0..MAX_TRANSFORM_WARNINGS - 1)
+            .map(|index| TransformWarning {
+                path: format!("/data/{index}"),
+                reason: "decode_failed".to_owned(),
+            })
+            .chain(std::iter::once(TransformWarning {
+                path: "/".to_owned(),
+                reason: "warnings_truncated".to_owned(),
+            }))
+            .collect();
+
+        let (warnings, warnings_truncated) = bounded_transform_warnings(core_bounded);
+
+        assert!(warnings_truncated);
+        assert_eq!(warnings.len(), MAX_TRANSFORM_WARNINGS);
+        assert_eq!(warnings.last().expect("sentinel").path, "/");
+        assert_eq!(
+            warnings.last().expect("sentinel").reason,
+            "warnings_truncated"
+        );
+        assert_eq!(
+            warnings
+                .iter()
+                .filter(|warning| warning.reason == "warnings_truncated")
+                .count(),
+            1
+        );
+    }
+
     #[tokio::test]
     async fn valid_args_are_mapped_to_upstream_request_and_audited() {
         let (addr, server) = one_request_server(StatusCode::CREATED, br#"{"ok":true}"#).await;
@@ -2528,6 +2754,265 @@ mod tests {
             "tool observation event should include latency_ms"
         );
         assert_eq!(executor.validator_cache_guard().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn currency_number_round_trips_to_micros_and_back_in_one_request() {
+        let response_body = br#"{"data":{"createCompany":{"annualRecurringRevenue":{"amountMicros":"24000000000","currencyCode":"USD"},"name":"Acme"}}}"#;
+        let (addr, server) = one_request_json_server(StatusCode::OK, response_body).await;
+        let tool = currency_transform_tool("create_company", "/data/createCompany");
+        let (executor, _capture) = executor_for_tools(
+            addr,
+            [tool],
+            runtime_config([("create_company", enabled_tool(1_000, 1))], 2, 1, 100),
+        );
+
+        let result = http_execution_result(
+            executor
+                .execute(
+                    "create_company",
+                    json!({
+                        "name": "Acme",
+                        "amount": 24000,
+                        "currency": "USD",
+                    }),
+                    invocation_context(),
+                    CancellationToken::new(),
+                )
+                .await
+                .expect("exact currency transform should succeed"),
+        );
+
+        assert!(result.warnings.is_empty());
+        assert_eq!(
+            serde_json::from_slice::<Value>(&result.response.body)
+                .expect("transformed response should remain JSON"),
+            json!({
+                "data": {
+                    "createCompany": {
+                        "name": "Acme",
+                        "amount": 24000,
+                        "currency": "USD",
+                    }
+                }
+            })
+        );
+        let request = server.await.expect("one-request server should join");
+        assert_eq!(request.method, "POST");
+        assert_eq!(request.target, "/v1/companies");
+        assert_eq!(
+            request.body,
+            br#"{"annualRecurringRevenue":{"amountMicros":"24000000000","currencyCode":"USD"},"name":"Acme"}"#
+        );
+    }
+
+    #[tokio::test]
+    async fn transform_rejection_is_structured_and_happens_before_upstream_io() {
+        let server = gated_server().await;
+        let tool = currency_transform_tool("create_company", "/data/createCompany");
+        let (executor, capture) = executor_for_tools(
+            server.addr,
+            [tool],
+            runtime_config([("create_company", enabled_tool(1_000, 1))], 2, 1, 100),
+        );
+        let inexact: Value =
+            serde_json::from_str("24000.1234567").expect("test decimal should parse exactly");
+
+        let error = executor
+            .execute(
+                "create_company",
+                json!({
+                    "name": "Acme",
+                    "amount": inexact,
+                    "currency": "USD",
+                }),
+                invocation_context(),
+                CancellationToken::new(),
+            )
+            .await
+            .expect_err("inexact decimal must be rejected without rounding");
+
+        match error {
+            ToolRuntimeError::WorkFailed {
+                reason,
+                details: Some(details),
+                ..
+            } => {
+                assert_eq!(reason.as_deref(), Some(TOOL_INVALID_PARAMS_REASON));
+                assert_eq!(details["problems"][0]["path"], json!("/amount"));
+                assert_eq!(details["problems"][0]["keyword"], json!("codec"));
+                assert_eq!(
+                    details["problems"][0]["reason"],
+                    json!("value has 7 fraction digits, codec allows 6")
+                );
+            }
+            other => panic!("unexpected transform rejection: {other:?}"),
+        }
+        assert_no_upstream_requests(&server).await;
+        assert!(capture
+            .events()
+            .iter()
+            .all(|event| event.event_type != audit::event::TOOL_UPSTREAM_REQUEST));
+        server.stop.cancel();
+        server.handle.abort();
+    }
+
+    #[tokio::test]
+    async fn markdown_body_is_written_to_both_wire_fields_and_read_back_from_one() {
+        let markdown = "First paragraph.\n\nSecond paragraph.";
+        let response_body = br#"{"data":{"createNote":{"bodyV2":{"markdown":"First paragraph.\n\nSecond paragraph.","blocknote":"[]"},"id":"note-1"}}}"#;
+        let (addr, server) = one_request_json_server(StatusCode::OK, response_body).await;
+        let (executor, _capture) = executor_for_tools(
+            addr,
+            [markdown_transform_tool()],
+            runtime_config([("create_note", enabled_tool(1_000, 1))], 2, 1, 100),
+        );
+
+        let result = http_execution_result(
+            executor
+                .execute(
+                    "create_note",
+                    json!({ "markdown": markdown }),
+                    invocation_context(),
+                    CancellationToken::new(),
+                )
+                .await
+                .expect("supported Markdown should transform"),
+        );
+        assert!(result.warnings.is_empty());
+        assert_eq!(
+            serde_json::from_slice::<Value>(&result.response.body)
+                .expect("normalized response should be JSON"),
+            json!({
+                "data": {
+                    "createNote": {
+                        "id": "note-1",
+                        "markdown": markdown,
+                    }
+                }
+            })
+        );
+
+        let request = server.await.expect("one-request server should join");
+        let wire: Value =
+            serde_json::from_slice(&request.body).expect("wire request body should be JSON");
+        assert_eq!(wire["bodyV2"]["markdown"], json!(markdown));
+        let blocknote = wire["bodyV2"]["blocknote"]
+            .as_str()
+            .expect("BlockNote document must be carried as a JSON string");
+        let blocks: Value =
+            serde_json::from_str(blocknote).expect("BlockNote JSON string should parse");
+        assert_eq!(
+            blocks.as_array().map(Vec::len),
+            Some(2),
+            "both Markdown paragraphs should become blocks: {blocks}"
+        );
+    }
+
+    #[tokio::test]
+    async fn response_transform_visits_multiple_objects_and_leaves_failed_field_atomic() {
+        let tool = paired_decimal_transform_tool();
+        let (executor, capture) = executor_for_tools(
+            socket_addr(1),
+            [tool],
+            runtime_config([("list_companies", enabled_tool(1_000, 1))], 2, 1, 100),
+        );
+        let definition = executor
+            .registry
+            .get("list_companies")
+            .expect("transformed definition should register");
+        let context = invocation_context();
+        let mut response = EgressResponse {
+            status: StatusCode::OK,
+            headers: HeaderMap::from_iter([(
+                header::CONTENT_TYPE,
+                HeaderValue::from_static("application/json"),
+            )]),
+            body: br#"{"data":{"companies":[{"financials":{"amountMicros":"1000000","taxMicros":"2000000"},"id":"one"},{"financials":{"amountMicros":"3000000","taxMicros":"007"},"id":"two"}]}}"#.to_vec(),
+        };
+
+        let warnings = executor.apply_http_response_transform(&context, &definition, &mut response);
+        assert_eq!(warnings.len(), 1, "one malformed field should warn once");
+        let body: Value =
+            serde_json::from_slice(&response.body).expect("response should remain JSON");
+        assert_eq!(
+            body["data"]["companies"][0],
+            json!({"amount": 1, "tax": 2, "id": "one"})
+        );
+        assert_eq!(
+            body["data"]["companies"][1],
+            json!({
+                "financials": {
+                    "amountMicros": "3000000",
+                    "taxMicros": "007",
+                },
+                "id": "two",
+            }),
+            "a failed decode must retain the entire wire field without partial agent properties"
+        );
+        let events = audit_events(&capture, 1).await;
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].event_type, audit::event::TOOL_TRANSFORM_WARNING);
+        assert_eq!(events[0].payload["warning_count"], json!(1));
+        assert!(events[0].payload.get("financials").is_none());
+    }
+
+    #[tokio::test]
+    async fn malformed_json_warns_only_for_transformed_tools_and_preserves_legacy_bytes() {
+        const MALFORMED: &[u8] = b"{FAKE_RESPONSE_VALUE_SHOULD_NOT_BE_AUDITED";
+        let (executor, capture) = executor_for_tools(
+            socket_addr(1),
+            [
+                currency_transform_tool("create_company", "/data/createCompany"),
+                echo_tool(),
+            ],
+            runtime_config(
+                [
+                    ("create_company", enabled_tool(1_000, 1)),
+                    ("echo", enabled_tool(1_000, 1)),
+                ],
+                2,
+                1,
+                100,
+            ),
+        );
+        let context = invocation_context();
+        let mut transformed_response = json_egress_response(MALFORMED);
+        let transformed = executor
+            .registry
+            .get("create_company")
+            .expect("transformed definition should register");
+        let warnings = executor.apply_http_response_transform(
+            &context,
+            &transformed,
+            &mut transformed_response,
+        );
+        assert_eq!(transformed_response.body, MALFORMED);
+        assert_eq!(
+            warnings,
+            vec![TransformWarning {
+                path: "/".to_owned(),
+                reason: "response_json_invalid".to_owned(),
+            }]
+        );
+
+        let legacy = executor
+            .registry
+            .get("echo")
+            .expect("legacy definition should register");
+        let mut legacy_response = json_egress_response(MALFORMED);
+        assert!(executor
+            .apply_http_response_transform(&context, &legacy, &mut legacy_response)
+            .is_empty());
+        assert_eq!(legacy_response.body, MALFORMED);
+
+        let events = audit_events(&capture, 1).await;
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].event_type, audit::event::TOOL_TRANSFORM_WARNING);
+        assert!(!events[0]
+            .payload
+            .to_string()
+            .contains("FAKE_RESPONSE_VALUE"));
     }
 
     #[tokio::test]
@@ -5184,8 +5669,12 @@ mod tests {
     }
 
     fn http_response(result: ToolExecutionResult) -> EgressResponse {
+        http_execution_result(result).response
+    }
+
+    fn http_execution_result(result: ToolExecutionResult) -> HttpToolExecutionResult {
         match result {
-            ToolExecutionResult::Http(response) => response,
+            ToolExecutionResult::Http(result) => result,
             ToolExecutionResult::McpCallToolResult(_) => {
                 panic!("expected HTTP tool execution result")
             }
@@ -5419,6 +5908,180 @@ mod tests {
                 }
             }
         })
+    }
+
+    fn currency_transform_tool(name: &str, response_root: &str) -> Value {
+        json!({
+            "name": name,
+            "description": "Creates a company with agent-facing currency values.",
+            "input_json_schema": {
+                "type": "object",
+                "required": ["name", "amount", "currency"],
+                "properties": {
+                    "name": { "type": "string" },
+                    "amount": { "type": "number" },
+                    "currency": { "type": "string" }
+                },
+                "additionalProperties": false
+            },
+            "upstream": {
+                "method": "POST",
+                "path_template": "/v1/companies",
+                "body": { "mode": "body_args_json" }
+            },
+            "transform": {
+                "parameters": [{
+                    "wire_property": "annualRecurringRevenue",
+                    "wire_required": true,
+                    "agent": [
+                        { "name": "amount", "schema": { "type": "number" } },
+                        { "name": "currency", "schema": { "type": "string" } }
+                    ],
+                    "wire": [
+                        {
+                            "pointer": "/amountMicros",
+                            "from": "amount",
+                            "codec": [{
+                                "kind": "decimal_scale",
+                                "scale": 6,
+                                "wire_encoding": "integer_string",
+                                "max_integer_digits": 24
+                            }]
+                        },
+                        { "pointer": "/currencyCode", "from": "currency" }
+                    ],
+                    "response": [
+                        {
+                            "agent_property": "amount",
+                            "from": "/amountMicros",
+                            "codec": [{
+                                "kind": "decimal_scale",
+                                "scale": 6,
+                                "wire_encoding": "integer_string",
+                                "max_integer_digits": 24
+                            }]
+                        },
+                        { "agent_property": "currency", "from": "/currencyCode" }
+                    ]
+                }],
+                "response_root": response_root
+            }
+        })
+    }
+
+    fn markdown_transform_tool() -> Value {
+        json!({
+            "name": "create_note",
+            "description": "Creates a note from agent-facing Markdown.",
+            "input_json_schema": {
+                "type": "object",
+                "required": ["markdown"],
+                "properties": { "markdown": { "type": "string" } },
+                "additionalProperties": false
+            },
+            "upstream": {
+                "method": "POST",
+                "path_template": "/v1/notes",
+                "body": { "mode": "body_args_json" }
+            },
+            "transform": {
+                "parameters": [{
+                    "wire_property": "bodyV2",
+                    "wire_required": true,
+                    "agent": [{
+                        "name": "markdown",
+                        "schema": { "type": "string" }
+                    }],
+                    "wire": [
+                        { "pointer": "/markdown", "from": "markdown" },
+                        {
+                            "pointer": "/blocknote",
+                            "from": "markdown",
+                            "codec": [
+                                {
+                                    "kind": "markdown_blocks",
+                                    "dialect": "blocknote",
+                                    "max_input_bytes": 65536
+                                },
+                                { "kind": "json_string" }
+                            ]
+                        }
+                    ],
+                    "response": [{
+                        "agent_property": "markdown",
+                        "from": "/markdown"
+                    }]
+                }],
+                "response_root": "/data/createNote"
+            }
+        })
+    }
+
+    fn paired_decimal_transform_tool() -> Value {
+        let decimal_codec = json!({
+            "kind": "decimal_scale",
+            "scale": 6,
+            "wire_encoding": "integer_string",
+            "max_integer_digits": 24
+        });
+        json!({
+            "name": "list_companies",
+            "description": "Lists normalized company financials.",
+            "input_json_schema": {
+                "type": "object",
+                "properties": {},
+                "additionalProperties": false
+            },
+            "upstream": {
+                "method": "GET",
+                "path_template": "/v1/companies"
+            },
+            "transform": {
+                "response_fields": [{
+                    "wire_property": "financials",
+                    "agent": [
+                        { "name": "amount", "schema": { "type": "number" } },
+                        { "name": "tax", "schema": { "type": "number" } }
+                    ],
+                    "wire": [
+                        {
+                            "pointer": "/amountMicros",
+                            "from": "amount",
+                            "codec": [decimal_codec.clone()]
+                        },
+                        {
+                            "pointer": "/taxMicros",
+                            "from": "tax",
+                            "codec": [decimal_codec.clone()]
+                        }
+                    ],
+                    "response": [
+                        {
+                            "agent_property": "amount",
+                            "from": "/amountMicros",
+                            "codec": [decimal_codec.clone()]
+                        },
+                        {
+                            "agent_property": "tax",
+                            "from": "/taxMicros",
+                            "codec": [decimal_codec]
+                        }
+                    ]
+                }],
+                "response_root": "/data/companies/*"
+            }
+        })
+    }
+
+    fn json_egress_response(body: &[u8]) -> EgressResponse {
+        EgressResponse {
+            status: StatusCode::OK,
+            headers: HeaderMap::from_iter([(
+                header::CONTENT_TYPE,
+                HeaderValue::from_static("application/json"),
+            )]),
+            body: body.to_vec(),
+        }
     }
 
     fn composite_only_echo_tool() -> Value {
@@ -5800,6 +6463,42 @@ mod tests {
                 .expect("test server should accept one request");
             let request = read_http_request(&mut stream).await;
             write_response(&mut stream, status, body).await;
+            request
+        });
+
+        (addr, handle)
+    }
+
+    async fn one_request_json_server(
+        status: StatusCode,
+        body: &'static [u8],
+    ) -> (SocketAddr, tokio::task::JoinHandle<CapturedRequest>) {
+        let listener = TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .expect("test listener should bind");
+        let addr = listener
+            .local_addr()
+            .expect("listener local address should be available");
+        let handle = tokio::spawn(async move {
+            let (mut stream, _) = listener
+                .accept()
+                .await
+                .expect("test server should accept one request");
+            let request = read_http_request(&mut stream).await;
+            let reason = status.canonical_reason().unwrap_or("OK");
+            let response = format!(
+                "HTTP/1.1 {} {reason}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                status.as_u16(),
+                body.len()
+            );
+            stream
+                .write_all(response.as_bytes())
+                .await
+                .expect("test JSON response headers should write");
+            stream
+                .write_all(body)
+                .await
+                .expect("test JSON response body should write");
             request
         });
 

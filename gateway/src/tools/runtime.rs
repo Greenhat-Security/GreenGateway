@@ -205,11 +205,19 @@ pub enum ToolRuntimeError {
         tool_name: String,
         message: String,
         reason: Option<String>,
+        /// Bounded, caller-safe metadata supplied by the executor. This is
+        /// deliberately separate from `message`: transports may expose these
+        /// fields without parsing display text or risking upstream values.
+        details: Option<Value>,
     },
 }
 
 pub(crate) enum ToolWorkErrorDisposition {
     Failure(Option<String>),
+    FailureWithDetails {
+        reason: Option<String>,
+        details: Value,
+    },
     Rejected(String),
 }
 
@@ -786,6 +794,23 @@ impl ToolRuntime {
                                     tool_name: tool_name.to_owned(),
                                     message,
                                     reason,
+                                    details: None,
+                                })
+                            }
+                            ToolWorkErrorDisposition::FailureWithDetails { reason, details } => {
+                                let message = err.to_string();
+                                self.emit(
+                                    audit::event::TOOL_INVOKE_FAILURE,
+                                    &context,
+                                    tool_name,
+                                    "failure",
+                                    Some("work_error"),
+                                );
+                                Err(ToolRuntimeError::WorkFailed {
+                                    tool_name: tool_name.to_owned(),
+                                    message,
+                                    reason,
+                                    details: Some(details),
                                 })
                             }
                             ToolWorkErrorDisposition::Rejected(reason) => {
@@ -1504,6 +1529,40 @@ mod tests {
 
         assert!(matches!(error, ToolRuntimeError::UnknownTool { .. }));
         assert_rejected_events(&capture, "missing", "unknown_tool", 1).await;
+    }
+
+    #[tokio::test]
+    async fn caller_safe_work_failure_details_cross_the_runtime_boundary() {
+        let (runtime, _capture) = runtime_with_tools([("tool", enabled_tool(100, 1))], 2, 1, 100);
+
+        let error = runtime
+            .execute_result_with_context_and_reason(
+                "tool",
+                context(),
+                CancellationToken::new(),
+                || async { Err::<(), _>("safe failure") },
+                |_| ToolWorkErrorDisposition::FailureWithDetails {
+                    reason: Some("invalid_params".to_owned()),
+                    details: json!({
+                        "problems": [{
+                            "path": "/amount",
+                            "keyword": "codec",
+                            "reason": "fractional precision is too large",
+                        }],
+                    }),
+                },
+            )
+            .await
+            .expect_err("work failure should retain safe structured details");
+
+        assert!(matches!(
+            error,
+            ToolRuntimeError::WorkFailed {
+                reason: Some(ref reason),
+                details: Some(ref details),
+                ..
+            } if reason == "invalid_params" && details["problems"][0]["path"] == json!("/amount")
+        ));
     }
 
     #[tokio::test]

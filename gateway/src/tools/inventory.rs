@@ -26,6 +26,7 @@ use super::definitions::{
     BodyMapping, HttpToolMapping, QueryParamMapping, ToolDefinition, ToolRegistry, ToolSource,
     ToolTarget,
 };
+use super::transforms::{ParameterShape, ToolTransform, WireSource};
 
 pub const DEFAULT_CAPABILITY_LIST_LIMIT: usize = 50;
 pub const MAX_CAPABILITY_LIST_LIMIT: usize = 100;
@@ -210,7 +211,27 @@ pub struct CapabilityDetail {
     pub input_schema: Option<Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub mapping: Option<CapabilityMapping>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub transform: Option<CapabilityTransformSummary>,
     pub actions: CapabilityActions,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct CapabilityTransformSummary {
+    pub parameters: Vec<CapabilityTransformShapeSummary>,
+    pub response_fields: Vec<CapabilityTransformShapeSummary>,
+    pub has_response_root: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct CapabilityTransformShapeSummary {
+    pub wire_property: String,
+    pub agent_properties: Vec<String>,
+    pub wire_pointer_count: usize,
+    pub response_properties: Vec<String>,
+    pub constant_binding_count: usize,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
@@ -261,6 +282,7 @@ struct BuiltCapability {
     summary: CapabilitySummary,
     input_schema: Option<Value>,
     mapping: Option<CapabilityMapping>,
+    transform: Option<CapabilityTransformSummary>,
     registered_definition: Option<ToolDefinition>,
     execution_revision: Option<CapabilityExecutionRevision>,
 }
@@ -624,6 +646,7 @@ impl CapabilityInventory {
                         }),
                         summary,
                         input_schema: None,
+                        transform: None,
                         registered_definition: None,
                         execution_revision: None,
                     },
@@ -665,6 +688,7 @@ impl CapabilityInventory {
                         }),
                         summary,
                         input_schema: None,
+                        transform: None,
                         registered_definition: None,
                         execution_revision: None,
                     },
@@ -1147,6 +1171,7 @@ fn tool_capability(
             })
             .or_else(|| Some(http_mapping(&definition.upstream))),
     };
+    let transform = definition.transform.as_ref().map(transform_summary);
     Ok(BuiltCapability {
         summary: CapabilitySummary {
             id: capability_id(&["tool", definition.name.as_str()]),
@@ -1167,6 +1192,7 @@ fn tool_capability(
         },
         input_schema: Some(definition.input_schema),
         mapping,
+        transform,
         registered_definition,
         execution_revision,
     })
@@ -1178,6 +1204,44 @@ fn http_mapping(mapping: &HttpToolMapping) -> CapabilityMapping {
         path_template: mapping.path_template.clone(),
         query_params: mapping.query_params.clone(),
         body: mapping.body.clone(),
+    }
+}
+
+fn transform_summary(transform: &ToolTransform) -> CapabilityTransformSummary {
+    CapabilityTransformSummary {
+        parameters: transform
+            .parameters
+            .iter()
+            .map(transform_shape_summary)
+            .collect(),
+        response_fields: transform
+            .response_fields
+            .iter()
+            .map(transform_shape_summary)
+            .collect(),
+        has_response_root: transform.response_root.is_some(),
+    }
+}
+
+fn transform_shape_summary(shape: &ParameterShape) -> CapabilityTransformShapeSummary {
+    CapabilityTransformShapeSummary {
+        wire_property: shape.wire_property.clone(),
+        agent_properties: shape
+            .agent
+            .iter()
+            .map(|property| property.name.clone())
+            .collect(),
+        wire_pointer_count: shape.wire.len(),
+        response_properties: shape
+            .response
+            .iter()
+            .map(|binding| binding.agent_property.clone())
+            .collect(),
+        constant_binding_count: shape
+            .wire
+            .iter()
+            .filter(|binding| matches!(&binding.source, WireSource::Const { .. }))
+            .count(),
     }
 }
 
@@ -1325,6 +1389,7 @@ fn capability_detail_result(
         summary,
         input_schema,
         mapping,
+        transform,
         registered_definition,
         execution_revision,
     } = capability;
@@ -1332,6 +1397,7 @@ fn capability_detail_result(
         summary,
         input_schema,
         mapping,
+        transform,
         actions,
     };
     let binding = serde_json::to_vec(&(
@@ -1487,6 +1553,68 @@ mod tests {
 
     use super::*;
 
+    #[test]
+    fn transform_summary_exposes_shape_metadata_without_constants_or_wire_pointers() {
+        let transform: ToolTransform = serde_json::from_value(json!({
+            "parameters": [{
+                "wire_property": "billing",
+                "agent": [{
+                    "name": "amount",
+                    "schema": { "type": "number" }
+                }],
+                "wire": [
+                    {
+                        "pointer": "/amountMicros",
+                        "from": "amount",
+                        "codec": [{
+                            "kind": "decimal_scale",
+                            "scale": 6,
+                            "wire_encoding": "integer_string",
+                            "max_integer_digits": 24
+                        }]
+                    },
+                    {
+                        "pointer": "/internalDefault",
+                        "const": "FAKE_INTERNAL_DEFAULT_VALUE"
+                    }
+                ],
+                "response": [{
+                    "agent_property": "amount",
+                    "from": "/amountMicros",
+                    "codec": [{
+                        "kind": "decimal_scale",
+                        "scale": 6,
+                        "wire_encoding": "integer_string",
+                        "max_integer_digits": 24
+                    }]
+                }]
+            }],
+            "response_root": "/data/company"
+        }))
+        .expect("compiled transform fixture should deserialize");
+
+        let serialized = serde_json::to_value(transform_summary(&transform))
+            .expect("transform summary should serialize");
+        assert_eq!(
+            serialized,
+            json!({
+                "parameters": [{
+                    "wire_property": "billing",
+                    "agent_properties": ["amount"],
+                    "wire_pointer_count": 2,
+                    "response_properties": ["amount"],
+                    "constant_binding_count": 1
+                }],
+                "response_fields": [],
+                "has_response_root": true
+            })
+        );
+        let text = serialized.to_string();
+        assert!(!text.contains("FAKE_INTERNAL_DEFAULT_VALUE"));
+        assert!(!text.contains("amountMicros"));
+        assert!(!text.contains("decimal_scale"));
+    }
+
     struct TemporaryInventoryDatabase {
         path: PathBuf,
     }
@@ -1589,6 +1717,7 @@ mod tests {
                 },
                 upstream: openapi_mapping,
                 visibility: crate::tools::definitions::ToolVisibility::Listed,
+                transform: None,
             };
 
             let store = control_plane
@@ -1833,6 +1962,7 @@ mod tests {
                 body: None,
             },
             visibility: crate::tools::definitions::ToolVisibility::Listed,
+            transform: None,
         };
         let mut capability = BuiltCapability {
             summary: CapabilitySummary {
@@ -1862,6 +1992,7 @@ mod tests {
             },
             input_schema: Some(definition.input_schema.clone()),
             mapping: None,
+            transform: None,
             registered_definition: Some(definition),
             execution_revision: Some(CapabilityExecutionRevision::Manual {
                 connection_etag: None,
@@ -2258,6 +2389,7 @@ mod tests {
                 source: ToolSource::Manual,
                 upstream: manual_mapping,
                 visibility: crate::tools::definitions::ToolVisibility::Listed,
+                transform: None,
             }])
             .expect("unassociated manual capability should publish");
 
@@ -2321,6 +2453,7 @@ mod tests {
                     },
                     input_schema: None,
                     mapping: None,
+                    transform: None,
                     registered_definition: None,
                     execution_revision: None,
                 },
@@ -2357,6 +2490,7 @@ mod tests {
                 },
                 input_schema: None,
                 mapping: None,
+                transform: None,
                 registered_definition: None,
                 execution_revision: None,
             },

@@ -27,7 +27,10 @@ use crate::{
     egress::EgressResponse,
     tools::{
         definitions::{ToolDefinition, ToolRegistry},
-        executor::{ToolConnectionRuntimes, ToolExecutionResult, ToolExecutor, ToolExecutorError},
+        executor::{
+            HttpToolExecutionResult, ToolConnectionRuntimes, ToolExecutionResult, ToolExecutor,
+            ToolExecutorError,
+        },
         runtime::{ToolInvocationContext, ToolInvocationSource, ToolRuntimeError},
     },
 };
@@ -165,8 +168,8 @@ impl ServerHandler for McpServer {
             )
             .await
         {
-            Ok(ToolExecutionResult::Http(response)) => {
-                Ok(call_tool_result_from_egress_response(response))
+            Ok(ToolExecutionResult::Http(result)) => {
+                Ok(call_tool_result_from_http_execution(result))
             }
             Ok(ToolExecutionResult::McpCallToolResult(result)) => Ok(result),
             Err(error) => Err(runtime_error_to_mcp_error(error)),
@@ -270,16 +273,20 @@ fn invocation_context_from_request(
     }
 }
 
-fn call_tool_result_from_egress_response(response: EgressResponse) -> CallToolResult {
+fn call_tool_result_from_http_execution(result: HttpToolExecutionResult) -> CallToolResult {
+    let HttpToolExecutionResult { response, warnings } = result;
     let body = if response.status.is_success() {
         response_body_value(&response)
     } else {
         sanitized_error_body_value(&response)
     };
-    let result = json!({
+    let mut result = json!({
         "status": response.status.as_u16(),
         "body": body,
     });
+    if !warnings.is_empty() {
+        result["warnings"] = json!(warnings);
+    }
 
     if response.status.is_success() {
         CallToolResult::structured(result)
@@ -539,11 +546,12 @@ fn runtime_error_to_mcp_error(error: ToolRuntimeError) -> ErrorData {
             tool_name,
             message,
             reason,
+            details,
         } => {
             let executor_error = classify_executor_work_failure(reason.as_deref(), &message);
             match executor_error {
                 ExecutorWorkFailure::InvalidParams => {
-                    ErrorData::invalid_params(message, Some(json!({ "tool_name": tool_name })))
+                    ErrorData::invalid_params(message, Some(work_failure_data(tool_name, details)))
                 }
                 ExecutorWorkFailure::UnknownTool => unknown_tool_error(&tool_name),
                 ExecutorWorkFailure::Internal { reason } => ErrorData::internal_error(
@@ -553,6 +561,24 @@ fn runtime_error_to_mcp_error(error: ToolRuntimeError) -> ErrorData {
             }
         }
     }
+}
+
+fn work_failure_data(tool_name: String, details: Option<Value>) -> Value {
+    let mut data = Map::from_iter([("tool_name".to_owned(), Value::String(tool_name))]);
+    match details {
+        Some(Value::Object(details)) => {
+            for (key, value) in details {
+                if key != "tool_name" {
+                    data.insert(key, value);
+                }
+            }
+        }
+        Some(details) => {
+            data.insert("details".to_owned(), details);
+        }
+        None => {}
+    }
+    Value::Object(data)
 }
 
 fn unknown_tool_error(tool_name: &str) -> ErrorData {
@@ -716,6 +742,110 @@ mod tests {
         );
     }
 
+    #[test]
+    fn http_transform_warnings_are_optional_in_mcp_structured_content() {
+        let response = || EgressResponse {
+            status: http::StatusCode::OK,
+            headers: http::HeaderMap::from_iter([(
+                header::CONTENT_TYPE,
+                http::HeaderValue::from_static(JSON_MIME),
+            )]),
+            body: br#"{"amount":24000}"#.to_vec(),
+        };
+
+        let plain = call_tool_result_from_http_execution(HttpToolExecutionResult {
+            response: response(),
+            warnings: Vec::new(),
+        });
+        assert_eq!(
+            plain.structured_content,
+            Some(json!({"status": 200, "body": {"amount": 24000}}))
+        );
+
+        let warned = call_tool_result_from_http_execution(HttpToolExecutionResult {
+            response: response(),
+            warnings: vec![crate::tools::transforms::TransformWarning {
+                path: "/data/company/annualRecurringRevenue".to_owned(),
+                reason: "wire value must match the canonical integer grammar".to_owned(),
+            }],
+        });
+        assert_eq!(
+            warned
+                .structured_content
+                .as_ref()
+                .and_then(|content| content.get("warnings")),
+            Some(&json!([{
+                "path": "/data/company/annualRecurringRevenue",
+                "reason": "wire value must match the canonical integer grammar",
+            }]))
+        );
+    }
+
+    #[test]
+    fn transformed_http_body_and_warnings_have_mcp_playground_parity() {
+        let response = || EgressResponse {
+            status: http::StatusCode::OK,
+            headers: http::HeaderMap::from_iter([(
+                header::CONTENT_TYPE,
+                http::HeaderValue::from_static(JSON_MIME),
+            )]),
+            body: br#"{"amount":24000,"currency":"USD"}"#.to_vec(),
+        };
+        let warnings = || {
+            vec![crate::tools::transforms::TransformWarning {
+                path: "/data/company/annualRecurringRevenue".to_owned(),
+                reason: "wire value must match the canonical integer grammar".to_owned(),
+            }]
+        };
+
+        let mcp = call_tool_result_from_http_execution(HttpToolExecutionResult {
+            response: response(),
+            warnings: warnings(),
+        })
+        .structured_content
+        .expect("MCP HTTP result should carry structured content");
+        let playground = crate::tools::playground::project_tool_execution_result(
+            ToolExecutionResult::Http(HttpToolExecutionResult {
+                response: response(),
+                warnings: warnings(),
+            }),
+        )
+        .expect("playground should project the same executor result");
+
+        assert_eq!(mcp["status"], playground["status"]);
+        assert_eq!(mcp["body"], playground["body"]["value"]);
+        assert_eq!(mcp["warnings"], playground["warnings"]);
+    }
+
+    #[test]
+    fn transform_rejection_details_are_preserved_in_mcp_invalid_params() {
+        let error = runtime_error_to_mcp_error(ToolRuntimeError::WorkFailed {
+            tool_name: "createCompany".to_owned(),
+            message: "tool 'createCompany' argument 'amount' could not be encoded".to_owned(),
+            reason: Some("invalid_params".to_owned()),
+            details: Some(json!({
+                "problems": [{
+                    "path": "/amount",
+                    "keyword": "codec",
+                    "reason": "value has 7 fraction digits, codec allows 6",
+                }],
+            })),
+        });
+
+        assert_eq!(error.code, ErrorCode::INVALID_PARAMS);
+        assert_eq!(
+            error.data,
+            Some(json!({
+                "tool_name": "createCompany",
+                "problems": [{
+                    "path": "/amount",
+                    "keyword": "codec",
+                    "reason": "value has 7 fraction digits, codec allows 6",
+                }],
+            }))
+        );
+    }
+
     #[tokio::test]
     async fn hot_reloaded_tools_are_still_filtered_by_visibility_policy() {
         let (state, registry) = mcp_state_from_empty_registry();
@@ -737,6 +867,70 @@ mod tests {
             !listed.iter().any(|name| name == RESTRICTED_TOOL),
             "a tool restricted to '{PRIVILEGED_ROLE}' must not be advertised to a caller without that role: {listed:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn transformed_tool_advertises_agent_schema_and_validates_it_over_mcp() {
+        let (state, registry) = mcp_state_from_empty_registry();
+        registry
+            .merge_definitions(vec![transformed_visible_tool_definition()])
+            .expect("transformed definition should register");
+
+        let listed = mcp_json_rpc(&state, 20, "tools/list", None).await;
+        let tool = listed["result"]["tools"]
+            .as_array()
+            .and_then(|tools| {
+                tools
+                    .iter()
+                    .find(|tool| tool["name"] == json!(VISIBLE_TOOL))
+            })
+            .unwrap_or_else(|| panic!("transformed tool should be listed: {listed}"));
+        assert_eq!(
+            tool["inputSchema"]["properties"]["amount"]["type"],
+            "number"
+        );
+        assert_eq!(
+            tool["inputSchema"]["properties"]["currency"]["type"],
+            "string"
+        );
+        assert!(tool["inputSchema"]["properties"]
+            .get("annualRecurringRevenue")
+            .is_none());
+
+        let wire_shaped = mcp_json_rpc(
+            &state,
+            21,
+            "tools/call",
+            Some(json!({
+                "name": VISIBLE_TOOL,
+                "arguments": {
+                    "annualRecurringRevenue": {
+                        "amountMicros": "24000000000",
+                        "currencyCode": "USD"
+                    }
+                }
+            })),
+        )
+        .await;
+        assert_eq!(
+            wire_shaped["error"]["code"],
+            json!(ErrorCode::INVALID_PARAMS.0),
+            "wire-facing arguments must not bypass the agent schema: {wire_shaped}"
+        );
+
+        let inexact = mcp_json_rpc(
+            &state,
+            22,
+            "tools/call",
+            Some(json!({
+                "name": VISIBLE_TOOL,
+                "arguments": {"amount": 24000.1234567, "currency": "USD"}
+            })),
+        )
+        .await;
+        assert_eq!(inexact["error"]["code"], json!(ErrorCode::INVALID_PARAMS.0));
+        assert_eq!(inexact["error"]["data"]["problems"][0]["path"], "/amount");
+        assert_eq!(inexact["error"]["data"]["problems"][0]["keyword"], "codec");
     }
 
     #[tokio::test]
@@ -931,7 +1125,66 @@ mod tests {
                 body: None,
             },
             visibility: crate::tools::definitions::ToolVisibility::Listed,
+            transform: None,
         }
+    }
+
+    fn transformed_visible_tool_definition() -> ToolDefinition {
+        serde_json::from_value(json!({
+            "name": VISIBLE_TOOL,
+            "description": "Creates a company with normalized currency.",
+            "input_json_schema": {
+                "type": "object",
+                "required": ["amount", "currency"],
+                "properties": {
+                    "amount": { "type": "number" },
+                    "currency": { "type": "string" }
+                },
+                "additionalProperties": false
+            },
+            "upstream": {
+                "method": "POST",
+                "path_template": "/companies",
+                "body": { "mode": "body_args_json" }
+            },
+            "transform": {
+                "parameters": [{
+                    "wire_property": "annualRecurringRevenue",
+                    "wire_required": true,
+                    "agent": [
+                        { "name": "amount", "schema": { "type": "number" } },
+                        { "name": "currency", "schema": { "type": "string" } }
+                    ],
+                    "wire": [
+                        {
+                            "pointer": "/amountMicros",
+                            "from": "amount",
+                            "codec": [{
+                                "kind": "decimal_scale",
+                                "scale": 6,
+                                "wire_encoding": "integer_string",
+                                "max_integer_digits": 24
+                            }]
+                        },
+                        { "pointer": "/currencyCode", "from": "currency" }
+                    ],
+                    "response": [
+                        {
+                            "agent_property": "amount",
+                            "from": "/amountMicros",
+                            "codec": [{
+                                "kind": "decimal_scale",
+                                "scale": 6,
+                                "wire_encoding": "integer_string",
+                                "max_integer_digits": 24
+                            }]
+                        },
+                        { "agent_property": "currency", "from": "/currencyCode" }
+                    ]
+                }]
+            }
+        }))
+        .expect("transformed MCP fixture definition should deserialize")
     }
 
     fn composite_only_tool_definition() -> ToolDefinition {
