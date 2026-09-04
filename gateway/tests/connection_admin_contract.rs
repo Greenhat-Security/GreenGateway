@@ -720,3 +720,73 @@ fn connection_admin_json_schema_is_strict_resolvable_and_secret_safe() {
         );
     }
 }
+
+#[test]
+fn connection_admin_request_schema_tracks_additional_header_validation() {
+    let schema = load_json(&docs_root().join(SCHEMA_RELATIVE_PATH));
+    let candidate = |enabled: bool, base_url: &str| {
+        json!({
+            "display_name": "Proxy-fronted API",
+            "enabled": enabled,
+            "kind": "http_api",
+            "endpoint": {
+                "base_url": base_url,
+                "base_path": "/"
+            },
+            "authentication": { "type": "none" },
+            "additional_headers": [
+                { "header_name": "x-proxy-token" }
+            ]
+        })
+    };
+
+    for definition_name in ["ConnectionCreateRequest", "ConnectionReplaceRequest"] {
+        let mut request_schema = schema.clone();
+        request_schema
+            .as_object_mut()
+            .expect("admin schema should be an object")
+            .insert(
+                "$ref".to_owned(),
+                Value::String(format!("#/$defs/{definition_name}")),
+            );
+        let validator = jsonschema::validator_for(&request_schema)
+            .unwrap_or_else(|error| panic!("{definition_name} should compile: {error}"));
+
+        assert!(
+            validator.is_valid(&candidate(false, "https://api.example.test")),
+            "{definition_name} should accept an HTTPS disabled draft without a secret binding"
+        );
+        assert!(
+            !validator.is_valid(&candidate(false, "http://api.example.test")),
+            "{definition_name} should reject every non-empty additional-header list over HTTP"
+        );
+        assert!(
+            !validator.is_valid(&candidate(true, "https://api.example.test")),
+            "{definition_name} should reject an enabled additional header without a secret binding"
+        );
+
+        let mut enabled_with_secret = candidate(true, "https://api.example.test");
+        enabled_with_secret["additional_headers"][0]["secret_id"] = json!("proxy-token");
+        assert!(
+            validator.is_valid(&enabled_with_secret),
+            "{definition_name} should accept an enabled additional header with a secret binding"
+        );
+
+        if definition_name == "ConnectionReplaceRequest" {
+            let mut enabled_with_retained_secret = candidate(true, "https://api.example.test");
+            enabled_with_retained_secret["additional_headers"][0]["secret_configured"] =
+                json!(true);
+            assert!(
+                validator.is_valid(&enabled_with_retained_secret),
+                "replacement should accept a true configured marker for a retained binding"
+            );
+
+            enabled_with_retained_secret["additional_headers"][0]["secret_configured"] =
+                json!(false);
+            assert!(
+                !validator.is_valid(&enabled_with_retained_secret),
+                "replacement should reject a cleared binding on an enabled additional header"
+            );
+        }
+    }
+}

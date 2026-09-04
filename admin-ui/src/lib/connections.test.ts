@@ -192,6 +192,16 @@ describe('connections API client', () => {
         client_auth_method: 'client_secret_basic',
         client_secret_configured: true,
       });
+      expect(value.configuration?.additional_headers).toEqual([
+        {
+          header_name: 'cf-access-client-id',
+          secret_configured: true,
+        },
+        {
+          header_name: 'cf-access-client-secret',
+          secret_configured: false,
+        },
+      ]);
       expect(value.configuration?.tls).toEqual({
         ca_bundle_configured: true,
         client_certificate_configured: true,
@@ -206,6 +216,40 @@ describe('connections API client', () => {
       ]);
       expect(value.actions.can_manage_secrets).toBe(false);
       expect(JSON.stringify(value)).not.toContain(canary);
+    }
+  });
+
+  it('rejects malformed or oversized safe additional-header projections', async () => {
+    const invalidLists: unknown[] = [
+      {},
+      Array.from({ length: 5 }, (_value, index) => ({
+        header_name: `x-extra-${index}`,
+        secret_configured: false,
+      })),
+      [{ header_name: '', secret_configured: false }],
+      [{ header_name: 'x-extra', secret_configured: 'yes' }],
+    ];
+
+    for (const additionalHeaders of invalidLists) {
+      const detail = connectionDetail();
+      vi.stubGlobal(
+        'fetch',
+        vi.fn(() =>
+          Promise.resolve(
+            jsonResponse(200, {
+              ...detail,
+              configuration: {
+                ...detail.configuration,
+                additional_headers: additionalHeaders,
+              },
+            }),
+          ),
+        ),
+      );
+      await expect(getConnection('connection/one')).rejects.toMatchObject({
+        name: ConnectionContractError.name,
+        requiresReload: false,
+      });
     }
   });
 
@@ -813,6 +857,20 @@ function connectionDetailWithCanary(canary: string) {
         ciphertext: canary,
         locator: canary,
       },
+      additional_headers: [
+        {
+          header_name: 'cf-access-client-id',
+          secret_configured: true,
+          secret_id: canary,
+          value: canary,
+        },
+        {
+          header_name: 'cf-access-client-secret',
+          secret_configured: false,
+          secret_id: canary,
+          ciphertext: canary,
+        },
+      ],
       tls: {
         ca_bundle_configured: true,
         client_certificate_configured: true,

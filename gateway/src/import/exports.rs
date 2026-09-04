@@ -156,15 +156,21 @@ pub(super) fn connections_export(connections: &[ImportedConnection]) -> Result<V
         })?;
         let bindings: Vec<Value> = expected_bindings(&record.write, &record.revisions)
             .into_iter()
-            .map(|(purpose, secret_id, version)| {
-                json!({
-                    "purpose": purpose,
+            .map(|binding| {
+                let mut value = json!({
+                    "purpose": binding.purpose,
                     // A secret ID is a LOCATOR, not a secret: it names an
                     // entry in the operator's secret store. The value it
                     // locates is never read here.
-                    "secret_id": secret_id,
-                    "binding_version": version.max(1),
-                })
+                    "secret_id": binding.secret_id,
+                    "binding_version": binding.version.max(1),
+                });
+                // Only an additional header carries a header name; the
+                // primary bindings keep the shape they always had.
+                if !binding.header_name.is_empty() {
+                    value["header_name"] = Value::String(binding.header_name.to_owned());
+                }
+                value
             })
             .collect();
         let mut dependencies: Vec<Value> = connection

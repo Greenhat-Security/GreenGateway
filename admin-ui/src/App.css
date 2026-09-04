@@ -1058,6 +1058,28 @@ textarea:focus-visible {
   gap: var(--gh-ref-space-2);
 }
 
+.connection-additional-headers-heading {
+  align-items: flex-start;
+}
+
+.connection-additional-header-list {
+  display: grid;
+  gap: var(--gh-ref-space-3);
+}
+
+.connection-additional-header-row {
+  display: grid;
+  gap: var(--gh-ref-space-3);
+  border: 1px solid var(--gh-sys-border);
+  border-radius: var(--gh-ref-radius-md);
+  padding: var(--gh-ref-space-3);
+  background: var(--gh-sys-bg-raised);
+}
+
+.connection-additional-header-remove {
+  justify-self: start;
+}
+
 .connection-enable-confirmation {
   align-items: flex-start;
   border: 1px solid var(--gh-sys-warning);

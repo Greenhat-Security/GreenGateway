@@ -483,6 +483,12 @@ function ConnectionConfiguration({
               value={formatSafeAuthentication(configuration.authentication)}
             />
             <SpecRow
+              label="Additional secret headers"
+              value={formatSafeAdditionalHeaders(
+                configuration.additional_headers ?? [],
+              )}
+            />
+            <SpecRow
               label="Custom CA"
               value={
                 configuration.tls.ca_bundle_configured
@@ -1128,6 +1134,24 @@ function formatSafeAuthentication(
           : 'secret not configured'
       }`;
   }
+}
+
+function formatSafeAdditionalHeaders(
+  headers: NonNullable<
+    NonNullable<ConnectionDetailData['configuration']>['additional_headers']
+  >,
+): string {
+  if (headers.length === 0) {
+    return 'None';
+  }
+  return headers
+    .map(
+      (header) =>
+        `${header.header_name} - ${
+          header.secret_configured ? 'configured' : 'not configured'
+        }`,
+    )
+    .join('; ');
 }
 
 function SpecRow({

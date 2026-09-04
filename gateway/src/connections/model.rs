@@ -21,6 +21,7 @@ pub const MAX_URL_BYTES: usize = 2_048;
 pub const MAX_PATH_BYTES: usize = 1_024;
 pub const MAX_SECRET_ID_BYTES: usize = 128;
 pub const MAX_HEADER_NAME_BYTES: usize = 64;
+pub const MAX_ADDITIONAL_HEADERS: usize = 4;
 pub const MAX_CLIENT_ID_BYTES: usize = 256;
 pub const MAX_SCOPE_CHARS: usize = 128;
 pub const MAX_SCOPES: usize = 16;
@@ -119,6 +120,12 @@ pub struct ConnectionWrite {
     pub kind: ConnectionKind,
     pub endpoint: ConnectionEndpoint,
     pub authentication: ConnectionAuthentication,
+    /// Secret-backed headers injected alongside the primary credential, in
+    /// this order, on every credentialed lane. An identity-aware proxy in
+    /// front of the upstream (Cloudflare Access needs two of its own) is the
+    /// motivating case; `authentication` stays the upstream's own credential.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub additional_headers: Vec<AdditionalHeader>,
     #[serde(default, skip_serializing_if = "TlsProfile::is_empty")]
     pub tls: TlsProfile,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -169,6 +176,18 @@ impl ConnectionAuthentication {
     pub fn requires_confidential_transport(&self) -> bool {
         !matches!(self, Self::None)
     }
+}
+
+/// One secret-backed header beyond the primary credential. The secret is
+/// bound by opaque ID under [`super::secret::SecretPurpose::HeaderApiKey`],
+/// so the same byte cap and header-value safety check apply as to a primary
+/// `header_api_key`; a disabled draft may leave `secret_id` unset.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct AdditionalHeader {
+    pub header_name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub secret_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
@@ -310,6 +329,12 @@ impl ConnectionWrite {
         }
 
         validate_authentication(&mut self.authentication, self.enabled, &mut errors);
+        validate_additional_headers(
+            &mut self.additional_headers,
+            &self.authentication,
+            self.enabled,
+            &mut errors,
+        );
         validate_tls(&self.tls, self.enabled, &mut errors);
         validate_timeouts(self.timeouts.as_ref(), &mut errors);
         validate_discovery(self.kind, self.discovery.as_mut(), &mut errors);
@@ -319,8 +344,9 @@ impl ConnectionWrite {
             &mut errors,
         );
 
-        let requires_tls =
-            self.authentication.requires_confidential_transport() || !self.tls.is_empty();
+        let requires_tls = self.authentication.requires_confidential_transport()
+            || !self.additional_headers.is_empty()
+            || !self.tls.is_empty();
         if requires_tls && !self.endpoint.base_url.starts_with("https://") {
             errors.push(ConnectionValidationError::new(
                 "endpoint.base_url",
@@ -337,7 +363,16 @@ impl ConnectionWrite {
     }
 
     pub fn configures_credential_authority(&self) -> bool {
-        !matches!(self.authentication, ConnectionAuthentication::None) || !self.tls.is_empty()
+        !matches!(self.authentication, ConnectionAuthentication::None)
+            || !self.additional_headers.is_empty()
+            || !self.tls.is_empty()
+    }
+
+    /// Whether any request on this Connection carries a secret-backed
+    /// header: the primary credential or at least one additional header.
+    pub fn sends_credentials(&self) -> bool {
+        !matches!(self.authentication, ConnectionAuthentication::None)
+            || !self.additional_headers.is_empty()
     }
 
     pub fn requires_secrets_write_to_create(&self) -> bool {
@@ -346,6 +381,7 @@ impl ConnectionWrite {
 
     pub fn requires_secrets_write_to_replace(&self, candidate: &Self) -> bool {
         self.authentication != candidate.authentication
+            || self.additional_headers != candidate.additional_headers
             || self.tls != candidate.tls
             || ((self.configures_credential_authority()
                 || candidate.configures_credential_authority())
@@ -400,6 +436,14 @@ impl ConnectionWrite {
                 client_secret_id: None,
                 ..
             } => {}
+        }
+        if self
+            .additional_headers
+            .iter()
+            .filter_map(|header| header.secret_id.as_deref())
+            .any(|secret_id| !binding_is_configured(secret_id))
+        {
+            unresolved.push("additional_headers.secret_id");
         }
         for (field, binding) in [
             ("tls.ca_bundle_alias", self.tls.ca_bundle_alias.as_deref()),
@@ -537,6 +581,72 @@ fn validate_authentication(
                 errors,
             );
         }
+    }
+}
+
+/// Every additional header must be a header the gateway is willing to let a
+/// Connection own (the same reserved set as the primary API-key header, which
+/// keeps `Authorization` out), must not collide with the primary credential's
+/// header or with another additional header, and is normalized to lowercase
+/// so the strip-before-inject step and the persisted binding key agree.
+fn validate_additional_headers(
+    headers: &mut [AdditionalHeader],
+    authentication: &ConnectionAuthentication,
+    enabled: bool,
+    errors: &mut Vec<ConnectionValidationError>,
+) {
+    if headers.len() > MAX_ADDITIONAL_HEADERS {
+        errors.push(ConnectionValidationError::new(
+            "additional_headers",
+            "too_many",
+            format!("must contain at most {MAX_ADDITIONAL_HEADERS} entries"),
+        ));
+    }
+    let primary_header_name = match authentication {
+        ConnectionAuthentication::HeaderApiKey { header_name, .. } => {
+            Some(header_name.to_ascii_lowercase())
+        }
+        ConnectionAuthentication::None
+        | ConnectionAuthentication::StaticBearer { .. }
+        | ConnectionAuthentication::OAuth2ClientCredentials { .. } => None,
+    };
+    let mut seen = std::collections::BTreeSet::new();
+    for header in headers.iter_mut() {
+        validate_optional_secret_id(
+            "additional_headers.secret_id",
+            header.secret_id.as_deref(),
+            enabled,
+            errors,
+        );
+        let name = &header.header_name;
+        if name.is_empty()
+            || name.len() > MAX_HEADER_NAME_BYTES
+            || HeaderName::from_str(name).is_err()
+            || is_reserved_credential_header(name)
+        {
+            errors.push(ConnectionValidationError::new(
+                "additional_headers.header_name",
+                "invalid_header_name",
+                "must be a valid non-reserved HTTP header name of at most 64 bytes",
+            ));
+            continue;
+        }
+        let normalized = name.to_ascii_lowercase();
+        if primary_header_name.as_deref() == Some(normalized.as_str()) {
+            errors.push(ConnectionValidationError::new(
+                "additional_headers.header_name",
+                "credential_header_conflict",
+                "must not name the primary credential header",
+            ));
+        }
+        if !seen.insert(normalized.clone()) {
+            errors.push(ConnectionValidationError::new(
+                "additional_headers.header_name",
+                "duplicate_header_name",
+                "header names must be unique",
+            ));
+        }
+        header.header_name = normalized;
     }
 }
 
@@ -885,29 +995,49 @@ fn is_valid_stable_id(value: &str, maximum: usize) -> bool {
         && bytes.all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
 }
 
-fn is_reserved_credential_header(value: &str) -> bool {
-    let value = value.to_ascii_lowercase();
+pub(crate) fn is_reserved_credential_header(value: &str) -> bool {
+    let Ok(value) = HeaderName::from_str(value) else {
+        return false;
+    };
+    let value = value.as_str();
     matches!(
-        value.as_str(),
-        "authorization"
+        value,
+        "accept"
+            | "authorization"
+            | "cf-connecting-ip"
+            | "client-ip"
             | "cookie"
             | "host"
             | "content-length"
             | "content-type"
             | "connection"
             | "expect"
+            | "fastly-client-ip"
+            | "fly-client-ip"
+            | "forwarded-for"
+            | "forwarded-for-ip"
             | "keep-alive"
+            | "last-event-id"
+            | "mcp-session-id"
             | "proxy-authenticate"
             | "proxy-authorization"
+            | "proxy-connection"
             | "te"
             | "trailer"
             | "transfer-encoding"
+            | "true-client-ip"
             | "upgrade"
+            | "x-client-ip"
+            | "x-cluster-client-ip"
+            | "x-envoy-external-address"
             | "x-request-id"
+            | "x-forwarded"
             | "x-forwarded-for"
             | "x-forwarded-host"
             | "x-forwarded-port"
             | "x-forwarded-proto"
+            | "x-original-forwarded-for"
+            | "x-proxyuser-ip"
             | "x-real-ip"
             | "x-csrf-token"
             | "forwarded"
@@ -1143,6 +1273,173 @@ mod tests {
     }
 
     #[test]
+    fn additional_headers_reject_proxy_boundaries_and_mcp_protocol_headers() {
+        const PROXY_HOP_BY_HOP_HEADERS: &[&str] = &[
+            "connection",
+            "keep-alive",
+            "proxy-connection",
+            "proxy-authenticate",
+            "proxy-authorization",
+            "te",
+            "trailer",
+            "transfer-encoding",
+            "upgrade",
+            "host",
+            "content-length",
+        ];
+        const PROXY_CLIENT_IP_HEADERS: &[&str] = &[
+            "cf-connecting-ip",
+            "client-ip",
+            "fastly-client-ip",
+            "fly-client-ip",
+            "forwarded",
+            "forwarded-for",
+            "forwarded-for-ip",
+            "true-client-ip",
+            "x-client-ip",
+            "x-cluster-client-ip",
+            "x-envoy-external-address",
+            "x-forwarded",
+            "x-original-forwarded-for",
+            "x-proxyuser-ip",
+            "x-real-ip",
+        ];
+        const MCP_PROTOCOL_HEADERS: &[&str] = &["accept", "mcp-session-id", "last-event-id"];
+
+        let mixed_case = |value: &str| {
+            value
+                .chars()
+                .enumerate()
+                .map(|(index, character)| {
+                    if index.is_multiple_of(2) {
+                        character.to_ascii_uppercase()
+                    } else {
+                        character
+                    }
+                })
+                .collect::<String>()
+        };
+
+        for canonical_name in PROXY_HOP_BY_HOP_HEADERS
+            .iter()
+            .chain(PROXY_CLIENT_IP_HEADERS)
+            .chain(MCP_PROTOCOL_HEADERS)
+            .chain(["x-forwarded-client-cert"].iter())
+        {
+            for header_name in [canonical_name.to_string(), mixed_case(canonical_name)] {
+                assert!(
+                    is_reserved_credential_header(&header_name),
+                    "{header_name} must be recognized after HeaderName normalization"
+                );
+
+                let mut candidate: ConnectionWrite =
+                    serde_json::from_value(example()).expect("example should deserialize");
+                candidate.additional_headers.push(AdditionalHeader {
+                    header_name: header_name.clone(),
+                    secret_id: Some("additional-secret".to_owned()),
+                });
+
+                let errors = candidate
+                    .validated()
+                    .expect_err("proxy-boundary and MCP protocol headers must fail closed");
+                assert!(
+                    errors.iter().any(|error| {
+                        error.field == "additional_headers.header_name"
+                            && error.code == "invalid_header_name"
+                    }),
+                    "{header_name} should be rejected as an additional header: {errors:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn additional_headers_are_bounded_normalized_and_fail_closed() {
+        let validator = connection_schema_validator();
+        let mut candidate_json = example();
+        candidate_json["authentication"] = json!({
+            "type": "header_api_key",
+            "header_name": "X-Api-Key",
+            "secret_id": "billing-api-key"
+        });
+        candidate_json["additional_headers"] = json!([
+            {
+                "header_name": "CF-Access-Client-Id",
+                "secret_id": "proxy-client-id"
+            },
+            {
+                "header_name": "CF-Access-Client-Secret",
+                "secret_id": "proxy-client-secret"
+            }
+        ]);
+        validator
+            .validate(&candidate_json)
+            .expect("two additional headers should match the published schema");
+        let candidate: ConnectionWrite =
+            serde_json::from_value(candidate_json).expect("additional headers should deserialize");
+        let validated = candidate
+            .validated()
+            .expect("safe distinct additional headers should validate");
+        assert_eq!(
+            validated
+                .additional_headers
+                .iter()
+                .map(|header| header.header_name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["cf-access-client-id", "cf-access-client-secret"]
+        );
+        assert!(validated.sends_credentials());
+
+        for (header_name, expected_code) in [
+            ("Authorization", "invalid_header_name"),
+            ("X-Api-Key", "credential_header_conflict"),
+        ] {
+            let mut invalid = validated.clone();
+            invalid.additional_headers[0].header_name = header_name.to_owned();
+            let errors = invalid
+                .validated()
+                .expect_err("reserved and primary credential headers must fail");
+            assert!(
+                errors.iter().any(|error| error.code == expected_code),
+                "{header_name} should fail with {expected_code}: {errors:?}"
+            );
+        }
+
+        let mut duplicate = validated.clone();
+        duplicate.additional_headers[1].header_name = "CF-ACCESS-CLIENT-ID".to_owned();
+        let errors = duplicate
+            .validated()
+            .expect_err("header names must be unique case-insensitively");
+        assert!(errors
+            .iter()
+            .any(|error| error.code == "duplicate_header_name"));
+
+        let mut too_many = validated.clone();
+        too_many.additional_headers = (0..=MAX_ADDITIONAL_HEADERS)
+            .map(|index| AdditionalHeader {
+                header_name: format!("x-extra-{index}"),
+                secret_id: Some(format!("extra-{index}")),
+            })
+            .collect();
+        let errors = too_many
+            .validated()
+            .expect_err("more than four additional headers must fail");
+        assert!(errors.iter().any(|error| error.code == "too_many"));
+
+        let mut too_many_json = example();
+        too_many_json["additional_headers"] = json!((0..=MAX_ADDITIONAL_HEADERS)
+            .map(|index| json!({
+                "header_name": format!("x-extra-{index}"),
+                "secret_id": format!("extra-{index}")
+            }))
+            .collect::<Vec<_>>());
+        assert!(
+            validator.validate(&too_many_json).is_err(),
+            "the published schema must enforce the same four-header bound"
+        );
+    }
+
+    #[test]
     fn connection_ids_are_url_safe_and_managed_ids_are_uuid_backed() {
         let managed = ConnectionId::new_managed();
         assert!(Uuid::parse_str(managed.as_str()).is_ok());
@@ -1190,6 +1487,33 @@ mod tests {
             validator.validate(&disabled_json).is_err(),
             "schema must reject incomplete enabled bindings"
         );
+
+        let mut additional_draft = example();
+        additional_draft["authentication"] = json!({ "type": "none" });
+        additional_draft["tls"] = json!({});
+        additional_draft["additional_headers"] = json!([{
+            "header_name": "x-proxy-token"
+        }]);
+        additional_draft["enabled"] = json!(false);
+        validator
+            .validate(&additional_draft)
+            .expect("a disabled draft may omit an additional-header binding");
+        let draft: ConnectionWrite = serde_json::from_value(additional_draft.clone())
+            .expect("additional-header draft should deserialize");
+        draft
+            .validated()
+            .expect("model must allow an incomplete disabled additional header");
+
+        additional_draft["enabled"] = json!(true);
+        assert!(validator.validate(&additional_draft).is_err());
+        let enabled: ConnectionWrite = serde_json::from_value(additional_draft)
+            .expect("enabled incomplete additional header should deserialize");
+        let errors = enabled
+            .validated()
+            .expect_err("enabled additional headers need secret bindings");
+        assert!(errors.iter().any(|error| {
+            error.field == "additional_headers.secret_id" && error.code == "missing_binding"
+        }));
     }
 
     #[test]
@@ -1356,6 +1680,25 @@ mod tests {
         credentialed_without_test.test_profile = None;
         assert!(credentialed.requires_secrets_write_to_replace(&credentialed_without_test));
         assert!(credentialed_without_test.requires_secrets_write_to_replace(&credentialed));
+
+        let mut additional = plain.clone();
+        additional.enabled = true;
+        additional.additional_headers.push(AdditionalHeader {
+            header_name: "x-proxy-token".to_owned(),
+            secret_id: Some("proxy-token".to_owned()),
+        });
+        assert!(additional.requires_secrets_write_to_create());
+        assert!(additional.requires_secrets_write_to_delete());
+        assert!(plain.requires_secrets_write_to_replace(&additional));
+        assert!(additional.requires_secrets_write_to_replace(&plain));
+        assert_eq!(
+            additional.unresolved_enabled_binding_fields(|id| id == "proxy-token"),
+            Vec::<&'static str>::new()
+        );
+        assert_eq!(
+            additional.unresolved_enabled_binding_fields(|_| false),
+            vec!["additional_headers.secret_id"]
+        );
 
         let mut credentialed_discovery = credentialed.clone();
         credentialed_discovery.discovery = Some(DiscoveryConfig::ManagedOpenapi {

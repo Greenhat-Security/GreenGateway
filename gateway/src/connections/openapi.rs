@@ -1009,7 +1009,7 @@ impl OpenApiConnectionCatalogService {
         if matches!(
             response.status,
             StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN
-        ) && target.authentication_kind() != "none"
+        ) && target.is_credentialed()
         {
             if response.status == StatusCode::UNAUTHORIZED {
                 if let Some(credential) = credential
@@ -1614,6 +1614,124 @@ mod tests {
         assert_eq!(
             validate_spec_size(&"x".repeat(MAX_MANAGED_SPEC_BYTES + 1)),
             Err(OpenApiCatalogError::SpecTooLarge)
+        );
+    }
+
+    #[test]
+    fn additional_headers_do_not_participate_in_openapi_security_matching() {
+        let generation = openapi::generate_tools_from_openapi_str(
+            "additional-header-security.yaml",
+            r#"
+openapi: 3.0.3
+info: { title: Additional header security, version: 1.0.0 }
+components:
+  securitySchemes:
+    UpstreamKey: { type: apiKey, in: header, name: X-Upstream-Key }
+    AccessKey: { type: apiKey, in: header, name: CF-Access-Client-Id }
+    BearerAuth: { type: http, scheme: bearer }
+paths:
+  /widgets:
+    get:
+      operationId: list_widgets
+      security:
+        - UpstreamKey: []
+        - AccessKey: []
+        - BearerAuth: []
+"#,
+        )
+        .expect("security alternatives should parse");
+        let connection_id =
+            ConnectionId::parse("widgets-api").expect("test Connection ID should parse");
+        let selection = |scheme: &str| OpenApiToolSecuritySelection {
+            tool_name: "list_widgets".to_owned(),
+            selected_scheme_names: vec![scheme.to_owned()],
+        };
+        let record = |authentication: serde_json::Value, additional_name: &str| {
+            let write = serde_json::from_value(json!({
+                "display_name": "Widgets API",
+                "enabled": true,
+                "kind": "http_api",
+                "endpoint": {
+                    "base_url": "https://widgets.example.test",
+                    "base_path": "/v1"
+                },
+                "authentication": authentication,
+                "additional_headers": [{
+                    "header_name": additional_name,
+                    "secret_id": "additional-secret"
+                }],
+                "tls": {},
+                "discovery": {
+                    "type": "managed_openapi",
+                    "use_connection_authentication": true
+                }
+            }))
+            .expect("test Connection should deserialize");
+            StoredConnection {
+                id: connection_id.clone(),
+                write,
+                revisions: crate::connections::status::ConnectionRevisions {
+                    connection: 1,
+                    credential: 1,
+                    tls: 0,
+                    discovery: 1,
+                    status: 0,
+                },
+                created_at: "2026-09-03T00:00:00Z".to_owned(),
+                updated_at: "2026-09-03T00:00:00Z".to_owned(),
+            }
+        };
+
+        let bearer_with_upstream_key_as_extra = record(
+            json!({"type": "static_bearer", "secret_id": "bearer-secret"}),
+            "x-upstream-key",
+        );
+        assert_eq!(
+            bind_selected_tools(
+                &generation,
+                &connection_id,
+                &bearer_with_upstream_key_as_extra,
+                &["list_widgets".to_owned()],
+                &[selection("UpstreamKey")],
+            ),
+            Err(OpenApiCatalogError::AuthenticationMismatch),
+            "an additional header must not satisfy an OpenAPI apiKey scheme"
+        );
+        assert!(bind_selected_tools(
+            &generation,
+            &connection_id,
+            &bearer_with_upstream_key_as_extra,
+            &["list_widgets".to_owned()],
+            &[selection("BearerAuth")],
+        )
+        .is_ok());
+
+        let upstream_key_with_access_key_as_extra = record(
+            json!({
+                "type": "header_api_key",
+                "header_name": "x-upstream-key",
+                "secret_id": "upstream-secret"
+            }),
+            "cf-access-client-id",
+        );
+        assert!(bind_selected_tools(
+            &generation,
+            &connection_id,
+            &upstream_key_with_access_key_as_extra,
+            &["list_widgets".to_owned()],
+            &[selection("UpstreamKey")],
+        )
+        .is_ok());
+        assert_eq!(
+            bind_selected_tools(
+                &generation,
+                &connection_id,
+                &upstream_key_with_access_key_as_extra,
+                &["list_widgets".to_owned()],
+                &[selection("AccessKey")],
+            ),
+            Err(OpenApiCatalogError::AuthenticationMismatch),
+            "a matching additional proxy header must not replace the primary OpenAPI scheme"
         );
     }
 

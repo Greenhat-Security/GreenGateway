@@ -254,6 +254,7 @@ fn http_connection(
             base_path: "/".to_owned(),
         },
         authentication,
+        additional_headers: Vec::new(),
         tls,
         timeouts: Some(ConnectionTimeouts {
             request_timeout_ms: 1_500,

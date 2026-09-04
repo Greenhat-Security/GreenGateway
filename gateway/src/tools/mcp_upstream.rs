@@ -576,7 +576,7 @@ pub async fn probe_connection_protocol_before(
         client,
         ManagedMcpAuthentication {
             credential,
-            credential_header_name: target.credential_header_name().cloned(),
+            credential_header_names: target.credential_header_names().to_vec(),
         },
         operation_deadline,
         hard_deadline,
@@ -1626,7 +1626,7 @@ async fn connect_connection(
         client,
         Some(ManagedMcpAuthentication {
             credential,
-            credential_header_name: target.credential_header_name().cloned(),
+            credential_header_names: target.credential_header_names().to_vec(),
         }),
         discovery_response_budget,
         None,
@@ -1636,7 +1636,7 @@ async fn connect_connection(
 
 struct ManagedMcpAuthentication {
     credential: Option<Arc<ResolvedConnectionCredential>>,
-    credential_header_name: Option<HeaderName>,
+    credential_header_names: Vec<HeaderName>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1691,7 +1691,7 @@ async fn connect_endpoint_with_client(
     let client = if let Some(authentication) = managed_authentication {
         client.with_connection_credential(
             authentication.credential,
-            authentication.credential_header_name,
+            authentication.credential_header_names,
         )
     } else {
         client
@@ -1822,7 +1822,7 @@ struct LimitedMcpHttpClient {
     protocol_probe_control: Option<ProtocolProbeTransportControl>,
     managed_connection: bool,
     connection_credential: Option<Arc<ResolvedConnectionCredential>>,
-    credential_header_name: Option<HeaderName>,
+    credential_header_names: Vec<HeaderName>,
 }
 
 impl LimitedMcpHttpClient {
@@ -1841,7 +1841,7 @@ impl LimitedMcpHttpClient {
             protocol_probe_control: None,
             managed_connection: false,
             connection_credential: None,
-            credential_header_name: None,
+            credential_header_names: Vec::new(),
         }
     }
 
@@ -1874,11 +1874,11 @@ impl LimitedMcpHttpClient {
     fn with_connection_credential(
         mut self,
         connection_credential: Option<Arc<ResolvedConnectionCredential>>,
-        credential_header_name: Option<HeaderName>,
+        credential_header_names: Vec<HeaderName>,
     ) -> Self {
         self.managed_connection = true;
         self.connection_credential = connection_credential;
-        self.credential_header_name = credential_header_name;
+        self.credential_header_names = credential_header_names;
         self
     }
 
@@ -2074,7 +2074,7 @@ impl StreamableHttpClient for LimitedMcpHttpClient {
             request_builder = apply_mcp_custom_headers(
                 request_builder,
                 custom_headers,
-                self.credential_header_name.as_ref(),
+                &self.credential_header_names,
                 self.managed_connection,
             )?;
             request_builder = self.apply_connection_credential(request_builder)?;
@@ -2140,7 +2140,7 @@ impl StreamableHttpClient for LimitedMcpHttpClient {
             request_builder = apply_mcp_custom_headers(
                 request_builder,
                 custom_headers,
-                self.credential_header_name.as_ref(),
+                &self.credential_header_names,
                 self.managed_connection,
             )?;
             request_builder = self.apply_connection_credential(request_builder)?;
@@ -2186,7 +2186,7 @@ impl StreamableHttpClient for LimitedMcpHttpClient {
             request = apply_mcp_custom_headers(
                 request,
                 custom_headers,
-                self.credential_header_name.as_ref(),
+                &self.credential_header_names,
                 self.managed_connection,
             )?;
             let session_was_attached = session_id.is_some();
@@ -2680,11 +2680,11 @@ fn validate_mcp_response_content_type(
 fn apply_mcp_custom_headers(
     mut builder: rmcp_http::RequestBuilder,
     custom_headers: HashMap<HeaderName, HeaderValue>,
-    credential_header_name: Option<&HeaderName>,
+    credential_header_names: &[HeaderName],
     managed_connection: bool,
 ) -> Result<rmcp_http::RequestBuilder, StreamableHttpError<LimitedMcpHttpError>> {
     for (name, value) in custom_headers {
-        validate_mcp_custom_header(&name, credential_header_name, managed_connection)
+        validate_mcp_custom_header(&name, credential_header_names, managed_connection)
             .map_err(StreamableHttpError::ReservedHeaderConflict)?;
         builder = builder.header(name, value);
     }
@@ -2692,9 +2692,12 @@ fn apply_mcp_custom_headers(
     Ok(builder)
 }
 
+/// A custom header may not name any header the Connection owns: the primary
+/// credential's header or an additional header. `HeaderName` equality is
+/// already case-insensitive.
 fn validate_mcp_custom_header(
     name: &HeaderName,
-    credential_header_name: Option<&HeaderName>,
+    credential_header_names: &[HeaderName],
     managed_connection: bool,
 ) -> Result<(), String> {
     let is_reserved = name.as_str().eq_ignore_ascii_case("accept")
@@ -2705,7 +2708,7 @@ fn validate_mcp_custom_header(
                 || name.as_str().eq_ignore_ascii_case("cookie")
                 || name.as_str().eq_ignore_ascii_case("host")
                 || name.as_str().eq_ignore_ascii_case("content-length")))
-        || credential_header_name.is_some_and(|credential_header| credential_header == name);
+        || credential_header_names.contains(name);
     if is_reserved {
         return Err(name.to_string());
     }
@@ -3899,12 +3902,23 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn managed_connection_credential_is_injected_on_post_get_and_delete() {
+    async fn managed_connection_credentials_are_injected_on_post_get_and_delete() {
         let api_key_header = HeaderName::from_static("x-managed-mcp-key");
-        let credential = Arc::new(ResolvedConnectionCredential::header_api_key_for_test(
-            api_key_header.clone(),
-            b"managed-mcp-key-canary",
-        ));
+        let additional_id = HeaderName::from_static("cf-access-client-id");
+        let additional_secret = HeaderName::from_static("cf-access-client-secret");
+        let credential = Arc::new(
+            ResolvedConnectionCredential::header_api_key_for_test(
+                api_key_header.clone(),
+                b"managed-mcp-key-canary",
+            )
+            .with_additional_header_for_test(additional_id.clone(), b"managed-client-id-canary")
+            .with_additional_header_for_test(
+                additional_secret.clone(),
+                b"managed-client-secret-canary",
+            ),
+        );
+        let credential_header_names =
+            vec![api_key_header.clone(), additional_id, additional_secret];
         let request = ClientJsonRpcMessage::request(
             ClientRequest::CallToolRequest(CallToolRequest::new(CallToolRequestParams::new(
                 "credential_test".to_owned(),
@@ -3912,9 +3926,9 @@ mod tests {
             NumberOrString::Number(1),
         );
 
-        let (post_client, post_url, post_server) = managed_client_capture(
+        let (post_client, post_url, post_server) = managed_client_capture_with_headers(
             Arc::clone(&credential),
-            api_key_header.clone(),
+            credential_header_names.clone(),
             b"HTTP/1.1 202 Accepted\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
         )
         .await;
@@ -3930,9 +3944,9 @@ mod tests {
             .expect("managed MCP POST should succeed");
         assert_managed_credential_headers(post_server.await.expect("POST capture should finish"));
 
-        let (get_client, get_url, get_server) = managed_client_capture(
+        let (get_client, get_url, get_server) = managed_client_capture_with_headers(
             Arc::clone(&credential),
-            api_key_header.clone(),
+            credential_header_names.clone(),
             b"HTTP/1.1 405 Method Not Allowed\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
         )
         .await;
@@ -3950,9 +3964,9 @@ mod tests {
         ));
         assert_managed_credential_headers(get_server.await.expect("GET capture should finish"));
 
-        let (delete_client, delete_url, delete_server) = managed_client_capture(
+        let (delete_client, delete_url, delete_server) = managed_client_capture_with_headers(
             credential,
-            api_key_header,
+            credential_header_names,
             b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
         )
         .await;
@@ -3970,16 +3984,42 @@ mod tests {
         );
     }
 
+    #[test]
+    fn managed_mcp_custom_headers_reject_every_connection_owned_header() {
+        let owned = vec![
+            HeaderName::from_static("x-managed-mcp-key"),
+            HeaderName::from_static("cf-access-client-id"),
+            HeaderName::from_static("cf-access-client-secret"),
+        ];
+        for name in &owned {
+            assert_eq!(
+                validate_mcp_custom_header(name, &owned, true),
+                Err(name.to_string())
+            );
+        }
+        validate_mcp_custom_header(&HeaderName::from_static("x-safe-label"), &owned, true)
+            .expect("unrelated custom headers should remain available");
+    }
+
     #[tokio::test]
     async fn managed_authentication_rejection_discards_challenge_and_body() {
         let api_key_header = HeaderName::from_static("x-managed-mcp-key");
-        let credential = Arc::new(ResolvedConnectionCredential::header_api_key_for_test(
-            api_key_header.clone(),
-            b"managed-mcp-key-canary",
-        ));
-        let (client, url, server) = managed_client_capture(
+        let additional_id = HeaderName::from_static("cf-access-client-id");
+        let additional_secret = HeaderName::from_static("cf-access-client-secret");
+        let credential = Arc::new(
+            ResolvedConnectionCredential::header_api_key_for_test(
+                api_key_header.clone(),
+                b"managed-mcp-key-canary",
+            )
+            .with_additional_header_for_test(additional_id.clone(), b"managed-client-id-canary")
+            .with_additional_header_for_test(
+                additional_secret.clone(),
+                b"managed-client-secret-canary",
+            ),
+        );
+        let (client, url, server) = managed_client_capture_with_headers(
             credential,
-            api_key_header,
+            vec![api_key_header, additional_id, additional_secret],
             b"HTTP/1.1 401 Unauthorized\r\nWWW-Authenticate: Bearer realm=\"challenge-canary\"\r\nContent-Type: text/plain\r\nContent-Length: 18\r\nConnection: close\r\n\r\ndenial-body-canary",
         )
         .await;
@@ -4000,9 +4040,9 @@ mod tests {
         assert_managed_credential_headers(server.await.expect("denial capture should finish"));
     }
 
-    async fn managed_client_capture(
+    async fn managed_client_capture_with_headers(
         credential: Arc<ResolvedConnectionCredential>,
-        credential_header_name: HeaderName,
+        credential_header_names: Vec<HeaderName>,
         response: &'static [u8],
     ) -> (LimitedMcpHttpClient, String, JoinHandle<String>) {
         let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
@@ -4030,7 +4070,7 @@ mod tests {
             .expect("managed MCP capture client should build");
         (
             LimitedMcpHttpClient::new(inner, 1024, 1024)
-                .with_connection_credential(Some(credential), Some(credential_header_name)),
+                .with_connection_credential(Some(credential), credential_header_names),
             format!("http://{address}/mcp"),
             server,
         )
@@ -4039,6 +4079,8 @@ mod tests {
     fn assert_managed_credential_headers(request: String) {
         let request = request.to_ascii_lowercase();
         assert!(request.contains("\r\nx-managed-mcp-key: managed-mcp-key-canary\r\n"));
+        assert!(request.contains("\r\ncf-access-client-id: managed-client-id-canary\r\n"));
+        assert!(request.contains("\r\ncf-access-client-secret: managed-client-secret-canary\r\n"));
         assert!(
             !request.contains("authorization: bearer attacker-transport-token"),
             "transport-provided auth must not override managed Connection authority"
@@ -4267,7 +4309,7 @@ mod tests {
             client,
             ManagedMcpAuthentication {
                 credential: None,
-                credential_header_name: None,
+                credential_header_names: Vec::new(),
             },
             operation_deadline,
             hard_deadline,

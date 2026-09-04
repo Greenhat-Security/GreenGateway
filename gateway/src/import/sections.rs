@@ -348,11 +348,11 @@ impl ToolsSection {
 /// refuses to boot on. A failure therefore leaves the section untouched
 /// and `--resume` starts it again.
 ///
-/// Credential bindings are carried as REFERENCES: a purpose, a secret id
-/// and a version, derived from the record by the same `expected_bindings`
-/// the live write path derives them with. No secret value is read from
-/// the source and none is written to the target -- the operator's secret
-/// store keeps them, and a local-secret keyring (bound to
+/// Credential bindings are carried as REFERENCES: a purpose, an optional
+/// header name, a secret id and a version, derived from the record by the
+/// same `expected_bindings` the live write path derives them with. No secret
+/// value is read from the source and none is written to the target -- the
+/// operator's secret store keeps them, and a local-secret keyring (bound to
 /// `CONNECTIONS_SQLITE_PATH`, which cluster mode rejects outright) is
 /// never moved by this command.
 pub(super) struct ConnectionsSection<'a> {

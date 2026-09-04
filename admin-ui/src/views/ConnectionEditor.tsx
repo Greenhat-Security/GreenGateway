@@ -41,6 +41,14 @@ type BindingDraft = {
   secretId: string;
 };
 
+type AdditionalHeaderDraft = {
+  draftId: number;
+  headerName: string;
+  initialHeaderName?: string;
+  initiallyConfigured: boolean;
+  binding: BindingDraft;
+};
+
 type ConnectionFormState = {
   displayName: string;
   description: string;
@@ -59,6 +67,7 @@ type ConnectionFormState = {
   audience: string;
   resource: string;
   authenticationBinding: BindingDraft;
+  additionalHeaders: AdditionalHeaderDraft[];
   caBundleBinding: BindingDraft;
   clientCertificateBinding: BindingDraft;
   clientPrivateKeyBinding: BindingDraft;
@@ -138,6 +147,7 @@ const DEFAULT_FORM: ConnectionFormState = {
   audience: '',
   resource: '',
   authenticationBinding: emptyBinding(),
+  additionalHeaders: [],
   caBundleBinding: emptyBinding(),
   clientCertificateBinding: emptyBinding(),
   clientPrivateKeyBinding: emptyBinding(),
@@ -153,6 +163,9 @@ const DEFAULT_FORM: ConnectionFormState = {
   testPath: '/',
   expectedStatuses: '200',
 };
+
+const MAX_ADDITIONAL_HEADERS = 4;
+let nextAdditionalHeaderDraftId = 1;
 
 const ALL_SECRET_PURPOSES: ConnectionSecretPurpose[] = [
   'header_api_key',
@@ -362,6 +375,43 @@ export function ConnectionEditor() {
           : emptyBinding(),
       };
     });
+  }
+
+  function addAdditionalHeader() {
+    updateForm((current) =>
+      current.additionalHeaders.length >= MAX_ADDITIONAL_HEADERS
+        ? current
+        : {
+            ...current,
+            additionalHeaders: [
+              ...current.additionalHeaders,
+              emptyAdditionalHeader(),
+            ],
+          },
+    );
+  }
+
+  function updateAdditionalHeader(
+    index: number,
+    patch: Partial<Pick<AdditionalHeaderDraft, 'headerName' | 'binding'>>,
+  ) {
+    updateForm((current) => ({
+      ...current,
+      additionalHeaders: current.additionalHeaders.map((header, position) =>
+        position === index
+          ? additionalHeaderWithPatch(header, patch)
+          : header,
+      ),
+    }));
+  }
+
+  function removeAdditionalHeader(index: number) {
+    updateForm((current) => ({
+      ...current,
+      additionalHeaders: current.additionalHeaders.filter(
+        (_header, position) => position !== index,
+      ),
+    }));
   }
 
   function updateKind(next: ConnectionKind) {
@@ -611,6 +661,10 @@ export function ConnectionEditor() {
         current.authenticationBinding,
         secretId,
       ),
+      additionalHeaders: current.additionalHeaders.map((header) => ({
+        ...header,
+        binding: withoutDeletedBinding(header.binding, secretId),
+      })),
       caBundleBinding: withoutDeletedBinding(
         current.caBundleBinding,
         secretId,
@@ -737,6 +791,21 @@ export function ConnectionEditor() {
               }
               onUpdate={updateForm}
               onAuthenticationTypeChange={updateAuthenticationType}
+            />
+            <AdditionalHeadersSection
+              headers={form.additionalHeaders}
+              errors={fieldErrors}
+              canBindSecret={canUseSecretBindings}
+              secrets={availableSecrets}
+              disabled={
+                !canEdit ||
+                editorBusy ||
+                credentialAuthorityLocked ||
+                !canBindSecret
+              }
+              onAdd={addAdditionalHeader}
+              onUpdate={updateAdditionalHeader}
+              onRemove={removeAdditionalHeader}
             />
             <TlsSection
               form={form}
@@ -1236,6 +1305,130 @@ function AuthenticationSection({
           }
         />
       ) : null}
+    </section>
+  );
+}
+
+function AdditionalHeadersSection({
+  headers,
+  errors,
+  canBindSecret,
+  secrets,
+  disabled,
+  onAdd,
+  onUpdate,
+  onRemove,
+}: {
+  headers: AdditionalHeaderDraft[];
+  errors: FieldErrors;
+  canBindSecret: boolean;
+  secrets: ConnectionSecretMetadata[];
+  disabled: boolean;
+  onAdd: () => void;
+  onUpdate: (
+    index: number,
+    patch: Partial<Pick<AdditionalHeaderDraft, 'headerName' | 'binding'>>,
+  ) => void;
+  onRemove: (index: number) => void;
+}) {
+  return (
+    <section
+      className="connection-form-section"
+      aria-labelledby="connection-additional-headers-heading"
+    >
+      <div className="section-heading connection-additional-headers-heading">
+        <div>
+          <p className="eyebrow">Proxy identity</p>
+          <h3 id="connection-additional-headers-heading">
+            Additional secret headers
+          </h3>
+        </div>
+        <button
+          type="button"
+          className="secondary-button"
+          disabled={disabled || headers.length >= MAX_ADDITIONAL_HEADERS}
+          onClick={onAdd}
+        >
+          Add secret header
+        </button>
+      </div>
+      <p className="capability-description">
+        Add up to four secret-backed headers for an identity-aware proxy or
+        another upstream credential layer. The gateway strips caller values
+        before injecting these headers on every connection lane.
+      </p>
+      {headers.length === 0 ? (
+        <p className="capability-description">No additional headers.</p>
+      ) : (
+        <div className="connection-additional-header-list">
+          {headers.map((header, index) => {
+            const headerNameError = additionalHeaderFieldError(
+              errors,
+              index,
+              'header_name',
+            );
+            const secretError = additionalHeaderFieldError(
+              errors,
+              index,
+              'secret_id',
+            );
+            const number = index + 1;
+            return (
+              <div
+                className="connection-additional-header-row"
+                key={header.draftId}
+              >
+                <div className="filter-grid connection-form-grid">
+                  <FormField
+                    id={`connection-additional-header-${index}-name`}
+                    label={`Additional header ${number} name`}
+                    error={headerNameError}
+                  >
+                    <input
+                      id={`connection-additional-header-${index}-name`}
+                      value={header.headerName}
+                      disabled={disabled}
+                      maxLength={64}
+                      autoComplete="off"
+                      spellCheck={false}
+                      aria-invalid={Boolean(headerNameError)}
+                      aria-describedby={describedBy(
+                        `connection-additional-header-${index}-name`,
+                        headerNameError,
+                      )}
+                      onChange={(event) =>
+                        onUpdate(index, { headerName: event.target.value })
+                      }
+                    />
+                  </FormField>
+                  <BindingControl
+                    id={`connection-additional-header-${index}-secret`}
+                    label={`Additional header ${number} secret`}
+                    binding={header.binding}
+                    purpose="header_api_key"
+                    secrets={secrets}
+                    canBindSecret={canBindSecret}
+                    disabled={disabled}
+                    error={secretError}
+                    onChange={(binding) => onUpdate(index, { binding })}
+                  />
+                </div>
+                <button
+                  type="button"
+                  className="secondary-button connection-additional-header-remove"
+                  disabled={disabled}
+                  onClick={() => onRemove(index)}
+                >
+                  Remove additional header {number}
+                </button>
+              </div>
+            );
+          })}
+        </div>
+      )}
+      <p className="capability-description">
+        {headers.length} of {MAX_ADDITIONAL_HEADERS} configured.
+      </p>
     </section>
   );
 }
@@ -2518,6 +2711,15 @@ function formFromDetail(detail: ConnectionDetail): ConnectionFormState {
     authenticationBinding: authenticationConfigured
       ? configuredBinding()
       : emptyBinding(),
+    additionalHeaders: (configuration.additional_headers ?? []).map(
+      (header) => ({
+        draftId: nextAdditionalHeaderDraftId++,
+        headerName: header.header_name,
+        initialHeaderName: header.header_name,
+        initiallyConfigured: header.secret_configured,
+        binding: bindingFromMarker(header.secret_configured),
+      }),
+    ),
     caBundleBinding: bindingFromMarker(
       configuration.tls.ca_bundle_configured,
     ),
@@ -2556,6 +2758,7 @@ function detailConfiguresCredentialAuthority(
     configuration.authentication.type !== 'none';
   return (
     authenticationConfigured ||
+    (configuration.additional_headers?.length ?? 0) > 0 ||
     configuration.tls.ca_bundle_configured ||
     configuration.tls.client_certificate_configured ||
     configuration.tls.client_private_key_configured
@@ -2610,6 +2813,18 @@ function writeFromForm(form: ConnectionFormState): ConnectionWrite {
       base_path: form.basePath.trim(),
     },
     authentication,
+    ...(form.additionalHeaders.length > 0
+      ? {
+          additional_headers: form.additionalHeaders.map((header) => ({
+            header_name: header.headerName.trim(),
+            ...bindingPayload(
+              header.binding,
+              'secret_id',
+              'secret_configured',
+            ),
+          })),
+        }
+      : {}),
     tls,
     ...(form.customTimeouts
       ? {
@@ -2725,6 +2940,55 @@ function validateForm(
   ) {
     errors['authentication.header_name'] = 'Enter the API key header name.';
   }
+  if (form.additionalHeaders.length > MAX_ADDITIONAL_HEADERS) {
+    errors.form = `Configure no more than ${MAX_ADDITIONAL_HEADERS} additional headers.`;
+  }
+  const additionalHeaderNames = new Map<string, number>();
+  for (const [index, header] of form.additionalHeaders.entries()) {
+    const nameField = `additional_headers.${index}.header_name`;
+    const secretField = `additional_headers.${index}.secret_id`;
+    const headerName = header.headerName.trim();
+    if (!validCredentialHeaderName(headerName)) {
+      errors[nameField] =
+        'Enter a valid, non-reserved HTTP header name of at most 64 bytes.';
+    } else {
+      const normalized = headerName.toLowerCase();
+      if (
+        form.authenticationType === 'header_api_key' &&
+        normalized === form.headerName.trim().toLowerCase()
+      ) {
+        errors[nameField] =
+          'An additional header cannot use the primary credential header name.';
+      } else if (additionalHeaderNames.has(normalized)) {
+        errors[nameField] =
+          'Additional header names must be unique, ignoring case.';
+      } else {
+        additionalHeaderNames.set(normalized, index);
+      }
+    }
+    if (
+      header.binding.intent === 'replace' &&
+      !bindingHasCompatibleSecret(
+        header.binding,
+        'header_api_key',
+        secrets,
+      )
+    ) {
+      errors[secretField] =
+        'Select a configured header API key secret alias.';
+    }
+    if (
+      form.enabled &&
+      !bindingIsEffectivelyConfigured(
+        header.binding,
+        'header_api_key',
+        secrets,
+      )
+    ) {
+      errors[secretField] =
+        'Enabled connections require a configured secret for every additional header.';
+    }
+  }
   if (form.authenticationType === 'oauth2_client_credentials') {
     if (!form.clientId.trim()) {
       errors['authentication.client_id'] = 'Enter the OAuth client ID.';
@@ -2820,8 +3084,11 @@ function validateForm(
     bindingRequestsSecret(form.caBundleBinding) ||
     bindingRequestsSecret(form.clientCertificateBinding) ||
     bindingRequestsSecret(form.clientPrivateKeyBinding);
+  const requestsAdditionalHeaders = form.additionalHeaders.length > 0;
   if (
-    (form.authenticationType !== 'none' || requestsTls) &&
+    (form.authenticationType !== 'none' ||
+      requestsTls ||
+      requestsAdditionalHeaders) &&
     !isHttpsOrigin(form.baseUrl)
   ) {
     errors['endpoint.base_url'] =
@@ -2942,6 +3209,43 @@ function validateTimeout(
   }
 }
 
+function validCredentialHeaderName(value: string): boolean {
+  const normalized = value.toLowerCase();
+  return (
+    value.length > 0 &&
+    new TextEncoder().encode(value).length <= 64 &&
+    /^[!#$%&'*+.^_`|~0-9A-Za-z-]+$/.test(value) &&
+    ![
+      'authorization',
+      'cookie',
+      'host',
+      'content-length',
+      'content-type',
+      'connection',
+      'expect',
+      'keep-alive',
+      'proxy-authenticate',
+      'proxy-authorization',
+      'te',
+      'trailer',
+      'transfer-encoding',
+      'upgrade',
+      'x-request-id',
+      'x-forwarded-for',
+      'x-forwarded-host',
+      'x-forwarded-port',
+      'x-forwarded-proto',
+      'x-real-ip',
+      'x-csrf-token',
+      'forwarded',
+      'via',
+    ].includes(normalized) &&
+    !normalized.startsWith('x-forwarded-') &&
+    !normalized.startsWith('x-greengateway-') &&
+    !normalized.startsWith('sec-')
+  );
+}
+
 function validBaseUrl(value: string): boolean {
   const trimmed = value.trim();
   if (
@@ -3049,6 +3353,43 @@ function emptyBinding(): BindingDraft {
   return { configured: false, intent: 'none', secretId: '' };
 }
 
+function emptyAdditionalHeader(): AdditionalHeaderDraft {
+  return {
+    draftId: nextAdditionalHeaderDraftId++,
+    headerName: '',
+    initiallyConfigured: false,
+    binding: emptyBinding(),
+  };
+}
+
+function additionalHeaderWithPatch(
+  header: AdditionalHeaderDraft,
+  patch: Partial<Pick<AdditionalHeaderDraft, 'headerName' | 'binding'>>,
+): AdditionalHeaderDraft {
+  const next = { ...header, ...patch };
+  if (
+    patch.headerName === undefined ||
+    header.initialHeaderName === undefined ||
+    !header.initiallyConfigured
+  ) {
+    return next;
+  }
+  const stillNamesCurrentBinding =
+    patch.headerName.trim().toLowerCase() ===
+    header.initialHeaderName.trim().toLowerCase();
+  if (!stillNamesCurrentBinding && header.binding.intent === 'preserve') {
+    return { ...next, binding: emptyBinding() };
+  }
+  if (
+    stillNamesCurrentBinding &&
+    header.binding.intent === 'none' &&
+    patch.binding === undefined
+  ) {
+    return { ...next, binding: configuredBinding() };
+  }
+  return next;
+}
+
 function configuredBinding(): BindingDraft {
   return { configured: true, intent: 'preserve', secretId: '' };
 }
@@ -3090,6 +3431,10 @@ function secretDraftResetKey(
     form.kind,
     form.authenticationType,
     bindingKey(form.authenticationBinding),
+    ...form.additionalHeaders.flatMap((header) => [
+      header.headerName,
+      bindingKey(header.binding),
+    ]),
     bindingKey(form.caBundleBinding),
     bindingKey(form.clientCertificateBinding),
     bindingKey(form.clientPrivateKeyBinding),
@@ -3314,6 +3659,17 @@ function describedBy(id: string, error?: string): string | undefined {
   return error ? `${id}-error` : undefined;
 }
 
+function additionalHeaderFieldError(
+  errors: FieldErrors,
+  index: number,
+  field: 'header_name' | 'secret_id',
+): string | undefined {
+  return (
+    errors[`additional_headers.${index}.${field}`] ??
+    (index === 0 ? errors[`additional_headers.${field}`] : undefined)
+  );
+}
+
 function focusFirstProblem(errors: FieldErrors) {
   const fieldToId: Record<string, string> = {
     display_name: 'connection-display-name',
@@ -3327,6 +3683,8 @@ function focusFirstProblem(errors: FieldErrors) {
     'authentication.resource': 'connection-oauth-resource',
     'authentication.secret_id': 'connection-auth-secret',
     'authentication.client_secret_id': 'connection-auth-secret',
+    'additional_headers.header_name': 'connection-additional-header-0-name',
+    'additional_headers.secret_id': 'connection-additional-header-0-secret',
     'tls.ca_bundle_alias': 'connection-ca-bundle',
     'tls.client_certificate_id': 'connection-client-certificate',
     'tls.client_private_key_id': 'connection-client-private-key',
@@ -3337,9 +3695,22 @@ function focusFirstProblem(errors: FieldErrors) {
     'test_profile.path': 'connection-test-path',
     'test_profile.expected_statuses': 'connection-expected-statuses',
   };
-  const firstField = Object.keys(errors).find((field) => fieldToId[field]);
-  if (firstField) {
-    queueMicrotask(() => document.getElementById(fieldToId[firstField])?.focus());
+  const target = Object.keys(errors)
+    .map((field) => {
+      if (fieldToId[field]) {
+        return fieldToId[field];
+      }
+      const indexedAdditionalHeader =
+        /^additional_headers\.(\d+)\.(header_name|secret_id)$/.exec(field);
+      return indexedAdditionalHeader
+        ? `connection-additional-header-${indexedAdditionalHeader[1]}-${
+            indexedAdditionalHeader[2] === 'header_name' ? 'name' : 'secret'
+          }`
+        : undefined;
+    })
+    .find((id) => id !== undefined);
+  if (target) {
+    queueMicrotask(() => document.getElementById(target)?.focus());
   }
 }
 
@@ -3358,6 +3729,8 @@ function fieldErrorsFromProblems(
     'authentication.resource',
     'authentication.secret_id',
     'authentication.client_secret_id',
+    'additional_headers.header_name',
+    'additional_headers.secret_id',
     'tls.ca_bundle_alias',
     'tls.client_certificate_id',
     'tls.client_private_key_id',

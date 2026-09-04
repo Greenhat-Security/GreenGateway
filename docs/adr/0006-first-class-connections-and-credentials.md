@@ -4,7 +4,7 @@
 
 Accepted and implemented for the issue #240 runtime, control-plane, discovery,
 inventory, UI, test, and constrained-playground slices on the current `main`
-branch.
+branch. The additional-secret-header extension below records issue #360 PR A.
 
 ## Context
 
@@ -36,7 +36,8 @@ A managed Connection contains:
   and `managed` source;
 - one normalized HTTP(S) origin and a separately validated origin-relative base
   path;
-- one HTTP authentication binding and an independent TLS profile;
+- one primary HTTP authentication binding, up to four additional secret-backed
+  HTTP headers, and an independent TLS profile;
 - bounded timeout and stored test profiles;
 - optional typed OpenAPI or MCP discovery configuration; and
 - monotonic connection, credential, TLS, discovery, and status revisions.
@@ -80,8 +81,8 @@ authenticate and rate-limit
   -> validate scheme/host/port
   -> resolve DNS, validate every answer, exact-pin one accepted address
   -> prepare TLS/provider/client against that checked destination
-  -> resolve static credential or obtain OAuth token
-  -> remove caller/conflicting credentials and inject configured credential last
+  -> resolve the complete static credential set or obtain OAuth token
+  -> remove caller/conflicting credentials and inject configured credentials last
   -> send bounded upstream bytes
 ```
 
@@ -123,7 +124,7 @@ reject scheme-relative forms, repeated leading authorities, backslashes,
 queries, fragments, literal or percent-encoded dot segments, encoded
 separators, NULs, and invalid percent-encoded UTF-8. Tool arguments, request
 headers/bodies, OpenAPI `servers`, and discovered MCP metadata cannot replace
-the configured Connection ID, origin, token URL, credential header, or TLS
+the configured Connection ID, origin, token URL, credential headers, or TLS
 profile.
 
 The version 0.1 write schema is
@@ -192,10 +193,47 @@ purpose-specific preflight.
 Header API-key names reject `Authorization`, `Cookie`, `Host`,
 `Content-Length`, proxy authentication, forwarding, hop-by-hop,
 connection-nominated, framing, request-ID, and `Sec-*` headers. Runtime
-forwarding strips gateway/caller credentials and the configured API-key header,
-applies permitted route transforms, and injects the Connection credential only
-after egress/TLS preparation. Resolution or injection failure is fail-closed;
-there is no anonymous retry. A credentialed `TRACE` tool call is rejected.
+forwarding strips gateway/caller credentials and every Connection-owned header,
+applies permitted route transforms, and injects the complete Connection
+credential set only after egress/TLS preparation. Resolution or injection
+failure is fail-closed; there is no anonymous retry. A credentialed `TRACE`
+tool call is rejected.
+
+#### Additional secret headers (issue #360)
+
+`ConnectionWrite.additional_headers` is an ordered list of at most four
+`{header_name, secret_id}` entries beyond the primary authentication profile.
+This supports an identity-aware intermediary which requires its own service
+credentials while the upstream application still requires a primary API key or
+bearer/OAuth credential. Cloudflare Access is the motivating example: its
+default `CF-Access-Client-Id` and `CF-Access-Client-Secret` headers use two
+distinct secret bindings, while `authentication` remains the upstream's own
+credential. If the intermediary accepts client certificates, the independent
+mTLS profile is an alternative which requires no additional HTTP token header.
+
+Every additional binding resolves with `SecretPurpose::HeaderApiKey`, including
+the same 8 KiB material bound and header-value safety checks. Names are
+normalized to lowercase, unique case-insensitively, distinct from a primary
+header API-key name, and subject to the same reserved-name policy as a primary
+API-key header; `Authorization` is therefore never an additional header. An
+enabled Connection requires every listed secret binding and HTTPS. Disabled
+drafts may retain an entry without its secret ID.
+
+The credential-binding key is `(connection_id, purpose, header_name)`. Existing
+primary and TLS bindings use the empty header-name sentinel, preserving their
+rows during migration; additional rows carry the normalized header name. Both
+SQLite and PostgreSQL widen the key without moving plaintext secret material.
+
+Every tool, proxy, test, OpenAPI discovery, and MCP lane prevents an untrusted
+value from occupying a primary or additional credential name. Tool and proxy
+request builders strip colliding values; managed MCP refuses a colliding custom
+transport header. After safe transforms, resolution succeeds for the entire set
+or the request fails before sending upstream bytes; values are then injected in
+configured order with the primary first. Managed OpenAPI discovery and managed
+MCP protocol traffic include the set only when `use_connection_authentication`
+is true. Additional headers are transport credentials, not OpenAPI
+security-scheme evidence, so the OpenAPI security matcher deliberately
+considers only the primary authentication profile.
 
 TLS material is resolved only after the ordinary egress preflight. The exact
 checked socket is rebound to the prepared TLS client without another DNS lookup.
@@ -233,8 +271,8 @@ the detached data-plane token cache.
 The trust chain is:
 
 ```text
-Connection -> credential/TLS binding -> opaque SecretId
-  -> SecretResolver -> purpose-bounded ResolvedSecret
+Connection -> credential/TLS bindings -> opaque SecretIds
+  -> SecretResolver -> purpose-bounded ResolvedSecrets
 ```
 
 Ordinary Connection APIs accept opaque IDs only. Operator environment and file
@@ -263,7 +301,8 @@ Connection dependency IDs. Database/WAL/backups contain ciphertext, but the
 database and key files are separate recovery artifacts that must be restored
 together.
 
-Connection DTOs expose only configured booleans for bound credentials/TLS.
+Connection DTOs expose configured booleans for bound primary credentials/TLS;
+additional headers expose only their normalized names and configured booleans.
 The separately permissioned secret catalog exposes opaque resource IDs, label,
 provider kind, compatible purpose, version, dependency count, and allowed
 actions; it never exposes a locator or value.
@@ -322,6 +361,7 @@ reason.
 | Display name / description | 128 / 1,024 characters |
 | URL / origin-relative path | 2,048 / 1,024 bytes |
 | Header name | 64 bytes |
+| Additional secret headers | 4 per Connection |
 | OAuth client ID | 256 bytes |
 | OAuth scopes | 16 entries, 128 characters each |
 | API key, bearer, or OAuth client secret | 8 KiB |
@@ -346,10 +386,14 @@ compilation, or network work.
 
 Changing where an existing credential may be sent is a secret-use mutation.
 Secrets-write is required for a credentialed origin, OAuth token URL,
-scopes/audience/resource, authentication mode/header, mTLS identity, or
+scopes/audience/resource, authentication mode/header, any addition, removal,
+reordering, rename, bind, or clear in `additional_headers`, mTLS identity, or
 credentialed discovery/test target, and for explicit hidden binding fields even
-when the submitted marker appears unchanged. A plain Connection writer cannot
-perform these operations.
+when the submitted marker appears unchanged. These changes advance the
+Connection and credential revisions and produce a new resource ETag. A plain
+Connection writer cannot perform these operations. Safe DTOs expose an
+additional header's normalized name and configured boolean, never its secret ID
+or value.
 
 Authorization precedes resource-ID lookup. Control-plane writes use exact strong
 ETags/`If-Match`; missing preconditions are `428`, stale revisions are `412`,
@@ -361,8 +405,8 @@ header override, arbitrary probe body, or client-decoded permission path.
 
 Safe status contains bounded state/reason codes, times, latency, catalog age and
 count, kind/source, and revisions. Public probes reveal no Connection topology.
-Connection read DTOs summarize authentication/provider configuration without
-bound secret IDs or locators.
+Connection read DTOs summarize authentication/provider configuration and
+additional-header names without bound secret IDs or locators.
 
 Implemented event types include `connection.changed`,
 `connection.credential_changed`, `connection.secret_changed`,
@@ -393,7 +437,7 @@ credential challenges, and MCP session/content payloads.
 | SSRF, rebinding, or redirect leaks a credential | Host/port policy, validate all DNS answers, exact pin, TLS verification, redirects/ambient proxy off, credential injection last | Operators can explicitly allow risky destinations |
 | OAuth token endpoint bypasses upstream egress | Independent token client, egress/DNS/pin/TLS/bounds, no discovery/redirects, no inherited upstream mTLS | A compromised intended IdP observes the client credential |
 | Cross-Connection credential/client reuse | Cache partitions include Connection/revisions, destination/egress generation, profile/timeouts, TLS identity/roots, and local-secret versions | Bounded old entries can remain unreachable until eviction; in-flight calls hold old material |
-| Caller overrides configured credential | Strip inbound sensitive/configured headers, reject conflicts, inject last | Approved legacy literal route headers remain a migration risk |
+| Caller overrides configured credential | Strip every inbound primary/additional configured header, reject conflicts, inject the complete set last | Approved legacy literal route headers remain a migration risk |
 | Secret exposure through DTO/debug/storage/audit | Separate DTOs, redacted non-serializable wrapper, encryption, no reveal, canary scans, safe event vocabulary | Process memory and privileged host inspection remain trusted |
 | Local file/environment exfiltration | Opaque admin aliases, trusted startup locators, canonical root, no-follow/permission/device checks, bounded reads | Platform filesystem guarantees vary |
 | OAuth stampede or stale token reuse | Bounded single-flight cache, expiry skew, revision/version/egress key, exact-generation `401` invalidation | Provider outage fails closed and can reduce availability |
@@ -426,7 +470,7 @@ Operational procedures are documented in the
 ## Consequences
 
 Proxy, HTTP tool, OpenAPI, MCP, test, refresh, inventory, and playground lanes
-share one destination and credential authority model. New providers can
+share one destination and credential-set authority model. New providers can
 implement the narrow opaque-ID resolver boundary without changing admin input
 into an arbitrary locator. Egress, TLS, cache, audit, and revision behavior are
 explicit and testable.

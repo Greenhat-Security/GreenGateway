@@ -93,7 +93,7 @@ Expected output: pretty-printed JSON on stdout and exit `0`. The shape:
   "command": "import-standalone",
   "mode": "dry-run",
   "deployment_id": "deploy-prod-eu",
-  "schema": { "status": "current", "applied": 11, "version_min": 1, "version_max": 11 },
+  "schema": { "status": "current", "applied": 12, "version_min": 1, "version_max": 12 },
   "source": {
     "policy_file": "/var/lib/greengateway/policy.json",
     "policy_history_file": "/var/lib/greengateway/policy-history.sqlite",

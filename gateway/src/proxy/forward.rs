@@ -15,7 +15,7 @@ use axum::{
 use futures_util::{stream, StreamExt};
 use http::{
     header::{self, CONTENT_LENGTH, CONTENT_TYPE},
-    HeaderMap, HeaderName, HeaderValue, Request, StatusCode,
+    HeaderMap, HeaderName, HeaderValue, Method, Request, StatusCode,
 };
 use serde_json::json;
 
@@ -431,6 +431,22 @@ async fn forward_to_upstream(
         }
         None => None,
     };
+    if let Some(target) = connection_target.as_ref() {
+        if parts.method == Method::TRACE && target.is_credentialed() {
+            emit_connection_unsafe_method_rejected(
+                proxy,
+                &parts,
+                source_ip,
+                &upstream.pool.id,
+                target,
+            );
+            return unsafe_connection_method_response(
+                &upstream.pool.id,
+                request_id,
+                "unsafe_trace_method",
+            );
+        }
+    }
     let request_started = Instant::now();
     let request_timeout = connection_target.as_ref().map_or_else(
         || upstream.pool.request_timeout(),
@@ -523,18 +539,10 @@ async fn forward_to_upstream(
                 () = forced_shutdown.cancelled() => {
                     return admission_unavailable_response(&upstream.pool.id, request_id);
                 }
-                credential = tokio::time::timeout_at(
-                    deadline,
-                    runtime.resolve_credential(target),
-                ) => credential,
+                credential = runtime.resolve_credential_before(target, deadline) => credential,
             };
             let credential = match credential {
-                Err(_) => {
-                    let error = if target.authentication_kind() == "oauth2_client_credentials" {
-                        ConnectionHttpError::OAuthTokenUnavailable
-                    } else {
-                        ConnectionHttpError::CredentialUnavailable
-                    };
+                Err(error) => {
                     if error.is_secret_resolution_failure() {
                         emit_connection_secret_resolution_failed(
                             proxy,
@@ -553,32 +561,13 @@ async fn forward_to_upstream(
                         request_started.elapsed(),
                     );
                 }
-                Ok(Err(error)) => {
-                    if error.is_secret_resolution_failure() {
-                        emit_connection_secret_resolution_failed(
-                            proxy,
-                            &parts,
-                            source_ip,
-                            &upstream.pool.id,
-                            target,
-                            error.safe_reason(),
-                        );
-                    }
-                    return connection_failure_response(
-                        error,
-                        &upstream.pool.id,
-                        request_id,
-                        Vec::new(),
-                        request_started.elapsed(),
-                    );
-                }
-                Ok(Ok(credential)) => credential,
+                Ok(credential) => credential,
             };
             let mut headers = attempt_headers(
                 &parts.headers,
                 source_ip,
                 &upstream.request_header_policy,
-                target.credential_header_name(),
+                target.credential_header_names(),
             );
             if let Some(credential) = credential.as_ref() {
                 if let Err(error) = credential.inject(&mut headers) {
@@ -680,7 +669,7 @@ async fn forward_to_upstream(
                     &parts.headers,
                     source_ip,
                     &upstream.request_header_policy,
-                    None,
+                    &[],
                 )
             },
             |(headers, _credential)| headers.clone(),
@@ -871,8 +860,12 @@ async fn forward_to_upstream(
             .map(ConnectionHttpTarget::authentication_kind);
         let oauth_unauthorized =
             oauth_unauthorized_forbids_retry(upstream_status, authentication_kind);
-        let authentication_rejected =
-            connection_authentication_rejected(upstream_status, authentication_kind);
+        let authentication_rejected = connection_authentication_rejected(
+            upstream_status,
+            connection_target
+                .as_ref()
+                .map(ConnectionHttpTarget::is_credentialed),
+        );
         if oauth_unauthorized {
             if let Some(credential) = connection_headers
                 .as_ref()
@@ -1199,12 +1192,12 @@ pub(super) fn attempt_headers(
     inbound: &HeaderMap,
     source_ip: &str,
     policy: &RouteRequestHeaderPolicy,
-    credential_header: Option<&HeaderName>,
+    credential_headers: &[HeaderName],
 ) -> HeaderMap {
     let mut headers = strip_hop_by_hop_headers(inbound);
     strip_gateway_credentials(&mut headers);
     headers.remove(REQUEST_ID_HEADER);
-    if let Some(credential_header) = credential_header {
+    for credential_header in credential_headers {
         headers.remove(credential_header);
     }
     set_upstream_client_ip(&mut headers, source_ip);
@@ -1270,12 +1263,10 @@ fn oauth_unauthorized_forbids_retry(status: StatusCode, authentication_kind: Opt
     status == StatusCode::UNAUTHORIZED && authentication_kind == Some("oauth2_client_credentials")
 }
 
-fn connection_authentication_rejected(
-    status: StatusCode,
-    authentication_kind: Option<&str>,
-) -> bool {
-    matches!(status, StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN)
-        && authentication_kind.is_some_and(|kind| kind != "none")
+/// `credentialed` is `None` for a route that is not Connection-bound and
+/// otherwise says whether the target injects any Connection-owned header.
+fn connection_authentication_rejected(status: StatusCode, credentialed: Option<bool>) -> bool {
+    matches!(status, StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN) && credentialed == Some(true)
 }
 
 fn circuit_failure_reason(error: &egress::EgressError) -> &'static str {
@@ -1850,6 +1841,72 @@ fn emit_connection_secret_resolution_failed(
     ));
 }
 
+fn emit_connection_unsafe_method_rejected(
+    proxy: &ProxyState,
+    parts: &http::request::Parts,
+    source_ip: &str,
+    route_id: &str,
+    target: &ConnectionHttpTarget,
+) {
+    let request_id = parts
+        .headers
+        .get(REQUEST_ID_HEADER)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("unknown");
+    let actor = parts
+        .extensions
+        .get::<auth::Principal>()
+        .map(auth::actor_from_principal);
+    proxy.audit.emit(audit::AuditEvent::new(
+        audit::event::CONNECTION_UNSAFE_METHOD_REJECTED,
+        request_id,
+        source_ip,
+        actor,
+        json!({
+            "connection_id": target.connection_id(),
+            "auth_type": target.authentication_kind(),
+            "consumer_kind": "proxy_route",
+            "consumer_id": route_id,
+            "outcome": "failure",
+            "reason": "unsafe_trace_method",
+        }),
+    ));
+}
+
+fn unsafe_connection_method_response(
+    pool_id: &str,
+    request_id: Option<HeaderValue>,
+    reason: &'static str,
+) -> Response {
+    tracing::warn!(
+        pool_id,
+        error_category = reason,
+        "credentialed Connection rejected an unsafe proxied method"
+    );
+    let mut response = (
+        StatusCode::METHOD_NOT_ALLOWED,
+        Json(json!({ "error": reason })),
+    )
+        .into_response();
+    response
+        .extensions_mut()
+        .insert(middleware::decision::UpstreamOutcome {
+            latency_ms: 0,
+            status: None,
+            pool_id: Some(pool_id.to_owned()),
+            endpoint_id: None,
+            attempts: Vec::new(),
+            retry_exhausted: false,
+            stream_terminal_pending: false,
+        });
+    if let Some(request_id) = request_id {
+        response
+            .headers_mut()
+            .insert(request_id_header(), request_id);
+    }
+    response
+}
+
 fn gateway_timeout_response(
     request_id: Option<HeaderValue>,
     pool_id: &str,
@@ -2212,6 +2269,12 @@ mod tests {
     use crate::{
         audit::sink::tests::CaptureSink,
         config,
+        connections::{
+            control_plane::ConnectionControlPlane,
+            http::ConnectionHttpRuntime,
+            model::ConnectionWrite,
+            secret::{OperatorSecretAliasConfig, OperatorSecretAliasSource, SecretRootConfig},
+        },
         proxy::{health, ProxyEndpoint, ProxyRoute, ProxyRoutes, RequestBodyMode, UpstreamPool},
     };
 
@@ -2295,6 +2358,14 @@ mod tests {
         );
         inbound.insert(header::COOKIE, HeaderValue::from_static("session=caller"));
         inbound.insert("x-api-key", HeaderValue::from_static("caller-api-key"));
+        inbound.insert(
+            "cf-access-client-id",
+            HeaderValue::from_static("caller-client-id"),
+        );
+        inbound.insert(
+            "cf-access-client-secret",
+            HeaderValue::from_static("caller-client-secret"),
+        );
         inbound.insert("x-end-to-end", HeaderValue::from_static("caller-value"));
         inbound.insert(
             REQUEST_ID_HEADER,
@@ -2312,18 +2383,198 @@ mod tests {
             &inbound,
             "203.0.113.8",
             &policy,
-            Some(&HeaderName::from_static("x-api-key")),
+            &[
+                HeaderName::from_static("x-api-key"),
+                HeaderName::from_static("cf-access-client-id"),
+                HeaderName::from_static("cf-access-client-secret"),
+            ],
         );
 
         assert!(!forwarded.contains_key(header::AUTHORIZATION));
         assert!(!forwarded.contains_key(header::COOKIE));
         assert!(!forwarded.contains_key("x-api-key"));
+        assert!(!forwarded.contains_key("cf-access-client-id"));
+        assert!(!forwarded.contains_key("cf-access-client-secret"));
         assert!(!forwarded.contains_key("x-end-to-end"));
         assert!(!forwarded.contains_key(REQUEST_ID_HEADER));
         assert_eq!(
             forwarded.get("x-route-label"),
             Some(&HeaderValue::from_static("billing"))
         );
+    }
+
+    #[tokio::test]
+    async fn credentialed_connection_trace_is_rejected_before_secret_or_upstream_io() {
+        let root =
+            std::env::temp_dir().join(format!("greengateway-proxy-trace-{}", uuid::Uuid::new_v4()));
+        fs::create_dir(&root).expect("TRACE test secret root should create");
+        for (file, value) in [
+            ("primary", b"primary-secret-canary".as_slice()),
+            ("proxy-client-id", b"client-id-secret-canary".as_slice()),
+            (
+                "proxy-client-secret",
+                b"client-secret-secret-canary".as_slice(),
+            ),
+        ] {
+            fs::write(root.join(file), value).expect("TRACE test secret should write");
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+
+            fs::set_permissions(&root, fs::Permissions::from_mode(0o700))
+                .expect("TRACE test secret root permissions should set");
+            for file in ["primary", "proxy-client-id", "proxy-client-secret"] {
+                fs::set_permissions(root.join(file), fs::Permissions::from_mode(0o600))
+                    .expect("TRACE test secret permissions should set");
+            }
+        }
+
+        let mut connection_config = config::Config::test_defaults();
+        connection_config.connections_sqlite_path =
+            Some(root.join("connections.sqlite").display().to_string());
+        connection_config.connection_secrets_root = Some(SecretRootConfig::new(root.clone()));
+        connection_config.connection_secret_aliases = [
+            ("primary", "Primary"),
+            ("proxy-client-id", "Proxy client ID"),
+            ("proxy-client-secret", "Proxy client secret"),
+        ]
+        .into_iter()
+        .map(|(id, label)| OperatorSecretAliasConfig {
+            id: id.to_owned(),
+            label: label.to_owned(),
+            source: OperatorSecretAliasSource::File { key: id.to_owned() },
+        })
+        .collect();
+        let control_plane = ConnectionControlPlane::from_config(&connection_config)
+            .expect("TRACE test control plane should build");
+        let write: ConnectionWrite = serde_json::from_value(json!({
+            "display_name": "TRACE guard",
+            "enabled": true,
+            "kind": "http_api",
+            "endpoint": {
+                "base_url": "https://billing.example.test",
+                "base_path": "/"
+            },
+            "authentication": {
+                "type": "header_api_key",
+                "header_name": "x-api-key",
+                "secret_id": "primary"
+            },
+            "additional_headers": [
+                {
+                    "header_name": "cf-access-client-id",
+                    "secret_id": "proxy-client-id"
+                },
+                {
+                    "header_name": "cf-access-client-secret",
+                    "secret_id": "proxy-client-secret"
+                }
+            ]
+        }))
+        .expect("TRACE test Connection should deserialize");
+        let initial = control_plane.runtime_snapshot();
+        let created = control_plane
+            .create_managed(initial.collection_etag(), write, "test-admin")
+            .await
+            .expect("TRACE test Connection should create");
+        let connection_id = created.id.to_string();
+        let egress_config = egress::EgressConfig {
+            allowed_hosts: HashSet::from(["billing.example.test".to_owned()]),
+            ..egress::EgressConfig::default()
+        };
+        let egress_client = Arc::new(
+            egress::EgressClient::new(egress_config.clone())
+                .expect("TRACE test egress client should build"),
+        );
+        let runtime = ConnectionHttpRuntime::new(control_plane, egress_config, egress_client);
+        let target = runtime
+            .target(&connection_id, "/trace")
+            .expect("TRACE target should build");
+        assert_eq!(
+            target.credential_header_names(),
+            &[
+                HeaderName::from_static("x-api-key"),
+                HeaderName::from_static("cf-access-client-id"),
+                HeaderName::from_static("cf-access-client-secret"),
+            ]
+        );
+
+        // If the guard regresses below resolution, these missing files turn
+        // the result into a 503 and emit a secret-resolution event. No server
+        // listens for the configured target, so reaching egress cannot pass
+        // this test with the fixed response and audit asserted below either.
+        for file in ["primary", "proxy-client-id", "proxy-client-secret"] {
+            fs::remove_file(root.join(file)).expect("TRACE test secret should be removed");
+        }
+
+        let nowhere_a = SocketAddr::from(([127, 0, 0, 1], 9));
+        let nowhere_b = SocketAddr::from(([127, 0, 0, 1], 10));
+        let (mut proxy, sink) =
+            retry_proxy([nowhere_a, nowhere_b], None, Duration::from_millis(100));
+        let ProxyRoutes::RoutingTable { routes } = &mut proxy.routes else {
+            panic!("TRACE test proxy should use a routing table");
+        };
+        routes[0].connection_id = Some(connection_id.clone());
+        proxy.connection_http = Some(runtime);
+
+        let request = Request::builder()
+            .method(Method::TRACE)
+            .uri("/trace")
+            .header(REQUEST_ID_HEADER, "trace-request")
+            .body(Body::empty())
+            .expect("TRACE request should build");
+        let response = proxy.forward_request(request, "203.0.113.8").await;
+        assert_eq!(response.status(), StatusCode::METHOD_NOT_ALLOWED);
+        assert_eq!(
+            response.headers().get(REQUEST_ID_HEADER),
+            Some(&HeaderValue::from_static("trace-request"))
+        );
+        let outcome = response
+            .extensions()
+            .get::<middleware::decision::UpstreamOutcome>()
+            .expect("TRACE rejection should record a fixed upstream outcome");
+        assert_eq!(outcome.status, None);
+        assert_eq!(outcome.endpoint_id, None);
+        assert!(outcome.attempts.is_empty());
+        let body = axum::body::to_bytes(response.into_body(), 1024)
+            .await
+            .expect("TRACE rejection body should read");
+        assert_eq!(body.as_ref(), br#"{"error":"unsafe_trace_method"}"#);
+
+        let started = Instant::now();
+        while !sink
+            .events()
+            .iter()
+            .any(|event| event.event_type == audit::event::CONNECTION_UNSAFE_METHOD_REJECTED)
+            && started.elapsed() < Duration::from_secs(1)
+        {
+            tokio::task::yield_now().await;
+        }
+        let events = sink.events();
+        let rejection = events
+            .iter()
+            .find(|event| event.event_type == audit::event::CONNECTION_UNSAFE_METHOD_REJECTED)
+            .expect("TRACE rejection should be audited");
+        assert_eq!(rejection.request_id, "trace-request");
+        assert_eq!(rejection.payload["connection_id"], json!(connection_id));
+        assert_eq!(rejection.payload["auth_type"], json!("header_api_key"));
+        assert_eq!(rejection.payload["consumer_kind"], json!("proxy_route"));
+        assert_eq!(rejection.payload["consumer_id"], json!("payments"));
+        assert_eq!(rejection.payload["reason"], json!("unsafe_trace_method"));
+        assert!(events.iter().all(|event| {
+            event.event_type != audit::event::CONNECTION_SECRET_RESOLUTION_FAILED
+        }));
+        let rendered = serde_json::to_string(&events).expect("TRACE audits should serialize");
+        for secret in [
+            "primary-secret-canary",
+            "client-id-secret-canary",
+            "client-secret-secret-canary",
+        ] {
+            assert!(!rendered.contains(secret), "TRACE audit leaked {secret}");
+        }
+
+        let _ = fs::remove_dir_all(&root);
     }
 
     #[test]
@@ -2346,15 +2597,19 @@ mod tests {
         ));
         assert!(connection_authentication_rejected(
             StatusCode::UNAUTHORIZED,
-            Some("oauth2_client_credentials")
+            Some(true)
         ));
         assert!(connection_authentication_rejected(
             StatusCode::FORBIDDEN,
-            Some("static_bearer")
+            Some(true)
         ));
         assert!(!connection_authentication_rejected(
             StatusCode::UNAUTHORIZED,
-            Some("none")
+            Some(false)
+        ));
+        assert!(!connection_authentication_rejected(
+            StatusCode::UNAUTHORIZED,
+            None
         ));
     }
 

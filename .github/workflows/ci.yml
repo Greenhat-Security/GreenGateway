@@ -186,6 +186,10 @@ jobs:
       - name: Cache Rust dependencies
         uses: Swatinem/rust-cache@v2
 
+      - name: Build gateway for live admin UI
+        timeout-minutes: 15
+        run: cargo build --locked -p gateway
+
       - name: Install Node.js
         uses: actions/setup-node@v4
         with:

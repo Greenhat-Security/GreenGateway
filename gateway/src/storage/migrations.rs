@@ -203,6 +203,13 @@ static MANIFEST: LazyLock<Vec<Migration>> = LazyLock::new(|| {
         )
         .finalize()
         .with_pinned_checksum("62867cfebe55b9a31f2aa010add3c6b71ba3adaabb84d356936ead2836583787"),
+        Migration::new(
+            12,
+            "connection_additional_headers",
+            include_str!("migrations/0012_connection_additional_headers.sql"),
+        )
+        .finalize()
+        .with_pinned_checksum("223e70073aceb9fd722db0f775ac86ea8b2ce05666ec6c39e714977f0d70b580"),
     ]
 });
 
@@ -1282,6 +1289,112 @@ mod tests {
         for (index, row) in rows.iter().enumerate() {
             assert_eq!(row.get::<_, i64>(0), MANIFEST[index].version);
         }
+    }
+
+    #[tokio::test]
+    async fn additional_header_migration_preserves_existing_binding_and_widens_its_key() {
+        let Some(dsn) = real_dsn() else {
+            eprintln!("skipping: no test database locator; CI runs this test");
+            return;
+        };
+        let _guard = REAL_DATABASE.lock().await;
+        let dsn_file = write_dsn_file(&dsn);
+        let config = migration_config(&dsn_file);
+        let foundation = establish(&config).await;
+        clean_database(foundation.pool()).await;
+
+        let client = foundation.pool().get().await.expect("checkout");
+        bootstrap_ledger(&client)
+            .await
+            .expect("migration ledger should bootstrap");
+        for migration in &MANIFEST[..MANIFEST.len() - 1] {
+            apply_one(&client, migration, &test_settings())
+                .await
+                .expect("pre-additional-header migration should apply");
+        }
+        let connection_id = uuid::Uuid::new_v4().to_string();
+        let timestamp = "2026-09-03T00:00:00Z";
+        client
+            .execute(
+                r#"
+                INSERT INTO greengateway.connection_records (
+                    id, schema_version, source, spec_json, connection_revision,
+                    credential_revision, tls_revision, discovery_revision,
+                    status_revision, created_at, updated_at
+                ) VALUES ($1::text::uuid, 'v0', 'managed', '{}', 1, 1, 0, 0, 0, $2, $2)
+                "#,
+                &[&connection_id, &timestamp],
+            )
+            .await
+            .expect("pre-migration Connection should insert");
+        client
+            .execute(
+                r#"
+                INSERT INTO greengateway.connection_credential_bindings (
+                    connection_id, purpose, secret_id, binding_version, updated_at
+                ) VALUES ($1::text::uuid, 'http_authentication', 'primary-secret', 1, $2)
+                "#,
+                &[&connection_id, &timestamp],
+            )
+            .await
+            .expect("pre-migration binding should insert");
+        drop(client);
+
+        let applied = apply_missing(foundation.pool(), &test_settings())
+            .await
+            .expect("additional-header migration should apply");
+        assert_eq!(applied, MigrateOutput::Applied { applied: 1 });
+
+        let client = foundation
+            .pool()
+            .get()
+            .await
+            .expect("verification checkout");
+        let existing = client
+            .query_one(
+                r#"
+                SELECT purpose, header_name, secret_id, binding_version, updated_at
+                FROM greengateway.connection_credential_bindings
+                WHERE connection_id = $1::text::uuid
+                "#,
+                &[&connection_id],
+            )
+            .await
+            .expect("migrated binding should read");
+        assert_eq!(existing.get::<_, String>(0), "http_authentication");
+        assert_eq!(existing.get::<_, String>(1), "");
+        assert_eq!(existing.get::<_, String>(2), "primary-secret");
+        assert_eq!(existing.get::<_, i64>(3), 1);
+        assert_eq!(existing.get::<_, String>(4), timestamp);
+
+        for (name, secret) in [
+            ("cf-access-client-id", "access-client-id"),
+            ("cf-access-client-secret", "access-client-secret"),
+        ] {
+            client
+                .execute(
+                    r#"
+                    INSERT INTO greengateway.connection_credential_bindings (
+                        connection_id, purpose, header_name, secret_id,
+                        binding_version, updated_at
+                    ) VALUES ($1::text::uuid, 'additional_header', $2, $3, 2, $4)
+                    "#,
+                    &[&connection_id, &name, &secret, &timestamp],
+                )
+                .await
+                .expect("distinct additional-header binding should insert");
+        }
+        assert_eq!(
+            client
+                .query_one(
+                    "SELECT COUNT(*) FROM greengateway.connection_credential_bindings WHERE connection_id = $1::text::uuid",
+                    &[&connection_id],
+                )
+                .await
+                .expect("binding count should read")
+                .get::<_, i64>(0),
+            3
+        );
     }
 
     #[tokio::test]

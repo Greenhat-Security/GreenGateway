@@ -332,6 +332,34 @@
         }
       ]
     },
+    "MutationAdditionalHeader": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "header_name"
+      ],
+      "properties": {
+        "header_name": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 64
+        },
+        "secret_id": {
+          "$ref": "#/$defs/StableId"
+        },
+        "secret_configured": {
+          "type": "boolean",
+          "description": "PUT-only redaction marker, matched to the current entry with the same header name. true retains the current hidden binding and false clears it."
+        }
+      },
+      "not": {
+        "required": [
+          "secret_id",
+          "secret_configured"
+        ]
+      },
+      "description": "One secret-backed header injected alongside the primary credential. The name must be a non-reserved HTTP header (never Authorization), must not name the primary credential's header, and must be unique in the list. Any change to the list is a secrets write."
+    },
     "MutationTls": {
       "type": "object",
       "additionalProperties": false,
@@ -414,6 +442,13 @@
         "authentication": {
           "$ref": "#/$defs/CreateAuthentication"
         },
+        "additional_headers": {
+          "type": "array",
+          "maxItems": 4,
+          "items": {
+            "$ref": "#/$defs/CreateAdditionalHeader"
+          }
+        },
         "tls": {
           "$ref": "#/$defs/CreateTls"
         },
@@ -426,7 +461,55 @@
         "test_profile": {
           "$ref": "#/$defs/TestProfile"
         }
-      }
+      },
+      "allOf": [
+        {
+          "if": {
+            "required": [
+              "additional_headers"
+            ],
+            "properties": {
+              "additional_headers": {
+                "minItems": 1
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "endpoint": {
+                "properties": {
+                  "base_url": {
+                    "pattern": "^https://"
+                  }
+                }
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "required": [
+              "enabled"
+            ],
+            "properties": {
+              "enabled": {
+                "const": true
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "additional_headers": {
+                "items": {
+                  "required": [
+                    "secret_id"
+                  ]
+                }
+              }
+            }
+          }
+        }
+      ]
     },
     "ConnectionReplaceRequest": {
       "type": "object",
@@ -461,6 +544,13 @@
         "authentication": {
           "$ref": "#/$defs/MutationAuthentication"
         },
+        "additional_headers": {
+          "type": "array",
+          "maxItems": 4,
+          "items": {
+            "$ref": "#/$defs/MutationAdditionalHeader"
+          }
+        },
         "tls": {
           "$ref": "#/$defs/MutationTls"
         },
@@ -474,6 +564,65 @@
           "$ref": "#/$defs/TestProfile"
         }
       },
+      "allOf": [
+        {
+          "if": {
+            "required": [
+              "additional_headers"
+            ],
+            "properties": {
+              "additional_headers": {
+                "minItems": 1
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "endpoint": {
+                "properties": {
+                  "base_url": {
+                    "pattern": "^https://"
+                  }
+                }
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "enabled": {
+                "const": true
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "additional_headers": {
+                "items": {
+                  "anyOf": [
+                    {
+                      "required": [
+                        "secret_id"
+                      ]
+                    },
+                    {
+                      "required": [
+                        "secret_configured"
+                      ],
+                      "properties": {
+                        "secret_configured": {
+                          "const": true
+                        }
+                      }
+                    }
+                  ]
+                }
+              }
+            }
+          }
+        }
+      ],
       "description": "Full replacement. Hidden binding IDs may be supplied by a secrets-writer, or their corresponding configured markers may be round-tripped to retain or clear the current hidden binding."
     },
     "SafeAuthentication": {
@@ -569,6 +718,22 @@
           }
         }
       ]
+    },
+    "SafeAdditionalHeader": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "header_name",
+        "secret_configured"
+      ],
+      "properties": {
+        "header_name": {
+          "type": "string"
+        },
+        "secret_configured": {
+          "type": "boolean"
+        }
+      }
     },
     "SafeTls": {
       "type": "object",
@@ -842,6 +1007,13 @@
         },
         "authentication": {
           "$ref": "#/$defs/SafeAuthentication"
+        },
+        "additional_headers": {
+          "type": "array",
+          "maxItems": 4,
+          "items": {
+            "$ref": "#/$defs/SafeAdditionalHeader"
+          }
         },
         "tls": {
           "$ref": "#/$defs/SafeTls"
@@ -2613,6 +2785,24 @@
           }
         }
       ]
+    },
+    "CreateAdditionalHeader": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "header_name"
+      ],
+      "properties": {
+        "header_name": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 64
+        },
+        "secret_id": {
+          "$ref": "#/$defs/StableId"
+        }
+      },
+      "description": "One secret-backed header injected alongside the primary credential; secret_id names a header_api_key secret and is required once the Connection is enabled."
     },
     "CreateTls": {
       "type": "object",

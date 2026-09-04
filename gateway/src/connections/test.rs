@@ -479,7 +479,7 @@ impl ConnectionTestService {
             }
         };
         let target = test_target.target();
-        let uses_authentication = target.authentication_kind() != "none";
+        let uses_authentication = target.is_credentialed();
         let uses_tls = !record.write.tls.is_empty();
         let mut stages = Vec::with_capacity(6);
 
@@ -666,16 +666,6 @@ impl ConnectionTestService {
         deadline: tokio::time::Instant,
     ) -> ConnectionTestExecution {
         let started = Instant::now();
-        let uses_authentication = matches!(
-            &record.write.discovery,
-            Some(super::model::DiscoveryConfig::ManagedMcp {
-                use_connection_authentication: true,
-            })
-        ) && !matches!(
-            &record.write.authentication,
-            super::model::ConnectionAuthentication::None
-        );
-        let uses_tls = !record.write.tls.is_empty();
         match crate::tools::mcp_upstream::probe_connection_protocol_before(
             &self.runtime,
             record.id.as_str(),
@@ -684,31 +674,7 @@ impl ConnectionTestService {
         )
         .await
         {
-            Ok(()) => successful_execution(
-                started,
-                vec![
-                    ConnectionTestStage::success(ConnectionTestStageName::EgressPolicy),
-                    if uses_authentication || uses_tls {
-                        ConnectionTestStage::success(ConnectionTestStageName::SecretAvailable)
-                    } else {
-                        ConnectionTestStage::not_applicable(
-                            ConnectionTestStageName::SecretAvailable,
-                        )
-                    },
-                    ConnectionTestStage::success(ConnectionTestStageName::Connected),
-                    if uses_tls {
-                        ConnectionTestStage::success(ConnectionTestStageName::TlsValid)
-                    } else {
-                        ConnectionTestStage::not_applicable(ConnectionTestStageName::TlsValid)
-                    },
-                    if uses_authentication {
-                        ConnectionTestStage::success(ConnectionTestStageName::Authenticated)
-                    } else {
-                        ConnectionTestStage::not_applicable(ConnectionTestStageName::Authenticated)
-                    },
-                    ConnectionTestStage::success(ConnectionTestStageName::ProtocolValid),
-                ],
-            ),
+            Ok(()) => successful_execution(started, successful_mcp_stages(record)),
             Err(error) => failed_execution(
                 started,
                 error.operational_state(),
@@ -720,6 +686,40 @@ impl ConnectionTestService {
             ),
         }
     }
+}
+
+fn managed_mcp_uses_authentication(record: &StoredConnection) -> bool {
+    matches!(
+        &record.write.discovery,
+        Some(super::model::DiscoveryConfig::ManagedMcp {
+            use_connection_authentication: true,
+        })
+    ) && record.write.sends_credentials()
+}
+
+fn successful_mcp_stages(record: &StoredConnection) -> Vec<ConnectionTestStage> {
+    let uses_authentication = managed_mcp_uses_authentication(record);
+    let uses_tls = !record.write.tls.is_empty();
+    vec![
+        ConnectionTestStage::success(ConnectionTestStageName::EgressPolicy),
+        if uses_authentication || uses_tls {
+            ConnectionTestStage::success(ConnectionTestStageName::SecretAvailable)
+        } else {
+            ConnectionTestStage::not_applicable(ConnectionTestStageName::SecretAvailable)
+        },
+        ConnectionTestStage::success(ConnectionTestStageName::Connected),
+        if uses_tls {
+            ConnectionTestStage::success(ConnectionTestStageName::TlsValid)
+        } else {
+            ConnectionTestStage::not_applicable(ConnectionTestStageName::TlsValid)
+        },
+        if uses_authentication {
+            ConnectionTestStage::success(ConnectionTestStageName::Authenticated)
+        } else {
+            ConnectionTestStage::not_applicable(ConnectionTestStageName::Authenticated)
+        },
+        ConnectionTestStage::success(ConnectionTestStageName::ProtocolValid),
+    ]
 }
 
 impl AdmissionEntry {
@@ -1180,6 +1180,57 @@ mod tests {
             assert_eq!(
                 connection_failure_classification(error),
                 (expected_stage, expected_state, expected_status_reason)
+            );
+        }
+    }
+
+    #[test]
+    fn additional_header_only_managed_mcp_exercises_credential_stages() {
+        let write = serde_json::from_value(serde_json::json!({
+            "display_name": "Access-protected MCP",
+            "enabled": true,
+            "kind": "mcp_streamable_http",
+            "endpoint": {
+                "base_url": "https://mcp.example.test",
+                "base_path": "/mcp"
+            },
+            "authentication": {"type": "none"},
+            "additional_headers": [{
+                "header_name": "cf-access-client-id",
+                "secret_id": "access-client-id"
+            }],
+            "tls": {},
+            "discovery": {
+                "type": "managed_mcp",
+                "use_connection_authentication": true
+            }
+        }))
+        .expect("additional-header MCP Connection should deserialize");
+        let record = StoredConnection {
+            id: ConnectionId::parse("access-protected-mcp")
+                .expect("test Connection ID should parse"),
+            write,
+            revisions: crate::connections::status::ConnectionRevisions {
+                connection: 1,
+                credential: 1,
+                tls: 0,
+                discovery: 1,
+                status: 0,
+            },
+            created_at: "2026-09-03T00:00:00Z".to_owned(),
+            updated_at: "2026-09-03T00:00:00Z".to_owned(),
+        };
+
+        assert!(managed_mcp_uses_authentication(&record));
+        let stages = successful_mcp_stages(&record);
+        for name in [
+            ConnectionTestStageName::SecretAvailable,
+            ConnectionTestStageName::Authenticated,
+        ] {
+            assert_eq!(
+                stages.iter().find(|stage| stage.name == name),
+                Some(&ConnectionTestStage::success(name)),
+                "an additional secret header must exercise the {name:?} MCP test stage"
             );
         }
     }

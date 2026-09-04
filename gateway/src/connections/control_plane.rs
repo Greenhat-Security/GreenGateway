@@ -1317,6 +1317,22 @@ impl ConnectionControlPlane {
             }
         }
 
+        for header in &candidate.additional_headers {
+            if let Some(secret_id) = header
+                .secret_id
+                .as_deref()
+                .filter(|id| resolver.is_deferred_alias(id))
+            {
+                resolve_deferred(
+                    &resolver,
+                    "additional_headers.secret_id",
+                    secret_id,
+                    SecretPurpose::HeaderApiKey,
+                )
+                .await?;
+            }
+        }
+
         if let Some(alias) = candidate
             .tls
             .ca_bundle_alias
@@ -1641,6 +1657,20 @@ impl ConnectionSecretResolver {
             | ConnectionAuthentication::OAuth2ClientCredentials { .. } => {}
         }
 
+        for header in &candidate.additional_headers {
+            if let Some(secret_id) = header
+                .secret_id
+                .as_deref()
+                .filter(|id| !self.is_deferred_alias(id))
+            {
+                self.resolve_required(
+                    "additional_headers.secret_id",
+                    secret_id,
+                    SecretPurpose::HeaderApiKey,
+                )?;
+            }
+        }
+
         let ca_bundle = candidate
             .tls
             .ca_bundle_alias
@@ -1719,6 +1749,15 @@ impl ConnectionSecretResolver {
         if authentication_purpose.is_some_and(|purpose| replacement.purpose() != purpose) {
             return Err(BindingActivationError::Invalid {
                 fields: vec!["authentication"],
+            });
+        }
+
+        if candidate.additional_headers.iter().any(|header| {
+            header.secret_id.as_deref() == Some(rotated_id)
+                && replacement.purpose() != SecretPurpose::HeaderApiKey
+        }) {
+            return Err(BindingActivationError::Invalid {
+                fields: vec!["additional_headers.secret_id"],
             });
         }
 
@@ -2431,6 +2470,77 @@ mod tests {
                 rotated_at: None,
             }]
         }
+    }
+
+    struct HeaderOnlyNetworkProvider {
+        alias_id: &'static str,
+    }
+
+    #[async_trait]
+    impl SecretResolver for HeaderOnlyNetworkProvider {
+        async fn resolve(
+            &self,
+            alias_id: &str,
+            purpose: SecretPurpose,
+        ) -> Result<ResolvedSecret, SecretResolveError> {
+            if alias_id != self.alias_id {
+                return Err(SecretResolveError::new(
+                    alias_id,
+                    SecretResolveErrorKind::UnknownAlias,
+                ));
+            }
+            if purpose != SecretPurpose::HeaderApiKey {
+                return Err(SecretResolveError::new(
+                    alias_id,
+                    SecretResolveErrorKind::InvalidMaterial,
+                ));
+            }
+            ResolvedSecret::new(purpose, b"deferred-header-value".to_vec()).map_err(|_| {
+                SecretResolveError::new(alias_id, SecretResolveErrorKind::InvalidMaterial)
+            })
+        }
+
+        fn contains_alias(&self, alias_id: &str) -> bool {
+            alias_id == self.alias_id
+        }
+
+        fn aliases(&self) -> Vec<SecretAliasMetadata> {
+            vec![network_alias_metadata(self.alias_id)]
+        }
+    }
+
+    #[tokio::test]
+    async fn deferred_additional_header_is_resolved_as_a_header_api_key_before_mutation() {
+        const ALIAS: &str = "vault-access-client-id";
+        let temporary = TemporaryLocalControlPlane::new("deferred-additional-header");
+        let mut config = temporary.config();
+        config.connection_vault_provider = vault_config_declaring(ALIAS);
+        let control_plane =
+            ConnectionControlPlane::from_config(&config).expect("control plane should build");
+        control_plane.install_network_secret_providers(vec![Arc::new(HeaderOnlyNetworkProvider {
+            alias_id: ALIAS,
+        })]);
+        let mut candidate = managed_candidate();
+        candidate
+            .additional_headers
+            .push(crate::connections::model::AdditionalHeader {
+                header_name: "cf-access-client-id".to_owned(),
+                secret_id: Some(ALIAS.to_owned()),
+            });
+
+        control_plane
+            .ensure_deferred_bindings_resolvable(&candidate)
+            .await
+            .expect("the deferred header must resolve with HeaderApiKey purpose");
+        let before = control_plane.runtime_snapshot();
+        let created = control_plane
+            .create_managed(before.collection_etag(), candidate, "test-admin")
+            .await
+            .expect("preflighted deferred header should persist and publish");
+        assert_eq!(
+            created.write.additional_headers[0].secret_id.as_deref(),
+            Some(ALIAS)
+        );
     }
 
     fn network_alias_metadata(alias_id: &str) -> SecretAliasMetadata {
@@ -3172,6 +3282,136 @@ mod tests {
                 .expect("count should load"),
             0
         );
+
+        let bearer_secret = blocking_secret_mutation(|| {
+            control_plane
+                .local_secret_manager()
+                .expect("local manager should exist")
+                .create(
+                    "Bearer-only secret",
+                    ResolvedSecret::new(SecretPurpose::StaticBearer, b"bearer-canary".to_vec())
+                        .expect("fixture secret should validate"),
+                )
+        })
+        .expect("fixture secret should create");
+        let before = control_plane.runtime_snapshot();
+        let mut candidate = managed_candidate();
+        candidate
+            .additional_headers
+            .push(crate::connections::model::AdditionalHeader {
+                header_name: "x-proxy-token".to_owned(),
+                secret_id: Some(bearer_secret.id),
+            });
+        assert!(matches!(
+            control_plane
+                .create_managed(before.collection_etag(), candidate, "test-admin")
+                .await,
+            Err(ConnectionMutationError::UnresolvableBindings { fields })
+                if fields == vec!["additional_headers.secret_id"]
+        ));
+        assert!(control_plane.runtime_snapshot().managed().is_empty());
+    }
+
+    #[tokio::test]
+    async fn unavailable_additional_header_binding_preserves_persisted_and_runtime_state() {
+        let temporary = TemporaryLocalControlPlane::new("additional-binding-unavailable");
+        let mut config = temporary.config();
+        let alias_id = format!("missing-additional-alias-{}", uuid::Uuid::new_v4());
+        config.connection_secret_aliases =
+            vec![crate::connections::secret::OperatorSecretAliasConfig {
+                id: alias_id.clone(),
+                label: "Unavailable proxy token".to_owned(),
+                source: crate::connections::secret::OperatorSecretAliasSource::Environment {
+                    key: format!("GGW_MISSING_{}", uuid::Uuid::new_v4().simple()),
+                },
+            }];
+        let control_plane =
+            ConnectionControlPlane::from_config(&config).expect("control plane should build");
+        let initial = control_plane.runtime_snapshot();
+        let mut candidate = managed_candidate();
+        candidate
+            .additional_headers
+            .push(crate::connections::model::AdditionalHeader {
+                header_name: "x-proxy-token".to_owned(),
+                secret_id: Some(alias_id),
+            });
+
+        assert!(matches!(
+            control_plane
+                .create_managed(initial.collection_etag(), candidate, "test-admin")
+                .await,
+            Err(ConnectionMutationError::BindingUnavailable)
+        ));
+        assert!(control_plane.runtime_snapshot().managed().is_empty());
+        assert_eq!(
+            control_plane
+                .managed_store()
+                .expect("store should exist")
+                .count()
+                .await
+                .expect("count should load"),
+            0
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn in_use_additional_header_rejects_rotation_to_a_different_secret_purpose() {
+        let temporary = TemporaryLocalControlPlane::new("additional-header-rotation-purpose");
+        let config = temporary.config();
+        let control_plane =
+            ConnectionControlPlane::from_config(&config).expect("control plane should build");
+        let manager = control_plane
+            .local_secret_manager()
+            .expect("local manager should exist");
+        let original = b"original-additional-header-value".to_vec();
+        let secret = blocking_secret_mutation(|| {
+            manager.create(
+                "Access client ID",
+                ResolvedSecret::new(SecretPurpose::HeaderApiKey, original.clone())
+                    .expect("header secret should validate"),
+            )
+        })
+        .expect("header secret should create");
+        let before = control_plane.runtime_snapshot();
+        let mut candidate = managed_candidate();
+        candidate
+            .additional_headers
+            .push(crate::connections::model::AdditionalHeader {
+                header_name: "cf-access-client-id".to_owned(),
+                secret_id: Some(secret.id.clone()),
+            });
+        let created = control_plane
+            .create_managed(before.collection_etag(), candidate, "test-admin")
+            .await
+            .expect("additional-header Connection should activate");
+
+        assert_eq!(
+            blocking_secret_mutation(|| manager.rotate(
+                &secret.id,
+                ResolvedSecret::new(
+                    SecretPurpose::StaticBearer,
+                    b"wrong-purpose-replacement".to_vec(),
+                )
+                .expect("bounded replacement should construct"),
+            )),
+            Err(LocalSecretError::InvalidSecret)
+        );
+        assert_eq!(
+            control_plane
+                .secret_resolver()
+                .resolve(&secret.id, SecretPurpose::HeaderApiKey)
+                .await
+                .expect("the previous header material should remain resolvable")
+                .expose(),
+            original
+        );
+        assert_eq!(
+            control_plane.runtime_snapshot().managed().get(&created.id),
+            Some(&created)
+        );
+        drop(control_plane);
+        ConnectionControlPlane::from_config(&config)
+            .expect("rejected rotation must leave restartable state");
     }
 
     #[tokio::test]

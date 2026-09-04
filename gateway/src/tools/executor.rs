@@ -1109,13 +1109,15 @@ impl ToolExecutor {
                 reason: "catalog_stale",
             });
         }
-        if request.method == Method::TRACE && target.authentication_kind() != "none" {
+        if request.method == Method::TRACE && target.is_credentialed() {
             return Err(ToolExecutorError::Connection {
                 tool_name: tool.name.clone(),
                 reason: "unsafe_trace_method",
             });
         }
-        if let Some(header_name) = target.credential_header_name() {
+        // Every header the Connection owns is stripped before injection, so
+        // a caller cannot smuggle a value under a configured name.
+        for header_name in target.credential_header_names() {
             request.headers.remove(header_name);
         }
 
@@ -1176,7 +1178,7 @@ impl ToolExecutor {
             )
             .await
             .map_err(|source| connection_egress_tool_error(tool, &source))?;
-        if connection_authentication_rejected(response.status, target.authentication_kind()) {
+        if connection_authentication_rejected(response.status, target.is_credentialed()) {
             if response.status == StatusCode::UNAUTHORIZED {
                 if let Some(credential) = credential
                     .as_ref()
@@ -2088,9 +2090,8 @@ fn connection_tool_error(tool: &ToolDefinition, error: ConnectionHttpError) -> T
     }
 }
 
-fn connection_authentication_rejected(status: StatusCode, authentication_kind: &str) -> bool {
-    matches!(status, StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN)
-        && authentication_kind != "none"
+fn connection_authentication_rejected(status: StatusCode, credentialed: bool) -> bool {
+    matches!(status, StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN) && credentialed
 }
 
 fn connection_egress_tool_error(tool: &ToolDefinition, error: &EgressError) -> ToolExecutorError {
@@ -2350,8 +2351,8 @@ mod tests {
             control_plane::ConnectionControlPlane,
             http::ConnectionHttpRuntime,
             model::{
-                ConnectionAuthentication, ConnectionEndpoint, ConnectionKind, ConnectionWrite,
-                OAuthClientAuthMethod, TlsProfile,
+                AdditionalHeader, ConnectionAuthentication, ConnectionEndpoint, ConnectionKind,
+                ConnectionWrite, OAuthClientAuthMethod, TlsProfile,
             },
             secret::{OperatorSecretAliasConfig, OperatorSecretAliasSource, SecretRootConfig},
             store::{StoredOpenApiCatalog, StoredOpenApiCatalogEntry},
@@ -2768,10 +2769,26 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn connection_bound_manual_tool_injects_operator_api_key_after_destination_check() {
+    async fn connection_bound_manual_tool_injects_primary_and_additional_headers() {
         let (addr, ca_pem, server) = one_request_tls_server().await;
-        let connection =
-            TemporaryStaticAuthRuntime::header_api_key(addr, &ca_pem, b"operator-owned-key").await;
+        let connection = TemporaryStaticAuthRuntime::header_api_key_with_additional(
+            addr,
+            &ca_pem,
+            b"operator-owned-key",
+            &[
+                (
+                    "cf-access-client-id",
+                    "proxy-client-id",
+                    b"operator-client-id",
+                ),
+                (
+                    "cf-access-client-secret",
+                    "proxy-client-secret",
+                    b"operator-client-secret",
+                ),
+            ],
+        )
+        .await;
         let capture = CaptureSink::new();
         let audit = AuditLog::new(Arc::new(capture.clone()) as Arc<dyn AuditSink>);
         let runtime = ToolRuntime::new(
@@ -2802,6 +2819,14 @@ mod tests {
         assert_eq!(request.method, "GET");
         assert_eq!(request.target, "/v1/charges/ch_123");
         assert_eq!(request.header("x-api-key"), Some("operator-owned-key"));
+        assert_eq!(
+            request.header("cf-access-client-id"),
+            Some("operator-client-id")
+        );
+        assert_eq!(
+            request.header("cf-access-client-secret"),
+            Some("operator-client-secret")
+        );
         assert_eq!(request.header("authorization"), None);
         assert_eq!(request.header("cookie"), None);
 
@@ -2815,7 +2840,9 @@ mod tests {
             json!(connection.connection_id)
         );
         assert!(
-            !format!("{events:?}").contains("operator-owned-key"),
+            !format!("{events:?}").contains("operator-owned-key")
+                && !format!("{events:?}").contains("operator-client-id")
+                && !format!("{events:?}").contains("operator-client-secret"),
             "audit events must never contain resolved credential material"
         );
     }
@@ -5825,6 +5852,15 @@ mod tests {
 
     impl TemporaryStaticAuthRuntime {
         async fn header_api_key(addr: SocketAddr, ca_pem: &str, secret: &[u8]) -> Self {
+            Self::header_api_key_with_additional(addr, ca_pem, secret, &[]).await
+        }
+
+        async fn header_api_key_with_additional(
+            addr: SocketAddr,
+            ca_pem: &str,
+            secret: &[u8],
+            additional: &[(&str, &str, &[u8])],
+        ) -> Self {
             let root = std::env::temp_dir().join(format!(
                 "greengateway-tool-static-auth-{}",
                 uuid::Uuid::new_v4()
@@ -5845,17 +5881,36 @@ mod tests {
                     .expect("temporary CA permissions should set");
             }
 
-            let mut config = Config::test_defaults();
-            config.connections_sqlite_path =
-                Some(root.join("connections.sqlite").display().to_string());
-            config.connection_secrets_root = Some(SecretRootConfig::new(root.clone()));
-            config.connection_secret_aliases = vec![OperatorSecretAliasConfig {
+            let mut aliases = vec![OperatorSecretAliasConfig {
                 id: "billing-api-key".to_owned(),
                 label: "Billing API key".to_owned(),
                 source: OperatorSecretAliasSource::File {
                     key: "api-key".to_owned(),
                 },
             }];
+            for (_, alias_id, value) in additional {
+                let path = root.join(alias_id);
+                fs::write(&path, value).expect("temporary additional secret should write");
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    fs::set_permissions(&path, fs::Permissions::from_mode(0o600))
+                        .expect("temporary additional secret permissions should set");
+                }
+                aliases.push(OperatorSecretAliasConfig {
+                    id: (*alias_id).to_owned(),
+                    label: format!("Additional header {alias_id}"),
+                    source: OperatorSecretAliasSource::File {
+                        key: (*alias_id).to_owned(),
+                    },
+                });
+            }
+
+            let mut config = Config::test_defaults();
+            config.connections_sqlite_path =
+                Some(root.join("connections.sqlite").display().to_string());
+            config.connection_secrets_root = Some(SecretRootConfig::new(root.clone()));
+            config.connection_secret_aliases = aliases;
             let control_plane =
                 ConnectionControlPlane::from_config(&config).expect("control plane should build");
             let initial = control_plane.runtime_snapshot();
@@ -5875,6 +5930,13 @@ mod tests {
                             header_name: "x-api-key".to_owned(),
                             secret_id: Some("billing-api-key".to_owned()),
                         },
+                        additional_headers: additional
+                            .iter()
+                            .map(|(header_name, alias_id, _)| AdditionalHeader {
+                                header_name: (*header_name).to_owned(),
+                                secret_id: Some((*alias_id).to_owned()),
+                            })
+                            .collect(),
                         tls: TlsProfile::default(),
                         timeouts: None,
                         discovery: None,
@@ -5968,6 +6030,7 @@ mod tests {
                             resource: None,
                             client_auth_method: OAuthClientAuthMethod::ClientSecretBasic,
                         },
+                        additional_headers: Vec::new(),
                         tls: TlsProfile::default(),
                         timeouts: None,
                         discovery: None,

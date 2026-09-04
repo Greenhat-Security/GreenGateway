@@ -274,6 +274,8 @@ pub struct SafeConnectionConfiguration {
     pub description: Option<String>,
     pub endpoint: ConnectionEndpoint,
     pub authentication: SafeConnectionAuthentication,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub additional_headers: Vec<SafeAdditionalHeader>,
     pub tls: SafeTlsConfiguration,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub timeouts: Option<ConnectionTimeouts>,
@@ -281,6 +283,15 @@ pub struct SafeConnectionConfiguration {
     pub discovery: Option<DiscoveryConfig>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub test_profile: Option<ConnectionTestProfile>,
+}
+
+/// One additional header as the admin API shows it: the header name and
+/// whether a secret is bound, never the secret ID.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct SafeAdditionalHeader {
+    pub header_name: String,
+    pub secret_configured: bool,
 }
 
 impl SafeConnectionConfiguration {
@@ -291,6 +302,14 @@ impl SafeConnectionConfiguration {
             authentication: SafeConnectionAuthentication::from_authentication(
                 &write.authentication,
             ),
+            additional_headers: write
+                .additional_headers
+                .iter()
+                .map(|header| SafeAdditionalHeader {
+                    header_name: header.header_name.clone(),
+                    secret_configured: header.secret_id.is_some(),
+                })
+                .collect(),
             tls: SafeTlsConfiguration {
                 ca_bundle_configured: write.tls.ca_bundle_alias.is_some(),
                 client_certificate_configured: write.tls.client_certificate_id.is_some(),
@@ -625,6 +644,9 @@ pub fn changed_connection_fields(
             if before.authentication != after.authentication {
                 fields.push("authentication");
             }
+            if before.additional_headers != after.additional_headers {
+                fields.push("additional_headers");
+            }
             if before.tls != after.tls {
                 fields.push("tls");
             }
@@ -646,6 +668,7 @@ pub fn changed_connection_fields(
                 "kind",
                 "endpoint",
                 "authentication",
+                "additional_headers",
                 "tls",
                 "timeouts",
                 "discovery",
@@ -693,6 +716,15 @@ mod tests {
                 "type": "static_bearer",
                 "secret_id": "billing-secret-id-canary"
             },
+            "additional_headers": [
+                {
+                    "header_name": "cf-access-client-id",
+                    "secret_id": "proxy-client-id-canary"
+                },
+                {
+                    "header_name": "cf-access-client-secret"
+                }
+            ],
             "tls": {
                 "ca_bundle_alias": "billing-ca-id-canary"
             },
@@ -712,6 +744,10 @@ mod tests {
             .expect("safe configuration should serialize");
         assert!(!serialized.contains("billing-secret-id-canary"));
         assert!(!serialized.contains("billing-ca-id-canary"));
+        assert!(!serialized.contains("proxy-client-id-canary"));
+        assert!(serialized.contains(
+            "\"additional_headers\":[{\"header_name\":\"cf-access-client-id\",\"secret_configured\":true},{\"header_name\":\"cf-access-client-secret\",\"secret_configured\":false}]"
+        ));
         assert!(serialized.contains("\"secret_configured\":true"));
         assert!(serialized.contains("\"ca_bundle_configured\":true"));
         assert!(serialized.contains("\"client_certificate_configured\":false"));

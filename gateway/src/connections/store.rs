@@ -545,6 +545,42 @@ SET last_refresh_at = COALESCE(
 );
 "#;
 
+// Migration 8: additional secret headers on a Connection (issue #360, PR A).
+//
+// A Connection may now bind up to four secret-backed headers beyond its
+// primary credential, each under the `additional_header` binding purpose,
+// so the binding key must carry the header name: `(connection_id, purpose)`
+// can hold only one row per purpose. SQLite cannot change a primary key in
+// place, so the table is rebuilt: every existing row is copied with an
+// empty `header_name` (the primary and TLS bindings have none), which keeps
+// a single-binding Connection's rows byte-for-byte what they were, and the
+// foreign key and cascade are re-declared unchanged.
+const MIGRATION_8_SQL: &str = r#"
+CREATE TABLE connection_credential_bindings_v8 (
+    connection_id TEXT NOT NULL,
+    purpose TEXT NOT NULL,
+    header_name TEXT NOT NULL DEFAULT '' CHECK (
+        length(CAST(header_name AS BLOB)) <= 64
+        AND instr(header_name, char(0)) = 0
+    ),
+    secret_id TEXT NOT NULL,
+    binding_version INTEGER NOT NULL CHECK (binding_version >= 1),
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY (connection_id, purpose, header_name),
+    FOREIGN KEY (connection_id) REFERENCES connection_records(id) ON DELETE CASCADE
+);
+
+INSERT INTO connection_credential_bindings_v8 (
+    connection_id, purpose, header_name, secret_id, binding_version, updated_at
+)
+SELECT connection_id, purpose, '', secret_id, binding_version, updated_at
+FROM connection_credential_bindings;
+
+DROP TABLE connection_credential_bindings;
+
+ALTER TABLE connection_credential_bindings_v8 RENAME TO connection_credential_bindings;
+"#;
+
 const MIGRATIONS: &[Migration] = &[
     Migration {
         version: 1,
@@ -573,6 +609,10 @@ const MIGRATIONS: &[Migration] = &[
     Migration {
         version: 7,
         sql: MIGRATION_7_SQL,
+    },
+    Migration {
+        version: 8,
+        sql: MIGRATION_8_SQL,
     },
 ];
 
@@ -2752,7 +2792,7 @@ fn run_migrations(
 fn validate_schema(connection: &Connection, path: &Path) -> Result<(), ConnectionStoreError> {
     for query in [
         "SELECT id, schema_version, source, spec_json, connection_revision, credential_revision, tls_revision, discovery_revision, status_revision, created_at, updated_at, last_test_at, last_refresh_at FROM connection_records LIMIT 0",
-        "SELECT connection_id, purpose, secret_id, binding_version, updated_at FROM connection_credential_bindings LIMIT 0",
+        "SELECT connection_id, purpose, header_name, secret_id, binding_version, updated_at FROM connection_credential_bindings LIMIT 0",
         "SELECT connection_id, consumer_kind, consumer_id, created_at FROM connection_dependencies LIMIT 0",
         "SELECT connection_id, status_revision, observed_connection_revision, observed_credential_revision, observed_tls_revision, observed_discovery_revision, state, reason, observed_at, latency_ms, catalog_age_secs, catalog_entry_count FROM connection_current_status LIMIT 0",
         "SELECT sequence, connection_id, status_revision, observed_connection_revision, observed_credential_revision, observed_tls_revision, observed_discovery_revision, state, reason, observed_at, latency_ms, catalog_age_secs, catalog_entry_count FROM connection_status_history LIMIT 0",
@@ -4872,19 +4912,20 @@ fn replace_bindings(
         )
         .map_err(|source| sqlite_error(path, "binding replacement", source))?;
 
-    for (purpose, secret_id, version) in expected_bindings(write, revisions) {
+    for binding in expected_bindings(write, revisions) {
         transaction
             .execute(
                 r#"
                 INSERT INTO connection_credential_bindings (
-                    connection_id, purpose, secret_id, binding_version, updated_at
-                ) VALUES (?1, ?2, ?3, ?4, ?5)
+                    connection_id, purpose, header_name, secret_id, binding_version, updated_at
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)
                 "#,
                 params![
                     id.as_str(),
-                    purpose,
-                    secret_id,
-                    u64_to_i64(id, version.max(1))?,
+                    binding.purpose,
+                    binding.header_name,
+                    binding.secret_id,
+                    u64_to_i64(id, binding.version.max(1))?,
                     now
                 ],
             )
@@ -4901,10 +4942,10 @@ fn validate_record_bindings(
     let mut statement = connection
         .prepare(
             r#"
-            SELECT purpose, secret_id, binding_version
+            SELECT purpose, header_name, secret_id, binding_version
             FROM connection_credential_bindings
             WHERE connection_id = ?1
-            ORDER BY purpose ASC
+            ORDER BY purpose ASC, header_name ASC
             "#,
         )
         .map_err(|source| sqlite_error(path, "binding validation prepare", source))?;
@@ -4913,7 +4954,8 @@ fn validate_record_bindings(
             Ok((
                 row.get::<_, String>(0)?,
                 row.get::<_, String>(1)?,
-                row.get::<_, i64>(2)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, i64>(3)?,
             ))
         })
         .map_err(|source| sqlite_error(path, "binding validation query", source))?
@@ -4921,11 +4963,12 @@ fn validate_record_bindings(
         .map_err(|source| sqlite_error(path, "binding validation read", source))?;
     let mut expected = expected_bindings(&record.write, &record.revisions)
         .into_iter()
-        .map(|(purpose, secret_id, version)| {
+        .map(|binding| {
             Ok((
-                purpose.to_owned(),
-                secret_id.to_owned(),
-                u64_to_i64(&record.id, version.max(1))?,
+                binding.purpose.to_owned(),
+                binding.header_name.to_owned(),
+                binding.secret_id.to_owned(),
+                u64_to_i64(&record.id, binding.version.max(1))?,
             ))
         })
         .collect::<Result<Vec<_>, ConnectionStoreError>>()?;
@@ -4939,10 +4982,29 @@ fn validate_record_bindings(
     Ok(())
 }
 
+/// One row of `connection_credential_bindings` as derived from the stored
+/// document. `header_name` is empty for every binding except an additional
+/// header, whose name is part of the row's key.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ExpectedBinding<'a> {
+    pub(crate) purpose: &'static str,
+    pub(crate) header_name: &'a str,
+    pub(crate) secret_id: &'a str,
+    pub(crate) version: u64,
+}
+
+pub(crate) const ADDITIONAL_HEADER_BINDING_PURPOSE: &str = "additional_header";
+
 pub(crate) fn expected_bindings<'a>(
     write: &'a ConnectionWrite,
     revisions: &ConnectionRevisions,
-) -> Vec<(&'static str, &'a str, u64)> {
+) -> Vec<ExpectedBinding<'a>> {
+    let binding = |purpose: &'static str, secret_id: &'a str, version: u64| ExpectedBinding {
+        purpose,
+        header_name: "",
+        secret_id,
+        version,
+    };
     let mut bindings = Vec::new();
     match &write.authentication {
         ConnectionAuthentication::None => {}
@@ -4952,7 +5014,7 @@ pub(crate) fn expected_bindings<'a>(
         }
         | ConnectionAuthentication::StaticBearer {
             secret_id: Some(secret_id),
-        } => bindings.push((
+        } => bindings.push(binding(
             "http_authentication",
             secret_id.as_str(),
             revisions.credential,
@@ -4960,7 +5022,7 @@ pub(crate) fn expected_bindings<'a>(
         ConnectionAuthentication::OAuth2ClientCredentials {
             client_secret_id: Some(secret_id),
             ..
-        } => bindings.push((
+        } => bindings.push(binding(
             "oauth_client_secret",
             secret_id.as_str(),
             revisions.credential,
@@ -4974,14 +5036,24 @@ pub(crate) fn expected_bindings<'a>(
             ..
         } => {}
     }
+    for header in &write.additional_headers {
+        if let Some(secret_id) = header.secret_id.as_deref() {
+            bindings.push(ExpectedBinding {
+                purpose: ADDITIONAL_HEADER_BINDING_PURPOSE,
+                header_name: header.header_name.as_str(),
+                secret_id,
+                version: revisions.credential,
+            });
+        }
+    }
     if let Some(secret_id) = write.tls.ca_bundle_alias.as_deref() {
-        bindings.push(("tls_ca_bundle", secret_id, revisions.tls));
+        bindings.push(binding("tls_ca_bundle", secret_id, revisions.tls));
     }
     if let Some(secret_id) = write.tls.client_certificate_id.as_deref() {
-        bindings.push(("tls_client_certificate", secret_id, revisions.tls));
+        bindings.push(binding("tls_client_certificate", secret_id, revisions.tls));
     }
     if let Some(secret_id) = write.tls.client_private_key_id.as_deref() {
-        bindings.push(("tls_client_private_key", secret_id, revisions.tls));
+        bindings.push(binding("tls_client_private_key", secret_id, revisions.tls));
     }
     bindings
 }
@@ -5007,6 +5079,11 @@ pub(crate) fn binding_count(write: &ConnectionWrite) -> usize {
         } => 1,
     };
     authentication
+        + write
+            .additional_headers
+            .iter()
+            .filter(|header| header.secret_id.is_some())
+            .count()
         + usize::from(write.tls.ca_bundle_alias.is_some())
         + usize::from(write.tls.client_certificate_id.is_some())
         + usize::from(write.tls.client_private_key_id.is_some())
@@ -5627,7 +5704,7 @@ mod tests {
             .expect("migration query should run")
             .collect::<Result<Vec<_>, _>>()
             .expect("migration rows should read");
-        assert_eq!(versions, vec![1, 2, 3, 4, 5, 6, 7]);
+        assert_eq!(versions, vec![1, 2, 3, 4, 5, 6, 7, 8]);
     }
 
     #[test]
@@ -5954,7 +6031,7 @@ mod tests {
             .expect("migration query should run")
             .collect::<Result<Vec<_>, _>>()
             .expect("migration rows should read");
-        assert_eq!(versions, vec![1, 2, 3, 4, 5, 6, 7]);
+        assert_eq!(versions, vec![1, 2, 3, 4, 5, 6, 7, 8]);
     }
 
     #[test]
@@ -6058,7 +6135,7 @@ mod tests {
             .expect("migration query should run")
             .collect::<Result<Vec<_>, _>>()
             .expect("migration rows should read");
-        assert_eq!(versions, vec![1, 2, 3, 4, 5, 6, 7]);
+        assert_eq!(versions, vec![1, 2, 3, 4, 5, 6, 7, 8]);
     }
 
     #[test]
@@ -6179,6 +6256,177 @@ mod tests {
             .remove(&connection_id)
             .expect("restarted Connection activity should remain");
         assert_eq!(restarted_activity, activity);
+    }
+
+    #[test]
+    fn migration_eight_preserves_existing_bindings_and_supports_multiple_header_rows() {
+        let database = TemporaryDatabase::new("migration-v7-additional-headers");
+        let path = database.path.clone();
+        let connection_id = ConnectionId::new_managed();
+        let write = candidate();
+        let spec_json =
+            serde_json::to_string(&write).expect("v7 fixture candidate should serialize");
+        let timestamp = "2026-09-03T00:00:00Z";
+        {
+            let connection =
+                Connection::open(&path).expect("v7 fixture database should open directly");
+            connection
+                .execute_batch(CONFIGURE_SQL)
+                .expect("v7 fixture pragmas should apply");
+            connection
+                .execute_batch(CREATE_MIGRATIONS_TABLE_SQL)
+                .expect("v7 fixture migration table should create");
+            for migration in MIGRATIONS.iter().take(7) {
+                connection
+                    .execute_batch(migration.sql)
+                    .expect("v7 fixture migration should apply");
+                connection
+                    .execute(
+                        "INSERT INTO connection_schema_migrations (version, applied_at) VALUES (?1, ?2)",
+                        params![migration.version, timestamp],
+                    )
+                    .expect("v7 fixture migration should record");
+            }
+            connection
+                .execute(
+                    r#"
+                    INSERT INTO connection_records (
+                        id, schema_version, source, spec_json, connection_revision,
+                        credential_revision, tls_revision, discovery_revision,
+                        status_revision, created_at, updated_at
+                    ) VALUES (?1, ?2, ?3, ?4, 1, 1, 0, 1, 0, ?5, ?5)
+                    "#,
+                    params![
+                        connection_id.as_str(),
+                        CONNECTION_SCHEMA_VERSION,
+                        SOURCE_MANAGED,
+                        spec_json,
+                        timestamp,
+                    ],
+                )
+                .expect("v7 fixture Connection should insert");
+            connection
+                .execute(
+                    r#"
+                    INSERT INTO connection_credential_bindings (
+                        connection_id, purpose, secret_id, binding_version, updated_at
+                    ) VALUES (?1, 'http_authentication', 'billing-token', 1, ?2)
+                    "#,
+                    params![connection_id.as_str(), timestamp],
+                )
+                .expect("v7 fixture credential binding should insert");
+        }
+
+        let store = SqliteConnectionStore::open(&path)
+            .expect("migration 8 should upgrade a populated v7 binding table");
+        let persisted = store
+            .get(&connection_id)
+            .expect("migrated Connection should load")
+            .expect("migrated Connection should remain");
+        assert_eq!(persisted.write, write);
+        {
+            let connection = store.connection_guard();
+            let migrated = connection
+                .query_row(
+                    r#"
+                    SELECT purpose, header_name, secret_id, binding_version, updated_at
+                    FROM connection_credential_bindings
+                    WHERE connection_id = ?1
+                    "#,
+                    params![connection_id.as_str()],
+                    |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, String>(1)?,
+                            row.get::<_, String>(2)?,
+                            row.get::<_, i64>(3)?,
+                            row.get::<_, String>(4)?,
+                        ))
+                    },
+                )
+                .expect("migrated binding should load");
+            assert_eq!(
+                migrated,
+                (
+                    "http_authentication".to_owned(),
+                    String::new(),
+                    "billing-token".to_owned(),
+                    1,
+                    timestamp.to_owned(),
+                )
+            );
+        }
+
+        let mut replacement = persisted.write.clone();
+        replacement.additional_headers = serde_json::from_value(json!([
+            {"header_name": "CF-Access-Client-Id", "secret_id": "cf-client-id"},
+            {"header_name": "CF-Access-Client-Secret", "secret_id": "cf-client-secret"}
+        ]))
+        .expect("additional headers should deserialize");
+        let replaced = store
+            .replace(&connection_id, &persisted.etag(), replacement)
+            .expect("additional headers should persist after migration");
+        assert_eq!(replaced.revisions.connection, 2);
+        assert_eq!(replaced.revisions.credential, 2);
+        assert_ne!(replaced.etag(), persisted.etag());
+
+        let connection = store.connection_guard();
+        let rows = connection
+            .prepare(
+                r#"
+                SELECT purpose, header_name, secret_id, binding_version
+                FROM connection_credential_bindings
+                WHERE connection_id = ?1
+                ORDER BY purpose, header_name
+                "#,
+            )
+            .expect("binding query should prepare")
+            .query_map(params![connection_id.as_str()], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, i64>(3)?,
+                ))
+            })
+            .expect("binding query should run")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("binding rows should read");
+        assert_eq!(
+            rows,
+            vec![
+                (
+                    ADDITIONAL_HEADER_BINDING_PURPOSE.to_owned(),
+                    "cf-access-client-id".to_owned(),
+                    "cf-client-id".to_owned(),
+                    2,
+                ),
+                (
+                    ADDITIONAL_HEADER_BINDING_PURPOSE.to_owned(),
+                    "cf-access-client-secret".to_owned(),
+                    "cf-client-secret".to_owned(),
+                    2,
+                ),
+                (
+                    "http_authentication".to_owned(),
+                    String::new(),
+                    "billing-token".to_owned(),
+                    2,
+                ),
+            ]
+        );
+        drop(connection);
+        drop(store);
+
+        let reopened = SqliteConnectionStore::open(&path)
+            .expect("migration 8 database should remain restart-safe");
+        assert_eq!(
+            reopened
+                .get(&connection_id)
+                .expect("restarted Connection should load")
+                .expect("restarted Connection should remain"),
+            replaced
+        );
     }
 
     #[test]
@@ -7705,6 +7953,27 @@ mod tests {
                 maximum: MAX_CREDENTIALS,
             })
         ));
+    }
+
+    #[test]
+    fn binding_count_includes_each_configured_additional_header() {
+        let mut write = candidate();
+        write.additional_headers = serde_json::from_value(json!([
+            {"header_name": "X-Tenant", "secret_id": "tenant-secret"},
+            {"header_name": "X-Optional"},
+            {"header_name": "CF-Access-Client-Secret", "secret_id": "access-secret"}
+        ]))
+        .expect("additional headers should deserialize");
+
+        assert_eq!(binding_count(&write), 3);
+        let revisions = ConnectionRevisions {
+            connection: 7,
+            credential: 5,
+            tls: 0,
+            discovery: 2,
+            status: 0,
+        };
+        assert_eq!(expected_bindings(&write, &revisions).len(), 3);
     }
 
     #[test]

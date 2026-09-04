@@ -242,6 +242,17 @@ describe('ConnectionDetail', () => {
                 header_name: 'x-api-key',
                 secret_configured: true,
               },
+              additional_headers: [
+                {
+                  header_name: 'cf-access-client-id',
+                  secret_configured: true,
+                  secret_id: 'ADDITIONAL_HEADER_SECRET_CANARY',
+                },
+                {
+                  header_name: 'cf-access-client-secret',
+                  secret_configured: false,
+                },
+              ],
               tls: {
                 ca_bundle_configured: true,
                 client_certificate_configured: false,
@@ -262,6 +273,11 @@ describe('ConnectionDetail', () => {
     renderDetail();
 
     expect(await screen.findByText('x-api-key API key - configured')).toBeTruthy();
+    expect(
+      screen.getByText(
+        'cf-access-client-id - configured; cf-access-client-secret - not configured',
+      ),
+    ).toBeTruthy();
     expect(screen.getByText('Custom CA').parentElement?.textContent).toContain(
       'Configured',
     );
@@ -273,6 +289,9 @@ describe('ConnectionDetail', () => {
     expect(document.body.textContent).not.toContain('secret_id');
     expect(document.body.textContent).not.toContain('ca_bundle_alias');
     expect(document.body.textContent).not.toContain('private_key_id');
+    expect(document.body.textContent).not.toContain(
+      'ADDITIONAL_HEADER_SECRET_CANARY',
+    );
   });
 
   it('stops on an ETag conflict and reloads before allowing another operation', async () => {

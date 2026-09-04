@@ -3368,34 +3368,36 @@ async fn validate_bindings(
     let rows = client
         .query(
             r#"
-            SELECT purpose, secret_id, binding_version
+            SELECT purpose, header_name, secret_id, binding_version
             FROM greengateway.connection_credential_bindings
             WHERE connection_id = $1::text::uuid
-            ORDER BY purpose ASC
+            ORDER BY purpose ASC, header_name ASC
             "#,
             &[&record.id.as_str()],
         )
         .await
         .map_err(|error| pg_error(OPERATION_GET, error))?;
     const REASON: &str = "credential binding column does not decode as its schema type";
-    let mut actual: Vec<(String, String, i64)> = rows
+    let mut actual: Vec<(String, String, String, i64)> = rows
         .iter()
         .map(|row| {
             Ok((
                 column(row, 0, record.id.as_str(), REASON)?,
                 column(row, 1, record.id.as_str(), REASON)?,
                 column(row, 2, record.id.as_str(), REASON)?,
+                column(row, 3, record.id.as_str(), REASON)?,
             ))
         })
         .collect::<Result<Vec<_>, ConnectionStoreError>>()?;
-    let mut expected: Vec<(String, String, i64)> =
+    let mut expected: Vec<(String, String, String, i64)> =
         expected_bindings(&record.write, &record.revisions)
             .into_iter()
-            .map(|(purpose, secret_id, version)| {
+            .map(|binding| {
                 Ok((
-                    purpose.to_owned(),
-                    secret_id.to_owned(),
-                    u64_to_i64(&record.id, version.max(1))?,
+                    binding.purpose.to_owned(),
+                    binding.header_name.to_owned(),
+                    binding.secret_id.to_owned(),
+                    u64_to_i64(&record.id, binding.version.max(1))?,
                 ))
             })
             .collect::<Result<Vec<_>, ConnectionStoreError>>()?;
@@ -3424,19 +3426,20 @@ async fn replace_bindings(
         )
         .await
         .map_err(|error| pg_error(OPERATION_CREATE, error))?;
-    for (purpose, secret_id, version) in expected_bindings(write, revisions) {
+    for binding in expected_bindings(write, revisions) {
         client
             .execute(
                 r#"
                 INSERT INTO greengateway.connection_credential_bindings (
-                    connection_id, purpose, secret_id, binding_version, updated_at
-                ) VALUES ($1::text::uuid, $2, $3, $4, $5)
+                    connection_id, purpose, header_name, secret_id, binding_version, updated_at
+                ) VALUES ($1::text::uuid, $2, $3, $4, $5, $6)
                 "#,
                 &[
                     &id.as_str(),
-                    &purpose,
-                    &secret_id,
-                    &u64_to_i64(id, version.max(1))?,
+                    &binding.purpose,
+                    &binding.header_name,
+                    &binding.secret_id,
+                    &u64_to_i64(id, binding.version.max(1))?,
                     &now,
                 ],
             )
@@ -3972,21 +3975,22 @@ pub(crate) async fn import_connections_in(
         )
         .unwrap_or(i64::MAX);
 
-        for (purpose, secret_id, version) in expected_bindings(&record.write, &record.revisions) {
+        for binding in expected_bindings(&record.write, &record.revisions) {
             counts.credential_bindings += i64::try_from(
                 client
                     .execute(
                         r#"
                         INSERT INTO greengateway.connection_credential_bindings (
-                            connection_id, purpose, secret_id, binding_version, updated_at
-                        ) VALUES ($1::text::uuid, $2, $3, $4, $5)
-                        ON CONFLICT (connection_id, purpose) DO NOTHING
+                            connection_id, purpose, header_name, secret_id, binding_version, updated_at
+                        ) VALUES ($1::text::uuid, $2, $3, $4, $5, $6)
+                        ON CONFLICT (connection_id, purpose, header_name) DO NOTHING
                         "#,
                         &[
                             &id.as_str(),
-                            &purpose,
-                            &secret_id,
-                            &u64_to_i64(id, version.max(1))?,
+                            &binding.purpose,
+                            &binding.header_name,
+                            &binding.secret_id,
+                            &u64_to_i64(id, binding.version.max(1))?,
                             &record.updated_at,
                         ],
                     )
@@ -4735,6 +4739,107 @@ mod tests {
             .await,
             0,
             "the delete cascaded through the version history"
+        );
+    }
+
+    #[tokio::test]
+    async fn additional_header_bindings_round_trip_and_advance_the_credential_axis() {
+        let Some(admin_dsn) = locator() else {
+            eprintln!("skipping: no test database locator; CI runs this test");
+            return;
+        };
+        let database = create_test_database(&admin_dsn).await;
+        let (store, pool) = migrated_store(&database.dsn, 64).await;
+
+        let mut write = http_candidate("Access-fronted API");
+        write.additional_headers = serde_json::from_value(json!([
+            {"header_name": "CF-Access-Client-Id", "secret_id": "access-client-id"},
+            {"header_name": "CF-Access-Client-Secret", "secret_id": "access-client-secret"}
+        ]))
+        .expect("additional headers should deserialize");
+        let created = store
+            .create(write, "additional-create", None)
+            .await
+            .expect("Connection with additional headers should create");
+        assert_eq!(created.revisions.credential, 1);
+
+        let client = pool.get().await.expect("binding checkout");
+        let rows = client
+            .query(
+                r#"
+                SELECT purpose, header_name, secret_id, binding_version
+                FROM greengateway.connection_credential_bindings
+                WHERE connection_id = $1::text::uuid
+                ORDER BY purpose, header_name
+                "#,
+                &[&created.id.as_str()],
+            )
+            .await
+            .expect("binding rows should query")
+            .into_iter()
+            .map(|row| {
+                (
+                    row.get::<_, String>(0),
+                    row.get::<_, String>(1),
+                    row.get::<_, String>(2),
+                    row.get::<_, i64>(3),
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            rows,
+            vec![
+                (
+                    "additional_header".to_owned(),
+                    "cf-access-client-id".to_owned(),
+                    "access-client-id".to_owned(),
+                    1,
+                ),
+                (
+                    "additional_header".to_owned(),
+                    "cf-access-client-secret".to_owned(),
+                    "access-client-secret".to_owned(),
+                    1,
+                ),
+                (
+                    "http_authentication".to_owned(),
+                    String::new(),
+                    "billing-token".to_owned(),
+                    1,
+                ),
+            ]
+        );
+        drop(client);
+
+        let mut replacement = created.write.clone();
+        replacement.additional_headers[0].secret_id = Some("rotated-client-id".to_owned());
+        let replaced = store
+            .replace(
+                &created.id,
+                &created.etag(),
+                replacement,
+                "additional-replace",
+            )
+            .await
+            .expect("Connection with additional headers should replace");
+        assert_eq!(replaced.revisions.connection, 2);
+        assert_eq!(replaced.revisions.credential, 2);
+        assert_ne!(replaced.etag(), created.etag());
+        assert_eq!(
+            store
+                .get(&created.id)
+                .await
+                .expect("Connection should load")
+                .expect("Connection should remain"),
+            replaced
+        );
+        assert_eq!(
+            count(
+                &pool,
+                "SELECT COUNT(*) FROM greengateway.connection_credential_bindings"
+            )
+            .await,
+            3
         );
     }
 
