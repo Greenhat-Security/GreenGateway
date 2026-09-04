@@ -2418,6 +2418,17 @@ mod tests {
         ] {
             fs::write(root.join(file), value).expect("TRACE test secret should write");
         }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+
+            fs::set_permissions(&root, fs::Permissions::from_mode(0o700))
+                .expect("TRACE test secret root permissions should set");
+            for file in ["primary", "proxy-client-id", "proxy-client-secret"] {
+                fs::set_permissions(root.join(file), fs::Permissions::from_mode(0o600))
+                    .expect("TRACE test secret permissions should set");
+            }
+        }
 
         let mut connection_config = config::Config::test_defaults();
         connection_config.connections_sqlite_path =
