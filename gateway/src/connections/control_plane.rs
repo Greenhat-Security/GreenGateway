@@ -17,16 +17,16 @@ use crate::config::Config;
 
 use super::{
     aws_secret::{
-        AwsProviderConfig, AwsProviderConfigError, AwsSecretsManagerProvider, AwsTransport,
-        EgressAwsTransport,
+        provider_generation as aws_provider_generation, AwsProviderConfig, AwsProviderConfigError,
+        AwsSecretsManagerProvider, AwsTransport, EgressAwsTransport,
     },
     azure_secret::{
-        AzureKeyVaultSecretProvider, AzureProviderConfig, AzureProviderConfigError, AzureTransport,
-        EgressAzureTransport,
+        provider_generation as azure_provider_generation, AzureKeyVaultSecretProvider,
+        AzureProviderConfig, AzureProviderConfigError, AzureTransport, EgressAzureTransport,
     },
     gcp_secret::{
-        EgressGcpTransport, GcpProviderConfig, GcpProviderConfigError, GcpSecretManagerProvider,
-        GcpTransport,
+        provider_generation as gcp_provider_generation, EgressGcpTransport, GcpProviderConfig,
+        GcpProviderConfigError, GcpSecretManagerProvider, GcpTransport,
     },
     kubernetes_secret::{
         EgressKubernetesTransport, KubernetesProviderConfig, KubernetesProviderConfigError,
@@ -43,9 +43,9 @@ use super::{
     },
     projection::{project_legacy_connections, LegacyConnectionProjection, LegacyProjectionError},
     secret::{
-        OperatorAliasResolver, ResolvedSecret, SecretAliasMetadata, SecretProviderConfigError,
-        SecretProviderKind, SecretPurpose, SecretResolveError, SecretResolveErrorKind,
-        SecretResolver,
+        configured_secret_generation_digest, OperatorAliasResolver, ResolvedSecret,
+        SecretAliasMetadata, SecretProviderConfigError, SecretProviderKind, SecretPurpose,
+        SecretResolveError, SecretResolveErrorKind, SecretResolver,
     },
     status::SafeConnectionStatus,
     store::{
@@ -53,8 +53,8 @@ use super::{
         ConnectionStore, ConnectionStoreError, SqliteConnectionStore, StoredConnection,
     },
     vault_secret::{
-        EgressVaultTransport, VaultKvV2SecretProvider, VaultProviderConfig,
-        VaultProviderConfigError, VaultTransport,
+        provider_generation as vault_provider_generation, EgressVaultTransport,
+        VaultKvV2SecretProvider, VaultProviderConfig, VaultProviderConfigError, VaultTransport,
     },
 };
 
@@ -506,6 +506,66 @@ impl ConnectionControlPlane {
                 rotated_at: None,
             },
         ));
+        let mut network_alias_generations = BTreeMap::new();
+        let vault_generation = vault_provider_generation(&config.connection_vault_provider);
+        for alias in &config.connection_vault_provider.aliases {
+            network_alias_generations.insert(
+                alias.id.clone(),
+                alias.version.map(|version| {
+                    configured_secret_generation_digest(
+                        SecretProviderKind::VaultKvV2,
+                        &alias.id,
+                        &vault_generation,
+                        version.to_string().as_bytes(),
+                    )
+                }),
+            );
+        }
+        let gcp_generation = gcp_provider_generation(&config.connection_gcp_provider);
+        for alias in &config.connection_gcp_provider.aliases {
+            network_alias_generations.insert(
+                alias.id.clone(),
+                alias.version.map(|version| {
+                    configured_secret_generation_digest(
+                        SecretProviderKind::GcpSecretManager,
+                        &alias.id,
+                        &gcp_generation,
+                        version.to_string().as_bytes(),
+                    )
+                }),
+            );
+        }
+        let azure_generation = azure_provider_generation(&config.connection_azure_provider);
+        for alias in &config.connection_azure_provider.aliases {
+            network_alias_generations.insert(
+                alias.id.clone(),
+                alias.version.as_deref().map(|version| {
+                    configured_secret_generation_digest(
+                        SecretProviderKind::AzureKeyVault,
+                        &alias.id,
+                        &azure_generation,
+                        version.as_bytes(),
+                    )
+                }),
+            );
+        }
+        let aws_generation = aws_provider_generation(&config.connection_aws_provider);
+        for alias in &config.connection_aws_provider.aliases {
+            network_alias_generations.insert(
+                alias.id.clone(),
+                alias.version_id.as_deref().map(|version| {
+                    configured_secret_generation_digest(
+                        SecretProviderKind::AwsSecretsManager,
+                        &alias.id,
+                        &aws_generation,
+                        version.as_bytes(),
+                    )
+                }),
+            );
+        }
+        for alias in &config.connection_kubernetes_provider.aliases {
+            network_alias_generations.insert(alias.id.clone(), None);
+        }
         let local_secret_provider = if let Some(keyring) = local_secret_keyring {
             let store = sqlite_store
                 .as_ref()
@@ -530,6 +590,7 @@ impl ConnectionControlPlane {
             network: OnceLock::new(),
             network_alias_ids,
             network_alias_metadata,
+            network_alias_generations,
         });
         for record in &managed_records {
             if let Err(error) = secret_resolver.validate_enabled_candidate(&record.write) {
@@ -648,6 +709,86 @@ impl ConnectionControlPlane {
 
     pub(crate) fn local_secret_version(&self, id: &str) -> Option<u64> {
         self.local_secret_versions.load().get(id).copied()
+    }
+
+    /// Stable digest of every secret generation that can affect a request on
+    /// `record`. `None` marks at least one volatile alias; callers must then
+    /// refuse cross-boot adoption and stale-on-refresh-failure.
+    pub(crate) fn credential_generation_digest(&self, record: &StoredConnection) -> Option<String> {
+        let mut bindings: Vec<(&'static str, &str)> = Vec::new();
+        match &record.write.authentication {
+            ConnectionAuthentication::None => {}
+            ConnectionAuthentication::HeaderApiKey {
+                secret_id: Some(secret_id),
+                ..
+            }
+            | ConnectionAuthentication::StaticBearer {
+                secret_id: Some(secret_id),
+            } => bindings.push(("authentication", secret_id)),
+            ConnectionAuthentication::OAuth2ClientCredentials {
+                client_secret_id: Some(secret_id),
+                ..
+            } => bindings.push(("oauth_client_secret", secret_id)),
+            ConnectionAuthentication::HeaderApiKey {
+                secret_id: None, ..
+            }
+            | ConnectionAuthentication::StaticBearer { secret_id: None }
+            | ConnectionAuthentication::OAuth2ClientCredentials {
+                client_secret_id: None,
+                ..
+            } => return None,
+        }
+        for (purpose, alias) in [
+            ("tls_ca_bundle", record.write.tls.ca_bundle_alias.as_deref()),
+            (
+                "tls_client_certificate",
+                record.write.tls.client_certificate_id.as_deref(),
+            ),
+            (
+                "tls_client_private_key",
+                record.write.tls.client_private_key_id.as_deref(),
+            ),
+        ] {
+            if let Some(alias) = alias {
+                bindings.push((purpose, alias));
+            }
+        }
+        let mut digest = Sha256::new();
+        digest.update(b"greengateway-connection-credential-generation-v1\0");
+        for (purpose, alias_id) in bindings {
+            let generation = self.secret_resolver.generation_digest(alias_id)?;
+            digest.update(purpose.as_bytes());
+            digest.update([0]);
+            digest.update(alias_id.as_bytes());
+            digest.update([0]);
+            digest.update(generation.as_bytes());
+            digest.update([0]);
+        }
+        let mut additional_headers = record
+            .write
+            .additional_headers
+            .iter()
+            .map(|header| {
+                (
+                    header.header_name.to_ascii_lowercase(),
+                    header.secret_id.as_deref(),
+                )
+            })
+            .collect::<Vec<_>>();
+        additional_headers.sort_unstable_by(|left, right| left.0.cmp(&right.0));
+        for (header_name, alias_id) in additional_headers {
+            let alias_id = alias_id?;
+            let generation = self.secret_resolver.generation_digest(alias_id)?;
+            digest.update(b"additional_header");
+            digest.update([0]);
+            digest.update(header_name.as_bytes());
+            digest.update([0]);
+            digest.update(alias_id.as_bytes());
+            digest.update([0]);
+            digest.update(generation.as_bytes());
+            digest.update([0]);
+        }
+        Some(hex::encode(digest.finalize()))
     }
 
     pub fn local_secret_manager(
@@ -1557,6 +1698,9 @@ struct ConnectionSecretResolver {
     network: OnceLock<Vec<Arc<dyn SecretResolver>>>,
     network_alias_ids: BTreeSet<String>,
     network_alias_metadata: Vec<SecretAliasMetadata>,
+    /// Stable generations derived from trusted startup configuration. Values
+    /// are `None` for movable/volatile aliases.
+    network_alias_generations: BTreeMap<String, Option<String>>,
 }
 
 #[derive(Debug)]
@@ -1968,6 +2112,25 @@ impl SecretResolver for ConnectionSecretResolver {
         }
         aliases.sort_by(|left, right| left.id.cmp(&right.id));
         aliases
+    }
+
+    fn generation_digest(&self, alias_id: &str) -> Option<String> {
+        if self.operator.contains_alias(alias_id) {
+            return self.operator.generation_digest(alias_id);
+        }
+        if let Some(providers) = self.network.get() {
+            for provider in providers {
+                if provider.contains_alias(alias_id) {
+                    return provider.generation_digest(alias_id);
+                }
+            }
+        }
+        if let Some(generation) = self.network_alias_generations.get(alias_id) {
+            return generation.clone();
+        }
+        self.local
+            .as_ref()
+            .and_then(|local| local.generation_digest(alias_id))
     }
 }
 
@@ -2574,6 +2737,10 @@ mod tests {
                 network_alias_metadata("alpha"),
                 network_alias_metadata("beta"),
             ],
+            network_alias_generations: BTreeMap::from([
+                ("alpha".to_owned(), None),
+                ("beta".to_owned(), None),
+            ]),
         };
 
         let blocked = resolver
@@ -3133,6 +3300,135 @@ mod tests {
             .delete(&created.id)
             .expect("unused local secret should delete");
         assert_eq!(control_plane.local_secret_version(&created.id), None);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn additional_header_generations_are_order_independent_rotate_and_survive_restart() {
+        let temporary = TemporaryLocalControlPlane::new("additional-header-generations");
+        let mut config = temporary.config();
+        config.connection_secret_aliases =
+            vec![crate::connections::secret::OperatorSecretAliasConfig {
+                id: "volatile-proxy-token".to_owned(),
+                label: "Volatile proxy token".to_owned(),
+                source: crate::connections::secret::OperatorSecretAliasSource::Environment {
+                    key: "GGW_TEST_VOLATILE_PROXY_TOKEN".to_owned(),
+                },
+            }];
+        let control_plane =
+            ConnectionControlPlane::from_config(&config).expect("control plane should build");
+        let (alpha_id, zeta_id) = {
+            let manager = control_plane
+                .local_secret_manager()
+                .expect("local secret manager should be enabled");
+            let alpha = blocking_secret_mutation(|| {
+                manager.create(
+                    "Alpha proxy token",
+                    ResolvedSecret::new(
+                        SecretPurpose::HeaderApiKey,
+                        b"alpha-proxy-token-v1".to_vec(),
+                    )
+                    .expect("alpha header secret should validate"),
+                )
+            })
+            .expect("alpha header secret should create");
+            let zeta = blocking_secret_mutation(|| {
+                manager.create(
+                    "Zeta proxy token",
+                    ResolvedSecret::new(
+                        SecretPurpose::HeaderApiKey,
+                        b"zeta-proxy-token-v1".to_vec(),
+                    )
+                    .expect("zeta header secret should validate"),
+                )
+            })
+            .expect("zeta header secret should create");
+            (alpha.id, zeta.id)
+        };
+
+        let mut candidate = managed_candidate();
+        candidate.additional_headers = vec![
+            crate::connections::model::AdditionalHeader {
+                header_name: "X-Zeta-Proxy-Token".to_owned(),
+                secret_id: Some(zeta_id),
+            },
+            crate::connections::model::AdditionalHeader {
+                header_name: "X-Alpha-Proxy-Token".to_owned(),
+                secret_id: Some(alpha_id.clone()),
+            },
+        ];
+        let before = control_plane.runtime_snapshot();
+        let created = control_plane
+            .create_managed(before.collection_etag(), candidate, "test-admin")
+            .await
+            .expect("additional-header Connection should activate");
+        let initial_generation = control_plane
+            .credential_generation_digest(&created)
+            .expect("local aliases have stable generations");
+
+        let mut reordered = created.clone();
+        reordered.write.additional_headers.reverse();
+        assert_eq!(
+            control_plane.credential_generation_digest(&reordered),
+            Some(initial_generation.clone()),
+            "persisted header order must not affect cache provenance"
+        );
+        let mut rebound = created.clone();
+        let first_alias = rebound.write.additional_headers[0].secret_id.clone();
+        rebound.write.additional_headers[0].secret_id =
+            rebound.write.additional_headers[1].secret_id.clone();
+        rebound.write.additional_headers[1].secret_id = first_alias;
+        assert_ne!(
+            control_plane.credential_generation_digest(&rebound),
+            Some(initial_generation.clone()),
+            "header names and alias IDs must remain bound in the provenance digest"
+        );
+        let mut volatile = created.clone();
+        volatile.write.additional_headers[0].secret_id = Some("volatile-proxy-token".to_owned());
+        assert_eq!(
+            control_plane.credential_generation_digest(&volatile),
+            None,
+            "one volatile additional-header alias makes the aggregate provenance volatile"
+        );
+
+        blocking_secret_mutation(|| {
+            control_plane
+                .local_secret_manager()
+                .expect("local secret manager should be enabled")
+                .rotate(
+                    &alpha_id,
+                    ResolvedSecret::new(
+                        SecretPurpose::HeaderApiKey,
+                        b"alpha-proxy-token-v2".to_vec(),
+                    )
+                    .expect("rotated header secret should validate"),
+                )
+        })
+        .expect("additional header secret should rotate");
+        let current = control_plane
+            .runtime_snapshot()
+            .managed()
+            .get(&created.id)
+            .cloned()
+            .expect("rotated Connection should remain published");
+        let rotated_generation = control_plane
+            .credential_generation_digest(&current)
+            .expect("rotated local aliases remain stable");
+        assert_ne!(initial_generation, rotated_generation);
+
+        drop(control_plane);
+        let restarted =
+            ConnectionControlPlane::from_config(&config).expect("control plane should restart");
+        let restarted_record = restarted
+            .runtime_snapshot()
+            .managed()
+            .get(&created.id)
+            .cloned()
+            .expect("additional-header Connection should reload");
+        assert_eq!(
+            restarted.credential_generation_digest(&restarted_record),
+            Some(rotated_generation),
+            "restart must recover the same stable alias generations"
+        );
     }
 
     #[test]

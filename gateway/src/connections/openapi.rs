@@ -2,7 +2,7 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     convert::Infallible,
     fmt,
-    sync::Arc,
+    sync::{Arc, OnceLock},
     time::{Duration, Instant},
 };
 
@@ -22,10 +22,12 @@ use crate::{
             McpCatalogPublishError, ToolDefinition, ToolRegistry, ToolRegistryError, ToolSource,
             ToolTarget,
         },
+        enum_source::{EnumSourceRuntime, EnumSourceState, ResolvedPlan, SourceAuthorizer},
         openapi::{self, OpenApiToolBinding, OpenApiToolGeneration, OpenApiToolSecuritySelection},
         overlay::{
             self, CompiledCatalog, OverlayCompileContext, OverlayCompositeReport, OverlayDocument,
-            OverlayError, OverlayToolReport, OverlayWarning, OVERLAY_SCHEMA_VERSION,
+            OverlayError, OverlayProblem, OverlaySourcePlan, OverlayToolReport, OverlayWarning,
+            ResolvedOverlaySources, OVERLAY_SCHEMA_VERSION,
         },
     },
 };
@@ -39,9 +41,11 @@ use super::{
     },
     status::{ConnectionOperationalState, ConnectionStatusReason, SafeConnectionStatus},
     store::{
-        ConnectionEtag, ConnectionStatusUpdate, ConnectionStoreError, OverlayEtag,
-        StoredConnection, StoredOpenApiCatalog, StoredOpenApiCatalogEntry, StoredOpenApiOverlay,
-        StoredOpenApiSourceReports, StoredOverlayWrite,
+        decode_openapi_source_reports, ConnectionEtag, ConnectionStatusUpdate,
+        ConnectionStoreError, OverlayEtag, StoredConnection, StoredEnumSourceValueWrite,
+        StoredOpenApiCatalog, StoredOpenApiCatalogEntry, StoredOpenApiOverlay,
+        StoredOpenApiSourceKind, StoredOpenApiSourceReport, StoredOpenApiSourceReports,
+        StoredOverlayWrite,
     },
 };
 
@@ -65,6 +69,8 @@ pub struct OpenApiConnectionCatalogService {
     http: ConnectionHttpRuntime,
     registry: ToolRegistry,
     runtime: OpenApiConnectionCatalogRuntime,
+    enum_source_runtime: Option<EnumSourceRuntime>,
+    source_authorizer: Arc<OnceLock<Arc<dyn SourceAuthorizer>>>,
     rbac: Option<RbacState>,
     /// Test seam: runs between the authority commit and the registry
     /// install, where another lane can move underneath a publish.
@@ -89,6 +95,10 @@ struct OpenApiPublishCandidate<'a> {
     /// the prior stored overlay. PostgreSQL rechecks these against the
     /// authoritative policy under the shared policy/catalog advisory lock.
     policy_protected_names: Vec<String>,
+    /// The exact enum refresh plan published with this catalog. `None`
+    /// removes any prior plan after the authority commit.
+    source_plan: Option<OverlaySourcePlan>,
+    enum_values: Vec<StoredEnumSourceValueWrite>,
     started: Instant,
     /// Who is publishing. The authority records it on the immutable
     /// specification version; standalone mode has no version table and
@@ -121,6 +131,7 @@ pub struct OpenApiOverlayCompileReport {
     pub tools: Vec<OverlayToolReport>,
     pub composites: Vec<OverlayCompositeReport>,
     pub warnings: Vec<OverlayWarning>,
+    pub sources: Vec<StoredOpenApiSourceReport>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -139,6 +150,7 @@ pub enum OpenApiOverlayOperationError {
     Catalog(OpenApiCatalogError),
     Rejected(OverlayError),
     PreconditionFailed(OverlayEtag),
+    SecretsWriteRequired,
 }
 
 impl fmt::Display for OpenApiOverlayOperationError {
@@ -149,6 +161,10 @@ impl fmt::Display for OpenApiOverlayOperationError {
             Self::PreconditionFailed(current) => write!(
                 formatter,
                 "connection overlay changed; current ETag is {current}"
+            ),
+            Self::SecretsWriteRequired => write!(
+                formatter,
+                "raw OpenAPI overlay source paths require secrets-write authority"
             ),
         }
     }
@@ -469,6 +485,16 @@ impl OpenApiConnectionCatalogService {
         registry: ToolRegistry,
         conflicts: crate::tools::definitions::LaneConflicts,
     ) -> Result<Self, ConnectionStoreError> {
+        Self::load_with_enum_sources(control_plane, http, registry, conflicts, None)
+    }
+
+    pub fn load_with_enum_sources(
+        control_plane: ConnectionControlPlane,
+        http: ConnectionHttpRuntime,
+        registry: ToolRegistry,
+        conflicts: crate::tools::definitions::LaneConflicts,
+        enum_source_runtime: Option<EnumSourceRuntime>,
+    ) -> Result<Self, ConnectionStoreError> {
         let (catalogs, overlays) = if control_plane.is_managed_store_configured() {
             control_plane
                 .managed_store()
@@ -505,20 +531,35 @@ impl OpenApiConnectionCatalogService {
             .merge_definitions_with(definitions, conflicts)
             .map_err(tool_registry_store_error)?;
         let runtime = OpenApiConnectionCatalogRuntime::new(&active_catalogs)?;
-        Ok(Self {
+        let service = Self {
             control_plane,
             http,
             registry,
             runtime,
+            enum_source_runtime,
+            source_authorizer: Arc::new(OnceLock::new()),
             rbac: None,
             #[cfg(test)]
             install_hook: None,
-        })
+        };
+        service.install_boot_source_plans(&active_catalogs, &overlays)?;
+        if let Some(runtime) = &service.enum_source_runtime {
+            runtime.discard_unclaimed_boot_rows();
+        }
+        Ok(service)
     }
 
     pub fn with_rbac_state(mut self, rbac: Option<RbacState>) -> Self {
         self.rbac = rbac;
         self
+    }
+
+    pub fn set_source_authorizer(&self, authorizer: Arc<dyn SourceAuthorizer>) {
+        let _ = self.source_authorizer.set(authorizer);
+    }
+
+    pub fn enum_source_runtime(&self) -> Option<EnumSourceRuntime> {
+        self.enum_source_runtime.clone()
     }
 
     #[cfg(test)]
@@ -529,6 +570,74 @@ impl OpenApiConnectionCatalogService {
 
     pub fn runtime(&self) -> OpenApiConnectionCatalogRuntime {
         self.runtime.clone()
+    }
+
+    fn install_boot_source_plans(
+        &self,
+        catalogs: &[StoredOpenApiCatalog],
+        overlays: &[StoredOpenApiOverlay],
+    ) -> Result<(), ConnectionStoreError> {
+        let Some(runtime) = self.enum_source_runtime.as_ref() else {
+            return Ok(());
+        };
+        let overlays = overlays
+            .iter()
+            .map(|overlay| (&overlay.connection_id, overlay))
+            .collect::<BTreeMap<_, _>>();
+        for catalog in catalogs {
+            let Some(stored_overlay) = overlays.get(&catalog.connection_id).copied() else {
+                runtime.remove_plan(&catalog.connection_id);
+                continue;
+            };
+            let plan = stored_source_plan(catalog, stored_overlay)?;
+            runtime.install_plan(
+                &catalog.connection_id,
+                stored_overlay.overlay_revision,
+                &plan,
+            );
+        }
+        Ok(())
+    }
+
+    async fn resolve_source_plan(
+        &self,
+        connection_id: &ConnectionId,
+        overlay_revision: u64,
+        plan: &OverlaySourcePlan,
+        allow_unresolved_enum_sources: bool,
+    ) -> Result<ResolvedPlan, OverlayError> {
+        if plan.enum_sources.is_empty() && plan.label_sources.is_empty() {
+            return Ok(ResolvedPlan {
+                sources: ResolvedOverlaySources::default(),
+                enum_values: Vec::new(),
+                reports: StoredOpenApiSourceReports::empty(),
+                warnings: Vec::new(),
+            });
+        }
+        let runtime = self
+            .enum_source_runtime
+            .as_ref()
+            .ok_or_else(|| OverlayError {
+                problems: vec![OverlayProblem {
+                    path: "/".to_owned(),
+                    message: "dynamic source runtime is unavailable".to_owned(),
+                }],
+            })?;
+        let authorizer = self.source_authorizer.get().ok_or_else(|| OverlayError {
+            problems: vec![OverlayProblem {
+                path: "/".to_owned(),
+                message: "dynamic source authorization is unavailable".to_owned(),
+            }],
+        })?;
+        runtime
+            .resolve_plan(
+                connection_id,
+                overlay_revision,
+                plan,
+                allow_unresolved_enum_sources,
+                authorizer.as_ref(),
+            )
+            .await
     }
 
     /// Rebuild the managed-OpenAPI lane from the authority (issue #241,
@@ -544,14 +653,14 @@ impl OpenApiConnectionCatalogService {
     /// re-validating install so a catalog this binary cannot enforce fails
     /// closed instead of becoming live.
     pub async fn reconcile_from_authority(&self) -> Result<(), ConnectionStoreError> {
-        let (catalogs, overlays) = self
+        let store = self
             .control_plane
             .managed_store()
             .map_err(|_| ConnectionStoreError::Validation {
                 problems: vec!["managed Connection store is unavailable".to_owned()],
             })?
-            .openapi_catalogs_with_overlays()
-            .await?;
+            .clone();
+        let (catalogs, overlays) = store.openapi_catalogs_with_overlays().await?;
         if let Err(error) = validate_catalog_overlay_pairs(&catalogs, &overlays) {
             // The catalog and overlay are one logical authority resource.
             // The store returns them from one snapshot, so a mismatch is
@@ -570,6 +679,10 @@ impl OpenApiConnectionCatalogService {
             return Err(error);
         }
         let snapshot = self.control_plane.runtime_snapshot();
+        let overlays_by_id = overlays
+            .iter()
+            .map(|overlay| (&overlay.connection_id, overlay))
+            .collect::<BTreeMap<_, _>>();
         let active = catalogs
             .into_iter()
             .filter(|catalog| {
@@ -648,6 +761,30 @@ impl OpenApiConnectionCatalogService {
             // entries and rejects a catalog whose entries do not agree with
             // them, which is what the boot path does too.
             self.runtime.publish(catalog)?;
+            if let Some(enum_runtime) = self.enum_source_runtime.as_ref() {
+                if let Some(stored_overlay) = overlays_by_id.get(&catalog.connection_id).copied() {
+                    let plan = stored_source_plan(catalog, stored_overlay)?;
+                    // Reconciliation may observe a volatile row written by
+                    // another replica. Register the plan empty first, then
+                    // let the safe authority reader adopt only rows backed
+                    // by a stable credential generation.
+                    enum_runtime.remove_plan(&catalog.connection_id);
+                    enum_runtime.install_plan(
+                        &catalog.connection_id,
+                        stored_overlay.overlay_revision,
+                        &plan,
+                    );
+                    enum_runtime
+                        .install_plan_from_store(
+                            &catalog.connection_id,
+                            stored_overlay.overlay_revision,
+                            &plan,
+                        )
+                        .await?;
+                } else {
+                    enum_runtime.remove_plan(&catalog.connection_id);
+                }
+            }
         }
         // A catalog the authority no longer holds as active must stop
         // being served here too. Withdrawing is the fail-closed direction.
@@ -705,7 +842,7 @@ impl OpenApiConnectionCatalogService {
             .control_plane
             .managed_store()
             .map_err(|_| OpenApiCatalogError::StoreUnavailable)?;
-        let (catalog, stored) = store
+        let (catalog, mut stored) = store
             .openapi_catalog_with_overlay(&connection_id)
             .await
             .map_err(|_| OpenApiCatalogError::StorageUnavailable)?;
@@ -718,6 +855,14 @@ impl OpenApiConnectionCatalogService {
             .as_ref()
             .map_or(0, |catalog| catalog.catalog_revision);
         let applied_catalog_revision = catalog.as_ref().map(|catalog| catalog.catalog_revision);
+        if let (Some(enum_runtime), Some(catalog), Some(stored_overlay)) = (
+            self.enum_source_runtime.as_ref(),
+            catalog.as_ref(),
+            stored.as_mut(),
+        ) {
+            project_enum_source_reports(enum_runtime, catalog, stored_overlay)
+                .map_err(|_| OpenApiCatalogError::StorageUnavailable)?;
+        }
         Ok((
             stored,
             OverlayEtag::for_revisions(
@@ -741,12 +886,54 @@ impl OpenApiConnectionCatalogService {
         document: &Value,
         actor: &str,
     ) -> Result<OpenApiOverlayMutationResult, OpenApiOverlayOperationError> {
+        self.put_overlay_with_options(
+            raw_connection_id,
+            expected_overlay_etag,
+            document,
+            false,
+            actor,
+        )
+        .await
+    }
+
+    pub async fn put_overlay_with_options(
+        &self,
+        raw_connection_id: &str,
+        expected_overlay_etag: &str,
+        document: &Value,
+        allow_unresolved_enum_sources: bool,
+        actor: &str,
+    ) -> Result<OpenApiOverlayMutationResult, OpenApiOverlayOperationError> {
+        self.put_overlay_with_authorization(
+            raw_connection_id,
+            expected_overlay_etag,
+            document,
+            allow_unresolved_enum_sources,
+            true,
+            actor,
+        )
+        .await
+    }
+
+    pub async fn put_overlay_with_authorization(
+        &self,
+        raw_connection_id: &str,
+        expected_overlay_etag: &str,
+        document: &Value,
+        allow_unresolved_enum_sources: bool,
+        secrets_write_authorized: bool,
+        actor: &str,
+    ) -> Result<OpenApiOverlayMutationResult, OpenApiOverlayOperationError> {
         let connection_id = ConnectionId::parse(raw_connection_id.to_owned())
             .map_err(|_| OpenApiCatalogError::InvalidConnectionId)?;
         let _active = self
             .control_plane
             .begin_catalog_mutation(&connection_id)
             .map_err(catalog_lifecycle_error)?;
+        let document = overlay::validate(document)?;
+        if document.has_raw_path_sources() && !secrets_write_authorized {
+            return Err(OpenApiOverlayOperationError::SecretsWriteRequired);
+        }
         // A rename is checked against the live policy map. Serialize this
         // local mutation with policy writes so a grant cannot appear between
         // the ownership check and catalog publication.
@@ -777,7 +964,6 @@ impl OpenApiConnectionCatalogService {
         if prior.observed_etag != record.etag() {
             return Err(OpenApiCatalogError::StalePreview.into());
         }
-        let document = overlay::validate(document)?;
         let encoded_document = serde_json::to_string(&document)
             .map_err(|_| OpenApiOverlayOperationError::Catalog(OpenApiCatalogError::InvalidSpec))?;
         let prior_document = decode_stored_overlay(stored_overlay.as_ref())?;
@@ -795,9 +981,28 @@ impl OpenApiConnectionCatalogService {
         )?;
         let compile_context =
             self.overlay_compile_context(&connection_id, Some(&prior), prior_document.as_ref());
-        let compiled = overlay::compile(&generation, binding, &document, &compile_context)?;
+        let next_overlay_revision = current_overlay_revision
+            .checked_add(1)
+            .ok_or(OpenApiCatalogError::StorageUnavailable)?;
+        let source_plan = overlay::plan_sources(&generation, &document)?;
+        let resolved = self
+            .resolve_source_plan(
+                &connection_id,
+                next_overlay_revision,
+                &source_plan,
+                allow_unresolved_enum_sources,
+            )
+            .await?;
+        let mut compiled = overlay::compile_with_resolved_sources(
+            &generation,
+            binding,
+            &document,
+            &compile_context,
+            &resolved.sources,
+        )?;
+        compiled.warnings.extend(resolved.warnings.iter().cloned());
         validate_binding_budget(&compiled.binding)?;
-        let report = compiled_report(&compiled);
+        let report = compiled_report(&compiled, &resolved.reports);
         let policy_protected_names = compiled
             .renames
             .iter()
@@ -823,10 +1028,11 @@ impl OpenApiConnectionCatalogService {
             .collect::<BTreeSet<_>>()
             .into_iter()
             .collect();
-        let next_overlay_revision = current_overlay_revision
-            .checked_add(1)
-            .ok_or(OpenApiCatalogError::StorageUnavailable)?;
         let digest = prior.spec_digest.clone();
+        let source_reports_json = resolved
+            .reports
+            .canonical_json()
+            .map_err(|_| OpenApiCatalogError::StorageUnavailable)?;
         let published = self
             .publish_candidate(OpenApiPublishCandidate {
                 record: &record,
@@ -838,13 +1044,13 @@ impl OpenApiConnectionCatalogService {
                 overlay: Some(StoredOverlayWrite::Put {
                     schema_version: document.schema_version.clone(),
                     overlay_json: encoded_document.clone(),
-                    source_reports_json: StoredOpenApiSourceReports::empty()
-                        .canonical_json()
-                        .map_err(|_| OpenApiCatalogError::StorageUnavailable)?,
+                    source_reports_json: source_reports_json.clone(),
                     expected_overlay_revision: current_overlay_revision,
                 }),
                 compiled_overlay_revision: next_overlay_revision,
                 policy_protected_names,
+                source_plan: Some(compiled.source_plan.clone()),
+                enum_values: resolved.enum_values,
                 started: Instant::now(),
                 actor,
             })
@@ -858,11 +1064,7 @@ impl OpenApiConnectionCatalogService {
             schema_version: document.schema_version,
             overlay_revision: next_overlay_revision,
             overlay_json: encoded_document,
-            source_reports_json: Some(
-                StoredOpenApiSourceReports::empty()
-                    .canonical_json()
-                    .map_err(|_| OpenApiCatalogError::StorageUnavailable)?,
-            ),
+            source_reports_json: Some(source_reports_json),
             updated_at: published.catalog.refreshed_at.clone(),
         };
         let etag = OverlayEtag::for_revisions(
@@ -948,6 +1150,8 @@ impl OpenApiConnectionCatalogService {
                 }),
                 compiled_overlay_revision: 0,
                 policy_protected_names: Vec::new(),
+                source_plan: None,
+                enum_values: Vec::new(),
                 started: Instant::now(),
                 actor,
             })
@@ -985,6 +1189,9 @@ impl OpenApiConnectionCatalogService {
             Err(OpenApiOverlayOperationError::PreconditionFailed(_)) => {
                 Err(OpenApiCatalogError::StorageUnavailable)
             }
+            Err(OpenApiOverlayOperationError::SecretsWriteRequired) => {
+                Err(OpenApiCatalogError::InvalidSpec)
+            }
         }
     }
 
@@ -993,6 +1200,17 @@ impl OpenApiConnectionCatalogService {
         raw_connection_id: &str,
         spec: &str,
         candidate_overlay: Option<&Value>,
+    ) -> Result<OpenApiCatalogPreview, OpenApiOverlayOperationError> {
+        self.preview_with_overlay_authorization(raw_connection_id, spec, candidate_overlay, true)
+            .await
+    }
+
+    pub async fn preview_with_overlay_authorization(
+        &self,
+        raw_connection_id: &str,
+        spec: &str,
+        candidate_overlay: Option<&Value>,
+        secrets_write_authorized: bool,
     ) -> Result<OpenApiCatalogPreview, OpenApiOverlayOperationError> {
         validate_spec_size(spec)?;
         let (connection_id, record) = self.managed_openapi_record(raw_connection_id, None)?;
@@ -1020,8 +1238,30 @@ impl OpenApiConnectionCatalogService {
             Some(document) => Some(overlay::validate(document)?),
             None => prior_document.clone(),
         };
+        if candidate_document
+            .as_ref()
+            .is_some_and(|document| document.has_raw_path_sources())
+            && !secrets_write_authorized
+        {
+            return Err(OpenApiOverlayOperationError::SecretsWriteRequired);
+        }
         let overlay_report = if let Some(document) = candidate_document.as_ref() {
-            let compiled = overlay::compile(
+            let source_plan = overlay::plan_sources(&generation, document)?;
+            let overlay_revision = if candidate_overlay.is_some() {
+                stored_overlay
+                    .as_ref()
+                    .map_or(0, |stored| stored.overlay_revision)
+                    .checked_add(1)
+                    .ok_or(OpenApiCatalogError::StorageUnavailable)?
+            } else {
+                stored_overlay
+                    .as_ref()
+                    .map_or(0, |stored| stored.overlay_revision)
+            };
+            let resolved = self
+                .resolve_source_plan(&connection_id, overlay_revision, &source_plan, false)
+                .await?;
+            let mut compiled = overlay::compile_with_resolved_sources(
                 &generation,
                 binding,
                 document,
@@ -1030,10 +1270,13 @@ impl OpenApiConnectionCatalogService {
                     prior.as_ref(),
                     prior_document.as_ref(),
                 ),
+                &resolved.sources,
             )
             .map_err(OpenApiOverlayOperationError::Rejected)?;
-            let report = compiled_report(&compiled);
+            compiled.warnings.extend(resolved.warnings.iter().cloned());
+            let report = compiled_report(&compiled, &resolved.reports);
             binding = compiled.binding;
+            inject_preview_enum_values(&mut binding, &resolved.sources)?;
             Some(report)
         } else {
             None
@@ -1105,20 +1348,45 @@ impl OpenApiConnectionCatalogService {
             &selected_tool_names,
             confirmations,
         )?;
-        if let Some(document) = overlay_document.as_ref() {
-            binding = overlay::compile(
-                &generation,
-                binding,
-                document,
-                &self.overlay_compile_context(
-                    &connection_id,
-                    prior.as_ref(),
-                    overlay_document.as_ref(),
-                ),
-            )
-            .map_err(|_| OpenApiCatalogError::InvalidSpec)?
-            .binding;
-        }
+        let (source_plan, enum_values, overlay_write) =
+            if let Some(document) = overlay_document.as_ref() {
+                let source_plan = overlay::plan_sources(&generation, document)
+                    .map_err(|_| OpenApiCatalogError::InvalidSpec)?;
+                let overlay_revision = stored_overlay
+                    .as_ref()
+                    .map_or(0, |stored| stored.overlay_revision);
+                let resolved = self
+                    .resolve_source_plan(&connection_id, overlay_revision, &source_plan, false)
+                    .await
+                    .map_err(|_| OpenApiCatalogError::InvalidSpec)?;
+                let compiled = overlay::compile_with_resolved_sources(
+                    &generation,
+                    binding,
+                    document,
+                    &self.overlay_compile_context(
+                        &connection_id,
+                        prior.as_ref(),
+                        overlay_document.as_ref(),
+                    ),
+                    &resolved.sources,
+                )
+                .map_err(|_| OpenApiCatalogError::InvalidSpec)?;
+                binding = compiled.binding;
+                let source_reports_json = resolved
+                    .reports
+                    .canonical_json()
+                    .map_err(|_| OpenApiCatalogError::StorageUnavailable)?;
+                (
+                    Some(compiled.source_plan),
+                    resolved.enum_values,
+                    Some(StoredOverlayWrite::Reports {
+                        source_reports_json,
+                        expected_overlay_revision: overlay_revision,
+                    }),
+                )
+            } else {
+                (None, Vec::new(), None)
+            };
         self.publish_candidate(OpenApiPublishCandidate {
             record: &record,
             expected_spec_revision,
@@ -1126,11 +1394,13 @@ impl OpenApiConnectionCatalogService {
             spec,
             digest: expected_spec_digest,
             binding,
-            overlay: None,
+            overlay: overlay_write,
             compiled_overlay_revision: stored_overlay
                 .as_ref()
                 .map_or(0, |stored| stored.overlay_revision),
             policy_protected_names: Vec::new(),
+            source_plan,
+            enum_values,
             started: Instant::now(),
             actor,
         })
@@ -1247,7 +1517,7 @@ impl OpenApiConnectionCatalogService {
                     return Err(error);
                 }
             };
-        let binding = match bind_selected_tools(
+        let mut binding = match bind_selected_tools(
             &generation,
             &connection_id,
             &record,
@@ -1267,34 +1537,86 @@ impl OpenApiConnectionCatalogService {
                 return Err(error);
             }
         };
-        let binding = if let Some(document) = overlay_document.as_ref() {
-            match overlay::compile(
-                &generation,
-                binding,
-                document,
-                &self.overlay_compile_context(
-                    &connection_id,
-                    Some(&prior),
-                    overlay_document.as_ref(),
-                ),
-            ) {
-                Ok(compiled) => compiled.binding,
-                Err(_) => {
-                    let error = OpenApiCatalogError::InvalidSpec;
-                    self.record_failed_status(
+        let (source_plan, enum_values, overlay_write) =
+            if let Some(document) = overlay_document.as_ref() {
+                let source_plan = match overlay::plan_sources(&generation, document) {
+                    Ok(plan) => plan,
+                    Err(_) => {
+                        let error = OpenApiCatalogError::InvalidSpec;
+                        self.record_failed_status(
+                            &connection_id,
+                            &record.etag(),
+                            Some(&prior),
+                            error,
+                            started.elapsed(),
+                        )
+                        .await;
+                        return Err(error);
+                    }
+                };
+                let overlay_revision = stored_overlay
+                    .as_ref()
+                    .map_or(0, |stored| stored.overlay_revision);
+                let resolved = match self
+                    .resolve_source_plan(&connection_id, overlay_revision, &source_plan, false)
+                    .await
+                {
+                    Ok(resolved) => resolved,
+                    Err(_) => {
+                        let error = OpenApiCatalogError::InvalidSpec;
+                        self.record_failed_status(
+                            &connection_id,
+                            &record.etag(),
+                            Some(&prior),
+                            error,
+                            started.elapsed(),
+                        )
+                        .await;
+                        return Err(error);
+                    }
+                };
+                match overlay::compile_with_resolved_sources(
+                    &generation,
+                    binding,
+                    document,
+                    &self.overlay_compile_context(
                         &connection_id,
-                        &record.etag(),
                         Some(&prior),
-                        error,
-                        started.elapsed(),
-                    )
-                    .await;
-                    return Err(error);
+                        overlay_document.as_ref(),
+                    ),
+                    &resolved.sources,
+                ) {
+                    Ok(compiled) => {
+                        binding = compiled.binding;
+                        let source_reports_json = resolved
+                            .reports
+                            .canonical_json()
+                            .map_err(|_| OpenApiCatalogError::StorageUnavailable)?;
+                        (
+                            Some(compiled.source_plan),
+                            resolved.enum_values,
+                            Some(StoredOverlayWrite::Reports {
+                                source_reports_json,
+                                expected_overlay_revision: overlay_revision,
+                            }),
+                        )
+                    }
+                    Err(_) => {
+                        let error = OpenApiCatalogError::InvalidSpec;
+                        self.record_failed_status(
+                            &connection_id,
+                            &record.etag(),
+                            Some(&prior),
+                            error,
+                            started.elapsed(),
+                        )
+                        .await;
+                        return Err(error);
+                    }
                 }
-            }
-        } else {
-            binding
-        };
+            } else {
+                (None, Vec::new(), None)
+            };
         let digest = spec_digest(&spec);
         let published = self
             .publish_candidate(OpenApiPublishCandidate {
@@ -1304,11 +1626,13 @@ impl OpenApiConnectionCatalogService {
                 spec: &spec,
                 digest: &digest,
                 binding,
-                overlay: None,
+                overlay: overlay_write,
                 compiled_overlay_revision: stored_overlay
                     .as_ref()
                     .map_or(0, |stored| stored.overlay_revision),
                 policy_protected_names: Vec::new(),
+                source_plan,
+                enum_values,
                 started,
                 actor,
             })
@@ -1448,6 +1772,9 @@ impl OpenApiConnectionCatalogService {
             }
         }
         self.runtime.remove(connection_id);
+        if let Some(enum_runtime) = self.enum_source_runtime.as_ref() {
+            enum_runtime.remove_plan(connection_id);
+        }
     }
 
     async fn publish_candidate(
@@ -1464,6 +1791,8 @@ impl OpenApiConnectionCatalogService {
             overlay,
             compiled_overlay_revision,
             policy_protected_names,
+            source_plan,
+            enum_values,
             started,
             actor,
         } = candidate;
@@ -1524,7 +1853,7 @@ impl OpenApiConnectionCatalogService {
             .validate_openapi_connection_catalog(record.id.as_str(), &binding_definitions)
             .map_err(|_| OpenApiCatalogError::ToolConflict)?;
         let catalog = store
-            .replace_openapi_catalog_with_overlay(
+            .replace_openapi_catalog_with_overlay_and_enum_values(
                 &record.id,
                 &expected_connection_etag,
                 expected_spec_revision,
@@ -1536,6 +1865,7 @@ impl OpenApiConnectionCatalogService {
                 compiled_overlay_revision,
                 actor,
                 &policy_protected_names,
+                &enum_values,
             )
             .await
             .map_err(|error| publish_store_error(&record.id, &error))?;
@@ -1593,6 +1923,34 @@ impl OpenApiConnectionCatalogService {
             record.revisions.connection,
             definition_digests,
         );
+        if let Some(enum_runtime) = self.enum_source_runtime.as_ref() {
+            match source_plan.as_ref() {
+                Some(plan) => {
+                    // Clear the prior registration only after both the
+                    // authority commit and monotonic local catalog install.
+                    // An empty registration keeps a failed post-commit read
+                    // fail-closed without reviving a pruned boot row.
+                    enum_runtime.remove_plan(&record.id);
+                    enum_runtime.install_plan(&record.id, compiled_overlay_revision, plan);
+                    if let Err(error) = enum_runtime
+                        .install_published_plan_from_store(
+                            &record.id,
+                            compiled_overlay_revision,
+                            plan,
+                            &enum_values,
+                        )
+                        .await
+                    {
+                        tracing::error!(
+                            connection_id = %record.id,
+                            error = %error,
+                            "OpenAPI enum values are durable but could not be installed; calls remain fail-closed until refresh"
+                        );
+                    }
+                }
+                None => enum_runtime.remove_plan(&record.id),
+            }
+        }
         let status = {
             let latency = duration_millis(started.elapsed());
             match self
@@ -1889,6 +2247,109 @@ fn parse_stored_overlay(
     Ok(document)
 }
 
+fn stored_source_plan(
+    catalog: &StoredOpenApiCatalog,
+    stored_overlay: &StoredOpenApiOverlay,
+) -> Result<OverlaySourcePlan, ConnectionStoreError> {
+    let document = parse_stored_overlay(stored_overlay)?;
+    let generation = openapi::generate_tools_from_openapi_str(
+        "managed-openapi-source-plan-replay",
+        &catalog.spec,
+    )
+    .map_err(|_| ConnectionStoreError::CorruptRecord {
+        id: catalog.connection_id.to_string(),
+        reason: "stored OpenAPI catalog spec cannot rebuild its source plan",
+    })?;
+    overlay::plan_sources(&generation, &document).map_err(|_| ConnectionStoreError::CorruptRecord {
+        id: catalog.connection_id.to_string(),
+        reason: "stored OpenAPI overlay cannot rebuild its source plan",
+    })
+}
+
+/// Replace durable enum report entries with the exact in-memory state this
+/// replica currently serves. Label reports remain compile-time facts. This
+/// keeps the admin read path free of upstream/store side effects while making
+/// its enum status agree with `tools/list`, `tools/call`, and inventory after
+/// a timer refresh.
+fn project_enum_source_reports(
+    runtime: &EnumSourceRuntime,
+    catalog: &StoredOpenApiCatalog,
+    stored_overlay: &mut StoredOpenApiOverlay,
+) -> Result<(), ConnectionStoreError> {
+    let plan = stored_source_plan(catalog, stored_overlay)?;
+    let durable = match stored_overlay.source_reports_json.as_deref() {
+        Some(encoded) => decode_openapi_source_reports(encoded).map_err(|()| {
+            ConnectionStoreError::CorruptRecord {
+                id: stored_overlay.connection_id.to_string(),
+                reason: "stored OpenAPI overlay source reports are invalid",
+            }
+        })?,
+        None if plan.enum_sources.is_empty() && plan.label_sources.is_empty() => {
+            // PR1 overlays predate source reports. They remain valid when the
+            // rebuilt document has no PR2 sources; project a canonical empty
+            // report for this read rather than turning an upgrade into 503.
+            StoredOpenApiSourceReports::empty()
+        }
+        None => {
+            return Err(ConnectionStoreError::CorruptRecord {
+                id: stored_overlay.connection_id.to_string(),
+                reason: "stored OpenAPI overlay is missing source reports",
+            });
+        }
+    };
+    let durable_labels = durable
+        .sources
+        .iter()
+        .filter(|report| report.kind == StoredOpenApiSourceKind::Label)
+        .map(|report| (report.id.as_str(), report))
+        .collect::<BTreeMap<_, _>>();
+    let mut projected = Vec::with_capacity(
+        plan.enum_sources
+            .len()
+            .saturating_add(plan.label_sources.len()),
+    );
+    for (source_id, source) in &plan.enum_sources {
+        let snapshot = runtime.snapshot(
+            &stored_overlay.connection_id,
+            source_id,
+            &source.source_digest,
+        );
+        let state = match snapshot.state {
+            EnumSourceState::Fresh => "fresh",
+            EnumSourceState::Stale => "stale",
+            EnumSourceState::Missing => "missing",
+        };
+        projected.push(StoredOpenApiSourceReport {
+            id: source_id.clone(),
+            kind: StoredOpenApiSourceKind::Enum,
+            state: state.to_owned(),
+            item_count: u64::try_from(snapshot.item_count()).unwrap_or(u64::MAX),
+            resolved_at: snapshot.resolved_at,
+        });
+    }
+    for source_id in plan.label_sources.keys() {
+        let report = durable_labels.get(source_id.as_str()).ok_or_else(|| {
+            ConnectionStoreError::CorruptRecord {
+                id: stored_overlay.connection_id.to_string(),
+                reason: "stored OpenAPI overlay is missing a label source report",
+            }
+        })?;
+        projected.push((*report).clone());
+    }
+    stored_overlay.source_reports_json = Some(
+        StoredOpenApiSourceReports {
+            schema_version: durable.schema_version,
+            sources: projected,
+        }
+        .canonical_json()
+        .map_err(|_| ConnectionStoreError::CorruptRecord {
+            id: stored_overlay.connection_id.to_string(),
+            reason: "stored OpenAPI overlay source reports cannot be serialized",
+        })?,
+    );
+    Ok(())
+}
+
 fn decode_stored_overlay(
     stored: Option<&StoredOpenApiOverlay>,
 ) -> Result<Option<OverlayDocument>, OpenApiCatalogError> {
@@ -1918,12 +2379,45 @@ fn require_overlay_precondition(
     Ok(revision)
 }
 
-fn compiled_report(compiled: &CompiledCatalog) -> OpenApiOverlayCompileReport {
+fn compiled_report(
+    compiled: &CompiledCatalog,
+    reports: &StoredOpenApiSourceReports,
+) -> OpenApiOverlayCompileReport {
     OpenApiOverlayCompileReport {
         tools: compiled.tools.clone(),
         composites: compiled.composites.clone(),
         warnings: compiled.warnings.clone(),
+        sources: reports.sources.clone(),
     }
+}
+
+fn inject_preview_enum_values(
+    binding: &mut OpenApiToolBinding,
+    resolved: &ResolvedOverlaySources,
+) -> Result<(), OverlayError> {
+    for definition in &mut binding.definitions {
+        for enum_binding in definition.enum_bindings.clone() {
+            let Some(source) = resolved.enum_sources.get(&enum_binding.source_id) else {
+                continue;
+            };
+            overlay::apply_enum_to_served_clone(
+                definition,
+                &enum_binding,
+                &source.values,
+                source.labels.as_deref(),
+            )
+            .map_err(|message| OverlayError {
+                problems: vec![OverlayProblem {
+                    path: format!(
+                        "/tools/{}/parameters/{}/enum_source",
+                        definition.name, enum_binding.property
+                    ),
+                    message,
+                }],
+            })?;
+        }
+    }
+    Ok(())
 }
 
 fn bind_selected_tools(
@@ -2528,6 +3022,7 @@ mod tests {
             },
             upstream: mapping,
             composite: None,
+            enum_bindings: Vec::new(),
             visibility: ToolVisibility::Listed,
             transform: None,
         }
@@ -2571,6 +3066,7 @@ mod tests {
                 result: None,
                 limits: crate::tools::composite::CompositeLimits::default(),
             }),
+            enum_bindings: Vec::new(),
             visibility: ToolVisibility::Listed,
             transform: None,
         };
@@ -2660,6 +3156,7 @@ mod tests {
                 result: None,
                 limits: crate::tools::composite::CompositeLimits::default(),
             }),
+            enum_bindings: Vec::new(),
             visibility: ToolVisibility::Listed,
             transform: None,
         };
@@ -3493,6 +3990,44 @@ paths:
             .await
             .expect("initial catalog should publish");
 
+        let raw_source_document = json!({
+            "schema_version": "0.1.0",
+            "enum_sources": {
+                "statuses": {
+                    "request": {"path": "/metadata/statuses"},
+                    "select": {"items": "/items/*", "value": "/value"}
+                }
+            }
+        });
+        let unauthorized_preview = service
+            .preview_with_overlay_authorization(
+                record.id.as_str(),
+                spec,
+                Some(&raw_source_document),
+                false,
+            )
+            .await
+            .expect_err("raw source preview must require secrets-write authority");
+        assert!(matches!(
+            unauthorized_preview,
+            OpenApiOverlayOperationError::SecretsWriteRequired
+        ));
+        let unauthorized_put = service
+            .put_overlay_with_authorization(
+                record.id.as_str(),
+                "\"deliberately-stale\"",
+                &raw_source_document,
+                true,
+                false,
+                "test-admin",
+            )
+            .await
+            .expect_err("raw source PUT must require secrets-write authority");
+        assert!(matches!(
+            unauthorized_put,
+            OpenApiOverlayOperationError::SecretsWriteRequired
+        ));
+
         let document = json!({
             "schema_version": "0.1.0",
             "shapes": {
@@ -3647,6 +4182,29 @@ paths:
         let durable_overlay = durable_overlay.expect("overlay should exist");
         assert_eq!(durable_catalog.overlay_revision, 1);
         assert_eq!(durable_overlay.overlay_revision, 1);
+        let mut pre_source_reports_overlay = durable_overlay.clone();
+        pre_source_reports_overlay.source_reports_json = None;
+        let empty_enum_runtime = EnumSourceRuntime::new(
+            control_plane.clone(),
+            http.clone(),
+            AuditLog::new(Arc::new(CaptureSink::new()) as Arc<dyn AuditSink>),
+            Vec::new(),
+        );
+        project_enum_source_reports(
+            &empty_enum_runtime,
+            &durable_catalog,
+            &mut pre_source_reports_overlay,
+        )
+        .expect("a pre-PR2 overlay without sources should project an empty report");
+        assert!(decode_openapi_source_reports(
+            pre_source_reports_overlay
+                .source_reports_json
+                .as_deref()
+                .expect("empty reports should be canonicalized")
+        )
+        .expect("projected empty reports should decode")
+        .sources
+        .is_empty());
         let (read_overlay, read_etag, applied_catalog_revision) = service
             .openapi_overlay(record.id.as_str())
             .await

@@ -708,7 +708,10 @@ pub(crate) const MAX_OPENAPI_OVERLAY_BYTES: usize = 1_048_576;
 pub(crate) const OPENAPI_OVERLAY_SCHEMA_VERSION: &str = "0.1.0";
 pub(crate) const MAX_OPENAPI_SOURCE_REPORTS_BYTES: usize = 262_144;
 pub(crate) const OPENAPI_SOURCE_REPORTS_SCHEMA_VERSION: &str = "0.1.0";
-const MAX_OPENAPI_SOURCE_REPORTS: usize = 128;
+pub(crate) const MAX_OPENAPI_ENUM_SOURCE_VALUES_BYTES: usize = 262_144;
+pub(crate) const OPENAPI_ENUM_SOURCE_VALUES_VERSION: u32 = 1;
+pub(crate) const MAX_OPENAPI_ENUM_SOURCES: usize = 64;
+pub(crate) const MAX_OPENAPI_SOURCE_REPORTS: usize = 128;
 const MAX_OPENAPI_SOURCE_ITEMS: u64 = 1_024;
 const MAX_OPENAPI_TOOL_NAME_CHARS: usize = 128;
 const MAX_OPENAPI_OPERATION_ID_CHARS: usize = 256;
@@ -1038,6 +1041,71 @@ pub struct StoredOpenApiOverlay {
     pub updated_at: String,
 }
 
+/// One durable last-known-good value set for a dynamic OpenAPI enum source.
+///
+/// The row is useful only when every generation field still agrees with the
+/// live source plan and Connection. `credential_generation_digest == None`
+/// deliberately marks a volatile credential authority (for example an
+/// environment/file alias or a provider's movable `latest` selector): those
+/// rows may coordinate replicas during the process lifetime but must never be
+/// adopted at boot or used after a failed refresh.
+#[derive(Clone, Debug, PartialEq)]
+pub struct StoredEnumSourceValue {
+    pub connection_id: ConnectionId,
+    pub source_id: String,
+    pub overlay_revision: u64,
+    pub source_digest: String,
+    pub values_revision: u64,
+    pub connection_revision: u64,
+    pub credential_revision: u64,
+    pub credential_generation_digest: Option<String>,
+    pub values: Vec<Value>,
+    pub labels: Option<Vec<String>>,
+    pub resolved_at: String,
+}
+
+/// Small authority record polled by replicas. It deliberately excludes the
+/// potentially 256 KiB values document; full JSON is fetched only when this
+/// revision is newer than the replica's cache.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StoredEnumSourceRevision {
+    pub connection_id: ConnectionId,
+    pub source_id: String,
+    pub overlay_revision: u64,
+    pub source_digest: String,
+    pub values_revision: u64,
+    pub connection_revision: u64,
+    pub credential_revision: u64,
+    pub credential_generation_digest: Option<String>,
+}
+
+/// Candidate for a compare-and-set update of one enum source's durable LKG.
+#[derive(Clone, Debug, PartialEq)]
+pub struct StoredEnumSourceValueWrite {
+    pub connection_id: ConnectionId,
+    pub source_id: String,
+    pub overlay_revision: u64,
+    pub source_digest: String,
+    /// Durable revision observed before the upstream fetch began. This is not
+    /// persisted; publication fails rather than overwriting a newer winner.
+    pub expected_values_revision: u64,
+    pub connection_revision: u64,
+    pub credential_revision: u64,
+    pub credential_generation_digest: Option<String>,
+    pub values: Vec<Value>,
+    pub labels: Option<Vec<String>>,
+    pub resolved_at: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct StoredEnumSourceValuesDocument {
+    pub(crate) version: u32,
+    pub(crate) values: Vec<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) labels: Option<Vec<String>>,
+}
+
 /// Versioned, bounded compile-time source status stored with an overlay.
 ///
 /// PR 1 persists an empty snapshot. Later source resolvers populate the same
@@ -1198,6 +1266,13 @@ pub enum ConnectionStoreError {
         current_catalog_revision: u64,
         current_overlay_revision: u64,
     },
+    /// A dynamic-enum writer lost its per-source CAS, or the Connection /
+    /// overlay generation it resolved under is no longer authoritative.
+    EnumSourceConflict {
+        id: String,
+        source_id: String,
+        current_values_revision: u64,
+    },
     /// A catalog tool name is already published by another lane at the
     /// authority (cluster mode). The caller surfaces `409`.
     ToolNameConflict {
@@ -1350,6 +1425,14 @@ impl fmt::Display for ConnectionStoreError {
                 formatter,
                 "connection '{id}' overlay changed during the mutation; current connection/catalog/overlay revisions are {current_connection_revision}/{current_catalog_revision}/{current_overlay_revision}"
             ),
+            Self::EnumSourceConflict {
+                id,
+                source_id,
+                current_values_revision,
+            } => write!(
+                formatter,
+                "connection '{id}' enum source '{source_id}' changed during refresh; current values revision is {current_values_revision}"
+            ),
         }
     }
 }
@@ -1416,21 +1499,6 @@ impl SqliteConnectionStore {
             &self.path,
             "encrypted local secrets",
             "SELECT COUNT(*) FROM connection_local_secrets",
-        )
-    }
-
-    /// PR 1 creates the durable dynamic-enum table but has no value codec
-    /// yet. The standalone-to-cluster importer uses this count to refuse a
-    /// database written by a newer enum-capable binary instead of silently
-    /// dropping its last-known-good values and still reporting matching
-    /// checksums.
-    pub(crate) fn openapi_enum_source_value_count(&self) -> Result<usize, ConnectionStoreError> {
-        let connection = self.connection_guard();
-        count_rows(
-            &connection,
-            &self.path,
-            "OpenAPI enum source values",
-            "SELECT COUNT(*) FROM connection_enum_source_values",
         )
     }
 
@@ -2150,6 +2218,210 @@ impl SqliteConnectionStore {
             .next())
     }
 
+    /// Bulk-read every durable dynamic-enum LKG in one SQLite snapshot.
+    pub fn enum_source_values(&self) -> Result<Vec<StoredEnumSourceValue>, ConnectionStoreError> {
+        let connection = self.connection_guard();
+        let values = load_enum_source_values(&connection, &self.path, None)?;
+        let maximum = self
+            .maximum_connections
+            .saturating_mul(MAX_OPENAPI_ENUM_SOURCES);
+        if values.len() > maximum {
+            return Err(ConnectionStoreError::LimitExceeded {
+                resource: "connection enum source values",
+                maximum,
+            });
+        }
+        Ok(values)
+    }
+
+    /// Read all durable dynamic-enum LKG rows for one Connection.
+    pub fn enum_source_values_for_connection(
+        &self,
+        id: &ConnectionId,
+    ) -> Result<Vec<StoredEnumSourceValue>, ConnectionStoreError> {
+        let connection = self.connection_guard();
+        let values = load_enum_source_values(&connection, &self.path, Some(id))?;
+        if values.len() > MAX_OPENAPI_ENUM_SOURCES {
+            return Err(ConnectionStoreError::LimitExceeded {
+                resource: "connection enum source values",
+                maximum: MAX_OPENAPI_ENUM_SOURCES,
+            });
+        }
+        Ok(values)
+    }
+
+    /// Poll only enum-source generation metadata. The SQL limit is applied
+    /// before allocation so a corrupt/oversized authority cannot force an
+    /// unbounded timer-tick read.
+    pub fn enum_source_revisions(
+        &self,
+    ) -> Result<Vec<StoredEnumSourceRevision>, ConnectionStoreError> {
+        let maximum = self
+            .maximum_connections
+            .saturating_mul(MAX_OPENAPI_ENUM_SOURCES);
+        let connection = self.connection_guard();
+        load_enum_source_revisions(&connection, &self.path, maximum)
+    }
+
+    /// Fetch one full values document after a metadata poll found a change.
+    pub fn enum_source_value(
+        &self,
+        id: &ConnectionId,
+        source_id: &str,
+    ) -> Result<Option<StoredEnumSourceValue>, ConnectionStoreError> {
+        let connection = self.connection_guard();
+        let mut statement = connection
+            .prepare(
+                r#"
+                SELECT connection_id, source_id, overlay_revision, source_digest,
+                       values_revision, connection_revision, credential_revision,
+                       credential_generation_digest, values_json, resolved_at
+                FROM connection_enum_source_values
+                WHERE connection_id = ?1 AND source_id = ?2
+                "#,
+            )
+            .map_err(|source| sqlite_error(&self.path, "enum source value prepare", source))?;
+        statement
+            .query_row(params![id.as_str(), source_id], decode_raw_enum_source_row)
+            .optional()
+            .map_err(|source| sqlite_error(&self.path, "enum source value read", source))?
+            .map(decode_enum_source_row)
+            .transpose()
+    }
+
+    /// Publish one resolved enum value set under an exact generation fence.
+    ///
+    /// SQLite's immediate transaction serializes the compare-and-set with an
+    /// overlay mutation. The latter prunes every row for the Connection in its
+    /// catalog transaction, so an old resolver can never resurrect values for
+    /// a replaced source declaration.
+    pub fn replace_enum_source_value(
+        &self,
+        write: &StoredEnumSourceValueWrite,
+        expected_values_revision: u64,
+    ) -> Result<StoredEnumSourceValue, ConnectionStoreError> {
+        let values_json = encode_enum_source_values(write)?;
+        if write.expected_values_revision != expected_values_revision {
+            return Err(ConnectionStoreError::Validation {
+                problems: vec![
+                    "enum source expected values revision does not match the fetched candidate"
+                        .to_owned(),
+                ],
+            });
+        }
+        let mut connection = self.connection_guard();
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|source| sqlite_error(&self.path, "enum source value transaction", source))?;
+        let current = load_raw_by_id(&transaction, &self.path, &write.connection_id)?
+            .ok_or_else(|| ConnectionStoreError::NotFound {
+                id: write.connection_id.to_string(),
+            })?
+            .into_stored()?;
+        let overlay_revision = transaction
+            .query_row(
+                "SELECT overlay_revision FROM connection_openapi_overlays WHERE connection_id = ?1",
+                params![write.connection_id.as_str()],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()
+            .map_err(|source| sqlite_error(&self.path, "enum source overlay lookup", source))?
+            .map(|revision| {
+                persisted_revision(
+                    &write.connection_id,
+                    revision,
+                    "invalid OpenAPI overlay revision",
+                )
+            })
+            .transpose()?
+            .unwrap_or_default();
+        let previous = transaction
+            .query_row(
+                "SELECT values_revision, source_digest FROM connection_enum_source_values WHERE connection_id = ?1 AND source_id = ?2",
+                params![write.connection_id.as_str(), write.source_id],
+                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)),
+            )
+            .optional()
+            .map_err(|source| {
+                sqlite_error(&self.path, "enum source revision lookup", source)
+            })?;
+        let current_values_revision = previous
+            .as_ref()
+            .map(|(revision, _)| {
+                persisted_revision(
+                    &write.connection_id,
+                    *revision,
+                    "invalid enum source values revision",
+                )
+            })
+            .transpose()?
+            .unwrap_or_default();
+
+        if current_values_revision != expected_values_revision
+            || previous
+                .as_ref()
+                .is_some_and(|(_, source_digest)| source_digest != &write.source_digest)
+            || overlay_revision != write.overlay_revision
+            || current.revisions.connection != write.connection_revision
+            || current.revisions.credential != write.credential_revision
+        {
+            return Err(ConnectionStoreError::EnumSourceConflict {
+                id: write.connection_id.to_string(),
+                source_id: write.source_id.clone(),
+                current_values_revision,
+            });
+        }
+        let values_revision = increment_revision(&write.connection_id, current_values_revision)?;
+        transaction
+            .execute(
+                r#"
+                INSERT INTO connection_enum_source_values (
+                    connection_id, source_id, overlay_revision, source_digest,
+                    values_revision, connection_revision, credential_revision,
+                    credential_generation_digest, values_json, resolved_at
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+                ON CONFLICT(connection_id, source_id) DO UPDATE SET
+                    overlay_revision = excluded.overlay_revision,
+                    source_digest = excluded.source_digest,
+                    values_revision = excluded.values_revision,
+                    connection_revision = excluded.connection_revision,
+                    credential_revision = excluded.credential_revision,
+                    credential_generation_digest = excluded.credential_generation_digest,
+                    values_json = excluded.values_json,
+                    resolved_at = excluded.resolved_at
+                "#,
+                params![
+                    write.connection_id.as_str(),
+                    write.source_id,
+                    u64_to_i64(&write.connection_id, write.overlay_revision)?,
+                    write.source_digest,
+                    u64_to_i64(&write.connection_id, values_revision)?,
+                    u64_to_i64(&write.connection_id, write.connection_revision)?,
+                    u64_to_i64(&write.connection_id, write.credential_revision)?,
+                    write.credential_generation_digest,
+                    values_json,
+                    write.resolved_at,
+                ],
+            )
+            .map_err(|source| sqlite_error(&self.path, "enum source value upsert", source))?;
+        transaction
+            .commit()
+            .map_err(|source| sqlite_error(&self.path, "enum source value commit", source))?;
+        Ok(StoredEnumSourceValue {
+            connection_id: write.connection_id.clone(),
+            source_id: write.source_id.clone(),
+            overlay_revision: write.overlay_revision,
+            source_digest: write.source_digest.clone(),
+            values_revision,
+            connection_revision: write.connection_revision,
+            credential_revision: write.credential_revision,
+            credential_generation_digest: write.credential_generation_digest.clone(),
+            values: write.values.clone(),
+            labels: write.labels.clone(),
+            resolved_at: write.resolved_at.clone(),
+        })
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn replace_openapi_catalog(
         &self,
@@ -2194,6 +2466,41 @@ impl SqliteConnectionStore {
         compiled_overlay_revision: u64,
         actor_user_id: &str,
         policy_protected_names: &[String],
+    ) -> Result<StoredOpenApiCatalog, ConnectionStoreError> {
+        self.replace_openapi_catalog_with_overlay_and_enum_values(
+            id,
+            expected_connection_etag,
+            expected_spec_revision,
+            expected_catalog_revision,
+            spec,
+            spec_digest,
+            entries,
+            overlay,
+            compiled_overlay_revision,
+            actor_user_id,
+            policy_protected_names,
+            &[],
+        )
+    }
+
+    /// Catalog/overlay publication including the source values resolved for
+    /// that exact compile. The enum rows are committed after the overlay has
+    /// pruned superseded rows and before the transaction becomes visible.
+    #[allow(clippy::too_many_arguments)]
+    pub fn replace_openapi_catalog_with_overlay_and_enum_values(
+        &self,
+        id: &ConnectionId,
+        expected_connection_etag: &ConnectionEtag,
+        expected_spec_revision: u64,
+        expected_catalog_revision: u64,
+        spec: &str,
+        spec_digest: &str,
+        entries: &[StoredOpenApiCatalogEntry],
+        overlay: Option<&StoredOverlayWrite>,
+        compiled_overlay_revision: u64,
+        actor_user_id: &str,
+        policy_protected_names: &[String],
+        enum_values: &[StoredEnumSourceValueWrite],
     ) -> Result<StoredOpenApiCatalog, ConnectionStoreError> {
         // Standalone SQLite serializes overlay adoption with local policy
         // swaps before this call. PostgreSQL additionally rechecks these
@@ -2457,6 +2764,14 @@ impl SqliteConnectionStore {
             previous_catalog_revision,
             actor_user_id,
             &now,
+        )?;
+        write_catalog_enum_source_values(
+            &transaction,
+            &self.path,
+            id,
+            &current,
+            overlay_revision,
+            enum_values,
         )?;
         transaction
             .execute(
@@ -3336,6 +3651,19 @@ fn validate_persisted_state(
             maximum: MAX_CATALOG_ENTRIES,
         });
     }
+    let enum_source_value_count = count_rows(
+        &transaction,
+        path,
+        "connection enum source values",
+        "SELECT COUNT(*) FROM connection_enum_source_values",
+    )?;
+    let maximum_enum_source_values = maximum_connections.saturating_mul(MAX_OPENAPI_ENUM_SOURCES);
+    if enum_source_value_count > maximum_enum_source_values {
+        return Err(ConnectionStoreError::LimitExceeded {
+            resource: "connection enum source values",
+            maximum: maximum_enum_source_values,
+        });
+    }
     if openapi_definition_bytes(
         &transaction,
         path,
@@ -3498,6 +3826,7 @@ fn validate_persisted_state(
     let mcp_catalogs = load_mcp_catalogs(&transaction, path, None)?;
     let openapi_catalogs = load_openapi_catalogs(&transaction, path, None)?;
     let openapi_overlays = load_openapi_overlays(&transaction, path, None)?;
+    let enum_source_values = load_enum_source_values(&transaction, path, None)?;
     let record_by_id = records
         .iter()
         .map(|record| (record.id.clone(), record))
@@ -3549,6 +3878,27 @@ fn validate_persisted_state(
             id: "<openapi-overlays>".to_owned(),
             reason: "OpenAPI overlay has no durable catalog",
         });
+    }
+    for row in &enum_source_values {
+        let Some(record) = record_by_id.get(&row.connection_id) else {
+            return Err(ConnectionStoreError::CorruptRecord {
+                id: row.connection_id.to_string(),
+                reason: "enum source value owner is missing",
+            });
+        };
+        let overlay_matches = overlay_by_id
+            .get(&row.connection_id)
+            .is_some_and(|overlay| overlay.overlay_revision == row.overlay_revision);
+        if !supports_managed_openapi_catalog(&record.write)
+            || !overlay_matches
+            || row.connection_revision > record.revisions.connection
+            || row.credential_revision > record.revisions.credential
+        {
+            return Err(ConnectionStoreError::CorruptRecord {
+                id: row.connection_id.to_string(),
+                reason: "enum source values do not match their OpenAPI overlay generation",
+            });
+        }
     }
     validate_managed_catalog_dependencies(&transaction, path, &mcp_catalogs, &openapi_catalogs)?;
     transaction
@@ -4061,11 +4411,111 @@ pub(crate) fn decode_openapi_source_reports(
     Ok(reports)
 }
 
-fn valid_overlay_local_name(value: &str) -> bool {
+pub(crate) fn valid_overlay_local_name(value: &str) -> bool {
     let mut bytes = value.bytes();
     matches!(bytes.next(), Some(first) if first.is_ascii_alphabetic())
         && bytes.all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
         && value.len() <= 64
+}
+
+fn write_catalog_enum_source_values(
+    transaction: &Transaction<'_>,
+    path: &Path,
+    id: &ConnectionId,
+    current: &StoredConnection,
+    overlay_revision: u64,
+    writes: &[StoredEnumSourceValueWrite],
+) -> Result<(), ConnectionStoreError> {
+    if writes.len() > MAX_OPENAPI_ENUM_SOURCES {
+        return Err(ConnectionStoreError::LimitExceeded {
+            resource: "connection enum sources",
+            maximum: MAX_OPENAPI_ENUM_SOURCES,
+        });
+    }
+    let mut source_ids = BTreeSet::new();
+    for write in writes {
+        if &write.connection_id != id
+            || write.overlay_revision != overlay_revision
+            || write.connection_revision != current.revisions.connection
+            || write.credential_revision != current.revisions.credential
+            || !source_ids.insert(write.source_id.as_str())
+        {
+            return Err(ConnectionStoreError::Validation {
+                problems: vec![
+                    "resolved enum source values do not match the catalog generation".to_owned(),
+                ],
+            });
+        }
+        let values_json = encode_enum_source_values(write)?;
+        let previous = transaction
+            .query_row(
+                "SELECT values_revision, source_digest FROM connection_enum_source_values WHERE connection_id = ?1 AND source_id = ?2",
+                params![id.as_str(), write.source_id],
+                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)),
+            )
+            .optional()
+            .map_err(|source| {
+                sqlite_error(path, "catalog enum source revision lookup", source)
+            })?;
+        if previous
+            .as_ref()
+            .is_some_and(|(_, source_digest)| source_digest != &write.source_digest)
+        {
+            return Err(ConnectionStoreError::Validation {
+                problems: vec![
+                    "resolved enum source values do not match the stored source generation"
+                        .to_owned(),
+                ],
+            });
+        }
+        let current_values_revision = previous
+            .map(|(revision, _)| {
+                persisted_revision(id, revision, "invalid enum source values revision")
+            })
+            .transpose()?
+            .unwrap_or_default();
+        if current_values_revision != write.expected_values_revision {
+            return Err(ConnectionStoreError::EnumSourceConflict {
+                id: id.to_string(),
+                source_id: write.source_id.clone(),
+                current_values_revision,
+            });
+        }
+        let values_revision = increment_revision(id, current_values_revision)?;
+        transaction
+            .execute(
+                r#"
+                INSERT INTO connection_enum_source_values (
+                    connection_id, source_id, overlay_revision, source_digest,
+                    values_revision, connection_revision, credential_revision,
+                    credential_generation_digest, values_json, resolved_at
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+                ON CONFLICT(connection_id, source_id) DO UPDATE SET
+                    overlay_revision = excluded.overlay_revision,
+                    source_digest = excluded.source_digest,
+                    values_revision = excluded.values_revision,
+                    connection_revision = excluded.connection_revision,
+                    credential_revision = excluded.credential_revision,
+                    credential_generation_digest = excluded.credential_generation_digest,
+                    values_json = excluded.values_json,
+                    resolved_at = excluded.resolved_at
+                "#,
+                params![
+                    id.as_str(),
+                    write.source_id,
+                    u64_to_i64(id, write.overlay_revision)?,
+                    write.source_digest,
+                    u64_to_i64(id, values_revision)?,
+                    u64_to_i64(id, write.connection_revision)?,
+                    u64_to_i64(id, write.credential_revision)?,
+                    write.credential_generation_digest,
+                    values_json,
+                    write.resolved_at,
+                ],
+            )
+            .map_err(|source| sqlite_error(path, "catalog enum source upsert", source))?;
+    }
+    Ok(())
 }
 
 /// Read the stored overlay revision, then apply the requested write inside
@@ -4308,6 +4758,495 @@ fn load_openapi_overlays(
             },
         )
         .collect()
+}
+
+fn load_enum_source_revisions(
+    connection: &Connection,
+    path: &Path,
+    maximum: usize,
+) -> Result<Vec<StoredEnumSourceRevision>, ConnectionStoreError> {
+    let mut statement = connection
+        .prepare(
+            r#"
+            SELECT connection_id, source_id, overlay_revision, source_digest,
+                   values_revision, connection_revision, credential_revision,
+                   credential_generation_digest
+            FROM connection_enum_source_values
+            ORDER BY connection_id, source_id
+            LIMIT ?1
+            "#,
+        )
+        .map_err(|source| sqlite_error(path, "enum source revisions prepare", source))?;
+    let limit = i64::try_from(maximum.saturating_add(1)).unwrap_or(i64::MAX);
+    let rows = statement
+        .query_map(params![limit], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, i64>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, i64>(4)?,
+                row.get::<_, i64>(5)?,
+                row.get::<_, i64>(6)?,
+                row.get::<_, Option<String>>(7)?,
+            ))
+        })
+        .map_err(|source| sqlite_error(path, "enum source revisions query", source))?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|source| sqlite_error(path, "enum source revisions read", source))?;
+    if rows.len() > maximum {
+        return Err(ConnectionStoreError::LimitExceeded {
+            resource: "connection enum source values",
+            maximum,
+        });
+    }
+    rows.into_iter()
+        .map(
+            |(
+                raw_id,
+                source_id,
+                overlay_revision,
+                source_digest,
+                values_revision,
+                connection_revision,
+                credential_revision,
+                credential_generation_digest,
+            )| {
+                let connection_id = ConnectionId::parse(raw_id.clone()).map_err(|_| {
+                    ConnectionStoreError::CorruptRecord {
+                        id: raw_id,
+                        reason: "invalid enum source connection ID",
+                    }
+                })?;
+                if !valid_overlay_local_name(&source_id)
+                    || !valid_sha256_hex(&source_digest)
+                    || credential_generation_digest
+                        .as_deref()
+                        .is_some_and(|digest| !valid_sha256_hex(digest))
+                {
+                    return Err(ConnectionStoreError::CorruptRecord {
+                        id: connection_id.to_string(),
+                        reason: "invalid enum source provenance",
+                    });
+                }
+                Ok(StoredEnumSourceRevision {
+                    connection_id: connection_id.clone(),
+                    source_id,
+                    overlay_revision: persisted_revision(
+                        &connection_id,
+                        overlay_revision,
+                        "invalid enum source overlay revision",
+                    )?,
+                    source_digest,
+                    values_revision: persisted_revision(
+                        &connection_id,
+                        values_revision,
+                        "invalid enum source values revision",
+                    )?,
+                    connection_revision: persisted_revision(
+                        &connection_id,
+                        connection_revision,
+                        "invalid enum source connection revision",
+                    )?,
+                    credential_revision: revision_from_i64(
+                        &connection_id,
+                        credential_revision,
+                        true,
+                    )?,
+                    credential_generation_digest,
+                })
+            },
+        )
+        .collect()
+}
+
+fn load_enum_source_values(
+    connection: &Connection,
+    path: &Path,
+    requested_id: Option<&ConnectionId>,
+) -> Result<Vec<StoredEnumSourceValue>, ConnectionStoreError> {
+    let query = if requested_id.is_some() {
+        r#"
+            SELECT connection_id, source_id, overlay_revision, source_digest,
+                   values_revision, connection_revision, credential_revision,
+                   credential_generation_digest, values_json, resolved_at
+            FROM connection_enum_source_values
+            WHERE connection_id = ?1
+            ORDER BY connection_id, source_id
+        "#
+    } else {
+        r#"
+            SELECT connection_id, source_id, overlay_revision, source_digest,
+                   values_revision, connection_revision, credential_revision,
+                   credential_generation_digest, values_json, resolved_at
+            FROM connection_enum_source_values
+            ORDER BY connection_id, source_id
+        "#
+    };
+    let mut statement = connection
+        .prepare(query)
+        .map_err(|source| sqlite_error(path, "enum source values prepare", source))?;
+    let rows = if let Some(id) = requested_id {
+        statement.query_map(params![id.as_str()], decode_raw_enum_source_row)
+    } else {
+        statement.query_map([], decode_raw_enum_source_row)
+    }
+    .map_err(|source| sqlite_error(path, "enum source values query", source))?
+    .collect::<Result<Vec<_>, _>>()
+    .map_err(|source| sqlite_error(path, "enum source values read", source))?;
+    rows.into_iter().map(decode_enum_source_row).collect()
+}
+
+type RawEnumSourceRow = (
+    String,
+    String,
+    i64,
+    String,
+    i64,
+    i64,
+    i64,
+    Option<String>,
+    String,
+    String,
+);
+
+fn decode_raw_enum_source_row(row: &Row<'_>) -> rusqlite::Result<RawEnumSourceRow> {
+    Ok((
+        row.get(0)?,
+        row.get(1)?,
+        row.get(2)?,
+        row.get(3)?,
+        row.get(4)?,
+        row.get(5)?,
+        row.get(6)?,
+        row.get(7)?,
+        row.get(8)?,
+        row.get(9)?,
+    ))
+}
+
+fn decode_enum_source_row(
+    raw: RawEnumSourceRow,
+) -> Result<StoredEnumSourceValue, ConnectionStoreError> {
+    let (
+        raw_id,
+        source_id,
+        overlay_revision,
+        source_digest,
+        values_revision,
+        connection_revision,
+        credential_revision,
+        credential_generation_digest,
+        values_json,
+        resolved_at,
+    ) = raw;
+    let connection_id =
+        ConnectionId::parse(raw_id.clone()).map_err(|_| ConnectionStoreError::CorruptRecord {
+            id: raw_id.clone(),
+            reason: "invalid enum source connection ID",
+        })?;
+    if !valid_overlay_local_name(&source_id) {
+        return Err(ConnectionStoreError::CorruptRecord {
+            id: raw_id,
+            reason: "invalid enum source ID",
+        });
+    }
+    let overlay_revision = persisted_revision(
+        &connection_id,
+        overlay_revision,
+        "invalid enum source overlay revision",
+    )?;
+    let values_revision = persisted_revision(
+        &connection_id,
+        values_revision,
+        "invalid enum source values revision",
+    )?;
+    let connection_revision = persisted_revision(
+        &connection_id,
+        connection_revision,
+        "invalid enum source connection revision",
+    )?;
+    let credential_revision = revision_from_i64(&connection_id, credential_revision, true)?;
+    if !valid_sha256_hex(&source_digest)
+        || credential_generation_digest
+            .as_deref()
+            .is_some_and(|digest| !valid_sha256_hex(digest))
+        || !valid_enum_source_timestamp(&resolved_at)
+    {
+        return Err(ConnectionStoreError::CorruptRecord {
+            id: connection_id.to_string(),
+            reason: "invalid enum source provenance",
+        });
+    }
+    let document = decode_enum_source_values(&values_json).map_err(|_| {
+        ConnectionStoreError::CorruptRecord {
+            id: connection_id.to_string(),
+            reason: "invalid enum source values",
+        }
+    })?;
+    Ok(StoredEnumSourceValue {
+        connection_id,
+        source_id,
+        overlay_revision,
+        source_digest,
+        values_revision,
+        connection_revision,
+        credential_revision,
+        credential_generation_digest,
+        values: document.values,
+        labels: document.labels,
+        resolved_at,
+    })
+}
+
+pub(crate) fn encode_enum_source_values(
+    write: &StoredEnumSourceValueWrite,
+) -> Result<String, ConnectionStoreError> {
+    let mut problems = Vec::new();
+    if !valid_overlay_local_name(&write.source_id) {
+        problems.push("enum source ID must be a valid overlay local name".to_owned());
+    }
+    if write.overlay_revision == 0 {
+        problems.push("enum source overlay revision must be positive".to_owned());
+    }
+    if write.connection_revision == 0 {
+        problems.push("enum source connection revision must be positive".to_owned());
+    }
+    if !valid_sha256_hex(&write.source_digest) {
+        problems.push("enum source digest must be 64 lowercase hexadecimal characters".to_owned());
+    }
+    if write
+        .credential_generation_digest
+        .as_deref()
+        .is_some_and(|digest| !valid_sha256_hex(digest))
+    {
+        problems.push(
+            "enum source credential generation digest must be 64 lowercase hexadecimal characters"
+                .to_owned(),
+        );
+    }
+    if !valid_enum_source_timestamp(&write.resolved_at) {
+        problems.push("enum source resolved_at must be an RFC 3339 timestamp".to_owned());
+    }
+    let document = StoredEnumSourceValuesDocument {
+        version: OPENAPI_ENUM_SOURCE_VALUES_VERSION,
+        values: write.values.clone(),
+        labels: write.labels.clone(),
+    };
+    validate_enum_source_values_document(&document, &mut problems);
+    let encoded =
+        serde_json::to_string(&document).map_err(|source| ConnectionStoreError::Json {
+            operation: "enum source values",
+            source,
+        })?;
+    if encoded.len() < 2 || encoded.len() > MAX_OPENAPI_ENUM_SOURCE_VALUES_BYTES {
+        problems.push(format!(
+            "enum source values must contain 2-{MAX_OPENAPI_ENUM_SOURCE_VALUES_BYTES} bytes"
+        ));
+    }
+    if problems.is_empty() {
+        Ok(encoded)
+    } else {
+        Err(ConnectionStoreError::Validation { problems })
+    }
+}
+
+pub(crate) fn decode_enum_source_values(
+    encoded: &str,
+) -> Result<StoredEnumSourceValuesDocument, ()> {
+    if encoded.len() < 2 || encoded.len() > MAX_OPENAPI_ENUM_SOURCE_VALUES_BYTES {
+        return Err(());
+    }
+    let document =
+        serde_json::from_str::<StoredEnumSourceValuesDocument>(encoded).map_err(|_| ())?;
+    let mut problems = Vec::new();
+    validate_enum_source_values_document(&document, &mut problems);
+    if !problems.is_empty() || serde_json::to_string(&document).map_err(|_| ())? != encoded {
+        return Err(());
+    }
+    Ok(document)
+}
+
+/// Validate the exact canonical document that a resolver would persist. This
+/// keeps the 256 KiB durable LKG limit at the fetch boundary instead of
+/// allowing a successful resolve that cannot be published.
+pub(crate) fn validate_enum_source_values_payload(
+    values: &[Value],
+    labels: Option<&[String]>,
+) -> Result<(), ()> {
+    let document = StoredEnumSourceValuesDocument {
+        version: OPENAPI_ENUM_SOURCE_VALUES_VERSION,
+        values: values.to_vec(),
+        labels: labels.map(<[String]>::to_vec),
+    };
+    let mut problems = Vec::new();
+    validate_enum_source_values_document(&document, &mut problems);
+    let encoded = serde_json::to_string(&document).map_err(|_| ())?;
+    if problems.is_empty()
+        && encoded.len() >= 2
+        && encoded.len() <= MAX_OPENAPI_ENUM_SOURCE_VALUES_BYTES
+    {
+        Ok(())
+    } else {
+        Err(())
+    }
+}
+
+/// Reject line-breaking and direction/format control characters that can make
+/// generated schema descriptions span lines or display different text than
+/// the stored value.
+pub(crate) fn enum_source_text_is_printable(value: &str) -> bool {
+    value.chars().all(|character| {
+        !character.is_control()
+            && !matches!(
+                character,
+                '\u{00ad}'
+                    | '\u{061c}'
+                    | '\u{06dd}'
+                    | '\u{070f}'
+                    | '\u{08e2}'
+                    | '\u{180e}'
+                    | '\u{2028}'
+                    | '\u{2029}'
+                    | '\u{2060}'
+                    | '\u{feff}'
+                    | '\u{110bd}'
+                    | '\u{110cd}'
+                    | '\u{e0001}'
+            )
+            && !matches!(
+                character as u32,
+                0x0600..=0x0605
+                    | 0x0890..=0x0891
+                    | 0x200b..=0x200f
+                    | 0x202a..=0x202e
+                    | 0x2061..=0x2064
+                    | 0x2066..=0x206f
+                    | 0xfff9..=0xfffb
+                    | 0x13430..=0x13455
+                    | 0x1bca0..=0x1bca3
+                    | 0x1d173..=0x1d17a
+                    | 0xe0020..=0xe007f
+            )
+    })
+}
+
+fn validate_enum_source_values_document(
+    document: &StoredEnumSourceValuesDocument,
+    problems: &mut Vec<String>,
+) {
+    if document.version != OPENAPI_ENUM_SOURCE_VALUES_VERSION {
+        problems.push(format!(
+            "enum source values version must be {OPENAPI_ENUM_SOURCE_VALUES_VERSION}"
+        ));
+    }
+    if document.values.len() > usize::try_from(MAX_OPENAPI_SOURCE_ITEMS).unwrap_or(usize::MAX) {
+        problems.push(format!(
+            "enum source values must contain at most {MAX_OPENAPI_SOURCE_ITEMS} items"
+        ));
+    }
+    if document
+        .labels
+        .as_ref()
+        .is_some_and(|labels| labels.len() != document.values.len())
+    {
+        problems.push("enum source labels must align one-for-one with values".to_owned());
+    }
+    let mut seen = BTreeSet::new();
+    for value in &document.values {
+        let valid = match value {
+            Value::String(value) => {
+                !value.is_empty()
+                    && value.len() <= 1_024
+                    && enum_source_text_is_printable(value)
+                    && !suspicious_enum_source_text(value)
+            }
+            Value::Bool(_) => true,
+            Value::Null | Value::Number(_) | Value::Array(_) | Value::Object(_) => false,
+        };
+        let identity = serde_json::to_string(value).unwrap_or_default();
+        if !valid || !seen.insert(identity) {
+            problems
+                .push("enum source values must be unique printable strings or booleans".to_owned());
+            break;
+        }
+    }
+    if document.labels.as_ref().is_some_and(|labels| {
+        labels.iter().any(|label| {
+            label.is_empty()
+                || label.len() > 64
+                || !enum_source_text_is_printable(label)
+                || suspicious_enum_source_text(label)
+        })
+    }) {
+        problems.push(
+            "enum source labels must be printable single-line strings of at most 64 bytes"
+                .to_owned(),
+        );
+    }
+}
+
+fn suspicious_enum_source_text(value: &str) -> bool {
+    let mut token = String::new();
+    for character in value.chars() {
+        if enum_source_token_character(character) {
+            token.push(character);
+        } else {
+            if suspicious_enum_source_token(&token) {
+                return true;
+            }
+            token.clear();
+        }
+    }
+    suspicious_enum_source_token(&token)
+}
+
+fn enum_source_token_character(character: char) -> bool {
+    character.is_ascii_alphanumeric()
+        || matches!(
+            character,
+            '.' | '-' | '_' | ':' | '/' | '?' | '&' | '=' | '%' | '+' | '@'
+        )
+}
+
+fn suspicious_enum_source_token(token: &str) -> bool {
+    let token = token
+        .trim_matches(|character: char| {
+            matches!(character, '"' | '\'' | ',' | ';' | ')' | '(' | '[' | ']')
+        })
+        .to_ascii_lowercase();
+    token.starts_with("http://")
+        || token.starts_with("https://")
+        || token.starts_with("sk_")
+        || token.starts_with("pk_")
+        || token.starts_with("ghp_")
+        || token.starts_with("github_pat_")
+        || token.starts_with("xoxb-")
+        || token.starts_with("xoxp-")
+        || token.contains("secret=")
+        || token.contains("token=")
+        || token.contains("password=")
+        || token.contains("api_key=")
+        || token.contains("apikey=")
+        || token.contains(".internal")
+        || token.contains("internal.")
+        || token.ends_with(".local")
+}
+
+pub(crate) fn valid_enum_source_timestamp(value: &str) -> bool {
+    OffsetDateTime::parse(value, &Rfc3339).is_ok_and(|timestamp| {
+        timestamp
+            .format(&Rfc3339)
+            .is_ok_and(|canonical| canonical == value)
+            && timestamp <= OffsetDateTime::now_utc() + time::Duration::minutes(5)
+    })
+}
+
+pub(crate) fn valid_sha256_hex(value: &str) -> bool {
+    value.len() == SHA256_HEX_CHARS
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
 pub(crate) fn validate_openapi_catalog_entries(
@@ -8395,6 +9334,195 @@ mod tests {
                 .overlay_revision,
             0
         );
+    }
+
+    #[test]
+    fn enum_source_values_publish_atomically_and_use_exact_generation_cas() {
+        let (_directory, path, store) = temporary_store("enum-source-cas");
+        let created = store.create(candidate()).expect("Connection should create");
+        let spec = r#"{"openapi":"3.1.0","info":{"title":"Enums","version":"1"}}"#;
+        let digest = spec_digest(spec);
+        let overlay = StoredOverlayWrite::Put {
+            schema_version: "0.1.0".to_owned(),
+            overlay_json: r#"{"schema_version":"0.1.0","tools":{}}"#.to_owned(),
+            source_reports_json: r#"{"schema_version":"0.1.0","sources":[{"id":"regions","kind":"enum","state":"fresh","item_count":2,"resolved_at":"2026-09-03T00:00:00Z"}]}"#.to_owned(),
+            expected_overlay_revision: 0,
+        };
+        let first_write = StoredEnumSourceValueWrite {
+            connection_id: created.id.clone(),
+            source_id: "regions".to_owned(),
+            overlay_revision: 1,
+            source_digest: "a".repeat(SHA256_HEX_CHARS),
+            expected_values_revision: 0,
+            connection_revision: created.revisions.connection,
+            credential_revision: created.revisions.credential,
+            credential_generation_digest: Some("b".repeat(SHA256_HEX_CHARS)),
+            values: vec![json!("na"), json!("eu")],
+            labels: Some(vec!["North America".to_owned(), "Europe".to_owned()]),
+            resolved_at: "2026-09-03T00:00:00Z".to_owned(),
+        };
+        let catalog = store
+            .replace_openapi_catalog_with_overlay_and_enum_values(
+                &created.id,
+                &created.etag(),
+                0,
+                0,
+                spec,
+                &digest,
+                &[openapi_catalog_entry("enum_tool")],
+                Some(&overlay),
+                1,
+                "enum-resolver",
+                &[],
+                std::slice::from_ref(&first_write),
+            )
+            .expect("catalog, overlay, and initial enum values should publish together");
+        assert_eq!((catalog.catalog_revision, catalog.overlay_revision), (1, 1));
+
+        let first = store
+            .enum_source_values_for_connection(&created.id)
+            .expect("typed enum values should load");
+        assert_eq!(first.len(), 1);
+        assert_eq!(first[0].values_revision, 1);
+        assert_eq!(first[0].values, first_write.values);
+        assert_eq!(first[0].labels, first_write.labels);
+
+        let mut second_write = first_write.clone();
+        second_write.expected_values_revision = 1;
+        second_write.values = vec![json!("apac"), json!(true)];
+        second_write.labels = None;
+        second_write.resolved_at = "2026-09-03T00:01:00Z".to_owned();
+        let second = store
+            .replace_enum_source_value(&second_write, 1)
+            .expect("the exact enum values revision should replace");
+        assert_eq!(second.values_revision, 2);
+        assert_eq!(second.values, second_write.values);
+
+        let stale = store
+            .replace_enum_source_value(&first_write, 0)
+            .expect_err("a stale resolver must not overwrite the winner");
+        assert!(matches!(
+            stale,
+            ConnectionStoreError::EnumSourceConflict {
+                current_values_revision: 2,
+                ..
+            }
+        ));
+
+        let mut wrong_source_generation = second_write.clone();
+        wrong_source_generation.expected_values_revision = 2;
+        wrong_source_generation.source_digest = "c".repeat(SHA256_HEX_CHARS);
+        assert!(matches!(
+            store.replace_enum_source_value(&wrong_source_generation, 2),
+            Err(ConnectionStoreError::EnumSourceConflict {
+                current_values_revision: 2,
+                ..
+            })
+        ));
+        assert_eq!(
+            store
+                .enum_source_values()
+                .expect("winner should remain after stale CAS"),
+            vec![second.clone()]
+        );
+
+        let mut oversized = second_write.clone();
+        oversized.expected_values_revision = 2;
+        oversized.values = (0..1_024)
+            .map(|index| json!(format!("{index:04}-{}", "a".repeat(1_019))))
+            .collect();
+        let rejected = store
+            .replace_enum_source_value(&oversized, 2)
+            .expect_err("a values document above 256 KiB must fail closed");
+        assert!(matches!(rejected, ConnectionStoreError::Validation { .. }));
+        assert_eq!(
+            store
+                .enum_source_values()
+                .expect("oversize rejection should leave the winner"),
+            vec![second.clone()]
+        );
+
+        let mut suspicious = second_write.clone();
+        suspicious.expected_values_revision = 2;
+        suspicious.values = vec![json!("region ghp_canary")];
+        let rejected = store
+            .replace_enum_source_value(&suspicious, 2)
+            .expect_err("embedded secret-shaped tokens must not enter the LKG store");
+        assert!(matches!(rejected, ConnectionStoreError::Validation { .. }));
+        assert_eq!(
+            store
+                .enum_source_values()
+                .expect("suspicious-value rejection should leave the winner"),
+            vec![second.clone()]
+        );
+
+        for spoofed in [
+            "north\u{2028}america",
+            "north\u{2029}america",
+            "north\u{202e}america",
+        ] {
+            let mut non_printable = second_write.clone();
+            non_printable.expected_values_revision = 2;
+            non_printable.values = vec![json!(spoofed)];
+            non_printable.labels = None;
+            assert!(matches!(
+                store.replace_enum_source_value(&non_printable, 2),
+                Err(ConnectionStoreError::Validation { .. })
+            ));
+            non_printable.values = vec![json!("safe")];
+            non_printable.labels = Some(vec![spoofed.to_owned()]);
+            assert!(matches!(
+                store.replace_enum_source_value(&non_printable, 2),
+                Err(ConnectionStoreError::Validation { .. })
+            ));
+        }
+
+        let mut future_timestamp = second_write.clone();
+        future_timestamp.expected_values_revision = 2;
+        future_timestamp.resolved_at = "2099-01-01T00:00:00Z".to_owned();
+        assert!(matches!(
+            store.replace_enum_source_value(&future_timestamp, 2),
+            Err(ConnectionStoreError::Validation { .. })
+        ));
+
+        drop(store);
+        let reopened = SqliteConnectionStore::open(&path).expect("enum store should restart");
+        assert_eq!(
+            reopened
+                .enum_source_values_for_connection(&created.id)
+                .expect("restart should bulk-read the exact winner"),
+            vec![second]
+        );
+        let connection = Connection::open(&path).expect("enum database should open directly");
+        connection
+            .execute(
+                "UPDATE connection_enum_source_values SET values_json = ?1 WHERE connection_id = ?2",
+                params![r#"{"version":2,"values":["future"]}"#, created.id.as_str()],
+            )
+            .expect("future enum codec fixture should write");
+        drop(connection);
+        assert_eq!(
+            reopened
+                .enum_source_revisions()
+                .expect("metadata-only scan must not decode values_json")
+                .len(),
+            1
+        );
+        assert!(matches!(
+            reopened.enum_source_value(&created.id, "regions"),
+            Err(ConnectionStoreError::CorruptRecord {
+                reason: "invalid enum source values",
+                ..
+            })
+        ));
+        drop(reopened);
+        assert!(matches!(
+            SqliteConnectionStore::open(path),
+            Err(ConnectionStoreError::CorruptRecord {
+                reason: "invalid enum source values",
+                ..
+            })
+        ));
     }
 
     #[test]

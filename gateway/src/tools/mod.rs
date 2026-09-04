@@ -1,6 +1,7 @@
 pub mod codecs;
 pub mod composite;
 pub mod definitions;
+pub mod enum_source;
 pub mod executor;
 pub mod inventory;
 pub mod lease;

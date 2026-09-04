@@ -420,10 +420,10 @@ DELETE followed by a new POST creates a replacement Connection resource and is
 governed by the Connection resource's own precondition contract.
 
 This release accepts tool rename, tool and parameter descriptions, parameter
-titles, visibility, document-label disambiguation, body serialization, and
-declarative request/response transforms, plus bounded composite tools with
-compensation. Dynamic enum and label sources remain reserved and are rejected
-until their implementation lands.
+titles, visibility, document- and source-label disambiguation, body
+serialization, and declarative request/response transforms, plus bounded
+composite tools with compensation, dynamic enum bindings, and
+compile-time label sources.
 
 Overlay keys always use the generated name shown by OpenAPI preview, even when
 the tool is renamed for agents. Operation IDs are case-sensitive. In
@@ -435,8 +435,9 @@ its original definition and `whole_args_json` body byte-for-byte.
 Use this workflow:
 
 1. Preview the OpenAPI document with the candidate `overlay` field. Review the
-   compiled tool names, descriptions, schemas, body modes, warnings, and label
-   reports. Preview does not persist the overlay.
+   compiled tool names, descriptions, schemas, body modes, warnings, label
+   reports, and resolved enum values. Preview resolves sources but does not
+   persist the overlay or install a refresh schedule.
 2. `GET /v1/admin/connections/{id}/overlay` and retain its overlay ETag. A
    Connection with no overlay reports revision `0` and an `o0` ETag.
 3. `PUT /v1/admin/connections/{id}/overlay` with that exact ETag in `If-Match`.
@@ -449,19 +450,64 @@ Use this workflow:
 5. To remove the overlay, send `DELETE` with its exact ETag. The gateway
    republishes the bare generated catalog and deletes the overlay atomically.
 
-The gateway persists a bounded canonical snapshot of compile-time source
-reports with the overlay. Overlay GET projects that snapshot through `sources`,
-including after restart, and never performs source I/O merely to describe saved
-state. The list is empty in this release because source declarations remain
-reserved. Later dynamic value rows are also bound to both the overlay revision
-and a digest of the complete source declaration, so reusing a source ID with a
-different path or selector cannot resurrect values from its previous meaning.
+The gateway persists a bounded canonical snapshot of initial and label-source
+reports with the overlay. Overlay GET preserves those compile-time label facts
+and projects each enum entry from the exact in-memory state this replica serves,
+so `sources` agrees with tools/list, tools/call, and inventory after a timer
+refresh. The read performs no source fetch and no durable write. Dynamic value
+rows are bound to the Connection and credential revisions, the overlay revision,
+and a digest of the complete source declaration. Reusing a source ID, changing
+tenants, or changing a credential therefore cannot resurrect values from the
+source's previous meaning.
 
 Reading requires `admin:connections:read`; PUT and DELETE require
-`admin:connections:write`. A future source declaration that supplies a raw
-`request.path` on an authenticated Connection also requires
-`admin:connections:secrets:write`, because it authorizes a credentialed GET
-that the OpenAPI document did not declare.
+`admin:connections:write`. A source declaration that supplies a raw
+`request.path` always also requires `admin:connections:secrets:write`, because
+the Connection may gain HTTP, additional-header, or mTLS authority before a
+later resolve and the GET is not constrained by the OpenAPI document. A source that names
+`request.tool` is constrained to a generated GET operation instead. Refresh
+continues to require `admin:connections:refresh`; its stored source plan was
+already authorized when the overlay was written.
+
+### Dynamic enum and label sources
+
+`enum_sources` select string or boolean values from a bounded GET response.
+`tools.<generated>.parameters.<name>.enum_source` binds that set to a generated
+property, while `composites.<name>.parameters.<name>.enum_source` binds it to a
+composite input property. The resolved set replaces any static OpenAPI `enum`;
+it is never combined with or backfilled from the document. Values are compared
+by exact JSON equality, with no trimming, case folding, numeric conversion, or
+other coercion. Duplicate values are removed in upstream order. Numeric dynamic
+values are rejected.
+
+Source resolution is synchronous for preview, overlay PUT, registration, and
+Connection Refresh. By default, a source that has never resolved makes the
+write fail with `422`. `allow_unresolved_enum_sources=true` permits only enum
+sources to begin missing; label sources are compile input and must resolve.
+While an enum is missing, `tools/list` advertises the property without an enum
+and marks its description unavailable, and every call using the tool fails
+closed with `enum_source_unavailable` before egress.
+
+After publication, a timer refreshes expired enum sources. `tools/list`,
+`tools/call`, inventory reads, and overlay GET perform no upstream fetch and do
+not enqueue refresh work. Fresh and permitted last-known-good stale values are
+injected into an owned validation/list clone; the stored `ToolDefinition` and
+its digest never change. Each fetch is GET-only, remains below the Connection's
+base path, is path-normalized, refuses redirects, checks a contextless HTTP
+deny and a referenced tool's enabled flag before credentials are read, and uses
+the Connection's ordinary egress, TLS, credential, and response bounds.
+
+The refresh tick is 15 seconds, so replicas adopt a newer durable value revision
+within one tick. `ttl_secs` has a 60-second floor, `max_stale_secs` bounds how
+long a failed refresh may keep serving the last good set, and an expired set
+becomes missing rather than accepting unchecked input. Enum validation errors
+name the JSON pointer and return the exact `allowed` values in MCP and
+playground error details.
+
+`label_sources` are resolved only during compile flows. Their bounded printable
+labels are compiled into property descriptions through fixed templates and are
+therefore covered by the stored definition digest. Treat label text as
+untrusted upstream data, not as instructions.
 
 `body_args_json` is the default body mode for a tool named in the overlay. It
 omits path placeholders and query arguments from the JSON body after using them
@@ -571,6 +617,10 @@ path. Each real forward or compensation request still uses the Connection's
 credential and additional headers, passes the Connection egress policy, and is
 checked against HTTP deny rules on its rendered path.
 
+Composite input properties can use
+`composites.<name>.parameters.<property>.enum_source` to share the same dynamic
+enum sources and exact-value validation as generated-tool properties.
+
 Use `visibility: composite_only` for sharp step or rollback tools that agents
 must not discover or call directly. They remain visible in the admin inventory
 and usable by the admin playground. The composite itself needs its own tool
@@ -593,9 +643,7 @@ dropped; the audit tree records any pending compensation.
 
 ### JSON pointer bases
 
-The meaning of `/` is determined by the field containing the pointer. Source
-fields for dynamic enum and label sources below remain reserved until their
-later capability.
+The meaning of `/` is determined by the field containing the pointer.
 
 | Field | `/` is the root of |
 | --- | --- |

@@ -374,6 +374,7 @@ impl<'a> ConnectionsSection<'a> {
         let mut mcp_catalogs = 0_i64;
         let mut openapi_catalogs = 0_i64;
         let mut openapi_overlays = 0_i64;
+        let mut enum_source_values = 0_i64;
         let mut catalog_entries = 0_i64;
         let mut reservations = 0_i64;
 
@@ -404,6 +405,8 @@ impl<'a> ConnectionsSection<'a> {
             if connection.openapi_overlay.is_some() {
                 openapi_overlays += 1;
             }
+            enum_source_values +=
+                i64::try_from(connection.enum_source_values.len()).unwrap_or(i64::MAX);
         }
 
         let records = i64::try_from(connections.len()).unwrap_or(i64::MAX);
@@ -420,6 +423,7 @@ impl<'a> ConnectionsSection<'a> {
                 ("mcp_catalogs", mcp_catalogs),
                 ("openapi_catalogs", openapi_catalogs),
                 ("openapi_overlays", openapi_overlays),
+                ("enum_source_values", enum_source_values),
                 ("catalog_entries", catalog_entries),
                 ("tool_name_reservations", reservations),
             ]),
@@ -500,6 +504,7 @@ fn written_counts(written: &ImportedConnectionCounts) -> BTreeMap<String, i64> {
         ("mcp_catalogs", written.mcp_catalogs),
         ("openapi_catalogs", written.openapi_catalogs),
         ("openapi_overlays", written.openapi_overlays),
+        ("enum_source_values", written.enum_source_values),
         (
             "catalog_entries",
             written.mcp_catalog_entries

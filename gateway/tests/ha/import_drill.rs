@@ -290,13 +290,15 @@ impl Standalone {
             standalone.drive(&gateway.base_url()).await;
             gateway.stop();
         }
+        standalone.seed_enum_source_value();
         standalone.quiesce();
         standalone.facts = standalone.read_facts();
         assert!(
             standalone.facts.openapi_catalogs > 0
                 && standalone.facts.openapi_overlays > 0
-                && standalone.facts.openapi_catalog_entries > 0,
-            "the standalone fixture must contain a real registered OpenAPI catalog and overlay: {:?}",
+                && standalone.facts.openapi_catalog_entries > 0
+                && standalone.facts.enum_source_values > 0,
+            "the standalone fixture must contain a registered OpenAPI catalog, overlay, and enum LKG: {:?}",
             standalone.facts
         );
         assert_eq!(
@@ -308,6 +310,39 @@ impl Standalone {
             "overlay PUT must persist the typed empty source report the import carries"
         );
         standalone
+    }
+
+    /// Add a durable enum last-known-good row under the exact revisions the
+    /// real admin flow created. The fixture intentionally uses a volatile
+    /// credential generation (`NULL`): import must preserve the row, while a
+    /// restarted replica must still refuse to adopt it as cross-boot cache.
+    fn seed_enum_source_value(&self) {
+        let connection = rusqlite::Connection::open(&self.connections_file)
+            .expect("the standalone Connections database should open for enum seeding");
+        let inserted = connection
+            .execute(
+                r#"
+                INSERT INTO connection_enum_source_values (
+                    connection_id, source_id, overlay_revision, source_digest,
+                    values_revision, connection_revision, credential_revision,
+                    credential_generation_digest, values_json, resolved_at
+                )
+                SELECT overlay.connection_id, 'drill_regions', overlay.overlay_revision,
+                       ?1, 1, record.connection_revision, record.credential_revision,
+                       NULL, ?2, ?3
+                FROM connection_openapi_overlays AS overlay
+                JOIN connection_records AS record ON record.id = overlay.connection_id
+                ORDER BY overlay.connection_id
+                LIMIT 1
+                "#,
+                rusqlite::params![
+                    "a".repeat(64),
+                    r#"{"version":1,"values":["na","eu"],"labels":["North America","Europe"]}"#,
+                    "2026-09-03T00:00:00Z",
+                ],
+            )
+            .expect("the standalone enum LKG should seed");
+        assert_eq!(inserted, 1, "the real overlay must accept one enum LKG row");
     }
 
     /// The environment a standalone gateway runs with: the source settings
@@ -1454,6 +1489,11 @@ async fn the_cutover_writes_what_the_rehearsal_planned() {
     assert_eq!(
         section(&applied, "connections")["counts"]["catalog_entries"],
         facts.openapi_catalog_entries
+    );
+    assert_eq!(
+        section(&applied, "connections")["counts"]["enum_source_values"],
+        facts.enum_source_values,
+        "the Connections section must report every durable enum LKG it transferred"
     );
     assert_eq!(
         section(&applied, "audit")["counts"]["audit_events_deduplicated"],

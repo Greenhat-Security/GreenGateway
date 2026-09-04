@@ -19,7 +19,7 @@ rechecks permission and current state for every operation.
 |---|---|
 | `admin:connections:read` | View redacted Connection list, detail, and status |
 | `admin:connections:write` | Create, update, disable, enable, or delete managed non-sensitive configuration |
-| `admin:connections:secrets:write` | List safe secret-alias metadata; create/rotate/delete local secrets; bind, replace, clear, or redirect credential/TLS authority |
+| `admin:connections:secrets:write` | List safe secret-alias metadata; create/rotate/delete local secrets; bind, replace, clear, or redirect credential/TLS authority; declare or preview raw overlay source paths |
 | `admin:connections:test` | Run the saved bounded Connection test |
 | `admin:connections:refresh` | Refresh an enabled managed OpenAPI or MCP catalog |
 | `admin:tools:read` | View capability inventory and safe detail |
@@ -163,10 +163,18 @@ Detail shows:
 - availability/staleness and policy eligibility;
 - safe HTTP mapping or remote MCP name;
 - input JSON Schema;
-- a bounded transform summary (agent property names, binding counts, and only
-  a boolean indicating whether a response root exists; never constant values,
-  selector or pointer paths, codecs, or upstream schemas);
+- a bounded transform summary (agent property names, binding counts, and only a boolean indicating whether a response root exists; never constant values, selector or pointer paths, codecs, or upstream schemas);
+- dynamic enum bindings with property, source ID, freshness state, item count, durable values revision, and resolution time;
 - whether the constrained playground is available.
+
+Dynamic enum values are serve-time validation state. The capability's schema
+digest and playground ETag continue to cover the stored compiled schema, so a
+timer refresh does not make every inventory row churn. A rejected enum value is
+returned as `422` in the playground with `problems[].path`, `keyword: "enum"`,
+and the exact `allowed` list. Problem counts and text are bounded and the
+rejected value is never echoed; the gateway performs no upstream request for
+that rejection. If the source is unavailable, execution fails closed with
+`enum_source_unavailable` instead of accepting unchecked input.
 
 Inventory is descriptive, not an authorization grant. A capability may exist
 but remain disabled, stale, metadata-only, blocked by Connection state, or

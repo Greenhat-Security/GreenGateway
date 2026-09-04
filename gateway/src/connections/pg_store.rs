@@ -37,18 +37,21 @@ use crate::storage::{
 };
 
 use super::store::{
-    binding_count, ensure_etag, expected_bindings, increment_revision, initial_revisions,
-    managed_tool_dependency_id, optional_i64_to_u64, optional_u64_to_i64, parse_reason,
-    parse_state, persisted_revision, reason_as_str, replacement_revisions, revision_from_i64,
-    state_as_str, supports_managed_mcp_catalog, supports_managed_openapi_catalog, u64_to_i64,
-    utc_timestamp, validate_activity_timestamp, validate_candidate, validate_dependency_id,
-    validate_mcp_catalog, validate_openapi_catalog_entries, validate_openapi_overlay_write,
-    validate_openapi_spec, ConnectionActivityTimes, ConnectionDependency, ConnectionDependencyKind,
-    ConnectionEtag, ConnectionStatusUpdate, ConnectionStoreError, ExportedConnectionStatuses,
-    PersistedConnectionStatus, StoredConnection, StoredMcpCatalog, StoredMcpCatalogEntry,
-    StoredMcpResource, StoredMcpResourceTemplate, StoredOpenApiCatalog, StoredOpenApiCatalogEntry,
+    binding_count, decode_enum_source_values, encode_enum_source_values, ensure_etag,
+    expected_bindings, increment_revision, initial_revisions, managed_tool_dependency_id,
+    optional_i64_to_u64, optional_u64_to_i64, parse_reason, parse_state, persisted_revision,
+    reason_as_str, replacement_revisions, revision_from_i64, state_as_str,
+    supports_managed_mcp_catalog, supports_managed_openapi_catalog, u64_to_i64, utc_timestamp,
+    valid_enum_source_timestamp, valid_overlay_local_name, valid_sha256_hex,
+    validate_activity_timestamp, validate_candidate, validate_dependency_id, validate_mcp_catalog,
+    validate_openapi_catalog_entries, validate_openapi_overlay_write, validate_openapi_spec,
+    ConnectionActivityTimes, ConnectionDependency, ConnectionDependencyKind, ConnectionEtag,
+    ConnectionStatusUpdate, ConnectionStoreError, ExportedConnectionStatuses,
+    PersistedConnectionStatus, StoredConnection, StoredEnumSourceRevision, StoredEnumSourceValue,
+    StoredEnumSourceValueWrite, StoredMcpCatalog, StoredMcpCatalogEntry, StoredMcpResource,
+    StoredMcpResourceTemplate, StoredOpenApiCatalog, StoredOpenApiCatalogEntry,
     StoredOpenApiInventoryCatalog, StoredOpenApiOverlay, StoredOpenApiSourceReports,
-    StoredOverlayWrite, MAX_CONNECTION_DEPENDENCIES, SOURCE_MANAGED,
+    StoredOverlayWrite, MAX_CONNECTION_DEPENDENCIES, MAX_OPENAPI_ENUM_SOURCES, SOURCE_MANAGED,
 };
 use super::{
     model::{ConnectionId, ConnectionWrite, MAX_CONNECTIONS, MAX_CREDENTIALS},
@@ -62,6 +65,7 @@ const OPERATION_CREATE: &str = "record_create";
 const OPERATION_REPLACE: &str = "record_replace";
 const OPERATION_DELETE: &str = "record_delete";
 const OPERATION_STATE_REVISION: &str = "connection_state_revision_read";
+const OPERATION_ENUM_SOURCE_VALUES: &str = "enum_source_values";
 
 /// The record row as persisted. `spec_json` is the authoritative
 /// specification document; the per-axis revisions derive the etag.
@@ -1136,6 +1140,287 @@ impl PostgresConnectionStore {
         finish_read(&client, OPERATION_OPENAPI_READ, outcome).await
     }
 
+    pub async fn enum_source_values(
+        &self,
+    ) -> Result<Vec<StoredEnumSourceValue>, ConnectionStoreError> {
+        self.read_enum_source_values(None).await
+    }
+
+    pub async fn enum_source_values_for_connection(
+        &self,
+        id: &ConnectionId,
+    ) -> Result<Vec<StoredEnumSourceValue>, ConnectionStoreError> {
+        self.read_enum_source_values(Some(id)).await
+    }
+
+    pub async fn enum_source_revisions(
+        &self,
+    ) -> Result<Vec<StoredEnumSourceRevision>, ConnectionStoreError> {
+        let client = self
+            .pool
+            .get()
+            .await
+            .map_err(|_| pg_unavailable(OPERATION_ENUM_SOURCE_VALUES))?;
+        begin_snapshot(&client, OPERATION_ENUM_SOURCE_VALUES).await?;
+        let maximum = self
+            .maximum_connections
+            .saturating_mul(MAX_OPENAPI_ENUM_SOURCES);
+        let outcome = load_enum_source_revisions(&client, maximum).await;
+        finish_read(&client, OPERATION_ENUM_SOURCE_VALUES, outcome).await
+    }
+
+    pub async fn enum_source_value(
+        &self,
+        id: &ConnectionId,
+        source_id: &str,
+    ) -> Result<Option<StoredEnumSourceValue>, ConnectionStoreError> {
+        let client = self
+            .pool
+            .get()
+            .await
+            .map_err(|_| pg_unavailable(OPERATION_ENUM_SOURCE_VALUES))?;
+        load_enum_source_value(&client, id, source_id).await
+    }
+
+    async fn read_enum_source_values(
+        &self,
+        requested: Option<&ConnectionId>,
+    ) -> Result<Vec<StoredEnumSourceValue>, ConnectionStoreError> {
+        let client = self
+            .pool
+            .get()
+            .await
+            .map_err(|_| pg_unavailable(OPERATION_ENUM_SOURCE_VALUES))?;
+        begin_snapshot(&client, OPERATION_ENUM_SOURCE_VALUES).await?;
+        let outcome = load_enum_source_values(&client, requested).await;
+        let values = finish_read(&client, OPERATION_ENUM_SOURCE_VALUES, outcome).await?;
+        let maximum = if requested.is_some() {
+            MAX_OPENAPI_ENUM_SOURCES
+        } else {
+            self.maximum_connections
+                .saturating_mul(MAX_OPENAPI_ENUM_SOURCES)
+        };
+        if values.len() > maximum {
+            return Err(ConnectionStoreError::LimitExceeded {
+                resource: "connection enum source values",
+                maximum,
+            });
+        }
+        Ok(values)
+    }
+
+    /// Publish one dynamic enum LKG under its source and Connection fences.
+    ///
+    /// This intentionally does not take the global Connection mutation lock or
+    /// emit a security outbox event: enum refresh is data-plane cache state,
+    /// not a catalog/policy mutation. Row locks on the Connection, overlay and
+    /// source serialize it against replacement/pruning without consuming the
+    /// catalog refresh semaphore.
+    pub async fn replace_enum_source_value(
+        &self,
+        write: &StoredEnumSourceValueWrite,
+        expected_values_revision: u64,
+    ) -> Result<StoredEnumSourceValue, ConnectionStoreError> {
+        let values_json = encode_enum_source_values(write)?;
+        if write.expected_values_revision != expected_values_revision {
+            return Err(ConnectionStoreError::Validation {
+                problems: vec![
+                    "enum source expected values revision does not match the fetched candidate"
+                        .to_owned(),
+                ],
+            });
+        }
+        let client = self
+            .pool
+            .get()
+            .await
+            .map_err(|_| pg_unavailable(OPERATION_ENUM_SOURCE_VALUES))?;
+        client
+            .batch_execute("BEGIN")
+            .await
+            .map_err(|error| pg_error(OPERATION_ENUM_SOURCE_VALUES, error))?;
+        let outcome: Result<StoredEnumSourceValue, ConnectionStoreError> = async {
+            // `SELECT .. FOR UPDATE` cannot lock a row that does not exist.
+            // Serialize the `(connection, source)` key first so two replicas
+            // racing the initial revision cannot both observe revision zero
+            // and let `ON CONFLICT` overwrite the winner with revision one.
+            let lock_name = format!(
+                "greengateway:enum-source:{}:{}",
+                write.connection_id, write.source_id
+            );
+            client
+                .execute(
+                    "SELECT pg_advisory_xact_lock(hashtextextended($1, 0))",
+                    &[&lock_name],
+                )
+                .await
+                .map_err(|error| pg_error(OPERATION_ENUM_SOURCE_VALUES, error))?;
+            let record = client
+                .query_opt(
+                    r#"
+                    SELECT connection_revision, credential_revision
+                    FROM greengateway.connection_records
+                    WHERE id = $1::text::uuid
+                    FOR SHARE
+                    "#,
+                    &[&write.connection_id.as_str()],
+                )
+                .await
+                .map_err(|error| pg_error(OPERATION_ENUM_SOURCE_VALUES, error))?
+                .ok_or_else(|| ConnectionStoreError::NotFound {
+                    id: write.connection_id.to_string(),
+                })?;
+            let current_connection_revision: i64 = column(
+                &record,
+                0,
+                write.connection_id.as_str(),
+                "enum source Connection revision does not decode as bigint",
+            )?;
+            let current_credential_revision: i64 = column(
+                &record,
+                1,
+                write.connection_id.as_str(),
+                "enum source credential revision does not decode as bigint",
+            )?;
+            let overlay = client
+                .query_opt(
+                    r#"
+                    SELECT overlay_revision
+                    FROM greengateway.connection_openapi_overlays
+                    WHERE connection_id = $1::text::uuid
+                    FOR SHARE
+                    "#,
+                    &[&write.connection_id.as_str()],
+                )
+                .await
+                .map_err(|error| pg_error(OPERATION_ENUM_SOURCE_VALUES, error))?;
+            let current_overlay_revision = match overlay {
+                Some(row) => persisted_revision(
+                    &write.connection_id,
+                    column(
+                        &row,
+                        0,
+                        write.connection_id.as_str(),
+                        "enum source overlay revision does not decode as bigint",
+                    )?,
+                    "invalid enum source overlay revision",
+                )?,
+                None => 0,
+            };
+            let previous = client
+                .query_opt(
+                    r#"
+                    SELECT values_revision, source_digest
+                    FROM greengateway.connection_enum_source_values
+                    WHERE connection_id = $1::text::uuid AND source_id = $2
+                    FOR UPDATE
+                    "#,
+                    &[&write.connection_id.as_str(), &write.source_id],
+                )
+                .await
+                .map_err(|error| pg_error(OPERATION_ENUM_SOURCE_VALUES, error))?;
+            let current_values_revision = match previous {
+                Some(ref row) => persisted_revision(
+                    &write.connection_id,
+                    column(
+                        row,
+                        0,
+                        write.connection_id.as_str(),
+                        "enum source values revision does not decode as bigint",
+                    )?,
+                    "invalid enum source values revision",
+                )?,
+                None => 0,
+            };
+            let current_source_digest = previous
+                .as_ref()
+                .map(|row| {
+                    column::<String>(
+                        row,
+                        1,
+                        write.connection_id.as_str(),
+                        "enum source digest does not decode as text",
+                    )
+                })
+                .transpose()?;
+            if current_values_revision != expected_values_revision
+                || current_source_digest
+                    .as_ref()
+                    .is_some_and(|source_digest| source_digest != &write.source_digest)
+                || current_overlay_revision != write.overlay_revision
+                || revision_from_i64(&write.connection_id, current_connection_revision, false)?
+                    != write.connection_revision
+                || revision_from_i64(&write.connection_id, current_credential_revision, true)?
+                    != write.credential_revision
+            {
+                return Err(ConnectionStoreError::EnumSourceConflict {
+                    id: write.connection_id.to_string(),
+                    source_id: write.source_id.clone(),
+                    current_values_revision,
+                });
+            }
+            let values_revision =
+                increment_revision(&write.connection_id, current_values_revision)?;
+            client
+                .execute(
+                    r#"
+                    INSERT INTO greengateway.connection_enum_source_values (
+                        connection_id, source_id, overlay_revision, source_digest,
+                        values_revision, connection_revision, credential_revision,
+                        credential_generation_digest, values_json, resolved_at
+                    ) VALUES ($1::text::uuid, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+                    ON CONFLICT (connection_id, source_id) DO UPDATE SET
+                        overlay_revision = excluded.overlay_revision,
+                        source_digest = excluded.source_digest,
+                        values_revision = excluded.values_revision,
+                        connection_revision = excluded.connection_revision,
+                        credential_revision = excluded.credential_revision,
+                        credential_generation_digest = excluded.credential_generation_digest,
+                        values_json = excluded.values_json,
+                        resolved_at = excluded.resolved_at
+                    "#,
+                    &[
+                        &write.connection_id.as_str(),
+                        &write.source_id,
+                        &u64_to_i64(&write.connection_id, write.overlay_revision)?,
+                        &write.source_digest,
+                        &u64_to_i64(&write.connection_id, values_revision)?,
+                        &u64_to_i64(&write.connection_id, write.connection_revision)?,
+                        &u64_to_i64(&write.connection_id, write.credential_revision)?,
+                        &write.credential_generation_digest,
+                        &values_json,
+                        &write.resolved_at,
+                    ],
+                )
+                .await
+                .map_err(|error| pg_error(OPERATION_ENUM_SOURCE_VALUES, error))?;
+            Ok(StoredEnumSourceValue {
+                connection_id: write.connection_id.clone(),
+                source_id: write.source_id.clone(),
+                overlay_revision: write.overlay_revision,
+                source_digest: write.source_digest.clone(),
+                values_revision,
+                connection_revision: write.connection_revision,
+                credential_revision: write.credential_revision,
+                credential_generation_digest: write.credential_generation_digest.clone(),
+                values: write.values.clone(),
+                labels: write.labels.clone(),
+                resolved_at: write.resolved_at.clone(),
+            })
+        }
+        .await;
+        match outcome {
+            Ok(stored) => {
+                commit(&client, OPERATION_ENUM_SOURCE_VALUES).await?;
+                Ok(stored)
+            }
+            Err(error) => {
+                let _ = client.batch_execute("ROLLBACK").await;
+                Err(error)
+            }
+        }
+    }
+
     async fn read_openapi_catalogs(
         &self,
         requested: Option<&ConnectionId>,
@@ -1199,6 +1484,39 @@ impl PostgresConnectionStore {
         compiled_overlay_revision: u64,
         actor_user_id: &str,
         policy_protected_names: &[String],
+    ) -> Result<StoredOpenApiCatalog, ConnectionStoreError> {
+        self.replace_openapi_catalog_with_overlay_and_enum_values(
+            id,
+            expected_connection_etag,
+            expected_spec_revision,
+            expected_catalog_revision,
+            spec,
+            spec_digest,
+            entries,
+            overlay,
+            compiled_overlay_revision,
+            actor_user_id,
+            policy_protected_names,
+            &[],
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn replace_openapi_catalog_with_overlay_and_enum_values(
+        &self,
+        id: &ConnectionId,
+        expected_connection_etag: &ConnectionEtag,
+        expected_spec_revision: u64,
+        expected_catalog_revision: u64,
+        spec: &str,
+        spec_digest: &str,
+        entries: &[StoredOpenApiCatalogEntry],
+        overlay: Option<&StoredOverlayWrite>,
+        compiled_overlay_revision: u64,
+        actor_user_id: &str,
+        policy_protected_names: &[String],
+        enum_values: &[StoredEnumSourceValueWrite],
     ) -> Result<StoredOpenApiCatalog, ConnectionStoreError> {
         validate_openapi_spec(spec, spec_digest)?;
         if let Some(overlay) = overlay {
@@ -1478,6 +1796,14 @@ impl PostgresConnectionStore {
                 previous_catalog_revision,
                 actor_user_id,
                 &now,
+            )
+            .await?;
+            write_catalog_enum_source_values(
+                &client,
+                id,
+                &current,
+                overlay_revision,
+                enum_values,
             )
             .await?;
             client
@@ -2365,7 +2691,8 @@ impl PostgresConnectionStore {
                     (SELECT COUNT(*) FROM greengateway.connection_current_status)
                   + (SELECT COUNT(*) FROM greengateway.connection_status_history),
                     (SELECT COALESCE(SUM(octet_length(definition_json)), 0)
-                     FROM greengateway.connection_openapi_catalog_entries)
+                     FROM greengateway.connection_openapi_catalog_entries),
+                    (SELECT COUNT(*) FROM greengateway.connection_enum_source_values)
                 "#,
                 &[],
             )
@@ -2419,6 +2746,15 @@ impl PostgresConnectionStore {
             return Err(ConnectionStoreError::LimitExceeded {
                 resource: "connection OpenAPI catalog definition bytes",
                 maximum: super::model::MAX_MANAGED_OPENAPI_CATALOG_BYTES,
+            });
+        }
+        let maximum_enum_rows = self
+            .maximum_connections
+            .saturating_mul(MAX_OPENAPI_ENUM_SOURCES);
+        if counted(&counts, 6, "<openapi-enum-source-values>")? > maximum_enum_rows {
+            return Err(ConnectionStoreError::LimitExceeded {
+                resource: "connection enum source values",
+                maximum: maximum_enum_rows,
             });
         }
         if mcp_catalog_bytes(client, None, OPERATION_VALIDATE).await?
@@ -2576,6 +2912,7 @@ impl PostgresConnectionStore {
         let mcp_catalogs = load_mcp_catalogs(client, None).await?;
         let openapi_catalogs = load_openapi_catalogs(client, None).await?;
         let openapi_overlays = load_openapi_overlays(client, None).await?;
+        let enum_source_values = load_enum_source_values(client, None).await?;
         let record_by_id = records
             .iter()
             .map(|record| (record.id.clone(), record))
@@ -2627,6 +2964,27 @@ impl PostgresConnectionStore {
                 id: "<openapi-overlays>".to_owned(),
                 reason: "OpenAPI overlay has no durable catalog",
             });
+        }
+        for row in &enum_source_values {
+            let Some(record) = record_by_id.get(&row.connection_id) else {
+                return Err(corrupt(
+                    &row.connection_id,
+                    "enum source value owner is missing",
+                ));
+            };
+            let overlay_matches = overlay_by_id
+                .get(&row.connection_id)
+                .is_some_and(|overlay| overlay.overlay_revision == row.overlay_revision);
+            if !supports_managed_openapi_catalog(&record.write)
+                || !overlay_matches
+                || row.connection_revision > record.revisions.connection
+                || row.credential_revision > record.revisions.credential
+            {
+                return Err(corrupt(
+                    &row.connection_id,
+                    "enum source values do not match their OpenAPI overlay generation",
+                ));
+            }
         }
         validate_managed_catalog_dependencies(
             client,
@@ -3215,6 +3573,323 @@ async fn load_openapi_overlays(
             })
         })
         .collect()
+}
+
+async fn load_enum_source_revisions(
+    client: &deadpool_postgres::Object,
+    maximum: usize,
+) -> Result<Vec<StoredEnumSourceRevision>, ConnectionStoreError> {
+    let limit = i64::try_from(maximum.saturating_add(1)).unwrap_or(i64::MAX);
+    let rows = client
+        .query(
+            r#"
+            SELECT connection_id::text, source_id, overlay_revision, source_digest,
+                   values_revision, connection_revision, credential_revision,
+                   credential_generation_digest
+            FROM greengateway.connection_enum_source_values
+            ORDER BY connection_id, source_id
+            LIMIT $1
+            "#,
+            &[&limit],
+        )
+        .await
+        .map_err(|error| pg_error(OPERATION_ENUM_SOURCE_VALUES, error))?;
+    if rows.len() > maximum {
+        return Err(ConnectionStoreError::LimitExceeded {
+            resource: "connection enum source values",
+            maximum,
+        });
+    }
+    const REASON: &str = "enum source revision column does not decode as its schema type";
+    rows.iter()
+        .map(|row| {
+            let raw_id: String = column(row, 0, "<enum-source-revision>", REASON)?;
+            let connection_id = parse_catalog_id(&raw_id)?;
+            let source_id: String = column(row, 1, &raw_id, REASON)?;
+            let source_digest: String = column(row, 3, &raw_id, REASON)?;
+            let credential_generation_digest: Option<String> = column(row, 7, &raw_id, REASON)?;
+            if !valid_overlay_local_name(&source_id)
+                || !valid_sha256_hex(&source_digest)
+                || credential_generation_digest
+                    .as_deref()
+                    .is_some_and(|digest| !valid_sha256_hex(digest))
+            {
+                return Err(ConnectionStoreError::CorruptRecord {
+                    id: raw_id,
+                    reason: "invalid enum source provenance",
+                });
+            }
+            Ok(StoredEnumSourceRevision {
+                connection_id: connection_id.clone(),
+                source_id,
+                overlay_revision: persisted_revision(
+                    &connection_id,
+                    column(row, 2, &raw_id, REASON)?,
+                    "invalid enum source overlay revision",
+                )?,
+                source_digest,
+                values_revision: persisted_revision(
+                    &connection_id,
+                    column(row, 4, &raw_id, REASON)?,
+                    "invalid enum source values revision",
+                )?,
+                connection_revision: persisted_revision(
+                    &connection_id,
+                    column(row, 5, &raw_id, REASON)?,
+                    "invalid enum source connection revision",
+                )?,
+                credential_revision: revision_from_i64(
+                    &connection_id,
+                    column(row, 6, &raw_id, REASON)?,
+                    true,
+                )?,
+                credential_generation_digest,
+            })
+        })
+        .collect()
+}
+
+async fn load_enum_source_values(
+    client: &deadpool_postgres::Object,
+    requested: Option<&ConnectionId>,
+) -> Result<Vec<StoredEnumSourceValue>, ConnectionStoreError> {
+    let rows = match requested {
+        Some(id) => {
+            client
+                .query(
+                    r#"
+                    SELECT connection_id::text, source_id, overlay_revision, source_digest,
+                           values_revision, connection_revision, credential_revision,
+                           credential_generation_digest, values_json, resolved_at
+                    FROM greengateway.connection_enum_source_values
+                    WHERE connection_id = $1::text::uuid
+                    ORDER BY connection_id, source_id
+                    "#,
+                    &[&id.as_str()],
+                )
+                .await
+        }
+        None => {
+            client
+                .query(
+                    r#"
+                    SELECT connection_id::text, source_id, overlay_revision, source_digest,
+                           values_revision, connection_revision, credential_revision,
+                           credential_generation_digest, values_json, resolved_at
+                    FROM greengateway.connection_enum_source_values
+                    ORDER BY connection_id, source_id
+                    "#,
+                    &[],
+                )
+                .await
+        }
+    }
+    .map_err(|error| pg_error(OPERATION_ENUM_SOURCE_VALUES, error))?;
+
+    rows.iter().map(decode_pg_enum_source_row).collect()
+}
+
+async fn load_enum_source_value(
+    client: &deadpool_postgres::Object,
+    id: &ConnectionId,
+    source_id: &str,
+) -> Result<Option<StoredEnumSourceValue>, ConnectionStoreError> {
+    client
+        .query_opt(
+            r#"
+            SELECT connection_id::text, source_id, overlay_revision, source_digest,
+                   values_revision, connection_revision, credential_revision,
+                   credential_generation_digest, values_json, resolved_at
+            FROM greengateway.connection_enum_source_values
+            WHERE connection_id = $1::text::uuid AND source_id = $2
+            "#,
+            &[&id.as_str(), &source_id],
+        )
+        .await
+        .map_err(|error| pg_error(OPERATION_ENUM_SOURCE_VALUES, error))?
+        .as_ref()
+        .map(decode_pg_enum_source_row)
+        .transpose()
+}
+
+fn decode_pg_enum_source_row(
+    row: &tokio_postgres::Row,
+) -> Result<StoredEnumSourceValue, ConnectionStoreError> {
+    const REASON: &str = "enum source value column does not decode as its schema type";
+    let raw_id: String = column(row, 0, "<enum-source-value>", REASON)?;
+    let connection_id = parse_catalog_id(&raw_id)?;
+    let source_id: String = column(row, 1, &raw_id, REASON)?;
+    let overlay_revision = persisted_revision(
+        &connection_id,
+        column(row, 2, &raw_id, REASON)?,
+        "invalid enum source overlay revision",
+    )?;
+    let source_digest: String = column(row, 3, &raw_id, REASON)?;
+    let values_revision = persisted_revision(
+        &connection_id,
+        column(row, 4, &raw_id, REASON)?,
+        "invalid enum source values revision",
+    )?;
+    let connection_revision = persisted_revision(
+        &connection_id,
+        column(row, 5, &raw_id, REASON)?,
+        "invalid enum source connection revision",
+    )?;
+    let credential_revision =
+        revision_from_i64(&connection_id, column(row, 6, &raw_id, REASON)?, true)?;
+    let credential_generation_digest: Option<String> = column(row, 7, &raw_id, REASON)?;
+    let values_json: String = column(row, 8, &raw_id, REASON)?;
+    let resolved_at: String = column(row, 9, &raw_id, REASON)?;
+    if !valid_overlay_local_name(&source_id)
+        || !valid_sha256_hex(&source_digest)
+        || credential_generation_digest
+            .as_deref()
+            .is_some_and(|digest| !valid_sha256_hex(digest))
+        || !valid_enum_source_timestamp(&resolved_at)
+    {
+        return Err(ConnectionStoreError::CorruptRecord {
+            id: raw_id,
+            reason: "invalid enum source provenance",
+        });
+    }
+    let document = decode_enum_source_values(&values_json).map_err(|_| {
+        ConnectionStoreError::CorruptRecord {
+            id: connection_id.to_string(),
+            reason: "invalid enum source values",
+        }
+    })?;
+    Ok(StoredEnumSourceValue {
+        connection_id,
+        source_id,
+        overlay_revision,
+        source_digest,
+        values_revision,
+        connection_revision,
+        credential_revision,
+        credential_generation_digest,
+        values: document.values,
+        labels: document.labels,
+        resolved_at,
+    })
+}
+
+async fn write_catalog_enum_source_values(
+    client: &deadpool_postgres::Object,
+    id: &ConnectionId,
+    current: &StoredConnection,
+    overlay_revision: u64,
+    writes: &[StoredEnumSourceValueWrite],
+) -> Result<(), ConnectionStoreError> {
+    if writes.len() > MAX_OPENAPI_ENUM_SOURCES {
+        return Err(ConnectionStoreError::LimitExceeded {
+            resource: "connection enum sources",
+            maximum: MAX_OPENAPI_ENUM_SOURCES,
+        });
+    }
+    let mut source_ids = BTreeSet::new();
+    for write in writes {
+        if &write.connection_id != id
+            || write.overlay_revision != overlay_revision
+            || write.connection_revision != current.revisions.connection
+            || write.credential_revision != current.revisions.credential
+            || !source_ids.insert(write.source_id.as_str())
+        {
+            return Err(ConnectionStoreError::Validation {
+                problems: vec![
+                    "resolved enum source values do not match the catalog generation".to_owned(),
+                ],
+            });
+        }
+        let values_json = encode_enum_source_values(write)?;
+        let previous = client
+            .query_opt(
+                "SELECT values_revision, source_digest FROM greengateway.connection_enum_source_values WHERE connection_id = $1::text::uuid AND source_id = $2 FOR UPDATE",
+                &[&id.as_str(), &write.source_id],
+            )
+            .await
+            .map_err(|error| pg_error(OPERATION_OPENAPI_CATALOG, error))?;
+        let current_source_digest = previous
+            .as_ref()
+            .map(|row| {
+                column::<String>(
+                    row,
+                    1,
+                    id.as_str(),
+                    "enum source digest does not decode as text",
+                )
+            })
+            .transpose()?;
+        if current_source_digest
+            .as_ref()
+            .is_some_and(|source_digest| source_digest != &write.source_digest)
+        {
+            return Err(ConnectionStoreError::Validation {
+                problems: vec![
+                    "resolved enum source values do not match the stored source generation"
+                        .to_owned(),
+                ],
+            });
+        }
+        let current_values_revision = match previous {
+            Some(row) => persisted_revision(
+                id,
+                column(
+                    &row,
+                    0,
+                    id.as_str(),
+                    "enum source values revision does not decode as bigint",
+                )?,
+                "invalid enum source values revision",
+            )?,
+            None => 0,
+        };
+        if current_values_revision != write.expected_values_revision {
+            return Err(ConnectionStoreError::EnumSourceConflict {
+                id: id.to_string(),
+                source_id: write.source_id.clone(),
+                current_values_revision,
+            });
+        }
+        let values_revision = increment_revision(id, current_values_revision)?;
+        let overlay_revision = u64_to_i64(id, write.overlay_revision)?;
+        let values_revision = u64_to_i64(id, values_revision)?;
+        let connection_revision = u64_to_i64(id, write.connection_revision)?;
+        let credential_revision = u64_to_i64(id, write.credential_revision)?;
+        client
+            .execute(
+                r#"
+                INSERT INTO greengateway.connection_enum_source_values (
+                    connection_id, source_id, overlay_revision, source_digest,
+                    values_revision, connection_revision, credential_revision,
+                    credential_generation_digest, values_json, resolved_at
+                ) VALUES ($1::text::uuid, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+                ON CONFLICT (connection_id, source_id) DO UPDATE SET
+                    overlay_revision = excluded.overlay_revision,
+                    source_digest = excluded.source_digest,
+                    values_revision = excluded.values_revision,
+                    connection_revision = excluded.connection_revision,
+                    credential_revision = excluded.credential_revision,
+                    credential_generation_digest = excluded.credential_generation_digest,
+                    values_json = excluded.values_json,
+                    resolved_at = excluded.resolved_at
+                "#,
+                &[
+                    &id.as_str(),
+                    &write.source_id,
+                    &overlay_revision,
+                    &write.source_digest,
+                    &values_revision,
+                    &connection_revision,
+                    &credential_revision,
+                    &write.credential_generation_digest,
+                    &values_json,
+                    &write.resolved_at,
+                ],
+            )
+            .await
+            .map_err(|error| pg_error(OPERATION_OPENAPI_CATALOG, error))?;
+    }
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)] // One argument per independently fenced catalog/overlay axis.
@@ -4343,6 +5018,7 @@ pub(crate) struct ImportedConnection {
     pub mcp_catalog: Option<StoredMcpCatalog>,
     pub openapi_catalog: Option<StoredOpenApiCatalog>,
     pub openapi_overlay: Option<StoredOpenApiOverlay>,
+    pub enum_source_values: Vec<StoredEnumSourceValue>,
 }
 
 /// What one import step wrote, per table, for the section's report.
@@ -4361,6 +5037,7 @@ pub(crate) struct ImportedConnectionCounts {
     pub openapi_catalogs: i64,
     pub openapi_catalog_entries: i64,
     pub openapi_overlays: i64,
+    pub enum_source_values: i64,
     pub tool_name_reservations: i64,
     /// The one shared security revision the step took, or 0 when it had
     /// nothing to write.
@@ -4405,6 +5082,44 @@ pub(crate) async fn import_connections_in(
                     )],
                 });
             }
+        }
+        let overlay_revision = connection
+            .openapi_overlay
+            .as_ref()
+            .map_or(0, |overlay| overlay.overlay_revision);
+        if connection.enum_source_values.len() > MAX_OPENAPI_ENUM_SOURCES {
+            return Err(ConnectionStoreError::LimitExceeded {
+                resource: "connection enum source values",
+                maximum: MAX_OPENAPI_ENUM_SOURCES,
+            });
+        }
+        let mut enum_source_ids = BTreeSet::new();
+        for row in &connection.enum_source_values {
+            if row.connection_id != *id
+                || row.overlay_revision != overlay_revision
+                || row.connection_revision > record.revisions.connection
+                || row.credential_revision > record.revisions.credential
+                || !enum_source_ids.insert(row.source_id.as_str())
+            {
+                return Err(ConnectionStoreError::Validation {
+                    problems: vec![format!(
+                        "imported enum source values do not match Connection '{id}'"
+                    )],
+                });
+            }
+            encode_enum_source_values(&StoredEnumSourceValueWrite {
+                connection_id: row.connection_id.clone(),
+                source_id: row.source_id.clone(),
+                overlay_revision: row.overlay_revision,
+                source_digest: row.source_digest.clone(),
+                expected_values_revision: row.values_revision,
+                connection_revision: row.connection_revision,
+                credential_revision: row.credential_revision,
+                credential_generation_digest: row.credential_generation_digest.clone(),
+                values: row.values.clone(),
+                labels: row.labels.clone(),
+                resolved_at: row.resolved_at.clone(),
+            })?;
         }
         // The PostgreSQL key column is `uuid` and the managed store only
         // ever mints UUIDs (`ConnectionId::new_managed`). A source row
@@ -4573,6 +5288,14 @@ pub(crate) async fn import_connections_in(
             import_openapi_catalog(client, id, catalog, actor_user_id, &mut counts, OPERATION)
                 .await?;
         }
+        import_enum_source_values(
+            client,
+            id,
+            &connection.enum_source_values,
+            &mut counts,
+            OPERATION,
+        )
+        .await?;
     }
 
     // The catalog lanes' names at the authority. `reserve_tool_names`
@@ -4945,6 +5668,63 @@ async fn import_openapi_overlay(
             .map_err(|error| pg_error(operation, error))?,
     )
     .unwrap_or(i64::MAX);
+    Ok(())
+}
+
+async fn import_enum_source_values(
+    client: &deadpool_postgres::Object,
+    id: &ConnectionId,
+    rows: &[StoredEnumSourceValue],
+    counts: &mut ImportedConnectionCounts,
+    operation: &'static str,
+) -> Result<(), ConnectionStoreError> {
+    for row in rows {
+        let values_json = encode_enum_source_values(&StoredEnumSourceValueWrite {
+            connection_id: row.connection_id.clone(),
+            source_id: row.source_id.clone(),
+            overlay_revision: row.overlay_revision,
+            source_digest: row.source_digest.clone(),
+            expected_values_revision: row.values_revision,
+            connection_revision: row.connection_revision,
+            credential_revision: row.credential_revision,
+            credential_generation_digest: row.credential_generation_digest.clone(),
+            values: row.values.clone(),
+            labels: row.labels.clone(),
+            resolved_at: row.resolved_at.clone(),
+        })?;
+        let overlay_revision = u64_to_i64(id, row.overlay_revision)?;
+        let values_revision = u64_to_i64(id, row.values_revision)?;
+        let connection_revision = u64_to_i64(id, row.connection_revision)?;
+        let credential_revision = u64_to_i64(id, row.credential_revision)?;
+        counts.enum_source_values += i64::try_from(
+            client
+                .execute(
+                    r#"
+                    INSERT INTO greengateway.connection_enum_source_values (
+                        connection_id, source_id, overlay_revision, source_digest,
+                        values_revision, connection_revision, credential_revision,
+                        credential_generation_digest, values_json, resolved_at
+                    ) VALUES ($1::text::uuid, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+                    ON CONFLICT (connection_id, source_id) DO NOTHING
+                    "#,
+                    &[
+                        &id.as_str(),
+                        &row.source_id,
+                        &overlay_revision,
+                        &row.source_digest,
+                        &values_revision,
+                        &connection_revision,
+                        &credential_revision,
+                        &row.credential_generation_digest,
+                        &values_json,
+                        &row.resolved_at,
+                    ],
+                )
+                .await
+                .map_err(|error| pg_error(operation, error))?,
+        )
+        .unwrap_or(i64::MAX);
+    }
     Ok(())
 }
 
@@ -6435,6 +7215,39 @@ mod tests {
         );
         drop(client);
 
+        let seeded = store
+            .enum_source_values_for_connection(&api.id)
+            .await
+            .expect("typed enum LKG read should succeed");
+        assert_eq!(seeded.len(), 1);
+        assert_eq!(seeded[0].values, vec![json!("na"), json!("eu")]);
+        let replacement = StoredEnumSourceValueWrite {
+            connection_id: api.id.clone(),
+            source_id: "regions".to_owned(),
+            overlay_revision: 1,
+            source_digest: source_digest.clone(),
+            expected_values_revision: 1,
+            connection_revision: api.revisions.connection,
+            credential_revision: api.revisions.credential,
+            credential_generation_digest: Some(credential_generation_digest.clone()),
+            values: vec![json!("apac"), json!(true)],
+            labels: None,
+            resolved_at: "2026-09-03T00:01:00Z".to_owned(),
+        };
+        let replaced = store
+            .replace_enum_source_value(&replacement, 1)
+            .await
+            .expect("exact PostgreSQL enum CAS should publish");
+        assert_eq!(replaced.values_revision, 2);
+        assert_eq!(replaced.values, replacement.values);
+        assert!(matches!(
+            store.replace_enum_source_value(&replacement, 1).await,
+            Err(ConnectionStoreError::EnumSourceConflict {
+                current_values_revision: 2,
+                ..
+            })
+        ));
+
         let stale = store
             .replace_openapi_catalog_with_overlay(
                 &api.id,
@@ -6778,6 +7591,84 @@ mod tests {
             deleted,
             "orphan report rejection rolls back the catalog replacement"
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn enum_source_initial_cas_has_one_cross_replica_winner() {
+        let Some(admin_dsn) = locator() else {
+            eprintln!("skipping: no test database locator; CI runs this test");
+            return;
+        };
+        let database = create_test_database(&admin_dsn).await;
+        let (store_a, pool) = migrated_store(&database.dsn, 64).await;
+        let store_b = PostgresConnectionStore::new(pool.clone(), 64).expect("second replica");
+        let api = store_a
+            .create(http_candidate("Enum CAS API"), "enum-cas-create", None)
+            .await
+            .expect("connection should create");
+        let digest = reservation_spec_digest();
+        store_a
+            .replace_openapi_catalog_with_overlay(
+                &api.id,
+                &api.etag(),
+                0,
+                0,
+                RESERVATION_SPEC,
+                &digest,
+                &[openapi_entry("enum_cas_tool")],
+                Some(&StoredOverlayWrite::Put {
+                    schema_version: "0.1.0".to_owned(),
+                    overlay_json: r#"{"schema_version":"0.1.0","tools":{}}"#.to_owned(),
+                    source_reports_json: StoredOpenApiSourceReports::empty()
+                        .canonical_json()
+                        .expect("empty reports serialize"),
+                    expected_overlay_revision: 0,
+                }),
+                1,
+                "enum-cas-overlay",
+                &[],
+            )
+            .await
+            .expect("overlay should publish");
+
+        let write = |value: &str| StoredEnumSourceValueWrite {
+            connection_id: api.id.clone(),
+            source_id: "regions".to_owned(),
+            overlay_revision: 1,
+            source_digest: "a".repeat(64),
+            expected_values_revision: 0,
+            connection_revision: api.revisions.connection,
+            credential_revision: api.revisions.credential,
+            credential_generation_digest: Some("b".repeat(64)),
+            values: vec![json!(value)],
+            labels: None,
+            resolved_at: "2026-09-03T00:00:00Z".to_owned(),
+        };
+        let a_write = write("replica-a");
+        let b_write = write("replica-b");
+        let (a, b) = tokio::join!(
+            store_a.replace_enum_source_value(&a_write, 0),
+            store_b.replace_enum_source_value(&b_write, 0),
+        );
+        assert_eq!(usize::from(a.is_ok()) + usize::from(b.is_ok()), 1);
+        let loser = match (a, b) {
+            (Ok(_), Err(error)) | (Err(error), Ok(_)) => error,
+            _ => unreachable!("one winner was asserted"),
+        };
+        assert!(matches!(
+            loser,
+            ConnectionStoreError::EnumSourceConflict {
+                current_values_revision: 1,
+                ..
+            }
+        ));
+        let rows = store_a
+            .enum_source_values_for_connection(&api.id)
+            .await
+            .expect("winner should read");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].values_revision, 1);
+        assert!(rows[0].values == a_write.values || rows[0].values == b_write.values);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -7205,6 +8096,7 @@ mod tests {
                         openapi_catalogs: Vec::new(),
                         openapi_inventory_catalogs: Vec::new(),
                         openapi_overlays: Vec::new(),
+                        enum_source_values: std::sync::Mutex::new(Some(Vec::new())),
                     }),
                 },
                 records: Vec::new(),
@@ -7299,6 +8191,7 @@ mod tests {
                         openapi_catalogs: Vec::new(),
                         openapi_inventory_catalogs: Vec::new(),
                         openapi_overlays: Vec::new(),
+                        enum_source_values: std::sync::Mutex::new(Some(Vec::new())),
                     }),
                 },
                 records: Vec::new(),

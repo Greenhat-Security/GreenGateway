@@ -22,6 +22,7 @@ use crate::{
         Config, DEFAULT_TOOL_RUNTIME_DEFAULT_TIMEOUT_MS, DEFAULT_TOOL_RUNTIME_GLOBAL_CONCURRENCY,
         DEFAULT_TOOL_RUNTIME_QUEUE_DEPTH, DEFAULT_TOOL_RUNTIME_QUEUE_TIMEOUT_MS,
     },
+    connections::model::ConnectionId,
     middleware::rbac::{
         MatchedRuleDecision, RbacState, ToolAuthorizationSnapshot, ToolPolicySnapshot,
     },
@@ -31,6 +32,8 @@ use crate::{
     },
     tools::lease::{self, ExecutionLease, ExecutionLeaseStore, LeaseAttempt},
 };
+
+use super::enum_source::{EnumSourceFailureReason, SourceAuthorizer};
 
 const AUTHZ_ALLOWED: &str = "authz.allowed";
 const AUTHZ_DENIED: &str = "authz.denied";
@@ -218,10 +221,9 @@ pub enum ToolRuntimeError {
 }
 
 pub(crate) enum ToolWorkErrorDisposition {
-    Failure(Option<String>),
-    FailureWithDetails {
+    Failure {
         reason: Option<String>,
-        details: Value,
+        details: Option<Value>,
     },
     Rejected(String),
 }
@@ -720,7 +722,10 @@ impl ToolRuntime {
             context,
             cancel,
             move |_| work(),
-            |_| ToolWorkErrorDisposition::Failure(None),
+            |_| ToolWorkErrorDisposition::Failure {
+                reason: None,
+                details: None,
+            },
         )
         .await
     }
@@ -793,7 +798,7 @@ impl ToolRuntime {
                     }
                     Ok(Err(err)) => {
                         match failure_reason(&err) {
-                            ToolWorkErrorDisposition::Failure(reason) => {
+                            ToolWorkErrorDisposition::Failure { reason, details } => {
                                 let message = err.to_string();
                                 self.emit(
                                     audit::event::TOOL_INVOKE_FAILURE,
@@ -806,23 +811,7 @@ impl ToolRuntime {
                                     tool_name: tool_name.to_owned(),
                                     message,
                                     reason,
-                                    details: None,
-                                })
-                            }
-                            ToolWorkErrorDisposition::FailureWithDetails { reason, details } => {
-                                let message = err.to_string();
-                                self.emit(
-                                    audit::event::TOOL_INVOKE_FAILURE,
-                                    &context,
-                                    tool_name,
-                                    "failure",
-                                    Some("work_error"),
-                                );
-                                Err(ToolRuntimeError::WorkFailed {
-                                    tool_name: tool_name.to_owned(),
-                                    message,
-                                    reason,
-                                    details: Some(details),
+                                    details,
                                 })
                             }
                             ToolWorkErrorDisposition::Rejected(reason) => {
@@ -1383,6 +1372,132 @@ impl ToolRuntime {
     }
 }
 
+impl SourceAuthorizer for ToolRuntime {
+    fn authorize(
+        &self,
+        connection_id: &ConnectionId,
+        source_id: &str,
+        tool: Option<&str>,
+        rendered_path_and_query: &str,
+        audit_path_template: &str,
+    ) -> Result<(), EnumSourceFailureReason> {
+        // Fixed overlay query values are not authorization metadata and may
+        // themselves be sensitive. Strip them before either policy matching
+        // or a denial audit is possible.
+        let rendered_path = rendered_path_and_query
+            .split_once('?')
+            .map_or(rendered_path_and_query, |(path, _)| path);
+        // Query mappings can also render path placeholders. Rules must see the
+        // concrete path, but audit metadata must retain only the operator's
+        // safe template so those mapped values can never be disclosed.
+        let audit_path = audit_path_template
+            .split_once('?')
+            .map_or(audit_path_template, |(path, _)| path);
+        if let Some(tool_name) = tool {
+            let enabled = if let Some(rbac_state) = &self.inner.rbac_state {
+                rbac_state
+                    .current_policy()
+                    .tools
+                    .get(tool_name)
+                    .is_some_and(|entry| entry.enabled)
+            } else {
+                self.lookup_tool(tool_name)
+                    .is_ok_and(|state| state.config.enabled)
+            };
+            if !enabled {
+                self.emit_enum_source_denial(
+                    connection_id,
+                    source_id,
+                    tool,
+                    audit_path,
+                    "tool_disabled",
+                    None,
+                );
+                return Err(EnumSourceFailureReason::ToolDisabled);
+            }
+        }
+
+        // Source requests have no caller principal or inbound route. Only an
+        // explicit deny can block this contextless internal GET; allow and
+        // shadow rules cannot grant additional authority. Match the rendered
+        // path identity, excluding the deterministic query string.
+        let matched_rule_id = if let Some(rbac_state) = &self.inner.rbac_state {
+            let policy = rbac_state.current_policy();
+            RuleMatcher::new(&policy.rules)
+                .evaluate_denies_with_dispatch(
+                    "GET",
+                    rendered_path,
+                    None,
+                    RuleDispatchContext::contextless(),
+                )
+                .map(|decision| {
+                    policy
+                        .rules
+                        .get(decision.rule_index)
+                        .and_then(|rule| rule.id.clone())
+                        .unwrap_or_else(|| decision.rule_index.to_string())
+                })
+        } else {
+            self.inner
+                .rule_matcher
+                .evaluate_denies_with_dispatch(
+                    "GET",
+                    rendered_path,
+                    None,
+                    RuleDispatchContext::contextless(),
+                )
+                .map(|decision| self.rule_id(decision.rule_index))
+        };
+        if let Some(matched_rule_id) = matched_rule_id {
+            self.emit_enum_source_denial(
+                connection_id,
+                source_id,
+                tool,
+                audit_path,
+                "http_rule_denied",
+                Some(&matched_rule_id),
+            );
+            return Err(EnumSourceFailureReason::HttpRuleDenied);
+        }
+        Ok(())
+    }
+}
+
+impl ToolRuntime {
+    fn emit_enum_source_denial(
+        &self,
+        connection_id: &ConnectionId,
+        source_id: &str,
+        tool_name: Option<&str>,
+        path: &str,
+        reason: &'static str,
+        matched_rule_id: Option<&str>,
+    ) {
+        self.inner.audit.emit(AuditEvent::new(
+            AUTHZ_DENIED,
+            "enum-source-refresh",
+            "internal",
+            Some(Actor {
+                user_id: "system".to_owned(),
+                issuer: None,
+                email: None,
+                roles: None,
+                auth_mode: "system".to_owned(),
+            }),
+            json!({
+                "connection_id": connection_id,
+                "source_id": source_id,
+                "tool_name": tool_name,
+                "path": path,
+                "method": "GET",
+                "reason": reason,
+                "matched_rule_id": matched_rule_id,
+                "invocation_source": "enum_source",
+            }),
+        ));
+    }
+}
+
 fn tool_config_from_policy(entry: &policy::ToolPolicyEntry) -> ToolRuntimeToolConfig {
     ToolRuntimeToolConfig {
         enabled: entry.enabled,
@@ -1568,15 +1683,15 @@ mod tests {
                 context(),
                 CancellationToken::new(),
                 |_| async { Err::<(), _>("safe failure") },
-                |_| ToolWorkErrorDisposition::FailureWithDetails {
+                |_| ToolWorkErrorDisposition::Failure {
                     reason: Some("invalid_params".to_owned()),
-                    details: json!({
+                    details: Some(json!({
                         "problems": [{
                             "path": "/amount",
                             "keyword": "codec",
                             "reason": "fractional precision is too large",
                         }],
-                    }),
+                    })),
                 },
             )
             .await
@@ -1606,6 +1721,67 @@ mod tests {
 
         assert!(matches!(error, ToolRuntimeError::Disabled { .. }));
         assert_rejected_events(&capture, "disabled", "disabled", 1).await;
+    }
+
+    #[tokio::test]
+    async fn enum_source_authorization_denies_before_egress_and_never_audits_query_values() {
+        let query_canary = "metadata-api-key-must-not-enter-audit";
+        let path_canary = "tenant-secret-must-not-enter-audit";
+        let policy = Policy::validate_json_value(json!({
+            "schema_version": "0.1.0",
+            "tools": {
+                "metadata": {
+                    "timeout_ms": 5000,
+                    "max_concurrent": 2
+                }
+            },
+            "rules": [{
+                "id": "deny-metadata-source",
+                "methods": ["GET"],
+                "path": format!("/metadata/{path_canary}/statuses"),
+                "action": "deny"
+            }]
+        }))
+        .expect("enum source policy should parse");
+        let capture = CaptureSink::new();
+        let audit = AuditLog::new(Arc::new(capture.clone()) as Arc<dyn AuditSink>);
+        let rbac_state = crate::middleware::rbac::RbacState::new(
+            policy.clone(),
+            Vec::new(),
+            false,
+            audit.clone(),
+        );
+        let config = ToolRuntimeConfig::from_policy(&policy)
+            .expect("the source tool should configure the runtime");
+        let runtime = ToolRuntime::new_with_rbac_state(config, audit, Some(rbac_state));
+        let connection_id =
+            ConnectionId::parse("metadata-api").expect("test Connection id should parse");
+
+        let denied = runtime.authorize(
+            &connection_id,
+            "statuses",
+            Some("metadata"),
+            &format!("/metadata/{path_canary}/statuses?api_key={query_canary}"),
+            "/metadata/{tenant}/statuses",
+        );
+
+        assert_eq!(denied, Err(EnumSourceFailureReason::HttpRuleDenied));
+        wait_until(Duration::from_secs(1), || capture.len() == 1).await;
+        let events = capture.events();
+        assert_eq!(events.len(), 1, "{events:#?}");
+        assert_eq!(events[0].event_type, AUTHZ_DENIED);
+        assert_eq!(events[0].payload["connection_id"], json!("metadata-api"));
+        assert_eq!(
+            events[0].payload["path"],
+            json!("/metadata/{tenant}/statuses")
+        );
+        assert_eq!(
+            events[0].payload["matched_rule_id"],
+            json!("deny-metadata-source")
+        );
+        let serialized = serde_json::to_string(&events).expect("audit events should serialize");
+        assert!(!serialized.contains(query_canary));
+        assert!(!serialized.contains(path_canary));
     }
 
     #[tokio::test]

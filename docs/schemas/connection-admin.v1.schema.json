@@ -2013,6 +2013,14 @@
         },
         "transform": {
           "$ref": "#/$defs/ToolTransform"
+        },
+        "enum_bindings": {
+          "type": "array",
+          "maxItems": 256,
+          "items": {
+            "$ref": "#/$defs/OpenApiEnumBinding"
+          },
+          "description": "Stable source bindings only; current values are injected into served clones and are never stored here."
         }
       }
     },
@@ -2055,8 +2063,8 @@
         "wire",
         "response"
       ],
-      "properties": {
-        "wire_property": {
+        "properties": {
+          "wire_property": {
           "type": "string",
           "minLength": 1,
           "maxLength": 256
@@ -2173,6 +2181,29 @@
         }
       }
     },
+    "OpenApiEnumBinding": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "property",
+        "source_id",
+        "source_digest"
+      ],
+      "properties": {
+        "property": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256
+        },
+        "source_id": {
+          "$ref": "#/$defs/OpenApiOverlayLocalName"
+        },
+        "source_digest": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
+        }
+      }
+    },
     "OpenApiOverlayDocument": {
       "type": "object",
       "additionalProperties": false,
@@ -2218,6 +2249,26 @@
             "$ref": "#/$defs/OpenApiOverlayShape"
           }
         },
+        "enum_sources": {
+          "type": "object",
+          "maxProperties": 64,
+          "propertyNames": {
+            "$ref": "#/$defs/OpenApiOverlayLocalName"
+          },
+          "additionalProperties": {
+            "$ref": "#/$defs/OpenApiOverlayEnumSource"
+          }
+        },
+        "label_sources": {
+          "type": "object",
+          "maxProperties": 64,
+          "propertyNames": {
+            "$ref": "#/$defs/OpenApiOverlayLocalName"
+          },
+          "additionalProperties": {
+            "$ref": "#/$defs/OpenApiOverlayLabelSource"
+          }
+        },
         "tools": {
           "type": "object",
           "maxProperties": 4096,
@@ -2237,7 +2288,7 @@
           "description": "Synthetic saga tools keyed by the served composite tool name."
         }
       },
-      "description": "The v0.1 per-Connection OpenAPI overlay request shape, including declarative request/response transforms and bounded composites, kept in lockstep with connection-overlay.v0.schema.json."
+      "description": "The v0.1 per-Connection OpenAPI overlay request shape, including declarative request/response transforms, dynamic enum and label sources, and bounded composites, kept in lockstep with connection-overlay.v0.schema.json."
     },
     "OpenApiOverlayDisambiguation": {
       "type": "object",
@@ -2267,7 +2318,7 @@
             "title",
             "description"
           ],
-          "description": "Label priority. label_source is reserved and contributes no value until label-source support lands."
+          "description": "Label priority. label_source reads the tool's labels_from source."
         },
         "template": {
           "type": "string",
@@ -2300,6 +2351,10 @@
           "minLength": 1,
           "maxLength": 4096
         },
+        "labels_from": {
+          "$ref": "#/$defs/OpenApiOverlayLocalName",
+          "description": "A label_sources entry keyed by generated top-level property names."
+        },
         "parameters": {
           "type": "object",
           "maxProperties": 256,
@@ -2329,6 +2384,9 @@
         },
         "shape": {
           "$ref": "#/$defs/OpenApiOverlayShapeOrUse"
+        },
+        "enum_source": {
+          "$ref": "#/$defs/OpenApiOverlayLocalName"
         }
       }
     },
@@ -2345,7 +2403,8 @@
     "OpenApiOverlaySelector": {
       "type": "string",
       "maxLength": 1024,
-      "pattern": "^(/([A-Za-z0-9_.-]+(\\[[A-Za-z0-9_.-]+=(int:-?[0-9]{1,18}|bool:(true|false)|[^\\]/]{1,128})\\])?|\\*))+$"
+      "pattern": "^(/([A-Za-z0-9_.-]+(\\[[A-Za-z0-9_.-]+=(int:-?[0-9]{1,18}|bool:(true|false)|[^\\]/]{1,128})\\])?|\\*))+$",
+      "description": "Bounded selector with at most 32 segments; typed int:/bool: filters never coerce."
     },
     "OpenApiOverlayShapeOrUse": {
       "oneOf": [
@@ -2587,10 +2646,6 @@
       "maxLength": 128,
       "pattern": "^[A-Za-z0-9_.-]+$"
     },
-    "OpenApiOverlayEnumSourceReference": {
-      "not": {},
-      "description": "Reserved: a parameter's reference to an enum_sources entry."
-    },
     "OpenApiOverlayComposites": {
       "type": "object",
       "maxProperties": 256,
@@ -2652,7 +2707,8 @@
             "additionalProperties": false,
             "properties": {
               "enum_source": {
-                "$ref": "#/$defs/OpenApiOverlayEnumSourceReference"
+                "$ref": "#/$defs/OpenApiOverlayLocalName",
+                "description": "An enum_sources entry applied to this composite input property."
               }
             }
           }
@@ -2853,6 +2909,170 @@
         }
       ]
     },
+    "OpenApiOverlaySourceRequest": {
+      "type": "object",
+      "additionalProperties": false,
+      "oneOf": [
+        {
+          "required": [
+            "tool"
+          ]
+        },
+        {
+          "required": [
+            "path"
+          ]
+        }
+      ],
+      "properties": {
+        "tool": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[A-Za-z0-9_.-]+$",
+          "description": "Generated GET tool name."
+        },
+        "path": {
+          "type": "string",
+          "pattern": "^/(?!/)[^?#\\\\]*$",
+          "maxLength": 1024,
+          "description": "Origin-relative GET path."
+        },
+        "query": {
+          "type": "object",
+          "maxProperties": 16,
+          "additionalProperties": {
+            "type": "string",
+            "maxLength": 256
+          }
+        }
+      }
+    },
+    "OpenApiOverlaySourceLimits": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "min_items": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 1024,
+          "default": 1
+        },
+        "max_items": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 1024,
+          "default": 256
+        },
+        "max_value_bytes": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 1024,
+          "default": 256
+        },
+        "max_label_bytes": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 64,
+          "default": 64
+        },
+        "max_response_bytes": {
+          "type": "integer",
+          "minimum": 1024,
+          "maximum": 2097152,
+          "default": 1048576
+        }
+      }
+    },
+    "OpenApiOverlayEnumSource": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "request",
+        "select"
+      ],
+      "properties": {
+        "request": {
+          "$ref": "#/$defs/OpenApiOverlaySourceRequest"
+        },
+        "select": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "items",
+            "value"
+          ],
+          "properties": {
+            "items": {
+              "$ref": "#/$defs/OpenApiOverlaySelector"
+            },
+            "value": {
+              "$ref": "#/$defs/OpenApiOverlayJsonPointer"
+            },
+            "label": {
+              "$ref": "#/$defs/OpenApiOverlayJsonPointer"
+            }
+          }
+        },
+        "cache": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "ttl_secs": {
+              "type": "integer",
+              "minimum": 60,
+              "maximum": 86400,
+              "default": 300
+            },
+            "max_stale_secs": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 2592000,
+              "default": 604800
+            }
+          }
+        },
+        "limits": {
+          "$ref": "#/$defs/OpenApiOverlaySourceLimits"
+        }
+      }
+    },
+    "OpenApiOverlayLabelSource": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "request",
+        "select"
+      ],
+      "properties": {
+        "request": {
+          "$ref": "#/$defs/OpenApiOverlaySourceRequest"
+        },
+        "select": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "items",
+            "key",
+            "label"
+          ],
+          "properties": {
+            "items": {
+              "$ref": "#/$defs/OpenApiOverlaySelector"
+            },
+            "key": {
+              "$ref": "#/$defs/OpenApiOverlayJsonPointer"
+            },
+            "label": {
+              "$ref": "#/$defs/OpenApiOverlayJsonPointer"
+            }
+          }
+        },
+        "limits": {
+          "$ref": "#/$defs/OpenApiOverlaySourceLimits"
+        }
+      }
+    },
     "OpenApiOverlayEtag": {
       "type": "string",
       "minLength": 17,
@@ -2909,6 +3129,7 @@
         "served_name",
         "visibility",
         "labels_found",
+        "labels_from_source",
         "labels_from_title",
         "labels_from_description",
         "qualified_properties",
@@ -2942,6 +3163,11 @@
           "minimum": 0,
           "maximum": 256
         },
+        "labels_from_source": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 256
+        },
         "labels_from_title": {
           "type": "integer",
           "minimum": 0,
@@ -2965,7 +3191,7 @@
           "type": "string",
           "minLength": 1,
           "maxLength": 1024,
-          "description": "Human-readable bounded summary; when none match the configured document label sources it states '0 labels matched the configured document label sources'. This does not imply that the document has no titles or descriptions, because label_from may exclude them."
+          "description": "Human-readable bounded summary of labels found from source, title, and description inputs."
         }
       }
     },
@@ -3063,7 +3289,7 @@
         "sources": {
           "type": "array",
           "maxItems": 128,
-          "description": "Compile-time source reports projected from the canonical snapshot stored with the overlay; empty when this revision accepts no source declarations.",
+          "description": "Source results from the synchronous compile or preview resolve. Returning this report performs no additional source I/O.",
           "items": {
             "$ref": "#/$defs/OpenApiOverlaySourceStatus"
           }
@@ -3123,7 +3349,7 @@
         "sources": {
           "type": "array",
           "maxItems": 128,
-          "description": "Compile-time source reports projected from the canonical snapshot stored with the overlay and available after restart without source I/O.",
+          "description": "Current enum-source states projected from this replica's exact in-memory cache, combined with durable compile-time label-source reports. Reading the overlay performs no source I/O.",
           "items": {
             "$ref": "#/$defs/OpenApiOverlaySourceStatus"
           }
@@ -3875,6 +4101,45 @@
         }
       }
     },
+    "CapabilityDynamicEnum": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "property",
+        "source_id",
+        "state",
+        "item_count"
+      ],
+      "properties": {
+        "property": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256
+        },
+        "source_id": {
+          "$ref": "#/$defs/OpenApiOverlayLocalName"
+        },
+        "state": {
+          "enum": [
+            "fresh",
+            "stale",
+            "missing"
+          ]
+        },
+        "item_count": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 1024
+        },
+        "values_revision": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "resolved_at": {
+          "$ref": "#/$defs/Timestamp"
+        }
+      }
+    },
     "CapabilityDetail": {
       "type": "object",
       "additionalProperties": false,
@@ -3954,6 +4219,14 @@
         },
         "transform": {
           "$ref": "#/$defs/CapabilityTransformSummary"
+        },
+        "dynamic_enums": {
+          "type": "array",
+          "maxItems": 256,
+          "items": {
+            "$ref": "#/$defs/CapabilityDynamicEnum"
+          },
+          "description": "Dynamic enum state for this tool. Values themselves are available through the served input schema and are not repeated in inventory."
         },
         "actions": {
           "$ref": "#/$defs/CapabilityActions"
@@ -4462,6 +4735,57 @@
           "maxItems": 32,
           "items": {
             "$ref": "#/$defs/TransformProblem"
+          }
+        }
+      }
+    },
+    "ToolInputValidationProblem": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "path",
+        "keyword",
+        "message"
+      ],
+      "properties": {
+        "path": {
+          "type": "string",
+          "maxLength": 65
+        },
+        "keyword": {
+          "type": "string",
+          "maxLength": 65
+        },
+        "allowed": {
+          "type": "array"
+        },
+        "message": {
+          "type": "string",
+          "maxLength": 256
+        }
+      }
+    },
+    "ToolPlaygroundValidationError": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "error",
+        "reason",
+        "problems"
+      ],
+      "properties": {
+        "error": {
+          "type": "string"
+        },
+        "reason": {
+          "const": "invalid_params"
+        },
+        "problems": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 16,
+          "items": {
+            "$ref": "#/$defs/ToolInputValidationProblem"
           }
         }
       }

@@ -129,6 +129,40 @@
         "transform": {
           "$ref": "#/$defs/tool_transform",
           "description": "Optional compiled declarative request/response transform. Omission preserves the legacy request and response bytes exactly."
+        },
+        "enum_bindings": {
+          "type": "array",
+          "maxItems": 256,
+          "items": {
+            "$ref": "#/$defs/enum_binding"
+          },
+          "description": "Stable dynamic-enum bindings. Current values are never persisted in a ToolDefinition; the gateway injects them into owned serve/validation clones."
+        }
+      }
+    },
+    "enum_binding": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "property",
+        "source_id",
+        "source_digest"
+      ],
+      "properties": {
+        "property": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256,
+          "description": "Top-level input property. Its schema must be string or boolean, or an array whose items are string or boolean."
+        },
+        "source_id": {
+          "type": "string",
+          "pattern": "^[A-Za-z][A-Za-z0-9_]{0,63}$"
+        },
+        "source_digest": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$",
+          "description": "SHA-256 of the normalized source plan."
         }
       }
     },

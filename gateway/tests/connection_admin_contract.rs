@@ -470,6 +470,13 @@ fn connection_admin_openapi_has_exact_routes_operations_and_safe_contracts() {
         EXPECTED_OPERATIONS.len(),
         "the v1 Connection admin operation surface changed"
     );
+    assert_eq!(
+        openapi.pointer("/paths/~1v1~1admin~1tools~1{id}~1execute/post/responses/422/$ref"),
+        Some(&json!(
+            "#/components/responses/ToolPlaygroundValidationError"
+        )),
+        "playground input rejection must use its structured 422 contract"
+    );
 
     let security = openapi
         .get("security")
@@ -681,6 +688,8 @@ fn connection_admin_json_schema_is_strict_resolvable_and_secret_safe() {
         "Error",
         "ReasonedError",
         "ValidationError",
+        "ToolInputValidationProblem",
+        "ToolPlaygroundValidationError",
         "DependencyConflict",
     ] {
         assert_closed_object(&schema, name);
@@ -702,6 +711,7 @@ fn connection_admin_json_schema_is_strict_resolvable_and_secret_safe() {
         "Error",
         "ReasonedError",
         "ValidationError",
+        "ToolPlaygroundValidationError",
         "DependencyConflict",
     ];
     let forbidden_secret_fields = [
@@ -915,11 +925,40 @@ fn connection_admin_closed_copies_accept_overlay_runtime_fields_and_exact_versio
                 }]
             }],
             "response_root": "/data/updateCompany"
-        }
+        },
+        "enum_bindings": [{
+            "property": "accountStatus",
+            "source_id": "company_account_status",
+            "source_digest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        }]
     });
     assert!(
         validates("ToolDefinition", &definition),
-        "the closed stored-definition copy must accept the compiled transform"
+        "the closed stored-definition copy must accept transforms, visibility, BodyArgsJson, and dynamic enum bindings"
+    );
+    assert!(validates(
+        "CapabilityDynamicEnum",
+        &json!({
+            "property": "accountStatus",
+            "source_id": "company_account_status",
+            "state": "stale",
+            "item_count": 3,
+            "values_revision": 9,
+            "resolved_at": "2026-09-03T00:00:00Z"
+        })
+    ));
+    assert!(
+        !validates(
+            "CapabilityDynamicEnum",
+            &json!({
+                "property": "accountStatus",
+                "source_id": "company_account_status",
+                "state": "fresh",
+                "item_count": 3,
+                "values": ["PRIVATE", "PUBLIC"]
+            })
+        ),
+        "inventory reports status and counts without leaking or duplicating served values"
     );
     assert!(validates(
         "CapabilityMapping",
@@ -977,7 +1016,6 @@ fn connection_admin_closed_copies_accept_overlay_runtime_fields_and_exact_versio
         "OpenApiOverlayDocument",
         &json!({"schema_version": "0.1.1"})
     ));
-
     let safe_summary = json!({
         "parameters": [{
             "wire_property": "annualRecurringRevenue",
@@ -1067,7 +1105,6 @@ fn connection_admin_closed_copies_accept_overlay_runtime_fields_and_exact_versio
             }]
         })
     ));
-
     let composite_definition = json!({
         "name": "create_note_for_records",
         "description": "Create and attach a note.",
@@ -1108,12 +1145,21 @@ fn connection_admin_closed_copies_accept_overlay_runtime_fields_and_exact_versio
 
     let overlay_with_composite = json!({
         "schema_version": "0.1.0",
+        "enum_sources": {
+            "note_titles": {
+                "request": { "path": "/metadata/note-titles" },
+                "select": { "items": "/items/*", "value": "/value" }
+            }
+        },
         "composites": {
             "create_note_for_records": {
                 "description": "Create and attach a note.",
                 "input": {
                     "properties": { "title": { "type": "string" } },
                     "required": ["title"]
+                },
+                "parameters": {
+                    "title": { "enum_source": "note_titles" }
                 },
                 "steps": [{
                     "id": "create",
@@ -1125,7 +1171,14 @@ fn connection_admin_closed_copies_accept_overlay_runtime_fields_and_exact_versio
     });
     assert!(
         validates("OpenApiOverlayDocument", &overlay_with_composite),
-        "the admin contract must accept the closed composite authoring model"
+        "the admin contract must accept the closed composite authoring model with a live enum binding"
+    );
+    let mut widened_composite_enum = overlay_with_composite.clone();
+    widened_composite_enum["composites"]["create_note_for_records"]["parameters"]["title"]
+        ["rejected_value"] = json!("must-not-be-exposed");
+    assert!(
+        !validates("OpenApiOverlayDocument", &widened_composite_enum),
+        "the composite enum parameter contract must remain closed"
     );
     assert!(validates(
         "OpenApiOverlayCompositeReport",
@@ -1167,4 +1220,27 @@ fn connection_admin_closed_copies_accept_overlay_runtime_fields_and_exact_versio
             }]
         })
     ));
+    let playground_validation = json!({
+        "error": "tool arguments were rejected",
+        "reason": "invalid_params",
+        "problems": [{
+            "path": "/accountStatus",
+            "keyword": "enum",
+            "allowed": ["PRIVATE", "PUBLIC"],
+            "message": "value is not one of the allowed values"
+        }]
+    });
+    assert!(validates(
+        "ToolPlaygroundValidationError",
+        &playground_validation
+    ));
+    let mut widened_playground_validation = playground_validation;
+    widened_playground_validation["problems"][0]["rejected_value"] = json!("must-not-be-exposed");
+    assert!(
+        !validates(
+            "ToolPlaygroundValidationError",
+            &widened_playground_validation
+        ),
+        "the playground validation contract must remain closed and never expose the rejected value"
+    );
 }
