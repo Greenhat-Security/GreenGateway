@@ -34,6 +34,9 @@ export type ConnectionStatusReason =
   | 'egress_denied'
   | 'secret_unavailable'
   | 'invalid_response'
+  | 'upstream_method_not_found'
+  | 'upstream_error'
+  | 'upstream_transport_failure'
   | 'catalog_stale';
 
 export type ConnectionRevisions = {
@@ -1164,6 +1167,9 @@ function isConnectionStatusReason(
     value === 'egress_denied' ||
     value === 'secret_unavailable' ||
     value === 'invalid_response' ||
+    value === 'upstream_method_not_found' ||
+    value === 'upstream_error' ||
+    value === 'upstream_transport_failure' ||
     value === 'catalog_stale'
   );
 }

@@ -35,6 +35,9 @@ pub enum ConnectionStatusReason {
     EgressDenied,
     SecretUnavailable,
     InvalidResponse,
+    UpstreamMethodNotFound,
+    UpstreamError,
+    UpstreamTransportFailure,
     CatalogStale,
 }
 

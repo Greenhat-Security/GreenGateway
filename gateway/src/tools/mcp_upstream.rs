@@ -140,7 +140,7 @@ impl Error for McpUpstreamDiscoveryError {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq)]
 pub enum McpUpstreamCallError {
     EgressRejected,
     ClientBuild,
@@ -148,6 +148,9 @@ pub enum McpUpstreamCallError {
     Call,
     Connection { reason: &'static str },
     AuthenticationRejected,
+    UpstreamMethodNotFound { method: &'static str },
+    UpstreamError { method: &'static str, code: i32 },
+    UpstreamTransport { method: &'static str },
     DiscoveryPageLimitExceeded { max: usize },
     DiscoveryToolLimitExceeded { max: usize },
     DiscoveryResourceLimitExceeded { max: usize },
@@ -168,6 +171,9 @@ impl McpUpstreamCallError {
             Self::Call => "call_failed",
             Self::Connection { reason } => reason,
             Self::AuthenticationRejected => "auth_failed",
+            Self::UpstreamMethodNotFound { .. } => "upstream_method_not_found",
+            Self::UpstreamError { .. } => "upstream_error",
+            Self::UpstreamTransport { .. } => "upstream_transport_failure",
             Self::DiscoveryPageLimitExceeded { .. } => "discovery_page_limit_exceeded",
             Self::DiscoveryToolLimitExceeded { .. } => "discovery_tool_limit_exceeded",
             Self::DiscoveryResourceLimitExceeded { .. } => "discovery_resource_limit_exceeded",
@@ -200,6 +206,19 @@ impl fmt::Display for McpUpstreamCallError {
             }
             Self::AuthenticationRejected => {
                 formatter.write_str("managed MCP authentication failed")
+            }
+            Self::UpstreamMethodNotFound { method } => {
+                write!(formatter, "upstream MCP method '{method}' was not found")
+            }
+            Self::UpstreamError { method, code } => write!(
+                formatter,
+                "upstream MCP method '{method}' returned JSON-RPC error {code}"
+            ),
+            Self::UpstreamTransport { method } => {
+                write!(
+                    formatter,
+                    "upstream MCP method '{method}' could not be completed"
+                )
             }
             Self::DiscoveryPageLimitExceeded { max } => write!(
                 formatter,
@@ -1207,6 +1226,9 @@ fn protocol_probe_mcp_error(
             )
         }
         McpUpstreamCallError::Call
+        | McpUpstreamCallError::UpstreamMethodNotFound { .. }
+        | McpUpstreamCallError::UpstreamError { .. }
+        | McpUpstreamCallError::UpstreamTransport { .. }
         | McpUpstreamCallError::DiscoveryPageLimitExceeded { .. }
         | McpUpstreamCallError::DiscoveryToolLimitExceeded { .. }
         | McpUpstreamCallError::DiscoveryResourceLimitExceeded { .. }
@@ -1380,7 +1402,7 @@ async fn probe_one_advertised_metadata_page(
         let result = service
             .list_tools(Some(PaginatedRequestParams::default()))
             .await
-            .map_err(|error| mcp_service_error(error, McpUpstreamCallError::Call))?;
+            .map_err(|error| mcp_discovery_method_error(error, "tools/list"))?;
         if result.tools.len() > MAX_DISCOVERY_TOOLS_PER_UPSTREAM {
             return Err(McpUpstreamCallError::DiscoveryToolLimitExceeded {
                 max: MAX_DISCOVERY_TOOLS_PER_UPSTREAM,
@@ -1390,7 +1412,7 @@ async fn probe_one_advertised_metadata_page(
         let result = service
             .list_resources(Some(PaginatedRequestParams::default()))
             .await
-            .map_err(|error| mcp_service_error(error, McpUpstreamCallError::Call))?;
+            .map_err(|error| mcp_discovery_method_error(error, "resources/list"))?;
         if result.resources.len() > MAX_DISCOVERY_RESOURCES_PER_UPSTREAM {
             return Err(McpUpstreamCallError::DiscoveryResourceLimitExceeded {
                 max: MAX_DISCOVERY_RESOURCES_PER_UPSTREAM,
@@ -1487,7 +1509,7 @@ async fn list_tools_with_limits_and_budget(
         let result = service
             .list_tools(Some(PaginatedRequestParams::default().with_cursor(cursor)))
             .await
-            .map_err(|error| mcp_service_error(error, McpUpstreamCallError::Call))?;
+            .map_err(|error| mcp_discovery_method_error(error, "tools/list"))?;
 
         if tools.len().saturating_add(result.tools.len()) > MAX_DISCOVERY_TOOLS_PER_UPSTREAM {
             tracing::warn!(
@@ -1515,10 +1537,20 @@ async fn list_resources_with_limits(
     let mut cursor = None;
     loop {
         budget.consume()?;
-        let result = service
+        let result = match service
             .list_resources(Some(PaginatedRequestParams::default().with_cursor(cursor)))
             .await
-            .map_err(|error| mcp_service_error(error, McpUpstreamCallError::Call))?;
+        {
+            Ok(result) => result,
+            Err(error) if mcp_json_rpc_error_code(&error) == Some(-32601) => {
+                tracing::debug!(
+                    method = "resources/list",
+                    "optional MCP discovery method is not implemented; treating it as empty"
+                );
+                return Ok(Vec::new());
+            }
+            Err(error) => return Err(mcp_discovery_method_error(error, "resources/list")),
+        };
         if resources.len().saturating_add(result.resources.len())
             > MAX_DISCOVERY_RESOURCES_PER_UPSTREAM
         {
@@ -1542,10 +1574,25 @@ async fn list_resource_templates_with_limits(
     let mut cursor = None;
     loop {
         budget.consume()?;
-        let result = service
+        let result = match service
             .list_resource_templates(Some(PaginatedRequestParams::default().with_cursor(cursor)))
             .await
-            .map_err(|error| mcp_service_error(error, McpUpstreamCallError::Call))?;
+        {
+            Ok(result) => result,
+            Err(error) if mcp_json_rpc_error_code(&error) == Some(-32601) => {
+                tracing::debug!(
+                    method = "resources/templates/list",
+                    "optional MCP discovery method is not implemented; treating it as empty"
+                );
+                return Ok(Vec::new());
+            }
+            Err(error) => {
+                return Err(mcp_discovery_method_error(
+                    error,
+                    "resources/templates/list",
+                ));
+            }
+        };
         if resource_templates
             .len()
             .saturating_add(result.resource_templates.len())
@@ -2773,6 +2820,32 @@ where
     }
 }
 
+fn mcp_discovery_method_error<E>(error: E, method: &'static str) -> McpUpstreamCallError
+where
+    E: Error + 'static,
+{
+    if let Some(code) = mcp_json_rpc_error_code(&error) {
+        if code == -32601 {
+            McpUpstreamCallError::UpstreamMethodNotFound { method }
+        } else {
+            McpUpstreamCallError::UpstreamError { method, code }
+        }
+    } else {
+        mcp_service_error(error, McpUpstreamCallError::UpstreamTransport { method })
+    }
+}
+
+fn mcp_json_rpc_error_code(error: &(dyn Error + 'static)) -> Option<i32> {
+    let mut current = Some(error);
+    while let Some(error) = current {
+        if let Some(ServiceError::McpError(error)) = error.downcast_ref::<ServiceError>() {
+            return Some(error.code.0);
+        }
+        current = error.source();
+    }
+    None
+}
+
 fn mcp_authentication_rejected(error: &(dyn Error + 'static)) -> bool {
     let mut current = Some(error);
     while let Some(error) = current {
@@ -3037,6 +3110,32 @@ mod tests {
     use tracing_subscriber::{fmt::MakeWriter, prelude::*};
 
     const TEST_RESPONSE_LIMIT: usize = 64;
+
+    #[test]
+    fn discovery_json_rpc_errors_keep_the_method_and_code() {
+        for (code, expected) in [
+            (
+                -32601,
+                McpUpstreamCallError::UpstreamMethodNotFound {
+                    method: "tools/list",
+                },
+            ),
+            (
+                -32000,
+                McpUpstreamCallError::UpstreamError {
+                    method: "tools/list",
+                    code: -32000,
+                },
+            ),
+        ] {
+            let error = ServiceError::McpError(ErrorData::new(
+                rmcp::model::ErrorCode(code),
+                "bounded upstream error",
+                None,
+            ));
+            assert_eq!(mcp_discovery_method_error(error, "tools/list"), expected);
+        }
+    }
 
     #[test]
     fn discovered_tool_metadata_survives_both_proxy_definition_paths() {

@@ -1201,6 +1201,31 @@ struct ConnectionRefreshAuditSummary {
     removed_count: usize,
 }
 
+#[derive(Clone, Copy)]
+struct ConnectionRefreshFailure {
+    reason: &'static str,
+    upstream_method: Option<&'static str>,
+    upstream_error_code: Option<i32>,
+}
+
+impl ConnectionRefreshFailure {
+    const fn plain(reason: &'static str) -> Self {
+        Self {
+            reason,
+            upstream_method: None,
+            upstream_error_code: None,
+        }
+    }
+
+    const fn mcp(error: connections::mcp::McpCatalogRefreshError) -> Self {
+        Self {
+            reason: error.safe_reason(),
+            upstream_method: error.upstream_method(),
+            upstream_error_code: error.upstream_error_code(),
+        }
+    }
+}
+
 #[derive(Serialize)]
 struct ToolNameConflictResponse {
     error: &'static str,
@@ -6919,7 +6944,7 @@ async fn connection_refresh_endpoint(
             .map(ConnectionCatalogRefreshResponse::Mcp)
             .map_err(|error| {
                 (
-                    error.safe_reason(),
+                    ConnectionRefreshFailure::mcp(error),
                     connection_refresh_error_response(error),
                 )
             }),
@@ -6930,12 +6955,12 @@ async fn connection_refresh_endpoint(
             .map(ConnectionCatalogRefreshResponse::OpenApi)
             .map_err(|error| {
                 (
-                    error.safe_reason(),
+                    ConnectionRefreshFailure::plain(error.safe_reason()),
                     openapi_catalog_error_response(error, "refresh"),
                 )
             }),
         None => Err((
-            "discovery_not_configured",
+            ConnectionRefreshFailure::plain("discovery_not_configured"),
             (
                 StatusCode::CONFLICT,
                 Json(json!({
@@ -6969,14 +6994,14 @@ async fn connection_refresh_endpoint(
             )
                 .into_response()
         }
-        Err((reason, response)) => {
+        Err((failure, response)) => {
             emit_connection_refreshed(
                 &state,
                 &parts,
                 &principal,
                 record,
                 "failure",
-                Some(reason),
+                Some(&failure),
                 started.elapsed(),
                 None,
             );
@@ -14776,7 +14801,7 @@ fn emit_connection_refreshed(
     principal: &auth::Principal,
     record: &connections::store::StoredConnection,
     outcome: &'static str,
-    reason: Option<&'static str>,
+    failure: Option<&ConnectionRefreshFailure>,
     elapsed: Duration,
     result: Option<&ConnectionRefreshAuditSummary>,
 ) {
@@ -14790,8 +14815,14 @@ fn emit_connection_refreshed(
         "outcome": outcome,
         "latency_ms": u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX),
     });
-    if let Some(reason) = reason {
-        payload["reason"] = json!(reason);
+    if let Some(failure) = failure {
+        payload["reason"] = json!(failure.reason);
+        if let Some(method) = failure.upstream_method {
+            payload["upstream_method"] = json!(method);
+        }
+        if let Some(code) = failure.upstream_error_code {
+            payload["upstream_error_code"] = json!(code);
+        }
     }
     if let Some(result) = result {
         payload["catalog_revision"] = json!(result.catalog_revision);
@@ -15588,17 +15619,23 @@ fn connection_refresh_error_response(error: connections::mcp::McpCatalogRefreshE
         connections::mcp::McpCatalogRefreshError::EgressDenied
         | connections::mcp::McpCatalogRefreshError::SecretUnavailable
         | connections::mcp::McpCatalogRefreshError::AuthenticationFailed
+        | connections::mcp::McpCatalogRefreshError::UpstreamMethodNotFound { .. }
+        | connections::mcp::McpCatalogRefreshError::UpstreamError { .. }
+        | connections::mcp::McpCatalogRefreshError::UpstreamTransport { .. }
         | connections::mcp::McpCatalogRefreshError::RequestFailed
         | connections::mcp::McpCatalogRefreshError::InvalidResponse => StatusCode::BAD_GATEWAY,
     };
-    (
-        status,
-        Json(json!({
-            "error": "MCP connection refresh failed",
-            "reason": error.safe_reason(),
-        })),
-    )
-        .into_response()
+    let mut body = json!({
+        "error": "MCP connection refresh failed",
+        "reason": error.safe_reason(),
+    });
+    if let Some(method) = error.upstream_method() {
+        body["upstream_method"] = json!(method);
+    }
+    if let Some(code) = error.upstream_error_code() {
+        body["upstream_error_code"] = json!(code);
+    }
+    (status, Json(body)).into_response()
 }
 
 fn openapi_catalog_error_response(
@@ -28034,6 +28071,45 @@ mod tests {
             final_read["applied_catalog_revision"],
             deleted["catalog_revision"]
         );
+    }
+
+    #[tokio::test]
+    async fn mcp_refresh_errors_expose_bounded_upstream_diagnostics() {
+        for (error, reason, method, code) in [
+            (
+                connections::mcp::McpCatalogRefreshError::UpstreamMethodNotFound {
+                    method: "tools/list",
+                },
+                "upstream_method_not_found",
+                "tools/list",
+                -32601,
+            ),
+            (
+                connections::mcp::McpCatalogRefreshError::UpstreamError {
+                    method: "resources/list",
+                    code: -32000,
+                },
+                "upstream_error",
+                "resources/list",
+                -32000,
+            ),
+        ] {
+            let failure = ConnectionRefreshFailure::mcp(error);
+            assert_eq!(failure.reason, reason);
+            assert_eq!(failure.upstream_method, Some(method));
+            assert_eq!(failure.upstream_error_code, Some(code));
+
+            let response = connection_refresh_error_response(error);
+            assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+            let body = json_body(response).await;
+            assert_eq!(body["reason"], json!(reason));
+            assert_eq!(body["upstream_method"], json!(method));
+            assert_eq!(body["upstream_error_code"], json!(code));
+            assert!(
+                !body.to_string().contains("bounded upstream error"),
+                "upstream messages must not cross the safe response boundary"
+            );
+        }
     }
 
     #[tokio::test]

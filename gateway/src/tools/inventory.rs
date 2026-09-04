@@ -1702,6 +1702,9 @@ fn status_reason(reason: ConnectionStatusReason) -> &'static str {
         ConnectionStatusReason::EgressDenied => "egress_denied",
         ConnectionStatusReason::SecretUnavailable => "secret_unavailable",
         ConnectionStatusReason::InvalidResponse => "invalid_response",
+        ConnectionStatusReason::UpstreamMethodNotFound => "upstream_method_not_found",
+        ConnectionStatusReason::UpstreamError => "upstream_error",
+        ConnectionStatusReason::UpstreamTransportFailure => "upstream_transport_failure",
         ConnectionStatusReason::CatalogStale => "catalog_stale",
     }
 }

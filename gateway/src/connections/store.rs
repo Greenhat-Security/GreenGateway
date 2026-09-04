@@ -667,6 +667,84 @@ ADD COLUMN annotations_json TEXT CHECK (
 );
 "#;
 
+// Migration 11: retain precise, bounded MCP upstream failure categories in
+// Connection status. SQLite cannot alter a CHECK constraint in place, so
+// both status tables are rebuilt with their rows and revision keys intact.
+const MIGRATION_11_SQL: &str = r#"
+ALTER TABLE connection_current_status RENAME TO connection_current_status_v10;
+
+CREATE TABLE connection_current_status (
+    connection_id TEXT PRIMARY KEY,
+    status_revision INTEGER NOT NULL CHECK (status_revision >= 1),
+    observed_connection_revision INTEGER NOT NULL CHECK (observed_connection_revision >= 1),
+    observed_credential_revision INTEGER NOT NULL CHECK (observed_credential_revision >= 0),
+    observed_tls_revision INTEGER NOT NULL CHECK (observed_tls_revision >= 0),
+    observed_discovery_revision INTEGER NOT NULL CHECK (observed_discovery_revision >= 0),
+    state TEXT NOT NULL CHECK (
+        state IN ('unknown', 'configured', 'healthy', 'degraded', 'unavailable', 'disabled')
+    ),
+    reason TEXT NOT NULL CHECK (
+        reason IN (
+            'not_tested', 'legacy_configured', 'disabled', 'test_succeeded',
+            'catalog_refreshed', 'request_failed', 'egress_denied', 'secret_unavailable',
+            'invalid_response', 'upstream_method_not_found', 'upstream_error',
+            'upstream_transport_failure', 'catalog_stale'
+        )
+    ),
+    observed_at TEXT NOT NULL CHECK (length(CAST(observed_at AS BLOB)) BETWEEN 1 AND 64),
+    latency_ms INTEGER CHECK (latency_ms IS NULL OR latency_ms >= 0),
+    catalog_age_secs INTEGER CHECK (catalog_age_secs IS NULL OR catalog_age_secs >= 0),
+    catalog_entry_count INTEGER CHECK (
+        catalog_entry_count IS NULL OR catalog_entry_count BETWEEN 0 AND 4096
+    ),
+    FOREIGN KEY (connection_id) REFERENCES connection_records(id) ON DELETE CASCADE
+);
+
+INSERT INTO connection_current_status
+SELECT * FROM connection_current_status_v10;
+DROP TABLE connection_current_status_v10;
+
+ALTER TABLE connection_status_history RENAME TO connection_status_history_v10;
+
+CREATE TABLE connection_status_history (
+    sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+    connection_id TEXT NOT NULL,
+    status_revision INTEGER NOT NULL CHECK (status_revision >= 1),
+    observed_connection_revision INTEGER NOT NULL CHECK (observed_connection_revision >= 1),
+    observed_credential_revision INTEGER NOT NULL CHECK (observed_credential_revision >= 0),
+    observed_tls_revision INTEGER NOT NULL CHECK (observed_tls_revision >= 0),
+    observed_discovery_revision INTEGER NOT NULL CHECK (observed_discovery_revision >= 0),
+    state TEXT NOT NULL CHECK (
+        state IN ('unknown', 'configured', 'healthy', 'degraded', 'unavailable', 'disabled')
+    ),
+    reason TEXT NOT NULL CHECK (
+        reason IN (
+            'not_tested', 'legacy_configured', 'disabled', 'test_succeeded',
+            'catalog_refreshed', 'request_failed', 'egress_denied', 'secret_unavailable',
+            'invalid_response', 'upstream_method_not_found', 'upstream_error',
+            'upstream_transport_failure', 'catalog_stale'
+        )
+    ),
+    observed_at TEXT NOT NULL CHECK (length(CAST(observed_at AS BLOB)) BETWEEN 1 AND 64),
+    latency_ms INTEGER CHECK (latency_ms IS NULL OR latency_ms >= 0),
+    catalog_age_secs INTEGER CHECK (catalog_age_secs IS NULL OR catalog_age_secs >= 0),
+    catalog_entry_count INTEGER CHECK (
+        catalog_entry_count IS NULL OR catalog_entry_count BETWEEN 0 AND 4096
+    ),
+    FOREIGN KEY (connection_id) REFERENCES connection_records(id) ON DELETE CASCADE
+);
+
+INSERT INTO connection_status_history
+SELECT * FROM connection_status_history_v10;
+DROP TABLE connection_status_history_v10;
+
+CREATE UNIQUE INDEX idx_connection_status_revision
+ON connection_status_history(connection_id, status_revision);
+
+CREATE INDEX idx_connection_status_latest
+ON connection_status_history(connection_id, status_revision DESC);
+"#;
+
 const MIGRATIONS: &[Migration] = &[
     Migration {
         version: 1,
@@ -707,6 +785,10 @@ const MIGRATIONS: &[Migration] = &[
     Migration {
         version: 10,
         sql: MIGRATION_10_SQL,
+    },
+    Migration {
+        version: 11,
+        sql: MIGRATION_11_SQL,
     },
 ];
 
@@ -2920,6 +3002,9 @@ impl SqliteConnectionStore {
                 | ConnectionStatusReason::EgressDenied
                 | ConnectionStatusReason::SecretUnavailable
                 | ConnectionStatusReason::InvalidResponse
+                | ConnectionStatusReason::UpstreamMethodNotFound
+                | ConnectionStatusReason::UpstreamError
+                | ConnectionStatusReason::UpstreamTransportFailure
         );
         let last_test_at = (update.reason == ConnectionStatusReason::TestSucceeded
             || (ambiguous_failure && update.catalog_entry_count.is_none()))
@@ -7244,6 +7329,9 @@ pub(crate) fn reason_as_str(reason: ConnectionStatusReason) -> &'static str {
         ConnectionStatusReason::EgressDenied => "egress_denied",
         ConnectionStatusReason::SecretUnavailable => "secret_unavailable",
         ConnectionStatusReason::InvalidResponse => "invalid_response",
+        ConnectionStatusReason::UpstreamMethodNotFound => "upstream_method_not_found",
+        ConnectionStatusReason::UpstreamError => "upstream_error",
+        ConnectionStatusReason::UpstreamTransportFailure => "upstream_transport_failure",
         ConnectionStatusReason::CatalogStale => "catalog_stale",
     }
 }
@@ -7259,6 +7347,9 @@ pub(crate) fn parse_reason(value: &str) -> Option<ConnectionStatusReason> {
         "egress_denied" => Some(ConnectionStatusReason::EgressDenied),
         "secret_unavailable" => Some(ConnectionStatusReason::SecretUnavailable),
         "invalid_response" => Some(ConnectionStatusReason::InvalidResponse),
+        "upstream_method_not_found" => Some(ConnectionStatusReason::UpstreamMethodNotFound),
+        "upstream_error" => Some(ConnectionStatusReason::UpstreamError),
+        "upstream_transport_failure" => Some(ConnectionStatusReason::UpstreamTransportFailure),
         "catalog_stale" => Some(ConnectionStatusReason::CatalogStale),
         _ => None,
     }
@@ -7638,7 +7729,7 @@ mod tests {
             .expect("migration query should run")
             .collect::<Result<Vec<_>, _>>()
             .expect("migration rows should read");
-        assert_eq!(versions, vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10]);
+        assert_eq!(versions, vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]);
     }
 
     #[test]
@@ -7965,7 +8056,7 @@ mod tests {
             .expect("migration query should run")
             .collect::<Result<Vec<_>, _>>()
             .expect("migration rows should read");
-        assert_eq!(versions, vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10]);
+        assert_eq!(versions, vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]);
     }
 
     #[test]
@@ -8069,7 +8160,7 @@ mod tests {
             .expect("migration query should run")
             .collect::<Result<Vec<_>, _>>()
             .expect("migration rows should read");
-        assert_eq!(versions, vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10]);
+        assert_eq!(versions, vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]);
     }
 
     #[test]
@@ -8410,7 +8501,7 @@ mod tests {
             .expect("migration query should run")
             .collect::<Result<Vec<_>, _>>()
             .expect("migration rows should read");
-        assert_eq!(versions, vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10]);
+        assert_eq!(versions, vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]);
         assert!(connection
             .prepare("SELECT source_digest, values_json FROM connection_enum_source_values LIMIT 0")
             .is_ok());
