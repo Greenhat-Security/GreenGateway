@@ -23,8 +23,8 @@ use crate::{
 };
 
 use super::definitions::{
-    BodyMapping, HttpToolMapping, QueryParamMapping, ToolDefinition, ToolRegistry, ToolSource,
-    ToolTarget, ToolVisibility,
+    BodyMapping, HttpToolMapping, QueryParamMapping, ToolAnnotations, ToolDefinition, ToolRegistry,
+    ToolSource, ToolTarget, ToolVisibility,
 };
 use super::enum_source::{EnumSourceRuntime, EnumSourceState};
 use super::transforms::{ParameterShape, ToolTransform, WireSource};
@@ -157,6 +157,8 @@ pub struct CapabilitySummary {
     pub name: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub title: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub annotations: Option<ToolAnnotations>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub uri: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -680,6 +682,7 @@ impl CapabilityInventory {
                     kind: CapabilityKind::Resource,
                     name: resource.name,
                     title: resource.title,
+                    annotations: None,
                     uri: Some(resource.uri.clone()),
                     uri_template: None,
                     description,
@@ -725,6 +728,7 @@ impl CapabilityInventory {
                     kind: CapabilityKind::ResourceTemplate,
                     name: template.name,
                     title: template.title,
+                    annotations: None,
                     uri: None,
                     uri_template: Some(template.uri_template.clone()),
                     description,
@@ -879,12 +883,17 @@ fn durable_tool_definition(
             serde_json::from_value::<ToolDefinition>(entry.definition.clone())
                 .map_err(|_| CapabilityInventoryError::CorruptState)
         }
-        DurableToolCatalog::Mcp { catalog, entry } => Ok(ToolDefinition::mcp_connection(
-            catalog.connection_id.to_string(),
-            entry.description.clone(),
-            entry.input_schema.clone(),
-            entry.remote_tool_name.clone(),
-        )),
+        DurableToolCatalog::Mcp { catalog, entry } => {
+            let mut definition = ToolDefinition::mcp_connection(
+                catalog.connection_id.to_string(),
+                entry.description.clone(),
+                entry.input_schema.clone(),
+                entry.remote_tool_name.clone(),
+            );
+            definition.title = entry.title.clone();
+            definition.annotations = entry.annotations.clone();
+            Ok(definition)
+        }
     }
 }
 
@@ -1305,7 +1314,8 @@ fn tool_capability(
             id: capability_id(&["tool", definition.name.as_str()]),
             kind: CapabilityKind::Tool,
             name: definition.name,
-            title: None,
+            title: definition.title.clone(),
+            annotations: definition.annotations.clone(),
             uri: None,
             uri_template: None,
             description,
@@ -1842,7 +1852,7 @@ mod tests {
                 create_managed_connection(&control_plane, managed_openapi_candidate()).await;
             let mcp_tool_name = format!("{}:lookup", mcp_record.id);
             let openapi_tool_name = "inventory_openapi_lookup".to_owned();
-            let mcp_definition = ToolDefinition::mcp_connection(
+            let mut mcp_definition = ToolDefinition::mcp_connection(
                 mcp_record.id.to_string(),
                 "Look up an MCP item".to_owned(),
                 json!({
@@ -1854,6 +1864,12 @@ mod tests {
                 }),
                 "lookup".to_owned(),
             );
+            mcp_definition.title = Some("Inventory MCP lookup".to_owned());
+            mcp_definition.annotations = Some(ToolAnnotations {
+                read_only_hint: Some(true),
+                open_world_hint: Some(false),
+                ..ToolAnnotations::default()
+            });
             let openapi_mapping = HttpToolMapping {
                 method: "GET".to_owned(),
                 path_template: "/inventory/{id}".to_owned(),
@@ -1862,6 +1878,7 @@ mod tests {
             };
             let openapi_definition = ToolDefinition {
                 name: openapi_tool_name.clone(),
+                title: None,
                 description: "Look up an OpenAPI item".to_owned(),
                 input_schema: json!({
                     "type": "object",
@@ -1885,6 +1902,7 @@ mod tests {
                 enum_bindings: Vec::new(),
                 visibility: crate::tools::definitions::ToolVisibility::Listed,
                 transform: None,
+                annotations: None,
             };
 
             let store = control_plane
@@ -1896,8 +1914,10 @@ mod tests {
                     &mcp_record.etag(),
                     &[StoredMcpCatalogEntry {
                         remote_tool_name: "lookup".to_owned(),
+                        title: mcp_definition.title.clone(),
                         description: "Look up an MCP item".to_owned(),
                         input_schema: mcp_definition.input_schema.clone(),
+                        annotations: mcp_definition.annotations.clone(),
                     }],
                     &[StoredMcpResource {
                         uri: "urn:inventory:resource".to_owned(),
@@ -2126,6 +2146,7 @@ mod tests {
             "createOneNote".to_owned(),
             ToolDefinition {
                 name: "createOneNote".to_owned(),
+                title: None,
                 description: "Create one note".to_owned(),
                 input_schema: json!({"type": "object"}),
                 target: Some(ToolTarget::Http {
@@ -2142,6 +2163,7 @@ mod tests {
                 visibility: ToolVisibility::Listed,
                 transform: None,
                 enum_bindings: Vec::new(),
+                annotations: None,
             },
         )]);
         let mapping = crate::tools::composite::CompositeMapping {
@@ -2186,6 +2208,7 @@ mod tests {
     fn capability_actions_use_only_the_stable_public_reason_vocabulary() {
         let definition = ToolDefinition {
             name: "playground_action_test".to_owned(),
+            title: None,
             description: "Action-state test tool".to_owned(),
             input_schema: json!({"type": "object"}),
             target: None,
@@ -2200,6 +2223,7 @@ mod tests {
             enum_bindings: Vec::new(),
             visibility: crate::tools::definitions::ToolVisibility::Listed,
             transform: None,
+            annotations: None,
         };
         let mut capability = BuiltCapability {
             summary: CapabilitySummary {
@@ -2207,6 +2231,7 @@ mod tests {
                 kind: CapabilityKind::Tool,
                 name: definition.name.clone(),
                 title: None,
+                annotations: None,
                 uri: None,
                 uri_template: None,
                 description: Some(definition.description.clone()),
@@ -2538,6 +2563,14 @@ mod tests {
         assert_eq!(mcp_tools.total_count, 1);
         let mcp_tool = &mcp_tools.capabilities[0];
         assert_eq!(mcp_tool.name, fixture.mcp_tool_name);
+        assert_eq!(mcp_tool.title.as_deref(), Some("Inventory MCP lookup"));
+        assert_eq!(
+            mcp_tool
+                .annotations
+                .as_ref()
+                .and_then(|annotations| annotations.read_only_hint),
+            Some(true)
+        );
         assert!(matches!(
             &mcp_tool.source,
             CapabilitySource::McpDiscovery {
@@ -2649,6 +2682,7 @@ mod tests {
             .registry
             .merge_definitions(vec![ToolDefinition {
                 name: "unassociated_manual_capability".to_owned(),
+                title: None,
                 description: "Manual capability without a connection".to_owned(),
                 input_schema: json!({"type": "object"}),
                 target: None,
@@ -2658,6 +2692,7 @@ mod tests {
                 enum_bindings: Vec::new(),
                 visibility: crate::tools::definitions::ToolVisibility::Listed,
                 transform: None,
+                annotations: None,
             }])
             .expect("unassociated manual capability should publish");
 
@@ -2695,6 +2730,7 @@ mod tests {
                         kind: CapabilityKind::Tool,
                         name: format!("bounded_tool_{index:05}"),
                         title: None,
+                        annotations: None,
                         uri: None,
                         uri_template: None,
                         description: None,
@@ -2738,6 +2774,7 @@ mod tests {
                     kind: CapabilityKind::Tool,
                     name: "bounded_tool_overflow".to_owned(),
                     title: None,
+                    annotations: None,
                     uri: None,
                     uri_template: None,
                     description: None,

@@ -826,6 +826,7 @@ pub fn generate_tools_from_openapi_str(
         }
         let definition = ToolDefinition {
             name: tool_name,
+            title: None,
             description: description_for(operation, operation_value),
             input_schema,
             target: None,
@@ -842,6 +843,7 @@ pub fn generate_tools_from_openapi_str(
             visibility: ToolVisibility::Listed,
             transform: None,
             enum_bindings: Vec::new(),
+            annotations: None,
         };
         let definition_bytes = serde_json::to_vec(&definition)
             .map_err(|source| OpenApiToolGenerationError::Json { source })?

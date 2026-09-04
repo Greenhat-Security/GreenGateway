@@ -2940,13 +2940,16 @@ fn proxy_definition(server: &McpUpstreamServerConfig, tool: Tool) -> ToolDefinit
         .map(ToString::to_string)
         .unwrap_or_else(|| remote_tool_name.clone());
 
-    ToolDefinition::mcp_proxy(
+    let mut definition = ToolDefinition::mcp_proxy(
         format!("{}:{remote_tool_name}", server.name),
         description,
         Value::Object(tool.input_schema.as_ref().clone()),
         server.name.clone(),
         remote_tool_name,
-    )
+    );
+    definition.title = tool.title;
+    definition.annotations = tool.annotations.map(Into::into);
+    definition
 }
 
 fn connection_proxy_definition(connection_id: &str, tool: Tool) -> ToolDefinition {
@@ -2956,12 +2959,15 @@ fn connection_proxy_definition(connection_id: &str, tool: Tool) -> ToolDefinitio
         .as_ref()
         .map(ToString::to_string)
         .unwrap_or_else(|| remote_tool_name.clone());
-    ToolDefinition::mcp_connection(
+    let mut definition = ToolDefinition::mcp_connection(
         connection_id.to_owned(),
         description,
         Value::Object(tool.input_schema.as_ref().clone()),
         remote_tool_name,
-    )
+    );
+    definition.title = tool.title;
+    definition.annotations = tool.annotations.map(Into::into);
+    definition
 }
 
 fn server_timeout(
@@ -3031,6 +3037,60 @@ mod tests {
     use tracing_subscriber::{fmt::MakeWriter, prelude::*};
 
     const TEST_RESPONSE_LIMIT: usize = 64;
+
+    #[test]
+    fn discovered_tool_metadata_survives_both_proxy_definition_paths() {
+        let annotated_tool = || {
+            let mut tool = Tool::new(
+                "search_contacts",
+                "Search contacts",
+                Arc::new(JsonObject::from_iter([(
+                    "type".to_owned(),
+                    Value::String("object".to_owned()),
+                )])),
+            );
+            tool.title = Some("Search contacts safely".to_owned());
+            let mut annotations = rmcp::model::ToolAnnotations::default();
+            annotations.read_only_hint = Some(true);
+            annotations.open_world_hint = Some(false);
+            tool.annotations = Some(annotations);
+            tool
+        };
+        let server = McpUpstreamServerConfig {
+            name: "crm".to_owned(),
+            url: "https://example.invalid/mcp".to_owned(),
+            timeout_ms: None,
+            response_idle_timeout_ms: None,
+            connect_timeout_ms: None,
+        };
+
+        for definition in [
+            proxy_definition(&server, annotated_tool()),
+            connection_proxy_definition("crm", annotated_tool()),
+        ] {
+            assert_eq!(definition.title.as_deref(), Some("Search contacts safely"));
+            let annotations = definition
+                .annotations
+                .expect("annotations survive discovery");
+            assert_eq!(annotations.read_only_hint, Some(true));
+            assert_eq!(annotations.open_world_hint, Some(false));
+            assert_eq!(annotations.destructive_hint, None);
+        }
+
+        let plain = connection_proxy_definition(
+            "crm",
+            Tool::new(
+                "plain",
+                "Plain",
+                Arc::new(JsonObject::from_iter([(
+                    "type".to_owned(),
+                    Value::String("object".to_owned()),
+                )])),
+            ),
+        );
+        assert!(plain.title.is_none());
+        assert!(plain.annotations.is_none());
+    }
 
     #[test]
     fn http_and_mcp_oauth_mint_failures_share_unavailable_dependency_classification() {

@@ -95,6 +95,12 @@
           "pattern": "^[A-Za-z0-9_.-]+$",
           "description": "Stable tool name used by callers and policy. Names are unique within one tools file."
         },
+        "title": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256,
+          "description": "Optional agent-facing display title."
+        },
         "description": {
           "type": "string",
           "minLength": 1,
@@ -137,7 +143,26 @@
             "$ref": "#/$defs/enum_binding"
           },
           "description": "Stable dynamic-enum bindings. Current values are never persisted in a ToolDefinition; the gateway injects them into owned serve/validation clones."
+        },
+        "annotations": {
+          "$ref": "#/$defs/tool_annotations",
+          "description": "MCP client hints only; these never change GreenGateway authorization or execution."
         }
+      }
+    },
+    "tool_annotations": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "title": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256
+        },
+        "readOnlyHint": { "type": "boolean" },
+        "destructiveHint": { "type": "boolean" },
+        "idempotentHint": { "type": "boolean" },
+        "openWorldHint": { "type": "boolean" }
       }
     },
     "enum_binding": {

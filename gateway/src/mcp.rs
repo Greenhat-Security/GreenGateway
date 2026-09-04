@@ -257,11 +257,14 @@ fn mcp_tool_from_definition(definition: &ToolDefinition) -> Result<Tool, ErrorDa
         ));
     };
 
-    Ok(Tool::new(
+    let mut tool = Tool::new(
         definition.name.clone(),
         definition.description.clone(),
         Arc::new(input_schema),
-    ))
+    );
+    tool.title = definition.title.clone();
+    tool.annotations = definition.annotations.clone().map(Into::into);
+    Ok(tool)
 }
 
 fn json_object_from_value(value: &Value) -> Option<JsonObject> {
@@ -1288,6 +1291,7 @@ mod tests {
     fn legacy_tool_definition(name: &str) -> ToolDefinition {
         ToolDefinition {
             name: name.to_owned(),
+            title: None,
             description: format!("{name} fixture"),
             input_schema: json!({ "type": "object" }),
             target: None,
@@ -1302,6 +1306,7 @@ mod tests {
             enum_bindings: Vec::new(),
             visibility: crate::tools::definitions::ToolVisibility::Listed,
             transform: None,
+            annotations: None,
         }
     }
 
@@ -1376,6 +1381,38 @@ mod tests {
             .iter()
             .map(|tool| tool["name"].as_str().unwrap_or_default().to_owned())
             .collect()
+    }
+
+    #[test]
+    fn mcp_tool_preserves_optional_title_and_annotations_without_inventing_them() {
+        let plain = mcp_tool_from_definition(&legacy_tool_definition("plain"))
+            .expect("plain definition converts");
+        let plain = serde_json::to_value(plain).expect("plain tool serializes");
+        assert!(plain.get("title").is_none());
+        assert!(plain.get("annotations").is_none());
+
+        let mut annotated = legacy_tool_definition("annotated");
+        annotated.title = Some("Search contacts".to_owned());
+        annotated.annotations = Some(crate::tools::definitions::ToolAnnotations {
+            title: Some("Contact lookup".to_owned()),
+            read_only_hint: Some(true),
+            destructive_hint: Some(false),
+            idempotent_hint: Some(true),
+            open_world_hint: Some(false),
+        });
+        let served = mcp_tool_from_definition(&annotated).expect("annotated definition converts");
+        let served = serde_json::to_value(served).expect("annotated tool serializes");
+        assert_eq!(served["title"], json!("Search contacts"));
+        assert_eq!(
+            served["annotations"],
+            json!({
+                "title": "Contact lookup",
+                "readOnlyHint": true,
+                "destructiveHint": false,
+                "idempotentHint": true,
+                "openWorldHint": false
+            })
+        );
     }
 
     async fn mcp_json_rpc(state: &McpState, id: u64, method: &str, params: Option<Value>) -> Value {

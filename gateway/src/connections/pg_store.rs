@@ -892,23 +892,27 @@ impl PostgresConnectionStore {
                 .await
                 .map_err(|error| pg_error(OPERATION_MCP_CATALOG, error))?;
 
-            for (ordinal, (entry, input_schema_json)) in entries
+            for (ordinal, ((entry, input_schema_json), annotations_json)) in entries
                 .iter()
                 .zip(validated.encoded_tool_schemas.iter())
+                .zip(validated.encoded_tool_annotations.iter())
                 .enumerate()
             {
                 client
                     .execute(
                         r#"
                         INSERT INTO greengateway.connection_mcp_catalog_entries (
-                            connection_id, remote_tool_name, description, input_schema_json, ordinal
-                        ) VALUES ($1::text::uuid, $2, $3, $4, $5)
+                            connection_id, remote_tool_name, title, description,
+                            input_schema_json, annotations_json, ordinal
+                        ) VALUES ($1::text::uuid, $2, $3, $4, $5, $6, $7)
                         "#,
                         &[
                             &id.as_str(),
                             &entry.remote_tool_name,
+                            &entry.title,
                             &entry.description,
                             &input_schema_json,
+                            &annotations_json,
                             &usize_to_i64(ordinal),
                         ],
                     )
@@ -3336,8 +3340,10 @@ async fn mcp_catalog_bytes(
         SELECT
             (SELECT COALESCE(SUM(
                  octet_length(remote_tool_name)
+               + COALESCE(octet_length(title), 0)
                + octet_length(description)
                + octet_length(input_schema_json)
+               + COALESCE(octet_length(annotations_json), 0)
              ), 0)
              FROM greengateway.connection_mcp_catalog_entries {filter})
           + (SELECT COALESCE(SUM(
@@ -4204,7 +4210,8 @@ async fn load_mcp_entries(
     let rows = client
         .query(
             r#"
-            SELECT remote_tool_name, description, input_schema_json, ordinal
+            SELECT remote_tool_name, title, description, input_schema_json,
+                   annotations_json, ordinal
             FROM greengateway.connection_mcp_catalog_entries
             WHERE connection_id = $1::text::uuid
             ORDER BY ordinal
@@ -4214,16 +4221,25 @@ async fn load_mcp_entries(
         .await
         .map_err(|error| pg_error(OPERATION_MCP_READ, error))?;
     const REASON: &str = "MCP catalog entry column does not decode as its schema type";
-    ensure_contiguous_ordinals(&rows, 3, id, "MCP catalog entries")?;
+    ensure_contiguous_ordinals(&rows, 5, id, "MCP catalog entries")?;
     rows.iter()
         .map(|row| {
             let input_schema: Value =
-                serde_json::from_str(&column::<String>(row, 2, id.as_str(), REASON)?)
+                serde_json::from_str(&column::<String>(row, 3, id.as_str(), REASON)?)
                     .map_err(|_| corrupt(id, "MCP catalog entry schema is not valid JSON"))?;
+            let annotations = column::<Option<String>>(row, 4, id.as_str(), REASON)?
+                .map(|annotations| {
+                    serde_json::from_str(&annotations).map_err(|_| {
+                        corrupt(id, "MCP catalog entry annotations are not valid JSON")
+                    })
+                })
+                .transpose()?;
             Ok(StoredMcpCatalogEntry {
                 remote_tool_name: column(row, 0, id.as_str(), REASON)?,
-                description: column(row, 1, id.as_str(), REASON)?,
+                title: column(row, 1, id.as_str(), REASON)?,
+                description: column(row, 2, id.as_str(), REASON)?,
                 input_schema,
+                annotations,
             })
         })
         .collect()
@@ -5473,10 +5489,11 @@ async fn import_mcp_catalog(
             .map_err(|error| pg_error(operation, error))?,
     )
     .unwrap_or(i64::MAX);
-    for (ordinal, (entry, input_schema_json)) in catalog
+    for (ordinal, ((entry, input_schema_json), annotations_json)) in catalog
         .entries
         .iter()
         .zip(validated.encoded_tool_schemas.iter())
+        .zip(validated.encoded_tool_annotations.iter())
         .enumerate()
     {
         counts.mcp_catalog_entries += i64::try_from(
@@ -5484,15 +5501,18 @@ async fn import_mcp_catalog(
                 .execute(
                     r#"
                     INSERT INTO greengateway.connection_mcp_catalog_entries (
-                        connection_id, remote_tool_name, description, input_schema_json, ordinal
-                    ) VALUES ($1::text::uuid, $2, $3, $4, $5)
+                        connection_id, remote_tool_name, title, description,
+                        input_schema_json, annotations_json, ordinal
+                    ) VALUES ($1::text::uuid, $2, $3, $4, $5, $6, $7)
                     ON CONFLICT (connection_id, remote_tool_name) DO NOTHING
                     "#,
                     &[
                         &id.as_str(),
                         &entry.remote_tool_name,
+                        &entry.title,
                         &entry.description,
                         input_schema_json,
+                        annotations_json,
                         &usize_to_i64(ordinal),
                     ],
                 )
@@ -6562,8 +6582,10 @@ mod tests {
     fn mcp_entry(name: &str) -> StoredMcpCatalogEntry {
         StoredMcpCatalogEntry {
             remote_tool_name: name.to_owned(),
+            title: None,
             description: format!("{name} description"),
             input_schema: json!({ "type": "object", "properties": {} }),
+            annotations: None,
         }
     }
 
@@ -6741,11 +6763,18 @@ mod tests {
             "SELECT last_revision FROM greengateway.security_revision_state WHERE singleton",
         )
         .await;
+        let mut annotated_alpha = mcp_entry("alpha");
+        annotated_alpha.title = Some("Alpha lookup".to_owned());
+        annotated_alpha.annotations = Some(crate::tools::definitions::ToolAnnotations {
+            read_only_hint: Some(true),
+            open_world_hint: Some(false),
+            ..crate::tools::definitions::ToolAnnotations::default()
+        });
         let catalog = store
             .replace_mcp_catalog(
                 &created.id,
                 &etag,
-                &[mcp_entry("alpha"), mcp_entry("beta")],
+                &[annotated_alpha.clone(), mcp_entry("beta")],
                 &[],
                 &[],
                 0,
@@ -6755,6 +6784,7 @@ mod tests {
             .expect("catalog replace should win");
         assert_eq!(catalog.catalog_revision, 1);
         assert_eq!(catalog.entries.len(), 2);
+        assert_eq!(catalog.entries[0], annotated_alpha);
         let loaded = store
             .mcp_catalog(&created.id)
             .await

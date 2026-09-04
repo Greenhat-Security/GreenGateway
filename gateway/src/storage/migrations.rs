@@ -217,6 +217,13 @@ static MANIFEST: LazyLock<Vec<Migration>> = LazyLock::new(|| {
         )
         .finalize()
         .with_pinned_checksum("511c1fc251b801a4054940a8482ac84d8d080610a14d7b8b102abb2427ef31a4"),
+        Migration::new(
+            14,
+            "mcp_tool_annotations",
+            include_str!("migrations/0014_mcp_tool_annotations.sql"),
+        )
+        .finalize()
+        .with_pinned_checksum("b827ea92626782241b850f4e5041870da65c7a2f4e3ad18bd1215b2257cc092f"),
     ]
 });
 

@@ -548,8 +548,10 @@ mod database {
     fn mcp_entry(name: &str) -> StoredMcpCatalogEntry {
         StoredMcpCatalogEntry {
             remote_tool_name: name.to_owned(),
+            title: None,
             description: format!("{name} description"),
             input_schema: json!({ "type": "object", "properties": {} }),
+            annotations: None,
         }
     }
 

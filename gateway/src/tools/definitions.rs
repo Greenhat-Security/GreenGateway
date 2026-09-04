@@ -12,6 +12,7 @@ use arc_swap::ArcSwap;
 use http::Method;
 use notify::{RecursiveMode, Watcher};
 use percent_encoding::percent_decode_str;
+use rmcp::model::ToolAnnotations as McpToolAnnotations;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tokio::sync::mpsc;
@@ -52,6 +53,10 @@ static TOOLS_FILE_SCHEMA_VALIDATOR: LazyLock<jsonschema::Validator> = LazyLock::
 #[serde(deny_unknown_fields)]
 pub struct ToolDefinition {
     pub name: String,
+    /// Optional agent-facing display title. Omission preserves the serialized
+    /// representation of definitions created before MCP metadata pass-through.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
     pub description: String,
     #[serde(rename = "input_json_schema")]
     pub input_schema: Value,
@@ -81,6 +86,50 @@ pub struct ToolDefinition {
     /// churn when upstream metadata changes.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub enum_bindings: Vec<EnumBinding>,
+    /// MCP client hints. These never affect GreenGateway authorization or
+    /// execution; they are preserved for clients that choose to display or
+    /// interpret them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub annotations: Option<ToolAnnotations>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ToolAnnotations {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub read_only_hint: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub destructive_hint: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub idempotent_hint: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub open_world_hint: Option<bool>,
+}
+
+impl From<McpToolAnnotations> for ToolAnnotations {
+    fn from(value: McpToolAnnotations) -> Self {
+        Self {
+            title: value.title,
+            read_only_hint: value.read_only_hint,
+            destructive_hint: value.destructive_hint,
+            idempotent_hint: value.idempotent_hint,
+            open_world_hint: value.open_world_hint,
+        }
+    }
+}
+
+impl From<ToolAnnotations> for McpToolAnnotations {
+    fn from(value: ToolAnnotations) -> Self {
+        let mut annotations = Self::default();
+        annotations.title = value.title;
+        annotations.read_only_hint = value.read_only_hint;
+        annotations.destructive_hint = value.destructive_hint;
+        annotations.idempotent_hint = value.idempotent_hint;
+        annotations.open_world_hint = value.open_world_hint;
+        annotations
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
@@ -195,6 +244,7 @@ impl ToolDefinition {
     ) -> Self {
         Self {
             name,
+            title: None,
             description,
             input_schema,
             target: None,
@@ -204,6 +254,7 @@ impl ToolDefinition {
             visibility: ToolVisibility::Listed,
             transform: None,
             enum_bindings: Vec::new(),
+            annotations: None,
         }
     }
 
@@ -4560,6 +4611,13 @@ mod tests {
         assert!(serialized.get("upstream").is_some());
         assert!(serialized.get("composite").is_none());
         assert!(serialized.get("enum_bindings").is_none());
+        assert!(serialized.get("title").is_none());
+        assert!(serialized.get("annotations").is_none());
+        assert_eq!(
+            serialized,
+            echo_tool("echo", "POST", "/v1/echo"),
+            "adding optional MCP metadata must not change legacy definition bytes or digests"
+        );
     }
 
     #[test]
@@ -4825,6 +4883,7 @@ mod tests {
         };
         ToolDefinition {
             name: name.to_owned(),
+            title: None,
             description: format!("Local tool {name}"),
             input_schema: json!({
                 "type": "object",
@@ -4838,6 +4897,7 @@ mod tests {
             visibility: ToolVisibility::Listed,
             transform: None,
             enum_bindings: Vec::new(),
+            annotations: None,
         }
     }
 
@@ -4854,6 +4914,7 @@ mod tests {
         };
         ToolDefinition {
             name: name.to_owned(),
+            title: None,
             description: format!("Managed OpenAPI tool {name}"),
             input_schema: json!({
                 "type": "object",
@@ -4874,6 +4935,7 @@ mod tests {
             visibility: ToolVisibility::Listed,
             transform: None,
             enum_bindings: Vec::new(),
+            annotations: None,
         }
     }
 

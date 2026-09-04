@@ -419,11 +419,9 @@ pre-delete or pre-replacement ETag cannot become valid again. A full Connection
 DELETE followed by a new POST creates a replacement Connection resource and is
 governed by the Connection resource's own precondition contract.
 
-This release accepts tool rename, tool and parameter descriptions, parameter
-titles, visibility, document- and source-label disambiguation, body
-serialization, and declarative request/response transforms, plus bounded
-composite tools with compensation, dynamic enum bindings, and
-compile-time label sources.
+This release accepts tool rename, tool titles, tool and parameter descriptions, explicit MCP tool annotations, parameter titles, visibility, document- and source-label disambiguation, body serialization, and declarative request/response transforms, plus bounded composite tools with compensation, dynamic enum bindings, and compile-time label sources.
+
+Use `title` for the MCP tool's top-level display title and `annotations` for explicit MCP client hints: `title`, `readOnlyHint`, `destructiveHint`, `idempotentHint`, and `openWorldHint`. GreenGateway passes annotations published by an upstream MCP server through unchanged and exposes overlay-declared annotations on generated and composite tools. It never infers `readOnlyHint` from an HTTP method: a generated GET without an explicit overlay annotation remains unannotated. A composite cannot declare `readOnlyHint: true` when any step or compensation is non-GET. These values are advisory client metadata only; RBAC, direct rules, enabled state, and Connection policy remain authoritative.
 
 Overlay keys always use the generated name shown by OpenAPI preview, even when
 the tool is renamed for agents. Operation IDs are case-sensitive. In

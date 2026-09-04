@@ -647,6 +647,26 @@ CREATE INDEX idx_connection_enum_source_overlay
 ON connection_enum_source_values(connection_id, overlay_revision);
 "#;
 
+// Migration 10: preserve optional MCP tool display metadata and client hints
+// in the durable managed-discovery catalog. NULL keeps every existing row's
+// logical representation unchanged.
+const MIGRATION_10_SQL: &str = r#"
+ALTER TABLE connection_mcp_catalog_entries
+ADD COLUMN title TEXT CHECK (
+    title IS NULL OR (
+        length(title) BETWEEN 1 AND 256
+        AND length(CAST(title AS BLOB)) <= 1024
+        AND instr(title, char(0)) = 0
+    )
+);
+
+ALTER TABLE connection_mcp_catalog_entries
+ADD COLUMN annotations_json TEXT CHECK (
+    annotations_json IS NULL OR
+    length(CAST(annotations_json AS BLOB)) BETWEEN 2 AND 2048
+);
+"#;
+
 const MIGRATIONS: &[Migration] = &[
     Migration {
         version: 1,
@@ -684,6 +704,10 @@ const MIGRATIONS: &[Migration] = &[
         version: 9,
         sql: MIGRATION_9_SQL,
     },
+    Migration {
+        version: 10,
+        sql: MIGRATION_10_SQL,
+    },
 ];
 
 pub(crate) const SOURCE_MANAGED: &str = "managed";
@@ -693,6 +717,9 @@ const MAX_MCP_CATALOG_ENTRY_BYTES: usize = 262_144;
 pub(crate) const MAX_MANAGED_MCP_CATALOG_BYTES: usize = 16 * 1024 * 1024;
 const MAX_MCP_TOOL_NAME_CHARS: usize = 128;
 const MAX_MCP_TOOL_DESCRIPTION_CHARS: usize = 1_024;
+const MAX_MCP_TOOL_TITLE_CHARS: usize = 256;
+const MAX_MCP_TOOL_TITLE_BYTES: usize = 1_024;
+const MAX_MCP_TOOL_ANNOTATIONS_BYTES: usize = 2_048;
 const MAX_MCP_RESOURCE_URI_BYTES: usize = 2_048;
 const MAX_MCP_RESOURCE_NAME_CHARS: usize = 128;
 const MAX_MCP_RESOURCE_NAME_BYTES: usize = 512;
@@ -966,8 +993,10 @@ pub struct ExportedConnectionStatuses {
 #[derive(Clone, Debug, PartialEq)]
 pub struct StoredMcpCatalogEntry {
     pub remote_tool_name: String,
+    pub title: Option<String>,
     pub description: String,
     pub input_schema: Value,
+    pub annotations: Option<crate::tools::definitions::ToolAnnotations>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
@@ -2021,23 +2050,27 @@ impl SqliteConnectionStore {
             )
             .map_err(|source| sqlite_error(&self.path, "MCP catalog insert", source))?;
 
-        for (ordinal, (entry, input_schema_json)) in entries
+        for (ordinal, ((entry, input_schema_json), annotations_json)) in entries
             .iter()
             .zip(validated.encoded_tool_schemas.iter())
+            .zip(validated.encoded_tool_annotations.iter())
             .enumerate()
         {
             transaction
                 .execute(
                     r#"
                     INSERT INTO connection_mcp_catalog_entries (
-                        connection_id, remote_tool_name, description, input_schema_json, ordinal
-                    ) VALUES (?1, ?2, ?3, ?4, ?5)
+                        connection_id, remote_tool_name, title, description,
+                        input_schema_json, annotations_json, ordinal
+                    ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
                     "#,
                     params![
                         id.as_str(),
                         entry.remote_tool_name,
+                        entry.title,
                         entry.description,
                         input_schema_json,
+                        annotations_json,
                         i64::try_from(ordinal).unwrap_or(i64::MAX),
                     ],
                 )
@@ -3552,7 +3585,7 @@ fn validate_schema(connection: &Connection, path: &Path) -> Result<(), Connectio
         "SELECT sequence, connection_id, status_revision, observed_connection_revision, observed_credential_revision, observed_tls_revision, observed_discovery_revision, state, reason, observed_at, latency_ms, catalog_age_secs, catalog_entry_count FROM connection_status_history LIMIT 0",
         "SELECT id, schema_version, label, purpose, secret_version, algorithm, key_id, nonce, ciphertext, created_at, rotated_at, updated_at FROM connection_local_secrets LIMIT 0",
         "SELECT connection_id, catalog_revision, observed_etag, refreshed_at, entry_count, resource_count, resource_template_count FROM connection_mcp_catalogs LIMIT 0",
-        "SELECT connection_id, remote_tool_name, description, input_schema_json, ordinal FROM connection_mcp_catalog_entries LIMIT 0",
+        "SELECT connection_id, remote_tool_name, title, description, input_schema_json, annotations_json, ordinal FROM connection_mcp_catalog_entries LIMIT 0",
         "SELECT connection_id, uri, name, title, description, mime_type, size, ordinal FROM connection_mcp_catalog_resources LIMIT 0",
         "SELECT connection_id, uri_template, name, title, description, mime_type, ordinal FROM connection_mcp_catalog_resource_templates LIMIT 0",
         "SELECT connection_id, spec_revision, catalog_revision, observed_etag, spec_digest, spec, refreshed_at, entry_count, overlay_revision FROM connection_openapi_catalogs LIMIT 0",
@@ -3908,6 +3941,7 @@ fn validate_persisted_state(
 
 pub(crate) struct ValidatedMcpCatalog {
     pub(crate) encoded_tool_schemas: Vec<String>,
+    pub(crate) encoded_tool_annotations: Vec<Option<String>>,
     pub(crate) stored_bytes: usize,
 }
 
@@ -3927,18 +3961,22 @@ pub(crate) fn validate_mcp_catalog(
             maximum: MAX_CATALOG_ENTRIES,
         });
     }
-    let encoded_tool_schemas = validate_mcp_catalog_entries(id, entries)?;
+    let (encoded_tool_schemas, encoded_tool_annotations) =
+        validate_mcp_catalog_entries(id, entries)?;
     validate_mcp_resources(resources)?;
     validate_mcp_resource_templates(resource_templates)?;
 
     let mut encoded_bytes = entries
         .iter()
         .zip(&encoded_tool_schemas)
-        .try_fold(0_usize, |total, (entry, encoded)| {
+        .zip(&encoded_tool_annotations)
+        .try_fold(0_usize, |total, ((entry, encoded), annotations)| {
             total
                 .checked_add(entry.remote_tool_name.len())
+                .and_then(|total| total.checked_add(entry.title.as_ref().map_or(0, String::len)))
                 .and_then(|total| total.checked_add(entry.description.len()))
                 .and_then(|total| total.checked_add(encoded.len()))
+                .and_then(|total| total.checked_add(annotations.as_ref().map_or(0, String::len)))
         })
         .ok_or(ConnectionStoreError::LimitExceeded {
             resource: "connection MCP catalog bytes",
@@ -3983,6 +4021,7 @@ pub(crate) fn validate_mcp_catalog(
 
     Ok(ValidatedMcpCatalog {
         encoded_tool_schemas,
+        encoded_tool_annotations,
         stored_bytes: encoded_bytes,
     })
 }
@@ -3990,7 +4029,7 @@ pub(crate) fn validate_mcp_catalog(
 fn validate_mcp_catalog_entries(
     id: &ConnectionId,
     entries: &[StoredMcpCatalogEntry],
-) -> Result<Vec<String>, ConnectionStoreError> {
+) -> Result<(Vec<String>, Vec<Option<String>>), ConnectionStoreError> {
     if entries.len() > MAX_CATALOG_ENTRIES {
         return Err(ConnectionStoreError::LimitExceeded {
             resource: "connection MCP catalog entries",
@@ -3999,6 +4038,7 @@ fn validate_mcp_catalog_entries(
     }
     let mut seen = BTreeSet::new();
     let mut encoded = Vec::with_capacity(entries.len());
+    let mut encoded_annotations = Vec::with_capacity(entries.len());
     let mut problems = Vec::new();
     for (index, entry) in entries.iter().enumerate() {
         let remote_name_chars = entry.remote_tool_name.chars().count();
@@ -4026,6 +4066,29 @@ fn validate_mcp_catalog_entries(
                 "MCP catalog entry {index} duplicates an earlier remote tool name"
             ));
         }
+        for (field, title) in [
+            ("title", entry.title.as_deref()),
+            (
+                "annotations.title",
+                entry
+                    .annotations
+                    .as_ref()
+                    .and_then(|annotations| annotations.title.as_deref()),
+            ),
+        ] {
+            if let Some(title) = title {
+                let chars = title.chars().count();
+                if chars == 0
+                    || chars > MAX_MCP_TOOL_TITLE_CHARS
+                    || title.len() > MAX_MCP_TOOL_TITLE_BYTES
+                    || title.contains('\0')
+                {
+                    problems.push(format!(
+                        "MCP catalog entry {index} {field} must contain 1-{MAX_MCP_TOOL_TITLE_CHARS} characters and at most {MAX_MCP_TOOL_TITLE_BYTES} UTF-8 bytes without NUL"
+                    ));
+                }
+            }
+        }
         let description_chars = entry.description.chars().count();
         if description_chars == 0
             || description_chars > MAX_MCP_TOOL_DESCRIPTION_CHARS
@@ -4049,9 +4112,27 @@ fn validate_mcp_catalog_entries(
                 });
             }
         }
+        match entry.annotations.as_ref().map(serde_json::to_string) {
+            Some(Ok(value)) if value.len() <= MAX_MCP_TOOL_ANNOTATIONS_BYTES => {
+                encoded_annotations.push(Some(value));
+            }
+            Some(Ok(_)) => {
+                encoded_annotations.push(None);
+                problems.push(format!(
+                    "MCP catalog entry {index} annotations exceed the bounded stored size"
+                ));
+            }
+            Some(Err(error)) => {
+                return Err(ConnectionStoreError::Json {
+                    operation: "MCP catalog annotations",
+                    source: error,
+                });
+            }
+            None => encoded_annotations.push(None),
+        }
     }
     if problems.is_empty() {
-        Ok(encoded)
+        Ok((encoded, encoded_annotations))
     } else {
         Err(ConnectionStoreError::Validation { problems })
     }
@@ -5499,7 +5580,8 @@ fn load_mcp_catalogs(
                 let mut entry_statement = connection
                     .prepare(
                         r#"
-                        SELECT remote_tool_name, description, input_schema_json, ordinal
+                        SELECT remote_tool_name, title, description, input_schema_json,
+                               annotations_json, ordinal
                         FROM connection_mcp_catalog_entries
                         WHERE connection_id = ?1
                         ORDER BY ordinal ASC
@@ -5512,9 +5594,11 @@ fn load_mcp_catalogs(
                     .query_map(params![connection_id.as_str()], |row| {
                         Ok((
                             row.get::<_, String>(0)?,
-                            row.get::<_, String>(1)?,
+                            row.get::<_, Option<String>>(1)?,
                             row.get::<_, String>(2)?,
-                            row.get::<_, i64>(3)?,
+                            row.get::<_, String>(3)?,
+                            row.get::<_, Option<String>>(4)?,
+                            row.get::<_, i64>(5)?,
                         ))
                     })
                     .map_err(|source| sqlite_error(path, "MCP catalog entry query", source))?
@@ -5526,32 +5610,53 @@ fn load_mcp_catalogs(
                         reason: "MCP catalog entry count mismatch",
                     });
                 }
-                let entries = raw_entries
-                    .into_iter()
-                    .enumerate()
-                    .map(
-                        |(index, (remote_tool_name, description, input_schema_json, ordinal))| {
-                            if usize::try_from(ordinal).ok() != Some(index) {
-                                return Err(ConnectionStoreError::CorruptRecord {
-                                    id: connection_id.to_string(),
-                                    reason: "MCP catalog entry ordinals are not contiguous",
-                                });
-                            }
-                            let input_schema =
-                                serde_json::from_str(&input_schema_json).map_err(|source| {
-                                    ConnectionStoreError::Json {
+                let entries =
+                    raw_entries
+                        .into_iter()
+                        .enumerate()
+                        .map(
+                            |(
+                                index,
+                                (
+                                    remote_tool_name,
+                                    title,
+                                    description,
+                                    input_schema_json,
+                                    annotations_json,
+                                    ordinal,
+                                ),
+                            )| {
+                                if usize::try_from(ordinal).ok() != Some(index) {
+                                    return Err(ConnectionStoreError::CorruptRecord {
+                                        id: connection_id.to_string(),
+                                        reason: "MCP catalog entry ordinals are not contiguous",
+                                    });
+                                }
+                                let input_schema = serde_json::from_str(&input_schema_json)
+                                    .map_err(|source| ConnectionStoreError::Json {
                                         operation: "stored MCP catalog input schema",
                                         source,
-                                    }
-                                })?;
-                            Ok(StoredMcpCatalogEntry {
-                                remote_tool_name,
-                                description,
-                                input_schema,
-                            })
-                        },
-                    )
-                    .collect::<Result<Vec<_>, ConnectionStoreError>>()?;
+                                    })?;
+                                let annotations = annotations_json
+                                    .map(|annotations| {
+                                        serde_json::from_str(&annotations).map_err(|source| {
+                                            ConnectionStoreError::Json {
+                                                operation: "stored MCP catalog annotations",
+                                                source,
+                                            }
+                                        })
+                                    })
+                                    .transpose()?;
+                                Ok(StoredMcpCatalogEntry {
+                                    remote_tool_name,
+                                    title,
+                                    description,
+                                    input_schema,
+                                    annotations,
+                                })
+                            },
+                        )
+                        .collect::<Result<Vec<_>, ConnectionStoreError>>()?;
 
                 let mut resource_statement = connection
                     .prepare(
@@ -6123,16 +6228,20 @@ fn mcp_catalog_bytes(
         r#"
         SELECT COALESCE(SUM(
             length(CAST(remote_tool_name AS BLOB))
+          + COALESCE(length(CAST(title AS BLOB)), 0)
           + length(CAST(description AS BLOB))
           + length(CAST(input_schema_json AS BLOB))
+          + COALESCE(length(CAST(annotations_json AS BLOB)), 0)
         ), 0)
         FROM connection_mcp_catalog_entries
         "#,
         r#"
         SELECT COALESCE(SUM(
             length(CAST(remote_tool_name AS BLOB))
+          + COALESCE(length(CAST(title AS BLOB)), 0)
           + length(CAST(description AS BLOB))
           + length(CAST(input_schema_json AS BLOB))
+          + COALESCE(length(CAST(annotations_json AS BLOB)), 0)
         ), 0)
         FROM connection_mcp_catalog_entries
         WHERE connection_id != ?1
@@ -7349,11 +7458,13 @@ mod tests {
     fn mcp_catalog_entry(name: &str, description: &str) -> StoredMcpCatalogEntry {
         StoredMcpCatalogEntry {
             remote_tool_name: name.to_owned(),
+            title: None,
             description: description.to_owned(),
             input_schema: json!({
                 "type": "object",
                 "properties": {}
             }),
+            annotations: None,
         }
     }
 
@@ -7527,7 +7638,7 @@ mod tests {
             .expect("migration query should run")
             .collect::<Result<Vec<_>, _>>()
             .expect("migration rows should read");
-        assert_eq!(versions, vec![1, 2, 3, 4, 5, 6, 7, 8, 9]);
+        assert_eq!(versions, vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10]);
     }
 
     #[test]
@@ -7854,7 +7965,7 @@ mod tests {
             .expect("migration query should run")
             .collect::<Result<Vec<_>, _>>()
             .expect("migration rows should read");
-        assert_eq!(versions, vec![1, 2, 3, 4, 5, 6, 7, 8, 9]);
+        assert_eq!(versions, vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10]);
     }
 
     #[test]
@@ -7958,7 +8069,7 @@ mod tests {
             .expect("migration query should run")
             .collect::<Result<Vec<_>, _>>()
             .expect("migration rows should read");
-        assert_eq!(versions, vec![1, 2, 3, 4, 5, 6, 7, 8, 9]);
+        assert_eq!(versions, vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10]);
     }
 
     #[test]
@@ -8271,7 +8382,7 @@ mod tests {
         drop(store);
 
         let reopened = SqliteConnectionStore::open(&path)
-            .expect("migration 9 database should remain restart-safe");
+            .expect("migrated database should remain restart-safe");
         assert_eq!(
             reopened
                 .get(&connection_id)
@@ -8299,9 +8410,12 @@ mod tests {
             .expect("migration query should run")
             .collect::<Result<Vec<_>, _>>()
             .expect("migration rows should read");
-        assert_eq!(versions, vec![1, 2, 3, 4, 5, 6, 7, 8, 9]);
+        assert_eq!(versions, vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10]);
         assert!(connection
             .prepare("SELECT source_digest, values_json FROM connection_enum_source_values LIMIT 0")
+            .is_ok());
+        assert!(connection
+            .prepare("SELECT title, annotations_json FROM connection_mcp_catalog_entries LIMIT 0")
             .is_ok());
     }
 
@@ -8311,14 +8425,18 @@ mod tests {
         let created = store
             .create(mcp_candidate())
             .expect("MCP connection should create");
+        let mut annotated_alpha = mcp_catalog_entry("alpha", "Alpha");
+        annotated_alpha.title = Some("Alpha lookup".to_owned());
+        annotated_alpha.annotations = Some(crate::tools::definitions::ToolAnnotations {
+            read_only_hint: Some(true),
+            open_world_hint: Some(false),
+            ..crate::tools::definitions::ToolAnnotations::default()
+        });
         let first = store
             .replace_mcp_catalog(
                 &created.id,
                 &created.etag(),
-                &[
-                    mcp_catalog_entry("alpha", "Alpha"),
-                    mcp_catalog_entry("beta", "Beta"),
-                ],
+                &[annotated_alpha.clone(), mcp_catalog_entry("beta", "Beta")],
                 &[mcp_resource("gg://resource/alpha", "resource-alpha")],
                 &[mcp_resource_template(
                     "gg://resource/{id}",
@@ -8327,6 +8445,7 @@ mod tests {
             )
             .expect("first MCP catalog should publish");
         assert_eq!(first.catalog_revision, 1);
+        assert_eq!(first.entries[0], annotated_alpha);
         assert_eq!(first.resources.len(), 1);
         assert_eq!(first.resource_templates.len(), 1);
         assert_eq!(
@@ -8526,11 +8645,13 @@ mod tests {
         let oversized_bytes = (0..66)
             .map(|index| StoredMcpCatalogEntry {
                 remote_tool_name: format!("large-{index:03}"),
+                title: None,
                 description: "Large bounded schema".to_owned(),
                 input_schema: json!({
                     "type": "object",
                     "description": filler.clone()
                 }),
+                annotations: None,
             })
             .collect::<Vec<_>>();
         assert!(matches!(

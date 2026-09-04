@@ -5678,6 +5678,7 @@ mod tests {
         };
         let definition = ToolDefinition {
             name: "set_status".to_owned(),
+            title: None,
             description: "Set an exact status".to_owned(),
             input_schema: json!({
                 "type": "object",
@@ -5705,6 +5706,7 @@ mod tests {
                 source_id: source.id,
                 source_digest: source.source_digest,
             }],
+            annotations: None,
         };
         let registry = ToolRegistry::disabled();
         registry
@@ -8464,6 +8466,7 @@ mod tests {
             };
             ToolDefinition {
                 name: name.to_owned(),
+                title: None,
                 description: format!("Composite test leaf {name}"),
                 input_schema,
                 target: Some(ToolTarget::Http {
@@ -8476,6 +8479,7 @@ mod tests {
                 visibility,
                 transform: None,
                 enum_bindings: Vec::new(),
+                annotations: None,
             }
         };
         let object_schema = |properties: Value, required: Value| {
@@ -8521,6 +8525,7 @@ mod tests {
         );
         let composite = ToolDefinition {
             name: "create_note_for_records".to_owned(),
+            title: None,
             description: "Composite test workflow".to_owned(),
             input_schema: object_schema(
                 json!({
@@ -8534,6 +8539,7 @@ mod tests {
             }),
             source: source(None),
             upstream: crate::tools::definitions::HttpToolMapping::composite_sentinel(),
+            annotations: None,
             composite: Some(CompositeMapping {
                 steps: vec![
                     CompositeStep {

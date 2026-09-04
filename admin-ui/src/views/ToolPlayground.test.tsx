@@ -105,6 +105,36 @@ describe('ToolPlayground', () => {
     expect(document.body.textContent).not.toContain('PLAYGROUND_RESULT_CANARY');
   });
 
+  it('shows MCP annotations while keeping policy authoritative', async () => {
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(() =>
+        Promise.resolve(
+          jsonResponse(
+            200,
+            capabilityDetail({
+              annotations: {
+                title: 'Invoice lookup',
+                readOnlyHint: true,
+                destructiveHint: false,
+                idempotentHint: true,
+                openWorldHint: false,
+              },
+            }),
+            { ETag: '"capability:v1"' },
+          ),
+        ),
+      ),
+    );
+
+    renderPlayground('/tools/cap_abc/playground');
+    const panel = await screen.findByRole('region', { name: 'MCP annotations' });
+    expect(panel.textContent).toContain('Invoice lookup');
+    expect(panel.textContent).toContain('Read-only hintTrue');
+    expect(panel.textContent).toContain('Destructive hintFalse');
+    expect(panel.textContent).toContain('authorization and policy checks remain authoritative');
+  });
+
   it('renders a bounded composite body and step summary', async () => {
     vi.stubGlobal(
       'fetch',

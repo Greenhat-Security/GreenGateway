@@ -14,6 +14,7 @@ import {
 import {
   CapabilityContractError,
   type CapabilityDetail,
+  type ToolAnnotations,
   getCapability,
 } from '../lib/capabilityInventory';
 import {
@@ -328,6 +329,10 @@ export function ToolPlayground() {
           />
         ) : null}
 
+        {!isLoading && detail?.annotations ? (
+          <ToolAnnotationsPanel annotations={detail.annotations} />
+        ) : null}
+
         {!isLoading && detail !== null ? (
           <div className="tool-playground-layout">
             <form
@@ -444,6 +449,47 @@ export function ToolPlayground() {
       </section>
     </main>
   );
+}
+
+function ToolAnnotationsPanel({
+  annotations,
+}: {
+  annotations: ToolAnnotations;
+}) {
+  const rows = [
+    ['Title', annotations.title],
+    ['Read-only hint', hintValue(annotations.readOnlyHint)],
+    ['Destructive hint', hintValue(annotations.destructiveHint)],
+    ['Idempotent hint', hintValue(annotations.idempotentHint)],
+    ['Open-world hint', hintValue(annotations.openWorldHint)],
+  ] as const;
+  return (
+    <section
+      className="capability-detail-section"
+      aria-labelledby="tool-playground-annotations-heading"
+    >
+      <div className="section-heading">
+        <p className="eyebrow">Client hints</p>
+        <h3 id="tool-playground-annotations-heading">MCP annotations</h3>
+      </div>
+      <dl className="traffic-metadata-grid">
+        {rows.map(([label, value]) => (
+          <div key={label}>
+            <dt>{label}</dt>
+            <dd>{value ?? 'Not declared'}</dd>
+          </div>
+        ))}
+      </dl>
+      <p className="body-copy">
+        Annotations are advisory client metadata. Gateway authorization and
+        policy checks remain authoritative.
+      </p>
+    </section>
+  );
+}
+
+function hintValue(value: boolean | undefined): string {
+  return value === undefined ? 'Not declared' : value ? 'True' : 'False';
 }
 
 function ToolResult({

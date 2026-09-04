@@ -66,7 +66,8 @@ use super::{
     },
     definitions::{
         dynamic_enum_schema, dynamic_enum_schema_mut, BodyMappingMode, EnumBinding,
-        HttpToolMapping, QueryParamMapping, ToolDefinition, ToolSource, ToolTarget, ToolVisibility,
+        HttpToolMapping, QueryParamMapping, ToolAnnotations, ToolDefinition, ToolSource,
+        ToolTarget, ToolVisibility,
     },
     openapi::{OpenApiToolBinding, OpenApiToolGeneration, OpenApiToolSecuritySelection},
     selector::{
@@ -158,7 +159,11 @@ pub struct OverlayDocument {
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct CompositeOverlay {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
     pub description: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub annotations: Option<ToolAnnotations>,
     pub input: CompositeInput,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub parameters: BTreeMap<String, CompositeParameterOverlay>,
@@ -252,7 +257,11 @@ pub struct ToolOverlay {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub visibility: Option<ToolVisibility>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub annotations: Option<ToolAnnotations>,
     /// Compile-time labels keyed by this tool's generated property names.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub labels_from: Option<String>,
@@ -2079,6 +2088,8 @@ pub fn compile_with_resolved_sources(
         if let Some(description) = tool.description.as_deref() {
             definition.description = description.to_owned();
         }
+        definition.title = tool.title.clone();
+        definition.annotations = tool.annotations.clone();
         let visibility = tool.visibility.unwrap_or_default();
         definition.visibility = visibility;
         if visibility == ToolVisibility::CompositeOnly {
@@ -3287,6 +3298,7 @@ fn compile_composites(
         let composite_path = format!("/composites/{composite_name}");
         let mut prior_steps = BTreeMap::<String, CompiledStepInfo>::new();
         let mut compiled_steps = authored.steps.clone();
+        let mut all_steps_read_only = true;
         let mut iteration_bound = 0_usize;
         let mut steps_max = 0_usize;
         let mut first_definition_index = None;
@@ -3315,6 +3327,7 @@ fn compile_composites(
                 problems,
             );
             if let Some(index) = target_index {
+                all_steps_read_only &= definitions[index].upstream.method == "GET";
                 first_definition_index.get_or_insert(index);
                 referenced_generated_tools.insert(step.tool.clone());
                 validate_bound_arguments(
@@ -3381,6 +3394,7 @@ fn compile_composites(
                     problems,
                 );
                 if let Some(index) = compensation_index {
+                    all_steps_read_only &= definitions[index].upstream.method == "GET";
                     referenced_generated_tools.insert(compensation.tool.clone());
                     validate_bound_arguments(
                         &compensation.arguments,
@@ -3424,6 +3438,19 @@ fn compile_composites(
                     "for_each bounds total {iteration_bound} iterations, exceeding max_iterations {}",
                     authored.limits.max_iterations
                 ),
+            });
+        }
+
+        if authored
+            .annotations
+            .as_ref()
+            .and_then(|annotations| annotations.read_only_hint)
+            == Some(true)
+            && !all_steps_read_only
+        {
+            problems.push(OverlayProblem {
+                path: format!("{composite_path}/annotations/readOnlyHint"),
+                message: "a composite containing a non-GET step or compensation cannot declare readOnlyHint true".to_owned(),
             });
         }
 
@@ -3563,6 +3590,7 @@ fn compile_composites(
         };
         definitions.push(ToolDefinition {
             name: composite_name.clone(),
+            title: authored.title.clone(),
             description: authored.description.clone(),
             input_schema,
             target: Some(ToolTarget::Composite {
@@ -3578,6 +3606,7 @@ fn compile_composites(
             composite: Some(mapping),
             visibility: ToolVisibility::Listed,
             enum_bindings,
+            annotations: authored.annotations.clone(),
         });
         security_selections.push(OpenApiToolSecuritySelection {
             tool_name: composite_name.clone(),
@@ -5623,6 +5652,68 @@ paths:
                 "{serde_error}"
             );
         }
+    }
+
+    #[test]
+    fn explicit_tool_annotations_compile_without_implicit_get_inference() {
+        let (generation, binding) = bound(crm_spec());
+        let overlay = validate(&json!({
+            "schema_version": "0.1.0",
+            "tools": {
+                "findManyCompanies": {
+                    "title": "Search companies",
+                    "annotations": {
+                        "title": "Company lookup",
+                        "readOnlyHint": true,
+                        "openWorldHint": false
+                    }
+                }
+            }
+        }))
+        .expect("annotation overlay validates");
+        let compiled = compile(
+            &generation,
+            binding,
+            &overlay,
+            &OverlayCompileContext::default(),
+        )
+        .expect("annotation overlay compiles");
+        let annotated = definition(&compiled.binding, "findManyCompanies");
+        assert_eq!(annotated.title.as_deref(), Some("Search companies"));
+        let annotations = annotated.annotations.as_ref().expect("annotations compile");
+        assert_eq!(annotations.title.as_deref(), Some("Company lookup"));
+        assert_eq!(annotations.read_only_hint, Some(true));
+        assert_eq!(annotations.open_world_hint, Some(false));
+
+        let (_, plain_binding) = bound(crm_spec());
+        let plain = definition(&plain_binding, "findManyCompanies");
+        assert!(plain.title.is_none());
+        assert!(
+            plain.annotations.is_none(),
+            "GET must not gain an implicit trust hint"
+        );
+        let serialized = serde_json::to_value(plain).expect("plain definition serializes");
+        assert!(serialized.get("title").is_none());
+        assert!(serialized.get("annotations").is_none());
+    }
+
+    #[test]
+    fn composite_with_write_step_cannot_declare_read_only() {
+        let (generation, binding) = bound(crm_spec());
+        let mut document = example();
+        document["composites"]["delete_company"]["annotations"] = json!({"readOnlyHint": true});
+        let overlay = validate(&document).expect("annotation shape validates");
+        let error = compile(
+            &generation,
+            binding,
+            &overlay,
+            &OverlayCompileContext::default(),
+        )
+        .expect_err("a DELETE composite cannot claim to be read-only");
+        assert!(problems(error).iter().any(|(path, message)| {
+            path == "/composites/delete_company/annotations/readOnlyHint"
+                && message.contains("non-GET")
+        }));
     }
 
     #[test]
