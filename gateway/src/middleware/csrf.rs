@@ -8,6 +8,8 @@
 //! and default to the probe routes, so a deployment whose proxied clients
 //! authenticate with anything other than a bearer token has to echo the token
 //! or turn the layer off with `CSRF_ENABLED=false`.
+//! MCP requests without cookies or a verified client certificate also proceed
+//! to authentication so OAuth clients can receive their initial challenge.
 
 use axum::{
     extract::{Request, State},
@@ -21,7 +23,10 @@ use http::{
 };
 use serde::Serialize;
 
-use crate::{auth::protected_resource, config::Config};
+use crate::{
+    auth::{protected_resource, VerifiedClientIdentity},
+    config::Config,
+};
 
 use super::bearer::bearer_token;
 
@@ -81,6 +86,19 @@ pub async fn csrf_middleware(
 
     if is_state_changing(&method) {
         if bearer_auth_present(&request) {
+            return next.run(request).await;
+        }
+
+        // An MCP OAuth client starts without credentials and needs auth's 401
+        // challenge. Only bypass when neither form of ambient credential is
+        // present; even empty or malformed Cookie headers remain protected.
+        if is_mcp_route
+            && !request.headers().contains_key(COOKIE)
+            && request
+                .extensions()
+                .get::<VerifiedClientIdentity>()
+                .is_none()
+        {
             return next.run(request).await;
         }
 
@@ -392,6 +410,83 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn mcp_without_ambient_credentials_reaches_the_next_layer() {
+        for method in [Method::POST, Method::PUT, Method::PATCH, Method::DELETE] {
+            let router = Router::new()
+                .route(
+                    "/mcp",
+                    axum::routing::any(|| async { StatusCode::UNAUTHORIZED }),
+                )
+                .layer(from_fn_with_state(test_config(true), csrf_middleware));
+            let response = router
+                .oneshot(
+                    Request::builder()
+                        .method(method)
+                        .uri("/mcp")
+                        .body(Body::empty())
+                        .expect("request"),
+                )
+                .await
+                .expect("response");
+            assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        }
+    }
+
+    #[tokio::test]
+    async fn mcp_with_any_cookie_still_requires_csrf() {
+        for cookie in [
+            "session=test-session",
+            "csrf_token=token",
+            "unrelated=value",
+            "",
+            "malformed",
+        ] {
+            let response = test_router(test_config(true))
+                .oneshot(
+                    Request::builder()
+                        .method(Method::POST)
+                        .uri("/mcp")
+                        .header(COOKIE, cookie)
+                        .body(Body::empty())
+                        .expect("request"),
+                )
+                .await
+                .expect("response");
+            assert_eq!(
+                response.status(),
+                StatusCode::FORBIDDEN,
+                "cookie: {cookie:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn mcp_with_client_certificate_still_requires_csrf() {
+        let mut params = rcgen::CertificateParams::default();
+        params.subject_alt_names = vec![rcgen::SanType::URI(
+            rcgen::Ia5String::try_from("spiffe://example.test/client").expect("URI SAN"),
+        )];
+        let key = rcgen::KeyPair::generate().expect("key");
+        let certificate = params.self_signed(&key).expect("certificate");
+        let identity = crate::auth::identity_from_certificate(
+            certificate.der(),
+            crate::auth::ClientCertIdentitySource::Spiffe,
+        )
+        .expect("identity");
+        let mut request = Request::builder()
+            .method(Method::POST)
+            .uri("/mcp")
+            .body(Body::empty())
+            .expect("request");
+        request.extensions_mut().insert(identity);
+        let response = test_router(test_config(true))
+            .oneshot(request)
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
     async fn mcp_route_is_not_csrf_exempt_even_if_listed() {
         let mut config = test_config(true);
         config
@@ -403,6 +498,7 @@ mod tests {
                 Request::builder()
                     .method(Method::POST)
                     .uri(protected_resource::MCP_RESOURCE_PATH)
+                    .header(COOKIE, "session=test-session")
                     .body(Body::empty())
                     .expect("request should build"),
             )
