@@ -67,6 +67,10 @@
           ],
           "default": "listed",
           "description": "Where the tool is reachable from. composite_only tools are not advertised by tools/list and not callable through tools/call; they exist for composite steps and compensations and for the admin playground. Omission means listed."
+        },
+        "transform": {
+          "$ref": "#/$defs/tool_transform",
+          "description": "Optional compiled declarative request/response transform. Omission preserves the legacy request and response bytes exactly."
         }
       }
     },
@@ -293,6 +297,255 @@
           "description": "whole_args_json serializes the entire tool arguments object as the JSON body, path and query arguments included. body_args_json omits path-template placeholders and mapped query arguments from the body; the overlay compiler sets it on overlaid tools."
         }
       }
+    },
+    "local_name": {
+      "type": "string",
+      "pattern": "^[A-Za-z][A-Za-z0-9_]{0,63}$"
+    },
+    "agent_property_name": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 512
+    },
+    "json_pointer": {
+      "type": "string",
+      "pattern": "^(/([^/~]|~0|~1)*)*$",
+      "maxLength": 512
+    },
+    "selector": {
+      "type": "string",
+      "maxLength": 1024,
+      "pattern": "^(/([A-Za-z0-9_.-]+(\\[[A-Za-z0-9_.-]+=(int:-?[0-9]{1,18}|bool:(true|false)|[^\\]/]{1,128})\\])?|\\*))+$"
+    },
+    "tool_transform": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "parameters": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 256,
+          "items": {
+            "$ref": "#/$defs/parameter_shape"
+          }
+        },
+        "response_fields": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 64,
+          "items": {
+            "$ref": "#/$defs/parameter_shape"
+          }
+        },
+        "response_root": {
+          "$ref": "#/$defs/selector"
+        }
+      },
+      "anyOf": [
+        {
+          "required": [
+            "parameters"
+          ]
+        },
+        {
+          "required": [
+            "response_fields"
+          ]
+        },
+        {
+          "required": [
+            "response_root"
+          ]
+        }
+      ]
+    },
+    "parameter_shape": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "wire_property",
+        "agent",
+        "wire",
+        "response"
+      ],
+      "properties": {
+        "wire_property": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256
+        },
+        "wire_required": {
+          "type": "boolean",
+          "default": false
+        },
+        "agent": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 16,
+          "items": {
+            "$ref": "#/$defs/agent_property"
+          }
+        },
+        "wire": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 16,
+          "items": {
+            "$ref": "#/$defs/compiled_wire_binding"
+          }
+        },
+        "response": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 16,
+          "items": {
+            "$ref": "#/$defs/compiled_response_binding"
+          }
+        }
+      }
+    },
+    "agent_property": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "name",
+        "schema"
+      ],
+      "properties": {
+        "name": {
+          "$ref": "#/$defs/agent_property_name"
+        },
+        "schema": {
+          "type": "object"
+        }
+      }
+    },
+    "compiled_wire_binding": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "pointer"
+      ],
+      "properties": {
+        "pointer": {
+          "$ref": "#/$defs/json_pointer"
+        },
+        "from": {
+          "$ref": "#/$defs/agent_property_name"
+        },
+        "const": {},
+        "codec": {
+          "$ref": "#/$defs/compiled_codec_chain"
+        }
+      },
+      "oneOf": [
+        {
+          "required": [
+            "from"
+          ]
+        },
+        {
+          "required": [
+            "const"
+          ]
+        }
+      ]
+    },
+    "compiled_response_binding": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "agent_property",
+        "from"
+      ],
+      "properties": {
+        "agent_property": {
+          "$ref": "#/$defs/agent_property_name"
+        },
+        "from": {
+          "$ref": "#/$defs/json_pointer"
+        },
+        "codec": {
+          "$ref": "#/$defs/compiled_codec_chain"
+        }
+      }
+    },
+    "compiled_codec_chain": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 4,
+      "items": {
+        "$ref": "#/$defs/compiled_codec"
+      }
+    },
+    "compiled_codec": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "kind",
+            "scale"
+          ],
+          "properties": {
+            "kind": {
+              "const": "decimal_scale"
+            },
+            "scale": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 18
+            },
+            "wire_encoding": {
+              "enum": [
+                "integer_string",
+                "integer"
+              ],
+              "default": "integer_string"
+            },
+            "max_integer_digits": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 38,
+              "default": 24
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "kind",
+            "dialect"
+          ],
+          "properties": {
+            "kind": {
+              "const": "markdown_blocks"
+            },
+            "dialect": {
+              "const": "blocknote"
+            },
+            "max_input_bytes": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 262144,
+              "default": 65536
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "kind"
+          ],
+          "properties": {
+            "kind": {
+              "const": "json_string"
+            }
+          }
+        }
+      ]
     }
   }
 }

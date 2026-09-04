@@ -598,6 +598,23 @@ fn connection_admin_json_schema_is_strict_resolvable_and_secret_safe() {
         "OpenApiPreviewRequest",
         "OpenApiRegisterRequest",
         "PlaygroundRequest",
+        "ToolDefinition",
+        "ToolTransform",
+        "TransformParameterShape",
+        "TransformAgentProperty",
+        "TransformWireBinding",
+        "TransformResponseBinding",
+        "OpenApiOverlayDocument",
+        "OpenApiOverlayTool",
+        "OpenApiOverlayParameter",
+        "OpenApiOverlayShape",
+        "OpenApiOverlayWireBinding",
+        "OpenApiOverlayResponseBinding",
+        "OpenApiOverlayResponse",
+        "CapabilityTransformSummary",
+        "CapabilityTransformShapeSummary",
+        "TransformWarning",
+        "TransformProblem",
     ] {
         assert_closed_object(&schema, name);
     }
@@ -838,7 +855,15 @@ fn connection_admin_closed_copies_accept_overlay_runtime_fields_and_exact_versio
     let definition = json!({
         "name": "UpdateOneCompany",
         "description": "Update one company",
-        "input_json_schema": {"type": "object", "properties": {}},
+        "input_json_schema": {
+            "type": "object",
+            "properties": {
+                "revenue_amount": {"type": "number"},
+                "revenue_currency": {"type": "string"}
+            },
+            "required": ["revenue_amount", "revenue_currency"],
+            "additionalProperties": false
+        },
         "source": {
             "type": "open_api",
             "connection_id": "billing-api",
@@ -851,11 +876,48 @@ fn connection_admin_closed_copies_accept_overlay_runtime_fields_and_exact_versio
             "mapping": mapping.clone()
         },
         "upstream": mapping,
-        "visibility": "composite_only"
+        "visibility": "composite_only",
+        "transform": {
+            "parameters": [{
+                "wire_property": "annualRecurringRevenue",
+                "wire_required": true,
+                "agent": [
+                    {"name": "revenue_amount", "schema": {"type": "number"}},
+                    {"name": "revenue_currency", "schema": {"type": "string"}}
+                ],
+                "wire": [
+                    {
+                        "pointer": "/amountMicros",
+                        "from": "revenue_amount",
+                        "codec": [{
+                            "kind": "decimal_scale",
+                            "scale": 6,
+                            "wire_encoding": "integer_string",
+                            "max_integer_digits": 24
+                        }]
+                    },
+                    {
+                        "pointer": "/currencyCode",
+                        "const": "USD"
+                    }
+                ],
+                "response": [{
+                    "agent_property": "revenue_amount",
+                    "from": "/amountMicros",
+                    "codec": [{
+                        "kind": "decimal_scale",
+                        "scale": 6,
+                        "wire_encoding": "integer_string",
+                        "max_integer_digits": 24
+                    }]
+                }]
+            }],
+            "response_root": "/data/updateCompany"
+        }
     });
     assert!(
         validates("ToolDefinition", &definition),
-        "the closed stored-definition copy must accept visibility and BodyArgsJson"
+        "the closed stored-definition copy must accept the compiled transform"
     );
     assert!(validates(
         "CapabilityMapping",
@@ -870,10 +932,137 @@ fn connection_admin_closed_copies_accept_overlay_runtime_fields_and_exact_versio
 
     assert!(validates(
         "OpenApiOverlayDocument",
-        &json!({"schema_version": "0.1.0"})
+        &json!({
+            "schema_version": "0.1.0",
+            "defaults": {"response_root": "/data/*"},
+            "shapes": {
+                "money": {
+                    "agent": {
+                        "amount": {"type": "number"},
+                        "currency": {"type": "string"}
+                    },
+                    "required": ["amount", "currency"],
+                    "wire": {
+                        "/amountMicros": {
+                            "from": "amount",
+                            "codec": {
+                                "kind": "decimal_scale",
+                                "scale": 6
+                            }
+                        },
+                        "/currencyCode": {"from": "currency"}
+                    }
+                }
+            },
+            "tools": {
+                "UpdateOneCompany": {
+                    "parameters": {
+                        "annualRecurringRevenue": {
+                            "shape": {"$use": "money", "prefix": "revenue"}
+                        }
+                    },
+                    "response": {
+                        "root": "/data/updateCompany",
+                        "fields": {
+                            "annualRecurringRevenue": {"$use": "money"}
+                        }
+                    }
+                }
+            }
+        })
     ));
     assert!(!validates(
         "OpenApiOverlayDocument",
         &json!({"schema_version": "0.1.1"})
+    ));
+
+    let safe_summary = json!({
+        "parameters": [{
+            "wire_property": "annualRecurringRevenue",
+            "agent_properties": ["revenue_amount", "revenue_currency"],
+            "wire_pointer_count": 2,
+            "response_properties": ["revenue_amount"],
+            "constant_binding_count": 1
+        }],
+        "response_fields": [],
+        "has_response_root": true
+    });
+    assert!(validates("CapabilityTransformSummary", &safe_summary));
+    for (field, value) in [
+        ("wire_pointers", json!(["/amountMicros"])),
+        ("constant_values", json!(["USD"])),
+        ("codecs", json!(["decimal_scale"])),
+        ("agent_schemas", json!([{"type": "number"}])),
+    ] {
+        let mut unsafe_summary = safe_summary.clone();
+        unsafe_summary["parameters"][0][field] = value;
+        assert!(
+            !validates("CapabilityTransformSummary", &unsafe_summary),
+            "inventory summaries must not expose {field}"
+        );
+    }
+    let mut selector_leak = safe_summary;
+    selector_leak["response_root"] = json!("/data/updateCompany");
+    assert!(
+        !validates("CapabilityTransformSummary", &selector_leak),
+        "inventory summaries expose only has_response_root, never selector text"
+    );
+
+    assert!(validates(
+        "PlaygroundHttpResult",
+        &json!({
+            "kind": "http",
+            "status": 200,
+            "body": {"type": "json", "value": {}},
+            "warnings": [{"path": "/data/0/value", "reason": "response binding pointer is missing"}]
+        })
+    ));
+    let exact_warning_limit = (0..32)
+        .map(|index| json!({"path": format!("/data/{index}"), "reason": "decode failed"}))
+        .collect::<Vec<_>>();
+    assert!(validates(
+        "PlaygroundHttpResult",
+        &json!({
+            "kind": "http",
+            "status": 200,
+            "body": {"type": "json", "value": {}},
+            "warnings": exact_warning_limit
+        })
+    ));
+    let too_many_warnings = (0..33)
+        .map(|index| json!({"path": format!("/data/{index}"), "reason": "decode failed"}))
+        .collect::<Vec<_>>();
+    assert!(!validates(
+        "PlaygroundHttpResult",
+        &json!({
+            "kind": "http",
+            "status": 200,
+            "body": {"type": "json", "value": {}},
+            "warnings": too_many_warnings
+        })
+    ));
+    assert!(validates(
+        "ReasonedError",
+        &json!({
+            "error": "invalid_params",
+            "reason": "transform rejected",
+            "problems": [{
+                "path": "/revenue_amount",
+                "keyword": "codec",
+                "reason": "value has too many fraction digits"
+            }]
+        })
+    ));
+    assert!(!validates(
+        "ReasonedError",
+        &json!({
+            "error": "invalid_params",
+            "reason": "transform rejected",
+            "problems": [{
+                "path": "/revenue_amount",
+                "keyword": "coercion",
+                "reason": "not part of the wire contract"
+            }]
+        })
     ));
 }

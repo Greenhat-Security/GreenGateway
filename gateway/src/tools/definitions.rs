@@ -20,6 +20,10 @@ use tokio_util::sync::CancellationToken;
 use crate::{
     audit::{self, AuditEvent, AuditLog},
     config::Config,
+    tools::{
+        codecs::Codec,
+        transforms::{ParameterShape, ToolTransform, WireSource},
+    },
 };
 
 const TOOL_REGISTRY_RELOAD_DEBOUNCE: Duration = Duration::from_millis(200);
@@ -59,6 +63,11 @@ pub struct ToolDefinition {
     /// field keeps its exact stored bytes and digest.
     #[serde(default, skip_serializing_if = "ToolVisibility::is_listed")]
     pub visibility: ToolVisibility,
+    /// Declarative agent-to-wire and wire-to-agent mapping compiled from a
+    /// Connection OpenAPI overlay. Omission preserves legacy definitions and
+    /// their serialized bytes exactly.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transform: Option<ToolTransform>,
 }
 
 /// Where a tool is reachable from (issue #360).
@@ -165,6 +174,7 @@ impl ToolDefinition {
             source: ToolSource::Legacy,
             upstream: UpstreamMapping::mcp_proxy(server_name, tool_name),
             visibility: ToolVisibility::Listed,
+            transform: None,
         }
     }
 
@@ -1860,9 +1870,242 @@ fn tool_definition_problems(definitions: &[ToolDefinition]) -> Vec<String> {
         if is_http_mapping {
             problems.extend(tool_mapping_schema_problems(index, definition));
         }
+        problems.extend(tool_transform_problems(index, definition));
     }
 
     problems
+}
+
+fn tool_transform_problems(index: usize, definition: &ToolDefinition) -> Vec<String> {
+    let Some(transform) = &definition.transform else {
+        return Vec::new();
+    };
+    let mut problems = Vec::new();
+    if definition.upstream.is_mcp_proxy() {
+        problems.push(format!(
+            "tools[{index}].transform is only supported for HTTP tools"
+        ));
+    }
+    if !transform.parameters.is_empty()
+        && definition.upstream.body.as_ref().map(|body| body.mode)
+            != Some(BodyMappingMode::BodyArgsJson)
+    {
+        problems.push(format!(
+            "tools[{index}].transform requires upstream.body.mode body_args_json"
+        ));
+    }
+    if transform.parameters.len() > 256 {
+        problems.push(format!(
+            "tools[{index}].transform.parameters exceeds 256 entries"
+        ));
+    }
+    if transform.response_fields.len() > 64 {
+        problems.push(format!(
+            "tools[{index}].transform.response_fields exceeds 64 entries"
+        ));
+    }
+    if transform.parameters.is_empty()
+        && transform.response_fields.is_empty()
+        && transform.response_root.is_none()
+    {
+        problems.push(format!(
+            "tools[{index}].transform must contain a parameter, response field, or response root"
+        ));
+    }
+
+    let input_properties = definition
+        .input_schema
+        .get("properties")
+        .and_then(Value::as_object);
+    if !transform.parameters.is_empty()
+        && definition.input_schema.get("additionalProperties") != Some(&Value::Bool(false))
+    {
+        problems.push(format!(
+            "tools[{index}].transform requires input_json_schema.additionalProperties false so callers cannot bypass agent fields with raw wire properties"
+        ));
+    }
+    let mut wire_properties = BTreeSet::new();
+    for (lane, shapes) in [
+        ("parameters", transform.parameters.as_slice()),
+        ("response_fields", transform.response_fields.as_slice()),
+    ] {
+        for (shape_index, shape) in shapes.iter().enumerate() {
+            let path = format!("tools[{index}].transform.{lane}[{shape_index}]");
+            if !wire_properties.insert(shape.wire_property.as_str()) {
+                problems.push(format!(
+                    "{path}.wire_property duplicates transformed wire property '{}'",
+                    shape.wire_property
+                ));
+            }
+            if lane == "parameters" {
+                if input_properties
+                    .is_some_and(|properties| properties.contains_key(&shape.wire_property))
+                {
+                    problems.push(format!(
+                        "{path}.wire_property must be removed from the compiled agent input schema"
+                    ));
+                }
+                for agent in &shape.agent {
+                    if !input_properties
+                        .is_some_and(|properties| properties.contains_key(&agent.name))
+                    {
+                        problems.push(format!(
+                            "{path}.agent property '{}' is absent from the compiled agent input schema",
+                            agent.name
+                        ));
+                    }
+                }
+            }
+            parameter_shape_problems(&path, shape, &mut problems);
+        }
+    }
+    problems
+}
+
+fn parameter_shape_problems(path: &str, shape: &ParameterShape, problems: &mut Vec<String>) {
+    if shape.wire_property.is_empty() {
+        problems.push(format!("{path}.wire_property must be non-empty"));
+    }
+    if shape.agent.is_empty() || shape.agent.len() > 16 {
+        problems.push(format!("{path}.agent must contain 1-16 properties"));
+    }
+    if shape.wire.is_empty() || shape.wire.len() > 16 {
+        problems.push(format!("{path}.wire must contain 1-16 bindings"));
+    }
+    if shape.response.is_empty() || shape.response.len() > 16 {
+        problems.push(format!("{path}.response must contain 1-16 bindings"));
+    }
+
+    let mut agent_names = BTreeSet::new();
+    for agent in &shape.agent {
+        if agent.name.is_empty() || !agent_names.insert(agent.name.as_str()) {
+            problems.push(format!(
+                "{path}.agent contains an empty or duplicate property name"
+            ));
+        }
+        if agent.schema.get("type").and_then(Value::as_str).is_none() {
+            problems.push(format!(
+                "{path}.agent property '{}' must have a single schema type",
+                agent.name
+            ));
+        }
+        if contains_json_keyword(&agent.schema, "format") {
+            problems.push(format!(
+                "{path}.agent property '{}' must not contain format",
+                agent.name
+            ));
+        }
+        if let Err(error) = jsonschema::validator_for(&agent.schema) {
+            problems.push(format!(
+                "{path}.agent property '{}' is not a valid JSON Schema: {error}",
+                agent.name
+            ));
+        }
+    }
+
+    let mut pointers = Vec::new();
+    let mut used_agents = BTreeSet::new();
+    for (binding_index, binding) in shape.wire.iter().enumerate() {
+        let binding_path = format!("{path}.wire[{binding_index}]");
+        let pointer = binding.pointer.as_str();
+        if pointer.is_empty() {
+            problems.push(format!("{binding_path}.pointer must be non-empty"));
+        }
+        if pointers.iter().any(|other: &&str| {
+            json_pointer_is_prefix(other, pointer) || json_pointer_is_prefix(pointer, other)
+        }) {
+            problems.push(format!(
+                "{binding_path}.pointer overlaps another wire binding"
+            ));
+        }
+        pointers.push(pointer);
+        if let WireSource::From { from } = &binding.source {
+            if !agent_names.contains(from.as_str()) {
+                problems.push(format!(
+                    "{binding_path}.from names unknown agent property '{from}'"
+                ));
+            }
+            used_agents.insert(from.as_str());
+        }
+        codec_problems(&binding_path, &binding.codecs, true, problems);
+    }
+    for name in &agent_names {
+        if !used_agents.contains(name) {
+            problems.push(format!(
+                "{path}.agent property '{name}' is not used by a wire binding"
+            ));
+        }
+    }
+
+    let mut response_agents = BTreeSet::new();
+    for (binding_index, binding) in shape.response.iter().enumerate() {
+        let binding_path = format!("{path}.response[{binding_index}]");
+        if !agent_names.contains(binding.agent_property.as_str()) {
+            problems.push(format!(
+                "{binding_path}.agent_property names unknown agent property '{}'",
+                binding.agent_property
+            ));
+        }
+        if !response_agents.insert(binding.agent_property.as_str()) {
+            problems.push(format!("{binding_path}.agent_property is duplicated"));
+        }
+        codec_problems(&binding_path, &binding.codecs, false, problems);
+    }
+}
+
+fn codec_problems(path: &str, codecs: &[Codec], encode: bool, problems: &mut Vec<String>) {
+    if codecs.len() > 4 {
+        problems.push(format!("{path}.codec exceeds four codecs"));
+    }
+    for codec in codecs {
+        match codec {
+            Codec::DecimalScale {
+                scale,
+                max_integer_digits,
+                ..
+            } => {
+                if *scale > 18 || !(1..=38).contains(max_integer_digits) {
+                    problems.push(format!(
+                        "{path}.codec decimal_scale options are outside their supported bounds"
+                    ));
+                }
+            }
+            Codec::MarkdownBlocks {
+                max_input_bytes, ..
+            } => {
+                if !(1..=262_144).contains(max_input_bytes) {
+                    problems.push(format!(
+                        "{path}.codec markdown_blocks max_input_bytes is outside 1-262144"
+                    ));
+                }
+                if !encode {
+                    problems.push(format!(
+                        "{path}.codec markdown_blocks has no response decode direction"
+                    ));
+                }
+            }
+            Codec::JsonString => {}
+        }
+    }
+}
+
+fn contains_json_keyword(value: &Value, keyword: &str) -> bool {
+    match value {
+        Value::Object(object) => object
+            .iter()
+            .any(|(key, value)| key == keyword || contains_json_keyword(value, keyword)),
+        Value::Array(values) => values
+            .iter()
+            .any(|value| contains_json_keyword(value, keyword)),
+        _ => false,
+    }
+}
+
+fn json_pointer_is_prefix(left: &str, right: &str) -> bool {
+    left == right
+        || right
+            .strip_prefix(left)
+            .is_some_and(|suffix| suffix.starts_with('/'))
 }
 
 fn typed_tool_metadata_problems(index: usize, definition: &ToolDefinition) -> Vec<String> {
@@ -3968,6 +4211,70 @@ mod tests {
     }
 
     #[test]
+    fn response_only_transform_installs_on_a_get_without_a_request_body() {
+        let document = json!({
+            "schema_version": "0.1.0",
+            "tools": [{
+                "name": "find_company",
+                "description": "Find one company.",
+                "input_json_schema": {
+                    "type": "object",
+                    "properties": {},
+                    "additionalProperties": false
+                },
+                "upstream": {
+                    "method": "GET",
+                    "path_template": "/companies/current"
+                },
+                "transform": {
+                    "response_fields": [{
+                        "wire_property": "financials",
+                        "agent": [{
+                            "name": "amount",
+                            "schema": {"type":"number"}
+                        }],
+                        "wire": [{
+                            "pointer": "/amountMicros",
+                            "from": "amount",
+                            "codec": [{
+                                "kind": "decimal_scale",
+                                "scale": 6,
+                                "wire_encoding": "integer_string"
+                            }]
+                        }],
+                        "response": [{
+                            "agent_property": "amount",
+                            "from": "/amountMicros",
+                            "codec": [{
+                                "kind": "decimal_scale",
+                                "scale": 6,
+                                "wire_encoding": "integer_string"
+                            }]
+                        }]
+                    }],
+                    "response_root": "/data/company"
+                }
+            }]
+        });
+
+        assert_schema_accepts(&tools_schema_validator(), &document);
+        let registry = ToolRegistry::from_json_value(document)
+            .expect("response-only transforms must not require a request body");
+        assert!(registry
+            .get("find_company")
+            .expect("tool should install")
+            .transform
+            .is_some());
+    }
+
+    #[test]
+    fn absent_transform_keeps_legacy_definition_serialization_unchanged() {
+        let definition = local_http_tool("legacy", "/legacy");
+        let value = serde_json::to_value(definition).expect("definition should serialize");
+        assert!(value.get("transform").is_none());
+    }
+
+    #[test]
     fn tools_file_rejects_spoofed_managed_openapi_provenance() {
         let mapping = json!({
             "method": "POST",
@@ -4187,6 +4494,7 @@ mod tests {
             source: ToolSource::Legacy,
             upstream: mapping,
             visibility: ToolVisibility::Listed,
+            transform: None,
         }
     }
 
@@ -4220,6 +4528,7 @@ mod tests {
             },
             upstream: mapping,
             visibility: ToolVisibility::Listed,
+            transform: None,
         }
     }
 

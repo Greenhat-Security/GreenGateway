@@ -5,7 +5,9 @@ use rmcp::model::{CallToolResult, ContentBlock, Resource, ResourceContents};
 use serde::Deserialize;
 use serde_json::{json, Map, Value};
 
-use crate::{egress::EgressResponse, tools::executor::ToolExecutionResult};
+#[cfg(test)]
+use crate::egress::EgressResponse;
+use crate::tools::executor::{HttpToolExecutionResult, ToolExecutionResult};
 
 pub const TOOL_PLAYGROUND_REQUEST_LIMIT_BYTES: usize = 64 * 1024;
 pub const TOOL_PLAYGROUND_OUTPUT_LIMIT_BYTES: usize = 64 * 1024;
@@ -53,7 +55,7 @@ pub fn project_tool_execution_result(
     result: ToolExecutionResult,
 ) -> Result<Value, ToolPlaygroundOutputError> {
     let projected = match result {
-        ToolExecutionResult::Http(response) => project_http_response(response)?,
+        ToolExecutionResult::Http(result) => project_http_response(result)?,
         ToolExecutionResult::McpCallToolResult(result) => project_mcp_result(result)?,
     };
 
@@ -66,16 +68,23 @@ pub fn project_tool_execution_result(
     Ok(projected)
 }
 
-fn project_http_response(response: EgressResponse) -> Result<Value, ToolPlaygroundOutputError> {
+fn project_http_response(
+    result: HttpToolExecutionResult,
+) -> Result<Value, ToolPlaygroundOutputError> {
+    let HttpToolExecutionResult { response, warnings } = result;
     if !response.status.is_success() {
-        return Ok(json!({
+        let mut projected = json!({
             "kind": "http",
             "status": response.status.as_u16(),
             "body": {
                 "type": "text",
                 "value": HTTP_NON_SUCCESS_BODY_MESSAGE,
             },
-        }));
+        });
+        if !warnings.is_empty() {
+            projected["warnings"] = json!(warnings);
+        }
+        return Ok(projected);
     }
 
     let body = if response_is_json(&response.headers) {
@@ -90,11 +99,15 @@ fn project_http_response(response: EgressResponse) -> Result<Value, ToolPlaygrou
         project_http_text(response.body)?
     };
 
-    Ok(json!({
+    let mut projected = json!({
         "kind": "http",
         "status": response.status.as_u16(),
         "body": body,
-    }))
+    });
+    if !warnings.is_empty() {
+        projected["warnings"] = json!(warnings);
+    }
+    Ok(projected)
 }
 
 fn project_http_text(body: Vec<u8>) -> Result<Value, ToolPlaygroundOutputError> {
@@ -317,12 +330,16 @@ mod tests {
             HeaderValue::from_static("header-secret"),
         );
 
-        let projected = project_tool_execution_result(ToolExecutionResult::Http(EgressResponse {
-            status: StatusCode::CREATED,
-            headers,
-            body: br#"{"ok":true}"#.to_vec(),
-        }))
-        .expect("safe JSON response should project");
+        let projected =
+            project_tool_execution_result(ToolExecutionResult::Http(HttpToolExecutionResult {
+                response: EgressResponse {
+                    status: StatusCode::CREATED,
+                    headers,
+                    body: br#"{"ok":true}"#.to_vec(),
+                },
+                warnings: Vec::new(),
+            }))
+            .expect("safe JSON response should project");
 
         assert_eq!(
             projected,
@@ -340,6 +357,34 @@ mod tests {
         assert!(
             !projected.to_string().contains("header-secret"),
             "headers, cookies, and upstream metadata must be stripped"
+        );
+    }
+
+    #[test]
+    fn http_transform_warnings_match_the_mcp_warning_shape() {
+        let projected =
+            project_tool_execution_result(ToolExecutionResult::Http(HttpToolExecutionResult {
+                response: EgressResponse {
+                    status: StatusCode::OK,
+                    headers: HeaderMap::from_iter([(
+                        header::CONTENT_TYPE,
+                        HeaderValue::from_static("application/json"),
+                    )]),
+                    body: br#"{"amount":"invalid"}"#.to_vec(),
+                },
+                warnings: vec![crate::tools::transforms::TransformWarning {
+                    path: "/data/company/annualRecurringRevenue".to_owned(),
+                    reason: "wire value must match the canonical integer grammar".to_owned(),
+                }],
+            }))
+            .expect("a transform warning is caller-safe output metadata");
+
+        assert_eq!(
+            projected["warnings"],
+            json!([{
+                "path": "/data/company/annualRecurringRevenue",
+                "reason": "wire value must match the canonical integer grammar",
+            }])
         );
     }
 
@@ -605,10 +650,13 @@ mod tests {
                     .expect("test content type should be a valid header value"),
             );
         }
-        ToolExecutionResult::Http(EgressResponse {
-            status,
-            headers,
-            body,
+        ToolExecutionResult::Http(HttpToolExecutionResult {
+            response: EgressResponse {
+                status,
+                headers,
+                body,
+            },
+            warnings: Vec::new(),
         })
     }
 }

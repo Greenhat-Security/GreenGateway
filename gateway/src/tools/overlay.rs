@@ -1,4 +1,4 @@
-//! Per-Connection OpenAPI overlays (issue #360, PR 1).
+//! Per-Connection OpenAPI overlays (issue #360, through PR 3).
 //!
 //! An overlay is a declarative document stored beside a Connection's OpenAPI
 //! catalog. It is compiled into the same `ToolDefinition`s the catalog
@@ -11,8 +11,11 @@
 //! - `tools.<generated>.description` -- replaces the operation summary;
 //! - `tools.<generated>.visibility` -- `composite_only` hides a tool from
 //!   `tools/list` and `tools/call`;
-//! - `tools.<generated>.parameters.<p>.{title,description}` -- rewrites one
-//!   top-level property of the generated input schema;
+//! - `tools.<generated>.parameters.<p>.{title,description,shape}` -- rewrites
+//!   or replaces one top-level property of the generated input schema;
+//! - reusable `shapes`, request/response codecs, and
+//!   `tools.<generated>.response` / `defaults.response_root` -- compile an
+//!   ergonomic agent schema plus deterministic wire and response mappings;
 //! - `defaults.body_mode` -- `body_args_json` (the default for overlaid
 //!   tools) omits path and query arguments from the JSON body;
 //! - `defaults.disambiguation` -- when two properties of one tool carry the
@@ -20,9 +23,8 @@
 //!   descriptions are rewritten through a fixed template that names the
 //!   field and its static options.
 //!
-//! The `enum_sources`, `label_sources`, `shapes`, `response`, and
-//! `composites` branches are reserved in the published schema and refused
-//! here until their PRs land.
+//! The `enum_sources`, `label_sources`, and `composites` branches remain
+//! reserved in the published schema and are refused until their PRs land.
 //!
 //! Two rules are load-bearing and pinned by tests below:
 //!
@@ -49,8 +51,15 @@ use serde_json::{Map, Value};
 use crate::connections::model::MAX_MANAGED_OPENAPI_CATALOG_BYTES;
 
 use super::{
+    codecs::{Codec, DecimalWireEncoding},
     definitions::{BodyMappingMode, ToolDefinition, ToolTarget, ToolVisibility},
     openapi::{OpenApiToolBinding, OpenApiToolGeneration},
+    selector::{
+        resolve_pointer_schemas, select_object_schemas, JsonPointer, SchemaResolution, Selector,
+    },
+    transforms::{
+        AgentProperty, ParameterShape, ResponseBinding, ToolTransform, WireBinding, WireSource,
+    },
 };
 
 /// The overlay document revision this build authors and accepts.
@@ -92,6 +101,8 @@ pub struct OverlayDocument {
     pub description: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub defaults: Option<OverlayDefaults>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub shapes: BTreeMap<String, Shape>,
     /// Keyed by the GENERATED tool name (the document's `operationId`).
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub tools: BTreeMap<String, ToolOverlay>,
@@ -105,6 +116,8 @@ pub struct OverlayDefaults {
     /// Body serialisation for overlaid tools only. Default `body_args_json`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub body_mode: Option<BodyMappingMode>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub response_root: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default, Deserialize, Serialize)]
@@ -154,6 +167,8 @@ pub struct ToolOverlay {
     /// Keyed by a top-level property name of the generated input schema.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub parameters: BTreeMap<String, ParameterOverlay>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub response: Option<ResponseOverlay>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default, Deserialize, Serialize)]
@@ -164,6 +179,93 @@ pub struct ParameterOverlay {
     pub description: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub title: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shape: Option<ShapeOrUse>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(untagged)]
+pub enum ShapeOrUse {
+    Inline(Shape),
+    Use(ShapeReference),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ShapeReference {
+    #[serde(rename = "$use")]
+    pub shape_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prefix: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct Shape {
+    pub agent: BTreeMap<String, Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub required: Option<Vec<String>>,
+    pub wire: BTreeMap<String, OverlayWireBinding>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub response: BTreeMap<String, OverlayResponseBinding>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(untagged)]
+pub enum OverlayWireBinding {
+    From {
+        from: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        codec: Option<CodecChain>,
+    },
+    Const {
+        r#const: Value,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        codec: Option<CodecChain>,
+    },
+}
+
+impl OverlayWireBinding {
+    fn codecs(&self) -> Vec<Codec> {
+        match self {
+            Self::From { codec, .. } | Self::Const { codec, .. } => {
+                codec.as_ref().map(CodecChain::to_vec).unwrap_or_default()
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct OverlayResponseBinding {
+    pub from: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub codec: Option<CodecChain>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(untagged)]
+pub enum CodecChain {
+    One(Codec),
+    Many(Vec<Codec>),
+}
+
+impl CodecChain {
+    fn to_vec(&self) -> Vec<Codec> {
+        match self {
+            Self::One(codec) => vec![codec.clone()],
+            Self::Many(codecs) => codecs.clone(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ResponseOverlay {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub root: Option<String>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub fields: BTreeMap<String, ShapeOrUse>,
 }
 
 // ---------------------------------------------------------------------------
@@ -340,10 +442,9 @@ pub fn validate(document: &Value) -> Result<OverlayDocument, OverlayError> {
 /// schema so the schema itself refuses them, but the schema's wording for
 /// a `not` failure does not say why; this names the reservation.
 fn reserved_section_problems(document: &Value) -> Vec<OverlayProblem> {
-    const TOP_LEVEL: [(&str, &str); 4] = [
+    const TOP_LEVEL: [(&str, &str); 3] = [
         ("enum_sources", "dynamic enum binding"),
         ("label_sources", "label sources"),
-        ("shapes", "declarative transforms"),
         ("composites", "composite tools with compensation"),
     ];
     let mut problems = Vec::new();
@@ -354,16 +455,6 @@ fn reserved_section_problems(document: &Value) -> Vec<OverlayProblem> {
         if root.contains_key(key) {
             problems.push(reserved(format!("/{key}"), feature));
         }
-    }
-    if root
-        .get("defaults")
-        .and_then(Value::as_object)
-        .is_some_and(|defaults| defaults.contains_key("response_root"))
-    {
-        problems.push(reserved(
-            "/defaults/response_root",
-            "declarative transforms",
-        ));
     }
     if let Some(tools) = root.get("tools").and_then(Value::as_object) {
         for (tool_name, tool) in tools {
@@ -376,12 +467,6 @@ fn reserved_section_problems(document: &Value) -> Vec<OverlayProblem> {
                     "label sources",
                 ));
             }
-            if tool.contains_key("response") {
-                problems.push(reserved(
-                    format!("/tools/{tool_name}/response"),
-                    "declarative transforms",
-                ));
-            }
             if let Some(parameters) = tool.get("parameters").and_then(Value::as_object) {
                 for (property, parameter) in parameters {
                     let Some(parameter) = parameter.as_object() else {
@@ -391,12 +476,6 @@ fn reserved_section_problems(document: &Value) -> Vec<OverlayProblem> {
                         problems.push(reserved(
                             format!("/tools/{tool_name}/parameters/{property}/enum_source"),
                             "dynamic enum binding",
-                        ));
-                    }
-                    if parameter.contains_key("shape") {
-                        problems.push(reserved(
-                            format!("/tools/{tool_name}/parameters/{property}/shape"),
-                            "declarative transforms",
                         ));
                     }
                 }
@@ -574,7 +653,196 @@ fn document_problems(overlay: &OverlayDocument) -> Vec<OverlayProblem> {
             });
         }
     }
+
+    for (shape_name, shape) in &overlay.shapes {
+        shape_document_problems(&format!("/shapes/{shape_name}"), shape, &mut problems);
+    }
+    for (tool_name, tool) in &overlay.tools {
+        for (property, parameter) in &tool.parameters {
+            if parameter.shape.is_some() {
+                for (field, present) in [
+                    ("description", parameter.description.is_some()),
+                    ("title", parameter.title.is_some()),
+                ] {
+                    if present {
+                        problems.push(OverlayProblem {
+                            path: format!("/tools/{tool_name}/parameters/{property}/{field}"),
+                            message: format!(
+                                "`{field}` cannot be combined with `shape`; move agent-facing \
+                                 metadata into the relevant \
+                                 `shape.agent.<agent_property>.{field}` schema fragment"
+                            ),
+                        });
+                    }
+                }
+            }
+            if let Some(ShapeOrUse::Inline(shape)) = parameter.shape.as_ref() {
+                shape_document_problems(
+                    &format!("/tools/{tool_name}/parameters/{property}/shape"),
+                    shape,
+                    &mut problems,
+                );
+            }
+        }
+        if let Some(response) = tool.response.as_ref() {
+            for (property, shape) in &response.fields {
+                if let ShapeOrUse::Inline(shape) = shape {
+                    shape_document_problems(
+                        &format!("/tools/{tool_name}/response/fields/{property}"),
+                        shape,
+                        &mut problems,
+                    );
+                }
+            }
+        }
+    }
     problems
+}
+
+fn shape_document_problems(path: &str, shape: &Shape, problems: &mut Vec<OverlayProblem>) {
+    for (name, fragment) in &shape.agent {
+        let fragment_path = format!("{path}/agent/{name}");
+        if contains_keyword(fragment, "format") {
+            problems.push(OverlayProblem {
+                path: fragment_path.clone(),
+                message: "agent schema fragments must not contain format; this gateway does not assert formats (use pattern)".to_owned(),
+            });
+        }
+        if let Err(error) = jsonschema::validator_for(fragment) {
+            problems.push(OverlayProblem {
+                path: fragment_path,
+                message: format!("agent schema fragment is not valid JSON Schema: {error}"),
+            });
+        }
+    }
+
+    if let Some(required_names) = &shape.required {
+        for required in required_names {
+            if !shape.agent.contains_key(required) {
+                problems.push(OverlayProblem {
+                    path: format!("{path}/required"),
+                    message: format!(
+                        "required agent property '{required}' is not declared in agent"
+                    ),
+                });
+            }
+        }
+    }
+
+    let pointers = shape.wire.keys().collect::<Vec<_>>();
+    for (index, pointer) in pointers.iter().enumerate() {
+        if pointer.is_empty() {
+            problems.push(OverlayProblem {
+                path: format!("{path}/wire"),
+                message: "wire pointers must be non-empty; the empty RFC 6901 pointer would replace the whole wire value".to_owned(),
+            });
+        }
+        for other in pointers.iter().skip(index + 1) {
+            if pointer_is_prefix(pointer, other) || pointer_is_prefix(other, pointer) {
+                problems.push(OverlayProblem {
+                    path: format!("{path}/wire/{other}"),
+                    message: format!(
+                        "wire pointers '{pointer}' and '{other}' overlap; no pointer may be a prefix of another"
+                    ),
+                });
+            }
+        }
+    }
+
+    let mut uses = BTreeMap::<&str, usize>::new();
+    let mut noninvertible = BTreeSet::<&str>::new();
+    for (pointer, binding) in &shape.wire {
+        let OverlayWireBinding::From { from, codec } = binding else {
+            continue;
+        };
+        if !shape.agent.contains_key(from) {
+            problems.push(OverlayProblem {
+                path: format!("{path}/wire/{pointer}/from"),
+                message: format!("unknown agent property '{from}'"),
+            });
+            continue;
+        }
+        *uses.entry(from).or_default() += 1;
+        let codecs = codec.as_ref().map(CodecChain::to_vec).unwrap_or_default();
+        if codecs
+            .iter()
+            .any(|codec| matches!(codec, Codec::MarkdownBlocks { .. }))
+        {
+            noninvertible.insert(from);
+        }
+        if let Some(agent_type) = fragment_type(&shape.agent[from]) {
+            if let Err(message) = check_codec_input(agent_type, &codecs) {
+                problems.push(OverlayProblem {
+                    path: format!("{path}/wire/{pointer}/codec"),
+                    message,
+                });
+            }
+        }
+    }
+    for name in shape.agent.keys() {
+        if !uses.contains_key(name.as_str()) {
+            problems.push(OverlayProblem {
+                path: format!("{path}/agent/{name}"),
+                message: format!("agent property '{name}' is not used by any wire binding"),
+            });
+        }
+    }
+    for (name, response) in &shape.response {
+        if !shape.agent.contains_key(name) {
+            problems.push(OverlayProblem {
+                path: format!("{path}/response/{name}"),
+                message: format!("response binding names unknown agent property '{name}'"),
+            });
+        }
+        let codecs = response
+            .codec
+            .as_ref()
+            .map(CodecChain::to_vec)
+            .unwrap_or_default();
+        if codecs
+            .iter()
+            .any(|codec| matches!(codec, Codec::MarkdownBlocks { .. }))
+        {
+            problems.push(OverlayProblem {
+                path: format!("{path}/response/{name}/codec"),
+                message: "markdown_blocks has no decode direction and cannot appear in a response codec chain".to_owned(),
+            });
+        }
+        if let Some(agent_type) = shape.agent.get(name).and_then(fragment_type) {
+            if let Err(message) = check_codec_input(agent_type, &codecs) {
+                problems.push(OverlayProblem {
+                    path: format!("{path}/response/{name}/codec"),
+                    message,
+                });
+            }
+        }
+    }
+    for (name, count) in uses {
+        if (count > 1 || noninvertible.contains(name)) && !shape.response.contains_key(name) {
+            problems.push(OverlayProblem {
+                path: format!("{path}/response"),
+                message: format!(
+                    "response binding for '{name}' is required because its wire mapping is ambiguous or non-invertible"
+                ),
+            });
+        }
+    }
+}
+
+fn contains_keyword(value: &Value, keyword: &str) -> bool {
+    match value {
+        Value::Object(object) => object
+            .iter()
+            .any(|(key, value)| key == keyword || contains_keyword(value, keyword)),
+        Value::Array(values) => values.iter().any(|value| contains_keyword(value, keyword)),
+        _ => false,
+    }
+}
+
+fn pointer_is_prefix(prefix: &str, value: &str) -> bool {
+    value
+        .strip_prefix(prefix)
+        .is_some_and(|suffix| suffix.starts_with('/'))
 }
 
 // ---------------------------------------------------------------------------
@@ -614,6 +882,7 @@ pub fn compile(
     let mut problems = Vec::new();
     let mut warnings = Vec::new();
     let mut renames = BTreeMap::new();
+    let mut transformed = BTreeMap::new();
 
     // Name checks first, over the whole overlay, so the operator sees every
     // naming problem in one round trip.
@@ -667,7 +936,24 @@ pub fn compile(
             renames.insert(generated_name.clone(), target.to_owned());
         }
         if let Some(definition) = generated_index.get(generated_name.as_str()) {
-            validate_parameter_names(generated_name, tool, definition, &mut problems);
+            validate_parameter_names(
+                generated_name,
+                tool,
+                definition,
+                generation.transform_metadata.get(generated_name),
+                &mut problems,
+            );
+            if let Some(compiled) = compile_tool_transform(
+                generation,
+                generated_name,
+                tool,
+                overlay,
+                definition,
+                &mut warnings,
+                &mut problems,
+            ) {
+                transformed.insert(generated_name.clone(), compiled);
+            }
         }
         let Some(&index) = bound_index.get(generated_name.as_str()) else {
             warnings.push(OverlayWarning {
@@ -699,6 +985,14 @@ pub fn compile(
     for (generated_name, tool, index) in active_tools {
         let definition = &mut definitions[index];
         let tool_path = format!("/tools/{generated_name}");
+
+        // Agent-facing shape replacement must happen before label
+        // disambiguation so labels and collisions are computed over exactly
+        // the schema tools/list will advertise.
+        if let Some(compiled) = transformed.get(generated_name) {
+            definition.input_schema = compiled.input_schema.clone();
+            definition.transform = Some(compiled.transform.clone());
+        }
 
         if let Some(description) = tool.description.as_deref() {
             definition.description = description.to_owned();
@@ -734,6 +1028,9 @@ pub fn compile(
             ));
         };
         for (property, parameter) in &tool.parameters {
+            if parameter.shape.is_some() {
+                continue;
+            }
             let parameter_path = format!("{tool_path}/parameters/{property}");
             let Some(schema) = properties.get_mut(property) else {
                 let known = properties.keys().cloned().collect::<Vec<_>>().join(", ");
@@ -824,6 +1121,993 @@ pub fn compile(
     })
 }
 
+#[derive(Debug, Clone)]
+struct CompiledToolTransform {
+    input_schema: Value,
+    transform: ToolTransform,
+}
+
+#[derive(Debug)]
+struct CompiledShape {
+    parameter: ParameterShape,
+    required_agent_names: Vec<String>,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn compile_tool_transform(
+    generation: &OpenApiToolGeneration,
+    generated_name: &str,
+    tool: &ToolOverlay,
+    overlay: &OverlayDocument,
+    definition: &ToolDefinition,
+    warnings: &mut Vec<OverlayWarning>,
+    problems: &mut Vec<OverlayProblem>,
+) -> Option<CompiledToolTransform> {
+    let tool_path = format!("/tools/{generated_name}");
+    let request_shapes = tool
+        .parameters
+        .iter()
+        .filter_map(|(property, parameter)| parameter.shape.as_ref().map(|shape| (property, shape)))
+        .collect::<Vec<_>>();
+    let response_fields = tool
+        .response
+        .as_ref()
+        .map(|response| &response.fields)
+        .filter(|fields| !fields.is_empty());
+    let response_root_text = tool
+        .response
+        .as_ref()
+        .and_then(|response| response.root.as_deref())
+        .or_else(|| {
+            overlay
+                .defaults
+                .as_ref()
+                .and_then(|defaults| defaults.response_root.as_deref())
+        });
+    let response_root_path = if tool
+        .response
+        .as_ref()
+        .and_then(|response| response.root.as_ref())
+        .is_some()
+    {
+        format!("{tool_path}/response/root")
+    } else if overlay
+        .defaults
+        .as_ref()
+        .and_then(|defaults| defaults.response_root.as_ref())
+        .is_some()
+    {
+        "/defaults/response_root".to_owned()
+    } else {
+        tool_path.clone()
+    };
+    if request_shapes.is_empty() && response_fields.is_none() && response_root_text.is_none() {
+        return None;
+    }
+
+    let metadata = generation.transform_metadata.get(generated_name);
+    let Some(properties) = definition
+        .input_schema
+        .get("properties")
+        .and_then(Value::as_object)
+    else {
+        problems.push(OverlayProblem {
+            path: tool_path,
+            message:
+                "generated input schema has no properties object; this tool cannot be transformed"
+                    .to_owned(),
+        });
+        return None;
+    };
+    let required = definition
+        .input_schema
+        .get("required")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .map(str::to_owned)
+        .collect::<BTreeSet<_>>();
+
+    let mut compiled_parameters = Vec::new();
+    for (wire_property, shape_or_use) in request_shapes {
+        let shape_path = format!("{tool_path}/parameters/{wire_property}/shape");
+        let Some(metadata) = metadata else {
+            problems.push(OverlayProblem {
+                path: shape_path,
+                message: "OpenAPI request metadata is unavailable for this generated tool"
+                    .to_owned(),
+            });
+            continue;
+        };
+        if metadata.array_request_body {
+            // `validate_parameter_names` already reports this in the common
+            // path. Keep this guard for direct/manual compiler callers.
+            continue;
+        }
+        if !metadata.body_properties.contains(wire_property.as_str()) {
+            problems.push(OverlayProblem {
+                path: shape_path,
+                message: format!(
+                    "'{wire_property}' is not a JSON request-body property; path and query parameters cannot be shaped"
+                ),
+            });
+            continue;
+        }
+        let Some(wire_schema) = properties.get(wire_property) else {
+            continue;
+        };
+        if !schema_definitely_has_type(wire_schema, JsonType::Object) {
+            problems.push(OverlayProblem {
+                path: shape_path,
+                message: format!(
+                    "generated request-body property '{wire_property}' must have type object to be shaped"
+                ),
+            });
+            continue;
+        }
+        let Some((shape, prefix)) = resolve_shape(
+            shape_or_use,
+            &overlay.shapes,
+            wire_property,
+            &shape_path,
+            problems,
+        ) else {
+            continue;
+        };
+        if let Some(compiled) = compile_shape(
+            wire_property,
+            required.contains(wire_property.as_str()),
+            shape,
+            prefix.as_deref(),
+            std::slice::from_ref(wire_schema),
+            true,
+            false,
+            &shape_path,
+            warnings,
+            problems,
+        ) {
+            compiled_parameters.push(compiled);
+        }
+    }
+
+    let response_root =
+        response_root_text.and_then(|selector| match selector.parse::<Selector>() {
+            Ok(selector) => Some(selector),
+            Err(message) => {
+                problems.push(OverlayProblem {
+                    path: tool
+                        .response
+                        .as_ref()
+                        .and_then(|response| response.root.as_ref())
+                        .map_or_else(
+                            || "/defaults/response_root".to_owned(),
+                            |_| format!("{tool_path}/response/root"),
+                        ),
+                    message,
+                });
+                None
+            }
+        });
+    let needs_response_schema =
+        !compiled_parameters.is_empty() || response_fields.is_some() || response_root.is_some();
+    let response_roots = if needs_response_schema {
+        selected_response_root_schemas(
+            generation,
+            generated_name,
+            response_root.as_ref(),
+            &response_root_path,
+            warnings,
+            problems,
+        )
+    } else {
+        None
+    };
+
+    for compiled in &compiled_parameters {
+        validate_compiled_shape_response(
+            &compiled.parameter,
+            response_roots.as_deref(),
+            &format!(
+                "{tool_path}/parameters/{}/shape",
+                compiled.parameter.wire_property
+            ),
+            warnings,
+            problems,
+        );
+    }
+
+    let mut compiled_response_fields = Vec::new();
+    if let Some(fields) = response_fields {
+        for (wire_property, shape_or_use) in fields {
+            let shape_path = format!("{tool_path}/response/fields/{wire_property}");
+            let Some((shape, prefix)) = resolve_shape(
+                shape_or_use,
+                &overlay.shapes,
+                wire_property,
+                &shape_path,
+                problems,
+            ) else {
+                continue;
+            };
+            let wire_schemas = match response_roots.as_deref() {
+                Some(roots) => {
+                    let pointer = format!("/{}", json_pointer_escape(wire_property))
+                        .parse::<JsonPointer>()
+                        .expect("an escaped property name is a valid JSON pointer");
+                    match resolve_pointer_schemas(roots, &pointer) {
+                        SchemaResolution::Verified(schemas) => schemas,
+                        SchemaResolution::Unverifiable => {
+                            warnings.push(OverlayWarning {
+                                path: shape_path.clone(),
+                                message: format!(
+                                    "response field '{wire_property}' cannot be verified against a free-form declared success schema"
+                                ),
+                            });
+                            Vec::new()
+                        }
+                        SchemaResolution::Missing => {
+                            problems.push(OverlayProblem {
+                                path: shape_path.clone(),
+                                message: format!(
+                                    "response field '{wire_property}' is absent from the selected object schema"
+                                ),
+                            });
+                            continue;
+                        }
+                    }
+                }
+                None => Vec::new(),
+            };
+            if let Some(compiled) = compile_shape(
+                wire_property,
+                false,
+                shape,
+                prefix.as_deref(),
+                &wire_schemas,
+                false,
+                true,
+                &shape_path,
+                warnings,
+                problems,
+            ) {
+                compiled_response_fields.push(compiled.parameter);
+            }
+        }
+    }
+
+    let response_shapes = compiled_parameters
+        .iter()
+        .map(|compiled| {
+            (
+                &compiled.parameter,
+                format!(
+                    "{tool_path}/parameters/{}/shape",
+                    compiled.parameter.wire_property
+                ),
+            )
+        })
+        .chain(compiled_response_fields.iter().map(|compiled| {
+            (
+                compiled,
+                format!("{tool_path}/response/fields/{}", compiled.wire_property),
+            )
+        }))
+        .collect::<Vec<_>>();
+    let mut response_wire_owners = BTreeMap::<String, String>::new();
+    let mut response_agent_owners = BTreeMap::<String, String>::new();
+    for (parameter, shape_path) in &response_shapes {
+        if let Some(first_path) =
+            response_wire_owners.insert(parameter.wire_property.clone(), shape_path.clone())
+        {
+            problems.push(OverlayProblem {
+                path: shape_path.clone(),
+                message: format!(
+                    "wire property '{}' is already transformed by shape at {first_path}",
+                    parameter.wire_property
+                ),
+            });
+        }
+        for agent in &parameter.agent {
+            if let Some(first_path) =
+                response_agent_owners.insert(agent.name.clone(), shape_path.clone())
+            {
+                problems.push(OverlayProblem {
+                    path: format!("{shape_path}/agent/{}", agent.name),
+                    message: format!(
+                        "response agent property '{}' is already produced by shape at {first_path}",
+                        agent.name
+                    ),
+                });
+            }
+        }
+    }
+    if let Some(roots) = response_roots.as_deref() {
+        let existing_response_properties = roots
+            .iter()
+            .filter_map(|root| root.get("properties").and_then(Value::as_object))
+            .flat_map(|properties| properties.keys().cloned())
+            .collect::<BTreeSet<_>>();
+        for (parameter, shape_path) in &response_shapes {
+            for agent in &parameter.agent {
+                if agent.name != parameter.wire_property
+                    && existing_response_properties.contains(&agent.name)
+                {
+                    problems.push(OverlayProblem {
+                        path: format!("{shape_path}/agent/{}", agent.name),
+                        message: format!(
+                            "response agent property '{}' collides with an existing property of the selected response object",
+                            agent.name
+                        ),
+                    });
+                }
+            }
+        }
+    }
+
+    let mut input_schema = definition.input_schema.clone();
+    let input_properties = input_schema
+        .get_mut("properties")
+        .and_then(Value::as_object_mut)?;
+    let shaped_names = compiled_parameters
+        .iter()
+        .map(|compiled| compiled.parameter.wire_property.as_str())
+        .collect::<BTreeSet<_>>();
+    let mut occupied = input_properties
+        .keys()
+        .filter(|name| !shaped_names.contains(name.as_str()))
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    for compiled in &compiled_parameters {
+        for agent in &compiled.parameter.agent {
+            let aliases_other_wire_property = agent.name != compiled.parameter.wire_property
+                && shaped_names.contains(agent.name.as_str());
+            if aliases_other_wire_property || !occupied.insert(agent.name.clone()) {
+                problems.push(OverlayProblem {
+                    path: format!(
+                        "{tool_path}/parameters/{}/shape/agent/{}",
+                        compiled.parameter.wire_property, agent.name
+                    ),
+                    message: format!(
+                        "agent-facing property '{}' collides with another top-level property after all shapes are applied",
+                        agent.name
+                    ),
+                });
+            }
+        }
+    }
+    if problems
+        .iter()
+        .any(|problem| problem.path.starts_with(&tool_path))
+    {
+        return None;
+    }
+
+    let mut rewritten_required = required;
+    for compiled in &compiled_parameters {
+        input_properties.remove(&compiled.parameter.wire_property);
+        rewritten_required.remove(&compiled.parameter.wire_property);
+        for agent in &compiled.parameter.agent {
+            input_properties.insert(agent.name.clone(), agent.schema.clone());
+        }
+        rewritten_required.extend(compiled.required_agent_names.iter().cloned());
+    }
+    if let Some(object) = input_schema.as_object_mut() {
+        object.insert(
+            "required".to_owned(),
+            Value::Array(rewritten_required.into_iter().map(Value::String).collect()),
+        );
+    }
+    if let Err(error) = jsonschema::validator_for(&input_schema) {
+        problems.push(OverlayProblem {
+            path: tool_path,
+            message: format!("transformed agent input schema does not compile: {error}"),
+        });
+        return None;
+    }
+
+    Some(CompiledToolTransform {
+        input_schema,
+        transform: ToolTransform {
+            parameters: compiled_parameters
+                .into_iter()
+                .map(|compiled| compiled.parameter)
+                .collect(),
+            response_fields: compiled_response_fields,
+            response_root,
+        },
+    })
+}
+
+fn resolve_shape<'a>(
+    shape_or_use: &'a ShapeOrUse,
+    shapes: &'a BTreeMap<String, Shape>,
+    wire_property: &str,
+    path: &str,
+    problems: &mut Vec<OverlayProblem>,
+) -> Option<(&'a Shape, Option<String>)> {
+    match shape_or_use {
+        ShapeOrUse::Inline(shape) => Some((shape, None)),
+        ShapeOrUse::Use(reference) => match shapes.get(&reference.shape_id) {
+            Some(shape) => Some((
+                shape,
+                Some(
+                    reference
+                        .prefix
+                        .clone()
+                        .unwrap_or_else(|| wire_property.to_owned()),
+                ),
+            )),
+            None => {
+                problems.push(OverlayProblem {
+                    path: format!("{path}/$use"),
+                    message: format!("unknown reusable shape '{}'", reference.shape_id),
+                });
+                None
+            }
+        },
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn compile_shape(
+    wire_property: &str,
+    wire_required: bool,
+    shape: &Shape,
+    prefix: Option<&str>,
+    wire_schemas: &[Value],
+    validate_wire_bindings: bool,
+    validate_response_bindings: bool,
+    path: &str,
+    warnings: &mut Vec<OverlayWarning>,
+    problems: &mut Vec<OverlayProblem>,
+) -> Option<CompiledShape> {
+    let compiled_name = |name: &str| match prefix {
+        Some(prefix) => format!("{prefix}_{name}"),
+        None => name.to_owned(),
+    };
+    let names = shape
+        .agent
+        .keys()
+        .map(|name| (name.as_str(), compiled_name(name)))
+        .collect::<BTreeMap<_, _>>();
+    let agent = shape
+        .agent
+        .iter()
+        .map(|(name, schema)| AgentProperty {
+            name: names[name.as_str()].clone(),
+            schema: schema.clone(),
+        })
+        .collect::<Vec<_>>();
+    let required_agent_names = match &shape.required {
+        Some(required) => required
+            .iter()
+            .filter_map(|name| names.get(name.as_str()).cloned())
+            .collect(),
+        None if wire_required => agent.iter().map(|agent| agent.name.clone()).collect(),
+        None => Vec::new(),
+    };
+
+    let mut wire = Vec::new();
+    let mut derived = BTreeMap::<&str, Vec<(&str, Vec<Codec>)>>::new();
+    for (pointer_text, authored) in &shape.wire {
+        let pointer = match pointer_text.parse::<JsonPointer>() {
+            Ok(pointer) => pointer,
+            Err(message) => {
+                problems.push(OverlayProblem {
+                    path: format!("{path}/wire/{pointer_text}"),
+                    message,
+                });
+                continue;
+            }
+        };
+        let codecs = authored.codecs();
+        let source = match authored {
+            OverlayWireBinding::From { from, .. } => {
+                let Some(compiled_from) = names.get(from.as_str()) else {
+                    continue;
+                };
+                derived
+                    .entry(from.as_str())
+                    .or_default()
+                    .push((pointer_text.as_str(), codecs.clone()));
+                WireSource::From {
+                    from: compiled_from.clone(),
+                }
+            }
+            OverlayWireBinding::Const { r#const, .. } => WireSource::Const {
+                r#const: r#const.clone(),
+            },
+        };
+        let input_type = match authored {
+            OverlayWireBinding::From { from, .. } => shape.agent.get(from).and_then(fragment_type),
+            OverlayWireBinding::Const { r#const, .. } => value_type(r#const),
+        };
+        if validate_wire_bindings {
+            if pointer_crosses_declared_array(wire_schemas, &pointer) {
+                problems.push(OverlayProblem {
+                    path: format!("{path}/wire/{pointer_text}"),
+                    message: format!(
+                        "wire pointer '{}' crosses an array; request-shape pointers may only build object containers in overlay schema 0.1.0",
+                        pointer.as_str()
+                    ),
+                });
+            }
+            validate_wire_pointer_and_chain(
+                wire_schemas,
+                &pointer,
+                input_type,
+                &codecs,
+                &format!("{path}/wire/{pointer_text}"),
+                warnings,
+                problems,
+            );
+        }
+        wire.push(WireBinding {
+            pointer,
+            source,
+            codecs,
+        });
+    }
+
+    let mut response = Vec::new();
+    for (local_name, compiled_name) in &names {
+        if let Some(authored) = shape.response.get(*local_name) {
+            let from = match authored.from.parse::<JsonPointer>() {
+                Ok(pointer) => pointer,
+                Err(message) => {
+                    problems.push(OverlayProblem {
+                        path: format!("{path}/response/{local_name}/from"),
+                        message,
+                    });
+                    continue;
+                }
+            };
+            let codecs = authored
+                .codec
+                .as_ref()
+                .map(CodecChain::to_vec)
+                .unwrap_or_default();
+            if validate_response_bindings {
+                validate_wire_pointer_and_chain(
+                    wire_schemas,
+                    &from,
+                    shape.agent.get(*local_name).and_then(fragment_type),
+                    &codecs,
+                    &format!("{path}/response/{local_name}"),
+                    warnings,
+                    problems,
+                );
+            }
+            response.push(ResponseBinding {
+                agent_property: compiled_name.clone(),
+                from,
+                codecs,
+            });
+        } else if let Some(bindings) = derived.get(local_name).filter(|bindings| {
+            bindings.len() == 1
+                && !bindings[0]
+                    .1
+                    .iter()
+                    .any(|codec| matches!(codec, Codec::MarkdownBlocks { .. }))
+        }) {
+            let (pointer, codecs) = &bindings[0];
+            let from = pointer
+                .parse()
+                .expect("wire pointer was parsed successfully above");
+            if validate_response_bindings {
+                validate_wire_pointer_and_chain(
+                    wire_schemas,
+                    &from,
+                    shape.agent.get(*local_name).and_then(fragment_type),
+                    codecs,
+                    &format!("{path}/response/{local_name}"),
+                    warnings,
+                    problems,
+                );
+            }
+            response.push(ResponseBinding {
+                agent_property: compiled_name.clone(),
+                from,
+                codecs: codecs.clone(),
+            });
+        }
+    }
+
+    if problems
+        .iter()
+        .any(|problem| problem.path.starts_with(path))
+    {
+        return None;
+    }
+    Some(CompiledShape {
+        parameter: ParameterShape {
+            wire_property: wire_property.to_owned(),
+            wire_required,
+            agent,
+            wire,
+            response,
+        },
+        required_agent_names,
+    })
+}
+
+fn selected_response_root_schemas(
+    generation: &OpenApiToolGeneration,
+    generated_name: &str,
+    selector: Option<&Selector>,
+    root_path: &str,
+    warnings: &mut Vec<OverlayWarning>,
+    problems: &mut Vec<OverlayProblem>,
+) -> Option<Vec<Value>> {
+    let declared = match generation.declared_success_response_schemas(generated_name) {
+        Ok(declared) => declared,
+        Err(error) => {
+            problems.push(OverlayProblem {
+                path: root_path.to_owned(),
+                message: format!("declared success response schema cannot be resolved: {error}"),
+            });
+            return None;
+        }
+    };
+    if declared.is_empty() {
+        warnings.push(OverlayWarning {
+            path: root_path.to_owned(),
+            message: format!(
+                "'{generated_name}' declares no JSON 2xx response schema; the response transform is unverified"
+            ),
+        });
+        return None;
+    }
+
+    let mut selected = Vec::new();
+    for response in declared {
+        let resolution = match selector {
+            Some(selector) => {
+                select_object_schemas(std::slice::from_ref(&response.schema), selector)
+            }
+            None => root_object_schema(response.schema.clone()),
+        };
+        match resolution {
+            SchemaResolution::Verified(mut schemas) if !schemas.is_empty() => {
+                selected.append(&mut schemas);
+            }
+            SchemaResolution::Verified(_) | SchemaResolution::Missing => {
+                let selected_root = selector.map_or("the response root", Selector::as_str);
+                problems.push(OverlayProblem {
+                    path: root_path.to_owned(),
+                    message: format!(
+                        "response root '{selected_root}' selects no object in the {} response of {generated_name}",
+                        response.status
+                    ),
+                });
+            }
+            SchemaResolution::Unverifiable => warnings.push(OverlayWarning {
+                path: root_path.to_owned(),
+                message: format!(
+                    "response root for '{generated_name}' cannot be verified against the free-form {} response schema",
+                    response.status
+                ),
+            }),
+        }
+    }
+    (!selected.is_empty()).then_some(selected)
+}
+
+fn root_object_schema(schema: Value) -> SchemaResolution {
+    match fragment_type(&schema) {
+        Some(JsonType::Object) => SchemaResolution::Verified(vec![schema]),
+        Some(_) => SchemaResolution::Missing,
+        None if schema.get("properties").is_some() => SchemaResolution::Verified(vec![schema]),
+        None => SchemaResolution::Unverifiable,
+    }
+}
+
+fn validate_compiled_shape_response(
+    shape: &ParameterShape,
+    response_roots: Option<&[Value]>,
+    path: &str,
+    warnings: &mut Vec<OverlayWarning>,
+    problems: &mut Vec<OverlayProblem>,
+) {
+    let Some(response_roots) = response_roots else {
+        return;
+    };
+    let property_pointer = format!("/{}", json_pointer_escape(&shape.wire_property))
+        .parse::<JsonPointer>()
+        .expect("escaped property name is a valid JSON pointer");
+    let wire_schemas = match resolve_pointer_schemas(response_roots, &property_pointer) {
+        SchemaResolution::Verified(schemas) if !schemas.is_empty() => schemas,
+        SchemaResolution::Verified(_) | SchemaResolution::Missing => {
+            problems.push(OverlayProblem {
+                path: path.to_owned(),
+                message: format!(
+                    "wire property '{}' is absent from the selected success-response object schema",
+                    shape.wire_property
+                ),
+            });
+            return;
+        }
+        SchemaResolution::Unverifiable => {
+            warnings.push(OverlayWarning {
+                path: path.to_owned(),
+                message: format!(
+                    "wire property '{}' cannot be verified against a free-form success-response schema",
+                    shape.wire_property
+                ),
+            });
+            return;
+        }
+    };
+
+    let agent_types = shape
+        .agent
+        .iter()
+        .filter_map(|agent| fragment_type(&agent.schema).map(|kind| (agent.name.as_str(), kind)))
+        .collect::<BTreeMap<_, _>>();
+    for response in &shape.response {
+        validate_wire_pointer_and_chain(
+            &wire_schemas,
+            &response.from,
+            agent_types.get(response.agent_property.as_str()).copied(),
+            &response.codecs,
+            &format!("{path}/response/{}", response.agent_property),
+            warnings,
+            problems,
+        );
+    }
+}
+
+fn validate_wire_pointer_and_chain(
+    wire_schemas: &[Value],
+    pointer: &JsonPointer,
+    input_type: Option<JsonType>,
+    codecs: &[Codec],
+    path: &str,
+    warnings: &mut Vec<OverlayWarning>,
+    problems: &mut Vec<OverlayProblem>,
+) {
+    let output_type = match input_type {
+        Some(input_type) => match check_codec_input(input_type, codecs) {
+            Ok(output_type) => Some(output_type),
+            Err(message) => {
+                problems.push(OverlayProblem {
+                    path: format!("{path}/codec"),
+                    message,
+                });
+                None
+            }
+        },
+        None => None,
+    };
+    if wire_schemas.is_empty() {
+        return;
+    }
+    match resolve_pointer_schemas(wire_schemas, pointer) {
+        SchemaResolution::Missing => {
+            problems.push(OverlayProblem {
+                path: path.to_owned(),
+                message: format!(
+                    "wire pointer '{}' does not exist in the declared wire schema",
+                    pointer.as_str()
+                ),
+            });
+        }
+        SchemaResolution::Verified(schemas) if schemas.is_empty() => {
+            problems.push(OverlayProblem {
+                path: path.to_owned(),
+                message: format!(
+                    "wire pointer '{}' does not exist in the declared wire schema",
+                    pointer.as_str()
+                ),
+            });
+        }
+        SchemaResolution::Unverifiable => warnings.push(OverlayWarning {
+            path: path.to_owned(),
+            message: format!(
+                "wire pointer '{}' cannot be verified because the declared wire schema is free-form",
+                pointer.as_str()
+            ),
+        }),
+        SchemaResolution::Verified(schemas) => {
+            let mut saw_unknown = false;
+            for schema in schemas {
+                let Some(wire_type) = fragment_type(&schema) else {
+                    saw_unknown = true;
+                    continue;
+                };
+                if output_type.is_some_and(|output| !types_compatible(output, wire_type)) {
+                    problems.push(OverlayProblem {
+                        path: format!("{path}/codec"),
+                        message: format!(
+                            "codec chain output type {} does not match wire pointer '{}' type {}",
+                            output_type.expect("checked Some"),
+                            pointer.as_str(),
+                            wire_type
+                        ),
+                    });
+                }
+            }
+            if saw_unknown {
+                warnings.push(OverlayWarning {
+                    path: path.to_owned(),
+                    message: format!(
+                        "wire pointer '{}' has no definite schema type; codec output is unverified",
+                        pointer.as_str()
+                    ),
+                });
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum JsonType {
+    String,
+    Number,
+    Integer,
+    Boolean,
+    Array,
+    Object,
+    Null,
+}
+
+impl fmt::Display for JsonType {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::String => "string",
+            Self::Number => "number",
+            Self::Integer => "integer",
+            Self::Boolean => "boolean",
+            Self::Array => "array",
+            Self::Object => "object",
+            Self::Null => "null",
+        })
+    }
+}
+
+fn fragment_type(schema: &Value) -> Option<JsonType> {
+    match schema.get("type")?.as_str()? {
+        "string" => Some(JsonType::String),
+        "number" => Some(JsonType::Number),
+        "integer" => Some(JsonType::Integer),
+        "boolean" => Some(JsonType::Boolean),
+        "array" => Some(JsonType::Array),
+        "object" => Some(JsonType::Object),
+        "null" => Some(JsonType::Null),
+        _ => None,
+    }
+}
+
+fn value_type(value: &Value) -> Option<JsonType> {
+    match value {
+        Value::Null => Some(JsonType::Null),
+        Value::Bool(_) => Some(JsonType::Boolean),
+        Value::Number(number) => Some(if number.is_i64() || number.is_u64() {
+            JsonType::Integer
+        } else {
+            JsonType::Number
+        }),
+        Value::String(_) => Some(JsonType::String),
+        Value::Array(_) => Some(JsonType::Array),
+        Value::Object(_) => Some(JsonType::Object),
+    }
+}
+
+fn schema_definitely_has_type(schema: &Value, expected: JsonType) -> bool {
+    fragment_type(schema).is_some_and(|actual| types_compatible(actual, expected))
+}
+
+fn types_compatible(actual: JsonType, expected: JsonType) -> bool {
+    actual == expected || (actual == JsonType::Integer && expected == JsonType::Number)
+}
+
+fn check_codec_input(mut current: JsonType, codecs: &[Codec]) -> Result<JsonType, String> {
+    for codec in codecs {
+        current = match codec {
+            Codec::DecimalScale { wire_encoding, .. } => {
+                if !matches!(current, JsonType::Number | JsonType::Integer) {
+                    return Err(format!(
+                        "decimal_scale requires number or integer input, got {current}"
+                    ));
+                }
+                match wire_encoding {
+                    DecimalWireEncoding::IntegerString => JsonType::String,
+                    DecimalWireEncoding::Integer => JsonType::Integer,
+                }
+            }
+            Codec::MarkdownBlocks { .. } => {
+                if current != JsonType::String {
+                    return Err(format!(
+                        "markdown_blocks requires string input, got {current}"
+                    ));
+                }
+                JsonType::Array
+            }
+            Codec::JsonString => JsonType::String,
+        };
+    }
+    Ok(current)
+}
+
+fn json_pointer_escape(value: &str) -> String {
+    value.replace('~', "~0").replace('/', "~1")
+}
+
+/// Request materialisation deliberately creates object containers. RFC 6901
+/// text cannot distinguish an object key named `0` from array index zero, so
+/// compiling an encode pointer through a declared array without retaining
+/// container metadata would silently put the value at the wrong wire shape.
+/// Response pointers remain free to traverse arrays because they read an
+/// already-materialised JSON value.
+fn pointer_crosses_declared_array(roots: &[Value], pointer: &JsonPointer) -> bool {
+    let tokens = if pointer.as_str().is_empty() {
+        Vec::new()
+    } else {
+        pointer.as_str()[1..]
+            .split('/')
+            .map(|token| token.replace("~1", "/").replace("~0", "~"))
+            .collect::<Vec<_>>()
+    };
+    let mut candidates = roots.to_vec();
+    for token in tokens {
+        let mut next = Vec::new();
+        for candidate in candidates {
+            if collect_object_property_schemas(&candidate, &token, &mut next) {
+                return true;
+            }
+        }
+        candidates = next;
+        if candidates.is_empty() {
+            break;
+        }
+    }
+    false
+}
+
+/// Returns true when this schema can be an array at the point where the next
+/// pointer token would be applied. Otherwise, append any statically-known
+/// object-property schemas for that token.
+fn collect_object_property_schemas(schema: &Value, token: &str, next: &mut Vec<Value>) -> bool {
+    let Value::Object(object) = schema else {
+        return false;
+    };
+    for keyword in ["allOf", "anyOf", "oneOf"] {
+        if let Some(branches) = object.get(keyword).and_then(Value::as_array) {
+            for branch in branches {
+                if collect_object_property_schemas(branch, token, next) {
+                    return true;
+                }
+            }
+        }
+    }
+    let declares_array = object
+        .get("type")
+        .is_some_and(|schema_type| match schema_type {
+            Value::String(schema_type) => schema_type == "array",
+            Value::Array(schema_types) => schema_types
+                .iter()
+                .any(|schema_type| schema_type.as_str() == Some("array")),
+            _ => false,
+        })
+        || (object.contains_key("items") && !object.contains_key("properties"));
+    if declares_array {
+        return true;
+    }
+    if let Some(property) = object
+        .get("properties")
+        .and_then(Value::as_object)
+        .and_then(|properties| properties.get(token))
+    {
+        next.push(property.clone());
+    } else if let Some(additional) = object.get("additionalProperties") {
+        if additional.is_object() {
+            next.push(additional.clone());
+        }
+    }
+    false
+}
+
 /// Parameter overlays are validated against the generated catalog, not only
 /// the selected binding. Otherwise a typo on an unselected tool is accepted
 /// at PUT time and turns into a delayed failure when that tool is registered.
@@ -831,6 +2115,7 @@ fn validate_parameter_names(
     generated_name: &str,
     tool: &ToolOverlay,
     definition: &ToolDefinition,
+    metadata: Option<&super::openapi::OpenApiTransformMetadata>,
     problems: &mut Vec<OverlayProblem>,
 ) {
     let tool_path = format!("/tools/{generated_name}");
@@ -850,6 +2135,16 @@ fn validate_parameter_names(
         return;
     };
     for property in tool.parameters.keys() {
+        if tool.parameters[property].shape.is_some()
+            && metadata.is_some_and(|metadata| metadata.array_request_body)
+        {
+            problems.push(OverlayProblem {
+                path: format!("{tool_path}/parameters/{property}/shape"),
+                message: "array body operations are not shapeable in overlay schema 0.1.0"
+                    .to_owned(),
+            });
+            continue;
+        }
         match properties.get(property) {
             None => {
                 let known = properties.keys().cloned().collect::<Vec<_>>().join(", ");
@@ -1126,6 +2421,7 @@ mod tests {
         tools::{
             definitions::ToolRegistry,
             openapi::{bind_generated_openapi_tools, generate_tools_from_openapi_str},
+            transforms::{apply_request_transform, apply_response_transform},
         },
     };
 
@@ -1231,6 +2527,151 @@ paths:
                 accountStatus2:
                   type: string
 "#
+    }
+
+    /// Request- and response-shaped operations used by the PR3 compiler
+    /// contract tests. The write operation also has path and query arguments
+    /// so the compiler can prove that only request-body properties are
+    /// shapeable. The batch operation deliberately carries an array body.
+    fn transform_spec() -> &'static str {
+        r#"
+openapi: 3.0.3
+info:
+  title: CRM transforms
+  version: 1.0.0
+components:
+  schemas:
+    Money:
+      type: object
+      required: [amountMicros, currencyCode]
+      properties:
+        amountMicros: {type: string}
+        currencyCode: {type: string}
+    RichText:
+      type: object
+      required: [markdown, blocknote]
+      properties:
+        markdown: {type: string}
+        blocknote: {type: string}
+    Company:
+      type: object
+      properties:
+        annualRecurringRevenue:
+          $ref: '#/components/schemas/Money'
+        bodyV2:
+          $ref: '#/components/schemas/RichText'
+paths:
+  /companies/{id}:
+    patch:
+      operationId: UpdateOneCompany
+      summary: Update one company
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema: {type: string}
+        - in: query
+          name: dry_run
+          required: false
+          schema: {type: boolean}
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [annualRecurringRevenue]
+              properties:
+                annualRecurringRevenue:
+                  $ref: '#/components/schemas/Money'
+                bodyV2:
+                  $ref: '#/components/schemas/RichText'
+      responses:
+        '200':
+          description: Updated company
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    type: object
+                    properties:
+                      updateCompany:
+                        $ref: '#/components/schemas/Company'
+  /companies:
+    get:
+      operationId: findManyCompanies
+      responses:
+        '200':
+          description: Companies
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    type: object
+                    properties:
+                      companies:
+                        type: array
+                        items:
+                          $ref: '#/components/schemas/Company'
+  /companies/one:
+    get:
+      operationId: findOneCompany
+      responses:
+        '200':
+          description: Company
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    type: object
+                    properties:
+                      company:
+                        $ref: '#/components/schemas/Company'
+  /companies/batch:
+    post:
+      operationId: createManyCompanies
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: array
+              items:
+                $ref: '#/components/schemas/Company'
+"#
+    }
+
+    fn money_shape() -> Value {
+        json!({
+            "agent": {
+                "amount": {
+                    "type": "number",
+                    "title": "Annual recurring revenue"
+                },
+                "currency": {
+                    "type": "string",
+                    "title": "Annual recurring revenue"
+                }
+            },
+            "required": ["amount", "currency"],
+            "wire": {
+                "/amountMicros": {
+                    "from": "amount",
+                    "codec": {
+                        "kind": "decimal_scale",
+                        "scale": 6,
+                        "wire_encoding": "integer_string"
+                    }
+                },
+                "/currencyCode": {"from": "currency"}
+            }
+        })
     }
 
     fn bound(spec: &str) -> (OpenApiToolGeneration, OpenApiToolBinding) {
@@ -1389,13 +2830,50 @@ paths:
     }
 
     #[test]
+    fn shaped_parameter_rejects_legacy_title_and_description_metadata() {
+        let error = validate(&json!({
+            "schema_version": "0.1.0",
+            "tools": {
+                "UpdateOneCompany": {
+                    "parameters": {
+                        "annualRecurringRevenue": {
+                            "title": "Annual recurring revenue",
+                            "description": "Money in major units.",
+                            "shape": money_shape()
+                        }
+                    }
+                }
+            }
+        }))
+        .expect_err("shape and legacy parameter metadata must be unambiguous");
+
+        assert_eq!(
+            problems(error),
+            vec![
+                (
+                    "/tools/UpdateOneCompany/parameters/annualRecurringRevenue/description"
+                        .to_owned(),
+                    "`description` cannot be combined with `shape`; move agent-facing metadata \
+                     into the relevant `shape.agent.<agent_property>.description` schema fragment"
+                        .to_owned(),
+                ),
+                (
+                    "/tools/UpdateOneCompany/parameters/annualRecurringRevenue/title".to_owned(),
+                    "`title` cannot be combined with `shape`; move agent-facing metadata into \
+                     the relevant `shape.agent.<agent_property>.title` schema fragment"
+                        .to_owned(),
+                ),
+            ]
+        );
+    }
+
+    #[test]
     fn reserved_sections_are_refused_with_the_feature_named() {
         let mut document = example();
         document["enum_sources"] = json!({});
         document["composites"] = json!({});
         document["tools"]["createOneCompany"]["parameters"]["accountStatus"]["enum_source"] =
             json!("company_account_status");
-        document["tools"]["createOneCompany"]["response"] = json!({ "root": "/data/*" });
         let error = validate(&document).expect_err("reserved sections must fail");
         let paths = error
             .problems
@@ -1407,7 +2885,6 @@ paths:
             vec![
                 "/enum_sources",
                 "/composites",
-                "/tools/createOneCompany/response",
                 "/tools/createOneCompany/parameters/accountStatus/enum_source",
             ]
         );
@@ -2093,6 +3570,790 @@ paths:
                 "the generated schema of 'id' is not an object".to_owned(),
             )]
         );
+    }
+
+    #[test]
+    fn transformed_tool_advertises_agent_schema_and_compiles_wire_and_response_mappings() {
+        let (generation, binding) = bound(transform_spec());
+        let overlay = validate(&json!({
+            "schema_version": "0.1.0",
+            "shapes": {"money": money_shape()},
+            "tools": {
+                "UpdateOneCompany": {
+                    "parameters": {
+                        "annualRecurringRevenue": {
+                            "shape": {
+                                "$use": "money",
+                                "prefix": "revenue"
+                            }
+                        },
+                        "bodyV2": {
+                            "shape": {
+                                "agent": {
+                                    "markdown": {
+                                        "type": "string",
+                                        "title": "Company notes"
+                                    }
+                                },
+                                "required": ["markdown"],
+                                "wire": {
+                                    "/markdown": {"from": "markdown"}
+                                }
+                            }
+                        }
+                    },
+                    "response": {"root": "/data/updateCompany"}
+                }
+            }
+        }))
+        .expect("the transform authoring model should validate");
+        validate(&serde_json::to_value(&overlay).expect("transform overlay serialises"))
+            .expect("the transform Rust model and committed schema must round-trip");
+
+        let compiled = compile(
+            &generation,
+            binding,
+            &overlay,
+            &OverlayCompileContext::default(),
+        )
+        .expect("the request and response contracts agree");
+        let updated = definition(&compiled.binding, "UpdateOneCompany");
+        let properties = updated.input_schema["properties"]
+            .as_object()
+            .expect("agent input properties");
+        assert!(!properties.contains_key("annualRecurringRevenue"));
+        assert!(!properties.contains_key("bodyV2"));
+        assert!(properties.contains_key("id"));
+        assert!(properties.contains_key("dry_run"));
+        assert_eq!(properties["revenue_amount"]["type"], json!("number"));
+        assert_eq!(properties["revenue_currency"]["type"], json!("string"));
+        assert_eq!(properties["markdown"]["type"], json!("string"));
+        assert_eq!(
+            properties["revenue_amount"]["description"],
+            json!("Annual recurring revenue (field `revenue_amount`)")
+        );
+        assert_eq!(
+            properties["revenue_currency"]["description"],
+            json!("Annual recurring revenue (field `revenue_currency`)")
+        );
+        assert_eq!(
+            updated.input_schema["required"],
+            json!(["id", "markdown", "revenue_amount", "revenue_currency"]),
+            "an explicit shape.required applies even when the original wire property was optional"
+        );
+
+        let transform = updated
+            .transform
+            .as_ref()
+            .expect("compiled definition should retain the transform");
+        assert_eq!(transform.parameters.len(), 2);
+        assert_eq!(
+            transform.response_root.as_ref().map(ToString::to_string),
+            Some("/data/updateCompany".to_owned())
+        );
+        let revenue = transform
+            .parameters
+            .iter()
+            .find(|shape| shape.wire_property == "annualRecurringRevenue")
+            .expect("money shape");
+        assert!(revenue.wire_required);
+        assert_eq!(
+            revenue
+                .agent
+                .iter()
+                .map(|agent| agent.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["revenue_amount", "revenue_currency"]
+        );
+        assert_eq!(
+            revenue.response.len(),
+            2,
+            "invertible bindings derive a response mapping"
+        );
+
+        let args = json!({
+            "id": "company-1",
+            "dry_run": true,
+            "revenue_amount": 24000,
+            "revenue_currency": "USD",
+            "markdown": "Hello"
+        });
+        let wire = apply_request_transform(Some(transform), &args)
+            .expect("exact values should encode")
+            .into_owned();
+        assert_eq!(
+            wire,
+            json!({
+                "id": "company-1",
+                "dry_run": true,
+                "annualRecurringRevenue": {
+                    "amountMicros": "24000000000",
+                    "currencyCode": "USD"
+                },
+                "bodyV2": {"markdown": "Hello"}
+            })
+        );
+
+        let mut response = json!({
+            "data": {
+                "updateCompany": {
+                    "annualRecurringRevenue": {
+                        "amountMicros": "24000000000",
+                        "currencyCode": "USD"
+                    },
+                    "bodyV2": {"markdown": "Hello", "blocknote": "[]"}
+                }
+            }
+        });
+        assert!(apply_response_transform(transform, &mut response).is_empty());
+        assert_eq!(
+            response,
+            json!({
+                "data": {
+                    "updateCompany": {
+                        "revenue_amount": 24000,
+                        "revenue_currency": "USD",
+                        "markdown": "Hello"
+                    }
+                }
+            })
+        );
+
+        assert_registry_accepts(compiled.binding.definitions.clone());
+    }
+
+    #[test]
+    fn explicit_empty_shape_required_keeps_optional_wire_agents_optional() {
+        let (generation, binding) = bound(transform_spec());
+        let overlay = validate(&json!({
+            "schema_version": "0.1.0",
+            "tools": {
+                "UpdateOneCompany": {
+                    "parameters": {
+                        "bodyV2": {
+                            "shape": {
+                                "agent": {
+                                    "markdown": {"type": "string"},
+                                    "blocknote": {"type": "string"}
+                                },
+                                "required": [],
+                                "wire": {
+                                    "/markdown": {"from": "markdown"},
+                                    "/blocknote": {"from": "blocknote"}
+                                }
+                            }
+                        }
+                    },
+                    "response": {"root": "/data/updateCompany"}
+                }
+            }
+        }))
+        .expect("an explicitly empty required list is valid");
+
+        let compiled = compile(
+            &generation,
+            binding,
+            &overlay,
+            &OverlayCompileContext::default(),
+        )
+        .expect("optional body agents can all remain optional");
+        let updated = definition(&compiled.binding, "UpdateOneCompany");
+        assert_eq!(
+            updated.input_schema["required"],
+            json!(["annualRecurringRevenue", "id"])
+        );
+        assert!(updated.input_schema["properties"].get("markdown").is_some());
+        assert!(updated.input_schema["properties"]
+            .get("blocknote")
+            .is_some());
+    }
+
+    #[test]
+    fn codec_chain_output_type_must_match_wire_property_type() {
+        let (generation, binding) = bound(transform_spec());
+        let overlay = validate(&json!({
+            "schema_version": "0.1.0",
+            "tools": {
+                "UpdateOneCompany": {
+                    "parameters": {
+                        "bodyV2": {
+                            "shape": {
+                                "agent": {"markdown": {"type": "string"}},
+                                "wire": {
+                                    "/blocknote": {
+                                        "from": "markdown",
+                                        "codec": {
+                                            "kind": "markdown_blocks",
+                                            "dialect": "blocknote"
+                                        }
+                                    }
+                                },
+                                "response": {
+                                    "markdown": {"from": "/markdown"}
+                                }
+                            }
+                        }
+                    },
+                    "response": {"root": "/data/updateCompany"}
+                }
+            }
+        }))
+        .expect("shape is structurally valid");
+
+        let error = compile(
+            &generation,
+            binding,
+            &overlay,
+            &OverlayCompileContext::default(),
+        )
+        .expect_err("markdown blocks are an array until json_string encodes them");
+        assert!(
+            error.problems.iter().any(|problem| {
+                problem.path
+                    == "/tools/UpdateOneCompany/parameters/bodyV2/shape/wire//blocknote/codec"
+                    && problem.message.contains(
+                        "output type array does not match wire pointer '/blocknote' type string",
+                    )
+            }),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn explicit_request_response_binding_is_checked_against_the_response_representation() {
+        let spec = r#"
+openapi: 3.0.3
+info: {title: Split representation, version: 1.0.0}
+paths:
+  /records:
+    post:
+      operationId: writeRecord
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                amount:
+                  type: object
+                  properties:
+                    encoded: {type: string}
+      responses:
+        '200':
+          description: Record
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  amount:
+                    type: object
+                    properties:
+                      decoded: {type: string}
+"#;
+        let (generation, binding) = bound(spec);
+        let overlay = validate(&json!({
+            "schema_version": "0.1.0",
+            "tools": {
+                "writeRecord": {
+                    "parameters": {
+                        "amount": {
+                            "shape": {
+                                "agent": {"amount": {"type": "string"}},
+                                "wire": {"/encoded": {"from": "amount"}},
+                                "response": {"amount": {"from": "/decoded"}}
+                            }
+                        }
+                    }
+                }
+            }
+        }))
+        .expect("shape is valid");
+
+        let compiled = compile(
+            &generation,
+            binding,
+            &overlay,
+            &OverlayCompileContext::default(),
+        )
+        .expect("request and response pointers are validated against their own representations");
+        let transform = definition(&compiled.binding, "writeRecord")
+            .transform
+            .as_ref()
+            .expect("transform");
+        assert_eq!(transform.parameters[0].wire[0].pointer.as_str(), "/encoded");
+        assert_eq!(
+            transform.parameters[0].response[0].from.as_str(),
+            "/decoded"
+        );
+    }
+
+    #[test]
+    fn response_root_that_selects_no_object_in_the_declared_response_is_rejected_at_put() {
+        let (generation, binding) = bound(transform_spec());
+        let overlay = validate(&json!({
+            "schema_version": "0.1.0",
+            "shapes": {"money": money_shape()},
+            "tools": {
+                "UpdateOneCompany": {
+                    "parameters": {
+                        "annualRecurringRevenue": {"shape": {"$use": "money"}}
+                    },
+                    "response": {"root": "/data/companies/*"}
+                }
+            }
+        }))
+        .expect("selector syntax is valid");
+
+        let error = compile(
+            &generation,
+            binding,
+            &overlay,
+            &OverlayCompileContext::default(),
+        )
+        .expect_err("the selector has no matching object in the 200 schema");
+        assert!(
+            error.problems.iter().any(|problem| {
+                problem.path == "/tools/UpdateOneCompany/response/root"
+                    && problem.message.contains("selects no object")
+                    && problem.message.contains("200")
+            }),
+            "{error}"
+        );
+
+        let (generation, binding) = bound(transform_spec());
+        let overlay = validate(&json!({
+            "schema_version": "0.1.0",
+            "defaults": {"response_root": "/data/companies/*"},
+            "shapes": {"money": money_shape()},
+            "tools": {
+                "UpdateOneCompany": {
+                    "parameters": {
+                        "annualRecurringRevenue": {"shape": {"$use": "money"}}
+                    }
+                }
+            }
+        }))
+        .expect("default selector syntax is valid");
+        let error = compile(
+            &generation,
+            binding,
+            &overlay,
+            &OverlayCompileContext::default(),
+        )
+        .expect_err("a bad default root must retain its authoring path");
+        assert!(error
+            .problems
+            .iter()
+            .any(|problem| problem.path == "/defaults/response_root"));
+    }
+
+    #[test]
+    fn response_fields_decode_find_many_and_find_one_bodies() {
+        let (generation, binding) = bound(transform_spec());
+        let overlay = validate(&json!({
+            "schema_version": "0.1.0",
+            "shapes": {"money": money_shape()},
+            "tools": {
+                "findManyCompanies": {
+                    "response": {
+                        "root": "/data/companies/*",
+                        "fields": {
+                            "annualRecurringRevenue": {
+                                "$use": "money",
+                                "prefix": "revenue"
+                            }
+                        }
+                    }
+                },
+                "findOneCompany": {
+                    "response": {
+                        "root": "/data/company",
+                        "fields": {
+                            "annualRecurringRevenue": {
+                                "$use": "money",
+                                "prefix": "revenue"
+                            }
+                        }
+                    }
+                }
+            }
+        }))
+        .expect("decode-only response fields validate");
+        let compiled = compile(
+            &generation,
+            binding,
+            &overlay,
+            &OverlayCompileContext::default(),
+        )
+        .expect("both response roots and fields agree with the declared schemas");
+
+        let many = definition(&compiled.binding, "findManyCompanies");
+        assert!(many.upstream.body.is_none());
+        let many_transform = many.transform.as_ref().expect("many transform");
+        assert!(many_transform.parameters.is_empty());
+        assert_eq!(many_transform.response_fields.len(), 1);
+        let mut many_body = json!({
+            "data": {"companies": [
+                {"annualRecurringRevenue": {"amountMicros": "1000000", "currencyCode": "USD"}},
+                {"annualRecurringRevenue": {"amountMicros": "2500000", "currencyCode": "EUR"}}
+            ]}
+        });
+        assert!(apply_response_transform(many_transform, &mut many_body).is_empty());
+        assert_eq!(
+            many_body,
+            json!({
+                "data": {"companies": [
+                    {"revenue_amount": 1, "revenue_currency": "USD"},
+                    {"revenue_amount": 2.5, "revenue_currency": "EUR"}
+                ]}
+            })
+        );
+
+        let one_transform = definition(&compiled.binding, "findOneCompany")
+            .transform
+            .as_ref()
+            .expect("one transform");
+        let mut one_body = json!({
+            "data": {"company": {
+                "annualRecurringRevenue": {"amountMicros": "7000000", "currencyCode": "GBP"}
+            }}
+        });
+        assert!(apply_response_transform(one_transform, &mut one_body).is_empty());
+        assert_eq!(
+            one_body,
+            json!({"data": {"company": {"revenue_amount": 7, "revenue_currency": "GBP"}}})
+        );
+
+        assert_registry_accepts(compiled.binding.definitions.clone());
+    }
+
+    #[test]
+    fn transform_shapes_are_refused_on_path_query_and_array_body_operations_at_compile() {
+        let shape = json!({
+            "agent": {"value": {"type": "string"}},
+            "wire": {"/value": {"from": "value"}}
+        });
+        for (tool, property, expected) in [
+            ("UpdateOneCompany", "id", "not a JSON request-body property"),
+            (
+                "UpdateOneCompany",
+                "dry_run",
+                "not a JSON request-body property",
+            ),
+            (
+                "createManyCompanies",
+                "items",
+                "array body operations are not shapeable",
+            ),
+        ] {
+            let (generation, binding) = bound(transform_spec());
+            let overlay = validate(&json!({
+                "schema_version": "0.1.0",
+                "tools": {
+                    (tool): {
+                        "parameters": {(property): {"shape": shape.clone()}}
+                    }
+                }
+            }))
+            .expect("shape is structurally valid");
+            let error = compile(
+                &generation,
+                binding,
+                &overlay,
+                &OverlayCompileContext::default(),
+            )
+            .expect_err("unsupported shape location must fail at compile");
+            assert!(
+                error
+                    .problems
+                    .iter()
+                    .any(|problem| problem.message.contains(expected)),
+                "{tool}.{property}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn request_wire_pointer_cannot_cross_a_declared_array_container() {
+        let spec = r#"
+openapi: 3.0.3
+info: {title: Nested array, version: 1.0.0}
+paths:
+  /records:
+    post:
+      operationId: createRecord
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                payload:
+                  type: object
+                  properties:
+                    items:
+                      type: array
+                      items:
+                        type: object
+                        properties:
+                          id: {type: string}
+"#;
+        let (generation, binding) = bound(spec);
+        let overlay = validate(&json!({
+            "schema_version": "0.1.0",
+            "tools": {
+                "createRecord": {
+                    "parameters": {
+                        "payload": {
+                            "shape": {
+                                "agent": {"id": {"type": "string"}},
+                                "wire": {"/items/0/id": {"from": "id"}}
+                            }
+                        }
+                    }
+                }
+            }
+        }))
+        .expect("pointer is syntactically valid");
+        let error = compile(
+            &generation,
+            binding,
+            &overlay,
+            &OverlayCompileContext::default(),
+        )
+        .expect_err("the runtime cannot infer array containers from RFC 6901 text");
+        assert!(
+            error.problems.iter().any(|problem| {
+                problem.path.contains("/wire//items/0/id")
+                    && problem.message.contains("crosses an array")
+            }),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn response_agent_names_cannot_collide_across_decode_only_fields() {
+        let (generation, binding) = bound(transform_spec());
+        let overlay = validate(&json!({
+            "schema_version": "0.1.0",
+            "shapes": {"money": money_shape()},
+            "tools": {
+                "findOneCompany": {
+                    "response": {
+                        "root": "/data/company",
+                        "fields": {
+                            "annualRecurringRevenue": {
+                                "$use": "money",
+                                "prefix": "shared"
+                            },
+                            "bodyV2": {
+                                "agent": {"shared_amount": {"type": "string"}},
+                                "wire": {"/markdown": {"from": "shared_amount"}}
+                            }
+                        }
+                    }
+                }
+            }
+        }))
+        .expect("each field shape is independently valid");
+        let error = compile(
+            &generation,
+            binding,
+            &overlay,
+            &OverlayCompileContext::default(),
+        )
+        .expect_err("two fields may not project the same agent name");
+        assert!(
+            error.problems.iter().any(|problem| {
+                problem
+                    .message
+                    .contains("response agent property 'shared_amount' is already produced")
+            }),
+            "{error}"
+        );
+
+        let (generation, binding) = bound(transform_spec());
+        let overlay = validate(&json!({
+            "schema_version": "0.1.0",
+            "tools": {
+                "findOneCompany": {
+                    "response": {
+                        "root": "/data/company",
+                        "fields": {
+                            "annualRecurringRevenue": {
+                                "agent": {"bodyV2": {"type": "string"}},
+                                "wire": {"/currencyCode": {"from": "bodyV2"}}
+                            }
+                        }
+                    }
+                }
+            }
+        }))
+        .expect("field shape validates");
+        let error = compile(
+            &generation,
+            binding,
+            &overlay,
+            &OverlayCompileContext::default(),
+        )
+        .expect_err("a projected name may not overwrite an unshaped response property");
+        assert!(
+            error.problems.iter().any(|problem| problem
+                .message
+                .contains("collides with an existing property of the selected response object")),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn agent_fragments_and_shape_graph_invariants_fail_closed() {
+        for (fragment, expected) in [
+            (json!({"minimum": 0}), "required property"),
+            (json!({"type": "string", "format": "currency"}), "format"),
+        ] {
+            let error = validate(&json!({
+                "schema_version": "0.1.0",
+                "shapes": {
+                    "invalid": {
+                        "agent": {"value": fragment},
+                        "wire": {"/value": {"from": "value"}}
+                    }
+                }
+            }))
+            .expect_err("agent fragment must fail at PUT validation");
+            assert!(
+                error.problems.iter().any(|problem| {
+                    problem.path.contains(expected) || problem.message.contains(expected)
+                }),
+                "{error}"
+            );
+        }
+
+        let error = validate(&json!({
+            "schema_version": "0.1.0",
+            "shapes": {
+                "invalid": {
+                    "agent": {
+                        "first": {"type": "string"},
+                        "unused": {"type": "string"}
+                    },
+                    "wire": {
+                        "/value": {"from": "first"},
+                        "/value/nested": {"from": "first"}
+                    }
+                }
+            }
+        }))
+        .expect_err("overlap and unused agent fields must fail");
+        assert!(
+            error
+                .problems
+                .iter()
+                .any(|problem| problem.message.contains("overlap")),
+            "{error}"
+        );
+        assert!(
+            error
+                .problems
+                .iter()
+                .any(|problem| problem.message.contains("not used")),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn all_named_tools_are_transform_validated_even_when_unselected() {
+        let (generation, mut binding) = bound(transform_spec());
+        binding
+            .definitions
+            .retain(|definition| definition.name != "findOneCompany");
+        binding
+            .security_selections
+            .retain(|selection| selection.tool_name != "findOneCompany");
+        let overlay = validate(&json!({
+            "schema_version": "0.1.0",
+            "tools": {
+                "findOneCompany": {
+                    "response": {
+                        "root": "/data/company",
+                        "fields": {
+                            "annualRecurringRevenue": {"$use": "missing_shape"}
+                        }
+                    }
+                }
+            }
+        }))
+        .expect("an unresolved $use needs catalog-aware compilation");
+
+        let error = compile(
+            &generation,
+            binding,
+            &overlay,
+            &OverlayCompileContext::default(),
+        )
+        .expect_err("unselected named tools are validated now, not after registration");
+        assert!(
+            error.problems.iter().any(|problem| {
+                problem.path == "/tools/findOneCompany/response/fields/annualRecurringRevenue/$use"
+                    && problem.message.contains("missing_shape")
+            }),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn free_form_wire_and_response_schemas_warn_instead_of_rejecting() {
+        let spec = r#"
+openapi: 3.0.3
+info: {title: Free form, version: 1.0.0}
+paths:
+  /records:
+    post:
+      operationId: writeRecord
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                payload: {type: object, additionalProperties: true}
+      responses:
+        '200':
+          description: Free form
+          content:
+            application/json:
+              schema: {type: object, additionalProperties: true}
+"#;
+        let (generation, binding) = bound(spec);
+        let overlay = validate(&json!({
+            "schema_version": "0.1.0",
+            "tools": {
+                "writeRecord": {
+                    "parameters": {
+                        "payload": {
+                            "shape": {
+                                "agent": {"value": {"type": "string"}},
+                                "wire": {"/nested/value": {"from": "value"}}
+                            }
+                        }
+                    }
+                }
+            }
+        }))
+        .expect("shape validates");
+        let compiled = compile(
+            &generation,
+            binding,
+            &overlay,
+            &OverlayCompileContext::default(),
+        )
+        .expect("free-form schemas are accepted with warnings");
+        assert!(compiled
+            .warnings
+            .iter()
+            .any(|warning| warning.message.contains("cannot be verified")));
     }
 
     #[test]

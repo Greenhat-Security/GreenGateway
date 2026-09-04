@@ -47,6 +47,7 @@ metrics-exporter-prometheus = { version = "0.18.3", default-features = false }
 mime_guess = "2"
 notify = "8.2.0"
 percent-encoding = "2.3.2"
+pulldown-cmark = { version = "0.13.0", default-features = false }
 proptest = "1.9.0"
 rcgen = "0.13.2"
 reqwest = { version = "0.13.2", default-features = false, features = ["json", "rustls", "stream"] }

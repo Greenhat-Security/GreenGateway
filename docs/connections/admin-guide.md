@@ -163,6 +163,9 @@ Detail shows:
 - availability/staleness and policy eligibility;
 - safe HTTP mapping or remote MCP name;
 - input JSON Schema;
+- a bounded transform summary (agent property names, binding counts, and only
+  a boolean indicating whether a response root exists; never constant values,
+  selector or pointer paths, codecs, or upstream schemas);
 - whether the constrained playground is available.
 
 Inventory is descriptive, not an authorization grant. A capability may exist
@@ -198,6 +201,14 @@ Treat every Run as a real upstream side effect. Use a purpose-built
 non-production capability for experimentation, apply least privilege to
 `admin:tools:execute`, and do not assume an HTTP method is safe merely because
 the UI calls the feature a playground.
+
+For transformed HTTP tools, a successful result may include bounded
+`warnings`. A response field that cannot be decoded stays in its original wire
+form; use the warning path and reason to repair the overlay or investigate an
+upstream schema change. Results contain at most 32 warnings; when the warning
+set is truncated, the last item is
+`{"path":"/","reason":"warnings_truncated"}`. Transform input failures return
+`invalid_params` with codec problems and occur before any upstream request.
 
 ## Operational States
 

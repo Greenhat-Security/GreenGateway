@@ -23,6 +23,8 @@ use crate::{
     },
 };
 
+use super::transforms::DeclaredResponseSchema;
+
 const TOOLS_FILE_SCHEMA_VERSION: &str = "0.1.0";
 const MAX_TOOL_NAME_LENGTH: usize = 128;
 const MAX_OPENAPI_REFERENCE_DEPTH: usize = 64;
@@ -42,13 +44,52 @@ pub struct OpenApiToolGeneration {
     pub skipped_operations: Vec<OpenApiSkippedOperation>,
     pub api_key_header_auth_requirements: Vec<OpenApiApiKeyHeaderAuthRequirement>,
     pub security_requirements: Vec<OpenApiOperationSecurity>,
+    /// OpenAPI-only structure that is intentionally not copied into a bare
+    /// `ToolDefinition`. The overlay compiler uses it to prove that request
+    /// shapes target body properties and that response selectors/pointers
+    /// agree with every declared JSON success response.
+    pub transform_metadata: BTreeMap<String, OpenApiTransformMetadata>,
+    document: Value,
 }
 
 impl OpenApiToolGeneration {
     pub fn tools_file_value(&self) -> Value {
         tools_file_value(&self.definitions)
     }
+
+    /// Resolve declared JSON success schemas only for a compiler that needs
+    /// them. Ordinary generation and Connections without a transform overlay
+    /// therefore retain the legacy acceptance and resource profile exactly.
+    pub fn declared_success_response_schemas(
+        &self,
+        tool_name: &str,
+    ) -> Result<Vec<OpenApiSuccessResponseSchema>, OpenApiToolGenerationError> {
+        let Some(metadata) = self.transform_metadata.get(tool_name) else {
+            return Ok(Vec::new());
+        };
+        let mut expansion_budget = OpenApiSchemaExpansionBudget::new();
+        json_success_response_schemas(
+            &self.document,
+            metadata.responses.as_ref(),
+            &mut expansion_budget,
+        )
+    }
 }
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct OpenApiTransformMetadata {
+    /// Top-level properties contributed by the JSON request body. Path and
+    /// query arguments live beside these in the generated agent schema, so
+    /// retaining this set is what lets overlays refuse to reshape them.
+    pub body_properties: BTreeSet<String>,
+    /// Array request bodies are not flattened by the v0.1 generator and are
+    /// deliberately not shapeable in this overlay revision.
+    pub array_request_body: bool,
+    /// Kept raw and resolved lazily by `declared_success_response_schemas`.
+    responses: Option<Value>,
+}
+
+pub type OpenApiSuccessResponseSchema = DeclaredResponseSchema;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OpenApiToolNameFallback {
@@ -697,6 +738,7 @@ pub fn generate_tools_from_openapi_str(
     let mut skipped_operations = Vec::new();
     let mut api_key_header_auth_requirements = Vec::new();
     let mut security_requirements = Vec::new();
+    let mut transform_metadata = BTreeMap::new();
     let mut used_names = BTreeSet::new();
     let mut cumulative_definition_bytes = 0usize;
     let mut schema_expansion_budget = OpenApiSchemaExpansionBudget::new();
@@ -754,6 +796,18 @@ pub fn generate_tools_from_openapi_str(
             &tool_name,
         )?);
 
+        let metadata = OpenApiTransformMetadata {
+            body_properties: body_schema
+                .as_ref()
+                .map(body_property_names)
+                .unwrap_or_default(),
+            array_request_body: body_schema.as_ref().is_some_and(schema_is_array),
+            responses: operation_value
+                .and_then(|operation| operation.get("responses"))
+                .cloned(),
+        };
+        transform_metadata.insert(tool_name.clone(), metadata);
+
         let query_params = parameters
             .iter()
             .filter(|parameter| parameter.location == GeneratedParameterLocation::Query)
@@ -785,6 +839,7 @@ pub fn generate_tools_from_openapi_str(
                 }),
             },
             visibility: ToolVisibility::Listed,
+            transform: None,
         };
         let definition_bytes = serde_json::to_vec(&definition)
             .map_err(|source| OpenApiToolGenerationError::Json { source })?
@@ -810,6 +865,8 @@ pub fn generate_tools_from_openapi_str(
         skipped_operations,
         api_key_header_auth_requirements,
         security_requirements,
+        transform_metadata,
+        document,
     })
 }
 
@@ -1532,6 +1589,101 @@ fn json_request_body_schema(
         SchemaExpansionDepth::default(),
         expansion_budget,
     )?))
+}
+
+fn body_property_names(schema: &Value) -> BTreeSet<String> {
+    fn collect(schema: &Value, names: &mut BTreeSet<String>) {
+        let Some(object) = schema.as_object() else {
+            return;
+        };
+        if let Some(properties) = object.get("properties").and_then(Value::as_object) {
+            names.extend(properties.keys().cloned());
+        }
+        if let Some(all_of) = object.get("allOf").and_then(Value::as_array) {
+            for branch in all_of {
+                collect(branch, names);
+            }
+        }
+    }
+
+    let mut names = BTreeSet::new();
+    collect(schema, &mut names);
+    names
+}
+
+fn schema_is_array(schema: &Value) -> bool {
+    let Some(object) = schema.as_object() else {
+        return false;
+    };
+    let declared = object
+        .get("type")
+        .is_some_and(|schema_type| match schema_type {
+            Value::String(schema_type) => schema_type == "array",
+            Value::Array(schema_types) => schema_types
+                .iter()
+                .any(|schema_type| schema_type.as_str() == Some("array")),
+            _ => false,
+        })
+        || (object.contains_key("items") && !object.contains_key("properties"));
+    declared
+        || ["allOf", "anyOf", "oneOf"].iter().any(|keyword| {
+            object
+                .get(*keyword)
+                .and_then(Value::as_array)
+                .is_some_and(|branches| branches.iter().any(schema_is_array))
+        })
+}
+
+/// Retain every declared JSON success schema with its status key. The overlay
+/// compiler evaluates response roots against each schema independently so a
+/// candidate cannot be valid for 200 while corrupting a separately declared
+/// 201 response.
+fn json_success_response_schemas(
+    document: &Value,
+    responses: Option<&Value>,
+    expansion_budget: &mut OpenApiSchemaExpansionBudget,
+) -> Result<Vec<OpenApiSuccessResponseSchema>, OpenApiToolGenerationError> {
+    let Some(responses) = responses.and_then(Value::as_object) else {
+        return Ok(Vec::new());
+    };
+
+    let mut schemas = Vec::new();
+    for (status, response) in responses {
+        if !is_success_response_key(status) {
+            continue;
+        }
+        let response = resolve_reference(document, response, &mut BTreeSet::new())?;
+        let Some(content) = response.get("content").and_then(Value::as_object) else {
+            continue;
+        };
+        let Some(schema) = content
+            .iter()
+            .find(|(media_type, _)| is_json_media_type(media_type))
+            .and_then(|(_, media_type)| media_type.get("schema"))
+        else {
+            continue;
+        };
+        schemas.push(OpenApiSuccessResponseSchema {
+            status: status.clone(),
+            schema: dereference_schema(
+                document,
+                schema,
+                &mut BTreeSet::new(),
+                SchemaExpansionDepth::default(),
+                expansion_budget,
+            )?,
+        });
+    }
+    Ok(schemas)
+}
+
+fn is_success_response_key(status: &str) -> bool {
+    if status.eq_ignore_ascii_case("2XX") {
+        return true;
+    }
+    status
+        .parse::<u16>()
+        .is_ok_and(|status| (200..300).contains(&status))
 }
 
 fn dereference_schema(
@@ -3621,6 +3773,124 @@ paths:
             ),
             Err(OpenApiToolBindingError::UnexpectedSecurityConfirmation { tool_name })
                 if tool_name == "traceRequest"
+        ));
+    }
+
+    #[test]
+    fn transform_metadata_keeps_body_provenance_and_lazily_resolves_json_success_schemas() {
+        let generation = generate_tools_from_openapi_str(
+            "transforms.yaml",
+            r#"
+openapi: 3.0.3
+info: {title: Transform metadata, version: 1.0.0}
+components:
+  schemas:
+    Payload:
+      type: object
+      properties:
+        shaped: {type: object, properties: {wire: {type: string}}}
+        plain: {type: string}
+    Result:
+      type: object
+      properties:
+        data: {type: object, properties: {wire: {type: string}}}
+  responses:
+    ResultResponse:
+      description: Result
+      content:
+        application/problem+json:
+          schema: {$ref: '#/components/schemas/Result'}
+paths:
+  /records/{id}:
+    post:
+      operationId: writeRecord
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema: {type: string}
+        - in: query
+          name: filter
+          schema: {type: string}
+      requestBody:
+        content:
+          application/json:
+            schema: {$ref: '#/components/schemas/Payload'}
+      responses:
+        '200': {$ref: '#/components/responses/ResultResponse'}
+        2XX:
+          description: Alternate
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Result'}
+        '204': {description: No content}
+        default:
+          description: Error
+          content:
+            application/json:
+              schema: {type: object}
+"#,
+        )
+        .expect("response schemas should not be expanded during ordinary generation");
+
+        let metadata = generation
+            .transform_metadata
+            .get("writeRecord")
+            .expect("metadata follows the final generated name");
+        assert_eq!(
+            metadata.body_properties,
+            BTreeSet::from(["plain".to_owned(), "shaped".to_owned()])
+        );
+        assert!(!metadata.body_properties.contains("id"));
+        assert!(!metadata.body_properties.contains("filter"));
+        assert!(!metadata.array_request_body);
+
+        let responses = generation
+            .declared_success_response_schemas("writeRecord")
+            .expect("local response and schema references should resolve lazily");
+        assert_eq!(
+            responses
+                .iter()
+                .map(|response| response.status.as_str())
+                .collect::<Vec<_>>(),
+            vec!["200", "2XX"]
+        );
+        assert!(responses.iter().all(|response| {
+            response
+                .schema
+                .pointer("/properties/data/properties/wire/type")
+                == Some(&json!("string"))
+        }));
+    }
+
+    #[test]
+    fn unused_broken_response_schema_is_resolved_only_when_a_transform_needs_it() {
+        let generation = generate_tools_from_openapi_str(
+            "lazy-response.yaml",
+            r#"
+openapi: 3.0.3
+info: {title: Lazy response, version: 1.0.0}
+paths:
+  /records:
+    get:
+      operationId: listRecords
+      responses:
+        '200':
+          description: Broken only for transform projection
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Missing'}
+"#,
+        )
+        .expect("legacy generation must not eagerly reject an unused response schema");
+        let error = generation
+            .declared_success_response_schemas("listRecords")
+            .expect_err("transform compilation must resolve and reject the missing reference");
+        assert!(matches!(
+            error,
+            OpenApiToolGenerationError::Reference { reference, message }
+                if reference == "#/components/schemas/Missing"
+                    && message.contains("does not exist")
         ));
     }
 

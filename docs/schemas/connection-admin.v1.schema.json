@@ -1700,6 +1700,166 @@
             "composite_only"
           ],
           "default": "listed"
+        },
+        "transform": {
+          "$ref": "#/$defs/ToolTransform"
+        }
+      }
+    },
+    "ToolTransform": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "parameters": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 256,
+          "items": {
+            "$ref": "#/$defs/TransformParameterShape"
+          }
+        },
+        "response_fields": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 64,
+          "items": {
+            "$ref": "#/$defs/TransformParameterShape"
+          }
+        },
+        "response_root": {
+          "$ref": "#/$defs/OpenApiOverlaySelector"
+        }
+      },
+      "anyOf": [
+        {"required": ["parameters"]},
+        {"required": ["response_fields"]},
+        {"required": ["response_root"]}
+      ]
+    },
+    "TransformParameterShape": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "wire_property",
+        "agent",
+        "wire",
+        "response"
+      ],
+      "properties": {
+        "wire_property": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256
+        },
+        "wire_required": {
+          "type": "boolean",
+          "default": false
+        },
+        "agent": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 16,
+          "items": {
+            "$ref": "#/$defs/TransformAgentProperty"
+          }
+        },
+        "wire": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 16,
+          "items": {
+            "$ref": "#/$defs/TransformWireBinding"
+          }
+        },
+        "response": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 16,
+          "items": {
+            "$ref": "#/$defs/TransformResponseBinding"
+          }
+        }
+      }
+    },
+    "TransformAgentProperty": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "name",
+        "schema"
+      ],
+      "properties": {
+        "name": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 512
+        },
+        "schema": {
+          "type": "object"
+        }
+      }
+    },
+    "TransformWireBinding": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "pointer"
+      ],
+      "properties": {
+        "pointer": {
+          "$ref": "#/$defs/OpenApiOverlayJsonPointer"
+        },
+        "from": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 512
+        },
+        "const": true,
+        "codec": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 4,
+          "items": {
+            "$ref": "#/$defs/OpenApiOverlayCodec"
+          }
+        }
+      },
+      "oneOf": [
+        {
+          "required": [
+            "from"
+          ]
+        },
+        {
+          "required": [
+            "const"
+          ]
+        }
+      ]
+    },
+    "TransformResponseBinding": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "agent_property",
+        "from"
+      ],
+      "properties": {
+        "agent_property": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 512
+        },
+        "from": {
+          "$ref": "#/$defs/OpenApiOverlayJsonPointer"
+        },
+        "codec": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 4,
+          "items": {
+            "$ref": "#/$defs/OpenApiOverlayCodec"
+          }
         }
       }
     },
@@ -1732,7 +1892,20 @@
               ],
               "default": "body_args_json",
               "description": "Body serialization for generated tools explicitly named under tools.* only."
+            },
+            "response_root": {
+              "$ref": "#/$defs/OpenApiOverlaySelector"
             }
+          }
+        },
+        "shapes": {
+          "type": "object",
+          "maxProperties": 64,
+          "propertyNames": {
+            "$ref": "#/$defs/OpenApiOverlayLocalName"
+          },
+          "additionalProperties": {
+            "$ref": "#/$defs/OpenApiOverlayShape"
           }
         },
         "tools": {
@@ -1747,10 +1920,10 @@
           "additionalProperties": {
             "$ref": "#/$defs/OpenApiOverlayTool"
           },
-          "description": "Keyed by generated operationId names, never rename targets. Future source, shape, response, and composite branches are rejected by this PR 1 request shape."
+          "description": "Keyed by generated operationId names, never rename targets. Dynamic source and composite branches remain reserved."
         }
       },
-      "description": "The PR 1 per-Connection OpenAPI overlay request shape, kept in lockstep with connection-overlay.v0.schema.json."
+      "description": "The per-Connection OpenAPI overlay request shape, including declarative request and response transforms."
     },
     "OpenApiOverlayDisambiguation": {
       "type": "object",
@@ -1820,6 +1993,9 @@
             "$ref": "#/$defs/OpenApiOverlayParameter"
           },
           "description": "Keyed by top-level properties in the generated input schema."
+        },
+        "response": {
+          "$ref": "#/$defs/OpenApiOverlayResponse"
         }
       }
     },
@@ -1836,6 +2012,253 @@
           "type": "string",
           "minLength": 1,
           "maxLength": 256
+        },
+        "shape": {
+          "$ref": "#/$defs/OpenApiOverlayShapeOrUse"
+        }
+      }
+    },
+    "OpenApiOverlayLocalName": {
+      "type": "string",
+      "pattern": "^[A-Za-z][A-Za-z0-9_]{0,63}$"
+    },
+    "OpenApiOverlayJsonPointer": {
+      "type": "string",
+      "pattern": "^(/([^/~]|~0|~1)*)*$",
+      "maxLength": 512
+    },
+    "OpenApiOverlaySelector": {
+      "type": "string",
+      "maxLength": 1024,
+      "pattern": "^(/([A-Za-z0-9_.-]+(\\[[A-Za-z0-9_.-]+=(int:-?[0-9]{1,18}|bool:(true|false)|[^\\]/]{1,128})\\])?|\\*))+$"
+    },
+    "OpenApiOverlayShapeOrUse": {
+      "oneOf": [
+        {
+          "$ref": "#/$defs/OpenApiOverlayShape"
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "$use"
+          ],
+          "properties": {
+            "$use": {
+              "$ref": "#/$defs/OpenApiOverlayLocalName"
+            },
+            "prefix": {
+              "$ref": "#/$defs/OpenApiOverlayLocalName"
+            }
+          }
+        }
+      ]
+    },
+    "OpenApiOverlayShape": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "agent",
+        "wire"
+      ],
+      "properties": {
+        "agent": {
+          "type": "object",
+          "minProperties": 1,
+          "maxProperties": 16,
+          "propertyNames": {
+            "$ref": "#/$defs/OpenApiOverlayLocalName"
+          },
+          "additionalProperties": {
+            "$ref": "#/$defs/OpenApiOverlayAgentFragment"
+          }
+        },
+        "required": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "$ref": "#/$defs/OpenApiOverlayLocalName"
+          }
+        },
+        "wire": {
+          "type": "object",
+          "minProperties": 1,
+          "maxProperties": 16,
+          "propertyNames": {
+            "$ref": "#/$defs/OpenApiOverlayJsonPointer"
+          },
+          "additionalProperties": {
+            "$ref": "#/$defs/OpenApiOverlayWireBinding"
+          }
+        },
+        "response": {
+          "type": "object",
+          "maxProperties": 16,
+          "propertyNames": {
+            "$ref": "#/$defs/OpenApiOverlayLocalName"
+          },
+          "additionalProperties": {
+            "$ref": "#/$defs/OpenApiOverlayResponseBinding"
+          }
+        }
+      }
+    },
+    "OpenApiOverlayAgentFragment": {
+      "type": "object",
+      "required": [
+        "type"
+      ],
+      "properties": {
+        "type": {
+          "enum": [
+            "string",
+            "number",
+            "integer",
+            "boolean",
+            "array",
+            "object"
+          ]
+        },
+        "format": false
+      }
+    },
+    "OpenApiOverlayWireBinding": {
+      "type": "object",
+      "additionalProperties": false,
+      "oneOf": [
+        {
+          "required": [
+            "from"
+          ]
+        },
+        {
+          "required": [
+            "const"
+          ]
+        }
+      ],
+      "properties": {
+        "from": {
+          "$ref": "#/$defs/OpenApiOverlayLocalName"
+        },
+        "const": true,
+        "codec": {
+          "$ref": "#/$defs/OpenApiOverlayCodecChain"
+        }
+      }
+    },
+    "OpenApiOverlayResponseBinding": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "from"
+      ],
+      "properties": {
+        "from": {
+          "$ref": "#/$defs/OpenApiOverlayJsonPointer"
+        },
+        "codec": {
+          "$ref": "#/$defs/OpenApiOverlayCodecChain"
+        }
+      }
+    },
+    "OpenApiOverlayCodecChain": {
+      "oneOf": [
+        {
+          "$ref": "#/$defs/OpenApiOverlayCodec"
+        },
+        {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 4,
+          "items": {
+            "$ref": "#/$defs/OpenApiOverlayCodec"
+          }
+        }
+      ]
+    },
+    "OpenApiOverlayCodec": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "kind",
+            "scale"
+          ],
+          "properties": {
+            "kind": {
+              "const": "decimal_scale"
+            },
+            "scale": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 18
+            },
+            "wire_encoding": {
+              "enum": [
+                "integer_string",
+                "integer"
+              ],
+              "default": "integer_string"
+            },
+            "max_integer_digits": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 38,
+              "default": 24
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "kind",
+            "dialect"
+          ],
+          "properties": {
+            "kind": {
+              "const": "markdown_blocks"
+            },
+            "dialect": {
+              "const": "blocknote"
+            },
+            "max_input_bytes": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 262144,
+              "default": 65536
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "kind"
+          ],
+          "properties": {
+            "kind": {
+              "const": "json_string"
+            }
+          }
+        }
+      ]
+    },
+    "OpenApiOverlayResponse": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "root": {
+          "$ref": "#/$defs/OpenApiOverlaySelector"
+        },
+        "fields": {
+          "type": "object",
+          "maxProperties": 64,
+          "additionalProperties": {
+            "$ref": "#/$defs/OpenApiOverlayShapeOrUse"
+          }
         }
       }
     },
@@ -2873,8 +3296,86 @@
         "mapping": {
           "$ref": "#/$defs/CapabilityMapping"
         },
+        "transform": {
+          "$ref": "#/$defs/CapabilityTransformSummary"
+        },
         "actions": {
           "$ref": "#/$defs/CapabilityActions"
+        }
+      }
+    },
+    "CapabilityTransformSummary": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "parameters",
+        "response_fields",
+        "has_response_root"
+      ],
+      "properties": {
+        "parameters": {
+          "type": "array",
+          "maxItems": 256,
+          "items": {
+            "$ref": "#/$defs/CapabilityTransformShapeSummary"
+          }
+        },
+        "response_fields": {
+          "type": "array",
+          "maxItems": 64,
+          "items": {
+            "$ref": "#/$defs/CapabilityTransformShapeSummary"
+          }
+        },
+        "has_response_root": {
+          "type": "boolean",
+          "description": "Whether a response-root selector is compiled, without exposing the selector text."
+        }
+      }
+    },
+    "CapabilityTransformShapeSummary": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "wire_property",
+        "agent_properties",
+        "wire_pointer_count",
+        "response_properties",
+        "constant_binding_count"
+      ],
+      "properties": {
+        "wire_property": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256
+        },
+        "agent_properties": {
+          "type": "array",
+          "maxItems": 16,
+          "items": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 512
+          }
+        },
+        "wire_pointer_count": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 16
+        },
+        "response_properties": {
+          "type": "array",
+          "maxItems": 16,
+          "items": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 512
+          }
+        },
+        "constant_binding_count": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 16
         }
       }
     },
@@ -2970,6 +3471,57 @@
         },
         "body": {
           "$ref": "#/$defs/ProjectedHttpBody"
+        },
+        "warnings": {
+          "type": "array",
+          "maxItems": 32,
+          "items": {
+            "$ref": "#/$defs/TransformWarning"
+          }
+        }
+      }
+    },
+    "TransformWarning": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "path",
+        "reason"
+      ],
+      "properties": {
+        "path": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 1024
+        },
+        "reason": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 1024
+        }
+      }
+    },
+    "TransformProblem": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "path",
+        "keyword",
+        "reason"
+      ],
+      "properties": {
+        "path": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 1024
+        },
+        "keyword": {
+          "const": "codec"
+        },
+        "reason": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 1024
         }
       }
     },
@@ -3157,6 +3709,14 @@
         "reason": {
           "type": "string",
           "minLength": 1
+        },
+        "problems": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 32,
+          "items": {
+            "$ref": "#/$defs/TransformProblem"
+          }
         }
       }
     },
