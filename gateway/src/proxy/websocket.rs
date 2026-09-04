@@ -832,7 +832,7 @@ fn upstream_handshake_headers(
         &parts.headers,
         source_ip,
         &upstream.request_header_policy,
-        None,
+        &[],
     );
     let handshake_headers = headers
         .keys()

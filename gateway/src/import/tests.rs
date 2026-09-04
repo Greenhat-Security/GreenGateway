@@ -487,6 +487,8 @@ mod database {
     /// behind it exists anywhere in this test, which is the point --
     /// the import carries the reference and never the credential.
     const FAKE_SECRET_REFERENCE: &str = "FAKE_billing-token-reference";
+    const FAKE_ACCESS_CLIENT_ID_REFERENCE: &str = "FAKE_access-client-id-reference";
+    const FAKE_ACCESS_CLIENT_SECRET_REFERENCE: &str = "FAKE_access-client-secret-reference";
 
     /// The fixture's audit log. Four import batches' worth, so the
     /// section's paging, its per-batch transactions and the stream's
@@ -506,6 +508,16 @@ mod database {
                 "type": "static_bearer",
                 "secret_id": FAKE_SECRET_REFERENCE
             },
+            "additional_headers": [
+                {
+                    "header_name": "CF-Access-Client-Id",
+                    "secret_id": FAKE_ACCESS_CLIENT_ID_REFERENCE
+                },
+                {
+                    "header_name": "CF-Access-Client-Secret",
+                    "secret_id": FAKE_ACCESS_CLIENT_SECRET_REFERENCE
+                }
+            ],
             "tls": {}
         }))
         .expect("the HTTP fixture Connection should deserialize")
@@ -1286,7 +1298,7 @@ mod database {
         let planned_section = section(&planned, "connections");
         assert_eq!(planned_section.status, "planned");
         assert_eq!(planned_section.counts.get("connection_records"), Some(&2));
-        assert_eq!(planned_section.counts.get("credential_bindings"), Some(&1));
+        assert_eq!(planned_section.counts.get("credential_bindings"), Some(&3));
         assert_eq!(
             planned_section.counts.get("dependencies"),
             Some(&3),
@@ -1317,7 +1329,7 @@ mod database {
         );
         assert_eq!(applied_section.counts.get("connection_records"), Some(&2));
         assert_eq!(applied_section.counts.get("connection_documents"), Some(&2));
-        assert_eq!(applied_section.counts.get("credential_bindings"), Some(&1));
+        assert_eq!(applied_section.counts.get("credential_bindings"), Some(&3));
         assert_eq!(applied_section.counts.get("status_history"), Some(&1));
         assert_eq!(applied_section.counts.get("catalog_entries"), Some(&2));
 
@@ -1339,18 +1351,46 @@ mod database {
         // Credential bindings are references. The secret ID names an entry
         // in the operator's secret store; the value behind it was never
         // read and is nowhere in the target.
-        let bindings = client_pairs(
-            &pool,
-            "SELECT purpose, secret_id FROM greengateway.connection_credential_bindings \
-             ORDER BY purpose",
-        )
-        .await;
+        let bindings = pool
+            .get()
+            .await
+            .expect("binding checkout")
+            .query(
+                "SELECT purpose, header_name, secret_id \
+                 FROM greengateway.connection_credential_bindings \
+                 ORDER BY purpose, header_name",
+                &[],
+            )
+            .await
+            .expect("binding query")
+            .into_iter()
+            .map(|row| {
+                (
+                    row.get::<_, String>(0),
+                    row.get::<_, String>(1),
+                    row.get::<_, String>(2),
+                )
+            })
+            .collect::<Vec<_>>();
         assert_eq!(
             bindings,
-            vec![(
-                "http_authentication".to_owned(),
-                FAKE_SECRET_REFERENCE.to_owned()
-            )]
+            vec![
+                (
+                    "additional_header".to_owned(),
+                    "cf-access-client-id".to_owned(),
+                    FAKE_ACCESS_CLIENT_ID_REFERENCE.to_owned(),
+                ),
+                (
+                    "additional_header".to_owned(),
+                    "cf-access-client-secret".to_owned(),
+                    FAKE_ACCESS_CLIENT_SECRET_REFERENCE.to_owned(),
+                ),
+                (
+                    "http_authentication".to_owned(),
+                    String::new(),
+                    FAKE_SECRET_REFERENCE.to_owned(),
+                ),
+            ]
         );
 
         // Dependencies keep their kinds and claim no source document.
@@ -1457,6 +1497,8 @@ mod database {
         let rendered = applied.to_string();
         for forbidden in [
             FAKE_SECRET_REFERENCE,
+            FAKE_ACCESS_CLIENT_ID_REFERENCE,
+            FAKE_ACCESS_CLIENT_SECRET_REFERENCE,
             "secret_id",
             "postgres://",
             &database.dsn,

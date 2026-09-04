@@ -150,6 +150,17 @@ export type SafeConnectionAuthentication =
       client_secret_configured: boolean;
     };
 
+export type ConnectionAdditionalHeader = {
+  header_name: string;
+  secret_id?: string;
+  secret_configured?: boolean;
+};
+
+export type SafeConnectionAdditionalHeader = {
+  header_name: string;
+  secret_configured: boolean;
+};
+
 export type TlsProfile = {
   ca_bundle_alias?: string;
   client_certificate_id?: string;
@@ -195,6 +206,7 @@ export type ConnectionWrite = {
   kind: ConnectionKind;
   endpoint: ConnectionEndpoint;
   authentication: ConnectionAuthentication;
+  additional_headers?: ConnectionAdditionalHeader[];
   tls: TlsProfile;
   timeouts?: ConnectionTimeouts;
   discovery?: DiscoveryConfig;
@@ -205,6 +217,7 @@ export type SafeConnectionConfiguration = {
   description?: string;
   endpoint: ConnectionEndpoint;
   authentication: SafeConnectionAuthentication;
+  additional_headers?: SafeConnectionAdditionalHeader[];
   tls: SafeTlsConfiguration;
   timeouts?: ConnectionTimeouts;
   discovery?: DiscoveryConfig;
@@ -855,6 +868,13 @@ function projectSafeConnectionConfiguration(
     authentication: projectSafeConnectionAuthentication(
       source.authentication,
     ),
+    ...(source.additional_headers === undefined
+      ? {}
+      : {
+          additional_headers: projectSafeConnectionAdditionalHeaders(
+            source.additional_headers,
+          ),
+        }),
     tls: projectSafeTlsConfiguration(source.tls),
     ...(source.timeouts === undefined
       ? {}
@@ -870,6 +890,33 @@ function projectSafeConnectionConfiguration(
           ),
         }),
   };
+}
+
+function projectSafeConnectionAdditionalHeaders(
+  value: unknown,
+): SafeConnectionAdditionalHeader[] {
+  if (!Array.isArray(value) || value.length > 4) {
+    throw invalidConnectionResponse('safe connection additional headers');
+  }
+  return value.map((entry) => {
+    const source = responseObject(
+      entry,
+      'safe connection additional header',
+    );
+    if (
+      typeof source.header_name !== 'string' ||
+      source.header_name.length === 0 ||
+      typeof source.secret_configured !== 'boolean'
+    ) {
+      throw invalidConnectionResponse(
+        'safe connection additional header',
+      );
+    }
+    return {
+      header_name: source.header_name,
+      secret_configured: source.secret_configured,
+    };
+  });
 }
 
 function projectConnectionEndpoint(value: unknown): ConnectionEndpoint {

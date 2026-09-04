@@ -784,7 +784,7 @@ fn upstream_call_headers(
         &parts.headers,
         source_ip,
         &upstream.request_header_policy,
-        None,
+        &[],
     );
     headers.remove(GRPC_STATUS);
     headers.remove(GRPC_MESSAGE);

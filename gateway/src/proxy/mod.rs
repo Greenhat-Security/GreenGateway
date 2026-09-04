@@ -923,24 +923,21 @@ fn validate_connection_header_policy(
     policy: &RouteRequestHeaderPolicy,
     target: &ConnectionHttpTarget,
 ) -> Result<(), egress::EgressError> {
-    validate_connection_credential_header_policy(policy, target.credential_header_name())
+    validate_connection_credential_header_policy(policy, target.credential_header_names())
 }
 
+/// Route header transforms may not touch any header the Connection owns:
+/// neither the primary credential's header nor an additional header.
 fn validate_connection_credential_header_policy(
     policy: &RouteRequestHeaderPolicy,
-    credential_header: Option<&HeaderName>,
+    credential_headers: &[HeaderName],
 ) -> Result<(), egress::EgressError> {
-    let Some(credential_header) = credential_header else {
-        return Ok(());
-    };
+    let conflicts = |name: &HeaderName| credential_headers.contains(name);
     if policy
         .add_request_headers
         .iter()
-        .any(|(name, _)| name == credential_header)
-        || policy
-            .strip_request_headers
-            .iter()
-            .any(|name| name == credential_header)
+        .any(|(name, _)| conflicts(name))
+        || policy.strip_request_headers.iter().any(conflicts)
     {
         return Err(egress::EgressError::InvalidPolicy(
             "connection-bound route must not add or strip its credential header".to_owned(),
@@ -1046,6 +1043,8 @@ mod tests {
     #[test]
     fn connection_route_header_policy_rejects_credential_conflicts() {
         let credential_header = HeaderName::from_static("x-api-key");
+        let additional_header = HeaderName::from_static("cf-access-client-id");
+        let credential_headers = [credential_header.clone(), additional_header.clone()];
         let safe = RouteRequestHeaderPolicy {
             add_request_headers: vec![(
                 HeaderName::from_static("x-route-label"),
@@ -1053,7 +1052,7 @@ mod tests {
             )],
             strip_request_headers: vec![HeaderName::from_static("x-caller-value")],
         };
-        validate_connection_credential_header_policy(&safe, Some(&credential_header))
+        validate_connection_credential_header_policy(&safe, &credential_headers)
             .expect("unrelated route transforms should remain valid");
 
         let adding_credential = RouteRequestHeaderPolicy {
@@ -1064,10 +1063,7 @@ mod tests {
             strip_request_headers: Vec::new(),
         };
         assert!(matches!(
-            validate_connection_credential_header_policy(
-                &adding_credential,
-                Some(&credential_header)
-            ),
+            validate_connection_credential_header_policy(&adding_credential, &credential_headers),
             Err(egress::EgressError::InvalidPolicy(_))
         ));
 
@@ -1078,11 +1074,35 @@ mod tests {
         assert!(matches!(
             validate_connection_credential_header_policy(
                 &stripping_credential,
-                Some(&credential_header)
+                &credential_headers
             ),
             Err(egress::EgressError::InvalidPolicy(_))
         ));
-        validate_connection_credential_header_policy(&safe, None)
+
+        // An additional header is Connection-owned in exactly the same way.
+        let adding_additional = RouteRequestHeaderPolicy {
+            add_request_headers: vec![(
+                additional_header.clone(),
+                HeaderValue::from_static("forbidden"),
+            )],
+            strip_request_headers: Vec::new(),
+        };
+        assert!(matches!(
+            validate_connection_credential_header_policy(&adding_additional, &credential_headers),
+            Err(egress::EgressError::InvalidPolicy(_))
+        ));
+        let stripping_additional = RouteRequestHeaderPolicy {
+            add_request_headers: Vec::new(),
+            strip_request_headers: vec![additional_header],
+        };
+        assert!(matches!(
+            validate_connection_credential_header_policy(
+                &stripping_additional,
+                &credential_headers
+            ),
+            Err(egress::EgressError::InvalidPolicy(_))
+        ));
+        validate_connection_credential_header_policy(&safe, &[])
             .expect("no-auth Connections have no credential header conflict");
     }
 

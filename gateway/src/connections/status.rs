@@ -124,6 +124,8 @@ mod tests {
             "secret_id",
             "locator",
             "headers",
+            "additional_headers",
+            "header_name",
             "resolved_ip",
         ] {
             assert!(

@@ -11796,6 +11796,16 @@ fn has_explicit_connection_binding_intent(candidate: &Value) -> bool {
                 || authentication.contains_key("client_secret_id")
         })
         || candidate
+            .get("additional_headers")
+            .and_then(Value::as_array)
+            .is_some_and(|headers| {
+                headers.iter().any(|header| {
+                    header
+                        .as_object()
+                        .is_some_and(|header| header.contains_key("secret_id"))
+                })
+            })
+        || candidate
             .get("tls")
             .and_then(Value::as_object)
             .is_some_and(|tls| {
@@ -11852,6 +11862,45 @@ fn retain_hidden_connection_bindings(
         _ => {
             reject_redacted_marker(authentication, "secret_configured")?;
             reject_redacted_marker(authentication, "client_secret_configured")?;
+        }
+    }
+
+    // Additional headers are matched to the current document by header name
+    // (case-insensitively; the model lowercases on validation). A marker on
+    // a header the current document does not carry has nothing to retain.
+    if let Some(headers) = object
+        .get_mut("additional_headers")
+        .and_then(Value::as_array_mut)
+    {
+        for header in headers.iter_mut() {
+            let header = header.as_object_mut().ok_or_else(|| {
+                Box::new(bad_request(
+                    "connection additional_headers entries must be objects",
+                ))
+            })?;
+            let header_name = header
+                .get("header_name")
+                .and_then(Value::as_str)
+                .map(str::to_ascii_lowercase)
+                .ok_or_else(|| {
+                    Box::new(bad_request(
+                        "connection additional_headers entries require a header_name",
+                    ))
+                })?;
+            let current_secret = current
+                .additional_headers
+                .iter()
+                .find(|current| current.header_name.eq_ignore_ascii_case(&header_name));
+            match current_secret {
+                Some(current) => retain_hidden_binding(
+                    header,
+                    "secret_id",
+                    "secret_configured",
+                    current.secret_id.as_deref(),
+                    true,
+                )?,
+                None => reject_redacted_marker(header, "secret_configured")?,
+            }
         }
     }
 
@@ -12025,6 +12074,13 @@ fn connection_secret_dependency_counts(
             record.write.tls.client_private_key_id.as_deref(),
         ]
         .into_iter()
+        .chain(
+            record
+                .write
+                .additional_headers
+                .iter()
+                .map(|header| header.secret_id.as_deref()),
+        )
         .flatten()
         {
             *counts.entry(id.to_owned()).or_default() += 1;
@@ -26545,6 +26601,8 @@ mod tests {
         for candidate in [
             json!({"authentication": {"secret_id": "alias"}}),
             json!({"authentication": {"client_secret_id": null}}),
+            json!({"additional_headers": [{"header_name": "x-proxy-token", "secret_id": "alias"}]}),
+            json!({"additional_headers": [{"header_name": "x-proxy-token", "secret_id": null}]}),
             json!({"tls": {"ca_bundle_alias": "ca"}}),
             json!({"tls": {"client_certificate_id": "certificate"}}),
             json!({"tls": {"client_private_key_id": null}}),
@@ -26559,6 +26617,107 @@ mod tests {
                 "client_private_key_configured": true
             }
         })));
+    }
+
+    #[test]
+    fn redacted_additional_header_bindings_round_trip_clear_and_reject_false_markers() {
+        let current: connections::model::ConnectionWrite = serde_json::from_value(json!({
+            "display_name": "Access-fronted API",
+            "enabled": false,
+            "kind": "http_api",
+            "endpoint": {
+                "base_url": "https://access.example.test",
+                "base_path": "/"
+            },
+            "authentication": {"type": "none"},
+            "additional_headers": [
+                {
+                    "header_name": "cf-access-client-id",
+                    "secret_id": "additional-header-secret-id-canary"
+                },
+                {
+                    "header_name": "cf-access-client-secret"
+                }
+            ],
+            "tls": {}
+        }))
+        .expect("additional-header draft should deserialize");
+
+        let redacted_edit = json!({
+            "display_name": "Access-fronted API renamed",
+            "enabled": false,
+            "kind": "http_api",
+            "endpoint": {
+                "base_url": "https://access.example.test",
+                "base_path": "/"
+            },
+            "authentication": {"type": "none"},
+            "additional_headers": [
+                {
+                    "header_name": "CF-Access-Client-Id",
+                    "secret_configured": true
+                },
+                {
+                    "header_name": "cf-access-client-secret",
+                    "secret_configured": false
+                }
+            ],
+            "tls": {}
+        });
+        assert!(!has_explicit_connection_binding_intent(&redacted_edit));
+        let candidate =
+            parse_connection_write_body(&Bytes::from(redacted_edit.to_string()), &current)
+                .expect("redacted additional headers should retain matching hidden bindings");
+        assert_eq!(
+            candidate.additional_headers[0].secret_id.as_deref(),
+            Some("additional-header-secret-id-canary")
+        );
+        assert!(candidate.additional_headers[1].secret_id.is_none());
+        assert_eq!(
+            candidate.additional_headers[0].header_name,
+            "cf-access-client-id"
+        );
+        assert!(!current.requires_secrets_write_to_replace(&candidate));
+
+        let mut cleared = redacted_edit.clone();
+        cleared["additional_headers"][0]["secret_configured"] = json!(false);
+        let cleared = parse_connection_write_body(&Bytes::from(cleared.to_string()), &current)
+            .expect("a false marker should explicitly clear the hidden binding");
+        assert!(cleared.additional_headers[0].secret_id.is_none());
+        assert!(current.requires_secrets_write_to_replace(&cleared));
+
+        for invalid in [
+            json!({
+                "display_name": "Access-fronted API",
+                "enabled": false,
+                "kind": "http_api",
+                "endpoint": {"base_url": "https://access.example.test", "base_path": "/"},
+                "authentication": {"type": "none"},
+                "additional_headers": [{
+                    "header_name": "x-not-current",
+                    "secret_configured": true
+                }],
+                "tls": {}
+            }),
+            json!({
+                "display_name": "Access-fronted API",
+                "enabled": false,
+                "kind": "http_api",
+                "endpoint": {"base_url": "https://access.example.test", "base_path": "/"},
+                "authentication": {"type": "none"},
+                "additional_headers": [{
+                    "header_name": "cf-access-client-id",
+                    "secret_id": "replacement-secret",
+                    "secret_configured": true
+                }],
+                "tls": {}
+            }),
+        ] {
+            let error = parse_connection_write_body(&Bytes::from(invalid.to_string()), &current)
+                .expect_err("forged or contradictory redaction markers must fail closed");
+            let rendered = format!("{error:?}");
+            assert!(!rendered.contains("additional-header-secret-id-canary"));
+        }
     }
 
     #[test]

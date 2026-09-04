@@ -15,6 +15,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import type {
   ConnectionDetail,
   ConnectionListPage,
+  SafeConnectionAdditionalHeader,
 } from '../lib/connections';
 import type {
   ConnectionSecretListResponse,
@@ -260,6 +261,16 @@ describe('ConnectionEditor', () => {
 
   it('preserves redacted credential and TLS markers on exact-ETag update', async () => {
     const puts: RequestInit[] = [];
+    const additionalHeaders: SafeConnectionAdditionalHeader[] = [
+      {
+        header_name: 'cf-access-client-id',
+        secret_configured: true,
+      },
+      {
+        header_name: 'cf-access-client-secret',
+        secret_configured: false,
+      },
+    ];
     vi.stubGlobal(
       'fetch',
       vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
@@ -269,9 +280,11 @@ describe('ConnectionEditor', () => {
           !init?.method
         ) {
           return Promise.resolve(
-            jsonResponse(200, managedDetail({ canBindSecret: true }), {
-              ETag: '"record-7"',
-            }),
+            jsonResponse(
+              200,
+              managedDetail({ canBindSecret: true, additionalHeaders }),
+              { ETag: '"record-7"' },
+            ),
           );
         }
         if (
@@ -292,9 +305,11 @@ describe('ConnectionEditor', () => {
         ) {
           puts.push(init);
           return Promise.resolve(
-            jsonResponse(200, managedDetail({ canBindSecret: true }), {
-              ETag: '"record-8"',
-            }),
+            jsonResponse(
+              200,
+              managedDetail({ canBindSecret: true, additionalHeaders }),
+              { ETag: '"record-8"' },
+            ),
           );
         }
         return Promise.reject(new Error(`unexpected request: ${url.pathname}`));
@@ -303,6 +318,21 @@ describe('ConnectionEditor', () => {
 
     renderEditor('/connections/billing/edit');
     const name = await screen.findByLabelText('Display name');
+    const configuredAdditionalName = screen.getByLabelText(
+      'Additional header 1 name',
+    ) as HTMLInputElement;
+    const configuredAdditionalSecret = screen.getByLabelText(
+      'Additional header 1 secret',
+    ) as HTMLSelectElement;
+    expect(configuredAdditionalSecret.value).toBe('intent:preserve');
+    fireEvent.change(configuredAdditionalName, {
+      target: { value: 'x-renamed-client-id' },
+    });
+    expect(configuredAdditionalSecret.value).toBe('intent:none');
+    fireEvent.change(configuredAdditionalName, {
+      target: { value: 'CF-Access-Client-Id' },
+    });
+    expect(configuredAdditionalSecret.value).toBe('intent:preserve');
     fireEvent.change(name, { target: { value: 'Billing API updated' } });
     fireEvent.click(screen.getByRole('button', { name: 'Save connection' }));
 
@@ -314,12 +344,331 @@ describe('ConnectionEditor', () => {
       header_name: 'X-API-Key',
       secret_configured: true,
     });
+    expect(body.additional_headers).toEqual([
+      {
+        header_name: 'CF-Access-Client-Id',
+        secret_configured: true,
+      },
+      {
+        header_name: 'cf-access-client-secret',
+      },
+    ]);
     expect(body.tls).toEqual({
       ca_bundle_configured: true,
       client_certificate_configured: true,
       client_private_key_configured: true,
     });
     expect(JSON.stringify(body)).not.toContain('secret_id');
+  });
+
+  it('creates an ordered, four-row-bounded additional header list from header secret aliases', async () => {
+    const posts: RequestInit[] = [];
+    const aliases = [
+      localSecret({
+        id: 'cf-client-id',
+        label: 'Cloudflare client ID',
+        provider: 'operator_environment',
+        compatible_purposes: ['header_api_key'],
+        actions: { can_rotate: false, can_delete: false },
+      }),
+      localSecret({
+        id: 'cf-client-secret',
+        label: 'Cloudflare client secret',
+        provider: 'operator_environment',
+        compatible_purposes: ['header_api_key'],
+        actions: { can_rotate: false, can_delete: false },
+      }),
+    ];
+    vi.stubGlobal(
+      'fetch',
+      vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
+        const url = requestUrl(input);
+        if (url.pathname === '/v1/admin/connections' && !init?.method) {
+          return Promise.resolve(
+            jsonResponse(
+              200,
+              connectionList(true, { canManageSecrets: false }),
+              {
+                ETag: '"connections"',
+                'X-GreenGateway-Connections-ETag':
+                  '"connections-collection"',
+              },
+            ),
+          );
+        }
+        if (
+          url.pathname === '/v1/admin/connection-secrets' &&
+          !init?.method
+        ) {
+          return Promise.resolve(
+            jsonResponse(200, secretList({ secrets: aliases }), {
+              ETag: '"secrets"',
+              'X-GreenGateway-Connection-Secrets-ETag':
+                '"secret-collection"',
+            }),
+          );
+        }
+        if (
+          url.pathname === '/v1/admin/connections' &&
+          init?.method === 'POST'
+        ) {
+          posts.push(init);
+          return Promise.resolve(
+            jsonResponse(201, managedDetail({ authentication: 'none' }), {
+              ETag: '"record-1"',
+              'X-GreenGateway-Connections-ETag':
+                '"connections-collection-2"',
+            }),
+          );
+        }
+        return Promise.reject(new Error(`unexpected request: ${url.pathname}`));
+      }),
+    );
+
+    renderEditor('/connections/new');
+    fireEvent.change(await screen.findByLabelText('Display name'), {
+      target: { value: 'Protected billing API' },
+    });
+    fireEvent.change(screen.getByLabelText('Base URL'), {
+      target: { value: 'https://billing.example.test' },
+    });
+
+    const addHeader = screen.getByRole('button', {
+      name: 'Add secret header',
+    }) as HTMLButtonElement;
+    for (let index = 0; index < 4; index += 1) {
+      fireEvent.click(addHeader);
+    }
+    expect(addHeader.disabled).toBe(true);
+    fireEvent.click(
+      screen.getByRole('button', { name: 'Remove additional header 4' }),
+    );
+    fireEvent.click(
+      screen.getByRole('button', { name: 'Remove additional header 3' }),
+    );
+
+    fireEvent.change(screen.getByLabelText('Additional header 1 name'), {
+      target: { value: 'CF-Access-Client-Id' },
+    });
+    fireEvent.change(screen.getByLabelText('Additional header 2 name'), {
+      target: { value: 'CF-Access-Client-Secret' },
+    });
+    const firstSecret = screen.getByLabelText(
+      'Additional header 1 secret',
+    ) as HTMLSelectElement;
+    const secondSecret = screen.getByLabelText(
+      'Additional header 2 secret',
+    ) as HTMLSelectElement;
+    await waitFor(() =>
+      expect(
+        Array.from(firstSecret.options).some(
+          (option) => option.value === 'secret:cf-client-id',
+        ),
+      ).toBe(true),
+    );
+    fireEvent.change(firstSecret, {
+      target: { value: 'secret:cf-client-id' },
+    });
+    fireEvent.change(secondSecret, {
+      target: { value: 'secret:cf-client-secret' },
+    });
+    fireEvent.click(
+      screen.getByRole('button', { name: 'Save disabled draft' }),
+    );
+
+    expect(await screen.findByText('Connection detail route')).toBeTruthy();
+    expect(JSON.parse(String(posts[0]?.body)).additional_headers).toEqual([
+      {
+        header_name: 'CF-Access-Client-Id',
+        secret_id: 'cf-client-id',
+      },
+      {
+        header_name: 'CF-Access-Client-Secret',
+        secret_id: 'cf-client-secret',
+      },
+    ]);
+  });
+
+  it('allows an unbound disabled additional-header draft only over HTTPS', async () => {
+    const posts: RequestInit[] = [];
+    vi.stubGlobal(
+      'fetch',
+      vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
+        const url = requestUrl(input);
+        if (url.pathname === '/v1/admin/connections' && !init?.method) {
+          return Promise.resolve(
+            jsonResponse(200, connectionList(true), {
+              ETag: '"connections"',
+              'X-GreenGateway-Connections-ETag':
+                '"connections-collection"',
+            }),
+          );
+        }
+        if (
+          url.pathname === '/v1/admin/connection-secrets' &&
+          !init?.method
+        ) {
+          return Promise.resolve(
+            jsonResponse(200, secretList(), {
+              ETag: '"secrets"',
+              'X-GreenGateway-Connection-Secrets-ETag':
+                '"secret-collection"',
+            }),
+          );
+        }
+        if (
+          url.pathname === '/v1/admin/connections' &&
+          init?.method === 'POST'
+        ) {
+          posts.push(init);
+          return Promise.resolve(
+            jsonResponse(201, managedDetail({ authentication: 'none' }), {
+              ETag: '"record-1"',
+              'X-GreenGateway-Connections-ETag':
+                '"connections-collection-2"',
+            }),
+          );
+        }
+        return Promise.reject(new Error(`unexpected request: ${url.pathname}`));
+      }),
+    );
+
+    renderEditor('/connections/new');
+    fireEvent.change(await screen.findByLabelText('Display name'), {
+      target: { value: 'Proxy-fronted API draft' },
+    });
+    const baseUrl = screen.getByLabelText('Base URL') as HTMLInputElement;
+    fireEvent.change(baseUrl, {
+      target: { value: 'http://api.example.test' },
+    });
+    fireEvent.click(
+      screen.getByRole('button', { name: 'Add secret header' }),
+    );
+    fireEvent.change(screen.getByLabelText('Additional header 1 name'), {
+      target: { value: 'X-Proxy-Token' },
+    });
+    fireEvent.click(
+      screen.getByRole('button', { name: 'Save disabled draft' }),
+    );
+
+    expect(
+      await screen.findByText(/must use an HTTPS origin/),
+    ).toBeTruthy();
+    await waitFor(() => expect(document.activeElement).toBe(baseUrl));
+    expect(posts).toHaveLength(0);
+
+    fireEvent.change(baseUrl, {
+      target: { value: 'https://api.example.test' },
+    });
+    fireEvent.click(
+      screen.getByRole('button', { name: 'Save disabled draft' }),
+    );
+
+    expect(await screen.findByText('Connection detail route')).toBeTruthy();
+    expect(posts).toHaveLength(1);
+    expect(JSON.parse(String(posts[0]?.body)).additional_headers).toEqual([
+      { header_name: 'X-Proxy-Token' },
+    ]);
+  });
+
+  it('rejects reserved, primary-colliding, duplicate, and unbound enabled additional headers before writing', async () => {
+    let writes = 0;
+    vi.stubGlobal(
+      'fetch',
+      vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
+        const url = requestUrl(input);
+        if (url.pathname === '/v1/admin/connections' && !init?.method) {
+          return Promise.resolve(
+            jsonResponse(200, connectionList(true), {
+              ETag: '"connections"',
+              'X-GreenGateway-Connections-ETag':
+                '"connections-collection"',
+            }),
+          );
+        }
+        if (
+          url.pathname === '/v1/admin/connection-secrets' &&
+          !init?.method
+        ) {
+          return Promise.resolve(
+            jsonResponse(200, secretList(), {
+              ETag: '"secrets"',
+              'X-GreenGateway-Connection-Secrets-ETag':
+                '"secret-collection"',
+            }),
+          );
+        }
+        if (init?.method === 'POST') {
+          writes += 1;
+        }
+        return Promise.reject(new Error(`unexpected request: ${url.pathname}`));
+      }),
+    );
+
+    renderEditor('/connections/new');
+    fireEvent.change(await screen.findByLabelText('Display name'), {
+      target: { value: 'Protected API' },
+    });
+    fireEvent.change(screen.getByLabelText('Base URL'), {
+      target: { value: 'https://api.example.test' },
+    });
+    fireEvent.change(screen.getByLabelText('Authentication type'), {
+      target: { value: 'header_api_key' },
+    });
+    fireEvent.click(
+      screen.getByRole('button', { name: 'Add secret header' }),
+    );
+    fireEvent.click(
+      screen.getByRole('button', { name: 'Add secret header' }),
+    );
+    const firstName = screen.getByLabelText(
+      'Additional header 1 name',
+    ) as HTMLInputElement;
+    const secondName = screen.getByLabelText(
+      'Additional header 2 name',
+    ) as HTMLInputElement;
+    fireEvent.change(firstName, { target: { value: 'x-api-key' } });
+    fireEvent.change(secondName, { target: { value: 'Authorization' } });
+    fireEvent.click(
+      screen.getByRole('button', { name: 'Save disabled draft' }),
+    );
+    expect(
+      await screen.findByText(/cannot use the primary credential header name/),
+    ).toBeTruthy();
+    expect(
+      screen.getByText(/valid, non-reserved HTTP header name/),
+    ).toBeTruthy();
+    expect(writes).toBe(0);
+
+    fireEvent.change(firstName, { target: { value: 'X-Proxy-Token' } });
+    fireEvent.change(secondName, { target: { value: 'x-proxy-token' } });
+    fireEvent.click(
+      screen.getByRole('button', { name: 'Save disabled draft' }),
+    );
+    expect(
+      await screen.findByText(/must be unique, ignoring case/),
+    ).toBeTruthy();
+    expect(writes).toBe(0);
+
+    fireEvent.click(
+      screen.getByRole('button', { name: 'Remove additional header 2' }),
+    );
+    fireEvent.change(screen.getByLabelText('Authentication type'), {
+      target: { value: 'none' },
+    });
+    fireEvent.click(screen.getByLabelText('Enabled'));
+    fireEvent.click(
+      screen.getByLabelText(/I understand that enabling this connection/),
+    );
+    fireEvent.click(
+      screen.getByRole('button', { name: 'Create and enable' }),
+    );
+    expect(
+      await screen.findByText(
+        /require a configured secret for every additional header/,
+      ),
+    ).toBeTruthy();
+    expect(writes).toBe(0);
   });
 
   it('lets an ordinary writer edit presentation fields but locks credential authority and targets', async () => {
@@ -389,6 +738,60 @@ describe('ConnectionEditor', () => {
         .disabled,
     ).toBe(false);
     expect(secretInventoryCalls).toBe(0);
+  });
+
+  it('treats an existing additional-header list as credential authority for ordinary writers', async () => {
+    vi.stubGlobal(
+      'fetch',
+      vi.fn((input: RequestInfo | URL) => {
+        const url = requestUrl(input);
+        if (url.pathname === '/v1/admin/connections/billing') {
+          return Promise.resolve(
+            jsonResponse(
+              200,
+              managedDetail({
+                authentication: 'none',
+                discoveryUsesAuthentication: false,
+                additionalHeaders: [
+                  {
+                    header_name: 'cf-access-client-id',
+                    secret_configured: false,
+                  },
+                ],
+              }),
+              { ETag: '"record-7"' },
+            ),
+          );
+        }
+        return Promise.reject(new Error(`unexpected request: ${url.pathname}`));
+      }),
+    );
+
+    renderEditor('/connections/billing/edit');
+    await screen.findByDisplayValue('Billing API');
+
+    expect(
+      (screen.getByLabelText(
+        'Additional header 1 name',
+      ) as HTMLInputElement).disabled,
+    ).toBe(true);
+    expect(
+      (screen.getByLabelText(
+        'Additional header 1 secret',
+      ) as HTMLSelectElement).disabled,
+    ).toBe(true);
+    expect(
+      (screen.getByRole('button', {
+        name: 'Add secret header',
+      }) as HTMLButtonElement).disabled,
+    ).toBe(true);
+    expect(
+      (screen.getByRole('button', {
+        name: 'Remove additional header 1',
+      }) as HTMLButtonElement).disabled,
+    ).toBe(true);
+    expect((screen.getByLabelText('Base URL') as HTMLInputElement).disabled)
+      .toBe(true);
   });
 
   it('lets an ordinary writer edit an unauthenticated discovery target but not attach credentials', async () => {
@@ -1837,12 +2240,14 @@ function managedDetail({
   authentication = 'header',
   displayName = 'Billing API',
   discoveryUsesAuthentication,
+  additionalHeaders = [],
 }: {
   canBindSecret?: boolean;
   canManageSecrets?: boolean;
   authentication?: 'header' | 'none';
   displayName?: string;
   discoveryUsesAuthentication?: boolean;
+  additionalHeaders?: SafeConnectionAdditionalHeader[];
 } = {}): ConnectionDetail {
   return {
     id: 'billing',
@@ -1876,6 +2281,9 @@ function managedDetail({
               secret_configured: true,
             }
           : { type: 'none' },
+      ...(additionalHeaders.length > 0
+        ? { additional_headers: additionalHeaders }
+        : {}),
       tls: {
         ca_bundle_configured: authentication === 'header',
         client_certificate_configured: authentication === 'header',

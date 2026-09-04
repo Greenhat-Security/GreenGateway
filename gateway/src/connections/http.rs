@@ -37,6 +37,8 @@ pub struct ConnectionHttpRuntime {
     base_egress_client: Arc<EgressClient>,
     clients: Arc<Mutex<HashMap<ConnectionClientCacheKey, Arc<EgressClient>>>>,
     oauth: OAuthClientCredentialsRuntime,
+    #[cfg(test)]
+    additional_resolution_delay: Option<std::time::Duration>,
 }
 
 impl fmt::Debug for ConnectionHttpRuntime {
@@ -54,7 +56,56 @@ pub struct ConnectionHttpTarget {
     url: String,
     client: Arc<EgressClient>,
     authentication: HttpAuthenticationBinding,
+    additional_headers: Vec<AdditionalHeaderBinding>,
+    /// Every header this Connection owns on the wire, primary credential
+    /// first and then the additional headers in configured order. Each lane
+    /// strips exactly this set from the inbound request before injection.
+    credential_header_names: Vec<HeaderName>,
     transport: ConnectionTransportBinding,
+}
+
+impl ConnectionHttpTarget {
+    fn assemble(
+        connection_id: ConnectionId,
+        connection_etag: String,
+        url: String,
+        client: Arc<EgressClient>,
+        authentication: HttpAuthenticationBinding,
+        additional_headers: Vec<AdditionalHeaderBinding>,
+        transport: ConnectionTransportBinding,
+    ) -> Self {
+        let mut credential_header_names = Vec::with_capacity(additional_headers.len() + 1);
+        match &authentication {
+            HttpAuthenticationBinding::None => {}
+            HttpAuthenticationBinding::HeaderApiKey { header_name, .. } => {
+                credential_header_names.push(header_name.clone());
+            }
+            HttpAuthenticationBinding::StaticBearer { .. }
+            | HttpAuthenticationBinding::OAuth2ClientCredentials(_) => {
+                credential_header_names.push(header::AUTHORIZATION);
+            }
+        }
+        credential_header_names.extend(
+            additional_headers
+                .iter()
+                .map(|binding| binding.header_name.clone()),
+        );
+        Self {
+            connection_id,
+            connection_etag,
+            url,
+            client,
+            authentication,
+            additional_headers,
+            credential_header_names,
+            transport,
+        }
+    }
+}
+
+struct AdditionalHeaderBinding {
+    header_name: HeaderName,
+    secret_id: String,
 }
 
 #[derive(Clone)]
@@ -93,7 +144,13 @@ enum HttpAuthenticationBinding {
 }
 
 pub struct ResolvedConnectionCredential {
-    material: ResolvedCredentialMaterial,
+    material: Option<ResolvedCredentialMaterial>,
+    additional_headers: Vec<ResolvedAdditionalHeader>,
+}
+
+struct ResolvedAdditionalHeader {
+    header_name: HeaderName,
+    secret: ResolvedSecret,
 }
 
 enum ResolvedCredentialMaterial {
@@ -162,11 +219,19 @@ impl ConnectionHttpRuntime {
             base_egress_client,
             clients: Arc::new(Mutex::new(HashMap::new())),
             oauth,
+            #[cfg(test)]
+            additional_resolution_delay: None,
         }
     }
 
     pub fn with_audit(mut self, audit: crate::audit::AuditLog) -> Self {
         self.oauth = self.oauth.with_audit(audit);
+        self
+    }
+
+    #[cfg(test)]
+    fn with_additional_resolution_delay_for_test(mut self, delay: std::time::Duration) -> Self {
+        self.additional_resolution_delay = Some(delay);
         self
     }
 
@@ -198,15 +263,17 @@ impl ConnectionHttpRuntime {
         let url = connection_target_url(record, path_and_query)?;
         let client = self.client_for(record)?;
         let authentication = self.authentication_binding(record)?;
+        let additional_headers = additional_header_bindings(record)?;
 
-        Ok(ConnectionHttpTarget {
+        Ok(ConnectionHttpTarget::assemble(
             connection_id,
-            connection_etag: record.etag().to_string(),
+            record.etag().to_string(),
             url,
             client,
             authentication,
-            transport: connection_transport_binding(record),
-        })
+            additional_headers,
+            connection_transport_binding(record),
+        ))
     }
 
     pub fn mcp_target(
@@ -223,20 +290,24 @@ impl ConnectionHttpRuntime {
         let use_connection_authentication = validate_mcp_connection(record)?;
         let url = connection_target_url(record, "/")?;
         let client = self.client_for(record)?;
-        let authentication = if use_connection_authentication {
-            self.authentication_binding(record)?
+        let (authentication, additional_headers) = if use_connection_authentication {
+            (
+                self.authentication_binding(record)?,
+                additional_header_bindings(record)?,
+            )
         } else {
-            HttpAuthenticationBinding::None
+            (HttpAuthenticationBinding::None, Vec::new())
         };
 
-        Ok(ConnectionHttpTarget {
+        Ok(ConnectionHttpTarget::assemble(
             connection_id,
-            connection_etag: record.etag().to_string(),
+            record.etag().to_string(),
             url,
             client,
             authentication,
-            transport: connection_transport_binding(record),
-        })
+            additional_headers,
+            connection_transport_binding(record),
+        ))
     }
 
     pub fn openapi_discovery_target(
@@ -253,20 +324,24 @@ impl ConnectionHttpRuntime {
         let (path, use_connection_authentication) = validate_openapi_connection(record)?;
         let url = connection_target_url(record, path)?;
         let client = self.client_for(record)?;
-        let authentication = if use_connection_authentication {
-            self.authentication_binding(record)?
+        let (authentication, additional_headers) = if use_connection_authentication {
+            (
+                self.authentication_binding(record)?,
+                additional_header_bindings(record)?,
+            )
         } else {
-            HttpAuthenticationBinding::None
+            (HttpAuthenticationBinding::None, Vec::new())
         };
 
-        Ok(ConnectionHttpTarget {
+        Ok(ConnectionHttpTarget::assemble(
             connection_id,
-            connection_etag: record.etag().to_string(),
+            record.etag().to_string(),
             url,
             client,
             authentication,
-            transport: connection_transport_binding(record),
-        })
+            additional_headers,
+            connection_transport_binding(record),
+        ))
     }
 
     /// Builds the exact persisted HTTP test target, including for a disabled
@@ -322,16 +397,18 @@ impl ConnectionHttpRuntime {
         let url = connection_target_url(record, path)?;
         let client = self.client_for(record)?;
         let authentication = self.authentication_binding(record)?;
+        let additional_headers = additional_header_bindings(record)?;
 
         Ok(Some(ConnectionHttpTestTarget {
-            target: ConnectionHttpTarget {
+            target: ConnectionHttpTarget::assemble(
                 connection_id,
-                connection_etag: connection_etag.to_string(),
+                connection_etag.to_string(),
                 url,
                 client,
                 authentication,
-                transport: connection_transport_binding(record),
-            },
+                additional_headers,
+                connection_transport_binding(record),
+            ),
             method,
             expected_statuses: expected_statuses.clone(),
         }))
@@ -360,20 +437,24 @@ impl ConnectionHttpRuntime {
         let use_connection_authentication = validate_mcp_connection_mode(record, false)?;
         let url = connection_target_url(record, "/")?;
         let client = self.client_for(record)?;
-        let authentication = if use_connection_authentication {
-            self.authentication_binding(record)?
+        let (authentication, additional_headers) = if use_connection_authentication {
+            (
+                self.authentication_binding(record)?,
+                additional_header_bindings(record)?,
+            )
         } else {
-            HttpAuthenticationBinding::None
+            (HttpAuthenticationBinding::None, Vec::new())
         };
 
-        Ok(Some(ConnectionHttpTarget {
+        Ok(Some(ConnectionHttpTarget::assemble(
             connection_id,
-            connection_etag: connection_etag.to_string(),
+            connection_etag.to_string(),
             url,
             client,
             authentication,
-            transport: connection_transport_binding(record),
-        }))
+            additional_headers,
+            connection_transport_binding(record),
+        )))
     }
 
     pub fn validate_binding(&self, connection_id: &str) -> Result<(), ConnectionHttpError> {
@@ -413,17 +494,75 @@ impl ConnectionHttpRuntime {
             .map_err(|_| ConnectionHttpError::TransportUnavailable)
     }
 
+    /// Resolves everything the target injects: the primary credential, then
+    /// each additional header in configured order. `None` means the target
+    /// owns no header at all. Every secret is read on every call; a failure
+    /// anywhere fails the whole request, so a request never leaves with a
+    /// partial set of the Connection's headers.
     pub async fn resolve_credential(
         &self,
         target: &ConnectionHttpTarget,
     ) -> Result<Option<ResolvedConnectionCredential>, ConnectionHttpError> {
-        let (secret_id, purpose) = match &target.authentication {
-            HttpAuthenticationBinding::None => return Ok(None),
-            HttpAuthenticationBinding::HeaderApiKey { secret_id, .. } => {
-                (secret_id.as_str(), SecretPurpose::HeaderApiKey)
-            }
+        if target.credential_header_names.is_empty() {
+            return Ok(None);
+        }
+        let material = self.resolve_primary_credential(target).await?;
+        let additional_headers = self.resolve_additional_headers(target).await?;
+
+        Ok(Some(ResolvedConnectionCredential {
+            material,
+            additional_headers,
+        }))
+    }
+
+    /// Resolves a credential under the proxy route's absolute request
+    /// deadline without losing which phase exhausted it. OAuth minting owns
+    /// the primary phase; once that completes, every additional header is a
+    /// static credential-provider read and therefore reports the ordinary
+    /// credential-unavailable category on timeout.
+    pub async fn resolve_credential_before(
+        &self,
+        target: &ConnectionHttpTarget,
+        deadline: tokio::time::Instant,
+    ) -> Result<Option<ResolvedConnectionCredential>, ConnectionHttpError> {
+        if target.credential_header_names.is_empty() {
+            return Ok(None);
+        }
+        let material = tokio::time::timeout_at(deadline, self.resolve_primary_credential(target))
+            .await
+            .map_err(|_| target.primary_credential_timeout_error())??;
+        let additional_headers =
+            tokio::time::timeout_at(deadline, self.resolve_additional_headers(target))
+                .await
+                .map_err(|_| ConnectionHttpError::CredentialUnavailable)??;
+
+        Ok(Some(ResolvedConnectionCredential {
+            material,
+            additional_headers,
+        }))
+    }
+
+    async fn resolve_primary_credential(
+        &self,
+        target: &ConnectionHttpTarget,
+    ) -> Result<Option<ResolvedCredentialMaterial>, ConnectionHttpError> {
+        let material = match &target.authentication {
+            HttpAuthenticationBinding::None => None,
+            HttpAuthenticationBinding::HeaderApiKey {
+                header_name,
+                secret_id,
+            } => Some(ResolvedCredentialMaterial::HeaderApiKey {
+                header_name: header_name.clone(),
+                secret: self
+                    .resolve_static_secret(secret_id, SecretPurpose::HeaderApiKey)
+                    .await?,
+            }),
             HttpAuthenticationBinding::StaticBearer { secret_id } => {
-                (secret_id.as_str(), SecretPurpose::StaticBearer)
+                Some(ResolvedCredentialMaterial::StaticBearer {
+                    secret: self
+                        .resolve_static_secret(secret_id, SecretPurpose::StaticBearer)
+                        .await?,
+                })
             }
             HttpAuthenticationBinding::OAuth2ClientCredentials(binding) => {
                 let token = self
@@ -431,13 +570,40 @@ impl ConnectionHttpRuntime {
                     .access_token(binding)
                     .await
                     .map_err(connection_oauth_error)?;
-                return Ok(Some(ResolvedConnectionCredential {
-                    material: ResolvedCredentialMaterial::OAuthBearer(token),
-                }));
+                Some(ResolvedCredentialMaterial::OAuthBearer(token))
             }
         };
-        let secret = self
-            .control_plane
+        Ok(material)
+    }
+
+    async fn resolve_additional_headers(
+        &self,
+        target: &ConnectionHttpTarget,
+    ) -> Result<Vec<ResolvedAdditionalHeader>, ConnectionHttpError> {
+        #[cfg(test)]
+        if !target.additional_headers.is_empty() {
+            if let Some(delay) = self.additional_resolution_delay {
+                tokio::time::sleep(delay).await;
+            }
+        }
+        let mut additional_headers = Vec::with_capacity(target.additional_headers.len());
+        for binding in &target.additional_headers {
+            additional_headers.push(ResolvedAdditionalHeader {
+                header_name: binding.header_name.clone(),
+                secret: self
+                    .resolve_static_secret(&binding.secret_id, SecretPurpose::HeaderApiKey)
+                    .await?,
+            });
+        }
+        Ok(additional_headers)
+    }
+
+    async fn resolve_static_secret(
+        &self,
+        secret_id: &str,
+        purpose: SecretPurpose,
+    ) -> Result<ResolvedSecret, ConnectionHttpError> {
+        self.control_plane
             .secret_resolver()
             .resolve(secret_id, purpose)
             .await
@@ -451,25 +617,7 @@ impl ConnectionHttpRuntime {
                 | SecretResolveErrorKind::ProviderFailure => {
                     ConnectionHttpError::CredentialUnavailable
                 }
-            })?;
-
-        Ok(Some(ResolvedConnectionCredential {
-            material: match &target.authentication {
-                HttpAuthenticationBinding::HeaderApiKey { header_name, .. } => {
-                    ResolvedCredentialMaterial::HeaderApiKey {
-                        header_name: header_name.clone(),
-                        secret,
-                    }
-                }
-                HttpAuthenticationBinding::StaticBearer { .. } => {
-                    ResolvedCredentialMaterial::StaticBearer { secret }
-                }
-                HttpAuthenticationBinding::None
-                | HttpAuthenticationBinding::OAuth2ClientCredentials(_) => {
-                    unreachable!("no-auth and OAuth targets return before static secret resolution")
-                }
-            },
-        }))
+            })
     }
 
     /// Applies connection-owned TLS only after the caller has completed the
@@ -758,13 +906,17 @@ impl ConnectionHttpTarget {
         &self.client
     }
 
-    pub fn credential_header_name(&self) -> Option<&HeaderName> {
-        match &self.authentication {
-            HttpAuthenticationBinding::None => None,
-            HttpAuthenticationBinding::HeaderApiKey { header_name, .. } => Some(header_name),
-            HttpAuthenticationBinding::StaticBearer { .. }
-            | HttpAuthenticationBinding::OAuth2ClientCredentials(_) => Some(&header::AUTHORIZATION),
-        }
+    /// Every header the Connection owns on the wire: the primary credential's
+    /// header first (when there is one), then each additional header in
+    /// configured order. Empty for a target that injects nothing.
+    pub fn credential_header_names(&self) -> &[HeaderName] {
+        &self.credential_header_names
+    }
+
+    /// Whether this target injects any secret-backed header at all; the
+    /// upstream's `401`/`403` is only a credential rejection when it does.
+    pub fn is_credentialed(&self) -> bool {
+        !self.credential_header_names.is_empty()
     }
 
     pub fn authentication_kind(&self) -> &'static str {
@@ -775,47 +927,63 @@ impl ConnectionHttpTarget {
             HttpAuthenticationBinding::OAuth2ClientCredentials(_) => "oauth2_client_credentials",
         }
     }
+
+    fn primary_credential_timeout_error(&self) -> ConnectionHttpError {
+        if matches!(
+            self.authentication,
+            HttpAuthenticationBinding::OAuth2ClientCredentials(_)
+        ) {
+            ConnectionHttpError::OAuthTokenUnavailable
+        } else {
+            ConnectionHttpError::CredentialUnavailable
+        }
+    }
 }
 
 impl ResolvedConnectionCredential {
+    /// Writes every Connection-owned header, primary credential first and
+    /// then the additional headers in configured order. Each value is marked
+    /// sensitive and replaces whatever the caller left under that name; the
+    /// lanes strip those names beforehand, so this is belt and braces.
     pub fn inject(&self, headers: &mut HeaderMap) -> Result<(), ConnectionHttpError> {
-        let (name, mut value) = match &self.material {
-            ResolvedCredentialMaterial::HeaderApiKey {
+        match &self.material {
+            None => {}
+            Some(ResolvedCredentialMaterial::HeaderApiKey {
                 header_name,
                 secret,
-            } => (
-                header_name.clone(),
-                HeaderValue::from_bytes(secret.expose())
-                    .map_err(|_| ConnectionHttpError::CredentialInvalid)?,
-            ),
-            ResolvedCredentialMaterial::StaticBearer { secret } => {
+            }) => insert_sensitive_header(headers, header_name.clone(), secret.expose())?,
+            Some(ResolvedCredentialMaterial::StaticBearer { secret }) => {
                 let mut bearer =
                     Zeroizing::new(Vec::with_capacity("Bearer ".len() + secret.expose().len()));
                 bearer.extend_from_slice(b"Bearer ");
                 bearer.extend_from_slice(secret.expose());
-                (
-                    header::AUTHORIZATION,
-                    HeaderValue::from_bytes(bearer.as_slice())
-                        .map_err(|_| ConnectionHttpError::CredentialInvalid)?,
-                )
+                insert_sensitive_header(headers, header::AUTHORIZATION, bearer.as_slice())?;
             }
-            ResolvedCredentialMaterial::OAuthBearer(token) => {
-                return token.inject(headers).map_err(connection_oauth_error);
+            Some(ResolvedCredentialMaterial::OAuthBearer(token)) => {
+                token.inject(headers).map_err(connection_oauth_error)?;
             }
-        };
-        value.set_sensitive(true);
-        headers.insert(name, value);
+        }
+        for additional in &self.additional_headers {
+            insert_sensitive_header(
+                headers,
+                additional.header_name.clone(),
+                additional.secret.expose(),
+            )?;
+        }
         Ok(())
     }
 
     pub async fn invalidate_after_unauthorized(&self) {
-        if let ResolvedCredentialMaterial::OAuthBearer(token) = &self.material {
+        if let Some(ResolvedCredentialMaterial::OAuthBearer(token)) = &self.material {
             token.invalidate_after_unauthorized().await;
         }
     }
 
     pub fn is_oauth(&self) -> bool {
-        matches!(self.material, ResolvedCredentialMaterial::OAuthBearer(_))
+        matches!(
+            self.material,
+            Some(ResolvedCredentialMaterial::OAuthBearer(_))
+        )
     }
 
     #[cfg(test)]
@@ -824,13 +992,64 @@ impl ResolvedConnectionCredential {
         value: &[u8],
     ) -> ResolvedConnectionCredential {
         ResolvedConnectionCredential {
-            material: ResolvedCredentialMaterial::HeaderApiKey {
+            material: Some(ResolvedCredentialMaterial::HeaderApiKey {
                 header_name,
                 secret: ResolvedSecret::new(SecretPurpose::HeaderApiKey, value.to_vec())
                     .expect("test API-key material should be valid"),
-            },
+            }),
+            additional_headers: Vec::new(),
         }
     }
+
+    #[cfg(test)]
+    pub(crate) fn with_additional_header_for_test(
+        mut self,
+        header_name: HeaderName,
+        value: &[u8],
+    ) -> ResolvedConnectionCredential {
+        self.additional_headers.push(ResolvedAdditionalHeader {
+            header_name,
+            secret: ResolvedSecret::new(SecretPurpose::HeaderApiKey, value.to_vec())
+                .expect("test additional-header material should be valid"),
+        });
+        self
+    }
+}
+
+fn insert_sensitive_header(
+    headers: &mut HeaderMap,
+    name: HeaderName,
+    value: &[u8],
+) -> Result<(), ConnectionHttpError> {
+    let mut value =
+        HeaderValue::from_bytes(value).map_err(|_| ConnectionHttpError::CredentialInvalid)?;
+    value.set_sensitive(true);
+    headers.insert(name, value);
+    Ok(())
+}
+
+/// The additional headers a record binds, in configured order. An entry
+/// without a secret is a draft that must never reach a live target, exactly
+/// like a primary credential without one.
+fn additional_header_bindings(
+    record: &StoredConnection,
+) -> Result<Vec<AdditionalHeaderBinding>, ConnectionHttpError> {
+    record
+        .write
+        .additional_headers
+        .iter()
+        .map(|header| {
+            let secret_id = header
+                .secret_id
+                .clone()
+                .ok_or(ConnectionHttpError::UnsupportedAuthentication)?;
+            Ok(AdditionalHeaderBinding {
+                header_name: HeaderName::from_bytes(header.header_name.as_bytes())
+                    .map_err(|_| ConnectionHttpError::UnsupportedAuthentication)?,
+                secret_id,
+            })
+        })
+        .collect()
 }
 
 impl ConnectionHttpError {
@@ -1110,8 +1329,8 @@ mod tests {
         config::Config,
         connections::{
             model::{
-                ConnectionEndpoint, ConnectionTimeouts, ConnectionWrite, OAuthClientAuthMethod,
-                TlsProfile,
+                AdditionalHeader, ConnectionEndpoint, ConnectionTimeouts, ConnectionWrite,
+                OAuthClientAuthMethod, TlsProfile,
             },
             secret::{OperatorSecretAliasConfig, OperatorSecretAliasSource, SecretRootConfig},
             status::{ConnectionOperationalState, ConnectionRevisions, ConnectionStatusReason},
@@ -1298,6 +1517,15 @@ mod tests {
 
     impl TemporaryRuntime {
         async fn header_api_key(name: &str, header_name: &str, secret: &[u8]) -> Self {
+            Self::header_api_key_with_additional(name, header_name, secret, &[]).await
+        }
+
+        async fn header_api_key_with_additional(
+            name: &str,
+            header_name: &str,
+            secret: &[u8],
+            additional: &[(&str, &str, &[u8])],
+        ) -> Self {
             let root = std::env::temp_dir().join(format!(
                 "greengateway-static-auth-{name}-{}",
                 uuid::Uuid::new_v4()
@@ -1314,17 +1542,36 @@ mod tests {
                     .expect("temporary secret permissions should set");
             }
 
-            let mut config = Config::test_defaults();
-            config.connections_sqlite_path =
-                Some(root.join("connections.sqlite").display().to_string());
-            config.connection_secrets_root = Some(SecretRootConfig::new(root.clone()));
-            config.connection_secret_aliases = vec![OperatorSecretAliasConfig {
+            let mut aliases = vec![OperatorSecretAliasConfig {
                 id: "billing-api-key".to_owned(),
                 label: "Billing API key".to_owned(),
                 source: OperatorSecretAliasSource::File {
                     key: "api-key".to_owned(),
                 },
             }];
+            for (_, alias_id, value) in additional {
+                let path = root.join(alias_id);
+                fs::write(&path, value).expect("temporary additional secret should write");
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    fs::set_permissions(&path, fs::Permissions::from_mode(0o600))
+                        .expect("temporary additional secret permissions should set");
+                }
+                aliases.push(OperatorSecretAliasConfig {
+                    id: (*alias_id).to_owned(),
+                    label: format!("Additional header {alias_id}"),
+                    source: OperatorSecretAliasSource::File {
+                        key: (*alias_id).to_owned(),
+                    },
+                });
+            }
+
+            let mut config = Config::test_defaults();
+            config.connections_sqlite_path =
+                Some(root.join("connections.sqlite").display().to_string());
+            config.connection_secrets_root = Some(SecretRootConfig::new(root.clone()));
+            config.connection_secret_aliases = aliases;
             let control_plane =
                 ConnectionControlPlane::from_config(&config).expect("control plane should build");
             let initial = control_plane.runtime_snapshot();
@@ -1333,6 +1580,13 @@ mod tests {
                 header_name: header_name.to_owned(),
                 secret_id: Some("billing-api-key".to_owned()),
             };
+            write.additional_headers = additional
+                .iter()
+                .map(|(header_name, alias_id, _)| AdditionalHeader {
+                    header_name: (*header_name).to_owned(),
+                    secret_id: Some((*alias_id).to_owned()),
+                })
+                .collect();
             let created = control_plane
                 .create_managed(initial.collection_etag(), write, "test-admin")
                 .await
@@ -1694,6 +1948,7 @@ mod tests {
                     base_path: base_path.to_owned(),
                 },
                 authentication: ConnectionAuthentication::None,
+                additional_headers: Vec::new(),
                 tls: TlsProfile::default(),
                 timeouts: Some(ConnectionTimeouts::default()),
                 discovery: None,
@@ -2406,11 +2661,12 @@ mod tests {
         let mut headers = HeaderMap::new();
         headers.insert("x-api-key", HeaderValue::from_static("attacker"));
         let credential = ResolvedConnectionCredential {
-            material: ResolvedCredentialMaterial::HeaderApiKey {
+            material: Some(ResolvedCredentialMaterial::HeaderApiKey {
                 header_name: HeaderName::from_static("x-api-key"),
                 secret: ResolvedSecret::new(SecretPurpose::HeaderApiKey, b"real-key".to_vec())
                     .expect("test secret"),
-            },
+            }),
+            additional_headers: Vec::new(),
         };
         credential
             .inject(&mut headers)
@@ -2429,13 +2685,14 @@ mod tests {
             HeaderValue::from_static("Bearer caller-value"),
         );
         let credential = ResolvedConnectionCredential {
-            material: ResolvedCredentialMaterial::StaticBearer {
+            material: Some(ResolvedCredentialMaterial::StaticBearer {
                 secret: ResolvedSecret::new(
                     SecretPurpose::StaticBearer,
                     b"operator-token".to_vec(),
                 )
                 .expect("test secret"),
-            },
+            }),
+            additional_headers: Vec::new(),
         };
         credential.inject(&mut headers).expect("bearer injection");
 
@@ -2463,8 +2720,8 @@ mod tests {
         );
         assert_eq!(target.authentication_kind(), "header_api_key");
         assert_eq!(
-            target.credential_header_name(),
-            Some(&HeaderName::from_static("x-api-key"))
+            target.credential_header_names(),
+            &[HeaderName::from_static("x-api-key")]
         );
 
         let credential = temporary
@@ -2483,6 +2740,71 @@ mod tests {
             .expect("configured credential header should exist");
         assert_eq!(value, "operator-key");
         assert!(value.is_sensitive());
+    }
+
+    #[tokio::test]
+    async fn primary_and_additional_headers_resolve_and_inject_all_or_nothing() {
+        let temporary = TemporaryRuntime::header_api_key_with_additional(
+            "additional-headers",
+            "x-api-key",
+            b"operator-key",
+            &[
+                (
+                    "cf-access-client-id",
+                    "proxy-client-id",
+                    b"operator-client-id",
+                ),
+                (
+                    "cf-access-client-secret",
+                    "proxy-client-secret",
+                    b"operator-client-secret",
+                ),
+            ],
+        )
+        .await;
+        let target = temporary
+            .runtime
+            .target(temporary.connection_id.as_str(), "/charges")
+            .expect("stored connection target should resolve");
+        assert_eq!(
+            target.credential_header_names(),
+            &[
+                HeaderName::from_static("x-api-key"),
+                HeaderName::from_static("cf-access-client-id"),
+                HeaderName::from_static("cf-access-client-secret"),
+            ]
+        );
+
+        let credential = temporary
+            .runtime
+            .resolve_credential(&target)
+            .await
+            .expect("all configured secrets should resolve")
+            .expect("credentialed target should return material");
+        let mut headers = HeaderMap::new();
+        for name in target.credential_header_names() {
+            headers.insert(name, HeaderValue::from_static("caller-controlled"));
+        }
+        credential
+            .inject(&mut headers)
+            .expect("every configured header should inject");
+        for (name, expected) in [
+            ("x-api-key", "operator-key"),
+            ("cf-access-client-id", "operator-client-id"),
+            ("cf-access-client-secret", "operator-client-secret"),
+        ] {
+            let value = headers.get(name).expect("configured header should exist");
+            assert_eq!(value, expected);
+            assert!(value.is_sensitive(), "{name} must be marked sensitive");
+        }
+
+        fs::remove_file(temporary.root.join("proxy-client-secret"))
+            .expect("test should remove one additional secret");
+        let error = match temporary.runtime.resolve_credential(&target).await {
+            Ok(_) => panic!("one unavailable additional secret must fail the whole resolution"),
+            Err(error) => error,
+        };
+        assert_eq!(error, ConnectionHttpError::CredentialUnavailable);
     }
 
     #[tokio::test]
@@ -2531,10 +2853,7 @@ mod tests {
             .target(temporary.connection_id.as_str(), "/charges")
             .expect("OAuth target should resolve");
         assert_eq!(target.authentication_kind(), "oauth2_client_credentials");
-        assert_eq!(
-            target.credential_header_name(),
-            Some(&header::AUTHORIZATION)
-        );
+        assert_eq!(target.credential_header_names(), &[header::AUTHORIZATION]);
         target
             .client()
             .checked_destination(target.url())
@@ -2636,6 +2955,115 @@ mod tests {
         ] {
             assert!(!audit_json.contains(canary), "audit leaked {canary}");
         }
+    }
+
+    #[tokio::test]
+    async fn credential_deadline_preserves_oauth_and_additional_header_timeout_phases() {
+        let token_response = serde_json::to_vec(&json!({
+            "access_token": OAUTH_ACCESS_TOKEN_CANARY,
+            "token_type": "Bearer",
+            "expires_in": 3600
+        }))
+        .expect("token response should serialize");
+        let (slow_addr, slow_ca_pem, slow_request, _) = one_request_delayed_tls_token_server(
+            StatusCode::OK,
+            "application/json",
+            token_response.clone(),
+            Duration::from_millis(250),
+        )
+        .await;
+        let slow = TemporaryOAuthRuntime::new(
+            "deadline-primary-oauth",
+            format!("https://127.0.0.1:{}", slow_addr.port()),
+            format!("https://127.0.0.1:{}/oauth/token", slow_addr.port()),
+            HashSet::from(["127.0.0.1".to_owned()]),
+            Some(&slow_ca_pem),
+        )
+        .await;
+        let slow_target = slow
+            .runtime
+            .target(slow.connection_id.as_str(), "/charges")
+            .expect("slow OAuth target should build");
+        let error = match slow
+            .runtime
+            .resolve_credential_before(
+                &slow_target,
+                tokio::time::Instant::now() + Duration::from_millis(20),
+            )
+            .await
+        {
+            Err(error) => error,
+            Ok(_) => panic!("an OAuth mint exceeding the deadline must fail"),
+        };
+        assert_eq!(error, ConnectionHttpError::OAuthTokenUnavailable);
+        tokio::time::timeout(Duration::from_secs(1), slow_request)
+            .await
+            .expect("the detached slow mint should finish")
+            .expect("the slow token server should finish");
+
+        let (fast_addr, fast_ca_pem, fast_request) =
+            one_request_tls_token_server(StatusCode::OK, "application/json", token_response).await;
+        let mut mixed = TemporaryOAuthRuntime::new(
+            "deadline-additional-header",
+            format!("https://127.0.0.1:{}", fast_addr.port()),
+            format!("https://127.0.0.1:{}/oauth/token", fast_addr.port()),
+            HashSet::from(["127.0.0.1".to_owned()]),
+            Some(&fast_ca_pem),
+        )
+        .await;
+        let current = mixed.stored_connection();
+        let mut replacement = current.write.clone();
+        replacement.additional_headers.push(AdditionalHeader {
+            header_name: "x-proxy-token".to_owned(),
+            // Reusing the client-secret alias is safe for this phase test: the
+            // material is header-safe and the binding purpose is validated
+            // independently for each use.
+            secret_id: Some("billing-oauth-secret".to_owned()),
+        });
+        let replaced = mixed
+            .runtime
+            .control_plane
+            .replace_managed(&current.id, &current.etag(), replacement, "test-admin")
+            .await
+            .expect("mixed OAuth Connection should replace");
+        let target = mixed
+            .runtime
+            .target(replaced.id.as_str(), "/charges")
+            .expect("mixed OAuth target should build");
+        mixed
+            .runtime
+            .resolve_credential(&target)
+            .await
+            .expect("OAuth and the additional header should resolve before the timeout test")
+            .expect("the mixed target should be credentialed");
+        fast_request
+            .await
+            .expect("the successful OAuth mint should be observed");
+
+        mixed.runtime = mixed
+            .runtime
+            .clone()
+            .with_additional_resolution_delay_for_test(Duration::from_millis(250));
+        let target = mixed
+            .runtime
+            .target(replaced.id.as_str(), "/charges")
+            .expect("delayed mixed OAuth target should build");
+        let error = match mixed
+            .runtime
+            .resolve_credential_before(
+                &target,
+                tokio::time::Instant::now() + Duration::from_millis(20),
+            )
+            .await
+        {
+            Err(error) => error,
+            Ok(_) => panic!("an additional-header read exceeding the deadline must fail"),
+        };
+        assert_eq!(
+            error,
+            ConnectionHttpError::CredentialUnavailable,
+            "a completed OAuth phase must not relabel an additional-header timeout"
+        );
     }
 
     #[tokio::test]

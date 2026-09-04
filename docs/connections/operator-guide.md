@@ -247,14 +247,89 @@ recovery method.
 ## Authentication Profiles
 
 Connections support `none`, a header API key, a static bearer token, and OAuth
-2.0 client credentials. Enabled authenticated Connections require a compatible
-configured alias. Authentication and TLS material require HTTPS.
+2.0 client credentials. Every enabled secret-backed primary or additional
+binding requires a compatible configured alias. Authentication and TLS material
+require HTTPS.
 
 For header API keys, choose a dedicated upstream header. GreenGateway rejects
 headers that it or HTTP owns, including `Authorization`, `Cookie`, `Host`,
 framing, forwarding, hop-by-hop, proxy-authentication, `Sec-*`, and request-ID
 headers. The caller's value for the selected header is removed and the
 protected value is injected last.
+
+### Additional secret headers and identity-aware proxies
+
+A Connection can carry up to four `additional_headers` alongside its primary
+`authentication` profile. Each entry contains a `header_name` and an opaque
+`secret_id`; the referenced secret must be compatible with the
+`header_api_key` purpose, so the same 8 KiB limit and HTTP-header value safety
+checks apply. A disabled draft may temporarily omit an entry's `secret_id`, but
+every entry must be bound before the Connection can be enabled. Any Connection
+that sends a primary or additional credential must use HTTPS.
+
+Additional header names are normalized to lowercase and must be unique without
+regard to case. They cannot match the primary `header_api_key` name and cannot
+use any of the reserved names listed above, including `Authorization`. Use the
+primary authentication profile for the upstream application's credential and
+the additional list for credentials required by an intermediary.
+
+For example, a Cloudflare Access service token needs two distinct secrets in
+addition to this upstream API key. This is the relevant Connection fragment;
+each of the three IDs must refer to its own configured secret:
+
+```json
+{
+  "authentication": {
+    "type": "header_api_key",
+    "header_name": "x-api-key",
+    "secret_id": "twenty-api-key"
+  },
+  "additional_headers": [
+    {
+      "header_name": "cf-access-client-id",
+      "secret_id": "twenty-access-client-id"
+    },
+    {
+      "header_name": "cf-access-client-secret",
+      "secret_id": "twenty-access-client-secret"
+    }
+  ]
+}
+```
+
+If the identity-aware proxy accepts client certificates, mTLS is an alternative
+to its HTTP token headers: configure the Connection's independent client
+certificate and private-key bindings, and keep the primary HTTP authentication
+profile for the upstream. Do not assume this alternative works until the proxy
+has been configured to accept and authorize that certificate.
+
+Every data-plane lane treats all Connection-owned header names as one protected
+set. Tool and proxy request builders remove caller-supplied values for the
+primary and every additional name; managed MCP refuses any custom transport
+header with a colliding name. After permitted transforms and complete
+resolution, the operator values are injected last. If any binding cannot be
+resolved or injected, no anonymous or partially authenticated request is sent.
+This applies to Connection-bound manual and OpenAPI tools, Connection proxy
+routes, HTTP stored tests, and managed MCP POST, SSE GET, and session DELETE
+traffic. Managed OpenAPI discovery and all managed MCP protocol traffic,
+including its stored test, send the set only when
+`use_connection_authentication` is `true`; turning that flag off suppresses
+both the primary authentication and the additional headers for those gated
+operations. OpenAPI-generated tool execution remains an ordinary
+Connection-bound HTTP request and uses the Connection's credential set.
+Additional headers do not satisfy an OpenAPI security scheme—the security
+matcher considers only the primary `authentication` profile.
+
+Configuring an additional header on create—or adding, removing, reordering,
+renaming, binding, or clearing one later—is credential-authority work and
+requires `admin:connections:secrets:write` in addition to the ordinary
+Connection write permission. Creation initializes the credential and Connection
+revisions; a later change advances both revisions, changes the resource ETag,
+invalidates stale status, and is emitted as a redacted credential change. Safe
+read responses return only each normalized header name and `secret_configured`;
+they never return the secret ID or value. On `PUT`, round-trip the matching
+`secret_configured: true` marker to retain a hidden binding, or submit an
+explicit `secret_id` only as a secrets writer.
 
 ### OAuth 2.0 client credentials
 

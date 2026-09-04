@@ -37,6 +37,14 @@
     "authentication": {
       "$ref": "#/$defs/authentication"
     },
+    "additional_headers": {
+      "type": "array",
+      "maxItems": 4,
+      "description": "Secret-backed headers injected alongside the primary credential, in this order, on every credentialed lane (tools, proxy, MCP, discovery, test). Each header name must be a non-reserved HTTP header name (never Authorization), must not name the primary credential's header, and must be unique within the list; names are normalized to lowercase. Adding, removing, or changing an entry is a secrets write.",
+      "items": {
+        "$ref": "#/$defs/additional_header"
+      }
+    },
     "tls": {
       "$ref": "#/$defs/tls"
     },
@@ -112,6 +120,13 @@
                 }
               }
             ]
+          },
+          "additional_headers": {
+            "items": {
+              "required": [
+                "secret_id"
+              ]
+            }
           },
           "tls": {
             "dependentRequired": {
@@ -266,6 +281,24 @@
           }
         }
       ]
+    },
+    "additional_header": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "header_name"
+      ],
+      "properties": {
+        "header_name": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 64
+        },
+        "secret_id": {
+          "$ref": "#/$defs/stable_id",
+          "description": "Opaque ID of a header_api_key secret. Required once the Connection is enabled; a disabled draft may omit it."
+        }
+      }
     },
     "tls": {
       "type": "object",
