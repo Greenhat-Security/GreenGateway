@@ -74,6 +74,30 @@ const EXPECTED_OPERATIONS: &[ExpectedOperation] = &[
         response_definition: "CatalogPublishResult",
     },
     ExpectedOperation {
+        path: "/v1/admin/connections/{id}/overlay",
+        method: "get",
+        operation_id: "getConnectionOpenApiOverlay",
+        request_definition: None,
+        success_status: "200",
+        response_definition: "OpenApiOverlayGetResponse",
+    },
+    ExpectedOperation {
+        path: "/v1/admin/connections/{id}/overlay",
+        method: "put",
+        operation_id: "putConnectionOpenApiOverlay",
+        request_definition: Some("OpenApiOverlayDocument"),
+        success_status: "200",
+        response_definition: "OpenApiOverlayMutationResponse",
+    },
+    ExpectedOperation {
+        path: "/v1/admin/connections/{id}/overlay",
+        method: "delete",
+        operation_id: "deleteConnectionOpenApiOverlay",
+        request_definition: None,
+        success_status: "200",
+        response_definition: "OpenApiOverlayMutationResponse",
+    },
+    ExpectedOperation {
         path: "/v1/admin/connections/{id}/openapi/preview",
         method: "post",
         operation_id: "previewManagedOpenApi",
@@ -789,4 +813,67 @@ fn connection_admin_request_schema_tracks_additional_header_validation() {
             );
         }
     }
+}
+
+#[test]
+fn connection_admin_closed_copies_accept_overlay_runtime_fields_and_exact_version() {
+    let schema = load_json(&docs_root().join(SCHEMA_RELATIVE_PATH));
+    let validates = |name: &str, instance: &Value| {
+        let envelope = json!({
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "$defs": schema["$defs"].clone(),
+            "$ref": format!("#/$defs/{name}")
+        });
+        jsonschema::validator_for(&envelope)
+            .unwrap_or_else(|error| panic!("$defs/{name} should compile: {error}"))
+            .is_valid(instance)
+    };
+
+    let mapping = json!({
+        "method": "POST",
+        "path_template": "/companies/{id}",
+        "query_params": [],
+        "body": {"mode": "body_args_json"}
+    });
+    let definition = json!({
+        "name": "UpdateOneCompany",
+        "description": "Update one company",
+        "input_json_schema": {"type": "object", "properties": {}},
+        "source": {
+            "type": "open_api",
+            "connection_id": "billing-api",
+            "operation_id": "UpdateOneCompany",
+            "catalog_revision": 1
+        },
+        "target": {
+            "type": "http",
+            "connection_id": "billing-api",
+            "mapping": mapping.clone()
+        },
+        "upstream": mapping,
+        "visibility": "composite_only"
+    });
+    assert!(
+        validates("ToolDefinition", &definition),
+        "the closed stored-definition copy must accept visibility and BodyArgsJson"
+    );
+    assert!(validates(
+        "CapabilityMapping",
+        &json!({
+            "type": "http",
+            "method": "POST",
+            "path_template": "/companies/{id}",
+            "query_params": [],
+            "body": {"mode": "body_args_json"}
+        })
+    ));
+
+    assert!(validates(
+        "OpenApiOverlayDocument",
+        &json!({"schema_version": "0.1.0"})
+    ));
+    assert!(!validates(
+        "OpenApiOverlayDocument",
+        &json!({"schema_version": "0.1.1"})
+    ));
 }

@@ -31,7 +31,10 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use serde_json::Value;
 
-use crate::storage::postgres_tool_names::{self, ToolNameReservationError};
+use crate::storage::{
+    postgres_policy,
+    postgres_tool_names::{self, ToolNameReservationError},
+};
 
 use super::store::{
     binding_count, ensure_etag, expected_bindings, increment_revision, initial_revisions,
@@ -39,12 +42,13 @@ use super::store::{
     parse_state, persisted_revision, reason_as_str, replacement_revisions, revision_from_i64,
     state_as_str, supports_managed_mcp_catalog, supports_managed_openapi_catalog, u64_to_i64,
     utc_timestamp, validate_activity_timestamp, validate_candidate, validate_dependency_id,
-    validate_mcp_catalog, validate_openapi_catalog_entries, validate_openapi_spec,
-    ConnectionActivityTimes, ConnectionDependency, ConnectionDependencyKind, ConnectionEtag,
-    ConnectionStatusUpdate, ConnectionStoreError, ExportedConnectionStatuses,
+    validate_mcp_catalog, validate_openapi_catalog_entries, validate_openapi_overlay_write,
+    validate_openapi_spec, ConnectionActivityTimes, ConnectionDependency, ConnectionDependencyKind,
+    ConnectionEtag, ConnectionStatusUpdate, ConnectionStoreError, ExportedConnectionStatuses,
     PersistedConnectionStatus, StoredConnection, StoredMcpCatalog, StoredMcpCatalogEntry,
     StoredMcpResource, StoredMcpResourceTemplate, StoredOpenApiCatalog, StoredOpenApiCatalogEntry,
-    StoredOpenApiInventoryCatalog, MAX_CONNECTION_DEPENDENCIES, SOURCE_MANAGED,
+    StoredOpenApiInventoryCatalog, StoredOpenApiOverlay, StoredOpenApiSourceReports,
+    StoredOverlayWrite, MAX_CONNECTION_DEPENDENCIES, SOURCE_MANAGED,
 };
 use super::{
     model::{ConnectionId, ConnectionWrite, MAX_CONNECTIONS, MAX_CREDENTIALS},
@@ -508,6 +512,8 @@ impl PostgresConnectionStore {
                 for table in [
                     "greengateway.connection_mcp_catalogs",
                     "greengateway.connection_openapi_catalogs",
+                    "greengateway.connection_openapi_overlays",
+                    "greengateway.connection_enum_source_values",
                 ] {
                     client
                         .execute(
@@ -1021,6 +1027,54 @@ impl PostgresConnectionStore {
         self.read_openapi_catalogs(None).await
     }
 
+    /// Read the catalog/overlay pair from one repeatable-read snapshot.
+    /// Both tables are committed together and must be reconciled together;
+    /// separate snapshots can observe opposite sides of a concurrent
+    /// overlay publication and spuriously withdraw a healthy runtime lane.
+    pub async fn openapi_catalogs_with_overlays(
+        &self,
+    ) -> Result<(Vec<StoredOpenApiCatalog>, Vec<StoredOpenApiOverlay>), ConnectionStoreError> {
+        let client = self
+            .pool
+            .get()
+            .await
+            .map_err(|_| pg_unavailable(OPERATION_OPENAPI_READ))?;
+        begin_snapshot(&client, OPERATION_OPENAPI_READ).await?;
+        let outcome = async {
+            let catalogs = load_openapi_catalogs(&client, None).await?;
+            let overlays = load_openapi_overlays(&client, None).await?;
+            Ok((catalogs, overlays))
+        }
+        .await;
+        finish_read(&client, OPERATION_OPENAPI_READ, outcome).await
+    }
+
+    pub async fn openapi_catalog_with_overlay(
+        &self,
+        id: &ConnectionId,
+    ) -> Result<(Option<StoredOpenApiCatalog>, Option<StoredOpenApiOverlay>), ConnectionStoreError>
+    {
+        let client = self
+            .pool
+            .get()
+            .await
+            .map_err(|_| pg_unavailable(OPERATION_OPENAPI_READ))?;
+        begin_snapshot(&client, OPERATION_OPENAPI_READ).await?;
+        let outcome = async {
+            let catalog = load_openapi_catalogs(&client, Some(id))
+                .await?
+                .into_iter()
+                .next();
+            let overlay = load_openapi_overlays(&client, Some(id))
+                .await?
+                .into_iter()
+                .next();
+            Ok((catalog, overlay))
+        }
+        .await;
+        finish_read(&client, OPERATION_OPENAPI_READ, outcome).await
+    }
+
     pub async fn openapi_inventory_catalogs(
         &self,
     ) -> Result<Vec<StoredOpenApiInventoryCatalog>, ConnectionStoreError> {
@@ -1049,6 +1103,37 @@ impl PostgresConnectionStore {
             .await?
             .into_iter()
             .next())
+    }
+
+    pub async fn openapi_overlays(
+        &self,
+    ) -> Result<Vec<StoredOpenApiOverlay>, ConnectionStoreError> {
+        self.read_openapi_overlays(None).await
+    }
+
+    pub async fn openapi_overlay(
+        &self,
+        id: &ConnectionId,
+    ) -> Result<Option<StoredOpenApiOverlay>, ConnectionStoreError> {
+        Ok(self
+            .read_openapi_overlays(Some(id))
+            .await?
+            .into_iter()
+            .next())
+    }
+
+    async fn read_openapi_overlays(
+        &self,
+        requested: Option<&ConnectionId>,
+    ) -> Result<Vec<StoredOpenApiOverlay>, ConnectionStoreError> {
+        let client = self
+            .pool
+            .get()
+            .await
+            .map_err(|_| pg_unavailable(OPERATION_OPENAPI_READ))?;
+        begin_snapshot(&client, OPERATION_OPENAPI_READ).await?;
+        let outcome = load_openapi_overlays(&client, requested).await;
+        finish_read(&client, OPERATION_OPENAPI_READ, outcome).await
     }
 
     async fn read_openapi_catalogs(
@@ -1084,7 +1169,41 @@ impl PostgresConnectionStore {
         entries: &[StoredOpenApiCatalogEntry],
         actor_user_id: &str,
     ) -> Result<StoredOpenApiCatalog, ConnectionStoreError> {
+        self.replace_openapi_catalog_with_overlay(
+            id,
+            expected_connection_etag,
+            expected_spec_revision,
+            expected_catalog_revision,
+            spec,
+            spec_digest,
+            entries,
+            None,
+            0,
+            actor_user_id,
+            &[],
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn replace_openapi_catalog_with_overlay(
+        &self,
+        id: &ConnectionId,
+        expected_connection_etag: &ConnectionEtag,
+        expected_spec_revision: u64,
+        expected_catalog_revision: u64,
+        spec: &str,
+        spec_digest: &str,
+        entries: &[StoredOpenApiCatalogEntry],
+        overlay: Option<&StoredOverlayWrite>,
+        compiled_overlay_revision: u64,
+        actor_user_id: &str,
+        policy_protected_names: &[String],
+    ) -> Result<StoredOpenApiCatalog, ConnectionStoreError> {
         validate_openapi_spec(spec, spec_digest)?;
+        if let Some(overlay) = overlay {
+            validate_openapi_overlay_write(overlay)?;
+        }
         let encoded_entries = validate_openapi_catalog_entries(entries)?;
         let normalized_entries = encoded_entries
             .iter()
@@ -1098,23 +1217,35 @@ impl PostgresConnectionStore {
             .map_err(|_| pg_unavailable(OPERATION_OPENAPI_CATALOG))?;
         begin_mutation(&client, OPERATION_OPENAPI_CATALOG).await?;
         let outcome: Result<StoredOpenApiCatalog, ConnectionStoreError> = async {
+            if overlay.is_some() {
+                postgres_policy::acquire_policy_overlay_lock(&client)
+                    .await
+                    .map_err(|_| pg_unavailable(OPERATION_OPENAPI_CATALOG))?;
+                let authoritative_policy_names =
+                    postgres_policy::active_policy_tool_names_in(&client)
+                        .await
+                        .map_err(|_| pg_unavailable(OPERATION_OPENAPI_CATALOG))?;
+                if let Some(tool_name) = policy_protected_names
+                    .iter()
+                    .find(|name| authoritative_policy_names.contains(name.as_str()))
+                {
+                    return Err(ConnectionStoreError::ToolNameConflict {
+                        id: id.to_string(),
+                        tool_name: tool_name.clone(),
+                        lane: "policy".to_owned(),
+                        owner_id: "active-policy".to_owned(),
+                    });
+                }
+            }
             let current = load_record_for_update(&client, id, OPERATION_OPENAPI_CATALOG)
                 .await?
                 .ok_or_else(|| ConnectionStoreError::NotFound { id: id.to_string() })?;
             validate_bindings(&client, &current).await?;
-            ensure_etag(id, expected_connection_etag, &current)?;
-            if !supports_managed_openapi_catalog(&current.write) {
-                return Err(ConnectionStoreError::Validation {
-                    problems: vec![
-                        "OpenAPI catalogs require a managed HTTP API OpenAPI Connection".to_owned(),
-                    ],
-                });
-            }
 
             let previous = client
                 .query_opt(
                     r#"
-                    SELECT spec_revision, catalog_revision, spec_digest
+                    SELECT spec_revision, catalog_revision, spec_digest, overlay_revision
                     FROM greengateway.connection_openapi_catalogs
                     WHERE connection_id = $1::text::uuid
                     "#,
@@ -1122,7 +1253,12 @@ impl PostgresConnectionStore {
                 )
                 .await
                 .map_err(|error| pg_error(OPERATION_OPENAPI_CATALOG, error))?;
-            let (previous_spec_revision, previous_catalog_revision, previous_digest) =
+            let (
+                previous_spec_revision,
+                previous_catalog_revision,
+                previous_digest,
+                previous_overlay_revision,
+            ) =
                 match previous {
                     Some(row) => {
                         const REASON: &str =
@@ -1139,17 +1275,50 @@ impl PostgresConnectionStore {
                                 "invalid OpenAPI catalog revision",
                             )?,
                             Some(column::<String>(&row, 2, id.as_str(), REASON)?),
+                            revision_from_i64(
+                                id,
+                                column(&row, 3, id.as_str(), REASON)?,
+                                true,
+                            )?,
                         )
                     }
-                    None => (0, 0, None),
+                    None => (0, 0, None, 0),
                 };
+            if let Err(error) = ensure_etag(id, expected_connection_etag, &current) {
+                return if overlay.is_some() {
+                    Err(ConnectionStoreError::OverlayConflict {
+                        id: id.to_string(),
+                        current_connection_revision: current.revisions.connection,
+                        current_catalog_revision: previous_catalog_revision,
+                        current_overlay_revision: previous_overlay_revision,
+                    })
+                } else {
+                    Err(error)
+                };
+            }
+            if !supports_managed_openapi_catalog(&current.write) {
+                return Err(ConnectionStoreError::Validation {
+                    problems: vec![
+                        "OpenAPI catalogs require a managed HTTP API OpenAPI Connection".to_owned(),
+                    ],
+                });
+            }
             if expected_spec_revision != previous_spec_revision
                 || expected_catalog_revision != previous_catalog_revision
             {
-                return Err(ConnectionStoreError::Conflict {
-                    id: id.to_string(),
-                    current: current.etag(),
-                });
+                return if overlay.is_some() {
+                    Err(ConnectionStoreError::OverlayConflict {
+                        id: id.to_string(),
+                        current_connection_revision: current.revisions.connection,
+                        current_catalog_revision: previous_catalog_revision,
+                        current_overlay_revision: previous_overlay_revision,
+                    })
+                } else {
+                    Err(ConnectionStoreError::Conflict {
+                        id: id.to_string(),
+                        current: current.etag(),
+                    })
+                };
             }
 
             let retained_row = client
@@ -1300,6 +1469,26 @@ impl PostgresConnectionStore {
                     .map_err(|error| pg_error(OPERATION_OPENAPI_CATALOG, error))?;
             }
 
+            let overlay_revision = write_openapi_overlay(
+                &client,
+                id,
+                overlay,
+                compiled_overlay_revision,
+                current.revisions.connection,
+                previous_catalog_revision,
+                actor_user_id,
+                &now,
+            )
+            .await?;
+            client
+                .execute(
+                    "UPDATE greengateway.connection_openapi_catalogs \
+                     SET overlay_revision = $1 WHERE connection_id = $2::text::uuid",
+                    &[&u64_to_i64(id, overlay_revision)?, &id.as_str()],
+                )
+                .await
+                .map_err(|error| pg_error(OPERATION_OPENAPI_CATALOG, error))?;
+
             reserve_catalog_tool_names(
                 &client,
                 postgres_tool_names::LANE_OPENAPI,
@@ -1327,6 +1516,7 @@ impl PostgresConnectionStore {
                 spec: spec.to_owned(),
                 refreshed_at: now.clone(),
                 entries: normalized_entries,
+                overlay_revision,
             })
         }
         .await;
@@ -2324,6 +2514,21 @@ impl PostgresConnectionStore {
         .await?;
         ensure_no_invalid_rows(
             client,
+            "<openapi-enum-source-values>",
+            r#"
+            SELECT COUNT(*)
+            FROM greengateway.connection_enum_source_values
+            WHERE credential_generation_digest IS NOT NULL
+              AND (
+                    octet_length(credential_generation_digest) != 64
+                 OR credential_generation_digest !~ '^[0-9a-f]+$'
+              )
+            "#,
+            "stored OpenAPI enum credential generation digest is invalid",
+        )
+        .await?;
+        ensure_no_invalid_rows(
+            client,
             "<catalogs>",
             r#"
             SELECT COUNT(*)
@@ -2370,6 +2575,7 @@ impl PostgresConnectionStore {
         // specification still declares that managed catalog kind.
         let mcp_catalogs = load_mcp_catalogs(client, None).await?;
         let openapi_catalogs = load_openapi_catalogs(client, None).await?;
+        let openapi_overlays = load_openapi_overlays(client, None).await?;
         let record_by_id = records
             .iter()
             .map(|record| (record.id.clone(), record))
@@ -2395,6 +2601,32 @@ impl PostgresConnectionStore {
                     "OpenAPI catalog owner is not a compatible managed OpenAPI Connection",
                 ));
             }
+        }
+        let overlay_by_id = openapi_overlays
+            .iter()
+            .map(|overlay| (&overlay.connection_id, overlay))
+            .collect::<BTreeMap<_, _>>();
+        for catalog in &openapi_catalogs {
+            match overlay_by_id.get(&catalog.connection_id) {
+                Some(overlay) if overlay.overlay_revision == catalog.overlay_revision => {}
+                None if catalog.overlay_revision == 0 => {}
+                _ => {
+                    return Err(corrupt(
+                        &catalog.connection_id,
+                        "OpenAPI catalog and overlay revisions do not agree",
+                    ));
+                }
+            }
+        }
+        if openapi_overlays.iter().any(|overlay| {
+            !openapi_catalogs
+                .iter()
+                .any(|catalog| catalog.connection_id == overlay.connection_id)
+        }) {
+            return Err(ConnectionStoreError::CorruptRecord {
+                id: "<openapi-overlays>".to_owned(),
+                reason: "OpenAPI overlay has no durable catalog",
+            });
         }
         validate_managed_catalog_dependencies(
             client,
@@ -2911,6 +3143,259 @@ async fn load_mcp_catalogs(
 
 /// The OpenAPI catalog read, on the CALLER'S client and inside the
 /// caller's snapshot; see `load_mcp_catalogs`.
+async fn load_openapi_overlays(
+    client: &deadpool_postgres::Object,
+    requested: Option<&ConnectionId>,
+) -> Result<Vec<StoredOpenApiOverlay>, ConnectionStoreError> {
+    let rows = match requested {
+        Some(id) => {
+            client
+                .query(
+                    r#"
+                    SELECT connection_id::text, schema_version, overlay_revision,
+                           overlay_json, source_reports_json, updated_at
+                    FROM greengateway.connection_openapi_overlays
+                    WHERE connection_id = $1::text::uuid
+                    ORDER BY connection_id
+                    "#,
+                    &[&id.as_str()],
+                )
+                .await
+        }
+        None => {
+            client
+                .query(
+                    r#"
+                    SELECT connection_id::text, schema_version, overlay_revision,
+                           overlay_json, source_reports_json, updated_at
+                    FROM greengateway.connection_openapi_overlays
+                    ORDER BY connection_id
+                    "#,
+                    &[],
+                )
+                .await
+        }
+    }
+    .map_err(|error| pg_error(OPERATION_OPENAPI_READ, error))?;
+
+    const REASON: &str = "OpenAPI overlay column does not decode as its schema type";
+    rows.iter()
+        .map(|row| {
+            let raw_id: String = column(row, 0, "<openapi-overlay>", REASON)?;
+            let connection_id = parse_catalog_id(&raw_id)?;
+            let schema_version: String = column(row, 1, &raw_id, REASON)?;
+            let overlay_revision = persisted_revision(
+                &connection_id,
+                column(row, 2, &raw_id, REASON)?,
+                "invalid OpenAPI overlay revision",
+            )?;
+            if overlay_revision == 0 {
+                return Err(corrupt(&connection_id, "invalid OpenAPI overlay revision"));
+            }
+            let overlay_json: String = column(row, 3, &raw_id, REASON)?;
+            let source_reports_json: Option<String> = column(row, 4, &raw_id, REASON)?;
+            validate_openapi_overlay_write(&StoredOverlayWrite::Put {
+                schema_version: schema_version.clone(),
+                overlay_json: overlay_json.clone(),
+                source_reports_json: source_reports_json.clone().unwrap_or_else(|| {
+                    StoredOpenApiSourceReports::empty()
+                        .canonical_json()
+                        .expect("the fixed empty source report snapshot serializes")
+                }),
+                expected_overlay_revision: 0,
+            })
+            .map_err(|_| corrupt(&connection_id, "stored OpenAPI overlay fails validation"))?;
+            Ok(StoredOpenApiOverlay {
+                connection_id,
+                schema_version,
+                overlay_revision,
+                overlay_json,
+                source_reports_json,
+                updated_at: column(row, 5, &raw_id, REASON)?,
+            })
+        })
+        .collect()
+}
+
+#[allow(clippy::too_many_arguments)] // One argument per independently fenced catalog/overlay axis.
+async fn write_openapi_overlay(
+    client: &deadpool_postgres::Object,
+    id: &ConnectionId,
+    overlay: Option<&StoredOverlayWrite>,
+    compiled_overlay_revision: u64,
+    current_connection_revision: u64,
+    current_catalog_revision: u64,
+    actor_user_id: &str,
+    now: &str,
+) -> Result<u64, ConnectionStoreError> {
+    let current = client
+        .query_opt(
+            "SELECT overlay_revision FROM greengateway.connection_openapi_overlays \
+             WHERE connection_id = $1::text::uuid",
+            &[&id.as_str()],
+        )
+        .await
+        .map_err(|error| pg_error(OPERATION_OPENAPI_CATALOG, error))?;
+    let current_revision = match current {
+        Some(row) => persisted_revision(
+            id,
+            column(
+                &row,
+                0,
+                id.as_str(),
+                "OpenAPI overlay revision does not decode as bigint",
+            )?,
+            "invalid OpenAPI overlay revision",
+        )?,
+        None => 0,
+    };
+    let Some(write) = overlay else {
+        if compiled_overlay_revision != current_revision {
+            return Err(ConnectionStoreError::OverlayConflict {
+                id: id.to_string(),
+                current_connection_revision,
+                current_catalog_revision,
+                current_overlay_revision: current_revision,
+            });
+        }
+        return Ok(current_revision);
+    };
+    let expected_overlay_revision = match write {
+        StoredOverlayWrite::Put {
+            expected_overlay_revision,
+            ..
+        }
+        | StoredOverlayWrite::Delete {
+            expected_overlay_revision,
+        }
+        | StoredOverlayWrite::Reports {
+            expected_overlay_revision,
+            ..
+        } => *expected_overlay_revision,
+    };
+    if expected_overlay_revision != current_revision {
+        return Err(ConnectionStoreError::OverlayConflict {
+            id: id.to_string(),
+            current_connection_revision,
+            current_catalog_revision,
+            current_overlay_revision: current_revision,
+        });
+    }
+    let expected_compiled_revision = match write {
+        StoredOverlayWrite::Put { .. } => increment_revision(id, current_revision)?,
+        StoredOverlayWrite::Delete { .. } => 0,
+        StoredOverlayWrite::Reports { .. } => current_revision,
+    };
+    if compiled_overlay_revision != expected_compiled_revision {
+        return Err(ConnectionStoreError::Validation {
+            problems: vec![
+                "compiled OpenAPI overlay revision does not match the resulting overlay".to_owned(),
+            ],
+        });
+    }
+
+    match write {
+        StoredOverlayWrite::Put {
+            schema_version,
+            overlay_json,
+            source_reports_json,
+            ..
+        } => {
+            // Any source declaration can change while retaining its
+            // source_id. Pruning in this transaction prevents stale values
+            // from crossing an overlay revision or tenant-specific source
+            // plan.
+            client
+                .execute(
+                    "DELETE FROM greengateway.connection_enum_source_values \
+                     WHERE connection_id = $1::text::uuid",
+                    &[&id.as_str()],
+                )
+                .await
+                .map_err(|error| pg_error(OPERATION_OPENAPI_CATALOG, error))?;
+
+            let next_revision = expected_compiled_revision;
+            client
+                .execute(
+                    r#"
+                    INSERT INTO greengateway.connection_openapi_overlays (
+                        connection_id, schema_version, overlay_revision, overlay_json,
+                        source_reports_json, actor_user_id, updated_at
+                    ) VALUES ($1::text::uuid, $2, $3, $4, $5, $6, $7)
+                    ON CONFLICT (connection_id) DO UPDATE SET
+                        schema_version = excluded.schema_version,
+                        overlay_revision = excluded.overlay_revision,
+                        overlay_json = excluded.overlay_json,
+                        source_reports_json = excluded.source_reports_json,
+                        actor_user_id = excluded.actor_user_id,
+                        updated_at = excluded.updated_at
+                    "#,
+                    &[
+                        &id.as_str(),
+                        schema_version,
+                        &u64_to_i64(id, next_revision)?,
+                        overlay_json,
+                        source_reports_json,
+                        &actor_user_id,
+                        &now,
+                    ],
+                )
+                .await
+                .map_err(|error| pg_error(OPERATION_OPENAPI_CATALOG, error))?;
+            Ok(next_revision)
+        }
+        StoredOverlayWrite::Delete { .. } => {
+            client
+                .execute(
+                    "DELETE FROM greengateway.connection_enum_source_values \
+                     WHERE connection_id = $1::text::uuid",
+                    &[&id.as_str()],
+                )
+                .await
+                .map_err(|error| pg_error(OPERATION_OPENAPI_CATALOG, error))?;
+            client
+                .execute(
+                    "DELETE FROM greengateway.connection_openapi_overlays \
+                     WHERE connection_id = $1::text::uuid",
+                    &[&id.as_str()],
+                )
+                .await
+                .map_err(|error| pg_error(OPERATION_OPENAPI_CATALOG, error))?;
+            Ok(0)
+        }
+        StoredOverlayWrite::Reports {
+            source_reports_json,
+            ..
+        } => {
+            if current_revision == 0 {
+                return Err(ConnectionStoreError::Validation {
+                    problems: vec![
+                        "OpenAPI source reports cannot be stored without an overlay".to_owned()
+                    ],
+                });
+            }
+            let changed = client
+                .execute(
+                    r#"
+                    UPDATE greengateway.connection_openapi_overlays
+                    SET source_reports_json = $1, actor_user_id = $2, updated_at = $3
+                    WHERE connection_id = $4::text::uuid
+                    "#,
+                    &[source_reports_json, &actor_user_id, &now, &id.as_str()],
+                )
+                .await
+                .map_err(|error| pg_error(OPERATION_OPENAPI_CATALOG, error))?;
+            if changed != 1 {
+                return Err(ConnectionStoreError::CorruptRecord {
+                    id: id.to_string(),
+                    reason: "OpenAPI overlay disappeared during source report update",
+                });
+            }
+            Ok(current_revision)
+        }
+    }
+}
+
 async fn load_openapi_catalogs(
     client: &deadpool_postgres::Object,
     requested: Option<&ConnectionId>,
@@ -2935,7 +3420,7 @@ async fn load_openapi_catalogs(
                 .query(
                     r#"
                 SELECT connection_id::text, spec_revision, catalog_revision, observed_etag,
-                       spec_digest, spec, refreshed_at, entry_count
+                       spec_digest, spec, refreshed_at, entry_count, overlay_revision
                 FROM greengateway.connection_openapi_catalogs
                 WHERE connection_id = $1::text::uuid
                 ORDER BY connection_id
@@ -2949,7 +3434,7 @@ async fn load_openapi_catalogs(
                 .query(
                     r#"
                 SELECT connection_id::text, spec_revision, catalog_revision, observed_etag,
-                       spec_digest, spec, refreshed_at, entry_count
+                       spec_digest, spec, refreshed_at, entry_count, overlay_revision
                 FROM greengateway.connection_openapi_catalogs
                 ORDER BY connection_id
                 "#,
@@ -2998,6 +3483,8 @@ async fn load_openapi_catalogs(
             ));
         }
         let (entries, stored_json) = load_openapi_entries(client, &connection_id).await?;
+        let overlay_revision =
+            revision_from_i64(&connection_id, column(row, 8, &raw_id, REASON)?, true)?;
         if entries.len() != usize::try_from(entry_count).unwrap_or(usize::MAX) {
             return Err(corrupt(
                 &connection_id,
@@ -3029,6 +3516,7 @@ async fn load_openapi_catalogs(
             spec,
             refreshed_at: column(row, 6, &raw_id, REASON)?,
             entries,
+            overlay_revision,
         });
     }
     Ok(catalogs)
@@ -3854,6 +4342,7 @@ pub(crate) struct ImportedConnection {
     pub status_history: Vec<PersistedConnectionStatus>,
     pub mcp_catalog: Option<StoredMcpCatalog>,
     pub openapi_catalog: Option<StoredOpenApiCatalog>,
+    pub openapi_overlay: Option<StoredOpenApiOverlay>,
 }
 
 /// What one import step wrote, per table, for the section's report.
@@ -3871,6 +4360,7 @@ pub(crate) struct ImportedConnectionCounts {
     pub mcp_catalog_resource_templates: i64,
     pub openapi_catalogs: i64,
     pub openapi_catalog_entries: i64,
+    pub openapi_overlays: i64,
     pub tool_name_reservations: i64,
     /// The one shared security revision the step took, or 0 when it had
     /// nothing to write.
@@ -3900,6 +4390,22 @@ pub(crate) async fn import_connections_in(
     for connection in connections {
         let record = &connection.record;
         let id = &record.id;
+        match (
+            connection.openapi_catalog.as_ref(),
+            connection.openapi_overlay.as_ref(),
+        ) {
+            (Some(catalog), Some(overlay))
+                if catalog.overlay_revision == overlay.overlay_revision => {}
+            (Some(catalog), None) if catalog.overlay_revision == 0 => {}
+            (None, None) => {}
+            _ => {
+                return Err(ConnectionStoreError::Validation {
+                    problems: vec![format!(
+                        "imported OpenAPI catalog and overlay revisions do not agree for '{id}'"
+                    )],
+                });
+            }
+        }
         // The PostgreSQL key column is `uuid` and the managed store only
         // ever mints UUIDs (`ConnectionId::new_managed`). A source row
         // that carries anything else is refused by name here rather than
@@ -4058,6 +4564,10 @@ pub(crate) async fn import_connections_in(
 
         if let Some(catalog) = connection.mcp_catalog.as_ref() {
             import_mcp_catalog(client, id, catalog, actor_user_id, &mut counts, OPERATION).await?;
+        }
+        if let Some(overlay) = connection.openapi_overlay.as_ref() {
+            import_openapi_overlay(client, id, overlay, actor_user_id, &mut counts, OPERATION)
+                .await?;
         }
         if let Some(catalog) = connection.openapi_catalog.as_ref() {
             import_openapi_catalog(client, id, catalog, actor_user_id, &mut counts, OPERATION)
@@ -4338,8 +4848,9 @@ async fn import_openapi_catalog(
                 r#"
                 INSERT INTO greengateway.connection_openapi_catalogs (
                     connection_id, spec_revision, catalog_revision, observed_etag,
-                    spec_digest, spec, refreshed_at, entry_count, actor_user_id
-                ) VALUES ($1::text::uuid, $2, $3, $4, $5, $6, $7, $8, $9)
+                    spec_digest, spec, refreshed_at, entry_count, actor_user_id,
+                    overlay_revision
+                ) VALUES ($1::text::uuid, $2, $3, $4, $5, $6, $7, $8, $9, $10)
                 ON CONFLICT (connection_id) DO NOTHING
                 "#,
                 &[
@@ -4352,6 +4863,7 @@ async fn import_openapi_catalog(
                     &catalog.refreshed_at,
                     &usize_to_i64(catalog.entries.len()),
                     &actor_user_id,
+                    &u64_to_i64(id, catalog.overlay_revision)?,
                 ],
             )
             .await
@@ -4383,6 +4895,56 @@ async fn import_openapi_catalog(
         )
         .unwrap_or(i64::MAX);
     }
+    Ok(())
+}
+
+async fn import_openapi_overlay(
+    client: &deadpool_postgres::Object,
+    id: &ConnectionId,
+    overlay: &StoredOpenApiOverlay,
+    actor_user_id: &str,
+    counts: &mut ImportedConnectionCounts,
+    operation: &'static str,
+) -> Result<(), ConnectionStoreError> {
+    if overlay.connection_id != *id {
+        return Err(ConnectionStoreError::Validation {
+            problems: vec!["imported OpenAPI overlay belongs to another Connection".to_owned()],
+        });
+    }
+    validate_openapi_overlay_write(&StoredOverlayWrite::Put {
+        schema_version: overlay.schema_version.clone(),
+        overlay_json: overlay.overlay_json.clone(),
+        source_reports_json: overlay.source_reports_json.clone().unwrap_or_else(|| {
+            StoredOpenApiSourceReports::empty()
+                .canonical_json()
+                .expect("the fixed empty source report snapshot serializes")
+        }),
+        expected_overlay_revision: 0,
+    })?;
+    counts.openapi_overlays += i64::try_from(
+        client
+            .execute(
+                r#"
+                INSERT INTO greengateway.connection_openapi_overlays (
+                    connection_id, schema_version, overlay_revision, overlay_json,
+                    source_reports_json, actor_user_id, updated_at
+                ) VALUES ($1::text::uuid, $2, $3, $4, $5, $6, $7)
+                ON CONFLICT (connection_id) DO NOTHING
+                "#,
+                &[
+                    &id.as_str(),
+                    &overlay.schema_version,
+                    &u64_to_i64(id, overlay.overlay_revision)?,
+                    &overlay.overlay_json,
+                    &overlay.source_reports_json,
+                    &actor_user_id,
+                    &overlay.updated_at,
+                ],
+            )
+            .await
+            .map_err(|error| pg_error(operation, error))?,
+    )
+    .unwrap_or(i64::MAX);
     Ok(())
 }
 
@@ -4548,6 +5110,48 @@ mod tests {
             .await
             .expect("count query")
             .get(0)
+    }
+
+    async fn wait_for_advisory_waiters(pool: &deadpool_postgres::Pool, expected: i64) {
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                let client = pool.get().await.expect("advisory waiter probe checkout");
+                let waiting: i64 = client
+                    .query_one(
+                        r#"
+                        SELECT COUNT(*)
+                        FROM pg_locks
+                        WHERE locktype = 'advisory'
+                          AND database = (SELECT oid FROM pg_database WHERE datname = current_database())
+                          AND NOT granted
+                        "#,
+                        &[],
+                    )
+                    .await
+                    .expect("advisory waiter probe")
+                    .get(0);
+                if waiting >= expected {
+                    return;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("timed out waiting for {expected} advisory-lock waiters"));
+    }
+
+    fn policy_with_tools(id: &str, tool_names: &[&str]) -> crate::rbac::policy::Policy {
+        let tools = tool_names
+            .iter()
+            .map(|name| ((*name).to_owned(), json!({})))
+            .collect::<serde_json::Map<_, _>>();
+        crate::rbac::policy::Policy::validate_json_value(json!({
+            "schema_version": "0.1.0",
+            "id": id,
+            "default_action": "deny",
+            "tools": tools
+        }))
+        .expect("policy race fixture should validate")
     }
 
     /// An etag that cannot match any live record: fabricated revisions no
@@ -5747,6 +6351,657 @@ mod tests {
         }
     }
 
+    /// The PostgreSQL authority must make an overlay and its compiled
+    /// catalog one durable unit. A stale overlay precondition rolls back
+    /// all catalog work, a successful source-plan change prunes enum LKG
+    /// rows in that same unit, and a fresh store sees the exact document
+    /// and report bytes needed to rebuild runtime plans after restart.
+    #[tokio::test]
+    async fn openapi_overlay_catalog_cas_prune_and_restart_are_atomic() {
+        let Some(admin_dsn) = locator() else {
+            eprintln!("skipping: no test database locator; CI runs this test");
+            return;
+        };
+        let database = create_test_database(&admin_dsn).await;
+        let (store, pool) = migrated_store(&database.dsn, 64).await;
+        let api = store
+            .create(http_candidate("Overlay API"), "overlay-op-1", None)
+            .await
+            .expect("connection should create");
+        let digest = reservation_spec_digest();
+        let first_document = r#"{"schema_version":"0.1.0","tools":{}}"#;
+        let first_reports = r#"{"schema_version":"0.1.0","sources":[{"id":"regions","kind":"enum","state":"fresh","item_count":2}]}"#;
+        let first = store
+            .replace_openapi_catalog_with_overlay(
+                &api.id,
+                &api.etag(),
+                0,
+                0,
+                RESERVATION_SPEC,
+                &digest,
+                &[openapi_entry("overlay_first")],
+                Some(&StoredOverlayWrite::Put {
+                    schema_version: "0.1.0".to_owned(),
+                    overlay_json: first_document.to_owned(),
+                    source_reports_json: first_reports.to_owned(),
+                    expected_overlay_revision: 0,
+                }),
+                1,
+                "overlay-op-2",
+                &[],
+            )
+            .await
+            .expect("overlay and catalog should publish together");
+        assert_eq!((first.catalog_revision, first.overlay_revision), (1, 1));
+
+        let source_digest = "a".repeat(64);
+        let credential_generation_digest = "b".repeat(64);
+        let values_json =
+            r#"{"version":1,"values":["na","eu"],"labels":["North America","Europe"]}"#;
+        let resolved_at = "2026-09-03T00:00:00Z";
+        let client = pool.get().await.expect("enum seed checkout");
+        client
+            .execute(
+                r#"
+                INSERT INTO greengateway.connection_enum_source_values (
+                    connection_id, source_id, overlay_revision, source_digest,
+                    values_revision, connection_revision, credential_revision,
+                    credential_generation_digest, values_json, resolved_at
+                ) VALUES ($1::text::uuid, 'regions', 1, $2, 1, 1, 1, $3, $4, $5)
+                "#,
+                &[
+                    &api.id.as_str(),
+                    &source_digest,
+                    &credential_generation_digest,
+                    &values_json,
+                    &resolved_at,
+                ],
+            )
+            .await
+            .expect("future enum LKG row should seed");
+        let stored_credential_generation_digest: Option<String> = client
+            .query_one(
+                "SELECT credential_generation_digest \
+                 FROM greengateway.connection_enum_source_values \
+                 WHERE connection_id = $1::text::uuid AND source_id = 'regions'",
+                &[&api.id.as_str()],
+            )
+            .await
+            .expect("credential generation digest should read")
+            .get(0);
+        assert_eq!(
+            stored_credential_generation_digest.as_deref(),
+            Some(credential_generation_digest.as_str())
+        );
+        drop(client);
+
+        let stale = store
+            .replace_openapi_catalog_with_overlay(
+                &api.id,
+                &api.etag(),
+                first.spec_revision,
+                first.catalog_revision,
+                RESERVATION_SPEC,
+                &digest,
+                &[openapi_entry("must_not_commit")],
+                Some(&StoredOverlayWrite::Put {
+                    schema_version: "0.1.0".to_owned(),
+                    overlay_json: first_document.to_owned(),
+                    source_reports_json: first_reports.to_owned(),
+                    expected_overlay_revision: 0,
+                }),
+                1,
+                "overlay-stale",
+                &[],
+            )
+            .await
+            .expect_err("stale overlay revision must reject the transaction");
+        assert!(matches!(
+            stale,
+            ConnectionStoreError::OverlayConflict {
+                current_catalog_revision: 1,
+                current_overlay_revision: 1,
+                ..
+            }
+        ));
+        let after_stale = store
+            .openapi_catalog(&api.id)
+            .await
+            .expect("catalog after stale CAS")
+            .expect("catalog remains");
+        assert_eq!(after_stale, first, "catalog replacement rolled back");
+        assert_eq!(
+            count(
+                &pool,
+                "SELECT COUNT(*) FROM greengateway.connection_enum_source_values",
+            )
+            .await,
+            1,
+            "enum prune rolled back with the rejected catalog"
+        );
+
+        let second_document =
+            r#"{"schema_version":"0.1.0","tools":{},"defaults":{"body_mode":"fields"}}"#;
+        let second_reports = r#"{"schema_version":"0.1.0","sources":[{"id":"regions","kind":"enum","state":"last_known_good","item_count":2,"resolved_at":"2026-09-03T00:00:00Z"}]}"#;
+        let first_overlay = store
+            .openapi_overlay(&api.id)
+            .await
+            .expect("overlay before injected failure")
+            .expect("first overlay remains");
+        pool.get()
+            .await
+            .expect("failure trigger checkout")
+            .batch_execute(
+                r#"
+                CREATE FUNCTION greengateway.fail_openapi_overlay_update()
+                RETURNS trigger LANGUAGE plpgsql AS $$
+                BEGIN
+                    RAISE EXCEPTION 'injected overlay failure';
+                END;
+                $$;
+                CREATE TRIGGER fail_openapi_overlay_update
+                BEFORE UPDATE ON greengateway.connection_openapi_overlays
+                FOR EACH ROW EXECUTE FUNCTION greengateway.fail_openapi_overlay_update();
+                "#,
+            )
+            .await
+            .expect("failure trigger should install");
+        store
+            .replace_openapi_catalog_with_overlay(
+                &api.id,
+                &api.etag(),
+                first.spec_revision,
+                first.catalog_revision,
+                RESERVATION_SPEC,
+                &digest,
+                &[openapi_entry("must_roll_back")],
+                Some(&StoredOverlayWrite::Put {
+                    schema_version: "0.1.0".to_owned(),
+                    overlay_json: second_document.to_owned(),
+                    source_reports_json: second_reports.to_owned(),
+                    expected_overlay_revision: 1,
+                }),
+                2,
+                "overlay-injected-failure",
+                &[],
+            )
+            .await
+            .expect_err("a failure after prune/catalog work must roll back the transaction");
+        pool.get()
+            .await
+            .expect("failure trigger cleanup checkout")
+            .batch_execute(
+                r#"
+                DROP TRIGGER fail_openapi_overlay_update
+                    ON greengateway.connection_openapi_overlays;
+                DROP FUNCTION greengateway.fail_openapi_overlay_update();
+                "#,
+            )
+            .await
+            .expect("failure trigger should drop");
+        let (after_failure_catalog, after_failure_overlay) = store
+            .openapi_catalog_with_overlay(&api.id)
+            .await
+            .expect("atomic pair after injected failure");
+        assert_eq!(after_failure_catalog, Some(first.clone()));
+        assert_eq!(after_failure_overlay, Some(first_overlay));
+        assert_eq!(
+            count(
+                &pool,
+                "SELECT COUNT(*) FROM greengateway.connection_enum_source_values",
+            )
+            .await,
+            1,
+            "enum prune must roll back with the catalog and overlay"
+        );
+        let second = store
+            .replace_openapi_catalog_with_overlay(
+                &api.id,
+                &api.etag(),
+                first.spec_revision,
+                first.catalog_revision,
+                RESERVATION_SPEC,
+                &digest,
+                &[openapi_entry("overlay_second")],
+                Some(&StoredOverlayWrite::Put {
+                    schema_version: "0.1.0".to_owned(),
+                    overlay_json: second_document.to_owned(),
+                    source_reports_json: second_reports.to_owned(),
+                    expected_overlay_revision: 1,
+                }),
+                2,
+                "overlay-op-3",
+                &[],
+            )
+            .await
+            .expect("current overlay CAS should publish");
+        assert_eq!((second.catalog_revision, second.overlay_revision), (2, 2));
+        assert_eq!(
+            count(
+                &pool,
+                "SELECT COUNT(*) FROM greengateway.connection_enum_source_values",
+            )
+            .await,
+            0,
+            "a source-plan-changing overlay atomically prunes enum LKG rows"
+        );
+
+        let restarted = PostgresConnectionStore::new(pool.clone(), 64).expect("fresh store");
+        let restarted_overlay = restarted
+            .openapi_overlay(&api.id)
+            .await
+            .expect("restart overlay read")
+            .expect("overlay survives restart");
+        assert_eq!(restarted_overlay.overlay_json, second_document);
+        assert_eq!(
+            restarted_overlay.source_reports_json.as_deref(),
+            Some(second_reports)
+        );
+        assert_eq!(
+            restarted
+                .openapi_catalog(&api.id)
+                .await
+                .expect("restart catalog read")
+                .expect("catalog survives restart")
+                .overlay_revision,
+            2
+        );
+
+        let report_only_reports = r#"{"schema_version":"0.1.0","sources":[{"id":"regions","kind":"enum","state":"refreshed","item_count":2,"resolved_at":"2026-09-03T01:00:00Z"}]}"#;
+        let client = pool.get().await.expect("report-only seed checkout");
+        client
+            .execute(
+                r#"
+                INSERT INTO greengateway.connection_enum_source_values (
+                    connection_id, source_id, overlay_revision, source_digest,
+                    values_revision, connection_revision, credential_revision,
+                    credential_generation_digest, values_json, resolved_at
+                ) VALUES ($1::text::uuid, 'regions', 2, $2, 2, 1, 1, $3, $4, $5)
+                "#,
+                &[
+                    &api.id.as_str(),
+                    &source_digest,
+                    &credential_generation_digest,
+                    &values_json,
+                    &resolved_at,
+                ],
+            )
+            .await
+            .expect("report-only enum LKG row should seed");
+        client
+            .execute(
+                "UPDATE greengateway.connection_openapi_overlays \
+                 SET updated_at = '2020-01-01T00:00:00Z' \
+                 WHERE connection_id = $1::text::uuid",
+                &[&api.id.as_str()],
+            )
+            .await
+            .expect("report-only timestamp fixture should update");
+        drop(client);
+        let before_report_update = restarted
+            .openapi_overlay(&api.id)
+            .await
+            .expect("overlay before report-only update")
+            .expect("overlay remains before report-only update");
+        let third = restarted
+            .replace_openapi_catalog_with_overlay(
+                &api.id,
+                &api.etag(),
+                second.spec_revision,
+                second.catalog_revision,
+                RESERVATION_SPEC,
+                &digest,
+                &[openapi_entry("overlay_reported")],
+                Some(&StoredOverlayWrite::Reports {
+                    source_reports_json: report_only_reports.to_owned(),
+                    expected_overlay_revision: 2,
+                }),
+                2,
+                "overlay-report-only",
+                &[],
+            )
+            .await
+            .expect("report-only update should commit with the catalog");
+        assert_eq!((third.catalog_revision, third.overlay_revision), (3, 2));
+        let after_report_update = restarted
+            .openapi_overlay(&api.id)
+            .await
+            .expect("overlay after report-only update")
+            .expect("overlay remains after report-only update");
+        assert_eq!(
+            after_report_update.schema_version,
+            before_report_update.schema_version
+        );
+        assert_eq!(
+            after_report_update.overlay_json,
+            before_report_update.overlay_json
+        );
+        assert_eq!(after_report_update.overlay_revision, 2);
+        assert_eq!(
+            after_report_update.source_reports_json.as_deref(),
+            Some(report_only_reports)
+        );
+        assert_ne!(
+            after_report_update.updated_at, before_report_update.updated_at,
+            "report-only updates advance the stored report timestamp"
+        );
+        assert_eq!(
+            count(
+                &pool,
+                "SELECT COUNT(*) FROM greengateway.connection_enum_source_values",
+            )
+            .await,
+            1,
+            "report-only updates preserve enum LKG rows"
+        );
+        let stored_report_digest: Option<String> = pool
+            .get()
+            .await
+            .expect("report-only digest checkout")
+            .query_one(
+                "SELECT credential_generation_digest \
+                 FROM greengateway.connection_enum_source_values \
+                 WHERE connection_id = $1::text::uuid AND source_id = 'regions'",
+                &[&api.id.as_str()],
+            )
+            .await
+            .expect("report-only credential digest should remain readable")
+            .get(0);
+        assert_eq!(
+            stored_report_digest.as_deref(),
+            Some(credential_generation_digest.as_str())
+        );
+
+        let deleted = restarted
+            .replace_openapi_catalog_with_overlay(
+                &api.id,
+                &api.etag(),
+                third.spec_revision,
+                third.catalog_revision,
+                RESERVATION_SPEC,
+                &digest,
+                &[openapi_entry("overlay_restored")],
+                Some(&StoredOverlayWrite::Delete {
+                    expected_overlay_revision: 2,
+                }),
+                0,
+                "overlay-op-4",
+                &[],
+            )
+            .await
+            .expect("overlay delete should publish its restored catalog atomically");
+        assert_eq!((deleted.catalog_revision, deleted.overlay_revision), (4, 0));
+        assert!(restarted
+            .openapi_overlay(&api.id)
+            .await
+            .expect("deleted overlay lookup")
+            .is_none());
+        assert_eq!(
+            count(
+                &pool,
+                "SELECT COUNT(*) FROM greengateway.connection_enum_source_values",
+            )
+            .await,
+            0,
+            "overlay deletion prunes enum LKG rows"
+        );
+
+        let orphan_reports = restarted
+            .replace_openapi_catalog_with_overlay(
+                &api.id,
+                &api.etag(),
+                deleted.spec_revision,
+                deleted.catalog_revision,
+                RESERVATION_SPEC,
+                &digest,
+                &[openapi_entry("must_not_commit_without_overlay")],
+                Some(&StoredOverlayWrite::Reports {
+                    source_reports_json: report_only_reports.to_owned(),
+                    expected_overlay_revision: 0,
+                }),
+                0,
+                "overlay-orphan-reports",
+                &[],
+            )
+            .await
+            .expect_err("reports cannot be stored without an overlay");
+        assert!(matches!(
+            orphan_reports,
+            ConnectionStoreError::Validation { .. }
+        ));
+        assert_eq!(
+            restarted
+                .openapi_catalog(&api.id)
+                .await
+                .expect("catalog after orphan report rejection")
+                .expect("catalog remains after orphan report rejection"),
+            deleted,
+            "orphan report rejection rolls back the catalog replacement"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn policy_and_overlay_name_adoption_serialize_in_commit_order_across_replicas() {
+        use crate::storage::{
+            PolicyCommitPrecondition, PolicyCommitRequest, PolicyControlPlane, PostgresPolicyStore,
+        };
+
+        let Some(admin_dsn) = locator() else {
+            eprintln!("skipping: no test database locator; CI runs this test");
+            return;
+        };
+        let database = create_test_database(&admin_dsn).await;
+        let (store, pool) = migrated_store(&database.dsn, 64).await;
+        let store = std::sync::Arc::new(store);
+        let policy_store = std::sync::Arc::new(PostgresPolicyStore::new(pool.clone()));
+        let initial_policy = policy_with_tools("initial", &[]);
+        let initial_diff = json!({"action":"initialize"});
+        let initial = PolicyControlPlane::commit(
+            policy_store.as_ref(),
+            PolicyCommitRequest {
+                precondition: PolicyCommitPrecondition::Initialize,
+                candidate: &initial_policy,
+                actor_user_id: "installer",
+                diff_summary: &initial_diff,
+            },
+        )
+        .await
+        .expect("initial policy should commit");
+        let digest = reservation_spec_digest();
+
+        // Policy queues first behind a session-held lock. PostgreSQL wakes
+        // advisory waiters in queue order, so the overlay observes that
+        // authoritative commit and must refuse adoption of its name.
+        let policy_first_api = store
+            .create(http_candidate("Policy-first API"), "race-create-a", None)
+            .await
+            .expect("policy-first Connection should create");
+        let blocker = pool.get().await.expect("blocker checkout");
+        blocker
+            .execute(
+                "SELECT pg_advisory_lock($1)",
+                &[&*crate::storage::postgres_policy::POLICY_OVERLAY_LOCK_KEY],
+            )
+            .await
+            .expect("session lock should acquire");
+        let policy_task = {
+            let policy_store = policy_store.clone();
+            let expected = initial.etag.clone();
+            tokio::spawn(async move {
+                let candidate = policy_with_tools("policy-first", &["policy_first_name"]);
+                let diff = json!({"action":"policy-first"});
+                PolicyControlPlane::commit(
+                    policy_store.as_ref(),
+                    PolicyCommitRequest {
+                        precondition: PolicyCommitPrecondition::Expected { etag: expected },
+                        candidate: &candidate,
+                        actor_user_id: "policy-replica",
+                        diff_summary: &diff,
+                    },
+                )
+                .await
+            })
+        };
+        wait_for_advisory_waiters(&pool, 1).await;
+        let overlay_task = {
+            let store = store.clone();
+            let api = policy_first_api.clone();
+            let digest = digest.clone();
+            tokio::spawn(async move {
+                store
+                    .replace_openapi_catalog_with_overlay(
+                        &api.id,
+                        &api.etag(),
+                        0,
+                        0,
+                        RESERVATION_SPEC,
+                        &digest,
+                        &[openapi_entry("policy_first_name")],
+                        Some(&StoredOverlayWrite::Put {
+                            schema_version: "0.1.0".to_owned(),
+                            overlay_json: r#"{"schema_version":"0.1.0","tools":{"listInvoices":{"rename":"policy_first_name"}}}"#.to_owned(),
+                            source_reports_json: r#"{"schema_version":"0.1.0","sources":[]}"#.to_owned(),
+                            expected_overlay_revision: 0,
+                        }),
+                        1,
+                        "overlay-replica",
+                        &["policy_first_name".to_owned()],
+                    )
+                    .await
+            })
+        };
+        wait_for_advisory_waiters(&pool, 2).await;
+        blocker
+            .execute(
+                "SELECT pg_advisory_unlock($1)",
+                &[&*crate::storage::postgres_policy::POLICY_OVERLAY_LOCK_KEY],
+            )
+            .await
+            .expect("session lock should release");
+        let policy_first = policy_task
+            .await
+            .expect("policy task should join")
+            .expect("policy queued first should commit");
+        let rejected = overlay_task
+            .await
+            .expect("overlay task should join")
+            .expect_err("overlay queued second must observe and reject policy adoption");
+        assert!(matches!(
+            rejected,
+            ConnectionStoreError::ToolNameConflict {
+                ref tool_name,
+                ref lane,
+                ref owner_id,
+                ..
+            } if tool_name == "policy_first_name"
+                && lane == "policy"
+                && owner_id == "active-policy"
+        ));
+        assert!(store
+            .openapi_catalog(&policy_first_api.id)
+            .await
+            .expect("policy-first catalog lookup")
+            .is_none());
+        assert!(store
+            .openapi_overlay(&policy_first_api.id)
+            .await
+            .expect("policy-first overlay lookup")
+            .is_none());
+
+        // Reverse the queue. The overlay sees the older policy and adopts
+        // the unclaimed name; the later policy is deliberately allowed to
+        // grant that now-existing tool.
+        let overlay_first_api = store
+            .create(http_candidate("Overlay-first API"), "race-create-b", None)
+            .await
+            .expect("overlay-first Connection should create");
+        blocker
+            .execute(
+                "SELECT pg_advisory_lock($1)",
+                &[&*crate::storage::postgres_policy::POLICY_OVERLAY_LOCK_KEY],
+            )
+            .await
+            .expect("session lock should reacquire");
+        let overlay_task = {
+            let store = store.clone();
+            let api = overlay_first_api.clone();
+            let digest = digest.clone();
+            tokio::spawn(async move {
+                store
+                    .replace_openapi_catalog_with_overlay(
+                        &api.id,
+                        &api.etag(),
+                        0,
+                        0,
+                        RESERVATION_SPEC,
+                        &digest,
+                        &[openapi_entry("overlay_first_name")],
+                        Some(&StoredOverlayWrite::Put {
+                            schema_version: "0.1.0".to_owned(),
+                            overlay_json: r#"{"schema_version":"0.1.0","tools":{"listInvoices":{"rename":"overlay_first_name"}}}"#.to_owned(),
+                            source_reports_json: r#"{"schema_version":"0.1.0","sources":[]}"#.to_owned(),
+                            expected_overlay_revision: 0,
+                        }),
+                        1,
+                        "overlay-replica",
+                        &["overlay_first_name".to_owned()],
+                    )
+                    .await
+            })
+        };
+        wait_for_advisory_waiters(&pool, 1).await;
+        let policy_task = {
+            let policy_store = policy_store.clone();
+            let expected = policy_first.etag.clone();
+            tokio::spawn(async move {
+                let candidate = policy_with_tools(
+                    "overlay-first",
+                    &["policy_first_name", "overlay_first_name"],
+                );
+                let diff = json!({"action":"overlay-first-followed-by-policy"});
+                PolicyControlPlane::commit(
+                    policy_store.as_ref(),
+                    PolicyCommitRequest {
+                        precondition: PolicyCommitPrecondition::Expected { etag: expected },
+                        candidate: &candidate,
+                        actor_user_id: "policy-replica",
+                        diff_summary: &diff,
+                    },
+                )
+                .await
+            })
+        };
+        wait_for_advisory_waiters(&pool, 2).await;
+        blocker
+            .execute(
+                "SELECT pg_advisory_unlock($1)",
+                &[&*crate::storage::postgres_policy::POLICY_OVERLAY_LOCK_KEY],
+            )
+            .await
+            .expect("session lock should release after reverse queue");
+        let overlay_first = overlay_task
+            .await
+            .expect("overlay-first task should join")
+            .expect("overlay queued first should commit");
+        assert_eq!(
+            (
+                overlay_first.catalog_revision,
+                overlay_first.overlay_revision
+            ),
+            (1, 1)
+        );
+        let final_policy = policy_task
+            .await
+            .expect("final policy task should join")
+            .expect("policy queued after a valid overlay is allowed");
+        assert!(final_policy.policy.tools.contains_key("overlay_first_name"));
+        assert!(store
+            .openapi_overlay(&overlay_first_api.id)
+            .await
+            .expect("overlay-first row should load")
+            .is_some());
+    }
+
     fn local_tools_document(tool_names: &[&str]) -> Value {
         json!({
             "schema_version": "0.1.0",
@@ -5949,6 +7204,7 @@ mod tests {
                         mcp_catalogs: Vec::new(),
                         openapi_catalogs: Vec::new(),
                         openapi_inventory_catalogs: Vec::new(),
+                        openapi_overlays: Vec::new(),
                     }),
                 },
                 records: Vec::new(),
@@ -6042,6 +7298,7 @@ mod tests {
                         mcp_catalogs: Vec::new(),
                         openapi_catalogs: Vec::new(),
                         openapi_inventory_catalogs: Vec::new(),
+                        openapi_overlays: Vec::new(),
                     }),
                 },
                 records: Vec::new(),

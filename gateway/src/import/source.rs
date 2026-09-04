@@ -44,7 +44,7 @@ use crate::{
     config::{Config, StateBackend},
     connections::{
         pg_store::ImportedConnection,
-        store::{ConnectionStore, SqliteConnectionStore},
+        store::{ConnectionStore, SqliteConnectionStore, StoredOpenApiOverlay},
     },
     discovery::{
         aggregator::{AggregatorState, EndpointKey, PendingFlush},
@@ -547,6 +547,32 @@ fn read_connections(path: &Path) -> Result<(Vec<ImportedConnection>, i64), Impor
         .into_iter()
         .map(|catalog| (catalog.connection_id.clone(), catalog))
         .collect();
+    let openapi_overlays = store.openapi_overlays().map_err(connection_source_error)?;
+    for overlay in &openapi_overlays {
+        validate_imported_openapi_overlay(overlay)?;
+    }
+    let mut openapi_overlays: BTreeMap<_, _> = openapi_overlays
+        .into_iter()
+        .map(|overlay| (overlay.connection_id.clone(), overlay))
+        .collect();
+
+    // Dynamic enum rows belong to a later importer revision. Their absence
+    // is not an overlay compatibility check: every durable overlay above is
+    // decoded and validated by this binary independently before this
+    // forward-version gate is considered.
+    let enum_source_values = store
+        .openapi_enum_source_value_count()
+        .map_err(connection_source_error)?;
+    if enum_source_values != 0 {
+        return Err(ImportError::SourceDocumentUnparseable {
+            kind: "Connection",
+            detail: format!(
+                "the Connections database contains {enum_source_values} dynamic OpenAPI enum \
+                 source value row(s), which this importer cannot preserve; run the import with \
+                 an enum-capable gateway version"
+            ),
+        });
+    }
 
     let mut current_statuses: BTreeMap<_, _> = statuses
         .current
@@ -573,6 +599,7 @@ fn read_connections(path: &Path) -> Result<(Vec<ImportedConnection>, i64), Impor
             status_history: history.remove(&record.id).unwrap_or_default(),
             mcp_catalog: mcp_catalogs.remove(&record.id),
             openapi_catalog: openapi_catalogs.remove(&record.id),
+            openapi_overlay: openapi_overlays.remove(&record.id),
             record,
         });
     }
@@ -583,16 +610,54 @@ fn read_connections(path: &Path) -> Result<(Vec<ImportedConnection>, i64), Impor
         || !history.is_empty()
         || !mcp_catalogs.is_empty()
         || !openapi_catalogs.is_empty()
+        || !openapi_overlays.is_empty()
         || !activity.is_empty()
     {
         return Err(ImportError::SourceDocumentUnparseable {
             kind: "Connection",
-            detail: "the Connections database holds status, catalog or activity rows for \
+            detail:
+                "the Connections database holds status, catalog, overlay, or activity rows for \
                      Connections it has no record of"
-                .to_owned(),
+                    .to_owned(),
         });
     }
     Ok((connections, local_secrets))
+}
+
+/// Decode and validate a stored overlay with the same schema, Rust model,
+/// and catalog-free semantic validator used by preview and PUT. The SQLite
+/// store deliberately treats the document as opaque JSON bytes, so opening
+/// the store alone cannot prove that this binary could serve the overlay
+/// after it is imported.
+fn validate_imported_openapi_overlay(overlay: &StoredOpenApiOverlay) -> Result<(), ImportError> {
+    let document = serde_json::from_str::<Value>(&overlay.overlay_json).map_err(|error| {
+        ImportError::SourceDocumentUnparseable {
+            kind: "Connection",
+            detail: format!(
+                "stored OpenAPI overlay for {} is not JSON: {error}",
+                overlay.connection_id
+            ),
+        }
+    })?;
+    let parsed = crate::tools::overlay::validate(&document).map_err(|error| {
+        ImportError::SourceDocumentUnparseable {
+            kind: "Connection",
+            detail: format!(
+                "stored OpenAPI overlay for {} is not supported: {error}",
+                overlay.connection_id
+            ),
+        }
+    })?;
+    if parsed.schema_version != overlay.schema_version {
+        return Err(ImportError::SourceDocumentUnparseable {
+            kind: "Connection",
+            detail: format!(
+                "stored OpenAPI overlay for {} declares schema_version '{}' but its row records '{}'",
+                overlay.connection_id, parsed.schema_version, overlay.schema_version
+            ),
+        });
+    }
+    Ok(())
 }
 
 fn connection_source_error(error: crate::connections::store::ConnectionStoreError) -> ImportError {

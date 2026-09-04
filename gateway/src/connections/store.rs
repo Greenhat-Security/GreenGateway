@@ -8,7 +8,7 @@ use std::{
 };
 
 use rusqlite::{params, Connection, OptionalExtension, Row, Transaction, TransactionBehavior};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use time::{format_description::well_known::Rfc3339, OffsetDateTime};
@@ -581,6 +581,72 @@ DROP TABLE connection_credential_bindings;
 ALTER TABLE connection_credential_bindings_v8 RENAME TO connection_credential_bindings;
 "#;
 
+/// Issue #360: the per-Connection OpenAPI overlay document, the overlay
+/// revision a compiled catalog was produced under, and the last-known-good
+/// dynamic enum values (created now so the dynamic-enum PR needs no
+/// migration). PostgreSQL twin: `storage/migrations/0013_connection_overlays.sql`.
+const MIGRATION_9_SQL: &str = r#"
+CREATE TABLE connection_openapi_overlays (
+    connection_id TEXT PRIMARY KEY,
+    schema_version TEXT NOT NULL CHECK (
+        length(CAST(schema_version AS BLOB)) BETWEEN 1 AND 32
+        AND instr(schema_version, char(0)) = 0
+    ),
+    overlay_revision INTEGER NOT NULL CHECK (overlay_revision >= 1),
+    overlay_json TEXT NOT NULL CHECK (
+        length(CAST(overlay_json AS BLOB)) BETWEEN 2 AND 1048576
+    ),
+    source_reports_json TEXT CHECK (
+        source_reports_json IS NULL OR
+        length(CAST(source_reports_json AS BLOB)) BETWEEN 2 AND 262144
+    ),
+    actor_user_id TEXT,
+    updated_at TEXT NOT NULL CHECK (
+        length(CAST(updated_at AS BLOB)) BETWEEN 1 AND 64
+        AND instr(updated_at, char(0)) = 0
+    ),
+    FOREIGN KEY (connection_id) REFERENCES connection_records(id) ON DELETE CASCADE
+);
+
+ALTER TABLE connection_openapi_catalogs
+ADD COLUMN overlay_revision INTEGER NOT NULL DEFAULT 0
+CHECK (overlay_revision >= 0);
+
+CREATE TABLE connection_enum_source_values (
+    connection_id TEXT NOT NULL,
+    source_id TEXT NOT NULL CHECK (
+        length(source_id) BETWEEN 1 AND 64
+        AND instr(source_id, char(0)) = 0
+    ),
+    overlay_revision INTEGER NOT NULL CHECK (overlay_revision >= 1),
+    source_digest TEXT NOT NULL CHECK (
+        length(source_digest) = 64
+        AND source_digest NOT GLOB '*[^0-9a-f]*'
+    ),
+    values_revision INTEGER NOT NULL CHECK (values_revision >= 1),
+    connection_revision INTEGER NOT NULL CHECK (connection_revision >= 0),
+    credential_revision INTEGER NOT NULL CHECK (credential_revision >= 0),
+    credential_generation_digest TEXT CHECK (
+        credential_generation_digest IS NULL OR (
+            length(credential_generation_digest) = 64
+            AND credential_generation_digest NOT GLOB '*[^0-9a-f]*'
+        )
+    ),
+    values_json TEXT NOT NULL CHECK (
+        length(CAST(values_json AS BLOB)) BETWEEN 2 AND 262144
+    ),
+    resolved_at TEXT NOT NULL CHECK (
+        length(CAST(resolved_at AS BLOB)) BETWEEN 1 AND 64
+        AND instr(resolved_at, char(0)) = 0
+    ),
+    PRIMARY KEY (connection_id, source_id),
+    FOREIGN KEY (connection_id) REFERENCES connection_records(id) ON DELETE CASCADE
+);
+
+CREATE INDEX idx_connection_enum_source_overlay
+ON connection_enum_source_values(connection_id, overlay_revision);
+"#;
+
 const MIGRATIONS: &[Migration] = &[
     Migration {
         version: 1,
@@ -614,6 +680,10 @@ const MIGRATIONS: &[Migration] = &[
         version: 8,
         sql: MIGRATION_8_SQL,
     },
+    Migration {
+        version: 9,
+        sql: MIGRATION_9_SQL,
+    },
 ];
 
 pub(crate) const SOURCE_MANAGED: &str = "managed";
@@ -632,6 +702,14 @@ const MAX_MCP_RESOURCE_DESCRIPTION_CHARS: usize = 1_024;
 const MAX_MCP_RESOURCE_DESCRIPTION_BYTES: usize = 4_096;
 const MAX_MCP_RESOURCE_MIME_TYPE_BYTES: usize = 256;
 const MAX_OPENAPI_CATALOG_ENTRY_BYTES: usize = 262_144;
+/// Issue #360: the stored overlay document (`tools/overlay.rs`
+/// `MAX_OVERLAY_BYTES`, mirrored by the column CHECK in migration 9).
+pub(crate) const MAX_OPENAPI_OVERLAY_BYTES: usize = 1_048_576;
+pub(crate) const OPENAPI_OVERLAY_SCHEMA_VERSION: &str = "0.1.0";
+pub(crate) const MAX_OPENAPI_SOURCE_REPORTS_BYTES: usize = 262_144;
+pub(crate) const OPENAPI_SOURCE_REPORTS_SCHEMA_VERSION: &str = "0.1.0";
+const MAX_OPENAPI_SOURCE_REPORTS: usize = 128;
+const MAX_OPENAPI_SOURCE_ITEMS: u64 = 1_024;
 const MAX_OPENAPI_TOOL_NAME_CHARS: usize = 128;
 const MAX_OPENAPI_OPERATION_ID_CHARS: usize = 256;
 const MAX_OPENAPI_SECURITY_SCHEMES: usize = 64;
@@ -698,6 +776,42 @@ impl ConnectionEtag {
 }
 
 impl fmt::Display for ConnectionEtag {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+/// The strong ETag of a Connection's stored OpenAPI overlay (issue #360):
+/// `"overlay:{connection_id}:c{connection_revision}:r{catalog_revision}:o{overlay_revision}"`,
+/// quoted the way [`ConnectionEtag::for_record`] quotes, with `o0` meaning
+/// "no overlay stored". The monotonically increasing catalog revision prevents
+/// an ETag from becoming valid again after PUT -> DELETE -> recreate, while the
+/// monotonically increasing Connection revision also covers a compatible-ID
+/// kind replacement that removes and later recreates the OpenAPI catalog. A
+/// full Connection DELETE followed by a new POST is a replacement of the
+/// Connection resource itself and is governed by that resource's contract.
+/// PUT and DELETE of the overlay require an exact `If-Match`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OverlayEtag(String);
+
+impl OverlayEtag {
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    pub fn for_revisions(
+        connection_id: &str,
+        connection_revision: u64,
+        catalog_revision: u64,
+        overlay_revision: u64,
+    ) -> Self {
+        Self(format!(
+            "\"overlay:{connection_id}:c{connection_revision}:r{catalog_revision}:o{overlay_revision}\""
+        ))
+    }
+}
+
+impl fmt::Display for OverlayEtag {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str(&self.0)
     }
@@ -903,6 +1017,127 @@ pub struct StoredOpenApiCatalog {
     pub spec: String,
     pub refreshed_at: String,
     pub entries: Vec<StoredOpenApiCatalogEntry>,
+    /// The overlay revision this catalog was compiled under (issue #360);
+    /// `0` when no overlay was stored at publish time.
+    pub overlay_revision: u64,
+}
+
+/// A Connection's stored OpenAPI overlay document (issue #360). The JSON is
+/// stored verbatim and validated by `tools/overlay.rs::validate` on the way
+/// in; the store treats it as opaque bytes, like the spec.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StoredOpenApiOverlay {
+    pub connection_id: ConnectionId,
+    pub schema_version: String,
+    pub overlay_revision: u64,
+    pub overlay_json: String,
+    /// Compile-time source status served by overlay GET without performing
+    /// credentialed upstream I/O. PR1 normally leaves this absent; later
+    /// source compilers persist their canonical report object here.
+    pub source_reports_json: Option<String>,
+    pub updated_at: String,
+}
+
+/// Versioned, bounded compile-time source status stored with an overlay.
+///
+/// PR 1 persists an empty snapshot. Later source resolvers populate the same
+/// strict shape, so an admin GET never has to perform credentialed upstream
+/// I/O and an older binary fails closed instead of hiding fields it does not
+/// understand.
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct StoredOpenApiSourceReports {
+    pub schema_version: String,
+    pub sources: Vec<StoredOpenApiSourceReport>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct StoredOpenApiSourceReport {
+    pub id: String,
+    pub kind: StoredOpenApiSourceKind,
+    pub state: String,
+    pub item_count: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resolved_at: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum StoredOpenApiSourceKind {
+    Enum,
+    Label,
+}
+
+impl StoredOpenApiSourceReports {
+    pub fn empty() -> Self {
+        Self {
+            schema_version: OPENAPI_SOURCE_REPORTS_SCHEMA_VERSION.to_owned(),
+            sources: Vec::new(),
+        }
+    }
+
+    pub fn canonical_json(&self) -> Result<String, serde_json::Error> {
+        serde_json::to_string(self)
+    }
+}
+
+impl StoredOpenApiOverlay {
+    pub fn etag(&self, connection_revision: u64, catalog_revision: u64) -> OverlayEtag {
+        OverlayEtag::for_revisions(
+            self.connection_id.as_str(),
+            connection_revision,
+            catalog_revision,
+            self.overlay_revision,
+        )
+    }
+}
+
+/// The overlay half of `replace_openapi_catalog` (issue #360, D1): written
+/// in the same transaction as the catalog rows, so a catalog row can never
+/// name an overlay revision that is not stored.
+///
+/// `overlay_json: Some(_)` stores the document at `expected_overlay_revision
+/// + 1`; `None` deletes the stored overlay (the catalog row then records
+/// `0`). Either way `expected_overlay_revision` must equal the stored
+/// revision (`0` when nothing is stored) or the whole replace fails with
+/// [`ConnectionStoreError::OverlayConflict`] and nothing is written.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum StoredOverlayWrite {
+    /// Store a new authoring document and advance its overlay revision.
+    Put {
+        schema_version: String,
+        overlay_json: String,
+        source_reports_json: String,
+        expected_overlay_revision: u64,
+    },
+    /// Delete the authoring document and reset the compiled revision to zero.
+    Delete { expected_overlay_revision: u64 },
+    /// Replace only the canonical source report snapshot. The authoring
+    /// document and overlay revision remain unchanged, while the catalog and
+    /// report timestamp still commit atomically.
+    Reports {
+        source_reports_json: String,
+        expected_overlay_revision: u64,
+    },
+}
+
+impl StoredOverlayWrite {
+    fn expected_overlay_revision(&self) -> u64 {
+        match self {
+            Self::Put {
+                expected_overlay_revision,
+                ..
+            }
+            | Self::Delete {
+                expected_overlay_revision,
+            }
+            | Self::Reports {
+                expected_overlay_revision,
+                ..
+            } => *expected_overlay_revision,
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -952,6 +1187,16 @@ pub enum ConnectionStoreError {
     Conflict {
         id: String,
         current: ConnectionEtag,
+    },
+    /// The overlay precondition of a catalog replace did not hold (issue
+    /// #360): the stored overlay is at `current_overlay_revision`, not the
+    /// revision the caller expected. The caller surfaces `412` with the
+    /// current overlay ETag. Nothing was written.
+    OverlayConflict {
+        id: String,
+        current_connection_revision: u64,
+        current_catalog_revision: u64,
+        current_overlay_revision: u64,
     },
     /// A catalog tool name is already published by another lane at the
     /// authority (cluster mode). The caller surfaces `409`.
@@ -1096,6 +1341,15 @@ impl fmt::Display for ConnectionStoreError {
                 formatter,
                 "connection collection changed at the authority; current ETag is {current}"
             ),
+            Self::OverlayConflict {
+                id,
+                current_connection_revision,
+                current_catalog_revision,
+                current_overlay_revision,
+            } => write!(
+                formatter,
+                "connection '{id}' overlay changed during the mutation; current connection/catalog/overlay revisions are {current_connection_revision}/{current_catalog_revision}/{current_overlay_revision}"
+            ),
         }
     }
 }
@@ -1162,6 +1416,21 @@ impl SqliteConnectionStore {
             &self.path,
             "encrypted local secrets",
             "SELECT COUNT(*) FROM connection_local_secrets",
+        )
+    }
+
+    /// PR 1 creates the durable dynamic-enum table but has no value codec
+    /// yet. The standalone-to-cluster importer uses this count to refuse a
+    /// database written by a newer enum-capable binary instead of silently
+    /// dropping its last-known-good values and still reporting matching
+    /// checksums.
+    pub(crate) fn openapi_enum_source_value_count(&self) -> Result<usize, ConnectionStoreError> {
+        let connection = self.connection_guard();
+        count_rows(
+            &connection,
+            &self.path,
+            "OpenAPI enum source values",
+            "SELECT COUNT(*) FROM connection_enum_source_values",
         )
     }
 
@@ -1802,6 +2071,51 @@ impl SqliteConnectionStore {
         load_openapi_catalogs(&connection, &self.path, None)
     }
 
+    /// Read the compiled OpenAPI catalogs and their authoring overlays from
+    /// one SQLite snapshot. They are one logical resource: two independent
+    /// reads could otherwise straddle a writer from another process and
+    /// manufacture a revision mismatch during boot or reconciliation.
+    pub fn openapi_catalogs_with_overlays(
+        &self,
+    ) -> Result<(Vec<StoredOpenApiCatalog>, Vec<StoredOpenApiOverlay>), ConnectionStoreError> {
+        let mut connection = self.connection_guard();
+        let transaction = connection
+            .transaction()
+            .map_err(|source| sqlite_error(&self.path, "OpenAPI snapshot transaction", source))?;
+        let catalogs = load_openapi_catalogs(&transaction, &self.path, None)?;
+        let overlays = load_openapi_overlays(&transaction, &self.path, None)?;
+        transaction
+            .commit()
+            .map_err(|source| sqlite_error(&self.path, "OpenAPI snapshot commit", source))?;
+        Ok((catalogs, overlays))
+    }
+
+    /// Point-read counterpart of [`Self::openapi_catalogs_with_overlays`].
+    /// The shared snapshot is required even when the numeric overlay
+    /// revision happens to match on both sides: revision 1 may name a new
+    /// document after delete/recreate, while the catalog revision is what
+    /// distinguishes that generation.
+    pub fn openapi_catalog_with_overlay(
+        &self,
+        id: &ConnectionId,
+    ) -> Result<(Option<StoredOpenApiCatalog>, Option<StoredOpenApiOverlay>), ConnectionStoreError>
+    {
+        let mut connection = self.connection_guard();
+        let transaction = connection
+            .transaction()
+            .map_err(|source| sqlite_error(&self.path, "OpenAPI snapshot transaction", source))?;
+        let catalog = load_openapi_catalogs(&transaction, &self.path, Some(id))?
+            .into_iter()
+            .next();
+        let overlay = load_openapi_overlays(&transaction, &self.path, Some(id))?
+            .into_iter()
+            .next();
+        transaction
+            .commit()
+            .map_err(|source| sqlite_error(&self.path, "OpenAPI snapshot commit", source))?;
+        Ok((catalog, overlay))
+    }
+
     pub fn openapi_inventory_catalogs(
         &self,
     ) -> Result<Vec<StoredOpenApiInventoryCatalog>, ConnectionStoreError> {
@@ -1819,6 +2133,23 @@ impl SqliteConnectionStore {
             .next())
     }
 
+    /// The stored OpenAPI overlay document, if any (issue #360).
+    pub fn openapi_overlays(&self) -> Result<Vec<StoredOpenApiOverlay>, ConnectionStoreError> {
+        let connection = self.connection_guard();
+        load_openapi_overlays(&connection, &self.path, None)
+    }
+
+    /// The stored OpenAPI overlay document, if any (issue #360).
+    pub fn openapi_overlay(
+        &self,
+        id: &ConnectionId,
+    ) -> Result<Option<StoredOpenApiOverlay>, ConnectionStoreError> {
+        let connection = self.connection_guard();
+        Ok(load_openapi_overlays(&connection, &self.path, Some(id))?
+            .into_iter()
+            .next())
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn replace_openapi_catalog(
         &self,
@@ -1830,7 +2161,49 @@ impl SqliteConnectionStore {
         spec_digest: &str,
         entries: &[StoredOpenApiCatalogEntry],
     ) -> Result<StoredOpenApiCatalog, ConnectionStoreError> {
+        self.replace_openapi_catalog_with_overlay(
+            id,
+            expected_connection_etag,
+            expected_spec_revision,
+            expected_catalog_revision,
+            spec,
+            spec_digest,
+            entries,
+            None,
+            0,
+            "standalone",
+            &[],
+        )
+    }
+
+    /// Replace the catalog and, when `overlay` is given, the overlay row in
+    /// one transaction (issue #360, D1). `overlay: None` leaves the stored
+    /// overlay untouched (a refresh) and records its current revision on
+    /// the catalog row.
+    #[allow(clippy::too_many_arguments)]
+    pub fn replace_openapi_catalog_with_overlay(
+        &self,
+        id: &ConnectionId,
+        expected_connection_etag: &ConnectionEtag,
+        expected_spec_revision: u64,
+        expected_catalog_revision: u64,
+        spec: &str,
+        spec_digest: &str,
+        entries: &[StoredOpenApiCatalogEntry],
+        overlay: Option<&StoredOverlayWrite>,
+        compiled_overlay_revision: u64,
+        actor_user_id: &str,
+        policy_protected_names: &[String],
+    ) -> Result<StoredOpenApiCatalog, ConnectionStoreError> {
+        // Standalone SQLite serializes overlay adoption with local policy
+        // swaps before this call. PostgreSQL additionally rechecks these
+        // names against its authoritative policy under a shared advisory
+        // transaction lock.
+        let _ = policy_protected_names;
         validate_openapi_spec(spec, spec_digest)?;
+        if let Some(overlay) = overlay {
+            validate_openapi_overlay_write(overlay)?;
+        }
         let encoded_entries = validate_openapi_catalog_entries(entries)?;
         let normalized_entries = encoded_entries
             .iter()
@@ -1845,19 +2218,11 @@ impl SqliteConnectionStore {
             .ok_or_else(|| ConnectionStoreError::NotFound { id: id.to_string() })?
             .into_stored()?;
         validate_record_bindings(&transaction, &self.path, &current)?;
-        ensure_etag(id, expected_connection_etag, &current)?;
-        if !supports_managed_openapi_catalog(&current.write) {
-            return Err(ConnectionStoreError::Validation {
-                problems: vec![
-                    "OpenAPI catalogs require a managed HTTP API OpenAPI Connection".to_owned(),
-                ],
-            });
-        }
 
         let previous = transaction
             .query_row(
                 r#"
-                SELECT spec_revision, catalog_revision, spec_digest
+                SELECT spec_revision, catalog_revision, spec_digest, overlay_revision
                 FROM connection_openapi_catalogs
                 WHERE connection_id = ?1
                 "#,
@@ -1867,28 +2232,62 @@ impl SqliteConnectionStore {
                         row.get::<_, i64>(0)?,
                         row.get::<_, i64>(1)?,
                         row.get::<_, String>(2)?,
+                        row.get::<_, i64>(3)?,
                     ))
                 },
             )
             .optional()
             .map_err(|source| sqlite_error(&self.path, "OpenAPI revision lookup", source))?;
-        let (previous_spec_revision, previous_catalog_revision, previous_digest) =
-            if let Some((spec_revision, catalog_revision, digest)) = previous {
-                (
-                    persisted_revision(id, spec_revision, "invalid OpenAPI spec revision")?,
-                    persisted_revision(id, catalog_revision, "invalid OpenAPI catalog revision")?,
-                    Some(digest),
-                )
+        let (
+            previous_spec_revision,
+            previous_catalog_revision,
+            previous_digest,
+            previous_overlay_revision,
+        ) = if let Some((spec_revision, catalog_revision, digest, overlay_revision)) = previous {
+            (
+                persisted_revision(id, spec_revision, "invalid OpenAPI spec revision")?,
+                persisted_revision(id, catalog_revision, "invalid OpenAPI catalog revision")?,
+                Some(digest),
+                revision_from_i64(id, overlay_revision, true)?,
+            )
+        } else {
+            (0, 0, None, 0)
+        };
+        if let Err(error) = ensure_etag(id, expected_connection_etag, &current) {
+            return if overlay.is_some() {
+                Err(ConnectionStoreError::OverlayConflict {
+                    id: id.to_string(),
+                    current_connection_revision: current.revisions.connection,
+                    current_catalog_revision: previous_catalog_revision,
+                    current_overlay_revision: previous_overlay_revision,
+                })
             } else {
-                (0, 0, None)
+                Err(error)
             };
+        }
+        if !supports_managed_openapi_catalog(&current.write) {
+            return Err(ConnectionStoreError::Validation {
+                problems: vec![
+                    "OpenAPI catalogs require a managed HTTP API OpenAPI Connection".to_owned(),
+                ],
+            });
+        }
         if expected_spec_revision != previous_spec_revision
             || expected_catalog_revision != previous_catalog_revision
         {
-            return Err(ConnectionStoreError::Conflict {
-                id: id.to_string(),
-                current: current.etag(),
-            });
+            return if overlay.is_some() {
+                Err(ConnectionStoreError::OverlayConflict {
+                    id: id.to_string(),
+                    current_connection_revision: current.revisions.connection,
+                    current_catalog_revision: previous_catalog_revision,
+                    current_overlay_revision: previous_overlay_revision,
+                })
+            } else {
+                Err(ConnectionStoreError::Conflict {
+                    id: id.to_string(),
+                    current: current.etag(),
+                })
+            };
         }
 
         let retained_catalog_entry_count: i64 = transaction
@@ -2042,6 +2441,32 @@ impl SqliteConnectionStore {
                 })?;
         }
 
+        // The overlay row is written AFTER the catalog rows and inside the
+        // same transaction: a failure here (a stale overlay precondition
+        // included) rolls the catalog back with it, so there is no window
+        // in which the catalog names an overlay revision that is not
+        // stored. `openapi_overlay_is_written_in_the_catalog_transaction`
+        // pins this ordering.
+        let overlay_revision = write_openapi_overlay(
+            &transaction,
+            &self.path,
+            id,
+            overlay,
+            compiled_overlay_revision,
+            current.revisions.connection,
+            previous_catalog_revision,
+            actor_user_id,
+            &now,
+        )?;
+        transaction
+            .execute(
+                "UPDATE connection_openapi_catalogs SET overlay_revision = ?1 WHERE connection_id = ?2",
+                params![u64_to_i64(id, overlay_revision)?, id.as_str()],
+            )
+            .map_err(|source| {
+                sqlite_error(&self.path, "OpenAPI catalog overlay revision update", source)
+            })?;
+
         transaction.commit().map_err(|source| {
             sqlite_error(&self.path, "OpenAPI catalog transaction commit", source)
         })?;
@@ -2055,6 +2480,7 @@ impl SqliteConnectionStore {
             spec: spec.to_owned(),
             refreshed_at: now,
             entries: normalized_entries,
+            overlay_revision,
         })
     }
 
@@ -2634,6 +3060,19 @@ impl ConnectionStore for SqliteConnectionStore {
                         source,
                     )
                 })?;
+            for table in [
+                "connection_openapi_overlays",
+                "connection_enum_source_values",
+            ] {
+                transaction
+                    .execute(
+                        &format!("DELETE FROM {table} WHERE connection_id = ?1"),
+                        params![id.as_str()],
+                    )
+                    .map_err(|source| {
+                        sqlite_error(&self.path, "obsolete OpenAPI overlay removal", source)
+                    })?;
+            }
         }
 
         ensure_binding_capacity(
@@ -2801,8 +3240,10 @@ fn validate_schema(connection: &Connection, path: &Path) -> Result<(), Connectio
         "SELECT connection_id, remote_tool_name, description, input_schema_json, ordinal FROM connection_mcp_catalog_entries LIMIT 0",
         "SELECT connection_id, uri, name, title, description, mime_type, size, ordinal FROM connection_mcp_catalog_resources LIMIT 0",
         "SELECT connection_id, uri_template, name, title, description, mime_type, ordinal FROM connection_mcp_catalog_resource_templates LIMIT 0",
-        "SELECT connection_id, spec_revision, catalog_revision, observed_etag, spec_digest, spec, refreshed_at, entry_count FROM connection_openapi_catalogs LIMIT 0",
+        "SELECT connection_id, spec_revision, catalog_revision, observed_etag, spec_digest, spec, refreshed_at, entry_count, overlay_revision FROM connection_openapi_catalogs LIMIT 0",
         "SELECT connection_id, tool_name, operation_id, selected_scheme_names_json, definition_json, ordinal FROM connection_openapi_catalog_entries LIMIT 0",
+        "SELECT connection_id, schema_version, overlay_revision, overlay_json, source_reports_json, actor_user_id, updated_at FROM connection_openapi_overlays LIMIT 0",
+        "SELECT connection_id, source_id, overlay_revision, source_digest, values_revision, connection_revision, credential_revision, credential_generation_digest, values_json, resolved_at FROM connection_enum_source_values LIMIT 0",
     ] {
         connection
             .prepare(query)
@@ -3056,6 +3497,7 @@ fn validate_persisted_state(
     )?;
     let mcp_catalogs = load_mcp_catalogs(&transaction, path, None)?;
     let openapi_catalogs = load_openapi_catalogs(&transaction, path, None)?;
+    let openapi_overlays = load_openapi_overlays(&transaction, path, None)?;
     let record_by_id = records
         .iter()
         .map(|record| (record.id.clone(), record))
@@ -3081,6 +3523,32 @@ fn validate_persisted_state(
                 reason: "OpenAPI catalog owner is not a compatible managed OpenAPI Connection",
             });
         }
+    }
+    let overlay_by_id = openapi_overlays
+        .iter()
+        .map(|overlay| (&overlay.connection_id, overlay))
+        .collect::<BTreeMap<_, _>>();
+    for catalog in &openapi_catalogs {
+        match overlay_by_id.get(&catalog.connection_id) {
+            Some(overlay) if overlay.overlay_revision == catalog.overlay_revision => {}
+            None if catalog.overlay_revision == 0 => {}
+            _ => {
+                return Err(ConnectionStoreError::CorruptRecord {
+                    id: catalog.connection_id.to_string(),
+                    reason: "OpenAPI catalog and overlay revisions do not agree",
+                });
+            }
+        }
+    }
+    if openapi_overlays.iter().any(|overlay| {
+        !openapi_catalogs
+            .iter()
+            .any(|catalog| catalog.connection_id == overlay.connection_id)
+    }) {
+        return Err(ConnectionStoreError::CorruptRecord {
+            id: "<openapi-overlays>".to_owned(),
+            reason: "OpenAPI overlay has no durable catalog",
+        });
     }
     validate_managed_catalog_dependencies(&transaction, path, &mcp_catalogs, &openapi_catalogs)?;
     transaction
@@ -3497,6 +3965,349 @@ pub(crate) fn validate_openapi_spec(
     } else {
         Err(ConnectionStoreError::Validation { problems })
     }
+}
+
+/// The store-level shape check on an overlay write (issue #360): bounded,
+/// NUL-free, and JSON. Semantic validation is `tools/overlay.rs::validate`;
+/// this only guarantees the row satisfies its column constraints so a
+/// failure here is a `Validation` error, not a rolled-back transaction.
+pub(crate) fn validate_openapi_overlay_write(
+    overlay: &StoredOverlayWrite,
+) -> Result<(), ConnectionStoreError> {
+    let mut problems = Vec::new();
+    if let StoredOverlayWrite::Put {
+        schema_version,
+        overlay_json,
+        ..
+    } = overlay
+    {
+        if schema_version != OPENAPI_OVERLAY_SCHEMA_VERSION {
+            problems.push(format!(
+                "OpenAPI overlay schema_version must be {OPENAPI_OVERLAY_SCHEMA_VERSION}"
+            ));
+        }
+        if overlay_json.len() < 2 || overlay_json.len() > MAX_OPENAPI_OVERLAY_BYTES {
+            problems.push(format!(
+                "OpenAPI overlay document must contain 2-{MAX_OPENAPI_OVERLAY_BYTES} bytes"
+            ));
+        } else if !serde_json::from_str::<Value>(overlay_json).is_ok_and(|value| value.is_object())
+        {
+            problems.push("OpenAPI overlay document must be a JSON object".to_owned());
+        }
+    }
+
+    let source_reports_json = match overlay {
+        StoredOverlayWrite::Put {
+            source_reports_json,
+            ..
+        }
+        | StoredOverlayWrite::Reports {
+            source_reports_json,
+            ..
+        } => Some(source_reports_json.as_str()),
+        StoredOverlayWrite::Delete { .. } => None,
+    };
+    if let Some(source_reports_json) = source_reports_json {
+        if source_reports_json.len() < 2
+            || source_reports_json.len() > MAX_OPENAPI_SOURCE_REPORTS_BYTES
+        {
+            problems.push(format!(
+                "OpenAPI source reports must contain 2-{MAX_OPENAPI_SOURCE_REPORTS_BYTES} bytes"
+            ));
+        } else if decode_openapi_source_reports(source_reports_json).is_err() {
+            problems.push(
+                "OpenAPI source reports must be a canonical supported report snapshot".to_owned(),
+            );
+        }
+    }
+    if problems.is_empty() {
+        Ok(())
+    } else {
+        Err(ConnectionStoreError::Validation { problems })
+    }
+}
+
+/// Decode and strictly validate the safe report snapshot stored beside an
+/// overlay. Unknown fields or versions are not projected as empty: callers
+/// fail closed so a newer resolver cannot be silently misrepresented.
+pub(crate) fn decode_openapi_source_reports(
+    encoded: &str,
+) -> Result<StoredOpenApiSourceReports, ()> {
+    let reports = serde_json::from_str::<StoredOpenApiSourceReports>(encoded).map_err(|_| ())?;
+    if reports.schema_version != OPENAPI_SOURCE_REPORTS_SCHEMA_VERSION
+        || reports.sources.len() > MAX_OPENAPI_SOURCE_REPORTS
+    {
+        return Err(());
+    }
+    let mut seen = BTreeSet::new();
+    for report in &reports.sources {
+        if !valid_overlay_local_name(&report.id)
+            || !seen.insert(report.id.as_str())
+            || report.state.is_empty()
+            || report.state.chars().count() > 64
+            || report.state.chars().any(char::is_control)
+            || report.item_count > MAX_OPENAPI_SOURCE_ITEMS
+            || report
+                .resolved_at
+                .as_deref()
+                .is_some_and(|value| OffsetDateTime::parse(value, &Rfc3339).is_err())
+        {
+            return Err(());
+        }
+    }
+    if serde_json::to_string(&reports).map_err(|_| ())? != encoded {
+        return Err(());
+    }
+    Ok(reports)
+}
+
+fn valid_overlay_local_name(value: &str) -> bool {
+    let mut bytes = value.bytes();
+    matches!(bytes.next(), Some(first) if first.is_ascii_alphabetic())
+        && bytes.all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+        && value.len() <= 64
+}
+
+/// Read the stored overlay revision, then apply the requested write inside
+/// the caller's transaction. Returns the overlay revision the catalog row
+/// records: unchanged for `None`, `0` after a delete, the new revision
+/// after a store.
+#[allow(clippy::too_many_arguments)] // One argument per independently fenced catalog/overlay axis.
+fn write_openapi_overlay(
+    transaction: &Transaction<'_>,
+    path: &Path,
+    id: &ConnectionId,
+    overlay: Option<&StoredOverlayWrite>,
+    compiled_overlay_revision: u64,
+    current_connection_revision: u64,
+    current_catalog_revision: u64,
+    actor_user_id: &str,
+    now: &str,
+) -> Result<u64, ConnectionStoreError> {
+    let current = transaction
+        .query_row(
+            "SELECT overlay_revision FROM connection_openapi_overlays WHERE connection_id = ?1",
+            params![id.as_str()],
+            |row| row.get::<_, i64>(0),
+        )
+        .optional()
+        .map_err(|source| sqlite_error(path, "OpenAPI overlay revision lookup", source))?;
+    let current_revision = match current {
+        Some(revision) => persisted_revision(id, revision, "invalid OpenAPI overlay revision")?,
+        None => 0,
+    };
+    let Some(write) = overlay else {
+        if compiled_overlay_revision != current_revision {
+            return Err(ConnectionStoreError::OverlayConflict {
+                id: id.to_string(),
+                current_connection_revision,
+                current_catalog_revision,
+                current_overlay_revision: current_revision,
+            });
+        }
+        return Ok(current_revision);
+    };
+    if write.expected_overlay_revision() != current_revision {
+        return Err(ConnectionStoreError::OverlayConflict {
+            id: id.to_string(),
+            current_connection_revision,
+            current_catalog_revision,
+            current_overlay_revision: current_revision,
+        });
+    }
+    let expected_compiled_revision = match write {
+        StoredOverlayWrite::Put { .. } => increment_revision(id, current_revision)?,
+        StoredOverlayWrite::Delete { .. } => 0,
+        StoredOverlayWrite::Reports { .. } => current_revision,
+    };
+    if compiled_overlay_revision != expected_compiled_revision {
+        return Err(ConnectionStoreError::Validation {
+            problems: vec![
+                "compiled OpenAPI overlay revision does not match the resulting overlay".to_owned(),
+            ],
+        });
+    }
+    match write {
+        StoredOverlayWrite::Put {
+            schema_version,
+            overlay_json,
+            source_reports_json,
+            ..
+        } => {
+            transaction
+                .execute(
+                    "DELETE FROM connection_enum_source_values WHERE connection_id = ?1",
+                    params![id.as_str()],
+                )
+                .map_err(|source| sqlite_error(path, "OpenAPI enum source prune", source))?;
+            let next_revision = expected_compiled_revision;
+            transaction
+                .execute(
+                    r#"
+                    INSERT INTO connection_openapi_overlays (
+                        connection_id, schema_version, overlay_revision, overlay_json,
+                        source_reports_json, actor_user_id, updated_at
+                    ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+                    ON CONFLICT (connection_id) DO UPDATE SET
+                        schema_version = excluded.schema_version,
+                        overlay_revision = excluded.overlay_revision,
+                        overlay_json = excluded.overlay_json,
+                        source_reports_json = excluded.source_reports_json,
+                        actor_user_id = excluded.actor_user_id,
+                        updated_at = excluded.updated_at
+                    "#,
+                    params![
+                        id.as_str(),
+                        schema_version,
+                        u64_to_i64(id, next_revision)?,
+                        overlay_json,
+                        source_reports_json,
+                        actor_user_id,
+                        now,
+                    ],
+                )
+                .map_err(|source| sqlite_error(path, "OpenAPI overlay upsert", source))?;
+            Ok(next_revision)
+        }
+        StoredOverlayWrite::Delete { .. } => {
+            transaction
+                .execute(
+                    "DELETE FROM connection_enum_source_values WHERE connection_id = ?1",
+                    params![id.as_str()],
+                )
+                .map_err(|source| sqlite_error(path, "OpenAPI enum source prune", source))?;
+            transaction
+                .execute(
+                    "DELETE FROM connection_openapi_overlays WHERE connection_id = ?1",
+                    params![id.as_str()],
+                )
+                .map_err(|source| sqlite_error(path, "OpenAPI overlay delete", source))?;
+            Ok(0)
+        }
+        StoredOverlayWrite::Reports {
+            source_reports_json,
+            ..
+        } => {
+            if current_revision == 0 {
+                return Err(ConnectionStoreError::Validation {
+                    problems: vec![
+                        "OpenAPI source reports cannot be stored without an overlay".to_owned()
+                    ],
+                });
+            }
+            let changed = transaction
+                .execute(
+                    r#"
+                    UPDATE connection_openapi_overlays
+                    SET source_reports_json = ?1, actor_user_id = ?2, updated_at = ?3
+                    WHERE connection_id = ?4
+                    "#,
+                    params![source_reports_json, actor_user_id, now, id.as_str()],
+                )
+                .map_err(|source| sqlite_error(path, "OpenAPI source report update", source))?;
+            if changed != 1 {
+                return Err(ConnectionStoreError::CorruptRecord {
+                    id: id.to_string(),
+                    reason: "OpenAPI overlay disappeared during source report update",
+                });
+            }
+            Ok(current_revision)
+        }
+    }
+}
+
+fn load_openapi_overlays(
+    connection: &Connection,
+    path: &Path,
+    requested_id: Option<&ConnectionId>,
+) -> Result<Vec<StoredOpenApiOverlay>, ConnectionStoreError> {
+    let query = if requested_id.is_some() {
+        r#"
+            SELECT schema_version, overlay_revision, overlay_json,
+                   source_reports_json, updated_at, connection_id
+            FROM connection_openapi_overlays
+            WHERE connection_id = ?1
+            ORDER BY connection_id
+        "#
+    } else {
+        r#"
+            SELECT schema_version, overlay_revision, overlay_json,
+                   source_reports_json, updated_at, connection_id
+            FROM connection_openapi_overlays
+            ORDER BY connection_id
+        "#
+    };
+    let mut statement = connection
+        .prepare(query)
+        .map_err(|source| sqlite_error(path, "OpenAPI overlay query prepare", source))?;
+    let map_row = |row: &Row<'_>| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, i64>(1)?,
+            row.get::<_, String>(2)?,
+            row.get::<_, Option<String>>(3)?,
+            row.get::<_, String>(4)?,
+            row.get::<_, String>(5)?,
+        ))
+    };
+    let rows = if let Some(id) = requested_id {
+        statement.query_map(params![id.as_str()], map_row)
+    } else {
+        statement.query_map([], map_row)
+    }
+    .map_err(|source| sqlite_error(path, "OpenAPI overlay query", source))?
+    .collect::<Result<Vec<_>, _>>()
+    .map_err(|source| sqlite_error(path, "OpenAPI overlay read", source))?;
+
+    rows.into_iter()
+        .map(
+            |(
+                schema_version,
+                overlay_revision,
+                overlay_json,
+                source_reports_json,
+                updated_at,
+                raw_id,
+            )| {
+                let id = ConnectionId::parse(raw_id.clone()).map_err(|_| {
+                    ConnectionStoreError::CorruptRecord {
+                        id: raw_id,
+                        reason: "invalid OpenAPI overlay connection ID",
+                    }
+                })?;
+                let overlay_revision =
+                    persisted_revision(&id, overlay_revision, "invalid OpenAPI overlay revision")?;
+                if overlay_revision == 0 {
+                    return Err(ConnectionStoreError::CorruptRecord {
+                        id: id.to_string(),
+                        reason: "invalid OpenAPI overlay revision",
+                    });
+                }
+                validate_openapi_overlay_write(&StoredOverlayWrite::Put {
+                    schema_version: schema_version.clone(),
+                    overlay_json: overlay_json.clone(),
+                    source_reports_json: source_reports_json.clone().unwrap_or_else(|| {
+                        StoredOpenApiSourceReports::empty()
+                            .canonical_json()
+                            .expect("the fixed empty source report snapshot serializes")
+                    }),
+                    expected_overlay_revision: 0,
+                })
+                .map_err(|_| ConnectionStoreError::CorruptRecord {
+                    id: id.to_string(),
+                    reason: "stored OpenAPI overlay fails validation",
+                })?;
+                Ok(StoredOpenApiOverlay {
+                    connection_id: id,
+                    schema_version,
+                    overlay_revision,
+                    overlay_json,
+                    source_reports_json,
+                    updated_at,
+                })
+            },
+        )
+        .collect()
 }
 
 pub(crate) fn validate_openapi_catalog_entries(
@@ -3961,7 +4772,7 @@ fn load_openapi_catalogs(
     let query = if requested_id.is_some() {
         r#"
         SELECT connection_id, spec_revision, catalog_revision, observed_etag,
-               spec_digest, spec, refreshed_at, entry_count
+               spec_digest, spec, refreshed_at, entry_count, overlay_revision
         FROM connection_openapi_catalogs
         WHERE connection_id = ?1
         ORDER BY connection_id ASC
@@ -3969,7 +4780,7 @@ fn load_openapi_catalogs(
     } else {
         r#"
         SELECT connection_id, spec_revision, catalog_revision, observed_etag,
-               spec_digest, spec, refreshed_at, entry_count
+               spec_digest, spec, refreshed_at, entry_count, overlay_revision
         FROM connection_openapi_catalogs
         ORDER BY connection_id ASC
         "#
@@ -3987,6 +4798,7 @@ fn load_openapi_catalogs(
             row.get::<_, String>(5)?,
             row.get::<_, String>(6)?,
             row.get::<_, i64>(7)?,
+            row.get::<_, i64>(8)?,
         ))
     };
     let raw = if let Some(id) = requested_id {
@@ -4015,6 +4827,7 @@ fn load_openapi_catalogs(
                 spec,
                 refreshed_at,
                 raw_entry_count,
+                raw_overlay_revision,
             )| {
                 let connection_id = ConnectionId::parse(raw_id.clone()).map_err(|_| {
                     ConnectionStoreError::CorruptRecord {
@@ -4032,6 +4845,8 @@ fn load_openapi_catalogs(
                     raw_catalog_revision,
                     "invalid OpenAPI catalog revision",
                 )?;
+                let overlay_revision =
+                    revision_from_i64(&connection_id, raw_overlay_revision, true)?;
                 validate_openapi_spec(&spec, &spec_digest).map_err(|_| {
                     ConnectionStoreError::CorruptRecord {
                         id: connection_id.to_string(),
@@ -4066,6 +4881,7 @@ fn load_openapi_catalogs(
                     spec,
                     refreshed_at,
                     entries,
+                    overlay_revision,
                 })
             },
         )
@@ -5479,6 +6295,74 @@ mod tests {
 
     use super::*;
 
+    #[test]
+    fn overlay_etag_maximum_id_and_revisions_fit_the_admin_schema_bound() {
+        let id = format!(
+            "a{}",
+            "z".repeat(super::super::model::MAX_CONNECTION_ID_BYTES - 1)
+        );
+        ConnectionId::parse(id.clone()).expect("the maximum-length fixture must be a valid ID");
+        let etag = OverlayEtag::for_revisions(&id, u64::MAX, u64::MAX, u64::MAX);
+        assert_eq!(etag.as_str().len(), 204);
+        assert!(etag.as_str().len() <= 256);
+    }
+
+    #[test]
+    fn exact_overlay_schema_version_survives_restart_and_future_replay_fails_closed() {
+        let (_directory, path, store) = temporary_store("overlay-version-replay");
+        let created = store.create(candidate()).expect("Connection should create");
+        let spec = r#"{"openapi":"3.1.0","info":{"title":"Version","version":"1"}}"#;
+        let digest = spec_digest(spec);
+        store
+            .replace_openapi_catalog_with_overlay(
+                &created.id,
+                &created.etag(),
+                0,
+                0,
+                spec,
+                &digest,
+                &[],
+                Some(&StoredOverlayWrite::Put {
+                    schema_version: "0.1.0".to_owned(),
+                    overlay_json: r#"{"schema_version":"0.1.0"}"#.to_owned(),
+                    source_reports_json: r#"{"schema_version":"0.1.0","sources":[]}"#.to_owned(),
+                    expected_overlay_revision: 0,
+                }),
+                1,
+                "operator",
+                &[],
+            )
+            .expect("the exact supported overlay should publish");
+        drop(store);
+
+        let reopened = SqliteConnectionStore::open(&path).expect("store should restart");
+        assert_eq!(
+            reopened
+                .openapi_overlay(&created.id)
+                .expect("supported overlay should replay")
+                .expect("overlay should exist")
+                .schema_version,
+            "0.1.0"
+        );
+        reopened
+            .connection_guard()
+            .execute(
+                "UPDATE connection_openapi_overlays SET schema_version = '0.1.1' WHERE connection_id = ?1",
+                params![created.id.as_str()],
+            )
+            .expect("future-version corruption fixture should update");
+        assert!(matches!(
+            reopened.openapi_overlay(&created.id),
+            Err(ConnectionStoreError::CorruptRecord { .. })
+        ));
+        drop(reopened);
+
+        assert!(matches!(
+            SqliteConnectionStore::open(&path),
+            Err(ConnectionStoreError::CorruptRecord { .. })
+        ));
+    }
+
     fn candidate() -> ConnectionWrite {
         serde_json::from_value(json!({
             "display_name": "Billing API",
@@ -5704,7 +6588,7 @@ mod tests {
             .expect("migration query should run")
             .collect::<Result<Vec<_>, _>>()
             .expect("migration rows should read");
-        assert_eq!(versions, vec![1, 2, 3, 4, 5, 6, 7, 8]);
+        assert_eq!(versions, vec![1, 2, 3, 4, 5, 6, 7, 8, 9]);
     }
 
     #[test]
@@ -6031,7 +6915,7 @@ mod tests {
             .expect("migration query should run")
             .collect::<Result<Vec<_>, _>>()
             .expect("migration rows should read");
-        assert_eq!(versions, vec![1, 2, 3, 4, 5, 6, 7, 8]);
+        assert_eq!(versions, vec![1, 2, 3, 4, 5, 6, 7, 8, 9]);
     }
 
     #[test]
@@ -6135,7 +7019,7 @@ mod tests {
             .expect("migration query should run")
             .collect::<Result<Vec<_>, _>>()
             .expect("migration rows should read");
-        assert_eq!(versions, vec![1, 2, 3, 4, 5, 6, 7, 8]);
+        assert_eq!(versions, vec![1, 2, 3, 4, 5, 6, 7, 8, 9]);
     }
 
     #[test]
@@ -6259,14 +7143,16 @@ mod tests {
     }
 
     #[test]
-    fn migration_eight_preserves_existing_bindings_and_supports_multiple_header_rows() {
-        let database = TemporaryDatabase::new("migration-v7-additional-headers");
+    fn migrations_eight_and_nine_preserve_bindings_and_openapi_catalogs() {
+        let database = TemporaryDatabase::new("migration-v7-headers-and-overlays");
         let path = database.path.clone();
         let connection_id = ConnectionId::new_managed();
         let write = candidate();
         let spec_json =
             serde_json::to_string(&write).expect("v7 fixture candidate should serialize");
         let timestamp = "2026-09-03T00:00:00Z";
+        let spec = r#"{"openapi":"3.1.0","info":{"title":"Existing","version":"1"}}"#;
+        let digest = spec_digest(spec);
         {
             let connection =
                 Connection::open(&path).expect("v7 fixture database should open directly");
@@ -6315,10 +7201,37 @@ mod tests {
                     params![connection_id.as_str(), timestamp],
                 )
                 .expect("v7 fixture credential binding should insert");
+            connection
+                .execute(
+                    r#"
+                    INSERT INTO connection_openapi_catalogs (
+                        connection_id, spec_revision, catalog_revision, observed_etag,
+                        spec_digest, spec, refreshed_at, entry_count
+                    ) VALUES (?1, 2, 3, ?2, ?3, ?4, ?5, 0)
+                    "#,
+                    params![
+                        connection_id.as_str(),
+                        ConnectionEtag::for_record(
+                            &connection_id,
+                            &ConnectionRevisions {
+                                connection: 1,
+                                credential: 1,
+                                tls: 0,
+                                discovery: 1,
+                                status: 0,
+                            },
+                        )
+                        .as_str(),
+                        digest,
+                        spec,
+                        timestamp,
+                    ],
+                )
+                .expect("v7 OpenAPI catalog should insert");
         }
 
         let store = SqliteConnectionStore::open(&path)
-            .expect("migration 8 should upgrade a populated v7 binding table");
+            .expect("migrations 8 and 9 should upgrade a populated v7 database");
         let persisted = store
             .get(&connection_id)
             .expect("migrated Connection should load")
@@ -6419,7 +7332,7 @@ mod tests {
         drop(store);
 
         let reopened = SqliteConnectionStore::open(&path)
-            .expect("migration 8 database should remain restart-safe");
+            .expect("migration 9 database should remain restart-safe");
         assert_eq!(
             reopened
                 .get(&connection_id)
@@ -6427,6 +7340,30 @@ mod tests {
                 .expect("restarted Connection should remain"),
             replaced
         );
+        let catalog = reopened
+            .openapi_catalog(&connection_id)
+            .expect("migrated OpenAPI catalog should load")
+            .expect("migrated OpenAPI catalog should remain");
+        assert_eq!(catalog.spec_revision, 2);
+        assert_eq!(catalog.catalog_revision, 3);
+        assert_eq!(catalog.overlay_revision, 0);
+        assert!(reopened
+            .openapi_overlays()
+            .expect("new overlay table should load")
+            .is_empty());
+
+        let connection = reopened.connection_guard();
+        let versions = connection
+            .prepare("SELECT version FROM connection_schema_migrations ORDER BY version")
+            .expect("migration query should prepare")
+            .query_map([], |row| row.get::<_, u32>(0))
+            .expect("migration query should run")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("migration rows should read");
+        assert_eq!(versions, vec![1, 2, 3, 4, 5, 6, 7, 8, 9]);
+        assert!(connection
+            .prepare("SELECT source_digest, values_json FROM connection_enum_source_values LIMIT 0")
+            .is_ok());
     }
 
     #[test]
@@ -7089,6 +8026,374 @@ mod tests {
                 .openapi_catalog(&created.id)
                 .expect("reopened OpenAPI catalog should load"),
             Some(third)
+        );
+    }
+
+    #[test]
+    fn openapi_overlay_catalog_reports_and_enum_prune_are_one_atomic_revision() {
+        let (_directory, path, store) = temporary_store("openapi-overlay-atomic");
+        let created = store.create(candidate()).expect("Connection should create");
+        let spec = r#"{"openapi":"3.1.0","info":{"title":"Overlay","version":"1"}}"#;
+        let digest = spec_digest(spec);
+        let first_document = r#"{"schema_version":"0.1.0","tools":{}}"#;
+        let first_reports = r#"{"schema_version":"0.1.0","sources":[]}"#;
+        let first = store
+            .replace_openapi_catalog_with_overlay(
+                &created.id,
+                &created.etag(),
+                0,
+                0,
+                spec,
+                &digest,
+                &[openapi_catalog_entry("alpha")],
+                Some(&StoredOverlayWrite::Put {
+                    schema_version: "0.1.0".to_owned(),
+                    overlay_json: first_document.to_owned(),
+                    source_reports_json: first_reports.to_owned(),
+                    expected_overlay_revision: 0,
+                }),
+                1,
+                "operator-a",
+                &[],
+            )
+            .expect("overlay and catalog should publish together");
+        assert_eq!(first.overlay_revision, 1);
+        let stored = store
+            .openapi_overlay(&created.id)
+            .expect("overlay should load")
+            .expect("overlay should exist");
+        assert_eq!(stored.overlay_json, first_document);
+        assert_eq!(stored.source_reports_json.as_deref(), Some(first_reports));
+        assert_eq!(
+            stored
+                .etag(created.revisions.connection, first.catalog_revision)
+                .as_str(),
+            format!("\"overlay:{}:c1:r1:o1\"", created.id)
+        );
+        assert_eq!(
+            store.openapi_overlays().expect("bulk overlays"),
+            vec![stored.clone()]
+        );
+
+        drop(store);
+        let store = SqliteConnectionStore::open(&path)
+            .expect("overlay and non-empty source reports should survive restart");
+        assert_eq!(
+            store
+                .openapi_overlay(&created.id)
+                .expect("restarted overlay lookup"),
+            Some(stored.clone())
+        );
+
+        {
+            let connection = store.connection_guard();
+            connection
+                .execute(
+                    r#"
+                    INSERT INTO connection_enum_source_values (
+                        connection_id, source_id, overlay_revision, source_digest,
+                        values_revision, connection_revision, credential_revision,
+                        values_json, resolved_at
+                    ) VALUES (?1, 'industries', 1, ?2, 1, 1, 0, ?3, ?4)
+                    "#,
+                    params![
+                        created.id.as_str(),
+                        "a".repeat(SHA256_HEX_CHARS),
+                        r#"{"version":1,"values":["software"]}"#,
+                        utc_timestamp().expect("timestamp"),
+                    ],
+                )
+                .expect("enum provenance fixture should insert");
+        }
+
+        let stale = store
+            .replace_openapi_catalog_with_overlay(
+                &created.id,
+                &created.etag(),
+                1,
+                1,
+                spec,
+                &digest,
+                &[openapi_catalog_entry("stale")],
+                Some(&StoredOverlayWrite::Put {
+                    schema_version: "0.1.0".to_owned(),
+                    overlay_json: r#"{"schema_version":"0.1.0","description":"stale"}"#.to_owned(),
+                    source_reports_json: first_reports.to_owned(),
+                    expected_overlay_revision: 0,
+                }),
+                1,
+                "operator-b",
+                &[],
+            )
+            .expect_err("stale overlay CAS must reject the whole catalog write");
+        assert!(matches!(
+            stale,
+            ConnectionStoreError::OverlayConflict { .. }
+        ));
+        assert_eq!(
+            store
+                .openapi_catalog(&created.id)
+                .expect("catalog after rejection"),
+            Some(first.clone())
+        );
+        assert_eq!(
+            store
+                .openapi_overlay(&created.id)
+                .expect("overlay after rejection"),
+            Some(stored.clone())
+        );
+
+        let second_document =
+            r#"{"schema_version":"0.1.0","description":"replacement","tools":{}}"#;
+        let second_reports = r#"{"schema_version":"0.1.0","sources":[{"id":"industries","kind":"enum","state":"last_known_good","item_count":1,"resolved_at":"2026-09-03T00:00:00Z"}]}"#;
+        {
+            let connection = store.connection_guard();
+            connection
+                .execute_batch(
+                    r#"
+                    CREATE TRIGGER fail_openapi_overlay_update
+                    BEFORE UPDATE ON connection_openapi_overlays
+                    BEGIN
+                        SELECT RAISE(ABORT, 'injected overlay failure');
+                    END;
+                    "#,
+                )
+                .expect("failure trigger should install");
+        }
+        store
+            .replace_openapi_catalog_with_overlay(
+                &created.id,
+                &created.etag(),
+                1,
+                1,
+                spec,
+                &digest,
+                &[openapi_catalog_entry("must-roll-back")],
+                Some(&StoredOverlayWrite::Put {
+                    schema_version: "0.1.0".to_owned(),
+                    overlay_json: second_document.to_owned(),
+                    source_reports_json: second_reports.to_owned(),
+                    expected_overlay_revision: 1,
+                }),
+                2,
+                "operator-injected-failure",
+                &[],
+            )
+            .expect_err("a failure after catalog and enum work must roll back everything");
+        {
+            let connection = store.connection_guard();
+            connection
+                .execute_batch("DROP TRIGGER fail_openapi_overlay_update")
+                .expect("failure trigger should drop");
+            let enum_count: i64 = connection
+                .query_row(
+                    "SELECT COUNT(*) FROM connection_enum_source_values WHERE connection_id = ?1",
+                    params![created.id.as_str()],
+                    |row| row.get(0),
+                )
+                .expect("rolled-back enum count");
+            assert_eq!(enum_count, 1, "enum prune must roll back");
+        }
+        assert_eq!(
+            store
+                .openapi_catalog(&created.id)
+                .expect("catalog after injected failure"),
+            Some(first.clone()),
+            "catalog replacement must roll back"
+        );
+        assert_eq!(
+            store
+                .openapi_overlay(&created.id)
+                .expect("overlay after injected failure"),
+            Some(stored.clone()),
+            "overlay mutation must roll back"
+        );
+        let second = store
+            .replace_openapi_catalog_with_overlay(
+                &created.id,
+                &created.etag(),
+                1,
+                1,
+                spec,
+                &digest,
+                &[openapi_catalog_entry("beta")],
+                Some(&StoredOverlayWrite::Put {
+                    schema_version: "0.1.0".to_owned(),
+                    overlay_json: second_document.to_owned(),
+                    source_reports_json: second_reports.to_owned(),
+                    expected_overlay_revision: 1,
+                }),
+                2,
+                "operator-b",
+                &[],
+            )
+            .expect("second overlay should publish");
+        assert_eq!(second.overlay_revision, 2);
+        let enum_count: i64 = store
+            .connection_guard()
+            .query_row(
+                "SELECT COUNT(*) FROM connection_enum_source_values WHERE connection_id = ?1",
+                params![created.id.as_str()],
+                |row| row.get(0),
+            )
+            .expect("enum prune count");
+        assert_eq!(enum_count, 0, "overlay mutation must prune stale values");
+
+        // A resolver may refresh only the safe report snapshot. That CAS
+        // advances the catalog transaction while preserving the exact
+        // authoring document/revision and every durable enum value.
+        {
+            let connection = store.connection_guard();
+            let credential_generation_digest = "c".repeat(SHA256_HEX_CHARS);
+            connection
+                .execute(
+                    r#"
+                    INSERT INTO connection_enum_source_values (
+                        connection_id, source_id, overlay_revision, source_digest,
+                        values_revision, connection_revision, credential_revision,
+                        credential_generation_digest, values_json, resolved_at
+                    ) VALUES (?1, 'industries', 2, ?2, 1, 1, 0, ?3, ?4, ?5)
+                    "#,
+                    params![
+                        created.id.as_str(),
+                        "b".repeat(SHA256_HEX_CHARS),
+                        credential_generation_digest,
+                        r#"{"version":1,"values":["software"]}"#,
+                        utc_timestamp().expect("timestamp"),
+                    ],
+                )
+                .expect("current enum provenance fixture should insert");
+            let stored_digest: Option<String> = connection
+                .query_row(
+                    "SELECT credential_generation_digest FROM connection_enum_source_values WHERE connection_id = ?1 AND source_id = 'industries'",
+                    params![created.id.as_str()],
+                    |row| row.get(0),
+                )
+                .expect("credential generation digest should read");
+            assert_eq!(
+                stored_digest.as_deref(),
+                Some(credential_generation_digest.as_str())
+            );
+        }
+        let refreshed_reports = r#"{"schema_version":"0.1.0","sources":[{"id":"industries","kind":"enum","state":"fresh","item_count":1,"resolved_at":"2026-09-03T00:00:00Z"}]}"#;
+        let report_catalog = store
+            .replace_openapi_catalog_with_overlay(
+                &created.id,
+                &created.etag(),
+                1,
+                2,
+                spec,
+                &digest,
+                &[openapi_catalog_entry("beta")],
+                Some(&StoredOverlayWrite::Reports {
+                    source_reports_json: refreshed_reports.to_owned(),
+                    expected_overlay_revision: 2,
+                }),
+                2,
+                "resolver",
+                &[],
+            )
+            .expect("report-only CAS should commit");
+        assert_eq!(report_catalog.catalog_revision, 3);
+        assert_eq!(report_catalog.overlay_revision, 2);
+        let report_overlay = store
+            .openapi_overlay(&created.id)
+            .expect("report overlay lookup")
+            .expect("overlay remains stored");
+        assert_eq!(report_overlay.overlay_json, second_document);
+        assert_eq!(report_overlay.overlay_revision, 2);
+        assert_eq!(
+            report_overlay.source_reports_json.as_deref(),
+            Some(refreshed_reports)
+        );
+        assert_eq!(report_overlay.updated_at, report_catalog.refreshed_at);
+        let enum_count: i64 = store
+            .connection_guard()
+            .query_row(
+                "SELECT COUNT(*) FROM connection_enum_source_values WHERE connection_id = ?1",
+                params![created.id.as_str()],
+                |row| row.get(0),
+            )
+            .expect("enum rows should remain after report-only CAS");
+        assert_eq!(enum_count, 1);
+
+        drop(store);
+        let store = SqliteConnectionStore::open(&path).expect("overlay store should restart");
+        let (boot_catalogs, boot_overlays) = store
+            .openapi_catalogs_with_overlays()
+            .expect("restart must read the catalog/overlay pair atomically");
+        assert_eq!(boot_catalogs.len(), 1);
+        assert_eq!(boot_overlays.len(), 1);
+        assert_eq!(boot_overlays[0].overlay_revision, 2);
+        assert_eq!(boot_overlays[0].overlay_json, second_document);
+        assert_eq!(
+            boot_overlays[0].source_reports_json.as_deref(),
+            Some(refreshed_reports)
+        );
+        assert_eq!(
+            boot_catalogs[0].overlay_revision, boot_overlays[0].overlay_revision,
+            "boot catalog and exact durable overlay must remain joinable"
+        );
+
+        let preserved = store
+            .replace_openapi_catalog_with_overlay(
+                &created.id,
+                &created.etag(),
+                1,
+                3,
+                spec,
+                &digest,
+                &[openapi_catalog_entry("beta")],
+                None,
+                2,
+                "operator-refresh",
+                &[],
+            )
+            .expect("refresh-style publish should preserve the exact overlay");
+        assert_eq!(preserved.overlay_revision, 2);
+        assert_eq!(
+            store
+                .openapi_overlay(&created.id)
+                .expect("preserved overlay lookup"),
+            Some(boot_overlays[0].clone())
+        );
+
+        let deleted = store
+            .replace_openapi_catalog_with_overlay(
+                &created.id,
+                &created.etag(),
+                1,
+                4,
+                spec,
+                &digest,
+                &[openapi_catalog_entry("alpha")],
+                Some(&StoredOverlayWrite::Delete {
+                    expected_overlay_revision: 2,
+                }),
+                0,
+                "operator-c",
+                &[],
+            )
+            .expect("overlay delete and bare catalog should commit together");
+        assert_eq!(deleted.overlay_revision, 0);
+        assert!(store
+            .openapi_overlay(&created.id)
+            .expect("deleted overlay lookup")
+            .is_none());
+        drop(store);
+
+        let reopened = SqliteConnectionStore::open(&path).expect("overlay store should restart");
+        assert!(reopened
+            .openapi_overlays()
+            .expect("restart bulk overlays")
+            .is_empty());
+        assert_eq!(
+            reopened
+                .openapi_catalog(&created.id)
+                .expect("restart catalog")
+                .expect("catalog retained")
+                .overlay_revision,
+            0
         );
     }
 

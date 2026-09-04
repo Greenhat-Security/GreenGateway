@@ -1588,6 +1588,7 @@ mod tests {
                     catalog_revision: Some(1),
                 },
                 upstream: openapi_mapping,
+                visibility: crate::tools::definitions::ToolVisibility::Listed,
             };
 
             let store = control_plane
@@ -1831,6 +1832,7 @@ mod tests {
                 query_params: Vec::new(),
                 body: None,
             },
+            visibility: crate::tools::definitions::ToolVisibility::Listed,
         };
         let mut capability = BuiltCapability {
             summary: CapabilitySummary {
@@ -2255,6 +2257,7 @@ mod tests {
                 target: None,
                 source: ToolSource::Manual,
                 upstream: manual_mapping,
+                visibility: crate::tools::definitions::ToolVisibility::Listed,
             }])
             .expect("unassociated manual capability should publish");
 

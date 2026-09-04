@@ -149,7 +149,8 @@ pub struct RbacState {
     /// Serialize policy mutations across async boundaries. The guard may be
     /// held across `.await` points (the history-append repository call), so
     /// the lock is Tokio's: its guard is `Send` and waiting does not block
-    /// an executor thread. Contention is limited to admin policy writes.
+    /// an executor thread. Only policy mutation/install paths contend;
+    /// request-time policy reads remain lock-free.
     ///
     /// Swapping from `std::sync::Mutex` deliberately drops lock-poisoning
     /// semantics, and that is an improvement rather than a loss here. The
@@ -181,6 +182,13 @@ pub struct RbacState {
     mcp_route_paths: Vec<String>,
     proxy_dispatch_inventory: Arc<ProxyDispatchInventory>,
 }
+
+/// Proof that a caller owns this [`RbacState`]'s policy-write lane.
+///
+/// Mutation helpers that end in `_locked` accept this guard so admin paths
+/// that already serialize prepare/commit/install can reuse the same critical
+/// section without trying to acquire Tokio's non-reentrant mutex twice.
+pub(crate) type PolicyWriteGuard<'a> = MutexGuard<'a, ()>;
 
 #[derive(Default)]
 struct ProxyDispatchInventory {
@@ -458,12 +466,38 @@ impl RbacState {
     /// reconciler can never overwrite a newer snapshot with an older one
     /// and two racing installs converge on the higher revision.
     ///
-    /// Callers serialize installs (admin commits hold the policy write
-    /// guard; the reconciler serializes through its own mutex), so the
-    /// compare-and-swap loop below is defense in depth rather than the
-    /// only guard.
+    /// Ordinary callers acquire the same policy-write lane used by local
+    /// admin mutations and overlay compilation. Admin paths that already
+    /// hold that lane call [`RbacState::install_revision_snapshot_locked`]
+    /// instead, avoiding a recursive lock acquisition.
     #[cfg(feature = "postgres")]
-    pub(crate) fn install_revision_snapshot(&self, policy: Policy, security_revision: i64) {
+    pub(crate) async fn install_revision_snapshot(&self, policy: Policy, security_revision: i64) {
+        let guard = self.policy_write_guard().await;
+        self.install_revision_snapshot_locked(policy, security_revision, &guard);
+    }
+
+    /// Key the initial cluster snapshot before the state is shared or the
+    /// listener starts. The fresh-state invariant makes contention a wiring
+    /// bug, while `try_lock` still routes this synchronous bootstrap swap
+    /// through the same policy-write lane as every runtime mutation.
+    #[cfg(feature = "postgres")]
+    pub(crate) fn install_initial_revision_snapshot(&self, policy: Policy, security_revision: i64) {
+        let guard = self
+            .policy_write_lock
+            .try_lock()
+            .expect("initial policy snapshot must be installed before the state is shared");
+        self.install_revision_snapshot_locked(policy, security_revision, &guard);
+    }
+
+    /// Install an authoritative revision while the caller keeps the policy
+    /// write lane across a larger prepare/commit/install transaction.
+    #[cfg(feature = "postgres")]
+    pub(crate) fn install_revision_snapshot_locked(
+        &self,
+        policy: Policy,
+        security_revision: i64,
+        _guard: &PolicyWriteGuard<'_>,
+    ) {
         // One candidate Arc built up front: `Arc::ptr_eq` against the rcu's
         // result then distinguishes "this call installed the snapshot" from
         // "another install already held this revision", so a duplicate
@@ -503,7 +537,7 @@ impl RbacState {
         self.policy.load().engine.policy().egress.clone()
     }
 
-    pub(crate) async fn policy_write_guard(&self) -> MutexGuard<'_, ()> {
+    pub(crate) async fn policy_write_guard(&self) -> PolicyWriteGuard<'_> {
         self.policy_write_lock.lock().await
     }
 
@@ -744,9 +778,22 @@ impl RbacPolicyState {
     }
 }
 
-pub fn reload_policy_from_file(
+pub async fn reload_policy_from_file(
     state: &RbacState,
     path: impl AsRef<Path>,
+) -> Result<(), crate::rbac::policy::PolicyError> {
+    let guard = state.policy_write_guard().await;
+    reload_policy_from_file_locked(state, path, &guard)
+}
+
+/// Reload a file-backed policy while the caller already owns the policy
+/// write lane. This is used by the admin persistence path, which holds the
+/// lane across its precondition check, durable write, live install, history,
+/// and audit publication.
+pub(crate) fn reload_policy_from_file_locked(
+    state: &RbacState,
+    path: impl AsRef<Path>,
+    _guard: &PolicyWriteGuard<'_>,
 ) -> Result<(), crate::rbac::policy::PolicyError> {
     let path = path.as_ref();
 
@@ -874,7 +921,7 @@ async fn policy_file_watch_loop(
             let _ = handle_policy_watch_event(&policy_file, event);
         }
 
-        let _ = reload_policy_from_file(&state, &policy_file);
+        let _ = reload_policy_from_file(&state, &policy_file).await;
     }
 }
 
@@ -935,7 +982,7 @@ fn spawn_sighup_reload_task(
             if signal.is_none() {
                 return;
             }
-            let _ = reload_policy_from_file(&state, &policy_file);
+            let _ = reload_policy_from_file(&state, &policy_file).await;
         }
     }))
 }
@@ -3122,6 +3169,7 @@ mod tests {
             &serde_json::to_string(&unbound_policy).expect("unbound policy should serialize"),
         );
         reload_policy_from_file(&state, policy_file.path())
+            .await
             .expect("removing the host binding should reload");
         let denied = router
             .clone()
@@ -3145,6 +3193,7 @@ mod tests {
         policy_file
             .write(&serde_json::to_string(&host_policy).expect("host policy should serialize"));
         reload_policy_from_file(&state, policy_file.path())
+            .await
             .expect("restoring the host binding should reload");
         let restored = router
             .oneshot(proxy_request(
@@ -3387,6 +3436,7 @@ mod tests {
 
         file.write(r#"{ "schema_version": "#);
         let error = reload_policy_from_file(&state, file.path())
+            .await
             .expect_err("invalid policy reload should be rejected");
 
         assert!(
@@ -3409,6 +3459,39 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn policy_reload_waits_for_the_policy_write_guard() {
+        let file = TempPolicyFile::new(&default_policy_document("deny"));
+        let initial = Policy::from_file(file.path()).expect("initial policy should parse");
+        let (state, _capture) = test_state(initial, &[]);
+        file.write(&default_policy_document("allow"));
+
+        let guard = state.policy_write_guard().await;
+        let reload_state = state.clone();
+        let reload_path = file.path().to_owned();
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let reload = tokio::spawn(async move {
+            let _ = started_tx.send(());
+            reload_policy_from_file(&reload_state, reload_path).await
+        });
+
+        started_rx.await.expect("reload task should start");
+        tokio::task::yield_now().await;
+        assert!(
+            !reload.is_finished(),
+            "reload must wait while another policy writer owns the lane"
+        );
+        assert_eq!(state.current_policy().default_action, DefaultAction::Deny);
+
+        drop(guard);
+        tokio::time::timeout(Duration::from_secs(1), reload)
+            .await
+            .expect("reload should finish after the guard is released")
+            .expect("reload task should join")
+            .expect("valid policy reload should succeed");
+        assert_eq!(state.current_policy().default_action, DefaultAction::Allow);
+    }
+
     #[test]
     fn current_egress_policy_reflects_live_policy() {
         let file = TempPolicyFile::new(&egress_policy_document("deny", "initial.example.test"));
@@ -3425,8 +3508,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn reload_rejected_when_egress_section_changes() {
+    #[tokio::test]
+    async fn reload_rejected_when_egress_section_changes() {
         let file = TempPolicyFile::new(&egress_policy_document("deny", "initial.example.test"));
         let initial_policy =
             Policy::from_file(file.path()).expect("initial policy should parse before test");
@@ -3434,6 +3517,7 @@ mod tests {
 
         file.write(&egress_policy_document("allow", "replacement.example.test"));
         let error = reload_policy_from_file(&state, file.path())
+            .await
             .expect_err("egress-changing reload should be rejected");
 
         assert!(matches!(error, PolicyError::EgressReloadRejected));
@@ -3445,8 +3529,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn reload_accepted_when_egress_section_is_unchanged() {
+    #[tokio::test]
+    async fn reload_accepted_when_egress_section_is_unchanged() {
         let file = TempPolicyFile::new(&egress_policy_document("deny", "unchanged.example.test"));
         let initial_policy =
             Policy::from_file(file.path()).expect("initial policy should parse before test");
@@ -3454,6 +3538,7 @@ mod tests {
 
         file.write(&egress_policy_document("allow", "unchanged.example.test"));
         reload_policy_from_file(&state, file.path())
+            .await
             .expect("RBAC-only reload should be accepted when egress is unchanged");
 
         assert_eq!(state.current_policy().default_action, DefaultAction::Allow);
@@ -3463,8 +3548,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn reload_accepted_when_both_policies_have_empty_egress() {
+    #[tokio::test]
+    async fn reload_accepted_when_both_policies_have_empty_egress() {
         let file = TempPolicyFile::new(&default_policy_document("deny"));
         let initial_policy =
             Policy::from_file(file.path()).expect("initial policy should parse before test");
@@ -3472,6 +3557,7 @@ mod tests {
 
         file.write(&default_policy_document("allow"));
         reload_policy_from_file(&state, file.path())
+            .await
             .expect("RBAC-only reload should be accepted for empty egress policies");
 
         assert_eq!(state.current_policy().default_action, DefaultAction::Allow);
@@ -3494,7 +3580,9 @@ mod tests {
         assert_eq!(response.status(), StatusCode::FORBIDDEN);
 
         file.write(&default_policy_document("allow"));
-        reload_policy_from_file(&state, file.path()).expect("valid policy reload should succeed");
+        reload_policy_from_file(&state, file.path())
+            .await
+            .expect("valid policy reload should succeed");
 
         let response = router
             .oneshot(request(Method::GET, "/unmatched"))
@@ -3536,7 +3624,9 @@ mod tests {
         );
 
         file.write(&swap_policy_document("new:read"));
-        reload_policy_from_file(&state, file.path()).expect("valid policy reload should succeed");
+        reload_policy_from_file(&state, file.path())
+            .await
+            .expect("valid policy reload should succeed");
 
         let response = router
             .oneshot(request(Method::GET, "/swap/item"))
@@ -3579,7 +3669,9 @@ mod tests {
         );
 
         file.write(&direct_rule_policy_document("new-allow", "allow"));
-        reload_policy_from_file(&state, file.path()).expect("valid policy reload should succeed");
+        reload_policy_from_file(&state, file.path())
+            .await
+            .expect("valid policy reload should succeed");
 
         let response = router
             .oneshot(request(Method::GET, "/swap/item"))
@@ -3697,6 +3789,7 @@ mod tests {
                 fs::write(&reload_path, policy)
                     .unwrap_or_else(|err| panic!("failed to write reload policy: {err}"));
                 reload_policy_from_file(&reload_state, &reload_path)
+                    .await
                     .expect("valid reload policy should be accepted");
                 tokio::task::yield_now().await;
             }
@@ -3814,13 +3907,13 @@ mod tests {
     }
 
     #[cfg(feature = "postgres")]
-    fn gated_state(
+    async fn gated_state(
         policy: Policy,
         revision: i64,
         gate: Result<i64, SecurityRevisionCheckError>,
     ) -> (RbacState, Arc<crate::audit::sink::tests::CaptureSink>) {
         let (state, capture) = test_state(policy.clone(), &[]);
-        state.install_revision_snapshot(policy, revision);
+        state.install_revision_snapshot(policy, revision).await;
         (
             state.with_revision_gate(Arc::new(MockRevisionGate(gate))),
             Arc::new(capture),
@@ -3881,7 +3974,7 @@ mod tests {
 
         // The live lane denies (swapped after admission); the bundle allows.
         let (state, _capture) = test_state(denying.clone(), &[]);
-        state.install_revision_snapshot(denying.clone(), 7);
+        state.install_revision_snapshot(denying.clone(), 7).await;
         let state = state.with_revision_gate(Arc::new(BundleGate(bundle_with_policy(
             allowing.clone(),
             7,
@@ -3898,7 +3991,7 @@ mod tests {
 
         // The inverse: the live lane allows, the bundle denies.
         let (state, _capture) = test_state(allowing.clone(), &[]);
-        state.install_revision_snapshot(allowing, 7);
+        state.install_revision_snapshot(allowing, 7).await;
         let state = state.with_revision_gate(Arc::new(BundleGate(bundle_with_policy(denying, 7))));
         let response = test_router(state, Some(test_principal(&["reader"])))
             .oneshot(request(Method::GET, "/data/items"))
@@ -3927,7 +4020,8 @@ mod tests {
             ),
             4,
             Err(SecurityRevisionCheckError::Unavailable),
-        );
+        )
+        .await;
 
         let response = test_router(state, Some(test_principal(&["reader"])))
             .oneshot(request(Method::GET, "/data/items"))
@@ -3959,7 +4053,7 @@ mod tests {
             &[("reader", &["data:read"])],
             &[route(&[], "/data", "data:read")],
         );
-        let (state, capture) = gated_state(policy, 6, Ok(6));
+        let (state, capture) = gated_state(policy, 6, Ok(6)).await;
 
         let response = test_router(state, Some(test_principal(&["reader"])))
             .oneshot(request(Method::GET, "/data/items"))
@@ -3998,29 +4092,73 @@ mod tests {
     }
 
     #[cfg(feature = "postgres")]
-    #[test]
-    fn install_revision_snapshot_never_regresses_the_compiled_state() {
+    #[tokio::test]
+    async fn install_revision_snapshot_never_regresses_the_compiled_state() {
         let (state, _capture) = test_state(
             test_policy(DefaultAction::Deny, &[("reader", &["data:read"])], &[]),
             &[],
         );
-        state.install_revision_snapshot(
-            test_policy(DefaultAction::Deny, &[("reader", &["data:read"])], &[]),
-            5,
-        );
+        state
+            .install_revision_snapshot(
+                test_policy(DefaultAction::Deny, &[("reader", &["data:read"])], &[]),
+                5,
+            )
+            .await;
         assert_eq!(state.snapshot_security_revision(), 5);
         // A stale reconciler delivering an older revision must not
         // overwrite a newer compiled snapshot.
-        state.install_revision_snapshot(
-            test_policy(DefaultAction::Deny, &[("reader", &["data:read"])], &[]),
-            3,
-        );
+        state
+            .install_revision_snapshot(
+                test_policy(DefaultAction::Deny, &[("reader", &["data:read"])], &[]),
+                3,
+            )
+            .await;
         assert_eq!(state.snapshot_security_revision(), 5);
-        state.install_revision_snapshot(
-            test_policy(DefaultAction::Deny, &[("reader", &["data:read"])], &[]),
-            9,
-        );
+        state
+            .install_revision_snapshot(
+                test_policy(DefaultAction::Deny, &[("reader", &["data:read"])], &[]),
+                9,
+            )
+            .await;
         assert_eq!(state.snapshot_security_revision(), 9);
+    }
+
+    #[cfg(feature = "postgres")]
+    #[tokio::test]
+    async fn revision_snapshot_install_waits_for_the_policy_write_guard() {
+        let (state, _capture) = test_state(
+            test_policy(DefaultAction::Deny, &[("reader", &["data:read"])], &[]),
+            &[],
+        );
+        let guard = state.policy_write_guard().await;
+        let install_state = state.clone();
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let install = tokio::spawn(async move {
+            let _ = started_tx.send(());
+            install_state
+                .install_revision_snapshot(
+                    test_policy(DefaultAction::Allow, &[("reader", &["data:read"])], &[]),
+                    7,
+                )
+                .await;
+        });
+
+        started_rx.await.expect("install task should start");
+        tokio::task::yield_now().await;
+        assert!(
+            !install.is_finished(),
+            "cluster install must wait while another policy writer owns the lane"
+        );
+        assert_eq!(state.snapshot_security_revision(), 0);
+        assert_eq!(state.current_policy().default_action, DefaultAction::Deny);
+
+        drop(guard);
+        tokio::time::timeout(Duration::from_secs(1), install)
+            .await
+            .expect("install should finish after the guard is released")
+            .expect("install task should join");
+        assert_eq!(state.snapshot_security_revision(), 7);
+        assert_eq!(state.current_policy().default_action, DefaultAction::Allow);
     }
 
     #[cfg(feature = "postgres")]
@@ -4033,17 +4171,19 @@ mod tests {
         let low = state.clone();
         let high = state.clone();
         let (low, high) = tokio::join!(
-            tokio::task::spawn_blocking(move || {
+            tokio::spawn(async move {
                 low.install_revision_snapshot(
                     test_policy(DefaultAction::Deny, &[("reader", &["data:read"])], &[]),
                     7,
-                );
+                )
+                .await;
             }),
-            tokio::task::spawn_blocking(move || {
+            tokio::spawn(async move {
                 high.install_revision_snapshot(
                     test_policy(DefaultAction::Deny, &[("reader", &["data:read"])], &[]),
                     8,
-                );
+                )
+                .await;
             })
         );
         low.expect("low install should join");

@@ -16,12 +16,17 @@ use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 
 use crate::{
     egress::{EgressError, EgressRequestBody},
+    middleware::rbac::RbacState,
     tools::{
         definitions::{
             McpCatalogPublishError, ToolDefinition, ToolRegistry, ToolRegistryError, ToolSource,
             ToolTarget,
         },
         openapi::{self, OpenApiToolBinding, OpenApiToolGeneration, OpenApiToolSecuritySelection},
+        overlay::{
+            self, CompiledCatalog, OverlayCompileContext, OverlayDocument, OverlayError,
+            OverlayToolReport, OverlayWarning, OVERLAY_SCHEMA_VERSION,
+        },
     },
 };
 
@@ -34,8 +39,9 @@ use super::{
     },
     status::{ConnectionOperationalState, ConnectionStatusReason, SafeConnectionStatus},
     store::{
-        ConnectionEtag, ConnectionStatusUpdate, ConnectionStoreError, StoredConnection,
-        StoredOpenApiCatalog, StoredOpenApiCatalogEntry,
+        ConnectionEtag, ConnectionStatusUpdate, ConnectionStoreError, OverlayEtag,
+        StoredConnection, StoredOpenApiCatalog, StoredOpenApiCatalogEntry, StoredOpenApiOverlay,
+        StoredOpenApiSourceReports, StoredOverlayWrite,
     },
 };
 
@@ -46,6 +52,7 @@ pub struct OpenApiConnectionCatalogRuntime {
 
 #[derive(Clone, Debug)]
 struct ActiveOpenApiCatalog {
+    connection_revision: u64,
     observed_etag: String,
     catalog_revision: u64,
     refreshed_at: String,
@@ -58,6 +65,7 @@ pub struct OpenApiConnectionCatalogService {
     http: ConnectionHttpRuntime,
     registry: ToolRegistry,
     runtime: OpenApiConnectionCatalogRuntime,
+    rbac: Option<RbacState>,
     /// Test seam: runs between the authority commit and the registry
     /// install, where another lane can move underneath a publish.
     #[cfg(test)]
@@ -71,11 +79,26 @@ struct OpenApiPublishCandidate<'a> {
     spec: &'a str,
     digest: &'a str,
     binding: OpenApiToolBinding,
+    /// `None` preserves the durable overlay; `Some` stores or deletes it in
+    /// the same transaction as this compiled catalog.
+    overlay: Option<StoredOverlayWrite>,
+    /// Overlay revision the binding was compiled against. A preserve write
+    /// must compare this under the store transaction lock.
+    compiled_overlay_revision: u64,
+    /// Rename targets that were not owned by this generated operation in
+    /// the prior stored overlay. PostgreSQL rechecks these against the
+    /// authoritative policy under the shared policy/catalog advisory lock.
+    policy_protected_names: Vec<String>,
     started: Instant,
     /// Who is publishing. The authority records it on the immutable
     /// specification version; standalone mode has no version table and
     /// ignores it.
     actor: &'a str,
+}
+
+struct OpenApiPublishedCatalog {
+    result: OpenApiCatalogPublishResult,
+    catalog: StoredOpenApiCatalog,
 }
 
 #[derive(Debug)]
@@ -87,6 +110,94 @@ pub struct OpenApiCatalogPreview {
     pub catalog_revision: u64,
     pub generation: OpenApiToolGeneration,
     pub binding: OpenApiToolBinding,
+    /// Always keyed by generated names, even when the previewed binding was
+    /// renamed for serving. Registration confirmations use this copy.
+    pub registration_security_selections: Vec<OpenApiToolSecuritySelection>,
+    pub overlay_report: Option<OpenApiOverlayCompileReport>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct OpenApiOverlayCompileReport {
+    pub tools: Vec<OverlayToolReport>,
+    pub warnings: Vec<OverlayWarning>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct OpenApiOverlayMutationResult {
+    pub stored: Option<StoredOpenApiOverlay>,
+    /// The strong ETag of the catalog/overlay pair committed by this
+    /// mutation. Including the monotonically increasing catalog revision
+    /// prevents a deleted and recreated overlay from reusing an old tag.
+    pub etag: OverlayEtag,
+    pub report: Option<OpenApiOverlayCompileReport>,
+    pub catalog: OpenApiCatalogPublishResult,
+}
+
+#[derive(Debug)]
+pub enum OpenApiOverlayOperationError {
+    Catalog(OpenApiCatalogError),
+    Rejected(OverlayError),
+    PreconditionFailed(OverlayEtag),
+}
+
+impl fmt::Display for OpenApiOverlayOperationError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Catalog(error) => error.fmt(formatter),
+            Self::Rejected(error) => error.fmt(formatter),
+            Self::PreconditionFailed(current) => write!(
+                formatter,
+                "connection overlay changed; current ETag is {current}"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for OpenApiOverlayOperationError {}
+
+impl From<OpenApiCatalogError> for OpenApiOverlayOperationError {
+    fn from(error: OpenApiCatalogError) -> Self {
+        Self::Catalog(error)
+    }
+}
+
+impl From<OverlayError> for OpenApiOverlayOperationError {
+    fn from(error: OverlayError) -> Self {
+        Self::Rejected(error)
+    }
+}
+
+#[derive(Debug)]
+enum OpenApiPublishError {
+    Catalog(OpenApiCatalogError),
+    OverlayPreconditionFailed(OverlayEtag),
+}
+
+impl From<OpenApiCatalogError> for OpenApiPublishError {
+    fn from(error: OpenApiCatalogError) -> Self {
+        Self::Catalog(error)
+    }
+}
+
+impl OpenApiPublishError {
+    fn into_catalog(self) -> OpenApiCatalogError {
+        match self {
+            Self::Catalog(error) => error,
+            // Register and refresh preserve the overlay and never expose an
+            // overlay precondition. If another replica changed it after the
+            // compile, fail closed and make the caller retry from a preview.
+            Self::OverlayPreconditionFailed(_) => OpenApiCatalogError::StalePreview,
+        }
+    }
+
+    fn into_overlay_operation(self) -> OpenApiOverlayOperationError {
+        match self {
+            Self::Catalog(error) => OpenApiOverlayOperationError::Catalog(error),
+            Self::OverlayPreconditionFailed(current) => {
+                OpenApiOverlayOperationError::PreconditionFailed(current)
+            }
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
@@ -191,11 +302,13 @@ impl OpenApiConnectionCatalogRuntime {
     fn publish_prevalidated(
         &self,
         catalog: &StoredOpenApiCatalog,
+        connection_revision: u64,
         definition_digests: BTreeMap<String, [u8; 32]>,
     ) {
         self.publish_active(
             catalog.connection_id.clone(),
             ActiveOpenApiCatalog {
+                connection_revision,
                 observed_etag: catalog.observed_etag.to_string(),
                 catalog_revision: catalog.catalog_revision,
                 refreshed_at: catalog.refreshed_at.clone(),
@@ -238,6 +351,16 @@ impl OpenApiConnectionCatalogRuntime {
             .load()
             .get(connection_id)
             .map(|catalog| catalog.catalog_revision)
+    }
+
+    fn current_generation(&self, connection_id: &ConnectionId) -> Option<(u64, String, u64)> {
+        self.state.load().get(connection_id).map(|catalog| {
+            (
+                catalog.connection_revision,
+                catalog.observed_etag.clone(),
+                catalog.catalog_revision,
+            )
+        })
     }
 
     fn remove(&self, connection_id: &ConnectionId) {
@@ -342,16 +465,17 @@ impl OpenApiConnectionCatalogService {
         registry: ToolRegistry,
         conflicts: crate::tools::definitions::LaneConflicts,
     ) -> Result<Self, ConnectionStoreError> {
-        let catalogs = if control_plane.is_managed_store_configured() {
+        let (catalogs, overlays) = if control_plane.is_managed_store_configured() {
             control_plane
                 .managed_store()
                 .map_err(|_| ConnectionStoreError::Validation {
                     problems: vec!["managed Connection store is unavailable".to_owned()],
                 })?
-                .boot_openapi_catalogs()?
+                .boot_openapi_catalogs_with_overlays()?
         } else {
-            Vec::new()
+            (Vec::new(), Vec::new())
         };
+        validate_catalog_overlay_pairs(&catalogs, &overlays)?;
         let snapshot = control_plane.runtime_snapshot();
         let active_catalogs = catalogs
             .into_iter()
@@ -360,7 +484,9 @@ impl OpenApiConnectionCatalogService {
                     .managed()
                     .get(&catalog.connection_id)
                     .is_some_and(|record| {
-                        record.write.enabled && supports_managed_openapi_catalog(record)
+                        record.write.enabled
+                            && supports_managed_openapi_catalog(record)
+                            && catalog.observed_etag == record.etag()
                     })
             })
             .collect::<Vec<_>>();
@@ -380,9 +506,15 @@ impl OpenApiConnectionCatalogService {
             http,
             registry,
             runtime,
+            rbac: None,
             #[cfg(test)]
             install_hook: None,
         })
+    }
+
+    pub fn with_rbac_state(mut self, rbac: Option<RbacState>) -> Self {
+        self.rbac = rbac;
+        self
     }
 
     #[cfg(test)]
@@ -408,14 +540,31 @@ impl OpenApiConnectionCatalogService {
     /// re-validating install so a catalog this binary cannot enforce fails
     /// closed instead of becoming live.
     pub async fn reconcile_from_authority(&self) -> Result<(), ConnectionStoreError> {
-        let catalogs = self
+        let (catalogs, overlays) = self
             .control_plane
             .managed_store()
             .map_err(|_| ConnectionStoreError::Validation {
                 problems: vec!["managed Connection store is unavailable".to_owned()],
             })?
-            .openapi_catalogs()
+            .openapi_catalogs_with_overlays()
             .await?;
+        if let Err(error) = validate_catalog_overlay_pairs(&catalogs, &overlays) {
+            // The catalog and overlay are one logical authority resource.
+            // The store returns them from one snapshot, so a mismatch is
+            // durable corruption rather than a concurrent publication.
+            // Keeping an older compiled lane live could retain a name or
+            // visibility decision that no longer has an authoring document
+            // behind it, so withdraw every affected Connection.
+            let affected = catalogs
+                .iter()
+                .map(|catalog| catalog.connection_id.clone())
+                .chain(overlays.iter().map(|overlay| overlay.connection_id.clone()))
+                .collect::<BTreeSet<_>>();
+            for connection_id in affected {
+                self.discard_runtime_catalog(&connection_id);
+            }
+            return Err(error);
+        }
         let snapshot = self.control_plane.runtime_snapshot();
         let active = catalogs
             .into_iter()
@@ -424,7 +573,9 @@ impl OpenApiConnectionCatalogService {
                     .managed()
                     .get(&catalog.connection_id)
                     .is_some_and(|record| {
-                        record.write.enabled && supports_managed_openapi_catalog(record)
+                        record.write.enabled
+                            && supports_managed_openapi_catalog(record)
+                            && catalog.observed_etag == record.etag()
                     })
             })
             .collect::<Vec<_>>();
@@ -441,10 +592,40 @@ impl OpenApiConnectionCatalogService {
                 .map_err(|_| ConnectionStoreError::Busy {
                     resource: "connection catalog lifecycle",
                 })?;
+            // A Connection mutation can race the snapshot collected above.
+            // Re-read it while holding the same lifecycle guard used by
+            // publishers and refuse to install a catalog from an older
+            // endpoint/authentication generation.
+            let current_record = self
+                .control_plane
+                .runtime_snapshot()
+                .managed()
+                .get(&catalog.connection_id)
+                .cloned();
+            let Some(current_record) = current_record.filter(|record| {
+                record.write.enabled
+                    && supports_managed_openapi_catalog(record)
+                    && catalog.observed_etag == record.etag()
+            }) else {
+                self.discard_runtime_catalog(&catalog.connection_id);
+                continue;
+            };
+            let candidate_generation = (
+                current_record.revisions.connection,
+                catalog.observed_etag.as_str(),
+                catalog.catalog_revision,
+            );
             if self
                 .runtime
-                .current_revision(&catalog.connection_id)
-                .is_some_and(|live| live >= catalog.catalog_revision)
+                .current_generation(&catalog.connection_id)
+                .is_some_and(
+                    |(live_connection_revision, live_etag, live_catalog_revision)| {
+                        live_connection_revision > candidate_generation.0
+                            || (live_connection_revision == candidate_generation.0
+                                && live_etag == candidate_generation.1
+                                && live_catalog_revision >= candidate_generation.2)
+                    },
+                )
             {
                 continue;
             }
@@ -502,28 +683,343 @@ impl OpenApiConnectionCatalogService {
         stored.or_else(|| self.runtime.catalog_status(connection_id, current_etag))
     }
 
+    /// Read the authoring overlay independently of the compiled catalog.
+    ///
+    /// The returned ETag is present even when the document is absent (`o0`).
+    /// It includes both the catalog revision and the overlay document
+    /// revision, with `r0:o0` representing a Connection that has no catalog.
+    /// The third tuple item is the catalog revision that currently contains
+    /// the compiled document, or `None` when the Connection has not registered
+    /// an OpenAPI catalog yet. A corrupt revision/document pair fails closed.
+    pub async fn openapi_overlay(
+        &self,
+        raw_connection_id: &str,
+    ) -> Result<(Option<StoredOpenApiOverlay>, OverlayEtag, Option<u64>), OpenApiCatalogError> {
+        let (connection_id, record) =
+            self.managed_openapi_record_identity(raw_connection_id, None)?;
+        let store = self
+            .control_plane
+            .managed_store()
+            .map_err(|_| OpenApiCatalogError::StoreUnavailable)?;
+        let (catalog, stored) = store
+            .openapi_catalog_with_overlay(&connection_id)
+            .await
+            .map_err(|_| OpenApiCatalogError::StorageUnavailable)?;
+        validate_catalog_overlay_pair(catalog.as_ref(), stored.as_ref())
+            .map_err(|_| OpenApiCatalogError::StorageUnavailable)?;
+        let overlay_revision = stored
+            .as_ref()
+            .map_or(0, |overlay| overlay.overlay_revision);
+        let catalog_revision = catalog
+            .as_ref()
+            .map_or(0, |catalog| catalog.catalog_revision);
+        let applied_catalog_revision = catalog.as_ref().map(|catalog| catalog.catalog_revision);
+        Ok((
+            stored,
+            OverlayEtag::for_revisions(
+                connection_id.as_str(),
+                record.revisions.connection,
+                catalog_revision,
+                overlay_revision,
+            ),
+            applied_catalog_revision,
+        ))
+    }
+
+    /// Validate, compile, persist, and publish an overlay as one catalog
+    /// mutation. The document is canonicalised through its typed model before
+    /// storage; a failed validation, compile, CAS, or authority write leaves
+    /// both the overlay and the live registry lane unchanged.
+    pub async fn put_overlay(
+        &self,
+        raw_connection_id: &str,
+        expected_overlay_etag: &str,
+        document: &Value,
+        actor: &str,
+    ) -> Result<OpenApiOverlayMutationResult, OpenApiOverlayOperationError> {
+        let connection_id = ConnectionId::parse(raw_connection_id.to_owned())
+            .map_err(|_| OpenApiCatalogError::InvalidConnectionId)?;
+        let _active = self
+            .control_plane
+            .begin_catalog_mutation(&connection_id)
+            .map_err(catalog_lifecycle_error)?;
+        // A rename is checked against the live policy map. Serialize this
+        // local mutation with policy writes so a grant cannot appear between
+        // the ownership check and catalog publication.
+        let _policy_write_guard = match self.rbac.as_ref() {
+            Some(rbac) => Some(rbac.policy_write_guard().await),
+            None => None,
+        };
+        let (_, record) = self.managed_openapi_record(raw_connection_id, None)?;
+        let store = self
+            .control_plane
+            .managed_store()
+            .map_err(|_| OpenApiCatalogError::StoreUnavailable)?
+            .clone();
+        let (prior, stored_overlay) = store
+            .openapi_catalog_with_overlay(&connection_id)
+            .await
+            .map_err(|_| OpenApiCatalogError::StorageUnavailable)?;
+        let prior = prior.ok_or(OpenApiCatalogError::CatalogNotRegistered)?;
+        validate_catalog_overlay_pair(Some(&prior), stored_overlay.as_ref())
+            .map_err(|_| OpenApiCatalogError::StorageUnavailable)?;
+        let current_overlay_revision = require_overlay_precondition(
+            &connection_id,
+            record.revisions.connection,
+            prior.catalog_revision,
+            stored_overlay.as_ref(),
+            expected_overlay_etag,
+        )?;
+        if prior.observed_etag != record.etag() {
+            return Err(OpenApiCatalogError::StalePreview.into());
+        }
+        let document = overlay::validate(document)?;
+        let encoded_document = serde_json::to_string(&document)
+            .map_err(|_| OpenApiOverlayOperationError::Catalog(OpenApiCatalogError::InvalidSpec))?;
+        let prior_document = decode_stored_overlay(stored_overlay.as_ref())?;
+        let generation =
+            openapi::generate_tools_from_openapi_str("managed-openapi-overlay-put", &prior.spec)
+                .map_err(|_| OpenApiCatalogError::InvalidSpec)?;
+        let (selected_tool_names, confirmations) =
+            surviving_refresh_selection(&prior, &generation, prior_document.as_ref())?;
+        let binding = bind_selected_tools(
+            &generation,
+            &connection_id,
+            &record,
+            &selected_tool_names,
+            &confirmations,
+        )?;
+        let compile_context =
+            self.overlay_compile_context(&connection_id, Some(&prior), prior_document.as_ref());
+        let compiled = overlay::compile(&generation, binding, &document, &compile_context)?;
+        validate_binding_budget(&compiled.binding)?;
+        let report = compiled_report(&compiled);
+        let policy_protected_names = compiled
+            .renames
+            .iter()
+            .filter(|(generated_name, served_name)| {
+                compile_context
+                    .prior_overlay_name_owners
+                    .get(served_name.as_str())
+                    != Some(*generated_name)
+            })
+            .map(|(_, served_name)| served_name.clone())
+            .collect();
+        let next_overlay_revision = current_overlay_revision
+            .checked_add(1)
+            .ok_or(OpenApiCatalogError::StorageUnavailable)?;
+        let digest = prior.spec_digest.clone();
+        let published = self
+            .publish_candidate(OpenApiPublishCandidate {
+                record: &record,
+                expected_spec_revision: prior.spec_revision,
+                expected_catalog_revision: prior.catalog_revision,
+                spec: &prior.spec,
+                digest: &digest,
+                binding: compiled.binding,
+                overlay: Some(StoredOverlayWrite::Put {
+                    schema_version: document.schema_version.clone(),
+                    overlay_json: encoded_document.clone(),
+                    source_reports_json: StoredOpenApiSourceReports::empty()
+                        .canonical_json()
+                        .map_err(|_| OpenApiCatalogError::StorageUnavailable)?,
+                    expected_overlay_revision: current_overlay_revision,
+                }),
+                compiled_overlay_revision: next_overlay_revision,
+                policy_protected_names,
+                started: Instant::now(),
+                actor,
+            })
+            .await
+            .map_err(OpenApiPublishError::into_overlay_operation)?;
+        if published.catalog.overlay_revision != next_overlay_revision {
+            return Err(OpenApiCatalogError::StorageUnavailable.into());
+        }
+        let stored = StoredOpenApiOverlay {
+            connection_id,
+            schema_version: document.schema_version,
+            overlay_revision: next_overlay_revision,
+            overlay_json: encoded_document,
+            source_reports_json: Some(
+                StoredOpenApiSourceReports::empty()
+                    .canonical_json()
+                    .map_err(|_| OpenApiCatalogError::StorageUnavailable)?,
+            ),
+            updated_at: published.catalog.refreshed_at.clone(),
+        };
+        let etag = OverlayEtag::for_revisions(
+            stored.connection_id.as_str(),
+            record.revisions.connection,
+            published.catalog.catalog_revision,
+            stored.overlay_revision,
+        );
+        Ok(OpenApiOverlayMutationResult {
+            stored: Some(stored),
+            etag,
+            report: Some(report),
+            catalog: published.result,
+        })
+    }
+
+    /// Recompile the registered catalog without an overlay and delete the
+    /// authoring document in the same authority transaction.
+    pub async fn delete_overlay(
+        &self,
+        raw_connection_id: &str,
+        expected_overlay_etag: &str,
+        actor: &str,
+    ) -> Result<OpenApiOverlayMutationResult, OpenApiOverlayOperationError> {
+        let connection_id = ConnectionId::parse(raw_connection_id.to_owned())
+            .map_err(|_| OpenApiCatalogError::InvalidConnectionId)?;
+        let _active = self
+            .control_plane
+            .begin_catalog_mutation(&connection_id)
+            .map_err(catalog_lifecycle_error)?;
+        let _policy_write_guard = match self.rbac.as_ref() {
+            Some(rbac) => Some(rbac.policy_write_guard().await),
+            None => None,
+        };
+        let (_, record) = self.managed_openapi_record(raw_connection_id, None)?;
+        let store = self
+            .control_plane
+            .managed_store()
+            .map_err(|_| OpenApiCatalogError::StoreUnavailable)?
+            .clone();
+        let (prior, stored_overlay) = store
+            .openapi_catalog_with_overlay(&connection_id)
+            .await
+            .map_err(|_| OpenApiCatalogError::StorageUnavailable)?;
+        let prior = prior.ok_or(OpenApiCatalogError::CatalogNotRegistered)?;
+        validate_catalog_overlay_pair(Some(&prior), stored_overlay.as_ref())
+            .map_err(|_| OpenApiCatalogError::StorageUnavailable)?;
+        let current_overlay_revision = require_overlay_precondition(
+            &connection_id,
+            record.revisions.connection,
+            prior.catalog_revision,
+            stored_overlay.as_ref(),
+            expected_overlay_etag,
+        )?;
+        if prior.observed_etag != record.etag() {
+            return Err(OpenApiCatalogError::StalePreview.into());
+        }
+        let prior_document = decode_stored_overlay(stored_overlay.as_ref())?;
+        let generation =
+            openapi::generate_tools_from_openapi_str("managed-openapi-overlay-delete", &prior.spec)
+                .map_err(|_| OpenApiCatalogError::InvalidSpec)?;
+        let (selected_tool_names, confirmations) =
+            surviving_refresh_selection(&prior, &generation, prior_document.as_ref())?;
+        let binding = bind_selected_tools(
+            &generation,
+            &connection_id,
+            &record,
+            &selected_tool_names,
+            &confirmations,
+        )?;
+        validate_binding_budget(&binding)?;
+        let digest = prior.spec_digest.clone();
+        let published = self
+            .publish_candidate(OpenApiPublishCandidate {
+                record: &record,
+                expected_spec_revision: prior.spec_revision,
+                expected_catalog_revision: prior.catalog_revision,
+                spec: &prior.spec,
+                digest: &digest,
+                binding,
+                overlay: Some(StoredOverlayWrite::Delete {
+                    expected_overlay_revision: current_overlay_revision,
+                }),
+                compiled_overlay_revision: 0,
+                policy_protected_names: Vec::new(),
+                started: Instant::now(),
+                actor,
+            })
+            .await
+            .map_err(OpenApiPublishError::into_overlay_operation)?;
+        if published.catalog.overlay_revision != 0 {
+            return Err(OpenApiCatalogError::StorageUnavailable.into());
+        }
+        let etag = OverlayEtag::for_revisions(
+            connection_id.as_str(),
+            record.revisions.connection,
+            published.catalog.catalog_revision,
+            0,
+        );
+        Ok(OpenApiOverlayMutationResult {
+            stored: None,
+            etag,
+            report: None,
+            catalog: published.result,
+        })
+    }
+
     pub async fn preview(
         &self,
         raw_connection_id: &str,
         spec: &str,
     ) -> Result<OpenApiCatalogPreview, OpenApiCatalogError> {
+        match self
+            .preview_with_overlay(raw_connection_id, spec, None)
+            .await
+        {
+            Ok(preview) => Ok(preview),
+            Err(OpenApiOverlayOperationError::Catalog(error)) => Err(error),
+            Err(OpenApiOverlayOperationError::Rejected(_)) => Err(OpenApiCatalogError::InvalidSpec),
+            Err(OpenApiOverlayOperationError::PreconditionFailed(_)) => {
+                Err(OpenApiCatalogError::StorageUnavailable)
+            }
+        }
+    }
+
+    pub async fn preview_with_overlay(
+        &self,
+        raw_connection_id: &str,
+        spec: &str,
+        candidate_overlay: Option<&Value>,
+    ) -> Result<OpenApiCatalogPreview, OpenApiOverlayOperationError> {
         validate_spec_size(spec)?;
         let (connection_id, record) = self.managed_openapi_record(raw_connection_id, None)?;
-        let prior = self
+        let store = self
             .control_plane
             .managed_store()
-            .map_err(|_| OpenApiCatalogError::StoreUnavailable)?
-            .openapi_catalog(&connection_id)
+            .map_err(|_| OpenApiCatalogError::StoreUnavailable)?;
+        let (prior, stored_overlay) = store
+            .openapi_catalog_with_overlay(&connection_id)
             .await
+            .map_err(|_| OpenApiCatalogError::StorageUnavailable)?;
+        validate_catalog_overlay_pair(prior.as_ref(), stored_overlay.as_ref())
             .map_err(|_| OpenApiCatalogError::StorageUnavailable)?;
         let generation = openapi::generate_tools_from_openapi_str("managed-openapi-preview", spec)
             .map_err(|_| OpenApiCatalogError::InvalidSpec)?;
-        let binding = openapi::bind_generated_openapi_tools(
+        let mut binding = openapi::bind_generated_openapi_tools(
             &generation,
             &connection_id,
             &record.write.authentication,
         )
         .map_err(|_| OpenApiCatalogError::InvalidSpec)?;
+        let registration_security_selections = binding.security_selections.clone();
+        let prior_document = decode_stored_overlay(stored_overlay.as_ref())?;
+        let candidate_document = match candidate_overlay {
+            Some(document) => Some(overlay::validate(document)?),
+            None => prior_document.clone(),
+        };
+        let overlay_report = if let Some(document) = candidate_document.as_ref() {
+            let compiled = overlay::compile(
+                &generation,
+                binding,
+                document,
+                &self.overlay_compile_context(
+                    &connection_id,
+                    prior.as_ref(),
+                    prior_document.as_ref(),
+                ),
+            )
+            .map_err(OpenApiOverlayOperationError::Rejected)?;
+            let report = compiled_report(&compiled);
+            binding = compiled.binding;
+            Some(report)
+        } else {
+            None
+        };
         validate_binding_budget(&binding)?;
         Ok(OpenApiCatalogPreview {
             connection_id,
@@ -533,6 +1029,8 @@ impl OpenApiConnectionCatalogService {
             catalog_revision: prior.as_ref().map_or(0, |catalog| catalog.catalog_revision),
             generation,
             binding,
+            registration_security_selections,
+            overlay_report,
         })
     }
 
@@ -566,13 +1064,43 @@ impl OpenApiConnectionCatalogService {
         };
         let generation = openapi::generate_tools_from_openapi_str("managed-openapi-register", spec)
             .map_err(|_| OpenApiCatalogError::InvalidSpec)?;
-        let binding = bind_selected_tools(
+        let store = self
+            .control_plane
+            .managed_store()
+            .map_err(|_| OpenApiCatalogError::StoreUnavailable)?;
+        let (prior, stored_overlay) = store
+            .openapi_catalog_with_overlay(&connection_id)
+            .await
+            .map_err(|_| OpenApiCatalogError::StorageUnavailable)?;
+        validate_catalog_overlay_pair(prior.as_ref(), stored_overlay.as_ref())
+            .map_err(|_| OpenApiCatalogError::StorageUnavailable)?;
+        let overlay_document = decode_stored_overlay(stored_overlay.as_ref())?;
+        let selected_tool_names = normalize_registration_selection(
+            &generation,
+            selected_tool_names,
+            overlay_document.as_ref(),
+        )?;
+        let mut binding = bind_selected_tools(
             &generation,
             &connection_id,
             &record,
-            selected_tool_names,
+            &selected_tool_names,
             confirmations,
         )?;
+        if let Some(document) = overlay_document.as_ref() {
+            binding = overlay::compile(
+                &generation,
+                binding,
+                document,
+                &self.overlay_compile_context(
+                    &connection_id,
+                    prior.as_ref(),
+                    overlay_document.as_ref(),
+                ),
+            )
+            .map_err(|_| OpenApiCatalogError::InvalidSpec)?
+            .binding;
+        }
         self.publish_candidate(OpenApiPublishCandidate {
             record: &record,
             expected_spec_revision,
@@ -580,10 +1108,17 @@ impl OpenApiConnectionCatalogService {
             spec,
             digest: expected_spec_digest,
             binding,
+            overlay: None,
+            compiled_overlay_revision: stored_overlay
+                .as_ref()
+                .map_or(0, |stored| stored.overlay_revision),
+            policy_protected_names: Vec::new(),
             started: Instant::now(),
             actor,
         })
         .await
+        .map(|published| published.result)
+        .map_err(OpenApiPublishError::into_catalog)
     }
 
     pub async fn refresh(
@@ -608,10 +1143,14 @@ impl OpenApiConnectionCatalogService {
         // The store dispatch keeps standalone mode's SQLite query on the
         // blocking pool and awaits the authority in cluster mode; either
         // way the request executor stays free.
-        let prior = match store.openapi_catalog(&connection_id).await {
-            Ok(Some(prior)) => prior,
-            Ok(None) => return Err(OpenApiCatalogError::CatalogNotRegistered),
+        let (prior, stored_overlay) = match store.openapi_catalog_with_overlay(&connection_id).await
+        {
+            Ok(pair) => pair,
             Err(_) => return Err(OpenApiCatalogError::StorageUnavailable),
+        };
+        let prior = match prior {
+            Some(prior) => prior,
+            None => return Err(OpenApiCatalogError::CatalogNotRegistered),
         };
         let started = Instant::now();
         let spec = match &record.write.discovery {
@@ -649,8 +1188,34 @@ impl OpenApiConnectionCatalogService {
                     return Err(OpenApiCatalogError::InvalidSpec);
                 }
             };
+        if validate_catalog_overlay_pair(Some(&prior), stored_overlay.as_ref()).is_err() {
+            let error = OpenApiCatalogError::StorageUnavailable;
+            self.record_failed_status(
+                &connection_id,
+                &record.etag(),
+                Some(&prior),
+                error,
+                started.elapsed(),
+            )
+            .await;
+            return Err(error);
+        }
+        let overlay_document = match decode_stored_overlay(stored_overlay.as_ref()) {
+            Ok(document) => document,
+            Err(error) => {
+                self.record_failed_status(
+                    &connection_id,
+                    &record.etag(),
+                    Some(&prior),
+                    error,
+                    started.elapsed(),
+                )
+                .await;
+                return Err(error);
+            }
+        };
         let (selected_tool_names, confirmations) =
-            match surviving_refresh_selection(&prior, &generation) {
+            match surviving_refresh_selection(&prior, &generation, overlay_document.as_ref()) {
                 Ok(selection) => selection,
                 Err(error) => {
                     self.record_failed_status(
@@ -684,6 +1249,34 @@ impl OpenApiConnectionCatalogService {
                 return Err(error);
             }
         };
+        let binding = if let Some(document) = overlay_document.as_ref() {
+            match overlay::compile(
+                &generation,
+                binding,
+                document,
+                &self.overlay_compile_context(
+                    &connection_id,
+                    Some(&prior),
+                    overlay_document.as_ref(),
+                ),
+            ) {
+                Ok(compiled) => compiled.binding,
+                Err(_) => {
+                    let error = OpenApiCatalogError::InvalidSpec;
+                    self.record_failed_status(
+                        &connection_id,
+                        &record.etag(),
+                        Some(&prior),
+                        error,
+                        started.elapsed(),
+                    )
+                    .await;
+                    return Err(error);
+                }
+            }
+        } else {
+            binding
+        };
         let digest = spec_digest(&spec);
         let published = self
             .publish_candidate(OpenApiPublishCandidate {
@@ -693,13 +1286,19 @@ impl OpenApiConnectionCatalogService {
                 spec: &spec,
                 digest: &digest,
                 binding,
+                overlay: None,
+                compiled_overlay_revision: stored_overlay
+                    .as_ref()
+                    .map_or(0, |stored| stored.overlay_revision),
+                policy_protected_names: Vec::new(),
                 started,
                 actor,
             })
             .await;
         match published {
-            Ok(result) => Ok(result),
+            Ok(published) => Ok(published.result),
             Err(error) => {
+                let error = error.into_catalog();
                 self.record_failed_status(
                     &connection_id,
                     &record.etag(),
@@ -710,6 +1309,48 @@ impl OpenApiConnectionCatalogService {
                 .await;
                 Err(error)
             }
+        }
+    }
+
+    fn overlay_compile_context(
+        &self,
+        connection_id: &ConnectionId,
+        _stored_catalog: Option<&StoredOpenApiCatalog>,
+        stored_overlay: Option<&OverlayDocument>,
+    ) -> OverlayCompileContext {
+        let policy_tool_names = self
+            .rbac
+            .as_ref()
+            .map(|rbac| rbac.current_policy().tools.into_keys().collect())
+            .unwrap_or_default();
+        let other_lane_tool_names = self
+            .registry
+            .list()
+            .into_iter()
+            .filter(|definition| {
+                !matches!(
+                    &definition.source,
+                    ToolSource::OpenApi {
+                        connection_id: owner,
+                        ..
+                    } if owner == connection_id.as_str()
+                )
+            })
+            .map(|definition| definition.name.clone())
+            .collect();
+        let prior_overlay_name_owners = stored_overlay
+            .into_iter()
+            .flat_map(|overlay| overlay.tools.iter())
+            .filter_map(|(generated_name, tool)| {
+                tool.rename
+                    .as_ref()
+                    .map(|served_name| (served_name.clone(), generated_name.clone()))
+            })
+            .collect();
+        OverlayCompileContext {
+            policy_tool_names,
+            other_lane_tool_names,
+            prior_overlay_name_owners,
         }
     }
 
@@ -781,7 +1422,7 @@ impl OpenApiConnectionCatalogService {
     async fn publish_candidate(
         &self,
         candidate: OpenApiPublishCandidate<'_>,
-    ) -> Result<OpenApiCatalogPublishResult, OpenApiCatalogError> {
+    ) -> Result<OpenApiPublishedCatalog, OpenApiPublishError> {
         let OpenApiPublishCandidate {
             record,
             expected_spec_revision,
@@ -789,11 +1430,14 @@ impl OpenApiConnectionCatalogService {
             spec,
             digest,
             mut binding,
+            overlay,
+            compiled_overlay_revision,
+            policy_protected_names,
             started,
             actor,
         } = candidate;
         if !binding.incompatibilities.is_empty() {
-            return Err(OpenApiCatalogError::AuthenticationMismatch);
+            return Err(OpenApiCatalogError::AuthenticationMismatch.into());
         }
         let next_catalog_revision = expected_catalog_revision
             .checked_add(1)
@@ -803,7 +1447,7 @@ impl OpenApiConnectionCatalogService {
                 catalog_revision, ..
             } = &mut definition.source
             else {
-                return Err(OpenApiCatalogError::InvalidSpec);
+                return Err(OpenApiCatalogError::InvalidSpec.into());
             };
             *catalog_revision = Some(next_catalog_revision);
         }
@@ -849,7 +1493,7 @@ impl OpenApiConnectionCatalogService {
             .validate_openapi_connection_catalog(record.id.as_str(), &binding_definitions)
             .map_err(|_| OpenApiCatalogError::ToolConflict)?;
         let catalog = store
-            .replace_openapi_catalog(
+            .replace_openapi_catalog_with_overlay(
                 &record.id,
                 &expected_connection_etag,
                 expected_spec_revision,
@@ -857,27 +1501,39 @@ impl OpenApiConnectionCatalogService {
                 spec,
                 digest,
                 &entries,
+                overlay.as_ref(),
+                compiled_overlay_revision,
                 actor,
+                &policy_protected_names,
             )
             .await
-            .map_err(|error| openapi_store_error(&error))?;
-        // Publication is revision-monotonic: this publish holds the
-        // per-Connection lifecycle guard, but reconciliation may already
-        // have published a NEWER catalog another replica committed while
-        // this one was between its commit and here. Installing over it
-        // would roll the live lane back with no revision left to repair
-        // it; the committed catalog is durable at the authority.
-        if self
-            .runtime
-            .current_revision(&record.id)
-            .is_some_and(|live| live > catalog.catalog_revision)
-        {
+            .map_err(|error| publish_store_error(&record.id, &error))?;
+        // Catalog revisions reset when a Connection leaves and later
+        // re-enters managed OpenAPI. Order first by the monotonically
+        // increasing Connection generation, then by the exact observed
+        // ETag and catalog revision within that generation. Otherwise an
+        // old c1/r99 publisher can overwrite a current c3/r1 catalog on a
+        // replica that missed the intermediate removal callbacks.
+        let candidate_generation = (
+            record.revisions.connection,
+            catalog.observed_etag.as_str(),
+            catalog.catalog_revision,
+        );
+        if self.runtime.current_generation(&record.id).is_some_and(
+            |(live_connection_revision, live_etag, live_catalog_revision)| {
+                live_connection_revision > candidate_generation.0
+                    || (live_connection_revision == candidate_generation.0
+                        && live_etag == candidate_generation.1
+                        && live_catalog_revision > candidate_generation.2)
+            },
+        ) {
             tracing::info!(
                 connection_id = %record.id,
-                committed = catalog.catalog_revision,
-                "a newer OpenAPI catalog is already live on this replica; the committed one is durable and not installed"
+                connection_revision = record.revisions.connection,
+                catalog_revision = catalog.catalog_revision,
+                "a newer OpenAPI catalog generation is already live on this replica; the committed one is durable and not installed"
             );
-            return Err(OpenApiCatalogError::ToolConflict);
+            return Err(OpenApiCatalogError::ToolConflict.into());
         }
         // Registry first, runtime marker second. The marker is what
         // `reconcile_from_authority` compares against: publishing it before
@@ -899,10 +1555,13 @@ impl OpenApiConnectionCatalogService {
                 error = %error,
                 "OpenAPI catalog is durable but could not be installed into the tool registry; reconciliation will retry"
             );
-            return Err(OpenApiCatalogError::ToolConflict);
+            return Err(OpenApiCatalogError::ToolConflict.into());
         }
-        self.runtime
-            .publish_prevalidated(&catalog, definition_digests);
+        self.runtime.publish_prevalidated(
+            &catalog,
+            record.revisions.connection,
+            definition_digests,
+        );
         let status = {
             let latency = duration_millis(started.elapsed());
             match self
@@ -943,17 +1602,20 @@ impl OpenApiConnectionCatalogService {
             .iter()
             .map(|entry| entry.tool_name.clone())
             .collect::<Vec<_>>();
-        Ok(OpenApiCatalogPublishResult {
-            connection_id: record.id.clone(),
-            spec_digest: catalog.spec_digest.clone(),
-            spec_revision: catalog.spec_revision,
-            catalog_revision: catalog.catalog_revision,
-            status,
-            total_count: catalog.entries.len(),
-            registered_tool_names,
-            added_count: counts.0,
-            changed_count: counts.1,
-            removed_count: counts.2,
+        Ok(OpenApiPublishedCatalog {
+            result: OpenApiCatalogPublishResult {
+                connection_id: record.id.clone(),
+                spec_digest: catalog.spec_digest.clone(),
+                spec_revision: catalog.spec_revision,
+                catalog_revision: catalog.catalog_revision,
+                status,
+                total_count: catalog.entries.len(),
+                registered_tool_names,
+                added_count: counts.0,
+                changed_count: counts.1,
+                removed_count: counts.2,
+            },
+            catalog,
         })
     }
 
@@ -1098,6 +1760,140 @@ impl OpenApiConnectionCatalogService {
     }
 }
 
+fn validate_catalog_overlay_pairs(
+    catalogs: &[StoredOpenApiCatalog],
+    overlays: &[StoredOpenApiOverlay],
+) -> Result<(), ConnectionStoreError> {
+    let mut catalogs_by_id = BTreeMap::new();
+    for catalog in catalogs {
+        if catalogs_by_id
+            .insert(&catalog.connection_id, catalog)
+            .is_some()
+        {
+            return Err(ConnectionStoreError::CorruptRecord {
+                id: catalog.connection_id.to_string(),
+                reason: "duplicate stored OpenAPI catalog",
+            });
+        }
+    }
+    let mut overlays_by_id = BTreeMap::new();
+    for overlay in overlays {
+        if overlays_by_id
+            .insert(&overlay.connection_id, overlay)
+            .is_some()
+        {
+            return Err(ConnectionStoreError::CorruptRecord {
+                id: overlay.connection_id.to_string(),
+                reason: "duplicate stored OpenAPI overlay",
+            });
+        }
+    }
+    for (connection_id, catalog) in &catalogs_by_id {
+        validate_catalog_overlay_pair(Some(catalog), overlays_by_id.get(connection_id).copied())?;
+    }
+    for (connection_id, overlay) in overlays_by_id {
+        if !catalogs_by_id.contains_key(connection_id) {
+            validate_catalog_overlay_pair(None, Some(overlay))?;
+        }
+    }
+    Ok(())
+}
+
+fn validate_catalog_overlay_pair(
+    catalog: Option<&StoredOpenApiCatalog>,
+    overlay: Option<&StoredOpenApiOverlay>,
+) -> Result<(), ConnectionStoreError> {
+    if let Some(overlay) = overlay {
+        parse_stored_overlay(overlay)?;
+    }
+    match (catalog, overlay) {
+        (None, None) => Ok(()),
+        (None, Some(overlay)) => Err(ConnectionStoreError::CorruptRecord {
+            id: overlay.connection_id.to_string(),
+            reason: "stored OpenAPI overlay has no catalog",
+        }),
+        (Some(catalog), None) if catalog.overlay_revision == 0 => Ok(()),
+        (Some(catalog), None) => Err(ConnectionStoreError::CorruptRecord {
+            id: catalog.connection_id.to_string(),
+            reason: "OpenAPI catalog names a missing overlay revision",
+        }),
+        (Some(catalog), Some(overlay))
+            if catalog.connection_id == overlay.connection_id
+                && catalog.overlay_revision == overlay.overlay_revision =>
+        {
+            Ok(())
+        }
+        (Some(catalog), Some(_)) => Err(ConnectionStoreError::CorruptRecord {
+            id: catalog.connection_id.to_string(),
+            reason: "OpenAPI catalog and overlay revisions are inconsistent",
+        }),
+    }
+}
+
+fn parse_stored_overlay(
+    stored: &StoredOpenApiOverlay,
+) -> Result<OverlayDocument, ConnectionStoreError> {
+    if stored.schema_version != OVERLAY_SCHEMA_VERSION {
+        return Err(ConnectionStoreError::CorruptRecord {
+            id: stored.connection_id.to_string(),
+            reason: "stored OpenAPI overlay schema version is unsupported",
+        });
+    }
+    let value = serde_json::from_str::<Value>(&stored.overlay_json).map_err(|_| {
+        ConnectionStoreError::CorruptRecord {
+            id: stored.connection_id.to_string(),
+            reason: "stored OpenAPI overlay is not valid JSON",
+        }
+    })?;
+    let document = overlay::validate(&value).map_err(|_| ConnectionStoreError::CorruptRecord {
+        id: stored.connection_id.to_string(),
+        reason: "stored OpenAPI overlay fails validation",
+    })?;
+    if document.schema_version != stored.schema_version {
+        return Err(ConnectionStoreError::CorruptRecord {
+            id: stored.connection_id.to_string(),
+            reason: "stored OpenAPI overlay schema version is inconsistent",
+        });
+    }
+    Ok(document)
+}
+
+fn decode_stored_overlay(
+    stored: Option<&StoredOpenApiOverlay>,
+) -> Result<Option<OverlayDocument>, OpenApiCatalogError> {
+    stored
+        .map(parse_stored_overlay)
+        .transpose()
+        .map_err(|_| OpenApiCatalogError::StorageUnavailable)
+}
+
+fn require_overlay_precondition(
+    connection_id: &ConnectionId,
+    connection_revision: u64,
+    catalog_revision: u64,
+    stored: Option<&StoredOpenApiOverlay>,
+    expected: &str,
+) -> Result<u64, OpenApiOverlayOperationError> {
+    let revision = stored.map_or(0, |overlay| overlay.overlay_revision);
+    let current = OverlayEtag::for_revisions(
+        connection_id.as_str(),
+        connection_revision,
+        catalog_revision,
+        revision,
+    );
+    if expected != current.as_str() {
+        return Err(OpenApiOverlayOperationError::PreconditionFailed(current));
+    }
+    Ok(revision)
+}
+
+fn compiled_report(compiled: &CompiledCatalog) -> OpenApiOverlayCompileReport {
+    OpenApiOverlayCompileReport {
+        tools: compiled.tools.clone(),
+        warnings: compiled.warnings.clone(),
+    }
+}
+
 fn bind_selected_tools(
     generation: &OpenApiToolGeneration,
     connection_id: &ConnectionId,
@@ -1147,9 +1943,59 @@ fn bind_selected_tools(
     Ok(binding)
 }
 
+/// Preview exposes compiled (served) names, while OpenAPI binding and its
+/// security confirmations remain keyed by generated names. Accept either
+/// spelling at registration and collapse it to one generated identity. The
+/// stored overlay has already passed document validation, but keep the
+/// inverse construction defensive so corrupt or ambiguous aliases fail
+/// closed instead of selecting an arbitrary operation.
+fn normalize_registration_selection(
+    generation: &OpenApiToolGeneration,
+    selected_tool_names: &[String],
+    stored_overlay: Option<&OverlayDocument>,
+) -> Result<Vec<String>, OpenApiCatalogError> {
+    let generated_names = generation
+        .definitions
+        .iter()
+        .map(|definition| definition.name.as_str())
+        .collect::<BTreeSet<_>>();
+    let mut served_to_generated = BTreeMap::new();
+    for (generated_name, tool) in stored_overlay
+        .into_iter()
+        .flat_map(|document| document.tools.iter())
+    {
+        let Some(served_name) = tool.rename.as_deref() else {
+            continue;
+        };
+        if served_to_generated
+            .insert(served_name, generated_name.as_str())
+            .is_some()
+        {
+            return Err(OpenApiCatalogError::InvalidSelection);
+        }
+    }
+
+    let mut normalized = Vec::with_capacity(selected_tool_names.len());
+    let mut seen = BTreeSet::new();
+    for selected_name in selected_tool_names {
+        let generated = generated_names.contains(selected_name.as_str());
+        let renamed_owner = served_to_generated.get(selected_name.as_str()).copied();
+        if generated && renamed_owner.is_some() {
+            return Err(OpenApiCatalogError::InvalidSelection);
+        }
+        let normalized_name = renamed_owner.unwrap_or(selected_name.as_str()).to_owned();
+        if !seen.insert(normalized_name.clone()) {
+            return Err(OpenApiCatalogError::InvalidSelection);
+        }
+        normalized.push(normalized_name);
+    }
+    Ok(normalized)
+}
+
 fn surviving_refresh_selection(
     prior: &StoredOpenApiCatalog,
     generation: &OpenApiToolGeneration,
+    stored_overlay: Option<&OverlayDocument>,
 ) -> Result<(Vec<String>, Vec<OpenApiToolSecuritySelection>), OpenApiCatalogError> {
     let generated_definitions = generation
         .definitions
@@ -1168,16 +2014,37 @@ fn surviving_refresh_selection(
         .collect::<BTreeMap<_, _>>();
     let mut selected_tool_names = Vec::new();
     let mut confirmations = Vec::new();
+    let rename_inverse = stored_overlay
+        .into_iter()
+        .flat_map(|overlay| overlay.tools.iter())
+        .filter_map(|(generated, tool)| {
+            tool.rename
+                .as_deref()
+                .map(|served| (served, generated.as_str()))
+        })
+        .collect::<BTreeMap<_, _>>();
 
     for entry in &prior.entries {
-        let Some(candidate) = generated_definitions.get(entry.tool_name.as_str()) else {
+        let served_name = entry.tool_name.as_str();
+        let generated_name = rename_inverse
+            .get(served_name)
+            .copied()
+            .unwrap_or(served_name);
+        if stored_overlay
+            .and_then(|overlay| overlay.tools.get(generated_name))
+            .and_then(|tool| tool.rename.as_deref())
+            .is_some_and(|expected_served| expected_served != served_name)
+        {
+            return Err(OpenApiCatalogError::InvalidSpec);
+        }
+        let Some(candidate) = generated_definitions.get(generated_name) else {
             continue;
         };
         let security = generated_security
-            .get(entry.tool_name.as_str())
+            .get(generated_name)
             .ok_or(OpenApiCatalogError::InvalidSpec)?;
         let previous = prior_definitions
-            .get(entry.tool_name.as_str())
+            .get(served_name)
             .ok_or(OpenApiCatalogError::InvalidSpec)?;
         let candidate_path = normalize_origin_relative_path(
             "openapi.path_template",
@@ -1190,9 +2057,9 @@ fn surviving_refresh_selection(
         {
             return Err(OpenApiCatalogError::InvalidSelection);
         }
-        selected_tool_names.push(entry.tool_name.clone());
+        selected_tool_names.push(generated_name.to_owned());
         confirmations.push(OpenApiToolSecuritySelection {
-            tool_name: entry.tool_name.clone(),
+            tool_name: generated_name.to_owned(),
             selected_scheme_names: entry.selected_scheme_names.clone(),
         });
     }
@@ -1297,6 +2164,10 @@ fn active_catalog(
 ) -> Result<ActiveOpenApiCatalog, ConnectionStoreError> {
     let definitions = catalog_definitions(catalog)?;
     Ok(ActiveOpenApiCatalog {
+        connection_revision: connection_revision_from_etag(
+            &catalog.connection_id,
+            &catalog.observed_etag,
+        )?,
         observed_etag: catalog.observed_etag.to_string(),
         catalog_revision: catalog.catalog_revision,
         refreshed_at: catalog.refreshed_at.clone(),
@@ -1307,6 +2178,35 @@ fn active_catalog(
             })
             .collect::<Result<_, _>>()?,
     })
+}
+
+fn connection_revision_from_etag(
+    id: &ConnectionId,
+    etag: &ConnectionEtag,
+) -> Result<u64, ConnectionStoreError> {
+    let prefix = format!("\"connection:{}:c", id.as_str());
+    let invalid = || ConnectionStoreError::CorruptRecord {
+        id: id.to_string(),
+        reason: "stored OpenAPI catalog has a non-canonical Connection ETag",
+    };
+    let encoded = etag.as_str().strip_prefix(&prefix).ok_or_else(invalid)?;
+    let (connection, encoded) = encoded.split_once(":k").ok_or_else(invalid)?;
+    let (credential, encoded) = encoded.split_once(":t").ok_or_else(invalid)?;
+    let (tls, discovery) = encoded.split_once(":d").ok_or_else(invalid)?;
+    let discovery = discovery.strip_suffix('"').ok_or_else(invalid)?;
+    let connection = connection.parse::<u64>().map_err(|_| invalid())?;
+    let credential = credential.parse::<u64>().map_err(|_| invalid())?;
+    let tls = tls.parse::<u64>().map_err(|_| invalid())?;
+    let discovery = discovery.parse::<u64>().map_err(|_| invalid())?;
+    if etag.as_str()
+        != format!(
+            "\"connection:{}:c{connection}:k{credential}:t{tls}:d{discovery}\"",
+            id.as_str()
+        )
+    {
+        return Err(invalid());
+    }
+    Ok(connection)
 }
 
 fn definition_digest(definition: &ToolDefinition) -> Result<[u8; 32], ConnectionStoreError> {
@@ -1455,6 +2355,26 @@ fn openapi_store_error(error: &ConnectionStoreError) -> OpenApiCatalogError {
     }
 }
 
+fn publish_store_error(
+    connection_id: &ConnectionId,
+    error: &ConnectionStoreError,
+) -> OpenApiPublishError {
+    match error {
+        ConnectionStoreError::OverlayConflict {
+            current_connection_revision,
+            current_catalog_revision,
+            current_overlay_revision,
+            ..
+        } => OpenApiPublishError::OverlayPreconditionFailed(OverlayEtag::for_revisions(
+            connection_id.as_str(),
+            *current_connection_revision,
+            *current_catalog_revision,
+            *current_overlay_revision,
+        )),
+        _ => OpenApiPublishError::Catalog(openapi_store_error(error)),
+    }
+}
+
 fn tool_registry_store_error(error: ToolRegistryError) -> ConnectionStoreError {
     drop(error);
     ConnectionStoreError::Validation {
@@ -1487,10 +2407,12 @@ mod tests {
 
     use super::*;
     use crate::{
+        audit::{sink::tests::CaptureSink, AuditLog, AuditSink},
         config::Config,
         connections::model::ConnectionWrite,
         egress::{EgressClient, EgressConfig},
-        tools::definitions::{HttpToolMapping, ToolSource, ToolTarget},
+        rbac::policy::Policy,
+        tools::definitions::{HttpToolMapping, ToolSource, ToolTarget, ToolVisibility},
     };
 
     struct TemporaryDatabase(PathBuf);
@@ -1560,6 +2482,7 @@ mod tests {
                 catalog_revision: Some(catalog_revision),
             },
             upstream: mapping,
+            visibility: ToolVisibility::Listed,
         }
     }
 
@@ -1573,6 +2496,7 @@ mod tests {
             state: Arc::new(ArcSwap::from_pointee(BTreeMap::from([(
                 connection_id.clone(),
                 ActiveOpenApiCatalog {
+                    connection_revision: 1,
                     observed_etag: "\"connection:billing-api:c1:k1:t1:d1\"".to_owned(),
                     catalog_revision: 7,
                     refreshed_at: "2026-07-28T00:00:00Z".to_owned(),
@@ -1602,6 +2526,45 @@ mod tests {
         let mut tampered = definition;
         tampered.upstream.path_template = "/admin/invoices/{invoice_id}".to_owned();
         assert!(!runtime.definition_is_current(&tampered, "\"connection:billing-api:c1:k1:t1:d1\""));
+    }
+
+    #[test]
+    fn inactive_overlay_rename_retains_its_policy_ownership() {
+        let config = Config::test_defaults();
+        let control_plane =
+            ConnectionControlPlane::from_config(&config).expect("control plane should build");
+        let egress_config = EgressConfig::from_config(&config);
+        let egress_client =
+            Arc::new(EgressClient::new(egress_config.clone()).expect("egress should build"));
+        let policy = Policy::validate_json_value(json!({
+            "schema_version": "0.1.0",
+            "default_action": "deny",
+            "tools": {"read_invoice": {}}
+        }))
+        .expect("policy should validate");
+        let audit = AuditLog::new(Arc::new(CaptureSink::new()) as Arc<dyn AuditSink>);
+        let service = OpenApiConnectionCatalogService::load(
+            control_plane.clone(),
+            ConnectionHttpRuntime::new(control_plane, egress_config, egress_client),
+            ToolRegistry::disabled(),
+        )
+        .expect("service should load")
+        .with_rbac_state(Some(RbacState::new(policy, Vec::new(), false, audit)));
+        let connection_id =
+            ConnectionId::parse("inactive-api").expect("fixture Connection ID should validate");
+        let document = overlay::validate(&json!({
+            "schema_version": "0.1.0",
+            "tools": {"get_invoice": {"rename": "read_invoice"}}
+        }))
+        .expect("stored overlay should validate");
+
+        let context = service.overlay_compile_context(&connection_id, None, Some(&document));
+        assert_eq!(
+            context.prior_overlay_name_owners,
+            BTreeMap::from([("read_invoice".to_owned(), "get_invoice".to_owned())]),
+            "ownership comes from the durable overlay even while its tool is deselected"
+        );
+        assert!(context.policy_tool_names.contains("read_invoice"));
     }
 
     #[test]
@@ -1961,6 +2924,24 @@ paths:
             }),
             "the local lane keeps the name it took"
         );
+        service
+            .reconcile_from_authority()
+            .await
+            .expect("the atomic authority snapshot should repair the failed local install");
+        assert_eq!(service.runtime().current_revision(&record.id), Some(1));
+        assert!(
+            registry
+                .get("get_invoice")
+                .is_some_and(|definition| matches!(
+                    &definition.source,
+                    crate::tools::definitions::ToolSource::OpenApi {
+                        connection_id,
+                        catalog_revision: Some(1),
+                        ..
+                    } if connection_id == record.id.as_str()
+                )),
+            "reconciliation installs the durable authoritative catalog"
+        );
     }
 
     #[tokio::test]
@@ -2007,6 +2988,16 @@ paths:
             registry.clone(),
         )
         .expect("managed OpenAPI service should load");
+        let (absent_document, unregistered_etag, applied_catalog_revision) = service
+            .openapi_overlay(record.id.as_str())
+            .await
+            .expect("overlay GET should represent an unregistered catalog");
+        assert!(absent_document.is_none());
+        assert_eq!(
+            unregistered_etag,
+            OverlayEtag::for_revisions(record.id.as_str(), record.revisions.connection, 0, 0,)
+        );
+        assert_eq!(applied_catalog_revision, None);
         let spec = r#"
 openapi: 3.0.3
 info:
@@ -2199,6 +3190,1068 @@ paths:
     }
 
     #[tokio::test]
+    async fn overlay_put_delete_and_restart_keep_document_and_compiled_catalog_paired() {
+        let database = TemporaryDatabase::new();
+        let mut config = Config::test_defaults();
+        config.connections_sqlite_path = Some(database.0.display().to_string());
+        let control_plane =
+            ConnectionControlPlane::from_config(&config).expect("control plane should build");
+        let candidate: ConnectionWrite = serde_json::from_value(json!({
+            "display_name": "Overlaid Billing OpenAPI",
+            "enabled": true,
+            "kind": "http_api",
+            "endpoint": {
+                "base_url": "https://billing.example.test",
+                "base_path": "/v1"
+            },
+            "authentication": {"type": "none"},
+            "tls": {},
+            "timeouts": {
+                "connect_timeout_ms": 1000,
+                "request_timeout_ms": 3000,
+                "response_idle_timeout_ms": 1000
+            },
+            "discovery": {
+                "type": "managed_openapi",
+                "use_connection_authentication": false
+            }
+        }))
+        .expect("managed OpenAPI Connection should deserialize");
+        let record = control_plane
+            .create_managed(
+                control_plane.runtime_snapshot().collection_etag(),
+                candidate,
+                "test-admin",
+            )
+            .await
+            .expect("managed OpenAPI Connection should create");
+        let egress_config = EgressConfig::from_config(&config);
+        let egress_client =
+            Arc::new(EgressClient::new(egress_config.clone()).expect("egress should build"));
+        let http = ConnectionHttpRuntime::new(control_plane.clone(), egress_config, egress_client);
+        let registry = ToolRegistry::disabled();
+        let service = OpenApiConnectionCatalogService::load(
+            control_plane.clone(),
+            http.clone(),
+            registry.clone(),
+        )
+        .expect("managed OpenAPI service should load");
+        let spec = r#"
+openapi: 3.0.3
+info: {title: Billing, version: 1.0.0}
+paths:
+  /invoices/{invoice_id}:
+    get:
+      operationId: get_invoice
+      summary: Read one invoice
+      parameters:
+        - in: path
+          name: invoice_id
+          required: true
+          schema: {type: string}
+"#;
+        let preview = service
+            .preview(record.id.as_str(), spec)
+            .await
+            .expect("initial spec should preview");
+        let selected = preview
+            .generation
+            .definitions
+            .iter()
+            .map(|definition| definition.name.clone())
+            .collect::<Vec<_>>();
+        service
+            .register(
+                record.id.as_str(),
+                record.etag().as_str(),
+                preview.spec_revision,
+                preview.catalog_revision,
+                &preview.spec_digest,
+                spec,
+                &selected,
+                &preview.registration_security_selections,
+                "test-admin",
+            )
+            .await
+            .expect("initial catalog should publish");
+
+        let document = json!({
+            "schema_version": "0.1.0",
+            "tools": {
+                "get_invoice": {
+                    "rename": "read_invoice",
+                    "description": "Read a billing invoice safely"
+                }
+            }
+        });
+        let initial_store = control_plane
+            .managed_store()
+            .expect("managed store should exist");
+        let (initial_catalog, initial_overlay) = initial_store
+            .openapi_catalog_with_overlay(&record.id)
+            .await
+            .expect("catalog/overlay pair should read atomically");
+        let initial_catalog = initial_catalog.expect("registered catalog should exist");
+        assert_eq!(initial_catalog.overlay_revision, 0);
+        assert!(initial_overlay.is_none());
+        validate_catalog_overlay_pair(Some(&initial_catalog), initial_overlay.as_ref())
+            .expect("initial bare catalog should be a valid o0 pair");
+        let candidate_preview = service
+            .preview_with_overlay(record.id.as_str(), spec, Some(&document))
+            .await
+            .expect("candidate overlay should compile without being stored");
+        assert_eq!(
+            candidate_preview.binding.definitions[0].name,
+            "read_invoice"
+        );
+        assert_eq!(
+            candidate_preview.registration_security_selections[0].tool_name,
+            "get_invoice"
+        );
+        assert!(control_plane
+            .managed_store()
+            .expect("managed store should exist")
+            .openapi_overlay(&record.id)
+            .await
+            .expect("overlay read should succeed")
+            .is_none());
+        let stale = service
+            .put_overlay(
+                record.id.as_str(),
+                &format!(
+                    "\"overlay:{}:c{}:r1:o9\"",
+                    record.id, record.revisions.connection
+                ),
+                &document,
+                "test-admin",
+            )
+            .await
+            .expect_err("a stale overlay ETag must be refused");
+        match stale {
+            OpenApiOverlayOperationError::PreconditionFailed(current) => {
+                assert_eq!(
+                    current,
+                    OverlayEtag::for_revisions(
+                        record.id.as_str(),
+                        record.revisions.connection,
+                        1,
+                        0,
+                    )
+                )
+            }
+            other => panic!("unexpected stale overlay error: {other:?}"),
+        }
+
+        let put = service
+            .put_overlay(
+                record.id.as_str(),
+                &OverlayEtag::for_revisions(record.id.as_str(), record.revisions.connection, 1, 0)
+                    .to_string(),
+                &document,
+                "test-admin",
+            )
+            .await
+            .expect("valid overlay should atomically publish");
+        assert_eq!(put.catalog.catalog_revision, 2);
+        let first_put_etag = put.etag.clone();
+        assert_eq!(
+            first_put_etag,
+            OverlayEtag::for_revisions(record.id.as_str(), record.revisions.connection, 2, 1,)
+        );
+        let stored_overlay = put.stored.expect("PUT should return the stored document");
+        assert_eq!(stored_overlay.overlay_revision, 1);
+        assert_eq!(
+            put.report
+                .expect("PUT should report its compile")
+                .tools
+                .len(),
+            1
+        );
+        assert!(registry.get("get_invoice").is_none());
+        let served = registry
+            .get("read_invoice")
+            .expect("renamed definition should be live");
+        assert_eq!(served.description, "Read a billing invoice safely");
+
+        let store = control_plane
+            .managed_store()
+            .expect("managed store should exist");
+        let (durable_catalog, durable_overlay) = store
+            .openapi_catalog_with_overlay(&record.id)
+            .await
+            .expect("durable catalog/overlay pair should read atomically");
+        let durable_catalog = durable_catalog.expect("catalog should exist");
+        let durable_overlay = durable_overlay.expect("overlay should exist");
+        assert_eq!(durable_catalog.overlay_revision, 1);
+        assert_eq!(durable_overlay.overlay_revision, 1);
+        let (read_overlay, read_etag, applied_catalog_revision) = service
+            .openapi_overlay(record.id.as_str())
+            .await
+            .expect("overlay GET service should read the paired state");
+        assert_eq!(read_overlay, Some(durable_overlay.clone()));
+        assert_eq!(read_etag, first_put_etag);
+        assert_eq!(applied_catalog_revision, Some(2));
+
+        let overlaid_preview = service
+            .preview(record.id.as_str(), spec)
+            .await
+            .expect("stored overlay should compile in preview");
+        assert_eq!(overlaid_preview.binding.definitions[0].name, "read_invoice");
+        assert_eq!(
+            overlaid_preview.registration_security_selections[0].tool_name, "get_invoice",
+            "registration confirmations remain keyed by generated name"
+        );
+
+        let restarted_registry = ToolRegistry::disabled();
+        let restarted = OpenApiConnectionCatalogService::load(
+            control_plane.clone(),
+            http,
+            restarted_registry.clone(),
+        )
+        .expect("paired overlay catalog should replay after restart");
+        assert!(restarted_registry.get("read_invoice").is_some());
+        assert!(restarted
+            .runtime()
+            .definition_is_current(&served, record.etag().as_str()));
+
+        let deleted = service
+            .delete_overlay(record.id.as_str(), first_put_etag.as_str(), "test-admin")
+            .await
+            .expect("overlay DELETE should atomically publish the bare catalog");
+        let delete_etag = deleted.etag.clone();
+        assert!(deleted.stored.is_none());
+        assert_eq!(deleted.catalog.catalog_revision, 3);
+        assert_eq!(
+            delete_etag,
+            OverlayEtag::for_revisions(record.id.as_str(), record.revisions.connection, 3, 0,)
+        );
+        assert!(registry.get("read_invoice").is_none());
+        assert!(registry.get("get_invoice").is_some());
+        let (bare_catalog, absent_overlay) = store
+            .openapi_catalog_with_overlay(&record.id)
+            .await
+            .expect("bare catalog/overlay pair should read atomically");
+        assert!(absent_overlay.is_none());
+        assert_eq!(
+            bare_catalog.expect("catalog should exist").overlay_revision,
+            0
+        );
+        let (read_overlay, read_etag, applied_catalog_revision) = service
+            .openapi_overlay(record.id.as_str())
+            .await
+            .expect("overlay GET should expose the compiled bare catalog");
+        assert!(read_overlay.is_none());
+        assert_eq!(read_etag, delete_etag);
+        assert_eq!(applied_catalog_revision, Some(3));
+
+        let recreated = service
+            .put_overlay(
+                record.id.as_str(),
+                delete_etag.as_str(),
+                &document,
+                "test-admin",
+            )
+            .await
+            .expect("overlay should recreate after deletion");
+        let recreated_etag = recreated.etag.clone();
+        assert_eq!(recreated.catalog.catalog_revision, 4);
+        assert_eq!(
+            recreated_etag,
+            OverlayEtag::for_revisions(record.id.as_str(), record.revisions.connection, 4, 1,)
+        );
+        assert_eq!(
+            recreated
+                .stored
+                .as_ref()
+                .expect("recreated document should be returned")
+                .overlay_revision,
+            1,
+            "the document revision may repeat after deletion"
+        );
+
+        let aba_rejected = service
+            .put_overlay(
+                record.id.as_str(),
+                first_put_etag.as_str(),
+                &document,
+                "test-admin",
+            )
+            .await
+            .expect_err("a pre-delete ETag must not match the recreated overlay");
+        assert!(matches!(
+            aba_rejected,
+            OpenApiOverlayOperationError::PreconditionFailed(ref current)
+                if current == &recreated_etag
+        ));
+
+        let registration_preview = service
+            .preview(record.id.as_str(), spec)
+            .await
+            .expect("the recreated overlay should preview for registration");
+        let served_selection = registration_preview
+            .binding
+            .definitions
+            .iter()
+            .map(|definition| definition.name.clone())
+            .collect::<Vec<_>>();
+        assert_eq!(served_selection, vec!["read_invoice"]);
+        assert_eq!(
+            registration_preview.registration_security_selections[0].tool_name,
+            "get_invoice"
+        );
+        let alias_mix = service
+            .register(
+                record.id.as_str(),
+                record.etag().as_str(),
+                registration_preview.spec_revision,
+                registration_preview.catalog_revision,
+                &registration_preview.spec_digest,
+                spec,
+                &["get_invoice".to_owned(), "read_invoice".to_owned()],
+                &registration_preview.registration_security_selections,
+                "test-admin",
+            )
+            .await;
+        assert_eq!(
+            alias_mix,
+            Err(OpenApiCatalogError::InvalidSelection),
+            "generated and served aliases must not select one operation twice"
+        );
+        let reregistered = service
+            .register(
+                record.id.as_str(),
+                record.etag().as_str(),
+                registration_preview.spec_revision,
+                registration_preview.catalog_revision,
+                &registration_preview.spec_digest,
+                spec,
+                &served_selection,
+                &registration_preview.registration_security_selections,
+                "test-admin",
+            )
+            .await
+            .expect("served preview names should round-trip through registration");
+        assert_eq!(reregistered.catalog_revision, 5);
+        assert_eq!(reregistered.registered_tool_names, vec!["read_invoice"]);
+    }
+
+    #[tokio::test]
+    async fn current_overlay_etag_cannot_mutate_a_catalog_from_an_older_connection_generation() {
+        let database = TemporaryDatabase::new();
+        let mut config = Config::test_defaults();
+        config.connections_sqlite_path = Some(database.0.display().to_string());
+        let control_plane =
+            ConnectionControlPlane::from_config(&config).expect("control plane should build");
+        let candidate: ConnectionWrite = serde_json::from_value(json!({
+            "display_name": "Generation-stale overlay",
+            "enabled": true,
+            "kind": "http_api",
+            "endpoint": {
+                "base_url": "https://billing.example.test",
+                "base_path": "/v1"
+            },
+            "authentication": {"type": "none"},
+            "tls": {},
+            "timeouts": {
+                "connect_timeout_ms": 1000,
+                "request_timeout_ms": 3000,
+                "response_idle_timeout_ms": 1000
+            },
+            "discovery": {
+                "type": "managed_openapi",
+                "use_connection_authentication": false
+            }
+        }))
+        .expect("managed OpenAPI Connection should deserialize");
+        let record = control_plane
+            .create_managed(
+                control_plane.runtime_snapshot().collection_etag(),
+                candidate,
+                "test-admin",
+            )
+            .await
+            .expect("managed OpenAPI Connection should create");
+        let egress_config = EgressConfig::from_config(&config);
+        let egress_client =
+            Arc::new(EgressClient::new(egress_config.clone()).expect("egress should build"));
+        let registry = ToolRegistry::disabled();
+        let service = OpenApiConnectionCatalogService::load(
+            control_plane.clone(),
+            ConnectionHttpRuntime::new(control_plane.clone(), egress_config, egress_client),
+            registry.clone(),
+        )
+        .expect("managed OpenAPI service should load");
+        let spec = r#"
+openapi: 3.0.3
+info: {title: Billing, version: 1.0.0}
+paths:
+  /invoices/{invoice_id}:
+    get:
+      operationId: get_invoice
+      parameters:
+        - in: path
+          name: invoice_id
+          required: true
+          schema: {type: string}
+"#;
+        let preview = service
+            .preview(record.id.as_str(), spec)
+            .await
+            .expect("spec should preview");
+        service
+            .register(
+                record.id.as_str(),
+                record.etag().as_str(),
+                preview.spec_revision,
+                preview.catalog_revision,
+                &preview.spec_digest,
+                spec,
+                &["get_invoice".to_owned()],
+                &preview.registration_security_selections,
+                "test-admin",
+            )
+            .await
+            .expect("nonempty catalog should register");
+        let document = json!({
+            "schema_version": "0.1.0",
+            "tools": {
+                "get_invoice": {
+                    "rename": "read_invoice",
+                    "description": "Read an invoice from the generation that compiled this tool"
+                }
+            }
+        });
+        let put = service
+            .put_overlay(
+                record.id.as_str(),
+                OverlayEtag::for_revisions(record.id.as_str(), record.revisions.connection, 1, 0)
+                    .as_str(),
+                &document,
+                "test-admin",
+            )
+            .await
+            .expect("overlay should publish against the current catalog");
+        let held_definition = registry
+            .get("read_invoice")
+            .expect("the overlaid definition should be live");
+        assert!(service
+            .runtime()
+            .definition_is_current(&held_definition, record.etag().as_str()));
+        let durable_before = control_plane
+            .managed_store()
+            .expect("managed store should exist")
+            .openapi_catalog_with_overlay(&record.id)
+            .await
+            .expect("catalog/overlay pair should read atomically");
+        assert!(durable_before.0.is_some());
+        assert!(durable_before.1.is_some());
+
+        let mut endpoint_edit = record.write.clone();
+        endpoint_edit.endpoint.base_url = "https://replacement.example.test".to_owned();
+        let updated = control_plane
+            .replace_managed(&record.id, &record.etag(), endpoint_edit, "test-admin")
+            .await
+            .expect("a compatible endpoint edit should preserve the durable catalog");
+        assert!(updated.revisions.connection > record.revisions.connection);
+        assert!(!service
+            .runtime()
+            .definition_is_current(&held_definition, updated.etag().as_str()));
+
+        let (stored, current_etag, applied_catalog_revision) = service
+            .openapi_overlay(updated.id.as_str())
+            .await
+            .expect("overlay GET should expose the current Connection generation");
+        assert_eq!(stored, durable_before.1);
+        assert_eq!(applied_catalog_revision, Some(put.catalog.catalog_revision));
+        assert_eq!(
+            current_etag,
+            OverlayEtag::for_revisions(
+                updated.id.as_str(),
+                updated.revisions.connection,
+                put.catalog.catalog_revision,
+                1,
+            ),
+            "the read token must carry the current cN even though the catalog observed the prior one"
+        );
+
+        let rejected_put = service
+            .put_overlay(
+                updated.id.as_str(),
+                current_etag.as_str(),
+                &document,
+                "test-admin",
+            )
+            .await
+            .expect_err("PUT must not compile an old catalog under a current-generation token");
+        assert!(matches!(
+            rejected_put,
+            OpenApiOverlayOperationError::Catalog(OpenApiCatalogError::StalePreview)
+        ));
+        let rejected_delete = service
+            .delete_overlay(updated.id.as_str(), current_etag.as_str(), "test-admin")
+            .await
+            .expect_err("DELETE must not compile an old catalog under a current-generation token");
+        assert!(matches!(
+            rejected_delete,
+            OpenApiOverlayOperationError::Catalog(OpenApiCatalogError::StalePreview)
+        ));
+
+        let durable_after = control_plane
+            .managed_store()
+            .expect("managed store should exist")
+            .openapi_catalog_with_overlay(&record.id)
+            .await
+            .expect("catalog/overlay pair should remain readable");
+        assert_eq!(
+            durable_after, durable_before,
+            "rejected mutations must leave every durable catalog and overlay byte unchanged"
+        );
+
+        let restarted_registry = ToolRegistry::disabled();
+        let restarted_egress = EgressConfig::from_config(&config);
+        let restarted_client = Arc::new(
+            EgressClient::new(restarted_egress.clone()).expect("restart egress should build"),
+        );
+        let restarted = OpenApiConnectionCatalogService::load(
+            control_plane.clone(),
+            ConnectionHttpRuntime::new(control_plane, restarted_egress, restarted_client),
+            restarted_registry.clone(),
+        )
+        .expect("a stale durable pair is filtered rather than replayed");
+        assert_eq!(restarted.runtime().current_revision(&updated.id), None);
+        assert!(restarted_registry.get("read_invoice").is_none());
+    }
+
+    #[tokio::test]
+    async fn overlay_etag_rejects_a_previous_connection_generation_after_kind_round_trip() {
+        let database = TemporaryDatabase::new();
+        let mut config = Config::test_defaults();
+        config.connections_sqlite_path = Some(database.0.display().to_string());
+        let control_plane =
+            ConnectionControlPlane::from_config(&config).expect("control plane should build");
+        let openapi_write: ConnectionWrite = serde_json::from_value(json!({
+            "display_name": "Generation-bound OpenAPI",
+            "enabled": true,
+            "kind": "http_api",
+            "endpoint": {
+                "base_url": "https://billing.example.test",
+                "base_path": "/v1"
+            },
+            "authentication": {"type": "none"},
+            "tls": {},
+            "timeouts": {
+                "connect_timeout_ms": 1000,
+                "request_timeout_ms": 3000,
+                "response_idle_timeout_ms": 1000
+            },
+            "discovery": {
+                "type": "managed_openapi",
+                "use_connection_authentication": false
+            }
+        }))
+        .expect("managed OpenAPI Connection should deserialize");
+        let record = control_plane
+            .create_managed(
+                control_plane.runtime_snapshot().collection_etag(),
+                openapi_write.clone(),
+                "test-admin",
+            )
+            .await
+            .expect("managed OpenAPI Connection should create");
+        let egress_config = EgressConfig::from_config(&config);
+        let egress_client =
+            Arc::new(EgressClient::new(egress_config.clone()).expect("egress should build"));
+        let service = OpenApiConnectionCatalogService::load(
+            control_plane.clone(),
+            ConnectionHttpRuntime::new(control_plane.clone(), egress_config, egress_client),
+            ToolRegistry::disabled(),
+        )
+        .expect("managed OpenAPI service should load");
+        let spec = r#"
+openapi: 3.0.3
+info: {title: Billing, version: 1.0.0}
+paths:
+  /invoices:
+    get: {operationId: get_invoice}
+"#;
+        let document = json!({
+            "schema_version": "0.1.0",
+            "tools": {"get_invoice": {"rename": "read_invoice"}}
+        });
+
+        let preview = service
+            .preview(record.id.as_str(), spec)
+            .await
+            .expect("initial spec should preview");
+        service
+            .register(
+                record.id.as_str(),
+                record.etag().as_str(),
+                preview.spec_revision,
+                preview.catalog_revision,
+                &preview.spec_digest,
+                spec,
+                &[],
+                &[],
+                "test-admin",
+            )
+            .await
+            .expect("empty catalog should register");
+        let first = service
+            .put_overlay(
+                record.id.as_str(),
+                OverlayEtag::for_revisions(record.id.as_str(), record.revisions.connection, 1, 0)
+                    .as_str(),
+                &document,
+                "test-admin",
+            )
+            .await
+            .expect("first-generation overlay should publish");
+        let old_etag = first.etag;
+        assert_eq!(
+            old_etag,
+            OverlayEtag::for_revisions(record.id.as_str(), record.revisions.connection, 2, 1,)
+        );
+
+        let mcp_write: ConnectionWrite = serde_json::from_value(json!({
+            "display_name": "Generation-bound OpenAPI",
+            "enabled": true,
+            "kind": "mcp_streamable_http",
+            "endpoint": {
+                "base_url": "https://billing.example.test",
+                "base_path": "/mcp"
+            },
+            "authentication": {"type": "none"},
+            "tls": {},
+            "discovery": {
+                "type": "managed_mcp",
+                "use_connection_authentication": false
+            }
+        }))
+        .expect("managed MCP replacement should deserialize");
+        let converted = control_plane
+            .replace_managed(&record.id, &record.etag(), mcp_write, "test-admin")
+            .await
+            .expect("an empty catalog should permit a supported cross-kind replacement");
+        service.reconcile_connection(&converted);
+        assert_eq!(service.runtime().current_revision(&record.id), None);
+        let (removed_catalog, removed_overlay) = control_plane
+            .managed_store()
+            .expect("managed store should exist")
+            .openapi_catalog_with_overlay(&record.id)
+            .await
+            .expect("removed catalog/overlay pair should read atomically");
+        assert!(removed_catalog.is_none());
+        assert!(removed_overlay.is_none());
+
+        let restored = control_plane
+            .replace_managed(&record.id, &converted.etag(), openapi_write, "test-admin")
+            .await
+            .expect("Connection should convert back to managed OpenAPI");
+        assert!(restored.revisions.connection > record.revisions.connection);
+        let preview = service
+            .preview(restored.id.as_str(), spec)
+            .await
+            .expect("restored OpenAPI Connection should preview");
+        service
+            .register(
+                restored.id.as_str(),
+                restored.etag().as_str(),
+                preview.spec_revision,
+                preview.catalog_revision,
+                &preview.spec_digest,
+                spec,
+                &[],
+                &[],
+                "test-admin",
+            )
+            .await
+            .expect("restored empty catalog should register from revision zero");
+        let recreated = service
+            .put_overlay(
+                restored.id.as_str(),
+                OverlayEtag::for_revisions(
+                    restored.id.as_str(),
+                    restored.revisions.connection,
+                    1,
+                    0,
+                )
+                .as_str(),
+                &document,
+                "test-admin",
+            )
+            .await
+            .expect("restored overlay should reuse catalog/document revisions safely");
+        let current_etag = recreated.etag;
+        assert_eq!(
+            current_etag,
+            OverlayEtag::for_revisions(restored.id.as_str(), restored.revisions.connection, 2, 1,)
+        );
+        assert_ne!(old_etag, current_etag);
+
+        let stale = service
+            .put_overlay(
+                restored.id.as_str(),
+                old_etag.as_str(),
+                &document,
+                "test-admin",
+            )
+            .await
+            .expect_err("an ETag from the previous Connection generation must be refused");
+        assert!(matches!(
+            stale,
+            OpenApiOverlayOperationError::PreconditionFailed(ref current)
+                if current == &current_etag
+        ));
+    }
+
+    #[tokio::test]
+    async fn reconciliation_replaces_an_equal_catalog_revision_from_an_older_connection_generation()
+    {
+        let database = TemporaryDatabase::new();
+        let mut config = Config::test_defaults();
+        config.connections_sqlite_path = Some(database.0.display().to_string());
+        let replica_a =
+            ConnectionControlPlane::from_config(&config).expect("replica A should build");
+        let openapi_write: ConnectionWrite = serde_json::from_value(json!({
+            "display_name": "Replica generation ordering",
+            "enabled": true,
+            "kind": "http_api",
+            "endpoint": {
+                "base_url": "https://billing.example.test",
+                "base_path": "/v1"
+            },
+            "authentication": {"type": "none"},
+            "tls": {},
+            "timeouts": {
+                "connect_timeout_ms": 1000,
+                "request_timeout_ms": 3000,
+                "response_idle_timeout_ms": 1000
+            },
+            "discovery": {
+                "type": "managed_openapi",
+                "use_connection_authentication": false
+            }
+        }))
+        .expect("managed OpenAPI Connection should deserialize");
+        let original = replica_a
+            .create_managed(
+                replica_a.runtime_snapshot().collection_etag(),
+                openapi_write.clone(),
+                "replica-a",
+            )
+            .await
+            .expect("managed OpenAPI Connection should create");
+        let egress_config_a = EgressConfig::from_config(&config);
+        let egress_client_a = Arc::new(
+            EgressClient::new(egress_config_a.clone()).expect("replica A egress should build"),
+        );
+        let registry_a = ToolRegistry::disabled();
+        let service_a = OpenApiConnectionCatalogService::load(
+            replica_a.clone(),
+            ConnectionHttpRuntime::new(replica_a.clone(), egress_config_a, egress_client_a),
+            registry_a.clone(),
+        )
+        .expect("replica A OpenAPI service should load");
+        let spec = r#"
+openapi: 3.0.3
+info: {title: Billing, version: 1.0.0}
+paths:
+  /invoices:
+    get: {operationId: get_invoice}
+"#;
+        let original_preview = service_a
+            .preview(original.id.as_str(), spec)
+            .await
+            .expect("original catalog should preview");
+        service_a
+            .register(
+                original.id.as_str(),
+                original.etag().as_str(),
+                original_preview.spec_revision,
+                original_preview.catalog_revision,
+                &original_preview.spec_digest,
+                spec,
+                &[],
+                &[],
+                "replica-a",
+            )
+            .await
+            .expect("replica A should publish an empty c1/r1 catalog");
+        assert_eq!(
+            service_a.runtime().current_generation(&original.id),
+            Some((
+                original.revisions.connection,
+                original.etag().to_string(),
+                1,
+            ))
+        );
+        assert!(registry_a.get("get_invoice").is_none());
+
+        // Replica B shares the authority but has independent Connection and
+        // catalog runtimes. Replica A deliberately receives neither kind
+        // transition callback below.
+        let replica_b =
+            ConnectionControlPlane::from_config(&config).expect("replica B should build");
+        let mcp_write: ConnectionWrite = serde_json::from_value(json!({
+            "display_name": "Replica generation ordering",
+            "enabled": true,
+            "kind": "mcp_streamable_http",
+            "endpoint": {
+                "base_url": "https://billing.example.test",
+                "base_path": "/mcp"
+            },
+            "authentication": {"type": "none"},
+            "tls": {},
+            "discovery": {
+                "type": "managed_mcp",
+                "use_connection_authentication": false
+            }
+        }))
+        .expect("managed MCP replacement should deserialize");
+        let converted = replica_b
+            .replace_managed(&original.id, &original.etag(), mcp_write, "replica-b")
+            .await
+            .expect("an empty OpenAPI catalog should allow conversion to MCP");
+        let restored = replica_b
+            .replace_managed(&original.id, &converted.etag(), openapi_write, "replica-b")
+            .await
+            .expect("the Connection should convert back to OpenAPI");
+        assert!(restored.revisions.connection > original.revisions.connection);
+
+        let egress_config_b = EgressConfig::from_config(&config);
+        let egress_client_b = Arc::new(
+            EgressClient::new(egress_config_b.clone()).expect("replica B egress should build"),
+        );
+        let service_b = OpenApiConnectionCatalogService::load(
+            replica_b.clone(),
+            ConnectionHttpRuntime::new(replica_b.clone(), egress_config_b, egress_client_b),
+            ToolRegistry::disabled(),
+        )
+        .expect("replica B OpenAPI service should load after restoration");
+        let restored_preview = service_b
+            .preview(restored.id.as_str(), spec)
+            .await
+            .expect("restored catalog should preview from revision zero");
+        assert_eq!(restored_preview.catalog_revision, 0);
+        service_b
+            .register(
+                restored.id.as_str(),
+                restored.etag().as_str(),
+                restored_preview.spec_revision,
+                restored_preview.catalog_revision,
+                &restored_preview.spec_digest,
+                spec,
+                &["get_invoice".to_owned()],
+                &restored_preview.registration_security_selections,
+                "replica-b",
+            )
+            .await
+            .expect("replica B should publish a nonempty c3/r1 catalog");
+        let authoritative_catalog = replica_b
+            .managed_store()
+            .expect("managed store should exist")
+            .openapi_catalog(&restored.id)
+            .await
+            .expect("authoritative catalog should read")
+            .expect("authoritative catalog should exist");
+        assert_eq!(authoritative_catalog.catalog_revision, 1);
+        assert_eq!(authoritative_catalog.observed_etag, restored.etag());
+
+        assert_eq!(
+            service_a.runtime().current_generation(&original.id),
+            Some((
+                original.revisions.connection,
+                original.etag().to_string(),
+                1,
+            )),
+            "replica A intentionally missed both removal callbacks"
+        );
+        let authoritative_records = replica_a
+            .managed_store()
+            .expect("managed store should exist")
+            .list()
+            .await
+            .expect("replica A should read the shared authority");
+        replica_a
+            .publish_authoritative_records(authoritative_records)
+            .await
+            .expect("replica A should publish the c3 Connection snapshot");
+        assert_eq!(
+            service_a.runtime().current_generation(&original.id),
+            Some((
+                original.revisions.connection,
+                original.etag().to_string(),
+                1,
+            )),
+            "publishing Connection records alone must not forge a catalog callback"
+        );
+
+        service_a
+            .reconcile_from_authority()
+            .await
+            .expect("catalog reconciliation should prefer c3/r1 over c1/r1");
+        assert_eq!(
+            service_a.runtime().current_generation(&restored.id),
+            Some((
+                restored.revisions.connection,
+                restored.etag().to_string(),
+                1,
+            ))
+        );
+        let reconciled_definition = registry_a
+            .get("get_invoice")
+            .expect("replica A should serve the c3/r1 definition");
+        assert!(service_a
+            .runtime()
+            .definition_is_current(&reconciled_definition, restored.etag().as_str()));
+    }
+
+    #[tokio::test]
+    async fn rejected_overlay_put_keeps_the_live_and_durable_catalog_unchanged() {
+        let database = TemporaryDatabase::new();
+        let mut config = Config::test_defaults();
+        config.connections_sqlite_path = Some(database.0.display().to_string());
+        let control_plane =
+            ConnectionControlPlane::from_config(&config).expect("control plane should build");
+        let candidate: ConnectionWrite = serde_json::from_value(json!({
+            "display_name": "Overlay rejection OpenAPI",
+            "enabled": true,
+            "kind": "http_api",
+            "endpoint": {"base_url": "https://billing.example.test", "base_path": "/"},
+            "authentication": {"type": "none"},
+            "tls": {},
+            "timeouts": {
+                "connect_timeout_ms": 1000,
+                "request_timeout_ms": 3000,
+                "response_idle_timeout_ms": 1000
+            },
+            "discovery": {"type": "managed_openapi", "use_connection_authentication": false}
+        }))
+        .expect("managed OpenAPI Connection should deserialize");
+        let record = control_plane
+            .create_managed(
+                control_plane.runtime_snapshot().collection_etag(),
+                candidate,
+                "test-admin",
+            )
+            .await
+            .expect("managed OpenAPI Connection should create");
+        let egress_config = EgressConfig::from_config(&config);
+        let egress_client =
+            Arc::new(EgressClient::new(egress_config.clone()).expect("egress should build"));
+        let registry = ToolRegistry::disabled();
+        let policy = Policy::validate_json_value(json!({
+            "schema_version": "0.1.0",
+            "default_action": "deny",
+            "enforcement_mode": "enforce",
+            "roles": {"admin": {"permissions": []}},
+            "routes": [],
+            "tools": {
+                "unsafe_adoption": {
+                    "allowed_roles": ["admin"],
+                    "timeout_ms": 5000,
+                    "max_concurrent": 1
+                }
+            }
+        }))
+        .expect("test policy should validate");
+        let audit = AuditLog::new(Arc::new(CaptureSink::new()) as Arc<dyn AuditSink>);
+        let rbac = RbacState::new(policy, Vec::new(), false, audit);
+        let service = OpenApiConnectionCatalogService::load(
+            control_plane.clone(),
+            ConnectionHttpRuntime::new(control_plane.clone(), egress_config, egress_client),
+            registry.clone(),
+        )
+        .expect("managed OpenAPI service should load")
+        .with_rbac_state(Some(rbac));
+        let spec = r#"
+openapi: 3.0.3
+info: {title: Billing, version: 1.0.0}
+paths:
+  /invoices:
+    get: {operationId: get_invoice}
+"#;
+        let preview = service
+            .preview(record.id.as_str(), spec)
+            .await
+            .expect("spec should preview");
+        service
+            .register(
+                record.id.as_str(),
+                record.etag().as_str(),
+                0,
+                0,
+                &preview.spec_digest,
+                spec,
+                &["get_invoice".to_owned()],
+                &preview.registration_security_selections,
+                "test-admin",
+            )
+            .await
+            .expect("catalog should publish");
+        let absent_overlay_etag =
+            OverlayEtag::for_revisions(record.id.as_str(), record.revisions.connection, 1, 0);
+        let adoption_rejected = service
+            .put_overlay(
+                record.id.as_str(),
+                absent_overlay_etag.as_str(),
+                &json!({
+                    "schema_version": "0.1.0",
+                    "tools": {"get_invoice": {"rename": "unsafe_adoption"}}
+                }),
+                "test-admin",
+            )
+            .await
+            .expect_err("an unowned policy grant must not be adopted by rename");
+        assert!(matches!(
+            adoption_rejected,
+            OpenApiOverlayOperationError::Rejected(ref error)
+                if error.problems.iter().any(|problem| {
+                    problem.path == "/tools/get_invoice/rename"
+                        && problem.message.contains("existing policy entry")
+                })
+        ));
+        let invalid_document = json!({
+            "schema_version": "0.1.0",
+            "tools": {"unknown_operation": {"rename": "unsafe_adoption"}}
+        });
+        let rejected = service
+            .put_overlay(
+                record.id.as_str(),
+                absent_overlay_etag.as_str(),
+                &invalid_document,
+                "test-admin",
+            )
+            .await
+            .expect_err("unknown generated tool should reject the overlay");
+        assert!(matches!(
+            rejected,
+            OpenApiOverlayOperationError::Rejected(_)
+        ));
+        let preview_rejected = service
+            .preview_with_overlay(record.id.as_str(), spec, Some(&invalid_document))
+            .await
+            .expect_err("preview should preserve structured overlay problems");
+        assert!(matches!(
+            preview_rejected,
+            OpenApiOverlayOperationError::Rejected(ref error)
+                if error.problems.iter().any(|problem| problem.path == "/tools/unknown_operation")
+        ));
+        let catalog = control_plane
+            .managed_store()
+            .expect("managed store should exist")
+            .openapi_catalog(&record.id)
+            .await
+            .expect("catalog read should succeed")
+            .expect("catalog should remain");
+        assert_eq!(catalog.catalog_revision, 1);
+        assert_eq!(catalog.overlay_revision, 0);
+        assert!(registry.get("get_invoice").is_some());
+        assert!(registry.get("unsafe_adoption").is_none());
+    }
+
+    #[tokio::test]
     async fn successful_refresh_prunes_removed_tools_and_dependencies() {
         let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
             .await
@@ -2313,7 +4366,7 @@ paths:
         )
         .expect("reassigned-name spec should parse");
         assert_eq!(
-            surviving_refresh_selection(&initial_catalog, &reassigned_name).err(),
+            surviving_refresh_selection(&initial_catalog, &reassigned_name, None).err(),
             Some(OpenApiCatalogError::InvalidSelection),
             "a surviving public name must not silently move to another operation path"
         );

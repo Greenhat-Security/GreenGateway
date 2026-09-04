@@ -4,5 +4,6 @@ pub mod inventory;
 pub mod lease;
 pub mod mcp_upstream;
 pub mod openapi;
+pub mod overlay;
 pub mod playground;
 pub mod runtime;

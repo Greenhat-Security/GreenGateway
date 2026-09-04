@@ -298,6 +298,8 @@ mod database {
 
     use serde_json::json;
 
+    use crate::import::exports::CONNECTIONS_SECTION;
+
     use crate::{
         audit::{
             sqlite_sink::{SqliteSink, SqliteSinkConfig},
@@ -311,7 +313,8 @@ mod database {
             status::{ConnectionOperationalState, ConnectionStatusReason},
             store::{
                 ConnectionDependencyKind, ConnectionStatusUpdate, ConnectionStore,
-                SqliteConnectionStore, StoredMcpCatalogEntry,
+                SqliteConnectionStore, StoredMcpCatalogEntry, StoredOpenApiCatalogEntry,
+                StoredOverlayWrite,
             },
         },
         discovery::{
@@ -550,11 +553,64 @@ mod database {
         }
     }
 
+    fn openapi_connection() -> ConnectionWrite {
+        serde_json::from_value(json!({
+            "display_name": "Managed OpenAPI",
+            "enabled": true,
+            "kind": "http_api",
+            "endpoint": {
+                "base_url": "https://openapi.example.test",
+                "base_path": "/v1"
+            },
+            "authentication": { "type": "none" },
+            "tls": {},
+            "discovery": {
+                "type": "managed_openapi",
+                "path": "/openapi.json",
+                "use_connection_authentication": false
+            }
+        }))
+        .expect("the OpenAPI fixture Connection should deserialize")
+    }
+
+    fn openapi_entry(name: &str) -> StoredOpenApiCatalogEntry {
+        StoredOpenApiCatalogEntry {
+            tool_name: name.to_owned(),
+            operation_id: Some("listInvoices".to_owned()),
+            selected_scheme_names: vec!["oauth".to_owned(), "api_key".to_owned()],
+            definition: json!({
+                "name": name,
+                "description": "Lists invoices after the overlay is applied.",
+                "input_json_schema": {
+                    "type": "object",
+                    "properties": {}
+                },
+                "upstream": {
+                    "method": "GET",
+                    "path_template": "/invoices",
+                    "query_params": []
+                }
+            }),
+        }
+    }
+
+    const OPENAPI_SPEC: &str = r#"{"openapi":"3.1.0","info":{"title":"Invoices","version":"1"}}"#;
+    const OPENAPI_OVERLAY: &str = r#"{"schema_version":"0.1.0","tools":{"invoices.list":{"description":"Lists invoices after the overlay is applied."}}}"#;
+    const OPENAPI_SOURCE_REPORTS: &str = r#"{"schema_version":"0.1.0","sources":[{"id":"fixture_label","kind":"label","state":"resolved","item_count":1,"resolved_at":"2026-09-03T00:00:00Z"}]}"#;
+
+    fn openapi_spec_digest() -> String {
+        use sha2::{Digest, Sha256};
+
+        hex::encode(Sha256::digest(OPENAPI_SPEC.as_bytes()))
+    }
+
     /// A standalone deployment on disk: a policy file, a policy history
     /// with `history` versions written through the standalone store, a
-    /// tools file, a Connections database holding two Connections (one
+    /// tools file, a Connections database holding three Connections (one
     /// with a credential binding and a status observation, one with a
-    /// published MCP catalog), an audit log of `audit_events` events, and
+    /// published MCP catalog, and one with a paired OpenAPI catalog,
+    /// overlay, and non-empty source report), an audit log of
+    /// `audit_events` events, and
     /// the environment file that names them all. Every one of them is
     /// written through the store the standalone gateway itself writes it
     /// with, so the import reads exactly what a real deployment leaves.
@@ -564,6 +620,7 @@ mod database {
         policy: Policy,
         http_id: ConnectionId,
         mcp_id: ConnectionId,
+        openapi_id: ConnectionId,
         audit_events: i64,
         /// The discovery state the fixture actually produced, read back
         /// through the standalone store rather than assumed: the
@@ -699,8 +756,32 @@ mod database {
                 &[],
             )
             .expect("the MCP catalog should publish");
+        let openapi = store
+            .create(openapi_connection())
+            .expect("the OpenAPI fixture Connection should create");
+        store
+            .replace_openapi_catalog_with_overlay(
+                &openapi.id,
+                &openapi.etag(),
+                0,
+                0,
+                OPENAPI_SPEC,
+                &openapi_spec_digest(),
+                &[openapi_entry("invoices.list")],
+                Some(&StoredOverlayWrite::Put {
+                    schema_version: "0.1.0".to_owned(),
+                    overlay_json: OPENAPI_OVERLAY.to_owned(),
+                    source_reports_json: OPENAPI_SOURCE_REPORTS.to_owned(),
+                    expected_overlay_revision: 0,
+                }),
+                1,
+                "fixture-operator",
+                &[],
+            )
+            .expect("the OpenAPI catalog and overlay should publish atomically");
         let http_id = http.id.clone();
         let mcp_id = mcp.id.clone();
+        let openapi_id = openapi.id.clone();
         drop(store);
 
         // The audit log, through the sink the standalone gateway emits
@@ -901,6 +982,7 @@ mod database {
             policy,
             http_id,
             mcp_id,
+            openapi_id,
             audit_events: i64::try_from(audit_events + OBSERVATION_EVENTS)
                 .expect("the fixture count should fit"),
             discovery_endpoints,
@@ -1008,6 +1090,45 @@ mod database {
             standalone_env_file: fixture.env_file.clone(),
             mode,
         }
+    }
+
+    /// PR 1 creates the enum LKG table for PR 2 but intentionally has no
+    /// row codec. A source already written by an enum-capable binary must
+    /// therefore be refused by this importer, not silently copied without
+    /// those rows while the remaining Connections checksum still matches.
+    #[test]
+    fn enum_source_rows_from_a_newer_binary_are_refused_instead_of_dropped() {
+        let fixture = build_fixture("enum-source-refusal", 1, 0);
+        let connection = rusqlite::Connection::open(fixture.connections_file())
+            .expect("the fixture Connections database should open");
+        connection
+            .execute(
+                r#"
+                INSERT INTO connection_enum_source_values (
+                    connection_id, source_id, overlay_revision, source_digest,
+                    values_revision, connection_revision, credential_revision,
+                    values_json, resolved_at
+                ) VALUES (?1, 'regions', 1, ?2, 1, 1, 0, ?3, ?4)
+                "#,
+                rusqlite::params![
+                    fixture.openapi_id.as_str(),
+                    "b".repeat(64),
+                    r#"{"version":1,"values":["na","eu"]}"#,
+                    "2026-09-03T00:00:00Z",
+                ],
+            )
+            .expect("the future enum row should seed");
+        drop(connection);
+
+        let Err(error) = StandaloneSource::load(&fixture.env_file) else {
+            panic!("an importer without an enum codec must refuse a non-empty enum table");
+        };
+        assert_eq!(error.code(), "source_document_unparseable");
+        assert!(
+            error.to_string().contains("cannot preserve")
+                && error.to_string().contains("enum-capable gateway version"),
+            "{error}"
+        );
     }
 
     fn section<'a>(report: &'a ImportReport, name: &str) -> &'a SectionReport {
@@ -1271,7 +1392,8 @@ mod database {
     /// Step 4, end to end: the records with their identifiers and
     /// per-axis revisions, the credential bindings as references, the
     /// dependencies with `source_revision` 0, the status and its history,
-    /// and the published catalog with its tool-name reservations.
+    /// the published MCP catalog, and the paired OpenAPI catalog/overlay
+    /// (including its source report) with their tool-name reservations.
     ///
     /// The strongest assertion here is the last one: the cluster's own
     /// boot-time validation
@@ -1297,18 +1419,20 @@ mod database {
             .expect("the dry run should succeed");
         let planned_section = section(&planned, "connections");
         assert_eq!(planned_section.status, "planned");
-        assert_eq!(planned_section.counts.get("connection_records"), Some(&2));
+        assert_eq!(planned_section.counts.get("connection_records"), Some(&3));
         assert_eq!(planned_section.counts.get("credential_bindings"), Some(&3));
         assert_eq!(
             planned_section.counts.get("dependencies"),
-            Some(&3),
+            Some(&4),
             "one proxy route plus one managed_tool dependency per catalog entry"
         );
         assert_eq!(planned_section.counts.get("current_statuses"), Some(&1));
         assert_eq!(planned_section.counts.get("mcp_catalogs"), Some(&1));
+        assert_eq!(planned_section.counts.get("openapi_catalogs"), Some(&1));
+        assert_eq!(planned_section.counts.get("openapi_overlays"), Some(&1));
         assert_eq!(
             planned_section.counts.get("tool_name_reservations"),
-            Some(&2)
+            Some(&3)
         );
         assert!(
             super::super::preflight::occupied_namespace(&pool)
@@ -1327,11 +1451,13 @@ mod database {
             applied_section.checksum, planned_section.checksum,
             "the rehearsal's checksum is the apply's"
         );
-        assert_eq!(applied_section.counts.get("connection_records"), Some(&2));
-        assert_eq!(applied_section.counts.get("connection_documents"), Some(&2));
+        assert_eq!(applied_section.counts.get("connection_records"), Some(&3));
+        assert_eq!(applied_section.counts.get("connection_documents"), Some(&3));
         assert_eq!(applied_section.counts.get("credential_bindings"), Some(&3));
         assert_eq!(applied_section.counts.get("status_history"), Some(&1));
-        assert_eq!(applied_section.counts.get("catalog_entries"), Some(&2));
+        assert_eq!(applied_section.counts.get("openapi_catalogs"), Some(&1));
+        assert_eq!(applied_section.counts.get("openapi_overlays"), Some(&1));
+        assert_eq!(applied_section.counts.get("catalog_entries"), Some(&3));
 
         // The identifiers and the per-axis revisions are the source's:
         // the ETag an operator's automation holds is derived from them.
@@ -1400,20 +1526,20 @@ mod database {
              ORDER BY consumer_kind, consumer_id",
         )
         .await;
-        assert_eq!(
-            dependencies,
-            vec![
-                (
-                    "managed_tool".to_owned(),
-                    format!("{}:alpha", fixture.mcp_id.as_str())
-                ),
-                (
-                    "managed_tool".to_owned(),
-                    format!("{}:beta", fixture.mcp_id.as_str())
-                ),
-                ("proxy_route".to_owned(), "billing-proxy-route".to_owned()),
-            ]
-        );
+        let mut expected_dependencies = vec![
+            (
+                "managed_tool".to_owned(),
+                format!("{}:alpha", fixture.mcp_id.as_str()),
+            ),
+            (
+                "managed_tool".to_owned(),
+                format!("{}:beta", fixture.mcp_id.as_str()),
+            ),
+            ("managed_tool".to_owned(), "invoices.list".to_owned()),
+            ("proxy_route".to_owned(), "billing-proxy-route".to_owned()),
+        ];
+        expected_dependencies.sort();
+        assert_eq!(dependencies, expected_dependencies);
         assert_eq!(
             count_of(
                 &pool,
@@ -1421,7 +1547,7 @@ mod database {
                  WHERE source_revision = 0"
             )
             .await,
-            3,
+            4,
             "an imported dependency set is not one this deployment's documents derived"
         );
 
@@ -1466,6 +1592,52 @@ mod database {
                 format!("{}:beta:mcp", fixture.mcp_id.as_str()),
             ]
         );
+        assert_eq!(
+            client_names(
+                &pool,
+                "SELECT tool_name || ':' || lane FROM greengateway.tool_name_reservations \
+                 WHERE lane = 'openapi' ORDER BY tool_name",
+            )
+            .await,
+            vec!["invoices.list:openapi".to_owned()]
+        );
+
+        // The import/export checksum includes every byte of the paired
+        // catalog and overlay representation, including the optional
+        // compile-time source report. Compare through both stores so this
+        // cannot pass merely because source and target checksum code share
+        // the same omission.
+        let source_openapi_catalog = source_store
+            .openapi_catalog(&fixture.openapi_id)
+            .expect("the source OpenAPI catalog should read")
+            .expect("the source OpenAPI catalog should exist");
+        let target_openapi_catalog = target_store
+            .openapi_catalog(&fixture.openapi_id)
+            .await
+            .expect("the target OpenAPI catalog should read")
+            .expect("the target OpenAPI catalog should exist");
+        assert_eq!(target_openapi_catalog, source_openapi_catalog);
+        assert_eq!(target_openapi_catalog.overlay_revision, 1);
+
+        let source_openapi_overlay = source_store
+            .openapi_overlay(&fixture.openapi_id)
+            .expect("the source OpenAPI overlay should read")
+            .expect("the source OpenAPI overlay should exist");
+        let target_openapi_overlay = target_store
+            .openapi_overlay(&fixture.openapi_id)
+            .await
+            .expect("the target OpenAPI overlay should read")
+            .expect("the target OpenAPI overlay should exist");
+        assert_eq!(target_openapi_overlay, source_openapi_overlay);
+        assert_eq!(target_openapi_overlay.overlay_json, OPENAPI_OVERLAY);
+        assert_eq!(
+            target_openapi_overlay.source_reports_json.as_deref(),
+            Some(OPENAPI_SOURCE_REPORTS)
+        );
+        assert_eq!(
+            target_openapi_catalog.overlay_revision, target_openapi_overlay.overlay_revision,
+            "the imported catalog must name the exact imported overlay revision"
+        );
 
         // The connections high-water mark took one shared revision and did
         // not overtake the counter the gate compares it against.
@@ -1490,6 +1662,48 @@ mod database {
             .validate_persisted_state()
             .await
             .expect("the cluster's own startup validation should accept the imported state");
+
+        // Counts cannot catch a dropped or altered report because it is a
+        // nullable column on an existing row. Falsify only that field and
+        // require the shared source/target export to notice.
+        let source = StandaloneSource::load(&fixture.env_file)
+            .expect("the standalone source should reload for checksum validation");
+        let validation_inputs = super::super::validation::ValidationInputs {
+            source: &source,
+            checksums: vec![(CONNECTIONS_SECTION, applied_section.checksum.clone())],
+            expected_rows: super::super::validation::expected_rows(&source, fixture.audit_events),
+        };
+        super::super::validation::run(Some(&pool), &validation_inputs)
+            .await
+            .expect("the intact imported overlay should validate");
+        let client = pool.get().await.expect("checksum falsification checkout");
+        let tampered_reports = r#"{"schema_version":"0.1.0","sources":[{"id":"fixture_label","kind":"label","state":"resolved","item_count":2,"resolved_at":"2026-09-03T00:00:00Z"}]}"#;
+        client
+            .execute(
+                "UPDATE greengateway.connection_openapi_overlays \
+                 SET source_reports_json = $1 WHERE connection_id = $2::text::uuid",
+                &[&tampered_reports, &fixture.openapi_id.as_str()],
+            )
+            .await
+            .expect("the target source report should be falsified");
+        let error = super::super::validation::run(Some(&pool), &validation_inputs)
+            .await
+            .expect_err("an altered source report must change the Connections checksum");
+        assert_eq!(error.code(), "validation_failed");
+        assert!(
+            error.to_string().contains("checksums_match")
+                && error.to_string().contains(CONNECTIONS_SECTION),
+            "{error}"
+        );
+        client
+            .execute(
+                "UPDATE greengateway.connection_openapi_overlays \
+                 SET source_reports_json = $1 WHERE connection_id = $2::text::uuid",
+                &[&OPENAPI_SOURCE_REPORTS, &fixture.openapi_id.as_str()],
+            )
+            .await
+            .expect("the target source report should restore");
+        drop(client);
 
         // The report is counts, checksums and durations. A secret ID is a
         // locator rather than a secret, but it identifies an entry in the
@@ -1520,7 +1734,7 @@ mod database {
                 "SELECT count(*) FROM greengateway.connection_records"
             )
             .await,
-            2
+            3
         );
         assert_eq!(
             count_of(

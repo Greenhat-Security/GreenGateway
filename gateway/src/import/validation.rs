@@ -430,6 +430,13 @@ async fn target_connections(
         .into_iter()
         .map(|catalog| (catalog.connection_id.clone(), catalog))
         .collect();
+    let mut openapi_overlays: BTreeMap<_, _> = store
+        .openapi_overlays()
+        .await
+        .map_err(connections_failure)?
+        .into_iter()
+        .map(|overlay| (overlay.connection_id.clone(), overlay))
+        .collect();
 
     let mut connections = Vec::with_capacity(records.len());
     for record in records {
@@ -444,6 +451,7 @@ async fn target_connections(
             status_history: history.remove(&record.id).unwrap_or_default(),
             mcp_catalog: mcp.remove(&record.id),
             openapi_catalog: openapi.remove(&record.id),
+            openapi_overlay: openapi_overlays.remove(&record.id),
             record,
         });
     }
@@ -782,6 +790,7 @@ pub(super) fn expected_rows(
     let mut mcp_resources = 0_i64;
     let mut mcp_templates = 0_i64;
     let mut openapi_catalogs = 0_i64;
+    let mut openapi_overlays = 0_i64;
     let mut openapi_entries = 0_i64;
     let mut reservations =
         i64::try_from(super::exports::tool_names(&source.tools_document).len()).unwrap_or(i64::MAX);
@@ -809,6 +818,9 @@ pub(super) fn expected_rows(
             let entries = i64::try_from(catalog.entries.len()).unwrap_or(i64::MAX);
             openapi_entries += entries;
             reservations += entries;
+        }
+        if connection.openapi_overlay.is_some() {
+            openapi_overlays += 1;
         }
     }
 
@@ -851,6 +863,8 @@ pub(super) fn expected_rows(
     expected.insert("connection_mcp_catalog_resource_templates", mcp_templates);
     expected.insert("connection_openapi_catalogs", openapi_catalogs);
     expected.insert("connection_openapi_catalog_entries", openapi_entries);
+    expected.insert("connection_openapi_overlays", openapi_overlays);
+    expected.insert("connection_enum_source_values", 0);
     expected.insert("audit_events", audit_events);
     expected.insert("audit_stream", audit_events);
     expected.insert("discovery_endpoint_aggregates", endpoints);

@@ -411,6 +411,171 @@
         ]
       }
     },
+    "/v1/admin/connections/{id}/overlay": {
+      "parameters": [
+        {
+          "$ref": "#/components/parameters/StableId"
+        }
+      ],
+      "get": {
+        "operationId": "getConnectionOpenApiOverlay",
+        "tags": [
+          "Managed OpenAPI"
+        ],
+        "summary": "Read the stored OpenAPI overlay and its applied revision",
+        "description": "Requires admin:connections:read. The overlay has its own strong ETag, whose Connection revision component prevents reuse across a compatible-ID kind replacement. Source status is projected from the canonical report snapshot stored with the overlay, including after restart; this read performs no source I/O.",
+        "responses": {
+          "200": {
+            "description": "Stored overlay state. When no overlay exists, document is null, overlay_revision is 0, and the ETag ends in :o0.",
+            "headers": {
+              "ETag": {
+                "$ref": "#/components/headers/OpenApiOverlayETag"
+              },
+              "Cache-Control": {
+                "$ref": "#/components/headers/NoStore"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "../schemas/connection-admin.v1.schema.json#/$defs/OpenApiOverlayGetResponse"
+                }
+              }
+            }
+          },
+          "default": {
+            "$ref": "#/components/responses/AdminError"
+          }
+        }
+      },
+      "put": {
+        "operationId": "putConnectionOpenApiOverlay",
+        "tags": [
+          "Managed OpenAPI"
+        ],
+        "summary": "Validate, compile, and atomically publish an OpenAPI overlay",
+        "description": "Requires admin:connections:write and the exact overlay ETag. A raw source request.path on an authenticated Connection additionally requires admin:connections:secrets:write. Validation, source resolution, compilation, catalog publication, overlay persistence, and source-report persistence succeed as one mutation or leave the previous catalog and overlay unchanged.",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/OpenApiOverlayIfMatch"
+          },
+          {
+            "name": "allow_unresolved_enum_sources",
+            "in": "query",
+            "required": false,
+            "description": "Permit an enum source with no initial value set to be stored unresolved. Label sources must still resolve. Source declarations are reserved and rejected by the current overlay schema revision.",
+            "schema": {
+              "type": "boolean",
+              "default": false
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "../schemas/connection-admin.v1.schema.json#/$defs/OpenApiOverlayDocument"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Overlay and compiled catalog publication summary.",
+            "headers": {
+              "ETag": {
+                "$ref": "#/components/headers/OpenApiOverlayETag"
+              },
+              "Cache-Control": {
+                "$ref": "#/components/headers/NoStore"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "../schemas/connection-admin.v1.schema.json#/$defs/OpenApiOverlayMutationResponse"
+                }
+              }
+            }
+          },
+          "412": {
+            "$ref": "#/components/responses/AdminError"
+          },
+          "422": {
+            "$ref": "#/components/responses/OpenApiOverlayValidationError"
+          },
+          "428": {
+            "$ref": "#/components/responses/AdminError"
+          },
+          "default": {
+            "$ref": "#/components/responses/AdminError"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "cookieAuth": [],
+            "csrfCookie": [],
+            "csrfHeader": []
+          }
+        ]
+      },
+      "delete": {
+        "operationId": "deleteConnectionOpenApiOverlay",
+        "tags": [
+          "Managed OpenAPI"
+        ],
+        "summary": "Remove an OpenAPI overlay and republish the bare catalog",
+        "description": "Requires admin:connections:write and the exact overlay ETag. Bare generation, catalog replacement, overlay deletion, and source-report/value cleanup occur in one transaction; failure leaves the prior compiled catalog and overlay intact.",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/OpenApiOverlayIfMatch"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Bare catalog publication summary; overlay_revision is 0.",
+            "headers": {
+              "ETag": {
+                "$ref": "#/components/headers/OpenApiOverlayETag"
+              },
+              "Cache-Control": {
+                "$ref": "#/components/headers/NoStore"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "../schemas/connection-admin.v1.schema.json#/$defs/OpenApiOverlayMutationResponse"
+                }
+              }
+            }
+          },
+          "412": {
+            "$ref": "#/components/responses/AdminError"
+          },
+          "428": {
+            "$ref": "#/components/responses/AdminError"
+          },
+          "default": {
+            "$ref": "#/components/responses/AdminError"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": []
+          },
+          {
+            "cookieAuth": [],
+            "csrfCookie": [],
+            "csrfHeader": []
+          }
+        ]
+      }
+    },
     "/v1/admin/connections/{id}/openapi/preview": {
       "parameters": [
         {
@@ -423,7 +588,7 @@
           "Managed OpenAPI"
         ],
         "summary": "Preview a bounded OpenAPI document without persistence",
-        "description": "Requires admin:tools:read. Preview performs no network request or tool invocation and returns the current Connection ETag for a later register precondition.",
+        "description": "Requires admin:tools:read. Preview performs no tool invocation or persistence and returns the current Connection ETag for a later register precondition. When an optional overlay declares supported sources, preview performs the same bounded source resolution as overlay PUT so the operator sees compiled labels and values before storing anything.",
         "requestBody": {
           "required": true,
           "content": {
@@ -481,7 +646,7 @@
           "Managed OpenAPI"
         ],
         "summary": "Persist and publish an explicit OpenAPI selection",
-        "description": "Requires admin:tools:write and the exact Connection ETag. The repeated spec/digest/revisions bind registration to the reviewed preview.",
+        "description": "Requires admin:tools:write and the exact Connection ETag. The repeated spec/digest/revisions bind registration to the reviewed preview. The request shape is unchanged; registration compiles and publishes the stored overlay when one exists.",
         "parameters": [
           {
             "$ref": "#/components/parameters/IfMatch"
@@ -993,6 +1158,15 @@
           "$ref": "../schemas/connection-admin.v1.schema.json#/$defs/Etag"
         }
       },
+      "OpenApiOverlayIfMatch": {
+        "name": "If-Match",
+        "in": "header",
+        "required": true,
+        "description": "Exactly one current strong overlay ETag. Missing preconditions return 428 and stale Connection, catalog, or overlay revisions return 412.",
+        "schema": {
+          "$ref": "../schemas/connection-admin.v1.schema.json#/$defs/OpenApiOverlayEtag"
+        }
+      },
       "Cursor": {
         "name": "cursor",
         "in": "query",
@@ -1030,6 +1204,12 @@
           "$ref": "../schemas/connection-admin.v1.schema.json#/$defs/Etag"
         }
       },
+      "OpenApiOverlayETag": {
+        "description": "Strong overlay ETag in the form \"overlay:{connection_id}:c{connection_revision}:r{catalog_revision}:o{overlay_revision}\"; o0 means no overlay is stored. The Connection and catalog revisions prevent ABA reuse after overlay recreation or a kind replacement that rebuilds the OpenAPI catalog.",
+        "schema": {
+          "$ref": "../schemas/connection-admin.v1.schema.json#/$defs/OpenApiOverlayEtag"
+        }
+      },
       "ConnectionCollectionETag": {
         "description": "Canonical current Connection collection ETag used by create and stale-cursor preconditions.",
         "schema": {
@@ -1063,6 +1243,9 @@
             "$ref": "../schemas/connection-admin.v1.schema.json#/$defs/ValidationError"
           },
           {
+            "$ref": "../schemas/connection-admin.v1.schema.json#/$defs/OpenApiOverlayValidationError"
+          },
+          {
             "$ref": "../schemas/connection-admin.v1.schema.json#/$defs/DependencyConflict"
           }
         ]
@@ -1080,6 +1263,21 @@
           "application/json": {
             "schema": {
               "$ref": "#/components/schemas/AdminError"
+            }
+          }
+        }
+      },
+      "OpenApiOverlayValidationError": {
+        "description": "The candidate overlay was rejected. The prior overlay, catalog, source reports, and registry lane are unchanged.",
+        "headers": {
+          "Cache-Control": {
+            "$ref": "#/components/headers/NoStore"
+          }
+        },
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "../schemas/connection-admin.v1.schema.json#/$defs/OpenApiOverlayValidationError"
             }
           }
         }

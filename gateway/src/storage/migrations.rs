@@ -210,6 +210,13 @@ static MANIFEST: LazyLock<Vec<Migration>> = LazyLock::new(|| {
         )
         .finalize()
         .with_pinned_checksum("223e70073aceb9fd722db0f775ac86ea8b2ce05666ec6c39e714977f0d70b580"),
+        Migration::new(
+            13,
+            "connection_overlays",
+            include_str!("migrations/0013_connection_overlays.sql"),
+        )
+        .finalize()
+        .with_pinned_checksum("511c1fc251b801a4054940a8482ac84d8d080610a14d7b8b102abb2427ef31a4"),
     ]
 });
 
@@ -1292,7 +1299,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn additional_header_migration_preserves_existing_binding_and_widens_its_key() {
+    async fn migrations_twelve_and_thirteen_preserve_existing_connection_state() {
         let Some(dsn) = real_dsn() else {
             eprintln!("skipping: no test database locator; CI runs this test");
             return;
@@ -1302,15 +1309,14 @@ mod tests {
         let config = migration_config(&dsn_file);
         let foundation = establish(&config).await;
         clean_database(foundation.pool()).await;
-
         let client = foundation.pool().get().await.expect("checkout");
         bootstrap_ledger(&client)
             .await
             .expect("migration ledger should bootstrap");
-        for migration in &MANIFEST[..MANIFEST.len() - 1] {
+        for migration in &MANIFEST[..MANIFEST.len() - 2] {
             apply_one(&client, migration, &test_settings())
                 .await
-                .expect("pre-additional-header migration should apply");
+                .expect("pre-additional-header migrations should apply");
         }
         let connection_id = uuid::Uuid::new_v4().to_string();
         let timestamp = "2026-09-03T00:00:00Z";
@@ -1342,8 +1348,8 @@ mod tests {
 
         let applied = apply_missing(foundation.pool(), &test_settings())
             .await
-            .expect("additional-header migration should apply");
-        assert_eq!(applied, MigrateOutput::Applied { applied: 1 });
+            .expect("additional-header and overlay migrations should apply");
+        assert_eq!(applied, MigrateOutput::Applied { applied: 2 });
 
         let client = foundation
             .pool()
@@ -1395,6 +1401,119 @@ mod tests {
                 .get::<_, i64>(0),
             3
         );
+        drop(client);
+        clean_database(foundation.pool()).await;
+
+        apply_missing(foundation.pool(), &test_settings())
+            .await
+            .expect("fixture schema should migrate initially");
+
+        let store = crate::connections::pg_store::PostgresConnectionStore::new(
+            foundation.pool().clone(),
+            crate::connections::model::MAX_CONNECTIONS,
+        )
+        .expect("fixture store");
+        let write: crate::connections::model::ConnectionWrite =
+            serde_json::from_value(serde_json::json!({
+                "display_name": "Pre-overlay API",
+                "enabled": false,
+                "kind": "http_api",
+                "endpoint": {
+                    "base_url": "https://migration.example.test",
+                    "base_path": "/v1"
+                },
+                "authentication": {
+                    "type": "static_bearer",
+                    "secret_id": "migration-token"
+                },
+                "tls": {},
+                "discovery": {
+                    "type": "managed_openapi",
+                    "path": "/openapi.json",
+                    "use_connection_authentication": true
+                }
+            }))
+            .expect("fixture Connection should decode");
+        let record = store
+            .create(write, "migration-fixture", None)
+            .await
+            .expect("fixture Connection should create");
+        let spec = r#"{"openapi":"3.1.0"}"#;
+        let digest = hex::encode(Sha256::digest(spec.as_bytes()));
+        store
+            .replace_openapi_catalog(
+                &record.id,
+                &record.etag(),
+                0,
+                0,
+                spec,
+                &digest,
+                &[crate::connections::store::StoredOpenApiCatalogEntry {
+                    tool_name: "pre_overlay_tool".to_owned(),
+                    operation_id: Some("preOverlayTool".to_owned()),
+                    selected_scheme_names: Vec::new(),
+                    definition: serde_json::json!({
+                        "name": "pre_overlay_tool",
+                        "description": "Existing catalog entry.",
+                        "input_json_schema": {
+                            "type": "object",
+                            "properties": {},
+                            "additionalProperties": false
+                        },
+                        "upstream": {
+                            "method": "GET",
+                            "path_template": "/v1/existing",
+                            "body": { "mode": "whole_args_json" }
+                        }
+                    }),
+                }],
+                "migration-fixture",
+            )
+            .await
+            .expect("fixture catalog should publish");
+        drop(store);
+
+        // Reconstruct the exact v12 shape while retaining populated v12
+        // rows, then let only migration 13 run.
+        foundation
+            .pool()
+            .get()
+            .await
+            .expect("v11 fixture checkout")
+            .batch_execute(&format!(
+                "DROP TABLE greengateway.connection_enum_source_values; \
+                 DROP TABLE greengateway.connection_openapi_overlays; \
+                 ALTER TABLE greengateway.connection_openapi_catalogs \
+                     DROP COLUMN overlay_revision; \
+                 DELETE FROM {LEDGER_TABLE} WHERE version = 13;"
+            ))
+            .await
+            .expect("v11 fixture should reconstruct");
+
+        assert_eq!(
+            apply_missing(foundation.pool(), &test_settings())
+                .await
+                .expect("migration 13 should apply"),
+            MigrateOutput::Applied { applied: 1 }
+        );
+        let reopened = crate::connections::pg_store::PostgresConnectionStore::new(
+            foundation.pool().clone(),
+            crate::connections::model::MAX_CONNECTIONS,
+        )
+        .expect("post-migration store");
+        let catalog = reopened
+            .openapi_catalog(&record.id)
+            .await
+            .expect("migrated catalog should read")
+            .expect("migrated catalog should remain");
+        assert_eq!(catalog.catalog_revision, 1);
+        assert_eq!(catalog.overlay_revision, 0);
+        assert_eq!(catalog.entries[0].tool_name, "pre_overlay_tool");
+        assert!(reopened
+            .openapi_overlays()
+            .await
+            .expect("new overlay table should read")
+            .is_empty());
     }
 
     #[tokio::test]

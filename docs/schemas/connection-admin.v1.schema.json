@@ -1535,7 +1535,10 @@
           ],
           "properties": {
             "mode": {
-              "const": "whole_args_json"
+              "enum": [
+                "whole_args_json",
+                "body_args_json"
+              ]
             }
           }
         }
@@ -1690,8 +1693,512 @@
         },
         "upstream": {
           "$ref": "#/$defs/HttpMapping"
+        },
+        "visibility": {
+          "enum": [
+            "listed",
+            "composite_only"
+          ],
+          "default": "listed"
         }
       }
+    },
+    "OpenApiOverlayDocument": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schema_version"
+      ],
+      "properties": {
+        "schema_version": {
+          "type": "string",
+          "const": "0.1.0"
+        },
+        "description": {
+          "type": "string",
+          "maxLength": 1024
+        },
+        "defaults": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "disambiguation": {
+              "$ref": "#/$defs/OpenApiOverlayDisambiguation"
+            },
+            "body_mode": {
+              "enum": [
+                "whole_args_json",
+                "body_args_json"
+              ],
+              "default": "body_args_json",
+              "description": "Body serialization for generated tools explicitly named under tools.* only."
+            }
+          }
+        },
+        "tools": {
+          "type": "object",
+          "maxProperties": 4096,
+          "propertyNames": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 128,
+            "pattern": "^[A-Za-z0-9_.-]+$"
+          },
+          "additionalProperties": {
+            "$ref": "#/$defs/OpenApiOverlayTool"
+          },
+          "description": "Keyed by generated operationId names, never rename targets. Future source, shape, response, and composite branches are rejected by this PR 1 request shape."
+        }
+      },
+      "description": "The PR 1 per-Connection OpenAPI overlay request shape, kept in lockstep with connection-overlay.v0.schema.json."
+    },
+    "OpenApiOverlayDisambiguation": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "mode": {
+          "enum": [
+            "off",
+            "qualify_colliding_labels"
+          ],
+          "default": "qualify_colliding_labels"
+        },
+        "label_from": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 3,
+          "uniqueItems": true,
+          "items": {
+            "enum": [
+              "label_source",
+              "title",
+              "description"
+            ]
+          },
+          "default": [
+            "label_source",
+            "title",
+            "description"
+          ],
+          "description": "Label priority. label_source is reserved and contributes no value until label-source support lands."
+        },
+        "template": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256,
+          "default": "{label} (field `{name}`{options})",
+          "description": "Fixed label template. {name} is required by semantic validation; available placeholders are {label}, {name}, and {options}."
+        }
+      }
+    },
+    "OpenApiOverlayTool": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "rename": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[A-Za-z0-9_.-]+$"
+        },
+        "visibility": {
+          "enum": [
+            "listed",
+            "composite_only"
+          ],
+          "default": "listed"
+        },
+        "description": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 4096
+        },
+        "parameters": {
+          "type": "object",
+          "maxProperties": 256,
+          "additionalProperties": {
+            "$ref": "#/$defs/OpenApiOverlayParameter"
+          },
+          "description": "Keyed by top-level properties in the generated input schema."
+        }
+      }
+    },
+    "OpenApiOverlayParameter": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "description": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 2048
+        },
+        "title": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256
+        }
+      }
+    },
+    "OpenApiOverlayEtag": {
+      "type": "string",
+      "minLength": 17,
+      "maxLength": 256,
+      "pattern": "^\"overlay:[A-Za-z0-9][A-Za-z0-9._-]*:c[1-9][0-9]*:r(0|[1-9][0-9]*):o(0|[1-9][0-9]*)\"$",
+      "description": "Quoted strong overlay ETag: \"overlay:{connection_id}:c{connection_revision}:r{catalog_revision}:o{overlay_revision}\". Overlay revision 0 means no overlay is stored; the Connection and catalog revisions prevent stale ETags from becoming valid after overlay recreation or a kind replacement that rebuilds the OpenAPI catalog."
+    },
+    "OpenApiOverlayProblem": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "path",
+        "message"
+      ],
+      "properties": {
+        "path": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 1024,
+          "description": "JSON Pointer locating the rejected overlay field; / identifies the document."
+        },
+        "message": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 4096
+        }
+      }
+    },
+    "OpenApiOverlayWarning": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "path",
+        "message"
+      ],
+      "properties": {
+        "path": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 1024
+        },
+        "message": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 4096
+        }
+      }
+    },
+    "OpenApiOverlayToolReport": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "generated_name",
+        "served_name",
+        "visibility",
+        "labels_found",
+        "labels_from_title",
+        "labels_from_description",
+        "qualified_properties",
+        "label_summary"
+      ],
+      "properties": {
+        "generated_name": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128
+        },
+        "served_name": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128
+        },
+        "visibility": {
+          "enum": [
+            "listed",
+            "composite_only"
+          ]
+        },
+        "body_mode": {
+          "enum": [
+            "whole_args_json",
+            "body_args_json"
+          ]
+        },
+        "labels_found": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 256
+        },
+        "labels_from_title": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 256
+        },
+        "labels_from_description": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 256
+        },
+        "qualified_properties": {
+          "type": "array",
+          "maxItems": 256,
+          "uniqueItems": true,
+          "items": {
+            "type": "string",
+            "minLength": 1
+          }
+        },
+        "label_summary": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 1024,
+          "description": "Human-readable bounded summary; when none match the configured document label sources it states '0 labels matched the configured document label sources'. This does not imply that the document has no titles or descriptions, because label_from may exclude them."
+        }
+      }
+    },
+    "OpenApiOverlaySourceStatus": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "kind",
+        "state",
+        "item_count"
+      ],
+      "properties": {
+        "id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 64,
+          "pattern": "^[A-Za-z][A-Za-z0-9_]{0,63}$"
+        },
+        "kind": {
+          "enum": [
+            "enum",
+            "label"
+          ]
+        },
+        "state": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 64,
+          "description": "Bounded resolver state. A durable value set is current only when its overlay revision and source digest match the compiled source declaration."
+        },
+        "item_count": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 1024
+        },
+        "resolved_at": {
+          "$ref": "#/$defs/Timestamp"
+        }
+      }
+    },
+    "OpenApiOverlayCompositeReport": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "name",
+        "steps_max",
+        "policy_entry_present"
+      ],
+      "properties": {
+        "name": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128
+        },
+        "steps_max": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "policy_entry_present": {
+          "type": "boolean"
+        }
+      },
+      "description": "Reserved response shape for composite overlays; the array is empty until composite support lands."
+    },
+    "OpenApiOverlayReport": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "applied",
+        "problems",
+        "warnings",
+        "sources",
+        "tools",
+        "composites"
+      ],
+      "properties": {
+        "applied": {
+          "type": "boolean"
+        },
+        "problems": {
+          "type": "array",
+          "maxItems": 4096,
+          "items": {
+            "$ref": "#/$defs/OpenApiOverlayProblem"
+          }
+        },
+        "warnings": {
+          "type": "array",
+          "maxItems": 4096,
+          "items": {
+            "$ref": "#/$defs/OpenApiOverlayWarning"
+          }
+        },
+        "sources": {
+          "type": "array",
+          "maxItems": 128,
+          "description": "Compile-time source reports projected from the canonical snapshot stored with the overlay; empty when this revision accepts no source declarations.",
+          "items": {
+            "$ref": "#/$defs/OpenApiOverlaySourceStatus"
+          }
+        },
+        "tools": {
+          "type": "array",
+          "maxItems": 4096,
+          "items": {
+            "$ref": "#/$defs/OpenApiOverlayToolReport"
+          }
+        },
+        "composites": {
+          "type": "array",
+          "maxItems": 256,
+          "items": {
+            "$ref": "#/$defs/OpenApiOverlayCompositeReport"
+          }
+        }
+      }
+    },
+    "OpenApiOverlayGetResponse": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "connection_id",
+        "etag",
+        "overlay_revision",
+        "applied_catalog_revision",
+        "document",
+        "sources"
+      ],
+      "properties": {
+        "connection_id": {
+          "$ref": "#/$defs/StableId"
+        },
+        "etag": {
+          "$ref": "#/$defs/OpenApiOverlayEtag"
+        },
+        "overlay_revision": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "applied_catalog_revision": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "document": {
+          "oneOf": [
+            {
+              "$ref": "#/$defs/OpenApiOverlayDocument"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "sources": {
+          "type": "array",
+          "maxItems": 128,
+          "description": "Compile-time source reports projected from the canonical snapshot stored with the overlay and available after restart without source I/O.",
+          "items": {
+            "$ref": "#/$defs/OpenApiOverlaySourceStatus"
+          }
+        },
+        "updated_at": {
+          "$ref": "#/$defs/Timestamp"
+        }
+      }
+    },
+    "OpenApiOverlayMutationResponse": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "connection_id",
+        "overlay_revision",
+        "catalog_revision",
+        "warnings",
+        "sources",
+        "tools",
+        "composites"
+      ],
+      "properties": {
+        "connection_id": {
+          "$ref": "#/$defs/StableId"
+        },
+        "overlay_revision": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "catalog_revision": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "warnings": {
+          "type": "array",
+          "maxItems": 4096,
+          "items": {
+            "$ref": "#/$defs/OpenApiOverlayWarning"
+          }
+        },
+        "sources": {
+          "type": "array",
+          "maxItems": 128,
+          "description": "Compile-time source reports persisted atomically with this overlay/catalog publication.",
+          "items": {
+            "$ref": "#/$defs/OpenApiOverlaySourceStatus"
+          }
+        },
+        "tools": {
+          "type": "array",
+          "maxItems": 4096,
+          "items": {
+            "$ref": "#/$defs/OpenApiOverlayToolReport"
+          }
+        },
+        "composites": {
+          "type": "array",
+          "maxItems": 256,
+          "items": {
+            "$ref": "#/$defs/OpenApiOverlayCompositeReport"
+          }
+        }
+      }
+    },
+    "OpenApiOverlayValidationError": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "problems",
+        "warnings"
+      ],
+      "properties": {
+        "problems": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 4096,
+          "items": {
+            "$ref": "#/$defs/OpenApiOverlayProblem"
+          }
+        },
+        "warnings": {
+          "type": "array",
+          "maxItems": 4096,
+          "items": {
+            "$ref": "#/$defs/OpenApiOverlayWarning"
+          }
+        }
+      },
+      "description": "A failed overlay PUT or preview. No overlay or catalog mutation was committed."
     },
     "OpenApiPreviewRequest": {
       "type": "object",
@@ -1704,6 +2211,10 @@
           "type": "string",
           "minLength": 1,
           "maxLength": 2097152
+        },
+        "overlay": {
+          "$ref": "#/$defs/OpenApiOverlayDocument",
+          "description": "Optional candidate compiled into this preview without storing it."
         }
       }
     },
@@ -1826,7 +2337,8 @@
         "security_confirmations",
         "incompatibilities",
         "operation_id_fallbacks",
-        "skipped_operations"
+        "skipped_operations",
+        "overlay"
       ],
       "properties": {
         "connection_id": {
@@ -1881,6 +2393,9 @@
           "items": {
             "$ref": "#/$defs/OpenApiSkippedOperation"
           }
+        },
+        "overlay": {
+          "$ref": "#/$defs/OpenApiOverlayReport"
         }
       }
     },
@@ -2201,7 +2716,10 @@
               ],
               "properties": {
                 "mode": {
-                  "const": "whole_args_json"
+                  "enum": [
+                    "whole_args_json",
+                    "body_args_json"
+                  ]
                 }
               }
             }

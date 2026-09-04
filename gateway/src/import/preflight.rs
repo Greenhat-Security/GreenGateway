@@ -56,6 +56,8 @@ const AUTHORITATIVE_TABLES: &[&str] = &[
     "connection_mcp_catalog_resource_templates",
     "connection_openapi_catalogs",
     "connection_openapi_catalog_entries",
+    "connection_openapi_overlays",
+    "connection_enum_source_values",
     // 0007: service tokens
     "service_tokens",
     // 0009/0011: discovery

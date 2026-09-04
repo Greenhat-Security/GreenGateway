@@ -373,6 +373,7 @@ impl<'a> ConnectionsSection<'a> {
         let mut status_history = 0_i64;
         let mut mcp_catalogs = 0_i64;
         let mut openapi_catalogs = 0_i64;
+        let mut openapi_overlays = 0_i64;
         let mut catalog_entries = 0_i64;
         let mut reservations = 0_i64;
 
@@ -400,6 +401,9 @@ impl<'a> ConnectionsSection<'a> {
                 reservations += names;
                 catalog_entries += names;
             }
+            if connection.openapi_overlay.is_some() {
+                openapi_overlays += 1;
+            }
         }
 
         let records = i64::try_from(connections.len()).unwrap_or(i64::MAX);
@@ -415,6 +419,7 @@ impl<'a> ConnectionsSection<'a> {
                 ("status_history", status_history),
                 ("mcp_catalogs", mcp_catalogs),
                 ("openapi_catalogs", openapi_catalogs),
+                ("openapi_overlays", openapi_overlays),
                 ("catalog_entries", catalog_entries),
                 ("tool_name_reservations", reservations),
             ]),
@@ -494,6 +499,7 @@ fn written_counts(written: &ImportedConnectionCounts) -> BTreeMap<String, i64> {
         ("status_history", written.status_history),
         ("mcp_catalogs", written.mcp_catalogs),
         ("openapi_catalogs", written.openapi_catalogs),
+        ("openapi_overlays", written.openapi_overlays),
         (
             "catalog_entries",
             written.mcp_catalog_entries

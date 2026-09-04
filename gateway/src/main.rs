@@ -127,6 +127,7 @@ const CONNECTION_REFRESH_ADMIN_ROUTE: &str = "/v1/admin/connections/{id}/refresh
 const CONNECTION_TEST_ADMIN_ROUTE: &str = "/v1/admin/connections/{id}/test";
 const CONNECTION_OPENAPI_PREVIEW_ADMIN_ROUTE: &str = "/v1/admin/connections/{id}/openapi/preview";
 const CONNECTION_OPENAPI_REGISTER_ADMIN_ROUTE: &str = "/v1/admin/connections/{id}/openapi/register";
+const CONNECTION_OPENAPI_OVERLAY_ADMIN_ROUTE: &str = "/v1/admin/connections/{id}/overlay";
 const CONNECTION_SECRETS_ADMIN_ROUTE: &str = "/v1/admin/connection-secrets";
 const CONNECTION_SECRET_ADMIN_ROUTE: &str = "/v1/admin/connection-secrets/{id}";
 const CONNECTION_COLLECTION_ETAG_HEADER: &str = "x-greengateway-connections-etag";
@@ -284,6 +285,7 @@ struct AdminRoutes {
     connection_test_route: String,
     connection_openapi_preview_route: String,
     connection_openapi_register_route: String,
+    connection_openapi_overlay_route: String,
     connection_secrets_route: String,
     connection_secret_route: String,
     tools_route: String,
@@ -422,6 +424,7 @@ impl AdminRoutes {
             connection_openapi_register_route: format!(
                 "{api_prefix}/connections/{{id}}/openapi/register"
             ),
+            connection_openapi_overlay_route: format!("{api_prefix}/connections/{{id}}/overlay"),
             connection_secrets_route: format!("{api_prefix}/connection-secrets"),
             connection_secret_route: format!("{api_prefix}/connection-secrets/{{id}}"),
             tools_route: format!("{api_prefix}/tools"),
@@ -1069,6 +1072,8 @@ struct OpenApiToolsRegisterResponse {
 #[serde(deny_unknown_fields)]
 struct ManagedOpenApiPreviewRequest {
     spec: String,
+    #[serde(default)]
+    overlay: Option<Value>,
 }
 
 #[derive(Serialize)]
@@ -1083,6 +1088,40 @@ struct ManagedOpenApiPreviewResponse {
     incompatibilities: Vec<ManagedOpenApiIncompatibilityResponse>,
     operation_id_fallbacks: Vec<OpenApiToolNameFallbackResponse>,
     skipped_operations: Vec<OpenApiSkippedOperationResponse>,
+    overlay: ManagedOpenApiOverlayReportResponse,
+}
+
+#[derive(Serialize)]
+struct ManagedOpenApiOverlayReportResponse {
+    applied: bool,
+    problems: Vec<tools::overlay::OverlayProblem>,
+    warnings: Vec<tools::overlay::OverlayWarning>,
+    sources: Vec<Value>,
+    tools: Vec<tools::overlay::OverlayToolReport>,
+    composites: Vec<Value>,
+}
+
+#[derive(Serialize)]
+struct ConnectionOpenApiOverlayGetResponse {
+    connection_id: connections::model::ConnectionId,
+    etag: String,
+    overlay_revision: u64,
+    applied_catalog_revision: u64,
+    document: Option<Value>,
+    sources: Vec<connections::store::StoredOpenApiSourceReport>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    updated_at: Option<String>,
+}
+
+#[derive(Serialize)]
+struct ConnectionOpenApiOverlayMutationResponse {
+    connection_id: connections::model::ConnectionId,
+    overlay_revision: u64,
+    catalog_revision: u64,
+    warnings: Vec<tools::overlay::OverlayWarning>,
+    sources: Vec<connections::store::StoredOpenApiSourceReport>,
+    tools: Vec<tools::overlay::OverlayToolReport>,
+    composites: Vec<Value>,
 }
 
 #[derive(Deserialize)]
@@ -1313,9 +1352,10 @@ struct PolicyRuleCreateResult {
     history_append_failed: bool,
 }
 
-struct PolicyMutationCommitContext<'a> {
+struct PolicyMutationCommitContext<'a, 'guard> {
     state: &'a PolicyAdminState,
     rbac_state: &'a middleware::rbac::RbacState,
+    policy_write_guard: &'a middleware::rbac::PolicyWriteGuard<'guard>,
     parts: &'a http::request::Parts,
     principal: &'a auth::Principal,
 }
@@ -2501,13 +2541,29 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             // the newer number.
             let revision = store.state_revision().await.map_err(to_startup_error)?;
             let records = store.list().await.map_err(to_startup_error)?;
+            let (openapi_catalogs, openapi_overlays) = store
+                .openapi_catalogs_with_overlays()
+                .await
+                .map_err(to_startup_error)?;
+            let openapi_inventory_catalogs = openapi_catalogs
+                .iter()
+                .map(
+                    |catalog| connections::store::StoredOpenApiInventoryCatalog {
+                        connection_id: catalog.connection_id.clone(),
+                        spec_revision: catalog.spec_revision,
+                        catalog_revision: catalog.catalog_revision,
+                        observed_etag: catalog.observed_etag.clone(),
+                        spec_digest: catalog.spec_digest.clone(),
+                        refreshed_at: catalog.refreshed_at.clone(),
+                        entries: catalog.entries.clone(),
+                    },
+                )
+                .collect();
             let boot = connections::managed_store::ClusterConnectionsBoot {
                 mcp_catalogs: store.mcp_catalogs().await.map_err(to_startup_error)?,
-                openapi_catalogs: store.openapi_catalogs().await.map_err(to_startup_error)?,
-                openapi_inventory_catalogs: store
-                    .openapi_inventory_catalogs()
-                    .await
-                    .map_err(to_startup_error)?,
+                openapi_catalogs,
+                openapi_inventory_catalogs,
+                openapi_overlays,
             };
             Some(ClusterConnectionsSeed {
                 store,
@@ -3363,7 +3419,7 @@ fn gateway_app_with_process_started_at_and_overrides(
     #[cfg(feature = "postgres")]
     let rbac_state = match (build_overrides.pg_policy.as_ref(), rbac_state) {
         (Some(seed), Some(state)) => {
-            state.install_revision_snapshot(
+            state.install_initial_revision_snapshot(
                 seed.active.policy.clone(),
                 seed.active.security_revision,
             );
@@ -3470,7 +3526,8 @@ fn gateway_app_with_process_started_at_and_overrides(
         connection_http_runtime.clone(),
         tool_registry.clone(),
         boot_conflicts,
-    )?;
+    )?
+    .with_rbac_state(rbac_state.clone());
     // Cluster mode: register the Connection control plane with the security
     // runtime so every committed record or catalog change reconciles here
     // before the next protected request is served, and start the task that
@@ -4786,6 +4843,12 @@ fn add_admin_api_routes(
                 .route(
                     routes.admin.connection_openapi_register_route.as_str(),
                     post(connection_openapi_register_endpoint),
+                )
+                .route(
+                    routes.admin.connection_openapi_overlay_route.as_str(),
+                    get(connection_openapi_overlay_get_endpoint)
+                        .put(connection_openapi_overlay_put_endpoint)
+                        .delete(connection_openapi_overlay_delete_endpoint),
                 )
                 .route(
                     routes.admin.connection_secrets_route.as_str(),
@@ -7152,7 +7215,7 @@ async fn connection_openapi_preview_endpoint(
     // SQLite read and spec binding run on the blocking pool.
     match state
         .openapi_catalogs
-        .preview(&raw_id, &requested.spec)
+        .preview_with_overlay(&raw_id, &requested.spec, requested.overlay.as_ref())
         .await
     {
         Ok(preview) => {
@@ -7167,7 +7230,162 @@ async fn connection_openapi_preview_endpoint(
             )
                 .into_response()
         }
-        Err(error) => openapi_catalog_error_response(error, "preview"),
+        Err(error) => openapi_overlay_operation_error_response(error, "preview"),
+    }
+}
+
+async fn connection_openapi_overlay_get_endpoint(
+    State(state): State<ConnectionAdminState>,
+    Path(raw_id): Path<String>,
+    request: AxumRequest,
+) -> Response {
+    record_request(CONNECTION_OPENAPI_OVERLAY_ADMIN_ROUTE);
+    let Some(principal) = request.extensions().get::<auth::Principal>() else {
+        return unauthorized();
+    };
+    if let Err(error) =
+        authorized_connection_state(&state, principal, ADMIN_CONNECTIONS_READ_PERMISSION)
+    {
+        return connection_admin_authz_error_response(error);
+    }
+    if !state.control_plane.is_managed_store_configured() {
+        return connection_store_not_configured();
+    }
+
+    match state.openapi_catalogs.openapi_overlay(&raw_id).await {
+        Ok((stored, etag, applied_catalog_revision)) => {
+            let (document, sources, updated_at, overlay_revision) = match stored {
+                Some(stored) => {
+                    let document = match serde_json::from_str::<Value>(&stored.overlay_json) {
+                        Ok(document) => Some(document),
+                        Err(error) => {
+                            tracing::error!(error = %error, connection_id = %raw_id, "stored overlay JSON could not be decoded");
+                            return service_unavailable("stored OpenAPI overlay is unavailable");
+                        }
+                    };
+                    let sources = match stored_overlay_sources(&stored) {
+                        Ok(sources) => sources,
+                        Err(response) => return response,
+                    };
+                    (
+                        document,
+                        sources,
+                        Some(stored.updated_at),
+                        stored.overlay_revision,
+                    )
+                }
+                None => (None, Vec::new(), None, 0),
+            };
+            (
+                StatusCode::OK,
+                [
+                    (header::ETAG, etag_header_value(etag.as_str())),
+                    (header::CACHE_CONTROL, HeaderValue::from_static("no-store")),
+                ],
+                Json(ConnectionOpenApiOverlayGetResponse {
+                    connection_id: match connections::model::ConnectionId::parse(raw_id) {
+                        Ok(id) => id,
+                        Err(_) => return not_found("connection was not found"),
+                    },
+                    etag: etag.as_str().to_owned(),
+                    overlay_revision,
+                    applied_catalog_revision: applied_catalog_revision.unwrap_or(0),
+                    document,
+                    sources,
+                    updated_at,
+                }),
+            )
+                .into_response()
+        }
+        Err(error) => openapi_catalog_error_response(error, "overlay read"),
+    }
+}
+
+async fn connection_openapi_overlay_put_endpoint(
+    State(state): State<ConnectionAdminState>,
+    Path(raw_id): Path<String>,
+    request: AxumRequest,
+) -> Response {
+    record_request(CONNECTION_OPENAPI_OVERLAY_ADMIN_ROUTE);
+    let (parts, body) = request.into_parts();
+    let Some(principal) = parts.extensions.get::<auth::Principal>().cloned() else {
+        return unauthorized();
+    };
+    if let Err(error) =
+        authorized_connection_state(&state, &principal, ADMIN_CONNECTIONS_WRITE_PERMISSION)
+    {
+        return connection_admin_authz_error_response(error);
+    }
+    if !state.control_plane.is_managed_store_configured() {
+        return connection_store_not_configured();
+    }
+    let expected_etag = match exact_strong_if_match(&parts.headers) {
+        Ok(etag) => etag,
+        Err(ToolPlaygroundIfMatchError::Missing) => {
+            return precondition_required("If-Match header is required");
+        }
+        Err(ToolPlaygroundIfMatchError::Invalid) => {
+            return bad_request("If-Match must contain exactly one strong entity tag");
+        }
+    };
+    let body = match read_request_body(body, tools::overlay::MAX_OVERLAY_BYTES).await {
+        Ok(body) => body,
+        Err(response) => return *response,
+    };
+    let document = match serde_json::from_slice::<Value>(&body) {
+        Ok(document) => document,
+        Err(error) => return bad_request(&format!("invalid OpenAPI overlay JSON: {error}")),
+    };
+    match state
+        .openapi_catalogs
+        .put_overlay(&raw_id, &expected_etag, &document, &principal.user_id)
+        .await
+    {
+        Ok(result) => {
+            emit_managed_openapi_catalog_changed(&state, &parts, &principal, &result.catalog);
+            overlay_mutation_response(result)
+        }
+        Err(error) => openapi_overlay_operation_error_response(error, "overlay update"),
+    }
+}
+
+async fn connection_openapi_overlay_delete_endpoint(
+    State(state): State<ConnectionAdminState>,
+    Path(raw_id): Path<String>,
+    request: AxumRequest,
+) -> Response {
+    record_request(CONNECTION_OPENAPI_OVERLAY_ADMIN_ROUTE);
+    let (parts, _) = request.into_parts();
+    let Some(principal) = parts.extensions.get::<auth::Principal>().cloned() else {
+        return unauthorized();
+    };
+    if let Err(error) =
+        authorized_connection_state(&state, &principal, ADMIN_CONNECTIONS_WRITE_PERMISSION)
+    {
+        return connection_admin_authz_error_response(error);
+    }
+    if !state.control_plane.is_managed_store_configured() {
+        return connection_store_not_configured();
+    }
+    let expected_etag = match exact_strong_if_match(&parts.headers) {
+        Ok(etag) => etag,
+        Err(ToolPlaygroundIfMatchError::Missing) => {
+            return precondition_required("If-Match header is required");
+        }
+        Err(ToolPlaygroundIfMatchError::Invalid) => {
+            return bad_request("If-Match must contain exactly one strong entity tag");
+        }
+    };
+    match state
+        .openapi_catalogs
+        .delete_overlay(&raw_id, &expected_etag, &principal.user_id)
+        .await
+    {
+        Ok(result) => {
+            emit_managed_openapi_catalog_changed(&state, &parts, &principal, &result.catalog);
+            overlay_mutation_response(result)
+        }
+        Err(error) => openapi_overlay_operation_error_response(error, "overlay delete"),
     }
 }
 
@@ -7385,6 +7603,7 @@ async fn policy_put_endpoint(
         PolicyMutationCommitContext {
             state: &state,
             rbac_state,
+            policy_write_guard: &_policy_write_guard,
             parts: &parts,
             principal: &principal,
         },
@@ -7505,6 +7724,7 @@ async fn policy_rollback_endpoint(
         PolicyMutationCommitContext {
             state: &state,
             rbac_state,
+            policy_write_guard: &_policy_write_guard,
             parts: &parts,
             principal: &principal,
         },
@@ -7657,6 +7877,7 @@ async fn policy_rule_patch_endpoint(
         PolicyMutationCommitContext {
             state: &state,
             rbac_state,
+            policy_write_guard: &_policy_write_guard,
             parts: &parts,
             principal: &principal,
         },
@@ -7729,6 +7950,7 @@ async fn policy_rule_delete_endpoint(
         PolicyMutationCommitContext {
             state: &state,
             rbac_state,
+            policy_write_guard: &_policy_write_guard,
             parts: &parts,
             principal: &principal,
         },
@@ -7803,6 +8025,7 @@ async fn policy_rules_order_put_endpoint(
         PolicyMutationCommitContext {
             state: &state,
             rbac_state,
+            policy_write_guard: &_policy_write_guard,
             parts: &parts,
             principal: &principal,
         },
@@ -9808,9 +10031,10 @@ async fn accept_suggestion_in_cluster(
     // Committed. Install the authority's snapshot before answering, as
     // every other cluster-mode policy mutation does, then emit the two
     // changes this request made.
-    rbac_state.install_revision_snapshot(
+    rbac_state.install_revision_snapshot_locked(
         accepted.policy.policy.clone(),
         accepted.policy.security_revision,
+        &_policy_write_guard,
     );
     let rule = accepted
         .policy
@@ -13190,8 +13414,7 @@ fn managed_openapi_preview_response(
 ) -> ManagedOpenApiPreviewResponse {
     let connection_etag = preview.connection_etag.as_str().to_owned();
     let security_confirmations = preview
-        .binding
-        .security_selections
+        .registration_security_selections
         .into_iter()
         .map(|selection| ManagedOpenApiSecuritySelectionResponse {
             tool_name: selection.tool_name,
@@ -13204,6 +13427,7 @@ fn managed_openapi_preview_response(
         .into_iter()
         .map(managed_openapi_incompatibility_response)
         .collect();
+    let overlay = managed_openapi_overlay_report_response(preview.overlay_report);
     ManagedOpenApiPreviewResponse {
         connection_id: preview.connection_id,
         connection_etag,
@@ -13225,7 +13449,80 @@ fn managed_openapi_preview_response(
             .into_iter()
             .map(openapi_skipped_operation_response)
             .collect(),
+        overlay,
     }
+}
+
+fn managed_openapi_overlay_report_response(
+    report: Option<connections::openapi::OpenApiOverlayCompileReport>,
+) -> ManagedOpenApiOverlayReportResponse {
+    let (applied, warnings, tools) = report
+        .map(|report| (true, report.warnings, report.tools))
+        .unwrap_or_else(|| (false, Vec::new(), Vec::new()));
+    ManagedOpenApiOverlayReportResponse {
+        applied,
+        problems: Vec::new(),
+        warnings,
+        sources: Vec::new(),
+        tools,
+        composites: Vec::new(),
+    }
+}
+
+#[allow(clippy::result_large_err)] // Axum's complete safe HTTP failure is the useful error here.
+fn stored_overlay_sources(
+    stored: &connections::store::StoredOpenApiOverlay,
+) -> Result<Vec<connections::store::StoredOpenApiSourceReport>, Response> {
+    let Some(encoded) = stored.source_reports_json.as_deref() else {
+        tracing::error!(connection_id = %stored.connection_id, "stored overlay is missing its source report snapshot");
+        return Err(service_unavailable(
+            "stored OpenAPI overlay source reports are unavailable",
+        ));
+    };
+    let report = connections::store::decode_openapi_source_reports(encoded).map_err(|()| {
+        tracing::error!(connection_id = %stored.connection_id, "stored overlay source reports failed strict validation");
+        service_unavailable("stored OpenAPI overlay source reports are unavailable")
+    })?;
+    Ok(report.sources)
+}
+
+fn overlay_mutation_response(
+    result: connections::openapi::OpenApiOverlayMutationResult,
+) -> Response {
+    let connection_id = result.catalog.connection_id.clone();
+    let catalog_revision = result.catalog.catalog_revision;
+    let etag = result.etag;
+    let (overlay_revision, sources) = match result.stored.as_ref() {
+        Some(stored) => {
+            let sources = match stored_overlay_sources(stored) {
+                Ok(sources) => sources,
+                Err(response) => return response,
+            };
+            (stored.overlay_revision, sources)
+        }
+        None => (0, Vec::new()),
+    };
+    let (warnings, tools) = result
+        .report
+        .map(|report| (report.warnings, report.tools))
+        .unwrap_or_else(|| (Vec::new(), Vec::new()));
+    (
+        StatusCode::OK,
+        [
+            (header::ETAG, etag_header_value(etag.as_str())),
+            (header::CACHE_CONTROL, HeaderValue::from_static("no-store")),
+        ],
+        Json(ConnectionOpenApiOverlayMutationResponse {
+            connection_id,
+            overlay_revision,
+            catalog_revision,
+            warnings,
+            sources,
+            tools,
+            composites: Vec::new(),
+        }),
+    )
+        .into_response()
 }
 
 fn managed_openapi_incompatibility_response(
@@ -13675,6 +13972,7 @@ async fn create_policy_rule(
         PolicyMutationCommitContext {
             state,
             rbac_state,
+            policy_write_guard: &_policy_write_guard,
             parts,
             principal,
         },
@@ -13724,7 +14022,7 @@ fn validate_policy_mutation_candidate(
 }
 
 async fn persist_policy_mutation(
-    context: PolicyMutationCommitContext<'_>,
+    context: PolicyMutationCommitContext<'_, '_>,
     before_policy: &rbac::Policy,
     expected_etag: &str,
     candidate: &rbac::Policy,
@@ -13752,9 +14050,11 @@ async fn persist_policy_mutation(
             .await;
         return match commit {
             Ok(active) => {
-                context
-                    .rbac_state
-                    .install_revision_snapshot(active.policy.clone(), active.security_revision);
+                context.rbac_state.install_revision_snapshot_locked(
+                    active.policy.clone(),
+                    active.security_revision,
+                    context.policy_write_guard,
+                );
                 emit_policy_rule_changed(
                     context.state,
                     context.parts,
@@ -13802,7 +14102,11 @@ async fn persist_policy_mutation(
         return Err(Box::new(internal_server_error("policy persist failed")));
     }
 
-    if let Err(err) = middleware::rbac::reload_policy_from_file(context.rbac_state, policy_file) {
+    if let Err(err) = middleware::rbac::reload_policy_from_file_locked(
+        context.rbac_state,
+        policy_file,
+        context.policy_write_guard,
+    ) {
         tracing::error!(policy_file = %policy_file.display(), error = %err, "failed to reload persisted policy");
         return Err(Box::new(internal_server_error("policy reload failed")));
     }
@@ -15192,6 +15496,31 @@ fn openapi_catalog_error_response(
         })),
     )
         .into_response()
+}
+
+fn openapi_overlay_operation_error_response(
+    error: connections::openapi::OpenApiOverlayOperationError,
+    operation: &'static str,
+) -> Response {
+    match error {
+        connections::openapi::OpenApiOverlayOperationError::Catalog(error) => {
+            openapi_catalog_error_response(error, operation)
+        }
+        connections::openapi::OpenApiOverlayOperationError::Rejected(error) => (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(json!({
+                "problems": error.problems,
+                "warnings": [],
+            })),
+        )
+            .into_response(),
+        connections::openapi::OpenApiOverlayOperationError::PreconditionFailed(current) => {
+            with_etag(
+                precondition_failed("If-Match does not match the current overlay ETag"),
+                current.as_str(),
+            )
+        }
+    }
 }
 
 fn egress_reload_unsupported() -> Response {
@@ -16975,6 +17304,10 @@ mod tests {
             default_routes.connection_openapi_register_route,
             CONNECTION_OPENAPI_REGISTER_ADMIN_ROUTE
         );
+        assert_eq!(
+            default_routes.connection_openapi_overlay_route,
+            CONNECTION_OPENAPI_OVERLAY_ADMIN_ROUTE
+        );
         assert_eq!(default_routes.tools_route, TOOLS_ADMIN_ROUTE);
         assert_eq!(default_routes.tool_route, TOOL_ADMIN_ROUTE);
         assert_eq!(default_routes.tool_execute_route, TOOL_EXECUTE_ADMIN_ROUTE);
@@ -17084,6 +17417,10 @@ mod tests {
         assert_eq!(
             custom_routes.connection_openapi_register_route,
             "/v1/ops/connections/{id}/openapi/register"
+        );
+        assert_eq!(
+            custom_routes.connection_openapi_overlay_route,
+            "/v1/ops/connections/{id}/overlay"
         );
         assert_eq!(custom_routes.tools_route, "/v1/ops/tools");
         assert_eq!(custom_routes.tool_route, "/v1/ops/tools/{id}");
@@ -27039,6 +27376,484 @@ mod tests {
         assert_eq!(cleared["registered_tool_names"], json!([]));
         assert_eq!(cleared["total_count"], json!(0));
         assert_eq!(cleared["removed_count"], json!(1));
+    }
+
+    #[test]
+    fn stored_overlay_source_response_projects_only_a_strict_typed_envelope() {
+        let mut reports = connections::store::StoredOpenApiSourceReports::empty();
+        reports
+            .sources
+            .push(connections::store::StoredOpenApiSourceReport {
+                id: "statuses".to_owned(),
+                kind: connections::store::StoredOpenApiSourceKind::Enum,
+                state: "resolved".to_owned(),
+                item_count: 3,
+                resolved_at: Some("2026-09-03T12:00:00Z".to_owned()),
+            });
+        let stored = connections::store::StoredOpenApiOverlay {
+            connection_id: connections::model::ConnectionId::parse(
+                "00000000-0000-0000-0000-000000000360",
+            )
+            .expect("test connection ID should parse"),
+            schema_version: "0.1.0".to_owned(),
+            overlay_revision: 1,
+            overlay_json: r#"{"schema_version":"0.1.0"}"#.to_owned(),
+            source_reports_json: Some(
+                reports
+                    .canonical_json()
+                    .expect("typed source reports should serialize"),
+            ),
+            updated_at: "2026-09-03T12:00:00Z".to_owned(),
+        };
+
+        let sources = stored_overlay_sources(&stored).expect("strict source reports should decode");
+        assert_eq!(
+            serde_json::to_value(sources).expect("source response should serialize"),
+            json!([{
+                "id": "statuses",
+                "kind": "enum",
+                "state": "resolved",
+                "item_count": 3,
+                "resolved_at": "2026-09-03T12:00:00Z"
+            }])
+        );
+    }
+
+    #[test]
+    fn stored_overlay_source_response_fails_closed_on_invalid_envelopes() {
+        for encoded in [
+            None,
+            Some(r#"{"schema_version":"0.1.0"}"#),
+            Some(r#"{"schema_version":"future","sources":[]}"#),
+            Some(r#"{"schema_version":"0.1.0","sources":[],"future":true}"#),
+        ] {
+            let stored = connections::store::StoredOpenApiOverlay {
+                connection_id: connections::model::ConnectionId::parse(
+                    "00000000-0000-0000-0000-000000000360",
+                )
+                .expect("test connection ID should parse"),
+                schema_version: "0.1.0".to_owned(),
+                overlay_revision: 1,
+                overlay_json: r#"{"schema_version":"0.1.0"}"#.to_owned(),
+                source_reports_json: encoded.map(str::to_owned),
+                updated_at: "2026-09-03T12:00:00Z".to_owned(),
+            };
+
+            let response = stored_overlay_sources(&stored)
+                .expect_err("invalid source report envelope must fail closed");
+            assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        }
+    }
+
+    #[tokio::test]
+    async fn managed_openapi_overlay_api_enforces_permissions_etags_and_atomic_validation() {
+        let connection_db = TempDb::new("connection-openapi-overlay-api");
+        let policy = TempPolicyFile::new(&connection_policy_document_string());
+        let router = connection_admin_router(&connection_db, &policy, test_audit_log());
+
+        let list = router
+            .clone()
+            .oneshot(connection_admin_request(
+                Method::GET,
+                CONNECTIONS_ADMIN_ROUTE,
+                Some(test_principal(&["connections-reader"])),
+                None,
+                None,
+                false,
+            ))
+            .await
+            .expect("connection list should complete");
+        let collection_etag = list
+            .headers()
+            .get(CONNECTION_COLLECTION_ETAG_HEADER)
+            .and_then(|value| value.to_str().ok())
+            .expect("connection list should include collection ETag")
+            .to_owned();
+        let created = router
+            .clone()
+            .oneshot(connection_admin_request(
+                Method::POST,
+                CONNECTIONS_ADMIN_ROUTE,
+                Some(test_principal(&["connections-editor"])),
+                Some(managed_openapi_connection_body("Overlay API")),
+                Some(&collection_etag),
+                true,
+            ))
+            .await
+            .expect("managed OpenAPI connection create should complete");
+        assert_eq!(created.status(), StatusCode::CREATED);
+        let connection_etag = created
+            .headers()
+            .get(header::ETAG)
+            .and_then(|value| value.to_str().ok())
+            .expect("created connection should include ETag")
+            .to_owned();
+        let connection_id = json_body(created).await["id"]
+            .as_str()
+            .expect("created connection should include ID")
+            .to_owned();
+
+        let preview_uri = format!("{CONNECTIONS_ADMIN_ROUTE}/{connection_id}/openapi/preview");
+        let register_uri = format!("{CONNECTIONS_ADMIN_ROUTE}/{connection_id}/openapi/register");
+        let overlay_uri = format!("{CONNECTIONS_ADMIN_ROUTE}/{connection_id}/overlay");
+        let preview = router
+            .clone()
+            .oneshot(connection_admin_request(
+                Method::POST,
+                &preview_uri,
+                Some(test_principal(&["openapi-tools-reader"])),
+                Some(json!({ "spec": widget_openapi_spec() }).to_string()),
+                None,
+                true,
+            ))
+            .await
+            .expect("managed OpenAPI preview should complete");
+        assert_eq!(preview.status(), StatusCode::OK);
+        let preview = json_body(preview).await;
+        let selected_tool_name = preview["tools"][0]["name"]
+            .as_str()
+            .expect("preview should include a generated tool")
+            .to_owned();
+        let selected_security_confirmation = preview["security_confirmations"]
+            .as_array()
+            .and_then(|confirmations| {
+                confirmations.iter().find(|confirmation| {
+                    confirmation["tool_name"].as_str() == Some(selected_tool_name.as_str())
+                })
+            })
+            .cloned()
+            .expect("selected tool should include its security confirmation");
+        let registered = router
+            .clone()
+            .oneshot(connection_admin_request(
+                Method::POST,
+                &register_uri,
+                Some(test_principal(&["openapi-tools-writer"])),
+                Some(
+                    json!({
+                        "spec": widget_openapi_spec(),
+                        "spec_digest": preview["spec_digest"],
+                        "expected_spec_revision": preview["spec_revision"],
+                        "expected_catalog_revision": preview["catalog_revision"],
+                        "selected_tool_names": [selected_tool_name.clone()],
+                        "security_confirmations": [selected_security_confirmation],
+                    })
+                    .to_string(),
+                ),
+                Some(&connection_etag),
+                true,
+            ))
+            .await
+            .expect("managed OpenAPI registration should complete");
+        assert_eq!(registered.status(), StatusCode::CREATED);
+        let registered = json_body(registered).await;
+        let registered_catalog_revision = registered["catalog_revision"]
+            .as_u64()
+            .expect("registration must return the catalog revision");
+        let initial_expected_etag =
+            format!("\"overlay:{connection_id}:c1:r{registered_catalog_revision}:o0\"");
+
+        let forbidden = router
+            .clone()
+            .oneshot(connection_admin_request(
+                Method::GET,
+                &overlay_uri,
+                Some(test_principal(&["connections-observer"])),
+                None,
+                None,
+                false,
+            ))
+            .await
+            .expect("overlay read permission denial should complete");
+        assert_eq!(forbidden.status(), StatusCode::FORBIDDEN);
+
+        let initial = router
+            .clone()
+            .oneshot(connection_admin_request(
+                Method::GET,
+                &overlay_uri,
+                Some(test_principal(&["connections-reader"])),
+                None,
+                None,
+                false,
+            ))
+            .await
+            .expect("initial overlay read should complete");
+        assert_eq!(initial.status(), StatusCode::OK);
+        assert_eq!(
+            initial
+                .headers()
+                .get(header::ETAG)
+                .and_then(|value| value.to_str().ok()),
+            Some(initial_expected_etag.as_str())
+        );
+        assert_eq!(
+            initial
+                .headers()
+                .get(header::CACHE_CONTROL)
+                .and_then(|value| value.to_str().ok()),
+            Some("no-store")
+        );
+        let initial_etag = initial
+            .headers()
+            .get(header::ETAG)
+            .and_then(|value| value.to_str().ok())
+            .expect("initial overlay read should include ETag")
+            .to_owned();
+        let initial = json_body(initial).await;
+        assert_eq!(initial["connection_id"], json!(connection_id));
+        assert_eq!(initial["overlay_revision"], json!(0));
+        assert_eq!(initial["document"], Value::Null);
+        assert_eq!(
+            initial["applied_catalog_revision"],
+            registered["catalog_revision"]
+        );
+        assert_eq!(initial["sources"], json!([]));
+
+        let missing_precondition = router
+            .clone()
+            .oneshot(connection_admin_request(
+                Method::PUT,
+                &overlay_uri,
+                Some(test_principal(&["connections-editor"])),
+                Some(json!({ "schema_version": "0.1.0" }).to_string()),
+                None,
+                true,
+            ))
+            .await
+            .expect("missing overlay precondition should complete");
+        assert_eq!(
+            missing_precondition.status(),
+            StatusCode::PRECONDITION_REQUIRED
+        );
+
+        let weak_precondition = router
+            .clone()
+            .oneshot(connection_admin_request(
+                Method::PUT,
+                &overlay_uri,
+                Some(test_principal(&["connections-editor"])),
+                Some(json!({ "schema_version": "0.1.0" }).to_string()),
+                Some(&format!("W/{initial_etag}")),
+                true,
+            ))
+            .await
+            .expect("weak overlay precondition should complete");
+        assert_eq!(weak_precondition.status(), StatusCode::BAD_REQUEST);
+
+        let rejected = router
+            .clone()
+            .oneshot(connection_admin_request(
+                Method::PUT,
+                &overlay_uri,
+                Some(test_principal(&["connections-editor"])),
+                Some(
+                    json!({
+                        "schema_version": "0.1.0",
+                        "tools": { "missingGeneratedTool": {} }
+                    })
+                    .to_string(),
+                ),
+                Some(&initial_etag),
+                true,
+            ))
+            .await
+            .expect("invalid overlay should complete");
+        assert_eq!(rejected.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        let rejected = json_body(rejected).await;
+        assert_eq!(rejected["warnings"], json!([]));
+        assert!(rejected["problems"]
+            .as_array()
+            .is_some_and(|items| !items.is_empty()));
+
+        // The rejected compile must not have moved either durable resource.
+        let after_rejection = router
+            .clone()
+            .oneshot(connection_admin_request(
+                Method::GET,
+                &overlay_uri,
+                Some(test_principal(&["connections-reader"])),
+                None,
+                None,
+                false,
+            ))
+            .await
+            .expect("overlay read after rejection should complete");
+        assert_eq!(
+            after_rejection
+                .headers()
+                .get(header::ETAG)
+                .and_then(|value| value.to_str().ok()),
+            Some(initial_etag.as_str())
+        );
+        assert_eq!(json_body(after_rejection).await["document"], Value::Null);
+
+        let mut tool_overlays = serde_json::Map::new();
+        tool_overlays.insert(
+            selected_tool_name.clone(),
+            json!({
+                "rename": "overlay_widget",
+                "description": "Widget operation compiled from the overlay.",
+                "visibility": "composite_only"
+            }),
+        );
+        let document = json!({
+            "schema_version": "0.1.0",
+            "tools": tool_overlays
+        });
+        let stored = router
+            .clone()
+            .oneshot(connection_admin_request(
+                Method::PUT,
+                &overlay_uri,
+                Some(test_principal(&["connections-editor"])),
+                Some(document.to_string()),
+                Some(&initial_etag),
+                true,
+            ))
+            .await
+            .expect("valid overlay should publish");
+        assert_eq!(stored.status(), StatusCode::OK);
+        assert_eq!(
+            stored
+                .headers()
+                .get(header::CACHE_CONTROL)
+                .and_then(|value| value.to_str().ok()),
+            Some("no-store")
+        );
+        let stored_etag = stored
+            .headers()
+            .get(header::ETAG)
+            .and_then(|value| value.to_str().ok())
+            .expect("overlay mutation should include ETag")
+            .to_owned();
+        let stored_catalog_revision = registered_catalog_revision + 1;
+        assert_eq!(
+            stored_etag,
+            format!("\"overlay:{connection_id}:c1:r{stored_catalog_revision}:o1\"")
+        );
+        let stored = json_body(stored).await;
+        assert_eq!(stored["overlay_revision"], json!(1));
+        assert_eq!(
+            stored["tools"][0]["generated_name"],
+            json!(selected_tool_name)
+        );
+        assert_eq!(stored["tools"][0]["served_name"], json!("overlay_widget"));
+        assert_eq!(stored["tools"][0]["visibility"], json!("composite_only"));
+        assert!(stored["catalog_revision"]
+            .as_u64()
+            .is_some_and(|revision| { revision == stored_catalog_revision }));
+
+        let read_back = router
+            .clone()
+            .oneshot(connection_admin_request(
+                Method::GET,
+                &overlay_uri,
+                Some(test_principal(&["connections-reader"])),
+                None,
+                None,
+                false,
+            ))
+            .await
+            .expect("stored overlay read should complete");
+        assert_eq!(
+            read_back
+                .headers()
+                .get(header::ETAG)
+                .and_then(|value| value.to_str().ok()),
+            Some(stored_etag.as_str())
+        );
+        let read_back = json_body(read_back).await;
+        assert_eq!(read_back["overlay_revision"], json!(1));
+        assert_eq!(read_back["document"], document);
+        assert_eq!(
+            read_back["applied_catalog_revision"],
+            stored["catalog_revision"]
+        );
+
+        let stale = router
+            .clone()
+            .oneshot(connection_admin_request(
+                Method::PUT,
+                &overlay_uri,
+                Some(test_principal(&["connections-editor"])),
+                Some(json!({ "schema_version": "0.1.0" }).to_string()),
+                Some(&initial_etag),
+                true,
+            ))
+            .await
+            .expect("stale overlay write should complete");
+        assert_eq!(stale.status(), StatusCode::PRECONDITION_FAILED);
+        assert_eq!(
+            stale
+                .headers()
+                .get(header::ETAG)
+                .and_then(|value| value.to_str().ok()),
+            Some(stored_etag.as_str())
+        );
+
+        let missing_delete_precondition = router
+            .clone()
+            .oneshot(connection_admin_request(
+                Method::DELETE,
+                &overlay_uri,
+                Some(test_principal(&["connections-editor"])),
+                None,
+                None,
+                true,
+            ))
+            .await
+            .expect("missing overlay delete precondition should complete");
+        assert_eq!(
+            missing_delete_precondition.status(),
+            StatusCode::PRECONDITION_REQUIRED
+        );
+
+        let deleted = router
+            .clone()
+            .oneshot(connection_admin_request(
+                Method::DELETE,
+                &overlay_uri,
+                Some(test_principal(&["connections-editor"])),
+                None,
+                Some(&stored_etag),
+                true,
+            ))
+            .await
+            .expect("overlay delete should complete");
+        assert_eq!(deleted.status(), StatusCode::OK);
+        let deleted_catalog_revision = stored_catalog_revision + 1;
+        let deleted_etag = format!("\"overlay:{connection_id}:c1:r{deleted_catalog_revision}:o0\"");
+        assert_eq!(
+            deleted
+                .headers()
+                .get(header::ETAG)
+                .and_then(|value| value.to_str().ok()),
+            Some(deleted_etag.as_str())
+        );
+        let deleted = json_body(deleted).await;
+        assert_eq!(deleted["overlay_revision"], json!(0));
+        assert_eq!(deleted["tools"], json!([]));
+
+        let final_read = router
+            .oneshot(connection_admin_request(
+                Method::GET,
+                &overlay_uri,
+                Some(test_principal(&["connections-reader"])),
+                None,
+                None,
+                false,
+            ))
+            .await
+            .expect("deleted overlay read should complete");
+        assert_eq!(final_read.status(), StatusCode::OK);
+        let final_read = json_body(final_read).await;
+        assert_eq!(final_read["overlay_revision"], json!(0));
+        assert_eq!(final_read["document"], Value::Null);
+        assert_eq!(
+            final_read["applied_catalog_revision"],
+            deleted["catalog_revision"]
+        );
     }
 
     #[tokio::test]
@@ -44998,7 +45813,9 @@ O2gecI9QwDJNpm29J9wJB2F8
             let (router, rbac_state) = cluster_policy_router(store.clone());
             // The router's local snapshot starts unkeyed; install the
             // authority's revision like the production startup path does.
-            rbac_state.install_revision_snapshot(active.policy.clone(), active.security_revision);
+            rbac_state
+                .install_revision_snapshot(active.policy.clone(), active.security_revision)
+                .await;
 
             // GET serves the authoritative document and its verified ETag.
             let etag = etag_of(
@@ -45252,7 +46069,9 @@ O2gecI9QwDJNpm29J9wJB2F8
                 false,
                 test_audit_log(),
             );
-            rbac_state.install_revision_snapshot(active.policy.clone(), active.security_revision);
+            rbac_state
+                .install_revision_snapshot(active.policy.clone(), active.security_revision)
+                .await;
             let runtime = ClusterSecurityRuntime::new(
                 store.revision_source(),
                 PolicyResource::new(store.clone(), rbac_state.clone()),
@@ -45317,7 +46136,9 @@ O2gecI9QwDJNpm29J9wJB2F8
             let (router, rbac_state) = cluster_policy_router(store.clone());
             // Production startup: the snapshot is keyed to the revision the
             // replica booted against.
-            rbac_state.install_revision_snapshot(active.policy.clone(), active.security_revision);
+            rbac_state
+                .install_revision_snapshot(active.policy.clone(), active.security_revision)
+                .await;
 
             // Sanity: the granted admin principal is authorized while the
             // snapshot is current.
@@ -45410,7 +46231,9 @@ O2gecI9QwDJNpm29J9wJB2F8
                 false,
                 test_audit_log(),
             );
-            rbac_state.install_revision_snapshot(active.policy.clone(), active.security_revision);
+            rbac_state
+                .install_revision_snapshot(active.policy.clone(), active.security_revision)
+                .await;
             let runtime = ClusterSecurityRuntime::new(
                 store.revision_source(),
                 PolicyResource::new(store.clone(), rbac_state.clone()),
@@ -45816,10 +46639,12 @@ O2gecI9QwDJNpm29J9wJB2F8
                 false,
                 test_audit_log(),
             );
-            rbac_state.install_revision_snapshot(
-                active_policy.policy.clone(),
-                active_policy.security_revision,
-            );
+            rbac_state
+                .install_revision_snapshot(
+                    active_policy.policy.clone(),
+                    active_policy.security_revision,
+                )
+                .await;
             let registry =
                 ToolRegistry::from_definitions_with_audit(Vec::new(), Some(test_audit_log()));
             let boot_tools = tools_store
@@ -46069,10 +46894,12 @@ O2gecI9QwDJNpm29J9wJB2F8
                 false,
                 test_audit_log(),
             );
-            rbac_state.install_revision_snapshot(
-                active_policy.policy.clone(),
-                active_policy.security_revision,
-            );
+            rbac_state
+                .install_revision_snapshot(
+                    active_policy.policy.clone(),
+                    active_policy.security_revision,
+                )
+                .await;
             let runtime = ClusterSecurityRuntime::new(
                 policy_store.revision_source(),
                 PolicyResource::new(policy_store.clone(), rbac_state.clone()),
@@ -46154,10 +46981,12 @@ O2gecI9QwDJNpm29J9wJB2F8
                 false,
                 test_audit_log(),
             );
-            rbac_state.install_revision_snapshot(
-                active_policy.policy.clone(),
-                active_policy.security_revision,
-            );
+            rbac_state
+                .install_revision_snapshot(
+                    active_policy.policy.clone(),
+                    active_policy.security_revision,
+                )
+                .await;
             let runtime = ClusterSecurityRuntime::new(
                 policy_store.revision_source(),
                 PolicyResource::new(policy_store.clone(), rbac_state.clone()),
@@ -46375,10 +47204,12 @@ O2gecI9QwDJNpm29J9wJB2F8
                 false,
                 test_audit_log(),
             );
-            rbac_state.install_revision_snapshot(
-                active_policy.policy.clone(),
-                active_policy.security_revision,
-            );
+            rbac_state
+                .install_revision_snapshot(
+                    active_policy.policy.clone(),
+                    active_policy.security_revision,
+                )
+                .await;
             let runtime = ClusterSecurityRuntime::new(
                 policy_store.revision_source(),
                 PolicyResource::new(policy_store.clone(), rbac_state.clone()),
@@ -46503,10 +47334,12 @@ O2gecI9QwDJNpm29J9wJB2F8
                 false,
                 test_audit_log(),
             );
-            rbac_state.install_revision_snapshot(
-                active_policy.policy.clone(),
-                active_policy.security_revision,
-            );
+            rbac_state
+                .install_revision_snapshot(
+                    active_policy.policy.clone(),
+                    active_policy.security_revision,
+                )
+                .await;
             let registry =
                 ToolRegistry::from_definitions_with_audit(Vec::new(), Some(test_audit_log()));
             let boot_tools = tools_store
@@ -47078,7 +47911,9 @@ O2gecI9QwDJNpm29J9wJB2F8
                 middleware::rbac::RbacState::new(policy, Vec::new(), false, audit_log.clone());
             // Startup installs the authority's revision; without it the
             // handler's snapshot is unkeyed.
-            rbac_state.install_revision_snapshot(active.policy.clone(), active.security_revision);
+            rbac_state
+                .install_revision_snapshot(active.policy.clone(), active.security_revision)
+                .await;
 
             let engine = discovery::cluster_suggestions::ClusterRuleSuggestionEngine::new(
                 Arc::new(PostgresDiscoveryReadStore::new(pool.clone())),

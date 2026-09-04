@@ -629,7 +629,8 @@ impl PolicyResource {
         // The runtime's compiled-revision watermark -- not this per-resource
         // key -- is what the gate compares against the global counter.
         self.rbac_state
-            .install_revision_snapshot(active.policy, active.security_revision);
+            .install_revision_snapshot(active.policy, active.security_revision)
+            .await;
         Ok(())
     }
 }

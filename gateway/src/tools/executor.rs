@@ -32,7 +32,10 @@ use crate::{
             BodyMappingMode, McpProxyMapping, ToolDefinition, ToolRegistry, ToolSource, ToolTarget,
         },
         mcp_upstream::{self, McpUpstreamRuntimeConfig},
-        runtime::{ToolInvocationContext, ToolRuntime, ToolRuntimeError, ToolWorkErrorDisposition},
+        runtime::{
+            ToolInvocationContext, ToolInvocationSource, ToolRuntime, ToolRuntimeError,
+            ToolWorkErrorDisposition,
+        },
     },
 };
 
@@ -582,6 +585,24 @@ impl ToolExecutor {
         precondition: Option<ToolExecutionPrecondition>,
     ) -> Result<ToolExecutionResult, ToolRuntimeError> {
         let started = Instant::now();
+        if context.source != ToolInvocationSource::AdminPlayground
+            && self
+                .registry
+                .get(tool_name)
+                .is_some_and(|tool| !tool.visibility.is_listed())
+        {
+            // Composite-only tools deliberately look absent at the public
+            // executor boundary. This runs before runtime/RBAC admission so
+            // callers cannot infer a hidden tool from a different error.
+            self.emit_unknown_tool_observation(
+                &context,
+                tool_name,
+                duration_millis(started.elapsed()),
+            );
+            return Err(ToolRuntimeError::UnknownTool {
+                tool_name: tool_name.to_owned(),
+            });
+        }
         let runtime_tool_name = tool_name.to_owned();
         let work_tool_name = runtime_tool_name.clone();
         let observation_context = context.clone();
@@ -620,7 +641,10 @@ impl ToolExecutor {
     }
 
     pub(crate) fn can_list_tool(&self, tool_name: &str, context: &ToolInvocationContext) -> bool {
-        self.runtime.tool_visible_to_context(tool_name, context)
+        self.registry
+            .get(tool_name)
+            .is_some_and(|tool| tool.visibility.is_listed())
+            && self.runtime.tool_visible_to_context(tool_name, context)
     }
 
     pub(crate) fn record_unknown_tool_call(
@@ -638,6 +662,21 @@ impl ToolExecutor {
         tool_name: &str,
     ) -> Result<(), ToolRuntimeError> {
         let started = Instant::now();
+        if context.source != ToolInvocationSource::AdminPlayground
+            && self
+                .registry
+                .get(tool_name)
+                .is_some_and(|tool| !tool.visibility.is_listed())
+        {
+            self.emit_unknown_tool_observation(
+                &context,
+                tool_name,
+                duration_millis(started.elapsed()),
+            );
+            return Err(ToolRuntimeError::UnknownTool {
+                tool_name: tool_name.to_owned(),
+            });
+        }
         let result: Result<(), ToolRuntimeError> = self
             .runtime
             .execute_result_with_context_and_reason(
@@ -1480,6 +1519,19 @@ impl ToolExecutor {
                         }
                     })?)
                 }
+                BodyMappingMode::BodyArgsJson => {
+                    headers.insert(
+                        header::CONTENT_TYPE,
+                        HeaderValue::from_static("application/json"),
+                    );
+                    let body_args = body_arguments_without_path_and_query(tool, args);
+                    Some(serde_json::to_vec(&body_args).map_err(|err| {
+                        ToolExecutorError::BodySerialize {
+                            tool_name: tool.name.clone(),
+                            message: err.to_string(),
+                        }
+                    })?)
+                }
             },
             None => None,
         };
@@ -1860,6 +1912,37 @@ fn validate_args(
             problems,
         })
     }
+}
+
+/// The `body_args_json` body (issue #360): the validated argument object
+/// with every path-template placeholder and every mapped query argument
+/// removed. Runs after `render_path_template` has already validated the
+/// template, so a malformed placeholder cannot reach here; an unmatched
+/// brace simply contributes no exclusion.
+fn body_arguments_without_path_and_query(tool: &ToolDefinition, args: &Value) -> Value {
+    let Some(object) = args.as_object() else {
+        return args.clone();
+    };
+    let mut excluded = std::collections::BTreeSet::new();
+    let mut rest = tool.upstream.path_template.as_str();
+    while let Some(open) = rest.find('{') {
+        let after_open = &rest[open + 1..];
+        let Some(close) = after_open.find('}') else {
+            break;
+        };
+        excluded.insert(after_open[..close].to_owned());
+        rest = &after_open[close + 1..];
+    }
+    for mapping in &tool.upstream.query_params {
+        excluded.insert(mapping.arg_name.clone());
+    }
+    Value::Object(
+        object
+            .iter()
+            .filter(|(key, _)| !excluded.contains(key.as_str()))
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect(),
+    )
 }
 
 fn render_path_template(tool: &ToolDefinition, args: &Value) -> Result<String, ToolExecutorError> {
@@ -2970,6 +3053,7 @@ mod tests {
                 definition: serde_json::to_value(&current_definition)
                     .expect("current definition should serialize"),
             }],
+            overlay_revision: 0,
         };
         let openapi_catalog_runtime =
             OpenApiConnectionCatalogRuntime::from_catalogs_for_test(&[current_catalog])
@@ -3503,35 +3587,38 @@ mod tests {
         let policy_path_for_precondition = policy_path.clone();
         let rbac_state_for_precondition = rbac_state.clone();
         let secret_path = connection.secret_path.clone();
-        let precondition = ToolExecutionPrecondition::new(move |_| {
-            let deny_policy = json!({
-                "schema_version": "0.1.0",
-                "tools": {
-                    "get_charge": {
-                        "timeout_ms": 500,
-                        "max_concurrent": 1
-                    }
-                },
-                "rules": [{
-                    "id": "deny-charge-after-precondition",
-                    "methods": ["GET"],
-                    "path": "/charges/{charge_id}",
-                    "action": "deny"
-                }]
-            });
-            fs::write(
-                &policy_path_for_precondition,
-                serde_json::to_vec(&deny_policy).expect("deny policy should serialize"),
-            )
-            .expect("deny policy should write");
-            crate::middleware::rbac::reload_policy_from_file(
-                &rbac_state_for_precondition,
-                &policy_path_for_precondition,
-            )
-            .expect("deny policy should publish during the final precondition");
-            fs::remove_file(&secret_path)
-                .expect("secret canary should disappear after the policy reload");
-            Ok(())
+        let precondition = ToolExecutionPrecondition::new_async(move |_| {
+            let policy_path = policy_path_for_precondition.clone();
+            let rbac_state = rbac_state_for_precondition.clone();
+            let secret_path = secret_path.clone();
+            Box::pin(async move {
+                let deny_policy = json!({
+                    "schema_version": "0.1.0",
+                    "tools": {
+                        "get_charge": {
+                            "timeout_ms": 500,
+                            "max_concurrent": 1
+                        }
+                    },
+                    "rules": [{
+                        "id": "deny-charge-after-precondition",
+                        "methods": ["GET"],
+                        "path": "/charges/{charge_id}",
+                        "action": "deny"
+                    }]
+                });
+                fs::write(
+                    &policy_path,
+                    serde_json::to_vec(&deny_policy).expect("deny policy should serialize"),
+                )
+                .expect("deny policy should write");
+                crate::middleware::rbac::reload_policy_from_file(&rbac_state, &policy_path)
+                    .await
+                    .expect("deny policy should publish during the final precondition");
+                fs::remove_file(&secret_path)
+                    .expect("secret canary should disappear after the policy reload");
+                Ok(())
+            })
         });
         let mut context = invocation_context();
         context.source = ToolInvocationSource::AdminPlayground;
@@ -5020,6 +5107,82 @@ mod tests {
         assert_eq!(request.target, "/v1/echo");
     }
 
+    #[tokio::test]
+    async fn composite_only_tool_looks_unknown_to_non_admin_executor_callers() {
+        let (addr, server) = one_request_server(StatusCode::OK, b"must-not-run").await;
+        let (executor, _capture) = executor_for_tools(
+            addr,
+            [composite_only_echo_tool()],
+            runtime_config([("echo", enabled_tool(500, 1))], 2, 1, 100),
+        );
+
+        for source in [ToolInvocationSource::Internal, ToolInvocationSource::Mcp] {
+            let mut context = invocation_context();
+            context.source = source;
+            let error = executor
+                .execute(
+                    "echo",
+                    json!({ "message": "must stay private" }),
+                    context,
+                    CancellationToken::new(),
+                )
+                .await
+                .expect_err("composite-only tools must look absent outside the admin playground");
+
+            assert!(matches!(
+                error,
+                ToolRuntimeError::UnknownTool { ref tool_name } if tool_name == "echo"
+            ));
+        }
+
+        let mut task_context = invocation_context();
+        task_context.source = ToolInvocationSource::Mcp;
+        let task_error = executor
+            .reject_task_tool_call(task_context, "echo")
+            .await
+            .expect_err("task invocation must not disclose a composite-only tool");
+        assert!(matches!(
+            task_error,
+            ToolRuntimeError::UnknownTool { ref tool_name } if tool_name == "echo"
+        ));
+
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), server)
+                .await
+                .is_err(),
+            "visibility rejection must happen before upstream network I/O"
+        );
+    }
+
+    #[tokio::test]
+    async fn admin_playground_can_execute_composite_only_tool() {
+        let (addr, server) = one_request_server(StatusCode::OK, b"ok").await;
+        let (executor, _capture) = executor_for_tools(
+            addr,
+            [composite_only_echo_tool()],
+            runtime_config([("echo", enabled_tool(500, 1))], 2, 1, 100),
+        );
+        let mut context = invocation_context();
+        context.source = ToolInvocationSource::AdminPlayground;
+
+        let response = http_response(
+            executor
+                .execute(
+                    "echo",
+                    json!({ "message": "admin inspection" }),
+                    context,
+                    CancellationToken::new(),
+                )
+                .await
+                .expect("the admin playground is allowed to inspect a composite-only tool"),
+        );
+
+        assert_eq!(response.status, StatusCode::OK);
+        let request = server.await.expect("server task should join");
+        assert_eq!(request.target, "/v1/echo");
+        assert_eq!(request.body, br#"{"message":"admin inspection"}"#);
+    }
+
     fn http_response(result: ToolExecutionResult) -> EgressResponse {
         match result {
             ToolExecutionResult::Http(response) => response,
@@ -5256,6 +5419,12 @@ mod tests {
                 }
             }
         })
+    }
+
+    fn composite_only_echo_tool() -> Value {
+        let mut tool = echo_tool();
+        tool["visibility"] = json!("composite_only");
+        tool
     }
 
     fn connection_charge_tool(connection_id: &str) -> Value {

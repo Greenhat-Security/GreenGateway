@@ -59,6 +59,14 @@
         },
         "upstream": {
           "$ref": "#/$defs/upstream_mapping"
+        },
+        "visibility": {
+          "enum": [
+            "listed",
+            "composite_only"
+          ],
+          "default": "listed",
+          "description": "Where the tool is reachable from. composite_only tools are not advertised by tools/list and not callable through tools/call; they exist for composite steps and compensations and for the admin playground. Omission means listed."
         }
       }
     },
@@ -279,9 +287,10 @@
       "properties": {
         "mode": {
           "enum": [
-            "whole_args_json"
+            "whole_args_json",
+            "body_args_json"
           ],
-          "description": "Construct the future outbound request body by serializing the entire tool arguments object as JSON."
+          "description": "whole_args_json serializes the entire tool arguments object as the JSON body, path and query arguments included. body_args_json omits path-template placeholders and mapped query arguments from the body; the overlay compiler sets it on overlaid tools."
         }
       }
     }

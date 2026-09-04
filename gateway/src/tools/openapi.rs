@@ -19,7 +19,7 @@ use crate::{
     discovery::openapi::{OpenApiOperation, OpenApiSpec, OpenApiSpecError},
     tools::definitions::{
         BodyMapping, BodyMappingMode, QueryParamMapping, ToolDefinition, ToolSource, ToolTarget,
-        UpstreamMapping,
+        ToolVisibility, UpstreamMapping,
     },
 };
 
@@ -784,6 +784,7 @@ pub fn generate_tools_from_openapi_str(
                     mode: BodyMappingMode::WholeArgsJson,
                 }),
             },
+            visibility: ToolVisibility::Listed,
         };
         let definition_bytes = serde_json::to_vec(&definition)
             .map_err(|source| OpenApiToolGenerationError::Json { source })?
