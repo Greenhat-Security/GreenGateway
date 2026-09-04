@@ -69,11 +69,20 @@ export type CapabilityPolicyEligibility = {
   reason: string;
 };
 
+export type ToolAnnotations = {
+  title?: string;
+  readOnlyHint?: boolean;
+  destructiveHint?: boolean;
+  idempotentHint?: boolean;
+  openWorldHint?: boolean;
+};
+
 export type CapabilitySummary = {
   id: string;
   kind: CapabilityKind;
   name: string;
   title?: string;
+  annotations?: ToolAnnotations;
   uri?: string;
   uri_template?: string;
   description?: string;
@@ -322,9 +331,15 @@ function projectCapabilitySummary(value: unknown): CapabilitySummary {
     throw invalidCapabilityResponse('capability summary');
   }
 
+  const annotations =
+    source.annotations === undefined
+      ? undefined
+      : projectToolAnnotations(source.annotations);
+
   if (
     (source.kind === 'tool' &&
       (source.uri !== undefined || source.uri_template !== undefined)) ||
+    (source.kind !== 'tool' && annotations !== undefined) ||
     (source.kind === 'resource' &&
       (source.uri === undefined || source.uri_template !== undefined)) ||
     (source.kind === 'resource_template' &&
@@ -351,6 +366,7 @@ function projectCapabilitySummary(value: unknown): CapabilitySummary {
     kind: source.kind,
     name: source.name,
     ...(source.title === undefined ? {} : { title: source.title }),
+    ...(annotations === undefined ? {} : { annotations }),
     ...(source.uri === undefined ? {} : { uri: source.uri }),
     ...(source.uri_template === undefined
       ? {}
@@ -372,6 +388,34 @@ function projectCapabilitySummary(value: unknown): CapabilitySummary {
       : { last_success_at: source.last_success_at }),
     state: projectCapabilityState(source.state),
     policy: projectCapabilityPolicy(source.policy),
+  };
+}
+
+function projectToolAnnotations(value: unknown): ToolAnnotations {
+  const source = responseObject(value, 'tool annotations');
+  if (
+    !isOptionalBoundedString(source.title, MAX_PUBLIC_STRING_BYTES) ||
+    !isOptionalBoolean(source.readOnlyHint) ||
+    !isOptionalBoolean(source.destructiveHint) ||
+    !isOptionalBoolean(source.idempotentHint) ||
+    !isOptionalBoolean(source.openWorldHint)
+  ) {
+    throw invalidCapabilityResponse('tool annotations');
+  }
+  return {
+    ...(source.title === undefined ? {} : { title: source.title }),
+    ...(source.readOnlyHint === undefined
+      ? {}
+      : { readOnlyHint: source.readOnlyHint }),
+    ...(source.destructiveHint === undefined
+      ? {}
+      : { destructiveHint: source.destructiveHint }),
+    ...(source.idempotentHint === undefined
+      ? {}
+      : { idempotentHint: source.idempotentHint }),
+    ...(source.openWorldHint === undefined
+      ? {}
+      : { openWorldHint: source.openWorldHint }),
   };
 }
 
@@ -763,6 +807,10 @@ function isOptionalBoundedString(
   maxBytes: number,
 ): value is string | undefined {
   return value === undefined || isBoundedString(value, maxBytes);
+}
+
+function isOptionalBoolean(value: unknown): value is boolean | undefined {
+  return value === undefined || typeof value === 'boolean';
 }
 
 function isOptionalBoundedNonEmptyString(

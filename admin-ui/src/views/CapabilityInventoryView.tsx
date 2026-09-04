@@ -16,6 +16,7 @@ import {
   type CapabilityListFilters,
   type CapabilitySourceFilter,
   type CapabilitySummary,
+  type ToolAnnotations,
   getCapability,
   listCapabilityInventory,
 } from '../lib/capabilityInventory';
@@ -462,6 +463,7 @@ function CapabilityRow({
               {capability.description_truncated ? '...' : ''}
             </span>
           ) : null}
+          <ToolAnnotationBadges annotations={capability.annotations} />
         </div>
       </td>
       <td data-label="Kind">
@@ -718,6 +720,30 @@ function CapabilitySummarySection({
         <dl className="traffic-metadata-grid">
           <SpecRow label="Opaque ID" value={detail.id} code />
           <SpecRow label="Kind" value={kindLabel(detail.kind)} />
+          {detail.annotations ? (
+            <>
+              <SpecRow
+                label="Annotation title"
+                value={detail.annotations.title ?? 'Not declared'}
+              />
+              <SpecRow
+                label="Read-only hint"
+                value={annotationValue(detail.annotations.readOnlyHint)}
+              />
+              <SpecRow
+                label="Destructive hint"
+                value={annotationValue(detail.annotations.destructiveHint)}
+              />
+              <SpecRow
+                label="Idempotent hint"
+                value={annotationValue(detail.annotations.idempotentHint)}
+              />
+              <SpecRow
+                label="Open-world hint"
+                value={annotationValue(detail.annotations.openWorldHint)}
+              />
+            </>
+          ) : null}
           <SpecRow label="URI" value={detail.uri ?? 'Not applicable'} code />
           <SpecRow
             label="URI template"
@@ -741,6 +767,40 @@ function CapabilitySummarySection({
       </div>
     </section>
   );
+}
+
+function ToolAnnotationBadges({
+  annotations,
+}: {
+  annotations?: ToolAnnotations;
+}) {
+  if (!annotations) {
+    return null;
+  }
+  const hints = [
+    ['Read only', annotations.readOnlyHint],
+    ['Destructive', annotations.destructiveHint],
+    ['Idempotent', annotations.idempotentHint],
+    ['Open world', annotations.openWorldHint],
+  ] as const;
+  return (
+    <div className="endpoint-badges" aria-label="MCP annotations">
+      {annotations.title ? (
+        <span className="badge neutral">{annotations.title}</span>
+      ) : null}
+      {hints.map(([label, value]) =>
+        value === undefined ? null : (
+          <span className={`badge ${value ? 'success' : 'neutral'}`} key={label}>
+            {label}: {value ? 'yes' : 'no'}
+          </span>
+        ),
+      )}
+    </div>
+  );
+}
+
+function annotationValue(value: boolean | undefined): string {
+  return value === undefined ? 'Not declared' : value ? 'True' : 'False';
 }
 
 function CapabilityProvenanceSection({

@@ -76,6 +76,10 @@ describe('CapabilityInventoryView', () => {
             name: 'billing.lookup',
             title: 'Look up invoice',
             description: 'Returns one invoice.',
+            annotations: {
+              readOnlyHint: true,
+              destructiveHint: false,
+            },
             source: {
               type: 'openapi',
               connection_id: 'billing-prod',
@@ -117,6 +121,9 @@ describe('CapabilityInventoryView', () => {
     expect(rowQueries.getByText('Unavailable')).toBeTruthy();
     expect(rowQueries.getByText('Stale')).toBeTruthy();
     expect(rowQueries.getByText('Eligible')).toBeTruthy();
+    expect(rowQueries.getByLabelText('MCP annotations').textContent).toContain(
+      'Read only: yes',
+    );
 
     expect(
       rowQueries
@@ -326,6 +333,13 @@ describe('CapabilityDetail', () => {
       id,
       name: 'billing.lookup',
       title: 'Look up invoice',
+      annotations: {
+        title: 'Invoice lookup',
+        readOnlyHint: true,
+        destructiveHint: false,
+        idempotentHint: true,
+        openWorldHint: false,
+      },
       source: {
         type: 'openapi',
         connection_id: 'billing-prod',
@@ -374,6 +388,9 @@ describe('CapabilityDetail', () => {
     expect(screen.getByText('lookupInvoice')).toBeTruthy();
     expect(screen.getByText('/invoices/{invoice_id}')).toBeTruthy();
     expect(screen.getByText('Whole args json')).toBeTruthy();
+    expect(screen.getByText('Invoice lookup')).toBeTruthy();
+    expect(screen.getAllByText('True')).toHaveLength(2);
+    expect(screen.getAllByText('False')).toHaveLength(2);
     const queryMappingTable = screen.getByRole('table', {
       name: 'Query parameter mappings',
     });

@@ -217,6 +217,13 @@ static MANIFEST: LazyLock<Vec<Migration>> = LazyLock::new(|| {
         )
         .finalize()
         .with_pinned_checksum("511c1fc251b801a4054940a8482ac84d8d080610a14d7b8b102abb2427ef31a4"),
+        Migration::new(
+            14,
+            "mcp_tool_annotations",
+            include_str!("migrations/0014_mcp_tool_annotations.sql"),
+        )
+        .finalize()
+        .with_pinned_checksum("b827ea92626782241b850f4e5041870da65c7a2f4e3ad18bd1215b2257cc092f"),
     ]
 });
 
@@ -1299,7 +1306,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn migrations_twelve_and_thirteen_preserve_existing_connection_state() {
+    async fn migrations_twelve_through_fourteen_preserve_existing_connection_state() {
         let Some(dsn) = real_dsn() else {
             eprintln!("skipping: no test database locator; CI runs this test");
             return;
@@ -1474,7 +1481,7 @@ mod tests {
         drop(store);
 
         // Reconstruct the exact v12 shape while retaining populated v12
-        // rows, then let only migration 13 run.
+        // rows, then let migrations 13 and 14 run.
         foundation
             .pool()
             .get()
@@ -1485,7 +1492,9 @@ mod tests {
                  DROP TABLE greengateway.connection_openapi_overlays; \
                  ALTER TABLE greengateway.connection_openapi_catalogs \
                      DROP COLUMN overlay_revision; \
-                 DELETE FROM {LEDGER_TABLE} WHERE version = 13;"
+                 ALTER TABLE greengateway.connection_mcp_catalog_entries \
+                     DROP COLUMN annotations_json, DROP COLUMN title; \
+                 DELETE FROM {LEDGER_TABLE} WHERE version >= 13;"
             ))
             .await
             .expect("v11 fixture should reconstruct");
@@ -1493,8 +1502,8 @@ mod tests {
         assert_eq!(
             apply_missing(foundation.pool(), &test_settings())
                 .await
-                .expect("migration 13 should apply"),
-            MigrateOutput::Applied { applied: 1 }
+                .expect("migrations 13 and 14 should apply"),
+            MigrateOutput::Applied { applied: 2 }
         );
         let reopened = crate::connections::pg_store::PostgresConnectionStore::new(
             foundation.pool().clone(),
@@ -1509,6 +1518,17 @@ mod tests {
         assert_eq!(catalog.catalog_revision, 1);
         assert_eq!(catalog.overlay_revision, 0);
         assert_eq!(catalog.entries[0].tool_name, "pre_overlay_tool");
+        foundation
+            .pool()
+            .get()
+            .await
+            .expect("annotation-column verification checkout")
+            .query(
+                "SELECT title, annotations_json FROM greengateway.connection_mcp_catalog_entries LIMIT 0",
+                &[],
+            )
+            .await
+            .expect("annotation columns should resolve after migration 14");
         assert!(reopened
             .openapi_overlays()
             .await

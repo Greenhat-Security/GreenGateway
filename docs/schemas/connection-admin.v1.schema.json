@@ -1985,6 +1985,11 @@
           "minLength": 1,
           "maxLength": 128
         },
+        "title": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256
+        },
         "description": {
           "type": "string",
           "minLength": 1
@@ -2021,7 +2026,25 @@
             "$ref": "#/$defs/OpenApiEnumBinding"
           },
           "description": "Stable source bindings only; current values are injected into served clones and are never stored here."
+        },
+        "annotations": {
+          "$ref": "#/$defs/ToolAnnotations"
         }
+      }
+    },
+    "ToolAnnotations": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "title": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256
+        },
+        "readOnlyHint": { "type": "boolean" },
+        "destructiveHint": { "type": "boolean" },
+        "idempotentHint": { "type": "boolean" },
+        "openWorldHint": { "type": "boolean" }
       }
     },
     "ToolTransform": {
@@ -2346,10 +2369,18 @@
           ],
           "default": "listed"
         },
+        "title": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256
+        },
         "description": {
           "type": "string",
           "minLength": 1,
           "maxLength": 4096
+        },
+        "annotations": {
+          "$ref": "#/$defs/ToolAnnotations"
         },
         "labels_from": {
           "$ref": "#/$defs/OpenApiOverlayLocalName",
@@ -2372,6 +2403,11 @@
       "type": "object",
       "additionalProperties": false,
       "properties": {
+        "title": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256
+        },
         "description": {
           "type": "string",
           "minLength": 1,
@@ -2669,6 +2705,9 @@
           "type": "string",
           "minLength": 1,
           "maxLength": 4096
+        },
+        "annotations": {
+          "$ref": "#/$defs/ToolAnnotations"
         },
         "input": {
           "type": "object",
@@ -3867,6 +3906,10 @@
         "title": {
           "type": "string"
         },
+        "annotations": {
+          "$ref": "#/$defs/ToolAnnotations",
+          "description": "Present for tools that advertise MCP client hints."
+        },
         "uri": {
           "type": "string"
         },
@@ -4169,6 +4212,10 @@
         },
         "title": {
           "type": "string"
+        },
+        "annotations": {
+          "$ref": "#/$defs/ToolAnnotations",
+          "description": "Present for tools that advertise MCP client hints."
         },
         "uri": {
           "type": "string"

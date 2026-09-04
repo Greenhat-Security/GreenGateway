@@ -182,6 +182,39 @@ describe('capability inventory API client', () => {
     expect(JSON.stringify(detail.value)).not.toContain(canary);
   });
 
+  it('projects only the supported MCP annotation hints', async () => {
+    const canary = 'UNEXPECTED_ANNOTATION_CANARY';
+    const annotated = {
+      ...capabilitySummary(),
+      annotations: {
+        title: 'Invoice lookup',
+        readOnlyHint: true,
+        destructiveHint: false,
+        idempotentHint: true,
+        openWorldHint: false,
+        private_value: canary,
+      },
+    };
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(() =>
+        Promise.resolve(
+          jsonResponse(200, { capabilities: [annotated], total_count: 1 }),
+        ),
+      ),
+    );
+
+    const result = await listCapabilityInventory();
+    expect(result.value.capabilities[0].annotations).toEqual({
+      title: 'Invoice lookup',
+      readOnlyHint: true,
+      destructiveHint: false,
+      idempotentHint: true,
+      openWorldHint: false,
+    });
+    expect(JSON.stringify(result.value)).not.toContain(canary);
+  });
+
   it('rejects malformed identities, nested contracts, mappings, and bounded schemas', async () => {
     let deepSchema: unknown = { type: 'string' };
     for (let depth = 0; depth < 130; depth += 1) {
@@ -238,6 +271,17 @@ describe('capability inventory API client', () => {
                 ...capabilitySummary().state,
                 reason: 17,
               },
+            },
+          ],
+          total_count: 1,
+        },
+      },
+      {
+        body: {
+          capabilities: [
+            {
+              ...capabilitySummary(),
+              annotations: { readOnlyHint: 'true' },
             },
           ],
           total_count: 1,

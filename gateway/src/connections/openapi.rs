@@ -3002,6 +3002,7 @@ mod tests {
         };
         ToolDefinition {
             name: "get_invoice".to_owned(),
+            title: None,
             description: "Read one invoice".to_owned(),
             input_schema: json!({
                 "type": "object",
@@ -3025,6 +3026,7 @@ mod tests {
             enum_bindings: Vec::new(),
             visibility: ToolVisibility::Listed,
             transform: None,
+            annotations: None,
         }
     }
 
@@ -3036,6 +3038,7 @@ mod tests {
         let digest = definition_digest(&definition).expect("definition should serialize");
         let composite_definition = ToolDefinition {
             name: "read_invoice_composite".to_owned(),
+            title: None,
             description: "Read an invoice through a composite".to_owned(),
             input_schema: definition.input_schema.clone(),
             target: Some(ToolTarget::Composite {
@@ -3047,6 +3050,7 @@ mod tests {
                 catalog_revision: Some(7),
             },
             upstream: HttpToolMapping::composite_sentinel(),
+            annotations: None,
             composite: Some(crate::tools::composite::CompositeMapping {
                 steps: vec![crate::tools::composite::CompositeStep {
                     id: "read".to_owned(),
@@ -3126,6 +3130,7 @@ mod tests {
         *operation_id = Some("get_invoice".to_owned());
         let composite = ToolDefinition {
             name: "read_invoice_composite".to_owned(),
+            title: None,
             description: "Read an invoice through a composite".to_owned(),
             input_schema: leaf.input_schema.clone(),
             target: Some(ToolTarget::Composite {
@@ -3137,6 +3142,7 @@ mod tests {
                 catalog_revision: Some(7),
             },
             upstream: HttpToolMapping::composite_sentinel(),
+            annotations: None,
             composite: Some(crate::tools::composite::CompositeMapping {
                 steps: vec![crate::tools::composite::CompositeStep {
                     id: "read".to_owned(),

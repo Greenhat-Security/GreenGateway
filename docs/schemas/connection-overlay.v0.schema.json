@@ -144,10 +144,20 @@
           "default": "listed",
           "description": "composite_only: not listed by tools/list, not callable by tools/call directly (unknown tool), only invocable as a composite step or compensation; still shown in the admin inventory and usable from the admin playground."
         },
+        "title": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256,
+          "description": "Optional agent-facing title served at the top level of the MCP tool."
+        },
         "description": {
           "type": "string",
           "minLength": 1,
           "maxLength": 4096
+        },
+        "annotations": {
+          "$ref": "#/$defs/tool_annotations",
+          "description": "Explicit MCP client hints. These do not change gateway authorization or execution."
         },
         "labels_from": {
           "$ref": "#/$defs/label_source_reference",
@@ -190,6 +200,21 @@
           "$ref": "#/$defs/shape_or_use",
           "description": "Replace one object-valued request-body property with an ergonomic agent-facing shape."
         }
+      }
+    },
+    "tool_annotations": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "title": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256
+        },
+        "readOnlyHint": { "type": "boolean" },
+        "destructiveHint": { "type": "boolean" },
+        "idempotentHint": { "type": "boolean" },
+        "openWorldHint": { "type": "boolean" }
       }
     },
     "enum_sources": {
@@ -658,10 +683,20 @@
         "steps"
       ],
       "properties": {
+        "title": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256,
+          "description": "Optional agent-facing title served at the top level of the MCP tool."
+        },
         "description": {
           "type": "string",
           "minLength": 1,
           "maxLength": 4096
+        },
+        "annotations": {
+          "$ref": "#/$defs/tool_annotations",
+          "description": "Explicit MCP client hints. readOnlyHint true is rejected when any step or compensation uses a non-GET operation."
         },
         "input": {
           "type": "object",

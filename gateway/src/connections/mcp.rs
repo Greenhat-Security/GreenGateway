@@ -789,12 +789,15 @@ fn supports_managed_mcp_catalog(record: &StoredConnection) -> bool {
 
 fn catalog_definitions(catalog: &StoredMcpCatalog) -> impl Iterator<Item = ToolDefinition> + '_ {
     catalog.entries.iter().map(|entry| {
-        ToolDefinition::mcp_connection(
+        let mut definition = ToolDefinition::mcp_connection(
             catalog.connection_id.to_string(),
             entry.description.clone(),
             entry.input_schema.clone(),
             entry.remote_tool_name.clone(),
-        )
+        );
+        definition.title = entry.title.clone();
+        definition.annotations = entry.annotations.clone();
+        definition
     })
 }
 
@@ -817,8 +820,10 @@ fn definition_store_entry(
         {
             Ok(StoredMcpCatalogEntry {
                 remote_tool_name: remote_tool_name.clone(),
+                title: definition.title.clone(),
                 description: definition.description.clone(),
                 input_schema: definition.input_schema.clone(),
+                annotations: definition.annotations.clone(),
             })
         }
         _ => Err(McpCatalogRefreshError::InvalidResponse),
