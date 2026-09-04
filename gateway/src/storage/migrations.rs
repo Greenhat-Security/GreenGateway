@@ -1492,6 +1492,8 @@ mod tests {
                  DROP TABLE greengateway.connection_openapi_overlays; \
                  ALTER TABLE greengateway.connection_openapi_catalogs \
                      DROP COLUMN overlay_revision; \
+                 ALTER TABLE greengateway.connection_mcp_catalog_entries \
+                     DROP COLUMN annotations_json, DROP COLUMN title; \
                  DELETE FROM {LEDGER_TABLE} WHERE version >= 13;"
             ))
             .await
