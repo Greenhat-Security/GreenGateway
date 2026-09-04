@@ -37,6 +37,13 @@ describe('tool playground API client', () => {
                 value: { invoice_id: 'inv-1', paid: true },
                 ciphertext: canary,
               },
+              warnings: [
+                {
+                  path: '/amount',
+                  reason: 'wire value was left unchanged',
+                  wire_value: canary,
+                },
+              ],
               private_key_value: canary,
             },
             { ETag: '"capability:v7"' },
@@ -56,10 +63,16 @@ describe('tool playground API client', () => {
       value: {
         kind: 'http',
         status: 200,
-        body: {
-          type: 'json',
-          value: { invoice_id: 'inv-1', paid: true },
-        },
+          body: {
+            type: 'json',
+            value: { invoice_id: 'inv-1', paid: true },
+          },
+          warnings: [
+            {
+              path: '/amount',
+              reason: 'wire value was left unchanged',
+            },
+          ],
       },
       etag: '"capability:v7"',
       collectionEtag: null,
@@ -156,6 +169,92 @@ describe('tool playground API client', () => {
     ).toBe(Object.prototype);
   });
 
+  it('projects a bounded composite result and strips unknown step metadata', async () => {
+    const canary = 'UNEXPECTED_COMPOSITE_RESULT_CANARY';
+    vi.stubGlobal(
+      'fetch',
+      vi.fn().mockResolvedValue(
+        jsonResponse(
+          200,
+          {
+            kind: 'composite',
+            status: 200,
+            body: {
+              note_id: 'note-1',
+              nested: { complete: true },
+            },
+            steps_summary: [
+              {
+                index: 0,
+                id: 'note',
+                tool: 'create_note',
+                method: 'POST',
+                path_template: '/v1/notes',
+                outcome: 'succeeded',
+                upstream_status: 201,
+                latency_ms: 12,
+                response_body: canary,
+              },
+              {
+                index: 1,
+                id: 'attach',
+                iteration: 0,
+                tool: 'attach_note',
+                method: 'POST',
+                path_template: '/v1/attachments/{target}',
+                outcome: 'succeeded',
+                upstream_status: 201,
+                latency_ms: 8,
+                credential: canary,
+              },
+            ],
+            internal: canary,
+          },
+          { ETag: '"capability:v1"' },
+        ),
+      ),
+    );
+
+    const resource = await executeCapability(
+      'cap_composite',
+      '{}',
+      '"capability:v1"',
+    );
+
+    expect(resource.value).toEqual({
+      kind: 'composite',
+      status: 200,
+      body: {
+        note_id: 'note-1',
+        nested: { complete: true },
+      },
+      steps_summary: [
+        {
+          index: 0,
+          id: 'note',
+          tool: 'create_note',
+          method: 'POST',
+          path_template: '/v1/notes',
+          outcome: 'succeeded',
+          upstream_status: 201,
+          latency_ms: 12,
+        },
+        {
+          index: 1,
+          id: 'attach',
+          iteration: 0,
+          tool: 'attach_note',
+          method: 'POST',
+          path_template: '/v1/attachments/{target}',
+          outcome: 'succeeded',
+          upstream_status: 201,
+          latency_ms: 8,
+        },
+      ],
+    });
+    expect(JSON.stringify(resource.value)).not.toContain(canary);
+  });
+
   it('refuses invalid request and missing or mismatched response validators without retrying', async () => {
     const fetchMock = vi.fn();
     vi.stubGlobal('fetch', fetchMock);
@@ -209,6 +308,54 @@ describe('tool playground API client', () => {
         kind: 'http',
         status: 200,
         body: { type: 'text', value: 'x'.repeat(65_537) },
+      },
+    },
+    {
+      label: 'too many transform warnings',
+      body: {
+        kind: 'http',
+        status: 200,
+        body: { type: 'text', value: 'ok' },
+        warnings: Array.from({ length: 33 }, () => ({
+          path: '/amount',
+          reason: 'wire value was left unchanged',
+        })),
+      },
+    },
+    {
+      label: 'invalid composite step outcome',
+      body: {
+        kind: 'composite',
+        status: 200,
+        body: { ok: true },
+        steps_summary: [
+          {
+            index: 0,
+            id: 'create',
+            tool: 'create_record',
+            method: 'POST',
+            path_template: '/v1/records',
+            outcome: 'unknown',
+            latency_ms: 1,
+          },
+        ],
+      },
+    },
+    {
+      label: 'too many composite step summaries',
+      body: {
+        kind: 'composite',
+        status: 200,
+        body: { ok: true },
+        steps_summary: Array.from({ length: 81 }, (_, index) => ({
+          index,
+          id: 'create',
+          tool: 'create_record',
+          method: 'POST',
+          path_template: '/v1/records',
+          outcome: 'succeeded',
+          latency_ms: 1,
+        })),
       },
     },
   ])('fails closed on $label', async ({ body }) => {

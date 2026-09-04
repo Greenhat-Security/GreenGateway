@@ -1620,7 +1620,9 @@ async fn e2e_09_all_references_disable_atomically_and_block_delete_without_orpha
     assert!(snapshot.managed().contains_key(&disabled_mcp.id));
     for definition in registry.list() {
         if let Some(
-            ToolTarget::Http { connection_id, .. } | ToolTarget::Mcp { connection_id, .. },
+            ToolTarget::Http { connection_id, .. }
+            | ToolTarget::Mcp { connection_id, .. }
+            | ToolTarget::Composite { connection_id },
         ) = definition.target.as_ref()
         {
             let id = ConnectionId::parse(connection_id.clone())

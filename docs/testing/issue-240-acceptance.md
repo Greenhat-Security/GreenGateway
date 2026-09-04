@@ -133,6 +133,12 @@ row boundary has not been demonstrated by one durable acceptance test.
 | E2E-11 | Restart with encrypted rows and no or wrong master key fails closed without printing identifiers or secret material. | automated | gateway/tests/issue_240_process.rs#issue_240_e2e_11_wrong_key_process_restart | `cargo test -p gateway issue_240_e2e_11_wrong_key_process_restart` | n/a | n/a | n/a | 2026-07-29 |
 | E2E-12 | Existing auth, RBAC, proxy, egress, OpenAPI, MCP, audit, tools, UI, and Cloudflare parity suites pass unchanged on one commit. | manual-external | .github/workflows/ci.yml#connections-acceptance | `gh pr checks --watch` | PR14 CI owner | GitHub-hosted check results tied to the immutable PR head cannot be proven hermetically in the repository. | Verified 2026-08-23 on head `668dd15f01f6ea6a78ec2e51075c3dd3f43ac6d4`: all three pull-request workflows were green on that exact SHA -- CI (including connections-acceptance) https://github.com/Greenhat-Security/GreenGateway/actions/runs/32675004563, Secret scanning https://github.com/Greenhat-Security/GreenGateway/actions/runs/32675004577, and Publish image https://github.com/Greenhat-Security/GreenGateway/actions/runs/32675004576. The only change after that SHA is this documentation line, which alters no verified artifact. To re-verify after any future push: Run `gh pr checks --watch`, confirm connections-acceptance plus every dependency are green on the same SHA, then record the new run URLs and SHA. | 2026-08-23 |
 
+### Issue #360 overlay extension evidence
+
+| ID | Requirement | Status | Evidence | Command | Owner | Rationale | Deterministic closure/manual steps | Review date |
+|---|---|---|---|---|---|---|---|---|
+| I360-E2E-07 | One MCP composite call creates a note and three targets; a third-target rejection compensates both prior targets newest-first and then the note, leaving no records or unreported orphans. | automated | gateway/src/tests/issue_360_composite_acceptance.rs#e2e_07_overlay_crm_workflow | `cargo test -p gateway e2e_07_overlay_crm_workflow` | n/a | n/a | n/a | 2026-09-03 |
+
 ## Related external definition-of-done evidence
 
 The provider follow-up requirement is externally complete as of 2026-07-29:

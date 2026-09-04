@@ -24,7 +24,7 @@ use crate::{
 
 use super::definitions::{
     BodyMapping, HttpToolMapping, QueryParamMapping, ToolDefinition, ToolRegistry, ToolSource,
-    ToolTarget,
+    ToolTarget, ToolVisibility,
 };
 use super::transforms::{ParameterShape, ToolTransform, WireSource};
 
@@ -171,8 +171,24 @@ pub struct CapabilitySummary {
     pub discovered_at: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_success_at: Option<String>,
+    /// Omitted for ordinary listed tools and all non-tool capabilities.  A
+    /// composite-only tool remains visible to administrators even though it
+    /// is hidden from agent discovery and direct calls.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub visibility: Option<ToolVisibility>,
     pub state: CapabilityState,
     pub policy: CapabilityPolicyEligibility,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct CapabilityCompositeStep {
+    pub id: String,
+    pub tool: String,
+    pub method: String,
+    pub path_template: String,
+    pub has_compensation: bool,
+    pub for_each: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
@@ -187,6 +203,9 @@ pub enum CapabilityMapping {
     },
     Mcp {
         remote_tool_name: String,
+    },
+    Composite {
+        steps: Vec<CapabilityCompositeStep>,
     },
     Resource {
         uri: String,
@@ -540,6 +559,13 @@ impl CapabilityInventory {
             .map(|definition| (definition.name.clone(), definition))
             .collect::<BTreeMap<_, _>>();
         let durable_tools = durable_tool_catalogs(&mcp_catalogs, &openapi_catalogs)?;
+        let mut mapping_definitions = registry
+            .iter()
+            .map(|(name, definition)| (name.clone(), definition.as_ref().clone()))
+            .collect::<BTreeMap<_, _>>();
+        for (name, durable) in &durable_tools {
+            let _ = mapping_definitions.insert(name.clone(), durable_tool_definition(durable)?);
+        }
         let mut built = BTreeMap::new();
         let mut handled_names = BTreeSet::new();
 
@@ -570,6 +596,7 @@ impl CapabilityInventory {
                 state,
                 policy,
                 (registered_definition, Some(execution_revision)),
+                &mapping_definitions,
             )?;
             insert_capability(&mut built, capability)?;
         }
@@ -596,6 +623,7 @@ impl CapabilityInventory {
                 state,
                 policy,
                 (Some(definition.as_ref().clone()), Some(execution_revision)),
+                &mapping_definitions,
             )?;
             insert_capability(&mut built, capability)?;
         }
@@ -633,6 +661,7 @@ impl CapabilityInventory {
                     schema_digest: None,
                     discovered_at: Some(catalog.refreshed_at.clone()),
                     last_success_at: Some(catalog.refreshed_at.clone()),
+                    visibility: None,
                     state: state.clone(),
                     policy: metadata_only_policy(),
                 };
@@ -676,6 +705,7 @@ impl CapabilityInventory {
                     schema_digest: None,
                     discovered_at: Some(catalog.refreshed_at.clone()),
                     last_success_at: Some(catalog.refreshed_at.clone()),
+                    visibility: None,
                     state: state.clone(),
                     policy: metadata_only_policy(),
                 };
@@ -771,6 +801,23 @@ fn durable_tool_catalogs<'a>(
     Ok(tools)
 }
 
+fn durable_tool_definition(
+    durable: &DurableToolCatalog<'_>,
+) -> Result<ToolDefinition, CapabilityInventoryError> {
+    match durable {
+        DurableToolCatalog::Openapi { entry, .. } => {
+            serde_json::from_value::<ToolDefinition>(entry.definition.clone())
+                .map_err(|_| CapabilityInventoryError::CorruptState)
+        }
+        DurableToolCatalog::Mcp { catalog, entry } => Ok(ToolDefinition::mcp_connection(
+            catalog.connection_id.to_string(),
+            entry.description.clone(),
+            entry.input_schema.clone(),
+            entry.remote_tool_name.clone(),
+        )),
+    }
+}
+
 fn durable_tool_parts(
     durable: &DurableToolCatalog<'_>,
     connections: &BTreeMap<ConnectionId, ConnectionContext>,
@@ -784,10 +831,9 @@ fn durable_tool_parts(
     ),
     CapabilityInventoryError,
 > {
+    let definition = durable_tool_definition(durable)?;
     match durable {
         DurableToolCatalog::Openapi { catalog, entry } => {
-            let definition = serde_json::from_value::<ToolDefinition>(entry.definition.clone())
-                .map_err(|_| CapabilityInventoryError::CorruptState)?;
             if definition.name != entry.tool_name {
                 return Err(CapabilityInventoryError::CorruptState);
             }
@@ -804,6 +850,7 @@ fn durable_tool_parts(
                 || !matches!(
                     &definition.target,
                     Some(ToolTarget::Http { connection_id, .. })
+                        | Some(ToolTarget::Composite { connection_id })
                         if connection_id == source_connection_id
                 )
             {
@@ -830,13 +877,7 @@ fn durable_tool_parts(
                 ),
             ))
         }
-        DurableToolCatalog::Mcp { catalog, entry } => {
-            let definition = ToolDefinition::mcp_connection(
-                catalog.connection_id.to_string(),
-                entry.description.clone(),
-                entry.input_schema.clone(),
-                entry.remote_tool_name.clone(),
-            );
+        DurableToolCatalog::Mcp { catalog, .. } => {
             let connection = connections
                 .get(&catalog.connection_id)
                 .ok_or(CapabilityInventoryError::CorruptState)?;
@@ -936,9 +977,12 @@ fn local_execution_revision(
 ) -> CapabilityExecutionRevision {
     let context = match &definition.target {
         Some(ToolTarget::Http { connection_id, .. })
-        | Some(ToolTarget::Mcp { connection_id, .. }) => ConnectionId::parse(connection_id.clone())
-            .ok()
-            .and_then(|id| connections.get(&id)),
+        | Some(ToolTarget::Mcp { connection_id, .. })
+        | Some(ToolTarget::Composite { connection_id }) => {
+            ConnectionId::parse(connection_id.clone())
+                .ok()
+                .and_then(|id| connections.get(&id))
+        }
         None => {
             if let Some(proxy) = definition.upstream.mcp_proxy_mapping() {
                 snapshot
@@ -1092,9 +1136,12 @@ fn local_tool_context(
 
     let context = match &definition.target {
         Some(ToolTarget::Http { connection_id, .. })
-        | Some(ToolTarget::Mcp { connection_id, .. }) => ConnectionId::parse(connection_id.clone())
-            .ok()
-            .and_then(|id| connections.get(&id)),
+        | Some(ToolTarget::Mcp { connection_id, .. })
+        | Some(ToolTarget::Composite { connection_id }) => {
+            ConnectionId::parse(connection_id.clone())
+                .ok()
+                .and_then(|id| connections.get(&id))
+        }
         None => connections.values().find(|context| {
             context.reference.kind == ConnectionKind::HttpApi
                 && context.reference.management_source
@@ -1143,6 +1190,7 @@ fn local_tool_context(
     ))
 }
 
+#[allow(clippy::too_many_arguments)] // One input per independently reported capability dimension.
 fn tool_capability(
     definition: ToolDefinition,
     source: CapabilitySource,
@@ -1151,6 +1199,7 @@ fn tool_capability(
     state: CapabilityState,
     policy: CapabilityPolicyEligibility,
     execution_binding: (Option<ToolDefinition>, Option<CapabilityExecutionRevision>),
+    mapping_definitions: &BTreeMap<String, ToolDefinition>,
 ) -> Result<BuiltCapability, CapabilityInventoryError> {
     let (registered_definition, execution_revision) = execution_binding;
     let schema_digest = schema_digest(&definition.input_schema)?;
@@ -1163,6 +1212,13 @@ fn tool_capability(
         }) => Some(CapabilityMapping::Mcp {
             remote_tool_name: remote_tool_name.clone(),
         }),
+        Some(ToolTarget::Composite { .. }) => Some(composite_mapping(
+            definition
+                .composite
+                .as_ref()
+                .ok_or(CapabilityInventoryError::CorruptState)?,
+            mapping_definitions,
+        )?),
         None => definition
             .upstream
             .mcp_proxy_mapping()
@@ -1172,6 +1228,7 @@ fn tool_capability(
             .or_else(|| Some(http_mapping(&definition.upstream))),
     };
     let transform = definition.transform.as_ref().map(transform_summary);
+    let visibility = (!definition.visibility.is_listed()).then_some(definition.visibility);
     Ok(BuiltCapability {
         summary: CapabilitySummary {
             id: capability_id(&["tool", definition.name.as_str()]),
@@ -1187,6 +1244,7 @@ fn tool_capability(
             schema_digest: Some(schema_digest),
             discovered_at: refreshed_at.clone(),
             last_success_at: refreshed_at,
+            visibility,
             state,
             policy,
         },
@@ -1196,6 +1254,33 @@ fn tool_capability(
         registered_definition,
         execution_revision,
     })
+}
+
+fn composite_mapping(
+    mapping: &crate::tools::composite::CompositeMapping,
+    definitions: &BTreeMap<String, ToolDefinition>,
+) -> Result<CapabilityMapping, CapabilityInventoryError> {
+    let steps = mapping
+        .steps
+        .iter()
+        .map(|step| {
+            let definition = definitions
+                .get(&step.tool)
+                .ok_or(CapabilityInventoryError::CorruptState)?;
+            let Some(ToolTarget::Http { mapping, .. }) = &definition.target else {
+                return Err(CapabilityInventoryError::CorruptState);
+            };
+            Ok(CapabilityCompositeStep {
+                id: step.id.clone(),
+                tool: step.tool.clone(),
+                method: mapping.method.clone(),
+                path_template: mapping.path_template.clone(),
+                has_compensation: step.compensate.is_some(),
+                for_each: step.for_each.is_some(),
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(CapabilityMapping::Composite { steps })
 }
 
 fn http_mapping(mapping: &HttpToolMapping) -> CapabilityMapping {
@@ -1716,6 +1801,7 @@ mod tests {
                     catalog_revision: Some(1),
                 },
                 upstream: openapi_mapping,
+                composite: None,
                 visibility: crate::tools::definitions::ToolVisibility::Listed,
                 transform: None,
             };
@@ -1948,6 +2034,73 @@ mod tests {
     }
 
     #[test]
+    fn composite_inventory_mapping_exposes_the_reviewable_grant() {
+        let http = HttpToolMapping {
+            method: "POST".to_owned(),
+            path_template: "/notes".to_owned(),
+            query_params: Vec::new(),
+            body: None,
+        };
+        let definitions = BTreeMap::from([(
+            "createOneNote".to_owned(),
+            ToolDefinition {
+                name: "createOneNote".to_owned(),
+                description: "Create one note".to_owned(),
+                input_schema: json!({"type": "object"}),
+                target: Some(ToolTarget::Http {
+                    connection_id: "crm".to_owned(),
+                    mapping: http.clone(),
+                }),
+                source: ToolSource::OpenApi {
+                    connection_id: "crm".to_owned(),
+                    operation_id: Some("createOneNote".to_owned()),
+                    catalog_revision: Some(1),
+                },
+                upstream: http,
+                composite: None,
+                visibility: ToolVisibility::Listed,
+                transform: None,
+            },
+        )]);
+        let mapping = crate::tools::composite::CompositeMapping {
+            steps: vec![crate::tools::composite::CompositeStep {
+                id: "note".to_owned(),
+                tool: "createOneNote".to_owned(),
+                arguments: BTreeMap::new(),
+                for_each: Some(crate::tools::composite::CompositeForEach {
+                    over: crate::tools::composite::CompositeBinding::Input {
+                        input: "records".to_owned(),
+                        pointer: None,
+                    },
+                    item_name: "record".to_owned(),
+                }),
+                success_statuses: None,
+                ambiguous_statuses: None,
+                compensate: Some(crate::tools::composite::CompositeCompensation {
+                    tool: "deleteOneNote".to_owned(),
+                    arguments: BTreeMap::new(),
+                }),
+            }],
+            result: None,
+            limits: crate::tools::composite::CompositeLimits::default(),
+        };
+
+        assert_eq!(
+            composite_mapping(&mapping, &definitions).expect("composite projection"),
+            CapabilityMapping::Composite {
+                steps: vec![CapabilityCompositeStep {
+                    id: "note".to_owned(),
+                    tool: "createOneNote".to_owned(),
+                    method: "POST".to_owned(),
+                    path_template: "/notes".to_owned(),
+                    has_compensation: true,
+                    for_each: true,
+                }]
+            }
+        );
+    }
+
+    #[test]
     fn capability_actions_use_only_the_stable_public_reason_vocabulary() {
         let definition = ToolDefinition {
             name: "playground_action_test".to_owned(),
@@ -1961,6 +2114,7 @@ mod tests {
                 query_params: Vec::new(),
                 body: None,
             },
+            composite: None,
             visibility: crate::tools::definitions::ToolVisibility::Listed,
             transform: None,
         };
@@ -1979,6 +2133,7 @@ mod tests {
                 schema_digest: None,
                 discovered_at: None,
                 last_success_at: None,
+                visibility: None,
                 state: CapabilityState {
                     enabled: true,
                     available: true,
@@ -2388,6 +2543,7 @@ mod tests {
                 target: None,
                 source: ToolSource::Manual,
                 upstream: manual_mapping,
+                composite: None,
                 visibility: crate::tools::definitions::ToolVisibility::Listed,
                 transform: None,
             }])
@@ -2440,6 +2596,7 @@ mod tests {
                         schema_digest: None,
                         discovered_at: None,
                         last_success_at: None,
+                        visibility: None,
                         state: CapabilityState {
                             enabled: true,
                             available: true,
@@ -2477,6 +2634,7 @@ mod tests {
                     schema_digest: None,
                     discovered_at: None,
                     last_success_at: None,
+                    visibility: None,
                     state: CapabilityState {
                         enabled: true,
                         available: true,

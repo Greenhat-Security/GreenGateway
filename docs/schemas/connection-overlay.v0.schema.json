@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://greengateway.dev/schemas/connection-overlay.v0.schema.json",
   "title": "GreenGateway Connection OpenAPI Overlay",
-  "description": "Version 0.1 declarative overlay applied when a Connection's OpenAPI catalog is generated. It narrows and reshapes generated tools; it cannot add upstream paths, methods, or credentials. Tool references use generated (operationId) names. Dynamic enum and label sources and composite tools remain reserved in this revision.",
+  "description": "Version 0.1 declarative overlay applied when a Connection's OpenAPI catalog is generated. It narrows and reshapes generated tools with declarative request/response transforms and can compile bounded composite tools; it cannot add upstream paths, methods, or credentials. Tool references use generated (operationId) names. Dynamic enum and label sources remain reserved in this revision.",
   "type": "object",
   "additionalProperties": false,
   "required": [
@@ -63,7 +63,7 @@
     },
     "composites": {
       "$ref": "#/$defs/composites",
-      "description": "Reserved for composite tools with compensation. Not accepted by this revision."
+      "description": "Synthetic saga tools keyed by the served composite tool name."
     }
   },
   "$defs": {
@@ -314,6 +314,9 @@
         "type"
       ],
       "properties": {
+        "$schema": {
+          "const": "https://json-schema.org/draft/2020-12/schema"
+        },
         "type": {
           "enum": [
             "string",
@@ -477,20 +480,266 @@
       }
     },
     "composites": {
-      "not": {},
-      "description": "Reserved: composite tools with compensation."
+      "type": "object",
+      "maxProperties": 256,
+      "propertyNames": {
+        "$ref": "#/$defs/tool_name"
+      },
+      "additionalProperties": {
+        "$ref": "#/$defs/composite"
+      }
     },
     "composite": {
-      "not": {},
-      "description": "Reserved: one composite tool."
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "description",
+        "input",
+        "steps"
+      ],
+      "properties": {
+        "description": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 4096
+        },
+        "input": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "properties"
+          ],
+          "properties": {
+            "properties": {
+              "type": "object",
+              "maxProperties": 64,
+              "propertyNames": {
+                "$ref": "#/$defs/local_name"
+              },
+              "additionalProperties": {
+                "$ref": "#/$defs/agent_fragment"
+              }
+            },
+            "required": {
+              "type": "array",
+              "items": {
+                "$ref": "#/$defs/local_name"
+              },
+              "uniqueItems": true
+            }
+          }
+        },
+        "parameters": {
+          "type": "object",
+          "maxProperties": 64,
+          "propertyNames": {
+            "$ref": "#/$defs/local_name"
+          },
+          "additionalProperties": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "enum_source": {
+                "$ref": "#/$defs/enum_source_reference"
+              }
+            }
+          }
+        },
+        "steps": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 16,
+          "items": {
+            "$ref": "#/$defs/step"
+          }
+        },
+        "result": {
+          "type": "object",
+          "maxProperties": 32,
+          "propertyNames": {
+            "$ref": "#/$defs/local_name"
+          },
+          "additionalProperties": {
+            "$ref": "#/$defs/binding"
+          },
+          "description": "Body returned to the agent. Default: the last step's response body."
+        },
+        "limits": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "max_iterations": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 64,
+              "default": 32
+            },
+            "compensation_timeout_ms": {
+              "type": "integer",
+              "minimum": 100,
+              "maximum": 120000,
+              "default": 30000
+            }
+          }
+        }
+      }
     },
     "step": {
-      "not": {},
-      "description": "Reserved: one composite step."
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "tool",
+        "arguments"
+      ],
+      "properties": {
+        "id": {
+          "$ref": "#/$defs/local_name"
+        },
+        "tool": {
+          "$ref": "#/$defs/tool_name"
+        },
+        "arguments": {
+          "type": "object",
+          "maxProperties": 64,
+          "additionalProperties": {
+            "$ref": "#/$defs/binding"
+          }
+        },
+        "for_each": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "over",
+            "as"
+          ],
+          "properties": {
+            "over": {
+              "$ref": "#/$defs/binding"
+            },
+            "as": {
+              "$ref": "#/$defs/local_name"
+            }
+          }
+        },
+        "success_statuses": {
+          "type": "array",
+          "items": {
+            "type": "integer",
+            "minimum": 200,
+            "maximum": 299
+          },
+          "minItems": 1,
+          "maxItems": 16
+        },
+        "ambiguous_statuses": {
+          "type": "array",
+          "items": {
+            "type": "integer",
+            "minimum": 400,
+            "maximum": 599
+          },
+          "maxItems": 16
+        },
+        "compensate": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "tool",
+            "arguments"
+          ],
+          "properties": {
+            "tool": {
+              "$ref": "#/$defs/tool_name"
+            },
+            "arguments": {
+              "type": "object",
+              "maxProperties": 64,
+              "additionalProperties": {
+                "$ref": "#/$defs/binding"
+              }
+            }
+          }
+        }
+      }
     },
     "binding": {
-      "not": {},
-      "description": "Reserved: a literal or a $input/$step/$item/$self reference."
+      "description": "A literal JSON value, or exactly one reference object. Objects with any other $-prefixed key are rejected.",
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "$input"
+          ],
+          "properties": {
+            "$input": {
+              "$ref": "#/$defs/local_name"
+            },
+            "pointer": {
+              "$ref": "#/$defs/json_pointer"
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "$step"
+          ],
+          "properties": {
+            "$step": {
+              "$ref": "#/$defs/local_name"
+            },
+            "pointer": {
+              "$ref": "#/$defs/json_pointer"
+            },
+            "collect": {
+              "type": "boolean",
+              "default": false
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "$item"
+          ],
+          "properties": {
+            "$item": {
+              "$ref": "#/$defs/local_name"
+            },
+            "pointer": {
+              "$ref": "#/$defs/json_pointer"
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "$self"
+          ],
+          "properties": {
+            "$self": {
+              "$ref": "#/$defs/json_pointer"
+            }
+          }
+        },
+        {
+          "if": {
+            "type": "object"
+          },
+          "then": {
+            "propertyNames": {
+              "not": {
+                "pattern": "^\\$"
+              }
+            }
+          }
+        }
+      ]
     }
   }
 }

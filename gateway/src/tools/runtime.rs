@@ -148,6 +148,10 @@ pub struct ToolInvocationContext {
     pub source_ip: String,
     pub actor: Option<Actor>,
     pub source: ToolInvocationSource,
+    /// The hard execution deadline assigned after runtime admission. Internal
+    /// work such as composite compensation uses this to reserve time without
+    /// acquiring another permit or creating another invocation lifecycle.
+    pub admitted_deadline: Option<time::Instant>,
 }
 
 impl Default for ToolInvocationContext {
@@ -160,6 +164,7 @@ impl Default for ToolInvocationContext {
             source_ip: "127.0.0.1".to_owned(),
             actor: None,
             source: ToolInvocationSource::Internal,
+            admitted_deadline: None,
         }
     }
 }
@@ -710,22 +715,26 @@ impl ToolRuntime {
         Fut: Future<Output = Result<T, E>>,
         E: fmt::Display,
     {
-        self.execute_result_with_context_and_reason(tool_name, context, cancel, work, |_| {
-            ToolWorkErrorDisposition::Failure(None)
-        })
+        self.execute_result_with_context_and_reason(
+            tool_name,
+            context,
+            cancel,
+            move |_| work(),
+            |_| ToolWorkErrorDisposition::Failure(None),
+        )
         .await
     }
 
     pub(crate) async fn execute_result_with_context_and_reason<F, Fut, T, E, R>(
         &self,
         tool_name: &str,
-        context: ToolInvocationContext,
+        mut context: ToolInvocationContext,
         cancel: CancellationToken,
         work: F,
         failure_reason: R,
     ) -> Result<T, ToolRuntimeError>
     where
-        F: FnOnce() -> Fut,
+        F: FnOnce(ToolInvocationContext) -> Fut,
         Fut: Future<Output = Result<T, E>>,
         E: fmt::Display,
         R: Fn(&E) -> ToolWorkErrorDisposition,
@@ -733,6 +742,9 @@ impl ToolRuntime {
         let admitted = self
             .prepare_invocation(tool_name, &context, &cancel)
             .await?;
+        let admitted_deadline = time::Instant::now() + admitted.config.timeout;
+        context.admitted_deadline = Some(admitted_deadline);
+        let work_context = context.clone();
 
         self.emit(
             audit::event::TOOL_INVOKE_START,
@@ -767,7 +779,7 @@ impl ToolRuntime {
                     tool_name: tool_name.to_owned(),
                 })
             }
-            result = time::timeout(admitted.config.timeout, work()) => {
+            result = time::timeout_at(admitted_deadline, work(work_context)) => {
                 match result {
                     Ok(Ok(value)) => {
                         self.emit(
@@ -1061,6 +1073,21 @@ impl ToolRuntime {
         );
 
         decision.action != RuleAction::Deny
+    }
+
+    /// Check only the policy enable bit for a leaf executed under a composite
+    /// grant. Roles, issuers, auth methods, tool-name rules, admission, and
+    /// permits belong to the already-admitted composite. Rendered HTTP rules
+    /// are evaluated separately for every actual leaf request.
+    pub(crate) fn composite_leaf_enabled(&self, tool_name: &str) -> bool {
+        if let Some(rbac_state) = &self.inner.rbac_state {
+            return rbac_state.evaluate_tool_authorization(tool_name, None, |authorization| {
+                authorization.tool.is_some_and(|tool| tool.enabled)
+            });
+        }
+
+        self.lookup_tool(tool_name)
+            .is_ok_and(|state| state.config.enabled)
     }
 
     fn rule_id(&self, rule_index: usize) -> String {
@@ -1540,7 +1567,7 @@ mod tests {
                 "tool",
                 context(),
                 CancellationToken::new(),
-                || async { Err::<(), _>("safe failure") },
+                |_| async { Err::<(), _>("safe failure") },
                 |_| ToolWorkErrorDisposition::FailureWithDetails {
                     reason: Some("invalid_params".to_owned()),
                     details: json!({
@@ -3181,6 +3208,7 @@ mod tests {
                         auth_mode: "bearer_token".to_owned(),
                     }),
                     source: ToolInvocationSource::AdminPlayground,
+                    admitted_deadline: None,
                 },
                 CancellationToken::new(),
                 || async { 42 },
@@ -3607,6 +3635,7 @@ mod tests {
             source_ip: "127.0.0.1".to_owned(),
             actor: None,
             source: ToolInvocationSource::Internal,
+            admitted_deadline: None,
         }
     }
 
@@ -3630,6 +3659,7 @@ mod tests {
                 auth_mode: auth_mode.to_owned(),
             }),
             source: ToolInvocationSource::Internal,
+            admitted_deadline: None,
         }
     }
 

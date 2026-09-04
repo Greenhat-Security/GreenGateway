@@ -11,6 +11,8 @@ use crate::tools::executor::{HttpToolExecutionResult, ToolExecutionResult};
 
 pub const TOOL_PLAYGROUND_REQUEST_LIMIT_BYTES: usize = 64 * 1024;
 pub const TOOL_PLAYGROUND_OUTPUT_LIMIT_BYTES: usize = 64 * 1024;
+pub const MAX_COMPOSITE_FAILURE_ORPHANS: usize = crate::tools::composite::MAX_COMPOSITE_STEPS
+    + crate::tools::composite::MAX_COMPOSITE_ITERATIONS;
 const HTTP_NON_SUCCESS_BODY_MESSAGE: &str =
     "Upstream returned a non-success status; response body was withheld.";
 
@@ -57,6 +59,12 @@ pub fn project_tool_execution_result(
     let projected = match result {
         ToolExecutionResult::Http(result) => project_http_response(result)?,
         ToolExecutionResult::McpCallToolResult(result) => project_mcp_result(result)?,
+        ToolExecutionResult::Composite(result) => json!({
+            "kind": "composite",
+            "status": 200,
+            "body": result.body,
+            "steps_summary": result.steps_summary,
+        }),
     };
 
     let encoded =
@@ -66,6 +74,125 @@ pub fn project_tool_execution_result(
     }
 
     Ok(projected)
+}
+
+/// Allowlist the structured composite failure contract before it reaches an
+/// operator or MCP client. The executor produces this value from typed saga
+/// records, but the projection is deliberately defensive: future work-error
+/// producers cannot smuggle response bodies, headers, or credentials through
+/// the otherwise open `details` object.
+pub fn project_composite_failure_details(details: Value) -> Value {
+    let Some(source) = details.as_object() else {
+        return json!({
+            "reason": "composite_failed_compensation_incomplete",
+            "compensation": "incomplete",
+            "orphans": [],
+        });
+    };
+    let mut projected = Map::new();
+    copy_string(source, &mut projected, "tool_name");
+    copy_string(source, &mut projected, "request_id");
+    copy_enum_string(
+        source,
+        &mut projected,
+        "reason",
+        &[
+            "composite_failed",
+            "composite_failed_compensation_incomplete",
+        ],
+    );
+    copy_string(source, &mut projected, "failed_step");
+    if let Some(iteration) = source.get("failed_iteration").and_then(Value::as_u64) {
+        projected.insert("failed_iteration".to_owned(), json!(iteration));
+    }
+    copy_string(source, &mut projected, "failure_reason");
+    copy_enum_string(
+        source,
+        &mut projected,
+        "compensation",
+        &["complete", "incomplete"],
+    );
+
+    let source_orphans = source
+        .get("orphans")
+        .and_then(Value::as_array)
+        .map(Vec::as_slice)
+        .unwrap_or_default();
+    let orphans = source_orphans
+        .iter()
+        .take(MAX_COMPOSITE_FAILURE_ORPHANS)
+        .filter_map(project_composite_orphan)
+        .collect::<Vec<_>>();
+    let orphans_truncated = source_orphans.len() > orphans.len();
+    projected.insert("orphans".to_owned(), Value::Array(orphans));
+    if orphans_truncated {
+        projected.insert("orphans_truncated".to_owned(), Value::Bool(true));
+    }
+    Value::Object(projected)
+}
+
+fn project_composite_orphan(value: &Value) -> Option<Value> {
+    let source = value.as_object()?;
+    let mut projected = Map::new();
+    copy_required_string(source, &mut projected, "step")?;
+    if let Some(iteration) = source.get("iteration").and_then(Value::as_u64) {
+        projected.insert("iteration".to_owned(), json!(iteration));
+    }
+    copy_required_string(source, &mut projected, "tool")?;
+    copy_required_enum_string(
+        source,
+        &mut projected,
+        "certainty",
+        &["confirmed", "possible"],
+    )?;
+    copy_required_string(source, &mut projected, "reason")?;
+    if let Some(status) = source
+        .get("upstream_status")
+        .and_then(Value::as_u64)
+        .filter(|status| *status <= u64::from(u16::MAX))
+    {
+        projected.insert("upstream_status".to_owned(), json!(status));
+    }
+    Some(Value::Object(projected))
+}
+
+fn copy_string(source: &Map<String, Value>, target: &mut Map<String, Value>, key: &str) {
+    if let Some(value) = source.get(key).and_then(Value::as_str) {
+        target.insert(key.to_owned(), Value::String(value.to_owned()));
+    }
+}
+
+fn copy_required_string(
+    source: &Map<String, Value>,
+    target: &mut Map<String, Value>,
+    key: &str,
+) -> Option<()> {
+    let value = source.get(key).and_then(Value::as_str)?;
+    target.insert(key.to_owned(), Value::String(value.to_owned()));
+    Some(())
+}
+
+fn copy_enum_string(
+    source: &Map<String, Value>,
+    target: &mut Map<String, Value>,
+    key: &str,
+    allowed: &[&str],
+) {
+    let _ = copy_required_enum_string(source, target, key, allowed);
+}
+
+fn copy_required_enum_string(
+    source: &Map<String, Value>,
+    target: &mut Map<String, Value>,
+    key: &str,
+    allowed: &[&str],
+) -> Option<()> {
+    let value = source
+        .get(key)
+        .and_then(Value::as_str)
+        .filter(|value| allowed.contains(value))?;
+    target.insert(key.to_owned(), Value::String(value.to_owned()));
+    Some(())
 }
 
 fn project_http_response(
@@ -619,6 +746,93 @@ mod tests {
             })
         );
         assert!(projected.get("structured_content").is_none());
+    }
+
+    #[test]
+    fn composite_projection_exposes_body_and_bounded_step_summary() {
+        use crate::tools::composite::{
+            CompositeResult, CompositeStepOutcome, CompositeStepSummary,
+        };
+
+        let projected =
+            project_tool_execution_result(ToolExecutionResult::Composite(CompositeResult {
+                body: json!({ "note_id": "note-1" }),
+                steps_summary: vec![CompositeStepSummary {
+                    index: 0,
+                    id: "note".to_owned(),
+                    iteration: None,
+                    tool: "createOneNote".to_owned(),
+                    method: "POST".to_owned(),
+                    path_template: "/notes".to_owned(),
+                    outcome: CompositeStepOutcome::Succeeded,
+                    upstream_status: Some(201),
+                    latency_ms: 12,
+                }],
+            }))
+            .expect("composite result should project");
+
+        assert_eq!(
+            projected,
+            json!({
+                "kind": "composite",
+                "status": 200,
+                "body": { "note_id": "note-1" },
+                "steps_summary": [{
+                    "index": 0,
+                    "id": "note",
+                    "tool": "createOneNote",
+                    "method": "POST",
+                    "path_template": "/notes",
+                    "outcome": "succeeded",
+                    "upstream_status": 201,
+                    "latency_ms": 12
+                }]
+            })
+        );
+    }
+
+    #[test]
+    fn composite_failure_projection_bounds_orphans_and_strips_unapproved_data() {
+        let credential_canary = "FAKE_composite_reflected_credential";
+        let orphans = (0..MAX_COMPOSITE_FAILURE_ORPHANS + 3)
+            .map(|iteration| {
+                json!({
+                    "step": "attach",
+                    "iteration": iteration,
+                    "tool": "createOneNoteTarget",
+                    "certainty": "confirmed",
+                    "reason": "compensation_status:500",
+                    "upstream_status": 500,
+                    "wire_body": { "credential": credential_canary },
+                    "headers": { "authorization": credential_canary }
+                })
+            })
+            .collect::<Vec<_>>();
+        let projected = project_composite_failure_details(json!({
+            "tool_name": "create_note_for_records",
+            "request_id": "request-360",
+            "reason": "composite_failed_compensation_incomplete",
+            "failed_step": "attach",
+            "failed_iteration": 2,
+            "failure_reason": "upstream_status:400",
+            "compensation": "incomplete",
+            "orphans": orphans,
+            "upstream_body": credential_canary,
+            "authorization": credential_canary
+        }));
+
+        assert_eq!(
+            projected["orphans"].as_array().map(Vec::len),
+            Some(MAX_COMPOSITE_FAILURE_ORPHANS)
+        );
+        assert_eq!(projected["orphans_truncated"], json!(true));
+        assert_eq!(projected["failed_iteration"], json!(2));
+        assert!(projected.get("upstream_body").is_none());
+        assert!(projected.get("authorization").is_none());
+        let encoded = projected.to_string();
+        assert!(!encoded.contains(credential_canary));
+        assert!(!encoded.contains("wire_body"));
+        assert!(!encoded.contains("headers"));
     }
 
     #[test]

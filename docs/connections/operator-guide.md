@@ -421,9 +421,9 @@ governed by the Connection resource's own precondition contract.
 
 This release accepts tool rename, tool and parameter descriptions, parameter
 titles, visibility, document-label disambiguation, body serialization, and
-declarative request/response transforms. Dynamic enum and label sources and
-composite tools remain reserved and are rejected until their implementation
-lands.
+declarative request/response transforms, plus bounded composite tools with
+compensation. Dynamic enum and label sources remain reserved and are rejected
+until their implementation lands.
 
 Overlay keys always use the generated name shown by OpenAPI preview, even when
 the tool is renamed for agents. Operation IDs are case-sensitive. In
@@ -563,10 +563,39 @@ configured document label sources**; this wording also covers documents whose
 available labels are excluded by `label_from`. Add explicit parameter
 descriptions until configured label sources are available.
 
+### Composite tools
+
+A composite is one agent-facing tool whose sequential steps name generated
+tools from the same managed OpenAPI catalog. It cannot introduce a method or
+path. Each real forward or compensation request still uses the Connection's
+credential and additional headers, passes the Connection egress policy, and is
+checked against HTTP deny rules on its rendered path.
+
+Use `visibility: composite_only` for sharp step or rollback tools that agents
+must not discover or call directly. They remain visible in the admin inventory
+and usable by the admin playground. The composite itself needs its own tool
+policy entry. Under default-deny it is invisible until that entry exists; under
+default-allow it uses the runtime default timeout. Overlay PUT and preview
+report `policy_entry_present` and `steps_max` for every composite. Size the
+policy timeout with this lower bound:
+
+`timeout_ms >= steps_max * connection request timeout + compensation_timeout_ms`
+
+The executor reserves `compensation_timeout_ms` inside that one admitted policy
+timeout. Fan-out is sequential and bounded by `maxItems` plus
+`limits.max_iterations`. Successful steps are compensated in reverse completion
+order after a definite failure. Ambiguous writes, including the default
+500/502/503/504 outcomes, are never compensated automatically and are reported
+as possible orphans. Failed or budget-exhausted compensation is returned as an
+error with confirmed or possible orphans rather than being hidden. Cancellation,
+lease loss, or timeout sends no new request after the invocation future is
+dropped; the audit tree records any pending compensation.
+
 ### JSON pointer bases
 
 The meaning of `/` is determined by the field containing the pointer. Source
-and composite fields below remain reserved until their later capability.
+fields for dynamic enum and label sources below remain reserved until their
+later capability.
 
 | Field | `/` is the root of |
 | --- | --- |
@@ -612,6 +641,7 @@ playground operations:
   `tool.invoke_rejected`
 - `tool.transform_warning` (one bounded summary event for a transformed
   response that produced warnings)
+- `tool.composite_completed`
 - `tool.playground_output_rejected`
 
 Events contain stable IDs, safe reason/outcome categories, revision or count

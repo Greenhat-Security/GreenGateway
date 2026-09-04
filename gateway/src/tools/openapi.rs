@@ -838,6 +838,7 @@ pub fn generate_tools_from_openapi_str(
                     mode: BodyMappingMode::WholeArgsJson,
                 }),
             },
+            composite: None,
             visibility: ToolVisibility::Listed,
             transform: None,
         };
@@ -2280,7 +2281,7 @@ fn placeholder_name(segment: &str) -> Option<&str> {
         .filter(|name| !name.is_empty())
 }
 
-fn is_json_media_type(media_type: &str) -> bool {
+pub(super) fn is_json_media_type(media_type: &str) -> bool {
     let media_type = media_type
         .split(';')
         .next()

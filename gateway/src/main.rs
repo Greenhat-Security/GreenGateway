@@ -1098,7 +1098,7 @@ struct ManagedOpenApiOverlayReportResponse {
     warnings: Vec<tools::overlay::OverlayWarning>,
     sources: Vec<Value>,
     tools: Vec<tools::overlay::OverlayToolReport>,
-    composites: Vec<Value>,
+    composites: Vec<tools::overlay::OverlayCompositeReport>,
 }
 
 #[derive(Serialize)]
@@ -1121,7 +1121,7 @@ struct ConnectionOpenApiOverlayMutationResponse {
     warnings: Vec<tools::overlay::OverlayWarning>,
     sources: Vec<connections::store::StoredOpenApiSourceReport>,
     tools: Vec<tools::overlay::OverlayToolReport>,
-    composites: Vec<Value>,
+    composites: Vec<tools::overlay::OverlayCompositeReport>,
 }
 
 #[derive(Deserialize)]
@@ -4375,6 +4375,9 @@ fn validate_connection_bound_tools(
                 Some(ToolTarget::Http {
                     connection_id: target_connection_id,
                     ..
+                })
+                | Some(ToolTarget::Composite {
+                    connection_id: target_connection_id,
                 }),
             ) => {
                 if source_connection_id != target_connection_id {
@@ -4401,13 +4404,13 @@ fn validate_connection_bound_tools(
             }
             (ToolSource::OpenApi { .. }, _) => {
                 problems.push(format!(
-                    "managed OpenAPI tool '{}' must use a Connection HTTP target",
+                    "managed OpenAPI tool '{}' must use a Connection HTTP or composite target",
                     definition.name
                 ));
             }
-            (_, Some(ToolTarget::Http { .. })) => {
+            (_, Some(ToolTarget::Http { .. }) | Some(ToolTarget::Composite { .. })) => {
                 problems.push(format!(
-                    "tool '{}' uses a Connection HTTP target with an unsupported source",
+                    "tool '{}' uses a Connection HTTP or composite target with an unsupported source",
                     definition.name
                 ));
             }
@@ -8430,7 +8433,12 @@ async fn tool_playground_execute_endpoint(
         ),
         actor: Some(auth::actor_from_principal(&principal)),
         source: tools::runtime::ToolInvocationSource::AdminPlayground,
+        admitted_deadline: None,
     };
+    let composite_request_id = definition
+        .composite
+        .is_some()
+        .then(|| context.request_id.clone());
 
     let result = match state
         .executor
@@ -8444,7 +8452,9 @@ async fn tool_playground_execute_endpoint(
         .await
     {
         Ok(result) => result,
-        Err(error) => return tool_playground_runtime_error_response(error),
+        Err(error) => {
+            return tool_playground_runtime_error_response(error, composite_request_id.as_deref())
+        }
     };
     let projected = match tools::playground::project_tool_execution_result(result) {
         Ok(projected) => projected,
@@ -11778,7 +11788,10 @@ fn capability_inventory_error_response(
     }
 }
 
-fn tool_playground_runtime_error_response(error: tools::runtime::ToolRuntimeError) -> Response {
+fn tool_playground_runtime_error_response(
+    error: tools::runtime::ToolRuntimeError,
+    composite_request_id: Option<&str>,
+) -> Response {
     use tools::runtime::ToolRuntimeError;
 
     match error {
@@ -11824,26 +11837,42 @@ fn tool_playground_runtime_error_response(error: tools::runtime::ToolRuntimeErro
             "tool execution admission timed out",
             "queue_timeout",
         ),
-        ToolRuntimeError::Timeout { .. } => tool_playground_error_response(
+        ToolRuntimeError::Timeout { .. } => tool_playground_runtime_unavailable_response(
             StatusCode::GATEWAY_TIMEOUT,
             "tool execution timed out",
             "timeout",
+            composite_request_id,
         ),
-        ToolRuntimeError::Cancelled { .. } => tool_playground_error_response(
+        ToolRuntimeError::Cancelled { .. } => tool_playground_runtime_unavailable_response(
             StatusCode::SERVICE_UNAVAILABLE,
             "tool execution was cancelled",
             "cancelled",
+            composite_request_id,
         ),
         ToolRuntimeError::AuthorityUnavailable { .. } => tool_playground_error_response(
             StatusCode::SERVICE_UNAVAILABLE,
             "tool execution admission authority is unavailable",
             "authority_unavailable",
         ),
-        ToolRuntimeError::LeaseLost { .. } => tool_playground_error_response(
+        ToolRuntimeError::LeaseLost { .. } => tool_playground_runtime_unavailable_response(
             StatusCode::SERVICE_UNAVAILABLE,
             "tool execution lost its execution lease",
             "lease_lost",
+            composite_request_id,
         ),
+        ToolRuntimeError::WorkFailed {
+            reason,
+            details: Some(details),
+            ..
+        } if matches!(
+            reason.as_deref(),
+            Some("composite_failed" | "composite_failed_compensation_incomplete")
+        ) =>
+        {
+            let mut details = tools::playground::project_composite_failure_details(details);
+            details["error"] = json!("tool execution failed");
+            (StatusCode::BAD_GATEWAY, Json(details)).into_response()
+        }
         ToolRuntimeError::WorkFailed {
             reason, details, ..
         } => match reason.as_deref() {
@@ -11881,6 +11910,27 @@ fn tool_playground_runtime_error_response(error: tools::runtime::ToolRuntimeErro
             ),
         },
     }
+}
+
+fn tool_playground_runtime_unavailable_response(
+    status: StatusCode,
+    error: &'static str,
+    reason: &'static str,
+    composite_request_id: Option<&str>,
+) -> Response {
+    let Some(request_id) = composite_request_id else {
+        return tool_playground_error_response(status, error, reason);
+    };
+    (
+        status,
+        Json(json!({
+            "error": error,
+            "reason": reason,
+            "request_id": request_id,
+            "composite": "pending_compensation",
+        })),
+    )
+        .into_response()
 }
 
 fn tool_playground_error_response(
@@ -13487,16 +13537,16 @@ fn managed_openapi_preview_response(
 fn managed_openapi_overlay_report_response(
     report: Option<connections::openapi::OpenApiOverlayCompileReport>,
 ) -> ManagedOpenApiOverlayReportResponse {
-    let (applied, warnings, tools) = report
-        .map(|report| (true, report.warnings, report.tools))
-        .unwrap_or_else(|| (false, Vec::new(), Vec::new()));
+    let (applied, warnings, tools, composites) = report
+        .map(|report| (true, report.warnings, report.tools, report.composites))
+        .unwrap_or_else(|| (false, Vec::new(), Vec::new(), Vec::new()));
     ManagedOpenApiOverlayReportResponse {
         applied,
         problems: Vec::new(),
         warnings,
         sources: Vec::new(),
         tools,
-        composites: Vec::new(),
+        composites,
     }
 }
 
@@ -13533,10 +13583,10 @@ fn overlay_mutation_response(
         }
         None => (0, Vec::new()),
     };
-    let (warnings, tools) = result
+    let (warnings, tools, composites) = result
         .report
-        .map(|report| (report.warnings, report.tools))
-        .unwrap_or_else(|| (Vec::new(), Vec::new()));
+        .map(|report| (report.warnings, report.tools, report.composites))
+        .unwrap_or_else(|| (Vec::new(), Vec::new(), Vec::new()));
     (
         StatusCode::OK,
         [
@@ -13550,7 +13600,7 @@ fn overlay_mutation_response(
             warnings,
             sources,
             tools,
-            composites: Vec::new(),
+            composites,
         }),
     )
         .into_response()
@@ -15706,8 +15756,8 @@ mod tests {
 
     #[tokio::test]
     async fn playground_transform_rejection_is_422_with_structured_problems() {
-        let response =
-            tool_playground_runtime_error_response(tools::runtime::ToolRuntimeError::WorkFailed {
+        let response = tool_playground_runtime_error_response(
+            tools::runtime::ToolRuntimeError::WorkFailed {
                 tool_name: "createCompany".to_owned(),
                 message: "tool 'createCompany' argument 'amount' could not be encoded".to_owned(),
                 reason: Some("invalid_params".to_owned()),
@@ -15718,7 +15768,9 @@ mod tests {
                         "reason": "value has 7 fraction digits, codec allows 6",
                     }],
                 })),
-            });
+            },
+            None,
+        );
         assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
         let body = axum::body::to_bytes(response.into_body(), usize::MAX)
             .await
@@ -27758,7 +27810,7 @@ mod tests {
             json!({
                 "rename": "overlay_widget",
                 "description": "Widget operation compiled from the overlay.",
-                "visibility": "composite_only"
+                "visibility": "listed"
             }),
         );
         let document = json!({
@@ -27803,7 +27855,7 @@ mod tests {
             json!(selected_tool_name)
         );
         assert_eq!(stored["tools"][0]["served_name"], json!("overlay_widget"));
-        assert_eq!(stored["tools"][0]["visibility"], json!("composite_only"));
+        assert_eq!(stored["tools"][0]["visibility"], json!("listed"));
         assert!(stored["catalog_revision"]
             .as_u64()
             .is_some_and(|revision| { revision == stored_catalog_revision }));
@@ -45562,6 +45614,9 @@ O2gecI9QwDJNpm29J9wJB2F8
     }
 
     mod issue_240_acceptance_security;
+
+    #[path = "issue_360_composite_acceptance.rs"]
+    mod issue_360_composite_acceptance;
 
     #[path = "issue_240_acceptance_core.rs"]
     mod issue_240_acceptance_core;

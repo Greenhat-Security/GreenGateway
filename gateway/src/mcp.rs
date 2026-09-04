@@ -158,6 +158,12 @@ impl ServerHandler for McpServer {
         };
 
         let arguments = Value::Object(request.arguments.unwrap_or_default());
+        let composite_error_context =
+            executor
+                .is_composite(&tool_name)
+                .then(|| CompositeRuntimeErrorContext {
+                    request_id: invocation_context.request_id.clone(),
+                });
 
         match executor
             .execute(
@@ -172,7 +178,11 @@ impl ServerHandler for McpServer {
                 Ok(call_tool_result_from_http_execution(result))
             }
             Ok(ToolExecutionResult::McpCallToolResult(result)) => Ok(result),
-            Err(error) => Err(runtime_error_to_mcp_error(error)),
+            Ok(ToolExecutionResult::Composite(result)) => Ok(CallToolResult::structured(json!({
+                "status": http::StatusCode::OK.as_u16(),
+                "body": result.body,
+            }))),
+            Err(error) => Err(runtime_error_to_mcp_error(error, composite_error_context)),
         }
     }
 
@@ -213,7 +223,7 @@ impl ServerHandler for McpServer {
                 reason: Some(reason),
                 ..
             }) if reason == TOOL_TASK_UNSUPPORTED_REASON => Err(task_unsupported_error(tool_name)),
-            Err(error) => Err(runtime_error_to_mcp_error(error)),
+            Err(error) => Err(runtime_error_to_mcp_error(error, None)),
         }
     }
 
@@ -270,6 +280,7 @@ fn invocation_context_from_request(
             .get::<auth::Principal>()
             .map(auth::actor_from_principal),
         source: ToolInvocationSource::Mcp,
+        admitted_deadline: None,
     }
 }
 
@@ -497,7 +508,14 @@ fn sensitive_error_token(token: &str) -> bool {
         || token.ends_with(".local")
 }
 
-fn runtime_error_to_mcp_error(error: ToolRuntimeError) -> ErrorData {
+struct CompositeRuntimeErrorContext {
+    request_id: String,
+}
+
+fn runtime_error_to_mcp_error(
+    error: ToolRuntimeError,
+    composite: Option<CompositeRuntimeErrorContext>,
+) -> ErrorData {
     match error {
         ToolRuntimeError::UnknownTool { tool_name } => unknown_tool_error(&tool_name),
         ToolRuntimeError::Disabled { tool_name } => {
@@ -523,24 +541,31 @@ fn runtime_error_to_mcp_error(error: ToolRuntimeError) -> ErrorData {
             tool_name,
             "tool invocation timed out while waiting for admission",
             "queue_timeout",
+            None,
         ),
         ToolRuntimeError::Timeout { tool_name } => runtime_unavailable_error(
             tool_name,
             "tool invocation timed out during execution",
             "timeout",
+            composite.as_ref(),
         ),
-        ToolRuntimeError::Cancelled { tool_name } => {
-            runtime_unavailable_error(tool_name, "tool invocation was cancelled", "cancelled")
-        }
+        ToolRuntimeError::Cancelled { tool_name } => runtime_unavailable_error(
+            tool_name,
+            "tool invocation was cancelled",
+            "cancelled",
+            composite.as_ref(),
+        ),
         ToolRuntimeError::AuthorityUnavailable { tool_name } => runtime_unavailable_error(
             tool_name,
             "tool invocation could not be admitted: the execution lease authority is unavailable",
             "authority_unavailable",
+            None,
         ),
         ToolRuntimeError::LeaseLost { tool_name } => runtime_unavailable_error(
             tool_name,
             "tool invocation lost its execution lease",
             "lease_lost",
+            composite.as_ref(),
         ),
         ToolRuntimeError::WorkFailed {
             tool_name,
@@ -548,6 +573,16 @@ fn runtime_error_to_mcp_error(error: ToolRuntimeError) -> ErrorData {
             reason,
             details,
         } => {
+            let details = details.map(|details| {
+                if matches!(
+                    reason.as_deref(),
+                    Some("composite_failed" | "composite_failed_compensation_incomplete")
+                ) {
+                    crate::tools::playground::project_composite_failure_details(details)
+                } else {
+                    details
+                }
+            });
             let executor_error = classify_executor_work_failure(reason.as_deref(), &message);
             match executor_error {
                 ExecutorWorkFailure::InvalidParams => {
@@ -556,7 +591,7 @@ fn runtime_error_to_mcp_error(error: ToolRuntimeError) -> ErrorData {
                 ExecutorWorkFailure::UnknownTool => unknown_tool_error(&tool_name),
                 ExecutorWorkFailure::Internal { reason } => ErrorData::internal_error(
                     "tool invocation failed",
-                    Some(json!({ "tool_name": tool_name, "reason": reason })),
+                    details.or_else(|| Some(json!({ "tool_name": tool_name, "reason": reason }))),
                 ),
             }
         }
@@ -624,15 +659,17 @@ fn runtime_unavailable_error(
     tool_name: String,
     message: &'static str,
     reason: &'static str,
+    composite: Option<&CompositeRuntimeErrorContext>,
 ) -> ErrorData {
-    ErrorData::new(
-        TOOL_RUNTIME_UNAVAILABLE_CODE,
-        message,
-        Some(json!({
-            "tool_name": tool_name,
-            "reason": reason,
-        })),
-    )
+    let mut data = json!({
+        "tool_name": tool_name,
+        "reason": reason,
+    });
+    if let Some(composite) = composite {
+        data["request_id"] = json!(composite.request_id);
+        data["composite"] = json!("pending_compensation");
+    }
+    ErrorData::new(TOOL_RUNTIME_UNAVAILABLE_CODE, message, Some(data))
 }
 
 enum ExecutorWorkFailure {
@@ -715,6 +752,81 @@ mod tests {
     const RESTRICTED_TOOL: &str = "payroll_export";
     const COMPOSITE_ONLY_TOOL: &str = "composite_step";
     const PRIVILEGED_ROLE: &str = "payroll-admin";
+
+    #[test]
+    fn composite_runtime_error_carries_request_id_and_pending_compensation_marker() {
+        for error in [
+            ToolRuntimeError::Timeout {
+                tool_name: "workflow".to_owned(),
+            },
+            ToolRuntimeError::Cancelled {
+                tool_name: "workflow".to_owned(),
+            },
+            ToolRuntimeError::LeaseLost {
+                tool_name: "workflow".to_owned(),
+            },
+        ] {
+            let error = runtime_error_to_mcp_error(
+                error,
+                Some(CompositeRuntimeErrorContext {
+                    request_id: "request-composite-runtime".to_owned(),
+                }),
+            );
+            let data = error.data.expect("runtime error should carry data");
+            assert_eq!(data["request_id"], json!("request-composite-runtime"));
+            assert_eq!(data["composite"], json!("pending_compensation"));
+        }
+    }
+
+    #[test]
+    fn composite_failure_is_internal_error_with_bounded_safe_orphans() {
+        let credential_canary = "FAKE_mcp_composite_credential";
+        let orphans = (0..crate::tools::playground::MAX_COMPOSITE_FAILURE_ORPHANS + 2)
+            .map(|iteration| {
+                json!({
+                    "step": "attach",
+                    "iteration": iteration,
+                    "tool": "createOneNoteTarget",
+                    "certainty": "confirmed",
+                    "reason": "compensation_status:500",
+                    "upstream_status": 500,
+                    "wire_body": credential_canary
+                })
+            })
+            .collect::<Vec<_>>();
+        let error = runtime_error_to_mcp_error(
+            ToolRuntimeError::WorkFailed {
+                tool_name: "create_note_for_records".to_owned(),
+                message: "composite execution failed".to_owned(),
+                reason: Some("composite_failed_compensation_incomplete".to_owned()),
+                details: Some(json!({
+                    "tool_name": "create_note_for_records",
+                    "request_id": "request-composite-failure",
+                    "reason": "composite_failed_compensation_incomplete",
+                    "failed_step": "attach",
+                    "failed_iteration": 2,
+                    "failure_reason": "upstream_status:400",
+                    "compensation": "incomplete",
+                    "orphans": orphans,
+                    "upstream_body": credential_canary
+                })),
+            },
+            None,
+        );
+
+        assert_eq!(error.code, ErrorCode(-32603));
+        let data = error.data.expect("composite failure should carry data");
+        assert_eq!(
+            data["orphans"].as_array().map(Vec::len),
+            Some(crate::tools::playground::MAX_COMPOSITE_FAILURE_ORPHANS)
+        );
+        assert_eq!(data["orphans_truncated"], json!(true));
+        assert_eq!(data["request_id"], json!("request-composite-failure"));
+        let encoded = data.to_string();
+        assert!(!encoded.contains(credential_canary));
+        assert!(!encoded.contains("wire_body"));
+        assert!(!encoded.contains("upstream_body"));
+    }
 
     #[test]
     fn empty_registry_still_configures_mcp_executor() {
@@ -819,18 +931,21 @@ mod tests {
 
     #[test]
     fn transform_rejection_details_are_preserved_in_mcp_invalid_params() {
-        let error = runtime_error_to_mcp_error(ToolRuntimeError::WorkFailed {
-            tool_name: "createCompany".to_owned(),
-            message: "tool 'createCompany' argument 'amount' could not be encoded".to_owned(),
-            reason: Some("invalid_params".to_owned()),
-            details: Some(json!({
-                "problems": [{
-                    "path": "/amount",
-                    "keyword": "codec",
-                    "reason": "value has 7 fraction digits, codec allows 6",
-                }],
-            })),
-        });
+        let error = runtime_error_to_mcp_error(
+            ToolRuntimeError::WorkFailed {
+                tool_name: "createCompany".to_owned(),
+                message: "tool 'createCompany' argument 'amount' could not be encoded".to_owned(),
+                reason: Some("invalid_params".to_owned()),
+                details: Some(json!({
+                    "problems": [{
+                        "path": "/amount",
+                        "keyword": "codec",
+                        "reason": "value has 7 fraction digits, codec allows 6",
+                    }],
+                })),
+            },
+            None,
+        );
 
         assert_eq!(error.code, ErrorCode::INVALID_PARAMS);
         assert_eq!(
@@ -1124,6 +1239,7 @@ mod tests {
                 query_params: Vec::new(),
                 body: None,
             },
+            composite: None,
             visibility: crate::tools::definitions::ToolVisibility::Listed,
             transform: None,
         }

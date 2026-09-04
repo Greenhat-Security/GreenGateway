@@ -2,6 +2,7 @@ use std::{
     collections::HashMap,
     error::Error,
     fmt,
+    future::Future,
     sync::{
         atomic::{AtomicBool, Ordering},
         Arc, Mutex, MutexGuard,
@@ -28,6 +29,16 @@ use crate::{
     },
     egress::{EgressClient, EgressError, EgressRequestBody, EgressResponse},
     tools::{
+        composite::{
+            resolve_arguments, resolve_binding, resolve_for_each, status_is_ambiguous,
+            status_is_success, BindingScope, CompositeBinding, CompositeCompensation,
+            CompositeCompensationOutcome, CompositeCompensationState, CompositeCompensationSummary,
+            CompositeCompletionAudit, CompositeMapping, CompositeOrphan, CompositeOrphanCertainty,
+            CompositeOutputs, CompositeResult, CompositeStep, CompositeStepOutcome,
+            CompositeStepOutput, CompositeStepSummary, PendingCompensation,
+            MAX_COMPOSITE_ARGUMENTS, MAX_COMPOSITE_BODY_BYTES, MAX_COMPOSITE_ITERATIONS,
+            MAX_COMPOSITE_JSON_DEPTH, MAX_COMPOSITE_RESULT_PROPERTIES, MAX_COMPOSITE_STEPS,
+        },
         definitions::{
             BodyMappingMode, McpProxyMapping, ToolDefinition, ToolRegistry, ToolSource, ToolTarget,
         },
@@ -219,12 +230,22 @@ pub enum ToolExecutorError {
         tool_name: String,
         reason: &'static str,
     },
+    CompositeFailed {
+        tool_name: String,
+        request_id: String,
+        failed_step: String,
+        failed_iteration: Option<usize>,
+        reason: Box<str>,
+        compensation: CompositeCompensationState,
+        orphans: Box<[CompositeOrphan]>,
+    },
 }
 
 #[derive(Debug)]
 pub enum ToolExecutionResult {
     Http(HttpToolExecutionResult),
     McpCallToolResult(CallToolResult),
+    Composite(CompositeResult),
 }
 
 #[derive(Debug)]
@@ -425,6 +446,22 @@ impl fmt::Display for ToolExecutorError {
                     "tool '{tool_name}' connection-bound request failed: {reason}"
                 )
             }
+            Self::CompositeFailed {
+                tool_name,
+                failed_step,
+                failed_iteration,
+                reason,
+                compensation,
+                ..
+            } => {
+                let iteration = failed_iteration
+                    .map(|iteration| format!(" iteration {iteration}"))
+                    .unwrap_or_default();
+                write!(
+                    formatter,
+                    "composite tool '{tool_name}' failed at step '{failed_step}'{iteration}: {reason} (compensation {compensation:?})"
+                )
+            }
         }
     }
 }
@@ -460,6 +497,210 @@ struct ToolObservationOutcome {
     latency_ms: u64,
     schema_mismatch: bool,
     reason: Option<&'static str>,
+}
+
+struct ClassifiedConnectionError {
+    error: Box<ToolExecutorError>,
+    request_sent: bool,
+}
+
+struct PreparedCompositeLeaf {
+    tool: Arc<ToolDefinition>,
+    target: ConnectionHttpTarget,
+    request: ToolUpstreamRequest,
+}
+
+struct CompositeLeafPreparationError {
+    reason: String,
+    method: String,
+    path_template: String,
+}
+
+enum CompositeLeafCallOutcome {
+    Response {
+        response: EgressResponse,
+        latency_ms: u64,
+    },
+    Transport {
+        reason: String,
+        latency_ms: u64,
+        request_sent: bool,
+    },
+    Timeout {
+        latency_ms: u64,
+        request_sent: bool,
+    },
+}
+
+struct CompositeJournalEntry {
+    step_id: String,
+    iteration: Option<usize>,
+    forward_tool: String,
+    compensation: CompositeCompensation,
+    response_json: Option<Value>,
+    item: Option<(String, Value)>,
+}
+
+struct CompositeFailurePoint {
+    step_id: String,
+    iteration: Option<usize>,
+    reason: String,
+}
+
+struct CompositeAuditGuard {
+    audit: AuditLog,
+    context: ToolInvocationContext,
+    tool_name: String,
+    connection_id: String,
+    steps: Vec<CompositeStepSummary>,
+    compensations: Vec<CompositeCompensationSummary>,
+    pending_compensation: Vec<PendingCompensation>,
+    failed_step: Option<String>,
+    emitted: bool,
+}
+
+impl CompositeAuditGuard {
+    fn new(
+        audit: AuditLog,
+        context: ToolInvocationContext,
+        tool_name: &str,
+        connection_id: &str,
+    ) -> Self {
+        Self {
+            audit,
+            context,
+            tool_name: tool_name.to_owned(),
+            connection_id: connection_id.to_owned(),
+            steps: Vec::new(),
+            compensations: Vec::new(),
+            pending_compensation: Vec::new(),
+            failed_step: None,
+            emitted: false,
+        }
+    }
+
+    fn begin_step(
+        &mut self,
+        index: usize,
+        step: &CompositeStep,
+        iteration: Option<usize>,
+        method: &str,
+        path_template: &str,
+    ) -> usize {
+        self.steps.push(CompositeStepSummary {
+            index,
+            id: step.id.clone(),
+            iteration,
+            tool: step.tool.clone(),
+            method: method.to_owned(),
+            path_template: path_template.to_owned(),
+            // If the work future is dropped during I/O, this conservative
+            // placeholder is the final, truthful classification.
+            outcome: CompositeStepOutcome::Ambiguous,
+            upstream_status: None,
+            latency_ms: 0,
+        });
+        self.steps.len() - 1
+    }
+
+    fn record_preflight_failure(
+        &mut self,
+        index: usize,
+        step: &CompositeStep,
+        iteration: Option<usize>,
+        method: &str,
+        path_template: &str,
+        latency_ms: u64,
+    ) {
+        self.steps.push(CompositeStepSummary {
+            index,
+            id: step.id.clone(),
+            iteration,
+            tool: step.tool.clone(),
+            method: method.to_owned(),
+            path_template: path_template.to_owned(),
+            outcome: CompositeStepOutcome::Failed,
+            upstream_status: None,
+            latency_ms,
+        });
+    }
+
+    fn complete_step(
+        &mut self,
+        summary_index: usize,
+        outcome: CompositeStepOutcome,
+        upstream_status: Option<u16>,
+        latency_ms: u64,
+    ) {
+        if let Some(summary) = self.steps.get_mut(summary_index) {
+            summary.outcome = outcome;
+            summary.upstream_status = upstream_status;
+            summary.latency_ms = latency_ms;
+        }
+    }
+
+    fn add_pending(&mut self, entry: &CompositeJournalEntry) {
+        self.pending_compensation.push(PendingCompensation {
+            step: entry.step_id.clone(),
+            iteration: entry.iteration,
+            tool: entry.compensation.tool.clone(),
+        });
+    }
+
+    fn clear_pending(&mut self, step: &str, iteration: Option<usize>, tool: &str) {
+        if let Some(index) = self.pending_compensation.iter().position(|pending| {
+            pending.step == step && pending.iteration == iteration && pending.tool == tool
+        }) {
+            self.pending_compensation.remove(index);
+        }
+    }
+
+    fn finish(&mut self, outcome: &str, failed_step: Option<&str>) {
+        self.failed_step = failed_step.map(str::to_owned);
+        self.emit(outcome);
+    }
+
+    fn emit(&mut self, outcome: &str) {
+        if self.emitted {
+            return;
+        }
+        self.emitted = true;
+        let payload = CompositeCompletionAudit {
+            tool_name: self.tool_name.clone(),
+            request_id: self.context.request_id.clone(),
+            outcome: outcome.to_owned(),
+            failed_step: self.failed_step.clone(),
+            steps: self.steps.clone(),
+            compensations: self.compensations.clone(),
+            pending_compensation: self.pending_compensation.clone(),
+            invocation_source: self.context.source.as_str().to_owned(),
+            connection_id: self.connection_id.clone(),
+        };
+        let payload = serde_json::to_value(payload).unwrap_or_else(|_| {
+            json!({
+                "tool_name": self.tool_name,
+                "request_id": self.context.request_id,
+                "outcome": outcome,
+                "invocation_source": self.context.source.as_str(),
+                "connection_id": self.connection_id,
+            })
+        });
+        self.audit.emit(AuditEvent::new(
+            audit::event::TOOL_COMPOSITE_COMPLETED,
+            &self.context.request_id,
+            &self.context.source_ip,
+            self.context.actor.clone(),
+            payload,
+        ));
+    }
+}
+
+impl Drop for CompositeAuditGuard {
+    fn drop(&mut self) {
+        if !self.emitted {
+            self.emit("abandoned");
+        }
+    }
 }
 
 struct UnsupportedTaskInvocation;
@@ -634,7 +875,7 @@ impl ToolExecutor {
         let runtime_tool_name = tool_name.to_owned();
         let work_tool_name = runtime_tool_name.clone();
         let observation_context = context.clone();
-        let work_context = context.clone();
+        let work_cancel = cancel.clone();
         let work_started = Arc::new(AtomicBool::new(false));
         let work_started_for_closure = Arc::clone(&work_started);
         let executor = self.clone();
@@ -645,10 +886,16 @@ impl ToolExecutor {
                 &runtime_tool_name,
                 context,
                 cancel,
-                move || async move {
+                move |work_context| async move {
                     work_started_for_closure.store(true, Ordering::SeqCst);
                     executor
-                        .execute_inner(&work_tool_name, args, &work_context, precondition.as_ref())
+                        .execute_inner(
+                            &work_tool_name,
+                            args,
+                            &work_context,
+                            &work_cancel,
+                            precondition.as_ref(),
+                        )
                         .await
                 },
                 executor_work_error_disposition,
@@ -711,7 +958,7 @@ impl ToolExecutor {
                 tool_name,
                 context.clone(),
                 CancellationToken::new(),
-                || async { Err(UnsupportedTaskInvocation) },
+                |_| async { Err(UnsupportedTaskInvocation) },
                 |_| {
                     ToolWorkErrorDisposition::Failure(Some(TOOL_TASK_UNSUPPORTED_REASON.to_owned()))
                 },
@@ -755,6 +1002,7 @@ impl ToolExecutor {
         tool_name: &str,
         args: Value,
         context: &ToolInvocationContext,
+        cancel: &CancellationToken,
         precondition: Option<&ToolExecutionPrecondition>,
     ) -> Result<ToolExecutionResult, ToolExecutorError> {
         let lookup_started = Instant::now();
@@ -793,6 +1041,36 @@ impl ToolExecutor {
                 );
             }
             return Err(error);
+        }
+
+        if let Some(composite) = tool.composite.as_ref() {
+            let connection_id = match (&tool.target, &tool.source) {
+                (
+                    Some(ToolTarget::Composite { connection_id }),
+                    ToolSource::OpenApi {
+                        connection_id: source_connection_id,
+                        ..
+                    },
+                ) if connection_id == source_connection_id => connection_id,
+                _ => {
+                    return Err(ToolExecutorError::Connection {
+                        tool_name: tool.name.clone(),
+                        reason: "catalog_stale",
+                    });
+                }
+            };
+            self.enforce_execution_precondition(context, &tool, precondition)
+                .await?;
+            return self
+                .execute_composite(&tool, composite, connection_id, &args, context, cancel)
+                .await;
+        }
+
+        if matches!(tool.target, Some(ToolTarget::Composite { .. })) {
+            return Err(ToolExecutorError::Connection {
+                tool_name: tool.name.clone(),
+                reason: "catalog_stale",
+            });
         }
 
         if let Some(mapping) = tool.upstream.mcp_proxy_mapping() {
@@ -919,7 +1197,7 @@ impl ToolExecutor {
                     });
                 Some(target)
             }
-            (Some(ToolTarget::Mcp { .. }), _) => None,
+            (Some(ToolTarget::Mcp { .. } | ToolTarget::Composite { .. }), _) => None,
             (None, _) => None,
         };
         self.enforce_execution_precondition(context, &tool, precondition)
@@ -969,7 +1247,7 @@ impl ToolExecutor {
                 };
                 (result, Some(connection_id.as_str()))
             }
-            (Some(ToolTarget::Mcp { .. }), _) => {
+            (Some(ToolTarget::Mcp { .. } | ToolTarget::Composite { .. }), _) => {
                 let error = ToolExecutorError::Connection {
                     tool_name: tool.name.clone(),
                     reason: "target_kind_mismatch",
@@ -1125,6 +1403,802 @@ impl ToolExecutor {
         ));
     }
 
+    pub(crate) fn is_composite(&self, tool_name: &str) -> bool {
+        self.registry
+            .get(tool_name)
+            .is_some_and(|tool| tool.composite.is_some())
+    }
+
+    async fn execute_composite(
+        &self,
+        tool: &ToolDefinition,
+        mapping: &CompositeMapping,
+        connection_id: &str,
+        args: &Value,
+        context: &ToolInvocationContext,
+        cancel: &CancellationToken,
+    ) -> Result<ToolExecutionResult, ToolExecutorError> {
+        let mut audit = CompositeAuditGuard::new(
+            self.audit.clone(),
+            context.clone(),
+            &tool.name,
+            connection_id,
+        );
+        let input = args
+            .as_object()
+            .ok_or_else(|| ToolExecutorError::CompositeFailed {
+                tool_name: tool.name.clone(),
+                request_id: context.request_id.clone(),
+                failed_step: tool.name.clone(),
+                failed_iteration: None,
+                reason: "invalid_params".into(),
+                compensation: CompositeCompensationState::Complete,
+                orphans: Vec::new().into_boxed_slice(),
+            })?;
+        let first_step = mapping
+            .steps
+            .first()
+            .map(|step| step.id.clone())
+            .unwrap_or_else(|| tool.name.clone());
+        let definition_in_bounds = !mapping.steps.is_empty()
+            && mapping.steps.len() <= MAX_COMPOSITE_STEPS
+            && mapping
+                .result
+                .as_ref()
+                .is_none_or(|result| result.len() <= MAX_COMPOSITE_RESULT_PROPERTIES)
+            && mapping.limits.max_iterations <= MAX_COMPOSITE_ITERATIONS
+            && input.len() <= MAX_COMPOSITE_ARGUMENTS
+            && json_value_within_depth(args, MAX_COMPOSITE_JSON_DEPTH)
+            && serde_json::to_vec(args)
+                .is_ok_and(|encoded| encoded.len() <= MAX_COMPOSITE_BODY_BYTES);
+        if !definition_in_bounds {
+            audit.finish("failed", Some(&first_step));
+            return Err(ToolExecutorError::CompositeFailed {
+                tool_name: tool.name.clone(),
+                request_id: context.request_id.clone(),
+                failed_step: first_step,
+                failed_iteration: None,
+                reason: "composite_limit_exceeded".into(),
+                compensation: CompositeCompensationState::Complete,
+                orphans: Vec::new().into_boxed_slice(),
+            });
+        }
+
+        // Input-backed fan-outs are known before the first request. Reject an
+        // oversized call here so the limit can never leave partial upstream
+        // state. Step-collect fan-outs are checked again when they resolve.
+        let empty_outputs = CompositeOutputs::new();
+        let preflight_scope = BindingScope {
+            input,
+            steps: &empty_outputs,
+            item: None,
+            self_body: None,
+        };
+        let mut known_iterations = 0usize;
+        for step in &mapping.steps {
+            let Some(for_each) = &step.for_each else {
+                continue;
+            };
+            if !matches!(for_each.over, CompositeBinding::Input { .. }) {
+                continue;
+            }
+            match resolve_for_each(&for_each.over, &preflight_scope) {
+                Ok(items) => known_iterations = known_iterations.saturating_add(items.len()),
+                Err(error) => {
+                    audit.finish("failed", Some(&step.id));
+                    return Err(ToolExecutorError::CompositeFailed {
+                        tool_name: tool.name.clone(),
+                        request_id: context.request_id.clone(),
+                        failed_step: step.id.clone(),
+                        failed_iteration: None,
+                        reason: error.reason().into(),
+                        compensation: CompositeCompensationState::Complete,
+                        orphans: Vec::new().into_boxed_slice(),
+                    });
+                }
+            }
+        }
+        if known_iterations > mapping.limits.max_iterations
+            || known_iterations > MAX_COMPOSITE_ITERATIONS
+        {
+            audit.finish("failed", Some(&first_step));
+            return Err(ToolExecutorError::InputValidation {
+                tool_name: tool.name.clone(),
+                problems: vec![format!(
+                    "composite iteration count {known_iterations} exceeds the configured maximum {}",
+                    mapping.limits.max_iterations.min(MAX_COMPOSITE_ITERATIONS)
+                )],
+            });
+        }
+
+        let admitted_deadline = context
+            .admitted_deadline
+            .unwrap_or_else(tokio::time::Instant::now);
+        let reserve = Duration::from_millis(mapping.limits.compensation_timeout_ms);
+        let forward_deadline = admitted_deadline
+            .checked_sub(reserve)
+            .unwrap_or_else(tokio::time::Instant::now);
+        let mut outputs = CompositeOutputs::new();
+        let mut journal = Vec::<CompositeJournalEntry>::new();
+        let mut uncompensatable_writes = Vec::<CompositeOrphan>::new();
+        let mut failure = None::<CompositeFailurePoint>;
+        let mut total_iterations = 0usize;
+
+        'steps: for (step_index, step) in mapping.steps.iter().enumerate() {
+            if cancel.is_cancelled() {
+                return std::future::pending().await;
+            }
+            let scope = BindingScope {
+                input,
+                steps: &outputs,
+                item: None,
+                self_body: None,
+            };
+            let iterations = match &step.for_each {
+                Some(for_each) => match resolve_for_each(&for_each.over, &scope) {
+                    Ok(items) => items.into_iter().map(Some).collect::<Vec<_>>(),
+                    Err(error) => {
+                        audit.record_preflight_failure(step_index, step, None, "", "", 0);
+                        failure = Some(CompositeFailurePoint {
+                            step_id: step.id.clone(),
+                            iteration: None,
+                            reason: error.reason().to_owned(),
+                        });
+                        break 'steps;
+                    }
+                },
+                None => vec![None],
+            };
+            if step.for_each.is_some() {
+                total_iterations = total_iterations.saturating_add(iterations.len());
+                if total_iterations > mapping.limits.max_iterations
+                    || total_iterations > MAX_COMPOSITE_ITERATIONS
+                {
+                    audit.record_preflight_failure(step_index, step, None, "", "", 0);
+                    failure = Some(CompositeFailurePoint {
+                        step_id: step.id.clone(),
+                        iteration: None,
+                        reason: "iteration_limit_exceeded".to_owned(),
+                    });
+                    break 'steps;
+                }
+            }
+
+            let mut step_outputs = Vec::with_capacity(iterations.len());
+            for (iteration_index, item) in iterations.iter().enumerate() {
+                if cancel.is_cancelled() {
+                    return std::future::pending().await;
+                }
+                let iteration = step.for_each.as_ref().map(|_| iteration_index);
+                if tokio::time::Instant::now() >= forward_deadline {
+                    audit.record_preflight_failure(step_index, step, iteration, "", "", 0);
+                    failure = Some(CompositeFailurePoint {
+                        step_id: step.id.clone(),
+                        iteration,
+                        reason: "budget_exhausted".to_owned(),
+                    });
+                    break 'steps;
+                }
+                let scope = BindingScope {
+                    input,
+                    steps: &outputs,
+                    item: step
+                        .for_each
+                        .as_ref()
+                        .zip(item.as_ref())
+                        .map(|(for_each, item)| (for_each.item_name.as_str(), item)),
+                    self_body: None,
+                };
+                let resolved = match resolve_arguments(&step.arguments, &scope) {
+                    Ok(resolved) => resolved,
+                    Err(error) => {
+                        audit.record_preflight_failure(step_index, step, iteration, "", "", 0);
+                        failure = Some(CompositeFailurePoint {
+                            step_id: step.id.clone(),
+                            iteration,
+                            reason: error.reason().to_owned(),
+                        });
+                        break 'steps;
+                    }
+                };
+                let prepared = match self.prepare_composite_leaf(
+                    &step.tool,
+                    connection_id,
+                    &resolved,
+                    context,
+                ) {
+                    Ok(prepared) => prepared,
+                    Err(error) => {
+                        audit.record_preflight_failure(
+                            step_index,
+                            step,
+                            iteration,
+                            &error.method,
+                            &error.path_template,
+                            0,
+                        );
+                        failure = Some(CompositeFailurePoint {
+                            step_id: step.id.clone(),
+                            iteration,
+                            reason: error.reason,
+                        });
+                        break 'steps;
+                    }
+                };
+                let method = prepared.request.method.clone();
+                let summary_index = audit.begin_step(
+                    step_index,
+                    step,
+                    iteration,
+                    method.as_str(),
+                    &prepared.tool.upstream.path_template,
+                );
+                match self
+                    .call_composite_leaf(context, prepared, forward_deadline)
+                    .await
+                {
+                    CompositeLeafCallOutcome::Response {
+                        response,
+                        latency_ms,
+                    } => {
+                        let status = response.status.as_u16();
+                        if status_is_success(step, status) {
+                            if step.compensate.is_none()
+                                && method != Method::GET
+                                && method != Method::HEAD
+                            {
+                                uncompensatable_writes.push(CompositeOrphan {
+                                    step: step.id.clone(),
+                                    iteration,
+                                    tool: step.tool.clone(),
+                                    certainty: CompositeOrphanCertainty::Confirmed,
+                                    reason: "no_compensation".to_owned(),
+                                    upstream_status: Some(status),
+                                });
+                            }
+                            match composite_step_output(&response) {
+                                Ok(output) => {
+                                    audit.complete_step(
+                                        summary_index,
+                                        CompositeStepOutcome::Succeeded,
+                                        Some(status),
+                                        latency_ms,
+                                    );
+                                    if let Some(compensation) = step.compensate.clone() {
+                                        let entry = CompositeJournalEntry {
+                                            step_id: step.id.clone(),
+                                            iteration,
+                                            forward_tool: step.tool.clone(),
+                                            compensation,
+                                            response_json: output.json_body.clone(),
+                                            item: step.for_each.as_ref().zip(item.as_ref()).map(
+                                                |(for_each, item)| {
+                                                    (for_each.item_name.clone(), item.clone())
+                                                },
+                                            ),
+                                        };
+                                        audit.add_pending(&entry);
+                                        journal.push(entry);
+                                    }
+                                    step_outputs.push(output);
+                                }
+                                Err(reason) => {
+                                    audit.complete_step(
+                                        summary_index,
+                                        CompositeStepOutcome::Failed,
+                                        Some(status),
+                                        latency_ms,
+                                    );
+                                    if let Some(compensation) = step.compensate.clone() {
+                                        let entry = CompositeJournalEntry {
+                                            step_id: step.id.clone(),
+                                            iteration,
+                                            forward_tool: step.tool.clone(),
+                                            compensation,
+                                            response_json: None,
+                                            item: step.for_each.as_ref().zip(item.as_ref()).map(
+                                                |(for_each, item)| {
+                                                    (for_each.item_name.clone(), item.clone())
+                                                },
+                                            ),
+                                        };
+                                        audit.add_pending(&entry);
+                                        journal.push(entry);
+                                    }
+                                    failure = Some(CompositeFailurePoint {
+                                        step_id: step.id.clone(),
+                                        iteration,
+                                        reason: reason.to_owned(),
+                                    });
+                                    break 'steps;
+                                }
+                            }
+                        } else {
+                            let ambiguous = status_is_ambiguous(step, &method, status);
+                            audit.complete_step(
+                                summary_index,
+                                if ambiguous {
+                                    CompositeStepOutcome::Ambiguous
+                                } else {
+                                    CompositeStepOutcome::Failed
+                                },
+                                Some(status),
+                                latency_ms,
+                            );
+                            failure = Some(CompositeFailurePoint {
+                                step_id: step.id.clone(),
+                                iteration,
+                                reason: if ambiguous {
+                                    format!("ambiguous_status:{status}")
+                                } else {
+                                    format!("upstream_status:{status}")
+                                },
+                            });
+                            break 'steps;
+                        }
+                    }
+                    CompositeLeafCallOutcome::Transport {
+                        reason,
+                        latency_ms,
+                        request_sent,
+                    } => {
+                        let ambiguous =
+                            request_sent && method != Method::GET && method != Method::HEAD;
+                        audit.complete_step(
+                            summary_index,
+                            if ambiguous {
+                                CompositeStepOutcome::Ambiguous
+                            } else {
+                                CompositeStepOutcome::Failed
+                            },
+                            None,
+                            latency_ms,
+                        );
+                        failure = Some(CompositeFailurePoint {
+                            step_id: step.id.clone(),
+                            iteration,
+                            reason: if ambiguous {
+                                "transport_ambiguous".to_owned()
+                            } else {
+                                reason
+                            },
+                        });
+                        break 'steps;
+                    }
+                    CompositeLeafCallOutcome::Timeout {
+                        latency_ms,
+                        request_sent,
+                    } => {
+                        audit.complete_step(
+                            summary_index,
+                            if request_sent {
+                                CompositeStepOutcome::Ambiguous
+                            } else {
+                                CompositeStepOutcome::Failed
+                            },
+                            None,
+                            latency_ms,
+                        );
+                        failure = Some(CompositeFailurePoint {
+                            step_id: step.id.clone(),
+                            iteration,
+                            reason: if request_sent {
+                                "timeout_ambiguous".to_owned()
+                            } else {
+                                "budget_exhausted".to_owned()
+                            },
+                        });
+                        break 'steps;
+                    }
+                }
+            }
+            outputs.insert(step.id.clone(), step_outputs);
+        }
+
+        if failure.is_none() {
+            let scope = BindingScope {
+                input,
+                steps: &outputs,
+                item: None,
+                self_body: None,
+            };
+            let body = if let Some(result) = &mapping.result {
+                let mut body = Map::new();
+                for (name, binding) in result {
+                    match resolve_binding(binding, &scope) {
+                        Ok(value) => {
+                            body.insert(name.clone(), value);
+                        }
+                        Err(error) => {
+                            let failed_step =
+                                mapping.steps.last().expect("bounds checked").id.clone();
+                            failure = Some(CompositeFailurePoint {
+                                step_id: failed_step,
+                                iteration: None,
+                                reason: error.reason().to_owned(),
+                            });
+                            break;
+                        }
+                    }
+                }
+                Value::Object(body)
+            } else {
+                outputs
+                    .get(&mapping.steps.last().expect("bounds checked").id)
+                    .and_then(|values| values.last())
+                    .map(|output| output.result_body.clone())
+                    .unwrap_or(Value::Null)
+            };
+            if failure.is_none() {
+                audit.finish("success", None);
+                return Ok(ToolExecutionResult::Composite(CompositeResult {
+                    body,
+                    steps_summary: audit.steps.clone(),
+                }));
+            }
+        }
+
+        let failure = failure.expect("failure established before compensation");
+        audit.failed_step = Some(failure.step_id.clone());
+        let mut orphans = uncompensatable_writes;
+        if audit.steps.iter().any(|summary| {
+            summary.id == failure.step_id
+                && summary.iteration == failure.iteration
+                && summary.outcome == CompositeStepOutcome::Ambiguous
+        }) {
+            let failed_tool = mapping
+                .steps
+                .iter()
+                .find(|step| step.id == failure.step_id)
+                .map(|step| step.tool.clone())
+                .unwrap_or_else(|| failure.step_id.clone());
+            let upstream_status = audit
+                .steps
+                .iter()
+                .find(|summary| {
+                    summary.id == failure.step_id && summary.iteration == failure.iteration
+                })
+                .and_then(|summary| summary.upstream_status);
+            orphans.push(CompositeOrphan {
+                step: failure.step_id.clone(),
+                iteration: failure.iteration,
+                tool: failed_tool,
+                certainty: CompositeOrphanCertainty::Possible,
+                reason: failure.reason.clone(),
+                upstream_status,
+            });
+        }
+
+        for entry in journal.iter().rev() {
+            if cancel.is_cancelled() {
+                return std::future::pending().await;
+            }
+            if tokio::time::Instant::now() >= admitted_deadline {
+                audit.compensations.push(CompositeCompensationSummary {
+                    for_step: entry.step_id.clone(),
+                    iteration: entry.iteration,
+                    tool: entry.compensation.tool.clone(),
+                    outcome: CompositeCompensationOutcome::Skipped,
+                    upstream_status: None,
+                    reason: Some("budget_exhausted".to_owned()),
+                });
+                orphans.push(composite_confirmed_orphan(entry, "budget_exhausted", None));
+                continue;
+            }
+            let scope = BindingScope {
+                input,
+                steps: &outputs,
+                item: entry
+                    .item
+                    .as_ref()
+                    .map(|(name, item)| (name.as_str(), item)),
+                self_body: entry.response_json.as_ref(),
+            };
+            let resolved = match resolve_arguments(&entry.compensation.arguments, &scope) {
+                Ok(resolved) => resolved,
+                Err(_) => {
+                    audit.compensations.push(CompositeCompensationSummary {
+                        for_step: entry.step_id.clone(),
+                        iteration: entry.iteration,
+                        tool: entry.compensation.tool.clone(),
+                        outcome: CompositeCompensationOutcome::Skipped,
+                        upstream_status: None,
+                        reason: Some("self_pointer_unresolved".to_owned()),
+                    });
+                    orphans.push(composite_confirmed_orphan(
+                        entry,
+                        "self_pointer_unresolved",
+                        None,
+                    ));
+                    continue;
+                }
+            };
+            let prepared = match self.prepare_composite_leaf(
+                &entry.compensation.tool,
+                connection_id,
+                &resolved,
+                context,
+            ) {
+                Ok(prepared) => prepared,
+                Err(error) => {
+                    let reason = composite_compensation_preflight_reason(&error.reason);
+                    audit.compensations.push(CompositeCompensationSummary {
+                        for_step: entry.step_id.clone(),
+                        iteration: entry.iteration,
+                        tool: entry.compensation.tool.clone(),
+                        outcome: CompositeCompensationOutcome::Skipped,
+                        upstream_status: None,
+                        reason: Some(reason.to_owned()),
+                    });
+                    orphans.push(composite_confirmed_orphan(entry, reason, None));
+                    continue;
+                }
+            };
+            match self
+                .call_composite_leaf(context, prepared, admitted_deadline)
+                .await
+            {
+                CompositeLeafCallOutcome::Response {
+                    response,
+                    latency_ms: _,
+                } if response.status.is_success() => {
+                    audit.compensations.push(CompositeCompensationSummary {
+                        for_step: entry.step_id.clone(),
+                        iteration: entry.iteration,
+                        tool: entry.compensation.tool.clone(),
+                        outcome: CompositeCompensationOutcome::Succeeded,
+                        upstream_status: Some(response.status.as_u16()),
+                        reason: None,
+                    });
+                    audit.clear_pending(&entry.step_id, entry.iteration, &entry.compensation.tool);
+                }
+                CompositeLeafCallOutcome::Response { response, .. } => {
+                    let status = response.status.as_u16();
+                    let reason = format!("compensation_status:{status}");
+                    audit.compensations.push(CompositeCompensationSummary {
+                        for_step: entry.step_id.clone(),
+                        iteration: entry.iteration,
+                        tool: entry.compensation.tool.clone(),
+                        outcome: CompositeCompensationOutcome::Failed,
+                        upstream_status: Some(status),
+                        reason: Some(reason.clone()),
+                    });
+                    orphans.push(composite_confirmed_orphan(entry, &reason, Some(status)));
+                }
+                CompositeLeafCallOutcome::Timeout { .. } => {
+                    audit.compensations.push(CompositeCompensationSummary {
+                        for_step: entry.step_id.clone(),
+                        iteration: entry.iteration,
+                        tool: entry.compensation.tool.clone(),
+                        outcome: CompositeCompensationOutcome::Failed,
+                        upstream_status: None,
+                        reason: Some("compensation_timeout".to_owned()),
+                    });
+                    orphans.push(composite_confirmed_orphan(
+                        entry,
+                        "compensation_timeout",
+                        None,
+                    ));
+                }
+                CompositeLeafCallOutcome::Transport { .. } => {
+                    audit.compensations.push(CompositeCompensationSummary {
+                        for_step: entry.step_id.clone(),
+                        iteration: entry.iteration,
+                        tool: entry.compensation.tool.clone(),
+                        outcome: CompositeCompensationOutcome::Failed,
+                        upstream_status: None,
+                        reason: Some("compensation_transport_error".to_owned()),
+                    });
+                    orphans.push(composite_confirmed_orphan(
+                        entry,
+                        "compensation_transport_error",
+                        None,
+                    ));
+                }
+            }
+        }
+
+        let compensation = if orphans.is_empty() && audit.pending_compensation.is_empty() {
+            CompositeCompensationState::Complete
+        } else {
+            CompositeCompensationState::Incomplete
+        };
+        audit.finish(
+            if compensation == CompositeCompensationState::Complete {
+                "failed"
+            } else {
+                "failed_compensation_incomplete"
+            },
+            Some(&failure.step_id),
+        );
+        Err(ToolExecutorError::CompositeFailed {
+            tool_name: tool.name.clone(),
+            request_id: context.request_id.clone(),
+            failed_step: failure.step_id,
+            failed_iteration: failure.iteration,
+            reason: failure.reason.into_boxed_str(),
+            compensation,
+            orphans: orphans.into_boxed_slice(),
+        })
+    }
+
+    fn prepare_composite_leaf(
+        &self,
+        tool_name: &str,
+        connection_id: &str,
+        args: &Value,
+        context: &ToolInvocationContext,
+    ) -> Result<PreparedCompositeLeaf, CompositeLeafPreparationError> {
+        let tool = self
+            .registry
+            .get(tool_name)
+            .ok_or_else(|| CompositeLeafPreparationError {
+                reason: "catalog_stale".to_owned(),
+                method: String::new(),
+                path_template: String::new(),
+            })?;
+        let method = tool.upstream.method.clone();
+        let path_template = tool.upstream.path_template.clone();
+        let fail = |reason: &str| CompositeLeafPreparationError {
+            reason: reason.to_owned(),
+            method: method.clone(),
+            path_template: path_template.clone(),
+        };
+        if tool.composite.is_some()
+            || !matches!(
+                (&tool.source, &tool.target),
+                (
+                    ToolSource::OpenApi {
+                        connection_id: source_connection_id,
+                        ..
+                    },
+                    Some(ToolTarget::Http {
+                        connection_id: target_connection_id,
+                        ..
+                    })
+                ) if source_connection_id == connection_id
+                    && target_connection_id == connection_id
+            )
+        {
+            return Err(fail("catalog_stale"));
+        }
+        if !self.runtime.composite_leaf_enabled(tool_name) {
+            return Err(fail("tool_disabled"));
+        }
+        if args
+            .as_object()
+            .is_none_or(|args| args.len() > MAX_COMPOSITE_ARGUMENTS)
+            || !json_value_within_depth(args, MAX_COMPOSITE_JSON_DEPTH)
+            || !serde_json::to_vec(args)
+                .is_ok_and(|encoded| encoded.len() <= MAX_COMPOSITE_BODY_BYTES)
+        {
+            return Err(fail("composite_limit_exceeded"));
+        }
+        let validator = self
+            .validator_for(&tool)
+            .map_err(|error| fail(executor_error_safe_reason(&error)))?;
+        validate_args(&tool, &validator, args)
+            .map_err(|error| fail(executor_error_safe_reason(&error)))?;
+        let wire_args =
+            apply_request_transform(tool.transform.as_ref(), args).map_err(|error| {
+                let error = transform_executor_error(&tool, error);
+                fail(executor_error_safe_reason(&error))
+            })?;
+        let request = self
+            .build_request(&tool, wire_args.as_ref())
+            .map_err(|error| fail(executor_error_safe_reason(&error)))?;
+        if request
+            .body
+            .as_ref()
+            .is_some_and(|body| body.len() > MAX_COMPOSITE_BODY_BYTES)
+        {
+            return Err(fail("request_body_too_large"));
+        }
+        if !self.runtime.authorize_http_operation(
+            &tool.name,
+            request.method.as_str(),
+            &request.path,
+            context,
+        ) {
+            return Err(fail("http_rule_denied"));
+        }
+        let runtime = self
+            .connection_http
+            .as_ref()
+            .ok_or_else(|| fail("connection_runtime_unavailable"))?;
+        let target = runtime
+            .target(connection_id, &request.path_and_query)
+            .map_err(|error| fail(error.safe_reason()))?;
+        Ok(PreparedCompositeLeaf {
+            tool,
+            target,
+            request,
+        })
+    }
+
+    async fn call_composite_leaf(
+        &self,
+        context: &ToolInvocationContext,
+        prepared: PreparedCompositeLeaf,
+        deadline: tokio::time::Instant,
+    ) -> CompositeLeafCallOutcome {
+        let started = Instant::now();
+        let method = prepared.request.method.clone();
+        let connection_id = prepared.target.connection_id().to_string();
+        let result = self
+            .execute_connection_http_classified(
+                context,
+                &prepared.tool,
+                prepared.target,
+                prepared.request,
+                Some(deadline),
+            )
+            .await;
+        let latency_ms = duration_millis(started.elapsed());
+        match result {
+            Ok(mut response) => {
+                let status = response.status.as_u16();
+                self.emit_upstream_audit(
+                    context,
+                    &prepared.tool,
+                    &method,
+                    Some(&connection_id),
+                    UpstreamAuditOutcome {
+                        outcome: "success",
+                        status: Some(status),
+                        latency_ms,
+                        reason: None,
+                    },
+                );
+                self.emit_tool_observation(
+                    context,
+                    &prepared.tool,
+                    ToolObservationOutcome {
+                        status,
+                        latency_ms,
+                        schema_mismatch: false,
+                        reason: None,
+                    },
+                );
+                let _warnings =
+                    self.apply_http_response_transform(context, &prepared.tool, &mut response);
+                CompositeLeafCallOutcome::Response {
+                    response,
+                    latency_ms,
+                }
+            }
+            Err(classified) => {
+                let reason = executor_error_safe_reason(&classified.error);
+                let outcome = executor_failure_observation_outcome(latency_ms, &classified.error);
+                self.emit_upstream_audit(
+                    context,
+                    &prepared.tool,
+                    &method,
+                    Some(&connection_id),
+                    UpstreamAuditOutcome {
+                        outcome: "failure",
+                        status: None,
+                        latency_ms,
+                        reason: Some(reason),
+                    },
+                );
+                self.emit_tool_observation(context, &prepared.tool, outcome);
+                if reason == "timeout" || reason == "response_idle_timeout" {
+                    CompositeLeafCallOutcome::Timeout {
+                        latency_ms,
+                        request_sent: classified.request_sent,
+                    }
+                } else {
+                    CompositeLeafCallOutcome::Transport {
+                        reason: reason.to_owned(),
+                        latency_ms,
+                        request_sent: classified.request_sent,
+                    }
+                }
+            }
+        }
+    }
+
     async fn enforce_execution_precondition(
         &self,
         context: &ToolInvocationContext,
@@ -1245,15 +2319,31 @@ impl ToolExecutor {
         context: &ToolInvocationContext,
         tool: &ToolDefinition,
         target: ConnectionHttpTarget,
-        mut request: ToolUpstreamRequest,
+        request: ToolUpstreamRequest,
     ) -> Result<EgressResponse, ToolExecutorError> {
-        let runtime =
-            self.connection_http
-                .as_ref()
-                .ok_or_else(|| ToolExecutorError::Connection {
+        self.execute_connection_http_classified(context, tool, target, request, None)
+            .await
+            .map_err(|classified| *classified.error)
+    }
+
+    async fn execute_connection_http_classified(
+        &self,
+        context: &ToolInvocationContext,
+        tool: &ToolDefinition,
+        target: ConnectionHttpTarget,
+        mut request: ToolUpstreamRequest,
+        deadline: Option<tokio::time::Instant>,
+    ) -> Result<EgressResponse, ClassifiedConnectionError> {
+        let runtime = self
+            .connection_http
+            .as_ref()
+            .ok_or_else(|| ClassifiedConnectionError {
+                error: Box::new(ToolExecutorError::Connection {
                     tool_name: tool.name.clone(),
                     reason: "connection_runtime_unavailable",
-                })?;
+                }),
+                request_sent: false,
+            })?;
         if matches!(tool.source, ToolSource::OpenApi { .. })
             && !self
                 .openapi_catalog_runtime
@@ -1262,15 +2352,21 @@ impl ToolExecutor {
                     catalog.definition_is_current(tool, target.connection_etag())
                 })
         {
-            return Err(ToolExecutorError::Connection {
-                tool_name: tool.name.clone(),
-                reason: "catalog_stale",
+            return Err(ClassifiedConnectionError {
+                error: Box::new(ToolExecutorError::Connection {
+                    tool_name: tool.name.clone(),
+                    reason: "catalog_stale",
+                }),
+                request_sent: false,
             });
         }
         if request.method == Method::TRACE && target.is_credentialed() {
-            return Err(ToolExecutorError::Connection {
-                tool_name: tool.name.clone(),
-                reason: "unsafe_trace_method",
+            return Err(ClassifiedConnectionError {
+                error: Box::new(ToolExecutorError::Connection {
+                    tool_name: tool.name.clone(),
+                    reason: "unsafe_trace_method",
+                }),
+                request_sent: false,
             });
         }
         // Every header the Connection owns is stripped before injection, so
@@ -1279,14 +2375,55 @@ impl ToolExecutor {
             request.headers.remove(header_name);
         }
 
-        let destination = target
-            .preflight_client()
-            .checked_destination(target.url())
+        let destination = run_before_deadline(
+            deadline,
+            target.preflight_client().checked_destination(target.url()),
+        )
+        .await
+        .map_err(|_| ClassifiedConnectionError {
+            error: Box::new(ToolExecutorError::Connection {
+                tool_name: tool.name.clone(),
+                reason: "timeout",
+            }),
+            request_sent: false,
+        })?
+        .map_err(|source| ClassifiedConnectionError {
+            error: Box::new(connection_egress_tool_error(tool, &source)),
+            request_sent: false,
+        })?;
+        let prepared =
+            run_before_deadline(deadline, runtime.prepare_transport(&target, &destination))
+                .await
+                .map_err(|_| ClassifiedConnectionError {
+                    error: Box::new(ToolExecutorError::Connection {
+                        tool_name: tool.name.clone(),
+                        reason: "timeout",
+                    }),
+                    request_sent: false,
+                })?
+                .map_err(|error| {
+                    if error.is_secret_resolution_failure() {
+                        self.emit_connection_secret_resolution_failed(
+                            context,
+                            tool,
+                            &target,
+                            error.safe_reason(),
+                        );
+                    }
+                    ClassifiedConnectionError {
+                        error: Box::new(connection_tool_error(tool, error)),
+                        request_sent: false,
+                    }
+                })?;
+        let credential = run_before_deadline(deadline, runtime.resolve_credential(&target))
             .await
-            .map_err(|source| connection_egress_tool_error(tool, &source))?;
-        let prepared = runtime
-            .prepare_transport(&target, &destination)
-            .await
+            .map_err(|_| ClassifiedConnectionError {
+                error: Box::new(ToolExecutorError::Connection {
+                    tool_name: tool.name.clone(),
+                    reason: "timeout",
+                }),
+                request_sent: false,
+            })?
             .map_err(|error| {
                 if error.is_secret_resolution_failure() {
                     self.emit_connection_secret_resolution_failed(
@@ -1296,19 +2433,11 @@ impl ToolExecutor {
                         error.safe_reason(),
                     );
                 }
-                connection_tool_error(tool, error)
+                ClassifiedConnectionError {
+                    error: Box::new(connection_tool_error(tool, error)),
+                    request_sent: false,
+                }
             })?;
-        let credential = runtime.resolve_credential(&target).await.map_err(|error| {
-            if error.is_secret_resolution_failure() {
-                self.emit_connection_secret_resolution_failed(
-                    context,
-                    tool,
-                    &target,
-                    error.safe_reason(),
-                );
-            }
-            connection_tool_error(tool, error)
-        })?;
         if let Some(credential) = credential.as_ref() {
             credential.inject(&mut request.headers).map_err(|error| {
                 if error.is_secret_resolution_failure() {
@@ -1319,23 +2448,39 @@ impl ToolExecutor {
                         error.safe_reason(),
                     );
                 }
-                connection_tool_error(tool, error)
+                ClassifiedConnectionError {
+                    error: Box::new(connection_tool_error(tool, error)),
+                    request_sent: false,
+                }
             })?;
         }
 
-        let response = prepared
-            .client()
-            .stream_request_with_body_at_checked_destination(
-                prepared.destination(),
-                request.method,
-                target.url(),
-                request.headers,
-                request
-                    .body
-                    .map_or(EgressRequestBody::Empty, EgressRequestBody::Buffered),
-            )
-            .await
-            .map_err(|source| connection_egress_tool_error(tool, &source))?;
+        let response = run_before_deadline(
+            deadline,
+            prepared
+                .client()
+                .stream_request_with_body_at_checked_destination(
+                    prepared.destination(),
+                    request.method,
+                    target.url(),
+                    request.headers,
+                    request
+                        .body
+                        .map_or(EgressRequestBody::Empty, EgressRequestBody::Buffered),
+                ),
+        )
+        .await
+        .map_err(|_| ClassifiedConnectionError {
+            error: Box::new(ToolExecutorError::Connection {
+                tool_name: tool.name.clone(),
+                reason: "timeout",
+            }),
+            request_sent: true,
+        })?
+        .map_err(|source| ClassifiedConnectionError {
+            error: Box::new(connection_egress_tool_error(tool, &source)),
+            request_sent: true,
+        })?;
         if connection_authentication_rejected(response.status, target.is_credentialed()) {
             if response.status == StatusCode::UNAUTHORIZED {
                 if let Some(credential) = credential
@@ -1345,17 +2490,35 @@ impl ToolExecutor {
                     credential.invalidate_after_unauthorized().await;
                 }
             }
-            return Err(connection_tool_error(
-                tool,
-                ConnectionHttpError::UpstreamAuthenticationRejected,
-            ));
+            return Err(ClassifiedConnectionError {
+                error: Box::new(connection_tool_error(
+                    tool,
+                    ConnectionHttpError::UpstreamAuthenticationRejected,
+                )),
+                // The upstream gave a definite rejection; it did not perform
+                // the requested operation.
+                request_sent: false,
+            });
         }
         let mut body = Vec::new();
         let mut response_body = response.body;
-        while let Some(chunk) = response_body.next().await {
-            body.extend_from_slice(
-                &chunk.map_err(|source| connection_egress_tool_error(tool, &source))?,
-            );
+        loop {
+            let next = run_before_deadline(deadline, response_body.next())
+                .await
+                .map_err(|_| ClassifiedConnectionError {
+                    error: Box::new(ToolExecutorError::Connection {
+                        tool_name: tool.name.clone(),
+                        reason: "timeout",
+                    }),
+                    request_sent: true,
+                })?;
+            let Some(chunk) = next else {
+                break;
+            };
+            body.extend_from_slice(&chunk.map_err(|source| ClassifiedConnectionError {
+                error: Box::new(connection_egress_tool_error(tool, &source)),
+                request_sent: true,
+            })?);
         }
         Ok(EgressResponse {
             status: response.status,
@@ -2429,6 +3592,12 @@ fn executor_failure_observation_outcome(
             schema_mismatch: false,
             reason: Some(TOOL_EXECUTION_STATE_UNAVAILABLE_REASON),
         },
+        ToolExecutorError::CompositeFailed { .. } => ToolObservationOutcome {
+            status: StatusCode::BAD_GATEWAY.as_u16(),
+            latency_ms,
+            schema_mismatch: false,
+            reason: Some("composite_failed"),
+        },
         ToolExecutorError::MissingUpstreamUrl
         | ToolExecutorError::InvalidUpstreamUrl { .. }
         | ToolExecutorError::SchemaCacheKey { .. }
@@ -2529,6 +3698,35 @@ fn runtime_admission_failure_observation_outcome(
 }
 
 fn executor_work_error_disposition(error: &ToolExecutorError) -> ToolWorkErrorDisposition {
+    if let ToolExecutorError::CompositeFailed {
+        tool_name,
+        request_id,
+        failed_step,
+        failed_iteration,
+        reason,
+        compensation,
+        orphans,
+    } = error
+    {
+        let failure_reason = if *compensation == CompositeCompensationState::Complete {
+            "composite_failed"
+        } else {
+            "composite_failed_compensation_incomplete"
+        };
+        return ToolWorkErrorDisposition::FailureWithDetails {
+            reason: Some(failure_reason.to_owned()),
+            details: json!({
+                "tool_name": tool_name,
+                "request_id": request_id,
+                "reason": failure_reason,
+                "failed_step": failed_step,
+                "failed_iteration": failed_iteration,
+                "failure_reason": reason,
+                "compensation": compensation,
+                "orphans": orphans,
+            }),
+        };
+    }
     match error {
         ToolExecutorError::TransformRejected { path, reason, .. } => {
             return ToolWorkErrorDisposition::FailureWithDetails {
@@ -2561,6 +3759,7 @@ fn executor_work_error_disposition(error: &ToolExecutorError) -> ToolWorkErrorDi
             ToolExecutorError::Egress { source, .. } => egress_error_reason(source),
             ToolExecutorError::McpUpstream { reason, .. } => reason,
             ToolExecutorError::Connection { reason, .. } => reason,
+            ToolExecutorError::CompositeFailed { .. } => unreachable!("handled above"),
             ToolExecutorError::ExecutionStateUnavailable { .. } => {
                 TOOL_EXECUTION_STATE_UNAVAILABLE_REASON
             }
@@ -2582,6 +3781,108 @@ fn executor_work_error_disposition(error: &ToolExecutorError) -> ToolWorkErrorDi
 
 fn duration_millis(duration: Duration) -> u64 {
     u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
+}
+
+fn executor_error_safe_reason(error: &ToolExecutorError) -> &'static str {
+    match error {
+        ToolExecutorError::UnknownTool { .. } => "unknown_tool",
+        ToolExecutorError::InputValidation { .. }
+        | ToolExecutorError::MissingArgument { .. }
+        | ToolExecutorError::UnsupportedArgumentValue { .. }
+        | ToolExecutorError::PathSegmentIsDotSegment { .. }
+        | ToolExecutorError::TransformRejected { .. } => "invalid_params",
+        ToolExecutorError::Egress { source, .. } => egress_error_reason(source),
+        ToolExecutorError::McpUpstream { reason, .. }
+        | ToolExecutorError::Connection { reason, .. } => reason,
+        ToolExecutorError::HttpRuleDenied { .. } => "http_rule_denied",
+        ToolExecutorError::PreconditionFailed { .. } => "precondition_failed",
+        ToolExecutorError::ExecutionStateUnavailable { .. } => "execution_state_unavailable",
+        ToolExecutorError::CompositeFailed { .. } => "composite_failed",
+        ToolExecutorError::MissingUpstreamUrl
+        | ToolExecutorError::InvalidUpstreamUrl { .. }
+        | ToolExecutorError::SchemaCacheKey { .. }
+        | ToolExecutorError::SchemaCompile { .. }
+        | ToolExecutorError::InvalidMapping { .. }
+        | ToolExecutorError::InvalidMethod { .. }
+        | ToolExecutorError::BodySerialize { .. }
+        | ToolExecutorError::UrlBuild { .. } => "internal_configuration_error",
+    }
+}
+
+fn composite_step_output(response: &EgressResponse) -> Result<CompositeStepOutput, &'static str> {
+    if response.body.len() > MAX_COMPOSITE_BODY_BYTES {
+        return Err("response_too_large");
+    }
+    let json_body = serde_json::from_slice::<Value>(&response.body).ok();
+    if json_body
+        .as_ref()
+        .is_some_and(|value| !json_value_within_depth(value, MAX_COMPOSITE_JSON_DEPTH))
+    {
+        return Err("response_too_deep");
+    }
+    let result_body = json_body.clone().unwrap_or_else(|| {
+        String::from_utf8(response.body.clone())
+            .map(Value::String)
+            .unwrap_or(Value::Null)
+    });
+    Ok(CompositeStepOutput {
+        json_body,
+        result_body,
+    })
+}
+
+fn json_value_within_depth(value: &Value, maximum: usize) -> bool {
+    fn visit(value: &Value, depth: usize, maximum: usize) -> bool {
+        if depth > maximum {
+            return false;
+        }
+        match value {
+            Value::Array(values) => values
+                .iter()
+                .all(|value| visit(value, depth.saturating_add(1), maximum)),
+            Value::Object(values) => values
+                .values()
+                .all(|value| visit(value, depth.saturating_add(1), maximum)),
+            _ => true,
+        }
+    }
+    visit(value, 0, maximum)
+}
+
+fn composite_confirmed_orphan(
+    entry: &CompositeJournalEntry,
+    reason: &str,
+    upstream_status: Option<u16>,
+) -> CompositeOrphan {
+    CompositeOrphan {
+        step: entry.step_id.clone(),
+        iteration: entry.iteration,
+        tool: entry.forward_tool.clone(),
+        certainty: CompositeOrphanCertainty::Confirmed,
+        reason: reason.to_owned(),
+        upstream_status,
+    }
+}
+
+fn composite_compensation_preflight_reason(reason: &str) -> &'static str {
+    match reason {
+        "tool_disabled" => "tool_disabled",
+        "http_rule_denied" => "http_rule_denied",
+        "timeout" => "compensation_timeout",
+        _ => "compensation_transport_error",
+    }
+}
+
+async fn run_before_deadline<F, T>(deadline: Option<tokio::time::Instant>, work: F) -> Result<T, ()>
+where
+    F: Future<Output = T>,
+{
+    match deadline {
+        Some(deadline) => tokio::time::timeout_at(deadline, work)
+            .await
+            .map_err(|_| ()),
+        None => Ok(work.await),
+    }
 }
 
 fn tool_observation_path(tool_name: &str) -> String {
@@ -2640,7 +3941,7 @@ mod tests {
             signals::{DEFAULT_SCHEMA_MISMATCH_SIGNAL_THRESHOLD, SCHEMA_MISMATCH_SIGNAL_TYPE},
         },
         egress::EgressConfig,
-        rbac::Policy,
+        rbac::{Policy, PrincipalMatcher, Rule, RuleAction},
         tools::runtime::{
             DefaultToolPolicy, ToolInvocationSource, ToolRuntimeConfig, ToolRuntimeToolConfig,
         },
@@ -3100,6 +4401,610 @@ mod tests {
                 && event.payload["status"] == json!(StatusCode::SERVICE_UNAVAILABLE.as_u16())
                 && event.payload["reason"] == json!(TOOL_EXECUTION_STATE_UNAVAILABLE_REASON)
         }));
+    }
+
+    #[tokio::test]
+    async fn composite_failing_for_each_step_compensates_its_own_iterations_first() {
+        let responses = vec![
+            (StatusCode::CREATED, json!({"id":"note-1"})),
+            (StatusCode::CREATED, json!({"id":"attachment-a"})),
+            (StatusCode::BAD_REQUEST, json!({"error":"rejected"})),
+            (StatusCode::NO_CONTENT, Value::Null),
+            (StatusCode::NO_CONTENT, Value::Null),
+        ];
+        let (addr, ca_pem, server) = scripted_tls_server(responses).await;
+        let connection =
+            TemporaryStaticAuthRuntime::header_api_key(addr, &ca_pem, b"composite-key").await;
+        let definitions = composite_note_definitions(&connection.connection_id);
+        let (executor, _capture) = executor_for_composite_definitions(
+            definitions,
+            &connection,
+            [
+                "create_note_for_records",
+                "create_note",
+                "attach_note",
+                "delete_attachment",
+                "delete_note",
+            ],
+        );
+
+        let error = executor
+            .execute(
+                "create_note_for_records",
+                json!({"title":"hello","targets":["a","b"]}),
+                invocation_context(),
+                CancellationToken::new(),
+            )
+            .await
+            .expect_err("the second attachment should fail the composite");
+        let ToolRuntimeError::WorkFailed {
+            reason,
+            details: Some(details),
+            ..
+        } = error
+        else {
+            panic!("expected a structured composite work failure");
+        };
+        assert_eq!(reason.as_deref(), Some("composite_failed"));
+        assert_eq!(details["failed_step"], json!("attach"));
+        assert_eq!(details["failed_iteration"], json!(1));
+        assert_eq!(details["compensation"], json!("complete"));
+        assert_eq!(details["orphans"], json!([]));
+
+        let requests = server.await.expect("scripted TLS server should join");
+        assert_eq!(
+            requests
+                .iter()
+                .map(|request| request.target.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                "/v1/notes",
+                "/v1/attachments/a",
+                "/v1/attachments/b",
+                "/v1/attachments/a",
+                "/v1/notes/note-1",
+            ]
+        );
+        assert!(requests
+            .iter()
+            .all(|request| { request.header("x-api-key") == Some("composite-key") }));
+    }
+
+    #[tokio::test]
+    async fn composite_executes_multiple_requests_and_projects_declared_result() {
+        let responses = vec![
+            (StatusCode::CREATED, json!({"id":"note-1"})),
+            (StatusCode::CREATED, json!({"id":"attachment-a"})),
+            (StatusCode::CREATED, json!({"id":"attachment-b"})),
+        ];
+        let (addr, ca_pem, server) = scripted_tls_server(responses).await;
+        let connection = TemporaryStaticAuthRuntime::header_api_key_with_additional(
+            addr,
+            &ca_pem,
+            b"primary-key",
+            &[("cf-access-client-secret", "proxy-secret", b"secondary-key")],
+        )
+        .await;
+        let definitions = composite_note_definitions(&connection.connection_id);
+        let (executor, capture) = executor_for_composite_definitions(
+            definitions,
+            &connection,
+            [
+                "create_note_for_records",
+                "create_note",
+                "attach_note",
+                "delete_attachment",
+                "delete_note",
+            ],
+        );
+
+        let result = executor
+            .execute(
+                "create_note_for_records",
+                json!({"title":"hello","targets":["a","b"]}),
+                invocation_context(),
+                CancellationToken::new(),
+            )
+            .await
+            .expect("the composite should succeed");
+        let ToolExecutionResult::Composite(result) = result else {
+            panic!("expected a composite result");
+        };
+        assert_eq!(result.body, json!({"note_id":"note-1"}));
+        assert_eq!(result.steps_summary.len(), 3);
+        assert!(result
+            .steps_summary
+            .iter()
+            .all(|step| step.outcome == CompositeStepOutcome::Succeeded));
+
+        let requests = server.await.expect("scripted TLS server should join");
+        assert_eq!(requests.len(), 3);
+        assert!(requests.iter().all(|request| {
+            request.header("x-api-key") == Some("primary-key")
+                && request.header("cf-access-client-secret") == Some("secondary-key")
+        }));
+        let events = audit_events(&capture, 9).await;
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event.event_type == audit::event::TOOL_UPSTREAM_REQUEST)
+                .count(),
+            3
+        );
+        let completed = events
+            .iter()
+            .find(|event| event.event_type == audit::event::TOOL_COMPOSITE_COMPLETED)
+            .expect("composite completion should be audited");
+        assert_eq!(completed.payload["outcome"], json!("success"));
+        assert_eq!(completed.payload["steps"].as_array().map(Vec::len), Some(3));
+    }
+
+    #[tokio::test]
+    async fn composite_write_5xx_is_possible_orphan_and_is_not_compensated() {
+        let responses = vec![
+            (StatusCode::CREATED, json!({"id":"note-1"})),
+            (StatusCode::BAD_GATEWAY, json!({"error":"proxy lost reply"})),
+            (StatusCode::NO_CONTENT, Value::Null),
+        ];
+        let (addr, ca_pem, server) = scripted_tls_server(responses).await;
+        let connection =
+            TemporaryStaticAuthRuntime::header_api_key(addr, &ca_pem, b"composite-key").await;
+        let definitions = composite_note_definitions(&connection.connection_id);
+        let (executor, _capture) = executor_for_composite_definitions(
+            definitions,
+            &connection,
+            [
+                "create_note_for_records",
+                "create_note",
+                "attach_note",
+                "delete_attachment",
+                "delete_note",
+            ],
+        );
+
+        let error = executor
+            .execute(
+                "create_note_for_records",
+                json!({"title":"hello","targets":["a"]}),
+                invocation_context(),
+                CancellationToken::new(),
+            )
+            .await
+            .expect_err("a write-side 502 must fail ambiguously");
+        let ToolRuntimeError::WorkFailed {
+            reason,
+            details: Some(details),
+            ..
+        } = error
+        else {
+            panic!("expected a structured composite work failure");
+        };
+        assert_eq!(
+            reason.as_deref(),
+            Some("composite_failed_compensation_incomplete")
+        );
+        assert_eq!(details["compensation"], json!("incomplete"));
+        assert_eq!(details["orphans"][0]["step"], json!("attach"));
+        assert_eq!(details["orphans"][0]["certainty"], json!("possible"));
+        assert_eq!(details["orphans"][0]["upstream_status"], json!(502));
+
+        let requests = server.await.expect("scripted TLS server should join");
+        assert_eq!(
+            requests
+                .iter()
+                .map(|request| request.target.as_str())
+                .collect::<Vec<_>>(),
+            vec!["/v1/notes", "/v1/attachments/a", "/v1/notes/note-1"]
+        );
+    }
+
+    #[tokio::test]
+    async fn composite_step_http_deny_blocks_rendered_path_before_member_io() {
+        let responses = vec![
+            (StatusCode::CREATED, json!({"id":"note-1"})),
+            (StatusCode::NO_CONTENT, Value::Null),
+        ];
+        let (addr, ca_pem, server) = scripted_tls_server(responses).await;
+        let connection =
+            TemporaryStaticAuthRuntime::header_api_key(addr, &ca_pem, b"composite-key").await;
+        let definitions = composite_note_definitions(&connection.connection_id);
+        let tool_names = [
+            "create_note_for_records",
+            "create_note",
+            "attach_note",
+            "delete_attachment",
+            "delete_note",
+        ];
+        let mut config = runtime_config(
+            tool_names.map(|name| (name, enabled_tool(5_000, 1))),
+            2,
+            1,
+            100,
+        );
+        config.rules.push(Rule {
+            id: Some("deny-rendered-attachment".to_owned()),
+            enabled: true,
+            methods: vec!["POST".to_owned()],
+            path: "/attachments/blocked".to_owned(),
+            tool_name: None,
+            dispatch: None,
+            principal: PrincipalMatcher::default(),
+            action: RuleAction::Deny,
+        });
+        let (executor, _capture) =
+            executor_for_composite_definitions_with_config(definitions, &connection, config);
+
+        let error = executor
+            .execute(
+                "create_note_for_records",
+                json!({"title":"hello","targets":["blocked"]}),
+                invocation_context(),
+                CancellationToken::new(),
+            )
+            .await
+            .expect_err("the rendered member path must be denied");
+        let ToolRuntimeError::WorkFailed {
+            details: Some(details),
+            ..
+        } = error
+        else {
+            panic!("expected structured composite failure");
+        };
+        assert_eq!(details["failure_reason"], json!("http_rule_denied"));
+        let requests = server.await.expect("scripted TLS server should join");
+        assert_eq!(
+            requests
+                .iter()
+                .map(|request| request.target.as_str())
+                .collect::<Vec<_>>(),
+            vec!["/v1/notes", "/v1/notes/note-1"]
+        );
+    }
+
+    #[tokio::test]
+    async fn composite_failed_compensation_continues_and_reports_confirmed_orphan() {
+        let responses = vec![
+            (StatusCode::CREATED, json!({"id":"note-1"})),
+            (StatusCode::CREATED, json!({"id":"attachment-a"})),
+            (StatusCode::BAD_REQUEST, json!({"error":"rejected"})),
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                json!({"error":"delete failed"}),
+            ),
+            (StatusCode::NO_CONTENT, Value::Null),
+        ];
+        let (addr, ca_pem, server) = scripted_tls_server(responses).await;
+        let connection =
+            TemporaryStaticAuthRuntime::header_api_key(addr, &ca_pem, b"composite-key").await;
+        let definitions = composite_note_definitions(&connection.connection_id);
+        let (executor, _capture) = executor_for_composite_definitions(
+            definitions,
+            &connection,
+            [
+                "create_note_for_records",
+                "create_note",
+                "attach_note",
+                "delete_attachment",
+                "delete_note",
+            ],
+        );
+
+        let error = executor
+            .execute(
+                "create_note_for_records",
+                json!({"title":"hello","targets":["a","b"]}),
+                invocation_context(),
+                CancellationToken::new(),
+            )
+            .await
+            .expect_err("failed compensation must remain visible");
+        let ToolRuntimeError::WorkFailed {
+            reason,
+            details: Some(details),
+            ..
+        } = error
+        else {
+            panic!("expected structured composite failure");
+        };
+        assert_eq!(
+            reason.as_deref(),
+            Some("composite_failed_compensation_incomplete")
+        );
+        assert_eq!(details["orphans"][0]["certainty"], json!("confirmed"));
+        assert_eq!(
+            details["orphans"][0]["reason"],
+            json!("compensation_status:500")
+        );
+        let requests = server.await.expect("scripted TLS server should join");
+        assert_eq!(
+            requests
+                .iter()
+                .map(|request| request.target.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                "/v1/notes",
+                "/v1/attachments/a",
+                "/v1/attachments/b",
+                "/v1/attachments/a",
+                "/v1/notes/note-1",
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn composite_reserves_compensation_budget_inside_policy_timeout() {
+        let responses = vec![
+            (StatusCode::CREATED, json!({"id":"note-1"}), Duration::ZERO),
+            (
+                StatusCode::CREATED,
+                json!({"id":"attachment-a"}),
+                Duration::from_millis(400),
+            ),
+            (StatusCode::NO_CONTENT, Value::Null, Duration::ZERO),
+        ];
+        let (addr, ca_pem, server, _requests_seen) =
+            scripted_tls_server_with_delays(responses).await;
+        let connection =
+            TemporaryStaticAuthRuntime::header_api_key(addr, &ca_pem, b"composite-key").await;
+        let mut definitions = composite_note_definitions(&connection.connection_id);
+        definitions
+            .iter_mut()
+            .find_map(|definition| definition.composite.as_mut())
+            .expect("composite definition should exist")
+            .limits
+            .compensation_timeout_ms = 250;
+        let tool_names = [
+            "create_note_for_records",
+            "create_note",
+            "attach_note",
+            "delete_attachment",
+            "delete_note",
+        ];
+        let config = runtime_config(
+            tool_names.map(|name| (name, enabled_tool(600, 1))),
+            2,
+            1,
+            100,
+        );
+        let (executor, _capture) =
+            executor_for_composite_definitions_with_config(definitions, &connection, config);
+        let started = Instant::now();
+        let error = executor
+            .execute(
+                "create_note_for_records",
+                json!({"title":"hello","targets":["a"]}),
+                invocation_context(),
+                CancellationToken::new(),
+            )
+            .await
+            .expect_err("the delayed forward step should exhaust only the forward budget");
+        assert!(started.elapsed() < Duration::from_millis(600));
+        let ToolRuntimeError::WorkFailed {
+            details: Some(details),
+            ..
+        } = error
+        else {
+            panic!("expected a structured composite failure");
+        };
+        assert_eq!(details["compensation"], json!("incomplete"));
+        let requests = server.await.expect("scripted TLS server should join");
+        assert_eq!(
+            requests
+                .iter()
+                .map(|request| request.target.as_str())
+                .collect::<Vec<_>>(),
+            vec!["/v1/notes", "/v1/attachments/a", "/v1/notes/note-1"]
+        );
+    }
+
+    #[tokio::test]
+    async fn composite_cancel_sends_no_compensation_tail_after_runtime_returns() {
+        let responses = vec![
+            (StatusCode::CREATED, json!({"id":"note-1"}), Duration::ZERO),
+            (
+                StatusCode::CREATED,
+                json!({"id":"attachment-a"}),
+                Duration::from_millis(1_000),
+            ),
+        ];
+        let (addr, ca_pem, server, requests_seen) =
+            scripted_tls_server_with_delays(responses).await;
+        let connection =
+            TemporaryStaticAuthRuntime::header_api_key(addr, &ca_pem, b"composite-key").await;
+        let definitions = composite_note_definitions(&connection.connection_id);
+        let (executor, capture) = executor_for_composite_definitions(
+            definitions,
+            &connection,
+            [
+                "create_note_for_records",
+                "create_note",
+                "attach_note",
+                "delete_attachment",
+                "delete_note",
+            ],
+        );
+        let cancel = CancellationToken::new();
+        let running = tokio::spawn({
+            let executor = executor.clone();
+            let cancel = cancel.clone();
+            async move {
+                executor
+                    .execute(
+                        "create_note_for_records",
+                        json!({"title":"hello","targets":["a"]}),
+                        invocation_context(),
+                        cancel,
+                    )
+                    .await
+            }
+        });
+        wait_until(Duration::from_secs(2), || {
+            requests_seen.load(Ordering::Acquire) >= 2
+        })
+        .await;
+        cancel.cancel();
+        let error = running
+            .await
+            .expect("cancelled composite task should join")
+            .expect_err("the runtime should report cancellation");
+        assert!(matches!(error, ToolRuntimeError::Cancelled { .. }));
+
+        wait_until(Duration::from_secs(1), || {
+            capture
+                .events()
+                .iter()
+                .any(|event| event.event_type == audit::event::TOOL_COMPOSITE_COMPLETED)
+        })
+        .await;
+        let events = capture.events();
+        let completed = events
+            .iter()
+            .find(|event| event.event_type == audit::event::TOOL_COMPOSITE_COMPLETED)
+            .expect("Drop must audit the abandoned composite");
+        assert_eq!(completed.payload["outcome"], json!("abandoned"));
+        assert_eq!(
+            completed.payload["pending_compensation"][0]["step"],
+            json!("note")
+        );
+        let requests = server.await.expect("delayed TLS server should join");
+        assert_eq!(
+            requests.len(),
+            2,
+            "no compensation request may escape as a tail"
+        );
+    }
+
+    #[tokio::test]
+    async fn composite_lease_loss_sends_no_compensation_tail_after_runtime_returns() {
+        let responses = vec![
+            (StatusCode::CREATED, json!({"id":"note-1"}), Duration::ZERO),
+            (
+                StatusCode::CREATED,
+                json!({"id":"attachment-a"}),
+                Duration::from_millis(1_000),
+            ),
+        ];
+        let (addr, ca_pem, server, requests_seen) =
+            scripted_tls_server_with_delays(responses).await;
+        let connection =
+            TemporaryStaticAuthRuntime::header_api_key(addr, &ca_pem, b"composite-key").await;
+        let definitions = composite_note_definitions(&connection.connection_id);
+        let tool_names = [
+            "create_note_for_records",
+            "create_note",
+            "attach_note",
+            "delete_attachment",
+            "delete_note",
+        ];
+        let store = crate::tools::lease::memory::MemoryLeaseStore::new(Duration::from_millis(600));
+        let leases: Arc<dyn crate::tools::lease::ExecutionLeaseStore> = Arc::new(store.clone());
+        let config = runtime_config(
+            tool_names.map(|name| (name, enabled_tool(5_000, 1))),
+            2,
+            1,
+            100,
+        );
+        let (executor, capture) = executor_for_composite_definitions_with_config_and_leases(
+            definitions,
+            &connection,
+            config,
+            Some(leases),
+        );
+        let running = tokio::spawn({
+            let executor = executor.clone();
+            async move {
+                executor
+                    .execute(
+                        "create_note_for_records",
+                        json!({"title":"hello","targets":["a"]}),
+                        invocation_context(),
+                        CancellationToken::new(),
+                    )
+                    .await
+            }
+        });
+        wait_until(Duration::from_secs(2), || {
+            requests_seen.load(Ordering::Acquire) >= 2
+        })
+        .await;
+        store.advance(Duration::from_secs(2));
+        let error = tokio::time::timeout(Duration::from_secs(2), running)
+            .await
+            .expect("the composite invocation should end once its lease is lost")
+            .expect("lease-lost composite task should join")
+            .expect_err("the runtime should report lease loss");
+        assert!(matches!(
+            error,
+            ToolRuntimeError::LeaseLost { ref tool_name }
+                if tool_name == "create_note_for_records"
+        ));
+
+        wait_until(Duration::from_secs(1), || {
+            capture
+                .events()
+                .iter()
+                .any(|event| event.event_type == audit::event::TOOL_COMPOSITE_COMPLETED)
+        })
+        .await;
+        let events = capture.events();
+        let completed = events
+            .iter()
+            .find(|event| event.event_type == audit::event::TOOL_COMPOSITE_COMPLETED)
+            .expect("Drop must audit the lease-lost composite");
+        assert_eq!(completed.payload["outcome"], json!("abandoned"));
+        assert_eq!(
+            completed.payload["pending_compensation"][0]["step"],
+            json!("note")
+        );
+        let requests = server.await.expect("delayed TLS server should join");
+        assert_eq!(
+            requests.len(),
+            2,
+            "no compensation request may escape after lease loss returns"
+        );
+    }
+
+    #[tokio::test]
+    async fn composite_iteration_bound_is_invalid_params_before_any_upstream_call() {
+        let (addr, ca_pem, server) = scripted_tls_server(Vec::new()).await;
+        let connection =
+            TemporaryStaticAuthRuntime::header_api_key(addr, &ca_pem, b"unused-key").await;
+        let definitions = composite_note_definitions(&connection.connection_id);
+        let (executor, _capture) = executor_for_composite_definitions(
+            definitions,
+            &connection,
+            [
+                "create_note_for_records",
+                "create_note",
+                "attach_note",
+                "delete_attachment",
+                "delete_note",
+            ],
+        );
+
+        let targets = (0..65)
+            .map(|index| format!("target-{index}"))
+            .collect::<Vec<_>>();
+        let error = executor
+            .execute(
+                "create_note_for_records",
+                json!({"title":"too many","targets":targets}),
+                invocation_context(),
+                CancellationToken::new(),
+            )
+            .await
+            .expect_err("an oversized fan-out must fail before I/O");
+        assert!(matches!(
+            error,
+            ToolRuntimeError::WorkFailed {
+                reason: Some(reason),
+                ..
+            } if reason == TOOL_INVALID_PARAMS_REASON
+        ));
+        assert!(server
+            .await
+            .expect("zero-response TLS server should join")
+            .is_empty());
     }
 
     #[tokio::test]
@@ -4113,6 +6018,7 @@ mod tests {
                 "get_charge",
                 json!({ "charge_id": ARGUMENT_CANARY }),
                 &context,
+                &CancellationToken::new(),
                 Some(&precondition),
             )
             .await
@@ -5678,6 +7584,9 @@ mod tests {
             ToolExecutionResult::McpCallToolResult(_) => {
                 panic!("expected HTTP tool execution result")
             }
+            ToolExecutionResult::Composite(_) => {
+                panic!("expected HTTP tool execution result")
+            }
         }
     }
 
@@ -5810,6 +7719,309 @@ mod tests {
             },
         )
         .expect("connection-bound tool executor should build without UPSTREAM_URL")
+    }
+
+    fn executor_for_composite_definitions<const N: usize>(
+        definitions: Vec<ToolDefinition>,
+        connection: &TemporaryStaticAuthRuntime,
+        policy_tools: [&str; N],
+    ) -> (ToolExecutor, CaptureSink) {
+        executor_for_composite_definitions_with_config(
+            definitions,
+            connection,
+            runtime_config(
+                policy_tools.map(|name| (name, enabled_tool(5_000, 1))),
+                2,
+                1,
+                100,
+            ),
+        )
+    }
+
+    fn executor_for_composite_definitions_with_config(
+        definitions: Vec<ToolDefinition>,
+        connection: &TemporaryStaticAuthRuntime,
+        runtime_config: ToolRuntimeConfig,
+    ) -> (ToolExecutor, CaptureSink) {
+        executor_for_composite_definitions_with_config_and_leases(
+            definitions,
+            connection,
+            runtime_config,
+            None,
+        )
+    }
+
+    fn executor_for_composite_definitions_with_config_and_leases(
+        definitions: Vec<ToolDefinition>,
+        connection: &TemporaryStaticAuthRuntime,
+        runtime_config: ToolRuntimeConfig,
+        leases: Option<Arc<dyn crate::tools::lease::ExecutionLeaseStore>>,
+    ) -> (ToolExecutor, CaptureSink) {
+        let record = connection
+            .control_plane
+            .runtime_snapshot()
+            .managed()
+            .values()
+            .find(|record| record.id.as_str() == connection.connection_id)
+            .cloned()
+            .expect("composite test connection should be present");
+        let entries = definitions
+            .iter()
+            .map(|definition| StoredOpenApiCatalogEntry {
+                tool_name: definition.name.clone(),
+                operation_id: match &definition.source {
+                    ToolSource::OpenApi { operation_id, .. } => operation_id.clone(),
+                    _ => None,
+                },
+                selected_scheme_names: if matches!(
+                    definition.target,
+                    Some(ToolTarget::Composite { .. })
+                ) {
+                    Vec::new()
+                } else {
+                    vec!["ApiKey".to_owned()]
+                },
+                definition: serde_json::to_value(definition)
+                    .expect("composite test definition should serialize"),
+            })
+            .collect::<Vec<_>>();
+        let catalog = StoredOpenApiCatalog {
+            connection_id: record.id.clone(),
+            spec_revision: 1,
+            catalog_revision: 1,
+            observed_etag: record.etag(),
+            spec_digest: "composite-test-spec".to_owned(),
+            spec: r#"{"openapi":"3.0.0"}"#.to_owned(),
+            entries,
+            refreshed_at: "2026-09-03T00:00:00Z".to_owned(),
+            overlay_revision: 1,
+        };
+        let openapi_catalog_runtime =
+            OpenApiConnectionCatalogRuntime::from_catalogs_for_test(&[catalog])
+                .expect("composite test catalog runtime should build");
+        let registry = ToolRegistry::disabled();
+        registry
+            .replace_openapi_connection_catalog(&connection.connection_id, definitions, || {
+                Ok::<(), ()>(())
+            })
+            .expect("composite definitions should publish");
+        let capture = CaptureSink::new();
+        let audit = AuditLog::new(Arc::new(capture.clone()) as Arc<dyn AuditSink>);
+        let runtime = ToolRuntime::new_with_rbac_state_and_leases(
+            runtime_config,
+            audit.clone(),
+            None,
+            leases,
+        );
+        let executor = ToolExecutor::new_inner(
+            registry,
+            runtime,
+            Arc::clone(&connection.egress_client),
+            audit,
+            ToolExecutorBackends {
+                upstream_url: None,
+                connection_http: Some(connection.runtime.clone()),
+                mcp_catalog_runtime: None,
+                openapi_catalog_runtime: Some(openapi_catalog_runtime),
+                mcp_upstream_servers: HashMap::new(),
+                mcp_upstream_runtime_config: McpUpstreamRuntimeConfig {
+                    timeout: Duration::from_secs(30),
+                    response_idle_timeout: Duration::from_secs(30),
+                    connect_timeout: Duration::from_secs(10),
+                    max_request_body_bytes: 1_048_576,
+                    max_response_bytes: 5_242_880,
+                },
+            },
+        )
+        .expect("composite executor should build");
+        (executor, capture)
+    }
+
+    fn composite_note_definitions(connection_id: &str) -> Vec<ToolDefinition> {
+        let source = |operation_id: Option<&str>| ToolSource::OpenApi {
+            connection_id: connection_id.to_owned(),
+            operation_id: operation_id.map(str::to_owned),
+            catalog_revision: Some(1),
+        };
+        let http_tool = |name: &str, method: &str, path: &str, input_schema: Value, visibility| {
+            let mapping = crate::tools::definitions::HttpToolMapping {
+                method: method.to_owned(),
+                path_template: path.to_owned(),
+                query_params: Vec::new(),
+                body: None,
+            };
+            ToolDefinition {
+                name: name.to_owned(),
+                description: format!("Composite test leaf {name}"),
+                input_schema,
+                target: Some(ToolTarget::Http {
+                    connection_id: connection_id.to_owned(),
+                    mapping: mapping.clone(),
+                }),
+                source: source(Some(name)),
+                upstream: mapping,
+                composite: None,
+                visibility,
+                transform: None,
+            }
+        };
+        let object_schema = |properties: Value, required: Value| {
+            json!({
+                "type":"object",
+                "properties":properties,
+                "required":required,
+                "additionalProperties":false
+            })
+        };
+        let listed = crate::tools::definitions::ToolVisibility::Listed;
+        let hidden = crate::tools::definitions::ToolVisibility::CompositeOnly;
+        let create_note = http_tool(
+            "create_note",
+            "POST",
+            "/notes",
+            object_schema(json!({"title":{"type":"string"}}), json!(["title"])),
+            listed,
+        );
+        let attach_note = http_tool(
+            "attach_note",
+            "POST",
+            "/attachments/{target}",
+            object_schema(
+                json!({"target":{"type":"string"},"note_id":{"type":"string"}}),
+                json!(["target", "note_id"]),
+            ),
+            listed,
+        );
+        let delete_attachment = http_tool(
+            "delete_attachment",
+            "DELETE",
+            "/attachments/{target}",
+            object_schema(json!({"target":{"type":"string"}}), json!(["target"])),
+            hidden,
+        );
+        let delete_note = http_tool(
+            "delete_note",
+            "DELETE",
+            "/notes/{id}",
+            object_schema(json!({"id":{"type":"string"}}), json!(["id"])),
+            hidden,
+        );
+        let composite = ToolDefinition {
+            name: "create_note_for_records".to_owned(),
+            description: "Composite test workflow".to_owned(),
+            input_schema: object_schema(
+                json!({
+                    "title":{"type":"string"},
+                    "targets":{"type":"array","items":{"type":"string"}}
+                }),
+                json!(["title", "targets"]),
+            ),
+            target: Some(ToolTarget::Composite {
+                connection_id: connection_id.to_owned(),
+            }),
+            source: source(None),
+            upstream: crate::tools::definitions::HttpToolMapping::composite_sentinel(),
+            composite: Some(CompositeMapping {
+                steps: vec![
+                    CompositeStep {
+                        id: "note".to_owned(),
+                        tool: "create_note".to_owned(),
+                        arguments: [(
+                            "title".to_owned(),
+                            CompositeBinding::Input {
+                                input: "title".to_owned(),
+                                pointer: None,
+                            },
+                        )]
+                        .into_iter()
+                        .collect(),
+                        for_each: None,
+                        success_statuses: None,
+                        ambiguous_statuses: None,
+                        compensate: Some(CompositeCompensation {
+                            tool: "delete_note".to_owned(),
+                            arguments: [(
+                                "id".to_owned(),
+                                CompositeBinding::SelfValue {
+                                    pointer: "/id".to_owned(),
+                                },
+                            )]
+                            .into_iter()
+                            .collect(),
+                        }),
+                    },
+                    CompositeStep {
+                        id: "attach".to_owned(),
+                        tool: "attach_note".to_owned(),
+                        arguments: [
+                            (
+                                "target".to_owned(),
+                                CompositeBinding::Item {
+                                    item: "target".to_owned(),
+                                    pointer: None,
+                                },
+                            ),
+                            (
+                                "note_id".to_owned(),
+                                CompositeBinding::Step {
+                                    step: "note".to_owned(),
+                                    pointer: Some("/id".to_owned()),
+                                    collect: false,
+                                },
+                            ),
+                        ]
+                        .into_iter()
+                        .collect(),
+                        for_each: Some(crate::tools::composite::CompositeForEach {
+                            over: CompositeBinding::Input {
+                                input: "targets".to_owned(),
+                                pointer: None,
+                            },
+                            item_name: "target".to_owned(),
+                        }),
+                        success_statuses: None,
+                        ambiguous_statuses: None,
+                        compensate: Some(CompositeCompensation {
+                            tool: "delete_attachment".to_owned(),
+                            arguments: [(
+                                "target".to_owned(),
+                                CompositeBinding::Item {
+                                    item: "target".to_owned(),
+                                    pointer: None,
+                                },
+                            )]
+                            .into_iter()
+                            .collect(),
+                        }),
+                    },
+                ],
+                result: Some(
+                    [(
+                        "note_id".to_owned(),
+                        CompositeBinding::Step {
+                            step: "note".to_owned(),
+                            pointer: Some("/id".to_owned()),
+                            collect: false,
+                        },
+                    )]
+                    .into_iter()
+                    .collect(),
+                ),
+                limits: crate::tools::composite::CompositeLimits {
+                    max_iterations: 64,
+                    compensation_timeout_ms: 500,
+                },
+            }),
+            visibility: listed,
+            transform: None,
+        };
+        vec![
+            create_note,
+            attach_note,
+            delete_attachment,
+            delete_note,
+            composite,
+        ]
     }
 
     fn live_policy_runtime(
@@ -6510,6 +8722,116 @@ mod tests {
         one_request_tls_server_response(StatusCode::OK, b"secure", None).await
     }
 
+    async fn scripted_tls_server(
+        responses: Vec<(StatusCode, Value)>,
+    ) -> (
+        SocketAddr,
+        String,
+        tokio::task::JoinHandle<Vec<CapturedRequest>>,
+    ) {
+        let (addr, ca_pem, handle, _requests_seen) = scripted_tls_server_with_delays(
+            responses
+                .into_iter()
+                .map(|(status, value)| (status, value, Duration::ZERO))
+                .collect(),
+        )
+        .await;
+        (addr, ca_pem, handle)
+    }
+
+    async fn scripted_tls_server_with_delays(
+        responses: Vec<(StatusCode, Value, Duration)>,
+    ) -> (
+        SocketAddr,
+        String,
+        tokio::task::JoinHandle<Vec<CapturedRequest>>,
+        Arc<AtomicUsize>,
+    ) {
+        let _ = tokio_rustls::rustls::crypto::ring::default_provider().install_default();
+        let mut ca_params = rcgen::CertificateParams::default();
+        ca_params.distinguished_name = rcgen::DistinguishedName::new();
+        ca_params
+            .distinguished_name
+            .push(rcgen::DnType::CommonName, "GreenGateway Composite Test CA");
+        ca_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+        let ca_key = rcgen::KeyPair::generate().expect("composite test CA key should generate");
+        let ca = ca_params
+            .self_signed(&ca_key)
+            .expect("composite test CA certificate should build");
+        let mut server_params = rcgen::CertificateParams::default();
+        server_params.distinguished_name = rcgen::DistinguishedName::new();
+        server_params
+            .distinguished_name
+            .push(rcgen::DnType::CommonName, "127.0.0.1");
+        server_params
+            .subject_alt_names
+            .push(rcgen::SanType::IpAddress(IpAddr::V4(Ipv4Addr::LOCALHOST)));
+        let server_key =
+            rcgen::KeyPair::generate().expect("composite test server key should generate");
+        let server_certificate = server_params
+            .signed_by(&server_key, &ca, &ca_key)
+            .expect("composite test server certificate should build");
+        let server_config = ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(
+                vec![CertificateDer::from(
+                    server_certificate.der().as_ref().to_vec(),
+                )],
+                PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(server_key.serialize_der())),
+            )
+            .expect("composite test TLS config should build");
+        let acceptor = TlsAcceptor::from(Arc::new(server_config));
+        let listener = TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .expect("composite test TLS listener should bind");
+        let addr = listener
+            .local_addr()
+            .expect("composite test TLS address should be available");
+        let requests_seen = Arc::new(AtomicUsize::new(0));
+        let server_requests_seen = Arc::clone(&requests_seen);
+        let handle = tokio::spawn(async move {
+            let mut tasks = Vec::with_capacity(responses.len());
+            for (index, (status, value, delay)) in responses.into_iter().enumerate() {
+                let (stream, _) = listener
+                    .accept()
+                    .await
+                    .expect("composite test TLS server should accept a request");
+                let acceptor = acceptor.clone();
+                let requests_seen = Arc::clone(&server_requests_seen);
+                tasks.push(tokio::spawn(async move {
+                    let mut stream = acceptor
+                        .accept(stream)
+                        .await
+                        .expect("composite test TLS handshake should succeed");
+                    let request = read_http_request(&mut stream).await;
+                    requests_seen.fetch_add(1, Ordering::Release);
+                    tokio::time::sleep(delay).await;
+                    let body = if status == StatusCode::NO_CONTENT {
+                        Vec::new()
+                    } else {
+                        serde_json::to_vec(&value).expect("scripted response should serialize")
+                    };
+                    let reason = status.canonical_reason().unwrap_or("Response");
+                    let response = format!(
+                        "HTTP/1.1 {} {reason}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        status.as_u16(),
+                        body.len()
+                    );
+                    let _ = stream.write_all(response.as_bytes()).await;
+                    let _ = stream.write_all(&body).await;
+                    (index, request)
+                }));
+            }
+            let mut requests = Vec::with_capacity(tasks.len());
+            for task in tasks {
+                requests.push(task.await.expect("composite response task should join"));
+            }
+            requests.sort_by_key(|(index, _)| *index);
+            requests.into_iter().map(|(_, request)| request).collect()
+        });
+        (addr, ca.pem(), handle, requests_seen)
+    }
+
     async fn one_request_tls_server_response(
         status: StatusCode,
         body: &'static [u8],
@@ -7142,6 +9464,7 @@ mod tests {
             source_ip: "203.0.113.10".to_owned(),
             actor: None,
             source: ToolInvocationSource::Internal,
+            admitted_deadline: None,
         }
     }
 
@@ -7157,6 +9480,7 @@ mod tests {
                 auth_mode: "bearer_token".to_owned(),
             }),
             source: ToolInvocationSource::Internal,
+            admitted_deadline: None,
         }
     }
 
