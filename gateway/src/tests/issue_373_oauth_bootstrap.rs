@@ -87,16 +87,27 @@ async fn mcp_oauth_bootstrap_challenge_metadata_registration_authorize_token_ini
     .expect("app");
     let (gateway_addr, gateway_server) = spawn_gateway_router(router).await;
     let gateway_url = format!("http://{gateway_addr}");
-    let http = reqwest::Client::builder()
-        .redirect(reqwest::redirect::Policy::none())
-        .build()
-        .expect("HTTP client");
-    let response = http.post(format!("{gateway_url}/mcp"))
-        .header(header::ACCEPT, "application/json, text/event-stream")
-        .json(&json!({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": mcp_initialize_params()}))
-        .send().await.expect("initial request");
-    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
-    let challenge_header = response.headers()[header::WWW_AUTHENTICATE]
+    let http = egress::EgressClient::new(egress::EgressConfig {
+        allowed_hosts: HashSet::from(["127.0.0.1".to_owned()]),
+        deny_private_ips: false,
+        ..egress::EgressConfig::default()
+    })
+    .expect("HTTP client");
+    let headers = HeaderMap::from_iter([
+        (
+            header::ACCEPT,
+            HeaderValue::from_static("application/json, text/event-stream"),
+        ),
+        (
+            header::CONTENT_TYPE,
+            HeaderValue::from_static("application/json"),
+        ),
+    ]);
+    let response = http.request_with_headers(Method::POST, &format!("{gateway_url}/mcp"), headers,
+        Some(serde_json::to_vec(&json!({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": mcp_initialize_params()})).expect("initialize JSON")))
+        .await.expect("initial request");
+    assert_eq!(response.status, StatusCode::UNAUTHORIZED);
+    let challenge_header = response.headers[header::WWW_AUTHENTICATE]
         .to_str()
         .expect("challenge");
     let metadata_url = challenge_header
@@ -109,36 +120,28 @@ async fn mcp_oauth_bootstrap_challenge_metadata_registration_authorize_token_ini
         .path()
         .to_owned();
     // Route the advertised public URL to the local gateway fixture.
-    let metadata: Value = http
-        .get(format!("{gateway_url}{metadata_path}"))
-        .send()
-        .await
-        .expect("metadata")
-        .error_for_status()
-        .expect("metadata status")
-        .json()
-        .await
-        .expect("metadata JSON");
+    let metadata = response_json(
+        http.request(Method::GET, &format!("{gateway_url}{metadata_path}"))
+            .await
+            .expect("metadata"),
+    );
     assert_eq!(metadata["resource"], resource);
     let authorization_server = metadata["authorization_servers"][0]
         .as_str()
         .expect("AS issuer");
     assert_eq!(authorization_server, issuer);
-    let discovery: Value = http
-        .get(format!(
-            "{authorization_server}/.well-known/openid-configuration"
-        ))
-        .send()
+    let discovery = response_json(
+        http.request(
+            Method::GET,
+            &format!("{authorization_server}/.well-known/openid-configuration"),
+        )
         .await
-        .expect("AS discovery")
-        .error_for_status()
-        .expect("discovery status")
-        .json()
-        .await
-        .expect("discovery JSON");
-    let registration: Value = http.post(discovery["registration_endpoint"].as_str().expect("registration URL"))
-        .json(&json!({"client_name": "issue373-client", "redirect_uris": [redirect_uri], "token_endpoint_auth_method": "none"}))
-        .send().await.expect("registration").error_for_status().expect("registration status").json().await.expect("registration JSON");
+        .expect("AS discovery"),
+    );
+    let registration = response_json(http.request_with_headers(Method::POST, discovery["registration_endpoint"].as_str().expect("registration URL"),
+        HeaderMap::from_iter([(header::CONTENT_TYPE, HeaderValue::from_static("application/json"))]),
+        Some(serde_json::to_vec(&json!({"client_name": "issue373-client", "redirect_uris": [redirect_uri], "token_endpoint_auth_method": "none"})).expect("registration JSON")))
+        .await.expect("registration"));
     let client_id = registration["client_id"].as_str().expect("client ID");
     let code_challenge = URL_SAFE_NO_PAD.encode(Sha256::digest(verifier.as_bytes()));
     let mut authorize_url = url::Url::parse(
@@ -157,10 +160,13 @@ async fn mcp_oauth_bootstrap_challenge_metadata_registration_authorize_token_ini
         ("code_challenge_method", "S256"),
         ("code_challenge", code_challenge.as_str()),
     ]);
-    let authorize = http.get(authorize_url).send().await.expect("authorize");
-    assert!(authorize.status().is_redirection());
+    let authorize = http
+        .request(Method::GET, authorize_url.as_str())
+        .await
+        .expect("authorize");
+    assert!(authorize.status.is_redirection());
     let callback = url::Url::parse(
-        authorize.headers()[header::LOCATION]
+        authorize.headers[header::LOCATION]
             .to_str()
             .expect("callback"),
     )
@@ -177,18 +183,19 @@ async fn mcp_oauth_bootstrap_challenge_metadata_registration_authorize_token_ini
             ("code_verifier", verifier),
         ])
         .finish();
-    let tokens: Value = http
-        .post(discovery["token_endpoint"].as_str().expect("token URL"))
-        .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
-        .body(form)
-        .send()
+    let tokens = response_json(
+        http.request_with_headers(
+            Method::POST,
+            discovery["token_endpoint"].as_str().expect("token URL"),
+            HeaderMap::from_iter([(
+                header::CONTENT_TYPE,
+                HeaderValue::from_static("application/x-www-form-urlencoded"),
+            )]),
+            Some(form.into_bytes()),
+        )
         .await
-        .expect("token exchange")
-        .error_for_status()
-        .expect("token status")
-        .json()
-        .await
-        .expect("token JSON");
+        .expect("token exchange"),
+    );
     let transport = StreamableHttpClientTransport::from_config(
         StreamableHttpClientTransportConfig::with_uri(format!("{gateway_url}/mcp")).auth_header(
             tokens["access_token"]
@@ -202,4 +209,13 @@ async fn mcp_oauth_bootstrap_challenge_metadata_registration_authorize_token_ini
     client.cancel().await.expect("client shutdown");
     gateway_server.abort();
     as_server.abort();
+}
+
+fn response_json(response: egress::EgressResponse) -> Value {
+    assert!(
+        response.status.is_success(),
+        "HTTP status: {}",
+        response.status
+    );
+    serde_json::from_slice(&response.body).expect("response JSON")
 }
