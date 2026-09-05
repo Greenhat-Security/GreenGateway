@@ -426,6 +426,32 @@ describe('RuleEditor', () => {
     expect(screen.queryByText('1')).toBeNull();
   });
 
+  it('updates the created rule on a second save using its returned ID and ETag', async () => {
+    const baseFetch = policyBackedFetch(policyFixture(), '"policy-1"');
+    const fetcher = vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
+      if (String(input).endsWith('/policy/rules/rule-generated-1') && init?.method === 'PATCH') {
+        return Promise.resolve(jsonResponse(200, {id: 'rule-generated-1', action: 'allow'}, {ETag: '"policy-3"'}));
+      }
+      return baseFetch(input, init);
+    });
+    vi.stubGlobal('fetch', fetcher);
+    renderRuleEditor();
+    const path = await screen.findByLabelText('Path pattern');
+    fireEvent.change(path, {target: {value: '/orders/**'}});
+    fireEvent.click(screen.getByRole('button', {name: 'Save rule'}));
+    expect(await screen.findByText('Rule saved.')).toBeTruthy();
+    fireEvent.change(screen.getByLabelText('Path pattern'), {target: {value: '/orders/{id}'}});
+    fireEvent.click(screen.getByRole('button', {name: 'Save rule'}));
+    expect(await screen.findByText('Rule saved.')).toBeTruthy();
+    expect(await screen.findByRole('heading', {name: 'Edit policy rule'})).toBeTruthy();
+    const creates = fetcher.mock.calls.filter(([input, init]) => String(input).endsWith('/policy/rules') && init?.method === 'POST');
+    const patches = fetcher.mock.calls.filter(([, init]) => init?.method === 'PATCH');
+    expect(creates).toHaveLength(1);
+    expect(patches).toHaveLength(1);
+    expect(new Headers(patches[0][1]?.headers).get('If-Match')).toBe('W/"policy-2"');
+    expect(JSON.parse(String(patches[0][1]?.body)).path).toBe('/orders/{id}');
+  });
+
   it('creates a rule with the current policy ETag', async () => {
     const createdRule: PolicyRule = {
       id: 'rule-generated-1',

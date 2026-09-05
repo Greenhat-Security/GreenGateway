@@ -121,7 +121,7 @@ type PreviewState =
     };
 
 export function RuleEditor() {
-  const [searchParams] = useSearchParams();
+  const [searchParams, setSearchParams] = useSearchParams();
   const requestedRuleId = searchParams.get('rule_id')?.trim() || null;
   const [form, setForm] = useState<RuleFormState>(() => ({
     ...emptyRuleForm(),
@@ -141,8 +141,18 @@ export function RuleEditor() {
     DEFAULT_PREVIEW_WINDOW_HOURS,
   );
   const previewGenerationRef = useRef(0);
+  const createdRuleIdRef = useRef<string | null>(null);
+  const persistedRuleIdRef = useRef(requestedRuleId);
+  const savingRef = useRef(false);
 
   useEffect(() => {
+    // Creation already returned the rule and new ETag. Keep edits made while
+    // the save was in flight when moving to its persistent edit URL.
+    if (requestedRuleId !== null && requestedRuleId === createdRuleIdRef.current) {
+      createdRuleIdRef.current = null;
+      return;
+    }
+    persistedRuleIdRef.current = requestedRuleId;
     let isCurrent = true;
 
     async function loadPolicy() {
@@ -425,6 +435,9 @@ export function RuleEditor() {
 
   async function saveRule(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
+    if (savingRef.current) {
+      return;
+    }
 
     const nextErrors = validateForm(form);
     setErrors(nextErrors);
@@ -443,18 +456,38 @@ export function RuleEditor() {
       return;
     }
 
+    savingRef.current = true;
     setSaveState({ kind: 'saving' });
     const rule = ruleFromForm(form);
+    const persistedRuleId = persistedRuleIdRef.current;
 
     try {
       const response =
-        requestedRuleId === null
+        persistedRuleId === null
           ? await createPolicyRule(rule, policyEtag)
-          : await patchPolicyRule(requestedRuleId, policyEtag, rulePatchFromRule(rule));
-      setPolicyEtag(response.etag ?? policyEtag);
+          : await patchPolicyRule(persistedRuleId, policyEtag, rulePatchFromRule(rule));
+      setPolicyEtag(response.etag);
+      if (persistedRuleId === null) {
+        const createdId = response.value.id?.trim();
+        if (!createdId) {
+          setPolicyEtag(null);
+          setSaveState({
+            kind: 'error',
+            title: 'Rule created without an ID',
+            message: 'Open the saved rule from the rulebase before saving again.',
+            tone: 'warning',
+          });
+          return;
+        }
+        createdRuleIdRef.current = createdId;
+        persistedRuleIdRef.current = createdId;
+        setSearchParams({ rule_id: createdId }, { replace: true });
+      }
       setSaveState({ kind: 'saved', message: 'Rule saved.' });
     } catch (error) {
       setSaveState(toSaveError(error));
+    } finally {
+      savingRef.current = false;
     }
   }
 

@@ -2,8 +2,7 @@ import { useEffect, useMemo, useState } from 'react';
 import { Link } from 'react-router-dom';
 
 import { AdminApiError } from '../lib/api';
-import { decodeJwtRolesClaim, getStoredToken } from '../lib/auth';
-import { fetchPolicy, type PolicyDocument } from '../lib/policy';
+import { fetchPolicy } from '../lib/policy';
 import {
   fetchPolicyHistory,
   rollbackPolicy,
@@ -26,7 +25,6 @@ type HistoryViewError = {
 };
 
 const HISTORY_PAGE_SIZE = 20;
-const POLICY_WRITE_PERMISSION = 'admin:policy:write';
 const POLICY_CHANGED_MESSAGE =
   'Policy changed since this page loaded — refresh and retry.';
 
@@ -66,7 +64,7 @@ export function PolicyHistoryView() {
           return;
         }
 
-        setCanWritePolicy(currentTokenCanWritePolicy(policyResult.policy));
+        setCanWritePolicy(policyResult.canWrite);
         setVersions(historyPage.versions);
         setNextCursor(historyPage.next_cursor);
       } catch (error) {
@@ -141,7 +139,9 @@ export function PolicyHistoryView() {
       }
 
       const rollback = await rollbackPolicy(version, policyResult.etag);
-      setCanWritePolicy(currentTokenCanWritePolicy(rollback.policy));
+      setCanWritePolicy(false);
+      const refreshedPolicy = await fetchPolicy().catch(() => null);
+      setCanWritePolicy(refreshedPolicy?.canWrite ?? false);
       setRollbackNotice('Rollback applied.');
       setRollbackWarning(
         rollback.historyAppendWarning
@@ -302,30 +302,6 @@ function PolicyHistoryEntry({
         ) : null}
       </div>
     </li>
-  );
-}
-
-function currentTokenCanWritePolicy(policy: PolicyDocument): boolean {
-  const token = getStoredToken();
-  if (!token) {
-    return false;
-  }
-
-  const roles = decodeJwtRolesClaim(token);
-  if (roles === null) {
-    return false;
-  }
-
-  return roles.some((roleName) => roleGrantsPolicyWrite(policy.roles?.[roleName]));
-}
-
-function roleGrantsPolicyWrite(role: unknown): boolean {
-  if (!isJsonObject(role) || !Array.isArray(role.permissions)) {
-    return false;
-  }
-
-  return role.permissions.some(
-    (permission) => permission === POLICY_WRITE_PERMISSION || permission === '*',
   );
 }
 
@@ -562,8 +538,4 @@ function toRollbackError(error: unknown): HistoryViewError {
 
 function isHistoryUnavailableMessage(message: string): boolean {
   return message.includes('policy history requires');
-}
-
-function isJsonObject(value: unknown): value is Record<string, unknown> {
-  return value !== null && typeof value === 'object' && !Array.isArray(value);
 }

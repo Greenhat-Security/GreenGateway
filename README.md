@@ -258,6 +258,8 @@ You can:
 - Promote shadow rules into enforced rules
 - Roll back policy versions
 
+Write controls follow the gateway's permission response, including for service tokens and configured role mappings. After creating a rule, the editor keeps its returned ID and updates that same rule on later saves. The default-action banner distinguishes enforced denial from traffic forwarded in global shadow mode.
+
 This is designed to make API and MCP security policy easier to review before enforcement.
 
 ## Shadow Mode

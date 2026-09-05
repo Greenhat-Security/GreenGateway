@@ -240,6 +240,7 @@ describe('PolicyHistoryView', () => {
     vi.stubGlobal(
       'fetch',
       policyHistoryFetchMock({
+      canWrite: false,
         policy: policyDocument({
           roles: {
             reader: { permissions: ['admin:policy:read'] },
@@ -290,12 +291,14 @@ function renderPolicyHistoryView({
 }
 
 function policyHistoryFetchMock({
+  canWrite = true,
   policy,
   pages,
   policyEtags = ['"etag-initial"'],
   rollbackStatus = 200,
   rollbackWarning = false,
 }: {
+  canWrite?: boolean;
   policy: PolicyDocument;
   pages: PolicyHistoryPageFixture[];
   policyEtags?: string[];
@@ -314,7 +317,7 @@ function policyHistoryFetchMock({
       const etag =
         policyEtags[Math.min(policyRequestCount, policyEtags.length - 1)] ?? null;
       policyRequestCount += 1;
-      return Promise.resolve(jsonResponse(200, policy, etag ? { ETag: etag } : {}));
+      return Promise.resolve(jsonResponse(200, policy, { ...(etag ? { ETag: etag } : {}), 'x-greengateway-policy-write': String(canWrite) }));
     }
 
     if (url.pathname === '/v1/admin/policy/history') {
