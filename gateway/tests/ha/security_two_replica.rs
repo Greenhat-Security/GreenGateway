@@ -133,6 +133,7 @@ async fn a_login_started_on_one_replica_completes_on_the_other_exactly_once() {
     //    not in replica A's memory.
     let (status, headers, _) = cluster.get("a", ADMIN_LOGIN_PATH).send_with_headers().await;
     assert_eq!(status, 302, "the login endpoint should redirect to the IdP");
+    let cookies = harness::admin_login_cookies(&headers);
     let authorization_url = location(&headers, "the login redirect");
     assert!(
         authorization_url.starts_with(&cluster.oidc.authorize_url),
@@ -152,16 +153,41 @@ async fn a_login_started_on_one_replica_completes_on_the_other_exactly_once() {
 
     // 3. Complete on B. Replica B never saw the start, so everything it
     //    needs — verifier, nonce — comes from the shared store.
-    let (status, headers, _) = cluster.get("b", &callback).send_with_headers().await;
+    let (status, headers, _) = cluster
+        .get("b", &callback)
+        .header("cookie", &cookies)
+        .send_with_headers()
+        .await;
     assert_eq!(
         status, 302,
         "the callback should redirect; body-level failures are redirects too"
     );
     let completion = location(&headers, "the callback redirect");
     assert!(
-        completion.contains("/#/auth/complete?token="),
+        completion.contains("/#/auth/complete?code="),
         "the callback on B should complete the login, and instead said {completion}"
     );
+
+    assert!(cluster.oidc.exchanges().is_empty());
+    // A different browser, including a second valid login on A, cannot
+    // consume this transaction on B.
+    let (_, other_headers, _) = cluster.get("a", ADMIN_LOGIN_PATH).send_with_headers().await;
+    let other_cookies = harness::admin_login_cookies(&other_headers);
+    for wrong_cookie in ["", other_cookies.as_str()] {
+        let (status, body) =
+            harness::admin_login_completion(&cluster, "b", &callback, wrong_cookie)
+                .send()
+                .await;
+        assert_eq!(status, 400);
+        assert_eq!(body["error"], "invalid_state");
+    }
+    let (status, body) = harness::admin_login_completion(&cluster, "b", &callback, &cookies)
+        .send()
+        .await;
+    assert_eq!(status, 200);
+    assert!(body["access_token"]
+        .as_str()
+        .is_some_and(|token| !token.is_empty()));
 
     // Exactly one code exchange reached the issuer, and it was accepted.
     let exchanges = cluster.oidc.exchanges();
@@ -176,13 +202,12 @@ async fn a_login_started_on_one_replica_completes_on_the_other_exactly_once() {
     //    The pending login was consumed, so the state is unknown, and the
     //    replay never reaches the issuer at all.
     for replica in ["a", "b"] {
-        let (status, headers, _) = cluster.get(replica, &callback).send_with_headers().await;
-        assert_eq!(status, 302);
-        let replayed = location(&headers, "the replayed callback");
-        assert!(
-            replayed.contains("/#/auth/error?error=invalid_state"),
-            "replaying a spent callback on {replica} must be refused, and instead said {replayed}"
-        );
+        let (status, body) =
+            harness::admin_login_completion(&cluster, replica, &callback, &cookies)
+                .send()
+                .await;
+        assert_eq!(status, 400);
+        assert_eq!(body["error"], "invalid_state");
     }
     assert_eq!(
         cluster.oidc.exchanges().len(),
@@ -191,7 +216,7 @@ async fn a_login_started_on_one_replica_completes_on_the_other_exactly_once() {
     );
 }
 
-/// Two callbacks for one login, dispatched at the same moment to both
+/// Two completion POSTs for one login, dispatched at the same moment to both
 /// replicas: exactly one completes, and exactly one code exchange happens.
 ///
 /// This is the race the single-process store never has to survive. Both
@@ -199,12 +224,13 @@ async fn a_login_started_on_one_replica_completes_on_the_other_exactly_once() {
 /// the database, and the loser must be told "unknown state" rather than
 /// being allowed to exchange the code a second time.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn simultaneous_callbacks_for_one_login_yield_one_exchange() {
+async fn simultaneous_completions_for_one_login_yield_one_exchange() {
     let Some(cluster) = start_secure_cluster(ClusterOptions::default()).await else {
         return skipped();
     };
 
     let (_, headers, _) = cluster.get("a", ADMIN_LOGIN_PATH).send_with_headers().await;
+    let cookies = harness::admin_login_cookies(&headers);
     let authorization_url = location(&headers, "the login redirect");
     let issuer_response = harness::http_client()
         .get(&authorization_url)
@@ -218,21 +244,18 @@ async fn simultaneous_callbacks_for_one_login_yield_one_exchange() {
 
     // Both in flight before either can finish.
     let (first, second) = tokio::join!(
-        cluster.get("a", &callback).send_with_headers(),
-        cluster.get("b", &callback).send_with_headers(),
+        harness::admin_login_completion(&cluster, "a", &callback, &cookies).send_with_headers(),
+        harness::admin_login_completion(&cluster, "b", &callback, &cookies).send_with_headers(),
     );
 
-    let outcomes = [first, second].map(|(status, headers, _)| {
-        assert_eq!(status, 302, "every callback answers with a redirect");
-        location(&headers, "a simultaneous callback")
-    });
+    let outcomes = [first, second].map(|(status, _, body)| (status, body));
     let completed = outcomes
         .iter()
-        .filter(|target| target.contains("/#/auth/complete?token="))
+        .filter(|(status, body)| *status == 200 && body["access_token"].is_string())
         .count();
     let refused = outcomes
         .iter()
-        .filter(|target| target.contains("/#/auth/error?error=invalid_state"))
+        .filter(|(status, body)| *status == 400 && body["error"] == "invalid_state")
         .count();
     assert_eq!(
         (completed, refused),

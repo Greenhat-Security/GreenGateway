@@ -576,7 +576,60 @@ struct ToolAdminState {
 struct AdminAuthState {
     login: auth::OidcLoginState,
     admin_prefix: String,
+    cookie_max_age: u64,
     client_ip_policy: client_ip::ClientIpPolicy,
+}
+
+impl AdminAuthState {
+    fn cookie_name(&self) -> String {
+        let prefix = if self.login.uses_secure_cookie() {
+            "__Host-"
+        } else {
+            ""
+        };
+        let namespace = hex::encode(Sha256::digest(self.admin_prefix.as_bytes()));
+        format!("{prefix}ggw-admin-login-{}", &namespace[..16])
+    }
+
+    fn browser_binding(&self, headers: &HeaderMap) -> Option<String> {
+        let name = self.cookie_name();
+        let mut values = headers
+            .get_all(header::COOKIE)
+            .iter()
+            .filter_map(|header| header.to_str().ok())
+            .flat_map(|header| header.split(';'))
+            .filter_map(|cookie| cookie.trim().split_once('='))
+            .filter(|(key, _)| *key == name)
+            .map(|(_, value)| value);
+        let value = values.next()?;
+        // Ambiguous cookies fail closed, including duplicate identical values.
+        if values.next().is_some() {
+            return None;
+        }
+        Some(value.to_owned())
+    }
+
+    fn set_browser_cookie(&self, response: &mut Response, value: &str, max_age: u64) {
+        // Host-only and prefix-isolated; HTTPS uses __Host- to prevent cookie
+        // injection from sibling subdomains. HTTP is for local development.
+        let secure = if self.login.uses_secure_cookie() {
+            "; Secure"
+        } else {
+            ""
+        };
+        let cookie = format!(
+            "{}={value}; Path=/; HttpOnly; SameSite=Lax; Max-Age={max_age}{secure}",
+            self.cookie_name()
+        );
+        match HeaderValue::from_str(&cookie) {
+            Ok(cookie) => {
+                response.headers_mut().append(header::SET_COOKIE, cookie);
+            }
+            Err(_) => {
+                *response = internal_server_error("login cookie could not be set");
+            }
+        }
+    }
 }
 
 /// The discovery inventory the admin surfaces read: the SQLite file in
@@ -770,6 +823,13 @@ struct AdminAuthCallbackParams {
     code: Option<String>,
     state: Option<String>,
     error: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AdminAuthCompletionParams {
+    code: String,
+    state: String,
 }
 
 #[derive(Deserialize)]
@@ -4379,6 +4439,7 @@ fn admin_auth_state_from_config(
     Ok(Some(AdminAuthState {
         login,
         admin_prefix: config.admin_prefix.clone(),
+        cookie_max_age: config.admin_login_pending_ttl_secs,
         client_ip_policy: client_ip::ClientIpPolicy::from_config(config),
     }))
 }
@@ -5020,9 +5081,24 @@ fn admin_auth_router(routes: &GatewayRoutes, state: Option<AdminAuthState>) -> R
         )
         .route(
             routes.admin.auth_callback_route.as_str(),
-            get(admin_auth_callback_endpoint),
+            get(admin_auth_callback_endpoint).post(admin_auth_completion_endpoint),
         )
+        .layer(axum::middleware::map_response(admin_auth_no_store))
         .with_state(state)
+}
+
+async fn admin_auth_no_store(mut response: Response) -> Response {
+    response
+        .headers_mut()
+        .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    response
+        .headers_mut()
+        .insert(header::PRAGMA, HeaderValue::from_static("no-cache"));
+    response.headers_mut().insert(
+        header::REFERRER_POLICY,
+        HeaderValue::from_static("no-referrer"),
+    );
+    response
 }
 
 fn apply_middleware(
@@ -5548,7 +5624,11 @@ async fn admin_auth_login_endpoint(
     );
 
     match state.login.begin_login(&source_ip).await {
-        Ok(start) => found_redirect(start.authorization_url),
+        Ok(start) => {
+            let mut response = found_redirect(start.authorization_url);
+            state.set_browser_cookie(&mut response, &start.browser_binding, state.cookie_max_age);
+            response
+        }
         Err(err) if err.is_store_unavailable() => {
             tracing::error!(error = %err, "admin OIDC login state store is unavailable");
             service_unavailable("login state store is unavailable")
@@ -5566,6 +5646,7 @@ async fn admin_auth_login_endpoint(
 async fn admin_auth_callback_endpoint(
     State(state): State<AdminAuthState>,
     Query(params): Query<AdminAuthCallbackParams>,
+    headers: HeaderMap,
 ) -> Response {
     record_request(ADMIN_AUTH_CALLBACK_ROUTE);
 
@@ -5590,30 +5671,96 @@ async fn admin_auth_callback_endpoint(
         return found_redirect(admin_auth_error_url(&state.admin_prefix, "invalid_state"));
     };
 
-    match state.login.exchange_code(code, oauth_state).await {
-        Ok(exchange) => found_redirect(admin_auth_complete_url(
-            &state.admin_prefix,
-            &exchange.access_token,
-        )),
+    let binding = state.browser_binding(&headers).unwrap_or_default();
+    if !auth::OidcLoginState::browser_binding_matches(oauth_state, &binding) {
+        tracing::warn!(
+            reason = "browser_binding_mismatch",
+            "admin OIDC callback rejected"
+        );
+        return found_redirect(admin_auth_error_url(&state.admin_prefix, "invalid_state"));
+    }
+
+    // The fragment contains only a PKCE-protected authorization code and
+    // state. The browser must POST them with its HttpOnly binding cookie;
+    // only that exchange consumes the pending login and returns a token.
+    found_redirect(admin_auth_complete_url(
+        &state.admin_prefix,
+        code,
+        oauth_state,
+    ))
+}
+
+async fn admin_auth_completion_endpoint(
+    State(state): State<AdminAuthState>,
+    headers: HeaderMap,
+    Json(params): Json<AdminAuthCompletionParams>,
+) -> Response {
+    record_request(ADMIN_AUTH_CALLBACK_ROUTE);
+    let origin = state.login.redirect_origin();
+    if origin.is_empty()
+        || headers
+            .get(header::ORIGIN)
+            .and_then(|value| value.to_str().ok())
+            != Some(origin.as_str())
+    {
+        tracing::warn!(reason = "origin_mismatch", "admin OIDC completion rejected");
+        return (
+            StatusCode::FORBIDDEN,
+            Json(json!({"error": "invalid_origin"})),
+        )
+            .into_response();
+    }
+    let binding = state.browser_binding(&headers).unwrap_or_default();
+    if params.code.trim().is_empty()
+        || params.code.len() > 8192
+        || !auth::OidcLoginState::browser_binding_matches(&params.state, &binding)
+    {
+        tracing::warn!(
+            reason = "browser_binding_mismatch",
+            "admin OIDC completion rejected"
+        );
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": "invalid_state"})),
+        )
+            .into_response();
+    }
+
+    let mut response = match state
+        .login
+        .exchange_code(&params.code, &params.state, &binding)
+        .await
+    {
+        Ok(exchange) => {
+            tracing::info!(outcome = "success", "admin OIDC completion exchanged");
+            Json(json!({"access_token": exchange.access_token})).into_response()
+        }
         // A store that cannot be consulted is a dependency failure: 503,
         // never "unknown state" -- "cannot check" is not "checked and
         // denied", and no code is exchanged at the IdP.
         Err(err) if err.is_store_unavailable() => {
             tracing::error!(error = %err, "admin OIDC login state store is unavailable");
-            service_unavailable("login state store is unavailable")
+            return service_unavailable("login state store is unavailable");
         }
         Err(err) if err.is_invalid_state() => {
             tracing::warn!("admin OIDC callback rejected unknown or expired state");
-            found_redirect(admin_auth_error_url(&state.admin_prefix, "invalid_state"))
+            (
+                StatusCode::BAD_REQUEST,
+                Json(json!({"error": "invalid_state"})),
+            )
+                .into_response()
         }
         Err(err) => {
             tracing::warn!(error = %err, "admin OIDC token exchange failed");
-            found_redirect(admin_auth_error_url(
-                &state.admin_prefix,
-                "token_exchange_failed",
-            ))
+            (
+                StatusCode::BAD_REQUEST,
+                Json(json!({"error": "token_exchange_failed"})),
+            )
+                .into_response()
         }
-    }
+    };
+    state.set_browser_cookie(&mut response, "", 0);
+    response
 }
 
 fn found_redirect(location: String) -> Response {
@@ -5626,9 +5773,11 @@ fn found_redirect(location: String) -> Response {
     }
 }
 
-fn admin_auth_complete_url(admin_prefix: &str, token: &str) -> String {
+fn admin_auth_complete_url(admin_prefix: &str, code: &str, state: &str) -> String {
     let mut serializer = url::form_urlencoded::Serializer::new(String::new());
-    serializer.append_pair("token", token);
+    serializer
+        .append_pair("code", code)
+        .append_pair("state", state);
     format!(
         "{}/#/auth/complete?{}",
         admin_prefix.trim_end_matches('/'),
@@ -16496,6 +16645,64 @@ mod tests {
         config
     }
 
+    fn admin_oidc_cookies(response: &Response) -> String {
+        response
+            .headers()
+            .get_all(header::SET_COOKIE)
+            .iter()
+            .map(|value| {
+                value
+                    .to_str()
+                    .expect("cookie header")
+                    .split(';')
+                    .next()
+                    .expect("cookie pair")
+            })
+            .collect::<Vec<_>>()
+            .join("; ")
+    }
+
+    fn admin_oidc_complete_request(cookies: &str, code: &str, state: &str) -> Request<Body> {
+        let csrf = cookies
+            .split(';')
+            .find_map(|pair| pair.trim().strip_prefix("csrf_token="))
+            .unwrap_or("test-csrf");
+        let cookies = if cookies.contains("csrf_token=") {
+            cookies.to_owned()
+        } else {
+            format!("{cookies}; csrf_token={csrf}")
+        };
+        Request::builder()
+            .method(Method::POST)
+            .uri(ADMIN_AUTH_CALLBACK_ROUTE)
+            .header(header::COOKIE, cookies)
+            .header("x-csrf-token", csrf)
+            .header(header::ORIGIN, "http://gateway.example.test")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(
+                json!({"code": code, "state": state}).to_string(),
+            ))
+            .expect("completion request")
+    }
+
+    async fn assert_admin_oidc_token(response: Response, expected: &str) {
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers()[header::CACHE_CONTROL], "no-store");
+        assert!(!response.headers().contains_key(header::LOCATION));
+        assert!(response
+            .headers()
+            .get_all(header::SET_COOKIE)
+            .iter()
+            .any(|value| value.to_str().unwrap().contains("Max-Age=0")));
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&body).unwrap()["access_token"],
+            expected
+        );
+    }
+
     async fn admin_oidc_id_token_callback_response(
         id_token_for_nonce: impl FnOnce(&str, &str) -> String,
     ) -> (Response, String) {
@@ -16521,6 +16728,7 @@ mod tests {
             )
             .await
             .expect("login request should complete");
+        let cookies = admin_oidc_cookies(&login_response);
         let login_location = response_location(&login_response);
         let authorization_url =
             Url::parse(&login_location).expect("authorization redirect should be absolute");
@@ -16534,17 +16742,9 @@ mod tests {
         token_endpoint.set_id_token(id_token_for_nonce(nonce, &oidc.issuer));
 
         let callback_response = router
-            .oneshot(
-                Request::builder()
-                    .uri(format!(
-                        "/v1/admin/auth/callback?code=admin-code&state={}",
-                        query_encode(state)
-                    ))
-                    .body(Body::empty())
-                    .expect("callback request should build"),
-            )
+            .oneshot(admin_oidc_complete_request(&cookies, "admin-code", state))
             .await
-            .expect("callback request should complete");
+            .expect("completion request should complete");
 
         oidc.finish();
         token_endpoint.abort();
@@ -39126,15 +39326,22 @@ paths:
             "login state store is unavailable"
         );
 
+        let binding = "a".repeat(43);
+        let oauth_state = base64url_no_padding(&Sha256::digest(
+            format!("greengateway.admin-login.browser.v1\0{binding}").as_bytes(),
+        ));
+        let cookie_name = format!(
+            "ggw-admin-login-{}",
+            &hex::encode(Sha256::digest(b"/admin"))[..16]
+        );
         let callback_response = router
-            .oneshot(
-                Request::builder()
-                    .uri("/v1/admin/auth/callback?code=admin-code&state=any-state")
-                    .body(Body::empty())
-                    .expect("callback request should build"),
-            )
+            .oneshot(admin_oidc_complete_request(
+                &format!("{cookie_name}={binding}"),
+                "admin-code",
+                &oauth_state,
+            ))
             .await
-            .expect("callback request should complete");
+            .unwrap();
         assert_eq!(callback_response.status(), StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(
             json_error_message(callback_response).await,
@@ -39172,6 +39379,7 @@ paths:
             .expect("login request should complete");
 
         assert_eq!(login_response.status(), StatusCode::FOUND);
+        let cookies = admin_oidc_cookies(&login_response);
         let login_location = response_location(&login_response);
         let authorization_url =
             Url::parse(&login_location).expect("authorization redirect should be absolute");
@@ -39225,6 +39433,7 @@ paths:
                         "/v1/admin/auth/callback?code=admin-code&state={}",
                         query_encode(state)
                     ))
+                    .header(header::COOKIE, &cookies)
                     .body(Body::empty())
                     .expect("callback request should build"),
             )
@@ -39235,7 +39444,19 @@ paths:
         let callback_location = response_location(&callback_response);
         let completion = fragment_query_pairs(&callback_location, "/auth/complete")
             .expect("callback should redirect to auth completion fragment");
-        assert_eq!(completion.get("token"), Some(&access_token));
+        assert_eq!(
+            completion.get("code").map(String::as_str),
+            Some("admin-code")
+        );
+        assert_eq!(completion.get("state"), Some(state));
+        assert!(!callback_location.contains(&access_token));
+        assert!(token_endpoint.requests().is_empty());
+        let response = router
+            .clone()
+            .oneshot(admin_oidc_complete_request(&cookies, "admin-code", state))
+            .await
+            .unwrap();
+        assert_admin_oidc_token(response, &access_token).await;
 
         let token_requests = token_endpoint.requests();
         assert_eq!(token_requests.len(), 1);
@@ -39275,27 +39496,191 @@ paths:
         assert_eq!(pkce_challenge_for_verifier(verifier), *challenge);
 
         let replay_response = router
+            .oneshot(admin_oidc_complete_request(&cookies, "admin-code", state))
+            .await
+            .expect("replay completion");
+        assert_eq!(replay_response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(json_error_message(replay_response).await, "invalid_state");
+        assert_eq!(token_endpoint.requests().len(), 1);
+
+        oidc.finish();
+        token_endpoint.abort();
+    }
+
+    #[tokio::test]
+    async fn admin_oidc_completion_requires_initiating_browser_and_same_origin_without_spending_state(
+    ) {
+        let jwks_addr = spawn_test_jwks_server().await;
+        let token_endpoint =
+            spawn_mock_oidc_token_endpoint(Ipv4Addr::new(127, 0, 0, 2), None).await;
+        let oidc = spawn_mock_oidc_discovery_endpoint(Some(token_endpoint.url.clone()));
+        let mut config = admin_oidc_login_config(&oidc.issuer);
+        config.auth_providers[0].jwks_url =
+            Some(format!("http://127.0.0.1:{}/jwks.json", jwks_addr.port()));
+        let router = admin_oidc_login_router_from_config(config);
+        let login = router
+            .clone()
+            .oneshot(admin_oidc_login_request(Ipv4Addr::LOCALHOST, None))
+            .await
+            .unwrap();
+        let cookies = admin_oidc_cookies(&login);
+        let query = url_query_pairs(&Url::parse(&response_location(&login)).unwrap());
+        let state = &query["state"];
+        let other_login = router
+            .clone()
+            .oneshot(admin_oidc_login_request(Ipv4Addr::LOCALHOST, None))
+            .await
+            .unwrap();
+        let other_cookies = admin_oidc_cookies(&other_login);
+        let access_token = signed_token_with_issuer("admin-operator", &["admin"], &oidc.issuer);
+        token_endpoint.set_access_token(access_token.clone());
+        token_endpoint.set_id_token(signed_admin_id_token(
+            &oidc.issuer,
+            "admin-ui",
+            &query["nonce"],
+        ));
+
+        // Rejections must leave the original transaction usable. Each test
+        // supplies valid CSRF material so it reaches the browser-binding gate.
+        for cookie in [
+            String::new(),
+            other_cookies,
+            format!("{cookies}; {cookies}"),
+        ] {
+            let callback = router
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri(format!(
+                            "{ADMIN_AUTH_CALLBACK_ROUTE}?code=admin-code&state={state}"
+                        ))
+                        .header(header::COOKIE, &cookie)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert!(response_location(&callback).contains("error=invalid_state"));
+            assert_eq!(callback.headers()[header::CACHE_CONTROL], "no-store");
+            let completion = router
+                .clone()
+                .oneshot(admin_oidc_complete_request(&cookie, "admin-code", state))
+                .await
+                .unwrap();
+            assert_eq!(completion.status(), StatusCode::BAD_REQUEST);
+            assert_eq!(json_error_message(completion).await, "invalid_state");
+        }
+        for origin in [None, Some("https://other.example.test"), Some("null")] {
+            let mut request = admin_oidc_complete_request(&cookies, "admin-code", state);
+            request.headers_mut().remove(header::ORIGIN);
+            if let Some(origin) = origin {
+                request
+                    .headers_mut()
+                    .insert(header::ORIGIN, HeaderValue::from_str(origin).unwrap());
+            }
+            let response = router.clone().oneshot(request).await.unwrap();
+            assert_eq!(response.status(), StatusCode::FORBIDDEN);
+            assert_eq!(json_error_message(response).await, "invalid_origin");
+        }
+        let mut request = admin_oidc_complete_request(&cookies, "admin-code", state);
+        request.headers_mut().remove("x-csrf-token");
+        assert_eq!(
+            router.clone().oneshot(request).await.unwrap().status(),
+            StatusCode::FORBIDDEN
+        );
+        assert!(token_endpoint.requests().is_empty());
+
+        let (first, second) = tokio::join!(
+            router
+                .clone()
+                .oneshot(admin_oidc_complete_request(&cookies, "admin-code", state)),
+            router.oneshot(admin_oidc_complete_request(&cookies, "admin-code", state)),
+        );
+        let mut successes = 0;
+        for response in [first.unwrap(), second.unwrap()] {
+            if response.status() == StatusCode::OK {
+                assert_admin_oidc_token(response, &access_token).await;
+                successes += 1;
+            } else {
+                assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+                assert_eq!(json_error_message(response).await, "invalid_state");
+            }
+        }
+        assert_eq!(successes, 1);
+        assert_eq!(token_endpoint.requests().len(), 1);
+        oidc.finish();
+        token_endpoint.abort();
+    }
+
+    #[tokio::test]
+    async fn admin_oidc_browser_cookie_tracks_custom_prefix_https_and_expiry() {
+        let token_endpoint =
+            spawn_mock_oidc_token_endpoint(Ipv4Addr::new(127, 0, 0, 2), None).await;
+        let oidc = spawn_mock_oidc_discovery_endpoint(Some(token_endpoint.url.clone()));
+        let mut config = admin_oidc_login_config(&oidc.issuer);
+        config.admin_prefix = "/ops".to_owned();
+        config.admin_login_pending_ttl_secs = 1;
+        config.auth_exempt_paths.push("/v1/ops/auth".to_owned());
+        config.rbac_exempt_paths.push("/v1/ops/auth".to_owned());
+        config.auth_providers[0].redirect_uri =
+            Some("https://gateway.example.test/v1/ops/auth/callback".to_owned());
+        let router = admin_oidc_login_router_from_config(config);
+        let login = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/ops/auth/login")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let cookies = admin_oidc_cookies(&login);
+        let binding_cookie = login
+            .headers()
+            .get_all(header::SET_COOKIE)
+            .iter()
+            .map(|value| value.to_str().unwrap())
+            .find(|value| value.starts_with("__Host-ggw-admin-login-"))
+            .unwrap();
+        assert!(binding_cookie.contains("; Path=/; HttpOnly; SameSite=Lax; Max-Age=1; Secure"));
+        assert!(!binding_cookie.contains("Domain="));
+        let query = url_query_pairs(&Url::parse(&response_location(&login)).unwrap());
+        let binding = binding_cookie
+            .split(';')
+            .next()
+            .unwrap()
+            .split_once('=')
+            .unwrap()
+            .1;
+        assert_ne!(binding, query["state"]);
+        assert!(!response_location(&login).contains(binding));
+        let callback = router
+            .clone()
             .oneshot(
                 Request::builder()
                     .uri(format!(
-                        "/v1/admin/auth/callback?code=admin-code&state={}",
-                        query_encode(state)
+                        "/v1/ops/auth/callback?code=admin-code&state={}",
+                        query["state"]
                     ))
+                    .header(header::COOKIE, &cookies)
                     .body(Body::empty())
-                    .expect("replay callback request should build"),
+                    .unwrap(),
             )
             .await
-            .expect("replay callback should complete");
-
-        assert_eq!(replay_response.status(), StatusCode::FOUND);
-        assert!(
-            fragment_query_pairs(&response_location(&replay_response), "/auth/error")
-                .expect("replay should redirect to auth error fragment")
-                .get("error")
-                .is_some_and(|error| error == "invalid_state")
+            .unwrap();
+        assert!(response_location(&callback).starts_with("/ops/#/auth/complete?code="));
+        tokio::time::sleep(Duration::from_millis(1100)).await;
+        let mut request = admin_oidc_complete_request(&cookies, "admin-code", &query["state"]);
+        *request.uri_mut() = "/v1/ops/auth/callback".parse().unwrap();
+        request.headers_mut().insert(
+            header::ORIGIN,
+            HeaderValue::from_static("https://gateway.example.test"),
         );
-        assert_eq!(token_endpoint.requests().len(), 1);
-
+        let response = router.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(json_error_message(response).await, "invalid_state");
+        assert!(token_endpoint.requests().is_empty());
         oidc.finish();
         token_endpoint.abort();
     }
@@ -39322,6 +39707,7 @@ paths:
             )
             .await
             .expect("login request should complete");
+        let cookies = admin_oidc_cookies(&login_response);
         let login_location = response_location(&login_response);
         let authorization_url =
             Url::parse(&login_location).expect("authorization redirect should be absolute");
@@ -39331,24 +39717,14 @@ paths:
             .expect("authorization redirect should include state");
 
         let callback_response = router
-            .oneshot(
-                Request::builder()
-                    .uri(format!(
-                        "/v1/admin/auth/callback?code=admin-code&state={}",
-                        query_encode(state)
-                    ))
-                    .body(Body::empty())
-                    .expect("callback request should build"),
-            )
+            .oneshot(admin_oidc_complete_request(&cookies, "admin-code", state))
             .await
-            .expect("callback request should complete");
+            .expect("completion request should complete");
 
-        assert_eq!(callback_response.status(), StatusCode::FOUND);
-        assert!(
-            fragment_query_pairs(&response_location(&callback_response), "/auth/error")
-                .expect("missing id_token should redirect to auth error fragment")
-                .get("error")
-                .is_some_and(|error| error == "token_exchange_failed")
+        assert_eq!(callback_response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            json_error_message(callback_response).await,
+            "token_exchange_failed"
         );
         assert_eq!(token_endpoint.requests().len(), 1);
 
@@ -39364,11 +39740,7 @@ paths:
             })
             .await;
 
-        assert_eq!(callback_response.status(), StatusCode::FOUND);
-        let callback_location = response_location(&callback_response);
-        let completion = fragment_query_pairs(&callback_location, "/auth/complete")
-            .expect("callback should redirect to auth completion fragment");
-        assert_eq!(completion.get("token"), Some(&access_token));
+        assert_admin_oidc_token(callback_response, &access_token).await;
     }
 
     #[tokio::test]
@@ -39378,12 +39750,10 @@ paths:
         })
         .await;
 
-        assert_eq!(callback_response.status(), StatusCode::FOUND);
-        assert!(
-            fragment_query_pairs(&response_location(&callback_response), "/auth/error")
-                .expect("invalid id_token should redirect to auth error fragment")
-                .get("error")
-                .is_some_and(|error| error == "token_exchange_failed")
+        assert_eq!(callback_response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            json_error_message(callback_response).await,
+            "token_exchange_failed"
         );
     }
 
@@ -39394,12 +39764,10 @@ paths:
         })
         .await;
 
-        assert_eq!(callback_response.status(), StatusCode::FOUND);
-        assert!(
-            fragment_query_pairs(&response_location(&callback_response), "/auth/error")
-                .expect("invalid id_token should redirect to auth error fragment")
-                .get("error")
-                .is_some_and(|error| error == "token_exchange_failed")
+        assert_eq!(callback_response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            json_error_message(callback_response).await,
+            "token_exchange_failed"
         );
     }
 
@@ -39410,12 +39778,10 @@ paths:
         })
         .await;
 
-        assert_eq!(callback_response.status(), StatusCode::FOUND);
-        assert!(
-            fragment_query_pairs(&response_location(&callback_response), "/auth/error")
-                .expect("invalid id_token should redirect to auth error fragment")
-                .get("error")
-                .is_some_and(|error| error == "token_exchange_failed")
+        assert_eq!(callback_response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            json_error_message(callback_response).await,
+            "token_exchange_failed"
         );
     }
 
@@ -39426,12 +39792,10 @@ paths:
         })
         .await;
 
-        assert_eq!(callback_response.status(), StatusCode::FOUND);
-        assert!(
-            fragment_query_pairs(&response_location(&callback_response), "/auth/error")
-                .expect("invalid id_token should redirect to auth error fragment")
-                .get("error")
-                .is_some_and(|error| error == "token_exchange_failed")
+        assert_eq!(callback_response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            json_error_message(callback_response).await,
+            "token_exchange_failed"
         );
     }
 

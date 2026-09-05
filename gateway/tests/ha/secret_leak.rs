@@ -503,24 +503,6 @@ fn path_and_query(absolute: &str) -> String {
     }
 }
 
-/// A `name=value` pair from anywhere in a URL-shaped string, including the
-/// part after a `#`.
-///
-/// The admin console's completion redirect puts the session in the
-/// fragment so it never reaches a server log or a `Referer`; a URL parser
-/// treats everything after `#` as one opaque string, so this reads it as
-/// text rather than pretending it is a query.
-fn fragment_param(url: &str, name: &str) -> String {
-    let marker = format!("{name}=");
-    let start = url
-        .find(&marker)
-        .unwrap_or_else(|| panic!("{url} carried no {name} parameter"))
-        + marker.len();
-    let rest = &url[start..];
-    let end = rest.find(['&', '#']).unwrap_or(rest.len());
-    rest[..end].to_owned()
-}
-
 /// One query parameter of an absolute URL.
 fn query_value(absolute: &str, name: &str) -> String {
     url::Url::parse(absolute)
@@ -582,6 +564,7 @@ async fn no_planted_or_minted_secret_reaches_the_logs_metrics_or_audit_files() {
     // gateway's own, and the cookie is what it hands back.
     let (status, headers, _) = cluster.get("a", ADMIN_LOGIN_PATH).send_with_headers().await;
     assert_eq!(status, 302, "the login endpoint should redirect to the IdP");
+    let cookies = harness::admin_login_cookies(&headers);
     let authorization_url = location(&headers, "the login redirect");
     let state = query_value(&authorization_url, "state");
     let nonce = query_value(&authorization_url, "nonce");
@@ -598,19 +581,33 @@ async fn no_planted_or_minted_secret_reaches_the_logs_metrics_or_audit_files() {
     ));
     // Completed on the other replica, so the sealed verifier and nonce
     // cross the shared store — the crossing this suite most wants to watch.
-    let (status, headers, _) = cluster.get("b", &callback).send_with_headers().await;
+    let (status, headers, _) = cluster
+        .get("b", &callback)
+        .header("cookie", &cookies)
+        .send_with_headers()
+        .await;
     assert_eq!(status, 302, "the callback should complete the login");
     let completion = location(&headers, "the callback redirect");
-    // The completion redirect carries the session in the URL *fragment*
-    // (`/admin/#/auth/complete?token=...`), which a URL parser reports as
-    // an opaque fragment rather than a query — so it is read as text.
-    let session = fragment_param(&completion, "token");
-    let cookies: String = headers
-        .get_all(reqwest::header::SET_COOKIE)
-        .iter()
-        .filter_map(|value| value.to_str().ok())
-        .collect::<Vec<_>>()
-        .join("; ");
+    assert!(completion.contains("/#/auth/complete?code="));
+    let (status, _, body) = harness::admin_login_completion(&cluster, "b", &callback, &cookies)
+        .send_with_headers()
+        .await;
+    assert_eq!(status, 200);
+    let session = body["access_token"]
+        .as_str()
+        .expect("completion token")
+        .to_owned();
+    assert!(!completion.contains(&session));
+    let binding = cookies
+        .split(';')
+        .find_map(|cookie| {
+            cookie
+                .trim()
+                .split_once('=')
+                .filter(|(name, _)| name.contains("ggw-admin-login-"))
+                .map(|(_, value)| value)
+        })
+        .expect("browser binding");
 
     // A second login, deliberately left in flight, so the shared
     // pending-login store has a row to inspect below: its state must be
@@ -774,23 +771,7 @@ async fn no_planted_or_minted_secret_reaches_the_logs_metrics_or_audit_files() {
     haystack.assert_absent("request header value", &header_canary);
     haystack.assert_absent("request body value", &body_canary);
     haystack.assert_absent("refused bearer credential", &rejected_credential);
-    // The cookie needle, asserted rather than guarded.
-    //
-    // The completion redirect sets no cookie at all today: the session
-    // travels in the URL fragment, and the only `Set-Cookie` this binary
-    // emits comes from the CSRF middleware (which the harness disables) and
-    // the tools playground (which this suite never reaches). A `if
-    // !cookies.is_empty()` around the needle would therefore be dead in
-    // every run — a search that reports success without having searched.
-    // So the shape of the response is what is asserted: no cookie here. A
-    // change that starts setting one fails HERE, with a message saying to
-    // add the value to the needles below, instead of silently turning this
-    // category off.
-    assert!(
-        cookies.is_empty(),
-        "the admin callback set a cookie ({cookies}); the session used to travel only in the \
-         redirect fragment. Add the cookie to the needles below now that there is one to leak."
-    );
+    haystack.assert_absent("login browser binding cookie", binding);
 
     // The rate-limit keyring's material, which never leaves the process
     // but whose digests are written to a shared table: neither the key nor
@@ -856,6 +837,7 @@ async fn no_planted_or_minted_secret_reaches_the_logs_metrics_or_audit_files() {
     api.assert_absent("login nonce", &nonce);
     api.assert_absent("PKCE code challenge", &code_challenge);
     api.assert_absent("session token the callback returned", &session);
+    api.assert_absent("login browser binding cookie", binding);
     api.assert_absent("service token plaintext", &service_token);
     api.assert_absent("service token's stored digest", &stored_token_digest);
     api.assert_absent("connection secret plaintext", &connection_secret);

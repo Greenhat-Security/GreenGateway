@@ -14,6 +14,7 @@ import {
   setStoredToken,
 } from './lib/auth';
 import { adminApiUrl, adminBasePath } from './lib/config';
+import { addCsrfHeader } from './lib/api';
 import {
   CapabilityDetail,
   CapabilityInventoryView,
@@ -65,13 +66,12 @@ export function AdminShell() {
   }, [theme]);
 
   useEffect(() => {
-    const result = completeAuthFromFragment();
-    if (!result) {
-      return;
-    }
-
-    setAuthCompletionStatus(result.status);
-    setAuthRefreshKey((current) => current + 1);
+    void completeAuthFromFragment().then((result) => {
+      if (result) {
+        setAuthCompletionStatus(result.status);
+        setAuthRefreshKey((current) => current + 1);
+      }
+    });
   }, []);
 
   function toggleTheme() {
@@ -430,30 +430,59 @@ type AuthCompletionResult = {
   status: string;
 };
 
-function completeAuthFromFragment(): AuthCompletionResult | null {
+async function completeAuthFromFragment(): Promise<AuthCompletionResult | null> {
   if (typeof window === 'undefined') {
     return null;
   }
 
   const hash = window.location.hash;
   if (hash.startsWith('#/auth/complete?')) {
-    const token = new URLSearchParams(hash.slice('#/auth/complete?'.length))
-      .get('token')
-      ?.trim();
-    if (!token) {
-      clearLocationHash();
-      return {
-        status: 'SSO sign-in did not return a token.',
-      };
-    }
-
-    const saved = setStoredToken(token);
+    const params = new URLSearchParams(hash.slice('#/auth/complete?'.length));
+    // Remove the code before any asynchronous work, including React's
+    // development effect replay. Legacy bearer-token fragments are rejected.
     clearLocationHash();
-    return {
-      status: saved
-        ? 'Signed in with SSO for this browser session.'
-        : 'Session storage is unavailable in this browser context.',
-    };
+    const code = params.get('code')?.trim();
+    const state = params.get('state')?.trim();
+    if (
+      !code || !state || params.has('token') ||
+      params.getAll('code').length !== 1 ||
+      params.getAll('state').length !== 1
+    ) {
+      return { status: 'SSO sign-in did not complete. Start sign-in again.' };
+    }
+    try {
+      const headers = new Headers({
+        'Content-Type': 'application/json',
+        Accept: 'application/json',
+      });
+      addCsrfHeader(headers, 'POST');
+      const response = await fetch(adminApiUrl('/auth/callback'), {
+        method: 'POST',
+        credentials: 'same-origin',
+        cache: 'no-store',
+        redirect: 'error',
+        headers,
+        body: JSON.stringify({ code, state }),
+      });
+      if (!response.ok) {
+        throw new Error('SSO completion failed');
+      }
+      const body: unknown = await response.json();
+      if (
+        !body || typeof body !== 'object' || !('access_token' in body) ||
+        typeof body.access_token !== 'string' || !body.access_token.trim()
+      ) {
+        throw new Error('SSO completion failed');
+      }
+      const saved = setStoredToken(body.access_token.trim());
+      return {
+        status: saved
+          ? 'Signed in with SSO for this browser session.'
+          : 'Session storage is unavailable in this browser context.',
+      };
+    } catch {
+      return { status: 'SSO sign-in did not complete. Start sign-in again.' };
+    }
   }
 
   if (hash.startsWith('#/auth/error?')) {
