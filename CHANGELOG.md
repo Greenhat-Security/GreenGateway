@@ -212,6 +212,10 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 
 ### Fixed
 
+- Service-token rotation now requires the same live, identity-qualified scope
+  delegation authority as creation. Rejected rotations emit a delegation-denied
+  audit event and leave the existing credential unchanged. Token administrators
+  can still revoke tokens without holding their scopes.
 - Concurrent first-use JWT validation now re-checks the verified JWKS key cache
   after a coalesced refresh. Valid waiters no longer receive a spurious
   `unknown kid` rejection when the leading request has populated the key; an

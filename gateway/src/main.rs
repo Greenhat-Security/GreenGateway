@@ -8300,6 +8300,29 @@ async fn token_rotate_endpoint(
         Err(error) => return token_admin_authz_error_response(error),
     };
 
+    let record = match store.get_by_id(&token_id).await {
+        Ok(Some(record)) => record,
+        Ok(None) => return not_found("service token was not found"),
+        Err(error) => return token_store_error_response(error),
+    };
+    let Some(rbac_state) = state.rbac_state.as_ref() else {
+        return token_rbac_not_configured();
+    };
+    // Rotation returns a new credential carrying the existing scopes, so it
+    // requires the same delegation authority as creation. Scopes are immutable
+    // through the token store contract; each store still checks revocation
+    // when rotating.
+    if let Err(error) = authorize_requested_scopes(rbac_state, &principal, &record.scopes) {
+        emit_service_token_delegation_rejected(
+            &state,
+            &parts,
+            &principal,
+            &record.scopes,
+            &error.disallowed,
+        );
+        return token_scope_authz_error_response(error);
+    }
+
     match store.rotate(&token_id).await {
         Ok(Some(created)) => {
             if let Some(validator) = state.validator.as_ref() {
@@ -11605,9 +11628,9 @@ fn authorized_token_store<'a>(
         .ok_or(TokenAdminAuthzError::StoreNotConfigured)
 }
 
-/// Requested service-token scopes may not exceed the creator's own authority.
-/// A creator holding an identity-matched wildcard role may delegate any scope;
-/// otherwise every requested scope must be a policy role the creator carries
+/// Service-token creation and rotation may not exceed the actor's own authority.
+/// An actor holding an identity-matched wildcard role may delegate any scope;
+/// otherwise every scope must be a policy role the actor carries
 /// and can activate under its current identity.
 fn authorize_requested_scopes(
     rbac_state: &middleware::rbac::RbacState,
@@ -30817,6 +30840,195 @@ mod tests {
         );
     }
 
+    /// Exercise the same admin handler against both storage implementations.
+    /// Rejected rotation must preserve the record and the original credential.
+    async fn assert_token_rotation_delegation_contract(store: Arc<dyn storage::ServiceTokenStore>) {
+        let mut policy_json: Value = serde_json::from_str(&token_policy_document_string())
+            .expect("token policy should be JSON");
+        policy_json["roles"]["issuer-admin"] = json!({
+            "permissions": ["*"],
+            "issuers": ["https://issuer.example.test/"]
+        });
+        let policy = parse_policy_body(&Bytes::from(policy_json.to_string()))
+            .expect("token policy should parse");
+        let config = test_config(Vec::new());
+
+        for (roles, scopes, expected) in [
+            (
+                vec!["tokens-writer"],
+                vec!["probe-reader"],
+                StatusCode::FORBIDDEN,
+            ),
+            (
+                vec!["tokens-writer", "unknown-role"],
+                vec!["unknown-role"],
+                StatusCode::FORBIDDEN,
+            ),
+            (
+                vec!["tokens-writer", "service-admin"],
+                vec!["service-admin"],
+                StatusCode::FORBIDDEN,
+            ),
+            (
+                vec!["tokens-writer", "issuer-admin"],
+                vec!["issuer-admin"],
+                StatusCode::FORBIDDEN,
+            ),
+            (
+                vec!["probe-reader"],
+                vec!["probe-reader"],
+                StatusCode::FORBIDDEN,
+            ),
+            (
+                vec!["tokens-writer", "probe-reader"],
+                vec!["probe-reader"],
+                StatusCode::OK,
+            ),
+            (
+                vec!["superadmin"],
+                vec!["unknown-role", "mcp:tools"],
+                StatusCode::OK,
+            ),
+        ] {
+            let created = store
+                .create(auth::tokens::CreateTokenRequest {
+                    scopes: scopes.iter().map(|scope| (*scope).to_owned()).collect(),
+                    created_by: "bootstrap-admin".to_owned(),
+                    expires_at: None,
+                })
+                .await
+                .expect("fixture token should create");
+            let capture = audit::sink::tests::CaptureSink::new();
+            let audit_log =
+                audit::AuditLog::new(Arc::new(capture.clone()) as Arc<dyn audit::AuditSink>);
+            let rbac_state = middleware::rbac::RbacState::new(
+                policy.clone(),
+                Vec::new(),
+                false,
+                audit_log.clone(),
+            );
+            let principal = test_principal(&roles);
+            let can_manage =
+                rbac_state.principal_has_permission(&principal, ADMIN_TOKENS_WRITE_PERMISSION);
+            let state = TokenAdminState {
+                store: Some(Arc::clone(&store)),
+                validator: None,
+                rbac_state: Some(rbac_state),
+                audit: audit_log,
+                client_ip_policy: client_ip::ClientIpPolicy::from_config(&config),
+                max_body_size: config.max_body_size,
+            };
+            let request = token_admin_request(
+                Method::POST,
+                &format!("{TOKENS_ADMIN_ROUTE}/{}/rotate", created.record.id),
+                Some(principal),
+                None,
+            );
+            let response =
+                token_rotate_endpoint(State(state), Path(created.record.id.clone()), request).await;
+            assert_eq!(
+                response.status(),
+                expected,
+                "roles={roles:?}, scopes={scopes:?}"
+            );
+
+            if expected == StatusCode::FORBIDDEN {
+                let body = json_body(response).await;
+                assert!(body.get("plaintext_token").is_none());
+                let unchanged = store
+                    .get_by_id(&created.record.id)
+                    .await
+                    .expect("stored token should read")
+                    .expect("denied rotation must retain the token");
+                assert_eq!(unchanged, created.record);
+                assert!(matches!(
+                    store
+                        .verify(&created.plaintext_token)
+                        .await
+                        .expect("token should verify"),
+                    auth::tokens::TokenVerification::Valid(_)
+                ));
+                if can_manage {
+                    let event = captured_token_delegation_rejection(&capture);
+                    assert_eq!(event.payload["decision"], json!("deny"));
+                    assert_eq!(event.payload["requested_scopes"], json!(scopes));
+                    assert_eq!(event.payload["disallowed_scopes"], json!(scopes));
+                    let serialized = serde_json::to_string(&event).expect("audit should serialize");
+                    assert!(!serialized.contains(&created.plaintext_token));
+                    assert!(!serialized.contains("token_hash"));
+                }
+                assert!(!capture
+                    .events()
+                    .iter()
+                    .any(|event| { event.event_type == audit::event::SERVICE_TOKEN_CHANGED }));
+            } else {
+                let body = json_body(response).await;
+                assert_eq!(body["token"]["id"], json!(created.record.id));
+                assert_eq!(body["token"]["scopes"], json!(scopes));
+                let plaintext = body["plaintext_token"]
+                    .as_str()
+                    .expect("allowed rotation returns the replacement credential");
+                assert!(matches!(
+                    store
+                        .verify(&created.plaintext_token)
+                        .await
+                        .expect("old token should check"),
+                    auth::tokens::TokenVerification::Invalid(_)
+                ));
+                assert!(matches!(
+                    store
+                        .verify(plaintext)
+                        .await
+                        .expect("replacement should verify"),
+                    auth::tokens::TokenVerification::Valid(_)
+                ));
+                let event = captured_token_change(&capture, "token_rotated");
+                let serialized = serde_json::to_string(&event).expect("audit should serialize");
+                assert!(!serialized.contains(plaintext));
+                assert!(!serialized.contains(&created.plaintext_token));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn token_rotation_delegation_contract_sqlite() {
+        let token_db = TempDb::new("token-rotation-delegation");
+        let store =
+            auth::tokens::SqliteTokenStore::open(&token_db.path).expect("token store should open");
+        assert_token_rotation_delegation_contract(Arc::new(store)).await;
+    }
+
+    #[cfg(feature = "postgres")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn token_rotation_delegation_contract_postgres() {
+        use storage::contract_tests::postgres_audit_tests::{
+            create_test_database, locator, write_dsn_file, DATABASE,
+        };
+
+        let Some(admin_dsn) = locator() else {
+            eprintln!("skipping PostgreSQL rotation contract: no test database locator");
+            return;
+        };
+        let _serial = DATABASE.lock().await;
+        let database = create_test_database(&admin_dsn).await;
+        let dsn_file = write_dsn_file(&database.dsn);
+        let mut config = config::Config::test_defaults();
+        config.state_backend = config::StateBackend::Postgres;
+        config.deployment_id = Some("deploy-token-rotation-contract".to_owned());
+        config.database.url_file = Some(dsn_file.path.clone());
+        config.database.tls_mode = config::DatabaseTlsMode::LoopbackDev;
+        let foundation = storage::postgres::PostgresFoundation::establish(&config)
+            .await
+            .expect("test database should establish");
+        storage::migrations::apply_missing_for_startup(foundation.pool(), &config.database)
+            .await
+            .expect("test database should migrate");
+        let store = storage::postgres_service_tokens::PostgresServiceTokenStore::new(
+            foundation.pool().clone(),
+        );
+        assert_token_rotation_delegation_contract(Arc::new(store)).await;
+    }
+
     /// Pins the narrowed create mapping restored from the #340 review: a
     /// malformed `expires_at` is a `400` naming the field, because it is the
     /// one invalid-input case the caller controls on create.
@@ -30916,7 +31128,7 @@ mod tests {
             .oneshot(token_admin_request(
                 Method::POST,
                 &format!("{TOKENS_ADMIN_ROUTE}/{token_id}/rotate"),
-                Some(test_principal(&["tokens-writer"])),
+                Some(test_principal(&["tokens-writer", "probe-reader"])),
                 None,
             ))
             .await
