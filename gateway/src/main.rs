@@ -80,12 +80,14 @@ use lifecycle::{
     serve_gateway, GatewayApp, GatewayApps, GatewayLifecycle, GrpcApp, ShutdownConfig,
 };
 use proxy::{ProxyClassifier, ProxyState};
+#[cfg(all(test, feature = "postgres"))]
+use storage::AuditEventStore as _;
 #[cfg(feature = "postgres")]
 #[cfg(feature = "postgres")]
 use storage::PolicyControlPlane as _;
+use storage::PrincipalDirectoryStore;
 #[cfg(feature = "postgres")]
 use storage::ToolControlPlane;
-use storage::{AuditEventStore as _, PrincipalDirectoryStore};
 
 const REQUEST_COUNTER: &str = "gateway_http_requests";
 const REQUEST_ID_HEADER: &str = "x-request-id";
