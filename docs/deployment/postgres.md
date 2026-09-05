@@ -528,9 +528,11 @@ One entry per `/readyz` reason: the first three things to look at, then the reme
 
 1. The `fingerprint` column across `GET /v1{ADMIN_PREFIX}/cluster/replicas`. Two distinct values is the whole condition; which one is the majority tells you which side is the newcomer.
 2. `greengateway_cluster_config_mismatch` summed across the fleet — how many replicas the change is holding at the door.
-3. The static configuration that differs. It is any security-relevant setting: authentication, proxies, cookies, exemptions, routing, egress, key generation.
+3. The static configuration that differs. It is any security-relevant setting: authentication, proxies, cookies, exemptions, routing, egress, read/write rate limits, bucket capacity/TTL, and key generation IDs and roles.
 
 **Remediation.** Decide which configuration is correct and make the fleet agree. Agreement is sticky, so incumbents are never taken out of rotation by a mismatched newcomer, and under a readiness-gated rolling update the rollout stalls rather than spreads — that is the design, not a fault. The change completes only once the old replicas leave: see [Enabling cluster mode](#enabling-cluster-mode) and the rollout strategy in [the two-gateway example](#a-two-gateway-production-example). Note that restarting an *incumbent* while a new configuration is live costs it its agreement and stalls it too, so do not recycle old replicas mid-rollout.
+
+**Rate-limit agreement and format v2.** The fingerprint now includes both global rate-limit lanes, bucket capacity and idle TTL, and the sorted rate-limit key-generation IDs and roles. This extends the fingerprint format from v1 to v2. Old- and new-format replicas cannot agree even when their environment variables are otherwise identical. Plan a coordinated cutover: drain/remove the old fleet (or wait for stopped members to become stale), then let the consistently configured new fleet establish agreement before routing traffic to it. Budget for the readiness gap; an ordinary rollout that waits for a new replica to become ready before removing any old replica will stall. No database migration is required. The same coordination applies when changing rate settings or rotating key generations. Never reuse a generation ID for changed key bytes, since secret material and local file paths are excluded from the public fingerprint.
 
 #### required_upstream_unavailable
 

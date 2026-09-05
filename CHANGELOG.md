@@ -212,6 +212,9 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 
 ### Fixed
 
+- Included global read/write rates and bursts, bucket capacity and idle TTL, and rate-limit key-generation IDs and roles in cluster configuration agreement. Divergent joining replicas remain unready. Fingerprint format v2 requires a coordinated fleet cutover; reordered key entries and different local key paths still agree, and secret key material remains excluded.
+
+
 - Bound admin SSO callbacks and completion to the browser that initiated login using a short-lived HttpOnly transaction cookie. The UI now exchanges the authorization code and state in a same-origin, single-use POST; access tokens no longer travel in redirect fragments. PostgreSQL-backed completion remains atomic across replicas. In-flight logins and open admin pages from the previous protocol must be restarted or reloaded after upgrading.
 
 - Service-token rotation now requires the same live, identity-qualified scope
