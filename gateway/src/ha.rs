@@ -24,7 +24,7 @@
 //!
 //! The normative list from ADR-0007: mode selection (`STATE_BACKEND`),
 //! deployment ID, auth/provider settings, trusted proxies, public/cookie
-//! settings, exempt paths, routes, egress restrictions, policy mode, and
+//! settings, exempt paths, routes, egress restrictions, rate limits, policy mode, and
 //! secret/key generation IDs.
 //!
 //! Secret material is never an input. Provider `client_secret` values
@@ -33,9 +33,9 @@
 //! of configuration at all (it is read from `DATABASE_URL_FILE` at pool
 //! construction). Two replicas configured with identical structure and
 //! different secret values produce identical fingerprints — that is tested,
-//! not assumed. Later PRs extend the projection when they centralize the
-//! state it describes (rate limits when they become shared in PR 10, for
-//! example); each extension is a fingerprint-format change every replica of
+//! not assumed. The rate-limit projection includes both global lanes,
+//! bucket bounds, and the sorted key-generation IDs and roles. Each
+//! extension is a fingerprint-format change every replica of
 //! the rolling window must agree on, which is why the input carries a
 //! version string in its domain-separation prefix.
 
@@ -51,7 +51,7 @@ use crate::config::{AuthProviderType, Config, StateBackend, UpstreamRouteConfig}
 /// the version is a deliberate act: it changes every deployment's fingerprint
 /// at once, so mixed-version replicas must never happen outside a planned
 /// rolling window.
-const FINGERPRINT_DOMAIN: &str = "greengateway-static-config-fingerprint-v1";
+const FINGERPRINT_DOMAIN: &str = "greengateway-static-config-fingerprint-v2";
 
 /// One replica's identity for this boot.
 ///
@@ -263,6 +263,7 @@ pub fn static_config_fingerprint(config: &Config) -> StaticConfigFingerprint {
     insert_exempt_paths(&mut input, config);
     insert_routes(&mut input, config);
     insert_egress_restrictions(&mut input, config);
+    insert_rate_limit_settings(&mut input, config);
     insert_secret_generation_ids(&mut input, config);
 
     let mut hasher = Sha256::new();
@@ -277,6 +278,60 @@ pub fn static_config_fingerprint(config: &Config) -> StaticConfigFingerprint {
     hasher.update(&canonical);
     StaticConfigFingerprint {
         digest: hasher.finalize().into(),
+    }
+}
+
+fn insert_rate_limit_settings(input: &mut BTreeMap<String, String>, config: &Config) {
+    // Rates are validated finite and non-negative at startup. IEEE-754 bits
+    // preserve every effective value without depending on float formatting;
+    // positive and negative zero have identical limiter semantics.
+    let rate_bits = |rate: f64| {
+        let rate = if rate == 0.0 { 0.0 } else { rate };
+        format!("{:016x}", rate.to_bits())
+    };
+    for (name, value) in [
+        ("rate_limit_read_rps", rate_bits(config.rate_limit_read_rps)),
+        (
+            "rate_limit_read_burst",
+            config.rate_limit_read_burst.to_string(),
+        ),
+        (
+            "rate_limit_write_rps",
+            rate_bits(config.rate_limit_write_rps),
+        ),
+        (
+            "rate_limit_write_burst",
+            config.rate_limit_write_burst.to_string(),
+        ),
+        (
+            "rate_limit_max_buckets",
+            config.rate_limit_max_buckets.to_string(),
+        ),
+        (
+            "rate_limit_bucket_ttl_ms",
+            config.rate_limit_bucket_ttl_ms.to_string(),
+        ),
+    ] {
+        input.insert(name.into(), value);
+    }
+
+    // Order and file locations are deployment details. The generation set
+    // and primary/decrypt-only roles determine which bucket namespace is
+    // used, so partial rotations must not report agreement. Never read key
+    // files or include secret-derived values in this public fingerprint.
+    let mut generations: Vec<_> = config.rate_limit_keyring.iter().collect();
+    generations.sort_by(|a, b| a.id.cmp(&b.id));
+    input.insert(
+        "rate_limit_keyring.count".into(),
+        generations.len().to_string(),
+    );
+    for (index, key) in generations.into_iter().enumerate() {
+        input.insert(format!("rate_limit_keyring[{index}].id"), key.id.clone());
+        let role = match key.role {
+            crate::connections::local_secret::LocalSecretKeyRole::Primary => "primary",
+            crate::connections::local_secret::LocalSecretKeyRole::DecryptOnly => "decrypt_only",
+        };
+        input.insert(format!("rate_limit_keyring[{index}].role"), role.into());
     }
 }
 
@@ -932,6 +987,99 @@ mod tests {
             static_config_fingerprint(&config),
             static_config_fingerprint(&config)
         );
+    }
+
+    #[test]
+    fn fingerprint_covers_every_static_rate_limit_setting() {
+        let base = config_from(&[]);
+        for (name, value) in [
+            ("RATE_LIMIT_READ_RPS", "1.25"),
+            ("RATE_LIMIT_READ_BURST", "7"),
+            ("RATE_LIMIT_WRITE_RPS", "2.5"),
+            ("RATE_LIMIT_WRITE_BURST", "9"),
+            ("RATE_LIMIT_MAX_BUCKETS", "1234"),
+            ("RATE_LIMIT_BUCKET_TTL_MS", "2345"),
+        ] {
+            let changed = config_from(&[(name, value)]);
+            assert_ne!(
+                static_config_fingerprint(&base),
+                static_config_fingerprint(&changed),
+                "{name} must participate in agreement"
+            );
+        }
+        let mut adjacent = base.clone();
+        adjacent.rate_limit_read_rps = f64::from_bits(base.rate_limit_read_rps.to_bits() + 1);
+        assert_ne!(
+            static_config_fingerprint(&base),
+            static_config_fingerprint(&adjacent),
+            "distinct finite rates must not be rounded into agreement"
+        );
+    }
+
+    #[test]
+    fn fingerprint_normalizes_equivalent_rate_representations() {
+        for (first, second) in [("0", "-0"), ("100", "1e2"), ("1.250", "1.25")] {
+            let first = config_from(&[
+                ("RATE_LIMIT_READ_RPS", first),
+                ("RATE_LIMIT_WRITE_RPS", first),
+            ]);
+            let second = config_from(&[
+                ("RATE_LIMIT_READ_RPS", second),
+                ("RATE_LIMIT_WRITE_RPS", second),
+            ]);
+            assert_eq!(
+                static_config_fingerprint(&first),
+                static_config_fingerprint(&second)
+            );
+        }
+    }
+
+    #[test]
+    fn fingerprint_covers_rate_limit_generations_and_roles_but_not_order_or_paths() {
+        use crate::connections::local_secret::{LocalSecretKeyConfig, LocalSecretKeyRole};
+        let mut base = Config::test_defaults();
+        base.rate_limit_keyring = vec![
+            LocalSecretKeyConfig {
+                id: "generation-a".into(),
+                file: "replica-a/primary.key".into(),
+                role: LocalSecretKeyRole::Primary,
+            },
+            LocalSecretKeyConfig {
+                id: "generation-b".into(),
+                file: "replica-a/previous.key".into(),
+                role: LocalSecretKeyRole::DecryptOnly,
+            },
+        ];
+        let fingerprint = static_config_fingerprint(&base);
+        let mut reordered = base.clone();
+        reordered.rate_limit_keyring.reverse();
+        for key in &mut reordered.rate_limit_keyring {
+            key.file = format!("replica-b/{}.key", key.id);
+        }
+        assert_eq!(fingerprint, static_config_fingerprint(&reordered));
+
+        let mut renamed = base.clone();
+        renamed.rate_limit_keyring[0].id = "generation-c".into();
+        let mut predecessor_changed = base.clone();
+        predecessor_changed.rate_limit_keyring[1].id = "generation-d".into();
+        let mut promoted = base.clone();
+        promoted.rate_limit_keyring[0].role = LocalSecretKeyRole::DecryptOnly;
+        promoted.rate_limit_keyring[1].role = LocalSecretKeyRole::Primary;
+        let mut removed = base.clone();
+        removed.rate_limit_keyring.pop();
+        let mut added = base.clone();
+        added.rate_limit_keyring.push(LocalSecretKeyConfig {
+            id: "generation-e".into(),
+            file: "extra.key".into(),
+            role: LocalSecretKeyRole::DecryptOnly,
+        });
+        for changed in [renamed, predecessor_changed, promoted, removed, added] {
+            assert_ne!(
+                fingerprint,
+                static_config_fingerprint(&changed),
+                "generation membership and roles must participate in agreement"
+            );
+        }
     }
 
     #[test]

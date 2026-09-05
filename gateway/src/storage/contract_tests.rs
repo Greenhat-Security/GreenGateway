@@ -6850,6 +6850,100 @@ pub(crate) mod postgres_audit_tests {
         assert_eq!(live.sweep_stale(narrow, 10).await.expect("sweep"), 0);
     }
 
+    /// Exercise real rate-limit fingerprints through the shared membership
+    /// store, including a partial primary-key rotation and equivalent mounts.
+    #[tokio::test]
+    async fn rate_limit_configuration_drift_refuses_cluster_agreement() {
+        use crate::config::Config;
+        use crate::connections::local_secret::{LocalSecretKeyConfig, LocalSecretKeyRole};
+        use crate::ha::static_config_fingerprint;
+        let Some(admin_dsn) = locator() else {
+            eprintln!("skipping: no test database locator; CI runs this test");
+            return;
+        };
+        let _guard = DATABASE.lock().await;
+        let database = create_test_database(&admin_dsn).await;
+        let pool = migrated_limits_pool(&database).await;
+        let mut base = Config::test_defaults();
+        base.state_backend = crate::config::StateBackend::Postgres;
+        base.deployment_id = Some(MEMBERS_DEPLOYMENT.into());
+        base.rate_limit_keyring = vec![
+            LocalSecretKeyConfig {
+                id: "generation-a".into(),
+                file: "a.key".into(),
+                role: LocalSecretKeyRole::Primary,
+            },
+            LocalSecretKeyConfig {
+                id: "generation-b".into(),
+                file: "b.key".into(),
+                role: LocalSecretKeyRole::DecryptOnly,
+            },
+        ];
+        let register_config = |config: &Config| {
+            let mut value = registration('a');
+            value.fingerprint = static_config_fingerprint(config).hex();
+            value
+        };
+        let heartbeat = Duration::from_secs(1);
+        let window = Duration::from_secs(30);
+        let first_store = member_store(&pool);
+        let first_id = first_store.instance_id();
+        let first = ClusterMembership::new(first_store, register_config(&base), heartbeat, window);
+        assert_eq!(
+            first.register_boot().await.unwrap(),
+            FingerprintAgreement::Agreed
+        );
+
+        let mut rate_drift = base.clone();
+        rate_drift.rate_limit_read_rps += 0.25;
+        let mut burst_drift = base.clone();
+        burst_drift.rate_limit_write_burst += 1;
+        let mut generation_drift = base.clone();
+        generation_drift.rate_limit_keyring[0].id = "generation-c".into();
+        let mut primary_drift = base.clone();
+        primary_drift.rate_limit_keyring[0].role = LocalSecretKeyRole::DecryptOnly;
+        primary_drift.rate_limit_keyring[1].role = LocalSecretKeyRole::Primary;
+        for changed in [rate_drift, burst_drift, generation_drift, primary_drift] {
+            let candidate_store = member_store(&pool);
+            let candidate = ClusterMembership::new(
+                candidate_store.clone(),
+                register_config(&changed),
+                heartbeat,
+                window,
+            );
+            assert!(
+                matches!(candidate.register_boot().await.unwrap(), FingerprintAgreement::Disagreeing(ids) if ids.contains(&first_id))
+            );
+            assert_eq!(
+                candidate.readiness().blocked_reason(),
+                Some("config_fingerprint_mismatch")
+            );
+            assert_eq!(
+                first.check_fingerprint_agreement().await.unwrap(),
+                FingerprintAgreement::Agreed,
+                "a divergent newcomer must not evict the serving incumbent"
+            );
+            candidate_store.mark_draining().await.unwrap();
+        }
+
+        let mut equivalent = base.clone();
+        equivalent.rate_limit_keyring.reverse();
+        for key in &mut equivalent.rate_limit_keyring {
+            key.file = format!("other-replica/{}.key", key.id);
+        }
+        let same = ClusterMembership::new(
+            member_store(&pool),
+            register_config(&equivalent),
+            heartbeat,
+            window,
+        );
+        assert_eq!(
+            same.register_boot().await.unwrap(),
+            FingerprintAgreement::Agreed
+        );
+        assert_eq!(same.readiness().blocked_reason(), None);
+    }
+
     /// The fingerprint gate: a lone replica agrees with itself; a second
     /// replica with another fingerprint is refused readiness while the
     /// first is live and not draining, and admitted once it drains or

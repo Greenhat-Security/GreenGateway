@@ -1218,6 +1218,8 @@ Default: `1048576` (1 MiB)
 
 Format and validation: must parse as a non-negative byte count that fits in `usize`. Requests with a `Content-Length` larger than this value are rejected early with `413 Payload Too Large`. Native MCP and control-plane handlers also count actual streamed bytes before parsing, so chunked, no-Length, and under-declared bodies cannot bypass the cap. Reverse-proxy and outbound tool payload limits use the separate egress body-size settings documented below.
 
+The static cluster fingerprint includes `RATE_LIMIT_READ_RPS`, `RATE_LIMIT_READ_BURST`, `RATE_LIMIT_WRITE_RPS`, `RATE_LIMIT_WRITE_BURST`, `RATE_LIMIT_MAX_BUCKETS`, `RATE_LIMIT_BUCKET_TTL_MS`, and the `RATE_LIMIT_KEYRING` generation IDs and roles. A joining replica with different values remains unready with `config_fingerprint_mismatch`. Equivalent numeric values (including signed zero), reordered key entries, and different local key-file paths do not cause disagreement. Policy-defined rate overrides continue to use the shared policy revision.
+
 ### RATE_LIMIT_READ_RPS
 
 Global pre-authentication read-lane token refill rate for `GET` and `HEAD` requests, in requests per second. Always enforced, regardless of any policy `rate_limits` override (see above).
@@ -1257,6 +1259,8 @@ Cluster mode's keyring for the shared rate limiter's bucket keys.
 Default: empty
 
 Format and validation: the same JSON array of `{ "id", "file", "role" }` objects as `CONNECTION_LOCAL_SECRET_KEYRING`, with key files beneath `CONNECTION_SECRETS_ROOT` and exactly one `primary`. Required when `STATE_BACKEND=postgres`; rejected when `STATE_BACKEND=sqlite`, where nothing reads it. In cluster mode every request the local buckets allow is also decided at `greengateway.rate_limit_buckets`, so one configured burst permits that many requests across the whole cluster rather than per replica -- except `/health`, `/livez`, `/readyz`, `/startupz`, and `/metrics`, which are decided by the local bucket alone so that a limiter which cannot reach the authority cannot silence the endpoints that report why; the row for a caller is keyed by an HMAC-SHA-256 under the primary key over the deployment ID, the lane, and the caller key (a client IP for the global lanes; the issuer- and method-qualified principal, prefixed by the matched rule's fingerprint, for the policy lane), so neither the address nor the principal reaches the database and a reader of the table or of a backup cannot enumerate the IPv4 space against it. Rotating the primary key retires every bucket at once (their digests change), which grants each caller one fresh burst; the bound on live buckets and the idle sweep reclaim the old rows. See [PostgreSQL deployment](deployment/postgres.md).
+
+Generation IDs must identify immutable key material: assign a new ID whenever the key changes, and use the same ID-to-key mapping on every replica. The fingerprint deliberately includes only generation IDs and roles, never key bytes, secret-derived hashes, or file paths; it cannot detect different material hidden behind a reused ID. Adding/removing a generation or changing which generation is primary changes agreement, even if the other entries are retained as `decrypt_only`. Coordinate the generation set and role changes across the fleet; a partial rotation leaves new replicas unready. The primary-key rotation still grants each caller a fresh burst as described above.
 
 ### RATE_LIMIT_MAX_BUCKETS
 
