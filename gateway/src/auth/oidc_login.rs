@@ -85,9 +85,10 @@ pub struct OidcLoginState {
     pending: Arc<dyn PendingLoginBackend>,
 }
 
-#[derive(Debug)]
 pub struct LoginStart {
     pub authorization_url: String,
+    /// A browser-only secret. Never place this in a URL or log it.
+    pub browser_binding: String,
 }
 
 #[derive(Debug)]
@@ -235,7 +236,10 @@ impl OidcLoginState {
     }
 
     pub async fn begin_login(&self, client_ip: &str) -> Result<LoginStart, OidcLoginError> {
-        let state = Uuid::new_v4().to_string();
+        let mut random = [0u8; 32];
+        getrandom::fill(&mut random).map_err(OidcLoginError::Random)?;
+        let browser_binding = base64url_no_padding(&random);
+        let state = browser_bound_state(&browser_binding);
         let nonce = Uuid::new_v4().to_string();
         let pkce = PkcePair::generate()?;
         let authorization_url = self.authorization_url(&state, &nonce, &pkce.code_challenge)?;
@@ -257,14 +261,44 @@ impl OidcLoginState {
             return Err(OidcLoginError::PendingStoreFull);
         }
 
-        Ok(LoginStart { authorization_url })
+        Ok(LoginStart {
+            authorization_url,
+            browser_binding,
+        })
+    }
+
+    /// The callback and the completion POST must both come from the browser
+    /// holding the secret minted at login start. Only its digest travels to
+    /// the provider; neither a copied callback nor a copied fragment suffices.
+    pub fn browser_binding_matches(state: &str, browser_binding: &str) -> bool {
+        browser_binding.len() == 43
+            && browser_binding
+                .bytes()
+                .all(|c| c.is_ascii_alphanumeric() || c == b'-' || c == b'_')
+            && state == browser_bound_state(browser_binding)
+    }
+
+    pub fn redirect_origin(&self) -> String {
+        Url::parse(&self.cfg.redirect_uri)
+            .map(|url| url.origin().ascii_serialization())
+            .unwrap_or_default()
+    }
+
+    pub fn uses_secure_cookie(&self) -> bool {
+        Url::parse(&self.cfg.redirect_uri).is_ok_and(|url| url.scheme() == "https")
     }
 
     pub async fn exchange_code(
         &self,
         code: &str,
         state: &str,
+        browser_binding: &str,
     ) -> Result<TokenExchange, OidcLoginError> {
+        // Reject before touching the one-use store so a different browser
+        // cannot consume the initiating browser's pending login.
+        if !Self::browser_binding_matches(state, browser_binding) {
+            return Err(OidcLoginError::InvalidState);
+        }
         let Some(pending) = self
             .pending
             .take(state)
@@ -369,6 +403,13 @@ impl OidcLoginState {
 
         Ok(TokenExchange { access_token })
     }
+}
+
+fn browser_bound_state(browser_binding: &str) -> String {
+    let mut digest = Sha256::new();
+    digest.update(b"greengateway.admin-login.browser.v1\0");
+    digest.update(browser_binding.as_bytes());
+    base64url_no_padding(&digest.finalize())
 }
 
 #[derive(Debug)]

@@ -473,7 +473,7 @@ function isBoundedNonEmptyString(
   );
 }
 
-function addCsrfHeader(headers: Headers, method: string | undefined): void {
+export function addCsrfHeader(headers: Headers, method: string | undefined): void {
   const normalizedMethod = (method ?? 'GET').toUpperCase();
   if (SAFE_METHODS.has(normalizedMethod) || bearerAuthorizationPresent(headers)) {
     return;

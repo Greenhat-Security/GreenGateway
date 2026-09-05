@@ -1162,6 +1162,39 @@ pub const ADMIN_API_PREFIX: &str = "/v1/admin";
 pub const ADMIN_LOGIN_PATH: &str = "/v1/admin/auth/login";
 pub const ADMIN_CALLBACK_PATH: &str = "/v1/admin/auth/callback";
 
+/// Preserve the browser's login binding across pinned replica requests.
+pub fn admin_login_cookies(headers: &reqwest::header::HeaderMap) -> String {
+    headers
+        .get_all(reqwest::header::SET_COOKIE)
+        .iter()
+        .map(|value| {
+            value
+                .to_str()
+                .expect("cookie header")
+                .split(';')
+                .next()
+                .expect("cookie pair")
+        })
+        .collect::<Vec<_>>()
+        .join("; ")
+}
+
+pub fn admin_login_completion(
+    cluster: &Cluster,
+    replica: &str,
+    callback: &str,
+    cookies: &str,
+) -> PinnedRequest {
+    let url = url::Url::parse(&format!("{}{}", cluster.balancer.base_url, callback))
+        .expect("callback URL");
+    let query: std::collections::HashMap<String, String> = url.query_pairs().into_owned().collect();
+    cluster
+        .post(replica, ADMIN_CALLBACK_PATH)
+        .header("cookie", cookies)
+        .header("origin", &cluster.balancer.base_url)
+        .json(&serde_json::json!({"code": query["code"], "state": query["state"]}))
+}
+
 /// Apply the schema with the one-shot migration command, as the migration
 /// role. Panics with the command's own output when it fails: a harness
 /// that swallowed this would report every later failure as "the replica

@@ -7,6 +7,7 @@ import {
   within,
 } from '@testing-library/react';
 import { MemoryRouter } from 'react-router-dom';
+import { StrictMode } from 'react';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import { AdminShell } from './App';
@@ -18,6 +19,7 @@ afterEach(() => {
   window.localStorage.removeItem('greengateway_admin_theme');
   window.sessionStorage.removeItem(ADMIN_TOKEN_STORAGE_KEY);
   window.history.replaceState(null, '', '/');
+  document.cookie = 'csrf_token=; Max-Age=0; Path=/';
   delete document.documentElement.dataset.theme;
 });
 
@@ -59,29 +61,84 @@ describe('AdminShell', () => {
     ).toBeTruthy();
   });
 
-  it('stores an OIDC completion fragment token and clears the fragment', async () => {
-    vi.stubGlobal('fetch', versionFetchMock(false));
+  it('exchanges completion once with browser cookies and clears the fragment before fetching', async () => {
+    document.cookie = 'csrf_token=browser-csrf; Path=/';
+    const fallback = versionFetchMock(false);
+    const completionCalls: RequestInit[] = [];
+    vi.stubGlobal('fetch', vi.fn((url: string, options?: RequestInit) => {
+      if (url !== '/v1/admin/auth/callback') return fallback(url);
+      expect(window.location.hash).toBe('');
+      completionCalls.push(options!);
+      return Promise.resolve(new Response(JSON.stringify({
+        access_token: 'oidc-exchanged-token',
+      })));
+    }));
     window.history.replaceState(
       null,
       '',
-      '/admin/#/auth/complete?token=oidc-fragment-token',
+      '/admin/#/auth/complete?code=authorization-code&state=browser-bound-state',
     );
 
     render(
-      <MemoryRouter initialEntries={['/']}>
-        <AdminShell />
-      </MemoryRouter>,
+      <StrictMode>
+        <MemoryRouter initialEntries={['/']}>
+          <AdminShell />
+        </MemoryRouter>
+      </StrictMode>,
     );
 
     await waitFor(() => {
       expect(window.sessionStorage.getItem(ADMIN_TOKEN_STORAGE_KEY)).toBe(
-        'oidc-fragment-token',
+        'oidc-exchanged-token',
       );
     });
     expect(window.location.hash).toBe('');
     expect(
-      screen.getByText('Signed in with SSO for this browser session.'),
+      await screen.findByText('Signed in with SSO for this browser session.'),
     ).toBeTruthy();
+    expect(completionCalls).toHaveLength(1);
+    expect(completionCalls[0]).toMatchObject({
+      method: 'POST',
+      credentials: 'same-origin',
+      cache: 'no-store',
+      redirect: 'error',
+      body: JSON.stringify({
+        code: 'authorization-code', state: 'browser-bound-state',
+      }),
+    });
+    const headers = new Headers(completionCalls[0].headers);
+    expect(headers.get('x-csrf-token')).toBe('browser-csrf');
+    expect(headers.has('authorization')).toBe(false);
+  });
+
+  it.each([
+    'token=unbound-token', 'code=code', 'state=state',
+    'code=code&state=state&token=unbound-token',
+    'code=one&code=two&state=state',
+  ])('rejects incomplete or legacy completion fragments: %s', async (fragment) => {
+    vi.stubGlobal('fetch', versionFetchMock(false));
+    window.sessionStorage.setItem(ADMIN_TOKEN_STORAGE_KEY, 'existing-session');
+    window.history.replaceState(null, '', `/admin/#/auth/complete?${fragment}`);
+    render(<MemoryRouter><AdminShell /></MemoryRouter>);
+    await screen.findByText('SSO sign-in did not complete. Start sign-in again.');
+    expect(window.sessionStorage.getItem(ADMIN_TOKEN_STORAGE_KEY)).toBe('existing-session');
+    expect(window.location.hash).toBe('');
+    expect(vi.mocked(fetch).mock.calls.some(([url]) => url === '/v1/admin/auth/callback')).toBe(false);
+  });
+
+  it.each(['denied', 'network', 'missing-token', 'invalid-json'])('keeps the session unchanged when completion fails: %s', async (failure) => {
+    const fallback = versionFetchMock(false);
+    vi.stubGlobal('fetch', vi.fn((url: string) => {
+      if (url !== '/v1/admin/auth/callback') return fallback(url);
+      if (failure === 'network') return Promise.reject(new Error('offline'));
+      return Promise.resolve(new Response(failure === 'invalid-json' ? 'invalid' : '{}', { status: failure === 'denied' ? 400 : 200 }));
+    }));
+    window.sessionStorage.setItem(ADMIN_TOKEN_STORAGE_KEY, 'existing-session');
+    window.history.replaceState(null, '', '/admin/#/auth/complete?code=code&state=state');
+    render(<MemoryRouter><AdminShell /></MemoryRouter>);
+    await screen.findByText('SSO sign-in did not complete. Start sign-in again.');
+    expect(window.sessionStorage.getItem(ADMIN_TOKEN_STORAGE_KEY)).toBe('existing-session');
+    expect(window.location.hash).toBe('');
   });
 
   it('hides the SSO login link when admin login is not configured', async () => {
