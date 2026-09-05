@@ -214,7 +214,10 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 
 - Bound admin SSO callbacks and completion to the browser that initiated login using a short-lived HttpOnly transaction cookie. The UI now exchanges the authorization code and state in a same-origin, single-use POST; access tokens no longer travel in redirect fragments. PostgreSQL-backed completion remains atomic across replicas. In-flight logins and open admin pages from the previous protocol must be restarted or reloaded after upgrading.
 
-
+- Service-token rotation now requires the same live, identity-qualified scope
+  delegation authority as creation. Rejected rotations emit a delegation-denied
+  audit event and leave the existing credential unchanged. Token administrators
+  can still revoke tokens without holding their scopes.
 - Concurrent first-use JWT validation now re-checks the verified JWKS key cache
   after a coalesced refresh. Valid waiters no longer receive a spurious
   `unknown kid` rejection when the leading request has populated the key; an
