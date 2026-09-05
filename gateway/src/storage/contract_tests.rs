@@ -189,11 +189,136 @@ async fn audit_event_store_contract(store: &dyn AuditEventStore) {
     );
 }
 
+async fn request_observation_contract(store: &dyn AuditEventStore) {
+    use crate::audit::query::RequestObservationFilters;
+    let mut events = (0..1005).map(|index| {
+        let mut event = contract_event(&format!("observation-{index:04}"), "http.request_observed",
+            json!({"method": "GET", "path": "/a_%/items", "status": 200, "routing_context_known": true}));
+        event.timestamp = "2026-01-01T00:00:00Z".to_owned();
+        event
+    }).collect::<Vec<_>>();
+    for (id, event_type, method, path, timestamp) in [
+        (
+            "different-method",
+            "http.request_observed",
+            "POST",
+            "/a_%/items",
+            "2026-01-01T00:00:00Z",
+        ),
+        (
+            "different-case",
+            "http.request_observed",
+            "GET",
+            "/A_%/items",
+            "2026-01-01T00:00:00Z",
+        ),
+        (
+            "literal-prefix",
+            "http.request_observed",
+            "GET",
+            "/abc/items",
+            "2026-01-01T00:00:00Z",
+        ),
+        (
+            "different-type",
+            "audit.other",
+            "GET",
+            "/a_%/items",
+            "2026-01-01T00:00:00Z",
+        ),
+        (
+            "outside-window",
+            "http.request_observed",
+            "GET",
+            "/a_%/items",
+            "2026-01-02T00:00:00Z",
+        ),
+    ] {
+        let mut event = contract_event(id, event_type, json!({"method": method, "path": path}));
+        event.timestamp = timestamp.to_owned();
+        events.push(event);
+    }
+    store
+        .insert_events(&events)
+        .await
+        .expect("observations ingest");
+    let historical = store
+        .query_events(&AuditQueryFilters {
+            from: Some("2026-01-01T00:00:00Z".to_owned()),
+            to: Some("2026-01-01T00:00:00Z".to_owned()),
+            event_type: Some("http.request_observed".to_owned()),
+            path: Some("/abc/items".to_owned()),
+            ..query_filters(None, 100)
+        })
+        .await
+        .expect("historical time bounds bind as text on both backends");
+    assert_eq!(event_ids(&historical), ["literal-prefix"]);
+    let mut filters = RequestObservationFilters {
+        from: Some("2026-01-01T00:00:00Z".to_owned()),
+        to: Some("2026-01-01T00:00:00Z".to_owned()),
+        methods: vec![" get ".to_owned(), "GET".to_owned()],
+        path_exact: None,
+        path_prefix: Some("/a_%/".to_owned()),
+        before_id: None,
+    };
+    let first = store
+        .query_request_observations(&filters)
+        .await
+        .expect("first page");
+    assert_eq!(first.len(), 1000);
+    assert_eq!(first[0].event_id, "observation-1004");
+    assert_eq!(
+        first[0].actor.as_ref().expect("actor").user_id,
+        "user-contract"
+    );
+    assert_eq!(first[0].status, Some(200));
+    assert!(first[0].payload_json.contains("routing_context_known"));
+    filters.before_id = first.last().map(|row| row.id);
+    let last = store
+        .query_request_observations(&filters)
+        .await
+        .expect("last page");
+    assert_eq!(
+        last.iter()
+            .map(|row| row.event_id.as_str())
+            .collect::<Vec<_>>(),
+        [
+            "observation-0004",
+            "observation-0003",
+            "observation-0002",
+            "observation-0001",
+            "observation-0000"
+        ]
+    );
+    filters.before_id = last.last().map(|row| row.id);
+    assert!(store
+        .query_request_observations(&filters)
+        .await
+        .expect("end")
+        .is_empty());
+    filters.before_id = None;
+    filters.methods = vec!["*".to_owned()];
+    filters.path_exact = Some("/abc/items".to_owned());
+    let exact = store
+        .query_request_observations(&filters)
+        .await
+        .expect("exact overrides prefix");
+    assert_eq!(exact.len(), 1);
+    assert_eq!(exact[0].event_id, "literal-prefix");
+    filters.path_exact = None;
+    let wildcard = store
+        .query_request_observations(&filters)
+        .await
+        .expect("wildcard method");
+    assert_eq!(wildcard[0].event_id, "different-method");
+}
+
 #[tokio::test]
 async fn sqlite_audit_event_store_satisfies_the_contract() {
     let db = TempDb::new("audit-contract");
     let store = SqliteAuditEventStore::open(&db.path).expect("audit store should open");
     audit_event_store_contract(&store).await;
+    request_observation_contract(&store).await;
 }
 
 #[tokio::test]
@@ -1094,6 +1219,7 @@ pub(crate) mod postgres_audit_tests {
         let database = create_test_database(&admin_dsn).await;
         let store = migrated_store(&database).await;
         super::audit_event_store_contract(&store).await;
+        super::request_observation_contract(&store).await;
     }
 
     /// The readiness probe's one bounded authority check against a real

@@ -49,6 +49,7 @@ pub struct AuditQueryFilters {
     pub before_id: Option<i64>,
 }
 
+#[derive(Clone)]
 pub struct RequestObservationFilters {
     pub from: Option<String>,
     pub to: Option<String>,
@@ -1080,7 +1081,7 @@ fn build_request_observation_query(filters: &RequestObservationFilters) -> (Stri
     (sql, params)
 }
 
-fn exact_method_filters(methods: &[String]) -> Vec<String> {
+pub(crate) fn exact_method_filters(methods: &[String]) -> Vec<String> {
     if methods.iter().any(|method| method.trim() == "*") {
         return Vec::new();
     }

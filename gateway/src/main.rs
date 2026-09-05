@@ -80,12 +80,14 @@ use lifecycle::{
     serve_gateway, GatewayApp, GatewayApps, GatewayLifecycle, GrpcApp, ShutdownConfig,
 };
 use proxy::{ProxyClassifier, ProxyState};
+#[cfg(all(test, feature = "postgres"))]
+use storage::AuditEventStore as _;
 #[cfg(feature = "postgres")]
 #[cfg(feature = "postgres")]
 use storage::PolicyControlPlane as _;
+use storage::PrincipalDirectoryStore;
 #[cfg(feature = "postgres")]
 use storage::ToolControlPlane;
-use storage::{AuditEventStore as _, PrincipalDirectoryStore};
 
 const REQUEST_COUNTER: &str = "gateway_http_requests";
 const REQUEST_ID_HEADER: &str = "x-request-id";
@@ -453,7 +455,7 @@ impl AdminRoutes {
 
 #[derive(Clone)]
 struct AuditAdminState {
-    query_store: Option<Arc<storage::SqliteAuditEventStore>>,
+    query_store: Option<Arc<dyn storage::AuditEventStore>>,
     event_sender: audit::AuditEventSender,
     rbac_state: Option<middleware::rbac::RbacState>,
     /// The durable PostgreSQL audit store, present only in cluster mode.
@@ -517,6 +519,7 @@ struct PolicyAdminState {
     /// CAS transaction instead of the file, and history is its documents.
     #[cfg(feature = "postgres")]
     control_plane: Option<Arc<dyn storage::PolicyControlPlane>>,
+    event_store: Option<Arc<dyn storage::AuditEventStore>>,
     query_store: Option<Arc<storage::SqliteAuditEventStore>>,
     audit: audit::AuditLog,
     client_ip_policy: client_ip::ClientIpPolicy,
@@ -1653,7 +1656,7 @@ struct GatewayAppBuildOverrides {
     /// builder generates a per-process identity for its self-report --
     /// there is no roster for it to have to agree with.
     ha_identity: Option<ha::InstanceIdentity>,
-    /// The durable PostgreSQL audit store for cluster mode's SSE endpoint;
+    /// The durable PostgreSQL audit store for cluster history, preview and SSE;
     /// None in standalone mode and in tests that exercise the broadcast
     /// path.
     #[cfg(feature = "postgres")]
@@ -3066,6 +3069,15 @@ fn gateway_app_with_process_started_at_and_overrides(
         .map(storage::SqliteAuditEventStore::open)
         .transpose()?
         .map(Arc::new);
+    let audit_event_store: Option<Arc<dyn storage::AuditEventStore>> = audit_query_store
+        .as_ref()
+        .map(|store| store.clone() as Arc<dyn storage::AuditEventStore>);
+    #[cfg(feature = "postgres")]
+    let audit_event_store = build_overrides
+        .pg_audit
+        .as_ref()
+        .map(|store| store.clone() as Arc<dyn storage::AuditEventStore>)
+        .or(audit_event_store);
     let schema_coverage = discovery::openapi::SchemaCoverage::from_config(&config)?;
     let discovery_query_store = config
         .discovery_sqlite_path
@@ -3953,6 +3965,7 @@ fn gateway_app_with_process_started_at_and_overrides(
         history_store: policy_history_store,
         #[cfg(feature = "postgres")]
         control_plane: policy_control_plane,
+        event_store: audit_event_store.clone(),
         query_store: audit_query_store.clone(),
         audit: audit_log.clone(),
         client_ip_policy: client_ip_policy.clone(),
@@ -4057,7 +4070,7 @@ fn gateway_app_with_process_started_at_and_overrides(
         _connections: connection_control_plane,
     };
     let audit_admin_state = AuditAdminState {
-        query_store: audit_query_store,
+        query_store: audit_event_store,
         event_sender: audit_event_sender,
         rbac_state: rbac_state.clone(),
         #[cfg(feature = "postgres")]
@@ -4076,13 +4089,13 @@ fn gateway_app_with_process_started_at_and_overrides(
     };
     let principal_admin_state = PrincipalAdminState {
         directory: principal_directory,
-        audit_query_store: audit_admin_state.query_store.clone(),
+        audit_query_store: audit_query_store.clone(),
         discovery_store: discovery_read_store.clone(),
         rbac_state: rbac_state.clone(),
     };
     let traffic_admin_state = TrafficAdminState {
         discovery_store: discovery_read_store,
-        audit_query_store: audit_admin_state.query_store.clone(),
+        audit_query_store: audit_query_store.clone(),
         rbac_state,
         audit: audit_log,
         client_ip_policy,
@@ -9303,10 +9316,8 @@ async fn policy_rule_preview_endpoint(
     if !rbac_state.principal_has_permission(principal, ADMIN_AUDIT_READ_PERMISSION) {
         return forbidden();
     }
-    let Some(query_store) = state.query_store.as_ref() else {
-        return service_unavailable(
-            "policy rule preview requires AUDIT_SQLITE_PATH to be configured",
-        );
+    let Some(query_store) = state.event_store.as_ref() else {
+        return service_unavailable("policy rule preview requires an audit query store");
     };
 
     let body = match read_request_body(body, state.max_body_size).await {
@@ -9318,23 +9329,13 @@ async fn policy_rule_preview_endpoint(
         Err(errors) => return policy_validation_failed(errors),
     };
 
-    // The preview scans up to 100k audit rows through a synchronous visitor;
-    // it runs on the blocking pool so the scan never sits on the executor.
-    let preview_store = Arc::clone(query_store.sqlite_query_store());
-    let previewed =
-        match tokio::task::spawn_blocking(move || preview_rule(&preview_store, preview_request))
-            .await
-        {
-            Ok(Ok(response)) => response,
-            Ok(Err(err)) => {
-                tracing::error!(error = %err, "failed to preview policy rule");
-                return internal_server_error("policy rule preview failed");
-            }
-            Err(err) => {
-                tracing::error!(error = %err, "policy rule preview task failed");
-                return internal_server_error("policy rule preview failed");
-            }
-        };
+    let previewed = match preview_rule(query_store.as_ref(), preview_request).await {
+        Ok(response) => response,
+        Err(err) => {
+            tracing::error!(error = %err, "failed to preview policy rule");
+            return internal_server_error("policy rule preview failed");
+        }
+    };
 
     (StatusCode::OK, Json(previewed)).into_response()
 }
@@ -13146,10 +13147,10 @@ fn validate_rule_preview_request(request: &PolicyRulePreviewRequest) -> Result<(
     }
 }
 
-fn preview_rule(
-    query_store: &audit::query::AuditQueryStore,
+async fn preview_rule(
+    query_store: &dyn storage::AuditEventStore,
     request: PolicyRulePreviewRequest,
-) -> Result<PolicyRulePreviewResponse, audit::query::AuditQueryError> {
+) -> Result<PolicyRulePreviewResponse, storage::RepositoryError> {
     let matcher = rbac::RuleMatcher::new(std::slice::from_ref(&request.rule));
     let sample_limit = request
         .sample_limit
@@ -13159,16 +13160,21 @@ fn preview_rule(
     let mut scanned_event_count = 0_u64;
     let mut samples = Vec::with_capacity(sample_limit);
 
-    query_store.scan_request_observations(
-        &audit::query::RequestObservationFilters {
-            from: request.from,
-            to: request.to,
-            methods: request.rule.methods.clone(),
-            path_exact: exact_preview_path_filter(&request.rule.path),
-            path_prefix: prefix_preview_path_filter(&request.rule.path),
-            before_id: None,
-        },
-        |observation| {
+    let mut filters = audit::query::RequestObservationFilters {
+        from: request.from,
+        to: request.to,
+        methods: request.rule.methods.clone(),
+        path_exact: exact_preview_path_filter(&request.rule.path),
+        path_prefix: prefix_preview_path_filter(&request.rule.path),
+        before_id: None,
+    };
+    loop {
+        let observations = query_store.query_request_observations(&filters).await?;
+        if observations.is_empty() {
+            break;
+        }
+        for observation in observations {
+            filters.before_id = Some(observation.id);
             scanned_event_count = scanned_event_count.saturating_add(1);
             let principal = observation
                 .actor
@@ -13212,10 +13218,8 @@ fn preview_rule(
                     samples.push(preview_sample(observation));
                 }
             }
-
-            true
-        },
-    )?;
+        }
+    }
 
     Ok(PolicyRulePreviewResponse {
         match_count,
@@ -33752,7 +33756,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn policy_rule_preview_requires_audit_sqlite_path() {
+    async fn policy_rule_preview_requires_audit_store() {
         let policy = TempPolicyFile::new(&policy_document_string("initial-policy", "test:old"));
         let router = policy_admin_router(Some(&policy), test_audit_log());
 
@@ -33779,7 +33783,7 @@ mod tests {
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(
             json_body(response).await,
-            json!({ "error": "policy rule preview requires AUDIT_SQLITE_PATH to be configured" })
+            json!({ "error": "policy rule preview requires an audit query store" })
         );
     }
 
@@ -34075,13 +34079,14 @@ mod tests {
         );
     }
 
-    #[test]
-    fn policy_rule_preview_moderate_scale_completes_under_two_seconds() {
+    #[tokio::test]
+    async fn policy_rule_preview_moderate_scale_completes_under_two_seconds() {
         let db = TempDb::new("rule-preview-performance");
         create_audit_schema(&db.path);
         let event_count = 50_000;
         bulk_insert_preview_events(&db.path, event_count);
-        let store = audit::query::AuditQueryStore::open(&db.path).expect("query store should open");
+        let store =
+            storage::SqliteAuditEventStore::open(&db.path).expect("query store should open");
         let request = PolicyRulePreviewRequest {
             rule: rbac::Rule {
                 id: None,
@@ -34104,7 +34109,9 @@ mod tests {
         };
 
         let started = Instant::now();
-        let response = preview_rule(&store, request).expect("preview should complete");
+        let response = preview_rule(&store, request)
+            .await
+            .expect("preview should complete");
         let elapsed = started.elapsed();
         println!(
             "previewed {event_count} synthetic events in {elapsed:?}; scanned={}, matched={}",
@@ -37405,6 +37412,7 @@ paths:
                     history_store: None,
                     #[cfg(feature = "postgres")]
                     control_plane: None,
+                    event_store: None,
                     query_store: None,
                     audit: test_audit_log(),
                     client_ip_policy: client_ip::ClientIpPolicy::default(),
@@ -46851,6 +46859,7 @@ O2gecI9QwDJNpm29J9wJB2F8
                     rbac_state: Some(rbac_state.clone().with_revision_gate(gate.clone())),
                     history_store: Some(store.clone() as Arc<dyn storage::PolicyHistory>),
                     control_plane: Some(store as Arc<dyn storage::PolicyControlPlane>),
+                    event_store: None,
                     query_store: None,
                     audit: test_audit_log(),
                     client_ip_policy: client_ip::ClientIpPolicy::default(),
@@ -48795,6 +48804,131 @@ O2gecI9QwDJNpm29J9wJB2F8
             }
         }
 
+        #[tokio::test]
+        async fn postgres_app_serves_historical_audit_and_rule_preview_without_sqlite() {
+            let Some(admin_dsn) = locator() else {
+                eprintln!("skipping: no test database locator; CI runs this test");
+                return;
+            };
+            let database = create_test_database(&admin_dsn).await;
+            let pool = migrated_pool(&database.dsn).await;
+            let audit_store = cluster_audit_store(&pool).await;
+            audit_store
+                .insert_events(&[
+                    observed_event(1, "GET", "/orders"),
+                    observed_event(2, "GET", "/orders"),
+                    observed_event(3, "POST", "/other"),
+                ])
+                .await
+                .expect("peer events ingest");
+            let policy = parse_policy_body(&Bytes::from(policy_document_string(
+                "audit-test",
+                "test:old",
+            )))
+            .expect("policy parses");
+            let store = Arc::new(PostgresPolicyStore::new(pool.clone()));
+            let active = store
+                .commit(storage::PolicyCommitRequest {
+                    precondition: storage::PolicyCommitPrecondition::Initialize,
+                    candidate: &policy,
+                    actor_user_id: "installer",
+                    diff_summary: &json!({"action": "seed"}),
+                })
+                .await
+                .expect("policy initializes");
+            let mut config = test_config(Vec::new());
+            config.auth_enabled = false;
+            config.state_backend = config::StateBackend::Postgres;
+            config.deployment_id = Some(DEPLOYMENT_ID.to_owned());
+            config
+                .rbac_exempt_paths
+                .extend([AUDIT_ADMIN_ROUTE.to_owned(), POLICY_ADMIN_ROUTE.to_owned()]);
+            assert!(config.audit_sqlite_path.is_none());
+            assert!(config.policy_file.is_none());
+            let lifecycle = GatewayLifecycle::new();
+            let recorder = PrometheusBuilder::new().build_recorder();
+            let app = gateway_app_with_process_started_at_and_overrides(
+                config,
+                recorder.handle(),
+                test_audit_log(),
+                test_audit_event_sender(),
+                Instant::now(),
+                GatewayAppBuildOverrides {
+                    lifecycle: Some(lifecycle.clone()),
+                    pg_audit: Some(audit_store),
+                    pg_policy: Some(ClusterPolicySeed { store, active }),
+                    disable_proxy_health_checks: true,
+                    ..GatewayAppBuildOverrides::default()
+                },
+            )
+            .expect("cluster app builds");
+            let router = match app.http {
+                GatewayApp::Unified(router) => router,
+                GatewayApp::Split { .. } => panic!("expected unified router"),
+            };
+            let first = router
+                .clone()
+                .oneshot(audit_query_request(
+                    "/v1/admin/audit?path=/orders&from=2020-01-01T00:00:00Z&to=2099-01-01T00:00:00Z&limit=1",
+                    Some(test_principal(&["policy-audit-reader"])),
+                ))
+                .await
+                .expect("history request");
+            assert_eq!(first.status(), StatusCode::OK);
+            let first = json_body(first).await;
+            assert_eq!(event_ids_from_body(&first), ["wiring-000002"]);
+            let cursor = first["next_cursor"].as_i64().expect("cursor");
+            let next = router
+                .clone()
+                .oneshot(audit_query_request(
+                    &format!("/v1/admin/audit?path=/orders&from=2020-01-01T00:00:00Z&to=2099-01-01T00:00:00Z&limit=1&before_id={cursor}"),
+                    Some(test_principal(&["policy-audit-reader"])),
+                ))
+                .await
+                .expect("next history request");
+            assert_eq!(
+                event_ids_from_body(&json_body(next).await),
+                ["wiring-000001"]
+            );
+            let preview_body = json!({"rule": {"methods": ["GET"], "path": "/orders",
+                "principal": {"roles": ["reader"]}, "action": "deny"}, "sample_limit": 1})
+            .to_string();
+            for (roles, expected) in [
+                (vec!["policy-audit-reader"], StatusCode::OK),
+                (vec!["policy-reader"], StatusCode::FORBIDDEN),
+            ] {
+                let response = router
+                    .clone()
+                    .oneshot(policy_admin_request(
+                        Method::POST,
+                        POLICY_RULE_PREVIEW_ADMIN_ROUTE,
+                        Some(test_principal(&roles)),
+                        Some(preview_body.clone()),
+                        None,
+                    ))
+                    .await
+                    .expect("preview request");
+                assert_eq!(response.status(), expected);
+                if expected == StatusCode::OK {
+                    let body = json_body(response).await;
+                    assert_eq!(body["match_count"], 2);
+                    assert_eq!(body["scanned_event_count"], 2);
+                    assert_eq!(body["samples"][0]["event_id"], "wiring-000002");
+                    assert_eq!(body["samples"].as_array().expect("samples").len(), 1);
+                }
+            }
+            let denied = router
+                .oneshot(audit_query_request(
+                    "/v1/admin/audit",
+                    Some(test_principal(&["policy-reader"])),
+                ))
+                .await
+                .expect("denied history");
+            assert_eq!(denied.status(), StatusCode::FORBIDDEN);
+            lifecycle.background_cancellation().cancel();
+            lifecycle.shutdown_background_tasks().await;
+        }
+
         /// The builder, handed the discovery seed, runs the projector as a
         /// registered background task and answers discovery reads from the
         /// projected tables: events ingested before boot and after it both
@@ -49045,6 +49179,7 @@ O2gecI9QwDJNpm29J9wJB2F8
                             control_plane: Some(
                                 policy_store.clone() as Arc<dyn storage::PolicyControlPlane>
                             ),
+                            event_store: None,
                             query_store: None,
                             audit: audit_log,
                             client_ip_policy: client_ip::ClientIpPolicy::default(),

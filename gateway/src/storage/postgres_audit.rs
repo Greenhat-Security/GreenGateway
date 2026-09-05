@@ -34,8 +34,9 @@ use sha2::{Digest, Sha256};
 
 use crate::audit::{
     query::{
-        AuditQueryFilters, AuditQueryPage, RequestObservation, RoleEndpointMatrixAccumulator,
-        RoleEndpointObservationFilters, RoleEndpointObservationMatrix,
+        AuditQueryFilters, AuditQueryPage, RequestObservation, RequestObservationFilters,
+        RoleEndpointMatrixAccumulator, RoleEndpointObservationFilters,
+        RoleEndpointObservationMatrix,
     },
     Actor, AuditEvent,
 };
@@ -538,6 +539,52 @@ WHERE id = ANY(ARRAY(
 
 #[async_trait]
 impl AuditEventStore for PostgresAuditEventStore {
+    async fn query_request_observations(
+        &self,
+        filters: &RequestObservationFilters,
+    ) -> Result<Vec<RequestObservation>, RepositoryError> {
+        const OPERATION: &str = "audit_request_observations";
+        let client = self.pool.get().await.map_err(classify_pool_error)?;
+        let methods = crate::audit::query::exact_method_filters(&filters.methods);
+        let limit = super::audit::OBSERVATION_PAGE_SIZE as i64;
+        // Prefix comparison is literal and case-sensitive, including '%' and
+        // '_'. Exact paths take precedence, as in the SQLite adapter.
+        let rows = client
+            .query(
+                r#"
+            SELECT id, event_id,
+                to_char(occurred_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"'),
+                request_id, source_ip, user_agent, actor_json::text,
+                payload_method, payload_path, payload_status,
+                payload_matched_rule_id, payload_json::text
+            FROM greengateway.audit_events
+            WHERE event_type = 'http.request_observed'
+                AND payload_method IS NOT NULL AND payload_path IS NOT NULL
+                AND ($1::text IS NULL OR occurred_at >= $1::text::timestamptz)
+                AND ($2::text IS NULL OR occurred_at <= $2::text::timestamptz)
+                AND ($3::bigint IS NULL OR id < $3)
+                AND (cardinality($4::text[]) = 0 OR payload_method = ANY($4))
+                AND CASE WHEN $5::text IS NOT NULL THEN payload_path = $5
+                    ELSE $6::text IS NULL OR starts_with(payload_path, $6) END
+            ORDER BY id DESC LIMIT $7
+        "#,
+                &[
+                    &filters.from,
+                    &filters.to,
+                    &filters.before_id,
+                    &methods,
+                    &filters.path_exact,
+                    &filters.path_prefix,
+                    &limit,
+                ],
+            )
+            .await
+            .map_err(|error| classify_query(error, OPERATION))?;
+        rows.iter()
+            .map(|row| request_observation_from_row(row, OPERATION))
+            .collect()
+    }
+
     async fn insert_events(&self, events: &[AuditEvent]) -> Result<(), RepositoryError> {
         if events.is_empty() {
             return Ok(());
@@ -713,11 +760,17 @@ impl AuditEventStore for PostgresAuditEventStore {
 
         if let Some(from) = filters.from.as_deref() {
             params.push(Box::new(from.to_owned()));
-            clauses.push(format!("occurred_at >= ${}::timestamptz", params.len()));
+            clauses.push(format!(
+                "occurred_at >= ${}::text::timestamptz",
+                params.len()
+            ));
         }
         if let Some(to) = filters.to.as_deref() {
             params.push(Box::new(to.to_owned()));
-            clauses.push(format!("occurred_at <= ${}::timestamptz", params.len()));
+            clauses.push(format!(
+                "occurred_at <= ${}::text::timestamptz",
+                params.len()
+            ));
         }
         if let Some(event_type) = filters.event_type.as_deref() {
             params.push(Box::new(event_type.to_owned()));
