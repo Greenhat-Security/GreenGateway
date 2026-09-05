@@ -575,12 +575,33 @@ struct ToolAdminState {
 #[derive(Clone)]
 struct AdminAuthState {
     login: auth::OidcLoginState,
+    audit: audit::AuditLog,
     admin_prefix: String,
     cookie_max_age: u64,
     client_ip_policy: client_ip::ClientIpPolicy,
 }
 
 impl AdminAuthState {
+    fn record(
+        &self,
+        parts: &http::request::Parts,
+        phase: &'static str,
+        outcome: &'static str,
+        reason: &'static str,
+    ) {
+        self.audit.emit(audit::AuditEvent::new(
+            "admin_login.transaction",
+            client_ip::request_id(&parts.headers, &parts.extensions),
+            client_ip::canonical_client_ip(
+                &parts.headers,
+                &parts.extensions,
+                &self.client_ip_policy,
+            ),
+            None,
+            json!({"phase": phase, "outcome": outcome, "reason": reason}),
+        ));
+    }
+
     fn cookie_name(&self) -> String {
         let prefix = if self.login.uses_secure_cookie() {
             "__Host-"
@@ -3476,6 +3497,7 @@ fn gateway_app_with_process_started_at_and_overrides(
         .or(pending_login_backend);
     let admin_auth_state = admin_auth_state_from_config(
         &config,
+        audit_log.clone(),
         &discovered_oidc,
         Arc::clone(&egress_client),
         pending_login_backend,
@@ -4368,6 +4390,7 @@ fn auth_validator_from_config(
 
 fn admin_auth_state_from_config(
     config: &config::Config,
+    audit: audit::AuditLog,
     discovered_oidc: &DiscoveredOidcConfig,
     egress_client: Arc<egress::EgressClient>,
     pending_login_backend: Option<Arc<dyn auth::oidc_login::PendingLoginBackend>>,
@@ -4438,6 +4461,7 @@ fn admin_auth_state_from_config(
 
     Ok(Some(AdminAuthState {
         login,
+        audit,
         admin_prefix: config.admin_prefix.clone(),
         cookie_max_age: config.admin_login_pending_ttl_secs,
         client_ip_policy: client_ip::ClientIpPolicy::from_config(config),
@@ -5617,23 +5641,24 @@ async fn admin_auth_login_endpoint(
     request: AxumRequest,
 ) -> Response {
     record_request(ADMIN_AUTH_LOGIN_ROUTE);
-    let source_ip = client_ip::canonical_client_ip(
-        request.headers(),
-        request.extensions(),
-        &state.client_ip_policy,
-    );
+    let (parts, _) = request.into_parts();
+    let source_ip =
+        client_ip::canonical_client_ip(&parts.headers, &parts.extensions, &state.client_ip_policy);
 
     match state.login.begin_login(&source_ip).await {
         Ok(start) => {
+            state.record(&parts, "start", "accepted", "transaction_created");
             let mut response = found_redirect(start.authorization_url);
             state.set_browser_cookie(&mut response, &start.browser_binding, state.cookie_max_age);
             response
         }
         Err(err) if err.is_store_unavailable() => {
+            state.record(&parts, "start", "unavailable", "store_unavailable");
             tracing::error!(error = %err, "admin OIDC login state store is unavailable");
             service_unavailable("login state store is unavailable")
         }
         Err(err) => {
+            state.record(&parts, "start", "denied", "login_start_failed");
             tracing::warn!(error = %err, "failed to start admin OIDC login");
             found_redirect(admin_auth_error_url(
                 &state.admin_prefix,
@@ -5646,11 +5671,12 @@ async fn admin_auth_login_endpoint(
 async fn admin_auth_callback_endpoint(
     State(state): State<AdminAuthState>,
     Query(params): Query<AdminAuthCallbackParams>,
-    headers: HeaderMap,
+    parts: http::request::Parts,
 ) -> Response {
     record_request(ADMIN_AUTH_CALLBACK_ROUTE);
 
     if params.error.is_some() {
+        state.record(&parts, "callback", "denied", "provider_error");
         return found_redirect(admin_auth_error_url(&state.admin_prefix, "provider_error"));
     }
 
@@ -5660,6 +5686,7 @@ async fn admin_auth_callback_endpoint(
         .map(str::trim)
         .filter(|code| !code.is_empty())
     else {
+        state.record(&parts, "callback", "denied", "missing_code");
         return found_redirect(admin_auth_error_url(&state.admin_prefix, "missing_code"));
     };
     let Some(oauth_state) = params
@@ -5668,11 +5695,13 @@ async fn admin_auth_callback_endpoint(
         .map(str::trim)
         .filter(|state| !state.is_empty())
     else {
+        state.record(&parts, "callback", "denied", "invalid_state");
         return found_redirect(admin_auth_error_url(&state.admin_prefix, "invalid_state"));
     };
 
-    let binding = state.browser_binding(&headers).unwrap_or_default();
+    let binding = state.browser_binding(&parts.headers).unwrap_or_default();
     if !auth::OidcLoginState::browser_binding_matches(oauth_state, &binding) {
+        state.record(&parts, "callback", "denied", "browser_binding_mismatch");
         tracing::warn!(
             reason = "browser_binding_mismatch",
             "admin OIDC callback rejected"
@@ -5683,6 +5712,7 @@ async fn admin_auth_callback_endpoint(
     // The fragment contains only a PKCE-protected authorization code and
     // state. The browser must POST them with its HttpOnly binding cookie;
     // only that exchange consumes the pending login and returns a token.
+    state.record(&parts, "callback", "accepted", "browser_bound");
     found_redirect(admin_auth_complete_url(
         &state.admin_prefix,
         code,
@@ -5692,17 +5722,19 @@ async fn admin_auth_callback_endpoint(
 
 async fn admin_auth_completion_endpoint(
     State(state): State<AdminAuthState>,
-    headers: HeaderMap,
+    parts: http::request::Parts,
     Json(params): Json<AdminAuthCompletionParams>,
 ) -> Response {
     record_request(ADMIN_AUTH_CALLBACK_ROUTE);
     let origin = state.login.redirect_origin();
     if origin.is_empty()
-        || headers
+        || parts
+            .headers
             .get(header::ORIGIN)
             .and_then(|value| value.to_str().ok())
             != Some(origin.as_str())
     {
+        state.record(&parts, "completion", "denied", "origin_mismatch");
         tracing::warn!(reason = "origin_mismatch", "admin OIDC completion rejected");
         return (
             StatusCode::FORBIDDEN,
@@ -5710,11 +5742,12 @@ async fn admin_auth_completion_endpoint(
         )
             .into_response();
     }
-    let binding = state.browser_binding(&headers).unwrap_or_default();
+    let binding = state.browser_binding(&parts.headers).unwrap_or_default();
     if params.code.trim().is_empty()
         || params.code.len() > 8192
         || !auth::OidcLoginState::browser_binding_matches(&params.state, &binding)
     {
+        state.record(&parts, "completion", "denied", "browser_binding_mismatch");
         tracing::warn!(
             reason = "browser_binding_mismatch",
             "admin OIDC completion rejected"
@@ -5732,6 +5765,7 @@ async fn admin_auth_completion_endpoint(
         .await
     {
         Ok(exchange) => {
+            state.record(&parts, "completion", "accepted", "token_exchanged");
             tracing::info!(outcome = "success", "admin OIDC completion exchanged");
             Json(json!({"access_token": exchange.access_token})).into_response()
         }
@@ -5739,10 +5773,12 @@ async fn admin_auth_completion_endpoint(
         // never "unknown state" -- "cannot check" is not "checked and
         // denied", and no code is exchanged at the IdP.
         Err(err) if err.is_store_unavailable() => {
+            state.record(&parts, "completion", "unavailable", "store_unavailable");
             tracing::error!(error = %err, "admin OIDC login state store is unavailable");
             return service_unavailable("login state store is unavailable");
         }
         Err(err) if err.is_invalid_state() => {
+            state.record(&parts, "completion", "denied", "invalid_state");
             tracing::warn!("admin OIDC callback rejected unknown or expired state");
             (
                 StatusCode::BAD_REQUEST,
@@ -5751,6 +5787,7 @@ async fn admin_auth_completion_endpoint(
                 .into_response()
         }
         Err(err) => {
+            state.record(&parts, "completion", "denied", "token_exchange_failed");
             tracing::warn!(error = %err, "admin OIDC token exchange failed");
             (
                 StatusCode::BAD_REQUEST,
@@ -39517,7 +39554,18 @@ paths:
         let mut config = admin_oidc_login_config(&oidc.issuer);
         config.auth_providers[0].jwks_url =
             Some(format!("http://127.0.0.1:{}/jwks.json", jwks_addr.port()));
-        let router = admin_oidc_login_router_from_config(config);
+        config.egress_deny_private_ips = false;
+        let capture = audit::sink::tests::CaptureSink::new();
+        let audit_log =
+            audit::AuditLog::new(Arc::new(capture.clone()) as Arc<dyn audit::AuditSink>);
+        let recorder = PrometheusBuilder::new().build_recorder();
+        let router = app(
+            config,
+            recorder.handle(),
+            audit_log,
+            test_audit_event_sender(),
+        )
+        .unwrap();
         let login = router
             .clone()
             .oneshot(admin_oidc_login_request(Ipv4Addr::LOCALHOST, None))
@@ -39608,6 +39656,51 @@ paths:
         }
         assert_eq!(successes, 1);
         assert_eq!(token_endpoint.requests().len(), 1);
+        assert_eventually(Duration::from_secs(1), || {
+            capture
+                .events()
+                .iter()
+                .filter(|event| event.event_type == "admin_login.transaction")
+                .count()
+                == 13
+        });
+        let events: Vec<_> = capture
+            .events()
+            .into_iter()
+            .filter(|event| event.event_type == "admin_login.transaction")
+            .collect();
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event.payload["reason"] == "token_exchanged")
+                .count(),
+            1
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event.payload["reason"] == "browser_binding_mismatch")
+                .count(),
+            6
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event.payload["reason"] == "origin_mismatch")
+                .count(),
+            3
+        );
+        let serialized = serde_json::to_string(&events).unwrap();
+        assert!(!serialized.contains(&access_token));
+        assert!(!serialized.contains(state));
+        assert!(!serialized.contains("admin-code"));
+        for pair in cookies.split(';') {
+            if let Some((name, value)) = pair.trim().split_once('=') {
+                if name.contains("ggw-admin-login-") {
+                    assert!(!serialized.contains(value));
+                }
+            }
+        }
         oidc.finish();
         token_endpoint.abort();
     }
