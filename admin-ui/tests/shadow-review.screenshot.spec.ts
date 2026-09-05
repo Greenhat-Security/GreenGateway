@@ -26,6 +26,7 @@ test('captures the shadow review queue', async ({ page }) => {
       status: 200,
       contentType: 'application/json',
       headers: {
+        'X-GreenGateway-Policy-Write': 'true',
         ETag: '"screenshot-shadow-policy"',
       },
       body: JSON.stringify({
