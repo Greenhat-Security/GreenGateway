@@ -12,7 +12,8 @@ use async_trait::async_trait;
 use crate::audit::{
     query::{
         AuditQueryError, AuditQueryFilters, AuditQueryPage, AuditQueryStore, EndpointAuditActivity,
-        EndpointAuditFilters, ShadowRuleWouldDenySummarySet,
+        EndpointAuditFilters, RequestObservation, RequestObservationFilters,
+        ShadowRuleWouldDenySummarySet,
     },
     sqlite_sink, AuditEvent,
 };
@@ -46,7 +47,17 @@ pub trait AuditEventStore: Send + Sync {
         &self,
         filters: &AuditQueryFilters,
     ) -> Result<AuditQueryPage, RepositoryError>;
+
+    /// Read at most 1,000 request observations, newest first. Continue with
+    /// the last observation's id in `before_id`; an empty page ends the scan.
+    /// Payloads stay bounded in memory even for large preview windows.
+    async fn query_request_observations(
+        &self,
+        filters: &RequestObservationFilters,
+    ) -> Result<Vec<RequestObservation>, RepositoryError>;
 }
+
+pub(crate) const OBSERVATION_PAGE_SIZE: usize = 1_000;
 
 /// Standalone SQLite adapter for the audit event store.
 ///
@@ -176,6 +187,25 @@ impl SqliteAuditEventStore {
 
 #[async_trait]
 impl AuditEventStore for SqliteAuditEventStore {
+    async fn query_request_observations(
+        &self,
+        filters: &RequestObservationFilters,
+    ) -> Result<Vec<RequestObservation>, RepositoryError> {
+        let query = Arc::clone(&self.query);
+        let filters = filters.clone();
+        run_blocking(move || {
+            let mut observations = Vec::new();
+            query
+                .scan_request_observations(&filters, |observation| {
+                    observations.push(observation);
+                    observations.len() < OBSERVATION_PAGE_SIZE
+                })
+                .map_err(|error| map_audit_query_error("audit_request_observations", error))?;
+            Ok(observations)
+        })
+        .await
+    }
+
     async fn insert_events(&self, events: &[AuditEvent]) -> Result<(), RepositoryError> {
         let write = Arc::clone(&self.write);
         let events = events.to_vec();

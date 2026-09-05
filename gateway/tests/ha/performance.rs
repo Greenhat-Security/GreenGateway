@@ -1205,17 +1205,11 @@ async fn measure_protected_requests(base_url: &str, token: &str, count: usize) -
 /// operator would actually use — an event type, a time window, a status —
 /// and the keyset `ORDER BY id DESC LIMIT n` the store always applies.
 ///
-/// Second, a note on the two ends of this query. The admin audit route is
-/// backed by `storage::SqliteAuditEventStore` and answers `503 audit query
-/// store not configured` when the deployment is PostgreSQL-backed, so there
-/// is still no HTTP surface that reaches this statement. The rows it reads
-/// ARE now written by serving replicas — issue #11's PostgreSQL audit sink,
-/// exercised by [`the_audit_enqueue_stays_off_the_request_path`] — but a
-/// million of them produced by traffic would be the night's whole budget,
-/// so the rows here are a fixture loaded in one statement, and the number
-/// this row publishes says what the query *would* cost an operator who
-/// could run it. The missing route belongs in the deployment guide, and it
-/// is why this measurement is a statement rather than a request.
+/// The admin audit route now reaches this store in cluster mode. This
+/// benchmark still measures the statement directly: loading a million
+/// synthetic rows in one statement isolates database query cost from
+/// ingestion and HTTP overhead. Handler wiring is covered separately by
+/// the PostgreSQL app integration test.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "nightly benchmark; run by the nightly-performance workflow"]
 async fn the_audit_filtered_query_answers_a_million_rows_within_its_budget() {
