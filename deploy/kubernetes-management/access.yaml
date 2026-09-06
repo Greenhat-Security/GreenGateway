@@ -1,0 +1,33 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: greengateway-management
+spec:
+  type: ClusterIP
+  selector:
+    app: greengateway
+  ports:
+    - name: admin
+      port: 9090
+      targetPort: admin
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: greengateway-management
+spec:
+  podSelector:
+    matchLabels:
+      app: greengateway
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              greengateway-management: "true"
+          podSelector:
+            matchLabels:
+              greengateway-admin-client: "true"
+      ports:
+        - protocol: TCP
+          port: 9090

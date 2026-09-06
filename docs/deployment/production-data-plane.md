@@ -216,6 +216,7 @@ smoke sequence verifies:
 Run the same sequence manually:
 
 ```sh
+node scripts/init-dev-jwks.mjs
 docker compose -f docker-compose.yml -f docker-compose.dev.yml up -d --build
 node scripts/generate-traffic.mjs --smoke-test
 node scripts/verify-dev-pool.mjs healthy
@@ -241,6 +242,7 @@ rate-limit ceiling so the proxy transportâ€”not the intentional default limiterâ
 is measured:
 
 ```sh
+node scripts/init-dev-jwks.mjs
 docker compose -f docker-compose.yml -f docker-compose.dev.yml -f docker-compose.load.yml up -d --build
 npm run load:quick
 npm run load:soak

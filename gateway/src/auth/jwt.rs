@@ -5,6 +5,7 @@ use std::{
     time::{Duration, Instant},
 };
 
+use base64::Engine as _;
 use http::Method;
 
 use crate::lifecycle::GatewayLifecycle;
@@ -722,6 +723,23 @@ fn normalize_auth_config_issuer(issuer: Option<&str>) -> Option<String> {
     issuer.map(|issuer| oidc::normalize_issuer(issuer).unwrap_or_else(|| issuer.to_owned()))
 }
 
+// Public modulus of the retired, publicly disclosed development signing key.
+const RETIRED_DEV_RSA_MODULUS: &str = "nZz3xMSjSyuvBiVU_kM7Bs_xpDc2gLgguzFbLwW2iN2Lhs_pCB6r5-Xi5xyMlbZARlq-uUfm6O7RvYhhjIdHS6BjcsfSDwTZi3FzB1JYs0jP2y0sbmwf9VS1mYD65GyPuMArMY930-htQTXTil-RUkvZzodETTXcJ-W_0HQmjJ7euE-X_BVyN4IjuACFQgFBPKO8OWx_9V3V3e0nzWtUTYX4zErCuyrqslhgDRQNFTS7oL5AT3cY3fkQJNbbtrPR30rC2_fI9yHFpfc3Hi8GBLnogdNrGJYX58ibn4uZiQQ6jcIG-glY_1v6pNI1TDuArQeMc1cEXomzk_cWjp0u5Q";
+
+fn is_retired_dev_key(modulus: &str) -> bool {
+    let decoder = base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    match (
+        decoder.decode(modulus.trim_end_matches('=')),
+        decoder.decode(RETIRED_DEV_RSA_MODULUS),
+    ) {
+        (Ok(candidate), Ok(retired)) => candidate
+            .iter()
+            .skip_while(|byte| **byte == 0)
+            .eq(retired.iter()),
+        _ => false,
+    }
+}
+
 fn cached_decoding_key(key: JwksKey) -> Option<CachedDecodingKey> {
     let JwksKey {
         kid,
@@ -738,6 +756,10 @@ fn cached_decoding_key(key: JwksKey) -> Option<CachedDecodingKey> {
             let (Some(kid), Some(n), Some(e)) = (kid, n, e) else {
                 return None;
             };
+            if is_retired_dev_key(&n) {
+                tracing::warn!("refusing retired public development JWT key");
+                return None;
+            }
             DecodingKey::from_rsa_components(&n, &e)
                 .ok()
                 .map(|decoding_key| CachedDecodingKey {
@@ -776,6 +798,19 @@ fn cached_decoding_key(key: JwksKey) -> Option<CachedDecodingKey> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn retired_development_key_is_never_trusted_even_with_a_new_id() {
+        for modulus in [
+            super::RETIRED_DEV_RSA_MODULUS.to_owned(),
+            format!("{}==", super::RETIRED_DEV_RSA_MODULUS),
+        ] {
+            let key = serde_json::from_value(serde_json::json!({
+                "kty": "RSA", "kid": "renamed", "n": modulus, "e": "AQAB"
+            }))
+            .expect("valid public JWK fixture");
+            assert!(super::cached_decoding_key(key).is_none());
+        }
+    }
     use std::{
         collections::{HashMap, HashSet},
         io::ErrorKind,

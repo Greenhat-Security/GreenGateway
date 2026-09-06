@@ -26,6 +26,7 @@ const devSigningKeyPath = path.join(
   repoRoot,
   "dev",
   "jwks",
+  "generated",
   "dev-signing-key.pem",
 );
 

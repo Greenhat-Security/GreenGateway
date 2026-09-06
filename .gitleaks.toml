@@ -4,9 +4,8 @@ useDefault = true
 # Ignore only the known test-only RSA key used to sign JWTs in
 # gateway/src/auth/jwt.rs tests. All default gitleaks detection remains enabled.
 #
-# Also ignore only the known dev-only RSA signing key fixture used by the
-# compose dev profile. This is intentionally checked in under dev/jwks for
-# local token minting; the allowlist stays content-specific, not path-based.
+# Retain the content-specific exception for the retired development key in
+# Git history. Current development keys are generated locally and ignored.
 #
 # Also ignore the `Sec-WebSocket-Key` value from RFC 6455 section 1.3, used
 # verbatim in the WebSocket acceptance tests. It is the example nonce printed in

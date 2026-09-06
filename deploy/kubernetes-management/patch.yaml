@@ -1,0 +1,16 @@
+# Strategic merge patch, applied only by this opt-in Kustomize overlay.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: greengateway
+spec:
+  template:
+    spec:
+      containers:
+        - name: gateway
+          env:
+            - name: ADMIN_LISTEN_ADDR
+              value: "0.0.0.0:9090"
+          ports:
+            - name: admin
+              containerPort: 9090
