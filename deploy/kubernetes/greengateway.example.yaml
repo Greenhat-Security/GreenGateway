@@ -27,11 +27,14 @@ spec:
         app: greengateway
     spec:
       automountServiceAccountToken: false
+      nodeSelector:
+        kubernetes.io/os: linux
+        kubernetes.io/arch: amd64
       terminationGracePeriodSeconds: 45
       containers:
         - name: gateway
-          # Reviewed image snapshot; update the digest after promoting a tested release.
-          image: ghcr.io/greenhat-security/greengateway:latest@sha256:2edd822f58a75d769f083428c8b08759233386eab457039f607300b9c194e4d7
+          # Promoted audit fixes; revision and digest verified by the release checks.
+          image: ghcr.io/greenhat-security/greengateway:878e6c904da65683ca72d312a529ad79984a6978@sha256:db1f8d0d344e9f552a32037301f076b9c5b6934d9db66c0b62024bd7bc355838
           imagePullPolicy: IfNotPresent
           env:
             - name: ADMIN_LISTEN_ADDR

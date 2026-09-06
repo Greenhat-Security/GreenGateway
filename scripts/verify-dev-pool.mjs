@@ -212,8 +212,29 @@ async function sendPoolRequests({
   requestPath,
   count = REQUESTS_PER_CHECK,
 }) {
+  let writeIntervalMs = 0;
+  if (method === "POST") {
+    const write = (await adminStatus(baseUrl, token)).rate_limits?.write;
+    assert(
+      Number.isFinite(write?.requests_per_second) &&
+        write.requests_per_second > 0 &&
+        Number.isSafeInteger(write?.burst) &&
+        write.burst > 0,
+      "pool smoke requires a replenishing write bucket with positive capacity",
+    );
+    writeIntervalMs = Math.ceil(1000 / write.requests_per_second) + 25;
+    assert(
+      writeIntervalMs * count <= WAIT_TIMEOUT_MS,
+      "configured write rate is too low for the bounded pool smoke check",
+    );
+  }
   const results = [];
   for (let index = 0; index < count; index += 1) {
+    // Pool routing assertions must not depend on upstream latency giving an
+    // earlier POST batch time to refill. Keep the gateway's limits in force.
+    if (writeIntervalMs > 0) {
+      await sleep(writeIntervalMs);
+    }
     const requestId = `${runId}-${method.toLowerCase()}-${index}`;
     const effectiveRequestPath =
       requestPath === "/__dev-echo/retry-probe"
@@ -452,19 +473,10 @@ async function verifyHealthy(baseUrl, token, runId) {
     "POST retry probe returned an unexpected status",
   );
 
-  const observations = await waitForObservations(
-    baseUrl,
-    token,
-    fromTimestamp,
-    runId,
-    getResults.length + postResults.length,
-  );
-  const getObservations = observations.filter((event) =>
-    event.request_id.startsWith(getRunId),
-  );
-  const postObservations = observations.filter((event) =>
-    event.request_id.startsWith(postRunId),
-  );
+  const [getObservations, postObservations] = await Promise.all([
+    waitForObservations(baseUrl, token, fromTimestamp, getRunId, getResults.length),
+    waitForObservations(baseUrl, token, fromTimestamp, postRunId, postResults.length),
+  ]);
   assert(
     getObservations.some(
       (event) =>
