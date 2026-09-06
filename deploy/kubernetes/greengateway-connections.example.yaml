@@ -53,7 +53,7 @@ spec:
       terminationGracePeriodSeconds: 45
       initContainers:
         - name: prepare-connections-storage
-          image: busybox:1.37.0
+          image: busybox:1.37.0@sha256:9db7b59979c38555a39def84a31fb98b5296952f9e3afd4f6f11f05b07adfab0
           command:
             - /bin/sh
             - -eu
@@ -84,8 +84,8 @@ spec:
               mountPath: /protected
       containers:
         - name: gateway
-          # Replace latest with an immutable release digest before production.
-          image: ghcr.io/greenhat-security/greengateway:latest
+          # Reviewed image snapshot; update the digest after promoting a tested release.
+          image: ghcr.io/greenhat-security/greengateway:latest@sha256:2edd822f58a75d769f083428c8b08759233386eab457039f607300b9c194e4d7
           imagePullPolicy: IfNotPresent
           envFrom:
             - configMapRef:

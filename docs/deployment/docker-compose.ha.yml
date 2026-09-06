@@ -235,7 +235,7 @@ services:
   # container is not itself HA.
   # ==========================================================================
   db:
-    image: postgres:16
+    image: postgres:16@sha256:f1c3376c26f2609ab9f29f71f824103fe2fcd8ee0346485cb6122a4f93df6f94
     command:
       - postgres
       - -c
@@ -285,7 +285,7 @@ services:
   db-bootstrap:
     profiles:
       - bootstrap
-    image: postgres:16
+    image: postgres:16@sha256:f1c3376c26f2609ab9f29f71f824103fe2fcd8ee0346485cb6122a4f93df6f94
     depends_on:
       db:
         condition: service_healthy
@@ -318,7 +318,7 @@ services:
   db-grants:
     profiles:
       - bootstrap
-    image: postgres:16
+    image: postgres:16@sha256:f1c3376c26f2609ab9f29f71f824103fe2fcd8ee0346485cb6122a4f93df6f94
     depends_on:
       db:
         condition: service_healthy
@@ -439,7 +439,7 @@ services:
     <<: *gateway-service
 
   lb:
-    image: nginx:1.27-alpine
+    image: nginx:1.27-alpine@sha256:65645c7bb6a0661892a8b03b89d0743208a18dd2f3f17a54ef4b76fb8e2f2a10
     configs:
       - source: nginx-conf
         target: /etc/nginx/nginx.conf
