@@ -400,6 +400,10 @@ jobs:
             smoke_status=$?
           fi
           if [ "$smoke_status" -eq 0 ]; then
+            # The healthy-pool check deliberately sends a POST burst. Refill
+            # the default write bucket (20 tokens, 10/s) before independently
+            # asserting successful streaming; keep rate limiting enabled.
+            sleep 3
             node scripts/proxy-load.mjs \
               --path /__dev-stream \
               --method POST \
