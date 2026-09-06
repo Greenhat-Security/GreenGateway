@@ -46,6 +46,8 @@ these local checks on 2026-09-06:
 - The documented Compose rehearsal passed verified database TLS, clean
   bootstrap, separate migration/runtime privileges, two ready replicas,
   database dump/restore, restored-schema verification and restored readiness.
+- Pool routing, incremental upload/download and GET-retry/POST-no-retry checks
+  passed, including endpoint loss, recovery and complete unavailability.
 
 The identity check used a fresh loopback JWKS fixture and an ephemeral writable
 policy-history volume. The Compose rehearsal used disposable databases and
