@@ -534,6 +534,14 @@ impl PostgresSinkShared {
         self.wake.notify_one();
     }
 
+    fn is_drained_after_shutdown(&self) -> bool {
+        // Recheck under the admission lock after observing shutdown. A writer
+        // may have enqueued its final event after take_batch observed empty,
+        // but before shutdown closed admission. An earlier empty observation
+        // cannot establish that those accepted events have been drained.
+        self.shutdown.load(Ordering::Acquire) && self.buffer_guard().is_empty()
+    }
+
     /// `None` while serving; the time left before the flush deadline once
     /// shutdown began (zero when it has passed).
     fn remaining_budget(&self) -> Option<Duration> {
@@ -591,7 +599,7 @@ async fn flusher_loop(shared: Arc<PostgresSinkShared>, completion: Sender<()>) {
     loop {
         let batch = shared.take_batch();
         if batch.is_empty() {
-            if shared.shutdown.load(Ordering::Acquire) {
+            if shared.is_drained_after_shutdown() {
                 break;
             }
             tokio::select! {
@@ -1136,6 +1144,32 @@ mod tests {
             "the unlanded batch must be dropped and counted, got {}",
             sink.dropped_total()
         );
+    }
+
+    #[tokio::test]
+    async fn shutdown_rechecks_events_enqueued_after_an_empty_batch() {
+        let (pool, _listener) = hanging_pool();
+        let store = Arc::new(PostgresAuditEventStore::new(pool, Some(identity())));
+        let sink = PostgresSink::new_with_settings(
+            store,
+            test_settings(
+                1_000,
+                Duration::from_secs(3_600),
+                64,
+                Duration::from_secs(30),
+            ),
+        )
+        .expect("sink should build");
+
+        // No await: drive the critical interleaving before the spawned flusher
+        // can run on this current-thread runtime.
+        assert!(sink.shared.take_batch().is_empty());
+        sink.emit(&test_event(0));
+        sink.shared
+            .begin_shutdown(Instant::now() + Duration::from_secs(30));
+        assert!(!sink.shared.is_drained_after_shutdown());
+        assert_eq!(sink.shared.take_batch().len(), 1);
+        assert!(sink.shared.is_drained_after_shutdown());
     }
 
     /// The batch the flusher holds when its runtime is torn down under it
