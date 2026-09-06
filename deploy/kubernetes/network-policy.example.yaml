@@ -1,0 +1,47 @@
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: greengateway-boundary
+spec:
+  podSelector:
+    matchExpressions:
+      - key: app
+        operator: In
+        values: [greengateway, greengateway-connections]
+  policyTypes: [Ingress, Egress]
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: ingress-nginx
+          podSelector:
+            matchLabels:
+              app.kubernetes.io/component: controller
+      ports:
+        - protocol: TCP
+          port: 8080
+  egress:
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+          podSelector:
+            matchLabels:
+              k8s-app: kube-dns
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+    # Explicitly label permitted upstream/identity-provider pods and namespaces.
+    # Add deployment-specific CIDRs/ports for external IdPs, APIs and databases.
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              greengateway-upstream: "true"
+          podSelector:
+            matchLabels:
+              greengateway-egress: "true"
+      ports:
+        - protocol: TCP
+          port: 443

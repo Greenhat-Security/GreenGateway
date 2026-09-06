@@ -1169,25 +1169,28 @@ const PROTECTED_WARMUP: usize = 50;
 
 /// Time `count` protected proxied requests against one base URL.
 async fn measure_protected_requests(base_url: &str, token: &str, count: usize) -> Quantiles {
-    let url = format!("{base_url}{PROXIED_PATH}");
     measure(count, PROTECTED_WARMUP, |_| {
-        let url = url.clone();
-        async move {
-            let response = harness::http_client()
-                .get(&url)
-                .bearer_auth(token)
-                .send()
-                .await
-                .expect("the gateway should answer");
-            assert_eq!(
-                response.status().as_u16(),
-                200,
-                "a protected request should be served while measuring latency"
-            );
-            let _ = response.bytes().await;
-        }
+        protected_request(base_url, token)
     })
     .await
+}
+
+async fn protected_request(base_url: &str, token: &str) {
+    let response = harness::http_client()
+        .get(format!("{base_url}{PROXIED_PATH}"))
+        .bearer_auth(token)
+        .send()
+        .await
+        .expect("the gateway should answer");
+    assert_eq!(
+        response.status().as_u16(),
+        200,
+        "a measured protected request must be served"
+    );
+    response
+        .bytes()
+        .await
+        .expect("the measured response body must complete");
 }
 
 // =====================================================================
@@ -1259,7 +1262,7 @@ async fn the_audit_filtered_query_answers_a_million_rows_within_its_budget() {
 
     let rows: i64 = client
         .query_one(
-            "SELECT count(*)::bigint FROM greengateway.audit_events",
+            "SELECT count(*)::bigint FROM greengateway.audit_events WHERE event_id LIKE 'perf-%'",
             &[],
         )
         .await
@@ -1425,18 +1428,57 @@ async fn the_audit_enqueue_stays_off_the_request_path() {
     // holder waits until that batch is observed wedged behind it — because
     // a lock nobody is waiting on stalls nothing.
     let unstalled = measure_protected_requests(&base_url, &admin, count).await;
-    let lock = cluster.database.hold_audit_events_exclusively().await;
-    let stalled_at = Instant::now();
-    let _primer = measure_protected_requests(&base_url, &admin, STALL_PRIMER).await;
-    cluster
-        .database
-        .wait_for_blocked_audit_writer(AUDIT_ROWS_BUDGET)
+    // Preserve the full sample count, but divide it into independently
+    // bounded stalls. A slow hosted runner must not stretch the fixture past
+    // the product's retry budget and misreport expected shedding as a bug.
+    let mut stalled_samples = Vec::with_capacity(count);
+    let mut stall = Duration::ZERO;
+    let mut windows = 0;
+    let mut blocked_writers = 0;
+    while stalled_samples.len() < count {
+        let lock = cluster.database.hold_audit_events_exclusively().await;
+        let started = Instant::now();
+        let remaining = (count - stalled_samples.len()).min(20);
+        let measured = tokio::time::timeout(Duration::from_secs(5), async {
+            for _ in 0..STALL_PRIMER {
+                protected_request(&base_url, &admin).await;
+            }
+            cluster
+                .database
+                .wait_for_blocked_audit_writer(Duration::from_secs(2))
+                .await;
+            blocked_writers += cluster.database.blocked_audit_writers().await;
+            for _ in 0..remaining {
+                let request_started = Instant::now();
+                protected_request(&base_url, &admin).await;
+                stalled_samples.push(request_started.elapsed().as_secs_f64() * 1000.0);
+            }
+        })
         .await;
-    let blocked_writers = cluster.database.blocked_audit_writers().await;
-    let stalled = measure_protected_requests(&base_url, &admin, count).await;
-    let stall = stalled_at.elapsed();
-    lock.release().await;
-    let served = 3 * PROTECTED_WARMUP + 2 * count + STALL_PRIMER;
+        lock.release().await;
+        measured.expect("the benchmark could not finish a 20-request stall window in 5s; investigate runner capacity before interpreting audit-loss results");
+        stall = stall.max(started.elapsed());
+        windows += 1;
+        // Let a committed batch become visible before taking another lock.
+        // Otherwise repeated short stalls can form one long outage.
+        let expected = PROTECTED_WARMUP + count + stalled_samples.len() + windows * STALL_PRIMER;
+        let deadline = Instant::now() + AUDIT_ROWS_BUDGET;
+        loop {
+            let rows = cluster.database.count(&format!(
+                "SELECT count(*)::bigint FROM greengateway.audit_events WHERE event_type = 'http.request_observed' AND payload_path = '{PROXIED_PATH}' AND payload_status = 200"
+            )).await;
+            if rows >= expected as i64 {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "a stall window must drain before the next one starts"
+            );
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    }
+    let stalled = quantiles(stalled_samples);
+    let served = PROTECTED_WARMUP + 2 * count + windows * STALL_PRIMER;
 
     // The queue's own account of itself, from the surface an operator
     // reads.
@@ -1458,22 +1500,20 @@ async fn the_audit_enqueue_stays_off_the_request_path() {
     // caught up" is an observable and not a duration to guess at.
     let deadline = Instant::now() + AUDIT_ROWS_BUDGET;
     let drained = loop {
-        let (_, body) = cluster
-            .get("a", "/v1/admin/cluster")
-            .bearer(&admin)
-            .send()
-            .await;
-        let depth = body["audit"]["queue_depth"].as_i64().unwrap_or(i64::MAX);
-        let oldest = body["audit"]["oldest_age_secs"]
-            .as_f64()
-            .unwrap_or(f64::MAX);
-        if depth == 0 && oldest < 1.0 {
+        // An authenticated status request enqueues its own auth events before
+        // reading status. Use the exempt metrics probe to observe quiescence.
+        let metrics = cluster.metrics("a").await;
+        assert!(metrics.contains("greengateway_audit_queue_depth"));
+        assert!(metrics.contains("greengateway_audit_queue_oldest_age_seconds"));
+        let depth = harness::metric_sum(&metrics, "greengateway_audit_queue_depth");
+        let oldest = harness::metric_sum(&metrics, "greengateway_audit_queue_oldest_age_seconds");
+        if depth == 0.0 && oldest < 1.0 {
             break true;
         }
         if Instant::now() >= deadline {
             break false;
         }
-        tokio::time::sleep(Duration::from_millis(200)).await;
+        tokio::time::sleep(Duration::from_millis(500)).await;
     };
 
     // The rows: every request the measurement made, served `200`, as one
@@ -1529,6 +1569,8 @@ async fn the_audit_enqueue_stays_off_the_request_path() {
                 "stalled_p95_ms": rounded(stalled.p95_ms),
                 "stalled_p99_ms": rounded(stalled.p99_ms),
                 "stall_ms": rounded(stall.as_secs_f64() * 1_000.0),
+                "stall_windows": windows,
+                "stall_ms_meaning": "longest bounded window",
                 "blocked_batch_inserts_at_start": blocked_writers,
                 "stalled_budget_p99_ms": rounded(stalled_budget_ms),
                 "p99_ms": rounded(stalled.p99_ms),

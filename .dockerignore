@@ -13,3 +13,6 @@ docker-compose.yml
 *.tmp
 .DS_Store
 Thumbs.db
+
+# Generated local signing material is never shipped.
+dev/jwks/generated/

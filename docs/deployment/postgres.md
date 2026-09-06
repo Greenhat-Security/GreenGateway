@@ -43,6 +43,8 @@ Three settings select the mode; everything else has a safe default:
 ```sh
 STATE_BACKEND=postgres
 DEPLOYMENT_ID=deploy-prod-eu          # stable, non-secret, 1-64 bytes, [A-Za-z0-9._-] with letter/digit ends
+CONNECTION_SECRETS_ROOT=/run/greengateway-keys
+RATE_LIMIT_KEYRING='[{"id":"rate-v1","file":"rate-limit.primary","role":"primary"}]'
 DATABASE_URL_FILE=/run/secrets/greengateway/database-url
 ```
 
@@ -557,6 +559,8 @@ The smallest shape this guide supports, written out end to end. Two replicas, on
 ```sh
 STATE_BACKEND=postgres
 DEPLOYMENT_ID=deploy-prod-eu
+CONNECTION_SECRETS_ROOT=/run/greengateway-keys
+RATE_LIMIT_KEYRING='[{"id":"rate-v1","file":"rate-limit.primary","role":"primary"}]'
 DATABASE_URL_FILE=/run/secrets/greengateway/database-url
 DATABASE_TLS_CA_FILE=/run/secrets/greengateway/database-ca.pem
 DATABASE_POOL_MAX=10
@@ -640,3 +644,11 @@ One pull request outside the sequence belongs beside this table, because it clos
 In cluster mode, `GET /v1/admin/audit` and `POST /v1/admin/policy/rules/preview` read the shared PostgreSQL audit store without an `AUDIT_SQLITE_PATH`. Search retains its filters and newest-first keyset pagination. Preview uses the same rule matcher and bounded newest-first observation pages as standalone mode, so samples can include traffic observed by any replica. Search requires `admin:audit:read`; preview requires both `admin:policy:read` and `admin:audit:read`. Only durably stored events are available, subject to audit retention. No schema migration is required for these handlers.
 
 This integration covers historical search and rule preview. Rule-hit/shadow-review aggregates and audit enrichment on principal/endpoint detail still use their existing SQLite-specific query surfaces.
+
+Run `sudo python3 scripts/check-ha-bootstrap.py --image <locally-built-gateway-image>` on a disposable Linux Docker host to rehearse the checked-in Compose example. It provisions private test files, bootstraps and imports a deny-by-default policy, checks both replicas, and verifies a restored database. It cleans up its unique Compose project and never starts the example load balancer.
+
+## Client-side database deadlines
+
+Readiness and startup connectivity reads bound their response wait on the client using `DATABASE_ACQUIRE_TIMEOUT_MS`, in addition to the bounded checkout and server-side SQL limits. A timed-out session is discarded, not returned to the pool. Budget a cold probe for checkout plus that response window; a cached probe does not perform I/O.
+
+Audit queue depth, capacity, oldest age and loss totals include the PostgreSQL asynchronous buffer and in-flight batch. They describe pending sink deliveries as well as events in the input channel. A zero input queue alone is not evidence that all accepted audit events are durable.

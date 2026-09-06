@@ -1156,11 +1156,6 @@ async fn bridge(
     drop(guard);
 }
 
-enum Incoming {
-    Client(Option<Result<AxumMessage, axum::Error>>),
-    Upstream(Option<Result<TungsteniteMessage, tungstenite::Error>>),
-}
-
 async fn run_bridge(
     client: &mut WebSocket,
     upstream: &mut WebSocketStream<EgressUpgradedStream>,
@@ -1170,85 +1165,105 @@ async fn run_bridge(
     let duration_deadline = context
         .max_duration
         .map(|duration| tokio::time::Instant::now() + duration);
-    let mut idle_deadline = context
-        .idle_timeout
-        .map(|duration| tokio::time::Instant::now() + duration);
-
-    loop {
-        let incoming = tokio::select! {
-            biased;
-            () = context.forced_shutdown.cancelled() => {
-                return Termination::gateway("shutdown", CLOSE_GOING_AWAY);
+    let (activity, mut activity_rx) = tokio::sync::watch::channel(tokio::time::Instant::now());
+    let mut client_counts = BridgeCounters::default();
+    let mut upstream_counts = BridgeCounters::default();
+    let termination = {
+        let (mut client_sink, mut client_stream) = client.split();
+        let (mut upstream_sink, mut upstream_stream) = upstream.split();
+        let to_upstream = async {
+            loop {
+                match client_stream.next().await {
+                    None => return Termination::forwarded("client_close", None),
+                    Some(Err(error)) => return client_termination(error),
+                    Some(Ok(message)) => {
+                        activity.send_replace(tokio::time::Instant::now());
+                        client_counts.observe_client(message_payload_len(&message));
+                        let close_code = match &message {
+                            AxumMessage::Close(frame) => {
+                                Some(frame.as_ref().map(|frame| frame.code))
+                            }
+                            _ => None,
+                        };
+                        if let Err(end) = send_to_upstream(
+                            &mut upstream_sink,
+                            to_tungstenite(message),
+                            context,
+                            duration_deadline,
+                        )
+                        .await
+                        {
+                            return end;
+                        }
+                        if let Some(code) = close_code {
+                            return Termination::forwarded("client_close", code);
+                        }
+                    }
+                }
             }
-            () = forward::sleep_until_optional(duration_deadline) => {
-                return Termination::gateway("duration_limit", CLOSE_NORMAL);
-            }
-            () = forward::sleep_until_optional(idle_deadline) => {
-                return Termination::gateway("idle_timeout", CLOSE_NORMAL);
-            }
-            message = client.next() => Incoming::Client(message),
-            message = upstream.next() => Incoming::Upstream(message),
         };
-
-        // Any frame in either direction is liveness, control frames included.
-        idle_deadline = context
-            .idle_timeout
-            .map(|duration| tokio::time::Instant::now() + duration);
-
-        match incoming {
-            Incoming::Client(None) => return Termination::forwarded("client_close", None),
-            Incoming::Client(Some(Err(error))) => return client_termination(error),
-            Incoming::Client(Some(Ok(message))) => {
-                counters.observe_client(message_payload_len(&message));
-                let close_code = match &message {
-                    AxumMessage::Close(frame) => Some(frame.as_ref().map(|frame| frame.code)),
-                    _ => None,
-                };
-                // Awaiting the send before reading again is the backpressure: at
-                // most one message per direction is ever in flight.
-                if let Err(termination) = send_to_upstream(
-                    upstream,
-                    to_tungstenite(message),
-                    context,
-                    duration_deadline,
-                )
-                .await
-                {
-                    return termination;
-                }
-                if let Some(code) = close_code {
-                    return Termination::forwarded("client_close", code);
-                }
-            }
-            Incoming::Upstream(None) => return Termination::forwarded("upstream_close", None),
-            Incoming::Upstream(Some(Err(error))) => {
-                let (outcome, code) = classify_tungstenite_error(&error, Side::Upstream);
-                return Termination::gateway(outcome, code);
-            }
-            Incoming::Upstream(Some(Ok(message))) => {
-                let Some(message) = from_tungstenite(message) else {
-                    continue;
-                };
-                counters.observe_upstream(message_payload_len(&message));
-                let close_code = match &message {
-                    AxumMessage::Close(frame) => Some(frame.as_ref().map(|frame| frame.code)),
-                    _ => None,
-                };
-                if let Err(termination) =
-                    send_to_client(client, message, context, duration_deadline).await
-                {
-                    return termination;
-                }
-                if let Some(code) = close_code {
-                    return Termination::forwarded("upstream_close", code);
+        let to_client = async {
+            loop {
+                match upstream_stream.next().await {
+                    None => return Termination::forwarded("upstream_close", None),
+                    Some(Err(error)) => {
+                        let (outcome, code) = classify_tungstenite_error(&error, Side::Upstream);
+                        return Termination::gateway(outcome, code);
+                    }
+                    Some(Ok(message)) => {
+                        activity.send_replace(tokio::time::Instant::now());
+                        let Some(message) = from_tungstenite(message) else {
+                            continue;
+                        };
+                        upstream_counts.observe_upstream(message_payload_len(&message));
+                        let close_code = match &message {
+                            AxumMessage::Close(frame) => {
+                                Some(frame.as_ref().map(|frame| frame.code))
+                            }
+                            _ => None,
+                        };
+                        if let Err(end) =
+                            send_to_client(&mut client_sink, message, context, duration_deadline)
+                                .await
+                        {
+                            return end;
+                        }
+                        if let Some(code) = close_code {
+                            return Termination::forwarded("upstream_close", code);
+                        }
+                    }
                 }
             }
+        };
+        let idle = async {
+            loop {
+                let last = *activity_rx.borrow_and_update();
+                tokio::select! {
+                    () = forward::sleep_until_optional(context.idle_timeout.map(|timeout| last + timeout)) => return,
+                    changed = activity_rx.changed() => { if changed.is_err() { return; } }
+                }
+            }
+        };
+        // Each direction has at most one message in flight. A blocked write
+        // does not prevent the opposite direction from making progress.
+        tokio::select! {
+            biased;
+            () = context.forced_shutdown.cancelled() => Termination::gateway("shutdown", CLOSE_GOING_AWAY),
+            () = forward::sleep_until_optional(duration_deadline) => Termination::gateway("duration_limit", CLOSE_NORMAL),
+            () = idle => Termination::gateway("idle_timeout", CLOSE_NORMAL),
+            end = to_upstream => end,
+            end = to_client => end,
         }
-    }
+    };
+    counters.client_frames = client_counts.client_frames;
+    counters.client_bytes = client_counts.client_bytes;
+    counters.upstream_frames = upstream_counts.upstream_frames;
+    counters.upstream_bytes = upstream_counts.upstream_bytes;
+    termination
 }
 
 async fn send_to_upstream(
-    upstream: &mut WebSocketStream<EgressUpgradedStream>,
+    upstream: &mut (impl futures_util::Sink<TungsteniteMessage, Error = tungstenite::Error> + Unpin),
     message: TungsteniteMessage,
     context: &BridgeContext,
     duration_deadline: Option<tokio::time::Instant>,
@@ -1261,6 +1276,11 @@ async fn send_to_upstream(
         () = forward::sleep_until_optional(duration_deadline) => {
             return Err(Termination::gateway("duration_limit", CLOSE_NORMAL));
         }
+        () = forward::sleep_until_optional(
+            context.idle_timeout.map(|timeout| tokio::time::Instant::now() + timeout),
+        ) => {
+            return Err(Termination::gateway("idle_timeout", CLOSE_NORMAL));
+        }
         result = upstream.send(message) => result,
     };
     result.map_err(|error| {
@@ -1270,7 +1290,7 @@ async fn send_to_upstream(
 }
 
 async fn send_to_client(
-    client: &mut WebSocket,
+    client: &mut (impl futures_util::Sink<AxumMessage, Error = axum::Error> + Unpin),
     message: AxumMessage,
     context: &BridgeContext,
     duration_deadline: Option<tokio::time::Instant>,
@@ -1282,6 +1302,11 @@ async fn send_to_client(
         }
         () = forward::sleep_until_optional(duration_deadline) => {
             return Err(Termination::gateway("duration_limit", CLOSE_NORMAL));
+        }
+        () = forward::sleep_until_optional(
+            context.idle_timeout.map(|timeout| tokio::time::Instant::now() + timeout),
+        ) => {
+            return Err(Termination::gateway("idle_timeout", CLOSE_NORMAL));
         }
         result = client.send(message) => result,
     };
@@ -1404,6 +1429,56 @@ fn truncate_close_reason(reason: &str) -> &str {
 mod tests {
     use super::*;
     use crate::proxy::RouteRequestHeaderPolicy;
+
+    #[tokio::test]
+    async fn blocked_writes_obey_idle_budget_in_both_directions() {
+        let context = BridgeContext {
+            audit: audit::AuditLog::new(Arc::new(audit::sink::tests::CaptureSink::new())),
+            request_id: "write-budget".into(),
+            source_ip: "127.0.0.1".into(),
+            pool_id: Arc::from("pool"),
+            endpoint_id: Arc::from("endpoint"),
+            subprotocol: None,
+            idle_timeout: Some(Duration::from_millis(20)),
+            max_duration: None,
+            forced_shutdown: CancellationToken::new(),
+        };
+        let mut upstream = Box::pin(futures_util::sink::unfold(
+            (),
+            |(), _: TungsteniteMessage| async {
+                std::future::pending::<Result<(), tungstenite::Error>>().await
+            },
+        ));
+        let end = tokio::time::timeout(
+            Duration::from_secs(1),
+            send_to_upstream(
+                &mut upstream,
+                TungsteniteMessage::Binary(bytes::Bytes::new()),
+                &context,
+                None,
+            ),
+        )
+        .await
+        .expect("blocked upstream write is bounded")
+        .unwrap_err();
+        assert_eq!(end.outcome, "idle_timeout");
+        let mut client = Box::pin(futures_util::sink::unfold((), |(), _: AxumMessage| async {
+            std::future::pending::<Result<(), axum::Error>>().await
+        }));
+        let end = tokio::time::timeout(
+            Duration::from_secs(1),
+            send_to_client(
+                &mut client,
+                AxumMessage::Binary(bytes::Bytes::new()),
+                &context,
+                None,
+            ),
+        )
+        .await
+        .expect("blocked client write is bounded")
+        .unwrap_err();
+        assert_eq!(end.outcome, "idle_timeout");
+    }
 
     const VALID_KEY: &str = "dGhlIHNhbXBsZSBub25jZQ==";
 

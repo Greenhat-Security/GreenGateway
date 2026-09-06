@@ -21,6 +21,7 @@ const signingKeyPath = path.join(
   "..",
   "dev",
   "jwks",
+  "generated",
   "dev-signing-key.pem",
 );
 

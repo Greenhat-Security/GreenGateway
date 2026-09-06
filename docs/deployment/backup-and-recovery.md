@@ -137,7 +137,7 @@ Only after all five: start **one** replica, confirm `/readyz` answers `200`, con
 
 A backup you have not restored is a hypothesis. Run a drill on a schedule — quarterly is defensible, monthly is better — and treat it as a real procedure:
 
-1. Restore the most recent backup into a scratch instance with a **different** `DEPLOYMENT_ID` than production. (Different, so that a scratch replica accidentally pointed at production is refused by the deployment binding rather than joining it.)
+1. Restore the most recent backup into an **isolated scratch database**, preserving the backup's `DEPLOYMENT_ID`. The immutable deployment binding is part of the backup; using a different ID must fail verification. Give the scratch environment separate credentials and network rules that cannot reach the production database or business upstreams. Verify the scratch DSN target through the database platform before starting a gateway; the preserved binding cannot distinguish two restored copies. Do not edit binding rows or deployment-scoped data to make a drill pass.
 2. Run all five verification checks above.
 3. Start one gateway replica against it and confirm `/readyz` answers `200`.
 4. Write down how long steps 1 to 3 took. That number, not the retention window, is your real recovery time objective.

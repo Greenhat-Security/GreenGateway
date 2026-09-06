@@ -955,20 +955,30 @@ pub(crate) const OPERATION_CONNECTIVITY_CHECK: &str = "database_connectivity_che
 pub(crate) async fn validate_connectivity(pool: &Pool) -> Result<(), RepositoryError> {
     timed_operation(OPERATION_CONNECTIVITY_CHECK, async {
         let client = pool.get().await.map_err(classify_pool_error)?;
-        client
-            .simple_query(CONNECTIVITY_CHECK_STATEMENT)
-            .await
-            .map_err(|error| {
-                log_classified(
-                    OPERATION_CONNECTIVITY_CHECK,
-                    &error,
-                    RepositoryError::new(
-                        classify_postgres_error(&error),
+        let budget = pool.timeouts().wait.unwrap_or(Duration::from_secs(5));
+        match tokio::time::timeout(budget, client.simple_query(CONNECTIVITY_CHECK_STATEMENT)).await
+        {
+            Ok(result) => {
+                result.map_err(|error| {
+                    log_classified(
                         OPERATION_CONNECTIVITY_CHECK,
-                    ),
-                )
-            })?;
-        Ok(())
+                        &error,
+                        RepositoryError::new(
+                            classify_postgres_error(&error),
+                            OPERATION_CONNECTIVITY_CHECK,
+                        ),
+                    )
+                })?;
+                Ok(())
+            }
+            Err(_) => {
+                drop(deadpool_postgres::Client::take(client));
+                Err(RepositoryError::new(
+                    RepositoryErrorKind::Timeout,
+                    OPERATION_CONNECTIVITY_CHECK,
+                ))
+            }
+        }
     })
     .await
 }

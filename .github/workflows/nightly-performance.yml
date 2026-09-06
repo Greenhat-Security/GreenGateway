@@ -39,7 +39,7 @@ jobs:
     timeout-minutes: 90
     services:
       postgres:
-        image: postgres:16
+        image: postgres:16@sha256:f1c3376c26f2609ab9f29f71f824103fe2fcd8ee0346485cb6122a4f93df6f94
         env:
           POSTGRES_USER: greengateway_ci
           POSTGRES_DB: greengateway_ci
@@ -53,13 +53,13 @@ jobs:
           --health-retries 10
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
 
       - name: Cache Rust dependencies
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
 
       - name: Write the test DSN file
         # The same shape as `ha-release-gate`: the harness connects as this
@@ -161,7 +161,7 @@ jobs:
         # and before it asserts that measurement's budget, so the number that
         # failed is in the file.
         if: ${{ always() }}
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: ha-performance
           path: ${{ runner.temp }}/ha/ha-performance.json

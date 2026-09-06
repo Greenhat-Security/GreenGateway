@@ -9,6 +9,7 @@ class, container limits, network topology, and load command are recorded.
 Start the seeded three-upstream stack:
 
 ```sh
+node scripts/init-dev-jwks.mjs
 docker compose -f docker-compose.yml -f docker-compose.dev.yml -f docker-compose.load.yml up -d --build
 ```
 

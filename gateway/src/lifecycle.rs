@@ -177,7 +177,17 @@ impl GatewayLifecycle {
     pub(crate) async fn force_shutdown_response_streams(&self) {
         self.close_response_stream_registration();
         self.inner.response_stream_cancellation.cancel();
-        self.inner.response_stream_tasks.wait().await;
+        // This is a final cooperative cleanup grace, not an extension of the
+        // normal drain. Never let a non-cooperative body hold process exit.
+        if tokio::time::timeout(
+            Duration::from_millis(100),
+            self.inner.response_stream_tasks.wait(),
+        )
+        .await
+        .is_err()
+        {
+            tracing::warn!("response cleanup exceeded the forced shutdown grace");
+        }
     }
 
     pub(crate) async fn shutdown_background_tasks(&self) {

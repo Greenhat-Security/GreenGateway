@@ -64,7 +64,7 @@
 //! The cache is held under an async mutex, so concurrent probes
 //! collapse onto one in-flight check rather than each starting their
 //! own. The check is bounded by the pool's acquire timeout and the
-//! session statement timeout, so the mutex cannot be held indefinitely.
+//! client response timeout (using DATABASE_ACQUIRE_TIMEOUT_MS), so the mutex cannot be held indefinitely.
 //!
 //! ## Standalone mode
 //!
@@ -415,6 +415,27 @@ impl PostgresReadinessAuthority {
                 return (AuthorityObservation::Unavailable, Some(failure));
             }
         };
+        let budget = self.pool.timeouts().wait.unwrap_or(Duration::from_secs(5));
+        match tokio::time::timeout(budget, self.observe_client(&client)).await {
+            Ok(result) => result,
+            Err(_) => {
+                // Do not recycle a session whose response never arrived.
+                drop(deadpool_postgres::Client::take(client));
+                (
+                    AuthorityObservation::Unavailable,
+                    Some(crate::storage::RepositoryErrorKind::Timeout),
+                )
+            }
+        }
+    }
+
+    async fn observe_client(
+        &self,
+        client: &deadpool_postgres::Client,
+    ) -> (
+        AuthorityObservation,
+        Option<crate::storage::RepositoryErrorKind>,
+    ) {
         let row = match client.query_one(&authority_check_statement(), &[]).await {
             Ok(row) => row,
             Err(error) => {
@@ -431,7 +452,7 @@ impl PostgresReadinessAuthority {
                     error.code().map(|state| state.code()),
                     Some("42P01") | Some("3F000")
                 ) {
-                    if self.session_is_read_only(&client).await {
+                    if self.session_is_read_only(client).await {
                         tracing::warn!(
                             kind = kind.as_str(),
                             "the readiness probe found no migration ledger on a read-only session; readiness is refused as storage_unavailable"

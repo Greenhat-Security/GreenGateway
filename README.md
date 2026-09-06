@@ -97,6 +97,7 @@ It starts:
 - Traffic-generator smoke test
 
 ```sh
+node scripts/init-dev-jwks.mjs
 docker compose -f docker-compose.yml -f docker-compose.dev.yml up --build
 ```
 
@@ -486,6 +487,7 @@ docker compose up --build
 Seeded local development stack:
 
 ```sh
+node scripts/init-dev-jwks.mjs
 docker compose -f docker-compose.yml -f docker-compose.dev.yml up --build
 ```
 
@@ -503,6 +505,7 @@ Add the load overlay before running the short load harness so the measurement
 is not dominated by the intentional default ingress limiter:
 
 ```sh
+node scripts/init-dev-jwks.mjs
 docker compose -f docker-compose.yml -f docker-compose.dev.yml -f docker-compose.load.yml up -d
 npm run load:quick
 ```

@@ -11,7 +11,7 @@ services:
       - --directory
       - /srv/jwks
     volumes:
-      - ./dev/jwks:/srv/jwks:ro
+      - ./dev/jwks/generated/public:/srv/jwks:ro
     healthcheck:
       test:
         - CMD

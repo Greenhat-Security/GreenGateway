@@ -21,7 +21,20 @@ use crate::{
 
 pub const AUDIT_BROADCAST_CAPACITY: usize = 512;
 
+#[derive(Clone, Copy, Debug, Default)]
+pub struct SinkBacklog {
+    pub depth: usize,
+    pub capacity: usize,
+    pub oldest_age: std::time::Duration,
+    pub dropped: u64,
+}
+
 pub trait AuditSink: Send + Sync {
+    /// Pending asynchronous delivery, beyond AuditLog's input channel.
+    fn backlog(&self) -> SinkBacklog {
+        SinkBacklog::default()
+    }
+
     /// A fixed, label-safe name for the sink. Read by the tests that pin
     /// which sinks each mode constructs (standalone never the PostgreSQL
     /// one, cluster never the SQLite one); never derived from runtime data.
@@ -345,6 +358,19 @@ impl CompositeSink {
 }
 
 impl AuditSink for CompositeSink {
+    fn backlog(&self) -> SinkBacklog {
+        self.sinks
+            .iter()
+            .fold(SinkBacklog::default(), |mut total, sink| {
+                let next = sink.backlog();
+                total.depth = total.depth.saturating_add(next.depth);
+                total.capacity = total.capacity.saturating_add(next.capacity);
+                total.oldest_age = total.oldest_age.max(next.oldest_age);
+                total.dropped = total.dropped.saturating_add(next.dropped);
+                total
+            })
+    }
+
     fn name(&self) -> &'static str {
         "composite"
     }

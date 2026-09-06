@@ -733,7 +733,7 @@ impl ToolRuntime {
     pub(crate) async fn execute_result_with_context_and_reason<F, Fut, T, E, R>(
         &self,
         tool_name: &str,
-        mut context: ToolInvocationContext,
+        context: ToolInvocationContext,
         cancel: CancellationToken,
         work: F,
         failure_reason: R,
@@ -743,6 +743,33 @@ impl ToolRuntime {
         Fut: Future<Output = Result<T, E>>,
         E: fmt::Display,
         R: Fn(&E) -> ToolWorkErrorDisposition,
+    {
+        self.execute_result_with_context_and_outcome(
+            tool_name,
+            context,
+            cancel,
+            work,
+            failure_reason,
+            |_| None,
+        )
+        .await
+    }
+
+    pub(crate) async fn execute_result_with_context_and_outcome<F, Fut, T, E, R, O>(
+        &self,
+        tool_name: &str,
+        mut context: ToolInvocationContext,
+        cancel: CancellationToken,
+        work: F,
+        failure_reason: R,
+        application_failure: O,
+    ) -> Result<T, ToolRuntimeError>
+    where
+        F: FnOnce(ToolInvocationContext) -> Fut,
+        Fut: Future<Output = Result<T, E>>,
+        E: fmt::Display,
+        R: Fn(&E) -> ToolWorkErrorDisposition,
+        O: Fn(&T) -> Option<&'static str>,
     {
         let admitted = self
             .prepare_invocation(tool_name, &context, &cancel)
@@ -787,12 +814,17 @@ impl ToolRuntime {
             result = time::timeout_at(admitted_deadline, work(work_context)) => {
                 match result {
                     Ok(Ok(value)) => {
+                        let reason = application_failure(&value);
                         self.emit(
-                            audit::event::TOOL_INVOKE_SUCCESS,
+                            if reason.is_some() {
+                                audit::event::TOOL_INVOKE_FAILURE
+                            } else {
+                                audit::event::TOOL_INVOKE_SUCCESS
+                            },
                             &context,
                             tool_name,
-                            "success",
-                            None,
+                            if reason.is_some() { "failure" } else { "success" },
+                            reason,
                         );
                         Ok(value)
                     }
@@ -1134,6 +1166,21 @@ impl ToolRuntime {
         tool_name: String,
         lease_plan: Option<LeasePlan>,
     ) -> Result<ExecutionPermits, ToolRuntimeError> {
+        // Do not reserve fleet-wide capacity for a caller still waiting on
+        // its narrower tool limit.
+        let tool = match tool {
+            Some(tool) => Some(tool.acquire().await),
+            None => None,
+        };
+        let mut leases = Vec::new();
+        if let Some(plan) = lease_plan.as_ref() {
+            if let Some(capacity) = plan.tool_capacity {
+                leases.push(
+                    Self::lease_slot(plan, lease::tool_scope(&tool_name), capacity, &tool_name)
+                        .await?,
+                );
+            }
+        }
         let global = global
             .acquire_owned()
             .await
@@ -1141,13 +1188,8 @@ impl ToolRuntime {
                 tool_name: tool_name.clone(),
                 reason: "runtime_closed".to_owned(),
             })?;
-        let tool = match tool {
-            Some(tool) => Some(tool.acquire().await),
-            None => None,
-        };
-        // Cluster bound last, once the replica's own permits are held, so a
-        // slot is never leased for an invocation this replica would queue.
-        let mut leases = Vec::new();
+        // Global capacity is acquired only after both tool-scoped limits.
+        // Queue cancellation drops every reservation, including shared leases.
         if let Some(plan) = lease_plan {
             leases.push(
                 Self::lease_slot(
@@ -1158,12 +1200,6 @@ impl ToolRuntime {
                 )
                 .await?,
             );
-            if let Some(capacity) = plan.tool_capacity {
-                leases.push(
-                    Self::lease_slot(&plan, lease::tool_scope(&tool_name), capacity, &tool_name)
-                        .await?,
-                );
-            }
         }
         Ok(ExecutionPermits {
             _queue: queue,
@@ -2800,6 +2836,89 @@ mod tests {
 
         release.notify_waiters();
         let _ = running.await.expect("task should join");
+    }
+
+    #[tokio::test]
+    async fn a_saturated_tool_does_not_reserve_global_capacity_while_waiting() {
+        let (runtime, _) = runtime_with_tools(
+            [
+                ("alpha", enabled_tool(5_000, 1)),
+                ("beta", enabled_tool(5_000, 1)),
+            ],
+            8,
+            2,
+            1_000,
+        );
+        let tracker = Arc::new(ConcurrencyTracker::default());
+        let release = ReleaseGate::new();
+        let first = spawn_tracked_invocation(
+            runtime.clone(),
+            "alpha",
+            Arc::clone(&tracker),
+            release.clone(),
+        );
+        tracker.wait_for_started(1).await;
+        let queued = spawn_tracked_invocation(
+            runtime.clone(),
+            "alpha",
+            Arc::clone(&tracker),
+            release.clone(),
+        );
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        tokio::time::timeout(
+            Duration::from_millis(300),
+            runtime.execute_with_context("beta", context(), CancellationToken::new(), || async {}),
+        )
+        .await
+        .expect("beta must start while alpha remains saturated")
+        .expect("beta succeeds");
+        queued.abort();
+        let _ = queued.await;
+        release.release();
+        first.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn application_errors_preserve_the_result_and_emit_failure() {
+        let (runtime, capture) = runtime_with_tools([("tool", enabled_tool(500, 1))], 2, 1, 100);
+        let value = runtime
+            .execute_result_with_context_and_outcome(
+                "tool",
+                context(),
+                CancellationToken::new(),
+                |_| async { Ok::<_, String>(true) },
+                |_| ToolWorkErrorDisposition::Failure {
+                    reason: None,
+                    details: None,
+                },
+                |is_error| is_error.then_some("mcp_tool_error"),
+            )
+            .await
+            .unwrap();
+        assert!(value, "the MCP result remains available to the caller");
+        wait_until(Duration::from_secs(2), || {
+            capture
+                .events()
+                .iter()
+                .any(|event| event.event_type == audit::event::TOOL_INVOKE_FAILURE)
+        })
+        .await;
+        let events = capture.events();
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event.event_type == audit::event::TOOL_INVOKE_SUCCESS)
+                .count(),
+            0
+        );
+        assert_eq!(
+            events
+                .iter()
+                .find(|event| event.event_type == audit::event::TOOL_INVOKE_FAILURE)
+                .unwrap()
+                .payload["reason"],
+            "mcp_tool_error"
+        );
     }
 
     #[tokio::test]

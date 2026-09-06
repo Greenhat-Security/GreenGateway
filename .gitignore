@@ -40,3 +40,6 @@ Thumbs.db
 .idea/
 .vscode/*
 !.vscode/extensions.json
+
+# Generated local signing material is never shipped.
+dev/jwks/generated/

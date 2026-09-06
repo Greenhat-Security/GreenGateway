@@ -24,9 +24,11 @@ Run as a superuser or the database owner. Replace the passwords with values your
 CREATE ROLE greengateway LOGIN PASSWORD '<runtime-password>';
 CREATE ROLE greengateway_migrator LOGIN PASSWORD '<migration-password>';
 GRANT CONNECT ON DATABASE greengateway TO greengateway;
-GRANT CONNECT ON DATABASE greengateway TO greengateway_migrator;
+GRANT CONNECT, CREATE ON DATABASE greengateway TO greengateway_migrator;
 GRANT greengateway TO greengateway_migrator;
 ```
+
+The migrator needs database `CREATE` to create the initial schema; this privilege is never granted to the runtime role.
 
 Expected output: `CREATE ROLE` twice, then `GRANT` three times. Nothing else exists yet — the `greengateway` schema is created by the first migration, so the table grants below cannot run until after it.
 
@@ -135,3 +137,16 @@ There is no way to make a running replica re-read the DSN file; a restart is the
 **A replica fails startup with a DSN file permission complaint.** The file has group or other bits set. `chmod 0400`; on Kubernetes set `defaultMode: 0400` on the Secret volume. The message names the setting, not the file's contents.
 
 **`CREATE ROLE` says the role already exists.** Someone provisioned it before. Confirm what it can do (`\du greengateway` and the `CREATE TABLE` probe above) rather than assuming; an existing role with `SUPERUSER` or `pg_write_all_data` is a finding, not a shortcut.
+
+## Shared keyring and file ownership
+
+Migration, import and serving processes all load the validated PostgreSQL configuration. Supply these settings to every one of them:
+
+```sh
+CONNECTION_SECRETS_ROOT=/run/greengateway-keys
+RATE_LIMIT_KEYRING='[{"id":"rate-v1","file":"rate-limit.primary","role":"primary"}]'
+```
+
+Generate the file with `openssl rand -out rate-limit.primary 32` in a private staging directory. It must contain exactly 32 raw bytes. Mount the same immutable generation on every replica. Never print or commit it.
+
+For Linux file-backed Docker Compose secrets, set the **host** DSN files and key file to UID/GID 10001:10001 and mode 0400. Set the key directory to 0700 with that ownership. Compose does not implement its long-syntax uid/gid/mode attributes for host file sources. Other container platforms must provide equivalent readable, private mounts through their secret manager. Do not relax the gateway's permission checks to compensate.

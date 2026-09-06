@@ -1,9 +1,7 @@
 import { FormEvent, useEffect, useMemo, useState } from 'react';
 import { Link } from 'react-router-dom';
 
-import { AdminApiError } from '../lib/api';
-import { decodeJwtRolesClaim, getStoredToken } from '../lib/auth';
-import { fetchPolicy, type PolicyDocument } from '../lib/policy';
+import { AdminApiError, fetchAdminCapabilities } from '../lib/api';
 import {
   type CreatedToken,
   type TokenRecord,
@@ -94,9 +92,9 @@ export function TokensView() {
       setCanWriteTokens(false);
 
       try {
-        const policyResult = await fetchPolicy();
+        const capabilities = await fetchAdminCapabilities();
         if (isCurrent) {
-          setCanWriteTokens(currentTokenCanWriteTokens(policyResult.policy));
+          setCanWriteTokens(capabilities.permissions.includes(TOKEN_WRITE_PERMISSION));
         }
       } catch {
         if (isCurrent) {
@@ -695,31 +693,6 @@ function TokensMutationErrorMessage({ error }: { error: TokensViewError }) {
   );
 }
 
-function currentTokenCanWriteTokens(policy: PolicyDocument): boolean {
-  const token = getStoredToken();
-  if (!token) {
-    return false;
-  }
-
-  const roles = decodeJwtRolesClaim(token);
-  if (roles === null) {
-    return false;
-  }
-
-  return roles.some((roleName) => roleGrantsTokensWrite(policy.roles?.[roleName]));
-}
-
-function roleGrantsTokensWrite(role: unknown): boolean {
-  if (!isJsonObject(role) || !Array.isArray(role.permissions)) {
-    return false;
-  }
-
-  return role.permissions.some(
-    (permission) =>
-      permission === TOKEN_WRITE_PERMISSION || permission === '*',
-  );
-}
-
 function normalizeScopes(value: string): string[] {
   return Array.from(
     new Set(
@@ -809,8 +782,4 @@ function toTokensViewError(error: unknown): TokensViewError {
   }
 
   return { kind: 'network', message: 'Network request failed.' };
-}
-
-function isJsonObject(value: unknown): value is Record<string, unknown> {
-  return value !== null && typeof value === 'object' && !Array.isArray(value);
 }

@@ -1,8 +1,7 @@
 import { FormEvent, useEffect, useMemo, useState } from 'react';
 import { Link } from 'react-router-dom';
 
-import { AdminApiError } from '../lib/api';
-import { decodeJwtRolesClaim, getStoredToken } from '../lib/auth';
+import { AdminApiError, fetchAdminCapabilities } from '../lib/api';
 import {
   type OpenApiApiKeyHeaderAuthRequirement,
   type OpenApiSkippedOperation,
@@ -12,7 +11,6 @@ import {
   previewOpenApiTools,
   registerOpenApiTools,
 } from '../lib/openapiTools';
-import { fetchPolicy, type PolicyDocument } from '../lib/policy';
 
 type OpenApiToolsViewError = {
   kind:
@@ -55,9 +53,9 @@ export function OpenApiToolsView() {
       setCanWriteTools(false);
 
       try {
-        const policyResult = await fetchPolicy();
+        const capabilities = await fetchAdminCapabilities();
         if (isCurrent) {
-          setCanWriteTools(currentTokenCanWriteTools(policyResult.policy));
+          setCanWriteTools(capabilities.permissions.includes(TOOLS_WRITE_PERMISSION));
         }
       } catch {
         if (isCurrent) {
@@ -509,30 +507,6 @@ function skippedReasonText(operation: OpenApiSkippedOperation): string {
   return operation.reason;
 }
 
-function currentTokenCanWriteTools(policy: PolicyDocument): boolean {
-  const token = getStoredToken();
-  if (!token) {
-    return false;
-  }
-
-  const roles = decodeJwtRolesClaim(token);
-  if (roles === null) {
-    return false;
-  }
-
-  return roles.some((roleName) => roleGrantsToolsWrite(policy.roles?.[roleName]));
-}
-
-function roleGrantsToolsWrite(role: unknown): boolean {
-  if (!isJsonObject(role) || !Array.isArray(role.permissions)) {
-    return false;
-  }
-
-  return role.permissions.some(
-    (permission) => permission === TOOLS_WRITE_PERMISSION || permission === '*',
-  );
-}
-
 function toOpenApiToolsViewError(error: unknown): OpenApiToolsViewError {
   if (error instanceof OpenApiToolsConflictError) {
     return {
@@ -567,8 +541,4 @@ function toOpenApiToolsViewError(error: unknown): OpenApiToolsViewError {
   }
 
   return { kind: 'network', message: 'Network request failed.' };
-}
-
-function isJsonObject(value: unknown): value is Record<string, unknown> {
-  return value !== null && typeof value === 'object' && !Array.isArray(value);
 }
