@@ -9,7 +9,7 @@ ROOT = Path(__file__).resolve().parents[1]
 
 def check(root=ROOT):
     errors = []
-    workflows = list((root / '.github/workflows').glob('*.yml'))
+    workflows = list((root / '.github/workflows').glob('*.y*ml'))
     for path in workflows:
         for line, value in enumerate(path.read_text(encoding='utf-8').splitlines(), 1):
             match = re.match(r'\s*(?:-\s*)?uses:\s*(\S+)', value)
@@ -17,7 +17,7 @@ def check(root=ROOT):
                 if not re.fullmatch(r'[^@]+@[0-9a-f]{40}', match[1]):
                     errors.append(f'{path.relative_to(root)}:{line}: action must use a full commit SHA')
     paths = workflows + [root / 'Dockerfile', root / 'docs/deployment/docker-compose.ha.yml']
-    paths += list((root / 'deploy/kubernetes').glob('*.yaml'))
+    paths += list((root / 'deploy').rglob('*.y*ml'))
     for path in paths:
         for line, value in enumerate(path.read_text(encoding='utf-8').splitlines(), 1):
             match = re.match(r'(?:FROM\s+|# syntax=|\s*image:\s*)(\S+)', value)

@@ -1,3 +1,6 @@
+// The async tool pipeline needs this solver depth on the pinned coverage compiler.
+#![recursion_limit = "256"]
+
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     convert::Infallible,

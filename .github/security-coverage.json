@@ -1,0 +1,12 @@
+{
+  "gateway/src/auth/jwt.rs": { "lines": 85, "branches": 80 },
+  "gateway/src/middleware/auth.rs": { "lines": 95, "branches": 88 },
+  "gateway/src/middleware/rbac.rs": { "lines": 94, "branches": 84 },
+  "gateway/src/middleware/csrf.rs": { "lines": 95, "branches": 88 },
+  "gateway/src/middleware/headers.rs": { "lines": 100, "branches": 85 },
+  "gateway/src/middleware/validate.rs": { "lines": 100, "branches": 100 },
+  "gateway/src/rbac/rule.rs": { "lines": 100, "branches": 100 },
+  "gateway/src/rbac/engine.rs": { "lines": 100, "branches": 100 },
+  "gateway/src/admin_authorization.rs": { "lines": 75, "branches": 75 },
+  "gateway/src/egress.rs": { "lines": 87, "branches": 74 }
+}
