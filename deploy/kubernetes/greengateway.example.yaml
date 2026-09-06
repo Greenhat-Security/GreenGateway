@@ -34,7 +34,7 @@ spec:
       containers:
         - name: gateway
           # Promoted audit fixes; revision and digest verified by the release checks.
-          image: ghcr.io/greenhat-security/greengateway:2c999cd4e993c58a752334e9d9230e67fcccbae4@sha256:4e20e2e1cd34353203362bcceb5ddcc7b235db4fd1704f60edb9810cf4b6deda
+          image: ghcr.io/greenhat-security/greengateway:878e6c904da65683ca72d312a529ad79984a6978@sha256:db1f8d0d344e9f552a32037301f076b9c5b6934d9db66c0b62024bd7bc355838
           imagePullPolicy: IfNotPresent
           env:
             - name: ADMIN_LISTEN_ADDR

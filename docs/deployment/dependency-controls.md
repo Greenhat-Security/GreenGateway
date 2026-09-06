@@ -8,7 +8,7 @@ alongside the release they consume. CI rejects missing pins.
 
 Digest pinning fixes artifact identity; it does not certify the contents. The
 Kubernetes examples now use the promoted September audit remediation image at
-revision `2c999cd4e993c58a752334e9d9230e67fcccbae4`. Its immutable digest,
+revision `878e6c904da65683ca72d312a529ad79984a6978`. Its immutable digest,
 published platform and local verification evidence are recorded in
 [`deploy/kubernetes/README.md`](../../deploy/kubernetes/README.md).
 For each release, wait for successful CI and promotion, verify its revision and
