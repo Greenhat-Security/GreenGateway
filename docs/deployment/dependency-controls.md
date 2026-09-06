@@ -16,7 +16,10 @@ digest, then update deployment references before rollout. Never substitute a
 build candidate or invent a digest.
 
 Both npm lockfiles have a high-severity audit gate. Pull requests also run GitHub
-dependency review. Cargo audit denies warnings, including yanked dependencies;
+dependency review, rejecting newly introduced advisories at moderate severity
+or higher. Review open Dependabot alerts before release as well: dependency
+review evaluates changes, and GitHub's advisory catalog can differ from RustSec.
+Cargo audit denies warnings, including yanked dependencies;
 there are no advisory exceptions. Any future exception needs a tracked owner,
 dependency chain, exposure analysis, removal condition and expiry, reviewed in
 the same PR as the exception.
@@ -34,6 +37,12 @@ names and dependency claims that do not match the current tree. In particular:
 - `chacha20` 0.10.0 was yanked. The lockfile now selects compatible 0.10.2, and
   `cargo audit --deny warnings` passes with no exceptions. Yanked status alone
   is not a CVE.
+- [GHSA-h395-gr6q-cpjc](https://github.com/Keats/jsonwebtoken/security/advisories/GHSA-h395-gr6q-cpjc)
+  affected the runtime `jsonwebtoken` dependency. Its minimum version is now
+  10.3.0, the first patched release, and Cargo.lock selects 10.4.0. JWT validation
+  uses the AWS-LC backend already present in the TLS stack. Publish and verify a
+  new image before updating deployment digests; a previous image retains its
+  original dependencies.
 - The npm gates and the nightly fixture/HTTP buffering fixes are included in
   the preceding production-readiness change. The five release benchmarks passed
   locally without increasing budgets; production load validation is separate.
