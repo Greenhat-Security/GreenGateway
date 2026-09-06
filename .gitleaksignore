@@ -6,3 +6,9 @@ d9ebee5ff9a3ce4a47a7311926bbc45291461180:gateway/src/egress.rs:private-key:1281
 c0cc40e2c6dae574d10561e096a39ddfdbdf9d30:admin-ui/src/lib/tokens.test.ts:generic-api-key:136
 c0cc40e2c6dae574d10561e096a39ddfdbdf9d30:admin-ui/src/views/TokensView.test.tsx:generic-api-key:414
 6db945e4c076277afeae2ab662925e77fb3337fd:gateway/src/auth/service_token_validator.rs:generic-api-key:456
+# The same reviewed JWT unit fixtures above, moved without changing their bytes.
+# Full-history scans include fetched stack branches, so preserve these exact
+# commit/path/line fingerprints on every branch; no file or rule is excluded.
+dae172eed9011fe33f81694399ec026fc0e067d0:gateway/src/auth/jwt_tests.rs:private-key:69
+dae172eed9011fe33f81694399ec026fc0e067d0:gateway/src/auth/jwt_tests.rs:private-key:76
+dae172eed9011fe33f81694399ec026fc0e067d0:gateway/src/auth/jwt_tests.rs:private-key:89
