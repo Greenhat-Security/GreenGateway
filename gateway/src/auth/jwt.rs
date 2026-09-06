@@ -666,7 +666,7 @@ pub(crate) struct CachedDecodingKey {
     algorithm: Algorithm,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize)]
 struct JwtClaims {
     sub: String,
     iss: Option<String>,
@@ -679,7 +679,7 @@ struct JwtClaims {
     extra: Map<String, Value>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize)]
 #[serde(untagged)]
 enum AudienceClaim {
     Single(String),
