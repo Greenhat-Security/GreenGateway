@@ -1175,19 +1175,22 @@ impl ManagedClientResponseBody {
                     () = task_closed.cancelled() => return,
                     () = shutdown.cancelled() => (GrpcStatus::Unavailable, "shutdown"),
                     () = forward::sleep_until_optional(deadline) => (GrpcStatus::DeadlineExceeded, "deadline_exceeded"),
-                    () = forward::sleep_until_optional(idle) => {
-                        // Activity may have reset the idle timer since this
-                        // sleep was armed. Re-read it under the body lock.
-                        let state = task_state.lock().unwrap_or_else(|e| e.into_inner());
-                        if state.body.as_ref().and_then(|body| body.idle.as_ref())
-                            .is_some_and(|(_, timer)| timer.deadline() > tokio::time::Instant::now()) {
-                            continue;
-                        }
-                        (GrpcStatus::Unavailable, "idle_timeout")
-                    }
+                    () = forward::sleep_until_optional(idle) => (GrpcStatus::Unavailable, "idle_timeout"),
                     () = task_activity.notified() => continue,
                 };
                 let mut state = task_state.lock().unwrap_or_else(|e| e.into_inner());
+                // Activity may have reset the timer after this sleep was armed.
+                // Hold the same lock through termination so a concurrent poll
+                // cannot refresh the timer between this check and body removal.
+                if outcome.1 == "idle_timeout"
+                    && state
+                        .body
+                        .as_ref()
+                        .and_then(|body| body.idle.as_ref())
+                        .is_some_and(|(_, timer)| timer.deadline() > tokio::time::Instant::now())
+                {
+                    continue;
+                }
                 if let Some(mut body) = state.body.take() {
                     state.terminal = Some(body.terminate(outcome.0, outcome.1));
                     // Dropping the body releases transport and admission even
