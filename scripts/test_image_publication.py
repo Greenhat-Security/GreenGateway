@@ -98,6 +98,15 @@ class WorkflowTests(unittest.TestCase):
         self.ci = yaml.load((ROOT / ".github/workflows/ci.yml").read_text(), Loader=yaml.BaseLoader)
         self.candidate = yaml.load((ROOT / ".github/workflows/publish-image.yml").read_text(), Loader=yaml.BaseLoader)
 
+    def test_new_push_cancels_old_run_before_promotion_becomes_eligible(self):
+        self.assertEqual(self.ci["concurrency"], {
+            "group": "ci-${{ github.event_name }}-${{ github.ref }}",
+            "cancel-in-progress": "true",
+        })
+        promotion = self.ci["jobs"]["promote-image"]["concurrency"]
+        self.assertEqual(promotion["group"], "image-promotion-${{ github.ref }}")
+        self.assertEqual(promotion["cancel-in-progress"], "false")
+
     def test_every_validation_job_gates_promotion_in_the_same_run(self):
         jobs = self.ci["jobs"]
         promotion = jobs["promote-image"]

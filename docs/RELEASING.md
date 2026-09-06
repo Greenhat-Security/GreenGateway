@@ -22,8 +22,8 @@ the bare version tag. For example, pushing `v0.1.0` publishes:
 
 A version-tag push does not update the GHCR `latest` image tag. A push to `main`
 updates `latest` only after every CI check succeeds for that exact commit.
-Promotion also confirms that the source branch or tag still names the checked
-commit; a superseded run leaves its candidate unpromoted.
+Promotion checks the source branch or tag immediately before publishing;
+runs already superseded at that check remain unpromoted.
 
 The `v`-prefixed tag mirrors the git tag, while the bare version is convenient
 for consumers that expect container image tags without the prefix.
@@ -41,7 +41,12 @@ secret scanning and all PostgreSQL/HA gates. Failure, cancellation, or a skipped
 dependency blocks promotion. After those checks pass, promotion copies the
 candidate's content-addressed digest to the commit and release tags without
 rebuilding or resolving the staging tag. Promotions are serialized per source
-ref. The run summary records the checked commit, published tags, and immutable
+ref, and a new push cancels the previous run for that ref. Cancellation and
+the ref check reduce stale promotions, but GitHub refs and registry tags cannot
+be updated atomically. A ref moving during publication can leave its image
+alias on the previously checked commit until a later successful promotion.
+Avoid force-moving release tags.
+The run summary records the checked commit, published tags, and immutable
 `ghcr.io/<owner>/<repo>@sha256:<digest>` reference; use that digest to pin a
 deployment to exact image bytes.
 
@@ -49,7 +54,7 @@ Secret scanning now runs as the `gitleaks` job inside CI, preserving its branch
 protection check name. When adding a CI validation job, add it to
 `promote-image.needs`; the `image-publication` structural test rejects an
 incomplete dependency list. Retry a failed run after addressing its cause;
-release tags are never promoted by a failed run.
+failed validation jobs never authorize promotion.
 
 The HA mixed-binary tripwire inspects the newest release tag on a different
 commit. Tags naming the current candidate are excluded, including annotated

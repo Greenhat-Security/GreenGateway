@@ -11,6 +11,12 @@ name: CI
 permissions:
   contents: read
 
+# A new push cancels the old run immediately, including candidate builds and
+# any pending promotion. Keep this distinct from the promotion job's lock.
+concurrency:
+  group: ci-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: true
+
 env:
   CARGO_TERM_COLOR: always
 
@@ -695,8 +701,8 @@ jobs:
     permissions:
       contents: read
       packages: write
-    # Serialize promotions. The script also checks that the source ref still
-    # names this SHA, so an older run cannot roll latest back after a newer push.
+    # Serialize promotions. The script rejects a run superseded at its ref
+    # check; GitHub refs and registry tags cannot be updated atomically.
     concurrency:
       group: image-promotion-${{ github.ref }}
       cancel-in-progress: false

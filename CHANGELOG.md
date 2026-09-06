@@ -212,7 +212,7 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 
 ### Fixed
 
-- Container release tags now depend on successful checks for the exact commit. CI builds a unique candidate, waits for all validation and secret-scanning jobs, and promotes its immutable digest without rebuilding. Pull-request builds cannot publish, and superseded branch/tag runs leave their candidates unpromoted.
+- Container release tags now depend on successful checks for the exact commit. CI builds a unique candidate, waits for all validation and secret-scanning jobs, and promotes its immutable digest without rebuilding. Pull-request builds cannot publish, and runs superseded before the final ref check leave their candidates unpromoted.
 
 - Policy screens now use server-computed write permission instead of decoding JWT roles in the browser. Repeated saves of a new rule update its returned ID, and the default-deny banner accurately describes forwarding under global shadow enforcement.
 
