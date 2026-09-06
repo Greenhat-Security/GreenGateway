@@ -5,7 +5,6 @@ import { AdminApiError } from '../lib/api';
 import {
   PolicyRulePatch,
   PolicyRuleShadowReviewSummary,
-  currentTokenCanWritePolicy,
   fetchPolicy,
   fetchPolicyRuleShadowReview,
   patchPolicyRule,
@@ -61,7 +60,7 @@ export function ShadowReviewView() {
           return;
         }
 
-        setCanWritePolicy(currentTokenCanWritePolicy(policyResult.policy));
+        setCanWritePolicy(policyResult.canWrite);
         setSummaries(review.rules);
         setScanTruncated(review.scan_truncated);
       } catch (error) {
@@ -132,7 +131,7 @@ export function ShadowReviewView() {
       }
 
       await patchPolicyRule(ruleId, policyResult.etag, patch);
-      setCanWritePolicy(currentTokenCanWritePolicy(policyResult.policy));
+      setCanWritePolicy(policyResult.canWrite);
       setSummaries((current) =>
         current.filter((summary) => summary.rule_id !== ruleId),
       );

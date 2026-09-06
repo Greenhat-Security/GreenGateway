@@ -184,6 +184,7 @@ describe('SignalsView', () => {
 
   it('disables signal rule creation for a read-only policy principal', async () => {
     const fetcher = signalsFetchMock({
+      canWrite: false,
       pages: [
         {
           signals: [
@@ -312,10 +313,12 @@ function LocationProbe() {
 }
 
 function signalsFetchMock({
+  canWrite = true,
   pages,
   transitions = [],
   policy = policyDocument(),
 }: {
+  canWrite?: boolean;
   pages: SignalListResponse[];
   transitions?: DiscoverySignal[];
   policy?: PolicyDocument;
@@ -332,7 +335,7 @@ function signalsFetchMock({
   const fetch = vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
     const url = new URL(String(input), 'http://localhost');
     if (url.pathname === '/v1/admin/policy' && !init?.method) {
-      return Promise.resolve(jsonResponse(200, policy, { ETag: '"policy-etag"' }));
+      return Promise.resolve(jsonResponse(200, policy, { ETag: '"policy-etag"', 'x-greengateway-policy-write': String(canWrite) }));
     }
     if (url.pathname === '/v1/admin/events/stream') {
       return Promise.resolve(

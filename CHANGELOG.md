@@ -212,6 +212,8 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 
 ### Fixed
 
+- Policy screens now use server-computed write permission instead of decoding JWT roles in the browser. Repeated saves of a new rule update its returned ID, and the default-deny banner accurately describes forwarding under global shadow enforcement.
+
 - Historical audit search and policy rule preview now read PostgreSQL audit events in cluster mode through the shared storage interface. Preview scans use bounded pages on both backends; permissions, filtering, matching and newest-first samples are preserved.
 
 - Included global read/write rates and bursts, bucket capacity and idle TTL, and rate-limit key-generation IDs and roles in cluster configuration agreement. Divergent joining replicas remain unready. Fingerprint format v2 requires a coordinated fleet cutover; reordered key entries and different local key paths still agree, and secret key material remains excluded.

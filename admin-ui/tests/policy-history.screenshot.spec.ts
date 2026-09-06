@@ -21,6 +21,7 @@ test('captures the policy version history timeline', async ({ page }) => {
       status: 200,
       contentType: 'application/json',
       headers: {
+        'X-GreenGateway-Policy-Write': 'true',
         ETag: '"screenshot-policy-etag"',
       },
       body: JSON.stringify({

@@ -7788,6 +7788,8 @@ async fn policy_get_endpoint(
         Err(error) => return policy_admin_authz_error_response(error),
     };
 
+    let can_write = rbac_state.principal_has_permission(principal, ADMIN_POLICY_WRITE_PERMISSION);
+
     // Cluster mode serves the authoritative active document (ETag already
     // verified against the document body by `active()`), not the local
     // snapshot: an admin reading the policy sees exactly what a commit
@@ -7795,12 +7797,7 @@ async fn policy_get_endpoint(
     #[cfg(feature = "postgres")]
     if let Some(control_plane) = state.control_plane.as_ref() {
         return match control_plane.active().await {
-            Ok(Some(active)) => (
-                StatusCode::OK,
-                [(header::ETAG, etag_header_value(&active.etag))],
-                Json(active.policy),
-            )
-                .into_response(),
+            Ok(Some(active)) => policy_read_response(active.policy, &active.etag, can_write),
             Ok(None) => {
                 tracing::error!("policy control plane has no active document");
                 service_unavailable("policy control plane unavailable")
@@ -7821,9 +7818,25 @@ async fn policy_get_endpoint(
         }
     };
 
+    policy_read_response(policy, &etag, can_write)
+}
+
+fn policy_read_response(policy: rbac::Policy, etag: &str, can_write: bool) -> Response {
+    // Authorization metadata belongs to this principal's response, not the
+    // persisted document or its ETag. Every mutation still authorizes afresh.
     (
         StatusCode::OK,
-        [(header::ETAG, etag_header_value(&etag))],
+        [
+            (header::ETAG, etag_header_value(etag)),
+            (
+                header::CACHE_CONTROL,
+                HeaderValue::from_static("private, no-store"),
+            ),
+            (
+                header::HeaderName::from_static("x-greengateway-policy-write"),
+                HeaderValue::from_static(if can_write { "true" } else { "false" }),
+            ),
+        ],
         Json(policy),
     )
         .into_response()
@@ -25606,6 +25619,76 @@ mod tests {
         let status = status_json(router, Some(test_principal(&["status-reader"]))).await;
 
         assert_eq!(status["egress"]["allowed_hosts_count"], 2);
+    }
+
+    #[tokio::test]
+    async fn policy_get_capability_uses_mapped_jwt_roles_and_service_token_roles() {
+        let jwks_addr = spawn_test_jwks_server().await;
+        let token_db = TempDb::new("policy-capability-tokens");
+        let token_store = auth::SqliteTokenStore::open(&token_db.path).expect("token store");
+        let service_writer = create_service_token(&token_store, &["admin"]);
+        let service_reader = create_service_token(&token_store, &["policy-reader"]);
+        let policy = TempPolicyFile::new(&policy_document_string("capabilities", "test:old"));
+        let mut config = test_config(Vec::new());
+        config.policy_file = Some(policy.path.to_string_lossy().into_owned());
+        config.service_token_sqlite_path = Some(token_db.path.to_string_lossy().into_owned());
+        config.egress_deny_private_ips = false;
+        config.roles_claim = "realm_access.roles".to_owned();
+        configure_test_jwt_provider(&mut config, jwks_addr);
+        let recorder = PrometheusBuilder::new().build_recorder();
+        let router = app(
+            config,
+            recorder.handle(),
+            test_audit_log(),
+            test_audit_event_sender(),
+        )
+        .expect("app");
+        let jwt = |role: &str, misleading_role: &str| {
+            signed_token_with_claims(json!({
+                "sub": "mapped-user", "jti": format!("mapped-{role}"),
+                "exp": OffsetDateTime::now_utc().unix_timestamp() + 3600,
+                "roles": [misleading_role], "realm_access": {"roles": [role]}
+            }))
+        };
+        let mut etag = None;
+        for (token, expected) in [
+            (jwt("admin", "policy-reader"), "true"),
+            (jwt("policy-reader", "admin"), "false"),
+            (service_writer, "true"),
+            (service_reader, "false"),
+        ] {
+            let response = router
+                .clone()
+                .oneshot(bearer_get_request(POLICY_ADMIN_ROUTE, &token))
+                .await
+                .expect("policy read");
+            assert_eq!(response.status(), StatusCode::OK);
+            assert_eq!(response.headers()["x-greengateway-policy-write"], expected);
+            assert_eq!(
+                response.headers()[header::CACHE_CONTROL],
+                "private, no-store"
+            );
+            let current_etag = policy_etag_header(&response);
+            if let Some(previous) = &etag {
+                assert_eq!(&current_etag, previous);
+            }
+            etag = Some(current_etag);
+            assert!(json_body(response).await.get("can_write").is_none());
+            if expected == "false" {
+                let denied = router
+                    .clone()
+                    .oneshot(bearer_json_request(
+                        Method::POST,
+                        POLICY_RULES_ADMIN_ROUTE,
+                        &token,
+                        json!({"methods": ["GET"], "path": "/orders", "action": "deny"})
+                            .to_string(),
+                    ))
+                    .await
+                    .expect("write remains authorized independently");
+                assert_eq!(denied.status(), StatusCode::FORBIDDEN);
+            }
+        }
     }
 
     #[tokio::test]

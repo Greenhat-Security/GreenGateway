@@ -9,7 +9,6 @@ import {
   subscribeToAuditEvents,
 } from '../lib/eventStream';
 import {
-  currentTokenCanWritePolicy,
   fetchPolicy,
   isAuthMethodName,
 } from '../lib/policy';
@@ -143,7 +142,7 @@ export function LiveTail() {
       try {
         const response = await fetchPolicy();
         if (isCurrent) {
-          setCanCreateRules(currentTokenCanWritePolicy(response.policy));
+          setCanCreateRules(response.canWrite);
         }
       } catch {
         if (isCurrent) {

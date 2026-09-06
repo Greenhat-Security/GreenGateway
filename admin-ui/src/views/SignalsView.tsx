@@ -7,7 +7,7 @@ import {
   buildAuditEventStreamUrl,
   subscribeToAuditEvents,
 } from '../lib/eventStream';
-import { currentTokenCanWritePolicy, fetchPolicy } from '../lib/policy';
+import { fetchPolicy } from '../lib/policy';
 import {
   DiscoverySignal,
   EndpointSignalTarget,
@@ -174,7 +174,7 @@ export function SignalsView() {
       try {
         const response = await fetchPolicy();
         if (isCurrent) {
-          setCanCreateRules(currentTokenCanWritePolicy(response.policy));
+          setCanCreateRules(response.canWrite);
         }
       } catch {
         if (isCurrent) {

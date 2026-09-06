@@ -11,6 +11,7 @@ test('captures the rule table in light and dark themes', async ({ page }) => {
       status: 200,
       contentType: 'application/json',
       headers: {
+        'X-GreenGateway-Policy-Write': 'false',
         ETag: '"screenshot-etag"',
       },
       body: JSON.stringify({

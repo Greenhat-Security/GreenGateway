@@ -155,6 +155,7 @@ describe('LiveTail', () => {
 
   it('disables audit-event rule creation for a read-only policy principal', async () => {
     const stream = sseFetchMock({
+      canWrite: false,
       policy: policyDocument({
         roles: {
           reader: { permissions: ['admin:policy:read'] },
@@ -448,8 +449,10 @@ function LocationProbe() {
 }
 
 function sseFetchMock({
+  canWrite = true,
   policy = policyDocument(),
 }: {
+  canWrite?: boolean;
   policy?: PolicyDocument;
 } = {}) {
   const encoder = new TextEncoder();
@@ -458,7 +461,7 @@ function sseFetchMock({
     const url = new URL(String(input), 'http://localhost');
 
     if (url.pathname === '/v1/admin/policy' && !init?.method) {
-      return Promise.resolve(jsonResponse(200, policy, { ETag: '"policy-etag"' }));
+      return Promise.resolve(jsonResponse(200, policy, { ETag: '"policy-etag"', 'x-greengateway-policy-write': String(canWrite) }));
     }
 
     if (url.pathname !== '/v1/admin/events/stream') {

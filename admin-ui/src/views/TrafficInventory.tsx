@@ -3,7 +3,6 @@ import { Link, useNavigate } from 'react-router-dom';
 
 import { AdminApiError } from '../lib/api';
 import {
-  currentTokenCanWritePolicy,
   fetchPolicy,
   type PolicyRuleDispatchMatcher,
 } from '../lib/policy';
@@ -109,7 +108,7 @@ export function TrafficInventory() {
       try {
         const response = await fetchPolicy();
         if (isCurrent) {
-          setCanCreateRules(currentTokenCanWritePolicy(response.policy));
+          setCanCreateRules(response.canWrite);
         }
       } catch {
         if (isCurrent) {

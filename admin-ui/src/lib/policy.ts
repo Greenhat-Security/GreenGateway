@@ -1,5 +1,4 @@
 import { adminFetchJson, adminFetchJsonResponse } from './api';
-import { decodeJwtRolesClaim, getStoredToken } from './auth';
 import { adminApiUrl } from './config';
 
 export type PolicyDefaultAction = 'allow' | 'deny';
@@ -45,6 +44,7 @@ export type PolicyDocument = {
 };
 
 export type PolicyReadResult = {
+  canWrite: boolean;
   policy: PolicyDocument;
   etag: string | null;
 };
@@ -144,13 +144,14 @@ type AdminFetchWithMetaOptions = Omit<RequestInit, 'headers'> & {
 };
 
 export async function fetchPolicy(): Promise<PolicyReadResult> {
-  const response = await adminFetchJsonWithEtag<PolicyDocument>(
+  const response = await adminFetchJsonResponse<PolicyDocument>(
     adminApiUrl('/policy'),
   );
 
   return {
-    policy: normalizePolicy(response.value),
+    policy: normalizePolicy(response.body),
     etag: response.etag,
+    canWrite: response.headers.get('x-greengateway-policy-write') === 'true',
   };
 }
 
@@ -263,22 +264,6 @@ export function isPolicyRuleEnabled(rule: PolicyRule): boolean {
   return rule.enabled !== false;
 }
 
-export function currentTokenCanWritePolicy(policy: PolicyDocument): boolean {
-  const token = getStoredToken();
-  if (!token) {
-    return false;
-  }
-
-  const roles = decodeJwtRolesClaim(token);
-  if (roles === null) {
-    return false;
-  }
-
-  return roles.some((roleName) =>
-    roleGrantsPolicyWrite(policy.roles?.[roleName]),
-  );
-}
-
 export function isAuthMethodName(value: string): value is AuthMethodName {
   return (
     value === 'bearer_token' ||
@@ -297,16 +282,6 @@ function normalizePolicy(policy: PolicyDocument): PolicyDocument {
     ...policy,
     rules: policy.rules ?? [],
   };
-}
-
-function roleGrantsPolicyWrite(role: unknown): boolean {
-  if (!isJsonObject(role) || !Array.isArray(role.permissions)) {
-    return false;
-  }
-
-  return role.permissions.some(
-    (permission) => permission === 'admin:policy:write' || permission === '*',
-  );
 }
 
 function isPolicyRuleHitsListResponse(
@@ -333,8 +308,4 @@ async function adminFetchJsonWithEtag<T>(
     value: response.body,
     etag: response.etag,
   };
-}
-
-function isJsonObject(value: unknown): value is Record<string, unknown> {
-  return value !== null && typeof value === 'object' && !Array.isArray(value);
 }

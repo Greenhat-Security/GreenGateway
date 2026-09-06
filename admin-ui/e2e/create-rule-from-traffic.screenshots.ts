@@ -26,6 +26,7 @@ test('captures traffic inventory create-rule prefill journey', async ({
     await route.fulfill({
       status: 200,
       headers: {
+        'X-GreenGateway-Policy-Write': 'true',
         'Content-Type': 'application/json',
         ETag: 'W/"create-rule-prefill-policy-1"',
       },

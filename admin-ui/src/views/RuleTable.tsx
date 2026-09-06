@@ -6,7 +6,6 @@ import {
   PolicyDefaultAction,
   PolicyDocument,
   PolicyRule,
-  currentTokenCanWritePolicy,
   deletePolicyRule,
   fetchPolicy,
   fetchPolicyRuleHits,
@@ -70,7 +69,7 @@ export function RuleTable() {
           return;
         }
 
-        setCanWritePolicy(currentTokenCanWritePolicy(policyResult.policy));
+        setCanWritePolicy(policyResult.canWrite);
         setPolicy(policyResult.policy);
         setEtag(policyResult.etag);
         setHits(hitCounts);
@@ -270,7 +269,7 @@ export function RuleTable() {
 
         <RuleWorkspaceNav />
 
-        {policy ? <DefaultActionBanner action={policy.default_action} /> : null}
+        {policy ? <DefaultActionBanner action={policy.default_action} shadow={policy.enforcement_mode === 'shadow'} /> : null}
         {rows.length > 0 ? (
           <p className="rule-order-note">Rules are evaluated top to bottom. First match wins.</p>
         ) : null}
@@ -422,9 +421,9 @@ export function RuleTable() {
   );
 }
 
-function DefaultActionBanner({ action }: { action: PolicyDefaultAction }) {
+function DefaultActionBanner({ action, shadow }: { action: PolicyDefaultAction; shadow: boolean }) {
   const title = actionTitle(action);
-  const alertClass = action === 'allow' ? 'success' : 'error';
+  const alertClass = shadow ? 'warning' : action === 'allow' ? 'success' : 'error';
 
   return (
     <div className={`rule-default-banner alert ${alertClass}`} role="status">
@@ -432,7 +431,9 @@ function DefaultActionBanner({ action }: { action: PolicyDefaultAction }) {
         Default action: {title}
       </span>
       <span>
-        Requests that miss every enabled rule are {action === 'allow' ? 'allowed' : 'denied'}.
+        {shadow && action === 'deny'
+          ? 'Requests that miss every enabled rule are forwarded and recorded as would-deny while global enforcement is in shadow mode.'
+          : `Requests that miss every enabled rule are ${action === 'allow' ? 'allowed' : 'denied'}.`}
       </span>
     </div>
   );

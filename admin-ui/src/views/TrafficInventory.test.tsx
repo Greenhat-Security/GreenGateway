@@ -345,6 +345,7 @@ describe('TrafficInventory', () => {
 
   it('disables tool rule creation for a read-only policy principal', async () => {
     const fetcher = trafficInventoryFetchMock({
+      canWrite: false,
       endpoints: [
         trafficEndpoint({
           method: 'MCP',
@@ -374,6 +375,7 @@ describe('TrafficInventory', () => {
 
   it('disables endpoint rule creation for a read-only policy principal', async () => {
     const fetcher = trafficInventoryFetchMock({
+      canWrite: false,
       endpoints: [
         trafficEndpoint({
           method: 'GET',
@@ -751,12 +753,14 @@ function reviewRequests(fetchMock: ReturnType<typeof vi.fn>) {
 }
 
 function trafficInventoryFetchMock({
+  canWrite = true,
   endpoints = [],
   pages,
   policy = policyDocument(),
   reviewResponses = [],
   reviewStatus = 200,
 }: {
+  canWrite?: boolean;
   endpoints?: TrafficEndpoint[];
   pages?: Array<{ endpoints: TrafficEndpoint[]; next_cursor: string | null }>;
   policy?: PolicyDocument;
@@ -787,7 +791,7 @@ function trafficInventoryFetchMock({
     }
 
     if (url.pathname === '/v1/admin/policy' && !init?.method) {
-      return Promise.resolve(jsonResponse(200, policy, { ETag: '"policy-etag"' }));
+      return Promise.resolve(jsonResponse(200, policy, { ETag: '"policy-etag"', 'x-greengateway-policy-write': String(canWrite) }));
     }
 
     if (

@@ -21,6 +21,25 @@ afterEach(() => {
 });
 
 describe('RuleTable', () => {
+  it.each(['service-token-placeholder', `header.${Buffer.from(JSON.stringify({groups: ['operators']})).toString('base64url')}.signature`])(
+    'enables server-authorized controls without decoding roles from %s', async (token) => {
+      const fetcher = policyFetchMock({canWrite: true, policy: policyDocument({roles: {},
+        rules: [rule({id: 'server-authorized', path: '/orders', action: 'deny'})]})});
+      vi.stubGlobal('fetch', fetcher.fetch);
+      renderRuleTable({token});
+      const toggle = await screen.findByRole('switch', {name: 'Disable rule server-authorized'});
+      expect((toggle as HTMLButtonElement).disabled).toBe(false);
+    },
+  );
+
+  it('describes global shadow default-deny as forwarded would-deny traffic', async () => {
+    const fetcher = policyFetchMock({policy: policyDocument({default_action: 'deny', enforcement_mode: 'shadow'})});
+    vi.stubGlobal('fetch', fetcher.fetch);
+    renderRuleTable();
+    expect(await screen.findByText('Requests that miss every enabled rule are forwarded and recorded as would-deny while global enforcement is in shadow mode.')).toBeTruthy();
+    expect(screen.queryByText('Requests that miss every enabled rule are denied.')).toBeNull();
+  });
+
   it('renders policy rules with action badges, hit counts, enabled state, and the default action', async () => {
     const fetcher = policyFetchMock({
       policy: policyDocument({
@@ -143,6 +162,7 @@ describe('RuleTable', () => {
 
   it('renders read-only policy rules with disabled mutation controls and an explanation from the initial load', async () => {
     const fetcher = policyFetchMock({
+      canWrite: false,
       policy: policyDocument({
         roles: {
           reader: { permissions: ['admin:policy:read'] },
@@ -207,8 +227,9 @@ describe('RuleTable', () => {
     },
   );
 
-  it('treats an undecodable JWT roles claim as read-only without crashing', async () => {
+  it('honors a read-only server response for an opaque token', async () => {
     const fetcher = policyFetchMock({
+      canWrite: false,
       policy: policyDocument({
         roles: {
           admin: { permissions: ['*'] },
@@ -230,8 +251,9 @@ describe('RuleTable', () => {
     ).toBe(true);
   });
 
-  it('treats JWT roles missing from the fetched policy role map as read-only', async () => {
+  it('honors a read-only server response regardless of JWT role claims', async () => {
     const fetcher = policyFetchMock({
+      canWrite: false,
       policy: policyDocument({
         roles: {
           admin: { permissions: ['*'] },
@@ -362,10 +384,12 @@ function renderRuleTable({
 }
 
 function policyFetchMock({
+  canWrite = true,
   policy,
   hits = {},
   patchStatus = 200,
 }: {
+  canWrite?: boolean;
   policy: PolicyDocument;
   hits?: Record<string, number>;
   patchStatus?: number;
@@ -378,7 +402,7 @@ function policyFetchMock({
     const url = new URL(String(input), 'http://localhost');
 
     if (url.pathname === '/v1/admin/policy' && !init?.method) {
-      return Promise.resolve(jsonResponse(200, currentPolicy, { ETag: currentEtag }));
+      return Promise.resolve(jsonResponse(200, currentPolicy, { ETag: currentEtag, 'x-greengateway-policy-write': String(canWrite) }));
     }
 
     if (url.pathname === '/v1/admin/policy/rules/hits') {
@@ -407,7 +431,7 @@ function policyFetchMock({
       }
       Object.assign(updatedRule, patch);
       currentEtag = '"etag-patch"';
-      return Promise.resolve(jsonResponse(200, updatedRule, { ETag: currentEtag }));
+      return Promise.resolve(jsonResponse(200, updatedRule, { ETag: currentEtag, 'x-greengateway-policy-write': String(canWrite) }));
     }
 
     if (url.pathname === '/v1/admin/policy/rules/order' && init?.method === 'PUT') {
@@ -421,7 +445,7 @@ function policyFetchMock({
           .filter((item): item is PolicyRule => Boolean(item)),
       };
       currentEtag = '"etag-reorder"';
-      return Promise.resolve(jsonResponse(200, { order }, { ETag: currentEtag }));
+      return Promise.resolve(jsonResponse(200, { order }, { ETag: currentEtag, 'x-greengateway-policy-write': String(canWrite) }));
     }
 
     return Promise.reject(new Error(`unexpected fetch: ${url.pathname}`));

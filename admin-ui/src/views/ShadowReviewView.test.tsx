@@ -165,6 +165,7 @@ describe('ShadowReviewView', () => {
     vi.stubGlobal(
       'fetch',
       shadowReviewFetchMock({
+      canWrite: false,
         policy: policyDocument({
           roles: {
             reader: { permissions: ['admin:policy:read'] },
@@ -254,10 +255,12 @@ function renderShadowReviewView({
 }
 
 function shadowReviewFetchMock({
+  canWrite = true,
   policy,
   review,
   policyEtags = ['"etag-initial"'],
 }: {
+  canWrite?: boolean;
   policy: PolicyDocument;
   review: ShadowReviewResponseFixture;
   policyEtags?: string[];
@@ -273,7 +276,7 @@ function shadowReviewFetchMock({
       const etag =
         policyEtags[Math.min(policyRequestCount, policyEtags.length - 1)] ?? null;
       policyRequestCount += 1;
-      return Promise.resolve(jsonResponse(200, policy, etag ? { ETag: etag } : {}));
+      return Promise.resolve(jsonResponse(200, policy, { ...(etag ? { ETag: etag } : {}), 'x-greengateway-policy-write': String(canWrite) }));
     }
 
     if (url.pathname === '/v1/admin/policy/rules/shadow-review') {

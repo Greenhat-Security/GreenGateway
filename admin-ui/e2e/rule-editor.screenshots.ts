@@ -16,6 +16,7 @@ test('captures rule editor empty, filled, and preview states', async ({
     await route.fulfill({
       status: 200,
       headers: {
+        'X-GreenGateway-Policy-Write': 'true',
         'Content-Type': 'application/json',
         ETag: 'W/"screenshot-policy-1"',
       },

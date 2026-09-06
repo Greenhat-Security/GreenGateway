@@ -2,6 +2,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import {
   createPolicyRule,
+  fetchPolicy,
   deletePolicyRule,
   patchPolicyRule,
   reorderPolicyRules,
@@ -10,6 +11,17 @@ import {
 afterEach(() => {
   vi.unstubAllGlobals();
   document.cookie = 'csrf_token=; Max-Age=0; Path=/';
+});
+
+describe('policy permissions', () => {
+  it.each([['true', true], ['false', false], [null, false], ['TRUE', false]])(
+    'uses only an explicit server capability (%s)', async (header, expected) => {
+      const headers = new Headers({'Content-Type': 'application/json'});
+      if (header !== null) headers.set('x-greengateway-policy-write', header);
+      vi.stubGlobal('fetch', vi.fn(() => Promise.resolve(new Response(JSON.stringify({rules: []}), {headers}))));
+      expect((await fetchPolicy()).canWrite).toBe(expected);
+    },
+  );
 });
 
 describe('policy writes', () => {

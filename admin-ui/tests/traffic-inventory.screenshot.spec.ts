@@ -11,6 +11,7 @@ test('captures the traffic inventory as mobile cards', async ({ page }) => {
       status: 200,
       contentType: 'application/json',
       headers: {
+        'X-GreenGateway-Policy-Write': 'false',
         ETag: '"traffic-mobile-policy"',
       },
       body: JSON.stringify({
