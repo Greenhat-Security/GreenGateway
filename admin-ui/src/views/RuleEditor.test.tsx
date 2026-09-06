@@ -12,6 +12,17 @@ afterEach(() => {
 });
 
 describe('RuleEditor', () => {
+  it('shows multiple roles as alternatives, grouped before other constraints', async () => {
+    vi.stubGlobal('fetch', policyBackedFetch(policyFixture(), 'W/"policy-1"'));
+    renderRuleEditor();
+    await screen.findByLabelText('Path pattern');
+    for (const role of ['support', 'admin']) {
+      fireEvent.change(screen.getByLabelText('Role constraints'), { target: { value: role } });
+      fireEvent.click(screen.getByRole('button', { name: 'Add role' }));
+    }
+    expect(screen.getByLabelText('Policy expression').textContent).toContain('(principal.roles contains "support" OR principal.roles contains "admin")');
+  });
+
   it('starts from the unchanged blank form when no prefill params are present', async () => {
     vi.stubGlobal('fetch', policyBackedFetch(policyFixture(), 'W/"policy-1"'));
 

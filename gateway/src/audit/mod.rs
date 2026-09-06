@@ -82,6 +82,7 @@ pub struct AuditLog {
 }
 
 struct AuditLogInner {
+    sink: Arc<dyn AuditSink>,
     tx: Mutex<Option<SyncSender<QueuedEvent>>>,
     writer: Mutex<Option<thread::JoinHandle<Result<(), String>>>>,
     closed: AtomicBool,
@@ -187,6 +188,7 @@ impl AuditLog {
         let writer_queued = Arc::clone(&queued);
         let writer_in_flight = Arc::clone(&in_flight_since);
         let writer_drain_deadline = Arc::clone(&drain_deadline);
+        let backlog_sink = Arc::clone(&sink);
         let writer = thread::Builder::new()
             .name("audit-log-writer".to_owned())
             .spawn(move || {
@@ -222,6 +224,7 @@ impl AuditLog {
 
         Ok(Self {
             inner: Arc::new(AuditLogInner {
+                sink: backlog_sink,
                 tx: Mutex::new(Some(tx)),
                 writer: Mutex::new(Some(writer)),
                 closed: AtomicBool::new(false),
@@ -235,15 +238,17 @@ impl AuditLog {
 
     /// Events waiting in the writer's channel.
     pub fn queue_depth(&self) -> usize {
-        self.inner.queued.load(Ordering::Acquire)
+        self.inner
+            .queued
+            .load(Ordering::Acquire)
+            .saturating_add(self.inner.sink.backlog().depth)
     }
 
-    /// The channel's bound. Ordinary events are refused
-    /// [`AUDIT_CONTROL_RESERVE`] short of it so lifecycle events always
-    /// have room; the capacity reported is the channel's, which is what an
-    /// operator comparing it with the depth wants.
+    /// Total capacity across the input channel and asynchronous sink buffers.
+    /// The input channel still reserves [`AUDIT_CONTROL_RESERVE`] slots for
+    /// lifecycle events; sink deliveries are counted separately.
     pub fn queue_capacity(&self) -> usize {
-        AUDIT_CHANNEL_CAPACITY
+        AUDIT_CHANNEL_CAPACITY.saturating_add(self.inner.sink.backlog().capacity)
     }
 
     /// How long the oldest event the writer has not finished delivering
@@ -255,11 +260,15 @@ impl AuditLog {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .map(|since| Instant::now().saturating_duration_since(since))
             .unwrap_or_default()
+            .max(self.inner.sink.backlog().oldest_age)
     }
 
-    /// Events refused admission since boot.
+    /// Admission failures plus asynchronous sink delivery losses since boot.
     pub fn dropped_total(&self) -> u64 {
-        self.inner.dropped.load(Ordering::Acquire)
+        self.inner
+            .dropped
+            .load(Ordering::Acquire)
+            .saturating_add(self.inner.sink.backlog().dropped)
     }
 
     /// Publish the writer queue's shape as gauges (issue #241, PR 14).
@@ -769,6 +778,27 @@ mod tests {
             condition(),
             "condition did not become true within {timeout:?}"
         );
+    }
+
+    #[test]
+    fn status_includes_asynchronous_sink_backlog_and_loss() {
+        struct PendingSink;
+        impl AuditSink for PendingSink {
+            fn emit(&self, _: &AuditEvent) {}
+            fn backlog(&self) -> sink::SinkBacklog {
+                sink::SinkBacklog {
+                    depth: 7,
+                    capacity: 20,
+                    oldest_age: Duration::from_secs(9),
+                    dropped: 3,
+                }
+            }
+        }
+        let log = AuditLog::new(Arc::new(PendingSink));
+        assert_eq!(log.queue_depth(), 7);
+        assert!(log.queue_capacity() >= 20);
+        assert!(log.oldest_queued_age() >= Duration::from_secs(9));
+        assert_eq!(log.dropped_total(), 3);
     }
 
     fn test_event(event_type: &str) -> AuditEvent {

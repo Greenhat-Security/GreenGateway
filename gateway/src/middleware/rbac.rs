@@ -1814,7 +1814,10 @@ fn decision_for_direct_rule(
 }
 
 fn with_policy_decision(mut response: Response, decision: PolicyDecision) -> Response {
-    response.extensions_mut().insert(decision);
+    // An endpoint may apply a narrower permission than the outer route.
+    if response.extensions().get::<PolicyDecision>().is_none() {
+        response.extensions_mut().insert(decision);
+    }
     response
 }
 

@@ -637,13 +637,16 @@ async fn attempt_call(
         idle: runtime
             .idle_timeout
             .map(|idle| (idle, Box::pin(tokio::time::sleep(idle)))),
-        shutdown: Box::pin(forced_shutdown.cancelled_owned()),
+        shutdown: Box::pin(forced_shutdown.clone().cancelled_owned()),
         max_metadata_entries: runtime.max_metadata_entries,
         finished: false,
         guard: Some(guard),
     };
 
-    let mut response = Response::new(Body::new(client_body));
+    let mut response = Response::new(Body::new(ManagedClientResponseBody::new(
+        client_body,
+        forced_shutdown,
+    )));
     *response.headers_mut() = response_headers;
     if let Some(value) = parts_request_id(request_id) {
         response
@@ -1126,6 +1129,126 @@ struct ClientResponseBody {
     max_metadata_entries: usize,
     finished: bool,
     guard: Option<CallGuard>,
+}
+
+// Control timers have an owner independent of Hyper's downstream polling.
+// The shared lock protects only synchronous body state; it is never held over
+// an await. No response bytes are buffered by the watchdog.
+struct ManagedResponseState {
+    body: Option<ClientResponseBody>,
+    terminal: Option<Frame<Bytes>>,
+    waker: Option<std::task::Waker>,
+}
+
+struct ManagedClientResponseBody {
+    state: Arc<Mutex<ManagedResponseState>>,
+    closed: tokio_util::sync::CancellationToken,
+    activity: Arc<tokio::sync::Notify>,
+}
+
+impl ManagedClientResponseBody {
+    fn new(body: ClientResponseBody, shutdown: tokio_util::sync::CancellationToken) -> Self {
+        let state = Arc::new(Mutex::new(ManagedResponseState {
+            body: Some(body),
+            terminal: None,
+            waker: None,
+        }));
+        let closed = tokio_util::sync::CancellationToken::new();
+        let activity = Arc::new(tokio::sync::Notify::new());
+        let task_state = Arc::clone(&state);
+        let task_closed = closed.clone();
+        let task_activity = Arc::clone(&activity);
+        tokio::spawn(async move {
+            loop {
+                let (deadline, idle) = {
+                    let state = task_state.lock().unwrap_or_else(|e| e.into_inner());
+                    let Some(body) = state.body.as_ref() else {
+                        return;
+                    };
+                    (
+                        body.deadline.as_ref().map(|timer| timer.deadline()),
+                        body.idle.as_ref().map(|(_, timer)| timer.deadline()),
+                    )
+                };
+                let outcome = tokio::select! {
+                    biased;
+                    () = task_closed.cancelled() => return,
+                    () = shutdown.cancelled() => (GrpcStatus::Unavailable, "shutdown"),
+                    () = forward::sleep_until_optional(deadline) => (GrpcStatus::DeadlineExceeded, "deadline_exceeded"),
+                    () = forward::sleep_until_optional(idle) => {
+                        // Activity may have reset the idle timer since this
+                        // sleep was armed. Re-read it under the body lock.
+                        let state = task_state.lock().unwrap_or_else(|e| e.into_inner());
+                        if state.body.as_ref().and_then(|body| body.idle.as_ref())
+                            .is_some_and(|(_, timer)| timer.deadline() > tokio::time::Instant::now()) {
+                            continue;
+                        }
+                        (GrpcStatus::Unavailable, "idle_timeout")
+                    }
+                    () = task_activity.notified() => continue,
+                };
+                let mut state = task_state.lock().unwrap_or_else(|e| e.into_inner());
+                if let Some(mut body) = state.body.take() {
+                    state.terminal = Some(body.terminate(outcome.0, outcome.1));
+                    // Dropping the body releases transport and admission even
+                    // when the downstream never asks for the terminal frame.
+                    drop(body);
+                }
+                if let Some(waker) = state.waker.take() {
+                    waker.wake();
+                }
+                return;
+            }
+        });
+        Self {
+            state,
+            closed,
+            activity,
+        }
+    }
+}
+
+impl Drop for ManagedClientResponseBody {
+    fn drop(&mut self) {
+        self.closed.cancel();
+        self.state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .body
+            .take();
+    }
+}
+
+impl HttpBody for ManagedClientResponseBody {
+    type Data = Bytes;
+    type Error = std::convert::Infallible;
+
+    fn poll_frame(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<Frame<Bytes>, Self::Error>>> {
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(frame) = state.terminal.take() {
+            return Poll::Ready(Some(Ok(frame)));
+        }
+        state.waker = Some(cx.waker().clone());
+        let Some(body) = state.body.as_mut() else {
+            return Poll::Ready(None);
+        };
+        let result = Pin::new(&mut *body).poll_frame(cx);
+        if result.is_ready() {
+            if body.finished {
+                state.body.take();
+            }
+            self.activity.notify_one();
+        }
+        result
+    }
+
+    fn is_end_stream(&self) -> bool {
+        let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        state.body.is_none() && state.terminal.is_none()
+    }
 }
 
 impl ClientResponseBody {

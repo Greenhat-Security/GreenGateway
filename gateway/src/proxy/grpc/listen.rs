@@ -53,7 +53,7 @@ use tokio::{
     net::{TcpListener, TcpStream},
     sync::{OwnedSemaphorePermit, Semaphore},
 };
-use tokio_util::{sync::CancellationToken, task::TaskTracker};
+use tokio_util::sync::CancellationToken;
 use tower::ServiceExt as _;
 
 use crate::metrics::{GRPC_LISTENER_CONNECTIONS_ACTIVE, GRPC_LISTENER_CONNECTIONS_TOTAL};
@@ -155,9 +155,10 @@ impl GrpcListener {
             limits,
         } = self;
         let connections = Arc::new(Semaphore::new(MAX_CONNECTIONS));
-        let tracker = TaskTracker::new();
+        let mut tracker = tokio::task::JoinSet::new();
 
         loop {
+            while tracker.try_join_next().is_some() {}
             // A connection slot is taken BEFORE the accept, so a saturated
             // gateway stops taking sockets off the queue instead of accepting
             // them and then dropping them -- which would look to a client like
@@ -214,8 +215,9 @@ impl GrpcListener {
         // Stop taking new connections, then wait for the ones in flight. The
         // per-connection tasks are already watching the same token and will have
         // begun their own graceful shutdown.
-        tracker.close();
-        tracker.wait().await;
+        // Dropping this listener future at the process deadline aborts every
+        // remaining connection; JoinSet owns the tasks instead of detaching them.
+        while tracker.join_next().await.is_some() {}
 
         Ok(())
     }

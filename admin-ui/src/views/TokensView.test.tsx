@@ -22,6 +22,15 @@ afterEach(() => {
 });
 
 describe('TokensView', () => {
+  it('enables token administration for an opaque identity using server capabilities', async () => {
+    const fetcher = tokensFetchMock();
+    vi.stubGlobal('fetch', fetcher.fetch);
+    renderTokensView({ token: 'ggw_opaque_identity' });
+    fireEvent.change(await screen.findByLabelText('Scopes'), { target: { value: 'admin:tokens:read' } });
+    await waitFor(() => expect((screen.getByRole('button', { name: 'Create token' }) as HTMLButtonElement).disabled).toBe(false));
+    expect(fetcher.fetch.mock.calls.some(([url]) => String(url).includes('/policy'))).toBe(false);
+  });
+
   it('renders tokens with active, expired, and revoked status badges', async () => {
     vi.stubGlobal(
       'fetch',
@@ -334,8 +343,8 @@ function tokensFetchMock({
   const fetch = vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
     const url = new URL(String(input), 'http://localhost');
 
-    if (url.pathname === '/v1/admin/policy' && !init?.method) {
-      return Promise.resolve(jsonResponse(200, policy));
+    if (url.pathname === '/v1/admin/capabilities' && !init?.method) {
+      return Promise.resolve(jsonResponse(200, { permissions: Object.values((policy.roles ?? {}) as Record<string, { permissions: string[] }>).flatMap(role => role.permissions) }));
     }
 
     if (url.pathname === '/v1/admin/tokens' && !init?.method) {

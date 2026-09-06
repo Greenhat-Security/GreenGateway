@@ -1478,18 +1478,18 @@ struct PolicyMutationCommitContext<'a, 'guard> {
 
 enum PolicyAdminAuthzError {
     NotConfigured,
-    Forbidden,
+    Forbidden(String),
 }
 
 enum TokenAdminAuthzError {
     StoreNotConfigured,
     RbacNotConfigured,
-    Forbidden,
+    Forbidden(String),
 }
 
 enum ConnectionAdminAuthzError {
     RbacNotConfigured,
-    Forbidden,
+    Forbidden(String),
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -1500,32 +1500,32 @@ struct TokenScopeAuthzError {
 enum ToolAdminAuthzError {
     RbacNotConfigured,
     ToolsFileNotConfigured,
-    Forbidden,
+    Forbidden(String),
 }
 
 enum TrafficAdminAuthzError {
     NotConfigured,
-    Forbidden,
+    Forbidden(String),
 }
 
 enum PrincipalAdminAuthzError {
     NotConfigured,
-    Forbidden,
+    Forbidden(String),
 }
 
 enum SignalsAdminAuthzError {
     NotConfigured,
-    Forbidden,
+    Forbidden(String),
 }
 
 enum SuggestionsAdminAuthzError {
     NotConfigured,
-    Forbidden,
+    Forbidden(String),
 }
 
 enum AdminReadAuthzError {
     NotConfigured,
-    Forbidden,
+    Forbidden(String),
 }
 
 enum IfMatchError {
@@ -3527,10 +3527,16 @@ fn gateway_app_with_process_started_at_and_overrides(
                 route_rules = policy.routes.len(),
                 "RBAC enabled: policy file loaded"
             );
-            Some(
+            let mut state =
                 middleware::rbac::RbacState::from_policy(policy, &config, audit_log.clone())
-                    .with_rate_limit_state(rate_limit_state.clone()),
-            )
+                    .with_rate_limit_state(rate_limit_state.clone());
+            // Self-capabilities require authentication, but no route permission.
+            // The endpoint still checks the principal and the admin revision
+            // gate still runs. This does not add an authentication exemption.
+            state
+                .exempt_paths
+                .push(format!("{}/capabilities", routes.admin.api_prefix));
+            Some(state)
         }
         None => {
             tracing::warn!("RBAC disabled: no policy file configured");
@@ -4837,6 +4843,10 @@ fn add_admin_api_routes(
     routes: &GatewayRoutes,
     admin_api_states: AdminApiStates,
 ) -> Router {
+    let decision_audit = (
+        admin_api_states.policy.audit.clone(),
+        admin_api_states.policy.client_ip_policy.clone(),
+    );
     // The admin API (minus the pre-authorization auth routes, merged
     // separately below) is one router so cluster mode can gate all of it
     // with one layer: every endpoint here authorizes against the compiled
@@ -4855,6 +4865,10 @@ fn add_admin_api_routes(
         .merge(
             Router::new()
                 .route(routes.admin.status_route.as_str(), get(status_endpoint))
+                .route(
+                    &format!("{}/capabilities", routes.admin.api_prefix),
+                    get(admin_capabilities_endpoint),
+                )
                 .with_state(admin_api_states.status),
         )
         .merge(
@@ -5071,6 +5085,11 @@ fn add_admin_api_routes(
                 )
                 .with_state(admin_api_states.traffic),
         );
+
+    api = api.layer(axum::middleware::from_fn_with_state(
+        decision_audit,
+        admin_decision_audit_middleware,
+    ));
 
     // Cluster mode's strict revision check for the admin plane: an admin
     // request whose replica cannot prove a current compiled snapshot fails
@@ -5635,7 +5654,14 @@ async fn proxy_fallback(State(state): State<AppState>, request: Request<Body>) -
         &state.client_ip_policy,
     );
 
-    proxy.forward_request(request, &source_ip).await
+    let mut response = proxy.forward_request(request, &source_ip).await;
+    // Proxy bodies are data, not trusted code on the gateway/admin origin.
+    // A second enforced policy intersects with the upstream's policy.
+    response.headers_mut().append(
+        header::CONTENT_SECURITY_POLICY,
+        HeaderValue::from_static("sandbox; frame-ancestors 'none'"),
+    );
+    response
 }
 
 fn payload_too_large(max_body_size: usize) -> Response {
@@ -5845,6 +5871,104 @@ fn admin_auth_error_url(admin_prefix: &str, error: &str) -> String {
     )
 }
 
+async fn admin_capabilities_endpoint(
+    State(state): State<StatusAdminState>,
+    principal: Option<Extension<auth::Principal>>,
+) -> Response {
+    let Some(Extension(principal)) = principal else {
+        return unauthorized();
+    };
+    let Some(rbac) = state.rbac_state.as_ref() else {
+        return service_unavailable("policy state unavailable");
+    };
+    let permissions: Vec<&str> = [
+        ADMIN_AUDIT_READ_PERMISSION,
+        ADMIN_AUDIT_STREAM_PERMISSION,
+        ADMIN_STATUS_READ_PERMISSION,
+        ADMIN_CLUSTER_READ_PERMISSION,
+        ADMIN_POLICY_READ_PERMISSION,
+        ADMIN_POLICY_WRITE_PERMISSION,
+        ADMIN_TOKENS_READ_PERMISSION,
+        ADMIN_TOKENS_WRITE_PERMISSION,
+        ADMIN_CONNECTIONS_READ_PERMISSION,
+        ADMIN_CONNECTIONS_WRITE_PERMISSION,
+        ADMIN_CONNECTIONS_SECRETS_WRITE_PERMISSION,
+        ADMIN_CONNECTIONS_TEST_PERMISSION,
+        ADMIN_CONNECTIONS_REFRESH_PERMISSION,
+        ADMIN_TOOLS_READ_PERMISSION,
+        ADMIN_TOOLS_WRITE_PERMISSION,
+        ADMIN_TOOLS_EXECUTE_PERMISSION,
+        ADMIN_SCHEMA_READ_PERMISSION,
+        ADMIN_SIGNALS_READ_PERMISSION,
+        ADMIN_SIGNALS_WRITE_PERMISSION,
+        ADMIN_SUGGESTIONS_READ_PERMISSION,
+        ADMIN_SUGGESTIONS_WRITE_PERMISSION,
+        ADMIN_TRAFFIC_READ_PERMISSION,
+        ADMIN_TRAFFIC_WRITE_PERMISSION,
+        ADMIN_PRINCIPALS_READ_PERMISSION,
+    ]
+    .into_iter()
+    .filter(|permission| rbac.principal_has_permission(&principal, permission))
+    .collect();
+    let mut response = Json(json!({ "permissions": permissions })).into_response();
+    response
+        .headers_mut()
+        .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    response
+}
+
+async fn admin_decision_audit_middleware(
+    State((audit, ip_policy)): State<(audit::AuditLog, client_ip::ClientIpPolicy)>,
+    request: AxumRequest,
+    next: axum::middleware::Next,
+) -> Response {
+    let principal = request.extensions().get::<auth::Principal>().cloned();
+    let request_id = client_ip::request_id(request.headers(), request.extensions());
+    let source_ip =
+        client_ip::canonical_client_ip(request.headers(), request.extensions(), &ip_policy);
+    let method = request.method().clone();
+    // MatchedPath is a bounded route template, never a raw URL/query.
+    let path = request
+        .extensions()
+        .get::<axum::extract::MatchedPath>()
+        .map(|path| path.as_str().to_owned())
+        .unwrap_or_else(|| "admin".to_owned());
+    let response = next.run(request).await;
+    if let Some(decision) = response
+        .extensions()
+        .get::<middleware::decision::PolicyDecision>()
+    {
+        if decision.outcome == middleware::decision::PolicyDecisionOutcome::Denied
+            && decision.permission.is_some()
+        {
+            audit.emit(audit::AuditEvent::new(
+                "authz.denied",
+                request_id,
+                source_ip,
+                principal.as_ref().map(auth::actor_from_principal),
+                json!({
+                    "path": path, "method": method.as_str(),
+                    "reason": decision.reason, "permission": decision.permission,
+                    "authorization_layer": "admin_endpoint",
+                }),
+            ));
+        }
+    }
+    response
+}
+
+fn admin_permission_denied_response(permission: String) -> Response {
+    let mut response = forbidden();
+    if let Some(decision) = response
+        .extensions_mut()
+        .get_mut::<middleware::decision::PolicyDecision>()
+    {
+        decision.permission = Some(permission);
+        decision.reason = "missing_permission";
+    }
+    response
+}
+
 async fn status_endpoint(
     State(state): State<StatusAdminState>,
     principal: Option<Extension<auth::Principal>>,
@@ -6044,7 +6168,7 @@ async fn connection_secret_list_endpoint(
         ADMIN_CONNECTIONS_SECRETS_WRITE_PERMISSION,
     ) {
         return match error {
-            ConnectionAdminAuthzError::Forbidden => connection_permission_forbidden(
+            ConnectionAdminAuthzError::Forbidden(_) => connection_permission_forbidden(
                 &state,
                 &parts,
                 &principal,
@@ -6123,7 +6247,7 @@ async fn connection_secret_create_endpoint(
         ADMIN_CONNECTIONS_SECRETS_WRITE_PERMISSION,
     ) {
         return match error {
-            ConnectionAdminAuthzError::Forbidden => connection_permission_forbidden(
+            ConnectionAdminAuthzError::Forbidden(_) => connection_permission_forbidden(
                 &state,
                 &parts,
                 &principal,
@@ -6265,7 +6389,7 @@ async fn connection_secret_rotate_endpoint(
         ADMIN_CONNECTIONS_SECRETS_WRITE_PERMISSION,
     ) {
         return match error {
-            ConnectionAdminAuthzError::Forbidden => connection_permission_forbidden(
+            ConnectionAdminAuthzError::Forbidden(_) => connection_permission_forbidden(
                 &state,
                 &parts,
                 &principal,
@@ -6446,7 +6570,7 @@ async fn connection_secret_delete_endpoint(
         ADMIN_CONNECTIONS_SECRETS_WRITE_PERMISSION,
     ) {
         return match error {
-            ConnectionAdminAuthzError::Forbidden => connection_permission_forbidden(
+            ConnectionAdminAuthzError::Forbidden(_) => connection_permission_forbidden(
                 &state,
                 &parts,
                 &principal,
@@ -7224,7 +7348,7 @@ async fn connection_test_endpoint(
         authorized_connection_state(&state, &principal, ADMIN_CONNECTIONS_TEST_PERMISSION)
     {
         return match error {
-            ConnectionAdminAuthzError::Forbidden => connection_permission_forbidden(
+            ConnectionAdminAuthzError::Forbidden(_) => connection_permission_forbidden(
                 &state,
                 &parts,
                 &principal,
@@ -8670,7 +8794,7 @@ async fn tool_playground_execute_endpoint(
     let rbac_state =
         match authorized_tool_rbac_state(&state, &principal, ADMIN_TOOLS_EXECUTE_PERMISSION) {
             Ok(rbac_state) => rbac_state.clone(),
-            Err(ToolAdminAuthzError::Forbidden) => {
+            Err(ToolAdminAuthzError::Forbidden(_)) => {
                 return tool_playground_permission_forbidden(&state, &parts, &principal);
             }
             Err(error) => return tool_admin_authz_error_response(error),
@@ -11742,7 +11866,7 @@ fn authorized_policy_state<'a>(
     };
 
     if !rbac_state.principal_has_permission(principal, permission) {
-        return Err(PolicyAdminAuthzError::Forbidden);
+        return Err(PolicyAdminAuthzError::Forbidden(permission.to_owned()));
     }
 
     Ok(rbac_state)
@@ -11757,7 +11881,7 @@ fn authorized_connection_state<'a>(
         return Err(ConnectionAdminAuthzError::RbacNotConfigured);
     };
     if !rbac_state.principal_has_permission(principal, permission) {
-        return Err(ConnectionAdminAuthzError::Forbidden);
+        return Err(ConnectionAdminAuthzError::Forbidden(permission.to_owned()));
     }
     Ok(rbac_state)
 }
@@ -11803,7 +11927,7 @@ fn authorized_admin_rbac_state<'a>(
     };
 
     if !rbac_state.principal_has_permission(principal, permission) {
-        return Err(AdminReadAuthzError::Forbidden);
+        return Err(AdminReadAuthzError::Forbidden(permission.to_owned()));
     }
 
     Ok(rbac_state)
@@ -11819,7 +11943,7 @@ fn authorized_token_store<'a>(
     };
 
     if !rbac_state.principal_has_permission(principal, permission) {
-        return Err(TokenAdminAuthzError::Forbidden);
+        return Err(TokenAdminAuthzError::Forbidden(permission.to_owned()));
     }
 
     state
@@ -11856,7 +11980,7 @@ fn authorized_tool_rbac_state<'a>(
     };
 
     if !rbac_state.principal_has_permission(principal, permission) {
-        return Err(ToolAdminAuthzError::Forbidden);
+        return Err(ToolAdminAuthzError::Forbidden(permission.to_owned()));
     }
 
     Ok(rbac_state)
@@ -11901,7 +12025,7 @@ fn authorized_traffic_state<'a>(
     };
 
     if !rbac_state.principal_has_permission(principal, permission) {
-        return Err(TrafficAdminAuthzError::Forbidden);
+        return Err(TrafficAdminAuthzError::Forbidden(permission.to_owned()));
     }
 
     Ok(rbac_state)
@@ -11917,7 +12041,7 @@ fn authorized_principal_state<'a>(
     };
 
     if !rbac_state.principal_has_permission(principal, permission) {
-        return Err(PrincipalAdminAuthzError::Forbidden);
+        return Err(PrincipalAdminAuthzError::Forbidden(permission.to_owned()));
     }
 
     Ok(rbac_state)
@@ -11933,7 +12057,7 @@ fn authorized_signals_state<'a>(
     };
 
     if !rbac_state.principal_has_permission(principal, permission) {
-        return Err(SignalsAdminAuthzError::Forbidden);
+        return Err(SignalsAdminAuthzError::Forbidden(permission.to_owned()));
     }
 
     Ok(rbac_state)
@@ -11949,7 +12073,7 @@ fn authorized_suggestions_state<'a>(
     };
 
     if !rbac_state.principal_has_permission(principal, permission) {
-        return Err(SuggestionsAdminAuthzError::Forbidden);
+        return Err(SuggestionsAdminAuthzError::Forbidden(permission.to_owned()));
     }
 
     Ok(rbac_state)
@@ -11958,28 +12082,30 @@ fn authorized_suggestions_state<'a>(
 fn policy_admin_authz_error_response(error: PolicyAdminAuthzError) -> Response {
     match error {
         PolicyAdminAuthzError::NotConfigured => policy_not_configured(),
-        PolicyAdminAuthzError::Forbidden => forbidden(),
+        PolicyAdminAuthzError::Forbidden(permission) => {
+            admin_permission_denied_response(permission)
+        }
     }
 }
 
 fn audit_admin_authz_error_response(error: AdminReadAuthzError) -> Response {
     match error {
         AdminReadAuthzError::NotConfigured => audit_rbac_not_configured(),
-        AdminReadAuthzError::Forbidden => forbidden(),
+        AdminReadAuthzError::Forbidden(permission) => admin_permission_denied_response(permission),
     }
 }
 
 fn status_admin_authz_error_response(error: AdminReadAuthzError) -> Response {
     match error {
         AdminReadAuthzError::NotConfigured => status_rbac_not_configured(),
-        AdminReadAuthzError::Forbidden => forbidden(),
+        AdminReadAuthzError::Forbidden(permission) => admin_permission_denied_response(permission),
     }
 }
 
 fn cluster_admin_authz_error_response(error: AdminReadAuthzError) -> Response {
     match error {
         AdminReadAuthzError::NotConfigured => cluster_rbac_not_configured(),
-        AdminReadAuthzError::Forbidden => forbidden(),
+        AdminReadAuthzError::Forbidden(permission) => admin_permission_denied_response(permission),
     }
 }
 
@@ -11987,14 +12113,16 @@ fn token_admin_authz_error_response(error: TokenAdminAuthzError) -> Response {
     match error {
         TokenAdminAuthzError::StoreNotConfigured => token_store_not_configured(),
         TokenAdminAuthzError::RbacNotConfigured => token_rbac_not_configured(),
-        TokenAdminAuthzError::Forbidden => forbidden(),
+        TokenAdminAuthzError::Forbidden(permission) => admin_permission_denied_response(permission),
     }
 }
 
 fn connection_admin_authz_error_response(error: ConnectionAdminAuthzError) -> Response {
     match error {
         ConnectionAdminAuthzError::RbacNotConfigured => connection_rbac_not_configured(),
-        ConnectionAdminAuthzError::Forbidden => forbidden(),
+        ConnectionAdminAuthzError::Forbidden(permission) => {
+            admin_permission_denied_response(permission)
+        }
     }
 }
 
@@ -12017,7 +12145,7 @@ fn tool_admin_authz_error_response(error: ToolAdminAuthzError) -> Response {
     match error {
         ToolAdminAuthzError::RbacNotConfigured => tools_rbac_not_configured(),
         ToolAdminAuthzError::ToolsFileNotConfigured => tools_file_not_configured(),
-        ToolAdminAuthzError::Forbidden => forbidden(),
+        ToolAdminAuthzError::Forbidden(permission) => admin_permission_denied_response(permission),
     }
 }
 
@@ -12282,28 +12410,36 @@ fn tool_playground_error_response_with_details(
 fn traffic_admin_authz_error_response(error: TrafficAdminAuthzError) -> Response {
     match error {
         TrafficAdminAuthzError::NotConfigured => traffic_rbac_not_configured(),
-        TrafficAdminAuthzError::Forbidden => forbidden(),
+        TrafficAdminAuthzError::Forbidden(permission) => {
+            admin_permission_denied_response(permission)
+        }
     }
 }
 
 fn principal_admin_authz_error_response(error: PrincipalAdminAuthzError) -> Response {
     match error {
         PrincipalAdminAuthzError::NotConfigured => principal_rbac_not_configured(),
-        PrincipalAdminAuthzError::Forbidden => forbidden(),
+        PrincipalAdminAuthzError::Forbidden(permission) => {
+            admin_permission_denied_response(permission)
+        }
     }
 }
 
 fn signals_admin_authz_error_response(error: SignalsAdminAuthzError) -> Response {
     match error {
         SignalsAdminAuthzError::NotConfigured => signals_rbac_not_configured(),
-        SignalsAdminAuthzError::Forbidden => forbidden(),
+        SignalsAdminAuthzError::Forbidden(permission) => {
+            admin_permission_denied_response(permission)
+        }
     }
 }
 
 fn suggestions_admin_authz_error_response(error: SuggestionsAdminAuthzError) -> Response {
     match error {
         SuggestionsAdminAuthzError::NotConfigured => suggestions_rbac_not_configured(),
-        SuggestionsAdminAuthzError::Forbidden => forbidden(),
+        SuggestionsAdminAuthzError::Forbidden(permission) => {
+            admin_permission_denied_response(permission)
+        }
     }
 }
 
@@ -15462,13 +15598,23 @@ fn unauthorized() -> Response {
 }
 
 fn forbidden() -> Response {
-    (
+    let mut response = (
         StatusCode::FORBIDDEN,
         Json(ErrorResponse {
             error: "forbidden".to_owned(),
         }),
     )
-        .into_response()
+        .into_response();
+    response
+        .extensions_mut()
+        .insert(middleware::decision::PolicyDecision {
+            outcome: middleware::decision::PolicyDecisionOutcome::Denied,
+            reason: "admin_endpoint_denied",
+            permission: None,
+            path_prefix: None,
+            matched_rule_id: None,
+        });
+    response
 }
 
 fn bad_request(error: &str) -> Response {
@@ -20349,6 +20495,44 @@ mod tests {
             r#"{"error":"gateway_timeout"}"#
         );
         server.abort();
+    }
+
+    #[tokio::test]
+    async fn proxied_documents_are_sandboxed_without_disabling_the_admin_ui() {
+        let (address, _captured) = spawn_capture_upstream().await;
+        let config = proxy_config(address);
+        let routes = GatewayRoutes::from_config(&config);
+        let router = proxy_router(config, test_audit_log());
+        let response = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/document")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert!(response
+            .headers()
+            .get_all(header::CONTENT_SECURITY_POLICY)
+            .iter()
+            .any(|value| value == "sandbox; frame-ancestors 'none'"));
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .uri(routes.admin.ui_prefix.as_str())
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(!response
+            .headers()
+            .get_all(header::CONTENT_SECURITY_POLICY)
+            .iter()
+            .any(|value| value == "sandbox; frame-ancestors 'none'"));
     }
 
     #[tokio::test]
@@ -31534,6 +31718,87 @@ mod tests {
             ),
             Ok(())
         );
+    }
+
+    #[tokio::test]
+    async fn admin_capabilities_use_effective_permissions_without_policy_read() {
+        let token_db = TempDb::new("admin-capabilities");
+        let policy = TempPolicyFile::new(&token_policy_document_string());
+        let router = token_admin_router(&token_db, &policy, test_audit_log());
+        let response = router
+            .clone()
+            .oneshot(token_admin_request(
+                Method::GET,
+                "/v1/admin/capabilities",
+                Some(test_principal(&["tokens-writer"])),
+                None,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers()[header::CACHE_CONTROL], "no-store");
+        let value = json_body(response).await;
+        assert!(value["permissions"]
+            .as_array()
+            .unwrap()
+            .contains(&json!(ADMIN_TOKENS_WRITE_PERMISSION)));
+        assert!(!value["permissions"]
+            .as_array()
+            .unwrap()
+            .contains(&json!(ADMIN_POLICY_READ_PERMISSION)));
+        let response = router
+            .oneshot(token_admin_request(
+                Method::GET,
+                "/v1/admin/capabilities",
+                None,
+                None,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn admin_endpoint_denial_preserves_decision_and_emits_one_audit_event() {
+        let token_db = TempDb::new("endpoint-denial-audit");
+        let policy = TempPolicyFile::new(&token_policy_document_string());
+        let capture = audit::sink::tests::CaptureSink::new();
+        let log = audit::AuditLog::new(Arc::new(capture.clone()));
+        let router = token_admin_router(&token_db, &policy, log.clone());
+        let response = router
+            .oneshot(token_admin_request(
+                Method::POST,
+                TOKENS_ADMIN_ROUTE,
+                Some(test_principal(&["tokens-reader"])),
+                Some(json!({ "scopes": ["probe-reader"] }).to_string()),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        let decision = response
+            .extensions()
+            .get::<middleware::decision::PolicyDecision>()
+            .unwrap();
+        assert_eq!(
+            decision.outcome,
+            middleware::decision::PolicyDecisionOutcome::Denied
+        );
+        assert_eq!(
+            decision.permission.as_deref(),
+            Some(ADMIN_TOKENS_WRITE_PERMISSION)
+        );
+        log.close_and_drain(Duration::from_secs(2)).await.unwrap();
+        let denied: Vec<_> = capture
+            .events()
+            .into_iter()
+            .filter(|event| event.event_type == "authz.denied")
+            .collect();
+        assert_eq!(denied.len(), 1);
+        assert_eq!(
+            denied[0].payload["permission"],
+            ADMIN_TOKENS_WRITE_PERMISSION
+        );
+        assert_eq!(denied[0].payload["authorization_layer"], "admin_endpoint");
     }
 
     #[tokio::test]

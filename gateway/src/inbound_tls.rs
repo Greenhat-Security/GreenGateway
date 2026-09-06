@@ -1948,6 +1948,9 @@ pub(crate) struct InboundConnectInfo {
 
 impl Connected<IncomingStream<'_, TcpListener>> for InboundConnectInfo {
     fn connect_info(stream: IncomingStream<'_, TcpListener>) -> Self {
+        // Streaming bodies produce small frames across separate polls. Do not
+        // hold a frame behind Nagle while the peer delays its acknowledgement.
+        let _ = stream.io().set_nodelay(true);
         // A plaintext listener never requested a certificate and can never have
         // verified one, so there is nothing here to make conditional.
         Self {
@@ -1959,6 +1962,7 @@ impl Connected<IncomingStream<'_, TcpListener>> for InboundConnectInfo {
 
 impl Connected<IncomingStream<'_, TlsListener>> for InboundConnectInfo {
     fn connect_info(stream: IncomingStream<'_, TlsListener>) -> Self {
+        let _ = stream.io().inner.get_ref().0.set_nodelay(true);
         Self {
             peer_addr: *stream.remote_addr(),
             client_identity: stream.io().client_identity.clone(),

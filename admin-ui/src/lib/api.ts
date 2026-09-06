@@ -1,4 +1,5 @@
 import { authHeaders } from './auth';
+import { adminApiUrl } from './config';
 
 const DEFAULT_CSRF_COOKIE_NAME = 'csrf_token';
 const DEFAULT_CSRF_HEADER_NAME = 'x-csrf-token';
@@ -548,4 +549,8 @@ function validHeaderName(value: string): boolean {
 
 function isJsonObject(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === 'object' && !Array.isArray(value);
+}
+
+export async function fetchAdminCapabilities(): Promise<{ permissions: string[] }> {
+  return adminFetchJson(adminApiUrl('/capabilities'));
 }

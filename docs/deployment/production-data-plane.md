@@ -322,3 +322,11 @@ There is no database migration for the proxy pool configuration. Do not
 silently weaken egress, TLS, authentication, or authorization to make rollback
 pass. If the legacy destination is no longer safe or reachable, keep the
 gateway unavailable and correct the infrastructure instead.
+
+## Admin browser isolation
+
+Deploy the control plane on a separate private origin using `ADMIN_LISTEN_ADDR` and edge host routing. Keep data-plane upstreams off that origin. Path prefixes alone are not browser isolation.
+
+All proxied response documents now receive an additional enforced CSP `sandbox; frame-ancestors 'none'`. Upstream headers cannot relax it. HTTP API clients are unaffected; active upstream web applications cannot execute scripts or forms on the gateway origin. Host such applications directly on their own origin. This is an intentional compatibility change for deployments previously browsing application HTML through the API gateway.
+
+Forced response cleanup has a final 100 ms cooperative grace within supervisor headroom. Remaining gRPC connection tasks are owned by their listener and aborted when its drain is cancelled; they are not detached from process shutdown.

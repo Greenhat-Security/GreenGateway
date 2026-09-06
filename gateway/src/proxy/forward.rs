@@ -883,11 +883,18 @@ async fn forward_to_upstream(
         {
             record_circuit_failure(&mut circuit_permit, "retryable_status");
         }
-        if let Some(config) = endpoint.health_config.as_deref() {
-            endpoint
-                .health
-                .record_passive_status(upstream_status.as_u16(), config)
-                .await;
+        let passive_status_failed = endpoint.health_config.as_deref().is_some_and(|config| {
+            config
+                .passive_failure_statuses
+                .contains(&upstream_status.as_u16())
+        });
+        if passive_status_failed {
+            if let Some(config) = endpoint.health_config.as_deref() {
+                endpoint
+                    .health
+                    .record_passive_status(upstream_status.as_u16(), config)
+                    .await;
+            }
         }
         if authentication_rejected {
             let duration = attempt_started.elapsed();
@@ -947,7 +954,11 @@ async fn forward_to_upstream(
             match first {
                 Err(_) => {
                     record_circuit_failure(&mut circuit_permit, "request_timeout");
-                    if let Some(config) = endpoint.health_config.as_deref() {
+                    if let Some(config) = endpoint
+                        .health_config
+                        .as_deref()
+                        .filter(|_| !passive_status_failed)
+                    {
                         endpoint.health.record_passive_timeout(config).await;
                     }
                     let duration = attempt_started.elapsed();
@@ -977,7 +988,11 @@ async fn forward_to_upstream(
                     if upstream.pool.retry_policy.retries_error(&error) {
                         record_circuit_failure(&mut circuit_permit, circuit_failure_reason(&error));
                     }
-                    if let Some(config) = endpoint.health_config.as_deref() {
+                    if let Some(config) = endpoint
+                        .health_config
+                        .as_deref()
+                        .filter(|_| !passive_status_failed)
+                    {
                         endpoint
                             .health
                             .record_passive_proxy_error(&error, config)
@@ -1107,6 +1122,7 @@ async fn forward_to_upstream(
             let passive_health = endpoint
                 .health_config
                 .as_ref()
+                .filter(|_| !passive_status_failed)
                 .map(|config| (endpoint.health.clone(), Arc::clone(config)));
             let stream_deadline = upstream.sse.map_or(Some(deadline), |sse| {
                 sse.max_duration
@@ -1132,6 +1148,14 @@ async fn forward_to_upstream(
                 },
             )
         } else {
+            if !passive_status_failed {
+                if let Some(config) = endpoint.health_config.as_deref() {
+                    endpoint
+                        .health
+                        .record_passive_status(upstream_status.as_u16(), config)
+                        .await;
+                }
+            }
             record_circuit_success(&mut circuit_permit);
             Body::empty()
         };
@@ -1615,6 +1639,12 @@ async fn pump_redacted_response_tail(pump: ResponseTailPump) {
             }
             None => {
                 release_response_permits(&mut admission_permit, &mut retry_permit);
+                if let Some((health, config)) = passive_health.as_ref() {
+                    // Only non-failing statuses reach this pump's passive
+                    // accounting. A success requires the complete body.
+                    let status = telemetry.as_ref().map_or(200, |event| event.status);
+                    health.record_passive_status(status, config).await;
+                }
                 record_circuit_success(&mut circuit_permit);
                 terminal_sender.send_replace(ResponseTailTerminal::Eof);
                 let _ = demand.response.send(ResponseTailEvent::Eof);
@@ -3838,6 +3868,43 @@ mod tests {
 
         first_server.abort();
         second_server.abort();
+    }
+
+    #[tokio::test]
+    async fn successful_headers_do_not_reset_consecutive_body_failures() {
+        let (address, server) =
+            spawn_trickling_upstream(Arc::new(Mutex::new(Vec::new())), Duration::from_secs(2))
+                .await;
+        let mut health = passive_health_config();
+        health.unhealthy_threshold = 2;
+        let (proxy, _, states) = retry_proxy_with_options(
+            [address, address],
+            RetryProxyOptions {
+                timeout: Duration::from_millis(200),
+                health_config: Some(health),
+                ..RetryProxyOptions::default()
+            },
+        );
+        for _ in 0..4 {
+            let response = proxy
+                .forward_request(
+                    Request::builder()
+                        .uri("/items")
+                        .body(Body::empty())
+                        .unwrap(),
+                    "203.0.113.8",
+                )
+                .await;
+            assert_eq!(response.status(), StatusCode::OK);
+            assert!(axum::body::to_bytes(response.into_body(), 1024)
+                .await
+                .is_err());
+        }
+        assert!(
+            states.iter().all(|state| !state.eligible()),
+            "each endpoint must be ejected after two failed bodies"
+        );
+        server.abort();
     }
 
     #[tokio::test]

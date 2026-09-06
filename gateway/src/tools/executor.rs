@@ -277,6 +277,23 @@ pub enum ToolExecutionResult {
     Composite(CompositeResult),
 }
 
+impl ToolExecutionResult {
+    fn application_failure_reason(&self) -> Option<&'static str> {
+        match self {
+            Self::McpCallToolResult(result) if result.is_error == Some(true) => {
+                Some("mcp_tool_error")
+            }
+            Self::Http(result)
+                if result.response.status.is_client_error()
+                    || result.response.status.is_server_error() =>
+            {
+                Some("upstream_http_status")
+            }
+            _ => None,
+        }
+    }
+}
+
 #[derive(Debug)]
 pub struct HttpToolExecutionResult {
     pub response: EgressResponse,
@@ -989,7 +1006,7 @@ impl ToolExecutor {
 
         let result = self
             .runtime
-            .execute_result_with_context_and_reason(
+            .execute_result_with_context_and_outcome(
                 &runtime_tool_name,
                 context,
                 cancel,
@@ -1006,6 +1023,7 @@ impl ToolExecutor {
                         .await
                 },
                 executor_work_error_disposition,
+                ToolExecutionResult::application_failure_reason,
             )
             .await;
 
@@ -2746,25 +2764,28 @@ impl ToolExecutor {
 
         match result {
             Ok(result) => {
+                let failed = result.is_error == Some(true);
                 self.emit_mcp_upstream_audit(
                     context,
                     tool,
                     &mapping,
                     UpstreamAuditOutcome {
-                        outcome: "success",
+                        outcome: if failed { "failure" } else { "success" },
                         status: Some(http::StatusCode::OK.as_u16()),
                         latency_ms,
-                        reason: None,
+                        reason: failed.then_some("mcp_tool_error"),
                     },
                 );
                 self.emit_tool_observation(
                     context,
                     tool,
                     ToolObservationOutcome {
-                        status: StatusCode::OK.as_u16(),
+                        // Observation status classifies the logical tool result;
+                        // the upstream audit above retains transport HTTP 200.
+                        status: if failed { 500 } else { 200 },
                         latency_ms,
                         schema_mismatch: false,
-                        reason: None,
+                        reason: failed.then_some("mcp_tool_error"),
                     },
                 );
                 Ok(ToolExecutionResult::McpCallToolResult(result))

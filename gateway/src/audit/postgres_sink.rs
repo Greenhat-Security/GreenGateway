@@ -198,6 +198,7 @@ impl PostgresSink {
             overflowing: AtomicBool::new(false),
             flush_failure: Mutex::new(None),
             in_flight: AtomicU64::new(0),
+            in_flight_since: Mutex::new(None),
             dropped: AtomicU64::new(0),
             stored: AtomicU64::new(0),
         });
@@ -286,6 +287,21 @@ impl PostgresSink {
 }
 
 impl AuditSink for PostgresSink {
+    fn backlog(&self) -> crate::audit::sink::SinkBacklog {
+        let buffer = self.shared.buffer_guard();
+        let buffered_since = buffer.front().map(|(since, _)| *since);
+        let in_flight_since = *recover_lock(&self.shared.in_flight_since, "postgres_sink_age");
+        let oldest = buffered_since.into_iter().chain(in_flight_since).min();
+        crate::audit::sink::SinkBacklog {
+            depth: buffer
+                .len()
+                .saturating_add(self.shared.in_flight.load(Ordering::Acquire) as usize),
+            capacity: self.shared.settings.buffer_capacity + self.shared.settings.batch_size,
+            oldest_age: oldest.map(|since| since.elapsed()).unwrap_or_default(),
+            dropped: self.shared.dropped.load(Ordering::Acquire),
+        }
+    }
+
     fn name(&self) -> &'static str {
         "postgres"
     }
@@ -339,7 +355,7 @@ enum Push {
 struct PostgresSinkShared {
     store: Arc<PostgresAuditEventStore>,
     settings: PostgresSinkSettings,
-    buffer: Mutex<VecDeque<AuditEvent>>,
+    buffer: Mutex<VecDeque<(Instant, AuditEvent)>>,
     wake: Notify,
     shutdown: AtomicBool,
     /// When the flusher must have finished, set by `begin_shutdown`; `None`
@@ -355,6 +371,7 @@ struct PostgresSinkShared {
     /// those events: the flusher on store or drop, or a waiter that stopped
     /// listening before the flusher reported (`count_stranded`).
     in_flight: AtomicU64,
+    in_flight_since: Mutex<Option<Instant>>,
     dropped: AtomicU64,
     stored: AtomicU64,
 }
@@ -373,7 +390,7 @@ impl PostgresSinkShared {
             }
             return Push::Refused;
         }
-        buffer.push_back(event.clone());
+        buffer.push_back((Instant::now(), event.clone()));
         if buffer.len() >= self.settings.batch_size {
             Push::BatchReady
         } else {
@@ -392,11 +409,18 @@ impl PostgresSinkShared {
         if take > 0 {
             self.overflowing.store(false, Ordering::Release);
         }
+        *recover_lock(&self.in_flight_since, "postgres_sink_age") =
+            buffer.front().map(|(since, _)| *since);
         let mut seen = HashSet::with_capacity(take);
-        buffer
+        let batch: Vec<_> = buffer
             .drain(..take)
+            .map(|(_, event)| event)
             .filter(|event| seen.insert(event.event_id.clone()))
-            .collect()
+            .collect();
+        // Publish the handoff before releasing the buffer lock, so status
+        // cannot observe an empty buffer and no batch between these stages.
+        self.in_flight.store(batch.len() as u64, Ordering::Release);
+        batch
     }
 
     /// One batch through the store's single write path, retried within the
@@ -408,7 +432,6 @@ impl PostgresSinkShared {
     /// `BEGIN` would leave the stream lock held on a pooled connection.
     async fn write_batch(&self, batch: Vec<AuditEvent>) {
         let count = batch.len();
-        self.in_flight.store(count as u64, Ordering::Release);
         let mut attempt = 0_u32;
         loop {
             attempt += 1;
@@ -428,6 +451,7 @@ impl PostgresSinkShared {
                     // the rows are there regardless.
                     let landed = self.in_flight.swap(0, Ordering::AcqRel);
                     self.stored.fetch_add(landed, Ordering::AcqRel);
+                    *recover_lock(&self.in_flight_since, "postgres_sink_age") = None;
                     return;
                 }
                 Ok(Err(error)) => error.to_string(),
@@ -456,6 +480,7 @@ impl PostgresSinkShared {
 
     fn drop_batch(&self, count: usize, error: &str) {
         record_flush_outcome(false);
+        *recover_lock(&self.in_flight_since, "postgres_sink_age") = None;
         // Zero if a waiter already counted this batch as lost.
         let dropped = self.in_flight.swap(0, Ordering::AcqRel);
         if dropped > 0 {
@@ -484,6 +509,7 @@ impl PostgresSinkShared {
     fn count_stranded(&self) -> u64 {
         let buffered = self.buffer_guard().drain(..).count() as u64;
         let stranded = buffered + self.in_flight.swap(0, Ordering::AcqRel);
+        *recover_lock(&self.in_flight_since, "postgres_sink_age") = None;
         if stranded > 0 {
             self.note_dropped(stranded);
         }
@@ -526,7 +552,7 @@ impl PostgresSinkShared {
         self.failure_guard().clone().map_or(Ok(()), Err)
     }
 
-    fn buffer_guard(&self) -> MutexGuard<'_, VecDeque<AuditEvent>> {
+    fn buffer_guard(&self) -> MutexGuard<'_, VecDeque<(Instant, AuditEvent)>> {
         recover_lock(&self.buffer, "postgres_sink_buffer")
     }
 
@@ -746,6 +772,14 @@ mod tests {
             capacity,
             "the buffer must hold exactly its bound"
         );
+        let batch = sink.shared.take_batch();
+        assert_eq!(batch.len(), 4);
+        assert_eq!(
+            sink.backlog().depth,
+            capacity,
+            "buffer-to-batch handoff must not hide pending deliveries"
+        );
+        sink.shared.drop_batch(batch.len(), "test cleanup");
     }
 
     #[test]

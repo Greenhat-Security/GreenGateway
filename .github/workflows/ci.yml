@@ -213,6 +213,10 @@ jobs:
         working-directory: admin-ui
         run: npm test
 
+      - name: Audit admin UI dependencies
+        working-directory: admin-ui
+        run: npm audit --audit-level=high
+
       - name: Build admin UI
         working-directory: admin-ui
         run: npm run build
@@ -262,23 +266,21 @@ jobs:
       - name: Test Cloudflare wrapper
         run: npm test
 
+      - name: Audit Cloudflare dependencies
+        run: npm audit --audit-level=high
+
       - name: Type-check Cloudflare wrapper
         run: npm run typecheck
 
   ha-compose-example:
     name: ha-compose-example
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 45
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      # Validity only. This job never starts a container, never builds an
-      # image and never pulls one: `docker compose config` parses, interpolates
-      # and merges the file and prints the resolved model. The example is an
-      # operator-facing document, and a document that no longer parses is a
-      # broken document — but it describes a two-replica deployment against a
-      # PostgreSQL the runner does not have, so running it is not the check.
+      # Validate syntax, then rehearse the actual runbook against an isolated DB.
       - name: Validate the HA compose example
         shell: bash
         run: |
@@ -300,6 +302,12 @@ jobs:
           # This is the one claim in the file an operator can be harmed by
           # losing, so it is asserted rather than trusted to review.
           grep -qi 'EXAMPLE ONLY' "$example"
+
+      - name: Build the production image
+        run: docker build -t greengateway:bootstrap .
+
+      - name: Rehearse clean bootstrap and restore
+        run: sudo python3 scripts/check-ha-bootstrap.py --image greengateway:bootstrap
 
   dev-traffic-smoke:
     name: dev-traffic-smoke

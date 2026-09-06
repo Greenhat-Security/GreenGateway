@@ -1179,8 +1179,11 @@ function generatedExpression(rule: PolicyRule): string {
     }
   }
 
-  for (const role of normalizeStrings(rule.principal?.roles ?? [])) {
-    lines.push(`principal.roles contains ${JSON.stringify(role)}`);
+  const roles = normalizeStrings(rule.principal?.roles ?? []);
+  if (roles.length > 0) {
+    lines.push(
+      `(${roles.map((role) => `principal.roles contains ${JSON.stringify(role)}`).join(' OR ')})`,
+    );
   }
   const issuers = normalizeStrings(rule.principal?.issuers ?? []);
   if (issuers.length > 0) {

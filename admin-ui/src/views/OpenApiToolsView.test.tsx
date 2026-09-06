@@ -20,6 +20,17 @@ afterEach(() => {
 });
 
 describe('OpenApiToolsView', () => {
+  it('uses server capabilities for a cookie identity without a readable JWT', async () => {
+    const fetcher = openApiToolsFetchMock();
+    vi.stubGlobal('fetch', fetcher.fetch);
+    renderOpenApiToolsView({ token: null });
+    fireEvent.change(screen.getByLabelText('OpenAPI spec'), { target: { value: widgetSpec } });
+    fireEvent.click(screen.getByRole('button', { name: 'Preview' }));
+    await screen.findByText('createWidget');
+    await waitFor(() => expect((screen.getByRole('button', { name: 'Register selected' }) as HTMLButtonElement).disabled).toBe(false));
+    expect(fetcher.fetch.mock.calls.some(([url]) => String(url).includes('/policy'))).toBe(false);
+  });
+
   it('previews pasted OpenAPI tools with skipped operations and upstream auth warnings', async () => {
     vi.stubGlobal('fetch', openApiToolsFetchMock().fetch);
 
@@ -210,8 +221,8 @@ function openApiToolsFetchMock({
   const fetch = vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
     const url = new URL(String(input), 'http://localhost');
 
-    if (url.pathname === '/v1/admin/policy' && !init?.method) {
-      return Promise.resolve(jsonResponse(200, policy));
+    if (url.pathname === '/v1/admin/capabilities' && !init?.method) {
+      return Promise.resolve(jsonResponse(200, { permissions: Object.values((policy.roles ?? {}) as Record<string, { permissions: string[] }>).flatMap(role => role.permissions) }));
     }
 
     if (

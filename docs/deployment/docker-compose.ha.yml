@@ -24,8 +24,12 @@
 #      loopback, so the `db` service needs a real certificate for the name
 #      `db` signed by the CA at ./tls/ca.pem.
 #   2. DSN files in ./secrets (see `roles-and-grants.md`). Two roles, two
-#      files, mode 0400: the migration role holds DDL, the runtime role does
-#      not.
+#      files, mode 0400, owned on the HOST by uid/gid 10001:10001.
+#      File-backed Compose secrets do not implement uid/gid/mode remapping.
+#      The migration role holds DDL; the runtime role does not.
+#      Generate ./keys/rate-limit.primary with 32 random bytes (openssl rand),
+#      chown the keys directory and file to 10001:10001, chmod the directory
+#      0700 and the key 0400. Preserve the same key/generation on every replica.
 #   3. `docker compose --profile bootstrap run --rm db-bootstrap` once, to
 #      create the roles.
 #   4. `docker compose run --rm migrate` to build the schema, then
@@ -39,7 +43,7 @@
 #      state the mode forbids. It exits naming
 #      "STATE_BACKEND=postgres requires an initialized deployment".
 #
-# The directories this file expects beside it - ./tls, ./secrets, ./standalone
+# The directories this file expects beside it - ./tls, ./secrets, ./keys, ./standalone
 # and ./wal-archive - hold key material, DSNs and a copy of a real deployment's
 # state. They are working directories for a local example. Do not commit them;
 # add them to .gitignore before you create them.
@@ -61,6 +65,8 @@ name: greengateway-ha
 x-gateway-environment: &gateway-environment
   LISTEN_ADDR: 0.0.0.0:8080
   STATE_BACKEND: postgres
+  CONNECTION_SECRETS_ROOT: /run/greengateway-keys
+  RATE_LIMIT_KEYRING: '[{"id":"rate-v1","file":"rate-limit.primary","role":"primary"}]'
   DEPLOYMENT_ID: deploy-compose-example
   DATABASE_URL_FILE: /run/secrets/database-url-runtime
   DATABASE_TLS_MODE: verify
@@ -91,6 +97,8 @@ x-gateway-service: &gateway-service
     context: ../..
     dockerfile: Dockerfile
   environment: *gateway-environment
+  # Prepare host files as uid/gid 10001 and mode 0400 before Compose starts.
+  # Compose ignores the uid/gid/mode below for file-backed secrets.
   # Mode 0400 and owned by the container's uid is not decoration: the gateway
   # refuses a DSN file that grants any group or other permission, and refuses
   # one it cannot read. The Dockerfile's runtime user is 10001:10001.
@@ -102,6 +110,7 @@ x-gateway-service: &gateway-service
       mode: 0400
   volumes:
     - ./tls/ca.pem:/etc/greengateway/tls/ca.pem:ro
+    - ./keys:/run/greengateway-keys:ro
   stop_signal: SIGTERM
   stop_grace_period: 45s
   # /readyz is the only correct probe for a cluster-mode replica. /livez says
@@ -196,7 +205,7 @@ configs:
       WHERE NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'greengateway_migrator')
       \gexec
       GRANT CONNECT ON DATABASE greengateway TO greengateway;
-      GRANT CONNECT ON DATABASE greengateway TO greengateway_migrator;
+      GRANT CONNECT, CREATE ON DATABASE greengateway TO greengateway_migrator;
       GRANT greengateway TO greengateway_migrator;
 
   # Run once, after the first `migrate up`. Re-running it is harmless.
@@ -336,6 +345,8 @@ services:
       dockerfile: Dockerfile
     environment:
       STATE_BACKEND: postgres
+      CONNECTION_SECRETS_ROOT: /run/greengateway-keys
+      RATE_LIMIT_KEYRING: '[{"id":"rate-v1","file":"rate-limit.primary","role":"primary"}]'
       DEPLOYMENT_ID: deploy-compose-example
       DATABASE_URL_FILE: /run/secrets/database-url-migration
       DATABASE_TLS_MODE: verify
@@ -349,6 +360,7 @@ services:
         mode: 0400
     volumes:
       - ./tls/ca.pem:/etc/greengateway/tls/ca.pem:ro
+      - ./keys:/run/greengateway-keys:ro
     depends_on:
       db:
         condition: service_healthy
@@ -391,6 +403,8 @@ services:
       dockerfile: Dockerfile
     environment:
       STATE_BACKEND: postgres
+      CONNECTION_SECRETS_ROOT: /run/greengateway-keys
+      RATE_LIMIT_KEYRING: '[{"id":"rate-v1","file":"rate-limit.primary","role":"primary"}]'
       DEPLOYMENT_ID: deploy-compose-example
       DATABASE_URL_FILE: /run/secrets/database-url-migration
       DATABASE_TLS_MODE: verify
@@ -404,6 +418,7 @@ services:
         mode: 0400
     volumes:
       - ./tls/ca.pem:/etc/greengateway/tls/ca.pem:ro
+      - ./keys:/run/greengateway-keys:ro
       - ./standalone:/standalone:ro
     depends_on:
       db:

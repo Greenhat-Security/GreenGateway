@@ -1660,6 +1660,69 @@ async fn an_unreachable_endpoint_becomes_unavailable_and_not_a_successful_envelo
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
+async fn unpolled_responses_release_resources_on_deadline_and_shutdown() {
+    let address = spawn_upstream(move |request| async move {
+        drop(request);
+        let (sender, response_body) = TestBody::channel(1);
+        tokio::spawn(async move {
+            sender.closed().await;
+        });
+        hyper::Response::builder()
+            .status(200)
+            .header("content-type", "application/grpc")
+            .body(response_body)
+            .unwrap()
+    })
+    .await;
+    for force_shutdown in [false, true] {
+        let harness = harness(address, |settings| {
+            settings.idle_timeout_ms = 0;
+            settings.max_duration_ms = if force_shutdown { 0 } else { 100 };
+        });
+        let response = harness
+            .proxy
+            .handle_grpc_call(
+                grpc_request("/pkg.Service/Watch", TestBody::empty()),
+                "203.0.113.7",
+            )
+            .await;
+        if force_shutdown {
+            harness.lifecycle.force_shutdown_response_streams().await;
+        }
+        let event = tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                if let Some(event) = harness
+                    .sink
+                    .events()
+                    .into_iter()
+                    .find(|event| event.event_type == audit::event::UPSTREAM_GRPC_CALL)
+                {
+                    break event;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("cleanup must run without downstream polling");
+        let reason = if force_shutdown {
+            "shutdown"
+        } else {
+            "deadline_exceeded"
+        };
+        assert_eq!(event.payload["reason"], reason);
+        let collected = collect(response).await;
+        collected.assert_status(
+            if force_shutdown {
+                GrpcStatus::Unavailable
+            } else {
+                GrpcStatus::DeadlineExceeded
+            },
+            reason,
+        );
+    }
+}
+
+#[tokio::test]
 async fn forced_shutdown_terminates_an_in_flight_stream_with_a_status() {
     let address = spawn_upstream(move |request| async move {
         let (_, body) = request.into_parts();
