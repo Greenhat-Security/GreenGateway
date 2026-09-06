@@ -8,7 +8,7 @@ The existing Linux, PostgreSQL and protocol acceptance gates remain mandatory.
 The gate checks each file in `.github/security-coverage.json` separately:
 JWT handling, authentication and RBAC middleware, CSRF, response headers,
 validation, role evaluation, admin authorization and egress. Their inline test
-suites are separate `*_tests.rs` files, so test implementation lines cannot
+suites are separate test files, so test implementation lines cannot
 inflate these production-file percentages. Missing files, absent branch
 instrumentation and results below either floor fail the job. Evidence is uploaded
 even when a floor fails, and image promotion depends on the coverage job.

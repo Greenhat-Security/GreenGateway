@@ -2407,5 +2407,5 @@ fn counted_request_body_stream(
 }
 
 #[cfg(test)]
-#[path = "egress_tests.rs"]
+#[path = "egress/tests.rs"]
 mod tests;
