@@ -4,10 +4,18 @@ name: CI
   push:
     branches:
       - main
+    tags:
+      - 'v*.*.*'
   pull_request:
 
 permissions:
   contents: read
+
+# A new push cancels the old run immediately, including candidate builds and
+# any pending promotion. Keep this distinct from the promotion job's lock.
+concurrency:
+  group: ci-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: true
 
 env:
   CARGO_TERM_COLOR: always
@@ -455,7 +463,8 @@ jobs:
         uses: actions/checkout@v4
         with:
           # `ha_rolling_upgrade` carries a tripwire that reads the newest
-          # reachable `v*` tag's own `gateway/Cargo.toml` and fails once a
+          # previous `v*` tag's own `gateway/Cargo.toml` (excluding HEAD)
+          # and fails once a
           # released binary declares the PostgreSQL dependency -- the moment
           # a mixed-version cluster becomes buildable and its documented
           # substitution expires. `actions/checkout@v4` fetches no tags at
@@ -596,3 +605,123 @@ jobs:
           if [ "$acceptance_status" -ne 0 ] || [ "$dependency_status" -ne 0 ]; then
             exit 1
           fi
+
+  gitleaks:
+    name: gitleaks
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Install gitleaks
+        env:
+          # Pinned to the published release asset. This binary is installed to a
+          # root-owned path and then run over the full repository history, so a
+          # swapped asset would execute as root in CI. TLS authenticates the
+          # host, not the artifact; the digest is what ties this job to the
+          # exact bytes that were reviewed. Update both together when bumping.
+          GITLEAKS_VERSION: 8.30.1
+          GITLEAKS_SHA256: 551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb
+        run: |
+          set -euo pipefail
+          archive="gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz"
+          curl -sSfL --proto '=https' --tlsv1.2             "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/${archive}"             -o gitleaks.tar.gz
+          echo "${GITLEAKS_SHA256}  gitleaks.tar.gz" | sha256sum --check --strict -
+          tar -xzf gitleaks.tar.gz gitleaks
+          sudo install -m 0755 gitleaks /usr/local/bin/gitleaks
+          gitleaks version
+
+      - name: Scan for secrets
+        run: gitleaks detect --source . --no-git=false --verbose --redact
+
+  image-publication:
+    name: image-publication
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Install workflow test parser
+        run: python -m pip install PyYAML==6.0.3
+      - name: Verify publication gates and promotion behavior
+        run: python -m unittest discover -s scripts -p 'test_image_publication.py' -v
+
+  image-preview:
+    name: Build image
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+      - name: Build without publishing
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: ./Dockerfile
+          push: false
+
+  image-candidate:
+    if: github.event_name == 'push'
+    permissions:
+      contents: read
+      packages: write
+    uses: ./.github/workflows/publish-image.yml
+
+  promote-image:
+    name: Promote checked image
+    # Every validation job is a dependency. The structural test above fails
+    # when a new check is added without also adding it to this list.
+    needs:
+      - egress-only
+      - fmt
+      - clippy
+      - test
+      - postgres-foundation
+      - admin-ui
+      - cloudflare
+      - dev-traffic-smoke
+      - audit
+      - ha-compose-example
+      - ha-release-gate
+      - connections-acceptance
+      - gitleaks
+      - image-publication
+      - image-candidate
+    if: ${{ github.event_name == 'push' && success() && !contains(needs.*.result, 'skipped') }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      packages: write
+    # Serialize promotions. The script rejects a run superseded at its ref
+    # check; GitHub refs and registry tags cannot be updated atomically.
+    concurrency:
+      group: image-promotion-${{ github.ref }}
+      cancel-in-progress: false
+    steps:
+      - name: Checkout checked commit
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Promote the candidate digest without rebuilding
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          CANDIDATE_DIGEST: ${{ needs.image-candidate.outputs.digest }}
+        run: python scripts/promote_image.py

@@ -27,8 +27,9 @@
 //!   the `#[ignore]`d row that names the missing coverage, so a reader
 //!   counting rows finds a reason rather than an absence.
 //! * [`the_newest_release_tag_still_predates_cluster_mode`] is the
-//!   tripwire that makes the reason expire. It reads the newest reachable
-//!   `v*` tag's own `gateway/Cargo.toml` and **fails** the moment one
+//!   tripwire that makes the reason expire. It reads the newest previous
+//!   `v*` tag's own `gateway/Cargo.toml` (excluding the current commit) and
+//!   **fails** the moment one
 //!   carries the `postgres` feature — which is the moment the substitution
 //!   stops being honest and the real mixed-binary row becomes writable.
 //!
@@ -1832,11 +1833,14 @@ async fn mixed_binary_replicas_need_a_release_that_ships_cluster_mode() {
 /// The tripwire that makes the substitution above expire.
 ///
 /// A documented substitution is only honest while its reason holds. This
-/// reads the newest reachable `v*` tag's own `gateway/Cargo.toml` and
+/// reads the newest `v*` tag on a different commit's `gateway/Cargo.toml` and
 /// fails if it declares the `postgres` feature — because at that moment a
 /// previous release's binary *can* be built and *can* join a cluster, and
 /// the row above stops being a description of reality and becomes an
 /// excuse.
+/// Tags on HEAD name the current candidate, not a previous binary. This
+/// distinction lets the first cluster-capable release pass its own tag CI;
+/// subsequent commits still trip the guard until mixed-binary coverage exists.
 ///
 /// It skips, loudly, when no tags are reachable: `actions/checkout@v4`
 /// fetches no tags at its default depth, so the CI gate must set
@@ -1869,9 +1873,9 @@ async fn the_newest_release_tag_still_predates_cluster_mode() {
         );
         return;
     };
-    let Some(newest) = tags.lines().map(str::trim).find(|tag| !tag.is_empty()) else {
+    let Some(newest) = previous_release_tag(&tags, &git) else {
         eprintln!(
-            "skipping: no release tags are reachable in this checkout, so the previous \
+            "skipping: no release tags on a different commit are available in this checkout, so the previous \
              release cannot be inspected. actions/checkout@v4 fetches no tags at its default \
              depth; the ha-release-gate job needs fetch-depth: 0 for this tripwire to be live \
              in CI."
@@ -1894,4 +1898,59 @@ async fn the_newest_release_tag_still_predates_cluster_mode() {
          {newest} into a second binary, run it beside the current one against one database, \
          and assert the mixed-version claims for real."
     );
+}
+
+fn previous_release_tag(tags: &str, git: &impl Fn(&[&str]) -> Option<String>) -> Option<String> {
+    let head = git(&["rev-parse", "--verify", "HEAD"]).expect("resolve the checked commit");
+    tags.lines()
+        .map(str::trim)
+        .filter(|tag| !tag.is_empty())
+        .find(|tag| {
+            // Peel annotated tags as well as lightweight tags to their commit.
+            let commit = git(&[
+                "rev-parse",
+                "--verify",
+                &format!("refs/tags/{tag}^{{commit}}"),
+            ])
+            .expect("release tags must resolve to commits");
+            commit.trim() != head.trim()
+        })
+        .map(str::to_owned)
+}
+
+#[test]
+fn previous_release_selection_excludes_candidate_tags_but_keeps_cluster_releases() {
+    let repository = TempDir::new("release-selection");
+    let git = |arguments: &[&str]| -> Option<String> {
+        let output = std::process::Command::new("git")
+            .arg("-C")
+            .arg(repository.path())
+            .args(arguments)
+            .output()
+            .expect("run git for the release-selection fixture");
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        Some(String::from_utf8_lossy(&output.stdout).into_owned())
+    };
+    git(&["init"]);
+    git(&["config", "user.name", "Release Test"]);
+    git(&["config", "user.email", "release-test@example.invalid"]);
+    git(&["config", "commit.gpgsign", "false"]);
+    git(&["config", "tag.gpgsign", "false"]);
+    git(&["commit", "--allow-empty", "-m", "SQLite release"]);
+    git(&["tag", "v1.0.1"]);
+    git(&["commit", "--allow-empty", "-m", "First cluster release"]);
+    git(&["tag", "v2.0.0"]);
+    git(&["tag", "-a", "v2.0.1", "-m", "Candidate alias"]);
+    let tags = git(&["tag", "--list", "v*", "--sort=-v:refname"]).unwrap();
+    assert_eq!(previous_release_tag(&tags, &git).as_deref(), Some("v1.0.1"));
+
+    // Once HEAD advances, the cluster release must become the previous
+    // binary again; its PostgreSQL manifest will still trip the guard above.
+    git(&["commit", "--allow-empty", "-m", "Next candidate"]);
+    assert_eq!(previous_release_tag(&tags, &git).as_deref(), Some("v2.0.1"));
+    assert_eq!(previous_release_tag("", &git), None);
 }
