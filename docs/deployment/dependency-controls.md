@@ -7,10 +7,13 @@ for Actions, Cargo, npm and the Dockerfile; deployment image updates are reviewe
 alongside the release they consume. CI rejects missing pins.
 
 Digest pinning fixes artifact identity; it does not certify the contents. The
-Kubernetes digest records the published image snapshot reviewed on 2026-09-06.
-It does not contain unmerged changes in this branch. After a release passes CI
-and is promoted, verify its revision/provenance and update deployment digests
-before rollout. Never substitute a build candidate or invent a digest.
+Kubernetes examples now use the promoted September audit remediation image at
+revision `2c999cd4e993c58a752334e9d9230e67fcccbae4`. Its immutable digest,
+published platform and local verification evidence are recorded in
+[`deploy/kubernetes/README.md`](../../deploy/kubernetes/README.md).
+For each release, wait for successful CI and promotion, verify its revision and
+digest, then update deployment references before rollout. Never substitute a
+build candidate or invent a digest.
 
 Both npm lockfiles have a high-severity audit gate. Pull requests also run GitHub
 dependency review. Cargo audit denies warnings, including yanked dependencies;
