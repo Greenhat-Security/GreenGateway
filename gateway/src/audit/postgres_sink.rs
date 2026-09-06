@@ -1170,7 +1170,12 @@ mod tests {
                 .expect("sink should build"),
             )
         });
-        emit_from_writer_thread(&sink, (0..10).map(test_event).collect());
+        // This regression needs one in-flight batch. Seed it atomically so
+        // the flusher cannot take a partial batch while the producer is
+        // still emitting, then park in I/O with the remaining events buffered.
+        sink.shared
+            .buffer_guard()
+            .extend((0..10).map(|index| (Instant::now(), test_event(index))));
         let flushing = {
             let sink = Arc::clone(&sink);
             thread::spawn(move || sink.flush())
@@ -1190,6 +1195,7 @@ mod tests {
             0,
             "nothing is lost before the teardown"
         );
+        assert_eq!(sink.shared.in_flight.load(Ordering::Acquire), 10);
 
         drop(runtime);
 
