@@ -15,6 +15,7 @@ pub(super) const AUDIT_ADMIN_ROUTE: &str = "/v1/admin/audit";
 pub(super) const AUDIT_EVENTS_STREAM_ROUTE: &str = "/v1/admin/events/stream";
 pub(super) const ADMIN_AUTH_LOGIN_ROUTE: &str = "/v1/admin/auth/login";
 pub(super) const ADMIN_AUTH_CALLBACK_ROUTE: &str = "/v1/admin/auth/callback";
+pub(super) const ADMIN_CAPABILITIES_ROUTE: &str = "/v1/admin/capabilities";
 pub(super) const STATUS_ADMIN_ROUTE: &str = "/v1/admin/status";
 pub(super) const CLUSTER_ADMIN_ROUTE: &str = "/v1/admin/cluster";
 pub(super) const CLUSTER_REPLICAS_ADMIN_ROUTE: &str = "/v1/admin/cluster/replicas";

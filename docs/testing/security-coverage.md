@@ -18,7 +18,7 @@ Reproduce on the same compiler/platform:
 ```powershell
 rustup toolchain install nightly-2026-09-01 --profile minimal --component llvm-tools-preview
 cargo install cargo-llvm-cov --version 0.9.0 --locked
-cargo +nightly-2026-09-01 llvm-cov --no-rustc-wrapper --branch --json --output-path target/security-coverage.json -p gateway --bin gateway --locked --jobs 2 -- --test-threads=8
+cargo +nightly-2026-09-01 llvm-cov --no-rustc-wrapper --branch --json --output-path target/security-coverage.json -p gateway --bin gateway --locked --jobs 2 -- --test-threads=8 --skip audit::sqlite_sink::tests::moderate_scale_batched_inserts_complete_quickly
 python scripts/check-security-coverage.py target/security-coverage.json
 python scripts/test_security_gates.py
 ```
@@ -28,6 +28,11 @@ command through a response file, which cargo-llvm-cov 0.9.0's wrapper does not
 inspect for the crate name. Without the flag, tests can pass while the gateway
 receives no instrumentation; report generation and our missing-data gate refuse
 that result.
+
+The SQLite insert throughput test retains its ten-second wall-clock budget in
+the mandatory, uninstrumented `test` job. Only the instrumented coverage run
+excludes that performance measurement: instrumentation on hosted Windows changes
+its timing. All security coverage floors and the normal test gate still apply.
 
 Do not run UI tests concurrently with a Rust build in the same checkout: the
 existing Rust build script runs `npm ci` to rebuild embedded UI assets.

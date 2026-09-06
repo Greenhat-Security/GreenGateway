@@ -7,6 +7,8 @@ import unittest
 
 def load(name):
     spec = importlib.util.spec_from_file_location(name, Path(__file__).with_name(name + '.py'))
+    if spec is None or spec.loader is None:
+        raise RuntimeError(f'cannot load security gate module: {name}')
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
@@ -25,6 +27,22 @@ class CoverageGate(unittest.TestCase):
 
     def test_accepts_instrumented_windows_paths(self):
         self.assertEqual(coverage.check(self.report(), self.limits), [])
+
+    def test_accepts_repository_relative_paths(self):
+        report = self.report()
+        report['data'][0]['files'][0]['filename'] = 'gateway/src/auth/jwt.rs'
+        self.assertEqual(coverage.check(report, self.limits), [])
+
+    def test_duplicate_source_cannot_silently_pass(self):
+        report = self.report()
+        report['data'][0]['files'].append({
+            **report['data'][0]['files'][0], 'filename': 'gateway/src/auth/jwt.rs'})
+        self.assertTrue(coverage.check(report, self.limits))
+
+    def test_partial_path_cannot_match(self):
+        report = self.report()
+        report['data'][0]['files'][0]['filename'] = 'othergateway/src/auth/jwt.rs'
+        self.assertTrue(coverage.check(report, self.limits))
 
     def test_rejects_branch_regression(self):
         self.assertTrue(coverage.check(self.report(6), self.limits))

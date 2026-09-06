@@ -10,7 +10,9 @@ def check(report, requirements):
     files = [entry for unit in report.get('data', []) for entry in unit.get('files', [])]
     errors = []
     for path, limits in requirements.items():
-        matches = [entry for entry in files if entry.get('filename', '').replace('\\', '/').endswith('/' + path)]
+        matches = [entry for entry in files
+                   if (filename := entry.get('filename', '').replace('\\', '/')) == path
+                   or filename.endswith('/' + path)]
         if len(matches) != 1:
             errors.append(f'{path}: expected exactly one instrumented source file, found {len(matches)}')
             continue

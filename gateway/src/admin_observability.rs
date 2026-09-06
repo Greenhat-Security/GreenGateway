@@ -11,7 +11,7 @@ pub(super) async fn schema_coverage_endpoint(
         return unauthorized();
     };
     if !authorized_schema_reader(&state, principal) {
-        return forbidden();
+        return admin_permission_denied_response(ADMIN_SCHEMA_READ_PERMISSION.to_owned());
     }
     if !state.coverage.spec_configured() {
         return schema_not_configured();
@@ -45,7 +45,7 @@ pub(super) async fn schema_inferred_endpoint(
         return unauthorized();
     };
     if !authorized_schema_reader(&state, &principal) {
-        return forbidden();
+        return admin_permission_denied_response(ADMIN_SCHEMA_READ_PERMISSION.to_owned());
     }
     if !state.payload_capture_enabled {
         return payload_capture_not_configured();

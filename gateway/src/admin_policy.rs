@@ -584,7 +584,7 @@ pub(super) async fn policy_rule_preview_endpoint(
         Err(error) => return policy_admin_authz_error_response(error),
     };
     if !rbac_state.principal_has_permission(principal, ADMIN_AUDIT_READ_PERMISSION) {
-        return forbidden();
+        return admin_permission_denied_response(ADMIN_AUDIT_READ_PERMISSION.to_owned());
     }
     let Some(query_store) = state.event_store.as_ref() else {
         return service_unavailable("policy rule preview requires an audit query store");
@@ -670,7 +670,7 @@ pub(super) async fn policy_rule_shadow_review_endpoint(
     // the same second check the rule-preview endpoint applies for the same
     // reason; `admin:policy:read` alone covers only aggregate rule counts.
     if !rbac_state.principal_has_permission(principal, ADMIN_AUDIT_READ_PERMISSION) {
-        return forbidden();
+        return admin_permission_denied_response(ADMIN_AUDIT_READ_PERMISSION.to_owned());
     }
     let policy = rbac_state.current_policy();
     let shadow_rules = policy

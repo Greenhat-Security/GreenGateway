@@ -60,7 +60,7 @@ pub(super) fn admin_ui_html_response(
             (header::CONTENT_TYPE, content_type_for_path(ADMIN_UI_INDEX)),
             (header::CACHE_CONTROL, HeaderValue::from_static("no-store")),
             (
-                HeaderName::from_static("content-security-policy"),
+                header::CONTENT_SECURITY_POLICY,
                 HeaderValue::from_static(ADMIN_UI_CONTENT_SECURITY_POLICY),
             ),
         ],
@@ -105,7 +105,7 @@ pub(super) fn embedded_asset_response(path: &str, asset: rust_embed::EmbeddedFil
         [
             (header::CONTENT_TYPE, content_type_for_path(path)),
             (
-                HeaderName::from_static("content-security-policy"),
+                header::CONTENT_SECURITY_POLICY,
                 HeaderValue::from_static(ADMIN_UI_CONTENT_SECURITY_POLICY),
             ),
         ],

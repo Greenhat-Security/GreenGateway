@@ -490,7 +490,9 @@ pub(super) fn openapi_overlay_operation_error_response(
                 current.as_str(),
             )
         }
-        connections::openapi::OpenApiOverlayOperationError::SecretsWriteRequired => forbidden(),
+        connections::openapi::OpenApiOverlayOperationError::SecretsWriteRequired => {
+            admin_permission_denied_response(ADMIN_CONNECTIONS_SECRETS_WRITE_PERMISSION.to_owned())
+        }
     }
 }
 

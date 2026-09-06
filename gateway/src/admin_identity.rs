@@ -201,6 +201,7 @@ pub(super) async fn admin_capabilities_endpoint(
     State(state): State<StatusAdminState>,
     principal: Option<Extension<auth::Principal>>,
 ) -> Response {
+    record_request(ADMIN_CAPABILITIES_ROUTE);
     let Some(Extension(principal)) = principal else {
         return unauthorized();
     };

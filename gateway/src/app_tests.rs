@@ -15504,6 +15504,15 @@ async fn admin_endpoint_denial_preserves_decision_and_emits_one_audit_event() {
         ))
         .await
         .unwrap();
+    assert_admin_denial(&response, &log, &capture, ADMIN_TOKENS_WRITE_PERMISSION).await;
+}
+
+async fn assert_admin_denial(
+    response: &Response,
+    log: &audit::AuditLog,
+    capture: &audit::sink::tests::CaptureSink,
+    permission: &str,
+) {
     assert_eq!(response.status(), StatusCode::FORBIDDEN);
     let decision = response
         .extensions()
@@ -15513,10 +15522,7 @@ async fn admin_endpoint_denial_preserves_decision_and_emits_one_audit_event() {
         decision.outcome,
         middleware::decision::PolicyDecisionOutcome::Denied
     );
-    assert_eq!(
-        decision.permission.as_deref(),
-        Some(ADMIN_TOKENS_WRITE_PERMISSION)
-    );
+    assert_eq!(decision.permission.as_deref(), Some(permission));
     log.close_and_drain(Duration::from_secs(2)).await.unwrap();
     let denied: Vec<_> = capture
         .events()
@@ -15524,10 +15530,7 @@ async fn admin_endpoint_denial_preserves_decision_and_emits_one_audit_event() {
         .filter(|event| event.event_type == "authz.denied")
         .collect();
     assert_eq!(denied.len(), 1);
-    assert_eq!(
-        denied[0].payload["permission"],
-        ADMIN_TOKENS_WRITE_PERMISSION
-    );
+    assert_eq!(denied[0].payload["permission"], permission);
     assert_eq!(denied[0].payload["authorization_layer"], "admin_endpoint");
 }
 
@@ -17884,7 +17887,9 @@ async fn policy_rule_preview_requires_audit_read_permission() {
     let db = TempDb::new("rule-preview-audit-forbidden");
     create_audit_schema(&db.path);
     let policy = TempPolicyFile::new(&policy_document_string("initial-policy", "test:old"));
-    let router = policy_admin_router_with_sqlite(Some(&policy), test_audit_log(), Some(&db.path));
+    let capture = audit::sink::tests::CaptureSink::new();
+    let log = audit::AuditLog::new(Arc::new(capture.clone()));
+    let router = policy_admin_router_with_sqlite(Some(&policy), log.clone(), Some(&db.path));
 
     let response = router
         .oneshot(policy_admin_request(
@@ -17906,7 +17911,7 @@ async fn policy_rule_preview_requires_audit_read_permission() {
         .await
         .expect("policy rule preview should complete");
 
-    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    assert_admin_denial(&response, &log, &capture, ADMIN_AUDIT_READ_PERMISSION).await;
 }
 
 #[tokio::test]
@@ -18087,7 +18092,9 @@ async fn policy_rule_shadow_review_requires_audit_read_permission() {
     let db = TempDb::new("shadow-review-audit-forbidden");
     create_audit_schema(&db.path);
     let policy = TempPolicyFile::new(&shadow_review_policy_document());
-    let router = policy_admin_router_with_sqlite(Some(&policy), test_audit_log(), Some(&db.path));
+    let capture = audit::sink::tests::CaptureSink::new();
+    let log = audit::AuditLog::new(Arc::new(capture.clone()));
+    let router = policy_admin_router_with_sqlite(Some(&policy), log.clone(), Some(&db.path));
 
     let response = router
         .oneshot(policy_admin_request(
@@ -18100,7 +18107,7 @@ async fn policy_rule_shadow_review_requires_audit_read_permission() {
         .await
         .expect("policy shadow review should complete");
 
-    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    assert_admin_denial(&response, &log, &capture, ADMIN_AUDIT_READ_PERMISSION).await;
 }
 
 #[tokio::test]
@@ -18465,6 +18472,52 @@ paths:
     assert_eq!(
         body_string(forbidden_response).await,
         r#"{"error":"forbidden"}"#
+    );
+}
+
+#[tokio::test]
+async fn schema_endpoint_denials_emit_one_audit_event_with_required_permission() {
+    let policy = TempPolicyFile::new(&schema_policy_document());
+    for route in [SCHEMA_COVERAGE_ADMIN_ROUTE, SCHEMA_INFERRED_ADMIN_ROUTE] {
+        let capture = audit::sink::tests::CaptureSink::new();
+        let log = audit::AuditLog::new(Arc::new(capture.clone()));
+        let mut config = test_config(Vec::new());
+        config.auth_enabled = false;
+        config.policy_file = Some(policy.path.to_string_lossy().into_owned());
+        config.rbac_exempt_paths.push(route.to_owned());
+        let recorder = PrometheusBuilder::new().build_recorder();
+        let router = app(
+            config,
+            recorder.handle(),
+            log.clone(),
+            test_audit_event_sender(),
+        )
+        .expect("app should build");
+        let response = router
+            .oneshot(audit_query_request(
+                route,
+                Some(test_principal(&["reader"])),
+            ))
+            .await
+            .expect("schema denial should complete");
+        assert_admin_denial(&response, &log, &capture, ADMIN_SCHEMA_READ_PERMISSION).await;
+    }
+}
+
+#[test]
+fn openapi_overlay_secret_denial_preserves_required_permission() {
+    let response = openapi_overlay_operation_error_response(
+        connections::openapi::OpenApiOverlayOperationError::SecretsWriteRequired,
+        "overlay update",
+    );
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    let decision = response
+        .extensions()
+        .get::<middleware::decision::PolicyDecision>()
+        .expect("permission denial should preserve its decision");
+    assert_eq!(
+        decision.permission.as_deref(),
+        Some(ADMIN_CONNECTIONS_SECRETS_WRITE_PERMISSION)
     );
 }
 

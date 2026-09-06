@@ -42,7 +42,9 @@ jobs:
       - name: Install the pinned coverage tool
         run: cargo install cargo-llvm-cov --version 0.9.0 --locked
       - name: Measure security branches
-        run: cargo llvm-cov --no-rustc-wrapper --branch --json --output-path target/security-coverage.json -p gateway --bin gateway --locked --jobs 2 -- --test-threads=8
+        # The mandatory uninstrumented test job enforces the SQLite wall-clock
+        # budget. Instrumentation changes that measurement on hosted Windows.
+        run: cargo llvm-cov --no-rustc-wrapper --branch --json --output-path target/security-coverage.json -p gateway --bin gateway --locked --jobs 2 -- --test-threads=8 --skip audit::sqlite_sink::tests::moderate_scale_batched_inserts_complete_quickly
       - name: Enforce production-code coverage floors
         run: python scripts/check-security-coverage.py target/security-coverage.json
       - name: Preserve coverage evidence
@@ -583,7 +585,10 @@ jobs:
         # time is what actually guards the gate.
         run: |
           set -euo pipefail
-          cargo test -p gateway --test ${{ matrix.suite }} 2>&1 | tee gate.log
+          # Each case launches its own cluster against this runner's PostgreSQL.
+          # Serialize cases; concurrency and availability thresholds within each
+          # cluster exercise remain unchanged.
+          cargo test -p gateway --test ${{ matrix.suite }} -- --test-threads=1 2>&1 | tee gate.log
           if grep -q 'test result: ok. 0 passed' gate.log; then
             echo "::error::${{ matrix.suite }} ran no tests; the gate would be vacuous"
             exit 1
