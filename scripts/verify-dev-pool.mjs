@@ -473,19 +473,10 @@ async function verifyHealthy(baseUrl, token, runId) {
     "POST retry probe returned an unexpected status",
   );
 
-  const observations = await waitForObservations(
-    baseUrl,
-    token,
-    fromTimestamp,
-    runId,
-    getResults.length + postResults.length,
-  );
-  const getObservations = observations.filter((event) =>
-    event.request_id.startsWith(getRunId),
-  );
-  const postObservations = observations.filter((event) =>
-    event.request_id.startsWith(postRunId),
-  );
+  const [getObservations, postObservations] = await Promise.all([
+    waitForObservations(baseUrl, token, fromTimestamp, getRunId, getResults.length),
+    waitForObservations(baseUrl, token, fromTimestamp, postRunId, postResults.length),
+  ]);
   assert(
     getObservations.some(
       (event) =>
