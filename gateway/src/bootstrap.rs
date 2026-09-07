@@ -11,7 +11,7 @@ pub(super) async fn run() -> Result<(), Box<dyn std::error::Error>> {
         let [url] = arguments.as_slice() else {
             return Err("usage: gateway healthcheck <loopback probe URL>".into());
         };
-        return probes::check_local_health(url.to_str().ok_or("probe URL must be UTF-8")?).await;
+        return egress::check_local_health(url.to_str().ok_or("probe URL must be UTF-8")?).await;
     }
     // `gateway migrate check|up` (issue #241, PR 4): a one-shot schema
     // command that connects, does its work, prints one line, and exits --

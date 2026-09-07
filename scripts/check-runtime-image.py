@@ -29,6 +29,7 @@ def command(*args, check=True):
 
 
 def runtime_check(image, output):
+    (output / 'runtime.json').write_text(json.dumps({'status': 'error', 'image': image}))
     config = json.loads(command('docker', 'image', 'inspect', image).stdout)[0]
     image_id = config['Id']
     require(config['Os'] == 'linux' and config['Architecture'] == 'amd64')
@@ -100,6 +101,7 @@ def runtime_check(image, output):
 
 
 def scan_preview(image, config, output):
+    (output / 'preview-decision.json').write_text(json.dumps({'status': 'error', 'image': image}))
     rules = policy(json.loads((ROOT / 'image-scan-policy.json').read_text()), datetime.now(timezone.utc))
     # PR previews have no signed release index to which an exception can bind.
     rules = {**rules, 'exceptions': []}
@@ -129,6 +131,7 @@ def scan_preview(image, config, output):
         fresh(report['CreatedAt'], datetime.now(timezone.utc), 1)
         fresh(db['UpdatedAt'], datetime.now(timezone.utc), rules['max_database_age_hours'])
         decision = evaluate_inventory(report, config['Id'], rules)
+        decision['status'] = 'blocked' if decision['blocked'] else 'passed'
         (output / 'preview-decision.json').write_text(json.dumps(decision, indent=2))
         if decision['blocked']:
             raise ValueError('preview contains blocking findings; inspect preview-scan.json')
