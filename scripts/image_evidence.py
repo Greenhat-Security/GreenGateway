@@ -20,6 +20,12 @@ SPDX = "https://spdx.dev/Document/v2.3"
 WORKFLOW = ".github/workflows/publish-image.yml"
 
 
+def run_utf8(command, **kwargs):
+    # CLI JSON is UTF-8 even when the operator's Windows locale is not.
+    return subprocess.run(command, check=True, capture_output=True,
+                          encoding="utf-8", **kwargs).stdout
+
+
 def identity(repository, digest, sha, ref):
     if not REPOSITORY.fullmatch(repository) or not DIGEST.fullmatch(digest) or not re.fullmatch(r"[0-9a-f]{40}", sha):
         raise ValueError("invalid evidence identity")
@@ -54,8 +60,7 @@ def generate(repository, digest, sha, ref, output, scanner=None):
         executable = scanner or install_trivy(sandbox / "trivy")
         env = {k: v for k, v in os.environ.items() if not k.startswith("TRIVY_")}
         def run(args):
-            return subprocess.run([executable, *args], cwd=sandbox, env=env, check=True,
-                                  text=True, capture_output=True, timeout=900).stdout
+            return run_utf8([executable, *args], cwd=sandbox, env=env, timeout=900)
         if run(["--version"]).splitlines()[0] != "Version: " + versions()["trivy"]:
             raise ValueError("SBOM generator version drift")
         path = output / "sbom.spdx.json"
@@ -116,6 +121,10 @@ def verify(repository, digest, sha, ref, evidence, output, gh=None, trusted_root
     if trusted_root and not gh:
         raise ValueError("offline verification requires an already installed verifier via --gh")
     output.mkdir(parents=True, exist_ok=True)
+    # Reusing an operator output directory must never leave an earlier pass as
+    # the verdict for a failed verification attempt.
+    (output / "verification.json").write_text(json.dumps({"status": "error", "candidate_digest": digest,
+        "source_sha": sha, "source_ref": ref}) + "\n")
     sbom_path = evidence / "sbom.spdx.json"
     raw_sbom = sbom_path.read_bytes()
     if not raw_sbom or len(raw_sbom) > 16 * 1024 * 1024:
@@ -125,7 +134,7 @@ def verify(repository, digest, sha, ref, evidence, output, gh=None, trusted_root
     with tempfile.TemporaryDirectory(prefix="greengateway-verify-") as temporary:
         executable = gh or install_gh(Path(temporary) / "gh")
         def run(args):
-            return subprocess.run([executable, *args], check=True, text=True, capture_output=True, timeout=300).stdout
+            return run_utf8([executable, *args], timeout=300)
         version = run(["--version"]).splitlines()[0]
         if not version.startswith("gh version " + versions()["github_cli"] + " "):
             raise ValueError("attestation verifier version drift")

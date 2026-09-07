@@ -5,6 +5,7 @@ import json
 import os
 from pathlib import Path
 import subprocess
+import sys
 import tempfile
 import unittest
 from unittest.mock import patch
@@ -33,6 +34,10 @@ def verified(predicate, digest, name, value=None):
 
 
 class EvidenceTests(unittest.TestCase):
+    def test_cli_unicode_json_uses_utf8_independent_of_windows_locale(self):
+        command = [sys.executable, "-c", "import sys; sys.stdout.buffer.write(bytes.fromhex('7b22617574686f72223a20224dc3bc6c6c6572227d'))"]
+        self.assertEqual(json.loads(evidence.run_utf8(command, timeout=10)), {"author": "M\u00fcller"})
+
     def test_constraints_pin_certificate_identity_not_only_claimed_predicate(self):
         args = evidence.constraints(REPO, SHA, REF)
         for flag, expected in [("--repo", REPO), ("--signer-workflow", REPO + "/.github/workflows/publish-image.yml"),
@@ -63,6 +68,8 @@ class EvidenceTests(unittest.TestCase):
             root = Path(directory)
             source, output = root/"source", root/"verified"
             source.mkdir()
+            output.mkdir()
+            (output/"verification.json").write_text('{"status":"passed"}')
             path = source/"sbom.spdx.json"
             path.write_text(json.dumps(sbom()))
             file_digest = "sha256:"+hashlib.sha256(path.read_bytes()).hexdigest()
@@ -101,7 +108,7 @@ class EvidenceTests(unittest.TestCase):
                     with self.assertRaises((ValueError, subprocess.CalledProcessError)):
                         evidence.verify(REPO, DIGEST, SHA, REF, source, output, "gh")
                     self.assertFalse(job_output.exists())
-                    self.assertFalse((output/"verification.json").exists())
+                    self.assertEqual(json.loads((output/"verification.json").read_text())["status"], "error")
 
     def test_independent_verification_requires_all_three_signed_subjects(self):
         self.exercise("clean")
