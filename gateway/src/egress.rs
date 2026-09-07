@@ -70,9 +70,10 @@ pub(crate) async fn check_local_health(url: &str) -> Result<(), Box<dyn std::err
     {
         return Err("probe URL must name a loopback IP and /livez, /readyz or /startupz".into());
     }
-    let response = reqwest::Client::builder()
-        .no_proxy()
-        .redirect(reqwest::redirect::Policy::none())
+    // Reuse the HTTP/1.1, no-proxy, no-redirect and platform-trust defaults.
+    // Only the literal loopback probe above can reach this one-shot client;
+    // caller-directed upstream traffic still requires checked egress policy.
+    let response = base_client_builder(&EgressConfig::default())?
         .timeout(Duration::from_secs(2))
         .build()?
         .get(url)
