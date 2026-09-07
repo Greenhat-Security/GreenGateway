@@ -114,10 +114,20 @@ test.describe.serial('Issue #240 live admin acceptance', () => {
     expect(await page.evaluate(() => sessionStorage.getItem('greengateway_admin_token') === null)).toBe(true);
     expect((await page.content()).includes(tokens.reader)).toBe(false);
     await expect(page.getByLabel('Token', { exact: true })).toHaveValue('');
-    await page.getByRole('link', { name: 'Connections', exact: true }).click();
+    const [authenticated] = await Promise.all([
+      page.waitForResponse((response) => new URL(response.url()).pathname === '/v1/admin/connections'),
+      page.getByRole('link', { name: 'Connections', exact: true }).click(),
+    ]);
+    expect(authenticated.status()).toBe(200);
+    expect(Boolean(await authenticated.request().headerValue('authorization'))).toBe(true);
+    await authenticated.finished();
     await expect(page.getByRole('heading', { level: 2, name: 'Connections', exact: true })).toBeVisible();
     const [response] = await Promise.all([
-      page.waitForResponse((response) => new URL(response.url()).pathname === '/v1/admin/connections'),
+      // Ignore any in-flight request from the old document. The reloaded page
+      // must send no bearer header and the actual gateway must reject it.
+      page.waitForResponse((response) =>
+        new URL(response.url()).pathname === '/v1/admin/connections' &&
+        response.request().headers()['authorization'] === undefined),
       page.reload(),
     ]);
     expect(response.status()).toBe(401);
