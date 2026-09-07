@@ -1,3 +1,4 @@
+import { adminAuthenticationSucceeded, adminAuthorizationFailed, adminIdentityChanged, adminPolicyChanged, getAdminIdentityVersion } from './adminSession';
 import { authHeaders } from './auth';
 import { adminApiUrl } from './config';
 
@@ -134,6 +135,7 @@ export async function adminFetchJsonResponse<T>(
   input: string,
   options: AdminFetchOptions = {},
 ): Promise<AdminJsonResponse<T>> {
+  const requestIdentity = getAdminIdentityVersion();
   const headers = new Headers({
     Accept: 'application/json',
     ...authHeaders(),
@@ -149,9 +151,25 @@ export async function adminFetchJsonResponse<T>(
     headers,
   });
   const body = await parseJsonBody(response);
-
+  if (options.signal?.aborted) {
+    throw new DOMException('Admin request aborted.', 'AbortError');
+  }
+  if (requestIdentity !== getAdminIdentityVersion()) {
+    throw new Error('Admin identity changed while the request was pending.');
+  }
   if (!response.ok) {
+    adminAuthorizationFailed(response.status, requestIdentity, input === adminApiUrl('/capabilities'));
     throw adminApiError(body, response);
+  }
+  const method = (options.method ?? 'GET').toUpperCase();
+  if (!SAFE_METHODS.has(method)) {
+    const path = new URL(input, window.location.origin).pathname;
+    if (path === adminApiUrl('/auth/logout') || path === adminApiUrl('/auth/callback')) {
+      adminIdentityChanged();
+    } else if ((path === adminApiUrl('/policy') || path.startsWith(adminApiUrl('/policy/'))) &&
+               !path.endsWith('/preview') && !path.endsWith('/validate')) {
+      adminPolicyChanged();
+    }
   }
 
   return {
@@ -552,11 +570,13 @@ function isJsonObject(value: unknown): value is Record<string, unknown> {
 }
 
 export async function fetchAdminCapabilities(signal?: AbortSignal): Promise<{ permissions: string[] }> {
+  const identity = getAdminIdentityVersion();
   const value = await adminFetchJson<unknown>(adminApiUrl('/capabilities'), { signal, cache: 'no-store' });
   if (!isJsonObject(value) || !Array.isArray(value.permissions) || value.permissions.length > 256 ||
       !value.permissions.every((permission): permission is string =>
         typeof permission === 'string' && permission.length <= 128 && /^admin:(?:[a-z_]+:)+[a-z_]+$/.test(permission))) {
     throw new Error('Invalid admin capabilities response.');
   }
+  adminAuthenticationSucceeded(identity);
   return { permissions: [...new Set(value.permissions)] };
 }

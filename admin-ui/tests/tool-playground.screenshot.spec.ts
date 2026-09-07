@@ -438,7 +438,12 @@ test('does not retry authentication, policy, precondition, or output-limit failu
     await expect(error).toBeVisible();
     await expect(error).toContainText(expectedMessage);
     await expect(error).toBeFocused();
-    await expect(argumentsEditor).toHaveValue('{}');
+    if (id === authFailureToolId) {
+      await expect(argumentsEditor).toHaveCount(0);
+      await expect(page.getByRole('heading', { name: 'Admin session expired' })).toBeVisible();
+    } else {
+      await expect(argumentsEditor).toHaveValue('{}');
+    }
     await expect.poll(() => attempts.get(id) ?? 0).toBe(1);
     await page.waitForTimeout(150);
     expect(attempts.get(id)).toBe(1);

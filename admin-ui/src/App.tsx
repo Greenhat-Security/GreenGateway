@@ -1,4 +1,6 @@
-import { FormEvent, useEffect, useMemo, useState } from 'react';
+import { useAdminIdentityVersion, useAdminUnauthenticated } from './lib/adminCapabilities';
+import { adminNavigationChanged } from './lib/adminSession';
+import { FormEvent, useEffect, useMemo, useRef, useState } from 'react';
 import {
   BrowserRouter,
   Link,
@@ -14,7 +16,7 @@ import {
   setStoredToken,
 } from './lib/auth';
 import { adminApiUrl, adminBasePath } from './lib/config';
-import { addCsrfHeader } from './lib/api';
+import { addCsrfHeader, AdminApiError, fetchAdminCapabilities } from './lib/api';
 import {
   CapabilityDetail,
   CapabilityInventoryView,
@@ -51,8 +53,45 @@ export function App() {
   );
 }
 
+function AdminSessionExpired() {
+  const alertRef = useRef<HTMLDivElement>(null);
+  const [checking, setChecking] = useState(false);
+  const [message, setMessage] = useState('Sign in again to continue. Previous session data has been cleared.');
+  useEffect(() => { alertRef.current?.focus(); }, []);
+
+  async function checkSession() {
+    setChecking(true);
+    try {
+      // The transport signals successful authentication, remounting the route.
+      await fetchAdminCapabilities(AbortSignal.timeout(10_000));
+    } catch (error) {
+      setMessage(error instanceof AdminApiError && error.status === 401
+        ? 'Sign in again to continue.'
+        : error instanceof AdminApiError && error.status === 403
+          ? 'Your session cannot read admin permissions.'
+          : 'Admin permissions are temporarily unavailable. Try checking your session again.');
+    } finally {
+      setChecking(false);
+    }
+  }
+
+  return <main className="panel">
+    <div className="error-panel alert warning" role="alert" tabIndex={-1} ref={alertRef}>
+      <h2>Admin session expired</h2>
+      <p>{message}</p>
+    </div>
+    <Link to="/">Sign in</Link>
+    <button type="button" disabled={checking} onClick={() => { void checkSession(); }}>
+      {checking ? 'Checking session' : 'Check session'}
+    </button>
+  </main>;
+}
+
 export function AdminShell() {
   const location = useLocation();
+  const identityVersion = useAdminIdentityVersion();
+  const unauthenticated = useAdminUnauthenticated();
+  useEffect(() => { adminNavigationChanged(); }, [location.pathname]);
   const [theme, setTheme] = useState<ThemeName>(() => readStoredTheme());
   const [authRefreshKey, setAuthRefreshKey] = useState(0);
   const [authCompletionStatus, setAuthCompletionStatus] = useState<string | null>(
@@ -163,7 +202,8 @@ export function AdminShell() {
           <h1>{pageTitle}</h1>
         </header>
 
-        <Routes>
+        {unauthenticated && location.pathname !== '/' ? <AdminSessionExpired /> : (
+        <Routes key={location.pathname === '/' ? 'dashboard' : identityVersion}>
           <Route
             path="/"
             element={
@@ -197,6 +237,7 @@ export function AdminShell() {
           <Route path="/status" element={<StatusPage />} />
           <Route path="*" element={<NotFoundPage />} />
         </Routes>
+        )}
       </div>
     </div>
   );
