@@ -87,3 +87,31 @@ real mixed-binary coverage before a later commit can be published.
 
    Review the generated notes and align the final release description with
    `CHANGELOG.md`.
+
+
+## Inspecting the final-image scan
+
+Before stable tags can move, `Scan immutable candidate` must pass for the exact
+candidate digest. Inspect its `image-scan-<SHA>` artifact and job summary. The
+index digest, each runtime manifest/configuration digest, source SHA, platform,
+scanner version and database update time are recorded separately. A failed scan
+leaves the candidate unpromoted; fixing source or the runtime base creates a new
+candidate that must complete all checks again.
+
+For a read-only rehearsal, install the exact Trivy version from
+`build-tools.json`, verify its official release checksum, and run:
+
+```sh
+python scripts/scan_candidate_image.py --repository Greenhat-Security/GreenGateway \
+  --digest sha256:<resolved-index-digest> --sha <40-character-source-commit> \
+  --scanner /absolute/path/to/trivy --output /absolute/path/to/scan-evidence
+```
+
+The command accepts digests only and never publishes tags. Private images need
+read-only GHCR login credentials; `GH_TOKEN`/`GITHUB_ACTOR` supply the registry
+metadata lookup and Trivy uses Docker's credential configuration. Do not pass
+credentials in command arguments. Exit status 1 means the candidate is not
+qualified; inspect `decision.json` and raw platform reports. Missing evidence or
+scanner/database errors are failures, not clean scans. Follow the narrowly scoped
+[exception policy](deployment/dependency-controls.md#final-candidate-image-gate)
+when a finding needs review. Keep Cargo/npm audits enabled for embedded components.

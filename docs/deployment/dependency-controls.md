@@ -94,3 +94,49 @@ utilities remain platform inputs; the shared action selects project Python befor
 repository scripts run. Debian package repositories also remain mutable inputs.
 The candidate image scan and provenance work cover final-image inventory and
 attribution; no byte-for-byte hermetic-build guarantee is claimed.
+
+
+## Final candidate image gate
+
+`image-scan` reads the current build's immutable OCI digest and resolves its
+runtime manifest and configuration by digest. Only `linux/amd64` is currently
+supported; an additional or missing runtime platform fails until this policy and
+its validation are deliberately extended. BuildKit's `unknown/unknown`
+attestation descriptors are preserved and distinguished from runnable images.
+The runtime configuration's source revision must match the triggering commit.
+
+Trivy 0.74.0 is installed from the checksum recorded in `build-tools.json`.
+Every run starts with a fresh cache, downloads the advisory database, and checks
+its schema and UTC update time. An unavailable database, age over 48 hours,
+future timestamp beyond five minutes, scanner error, malformed report, absent
+OS inventory, unsupported/end-of-life OS, or subject/platform mismatch fails the
+gate. The scan requests OS and discoverable application packages, all package
+inventory and all severities. Repository Trivy configuration and ambient
+`TRIVY_*` variables cannot silently alter this policy.
+
+High, critical and unknown-severity findings block, including unfixed findings.
+Lower-severity findings remain in the raw evidence. Cargo and npm source audits
+remain mandatory: compiled Rust binaries and embedded JavaScript bundles do not
+provide a complete language dependency inventory to an image scanner. Passing
+this gate is not a claim that every embedded component has been identified.
+
+`image-scan-policy.json` contains the reviewed exceptions (initially empty).
+Each entry requires `advisory`, exact `package`, exact installed `version`,
+`owner`, substantive `rationale`, and timezone-qualified `expires`, at most 90
+days ahead. Optional `digest` further restricts the exception to one OCI index.
+Wildcards, missing fields, duplicates and expired exceptions fail validation.
+Review the affected package, vendor advisory and exposure before approving an
+exception in a PR; never add blanket exceptions to obtain a green release.
+Reports retain both the original finding and the applied review metadata.
+
+Update the scanner release and its verified official Linux archive checksum
+together, run the gate regressions and a real registry scan, and review changes
+in package detection. The database intentionally refreshes independently of the
+scanner pin. See [Trivy image options](https://trivy.dev/docs/latest/references/configuration/cli/trivy_image/).
+
+CI retains `image-scan-<source SHA>` for 30 days: raw platform JSON inventories,
+OCI index, database metadata and `decision.json` with identities, scanner version,
+report hashes, unexcepted blocking findings, applied exceptions and gate stage.
+Export this evidence to your release archive for longer retention. Failure to
+upload available evidence also fails the job. A failed or skipped scan emits no
+passing digest, and promotion requires that output to equal the candidate digest.
