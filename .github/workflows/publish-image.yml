@@ -9,14 +9,18 @@ name: Build image candidate
 
 permissions:
   contents: read
-  packages: write
 
 jobs:
   build:
     name: Build immutable candidate
     if: github.event_name == 'push'
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 40
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+      attestations: write
     outputs:
       digest: ${{ steps.build.outputs.digest }}
     steps:
@@ -32,7 +36,9 @@ jobs:
           node: 'false'
       - name: Name the unpromoted candidate
         id: image
-        run: echo "tag=ghcr.io/${GITHUB_REPOSITORY,,}:candidate-${GITHUB_SHA}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" >> "$GITHUB_OUTPUT"
+        run: |
+          echo "image=ghcr.io/${GITHUB_REPOSITORY,,}" >> "$GITHUB_OUTPUT"
+          echo "tag=ghcr.io/${GITHUB_REPOSITORY,,}:candidate-${GITHUB_SHA}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" >> "$GITHUB_OUTPUT"
       - name: Set up verified Buildx and pinned BuildKit
         uses: ./.github/actions/buildx
       - name: Log in to GHCR
@@ -51,3 +57,46 @@ jobs:
           platforms: linux/amd64
           tags: ${{ steps.image.outputs.tag }}
           labels: org.opencontainers.image.revision=${{ github.sha }}
+      - name: Generate final-image SPDX inventory
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          CANDIDATE_DIGEST: ${{ steps.build.outputs.digest }}
+        run: python scripts/image_evidence.py generate
+      - name: Attest the image index build provenance
+        id: provenance
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4
+        with:
+          subject-name: ${{ steps.image.outputs.image }}
+          subject-digest: ${{ steps.build.outputs.digest }}
+          push-to-registry: true
+          create-storage-record: false
+      - name: Attest the image index SBOM predicate
+        id: sbom
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4
+        with:
+          subject-name: ${{ steps.image.outputs.image }}
+          subject-digest: ${{ steps.build.outputs.digest }}
+          sbom-path: target/image-evidence/sbom.spdx.json
+          push-to-registry: true
+          create-storage-record: false
+      - name: Attest the exact downloadable SBOM bytes
+        id: sbom-bytes
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4
+        with:
+          subject-path: target/image-evidence/sbom.spdx.json
+      - name: Preserve signature bundles for offline verification
+        env:
+          PROVENANCE_BUNDLE: ${{ steps.provenance.outputs.bundle-path }}
+          SBOM_BUNDLE: ${{ steps.sbom.outputs.bundle-path }}
+          BYTES_BUNDLE: ${{ steps.sbom-bytes.outputs.bundle-path }}
+        run: |
+          cp "$PROVENANCE_BUNDLE" target/image-evidence/image-provenance.jsonl
+          cp "$SBOM_BUNDLE" target/image-evidence/image-sbom.jsonl
+          cp "$BYTES_BUNDLE" target/image-evidence/sbom-bytes.jsonl
+      - name: Upload image inventory and signature bundles
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: image-evidence-${{ github.sha }}
+          path: target/image-evidence/
+          if-no-files-found: error
+          retention-days: 90

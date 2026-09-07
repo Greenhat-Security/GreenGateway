@@ -140,3 +140,22 @@ report hashes, unexcepted blocking findings, applied exceptions and gate stage.
 Export this evidence to your release archive for longer retention. Failure to
 upload available evidence also fails the job. A failed or skipped scan emits no
 passing digest, and promotion requires that output to equal the candidate digest.
+
+
+## Signed final-image evidence
+
+`image-verification` is a separate required promotion dependency alongside
+`image-scan`. The reusable candidate builder alone has OIDC/attestation write
+permissions, explicitly granted by its trusted push caller. PR previews remain
+read-only. The verifier has read permissions and consumes this run's downloaded
+SBOM; it independently retrieves image attestations from GHCR and SBOM-file
+provenance from GitHub. It constrains the certificate's source repository,
+source ref/commit and reusable signer workflow/commit, rather than trusting those
+values merely because they appear in the signed predicate.
+
+The GitHub CLI verifier version and Linux archive SHA are recorded in
+`build-tools.json`; the executable is checked before use. The signing and artifact
+transfer actions use full commit SHAs. Updating these requires the publication,
+scan, evidence and tool-contract regression suites and a real trusted candidate
+verification. Failed/skipped verification or a digest different from the scan/build
+output prevents promotion. See [operator verification and offline evidence](../RELEASING.md#verifying-image-provenance-and-retrieving-the-sbom).

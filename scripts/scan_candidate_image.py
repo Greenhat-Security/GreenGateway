@@ -88,6 +88,9 @@ class Registry:
             self.token = json.load(response)["token"]
 
     def get(self, digest, kind="manifests"):
+        return json.loads(self.raw(digest, kind))
+
+    def raw(self, digest, kind="manifests"):
         if not DIGEST.fullmatch(digest) or kind not in {"manifests", "blobs"}:
             raise ValueError("invalid registry object")
         request = urllib.request.Request(f"https://ghcr.io/v2/{self.name}/{kind}/{digest}", headers={
@@ -98,7 +101,7 @@ class Registry:
             raw = response.read(16 * 1024 * 1024 + 1)
         if len(raw) > 16 * 1024 * 1024 or "sha256:" + hashlib.sha256(raw).hexdigest() != digest:
             raise ValueError("registry object exceeds limit or differs from its digest")
-        return json.loads(raw)
+        return raw
 
 
 def runtime_manifests(registry, digest, platforms, sha):

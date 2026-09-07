@@ -728,6 +728,7 @@ jobs:
         run: |
           python -m unittest discover -s scripts -p 'test_image_publication.py' -v
           python -m unittest discover -s scripts -p 'test_candidate_scan.py' -v
+          python -m unittest discover -s scripts -p 'test_image_evidence.py' -v
 
   image-preview:
     name: Build image
@@ -759,6 +760,8 @@ jobs:
     permissions:
       contents: read
       packages: write
+      id-token: write
+      attestations: write
     uses: ./.github/workflows/publish-image.yml
 
 
@@ -802,6 +805,52 @@ jobs:
           if-no-files-found: error
           retention-days: 30
 
+  image-verification:
+    name: Verify candidate provenance and SBOM
+    needs: image-candidate
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      packages: read
+      attestations: read
+    outputs:
+      digest: ${{ steps.verify.outputs.digest }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - uses: ./.github/actions/build-tools
+        with:
+          rust: none
+          node: 'false'
+      - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Download this run's SBOM and bundles
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: image-evidence-${{ github.sha }}
+          path: target/image-evidence/
+      - name: Independently verify registry attestations and downloaded SBOM
+        id: verify
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          CANDIDATE_DIGEST: ${{ needs.image-candidate.outputs.digest }}
+        run: python scripts/image_evidence.py verify
+      - name: Preserve verifier results
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: image-verification-${{ github.sha }}
+          path: target/image-verification/
+          if-no-files-found: error
+          retention-days: 90
+
   production-compiler:
     name: production-compiler
     runs-on: ubuntu-latest
@@ -839,6 +888,7 @@ jobs:
       - image-publication
       - image-candidate
       - image-scan
+      - image-verification
     if: ${{ github.event_name == 'push' && success() && !contains(needs.*.result, 'skipped') }}
     runs-on: ubuntu-latest
     timeout-minutes: 10
@@ -873,5 +923,6 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           CANDIDATE_DIGEST: ${{ needs.image-candidate.outputs.digest }}
+          VERIFIED_DIGEST: ${{ needs.image-verification.outputs.digest }}
           SCANNED_DIGEST: ${{ needs.image-scan.outputs.digest }}
         run: python scripts/promote_image.py
