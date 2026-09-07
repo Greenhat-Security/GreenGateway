@@ -88,6 +88,9 @@ class Registry:
             self.token = json.load(response)["token"]
 
     def get(self, digest, kind="manifests"):
+        return json.loads(self.raw(digest, kind))
+
+    def raw(self, digest, kind="manifests"):
         if not DIGEST.fullmatch(digest) or kind not in {"manifests", "blobs"}:
             raise ValueError("invalid registry object")
         request = urllib.request.Request(f"https://ghcr.io/v2/{self.name}/{kind}/{digest}", headers={
@@ -98,7 +101,7 @@ class Registry:
             raw = response.read(16 * 1024 * 1024 + 1)
         if len(raw) > 16 * 1024 * 1024 or "sha256:" + hashlib.sha256(raw).hexdigest() != digest:
             raise ValueError("registry object exceeds limit or differs from its digest")
-        return json.loads(raw)
+        return raw
 
 
 def runtime_manifests(registry, digest, platforms, sha):
@@ -158,6 +161,15 @@ def evaluate(report, image, platform, config_digest, sha, candidate, rules, now)
     for result in results:
         if result.get("Class") not in {"os-pkgs", "lang-pkgs"}:
             raise ValueError("unexpected report class")
+        packages = result.get("Packages")
+        if not isinstance(packages, list) or not packages:
+            raise ValueError("result lacks a package inventory")
+        if any(not isinstance(package, dict) or
+               any(not isinstance(package.get(key), str) or not package[key] for key in ["Name", "Version"])
+               for package in packages):
+            raise ValueError("malformed package inventory")
+        if result["Class"] == "os-pkgs" and result.get("Type") != "debian":
+            raise ValueError("OS inventory type mismatch")
         findings = result.get("Vulnerabilities", [])
         if not isinstance(findings, list):
             raise ValueError("malformed findings")

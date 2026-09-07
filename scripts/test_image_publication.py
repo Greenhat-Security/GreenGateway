@@ -18,7 +18,7 @@ DIGEST = "sha256:" + "b" * 64
 def environment(ref="refs/heads/main"):
     return {
         "GITHUB_EVENT_NAME": "push", "GITHUB_REPOSITORY": "Example/Gateway",
-        "GITHUB_SHA": SHA, "GITHUB_REF": ref, "CANDIDATE_DIGEST": DIGEST, "SCANNED_DIGEST": DIGEST,
+        "GITHUB_SHA": SHA, "GITHUB_REF": ref, "CANDIDATE_DIGEST": DIGEST, "SCANNED_DIGEST": DIGEST, "VERIFIED_DIGEST": DIGEST,
     }
 
 
@@ -63,7 +63,8 @@ class PromotionTests(unittest.TestCase):
             ("GITHUB_EVENT_NAME", "pull_request"), ("GITHUB_EVENT_NAME", "workflow_run"),
             ("GITHUB_SHA", "main"), ("CANDIDATE_DIGEST", ""),
             ("CANDIDATE_DIGEST", "candidate-tag"), ("SCANNED_DIGEST", ""),
-            ("SCANNED_DIGEST", "sha256:" + "f" * 64), ("CANDIDATE_DIGEST", DIGEST + ";echo bad"),
+            ("SCANNED_DIGEST", "sha256:" + "f" * 64),
+            ("VERIFIED_DIGEST", ""), ("VERIFIED_DIGEST", "sha256:" + "e" * 64), ("CANDIDATE_DIGEST", DIGEST + ";echo bad"),
             ("GITHUB_REPOSITORY", "../other"), ("GITHUB_REF", "refs/heads/feature"),
             ("GITHUB_REF", "refs/tags/v1.2.3-rc1"), ("GITHUB_REF", "refs/tags/v01.2.3"),
         ]:

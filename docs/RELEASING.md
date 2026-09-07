@@ -115,3 +115,78 @@ qualified; inspect `decision.json` and raw platform reports. Missing evidence or
 scanner/database errors are failures, not clean scans. Follow the narrowly scoped
 [exception policy](deployment/dependency-controls.md#final-candidate-image-gate)
 when a finding needs review. Keep Cargo/npm audits enabled for embedded components.
+
+
+## Verifying image provenance and retrieving the SBOM
+
+New trusted candidates publish GitHub artifact attestations from
+`Greenhat-Security/GreenGateway/.github/workflows/publish-image.yml`. The index
+has a SLSA v1 build-provenance attestation and an SPDX 2.3 SBOM attestation in
+GHCR. The exact downloadable `sbom.spdx.json` bytes have their own build-provenance
+attestation in GitHub. The independent `Verify candidate provenance and SBOM`
+job must verify all three before promotion. A signing-step success is insufficient.
+
+This is an attributable build/evidence contract, not a claim of a particular SLSA
+level or complete language inventory. The SBOM describes the final Linux amd64
+filesystem, including OS and discoverable application packages. Rust dependencies
+and embedded UI code may not be individually discoverable; keep the source audits.
+The OCI index digest is the attested/promoted subject. `subjects.json` separately
+records its runtime manifest and configuration digests. Existing BuildKit
+`unknown/unknown` evidence manifests are not runnable platforms and remain intact.
+
+Use the exact GitHub CLI version in `build-tools.json` (currently 2.100.0), obtained
+from its official release with the platform archive checksum verified. Obtain the
+expected source SHA/ref from your reviewed release record, not from an unverified
+attestation. Resolve an approved tag once, then use the digest for every step:
+
+```sh
+docker buildx imagetools inspect ghcr.io/greenhat-security/greengateway:<approved-tag>
+gh run download <trusted-run-id> --repo Greenhat-Security/GreenGateway \
+  --name image-evidence-<source-sha> --dir /absolute/path/to/evidence
+python scripts/image_evidence.py verify --repository Greenhat-Security/GreenGateway \
+  --digest sha256:<resolved-index-digest> --sha <reviewed-source-sha> \
+  --ref refs/heads/main --evidence /absolute/path/to/evidence \
+  --output /absolute/path/to/verification --gh /absolute/path/to/gh
+```
+
+For a version release use the exact `refs/tags/vMAJOR.MINOR.PATCH` source ref.
+Use an authenticated GitHub CLI and GHCR read login where required. The verifier
+fetches image attestations from GHCR and the file attestation from GitHub, checks
+signature/trust, hosted-runner identity, exact repository/reusable workflow,
+signer/source commit and source ref, and validates the exact subject digest.
+It also compares the image's signed SPDX predicate to the downloaded document,
+then verifies the document's byte digest through its own signed provenance.
+A missing, substituted, malformed or incorrectly signed item fails closed.
+
+CI artifacts `image-evidence-<SHA>` and `image-verification-<SHA>` retain the SBOM,
+original OCI index bytes, signature bundles, subject mapping and verification
+results for 90 days. Archive them with the release for longer retention. The
+registry referrers remain attached to the content digest when promotion assigns
+stable tags; promotion neither rebuilds nor rewrites the index. Mirroring to a
+different registry must copy OCI referrers as well as image content and be verified
+again. A verified provenance/SBOM does not override a failed vulnerability scan.
+
+### Offline verification
+
+On a trusted online machine, download the evidence artifact above and obtain
+current trust roots independently from the artifact producer:
+
+```sh
+gh attestation trusted-root > trusted_root.jsonl
+```
+
+Transfer the verified GitHub CLI binary, Python and these scripts, the evidence
+directory, and the separately trusted roots into the offline environment. Run the
+same verification command with both `--gh /absolute/path/to/gh` and
+`--trusted-root /absolute/path/to/trusted_root.jsonl`. In this mode the verifier
+hashes the original `image-index.oci.json` bytes against the expected index digest,
+then verifies all three local bundles without accessing the registry or API.
+The SBOM byte attestation is still mandatory. Do not regenerate/reformat the index
+or SBOM files: their exact bytes are subjects. This verifies the index and evidence;
+validate any separately transported image layers against the index/manifests with
+your OCI tooling before execution.
+
+Refresh trusted roots whenever importing newly signed material. Offline checks
+cannot discover revocations or new vulnerability advisories since the last trusted
+update. See [GitHub's offline verification procedure](https://docs.github.com/en/actions/how-tos/secure-your-work/use-artifact-attestations/verify-attestations-offline)
+and [artifact attestation reference](https://docs.github.com/en/actions/how-tos/secure-your-work/use-artifact-attestations/use-artifact-attestations).
