@@ -19,7 +19,6 @@ const { chromium } = adminRequire('playwright');
 const viewport = { width: 1440, height: 900 };
 const targetSize = { width: 960, height: 600 };
 const frameDurationsMs = [4000, 3500, 4000, 4500, 5000, 4500, 4500];
-const adminTokenStorageKey = 'greengateway_admin_token';
 
 async function main() {
   await mkdir(path.dirname(outputGif), { recursive: true });
@@ -32,13 +31,9 @@ async function main() {
     browser = await chromium.launch();
     const page = await browser.newPage({ viewport, deviceScaleFactor: 1 });
 
-    await page.addInitScript(
-      ({ key, token }) => {
-        window.sessionStorage.setItem(key, token);
-        window.localStorage.setItem('greengateway_admin_theme', 'light');
-      },
-      { key: adminTokenStorageKey, token: jwtWithRoles(['admin']) },
-    );
+    await page.addInitScript(() => {
+      window.localStorage.setItem('greengateway_admin_theme', 'light');
+    });
 
     await installMockRoutes(page);
 
@@ -575,18 +570,6 @@ async function json(route, value) {
 
 function isoMinutesAgo(minutes) {
   return new Date(Date.now() - minutes * 60_000).toISOString();
-}
-
-function jwtWithRoles(roles) {
-  return [
-    base64UrlJson({ alg: 'none', typ: 'JWT' }),
-    base64UrlJson({ sub: 'readme-demo-operator', roles }),
-    'signature',
-  ].join('.');
-}
-
-function base64UrlJson(value) {
-  return Buffer.from(JSON.stringify(value), 'utf8').toString('base64url');
 }
 
 function boxToRect(box) {
