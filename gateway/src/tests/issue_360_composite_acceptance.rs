@@ -836,9 +836,23 @@ async fn e2e_07_overlay_crm_workflow() {
 
     assert_eventually(Duration::from_secs(2), || {
         let events = events_for_request(&harness.capture, FAILURE_REQUEST_ID);
-        events
-            .iter()
-            .any(|event| event.event_type == audit::event::TOOL_COMPOSITE_COMPLETED)
+        // Composite completion is emitted before the outer invocation's
+        // terminal event. Wait for the entire evidence set before taking
+        // the snapshot used by the exact-count and payload assertions below.
+        [
+            (audit::event::TOOL_INVOKE_START, 1),
+            (audit::event::TOOL_INVOKE_FAILURE, 1),
+            (audit::event::TOOL_UPSTREAM_REQUEST, 7),
+            (audit::event::TOOL_COMPOSITE_COMPLETED, 1),
+        ]
+        .iter()
+        .all(|(kind, expected)| {
+            events
+                .iter()
+                .filter(|event| event.event_type == *kind)
+                .count()
+                == *expected
+        })
     });
     let failure_events = events_for_request(&harness.capture, FAILURE_REQUEST_ID);
     assert_eq!(
@@ -955,9 +969,23 @@ async fn e2e_07_overlay_crm_workflow() {
 
     assert_eventually(Duration::from_secs(2), || {
         let events = events_for_request(&harness.capture, SUCCESS_REQUEST_ID);
-        events
-            .iter()
-            .any(|event| event.event_type == audit::event::TOOL_COMPOSITE_COMPLETED)
+        // Composite completion is emitted before the outer invocation's
+        // terminal event. Wait for the entire evidence set before taking
+        // the snapshot used by the exact-count and payload assertions below.
+        [
+            (audit::event::TOOL_INVOKE_START, 1),
+            (audit::event::TOOL_INVOKE_SUCCESS, 1),
+            (audit::event::TOOL_UPSTREAM_REQUEST, 4),
+            (audit::event::TOOL_COMPOSITE_COMPLETED, 1),
+        ]
+        .iter()
+        .all(|(kind, expected)| {
+            events
+                .iter()
+                .filter(|event| event.event_type == *kind)
+                .count()
+                == *expected
+        })
     });
     let success_events = events_for_request(&harness.capture, SUCCESS_REQUEST_ID);
     assert_eq!(
