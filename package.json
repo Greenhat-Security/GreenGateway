@@ -11,7 +11,8 @@
     "load:resilience": "node scripts/run-resilience-load.mjs",
     "load:resilience:quick": "node scripts/run-resilience-load.mjs --quick",
     "test": "vitest run cloudflare/src",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "preinstall": "node scripts/npm-script-policy.mjs check ."
   },
   "dependencies": {
     "@cloudflare/containers": "^0.3.7"
@@ -47,5 +48,10 @@
   "engines": {
     "node": "24.20.0",
     "npm": "11.19.0"
+  },
+  "allowScripts": {
+    "https://registry.npmjs.org/esbuild/-/esbuild-0.28.1.tgz": false,
+    "https://registry.npmjs.org/fsevents/-/fsevents-2.3.3.tgz": false,
+    "https://registry.npmjs.org/workerd/-/workerd-1.20260903.1.tgz": false
   }
 }

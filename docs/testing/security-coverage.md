@@ -35,7 +35,7 @@ excludes that performance measurement: instrumentation on hosted Windows changes
 its timing. All security coverage floors and the normal test gate still apply.
 
 Do not run UI tests concurrently with a Rust build in the same checkout: the
-existing Rust build script runs `npm ci` to rebuild embedded UI assets.
+existing Rust build script runs the reviewed npm installer (`scripts/npm-script-policy.mjs`) to rebuild embedded UI assets.
 
 ## Initial measured baseline
 

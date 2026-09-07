@@ -39,7 +39,20 @@ fn main() {
             "build tool differs from repository version contract"
         );
     }
-    run_npm(&admin_ui, &["ci"]);
+    for file in [
+        "build-tools.json",
+        "npm-script-policy.json",
+        "scripts/npm-script-policy.mjs",
+    ] {
+        println!("cargo:rerun-if-changed={}", repo_root.join(file).display());
+    }
+    let status = Command::new("node")
+        .arg(repo_root.join("scripts/npm-script-policy.mjs"))
+        .args(["install", "admin-ui"])
+        .current_dir(repo_root)
+        .status()
+        .expect("run reviewed npm installer");
+    assert!(status.success(), "reviewed npm install failed");
     run_npm(&admin_ui, &["run", "build"]);
 }
 

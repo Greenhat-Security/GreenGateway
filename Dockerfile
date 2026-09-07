@@ -12,7 +12,8 @@ RUN ln -s ../lib/node_modules/npm/bin/npm-cli.js /usr/local/bin/npm \
 WORKDIR /app
 
 COPY Cargo.toml Cargo.lock rust-toolchain.toml ./
-COPY .node-version .npm-version ./
+COPY .node-version .npm-version build-tools.json npm-script-policy.json ./
+COPY scripts/npm-script-policy.mjs scripts/npm-script-policy.mjs
 RUN test "$(node --version)" = "v$(cat .node-version)" \
     && test "$(npm --version)" = "$(cat .npm-version)" \
     && rustc --version | grep -E '^rustc 1\.88\.0 '

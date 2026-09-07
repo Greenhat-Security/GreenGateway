@@ -10,7 +10,8 @@
     "screenshots": "playwright test",
     "test": "vitest --run",
     "typecheck": "tsc --noEmit",
-    "preview": "vite preview"
+    "preview": "vite preview",
+    "preinstall": "node ../scripts/npm-script-policy.mjs check admin-ui"
   },
   "dependencies": {
     "react": "^19.1.1",
@@ -32,5 +33,10 @@
   "engines": {
     "node": "24.20.0",
     "npm": "11.19.0"
+  },
+  "allowScripts": {
+    "https://registry.npmjs.org/esbuild/-/esbuild-0.28.1.tgz": false,
+    "https://registry.npmjs.org/fsevents/-/fsevents-2.3.3.tgz": false,
+    "https://registry.npmjs.org/fsevents/-/fsevents-2.3.2.tgz": false
   }
 }

@@ -54,7 +54,7 @@ compatibility gate. `ignore-scripts` suppresses npm's strict preflight as well a
 hooks, so it is not a substitute for detecting newly unreviewed dependencies.
 No production dependency currently needs permission to run an install hook.
 
-## Install boundaries to enforce
+## Enforced install boundaries
 
 - Root Cloudflare package: dependencies stay denied; explicit test, typecheck,
   Wrangler and deployment commands remain intentional executable code.
@@ -65,5 +65,24 @@ No production dependency currently needs permission to run an install hook.
 - Tooling: use lockfile-installed executables; `npx --no-install` must fail if a
   command is absent instead of downloading it.
 
-Installation wiring and dependency-update regression gates are the subsequent
-focused slices of #430. This inventory alone does not enforce those boundaries.
+From the repository root, install with:
+
+```sh
+node scripts/npm-script-policy.mjs install .
+node scripts/npm-script-policy.mjs install admin-ui
+```
+
+The dependency-free Node gate checks the review before invoking the pinned npm,
+with strict policy enabled, hook bypasses disabled and optional packages included.
+Both project manifests also run the inventory check as their own `preinstall`, so
+ordinary `npm ci` and dependency updates verify the inventory. npm's strict
+preflight rejects unreviewed dependencies before any dependency hooks; the
+project preinstall checks denied identities after npm has installed them. There
+are no approved dependency hooks. The root package no longer uses
+`--ignore-scripts`, because that disables strict preflight; exact explicit denials
+preserve its no-dependency-script behavior while detecting new hooks.
+
+CI checks both inventories, independently of the runner's platform. A policy
+change invalidates Cargo's UI build. Docker includes the same checker and policy.
+Never use an approval-all flag or bypass the checker to get an upgrade through.
+Explicit `npm run build`, tests and lockfile-installed tools still run normally.
