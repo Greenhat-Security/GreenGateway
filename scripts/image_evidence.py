@@ -138,6 +138,7 @@ def verify(repository, digest, sha, ref, evidence, output, gh=None, trusted_root
                  ("image-sbom", image_subject, SPDX, digest, image),
                  ("sbom-bytes", str(sbom_path.resolve()), PROVENANCE, file_digest, None)]
         for label, subject, predicate, expected, name in cases:
+            print("Verifying " + label, flush=True)
             command = ["attestation", "verify", subject, *constraints(repository, sha, ref), "--predicate-type", predicate]
             if trusted_root:
                 command.extend(["--bundle", str((evidence / (label + ".jsonl")).resolve()),
@@ -183,4 +184,10 @@ if __name__ == "__main__":
             verify(args.repository, args.digest, args.sha, args.ref, args.evidence.resolve(), args.output.resolve(), args.gh, args.trusted_root)
     except (ValueError, OSError, KeyError, TypeError, subprocess.SubprocessError) as error:
         print("Image evidence failed (" + type(error).__name__ + "). No passing digest issued.", file=sys.stderr)
+        detail = error.stderr if isinstance(error, subprocess.CalledProcessError) else str(error)
+        if isinstance(detail, str):
+            for key in ["GH_TOKEN", "GITHUB_TOKEN"]:
+                if token := os.environ.get(key):
+                    detail = detail.replace(token, "[REDACTED]")
+            print(detail[:2000], file=sys.stderr)
         sys.exit(1)

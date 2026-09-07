@@ -28,7 +28,7 @@ def report():
             "CreatedAt": NOW.isoformat(), "Metadata": {"ImageID": CONFIG, "RepoDigests": [IMAGE],
             "OS": {"Family": "debian"}, "ImageConfig": {"os": "linux", "architecture": "amd64",
             "config": {"Labels": {"org.opencontainers.image.revision": SHA}}}},
-            "Results": [{"Class": "os-pkgs", "Packages": [{"Name": "fixture", "Version": "1.0"}],
+            "Results": [{"Class": "os-pkgs", "Type": "debian", "Packages": [{"Name": "fixture", "Version": "1.0"}],
                          "Vulnerabilities": []}]}
 
 
@@ -90,6 +90,9 @@ class DecisionTests(unittest.TestCase):
             lambda r: r.update(SchemaVersion=1),
             lambda r: r.update(Results=[]),
             lambda r: r["Results"][0].update(Packages=[]),
+            lambda r: r["Results"][0].update(Packages="not an inventory"),
+            lambda r: r["Results"][0].update(Packages=[{}]),
+            lambda r: r["Results"][0].update(Type="wrong-os"),
             lambda r: r["Results"][0].update(Vulnerabilities=None),
             lambda r: r["Metadata"].update(ImageID=DIGEST),
             lambda r: r["Metadata"].update(RepoDigests=[]),

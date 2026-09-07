@@ -161,6 +161,15 @@ def evaluate(report, image, platform, config_digest, sha, candidate, rules, now)
     for result in results:
         if result.get("Class") not in {"os-pkgs", "lang-pkgs"}:
             raise ValueError("unexpected report class")
+        packages = result.get("Packages")
+        if not isinstance(packages, list) or not packages:
+            raise ValueError("result lacks a package inventory")
+        if any(not isinstance(package, dict) or
+               any(not isinstance(package.get(key), str) or not package[key] for key in ["Name", "Version"])
+               for package in packages):
+            raise ValueError("malformed package inventory")
+        if result["Class"] == "os-pkgs" and result.get("Type") != "debian":
+            raise ValueError("OS inventory type mismatch")
         findings = result.get("Vulnerabilities", [])
         if not isinstance(findings, list):
             raise ValueError("malformed findings")
