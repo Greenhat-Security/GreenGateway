@@ -1,0 +1,6 @@
+{
+  "schema_version": 1,
+  "platforms": ["linux/amd64"],
+  "max_database_age_hours": 48,
+  "exceptions": []
+}

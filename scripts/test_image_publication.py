@@ -18,7 +18,7 @@ DIGEST = "sha256:" + "b" * 64
 def environment(ref="refs/heads/main"):
     return {
         "GITHUB_EVENT_NAME": "push", "GITHUB_REPOSITORY": "Example/Gateway",
-        "GITHUB_SHA": SHA, "GITHUB_REF": ref, "CANDIDATE_DIGEST": DIGEST,
+        "GITHUB_SHA": SHA, "GITHUB_REF": ref, "CANDIDATE_DIGEST": DIGEST, "SCANNED_DIGEST": DIGEST,
     }
 
 
@@ -62,7 +62,8 @@ class PromotionTests(unittest.TestCase):
         for field, value in [
             ("GITHUB_EVENT_NAME", "pull_request"), ("GITHUB_EVENT_NAME", "workflow_run"),
             ("GITHUB_SHA", "main"), ("CANDIDATE_DIGEST", ""),
-            ("CANDIDATE_DIGEST", "candidate-tag"), ("CANDIDATE_DIGEST", DIGEST + ";echo bad"),
+            ("CANDIDATE_DIGEST", "candidate-tag"), ("SCANNED_DIGEST", ""),
+            ("SCANNED_DIGEST", "sha256:" + "f" * 64), ("CANDIDATE_DIGEST", DIGEST + ";echo bad"),
             ("GITHUB_REPOSITORY", "../other"), ("GITHUB_REF", "refs/heads/feature"),
             ("GITHUB_REF", "refs/tags/v1.2.3-rc1"), ("GITHUB_REF", "refs/tags/v01.2.3"),
         ]:
@@ -147,6 +148,7 @@ class WorkflowTests(unittest.TestCase):
             self.assertNotIn("docker/build-push-action", step.get("uses", ""))
         self.assertEqual(promotion["steps"][-1]["env"]["CANDIDATE_DIGEST"], "${{ needs.image-candidate.outputs.digest }}")
         self.assertEqual(promotion["steps"][-1]["run"], "python scripts/promote_image.py")
+        self.assertEqual(promotion["steps"][-1]["env"]["SCANNED_DIGEST"], "${{ needs.image-scan.outputs.digest }}")
 
 
 if __name__ == "__main__":

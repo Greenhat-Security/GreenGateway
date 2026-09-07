@@ -725,7 +725,9 @@ jobs:
       - name: Install workflow test parser
         run: python -m pip install PyYAML==6.0.3
       - name: Verify publication gates and promotion behavior
-        run: python -m unittest discover -s scripts -p 'test_image_publication.py' -v
+        run: |
+          python -m unittest discover -s scripts -p 'test_image_publication.py' -v
+          python -m unittest discover -s scripts -p 'test_candidate_scan.py' -v
 
   image-preview:
     name: Build image
@@ -759,6 +761,46 @@ jobs:
       packages: write
     uses: ./.github/workflows/publish-image.yml
 
+
+  image-scan:
+    name: Scan immutable candidate
+    needs: image-candidate
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      packages: read
+    outputs:
+      digest: ${{ steps.scan.outputs.digest }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - uses: ./.github/actions/build-tools
+        with:
+          rust: none
+          node: 'false'
+      - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Scan exact runtime manifests and enforce policy
+        id: scan
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          CANDIDATE_DIGEST: ${{ needs.image-candidate.outputs.digest }}
+        run: python scripts/scan_candidate_image.py
+      - name: Preserve raw findings and gate decision
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: image-scan-${{ github.sha }}
+          path: target/image-scan/
+          if-no-files-found: error
+          retention-days: 30
 
   production-compiler:
     name: production-compiler
@@ -796,6 +838,7 @@ jobs:
       - gitleaks
       - image-publication
       - image-candidate
+      - image-scan
     if: ${{ github.event_name == 'push' && success() && !contains(needs.*.result, 'skipped') }}
     runs-on: ubuntu-latest
     timeout-minutes: 10
@@ -830,4 +873,5 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           CANDIDATE_DIGEST: ${{ needs.image-candidate.outputs.digest }}
+          SCANNED_DIGEST: ${{ needs.image-scan.outputs.digest }}
         run: python scripts/promote_image.py

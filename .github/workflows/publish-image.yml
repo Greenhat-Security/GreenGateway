@@ -48,5 +48,6 @@ jobs:
           context: .
           file: ./Dockerfile
           push: true
+          platforms: linux/amd64
           tags: ${{ steps.image.outputs.tag }}
           labels: org.opencontainers.image.revision=${{ github.sha }}

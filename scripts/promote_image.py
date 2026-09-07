@@ -21,6 +21,8 @@ def promote(environ):
         raise ValueError("invalid checked commit")
     if not re.fullmatch(r"sha256:[0-9a-f]{64}", digest):
         raise ValueError("missing or invalid candidate digest")
+    if environ.get("SCANNED_DIGEST") != digest:
+        raise ValueError("successful scan must bind the exact candidate digest")
     version = re.fullmatch(r"refs/tags/(v(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*))", ref)
     if ref != "refs/heads/main" and version is None:
         raise ValueError("only main and vMAJOR.MINOR.PATCH refs may promote images")
