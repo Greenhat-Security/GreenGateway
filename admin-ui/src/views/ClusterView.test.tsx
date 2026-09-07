@@ -16,6 +16,15 @@ afterEach(() => {
 });
 
 describe('ClusterView', () => {
+  it.each([null, 'generated-opaque-test-token', jwtWithRoles(['unrelated-role'])])('uses server read permission without policy access for identity %s', async (token) => {
+    const fetcher = clusterFetchMock({ status: clusterStatus() });
+    vi.stubGlobal('fetch', fetcher.fetch);
+    renderClusterView({ token });
+    await screen.findByTestId('cluster-state-badge');
+    expect(screen.queryByText(/permission required/i)).toBeNull();
+    expect(fetcher.fetch.mock.calls.some(([url]) => String(url).includes('/policy'))).toBe(false);
+  });
+
   it('reports a ready cluster with its replica, schema, revision, projector, and audit sections', async () => {
     const fetcher = clusterFetchMock({ status: clusterStatus() });
     vi.stubGlobal('fetch', fetcher.fetch);
@@ -267,9 +276,7 @@ describe('ClusterView', () => {
 
     renderClusterView();
 
-    expect(
-      (await screen.findByTestId('cluster-state-text')).textContent,
-    ).toContain('Reason: Unrecognized reason.');
+    await waitFor(() => expect(screen.getByTestId('cluster-state-text').textContent).toContain('Reason: Unrecognized reason.'));
     expect(
       document.body.textContent?.includes('postgres://'),
     ).toBe(false);
@@ -278,7 +285,7 @@ describe('ClusterView', () => {
   it('gates the view on admin:cluster:read without calling the cluster API', async () => {
     const fetcher = clusterFetchMock({
       status: clusterStatus(),
-      roles: { reader: { permissions: ['admin:policy:read'] } },
+      permissions: ['admin:policy:read'],
     });
     vi.stubGlobal('fetch', fetcher.fetch);
 
@@ -288,7 +295,7 @@ describe('ClusterView', () => {
       await screen.findByText('Cluster permission required'),
     ).toBeTruthy();
     expect(
-      screen.getByText('This token is valid but does not include admin:cluster:read.'),
+      screen.getByText('Your session does not include admin:cluster:read.'),
     ).toBeTruthy();
     expect(fetcher.clusterRequests).toBe(0);
     expect(screen.queryByTestId('cluster-state-badge')).toBeNull();
@@ -347,7 +354,7 @@ describe('ClusterView', () => {
     expect(stateText.getAttribute('role')).toBe('status');
 
     // The scrollable table is reachable and named for a keyboard user.
-    const tableRegion = screen.getByRole('region', {
+    const tableRegion = await screen.findByRole('region', {
       name: 'Leader task health',
     });
     expect(tableRegion.getAttribute('tabindex')).toBe('0');
@@ -480,10 +487,9 @@ describe('ClusterView', () => {
 
     renderClusterView();
 
-    expect(screen.getByText('Loading cluster status')).toBeTruthy();
-    await waitFor(() => {
-      expect(screen.queryByText('Loading cluster status')).toBeNull();
-    });
+    expect(screen.getByText('Checking admin permissions…')).toBeTruthy();
+    await screen.findByTestId('cluster-state-badge');
+    expect(screen.queryByText('Loading cluster status')).toBeNull();
   });
 
   it('mounts the state live region before the first response, so the state arriving is a change', async () => {
@@ -569,11 +575,11 @@ function sectionByLabel(label: string): HTMLElement {
 
 function clusterFetchMock({
   status,
-  roles = { admin: { permissions: ['*'] } },
+  permissions = ['admin:cluster:read'],
   clusterStatusCode = 200,
 }: {
   status: ClusterStatus;
-  roles?: Record<string, { permissions: string[] }>;
+  permissions?: string[];
   clusterStatusCode?: number;
 }) {
   const state = { clusterRequests: 0 };
@@ -581,16 +587,10 @@ function clusterFetchMock({
   const fetch = vi.fn((input: RequestInfo | URL) => {
     const url = new URL(String(input), 'http://localhost');
 
-    if (url.pathname === '/v1/admin/policy') {
+    if (url.pathname === '/v1/admin/capabilities') {
       return Promise.resolve(
         jsonResponse(200, {
-          schema_version: '0.1.0',
-          id: 'test-policy',
-          default_action: 'deny',
-          enforcement_mode: 'enforce',
-          roles,
-          routes: [],
-          rules: [],
+          permissions,
         }),
       );
     }

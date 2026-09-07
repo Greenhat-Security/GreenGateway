@@ -20,10 +20,10 @@ afterEach(() => {
 });
 
 describe('OpenApiToolsView', () => {
-  it('uses server capabilities for a cookie identity without a readable JWT', async () => {
+  it.each([null, 'generated-opaque-test-token', jwtWithRoles(['unrelated-role'])])('enables registration from server grants for identity %s', async (token) => {
     const fetcher = openApiToolsFetchMock();
     vi.stubGlobal('fetch', fetcher.fetch);
-    renderOpenApiToolsView({ token: null });
+    renderOpenApiToolsView({ token });
     fireEvent.change(screen.getByLabelText('OpenAPI spec'), { target: { value: widgetSpec } });
     fireEvent.click(screen.getByRole('button', { name: 'Preview' }));
     await screen.findByText('createWidget');

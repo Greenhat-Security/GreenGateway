@@ -10,7 +10,6 @@ import { MemoryRouter } from 'react-router-dom';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import { ADMIN_TOKEN_STORAGE_KEY } from '../lib/auth';
-import type { PolicyDocument } from '../lib/policy';
 import type { PrincipalPage, PrincipalRecord } from '../lib/principals';
 import { IdentitiesView } from './IdentitiesView';
 
@@ -21,6 +20,15 @@ afterEach(() => {
 });
 
 describe('IdentitiesView', () => {
+  it.each([null, 'generated-opaque-test-token', jwtWithRoles(['unrelated-role'])])('uses server read permission without policy access for identity %s', async (token) => {
+    const fetcher = principalsFetchMock({ page: principalPage({ principals: [principalRecord()] }) });
+    vi.stubGlobal('fetch', fetcher.fetch);
+    renderIdentitiesView({ token });
+    await screen.findByText('alice');
+    expect(screen.queryByText(/permission required/i)).toBeNull();
+    expect(fetcher.fetch.mock.calls.some(([url]) => String(url).includes('/policy'))).toBe(false);
+  });
+
   it('renders principals with IdP and auth-method badges', async () => {
     vi.stubGlobal(
       'fetch',
@@ -179,11 +187,6 @@ describe('IdentitiesView', () => {
       'fetch',
       principalsFetchMock({
         listStatus: 403,
-        policy: policyDocument({
-          roles: {
-            reader: { permissions: ['admin:tokens:read'] },
-          },
-        }),
       }).fetch,
     );
 
@@ -194,7 +197,7 @@ describe('IdentitiesView', () => {
     ).toBeTruthy();
     expect(
       screen.getByText(
-        'This token is valid but does not include admin:principals:read.',
+        'Your session does not include admin:principals:read.',
       ),
     ).toBeTruthy();
   });
@@ -255,12 +258,12 @@ function renderIdentitiesView({
 }
 
 function principalsFetchMock({
-  policy = policyDocument(),
+  permissions = ['admin:principals:read'],
   page = principalPage(),
   nextPage,
   listStatus = 200,
 }: {
-  policy?: PolicyDocument;
+  permissions?: string[];
   page?: PrincipalPage;
   nextPage?: PrincipalPage;
   listStatus?: number;
@@ -277,8 +280,8 @@ function principalsFetchMock({
   const fetch = vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
     const url = new URL(String(input), 'http://localhost');
 
-    if (url.pathname === '/v1/admin/policy' && !init?.method) {
-      return Promise.resolve(jsonResponse(200, policy));
+    if (url.pathname === '/v1/admin/capabilities' && !init?.method) {
+      return Promise.resolve(jsonResponse(200, { permissions }));
     }
 
     if (url.pathname === '/v1/admin/principals' && !init?.method) {
@@ -328,25 +331,6 @@ function principalRecord(
     first_seen: '2026-07-04T09:00:00Z',
     last_seen: '2026-07-04T10:00:00Z',
     request_count: 1,
-    ...overrides,
-  };
-}
-
-function policyDocument(
-  overrides: Partial<PolicyDocument> = {},
-): PolicyDocument {
-  return {
-    schema_version: '0.1.0',
-    id: 'test-policy',
-    default_action: 'deny',
-    enforcement_mode: 'enforce',
-    roles: {
-      'identity-admin': {
-        permissions: ['admin:principals:read'],
-      },
-    },
-    routes: [],
-    rules: [],
     ...overrides,
   };
 }

@@ -2,14 +2,14 @@ import { type ReactNode, useEffect, useState } from 'react';
 import { Link } from 'react-router-dom';
 
 import { AdminApiError } from '../lib/api';
-import { decodeJwtRolesClaim, getStoredToken } from '../lib/auth';
+import { hasAdminPermission, useAdminCapabilities } from '../lib/adminCapabilities';
+import { AdminCapabilitiesNotice } from '../lib/AdminCapabilitiesNotice';
 import {
   fetchClusterStatus,
   type ClusterLeaderTaskView,
   type ClusterState,
   type ClusterStatus,
 } from '../lib/cluster';
-import { fetchPolicy } from '../lib/policy';
 
 const CLUSTER_READ_PERMISSION = 'admin:cluster:read';
 
@@ -25,14 +25,6 @@ type ClusterLoadError = {
   kind: 'unauthorized' | 'forbidden' | 'network' | 'generic';
   message: string;
 };
-
-/**
- * Whether this console could prove, from the policy document and the
- * token's roles claim, that the principal may read cluster status.
- * `unknown` means the question could not be answered here (no token, no
- * roles claim, an unreadable policy) and the API is left to answer it.
- */
-type ClusterReadPermission = 'granted' | 'denied' | 'unknown';
 
 type ReasonDetail = {
   /** The short label rendered beside the state badge. */
@@ -171,7 +163,10 @@ const UNKNOWN_FAILURE_LABEL = 'Unknown error class';
 export function ClusterView() {
   const [status, setStatus] = useState<ClusterStatus | null>(null);
   const [isLoading, setIsLoading] = useState(true);
-  const [permission, setPermission] = useState<ClusterReadPermission>('unknown');
+  const capabilities = useAdminCapabilities();
+  const canReadCluster = hasAdminPermission(capabilities, CLUSTER_READ_PERMISSION);
+  const [readRequested, setReadRequested] = useState(false);
+  useEffect(() => { if (canReadCluster) setReadRequested(true); }, [canReadCluster]);
   const [loadError, setLoadError] = useState<ClusterLoadError | null>(null);
 
   useEffect(() => {
@@ -181,17 +176,6 @@ export function ClusterView() {
       setIsLoading(true);
       setLoadError(null);
       setStatus(null);
-
-      const readPermission = await resolveClusterReadPermission();
-      if (!isCurrent) {
-        return;
-      }
-
-      setPermission(readPermission);
-      if (readPermission === 'denied') {
-        setIsLoading(false);
-        return;
-      }
 
       try {
         const response = await fetchClusterStatus();
@@ -214,15 +198,16 @@ export function ClusterView() {
       }
     }
 
-    void loadClusterStatus();
+    if (readRequested) void loadClusterStatus();
 
     return () => {
       isCurrent = false;
     };
-  }, []);
+  }, [readRequested]);
 
   const permissionRequired =
-    permission === 'denied' || loadError?.kind === 'forbidden';
+    (capabilities.status === 'ready' && !canReadCluster) || loadError?.kind === 'forbidden';
+  const visibleStatus = canReadCluster ? status : null;
 
   return (
     <main className="logs-page cluster-page">
@@ -235,15 +220,16 @@ export function ClusterView() {
             <p className="eyebrow">Deployment</p>
             <h2 id="cluster-heading">Cluster status</h2>
           </div>
-          {status ? <ClusterModeBadge status={status} /> : null}
+          {visibleStatus ? <ClusterModeBadge status={visibleStatus} /> : null}
         </div>
 
+        <AdminCapabilitiesNotice state={capabilities} />
         {permissionRequired ? <ClusterPermissionNotice /> : null}
         {loadError && loadError.kind !== 'forbidden' ? (
           <ClusterErrorMessage error={loadError} />
         ) : null}
 
-        {isLoading ? (
+        {canReadCluster && isLoading ? (
           <div className="loading-state" role="status" aria-live="polite">
             Loading cluster status
           </div>
@@ -256,9 +242,9 @@ export function ClusterView() {
          * already in it is silent, which is the whole announcement this
          * page has to make.
          */}
-        <ClusterStatePanel status={status} />
+        <ClusterStatePanel status={visibleStatus} />
 
-        {status ? <ClusterSummary status={status} /> : null}
+        {visibleStatus ? <ClusterSummary status={visibleStatus} /> : null}
       </section>
     </main>
   );
@@ -679,7 +665,7 @@ function ClusterPermissionNotice() {
     <div className="error-panel alert warning" role="alert">
       <h3>Cluster permission required</h3>
       <p>
-        This token is valid but does not include {CLUSTER_READ_PERMISSION}.
+        Your session does not include {CLUSTER_READ_PERMISSION}.
       </p>
     </div>
   );
@@ -799,45 +785,6 @@ export function formatAge(seconds: number | null | undefined): string {
   return `${Math.floor(seconds / 86_400)}d ago`;
 }
 
-/**
- * The in-view permission gate, the same shape `PolicyHistoryView` uses:
- * the token's roles claim read against the policy document's roles. A
- * question this console cannot answer is left to the API, whose 403 is
- * handled in the fetch error path.
- */
-async function resolveClusterReadPermission(): Promise<ClusterReadPermission> {
-  const token = getStoredToken();
-  if (!token) {
-    return 'unknown';
-  }
-
-  const roles = decodeJwtRolesClaim(token);
-  if (roles === null) {
-    return 'unknown';
-  }
-
-  try {
-    const policyResult = await fetchPolicy();
-    return roles.some((roleName) =>
-      roleGrantsClusterRead(policyResult.policy.roles?.[roleName]),
-    )
-      ? 'granted'
-      : 'denied';
-  } catch {
-    return 'unknown';
-  }
-}
-
-function roleGrantsClusterRead(role: unknown): boolean {
-  if (!isJsonObject(role) || !Array.isArray(role.permissions)) {
-    return false;
-  }
-
-  return role.permissions.some(
-    (permission) => permission === CLUSTER_READ_PERMISSION || permission === '*',
-  );
-}
-
 function toClusterLoadError(error: unknown): ClusterLoadError {
   if (error instanceof AdminApiError) {
     if (error.status === 401) {
@@ -858,8 +805,4 @@ function toClusterLoadError(error: unknown): ClusterLoadError {
   }
 
   return { kind: 'network', message: 'Network request failed.' };
-}
-
-function isJsonObject(value: unknown): value is Record<string, unknown> {
-  return value !== null && typeof value === 'object' && !Array.isArray(value);
 }

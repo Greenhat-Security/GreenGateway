@@ -1,7 +1,9 @@
 import { FormEvent, useEffect, useMemo, useState } from 'react';
 import { Link } from 'react-router-dom';
 
-import { AdminApiError, fetchAdminCapabilities } from '../lib/api';
+import { AdminApiError } from '../lib/api';
+import { hasAdminPermission, useAdminCapabilities } from '../lib/adminCapabilities';
+import { AdminCapabilitiesNotice } from '../lib/AdminCapabilitiesNotice';
 import {
   type CreatedToken,
   type TokenRecord,
@@ -35,7 +37,9 @@ export function TokensView() {
     useState<TokensViewError | null>(null);
   const [oneTimeToken, setOneTimeToken] = useState<CreatedToken | null>(null);
   const [copyStatus, setCopyStatus] = useState<string | null>(null);
-  const [canWriteTokens, setCanWriteTokens] = useState(false);
+  const capabilities = useAdminCapabilities();
+  const [writeRejected, setWriteRejected] = useState(false);
+  const canWriteTokens = !writeRejected && hasAdminPermission(capabilities, TOKEN_WRITE_PERMISSION);
   const [scopeDraft, setScopeDraft] = useState('');
   const [expiresDate, setExpiresDate] = useState('');
   const [isCreating, setIsCreating] = useState(false);
@@ -85,31 +89,6 @@ export function TokensView() {
     };
   }, []);
 
-  useEffect(() => {
-    let isCurrent = true;
-
-    async function loadWritePermission() {
-      setCanWriteTokens(false);
-
-      try {
-        const capabilities = await fetchAdminCapabilities();
-        if (isCurrent) {
-          setCanWriteTokens(capabilities.permissions.includes(TOKEN_WRITE_PERMISSION));
-        }
-      } catch {
-        if (isCurrent) {
-          setCanWriteTokens(false);
-        }
-      }
-    }
-
-    void loadWritePermission();
-
-    return () => {
-      isCurrent = false;
-    };
-  }, []);
-
   const normalizedScopes = useMemo(
     () => normalizeScopes(scopeDraft),
     [scopeDraft],
@@ -126,6 +105,7 @@ export function TokensView() {
     oneTimeToken === null &&
     normalizedScopes.length > 0;
   const showWritePermissionNotice =
+    capabilities.status === 'ready' &&
     !isLoading &&
     !loadError &&
     !canWriteTokens &&
@@ -272,7 +252,7 @@ export function TokensView() {
   function handleMutationError(error: unknown) {
     const tokenError = toTokensViewError(error);
     if (tokenError.kind === 'forbidden') {
-      setCanWriteTokens(false);
+      setWriteRejected(true);
     }
     setMutationError(tokenError);
   }
@@ -345,6 +325,7 @@ export function TokensView() {
         </form>
 
         {loadError ? <TokensLoadErrorMessage error={loadError} /> : null}
+        <AdminCapabilitiesNotice state={capabilities} />
         {showWritePermissionNotice ? <TokensWritePermissionNotice /> : null}
         {mutationError ? (
           <TokensMutationErrorMessage error={mutationError} />
