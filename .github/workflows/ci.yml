@@ -66,6 +66,7 @@ jobs:
       - run: python -m pip install PyYAML==6.0.3
       - run: python -m unittest discover -s scripts -p 'test_build_tools.py' -v
       - run: node scripts/npm-script-policy.mjs check
+      - run: node --test scripts/test-npm-script-policy.mjs
       - run: python -m unittest discover -s scripts -p 'test_npm_script_policy.py' -v
       - run: python3 scripts/check-supply-chain.py
       - run: python3 scripts/test_security_gates.py
@@ -286,6 +287,37 @@ jobs:
             admin-ui/test-results/
           if-no-files-found: ignore
           retention-days: 7
+
+  npm-policy-windows:
+    name: npm-policy-windows
+    runs-on: windows-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: ./.github/actions/build-tools
+        with:
+          rust: none
+          node: 'true'
+      - name: Verify current review inventory
+        run: node scripts/npm-script-policy.mjs check
+      - name: Test review gate regressions
+        run: node --test scripts/test-npm-script-policy.mjs
+      - name: Test real npm lifecycle behavior
+        run: python -m unittest discover -s scripts -p 'test_npm_script_policy.py' -v
+      - name: Clean install admin UI with dependency hooks denied
+        run: node scripts/npm-script-policy.mjs install admin-ui
+      - name: Test admin UI on Windows
+        working-directory: admin-ui
+        run: npm test
+      - name: Build admin UI on Windows
+        working-directory: admin-ui
+        run: npm run build
+      - name: Clean install root with dependency hooks denied
+        run: node scripts/npm-script-policy.mjs install .
+      - name: Test root on Windows
+        run: npm test
+      - name: Typecheck root on Windows
+        run: npm run typecheck
 
   cloudflare:
     name: cloudflare
@@ -620,6 +652,7 @@ jobs:
       - test
       - admin-ui
       - cloudflare
+      - npm-policy-windows
       - dev-traffic-smoke
       - audit
     if: ${{ always() }}
@@ -898,6 +931,7 @@ jobs:
       - postgres-foundation
       - admin-ui
       - cloudflare
+      - npm-policy-windows
       - dev-traffic-smoke
       - audit
       - ha-compose-example

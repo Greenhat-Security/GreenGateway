@@ -129,6 +129,18 @@ def check(root=ROOT):
                 errors.append("Docker Cargo builds must be locked")
         if not all(x + " --version" in dockerfile for x in ["node", "npm", "rustc"]):
             errors.append("Docker must verify actual compiler/runtime versions")
+        for required in ["build-tools.json", "npm-script-policy.json", "scripts/npm-script-policy.mjs"]:
+            if required not in dockerfile:
+                errors.append(f"Docker must copy npm policy input {required}")
+        cargo_build = (root / "gateway/build.rs").read_text()
+        if 'repo_root.join("scripts/npm-script-policy.mjs")' not in cargo_build or '.args(["install", "admin-ui"])' not in cargo_build:
+            errors.append("Cargo must use the reviewed npm installer")
+        if 'run_npm(&admin_ui, &["ci"])' in cargo_build:
+            errors.append("Cargo must not bypass npm identity review")
+        tracked_inputs = re.search(r'for file in \[(.*?)\]\s*\{\s*println!\("cargo:rerun-if-changed=\{\}", repo_root\.join\(file\)\.display\(\)\);', cargo_build, re.DOTALL)
+        for required in ["build-tools.json", "npm-script-policy.json", "scripts/npm-script-policy.mjs"]:
+            if not tracked_inputs or f'"{required}"' not in tracked_inputs.group(1):
+                errors.append(f"Cargo must track npm policy input {required}")
         action = yaml.load((root / ".github/actions/build-tools/action.yml").read_text(), Loader=yaml.BaseLoader)
         steps = action["runs"]["steps"]
         python = next(s for s in steps if s.get("uses", "").startswith("actions/setup-python@"))
@@ -183,6 +195,8 @@ def check(root=ROOT):
                         errors.append(f"{job_name}: unreviewed Python dependency installation")
                     if re.search(r"\bnpx\s+(?!.*--no-install)", run):
                         errors.append(f"{job_name}: npx must not download missing tools")
+                    if re.search(r"\bnpm\s+(ci|install|i|exec|x|rebuild)\b", run):
+                        errors.append(f"{job_name}: use the reviewed npm installer or a locked no-download executable")
                     env = s.get("env", {})
                     if "GITLEAKS_VERSION" in env and env["GITLEAKS_VERSION"] != pins["gitleaks"]:
                         errors.append("gitleaks version drift")
