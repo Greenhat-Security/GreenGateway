@@ -92,7 +92,7 @@ test.describe.serial('Issue #240 live admin acceptance', () => {
         expect(directory.status()).toBe(200);
         await expect(page.getByText('Principal directory permission required')).toHaveCount(0);
         await page.getByRole('link', { name: 'Tokens', exact: true }).click();
-        await page.getByLabel('Scopes').fill('admin:tokens:read');
+        await page.getByLabel('Scopes', { exact: true }).fill('admin:tokens:read');
         await expect(page.getByText('Token write permission required')).toBeVisible();
         await expect(page.getByRole('button', { name: 'Create token', exact: true })).toBeDisabled();
         expect(policyRequests).toBe(0);
