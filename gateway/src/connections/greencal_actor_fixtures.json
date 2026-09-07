@@ -1,0 +1,261 @@
+[
+  {
+    "name": "empty object",
+    "operation": "greencal_list_meetings",
+    "body": {},
+    "canonical": "{}",
+    "digest": "560ea99730cecf8ea2347e36f29b5fe85e0ca753a5f7322521464e6c42d82c79"
+  },
+  {
+    "name": "flat, already sorted",
+    "operation": "greencal_get_meeting",
+    "body": {
+      "a": 1,
+      "b": "two",
+      "c": true
+    },
+    "canonical": "{\"a\":1,\"b\":\"two\",\"c\":true}",
+    "digest": "6265b5536f1e41714529f52f498610dc5cc91e251dce6a9cb39955b05668c622"
+  },
+  {
+    "name": "flat, needs sorting",
+    "operation": "greencal_get_meeting",
+    "body": {
+      "c": true,
+      "a": 1,
+      "b": "two"
+    },
+    "canonical": "{\"a\":1,\"b\":\"two\",\"c\":true}",
+    "digest": "6265b5536f1e41714529f52f498610dc5cc91e251dce6a9cb39955b05668c622"
+  },
+  {
+    "name": "null and false",
+    "operation": "greencal_get_booking_rules",
+    "body": {
+      "z": null,
+      "y": false
+    },
+    "canonical": "{\"y\":false,\"z\":null}",
+    "digest": "133ea9506a5e42c5fe1693feaeb3804ceab4cacbc7b4e4afa40284d2fb199b02"
+  },
+  {
+    "name": "nested objects and arrays",
+    "operation": "greencal_list_notetakers",
+    "body": {
+      "outer": {
+        "inner": [
+          1,
+          {
+            "k": "v"
+          },
+          []
+        ],
+        "flag": false
+      },
+      "list": [
+        "b",
+        "a"
+      ]
+    },
+    "canonical": "{\"list\":[\"b\",\"a\"],\"outer\":{\"flag\":false,\"inner\":[1,{\"k\":\"v\"},[]]}}",
+    "digest": "38ee7cdf3fc99c99c5b3aa041c25afbed6e47e5bc24dbdf7430babdcc107a5ba"
+  },
+  {
+    "name": "array order is preserved",
+    "operation": "greencal_list_meetings",
+    "body": {
+      "items": [
+        3,
+        1,
+        2
+      ]
+    },
+    "canonical": "{\"items\":[3,1,2]}",
+    "digest": "b98c521e5689ce87c345989d0fbf69ec7f3eb70faf1ea7e271c77e0381bbae22"
+  },
+  {
+    "name": "negative and zero",
+    "operation": "greencal_update_meeting",
+    "body": {
+      "a": -1,
+      "b": 0,
+      "c": 0
+    },
+    "canonical": "{\"a\":-1,\"b\":0,\"c\":0}",
+    "digest": "c7d2db1c7ad1286c684c689765600f2bcc576103f14ccc087a93629fdeb1a0b3"
+  },
+  {
+    "name": "max safe integer",
+    "operation": "greencal_update_meeting",
+    "body": {
+      "n": 9007199254740991
+    },
+    "canonical": "{\"n\":9007199254740991}",
+    "digest": "5ce162752911be1dd111c48f1c290a2bf1a37a1898e6d77b09f89c5c7e5e64b4"
+  },
+  {
+    "name": "min safe integer",
+    "operation": "greencal_update_meeting",
+    "body": {
+      "n": -9007199254740991
+    },
+    "canonical": "{\"n\":-9007199254740991}",
+    "digest": "6b2099e3b882a67316f41fd41cabc4ede2f37b3008d94986c081b2c7546733d1"
+  },
+  {
+    "name": "quotes and backslashes",
+    "operation": "greencal_get_booking_link",
+    "body": {
+      "s": "he said \"hi\" \\ bye"
+    },
+    "canonical": "{\"s\":\"he said \\\"hi\\\" \\\\ bye\"}",
+    "digest": "cd770237102a577d126269d0ccd5cfae452a5cb3b06dc325770d60bd9e372589"
+  },
+  {
+    "name": "control characters",
+    "operation": "greencal_get_booking_link",
+    "body": {
+      "s": "a\bb\tc\nd\fe\rf\u0000g\u001fh"
+    },
+    "canonical": "{\"s\":\"a\\bb\\tc\\nd\\fe\\rf\\u0000g\\u001fh\"}",
+    "digest": "6f1fbaf84555a331c2250022b9ad5a4071a140fd1fc45523b180c8cb1dbc99d0"
+  },
+  {
+    "name": "non-ascii stays literal",
+    "operation": "greencal_get_booking_link",
+    "body": {
+      "s": "café ☕ 日本語"
+    },
+    "canonical": "{\"s\":\"café ☕ 日本語\"}",
+    "digest": "ef819a43bad2b615f515551d0988bcf05e4743022868589d9e1e91325040ff8e"
+  },
+  {
+    "name": "emoji key and value",
+    "operation": "greencal_get_booking_link",
+    "body": {
+      "🔑": "🔒"
+    },
+    "canonical": "{\"🔑\":\"🔒\"}",
+    "digest": "1293524c1359c90ad7ed8ecbc13c1b816ffb105961ac771b441745d3bc9844e1"
+  },
+  {
+    "name": "utf16 vs codepoint key order",
+    "operation": "greencal_get_booking_link",
+    "body": {
+      "𐀀": "supplementary",
+      "￿": "bmp-high"
+    },
+    "canonical": "{\"𐀀\":\"supplementary\",\"￿\":\"bmp-high\"}",
+    "digest": "cd1fcbf27544e515ba549775571477791e02e8510a63b2c81eec5c32a0d34602"
+  },
+  {
+    "name": "surrogate ordering, three keys",
+    "operation": "greencal_get_booking_link",
+    "body": {
+      "": "private-use",
+      "😀": "emoji",
+      "�": "replacement"
+    },
+    "canonical": "{\"😀\":\"emoji\",\"\":\"private-use\",\"�\":\"replacement\"}",
+    "digest": "b519a0e638868a252afd93da5f1a738517a674322a432465af382c3e74dfd442"
+  },
+  {
+    "name": "ascii vs non-ascii key order",
+    "operation": "greencal_get_booking_link",
+    "body": {
+      "0": 4,
+      "z": 1,
+      "A": 2,
+      "_": 3,
+      "é": 5
+    },
+    "canonical": "{\"0\":4,\"A\":2,\"_\":3,\"z\":1,\"é\":5}",
+    "digest": "272fd5f8c384bf40aa4c3bdb0bb9d3dfd62bebe1e46934eeba5e1e6f4c602fcc"
+  },
+  {
+    "name": "empty string key",
+    "operation": "greencal_get_booking_link",
+    "body": {
+      "": "empty",
+      "a": "x"
+    },
+    "canonical": "{\"\":\"empty\",\"a\":\"x\"}",
+    "digest": "17d6a53e4969c35c4ef9b63dca47c0d4db220287b1ddb72da0e795b246437475"
+  },
+  {
+    "name": "mutation body with requestKey",
+    "operation": "greencal_update_booking_rules",
+    "body": {
+      "requestKey": "test-request-key-0000000000000000",
+      "expectedVersion": 7,
+      "window": {
+        "weekday": 3,
+        "start": "09:00",
+        "end": "17:00",
+        "timezone": "Europe/London",
+        "active": true
+      }
+    },
+    "canonical": "{\"expectedVersion\":7,\"requestKey\":\"test-request-key-0000000000000000\",\"window\":{\"active\":true,\"end\":\"17:00\",\"start\":\"09:00\",\"timezone\":\"Europe/London\",\"weekday\":3}}",
+    "digest": "56a9f723f0fded64e14b7260047608136dc380552ac2abc4eeacbdd455a6f70f"
+  },
+  {
+    "name": "deep nesting near the cap",
+    "operation": "greencal_get_meeting",
+    "body": {
+      "level24": {
+        "level23": {
+          "level22": {
+            "level21": {
+              "level20": {
+                "level19": {
+                  "level18": {
+                    "level17": {
+                      "level16": {
+                        "level15": {
+                          "level14": {
+                            "level13": {
+                              "level12": {
+                                "level11": {
+                                  "level10": {
+                                    "level9": {
+                                      "level8": {
+                                        "level7": {
+                                          "level6": {
+                                            "level5": {
+                                              "level4": {
+                                                "level3": {
+                                                  "level2": {
+                                                    "level1": {
+                                                      "level0": {
+                                                        "leaf": 1
+                                                      }
+                                                    }
+                                                  }
+                                                }
+                                              }
+                                            }
+                                          }
+                                        }
+                                      }
+                                    }
+                                  }
+                                }
+                              }
+                            }
+                          }
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "canonical": "{\"level24\":{\"level23\":{\"level22\":{\"level21\":{\"level20\":{\"level19\":{\"level18\":{\"level17\":{\"level16\":{\"level15\":{\"level14\":{\"level13\":{\"level12\":{\"level11\":{\"level10\":{\"level9\":{\"level8\":{\"level7\":{\"level6\":{\"level5\":{\"level4\":{\"level3\":{\"level2\":{\"level1\":{\"level0\":{\"leaf\":1}}}}}}}}}}}}}}}}}}}}}}}}}}",
+    "digest": "37d59d62f2cd0d9b76fab568c91c785303a8ca49f2b7b5387bc34eaa8a6f355c"
+  }
+]
