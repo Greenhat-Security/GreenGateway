@@ -35,7 +35,8 @@ class NpmLifecycleTests(unittest.TestCase):
         self.root = Path(temp.name)
         # Isolate developer npm preferences; fixtures must exercise strict mode.
         self.env = {k: v for k, v in os.environ.items() if not k.lower().startswith("npm_config_")}
-        self.env.update({"CI": "true", "npm_config_userconfig": str(self.root / "user.npmrc"),
+        self.env.update({"CI": "true", "npm_config_cache": str(self.root / "cache"),
+                         "npm_config_userconfig": str(self.root / "user.npmrc"),
                          "npm_config_globalconfig": str(self.root / "global.npmrc")})
         handler = functools.partial(http.server.SimpleHTTPRequestHandler, directory=str(self.root))
         self.server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), handler)
