@@ -1,0 +1,108 @@
+{
+  "schema_version": 1,
+  "projects": {
+    ".": {
+      "node_modules/esbuild": {
+        "version": "0.28.1",
+        "resolved": "https://registry.npmjs.org/esbuild/-/esbuild-0.28.1.tgz",
+        "integrity": "sha512-HrJrvZv5ayxBzPfwphOoNzkzOIIlifzk0KJrGK2c8R4+LKpMtpYLQeUdjnwjWv/LZlkH2laZk+4w78pi99D4Vw==",
+        "allow": false,
+        "scripts": {
+          "postinstall": "node install.js"
+        },
+        "source_sha256": {
+          "package/install.js": "612294e278914443bdcf81cb17f54afec34dbdd2ebd999a6ee187912320cc315"
+        },
+        "reason": "Native binary is supplied by the locked platform optional dependency; installer fallback downloads and binary rewrites are unnecessary for supported builds."
+      },
+      "node_modules/fsevents": {
+        "version": "2.3.3",
+        "resolved": "https://registry.npmjs.org/fsevents/-/fsevents-2.3.3.tgz",
+        "integrity": "sha512-5xoDfX+fL7faATnagmWPpbFtwh/R77WmMMqqHGS65C3vvB0YHrgF+B1YmZ3441tMj5n63k0212XNoJwzlhffQw==",
+        "optional": true,
+        "os": [
+          "darwin"
+        ],
+        "allow": false,
+        "scripts": {
+          "clean": "node-gyp clean && rm -f fsevents.node",
+          "build": "node-gyp clean && rm -f fsevents.node && node-gyp rebuild && node-gyp clean",
+          "test": "/bin/bash ./test.sh 2>/dev/null",
+          "prepublishOnly": "npm run build"
+        },
+        "source_sha256": {
+          "package/fsevents.js": "1d75660f48786792f0e98d6dabfd301883c8f2a8f61aa690cbf58fb4386c0f1a"
+        },
+        "reason": "Optional Darwin watcher; published tarball has no install lifecycle hook or binding.gyp despite lock metadata."
+      },
+      "node_modules/workerd": {
+        "version": "1.20260903.1",
+        "resolved": "https://registry.npmjs.org/workerd/-/workerd-1.20260903.1.tgz",
+        "integrity": "sha512-xJzt2RnCy7ulOULmZy/4JLbEPg1uisp9lVoOUsEz+UVhDsTmrSQ0rBXZMGcXuhr2HCGKs89bg8nnbbzvBSX1Ig==",
+        "allow": false,
+        "scripts": {
+          "postinstall": "node install.js"
+        },
+        "source_sha256": {
+          "package/install.js": "c947861ce70fa08edb3c45461f502cf26af84eb60cb7d16507f678b9ebfc830b"
+        },
+        "reason": "Native binary is supplied by the locked platform optional dependency; installer fallback downloads and binary rewrites are unnecessary for supported builds."
+      }
+    },
+    "admin-ui": {
+      "node_modules/esbuild": {
+        "version": "0.28.1",
+        "resolved": "https://registry.npmjs.org/esbuild/-/esbuild-0.28.1.tgz",
+        "integrity": "sha512-HrJrvZv5ayxBzPfwphOoNzkzOIIlifzk0KJrGK2c8R4+LKpMtpYLQeUdjnwjWv/LZlkH2laZk+4w78pi99D4Vw==",
+        "allow": false,
+        "scripts": {
+          "postinstall": "node install.js"
+        },
+        "source_sha256": {
+          "package/install.js": "612294e278914443bdcf81cb17f54afec34dbdd2ebd999a6ee187912320cc315"
+        },
+        "reason": "Native binary is supplied by the locked platform optional dependency; installer fallback downloads and binary rewrites are unnecessary for supported builds."
+      },
+      "node_modules/fsevents": {
+        "version": "2.3.3",
+        "resolved": "https://registry.npmjs.org/fsevents/-/fsevents-2.3.3.tgz",
+        "integrity": "sha512-5xoDfX+fL7faATnagmWPpbFtwh/R77WmMMqqHGS65C3vvB0YHrgF+B1YmZ3441tMj5n63k0212XNoJwzlhffQw==",
+        "optional": true,
+        "os": [
+          "darwin"
+        ],
+        "allow": false,
+        "scripts": {
+          "clean": "node-gyp clean && rm -f fsevents.node",
+          "build": "node-gyp clean && rm -f fsevents.node && node-gyp rebuild && node-gyp clean",
+          "test": "/bin/bash ./test.sh 2>/dev/null",
+          "prepublishOnly": "npm run build"
+        },
+        "source_sha256": {
+          "package/fsevents.js": "1d75660f48786792f0e98d6dabfd301883c8f2a8f61aa690cbf58fb4386c0f1a"
+        },
+        "reason": "Optional Darwin watcher; published tarball has no install lifecycle hook or binding.gyp despite lock metadata."
+      },
+      "node_modules/playwright/node_modules/fsevents": {
+        "version": "2.3.2",
+        "resolved": "https://registry.npmjs.org/fsevents/-/fsevents-2.3.2.tgz",
+        "integrity": "sha512-xiqMQR4xAeHTuB9uWm+fFRcIOgKBMiOBP+eXiyT7jsgVCq1bkVygt00oASowB7EdtpOHaaPgKt812P9ab+DDKA==",
+        "optional": true,
+        "os": [
+          "darwin"
+        ],
+        "allow": false,
+        "scripts": {
+          "clean": "node-gyp clean && rm -f fsevents.node",
+          "build": "node-gyp clean && rm -f fsevents.node && node-gyp rebuild && node-gyp clean",
+          "test": "/bin/bash ./test.sh 2>/dev/null",
+          "prepublishOnly": "npm run build"
+        },
+        "source_sha256": {
+          "package/fsevents.js": "f51b1bd9058d7a989c595e806fedbbd16a3bb34da5209c2804f97ab84050902a"
+        },
+        "reason": "Optional Darwin watcher; published tarball has no install lifecycle hook or binding.gyp despite lock metadata."
+      }
+    }
+  }
+}
