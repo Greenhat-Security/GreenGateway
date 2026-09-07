@@ -1,10 +1,7 @@
 import { mkdir } from 'node:fs/promises';
-import { Buffer } from 'node:buffer';
 import path from 'node:path';
 
 import { expect, test } from '@playwright/test';
-
-import { ADMIN_TOKEN_STORAGE_KEY } from '../src/lib/auth';
 
 const screenshotDir = path.join(process.cwd(), '.screenshots');
 
@@ -14,13 +11,6 @@ test('captures traffic inventory create-rule prefill journey', async ({
   page,
 }) => {
   await mkdir(screenshotDir, { recursive: true });
-
-  await page.addInitScript(
-    ([storageKey, token]) => {
-      window.sessionStorage.setItem(storageKey, token);
-    },
-    [ADMIN_TOKEN_STORAGE_KEY, jwtWithRoles(['writer'])],
-  );
 
   await page.route('**/v1/admin/policy', async (route) => {
     await route.fulfill({
@@ -149,15 +139,3 @@ test('captures traffic inventory create-rule prefill journey', async ({
   });
   expect(screenshot.length).toBeGreaterThan(10_000);
 });
-
-function jwtWithRoles(roles: string[]): string {
-  return [
-    base64UrlJson({ alg: 'none', typ: 'JWT' }),
-    base64UrlJson({ sub: 'screenshot-user', roles }),
-    'signature',
-  ].join('.');
-}
-
-function base64UrlJson(value: unknown): string {
-  return Buffer.from(JSON.stringify(value), 'utf8').toString('base64url');
-}

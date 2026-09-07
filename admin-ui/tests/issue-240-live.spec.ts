@@ -76,7 +76,7 @@ test.describe.serial('Issue #240 live admin acceptance', () => {
         });
         const [capabilities] = await Promise.all([
           page.waitForResponse((response) => new URL(response.url()).pathname === '/v1/admin/capabilities'),
-          page.goto('/admin/cluster'),
+          identity === 'cookie' ? page.goto('/admin/cluster') : page.getByRole('link', { name: 'Cluster', exact: true }).click(),
         ]);
         expect(capabilities.status()).toBe(200);
         expect(capabilities.headers()['cache-control']).toContain('no-store');
@@ -87,12 +87,12 @@ test.describe.serial('Issue #240 live admin acceptance', () => {
         await expect(page.getByText('Cluster permission required')).toHaveCount(0);
         const [directory] = await Promise.all([
           page.waitForResponse((response) => new URL(response.url()).pathname === '/v1/admin/principals'),
-          page.goto('/admin/identities'),
+          page.getByRole('link', { name: 'Identities', exact: true }).click(),
         ]);
         expect(directory.status()).toBe(200);
         await expect(page.getByText('Principal directory permission required')).toHaveCount(0);
-        await page.goto('/admin/tokens');
-        await page.getByLabel('Scopes').fill('admin:tokens:read');
+        await page.getByRole('link', { name: 'Tokens', exact: true }).click();
+        await page.getByLabel('Scopes', { exact: true }).fill('admin:tokens:read');
         await expect(page.getByText('Token write permission required')).toBeVisible();
         await expect(page.getByRole('button', { name: 'Create token', exact: true })).toBeDisabled();
         expect(policyRequests).toBe(0);
@@ -108,6 +108,34 @@ test.describe.serial('Issue #240 live admin acceptance', () => {
     });
   }
 
+  test('discards a legacy stored token and loses a pasted bearer on reload (#424)', async ({ page }) => {
+    await page.addInitScript(() => sessionStorage.setItem('greengateway_admin_token', `legacy-${crypto.randomUUID()}`));
+    await saveBearerToken(page, tokens.reader);
+    expect(await page.evaluate(() => sessionStorage.getItem('greengateway_admin_token') === null)).toBe(true);
+    expect((await page.content()).includes(tokens.reader)).toBe(false);
+    await expect(page.getByLabel('Token', { exact: true })).toHaveValue('');
+    const [authenticated] = await Promise.all([
+      page.waitForResponse((response) => new URL(response.url()).pathname === '/v1/admin/connections'),
+      page.getByRole('link', { name: 'Connections', exact: true }).click(),
+    ]);
+    expect(authenticated.status()).toBe(200);
+    expect(Boolean(await authenticated.request().headerValue('authorization'))).toBe(true);
+    await authenticated.finished();
+    await expect(page.getByRole('heading', { level: 2, name: 'Connections', exact: true })).toBeVisible();
+    const [response] = await Promise.all([
+      // Ignore any in-flight request from the old document. The reloaded page
+      // must send no bearer header and the actual gateway must reject it.
+      page.waitForResponse((response) =>
+        new URL(response.url()).pathname === '/v1/admin/connections' &&
+        response.request().headers()['authorization'] === undefined),
+      page.reload(),
+    ]);
+    expect(response.status()).toBe(401);
+    expect(await response.request().headerValue('authorization')).toBeNull();
+    await expect(page.getByRole('alert').filter({ hasText: 'Admin session expired' })).toBeVisible();
+    expect(await page.evaluate(() => sessionStorage.getItem('greengateway_admin_token') === null)).toBe(true);
+  });
+
   test('uses real bearer auth, server permissions, read-only actions, themes, and accessible controls', async ({
     browser,
     page,
@@ -120,7 +148,7 @@ test.describe.serial('Issue #240 live admin acceptance', () => {
           request.method() === 'GET' &&
           new URL(request.url()).pathname === '/v1/admin/connections',
       ),
-      page.goto('/admin/connections'),
+      page.getByRole('link', { name: 'Connections', exact: true }).click(),
     ]);
     expect(
       (await readerRequest.headerValue('authorization')) ===
@@ -183,7 +211,7 @@ test.describe.serial('Issue #240 live admin acceptance', () => {
 
     const writerPage = await browser.newPage();
     await saveBearerToken(writerPage, tokens.writer);
-    await writerPage.goto('/admin/connections');
+    await writerPage.getByRole('link', { name: 'Connections', exact: true }).click();
     await expect(
       writerPage.getByRole('button', { name: 'Add connection' }),
     ).toBeVisible();
@@ -211,7 +239,7 @@ test.describe.serial('Issue #240 live admin acceptance', () => {
 
     const secretManagerPage = await browser.newPage();
     await saveBearerToken(secretManagerPage, tokens.secretManager);
-    await secretManagerPage.goto('/admin/connections');
+    await secretManagerPage.getByRole('link', { name: 'Connections', exact: true }).click();
     await expect(
       secretManagerPage.getByRole('button', {
         name: 'Add connection',
@@ -361,9 +389,9 @@ test.describe.serial('Issue #240 live admin acceptance', () => {
     expect(managedConnectionId).toBeTruthy();
     await saveBearerToken(page, tokens.superadmin);
 
-    await page.goto(
-      `/admin/connections/${encodeURIComponent(managedConnectionId)}/edit`,
-    );
+    await page.getByRole('link', { name: 'Connections', exact: true }).click();
+    await page.locator(`a[href="/admin/connections/${encodeURIComponent(managedConnectionId)}"]`).click();
+    await page.getByRole('button', { name: 'Edit', exact: true }).click();
     await expect(
       page.getByRole('heading', {
         level: 2,
@@ -417,7 +445,8 @@ test.describe.serial('Issue #240 live admin acceptance', () => {
       }),
     ).toBeFocused();
 
-    await page.goto('/admin/connections/new');
+    await page.getByRole('link', { name: 'Connections', exact: true }).click();
+    await page.getByRole('button', { name: 'Add connection', exact: true }).click();
     await expect(
       page.getByRole('heading', {
         level: 3,
@@ -514,7 +543,7 @@ async function saveBearerToken(page: Page, token: string) {
   await page.getByRole('button', { name: 'Save' }).click();
   await expect(
     page.getByRole('status').filter({
-      hasText: 'Token saved for this browser session.',
+      hasText: 'Token active in this tab until reload or session expiry.',
     }),
   ).toBeVisible();
 }

@@ -1,5 +1,6 @@
-import { AdminApiError, adminFetchJsonResponse } from './api';
-import { authHeaders } from './auth';
+import { getAdminIdentityVersion, adminAuthorizationFailed } from './adminSession';
+import { AdminApiError, adminFetchJsonResponse, addCsrfHeader } from './api';
+import { authHeaders, adminRequestCredentials, assertAdminRequestOrigin } from './auth';
 import { adminApiUrl } from './config';
 
 export type ToolDefinition = {
@@ -96,22 +97,33 @@ export async function registerOpenApiTools(
   selectedToolNames: string[],
   etag: string,
 ): Promise<OpenApiToolsRegisterResponse> {
-  const response = await fetch(adminApiUrl('/tools/openapi/register'), {
+  const url = adminApiUrl('/tools/openapi/register');
+  assertAdminRequestOrigin(url);
+  const identity = getAdminIdentityVersion();
+  const headers = new Headers({
+    Accept: 'application/json',
+    ...authHeaders(),
+    'Content-Type': 'application/json',
+    'If-Match': etag,
+  });
+  addCsrfHeader(headers, 'POST');
+  const response = await fetch(url, {
     method: 'POST',
-    headers: {
-      Accept: 'application/json',
-      ...authHeaders(),
-      'Content-Type': 'application/json',
-      'If-Match': etag,
-    },
+    credentials: adminRequestCredentials(),
+    redirect: 'error',
+    headers,
     body: JSON.stringify({
       spec,
       selected_tool_names: selectedToolNames,
     }),
   });
   const body = await parseJsonBody(response);
+  if (identity !== getAdminIdentityVersion()) {
+    throw new Error('Admin identity changed while the request was pending.');
+  }
 
   if (!response.ok) {
+    adminAuthorizationFailed(response.status, identity, false);
     if (response.status === 409 && isConflictBody(body)) {
       throw new OpenApiToolsConflictError(body.error, body.conflicts);
     }

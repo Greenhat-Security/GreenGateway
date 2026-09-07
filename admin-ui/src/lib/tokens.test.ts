@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
-import { ADMIN_TOKEN_STORAGE_KEY } from './auth';
+import { clearMemoryToken, setMemoryToken } from './auth';
 import {
   createToken,
   fetchTokens,
@@ -11,12 +11,12 @@ import {
 
 afterEach(() => {
   vi.unstubAllGlobals();
-  window.sessionStorage.removeItem(ADMIN_TOKEN_STORAGE_KEY);
+  clearMemoryToken();
 });
 
 describe('tokens API client', () => {
   it('lists tokens with auth headers and pagination query params', async () => {
-    window.sessionStorage.setItem(ADMIN_TOKEN_STORAGE_KEY, 'admin-token');
+    setMemoryToken('admin-token');
     const fetch = vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
       const url = new URL(String(input), 'http://localhost');
 

@@ -1,26 +1,14 @@
 import { expect, test } from '@playwright/test';
 import { mkdir } from 'node:fs/promises';
-import { Buffer } from 'node:buffer';
 import path from 'node:path';
 
 const screenshotDir = path.join(process.cwd(), '.screenshots');
-const adminTokenStorageKey = 'greengateway_admin_token';
 
 test.beforeEach(async () => {
   await mkdir(screenshotDir, { recursive: true });
 });
 
 test('captures the shadow review queue', async ({ page }) => {
-  await page.addInitScript(
-    ({ key, token }) => {
-      window.sessionStorage.setItem(key, token);
-    },
-    {
-      key: adminTokenStorageKey,
-      token: jwtWithRoles(['admin']),
-    },
-  );
-
   await page.route('**/v1/admin/policy', async (route) => {
     await route.fulfill({
       status: 200,
@@ -135,15 +123,3 @@ test('captures the shadow review queue', async ({ page }) => {
   });
   expect(screenshot.length).toBeGreaterThan(10_000);
 });
-
-function jwtWithRoles(roles: string[]): string {
-  return [
-    base64UrlJson({ alg: 'none', typ: 'JWT' }),
-    base64UrlJson({ sub: 'screenshot-user', roles }),
-    'signature',
-  ].join('.');
-}
-
-function base64UrlJson(value: unknown): string {
-  return Buffer.from(JSON.stringify(value), 'utf8').toString('base64url');
-}
