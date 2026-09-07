@@ -141,7 +141,11 @@ class WorkflowTests(unittest.TestCase):
         preview = self.ci["jobs"]["image-preview"]
         self.assertEqual(preview["if"], "github.event_name == 'pull_request'")
         self.assertEqual(preview["permissions"], {"contents": "read"})
-        self.assertEqual(preview["steps"][-1]["with"]["push"], "false")
+        build = next(step for step in preview["steps"] if step.get("uses", "").startswith("docker/build-push-action@"))
+        self.assertEqual(build["with"]["push"], "false")
+        self.assertEqual(build["with"]["load"], "true")
+        self.assertTrue(any("--scan-preview" in step.get("run", "") for step in preview["steps"]))
+        self.assertTrue(any("check-runtime-image.py" in step.get("run", "") for step in self.ci["jobs"]["image-scan"]["steps"]))
         promotion = self.ci["jobs"]["promote-image"]
         self.assertEqual(promotion["concurrency"]["cancel-in-progress"], "false")
         self.assertEqual(promotion["steps"][0]["with"]["ref"], "${{ github.sha }}")

@@ -753,7 +753,17 @@ jobs:
           context: .
           file: ./Dockerfile
           push: false
-          outputs: type=cacheonly
+          load: true
+          tags: greengateway:preview
+      - name: Verify runtime compatibility and scan the PR image
+        run: python scripts/check-runtime-image.py --image greengateway:preview --scan-preview
+      - name: Preserve preview runtime and scan evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: preview-runtime
+          path: target/runtime-check/
+          if-no-files-found: error
 
   image-candidate:
     if: github.event_name == 'push'
@@ -796,6 +806,13 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           CANDIDATE_DIGEST: ${{ needs.image-candidate.outputs.digest }}
         run: python scripts/scan_candidate_image.py
+      - name: Exercise the exact scanned runtime
+        env:
+          CANDIDATE_DIGEST: ${{ needs.image-candidate.outputs.digest }}
+        run: |
+          image="ghcr.io/${GITHUB_REPOSITORY,,}@${CANDIDATE_DIGEST}"
+          docker pull "$image"
+          python scripts/check-runtime-image.py --image "$image" --output target/image-scan/runtime
       - name: Preserve raw findings and gate decision
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
