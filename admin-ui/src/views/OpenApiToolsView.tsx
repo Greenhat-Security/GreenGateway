@@ -1,7 +1,9 @@
-import { FormEvent, useEffect, useMemo, useState } from 'react';
+import { FormEvent, useMemo, useState } from 'react';
 import { Link } from 'react-router-dom';
 
-import { AdminApiError, fetchAdminCapabilities } from '../lib/api';
+import { AdminApiError } from '../lib/api';
+import { hasAdminPermission, useAdminCapabilities } from '../lib/adminCapabilities';
+import { AdminCapabilitiesNotice } from '../lib/AdminCapabilitiesNotice';
 import {
   type OpenApiApiKeyHeaderAuthRequirement,
   type OpenApiSkippedOperation,
@@ -44,32 +46,9 @@ export function OpenApiToolsView() {
   const [mutationError, setMutationError] =
     useState<OpenApiToolsViewError | null>(null);
   const [successMessage, setSuccessMessage] = useState<string | null>(null);
-  const [canWriteTools, setCanWriteTools] = useState(false);
-
-  useEffect(() => {
-    let isCurrent = true;
-
-    async function loadWritePermission() {
-      setCanWriteTools(false);
-
-      try {
-        const capabilities = await fetchAdminCapabilities();
-        if (isCurrent) {
-          setCanWriteTools(capabilities.permissions.includes(TOOLS_WRITE_PERMISSION));
-        }
-      } catch {
-        if (isCurrent) {
-          setCanWriteTools(false);
-        }
-      }
-    }
-
-    void loadWritePermission();
-
-    return () => {
-      isCurrent = false;
-    };
-  }, []);
+  const capabilities = useAdminCapabilities();
+  const [writeRejected, setWriteRejected] = useState(false);
+  const canWriteTools = !writeRejected && hasAdminPermission(capabilities, TOOLS_WRITE_PERMISSION);
 
   const authRequirementByTool = useMemo(
     () => authRequirementMap(preview?.api_key_header_auth_requirements ?? []),
@@ -89,6 +68,7 @@ export function OpenApiToolsView() {
     selectedCount > 0 &&
     !isRegistering;
   const showWritePermissionNotice =
+    capabilities.status === 'ready' &&
     preview !== null && !canWriteTools && mutationError?.kind !== 'forbidden';
 
   async function submitPreview(event: FormEvent<HTMLFormElement>) {
@@ -142,7 +122,7 @@ export function OpenApiToolsView() {
     } catch (error) {
       const viewError = toOpenApiToolsViewError(error);
       if (viewError.kind === 'forbidden') {
-        setCanWriteTools(false);
+        setWriteRejected(true);
       }
       setMutationError(viewError);
     } finally {
@@ -232,6 +212,7 @@ export function OpenApiToolsView() {
         </form>
 
         {loadError ? <OpenApiToolsLoadErrorMessage error={loadError} /> : null}
+        <AdminCapabilitiesNotice state={capabilities} />
         {showWritePermissionNotice ? <ToolsWritePermissionNotice /> : null}
         {mutationError ? (
           <OpenApiToolsMutationErrorMessage error={mutationError} />

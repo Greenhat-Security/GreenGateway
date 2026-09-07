@@ -551,6 +551,12 @@ function isJsonObject(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === 'object' && !Array.isArray(value);
 }
 
-export async function fetchAdminCapabilities(): Promise<{ permissions: string[] }> {
-  return adminFetchJson(adminApiUrl('/capabilities'));
+export async function fetchAdminCapabilities(signal?: AbortSignal): Promise<{ permissions: string[] }> {
+  const value = await adminFetchJson<unknown>(adminApiUrl('/capabilities'), { signal, cache: 'no-store' });
+  if (!isJsonObject(value) || !Array.isArray(value.permissions) || value.permissions.length > 256 ||
+      !value.permissions.every((permission): permission is string =>
+        typeof permission === 'string' && permission.length <= 128 && /^admin:(?:[a-z_]+:)+[a-z_]+$/.test(permission))) {
+    throw new Error('Invalid admin capabilities response.');
+  }
+  return { permissions: [...new Set(value.permissions)] };
 }

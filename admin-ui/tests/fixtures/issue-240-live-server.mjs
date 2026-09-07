@@ -54,6 +54,7 @@ const jwks = {
 };
 
 const bearerTokens = {
+  capabilitiesReader: signedToken('issue-423-reader', ['capabilities-reader']),
   reader: signedToken('issue-240-reader', ['connections-reader']),
   writer: signedToken('issue-240-writer', ['connections-editor']),
   secretManager: signedToken('issue-240-secret-manager', [
@@ -193,6 +194,9 @@ function prepareRuntimeFiles() {
         default_action: 'deny',
         enforcement_mode: 'enforce',
         roles: {
+          'capabilities-reader': {
+            permissions: ['admin:principals:read', 'admin:cluster:read', 'admin:tokens:read'],
+          },
           'connections-reader': {
             permissions: ['admin:connections:read'],
           },
@@ -214,6 +218,9 @@ function prepareRuntimeFiles() {
           },
         },
         routes: [
+          { methods: ['GET'], path_prefix: '/v1/admin/cluster', permission: 'admin:cluster:read' },
+          { methods: ['GET'], path_prefix: '/v1/admin/principals', permission: 'admin:principals:read' },
+          { methods: ['GET', 'POST', 'DELETE'], path_prefix: '/v1/admin/tokens', permission: 'admin:tokens:read' },
           {
             methods: ['GET', 'POST', 'PUT', 'DELETE'],
             path_prefix: '/v1/admin/connections',
@@ -309,6 +316,8 @@ function gatewayEnvironment() {
     ...environment,
     LISTEN_ADDR: `${FIXTURE_HOST}:${GATEWAY_PORT}`,
     CONNECTIONS_SQLITE_PATH: databasePath,
+    PRINCIPAL_SQLITE_PATH: path.join(runtimeRoot, 'principals.sqlite'),
+    SERVICE_TOKEN_SQLITE_PATH: path.join(runtimeRoot, 'tokens.sqlite'),
     CONNECTION_SECRETS_ROOT: runtimeRoot,
     CONNECTION_LOCAL_SECRET_KEYRING: JSON.stringify([
       {
@@ -406,6 +415,8 @@ function base64Url(value) {
 
 function cookieRoles(session) {
   switch (session) {
+    case 'cookie-capabilities-reader':
+      return ['capabilities-reader'];
     case 'cookie-superadmin':
       return ['connections-superadmin'];
     case 'cookie-reader':

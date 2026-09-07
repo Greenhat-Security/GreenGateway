@@ -22,10 +22,10 @@ afterEach(() => {
 });
 
 describe('TokensView', () => {
-  it('enables token administration for an opaque identity using server capabilities', async () => {
+  it.each([null, 'generated-opaque-test-token', jwtWithRoles(['unrelated-role'])])('enables token administration from server grants for identity %s', async (token) => {
     const fetcher = tokensFetchMock();
     vi.stubGlobal('fetch', fetcher.fetch);
-    renderTokensView({ token: 'ggw_opaque_identity' });
+    renderTokensView({ token });
     fireEvent.change(await screen.findByLabelText('Scopes'), { target: { value: 'admin:tokens:read' } });
     await waitFor(() => expect((screen.getByRole('button', { name: 'Create token' }) as HTMLButtonElement).disabled).toBe(false));
     expect(fetcher.fetch.mock.calls.some(([url]) => String(url).includes('/policy'))).toBe(false);

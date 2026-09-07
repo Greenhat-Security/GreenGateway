@@ -2,8 +2,8 @@ import { FormEvent, useEffect, useMemo, useState } from 'react';
 import { Link } from 'react-router-dom';
 
 import { AdminApiError } from '../lib/api';
-import { decodeJwtRolesClaim, getStoredToken } from '../lib/auth';
-import { fetchPolicy, type PolicyDocument } from '../lib/policy';
+import { hasAdminPermission, useAdminCapabilities } from '../lib/adminCapabilities';
+import { AdminCapabilitiesNotice } from '../lib/AdminCapabilitiesNotice';
 import {
   type PrincipalFilters,
   type PrincipalRecord,
@@ -45,7 +45,11 @@ export function IdentitiesView() {
   const [isLoading, setIsLoading] = useState(true);
   const [isLoadingMore, setIsLoadingMore] = useState(false);
   const [loadError, setLoadError] = useState<PrincipalLoadError | null>(null);
-  const [canReadPrincipals, setCanReadPrincipals] = useState(false);
+  const capabilities = useAdminCapabilities();
+  const canReadPrincipals = hasAdminPermission(capabilities, PRINCIPAL_READ_PERMISSION);
+  // Fetch once after the first grant. A resource 403 must not trigger a retry loop.
+  const [readRequested, setReadRequested] = useState(false);
+  useEffect(() => { if (canReadPrincipals) setReadRequested(true); }, [canReadPrincipals]);
 
   useEffect(() => {
     let isCurrent = true;
@@ -83,39 +87,12 @@ export function IdentitiesView() {
       }
     }
 
-    void loadFirstPage();
+    if (readRequested) void loadFirstPage();
 
     return () => {
       isCurrent = false;
     };
-  }, [appliedFilters]);
-
-  useEffect(() => {
-    let isCurrent = true;
-
-    async function loadReadPermission() {
-      setCanReadPrincipals(false);
-
-      try {
-        const policyResult = await fetchPolicy();
-        if (isCurrent) {
-          setCanReadPrincipals(
-            currentTokenCanReadPrincipals(policyResult.policy),
-          );
-        }
-      } catch {
-        if (isCurrent) {
-          setCanReadPrincipals(false);
-        }
-      }
-    }
-
-    void loadReadPermission();
-
-    return () => {
-      isCurrent = false;
-    };
-  }, []);
+  }, [appliedFilters, readRequested]);
 
   const resultCount = useMemo(
     () =>
@@ -125,7 +102,7 @@ export function IdentitiesView() {
     [anonymousRequestCount, principals.length],
   );
   const showReadPermissionNotice =
-    !isLoading && !loadError && !canReadPrincipals;
+    capabilities.status === 'ready' && !loadError && !canReadPrincipals;
 
   function updateIssuerFilter(value: string) {
     setFilters((current) => ({ ...current, issuer: value }));
@@ -148,7 +125,7 @@ export function IdentitiesView() {
   }
 
   async function loadMorePrincipals() {
-    if (!nextCursor || isLoadingMore) {
+    if (!canReadPrincipals || !nextCursor || isLoadingMore) {
       return;
     }
 
@@ -226,22 +203,23 @@ export function IdentitiesView() {
           </div>
         </form>
 
+        <AdminCapabilitiesNotice state={capabilities} />
         {loadError ? <PrincipalLoadErrorMessage error={loadError} /> : null}
         {showReadPermissionNotice ? <PrincipalReadPermissionNotice /> : null}
 
-        {isLoading ? (
+        {canReadPrincipals && isLoading ? (
           <div className="loading-state" role="status">
             Loading identity directory
           </div>
         ) : null}
 
-        {!isLoading && principals.length === 0 && !loadError ? (
+        {canReadPrincipals && !isLoading && principals.length === 0 && !loadError ? (
           <div className="empty-state">
             No principals matched these filters.
           </div>
         ) : null}
 
-        {principals.length > 0 ? (
+        {canReadPrincipals && principals.length > 0 ? (
           <>
             <div className="table-scroll">
               <table className="logs-table rule-table">
@@ -374,7 +352,7 @@ function PrincipalLoadErrorMessage({
     return (
       <div className="error-panel alert error" role="alert">
         <h3>Principal directory permission required</h3>
-        <p>This token is valid but does not include admin:principals:read.</p>
+        <p>Your session does not include admin:principals:read.</p>
       </div>
     );
   }
@@ -405,35 +383,8 @@ function PrincipalReadPermissionNotice() {
   return (
     <div className="error-panel alert warning" role="alert">
       <h3>Principal directory permission required</h3>
-      <p>This token does not appear to include admin:principals:read.</p>
+      <p>Your session does not include admin:principals:read.</p>
     </div>
-  );
-}
-
-function currentTokenCanReadPrincipals(policy: PolicyDocument): boolean {
-  const token = getStoredToken();
-  if (!token) {
-    return false;
-  }
-
-  const roles = decodeJwtRolesClaim(token);
-  if (roles === null) {
-    return false;
-  }
-
-  return roles.some((roleName) =>
-    roleGrantsPrincipalsRead(policy.roles?.[roleName]),
-  );
-}
-
-function roleGrantsPrincipalsRead(role: unknown): boolean {
-  if (!isJsonObject(role) || !Array.isArray(role.permissions)) {
-    return false;
-  }
-
-  return role.permissions.some(
-    (permission) =>
-      permission === PRINCIPAL_READ_PERMISSION || permission === '*',
   );
 }
 
@@ -539,8 +490,4 @@ function toPrincipalLoadError(error: unknown): PrincipalLoadError {
   }
 
   return { kind: 'network', message: 'Network request failed.' };
-}
-
-function isJsonObject(value: unknown): value is Record<string, unknown> {
-  return value !== null && typeof value === 'object' && !Array.isArray(value);
 }

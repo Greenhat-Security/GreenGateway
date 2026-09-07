@@ -12,6 +12,7 @@ const CONNECTIONS_API = `${GATEWAY_ORIGIN}/v1/admin/connections`;
 const SECRETS_API = `${GATEWAY_ORIGIN}/v1/admin/connection-secrets`;
 
 type BearerTokens = {
+  capabilitiesReader: string;
   reader: string;
   writer: string;
   secretManager: string;
@@ -45,6 +46,67 @@ test.describe.serial('Issue #240 live admin acceptance', () => {
       expect(token.split('.')).toHaveLength(3);
     }
   });
+
+  for (const identity of ['jwt', 'cookie', 'service-token'] as const) {
+    test(`uses real ${identity} read capabilities without policy-read access (#423)`, async ({ browser, request }) => {
+      const context = await browser.newContext();
+      const page = await context.newPage();
+      let createdId: string | undefined;
+      try {
+        let bearer = tokens.capabilitiesReader;
+        if (identity === 'service-token') {
+          const created = await request.post(`${GATEWAY_ORIGIN}/v1/admin/tokens`, {
+            headers: { Authorization: `Bearer ${tokens.superadmin}` },
+            data: { scopes: ['capabilities-reader'] },
+          });
+          expect(created.status()).toBe(201);
+          const result = await created.json();
+          bearer = result.plaintext_token;
+          createdId = result.token.id;
+          expect(bearer.startsWith('ggw_')).toBe(true);
+        }
+        if (identity === 'cookie') {
+          await context.addCookies([{ name: 'session', value: 'cookie-capabilities-reader', url: ADMIN_ORIGIN, httpOnly: true }]);
+        } else {
+          await saveBearerToken(page, bearer);
+        }
+        let policyRequests = 0;
+        page.on('request', (request) => {
+          if (new URL(request.url()).pathname.startsWith('/v1/admin/policy')) policyRequests++;
+        });
+        const [capabilities] = await Promise.all([
+          page.waitForResponse((response) => new URL(response.url()).pathname === '/v1/admin/capabilities'),
+          page.goto('/admin/cluster'),
+        ]);
+        expect(capabilities.status()).toBe(200);
+        expect(capabilities.headers()['cache-control']).toContain('no-store');
+        expect((await capabilities.json()).permissions).toEqual(expect.arrayContaining(['admin:principals:read', 'admin:cluster:read']));
+        expect((await capabilities.json()).permissions).not.toContain('admin:policy:read');
+        expect(Boolean(await capabilities.request().headerValue('authorization'))).toBe(identity !== 'cookie');
+        await expect(page.getByTestId('cluster-mode-badge')).toHaveText('Standalone mode');
+        await expect(page.getByText('Cluster permission required')).toHaveCount(0);
+        const [directory] = await Promise.all([
+          page.waitForResponse((response) => new URL(response.url()).pathname === '/v1/admin/principals'),
+          page.goto('/admin/identities'),
+        ]);
+        expect(directory.status()).toBe(200);
+        await expect(page.getByText('Principal directory permission required')).toHaveCount(0);
+        await page.goto('/admin/tokens');
+        await page.getByLabel('Scopes').fill('admin:tokens:read');
+        await expect(page.getByText('Token write permission required')).toBeVisible();
+        await expect(page.getByRole('button', { name: 'Create token', exact: true })).toBeDisabled();
+        expect(policyRequests).toBe(0);
+      } finally {
+        await context.close();
+        if (createdId) {
+          const revoked = await request.delete(`${GATEWAY_ORIGIN}/v1/admin/tokens/${encodeURIComponent(createdId)}`, {
+            headers: { Authorization: `Bearer ${tokens.superadmin}` },
+          });
+          expect(revoked.ok()).toBe(true);
+        }
+      }
+    });
+  }
 
   test('uses real bearer auth, server permissions, read-only actions, themes, and accessible controls', async ({
     browser,

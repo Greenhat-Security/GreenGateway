@@ -27,3 +27,34 @@ Building the gateway now requires Node.js and npm in addition to the Rust toolch
 The Vite dev-server proxy keeps frontend iteration separate from the gateway's egress-only HTTP client guard. No additional Rust outbound HTTP dependency or reverse-proxy path is introduced for development.
 
 Later admin UI PRs can add routes and shared frontend API clients without revisiting the stack or embedding model. Backend authorization stays centralized in the existing admin API handlers rather than in the static shell.
+
+## Server-provided admin permissions
+
+The admin UI uses the existing authenticated `GET /v1{ADMIN_PREFIX}/capabilities`
+endpoint for global permission affordances. It does not decode JWT roles or fetch
+policy to infer permissions. JWT, opaque service-token, and cookie sessions use
+the same permission checks and the existing bearer/cookie/CSRF transport.
+
+| Consumer | Server permission used |
+| --- | --- |
+| Identities | `admin:principals:read` |
+| Cluster | `admin:cluster:read` |
+| Service tokens | `admin:tokens:write` |
+| OpenAPI tool registration | `admin:tools:write` |
+
+`useAdminCapabilities` shares one active request across mounted consumers. Its
+states are loading, ready, unauthenticated (401), forbidden (403), and unavailable
+(network failure, timeout, 503, or malformed response). Only a ready response
+containing the exact permission enables a global mutation affordance. Loading and
+error states have accessible explanations; errors offer a retry button. Requests
+use `cache: no-store` and time out after ten seconds. URLs use the runtime admin
+API prefix on the management UI's origin, including split-listener deployments.
+
+The state is discarded when the last consumer unmounts. A new mount requests
+fresh capabilities. Retry attempts coalesce to at most one request per five
+seconds. Session lifecycle and external policy refresh integration are the next
+slice of issue #423.
+
+Per-resource action metadata remains authoritative where it is more precise:
+policy response write metadata and connection/tool action metadata continue to
+control those editors. A global grant cannot override a resource denial.
