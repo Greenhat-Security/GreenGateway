@@ -10,7 +10,8 @@ ROOT = Path(__file__).resolve().parents[1]
 def check(root=ROOT):
     errors = []
     workflows = list((root / '.github/workflows').glob('*.y*ml'))
-    for path in workflows:
+    action_files = list((root / '.github/actions').rglob('action.y*ml'))
+    for path in workflows + action_files:
         for line, value in enumerate(path.read_text(encoding='utf-8').splitlines(), 1):
             match = re.match(r'\s*(?:-\s*)?uses:\s*(\S+)', value)
             if match and not match[1].startswith('./'):
@@ -27,6 +28,7 @@ def check(root=ROOT):
 
 
 if __name__ == '__main__':
-    problems = check()
+    from build_tools import check as check_build_tools
+    problems = check() + check_build_tools()
     print('\n'.join(problems) if problems else 'Supply-chain input pins verified.')
     sys.exit(bool(problems))

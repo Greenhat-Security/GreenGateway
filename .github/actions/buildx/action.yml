@@ -1,0 +1,7 @@
+name: Verified Buildx and pinned BuildKit
+description: Verify the Linux Buildx binary before execution and select the immutable BuildKit daemon.
+runs:
+  using: composite
+  steps:
+    - shell: bash
+      run: python scripts/build_tools.py install-buildx

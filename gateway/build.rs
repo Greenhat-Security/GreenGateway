@@ -15,6 +15,7 @@ fn main() {
         "index.html",
         "package.json",
         "package-lock.json",
+        ".npmrc",
         "tsconfig.json",
         "vite.config.ts",
         "src",
@@ -22,6 +23,22 @@ fn main() {
         println!("cargo:rerun-if-changed={}", admin_ui.join(path).display());
     }
 
+    for (command, file) in [("node", ".node-version"), (npm_command(), ".npm-version")] {
+        let pin = repo_root.join(file);
+        println!("cargo:rerun-if-changed={}", pin.display());
+        let expected = std::fs::read_to_string(pin).expect("read declared build-tool version");
+        let actual = Command::new(command)
+            .arg("--version")
+            .output()
+            .expect("run declared build tool");
+        assert!(actual.status.success(), "build-tool version check failed");
+        let actual = String::from_utf8(actual.stdout).expect("build-tool version is UTF-8");
+        assert_eq!(
+            actual.trim().trim_start_matches('v'),
+            expected.trim(),
+            "build tool differs from repository version contract"
+        );
+    }
     run_npm(&admin_ui, &["ci"]);
     run_npm(&admin_ui, &["run", "build"]);
 }

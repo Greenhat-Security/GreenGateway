@@ -53,3 +53,44 @@ Run `python3 scripts/check-supply-chain.py` and `cargo audit --deny warnings`
 when updating inputs. Use `docker buildx imagetools inspect IMAGE:TAG` to resolve
 the multi-platform manifest digest, then inspect the selected artifact before
 changing a production reference.
+
+## Executable build-tool contract
+
+`build-tools.json` is the reviewed version inventory. The native
+`rust-toolchain.toml`, `.node-version`, `.npm-version`, both npm engine fields,
+and the Dockerfile must agree with it. `scripts/build_tools.py check` rejects
+missing declarations, version drift, unpinned installs and implicit npx downloads.
+CI uses the shared `.github/actions/build-tools` action before any build.
+
+The production/default compiler remains Rust 1.88.0, matching the existing
+Docker image and the maximum declared MSRV in the locked dependency graph.
+The required `production-compiler` job checks all targets with that compiler;
+ordinary CI uses the previously passing Rust 1.98.1. Coverage remains on
+nightly-2026-09-01 with cargo-llvm-cov 0.9.0 and unchanged floors. Its dated
+compiler is deliberate, not an invitation to follow nightly updates.
+Node 24.20.0 and bundled npm 11.19.0 match the current pinned Node image.
+Gateway builds verify the actual Node/npm executable versions before installing
+UI dependencies, and Docker additionally checks its actual Rust version.
+Cargo builds use the existing lockfile without resolution updates.
+
+Buildx is selected explicitly and its BuildKit daemon image is digest-pinned,
+including CI Compose builds. Action pins and the exact cargo-audit version
+remain separate declarations; cargo-audit installation retains checksum
+verification. Gitleaks retains its reviewed archive checksum. Rustup and the
+setup actions remain the pinned installation trust roots; npm lockfile integrity
+continues to authenticate dependency archives. Advisory databases still refresh.
+
+To update tools, change the manifest and native/package/Docker consumers in one
+PR, preserve image/action digests and installation verification, run the tool and
+publication-gate tests, and run fresh Linux, Windows coverage and production
+image builds. Record actual versions in the CI log. A coverage compiler/tool
+change needs a baseline comparison without reducing floors. Existing Dependabot
+PRs must satisfy this parity contract; do not merge a major Node/Rust Docker bump
+without updating and testing the declared compiler/runtime contract.
+
+This pins project-selected executable tools, not every program in a hosted
+runner OS. Runner Git, Docker Engine/Compose, system Python bootstrap and OS
+utilities remain platform inputs; the shared action selects project Python before
+repository scripts run. Debian package repositories also remain mutable inputs.
+The candidate image scan and provenance work cover final-image inventory and
+attribution; no byte-for-byte hermetic-build guarantee is claimed.

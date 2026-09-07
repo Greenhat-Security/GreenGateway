@@ -1,0 +1,35 @@
+name: Pinned build tools
+description: Install the declared compiler/runtime profile and verify bundled npm.
+inputs:
+  rust:
+    description: none, ci, production, or coverage
+    default: none
+  node:
+    description: Install Node and verify npm
+    default: 'false'
+runs:
+  using: composite
+  steps:
+    - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+      with:
+        python-version: '3.12.12'
+    - id: pins
+      shell: bash
+      env:
+        RUST_PROFILE: ${{ inputs.rust }}
+      run: python scripts/build_tools.py outputs
+    - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable action
+      if: inputs.rust != 'none'
+      with:
+        toolchain: ${{ steps.pins.outputs.rust }}
+        components: ${{ steps.pins.outputs.components }}
+    - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+      if: inputs.node == 'true'
+      with:
+        node-version-file: .node-version
+    - name: Verify tool versions
+      shell: bash
+      env:
+        RUST_PROFILE: ${{ inputs.rust }}
+        CHECK_NODE: ${{ inputs.node }}
+      run: python scripts/build_tools.py verify
