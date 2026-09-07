@@ -12,3 +12,9 @@ c0cc40e2c6dae574d10561e096a39ddfdbdf9d30:admin-ui/src/views/TokensView.test.tsx:
 dae172eed9011fe33f81694399ec026fc0e067d0:gateway/src/auth/jwt_tests.rs:private-key:69
 dae172eed9011fe33f81694399ec026fc0e067d0:gateway/src/auth/jwt_tests.rs:private-key:76
 dae172eed9011fe33f81694399ec026fc0e067d0:gateway/src/auth/jwt_tests.rs:private-key:89
+# Reviewed request-correlation IDs in the concurrent GreenCal fixture PR #461.
+# These static body values exercise requestKey binding; they do not authenticate.
+# The all-ref history scan sees that branch even when it is not in this PR.
+c0ea5f8487373ae18d5bc501b85cde8e3b8d474d:gateway/src/connections/greencal_actor_fixtures.json:generic-api-key:189
+c0ea5f8487373ae18d5bc501b85cde8e3b8d474d:gateway/src/connections/greencal_actor_tests.rs:generic-api-key:204
+c0ea5f8487373ae18d5bc501b85cde8e3b8d474d:gateway/tools/greencal-fixtures/fixtures.mjs:generic-api-key:44
