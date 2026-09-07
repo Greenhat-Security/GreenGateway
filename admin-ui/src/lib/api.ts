@@ -1,5 +1,5 @@
 import { adminAuthenticationSucceeded, adminAuthorizationFailed, adminIdentityChanged, adminPolicyChanged, getAdminIdentityVersion } from './adminSession';
-import { authHeaders } from './auth';
+import { authHeaders, adminRequestCredentials, assertAdminRequestOrigin, clearMemoryToken } from './auth';
 import { adminApiUrl } from './config';
 
 const DEFAULT_CSRF_COOKIE_NAME = 'csrf_token';
@@ -135,6 +135,7 @@ export async function adminFetchJsonResponse<T>(
   input: string,
   options: AdminFetchOptions = {},
 ): Promise<AdminJsonResponse<T>> {
+  assertAdminRequestOrigin(input);
   const requestIdentity = getAdminIdentityVersion();
   const headers = new Headers({
     Accept: 'application/json',
@@ -147,7 +148,8 @@ export async function adminFetchJsonResponse<T>(
 
   const response = await fetch(input, {
     ...options,
-    credentials: options.credentials ?? 'same-origin',
+    credentials: adminRequestCredentials(),
+    redirect: 'error',
     headers,
   });
   const body = await parseJsonBody(response);
@@ -164,7 +166,9 @@ export async function adminFetchJsonResponse<T>(
   const method = (options.method ?? 'GET').toUpperCase();
   if (!SAFE_METHODS.has(method)) {
     const path = new URL(input, window.location.origin).pathname;
-    if (path === adminApiUrl('/auth/logout') || path === adminApiUrl('/auth/callback')) {
+    if (path === adminApiUrl('/auth/logout')) {
+      clearMemoryToken();
+    } else if (path === adminApiUrl('/auth/callback')) {
       adminIdentityChanged();
     } else if ((path === adminApiUrl('/policy') || path.startsWith(adminApiUrl('/policy/'))) &&
                !path.endsWith('/preview') && !path.endsWith('/validate')) {

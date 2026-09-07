@@ -1,7 +1,7 @@
 import { act, cleanup, fireEvent, render, screen } from '@testing-library/react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { adminFetchJson, fetchAdminCapabilities } from './api';
-import { clearStoredToken, setStoredToken } from './auth';
+import { clearMemoryToken, setMemoryToken } from './auth';
 import { AdminCapabilitiesNotice } from './AdminCapabilitiesNotice';
 import { hasAdminPermission, refreshAdminCapabilities, useAdminCapabilities } from './adminCapabilities';
 import { adminIdentityChanged, adminNavigationChanged } from './adminSession';
@@ -32,12 +32,13 @@ function expectState(status: string, enabled = false) {
   expect((screen.getByRole('button', { name: 'Protected mutation' }) as HTMLButtonElement).disabled).toBe(!enabled);
 }
 
-beforeEach(() => { vi.useFakeTimers(); adminIdentityChanged(); });
+beforeEach(() => { vi.useFakeTimers(); clearMemoryToken(); });
 afterEach(() => {
   cleanup();
   vi.useRealTimers();
   vi.unstubAllGlobals();
   vi.restoreAllMocks();
+  clearMemoryToken();
   window.sessionStorage.clear();
 });
 
@@ -98,7 +99,7 @@ describe('shared server capabilities', () => {
     const fetch = vi.fn().mockReturnValueOnce(old.promise).mockReturnValueOnce(current.promise);
     vi.stubGlobal('fetch', fetch);
     render(<Consumer />);
-    await settle(() => { setStoredToken('generated-test-opaque-identity'); });
+    await settle(() => { setMemoryToken('generated-test-opaque-identity'); });
     expectState('loading');
     await settle(() => current.resolve(json({ permissions: [] })));
     expectState('ready');
@@ -111,9 +112,9 @@ describe('shared server capabilities', () => {
     const fetch = vi.fn().mockResolvedValueOnce(json({ permissions: [WRITE] })).mockReturnValue(next.promise);
     vi.stubGlobal('fetch', fetch);
     render(<Consumer />); await settle(); expectState('ready', true);
-    await settle(() => { setStoredToken('generated-test-new-identity'); });
+    await settle(() => { setMemoryToken('generated-test-new-identity'); });
     expectState('loading');
-    await settle(() => { clearStoredToken(); });
+    await settle(() => { clearMemoryToken(); });
     expectState('loading'); expect(fetch).toHaveBeenCalledTimes(3);
     const options = fetch.mock.calls[2][1] as RequestInit;
     expect(new Headers(options.headers).has('Authorization')).toBe(false);

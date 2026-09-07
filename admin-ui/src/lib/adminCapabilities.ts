@@ -1,8 +1,7 @@
 import { useSyncExternalStore } from 'react';
 import { AdminApiError, fetchAdminCapabilities } from './api';
-import { ADMIN_TOKEN_STORAGE_KEY } from './auth';
 import {
-  adminIdentityChanged, getAdminIdentityVersion, isAdminUnauthenticated, subscribeAdminSession,
+  getAdminIdentityVersion, isAdminUnauthenticated, subscribeAdminSession,
   type AdminSessionEvent,
 } from './adminSession';
 
@@ -112,14 +111,7 @@ function subscribe(listener: () => void) {
       if (document.visibilityState === 'hidden') { cancel(); publish(EMPTY); }
       else refreshAdminCapabilities();
     };
-    const onStorage = (event: StorageEvent) => {
-      try {
-        if (event.storageArea === window.sessionStorage &&
-            (event.key === ADMIN_TOKEN_STORAGE_KEY || event.key === null)) adminIdentityChanged();
-      } catch { /* Storage can be disabled; cookie sessions still refresh on focus. */ }
-    };
     window.addEventListener('focus', onFocus);
-    window.addEventListener('storage', onStorage);
     document.addEventListener('visibilitychange', onVisibility);
     const interval = setInterval(() => {
       if (document.visibilityState !== 'hidden' && state.status !== 'unauthenticated') refreshAdminCapabilities();
@@ -127,7 +119,6 @@ function subscribe(listener: () => void) {
     stop = () => {
       unsubscribeSession();
       window.removeEventListener('focus', onFocus);
-      window.removeEventListener('storage', onStorage);
       document.removeEventListener('visibilitychange', onVisibility);
       clearInterval(interval);
     };

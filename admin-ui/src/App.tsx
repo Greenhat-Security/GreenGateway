@@ -1,6 +1,6 @@
 import { useAdminIdentityVersion, useAdminUnauthenticated } from './lib/adminCapabilities';
-import { adminNavigationChanged } from './lib/adminSession';
-import { FormEvent, useEffect, useMemo, useRef, useState } from 'react';
+import { adminNavigationChanged, getAdminIdentityVersion, subscribeAdminSession } from './lib/adminSession';
+import { FormEvent, useEffect, useRef, useState } from 'react';
 import {
   BrowserRouter,
   Link,
@@ -11,9 +11,10 @@ import {
 } from 'react-router-dom';
 
 import {
-  clearStoredToken,
-  getStoredToken,
-  setStoredToken,
+  assertAdminRequestOrigin,
+  clearMemoryToken,
+  getMemoryToken,
+  setMemoryToken,
 } from './lib/auth';
 import { adminApiUrl, adminBasePath } from './lib/config';
 import { addCsrfHeader, AdminApiError, fetchAdminCapabilities } from './lib/api';
@@ -336,11 +337,19 @@ function TokenPanel({
   authRefreshKey: number;
   authCompletionStatus: string | null;
 }) {
-  const initialToken = useMemo(() => getStoredToken() ?? '', []);
-  const [token, setToken] = useState(initialToken);
-  const [hasStoredToken, setHasStoredToken] = useState(initialToken.length > 0);
+  const inputRef = useRef<HTMLInputElement>(null);
+  const [hasToken, setHasToken] = useState(() => getMemoryToken() !== null);
+  const [visible, setVisible] = useState(false);
   const [status, setStatus] = useState<string | null>(null);
   const [ssoConfigured, setSsoConfigured] = useState(false);
+
+  useEffect(() => subscribeAdminSession((event) => {
+    if (event.kind !== 'identity' && event.kind !== 'unauthenticated') return;
+    if (inputRef.current) inputRef.current.value = '';
+    setVisible(false);
+    setHasToken(getMemoryToken() !== null);
+    setStatus(event.kind === 'unauthenticated' ? 'Session ended. Sign in again.' : null);
+  }), []);
 
   useEffect(() => {
     let cancelled = false;
@@ -374,37 +383,28 @@ function TokenPanel({
       return;
     }
 
-    const storedToken = getStoredToken() ?? '';
-    setToken(storedToken);
-    setHasStoredToken(storedToken.length > 0);
+    setHasToken(getMemoryToken() !== null);
     setStatus(authCompletionStatus);
   }, [authRefreshKey, authCompletionStatus]);
 
   function saveToken(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
-
-    const saved = setStoredToken(token);
-    const trimmed = token.trim();
-    setHasStoredToken(saved && trimmed.length > 0);
-    setToken(trimmed);
-    setStatus(
-      saved
-        ? trimmed.length > 0
-          ? 'Token saved for this browser session.'
-          : 'Token cleared.'
-        : 'Session storage is unavailable in this browser context.',
-    );
+    const value = inputRef.current?.value.trim() ?? '';
+    // Keep the input uncontrolled: a credential must never become a value
+    // attribute or be repopulated from the active in-memory credential.
+    if (inputRef.current) inputRef.current.value = '';
+    setMemoryToken(value);
+    setVisible(false);
+    setHasToken(value.length > 0);
+    setStatus(value ? 'Token active in this tab until reload or session expiry.' : 'Token cleared.');
   }
 
   function clearToken() {
-    const cleared = clearStoredToken();
-    setToken('');
-    setHasStoredToken(false);
-    setStatus(
-      cleared
-        ? 'Token cleared.'
-        : 'Session storage is unavailable in this browser context.',
-    );
+    clearMemoryToken();
+    if (inputRef.current) inputRef.current.value = '';
+    setHasToken(false);
+    setVisible(false);
+    setStatus('Token cleared.');
   }
 
   return (
@@ -414,13 +414,13 @@ function TokenPanel({
         <h2 id="token-heading">Bearer token</h2>
       </div>
       <p className="body-copy">
-        Paste a bearer token for this browser session. Admin API requests send
-        it as an Authorization header.
+        Paste a bearer token for this tab. It stays in memory and is lost on
+        reload, navigation away, or session expiry. Admin requests send it as an Authorization header.
       </p>
 
       {ssoConfigured ? (
         <div className="sso-login-row">
-          <a className="secondary-button" href={adminApiUrl('/auth/login')}>
+          <a className="secondary-button" href={adminApiUrl('/auth/login')} onClick={clearToken}>
             Log in with SSO
           </a>
         </div>
@@ -434,13 +434,16 @@ function TokenPanel({
           <input
             id="admin-token"
             name="admin-token"
-            type="password"
+            ref={inputRef}
+            type={visible ? 'text' : 'password'}
             autoComplete="off"
             spellCheck={false}
-            value={token}
             placeholder="Paste bearer token"
-            onChange={(event) => setToken(event.target.value)}
           />
+          <button type="button" className="secondary-button" aria-pressed={visible}
+            aria-controls="admin-token" onClick={() => setVisible(!visible)}>
+            {visible ? 'Hide token' : 'Show token'}
+          </button>
           <button type="submit" className="primary-button">
             Save
           </button>
@@ -455,12 +458,12 @@ function TokenPanel({
       </form>
 
       <div className="token-state" role="status" aria-live="polite">
-        <span className={hasStoredToken ? 'state-dot saved' : 'state-dot'} />
+        <span className={hasToken ? 'state-dot saved' : 'state-dot'} />
         <span>
           {status ??
-            (hasStoredToken
-              ? 'A token is saved for this browser session.'
-              : 'No token is saved for this browser session.')}
+            (hasToken
+              ? 'A token is active in this tab until reload.'
+              : 'No bearer token is active in this tab.')}
         </span>
       </div>
     </section>
@@ -491,13 +494,16 @@ async function completeAuthFromFragment(): Promise<AuthCompletionResult | null> 
     ) {
       return { status: 'SSO sign-in did not complete. Start sign-in again.' };
     }
+    const identity = getAdminIdentityVersion();
     try {
       const headers = new Headers({
         'Content-Type': 'application/json',
         Accept: 'application/json',
       });
       addCsrfHeader(headers, 'POST');
-      const response = await fetch(adminApiUrl('/auth/callback'), {
+      const url = adminApiUrl('/auth/callback');
+      assertAdminRequestOrigin(url);
+      const response = await fetch(url, {
         method: 'POST',
         credentials: 'same-origin',
         cache: 'no-store',
@@ -515,12 +521,11 @@ async function completeAuthFromFragment(): Promise<AuthCompletionResult | null> 
       ) {
         throw new Error('SSO completion failed');
       }
-      const saved = setStoredToken(body.access_token.trim());
-      return {
-        status: saved
-          ? 'Signed in with SSO for this browser session.'
-          : 'Session storage is unavailable in this browser context.',
-      };
+      if (identity !== getAdminIdentityVersion()) {
+        return { status: 'SSO completion discarded because the session changed. Start sign-in again.' };
+      }
+      setMemoryToken(body.access_token);
+      return { status: 'Signed in with SSO in this tab until reload or session expiry.' };
     } catch {
       return { status: 'SSO sign-in did not complete. Start sign-in again.' };
     }

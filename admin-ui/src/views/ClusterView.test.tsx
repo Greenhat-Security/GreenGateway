@@ -5,7 +5,7 @@ import { resolve } from 'node:path';
 import { MemoryRouter } from 'react-router-dom';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
-import { ADMIN_TOKEN_STORAGE_KEY } from '../lib/auth';
+import { clearMemoryToken, setMemoryToken } from '../lib/auth';
 import type { ClusterStatus } from '../lib/cluster';
 import { ClusterView } from './ClusterView';
 
@@ -13,7 +13,7 @@ afterEach(() => {
   cleanup();
   vi.useRealTimers();
   vi.unstubAllGlobals();
-  window.sessionStorage.removeItem(ADMIN_TOKEN_STORAGE_KEY);
+  clearMemoryToken();
 });
 
 describe('ClusterView', () => {
@@ -570,9 +570,9 @@ function renderClusterView({
 }: {
   token?: string | null;
 } = {}) {
-  window.sessionStorage.removeItem(ADMIN_TOKEN_STORAGE_KEY);
+  clearMemoryToken();
   if (token !== null) {
-    window.sessionStorage.setItem(ADMIN_TOKEN_STORAGE_KEY, token);
+    setMemoryToken(token);
   }
 
   render(

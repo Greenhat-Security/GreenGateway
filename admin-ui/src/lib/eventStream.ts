@@ -1,6 +1,7 @@
+import { getAdminIdentityVersion, adminAuthorizationFailed } from './adminSession';
 import { AdminApiError } from './api';
 import { AuditEvent } from './audit';
-import { authHeaders } from './auth';
+import { authHeaders, adminRequestCredentials, assertAdminRequestOrigin } from './auth';
 import { adminApiUrl } from './config';
 
 export type AuditEventStreamFilters = {
@@ -33,7 +34,11 @@ export async function subscribeToAuditEvents(
   url: string,
   options: AuditEventStreamOptions,
 ): Promise<void> {
+  assertAdminRequestOrigin(url);
+  const identity = getAdminIdentityVersion();
   const response = await fetch(url, {
+    credentials: adminRequestCredentials(),
+    redirect: 'error',
     headers: {
       Accept: 'text/event-stream',
       ...authHeaders(),
@@ -41,8 +46,19 @@ export async function subscribeToAuditEvents(
     signal: options.signal,
   });
 
+  const assertCurrent = () => {
+    if (options.signal.aborted || identity !== getAdminIdentityVersion()) {
+      throw new DOMException('Admin stream session changed.', 'AbortError');
+    }
+  };
+  try { assertCurrent(); } catch (error) {
+    await response.body?.cancel();
+    throw error;
+  }
   if (!response.ok) {
     const body = await parseJsonBody(response);
+    assertCurrent();
+    adminAuthorizationFailed(response.status, identity, false);
     throw new AdminApiError(response.status, errorMessage(body, response));
   }
 
@@ -50,6 +66,7 @@ export async function subscribeToAuditEvents(
     throw new Error('Stream response did not include a readable body.');
   }
 
+  assertCurrent();
   options.onOpen?.();
 
   const reader = response.body.getReader();
@@ -59,6 +76,7 @@ export async function subscribeToAuditEvents(
   try {
     while (true) {
       const { done, value } = await reader.read();
+      assertCurrent();
       if (done) {
         break;
       }
@@ -72,6 +90,7 @@ export async function subscribeToAuditEvents(
     buffer = normalizeLineEndings(buffer + decoder.decode());
     drainCompleteFrames(buffer, options.onEvent);
   } finally {
+    await reader.cancel().catch(() => {});
     reader.releaseLock();
   }
 }

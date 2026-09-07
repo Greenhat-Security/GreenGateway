@@ -31,6 +31,13 @@ export function adminIdentityChanged() {
   emit({ kind: 'identity' });
 }
 
+/** Invalidate pending work even if the session was already unauthenticated. */
+export function adminSessionEnded() {
+  unauthenticated = true;
+  identityVersion += 1;
+  emit({ kind: 'unauthenticated' });
+}
+
 export function adminAuthorizationFailed(status: number, requestVersion: number, capabilitiesRequest: boolean) {
   if (requestVersion !== identityVersion) return;
   if (status === 401 && !unauthenticated) {

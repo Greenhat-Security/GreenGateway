@@ -5,11 +5,11 @@ import {
   adminFetchJson,
   adminFetchResource,
 } from './api';
-import { ADMIN_TOKEN_STORAGE_KEY } from './auth';
+import { clearMemoryToken, setMemoryToken } from './auth';
 
 afterEach(() => {
   vi.unstubAllGlobals();
-  window.sessionStorage.removeItem(ADMIN_TOKEN_STORAGE_KEY);
+  clearMemoryToken();
   document.cookie = 'csrf_token=; Max-Age=0; Path=/';
   document.cookie = 'custom_csrf=; Max-Age=0; Path=/';
   document
@@ -328,7 +328,7 @@ describe('admin API transport', () => {
 
   it('does not copy a CSRF cookie into safe or bearer-authenticated requests', async () => {
     document.cookie = 'csrf_token=token-123; Path=/';
-    window.sessionStorage.setItem(ADMIN_TOKEN_STORAGE_KEY, 'admin-token');
+    setMemoryToken('admin-token');
     const observed: Headers[] = [];
     vi.stubGlobal(
       'fetch',

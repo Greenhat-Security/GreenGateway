@@ -1,21 +1,9 @@
 import { expect, test } from '@playwright/test';
-import { Buffer } from 'node:buffer';
 import path from 'node:path';
 
 const screenshotDir = path.join(process.cwd(), '.screenshots');
-const adminTokenStorageKey = 'greengateway_admin_token';
 
 test('captures the policy version history timeline', async ({ page }) => {
-  await page.addInitScript(
-    ({ key, token }) => {
-      window.sessionStorage.setItem(key, token);
-    },
-    {
-      key: adminTokenStorageKey,
-      token: jwtWithRoles(['admin']),
-    },
-  );
-
   await page.route('**/v1/admin/policy', async (route) => {
     await route.fulfill({
       status: 200,
@@ -106,15 +94,3 @@ test('captures the policy version history timeline', async ({ page }) => {
     fullPage: true,
   });
 });
-
-function jwtWithRoles(roles: string[]): string {
-  return [
-    base64UrlJson({ alg: 'none', typ: 'JWT' }),
-    base64UrlJson({ sub: 'screenshot-user', roles }),
-    'signature',
-  ].join('.');
-}
-
-function base64UrlJson(value: unknown): string {
-  return Buffer.from(JSON.stringify(value), 'utf8').toString('base64url');
-}

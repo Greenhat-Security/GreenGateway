@@ -13,12 +13,11 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import { AdminShell } from './App';
 import { adminFetchJson } from './lib/api';
-import { adminIdentityChanged } from './lib/adminSession';
-import { ADMIN_TOKEN_STORAGE_KEY, setStoredToken } from './lib/auth';
+import { ADMIN_TOKEN_STORAGE_KEY, getMemoryToken, clearMemoryToken, setMemoryToken } from './lib/auth';
 
 afterEach(() => {
   cleanup();
-  adminIdentityChanged();
+  clearMemoryToken();
   vi.unstubAllGlobals();
   window.localStorage.removeItem('greengateway_admin_theme');
   window.sessionStorage.removeItem(ADMIN_TOKEN_STORAGE_KEY);
@@ -37,7 +36,7 @@ describe('AdminShell', () => {
     fireEvent.change(screen.getByLabelText('Scopes'), { target: { value: 'admin:tokens:read' } });
     await waitFor(() => expect((screen.getByRole('button', { name: 'Create token' }) as HTMLButtonElement).disabled).toBe(false));
     permissions = [];
-    await act(async () => { setStoredToken('generated-replacement-identity'); });
+    await act(async () => { setMemoryToken('generated-replacement-identity'); });
     expect((screen.getByLabelText('Scopes') as HTMLInputElement).value).toBe('');
     expect((screen.getByRole('button', { name: 'Create token' }) as HTMLButtonElement).disabled).toBe(true);
   });
@@ -64,6 +63,46 @@ describe('AdminShell', () => {
     fireEvent.click(screen.getByRole('button', { name: 'Check session' }));
     expect((await screen.findByLabelText('Scopes') as HTMLInputElement).value).toBe('');
     expect(fetch.mock.calls.filter(([url]) => url === '/expired')).toHaveLength(1);
+  });
+
+  it('keeps token values out of attributes and clears the draft on save, replacement and expiry', async () => {
+    vi.stubGlobal('fetch', versionFetchMock(false));
+    render(<MemoryRouter><AdminShell /></MemoryRouter>);
+    const input = screen.getByLabelText('Token', { exact: true }) as HTMLInputElement;
+    const canary = `test-${crypto.randomUUID()}`;
+    fireEvent.change(input, { target: { value: canary } });
+    expect(input.getAttribute('value')).toBeNull();
+    fireEvent.click(screen.getByRole('button', { name: 'Show token' }));
+    expect(input.type).toBe('text');
+    expect(screen.getByRole('button', { name: 'Hide token' }).getAttribute('aria-pressed')).toBe('true');
+    fireEvent.click(screen.getByRole('button', { name: 'Save' }));
+    expect(input.value).toBe('');
+    expect(input.type).toBe('password');
+    expect(getMemoryToken() === canary).toBe(true);
+    expect(document.documentElement.outerHTML.includes(canary)).toBe(false);
+    expect(sessionStorage.getItem(ADMIN_TOKEN_STORAGE_KEY)).toBeNull();
+    fireEvent.change(input, { target: { value: 'unsaved-draft' } });
+    await act(async () => { setMemoryToken('replacement'); });
+    expect(input.value).toBe('');
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(new Response('{}', { status: 401 })));
+    fireEvent.change(input, { target: { value: 'another-draft' } });
+    await act(async () => { await expect(adminFetchJson('/expired')).rejects.toMatchObject({ status: 401 }); });
+    expect(input.value).toBe('');
+    expect(getMemoryToken()).toBeNull();
+    await screen.findByText('Session ended. Sign in again.');
+  });
+
+  it('does not restore an SSO token after the active identity changed during completion', async () => {
+    let complete!: (response: Response) => void;
+    const pending = new Promise<Response>((resolve) => { complete = resolve; });
+    const fallback = versionFetchMock(true);
+    vi.stubGlobal('fetch', vi.fn((url: string) => url.endsWith('/auth/callback') ? pending : fallback(url)));
+    window.history.replaceState(null, '', '/admin/#/auth/complete?code=code&state=state');
+    render(<MemoryRouter><AdminShell /></MemoryRouter>);
+    await act(async () => { setMemoryToken('new-identity'); });
+    await act(async () => { complete(new Response(JSON.stringify({ access_token: 'old-identity' }))); });
+    await screen.findByText('SSO completion discarded because the session changed. Start sign-in again.');
+    expect(getMemoryToken()).toBe('new-identity');
   });
 
   it('persists the selected color theme on the document element', () => {
@@ -130,13 +169,13 @@ describe('AdminShell', () => {
     );
 
     await waitFor(() => {
-      expect(window.sessionStorage.getItem(ADMIN_TOKEN_STORAGE_KEY)).toBe(
+      expect(getMemoryToken()).toBe(
         'oidc-exchanged-token',
       );
     });
     expect(window.location.hash).toBe('');
     expect(
-      await screen.findByText('Signed in with SSO for this browser session.'),
+      await screen.findByText('Signed in with SSO in this tab until reload or session expiry.'),
     ).toBeTruthy();
     expect(completionCalls).toHaveLength(1);
     expect(completionCalls[0]).toMatchObject({
@@ -159,11 +198,11 @@ describe('AdminShell', () => {
     'code=one&code=two&state=state',
   ])('rejects incomplete or legacy completion fragments: %s', async (fragment) => {
     vi.stubGlobal('fetch', versionFetchMock(false));
-    window.sessionStorage.setItem(ADMIN_TOKEN_STORAGE_KEY, 'existing-session');
+    setMemoryToken('existing-session');
     window.history.replaceState(null, '', `/admin/#/auth/complete?${fragment}`);
     render(<MemoryRouter><AdminShell /></MemoryRouter>);
     await screen.findByText('SSO sign-in did not complete. Start sign-in again.');
-    expect(window.sessionStorage.getItem(ADMIN_TOKEN_STORAGE_KEY)).toBe('existing-session');
+    expect(getMemoryToken()).toBe('existing-session');
     expect(window.location.hash).toBe('');
     expect(vi.mocked(fetch).mock.calls.some(([url]) => url === '/v1/admin/auth/callback')).toBe(false);
   });
@@ -175,11 +214,11 @@ describe('AdminShell', () => {
       if (failure === 'network') return Promise.reject(new Error('offline'));
       return Promise.resolve(new Response(failure === 'invalid-json' ? 'invalid' : '{}', { status: failure === 'denied' ? 400 : 200 }));
     }));
-    window.sessionStorage.setItem(ADMIN_TOKEN_STORAGE_KEY, 'existing-session');
+    setMemoryToken('existing-session');
     window.history.replaceState(null, '', '/admin/#/auth/complete?code=code&state=state');
     render(<MemoryRouter><AdminShell /></MemoryRouter>);
     await screen.findByText('SSO sign-in did not complete. Start sign-in again.');
-    expect(window.sessionStorage.getItem(ADMIN_TOKEN_STORAGE_KEY)).toBe('existing-session');
+    expect(getMemoryToken()).toBe('existing-session');
     expect(window.location.hash).toBe('');
   });
 

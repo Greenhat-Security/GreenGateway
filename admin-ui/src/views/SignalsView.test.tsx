@@ -3,7 +3,7 @@ import { Buffer } from 'node:buffer';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { MemoryRouter, useLocation } from 'react-router-dom';
 
-import { ADMIN_TOKEN_STORAGE_KEY } from '../lib/auth';
+import { clearMemoryToken, setMemoryToken } from '../lib/auth';
 import { AuditEvent } from '../lib/audit';
 import type { PolicyDocument } from '../lib/policy';
 import { DiscoverySignal, SignalListResponse } from '../lib/signals';
@@ -12,7 +12,7 @@ import { SignalsView } from './SignalsView';
 afterEach(() => {
   cleanup();
   vi.unstubAllGlobals();
-  window.sessionStorage.removeItem(ADMIN_TOKEN_STORAGE_KEY);
+  clearMemoryToken();
 });
 
 describe('SignalsView', () => {
@@ -289,9 +289,9 @@ function renderSignalsView(
     token?: string | null;
   } = {},
 ) {
-  window.sessionStorage.removeItem(ADMIN_TOKEN_STORAGE_KEY);
+  clearMemoryToken();
   if (token !== null) {
-    window.sessionStorage.setItem(ADMIN_TOKEN_STORAGE_KEY, token);
+    setMemoryToken(token);
   }
 
   render(

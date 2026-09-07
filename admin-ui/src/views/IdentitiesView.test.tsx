@@ -9,14 +9,14 @@ import { Buffer } from 'node:buffer';
 import { MemoryRouter } from 'react-router-dom';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
-import { ADMIN_TOKEN_STORAGE_KEY } from '../lib/auth';
+import { clearMemoryToken, setMemoryToken } from '../lib/auth';
 import type { PrincipalPage, PrincipalRecord } from '../lib/principals';
 import { IdentitiesView } from './IdentitiesView';
 
 afterEach(() => {
   cleanup();
   vi.unstubAllGlobals();
-  window.sessionStorage.removeItem(ADMIN_TOKEN_STORAGE_KEY);
+  clearMemoryToken();
 });
 
 describe('IdentitiesView', () => {
@@ -245,9 +245,9 @@ function renderIdentitiesView({
 }: {
   token?: string | null;
 } = {}) {
-  window.sessionStorage.removeItem(ADMIN_TOKEN_STORAGE_KEY);
+  clearMemoryToken();
   if (token !== null) {
-    window.sessionStorage.setItem(ADMIN_TOKEN_STORAGE_KEY, token);
+    setMemoryToken(token);
   }
 
   render(
