@@ -105,8 +105,8 @@ To proxy gRPC through GreenGateway, run it somewhere the container is reached ov
 ## Manual Deploy
 
 ```sh
-npm ci
-npx wrangler login
+node scripts/npm-script-policy.mjs install .
+npx --no-install wrangler login
 npm run deploy
 ```
 

@@ -15,7 +15,7 @@ cargo fmt --check
 cargo clippy --workspace -- -D warnings
 ```
 
-The Cargo build for `gateway` runs `npm ci` and `npm run build` in `admin-ui/` so the Rust binary embeds the production UI assets. For frontend hot reload, run two terminals:
+The Cargo build for `gateway` runs the reviewed npm installer (`scripts/npm-script-policy.mjs`) and `npm run build` in `admin-ui/` so the Rust binary embeds the production UI assets. For frontend hot reload, run two terminals:
 
 ```sh
 cargo run
@@ -23,7 +23,7 @@ cargo run
 
 ```sh
 cd admin-ui
-npm ci
+node ../scripts/npm-script-policy.mjs install admin-ui
 npm run dev
 ```
 

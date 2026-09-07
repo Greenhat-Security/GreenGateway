@@ -12,7 +12,7 @@ cargo run
 
 ```sh
 cd admin-ui
-npm ci
+node ../scripts/npm-script-policy.mjs install admin-ui
 npm run dev
 ```
 
@@ -30,7 +30,7 @@ Production builds are produced by:
 npm run build
 ```
 
-The gateway Cargo build script also runs `npm ci` and `npm run build` so `cargo build --workspace` can produce a binary with embedded admin assets from a fresh checkout.
+The gateway Cargo build script also runs the reviewed npm installer (`scripts/npm-script-policy.mjs`) and `npm run build` so `cargo build --workspace` can produce a binary with embedded admin assets from a fresh checkout.
 
 ## Connections, Inventory, and Playground
 

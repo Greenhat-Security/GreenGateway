@@ -116,7 +116,8 @@ def check(root=ROOT):
             data = json.loads((root / package).read_text())
             if data.get("engines") != {"node": pins["node"], "npm": pins["npm"]}:
                 errors.append(f"{package}: exact Node/npm engines are required")
-            if (root / Path(package).parent / ".npmrc").read_text().strip() != "engine-strict=true":
+            npmrc = (root / Path(package).parent / ".npmrc").read_text().splitlines()
+            if [line for line in npmrc if line.startswith("engine-strict=")] != ["engine-strict=true"]:
                 errors.append(f"{package}: engine-strict must be enabled")
         dockerfile = (root / "Dockerfile").read_text()
         if f"FROM node:{pins['node']}-bookworm-slim@" not in dockerfile:

@@ -458,7 +458,7 @@ Terminal 2:
 
 ```sh
 cd admin-ui
-npm ci
+node ../scripts/npm-script-policy.mjs install admin-ui
 npm run dev
 ```
 
@@ -619,8 +619,8 @@ https://<worker-name>.<your-workers-subdomain>.workers.dev/admin
 If you are deploying from your own machine:
 
 ```sh
-npm install
-npx wrangler login
+node scripts/npm-script-policy.mjs install .
+npx --no-install wrangler login
 npm run deploy
 ```
 

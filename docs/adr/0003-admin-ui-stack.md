@@ -16,7 +16,7 @@ GreenGateway's admin UI is a separate top-level `admin-ui/` npm project using **
 
 Production UI assets are built into `admin-ui/dist/` and embedded in the `gateway` binary with `rust-embed`. The gateway serves the static shell at the configured admin prefix and its subpaths, defaulting to `/admin` and `/admin/*`, with SPA fallback to `index.html` for client-side routes. The admin shell path is exempt from auth and RBAC middleware because it contains no secrets and must show the token entry flow. Admin data APIs remain protected by their existing admin-role checks.
 
-The `gateway` Cargo build script runs `npm ci` and `npm run build` in `admin-ui/`, so `cargo build --workspace` from a fresh checkout produces a binary with embedded UI assets when Node.js and npm are available on `PATH`.
+The `gateway` Cargo build script runs the reviewed npm installer (`scripts/npm-script-policy.mjs`) and `npm run build` in `admin-ui/`, so `cargo build --workspace` from a fresh checkout produces a binary with embedded UI assets when Node.js and npm are available on `PATH`.
 
 Local frontend development uses Vite's own dev server and `server.proxy` configuration. Contributors run `cargo run` for the backend and `npm run dev` in `admin-ui/` for hot reload, then visit the Vite dev server directly. GreenGateway does not include a Rust-side proxy to Vite.
 
