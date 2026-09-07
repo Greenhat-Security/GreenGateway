@@ -750,6 +750,7 @@ jobs:
           context: .
           file: ./Dockerfile
           push: false
+          outputs: type=cacheonly
 
   image-candidate:
     if: github.event_name == 'push'
