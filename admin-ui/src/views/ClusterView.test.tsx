@@ -1,4 +1,4 @@
-import { cleanup, render, screen, waitFor, within } from '@testing-library/react';
+import { act, cleanup, render, screen, waitFor, within } from '@testing-library/react';
 import { Buffer } from 'node:buffer';
 import { readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
@@ -11,6 +11,7 @@ import { ClusterView } from './ClusterView';
 
 afterEach(() => {
   cleanup();
+  vi.useRealTimers();
   vi.unstubAllGlobals();
   window.sessionStorage.removeItem(ADMIN_TOKEN_STORAGE_KEY);
 });
@@ -313,6 +314,19 @@ describe('ClusterView', () => {
       await screen.findByText('Cluster permission required'),
     ).toBeTruthy();
     expect(screen.queryByText('Cluster status request failed')).toBeNull();
+  });
+
+  it('refreshes capabilities after a backend read denial without looping the cluster request', async () => {
+    vi.useFakeTimers();
+    const fetcher = clusterFetchMock({ status: clusterStatus(), clusterStatusCode: 403 });
+    vi.stubGlobal('fetch', fetcher.fetch);
+    renderClusterView();
+    await act(async () => {});
+    expect(screen.getByText('Cluster permission required')).toBeTruthy();
+    await act(async () => { await vi.advanceTimersByTimeAsync(15_000); });
+    expect(fetcher.clusterRequests).toBe(1);
+    expect(fetcher.fetch.mock.calls.filter(([url]) => String(url).endsWith('/capabilities'))).toHaveLength(2);
+    expect(screen.getByText('Cluster permission required')).toBeTruthy();
   });
 
   it('surfaces a failed cluster status request', async () => {

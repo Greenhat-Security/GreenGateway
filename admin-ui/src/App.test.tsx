@@ -1,4 +1,5 @@
 import {
+  act,
   cleanup,
   fireEvent,
   render,
@@ -11,10 +12,13 @@ import { StrictMode } from 'react';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import { AdminShell } from './App';
-import { ADMIN_TOKEN_STORAGE_KEY } from './lib/auth';
+import { adminFetchJson } from './lib/api';
+import { adminIdentityChanged } from './lib/adminSession';
+import { ADMIN_TOKEN_STORAGE_KEY, setStoredToken } from './lib/auth';
 
 afterEach(() => {
   cleanup();
+  adminIdentityChanged();
   vi.unstubAllGlobals();
   window.localStorage.removeItem('greengateway_admin_theme');
   window.sessionStorage.removeItem(ADMIN_TOKEN_STORAGE_KEY);
@@ -24,6 +28,44 @@ afterEach(() => {
 });
 
 describe('AdminShell', () => {
+  it('clears protected route drafts and grants immediately when the identity changes', async () => {
+    let permissions = ['admin:tokens:write'];
+    vi.stubGlobal('fetch', vi.fn((input: string) => Promise.resolve(new Response(JSON.stringify(
+      input.endsWith('/capabilities') ? { permissions } : { tokens: [], next_cursor: null },
+    )))));
+    render(<MemoryRouter initialEntries={['/tokens']}><AdminShell /></MemoryRouter>);
+    fireEvent.change(screen.getByLabelText('Scopes'), { target: { value: 'admin:tokens:read' } });
+    await waitFor(() => expect((screen.getByRole('button', { name: 'Create token' }) as HTMLButtonElement).disabled).toBe(false));
+    permissions = [];
+    await act(async () => { setStoredToken('generated-replacement-identity'); });
+    expect((screen.getByLabelText('Scopes') as HTMLInputElement).value).toBe('');
+    expect((screen.getByRole('button', { name: 'Create token' }) as HTMLButtonElement).disabled).toBe(true);
+  });
+
+  it('clears protected data on 401, keeps the error visible, and explicitly recovers a cookie session', async () => {
+    let capabilityStatus = 200;
+    const fetch = vi.fn((input: string) => Promise.resolve(new Response(JSON.stringify(
+      input.endsWith('/capabilities') ? { permissions: ['admin:tokens:write'] } : { tokens: [], next_cursor: null },
+    ), { status: input === '/expired' ? 401 : input.endsWith('/capabilities') ? capabilityStatus : 200 })));
+    vi.stubGlobal('fetch', fetch);
+    render(<MemoryRouter initialEntries={['/tokens']}><AdminShell /></MemoryRouter>);
+    fireEvent.change(screen.getByLabelText('Scopes'), { target: { value: 'admin:tokens:read' } });
+    await waitFor(() => expect((screen.getByRole('button', { name: 'Create token' }) as HTMLButtonElement).disabled).toBe(false));
+    await act(async () => { await expect(adminFetchJson('/expired')).rejects.toMatchObject({ status: 401 }); });
+    expect(screen.queryByLabelText('Scopes')).toBeNull();
+    expect(screen.getByRole('alert').textContent).toContain('Admin session expired');
+    expect(document.activeElement).toBe(screen.getByRole('alert'));
+    expect(fetch.mock.calls.filter(([url]) => url.startsWith('/v1/admin/tokens'))).toHaveLength(1);
+    capabilityStatus = 503;
+    fireEvent.click(screen.getByRole('button', { name: 'Check session' }));
+    await screen.findByText('Admin permissions are temporarily unavailable. Try checking your session again.');
+    expect(screen.queryByLabelText('Scopes')).toBeNull();
+    capabilityStatus = 200;
+    fireEvent.click(screen.getByRole('button', { name: 'Check session' }));
+    expect((await screen.findByLabelText('Scopes') as HTMLInputElement).value).toBe('');
+    expect(fetch.mock.calls.filter(([url]) => url === '/expired')).toHaveLength(1);
+  });
+
   it('persists the selected color theme on the document element', () => {
     render(
       <MemoryRouter initialEntries={['/']}>

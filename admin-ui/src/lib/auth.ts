@@ -1,3 +1,5 @@
+import { adminIdentityChanged } from './adminSession';
+
 export const ADMIN_TOKEN_STORAGE_KEY = 'greengateway_admin_token';
 
 export function getStoredToken(): string | null {
@@ -23,6 +25,7 @@ export function setStoredToken(token: string): boolean {
     storage.setItem(ADMIN_TOKEN_STORAGE_KEY, trimmed);
   }
 
+  adminIdentityChanged();
   return true;
 }
 
@@ -33,6 +36,7 @@ export function clearStoredToken(): boolean {
   }
 
   storage.removeItem(ADMIN_TOKEN_STORAGE_KEY);
+  adminIdentityChanged();
   return true;
 }
 

@@ -51,10 +51,37 @@ use `cache: no-store` and time out after ten seconds. URLs use the runtime admin
 API prefix on the management UI's origin, including split-listener deployments.
 
 The state is discarded when the last consumer unmounts. A new mount requests
-fresh capabilities. Retry attempts coalesce to at most one request per five
-seconds. Session lifecycle and external policy refresh integration are the next
-slice of issue #423.
+fresh capabilities. While mounted, focus, navigation, manual retries, successful
+local policy mutations, and resource authorization failures invalidate grants;
+refreshes coalesce to at most one request per five seconds. Visible pages also
+refresh every sixty seconds. Hidden pages discard their grants and suspend
+refreshes until visible. An in-flight refresh already satisfies focus/navigation.
+This bounds how long an external policy change can leave old affordances visible;
+the backend independently authorizes every action during that interval.
+
+Successful bearer save/clear and auth callback/logout integration notify an
+identity generation shared by the transport and UI shell. A new identity clears
+grants immediately, starts a fresh request without the old identity's delay, and
+remounts protected routes to clear data, drafts, and one-time token displays. The
+transport rejects late responses from previous generations. A 401 invalidates
+identity state once per authentication failure episode; canceled requests cannot
+invalidate the active session. A successful capabilities response allows a later
+401 to invalidate a recovered cookie session again. An expired session replaces
+the protected route with a focused sign-in notice; Check session explicitly
+rechecks an externally renewed cookie session. A 503 never means logout.
+No browser-readable identity identifier or policy contents are added to the API.
+HttpOnly cookie changes outside this UI are discovered on the next bounded
+capability refresh; they are not directly observable through browser storage.
+
+A resource 403 triggers a capability refresh, but never retries the rejected
+resource request or mutation. Token/tool mutation denials remain disabled until
+the view is reopened or the identity changes. Directory/cluster reads start after
+the first confirmed read grant; permission polling does not restart a failed read.
+Reopen the view to retry its resource request. Data is hidden while its global
+read permission is unknown or denied.
 
 Per-resource action metadata remains authoritative where it is more precise:
 policy response write metadata and connection/tool action metadata continue to
-control those editors. A global grant cannot override a resource denial.
+control those editors. A global grant cannot override a resource denial. The
+credential storage policy remains owned by issue #424; this change only adds
+session lifecycle notifications.
