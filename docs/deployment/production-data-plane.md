@@ -267,12 +267,15 @@ parseable GreenGateway `/metrics` response, require the deterministic mixed
 status counts, require flapping attempt amplification within `1.0`–`1.1`, and
 require exactly zero upstream attempts and retries after every endpoint is
 unhealthy. Capture host/container resource evidence at the start, peak, and end
-of each run:
+of each run. Run the `/proc` commands on the Linux Docker host; the production
+image has no shell or diagnostic utilities:
 
 ```sh
 docker stats --no-stream
-docker compose -f docker-compose.yml -f docker-compose.dev.yml -f docker-compose.load.yml exec gateway \
-  sh -c 'printf "fds="; find /proc/1/fd -maxdepth 1 -type l | wc -l; printf "threads="; grep Threads /proc/1/status; printf "rss="; grep VmRSS /proc/1/status'
+gateway_id=$(docker compose -f docker-compose.yml -f docker-compose.dev.yml -f docker-compose.load.yml ps -q gateway)
+gateway_pid=$(docker inspect --format '{{.State.Pid}}' "$gateway_id")
+printf "fds="; sudo find "/proc/$gateway_pid/fd" -maxdepth 1 -type l | wc -l
+sudo awk '/^(Threads|VmRSS):/' "/proc/$gateway_pid/status"
 docker compose -f docker-compose.yml -f docker-compose.dev.yml -f docker-compose.load.yml logs dev-echo-a dev-echo-b dev-echo-c \
   | grep -c '"GET '
 ```
