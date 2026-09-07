@@ -29,13 +29,11 @@ jobs:
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable action
+      - name: Set up pinned build tools
+        uses: ./.github/actions/build-tools
         with:
-          toolchain: nightly-2026-09-01
-          components: llvm-tools-preview
-      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
-        with:
-          node-version: 24
+          rust: coverage
+          node: 'true'
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           workspaces: ". -> target/llvm-cov-target"
@@ -60,6 +58,13 @@ jobs:
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Set up pinned build tools
+        uses: ./.github/actions/build-tools
+        with:
+          rust: none
+          node: 'false'
+      - run: python -m pip install PyYAML==6.0.3
+      - run: python -m unittest discover -s scripts -p 'test_build_tools.py' -v
       - run: python3 scripts/check-supply-chain.py
       - run: python3 scripts/test_security_gates.py
       - name: Review dependency changes
@@ -76,6 +81,11 @@ jobs:
       - name: Checkout
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
+      - name: Set up pinned build tools
+        uses: ./.github/actions/build-tools
+        with:
+          rust: ci
+          node: 'true'
       - name: Enforce egress-only outbound HTTP
         run: bash scripts/check-egress-only.sh
 
@@ -87,9 +97,11 @@ jobs:
       - name: Checkout
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
-
+      - name: Set up pinned build tools
+        uses: ./.github/actions/build-tools
+        with:
+          rust: ci
+          node: 'true'
       - name: Cache Rust dependencies
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
 
@@ -104,23 +116,16 @@ jobs:
       - name: Checkout
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+      - name: Set up pinned build tools
+        uses: ./.github/actions/build-tools
         with:
-          components: rustfmt, clippy
-
-      - name: Install Node.js
-        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
-        with:
-          node-version: 24
-          cache: npm
-          cache-dependency-path: admin-ui/package-lock.json
-
+          rust: ci
+          node: 'true'
       - name: Cache Rust dependencies
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
 
       - name: Lint
-        run: cargo clippy --workspace -- -D warnings
+        run: cargo clippy --workspace --locked -- -D warnings
 
   test:
     name: test
@@ -130,23 +135,16 @@ jobs:
       - name: Checkout
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+      - name: Set up pinned build tools
+        uses: ./.github/actions/build-tools
         with:
-          components: rustfmt, clippy
-
-      - name: Install Node.js
-        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
-        with:
-          node-version: 24
-          cache: npm
-          cache-dependency-path: admin-ui/package-lock.json
-
+          rust: ci
+          node: 'true'
       - name: Cache Rust dependencies
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
 
       - name: Test
-        run: cargo test --workspace
+        run: cargo test --workspace --locked
 
   # PostgreSQL foundation (issue #241, PR 3): the gateway suite against a real
   # PostgreSQL 16 service container, in both feature states.
@@ -183,11 +181,11 @@ jobs:
       - name: Checkout
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+      - name: Set up pinned build tools
+        uses: ./.github/actions/build-tools
         with:
-          components: rustfmt, clippy
-
+          rust: ci
+          node: 'true'
       - name: Cache Rust dependencies
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
 
@@ -235,22 +233,17 @@ jobs:
       - name: Checkout
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
-
+      - name: Set up pinned build tools
+        uses: ./.github/actions/build-tools
+        with:
+          rust: ci
+          node: 'true'
       - name: Cache Rust dependencies
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
 
       - name: Build gateway for live admin UI
         timeout-minutes: 15
         run: cargo build --locked -p gateway
-
-      - name: Install Node.js
-        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
-        with:
-          node-version: 24
-          cache: npm
-          cache-dependency-path: admin-ui/package-lock.json
 
       - name: Install admin UI dependencies
         working-directory: admin-ui
@@ -270,11 +263,11 @@ jobs:
 
       - name: Install Chromium
         working-directory: admin-ui
-        run: npx playwright install --with-deps chromium
+        run: npx --no-install playwright install --with-deps chromium
 
       - name: Test live Connection admin UI
         working-directory: admin-ui
-        run: npx playwright test --config playwright.issue240.config.ts
+        run: npx --no-install playwright test --config playwright.issue240.config.ts
 
       - name: Test admin UI screenshots
         working-directory: admin-ui
@@ -300,13 +293,11 @@ jobs:
       - name: Checkout
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
-      - name: Install Node.js
-        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+      - name: Set up pinned build tools
+        uses: ./.github/actions/build-tools
         with:
-          node-version: 24
-          cache: npm
-          cache-dependency-path: package-lock.json
-
+          rust: none
+          node: 'true'
       - name: Install Cloudflare wrapper dependencies
         run: npm ci --ignore-scripts
 
@@ -328,6 +319,13 @@ jobs:
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
       # Validate syntax, then rehearse the actual runbook against an isolated DB.
+      - name: Set up pinned build tools
+        uses: ./.github/actions/build-tools
+        with:
+          rust: none
+          node: 'false'
+      - name: Set up verified Buildx and pinned BuildKit
+        uses: ./.github/actions/buildx
       - name: Validate the HA compose example
         shell: bash
         run: |
@@ -364,11 +362,13 @@ jobs:
       - name: Checkout
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
-      - name: Install Node.js
-        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+      - name: Set up pinned build tools
+        uses: ./.github/actions/build-tools
         with:
-          node-version: 24
-
+          rust: none
+          node: 'true'
+      - name: Set up verified Buildx and pinned BuildKit
+        uses: ./.github/actions/buildx
       - name: Run dev traffic smoke test
         shell: bash
         run: |
@@ -447,16 +447,19 @@ jobs:
       - name: Checkout
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
-
+      - name: Set up pinned build tools
+        uses: ./.github/actions/build-tools
+        with:
+          rust: ci
+          node: 'true'
       - name: Cache Rust dependencies
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
 
       - name: Install cargo-audit
         uses: taiki-e/install-action@7b8d4719ee4aaa279bdf55df38dacb9ebfe12a6c # v2
         with:
-          tool: cargo-audit
+          tool: cargo-audit@0.22.2
+          checksum: true
 
       - name: Audit dependencies
         run: cargo audit --deny warnings
@@ -532,9 +535,11 @@ jobs:
           # skip path and the substitution never expires.
           fetch-depth: 0
 
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
-
+      - name: Set up pinned build tools
+        uses: ./.github/actions/build-tools
+        with:
+          rust: ci
+          node: 'true'
       - name: Cache Rust dependencies
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
 
@@ -622,11 +627,11 @@ jobs:
       - name: Checkout
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
-      - name: Install Node.js
-        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+      - name: Set up pinned build tools
+        uses: ./.github/actions/build-tools
         with:
-          node-version: 24
-
+          rust: none
+          node: 'true'
       - name: Run Issue 240 acceptance gate
         if: ${{ always() }}
         shell: bash
@@ -679,6 +684,11 @@ jobs:
         with:
           fetch-depth: 0
 
+      - name: Set up pinned build tools
+        uses: ./.github/actions/build-tools
+        with:
+          rust: none
+          node: 'false'
       - name: Install gitleaks
         env:
           # Pinned to the published release asset. This binary is installed to a
@@ -707,6 +717,11 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Set up pinned build tools
+        uses: ./.github/actions/build-tools
+        with:
+          rust: none
+          node: 'false'
       - name: Install workflow test parser
         run: python -m pip install PyYAML==6.0.3
       - name: Verify publication gates and promotion behavior
@@ -722,14 +737,20 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+      - name: Set up pinned build tools
+        uses: ./.github/actions/build-tools
+        with:
+          rust: none
+          node: 'false'
+      - name: Set up verified Buildx and pinned BuildKit
+        uses: ./.github/actions/buildx
       - name: Build without publishing
         uses: docker/build-push-action@ca052bb54ab0790a636c9b5f226502c73d547a25 # v5
         with:
           context: .
           file: ./Dockerfile
           push: false
+          outputs: type=cacheonly
 
   image-candidate:
     if: github.event_name == 'push'
@@ -738,11 +759,26 @@ jobs:
       packages: write
     uses: ./.github/workflows/publish-image.yml
 
+
+  production-compiler:
+    name: production-compiler
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: ./.github/actions/build-tools
+        with:
+          rust: production
+          node: 'true'
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      - run: cargo check --workspace --all-targets --locked
+
   promote-image:
     name: Promote checked image
     # Every validation job is a dependency. The structural test above fails
     # when a new check is added without also adding it to this list.
     needs:
+      - production-compiler
       - security-coverage
       - supply-chain
       - egress-only
@@ -777,8 +813,13 @@ jobs:
         with:
           ref: ${{ github.sha }}
           persist-credentials: false
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+      - name: Set up pinned build tools
+        uses: ./.github/actions/build-tools
+        with:
+          rust: none
+          node: 'false'
+      - name: Set up verified Buildx and pinned BuildKit
+        uses: ./.github/actions/buildx
       - name: Log in to GHCR
         uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
         with:

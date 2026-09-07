@@ -4,7 +4,7 @@ GreenGateway is an alpha, open-source, self-hosted universal MCP and API gateway
 
 ## Development Setup
 
-GreenGateway is a Rust workspace built with Cargo and now includes a separate Vite + React + TypeScript admin UI in `admin-ui/`. Local builds require Rust plus Node.js and npm on `PATH`; the admin UI scaffold was tested with Node.js `v24.15.0` and npm `11.12.1`.
+GreenGateway is a Rust workspace built with Cargo and now includes a separate Vite + React + TypeScript admin UI in `admin-ui/`. Local builds require the exact Rust, Node.js and npm versions declared in `build-tools.json` on `PATH`. Rustup reads `rust-toolchain.toml`; install Node from `.node-version` and verify npm against `.npm-version`. The gateway build and npm engine checks reject drift. See [the tool update procedure](docs/deployment/dependency-controls.md#executable-build-tool-contract).
 
 As the codebase lands, the standard local workflow is expected to be:
 

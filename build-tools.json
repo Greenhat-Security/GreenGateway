@@ -1,0 +1,16 @@
+{
+  "schema_version": 1,
+  "rust_ci": "1.98.1",
+  "rust_production": "1.88.0",
+  "rust_coverage": "nightly-2026-09-01",
+  "node": "24.20.0",
+  "npm": "11.19.0",
+  "python": "3.13.15",
+  "cargo_audit": "0.22.2",
+  "cargo_llvm_cov": "0.9.0",
+  "pyyaml": "6.0.3",
+  "buildx": "0.36.1",
+  "buildx_linux_amd64_sha256": "48af8a397ebd60178778bf63611dbcebe5f5e7a9be90eb9147b24b9587455778",
+  "buildkit_image": "moby/buildkit:buildx-stable-1@sha256:28a898719c18a33f4e8000685287fa36fd0dd9560c6440227d3a732d79bb41d8",
+  "gitleaks": "8.30.1"
+}
