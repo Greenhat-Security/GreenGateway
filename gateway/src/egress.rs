@@ -50,6 +50,99 @@ mod tls;
 #[cfg(test)]
 mod tls_tests;
 
+/// One-shot container probe. Never follows redirects, uses a proxy, initializes
+/// gateway state, or accepts an arbitrary destination. HTTPS uses normal trust
+/// validation; there is intentionally no insecure certificate bypass.
+pub(crate) async fn check_local_health(url: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let url = reqwest::Url::parse(url)?;
+    let loopback = match url.host() {
+        Some(url::Host::Ipv4(ip)) => ip.is_loopback(),
+        Some(url::Host::Ipv6(ip)) => ip.is_loopback(),
+        _ => false,
+    };
+    if !loopback
+        || !matches!(url.scheme(), "http" | "https")
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.query().is_some()
+        || url.fragment().is_some()
+        || !matches!(url.path(), "/livez" | "/readyz" | "/startupz")
+    {
+        return Err("probe URL must name a loopback IP and /livez, /readyz or /startupz".into());
+    }
+    // Reuse the HTTP/1.1, no-proxy, no-redirect and platform-trust defaults.
+    // Only the literal loopback probe above can reach this one-shot client;
+    // caller-directed upstream traffic still requires checked egress policy.
+    let response = base_client_builder(&EgressConfig::default())?
+        .timeout(Duration::from_secs(2))
+        .build()?
+        .get(url)
+        .send()
+        .await?;
+    if response.status() != StatusCode::OK {
+        return Err(format!("probe returned HTTP {}", response.status()).into());
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod healthcheck_tests {
+    use super::*;
+    use axum::{http::header, routing::get, Router};
+    use std::time::Instant;
+
+    #[tokio::test]
+    async fn only_successful_probe_status_passes() {
+        for status in [
+            StatusCode::OK,
+            StatusCode::SERVICE_UNAVAILABLE,
+            StatusCode::FOUND,
+            StatusCode::NO_CONTENT,
+        ] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let app = Router::new()
+                .route(
+                    "/readyz",
+                    get(move || async move { (status, [(header::LOCATION, "/livez")]) }),
+                )
+                .route("/livez", get(|| async { StatusCode::OK }));
+            let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+            let result = check_local_health(&format!("http://{address}/readyz")).await;
+            server.abort();
+            assert_eq!(result.is_ok(), status == StatusCode::OK);
+        }
+    }
+
+    #[tokio::test]
+    async fn rejects_non_probe_destinations() {
+        for url in [
+            "http://example.invalid/readyz",
+            "http://localhost/readyz",
+            "http://192.0.2.1/readyz",
+            "http://127.0.0.1/admin",
+            "http://user:password@127.0.0.1/readyz",
+            "http://127.0.0.1/readyz?x=1",
+            "http://127.0.0.1/readyz#fragment",
+            "ftp://127.0.0.1/readyz",
+        ] {
+            assert!(check_local_health(url).await.is_err(), "{url}");
+        }
+    }
+
+    #[tokio::test]
+    async fn fails_when_listener_is_unavailable_or_stalls() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/livez", listener.local_addr().unwrap());
+        // An open listener that never responds must not hang the Docker probe.
+        let started = Instant::now();
+        assert!(check_local_health(&url).await.is_err());
+        assert!(started.elapsed() < Duration::from_secs(5));
+        drop(listener);
+        assert!(check_local_health(&url).await.is_err());
+    }
+}
+
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
 const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const DEFAULT_MAX_RESPONSE_BYTES: usize = 5 * 1024 * 1024;

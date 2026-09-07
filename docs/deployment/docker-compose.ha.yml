@@ -122,10 +122,8 @@ x-gateway-service: &gateway-service
   healthcheck:
     test:
       - CMD
-      - curl
-      - --fail
-      - --silent
-      - --show-error
+      - /usr/local/bin/gateway
+      - healthcheck
       - http://127.0.0.1:8080/readyz
     interval: 5s
     timeout: 3s

@@ -152,6 +152,12 @@ def evaluate(report, image, platform, config_digest, sha, candidate, rules, now)
         raise ValueError("report platform mismatch")
     if config.get("config", {}).get("Labels", {}).get("org.opencontainers.image.revision") != sha:
         raise ValueError("report source revision mismatch")
+    return evaluate_inventory(report, candidate, rules)
+
+
+def evaluate_inventory(report, candidate, rules):
+    """Shared package gate; callers must independently validate image identity."""
+    meta = report["Metadata"]
     if meta.get("OS", {}).get("Family") != "debian" or meta["OS"].get("EOSL") is True:
         raise ValueError("unsupported or end-of-life runtime OS")
     results = report.get("Results")

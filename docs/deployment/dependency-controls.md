@@ -91,7 +91,8 @@ without updating and testing the declared compiler/runtime contract.
 This pins project-selected executable tools, not every program in a hosted
 runner OS. Runner Git, Docker Engine/Compose, system Python bootstrap and OS
 utilities remain platform inputs; the shared action selects project Python before
-repository scripts run. Debian package repositories also remain mutable inputs.
+repository scripts run. The runtime OS package set is supplied by the pinned
+Distroless image; its package versions and metadata remain in the image inventory.
 The candidate image scan and provenance work cover final-image inventory and
 attribution; no byte-for-byte hermetic-build guarantee is claimed.
 
@@ -159,3 +160,49 @@ transfer actions use full commit SHAs. Updating these requires the publication,
 scan, evidence and tool-contract regression suites and a real trusted candidate
 verification. Failed/skipped verification or a digest different from the scan/build
 output prevents promotion. See [operator verification and offline evidence](../RELEASING.md#verifying-image-provenance-and-retrieving-the-sbom).
+
+
+## Minimal production runtime
+
+The gateway uses the digest-pinned `gcr.io/distroless/cc-debian12:nonroot`
+runtime. It retains Debian glibc compatibility with the Rust builder, CA roots,
+DNS/NSS and timezone data, and Debian package metadata for scanning. The final
+stage installs no packages and copies no libraries from the builder. Shells,
+apt, curl, Perl and mount utilities are absent. See the upstream
+[Distroless runtime contents](https://github.com/GoogleContainerTools/distroless/blob/main/cc/README.md).
+
+The deployed UID/GID remains **10001:10001**, the working directory remains `/`,
+and the home is `/nonexistent`. Existing volume and secret ownership rules are
+unchanged. Writable application state still requires explicit volumes; the CI
+runtime check exercises SQLite and file audit output under a writable `/tmp`
+with a read-only root filesystem, all capabilities dropped, and no new privileges.
+
+Docker liveness and Compose readiness use the one-shot native command:
+
+```sh
+docker exec <gateway-container> /usr/local/bin/gateway healthcheck http://127.0.0.1:8080/readyz
+```
+
+It accepts only a literal loopback IP (IPv4 or IPv6) and `/livez`, `/readyz` or
+`/startupz`. Set the URL port to match a customized listener. HTTPS uses normal
+certificate validation; use an externally configured orchestrator probe if your
+inbound TLS certificate or client-certificate requirements cannot serve a local
+probe. The command requires HTTP 200, has a two-second request deadline, ignores
+proxy settings, rejects redirects, and does not load application configuration
+or secrets. It exits nonzero on failure. For troubleshooting, use host tools or
+a separate authorized debug container: `docker exec ... sh` is no longer available.
+
+PR image builds now load and exercise the actual image, including shared-library
+resolution, CA files, native probes, user identity, read-only storage and clean
+shutdown. A fresh, pinned Trivy scan uses the same inventory evaluator as the
+release gate and allows no exceptions. The trusted candidate is independently
+scanned by immutable registry digest, exercised again, and signed/verified before
+promotion. The required Compose bootstrap/restore, dev traffic, Rust, HA, frontend
+and source dependency checks remain in place.
+
+The September 2026 remediation removed all 21 installed packages implicated in
+the previous 83 blocking records. A base-image scan found 11 OS packages with zero
+high/critical/unknown findings, without suppressions. Lower-severity findings
+remain visible in raw evidence. This is a dated scan result, not a permanent
+vulnerability-free guarantee: every release refreshes advisory data, and base
+image digest updates must pass these same checks.

@@ -2,6 +2,17 @@
 use super::*;
 
 pub(super) async fn run() -> Result<(), Box<dyn std::error::Error>> {
+    // Container probes must not initialize application state or require secrets.
+    if std::env::args_os()
+        .nth(1)
+        .is_some_and(|word| word == "healthcheck")
+    {
+        let arguments = std::env::args_os().skip(2).collect::<Vec<_>>();
+        let [url] = arguments.as_slice() else {
+            return Err("usage: gateway healthcheck <loopback probe URL>".into());
+        };
+        return egress::check_local_health(url.to_str().ok_or("probe URL must be UTF-8")?).await;
+    }
     // `gateway migrate check|up` (issue #241, PR 4): a one-shot schema
     // command that connects, does its work, prints one line, and exits --
     // never a serving process. It is dispatched BEFORE the connection-secret

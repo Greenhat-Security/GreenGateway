@@ -85,7 +85,7 @@ def main():
            '--from', '/standalone/standalone.env', '--apply')
         dc('up', '-d', '--no-deps', '--no-build', '--wait', '--wait-timeout', '120', 'gateway-1', 'gateway-2')
         for service in ('gateway-1', 'gateway-2'):
-            dc('exec', '-T', service, 'curl', '--fail', '--silent', 'http://127.0.0.1:8080/readyz')
+            dc('exec', '-T', service, '/usr/local/bin/gateway', 'healthcheck', 'http://127.0.0.1:8080/readyz')
         result = dc('exec', '-T', 'db', 'psql', '-U', 'postgres', '-d', 'greengateway', '-Atc',
                     "SELECT has_database_privilege('greengateway_migrator','greengateway','CREATE'), "
                     "has_schema_privilege('greengateway','greengateway','CREATE')", capture=True)
@@ -104,7 +104,7 @@ def main():
         dc('up', '-d', '--no-deps', '--no-build', '--force-recreate', '--wait',
            '--wait-timeout', '120', 'gateway-1', 'gateway-2')
         for service in ('gateway-1', 'gateway-2'):
-            dc('exec', '-T', service, 'curl', '--fail', '--silent', 'http://127.0.0.1:8080/readyz')
+            dc('exec', '-T', service, '/usr/local/bin/gateway', 'healthcheck', 'http://127.0.0.1:8080/readyz')
         print('PASS: clean bootstrap, least privilege, two ready replicas, restored-schema verification, and restored readiness', flush=True)
     finally:
         if (scratch / 'override.json').exists():

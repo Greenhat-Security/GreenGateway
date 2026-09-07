@@ -29,22 +29,28 @@ COPY gateway gateway
 
 RUN cargo build --locked --release -p gateway
 
-FROM debian:bookworm-slim@sha256:88200866dfff7ea7f5cbcb6ec7c8a701889efe6fe859fe64d6990e4b07ea4171 AS runtime
+# Preserve the deployed UID/GID and home without shipping account-management
+# tools. These are data files only; no builder libraries enter the runtime.
+RUN printf 'root:x:0:0:root:/root:/sbin/nologin\ngreengateway:x:10001:10001::/nonexistent:/sbin/nologin\n' > /tmp/runtime-passwd \
+    && printf 'root:x:0:\ngreengateway:x:10001:\n' > /tmp/runtime-group
 
-RUN apt-get update \
-    && apt-get install --yes --no-install-recommends ca-certificates curl \
-    && rm -rf /var/lib/apt/lists/* \
-    && groupadd --gid 10001 greengateway \
-    && useradd --uid 10001 --gid 10001 --no-create-home --home-dir /nonexistent --shell /usr/sbin/nologin greengateway
+# Debian/glibc stays compatible with the production compiler. Distroless keeps
+# CA roots, NSS/DNS, timezone data and libgcc, but omits curl, Perl, mount tools,
+# shells and apt. Keep its Debian package metadata for the final-image scanner.
+FROM gcr.io/distroless/cc-debian12:nonroot@sha256:9dac0a79194e45a7da0158a9c6da57b217585af0786db3845d1f0ec1a0dd182f AS runtime
 
 COPY --from=builder /app/target/release/gateway /usr/local/bin/gateway
+COPY --from=builder /tmp/runtime-passwd /etc/passwd
+COPY --from=builder /tmp/runtime-group /etc/group
 
 ENV LISTEN_ADDR=0.0.0.0:8080
+ENV HOME=/nonexistent
+WORKDIR /
 
 EXPOSE 8080
 
 HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 \
-    CMD ["curl", "--fail", "--silent", "--show-error", "http://127.0.0.1:8080/livez"]
+    CMD ["/usr/local/bin/gateway", "healthcheck", "http://127.0.0.1:8080/livez"]
 
 USER 10001:10001
 
