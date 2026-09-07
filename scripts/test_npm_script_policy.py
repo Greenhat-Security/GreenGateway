@@ -1,6 +1,7 @@
 """Exercise the pinned npm with disposable local tarballs; no registry or hooks from real dependencies."""
 import base64
 import hashlib
+import gzip
 import functools
 import http.server
 import io
@@ -101,6 +102,16 @@ class NpmLifecycleTests(unittest.TestCase):
         result = self.npm_run("ci")
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertTrue(self.marker_exists())
+
+    def test_changed_tarball_bytes_cannot_use_an_existing_approval(self):
+        self.project(True)
+        archive = self.root / "marker-1.0.0.tgz"
+        payload = gzip.decompress(archive.read_bytes()).replace(b"fixture only", b"fixture edit")
+        archive.write_bytes(gzip.compress(payload, mtime=0))
+        result = self.npm_run("ci", "--fetch-retries=0")
+        self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("EINTEGRITY", result.stderr)
+        self.assertFalse(self.marker_exists())
 
     def test_changed_resolved_identity_requires_new_review(self):
         self.project(True, version="1.0.1", policy_spec="marker-1.0.0.tgz")

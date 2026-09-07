@@ -86,3 +86,37 @@ CI checks both inventories, independently of the runner's platform. A policy
 change invalidates Cargo's UI build. Docker includes the same checker and policy.
 Never use an approval-all flag or bypass the checker to get an upgrade through.
 Explicit `npm run build`, tests and lockfile-installed tools still run normally.
+
+
+## Dependency upgrades
+
+1. Use the pinned tools and produce a proposed lockfile without running hooks:
+   `npm install --package-lock-only --ignore-scripts <package>@<version>` in the
+   appropriate project. This is a review preparation command; do not use that
+   override to install `node_modules` or run a build.
+2. Run `node scripts/npm-script-policy.mjs check` from the repository root.
+   Added or removed flagged locations, versions, resolved URLs, integrity, and
+   platform changes fail review, including optional packages for other OSes.
+3. For each changed entry, fetch the proposed tarball as data, verify its SRI,
+   and inspect its package manifest, lifecycle entrypoints, native build files
+   and any code they invoke. Record the exact identity, published scripts,
+   reviewed source hashes, platform conditions and reason in the inventory.
+   Never execute an unreviewed dependency's hook as part of reviewing it.
+4. Update the matching exact URL denial in the project's `allowScripts`.
+   No current dependency needs an install hook. An exception would require a
+   separate code and policy review, because the gate refuses `allow: true`.
+5. Run the installer and required checks. Linux supply-chain CI and Windows
+   npm-policy CI run the real npm marker fixtures and inventory mutations.
+   Both platforms test and build the UI and test/typecheck the root package;
+   Linux additionally builds the Docker image and exercises the live gateway.
+
+The marker fixture also replaces tarball bytes without changing the approved
+URL and verifies npm rejects the integrity mismatch before the hook runs.
+The review-gate suite covers both projects, foreign-platform optional packages,
+alias locations, broad approvals, missing checks, new project hooks and config
+bypasses. The Windows job is a required image-promotion dependency.
+
+Dependabot proposals follow this same process. Do not auto-update the review
+inventory from a new lockfile or automatically approve a new installer. Normal
+package code, explicit build/test scripts and executable binaries still require
+ordinary dependency and code review; this gate controls install lifecycle code.

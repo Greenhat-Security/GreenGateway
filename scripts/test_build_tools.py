@@ -18,7 +18,7 @@ class ToolContractTests(unittest.TestCase):
         self.addCleanup(temp.cleanup)
         self.root = Path(temp.name)
         files = ["build-tools.json", ".node-version", ".npm-version",
-                 "rust-toolchain.toml", "Dockerfile", "package.json",
+                 "rust-toolchain.toml", "Dockerfile", "gateway/build.rs", "package.json",
                  "admin-ui/package.json", ".npmrc", "admin-ui/.npmrc",
                  ".github/actions/build-tools/action.yml", ".github/actions/buildx/action.yml"]
         files += [str(p.relative_to(ROOT)) for p in (ROOT / ".github/workflows").glob("*.y*ml")]
@@ -85,6 +85,32 @@ class ToolContractTests(unittest.TestCase):
     def test_npx_cannot_download_a_missing_executable(self):
         self.replace(".github/workflows/ci.yml", "npx --no-install playwright", "npx playwright")
         self.rejects("npx must not download")
+
+    def test_raw_npm_install_or_exec_cannot_bypass_review(self):
+        for command in ["npm ci", "npm install", "npm exec playwright", "npm rebuild"]:
+            with self.subTest(command=command):
+                path = self.root / ".github/workflows/ci.yml"
+                original = path.read_text()
+                self.replace(".github/workflows/ci.yml", "node scripts/npm-script-policy.mjs install .", command)
+                self.rejects("reviewed npm installer")
+                path.write_text(original)
+
+    def test_docker_cannot_omit_policy_inputs(self):
+        self.replace("Dockerfile", "build-tools.json npm-script-policy.json", "build-tools.json")
+        self.rejects("Docker must copy npm policy input")
+
+    def test_cargo_cannot_bypass_installer(self):
+        self.replace("gateway/build.rs", '.args(["install", "admin-ui"])', '.args(["ci"])')
+        self.rejects("Cargo must use the reviewed npm installer")
+
+    def test_cargo_must_rebuild_when_policy_changes(self):
+        self.replace("gateway/build.rs", '        "npm-script-policy.json",\n', '')
+        self.rejects("Cargo must track npm policy input")
+
+    def test_duplicate_engine_override_is_rejected(self):
+        path = self.root / "admin-ui/.npmrc"
+        path.write_text(path.read_text() + "engine-strict=false\n")
+        self.rejects("engine-strict")
 
     def test_npm_engines_and_strictness_required(self):
         (self.root / "admin-ui/.npmrc").write_text("engine-strict=false\n")
