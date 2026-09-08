@@ -154,6 +154,7 @@ async fn audit_event_store_contract(store: &dyn AuditEventStore) {
             path: Some("/a".to_owned()),
             status: Some(200),
             matched_rule_id: None,
+            reason: None,
             limit: 100,
             before_id: None,
         })
@@ -177,6 +178,7 @@ async fn audit_event_store_contract(store: &dyn AuditEventStore) {
             path: None,
             status: None,
             matched_rule_id: None,
+            reason: None,
             limit: 100,
             before_id: None,
         })
@@ -187,6 +189,121 @@ async fn audit_event_store_contract(store: &dyn AuditEventStore) {
         all.events.len(),
         "every contract event carries the contract actor"
     );
+
+    audit_reason_filter_contract(store).await;
+}
+
+async fn audit_reason_filter_contract(store: &dyn AuditEventStore) {
+    let mut events = [
+        ("reason-direct", json!({"reason": "invalid_params"})),
+        (
+            "reason-detailed",
+            json!({"reason": "work_error", "failure_reason": "invalid_params"}),
+        ),
+        (
+            "reason-both",
+            json!({"reason": "invalid_params", "failure_reason": "invalid_params"}),
+        ),
+        (
+            "reason-detail-only",
+            json!({"failure_reason": "invalid_params"}),
+        ),
+        ("reason-prefix", json!({"reason": "invalid_params_extra"})),
+        ("reason-case", json!({"failure_reason": "INVALID_PARAMS"})),
+        ("reason-missing", json!({})),
+        ("reason-unrelated", json!({"message": "invalid_params"})),
+        (
+            "reason-nested",
+            json!({"data": {"reason": "invalid_params", "failure_reason": "invalid_params"}}),
+        ),
+        (
+            "reason-null",
+            json!({"reason": null, "failure_reason": null}),
+        ),
+        (
+            "reason-number",
+            json!({"reason": 123, "failure_reason": 456}),
+        ),
+        (
+            "reason-bool",
+            json!({"reason": true, "failure_reason": false}),
+        ),
+        (
+            "reason-array",
+            json!({"reason": ["invalid_params"], "failure_reason": {"reason": "invalid_params"}}),
+        ),
+    ]
+    .into_iter()
+    .map(|(id, payload)| contract_event(id, "audit.contract.reason", payload))
+    .collect::<Vec<_>>();
+    events.push(contract_event(
+        "reason-other-event-type",
+        "audit.contract.other",
+        json!({"reason": "invalid_params", "failure_reason": "invalid_params"}),
+    ));
+    store
+        .insert_events(&events)
+        .await
+        .expect("reason filter fixtures should insert");
+
+    let mut filters = AuditQueryFilters {
+        event_type: Some("audit.contract.reason".to_owned()),
+        reason: Some("invalid_params".to_owned()),
+        ..query_filters(None, 2)
+    };
+    let mut collected = Vec::new();
+    loop {
+        let page = store
+            .query_events(&filters)
+            .await
+            .expect("reason-filtered page should query");
+        assert!(page.events.len() <= filters.limit);
+        collected.extend(event_ids(&page));
+        match page.next_cursor {
+            Some(cursor) => {
+                assert!(filters.before_id.is_none_or(|previous| cursor < previous));
+                filters.before_id = Some(cursor);
+            }
+            None => break,
+        }
+    }
+    assert_eq!(
+        collected,
+        [
+            "reason-detail-only",
+            "reason-both",
+            "reason-detailed",
+            "reason-direct"
+        ],
+        "reason matches either top-level string exactly and paginates without duplicates or gaps"
+    );
+
+    filters.before_id = None;
+    filters.reason = Some("work_error".to_owned());
+    let category = store
+        .query_events(&filters)
+        .await
+        .expect("existing category should remain queryable");
+    assert_eq!(event_ids(&category), ["reason-detailed"]);
+    assert_eq!(category.next_cursor, None);
+
+    for reason in [
+        "invalid",
+        "params",
+        "123",
+        "456",
+        "true",
+        "false",
+        "unknown_reason",
+    ] {
+        filters.reason = Some(reason.to_owned());
+        let page = store
+            .query_events(&filters)
+            .await
+            .expect("nonmatching reason should query");
+        assert!(page.events.is_empty(), "unexpected match for {reason}");
+        assert_eq!(page.next_cursor, None);
+    }
 }
 
 async fn request_observation_contract(store: &dyn AuditEventStore) {
@@ -989,6 +1106,7 @@ fn query_filters(before_id: Option<i64>, limit: usize) -> AuditQueryFilters {
         path: None,
         status: None,
         matched_rule_id: None,
+        reason: None,
         limit,
         before_id,
     }
@@ -1296,7 +1414,7 @@ pub(crate) mod postgres_audit_tests {
             .expect("the ledger row should delete");
         assert_eq!(
             authority.observe().await,
-            AuthorityObservation::Writable {
+            AuthorityObservation::IncompatibleSchema {
                 schema_version: schema_maximum - 1
             }
         );
@@ -1354,7 +1472,7 @@ pub(crate) mod postgres_audit_tests {
             .expect("the ledger should drop");
         assert_eq!(
             authority.observe().await,
-            AuthorityObservation::Writable { schema_version: 0 }
+            AuthorityObservation::IncompatibleSchema { schema_version: 0 }
         );
         assert_eq!(probe.blocked_reason().await, Some(SCHEMA_INCOMPATIBLE));
 

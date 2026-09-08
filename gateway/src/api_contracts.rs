@@ -138,6 +138,7 @@ pub(super) struct AuditQueryParams {
     pub(super) from: Option<String>,
     pub(super) to: Option<String>,
     pub(super) event_type: Option<String>,
+    pub(super) reason: Option<String>,
     pub(super) actor: Option<String>,
     pub(super) path: Option<String>,
     pub(super) status: Option<String>,
@@ -1331,14 +1332,15 @@ impl ClusterAdminState {
             Some(source) => source.read().await,
             None => cluster_status::ClusterReadout::default(),
         };
-        // The ledger's extent comes from the readiness probe's cached
-        // observation, so this endpoint reports the number `/readyz`
-        // judged `schema_incompatible` on rather than a second, possibly
-        // different, read.
-        readout.schema_ledger_version = match self.readiness_probe.as_ref() {
-            Some(probe) => probe.observed_schema_version().await,
+        // Keep the full compatibility verdict and extent from one cached
+        // observation; a recognized version with a changed checksum is
+        // incompatible on both the status endpoint and `/readyz`.
+        let schema = match self.readiness_probe.as_ref() {
+            Some(probe) => probe.observed_schema().await,
             None => None,
         };
+        readout.schema_ledger_version = schema.map(|(version, _)| version);
+        readout.schema_ledger_compatible = schema.map(|(_, compatible)| compatible);
         let local = cluster_status::LocalFacts {
             cluster_mode: self.cluster_mode,
             instance_id: self.identity.instance_id(),
@@ -1540,11 +1542,21 @@ impl AuditQueryParams {
         let status = parse_optional_i64("status", self.status)?;
         let limit = parse_limit(self.limit)?;
         let before_id = parse_before_id(self.before_id)?;
+        if self.reason.as_deref().is_some_and(|reason| {
+            reason.is_empty()
+                || reason.len() > 64
+                || !reason
+                    .bytes()
+                    .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_')
+        }) {
+            return Err("reason");
+        }
 
         Ok(audit::query::AuditQueryFilters {
             from,
             to,
             event_type: self.event_type,
+            reason: self.reason,
             actor: self.actor,
             actor_issuer: None,
             actor_auth_mode: None,

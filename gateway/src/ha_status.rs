@@ -14,12 +14,10 @@
 //!   primary was made read-only). A replica that cannot write cannot
 //!   renew a lease, record an audit event, or take a security decision
 //!   it can prove, so it must not receive traffic.
-//! - `schema_incompatible` — the migration ledger no longer covers this
-//!   binary's manifest. Startup validated the ledger in full (prefix
-//!   *and* checksums, `storage/migrations.rs`); what can change while a
-//!   replica serves is the ledger's *extent*, when another gateway
-//!   migrates the database out from under it. That is the fact this
-//!   probe re-reads.
+//! - `schema_incompatible` — the migration ledger fails the same history
+//!   and read/write compatibility checks startup performs. Each refresh
+//!   rechecks versions and checksums, including any compiled approval for
+//!   an additive extension; a version count alone is never approval.
 //! - `instance_lease_invalid` — the membership heartbeat has not
 //!   landed within the stale window, so the deployment's roster no
 //!   longer counts this replica as live and the maintenance singleton
@@ -55,7 +53,7 @@
 //! Probes arrive as often as an orchestrator is configured to send
 //! them, from every replica, and a probe that opens a transaction per
 //! call turns a readiness check into a load source. So the authority is
-//! consulted by exactly one statement — a `SELECT 1`-class read under
+//! consulted by exactly one statement — a bounded ledger read under
 //! the session's `statement_timeout` — and its result is cached for
 //! `READINESS_PROBE_CACHE_MS` (default 1000). The lease and revision
 //! checks read process-local state and are evaluated fresh on every
@@ -110,6 +108,10 @@ pub(crate) enum AuthorityObservation {
     /// The authority answered on a writable session, and its migration
     /// ledger covers this many migrations.
     Writable { schema_version: i32 },
+    /// The authority is writable, but ledger integrity or the compiled
+    /// read/write contract refused this schema. The extent alone may look
+    /// compatible; never reconstruct the verdict from that number.
+    IncompatibleSchema { schema_version: i32 },
     /// The authority answered, but the session cannot write: a standby,
     /// or a primary put into read-only.
     ReadOnly,
@@ -212,6 +214,11 @@ impl ReadinessProbe {
             AuthorityObservation::Unavailable | AuthorityObservation::ReadOnly => {
                 return Some(STORAGE_UNAVAILABLE)
             }
+            AuthorityObservation::IncompatibleSchema { .. } => {
+                #[cfg(feature = "postgres")]
+                crate::storage::migrations::record_schema_compatible(false);
+                return Some(SCHEMA_INCOMPATIBLE);
+            }
             AuthorityObservation::Writable { schema_version } => {
                 let (minimum, maximum) = self.settings.accepted_schema_versions;
                 let compatible = schema_version >= minimum && schema_version <= maximum;
@@ -235,17 +242,27 @@ impl ReadinessProbe {
         None
     }
 
-    /// How many migrations the authority's ledger carries, or `None`
+    /// The last sampled ledger version and its full compatibility verdict,
+    /// or `None`
     /// when the authority could not be read (or answered on a read-only
     /// session, where the ledger is not this replica's to judge).
     ///
     /// This is the same cached observation `blocked_reason` uses, not a
-    /// second query: the cluster status view reports the number that
+    /// second query: the cluster status view reports the verdict that
     /// `/readyz` decided `schema_incompatible` on, and asking for it
     /// inside the cache window costs nothing.
-    pub(crate) async fn observed_schema_version(&self) -> Option<i32> {
+    pub(crate) async fn observed_schema(&self) -> Option<(i32, bool)> {
         match self.observe_authority().await {
-            AuthorityObservation::Writable { schema_version } => Some(schema_version),
+            AuthorityObservation::Writable { schema_version } => {
+                let (minimum, maximum) = self.settings.accepted_schema_versions;
+                Some((
+                    schema_version,
+                    schema_version >= minimum && schema_version <= maximum,
+                ))
+            }
+            AuthorityObservation::IncompatibleSchema { schema_version } => {
+                Some((schema_version, false))
+            }
             AuthorityObservation::ReadOnly | AuthorityObservation::Unavailable => None,
         }
     }
@@ -328,10 +345,10 @@ pub(crate) struct PostgresReadinessAuthority {
 ///   `transaction_read_only` is `on` when the session cannot write for
 ///   any other reason (`default_transaction_read_only`, a primary
 ///   flipped read-only). Together they are "this session cannot write".
-/// - `count(*)` over the migration ledger is how many migrations the
-///   database carries. Startup proved the ledger is a checksum-matching
-///   prefix; the count is the part that can change underneath a serving
-///   replica when another gateway migrates.
+/// - The ordered versions and checksums are checked by startup's validator.
+///   Return at most the compiled history plus one row: any extra row already
+///   proves unknown history. Bound checksum text too; a SHA-256 hex digest
+///   has 64 characters, and the 65th preserves detection of appended text.
 ///
 /// One round trip, no writes, no locks, and exactly one row back.
 #[cfg(feature = "postgres")]
@@ -339,8 +356,10 @@ fn authority_check_statement() -> String {
     format!(
         "SELECT (pg_is_in_recovery() OR current_setting('transaction_read_only') = 'on') \
              AS read_only, \
-         (SELECT count(*) FROM {ledger})::int AS schema_version",
-        ledger = crate::storage::migrations::LEDGER_TABLE
+         ARRAY(SELECT version FROM {ledger} ORDER BY version LIMIT {limit}) AS versions, \
+         ARRAY(SELECT left(checksum, 65) FROM {ledger} ORDER BY version LIMIT {limit}) AS checksums",
+        ledger = crate::storage::migrations::LEDGER_TABLE,
+        limit = crate::storage::migrations::runtime_ledger_row_limit(),
     )
 }
 
@@ -463,7 +482,10 @@ impl PostgresReadinessAuthority {
                         kind = kind.as_str(),
                         "the readiness probe found no migration ledger; readiness is refused as schema_incompatible"
                     );
-                    return (AuthorityObservation::Writable { schema_version: 0 }, None);
+                    return (
+                        AuthorityObservation::IncompatibleSchema { schema_version: 0 },
+                        None,
+                    );
                 }
                 tracing::warn!(
                     kind = kind.as_str(),
@@ -476,12 +498,10 @@ impl PostgresReadinessAuthority {
         if read_only {
             return (AuthorityObservation::ReadOnly, None);
         }
-        (
-            AuthorityObservation::Writable {
-                schema_version: row.get("schema_version"),
-            },
-            None,
-        )
+        let versions: Vec<i64> = row.get("versions");
+        let checksums: Vec<String> = row.get("checksums");
+        let ledger: Vec<_> = versions.into_iter().zip(checksums).collect();
+        (observe_ledger(&ledger), None)
     }
 
     /// Whether this session cannot write, asked on its own. Only ever
@@ -501,6 +521,18 @@ impl PostgresReadinessAuthority {
             .await
             .map(|row| row.get::<_, bool>("read_only"))
             .unwrap_or(false)
+    }
+}
+
+#[cfg(feature = "postgres")]
+fn observe_ledger(ledger: &[(i64, String)]) -> AuthorityObservation {
+    let schema_version =
+        i32::try_from(ledger.last().map_or(0, |(version, _)| *version)).unwrap_or(i32::MAX);
+    match crate::storage::migrations::validate_runtime_ledger(ledger) {
+        Ok(crate::storage::migrations::SchemaStatus::Current) => {
+            AuthorityObservation::Writable { schema_version }
+        }
+        Ok(_) | Err(_) => AuthorityObservation::IncompatibleSchema { schema_version },
     }
 }
 
@@ -900,6 +932,15 @@ mod tests {
         // The ledger matches: the lease wins over the watermark.
         authority.set(AuthorityObservation::Writable { schema_version: 9 });
         assert_eq!(probe.blocked_reason().await, Some(INSTANCE_LEASE_INVALID));
+    }
+
+    #[tokio::test]
+    async fn a_matching_extent_cannot_override_an_invalid_history_verdict() {
+        let authority =
+            ScriptedAuthority::new(AuthorityObservation::IncompatibleSchema { schema_version: 9 });
+        let probe = ReadinessProbe::new(agreed_gate(), authority, None, healthy_settings());
+        assert_eq!(probe.blocked_reason().await, Some(SCHEMA_INCOMPATIBLE));
+        assert_eq!(probe.observed_schema().await, Some((9, false)));
     }
 
     /// The authority is consulted once per cache window however many
