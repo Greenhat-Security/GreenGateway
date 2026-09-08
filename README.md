@@ -690,6 +690,7 @@ Connection setup, safe migration, and control-plane operation are documented in:
 - [Connection migration and rollback](docs/connections/migration.md)
 - [Connections and capability admin guide](docs/connections/admin-guide.md)
 - [Issue #240 acceptance evidence](docs/testing/issue-240-acceptance.md)
+- [Authority-change evidence inventory and proposed contract](docs/authority-evidence.md)
 - [Load-sensitive tests](docs/testing/load-sensitive-tests.md)
 
 ## Repository Structure

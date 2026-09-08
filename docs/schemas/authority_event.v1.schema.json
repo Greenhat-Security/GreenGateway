@@ -1,0 +1,209 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Proposed GreenGateway authority event v1 (not emitted by current runtime)",
+  "description": "Safe committed-change projection; no raw mutation/document/credential payload. Runtime adoption and durable dispatch remain #425 PR2-4.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "event_id",
+    "operation_id",
+    "authority_id",
+    "operation",
+    "result",
+    "committed_at",
+    "actor",
+    "resource",
+    "revision"
+  ],
+  "properties": {
+    "schema_version": {
+      "const": "authority_event.v1"
+    },
+    "event_id": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
+      "maxLength": 36
+    },
+    "operation_id": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
+      "maxLength": 36
+    },
+    "authority_id": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
+      "maxLength": 36
+    },
+    "operation": {
+      "type": "string",
+      "enum": [
+        "catalog.mcp.publish",
+        "catalog.openapi.publish",
+        "catalog.overlay.delete",
+        "catalog.overlay.replace",
+        "configuration.activate",
+        "configuration.export",
+        "configuration.import",
+        "connection.create",
+        "connection.delete",
+        "connection.replace",
+        "credential.binding_change",
+        "jwt.revoke",
+        "policy.file_reload",
+        "policy.publish",
+        "policy.rollback",
+        "policy.rule.create",
+        "policy.rule.delete",
+        "policy.rule.reorder",
+        "policy.rule.update",
+        "policy.suggestion.accept",
+        "secret.create",
+        "secret.delete",
+        "secret.external_rotate",
+        "secret.reencrypt",
+        "secret.rotate",
+        "service_token.issue",
+        "service_token.revoke",
+        "service_token.rotate",
+        "tools.publish"
+      ]
+    },
+    "result": {
+      "const": "committed"
+    },
+    "committed_at": {
+      "type": "string",
+      "pattern": "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}(\\.\\d{1,9})?Z$",
+      "maxLength": 30
+    },
+    "actor": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "kind",
+        "subject_ref",
+        "issuer_ref",
+        "auth_mode"
+      ],
+      "properties": {
+        "kind": {
+          "enum": [
+            "principal",
+            "system"
+          ]
+        },
+        "subject_ref": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$",
+          "maxLength": 64
+        },
+        "issuer_ref": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$",
+          "maxLength": 64
+        },
+        "auth_mode": {
+          "enum": [
+            "bearer_token",
+            "session_cookie",
+            "service_token",
+            "client_certificate",
+            "system"
+          ]
+        }
+      }
+    },
+    "resource": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "kind",
+        "ref"
+      ],
+      "properties": {
+        "kind": {
+          "enum": [
+            "policy",
+            "tools",
+            "connection",
+            "catalog",
+            "credential_binding",
+            "local_secret",
+            "external_secret",
+            "service_token",
+            "jwt_revocation",
+            "configuration"
+          ]
+        },
+        "ref": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$",
+          "maxLength": 64
+        }
+      }
+    },
+    "revision": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "axis",
+        "before",
+        "after",
+        "security"
+      ],
+      "properties": {
+        "axis": {
+          "enum": [
+            "policy",
+            "tools",
+            "connection",
+            "credential",
+            "catalog",
+            "secret",
+            "token",
+            "jwt_revocation",
+            "configuration",
+            "maintenance"
+          ]
+        },
+        "before": {
+          "anyOf": [
+            {
+              "type": "string",
+              "pattern": "^(0|[1-9][0-9]{0,18})$",
+              "maxLength": 19
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "after": {
+          "anyOf": [
+            {
+              "type": "string",
+              "pattern": "^(0|[1-9][0-9]{0,18})$",
+              "maxLength": 19
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "security": {
+          "anyOf": [
+            {
+              "type": "string",
+              "pattern": "^(0|[1-9][0-9]{0,18})$",
+              "maxLength": 19
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      }
+    }
+  }
+}

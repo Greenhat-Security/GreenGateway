@@ -2857,7 +2857,7 @@ mod tests {
             mpsc as std_mpsc, Arc, Barrier, Mutex as StdMutex,
         },
         thread,
-        time::{Duration, SystemTime, UNIX_EPOCH},
+        time::Duration,
     };
 
     use jsonschema::Validator;
@@ -5338,7 +5338,7 @@ mod tests {
             let path = std::env::temp_dir().join(format!(
                 "greengateway-tools-test-{}-{}.json",
                 std::process::id(),
-                unique_suffix()
+                uuid::Uuid::new_v4()
             ));
             fs::write(&path, contents)
                 .unwrap_or_else(|err| panic!("failed to write {}: {err}", path.display()));
@@ -5360,12 +5360,5 @@ mod tests {
         fn drop(&mut self) {
             let _ = fs::remove_file(&self.path);
         }
-    }
-
-    fn unique_suffix() -> u128 {
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("system time should be after Unix epoch")
-            .as_nanos()
     }
 }
