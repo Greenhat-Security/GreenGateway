@@ -18,11 +18,12 @@ EXACT = re.compile(r"\d+\.\d+\.\d+")
 def versions(root=ROOT):
     data = json.loads((root / "build-tools.json").read_text(encoding="utf-8"))
     required = {"schema_version", "rust_ci", "rust_production", "rust_coverage",
-                "node", "npm", "python", "cargo_audit", "cargo_llvm_cov", "pyyaml",
+                "node", "npm", "python", "cargo_audit", "cargo_llvm_cov", "pyyaml", "cargo_deny",
+                "cargo_deny_linux_amd64_sha256", "cargo_deny_windows_amd64_sha256",
                 "buildx", "buildkit_image", "gitleaks", "buildx_linux_amd64_sha256", "trivy", "trivy_linux_amd64_sha256", "github_cli", "github_cli_linux_amd64_sha256"}
     if set(data) != required or data["schema_version"] != 1:
         raise ValueError("unknown or incomplete build-tool contract")
-    for key in required - {"schema_version", "rust_coverage", "buildkit_image", "buildx_linux_amd64_sha256", "trivy_linux_amd64_sha256", "github_cli_linux_amd64_sha256"}:
+    for key in required - {"schema_version", "rust_coverage", "buildkit_image", "buildx_linux_amd64_sha256", "trivy_linux_amd64_sha256", "github_cli_linux_amd64_sha256", "cargo_deny_linux_amd64_sha256", "cargo_deny_windows_amd64_sha256"}:
         if not isinstance(data[key], str) or not EXACT.fullmatch(data[key]):
             raise ValueError(f"{key} must be an exact version")
     if not re.fullmatch(r"nightly-\d{4}-\d{2}-\d{2}", data["rust_coverage"]):
@@ -35,6 +36,9 @@ def versions(root=ROOT):
         raise ValueError("Trivy archive must have a reviewed checksum")
     if not re.fullmatch(r"[0-9a-f]{64}", data["github_cli_linux_amd64_sha256"]):
         raise ValueError("GitHub CLI archive must have a reviewed checksum")
+    for key in ["cargo_deny_linux_amd64_sha256", "cargo_deny_windows_amd64_sha256"]:
+        if not re.fullmatch(r"[0-9a-f]{64}", data[key]):
+            raise ValueError("Cargo policy archive must have a reviewed checksum")
     return data
 
 
@@ -157,6 +161,8 @@ def check(root=ROOT):
             errors.append("Buildx setup must use the verified installer")
         for path in (root / ".github/workflows").glob("*.y*ml"):
             doc = yaml.load(path.read_text(), Loader=yaml.BaseLoader)
+            if path.name == "ci.yml" and "cargo-policy" not in doc.get("jobs", {}):
+                errors.append("CI must retain the required Cargo policy job")
             for job_name, job in doc.get("jobs", {}).items():
                 if "uses" in job:
                     continue
@@ -180,6 +186,12 @@ def check(root=ROOT):
                     errors.append(f"{job_name}: Cargo uses an undeclared compiler")
                 if re.search(r"\b(node|npm|npx)\b|\bcargo (build|test|clippy|llvm-cov)\b", commands) and config.get("node") != "true":
                     errors.append(f"{job_name}: Node/npm setup required before building")
+                if job_name == "cargo-policy":
+                    if job.get("strategy", {}).get("matrix", {}).get("os") != ["ubuntu-latest", "windows-latest"]:
+                        errors.append("Cargo policy requires Linux and Windows qualification")
+                    for required_command in ["python scripts/cargo_policy.py install", "python scripts/cargo_policy.py check", "test_cargo_policy.py"]:
+                        if required_command not in commands:
+                            errors.append("Cargo policy must retain verified installer, full-graph check and rejection fixtures")
                 for s in steps:
                     use, opts, run = s.get("uses", ""), s.get("with", {}), s.get("run", "")
                     if any(use.startswith(x) for x in ["actions/setup-node@", "actions/setup-python@", "dtolnay/rust-toolchain@"]):

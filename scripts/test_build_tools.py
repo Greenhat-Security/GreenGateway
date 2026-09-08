@@ -86,6 +86,16 @@ class ToolContractTests(unittest.TestCase):
         self.replace(".github/workflows/ci.yml", "npx --no-install playwright", "npx playwright")
         self.rejects("npx must not download")
 
+    def test_cargo_policy_gate_cannot_be_removed_or_reduced(self):
+        self.replace(".github/workflows/ci.yml", "python scripts/cargo_policy.py check", "echo skipped")
+        self.rejects("full-graph check")
+        self.replace(".github/workflows/ci.yml", "os: [ubuntu-latest, windows-latest]", "os: [ubuntu-latest]")
+        self.rejects("Linux and Windows qualification")
+
+    def test_cargo_policy_tool_requires_exact_version_and_checksum(self):
+        self.replace("build-tools.json", '"cargo_deny": "0.20.2"', '"cargo_deny": "latest"')
+        self.rejects("exact version")
+
     def test_raw_npm_install_or_exec_cannot_bypass_review(self):
         for command in ["npm ci", "npm install", "npm exec playwright", "npm rebuild"]:
             with self.subTest(command=command):

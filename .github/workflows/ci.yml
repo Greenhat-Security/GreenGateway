@@ -76,6 +76,34 @@ jobs:
         with:
           fail-on-severity: moderate
 
+  cargo-policy:
+    name: cargo-policy (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: ./.github/actions/build-tools
+        with:
+          rust: ci
+          node: 'false'
+      - name: Install checksum-verified Cargo policy tool
+        run: python scripts/cargo_policy.py install
+      - name: Exercise policy and native tool rejection fixtures
+        run: python -m unittest discover -s scripts -p 'test_cargo_policy.py' -v
+      - name: Check the locked full workspace graph
+        run: python scripts/cargo_policy.py check
+      - name: Retain policy decisions and exact exception evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: cargo-policy-${{ matrix.os }}
+          path: target/cargo-policy/
+          if-no-files-found: error
+
   egress-only:
     name: egress-only
     runs-on: ubuntu-latest
@@ -924,6 +952,7 @@ jobs:
       - production-compiler
       - security-coverage
       - supply-chain
+      - cargo-policy
       - egress-only
       - fmt
       - clippy
