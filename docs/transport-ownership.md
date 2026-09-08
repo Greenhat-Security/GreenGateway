@@ -46,3 +46,54 @@ review records; unexamined changes must fail review. The gate must describe its
 bounded alias handling and must not claim full Rust type or name resolution.
 Behavioral tests still establish checked-address pinning, hostname/SNI verification,
 redirect rejection, protocol restrictions and fail-closed errors.
+
+## Running the structural gate
+
+Run `python scripts/transport_guard.py check` with the pinned Rust/Node tools.
+CI runs it in the required `egress-only` job after the existing protocol guard,
+and retains `target/transport-guard/decision.json`, enumeration, syntax facts and
+candidate records. A failure never becomes a successful empty scan.
+
+`transport-ownership.json` records exact file, item/function, syntax SHA256, owner
+and purpose. Comparisons use equality, never glob matching. New, changed and stale
+records fail. A constructor change inside an already-reviewed function also fails.
+Imports, chained renames and reexports use a conservative global alias union;
+colliding names can require extra review. This is not lexical/type resolution.
+
+The dependency record covers the complete locked workspace graph, all features,
+unfiltered target alternatives, package checksums, dependency edges, workspace
+renames and Cargo target declarations. Every new package or feature/edge needs
+review, including a networking library whose name the source guard does not know.
+These comparisons run before compiling the syntax tool. Build-script input hashes
+are separately reviewed. The tool is a dev-only Cargo example using the existing
+syn/quote/proc-macro2 packages; it is not linked into the shipped gateway.
+
+The parser follows declared modules from all Cargo targets, parses every enumerated
+Rust file, and excludes from production only non-shipped Cargo targets or cfg
+expressions provably false with `test=false`. Other feature/target conditions stay
+in scope, including inactive platform alternatives. Unowned files, ambiguous paths,
+conditional module paths, escaping paths and parse errors fail. Generated Rust
+cannot quietly become an unowned source file; supporting a generator requires a
+reviewed extension to enumeration and its input contract.
+
+Raw client/socket/process/FFI references, conservative unresolved connection methods,
+capability imports and glob/renamed imports receive exact review records. PostgreSQL
+pool consumers and stream adapters can appear in the records without being socket
+constructors. Their purpose labels distinguish them from request egress.
+
+Macro rules, custom macro calls, unrecognized attributes and unsafe/foreign code
+require exact scope review. A small explicit set of standard formatting/container,
+Tokio expression-container, tracing/metrics, JSON and SQL-parameter macros has a
+reviewed implementation through the locked dependency graph; their recursive input
+tokens are still scanned for capability names/aliases and connection methods.
+Standard derives and serde/async-trait attributes are reviewed transformations over
+syntax the parser visits. Macro definitions and renamed imports cannot change
+silently. Custom expansion is not executed or claimed to be type-checked by this
+gate; existing behavioral tests and dependency review remain necessary.
+
+To change ownership, run `python scripts/transport_guard.py inventory` in a reviewed
+checkout. This produces a candidate artifact, never updates policy or reports a
+passing check. Review the graph and changed source scopes, explain each owner and
+purpose, and edit the exact policy records in the same PR. Do not copy the candidate
+over policy without reviewing it; the candidate deliberately lacks scope approvals.
+Never add a file-wide bypass or regenerate policy automatically in CI.
