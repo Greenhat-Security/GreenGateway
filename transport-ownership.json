@@ -10706,7 +10706,7 @@
         "network-or-process-reference"
       ],
       "scope": "gateway::storage::postgres_audit::impl AuditEventStore PostgresAuditEventStore::query_events#1",
-      "sha256": "1b8f0bf6e9e8de9ae93d8a57bc5103bbc9ad55530019bc8851fb97dc2b944b5c",
+      "sha256": "370ef8e9611eb20f45efddc77b0987646124fc848661108f0415243c22bc37e6",
       "owner": "GreenGateway maintainers",
       "purpose": "PostgreSQL repository operations through the shared infrastructure pool; no caller-selected HTTP authority."
     },

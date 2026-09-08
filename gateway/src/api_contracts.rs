@@ -126,6 +126,7 @@ pub(super) struct AuditQueryParams {
     pub(super) from: Option<String>,
     pub(super) to: Option<String>,
     pub(super) event_type: Option<String>,
+    pub(super) reason: Option<String>,
     pub(super) actor: Option<String>,
     pub(super) path: Option<String>,
     pub(super) status: Option<String>,
@@ -1519,11 +1520,21 @@ impl AuditQueryParams {
         let status = parse_optional_i64("status", self.status)?;
         let limit = parse_limit(self.limit)?;
         let before_id = parse_before_id(self.before_id)?;
+        if self.reason.as_deref().is_some_and(|reason| {
+            reason.is_empty()
+                || reason.len() > 64
+                || !reason
+                    .bytes()
+                    .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_')
+        }) {
+            return Err("reason");
+        }
 
         Ok(audit::query::AuditQueryFilters {
             from,
             to,
             event_type: self.event_type,
+            reason: self.reason,
             actor: self.actor,
             actor_issuer: None,
             actor_auth_mode: None,

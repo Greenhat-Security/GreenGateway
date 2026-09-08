@@ -48,8 +48,8 @@ use crate::{
         mcp_upstream::{self, McpUpstreamRuntimeConfig},
         overlay::{apply_enum_to_served_clone, mark_enum_unavailable_on_served_clone},
         runtime::{
-            ToolInvocationContext, ToolInvocationSource, ToolRuntime, ToolRuntimeError,
-            ToolWorkErrorDisposition,
+            ToolAuditValidationProblem, ToolInvocationContext, ToolInvocationSource, ToolRuntime,
+            ToolRuntimeError, ToolWorkErrorDisposition,
         },
         transforms::{
             apply_request_transform, apply_response_transform, TransformError, TransformWarning,
@@ -268,6 +268,10 @@ pub struct ValidationProblem {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub allowed: Option<Vec<Value>>,
     pub message: String,
+    // Only schema-defined property names and array indices may enter audit.
+    // The caller-facing path above can contain caller-selected object keys.
+    #[serde(skip)]
+    audit_path: String,
 }
 
 #[derive(Debug)]
@@ -1085,8 +1089,9 @@ impl ToolExecutor {
                 CancellationToken::new(),
                 |_| async { Err(UnsupportedTaskInvocation) },
                 |_| ToolWorkErrorDisposition::Failure {
-                    reason: Some(TOOL_TASK_UNSUPPORTED_REASON.to_owned()),
+                    reason: Some(TOOL_TASK_UNSUPPORTED_REASON),
                     details: None,
+                    audit_problems: Vec::new(),
                 },
             )
             .await;
@@ -1658,6 +1663,7 @@ impl ToolExecutor {
                 tool_name: tool.name.clone(),
                 problems: vec![ValidationProblem {
                     path: String::new(),
+                    audit_path: String::new(),
                     keyword: "max_iterations".to_owned(),
                     allowed: None,
                     message: format!(
@@ -3372,6 +3378,11 @@ fn validate_args(
                 keyword: bounded_validation_text(error.kind().keyword(), MAX_VALIDATION_TEXT_CHARS),
                 allowed,
                 message: safe_validation_message(error.kind()),
+                audit_path: audit_validation_path(
+                    &tool.input_schema,
+                    args,
+                    &error.instance_path().to_string(),
+                ),
             }
         })
         .collect();
@@ -3430,6 +3441,69 @@ fn safe_validation_message(kind: &jsonschema::error::ValidationErrorKind) -> Str
             "value does not satisfy the '{}' constraint",
             bounded_validation_text(kind.keyword(), MAX_VALIDATION_TEXT_CHARS)
         ),
+    }
+}
+
+// Walk the configured schema rather than copying a JSON instance pointer:
+// property names under maps/patternProperties can be caller-supplied values.
+// Stop at an ambiguous schema ($ref/combinators included) instead of guessing.
+fn audit_validation_path(schema: &Value, instance: &Value, instance_path: &str) -> String {
+    let mut schema = schema;
+    let mut instance = instance;
+    let mut path = String::new();
+    for segment in instance_path
+        .split('/')
+        .skip(1)
+        .take(MAX_VALIDATION_TEXT_CHARS)
+    {
+        let name = segment.replace("~1", "/").replace("~0", "~");
+        if let Some((property, value)) = schema
+            .get("properties")
+            .and_then(|value| value.get(&name))
+            .zip(instance.as_object().and_then(|object| object.get(&name)))
+        {
+            path.push('/');
+            path.push_str(segment);
+            schema = property;
+            instance = value;
+        } else if let Some((items, value)) =
+            schema
+                .get("items")
+                .zip(instance.as_array().and_then(|array| {
+                    segment
+                        .parse::<usize>()
+                        .ok()
+                        .and_then(|index| array.get(index))
+                }))
+        {
+            path.push('/');
+            path.push_str(segment);
+            schema = items;
+            instance = value;
+        } else {
+            path.push_str("/*");
+            break;
+        }
+        if path.chars().count() >= MAX_VALIDATION_TEXT_CHARS {
+            break;
+        }
+    }
+    bounded_validation_text(&path, MAX_VALIDATION_TEXT_CHARS)
+}
+
+fn audit_validation_problem(problem: &ValidationProblem) -> ToolAuditValidationProblem {
+    let message = match problem.keyword.as_str() {
+        "required" => "a required argument is missing",
+        "additionalProperties" | "unevaluatedProperties" => "unexpected arguments are not allowed",
+        "type" => "value has the wrong JSON type",
+        "enum" => "value is not one of the allowed values",
+        "max_iterations" => "composite iteration count exceeds the configured maximum",
+        _ => "value does not satisfy the schema constraint",
+    };
+    ToolAuditValidationProblem {
+        path: problem.audit_path.clone(),
+        keyword: problem.keyword.clone(),
+        message,
     }
 }
 
@@ -3995,7 +4069,8 @@ fn executor_work_error_disposition(error: &ToolExecutorError) -> ToolWorkErrorDi
             "composite_failed_compensation_incomplete"
         };
         return ToolWorkErrorDisposition::Failure {
-            reason: Some(failure_reason.to_owned()),
+            reason: Some(failure_reason),
+            audit_problems: Vec::new(),
             details: Some(json!({
                 "tool_name": tool_name,
                 "request_id": request_id,
@@ -4011,7 +4086,8 @@ fn executor_work_error_disposition(error: &ToolExecutorError) -> ToolWorkErrorDi
     match error {
         ToolExecutorError::TransformRejected { path, reason, .. } => {
             return ToolWorkErrorDisposition::Failure {
-                reason: Some(TOOL_INVALID_PARAMS_REASON.to_owned()),
+                reason: Some(TOOL_INVALID_PARAMS_REASON),
+                audit_problems: Vec::new(),
                 details: Some(json!({
                     "problems": [{
                         "path": path,
@@ -4064,8 +4140,16 @@ fn executor_work_error_disposition(error: &ToolExecutorError) -> ToolWorkErrorDi
         _ => None,
     };
     ToolWorkErrorDisposition::Failure {
-        reason: Some(reason.to_owned()),
+        reason: Some(reason),
         details,
+        audit_problems: match error {
+            ToolExecutorError::InputValidation { problems, .. } => problems
+                .iter()
+                .take(MAX_VALIDATION_PROBLEMS)
+                .map(audit_validation_problem)
+                .collect(),
+            _ => Vec::new(),
+        },
     }
 }
 
