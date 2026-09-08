@@ -90,6 +90,16 @@ Explicit `npm run build`, tests and lockfile-installed tools still run normally.
 
 ## Dependency upgrades
 
+The root package overrides `miniflare@5.20260903.0-alpha`'s pinned Sharp
+dependency to `0.35.4`, the patched version for
+[GHSA-rgj7-g3m4-5g8c](https://github.com/advisories/GHSA-rgj7-g3m4-5g8c).
+The override is limited to that reviewed Miniflare version. Reassess it when
+upgrading Wrangler/Miniflare; remove it once the upstream dependency uses a
+patched Sharp version and clean installs, audits and the local runtime/image
+smoke checks pass. Both npm projects use Vitest `4.1.11` or later in the 4.x line
+for [GHSA-82fw-gwwq-j7x9](https://github.com/advisories/GHSA-82fw-gwwq-j7x9).
+These patch updates do not require dependency install hooks.
+
 1. Use the pinned tools and produce a proposed lockfile without running hooks:
    `npm install --package-lock-only --ignore-scripts <package>@<version>` in the
    appropriate project. This is a review preparation command; do not use that

@@ -20,7 +20,7 @@
   "devDependencies": {
     "@cloudflare/workers-types": "^5.20260708.1",
     "typescript": "^5.8.3",
-    "vitest": "^4.1.10",
+    "vitest": "^4.1.11",
     "wrangler": "^4.108.0"
   },
   "cloudflare": {
@@ -48,6 +48,11 @@
   "engines": {
     "node": "24.20.0",
     "npm": "11.19.0"
+  },
+  "overrides": {
+    "miniflare@5.20260903.0-alpha": {
+      "sharp": "0.35.4"
+    }
   },
   "allowScripts": {
     "https://registry.npmjs.org/esbuild/-/esbuild-0.28.1.tgz": false,
