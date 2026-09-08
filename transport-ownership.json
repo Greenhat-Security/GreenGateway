@@ -5810,9 +5810,9 @@
         "network-or-process-reference"
       ],
       "scope": "gateway::app_state::AppState#1",
-      "sha256": "a2cb59c465832cea15f77e1ae952983c5f01a9a4d352ddc331756858c2c3c9a0",
+      "sha256": "bfc12724d8bf2db559896c90b65b9926d1aad97f72ced5e3c30dd4c7a57b1592",
       "owner": "GreenGateway maintainers",
-      "purpose": "Existing application transport references or syntax in this exact item; new or changed authority requires explicit review."
+      "purpose": "Application state retains existing transport handles; the optional admin-session capability field adds only serialized login, completion and logout metadata, with no new transport construction authority."
     },
     {
       "file": "gateway/src/main.rs",
@@ -5843,6 +5843,16 @@
       "sha256": "2dfa0d0c794ad3bdf7f0e5f3b4707b52404ada891f261fe80e5e5b760036b6b2",
       "owner": "GreenGateway maintainers",
       "purpose": "Existing application transport references or syntax in this exact item; new or changed authority requires explicit review."
+    },
+    {
+      "file": "gateway/src/api_contracts.rs",
+      "reasons": [
+        "unexpanded-attribute"
+      ],
+      "scope": "gateway::api_contracts::AdminAuthCompletionMode#1",
+      "sha256": "8ef47e75df76bf9118be5092eaae14ef8e1ec440ca226d909caaf884263c9aec",
+      "owner": "GreenGateway maintainers",
+      "purpose": "Reviewed standard default enum attribute selecting legacy bearer completion and serde snake_case decoding of the explicit cookie mode; the enum performs no I/O or transport construction."
     },
     {
       "file": "gateway/src/api_contracts.rs",

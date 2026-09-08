@@ -1531,6 +1531,7 @@ fn authenticating_router() -> Router {
 /// than about which credential won.
 fn authenticating_router_over(validators: Vec<Arc<dyn SessionValidator>>) -> Router {
     let state = AuthState {
+        admin_sessions: None,
         validator: Some(Arc::new(ChainValidator::new(validators)) as Arc<dyn SessionValidator>),
         mode: AuthMode::Required,
         cookie_name: "session".to_owned(),
