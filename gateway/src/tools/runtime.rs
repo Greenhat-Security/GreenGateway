@@ -222,10 +222,22 @@ pub enum ToolRuntimeError {
 
 pub(crate) enum ToolWorkErrorDisposition {
     Failure {
-        reason: Option<String>,
+        // Classifiers provide fixed categories, never a display error or an
+        // upstream response. These categories are also safe to log and audit.
+        reason: Option<&'static str>,
         details: Option<Value>,
+        audit_problems: Vec<ToolAuditValidationProblem>,
     },
     Rejected(String),
+}
+
+/// Separate from caller-facing details, which can contain dynamic enum values
+/// and caller-selected property names that must never enter durable evidence.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct ToolAuditValidationProblem {
+    pub path: String,
+    pub keyword: String,
+    pub message: &'static str,
 }
 
 impl fmt::Display for ToolRuntimeError {
@@ -725,6 +737,7 @@ impl ToolRuntime {
             |_| ToolWorkErrorDisposition::Failure {
                 reason: None,
                 details: None,
+                audit_problems: Vec::new(),
             },
         )
         .await
@@ -830,19 +843,18 @@ impl ToolRuntime {
                     }
                     Ok(Err(err)) => {
                         match failure_reason(&err) {
-                            ToolWorkErrorDisposition::Failure { reason, details } => {
+                            ToolWorkErrorDisposition::Failure { reason, details, audit_problems } => {
                                 let message = err.to_string();
-                                self.emit(
-                                    audit::event::TOOL_INVOKE_FAILURE,
+                                self.emit_work_failure(
                                     &context,
                                     tool_name,
-                                    "failure",
-                                    Some("work_error"),
+                                    reason,
+                                    &audit_problems,
                                 );
                                 Err(ToolRuntimeError::WorkFailed {
                                     tool_name: tool_name.to_owned(),
                                     message,
-                                    reason,
+                                    reason: reason.map(str::to_owned),
                                     details,
                                 })
                             }
@@ -1390,6 +1402,47 @@ impl ToolRuntime {
         ));
     }
 
+    fn emit_work_failure(
+        &self,
+        context: &ToolInvocationContext,
+        tool_name: &str,
+        failure_reason: Option<&'static str>,
+        problems: &[ToolAuditValidationProblem],
+    ) {
+        let mut payload =
+            tool_audit_payload(tool_name, "failure", Some("work_error"), context.source);
+        if let Some(reason) = failure_reason {
+            payload["failure_reason"] = json!(reason);
+        }
+        if !problems.is_empty() {
+            payload["problems"] = Value::Array(
+                problems
+                    .iter()
+                    .take(16)
+                    .map(|problem| {
+                        json!({
+                            "path": bounded_audit_text(&problem.path, 64),
+                            "keyword": bounded_audit_text(&problem.keyword, 64),
+                            "message": bounded_audit_text(problem.message, 128),
+                        })
+                    })
+                    .collect(),
+            );
+        }
+        tracing::warn!(
+            tool_name = %bounded_audit_text(tool_name, 128),
+            failure_reason = failure_reason.unwrap_or("work_error"),
+            "tool invocation work failed"
+        );
+        self.inner.audit.emit(AuditEvent::new(
+            audit::event::TOOL_INVOKE_FAILURE,
+            &context.request_id,
+            &context.source_ip,
+            context.actor.clone(),
+            payload,
+        ));
+    }
+
     fn emit(
         &self,
         event_type: &'static str,
@@ -1670,6 +1723,20 @@ fn tool_observation_path(tool_name: &str) -> String {
     format!("/mcp/tools/{tool_name}")
 }
 
+fn bounded_audit_text(value: &str, max_chars: usize) -> String {
+    value
+        .chars()
+        .take(max_chars)
+        .map(|character| {
+            if character.is_control() {
+                '\u{fffd}'
+            } else {
+                character
+            }
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use std::{
@@ -1720,7 +1787,8 @@ mod tests {
                 CancellationToken::new(),
                 |_| async { Err::<(), _>("safe failure") },
                 |_| ToolWorkErrorDisposition::Failure {
-                    reason: Some("invalid_params".to_owned()),
+                    reason: Some("invalid_params"),
+                    audit_problems: Vec::new(),
                     details: Some(json!({
                         "problems": [{
                             "path": "/amount",
@@ -1741,6 +1809,110 @@ mod tests {
                 ..
             } if reason == "invalid_params" && details["problems"][0]["path"] == json!("/amount")
         ));
+    }
+
+    #[derive(Clone, Default)]
+    struct WorkFailureLogs(Arc<Mutex<Vec<u8>>>);
+
+    impl std::io::Write for WorkFailureLogs {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0
+                .lock()
+                .expect("test log lock should be healthy")
+                .extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn work_failure_audit_preserves_categories_and_never_copies_caller_details() {
+        let logs = WorkFailureLogs::default();
+        let writer = logs.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .without_time()
+            .with_writer(move || writer.clone())
+            .finish();
+        let guard = crate::tracing_test_guard(subscriber);
+        let (runtime, capture) = runtime_with_tools([("tool", enabled_tool(500, 1))], 2, 1, 100);
+        for reason in [
+            Some("invalid_params"),
+            Some("host_not_allowed"),
+            Some("catalog_stale"),
+            Some("composite_failed"),
+            None,
+        ] {
+            runtime.execute_result_with_context_and_reason(
+                "tool", context(), CancellationToken::new(),
+                |_| async { Err::<(), _>("raw-display-error-canary") },
+                |_| ToolWorkErrorDisposition::Failure {
+                    reason,
+                    details: Some(json!({
+                        "allowed": ["enum-value-canary"],
+                        "token": "credential-canary",
+                        "problems": [{"path": "/caller-key-canary", "message": "caller-message-canary"}],
+                    })),
+                    audit_problems: Vec::new(),
+                },
+            ).await.expect_err("work should fail");
+        }
+        drop(guard);
+        wait_until(Duration::from_secs(2), || capture.events().len() == 10).await;
+        let events = capture.events();
+        let failures: Vec<_> = events
+            .iter()
+            .filter(|event| event.event_type == audit::event::TOOL_INVOKE_FAILURE)
+            .collect();
+        assert_eq!(failures.len(), 5);
+        for (event, reason) in failures.iter().zip([
+            Some("invalid_params"),
+            Some("host_not_allowed"),
+            Some("catalog_stale"),
+            Some("composite_failed"),
+            None,
+        ]) {
+            let mut expected = json!({
+                "tool_name": "tool",
+                "outcome": "failure",
+                "reason": "work_error",
+                "invocation_source": "internal",
+            });
+            if let Some(reason) = reason {
+                expected["failure_reason"] = json!(reason);
+            }
+            assert_eq!(event.payload, expected);
+        }
+        let logs = String::from_utf8(
+            logs.0
+                .lock()
+                .expect("test log lock should be healthy")
+                .clone(),
+        )
+        .expect("logs should be UTF-8");
+        assert!(logs.contains("tool_name=tool"));
+        assert!(logs.contains("failure_reason"));
+        assert!(logs.contains("invalid_params"));
+        assert!(logs.contains("work_error"));
+        let evidence = format!(
+            "{logs}{}",
+            serde_json::to_string(&events).expect("audit should serialize")
+        );
+        for canary in [
+            "raw-display-error-canary",
+            "enum-value-canary",
+            "credential-canary",
+            "caller-key-canary",
+            "caller-message-canary",
+        ] {
+            assert!(
+                !evidence.contains(canary),
+                "work failure evidence must not copy {canary}"
+            );
+        }
     }
 
     #[tokio::test]
@@ -2890,6 +3062,7 @@ mod tests {
                 |_| ToolWorkErrorDisposition::Failure {
                     reason: None,
                     details: None,
+                    audit_problems: Vec::new(),
                 },
                 |is_error| is_error.then_some("mcp_tool_error"),
             )
