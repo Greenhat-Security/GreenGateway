@@ -1,0 +1,609 @@
+{
+  "schema_version": 1,
+  "duplicates": [
+    {
+      "name": "block-buffer",
+      "versions": [
+        "0.10.4",
+        "0.12.1"
+      ],
+      "owner": "GreenGateway maintainers",
+      "expires": "2026-12-01",
+      "reason": "The 0.10 and 0.11 digest families use incompatible buffer APIs.",
+      "remediation": "Re-evaluate when the listed parent dependencies update; remove the exception once their version requirements converge.",
+      "parents": {
+        "0.10.4": [
+          "digest@0.10.7"
+        ],
+        "0.12.1": [
+          "cipher@0.5.2",
+          "digest@0.11.3"
+        ]
+      }
+    },
+    {
+      "name": "const-oid",
+      "versions": [
+        "0.9.6",
+        "0.10.2"
+      ],
+      "owner": "GreenGateway maintainers",
+      "expires": "2026-12-01",
+      "reason": "DER/X509 still use 0.9 while the newer digest family requires 0.10.",
+      "remediation": "Re-evaluate when the listed parent dependencies update; remove the exception once their version requirements converge.",
+      "parents": {
+        "0.9.6": [
+          "der@0.7.10",
+          "x509-cert@0.2.5"
+        ],
+        "0.10.2": [
+          "digest@0.11.3"
+        ]
+      }
+    },
+    {
+      "name": "cpufeatures",
+      "versions": [
+        "0.2.17",
+        "0.3.0"
+      ],
+      "owner": "GreenGateway maintainers",
+      "expires": "2026-12-01",
+      "reason": "SHA1/older SHA2 and current ChaCha/Poly1305 require different CPU feature APIs.",
+      "remediation": "Re-evaluate when the listed parent dependencies update; remove the exception once their version requirements converge.",
+      "parents": {
+        "0.2.17": [
+          "sha1@0.10.7",
+          "sha2@0.10.9"
+        ],
+        "0.3.0": [
+          "chacha20@0.10.2",
+          "poly1305@0.9.1",
+          "sha2@0.11.0"
+        ]
+      }
+    },
+    {
+      "name": "crypto-common",
+      "versions": [
+        "0.1.7",
+        "0.2.2"
+      ],
+      "owner": "GreenGateway maintainers",
+      "expires": "2026-12-01",
+      "reason": "The existing HMAC/SHA and current AEAD/cipher implementations use incompatible RustCrypto generations.",
+      "remediation": "Re-evaluate when the listed parent dependencies update; remove the exception once their version requirements converge.",
+      "parents": {
+        "0.1.7": [
+          "digest@0.10.7"
+        ],
+        "0.2.2": [
+          "aead@0.6.1",
+          "cipher@0.5.2",
+          "digest@0.11.3",
+          "universal-hash@0.6.1"
+        ]
+      }
+    },
+    {
+      "name": "digest",
+      "versions": [
+        "0.10.7",
+        "0.11.3"
+      ],
+      "owner": "GreenGateway maintainers",
+      "expires": "2026-12-01",
+      "reason": "Gateway HMAC/SHA1/SHA2 and PostgreSQL protocol crypto use different digest generations.",
+      "remediation": "Re-evaluate when the listed parent dependencies update; remove the exception once their version requirements converge.",
+      "parents": {
+        "0.10.7": [
+          "hmac@0.12.1",
+          "sha1@0.10.7",
+          "sha2@0.10.9"
+        ],
+        "0.11.3": [
+          "hmac@0.13.0",
+          "md-5@0.11.0",
+          "sha2@0.11.0"
+        ]
+      }
+    },
+    {
+      "name": "fallible-iterator",
+      "versions": [
+        "0.2.0",
+        "0.3.0"
+      ],
+      "owner": "GreenGateway maintainers",
+      "expires": "2026-12-01",
+      "reason": "PostgreSQL and bundled SQLite require different fallible iterator interfaces.",
+      "remediation": "Re-evaluate when the listed parent dependencies update; remove the exception once their version requirements converge.",
+      "parents": {
+        "0.2.0": [
+          "postgres-protocol@0.6.12",
+          "postgres-types@0.2.14",
+          "tokio-postgres@0.7.18"
+        ],
+        "0.3.0": [
+          "rusqlite@0.32.1"
+        ]
+      }
+    },
+    {
+      "name": "getrandom",
+      "versions": [
+        "0.2.17",
+        "0.3.4",
+        "0.4.3"
+      ],
+      "owner": "GreenGateway maintainers",
+      "expires": "2026-12-01",
+      "reason": "TLS, random generators, schema tooling and current UUID/tempfile use three incompatible generations.",
+      "remediation": "Re-evaluate when the listed parent dependencies update; remove the exception once their version requirements converge.",
+      "parents": {
+        "0.2.17": [
+          "jsonwebtoken@10.4.0",
+          "rand_core@0.6.4",
+          "ring@0.17.14"
+        ],
+        "0.3.4": [
+          "ahash@0.8.12",
+          "gateway@1.0.1",
+          "jobserver@0.1.34",
+          "jsonschema@0.46.9",
+          "quinn-proto@0.11.15",
+          "rand_core@0.9.5",
+          "referencing@0.46.9"
+        ],
+        "0.4.3": [
+          "crypto-common@0.2.2",
+          "deadpool-postgres@0.14.2",
+          "rand@0.10.2",
+          "tempfile@3.27.0",
+          "uuid@1.23.4"
+        ]
+      }
+    },
+    {
+      "name": "hashbrown",
+      "versions": [
+        "0.14.5",
+        "0.16.1",
+        "0.17.1"
+      ],
+      "owner": "GreenGateway maintainers",
+      "expires": "2026-12-01",
+      "reason": "SQLite hashlink, metrics/schema references and indexmap require distinct table APIs.",
+      "remediation": "Re-evaluate when the listed parent dependencies update; remove the exception once their version requirements converge.",
+      "parents": {
+        "0.14.5": [
+          "hashlink@0.9.1"
+        ],
+        "0.16.1": [
+          "metrics-util@0.20.4",
+          "referencing@0.46.9"
+        ],
+        "0.17.1": [
+          "indexmap@2.14.0"
+        ]
+      }
+    },
+    {
+      "name": "hmac",
+      "versions": [
+        "0.12.1",
+        "0.13.0"
+      ],
+      "owner": "GreenGateway maintainers",
+      "expires": "2026-12-01",
+      "reason": "Gateway request authentication uses 0.12 while PostgreSQL protocol uses 0.13.",
+      "remediation": "Re-evaluate when the listed parent dependencies update; remove the exception once their version requirements converge.",
+      "parents": {
+        "0.12.1": [
+          "gateway@1.0.1"
+        ],
+        "0.13.0": [
+          "postgres-protocol@0.6.12"
+        ]
+      }
+    },
+    {
+      "name": "io-lifetimes",
+      "versions": [
+        "2.0.4",
+        "3.0.1"
+      ],
+      "owner": "GreenGateway maintainers",
+      "expires": "2026-12-01",
+      "reason": "File timestamp support and capability filesystem APIs have different interface generations.",
+      "remediation": "Re-evaluate when the listed parent dependencies update; remove the exception once their version requirements converge.",
+      "parents": {
+        "2.0.4": [
+          "fs-set-times@0.20.3"
+        ],
+        "3.0.1": [
+          "cap-fs-ext@4.0.2",
+          "cap-primitives@4.0.2",
+          "cap-std@4.0.2",
+          "io-extras@0.19.0"
+        ]
+      }
+    },
+    {
+      "name": "r-efi",
+      "versions": [
+        "5.3.0",
+        "6.0.0"
+      ],
+      "owner": "GreenGateway maintainers",
+      "expires": "2026-12-01",
+      "reason": "The 0.3 and 0.4 getrandom generations require different UEFI bindings.",
+      "remediation": "Re-evaluate when the listed parent dependencies update; remove the exception once their version requirements converge.",
+      "parents": {
+        "5.3.0": [
+          "getrandom@0.3.4"
+        ],
+        "6.0.0": [
+          "getrandom@0.4.3"
+        ]
+      }
+    },
+    {
+      "name": "rand",
+      "versions": [
+        "0.9.4",
+        "0.10.2"
+      ],
+      "owner": "GreenGateway maintainers",
+      "expires": "2026-12-01",
+      "reason": "Metrics/properties/QUIC/WebSocket and PostgreSQL/MCP require different random-generator APIs.",
+      "remediation": "Re-evaluate when the listed parent dependencies update; remove the exception once their version requirements converge.",
+      "parents": {
+        "0.9.4": [
+          "metrics-util@0.20.4",
+          "proptest@1.11.0",
+          "quinn-proto@0.11.15",
+          "tungstenite@0.29.0"
+        ],
+        "0.10.2": [
+          "postgres-protocol@0.6.12",
+          "rmcp@2.1.0",
+          "tokio-postgres@0.7.18"
+        ]
+      }
+    },
+    {
+      "name": "rand_core",
+      "versions": [
+        "0.6.4",
+        "0.9.5",
+        "0.10.1"
+      ],
+      "owner": "GreenGateway maintainers",
+      "expires": "2026-12-01",
+      "reason": "Signature, property/QUIC generators and current crypto require distinct rand_core traits.",
+      "remediation": "Re-evaluate when the listed parent dependencies update; remove the exception once their version requirements converge.",
+      "parents": {
+        "0.6.4": [
+          "signature@2.2.0"
+        ],
+        "0.9.5": [
+          "rand@0.9.4",
+          "rand_chacha@0.9.0",
+          "rand_xorshift@0.4.0",
+          "rand_xoshiro@0.7.0"
+        ],
+        "0.10.1": [
+          "chacha20@0.10.2",
+          "crypto-common@0.2.2",
+          "getrandom@0.4.3",
+          "rand@0.10.2"
+        ]
+      }
+    },
+    {
+      "name": "sha2",
+      "versions": [
+        "0.10.9",
+        "0.11.0"
+      ],
+      "owner": "GreenGateway maintainers",
+      "expires": "2026-12-01",
+      "reason": "Gateway/embedded asset hashing and current PostgreSQL crypto use different digest APIs.",
+      "remediation": "Re-evaluate when the listed parent dependencies update; remove the exception once their version requirements converge.",
+      "parents": {
+        "0.10.9": [
+          "gateway@1.0.1",
+          "rust-embed-utils@8.11.0"
+        ],
+        "0.11.0": [
+          "postgres-protocol@0.6.12",
+          "tokio-postgres-rustls@0.14.0"
+        ]
+      }
+    },
+    {
+      "name": "untrusted",
+      "versions": [
+        "0.7.1",
+        "0.9.0"
+      ],
+      "owner": "GreenGateway maintainers",
+      "expires": "2026-12-01",
+      "reason": "AWS-LC and ring/webpki select distinct parsing interfaces; changing TLS backends is out of scope.",
+      "remediation": "Re-evaluate when the listed parent dependencies update; remove the exception once their version requirements converge.",
+      "parents": {
+        "0.7.1": [
+          "aws-lc-rs@1.17.1"
+        ],
+        "0.9.0": [
+          "ring@0.17.14",
+          "rustls-webpki@0.103.13"
+        ]
+      }
+    },
+    {
+      "name": "wasi",
+      "versions": [
+        "0.11.1+wasi-snapshot-preview1",
+        "0.14.7+wasi-0.2.4"
+      ],
+      "owner": "GreenGateway maintainers",
+      "expires": "2026-12-01",
+      "reason": "Existing socket/randomness support and wasite use separate WASI interface generations.",
+      "remediation": "Re-evaluate when the listed parent dependencies update; remove the exception once their version requirements converge.",
+      "parents": {
+        "0.11.1+wasi-snapshot-preview1": [
+          "getrandom@0.2.17",
+          "mio@1.2.1",
+          "quanta@0.12.6"
+        ],
+        "0.14.7+wasi-0.2.4": [
+          "wasite@1.0.2"
+        ]
+      }
+    },
+    {
+      "name": "windows-sys",
+      "versions": [
+        "0.52.0",
+        "0.60.2",
+        "0.61.2"
+      ],
+      "owner": "GreenGateway maintainers",
+      "expires": "2026-12-01",
+      "reason": "Filesystem, notifications and TLS/runtime dependencies select distinct Windows ABI binding generations.",
+      "remediation": "Re-evaluate when the listed parent dependencies update; remove the exception once their version requirements converge.",
+      "parents": {
+        "0.52.0": [
+          "fs-set-times@0.20.3",
+          "ring@0.17.14",
+          "winx@0.36.4"
+        ],
+        "0.60.2": [
+          "io-extras@0.19.0",
+          "notify@8.2.0",
+          "quinn-udp@0.5.14"
+        ],
+        "0.61.2": [
+          "cap-fs-ext@4.0.2",
+          "cap-primitives@4.0.2",
+          "errno@0.3.14",
+          "gateway@1.0.1",
+          "mio@1.2.1",
+          "nu-ansi-term@0.50.3",
+          "rustix@1.1.4",
+          "rustls-platform-verifier@0.7.0",
+          "schannel@0.1.29",
+          "socket2@0.6.4",
+          "tempfile@3.27.0",
+          "tokio@1.52.3",
+          "winapi-util@0.1.11"
+        ]
+      }
+    },
+    {
+      "name": "windows-targets",
+      "versions": [
+        "0.52.6",
+        "0.53.5"
+      ],
+      "owner": "GreenGateway maintainers",
+      "expires": "2026-12-01",
+      "reason": "windows-sys 0.52 and 0.60 require their matching native import libraries.",
+      "remediation": "Re-evaluate when the listed parent dependencies update; remove the exception once their version requirements converge.",
+      "parents": {
+        "0.52.6": [
+          "windows-sys@0.52.0"
+        ],
+        "0.53.5": [
+          "windows-sys@0.60.2"
+        ]
+      }
+    },
+    {
+      "name": "windows_aarch64_gnullvm",
+      "versions": [
+        "0.52.6",
+        "0.53.1"
+      ],
+      "owner": "GreenGateway maintainers",
+      "expires": "2026-12-01",
+      "reason": "The windows-targets 0.52 and 0.53 packages require their matching architecture-specific native import libraries.",
+      "remediation": "Re-evaluate when the listed parent dependencies update; remove the exception once their version requirements converge.",
+      "parents": {
+        "0.52.6": [
+          "windows-targets@0.52.6"
+        ],
+        "0.53.1": [
+          "windows-targets@0.53.5"
+        ]
+      }
+    },
+    {
+      "name": "windows_aarch64_msvc",
+      "versions": [
+        "0.52.6",
+        "0.53.1"
+      ],
+      "owner": "GreenGateway maintainers",
+      "expires": "2026-12-01",
+      "reason": "The windows-targets 0.52 and 0.53 packages require their matching architecture-specific native import libraries.",
+      "remediation": "Re-evaluate when the listed parent dependencies update; remove the exception once their version requirements converge.",
+      "parents": {
+        "0.52.6": [
+          "windows-targets@0.52.6"
+        ],
+        "0.53.1": [
+          "windows-targets@0.53.5"
+        ]
+      }
+    },
+    {
+      "name": "windows_i686_gnu",
+      "versions": [
+        "0.52.6",
+        "0.53.1"
+      ],
+      "owner": "GreenGateway maintainers",
+      "expires": "2026-12-01",
+      "reason": "The windows-targets 0.52 and 0.53 packages require their matching architecture-specific native import libraries.",
+      "remediation": "Re-evaluate when the listed parent dependencies update; remove the exception once their version requirements converge.",
+      "parents": {
+        "0.52.6": [
+          "windows-targets@0.52.6"
+        ],
+        "0.53.1": [
+          "windows-targets@0.53.5"
+        ]
+      }
+    },
+    {
+      "name": "windows_i686_gnullvm",
+      "versions": [
+        "0.52.6",
+        "0.53.1"
+      ],
+      "owner": "GreenGateway maintainers",
+      "expires": "2026-12-01",
+      "reason": "The windows-targets 0.52 and 0.53 packages require their matching architecture-specific native import libraries.",
+      "remediation": "Re-evaluate when the listed parent dependencies update; remove the exception once their version requirements converge.",
+      "parents": {
+        "0.52.6": [
+          "windows-targets@0.52.6"
+        ],
+        "0.53.1": [
+          "windows-targets@0.53.5"
+        ]
+      }
+    },
+    {
+      "name": "windows_i686_msvc",
+      "versions": [
+        "0.52.6",
+        "0.53.1"
+      ],
+      "owner": "GreenGateway maintainers",
+      "expires": "2026-12-01",
+      "reason": "The windows-targets 0.52 and 0.53 packages require their matching architecture-specific native import libraries.",
+      "remediation": "Re-evaluate when the listed parent dependencies update; remove the exception once their version requirements converge.",
+      "parents": {
+        "0.52.6": [
+          "windows-targets@0.52.6"
+        ],
+        "0.53.1": [
+          "windows-targets@0.53.5"
+        ]
+      }
+    },
+    {
+      "name": "windows_x86_64_gnu",
+      "versions": [
+        "0.52.6",
+        "0.53.1"
+      ],
+      "owner": "GreenGateway maintainers",
+      "expires": "2026-12-01",
+      "reason": "The windows-targets 0.52 and 0.53 packages require their matching architecture-specific native import libraries.",
+      "remediation": "Re-evaluate when the listed parent dependencies update; remove the exception once their version requirements converge.",
+      "parents": {
+        "0.52.6": [
+          "windows-targets@0.52.6"
+        ],
+        "0.53.1": [
+          "windows-targets@0.53.5"
+        ]
+      }
+    },
+    {
+      "name": "windows_x86_64_gnullvm",
+      "versions": [
+        "0.52.6",
+        "0.53.1"
+      ],
+      "owner": "GreenGateway maintainers",
+      "expires": "2026-12-01",
+      "reason": "The windows-targets 0.52 and 0.53 packages require their matching architecture-specific native import libraries.",
+      "remediation": "Re-evaluate when the listed parent dependencies update; remove the exception once their version requirements converge.",
+      "parents": {
+        "0.52.6": [
+          "windows-targets@0.52.6"
+        ],
+        "0.53.1": [
+          "windows-targets@0.53.5"
+        ]
+      }
+    },
+    {
+      "name": "windows_x86_64_msvc",
+      "versions": [
+        "0.52.6",
+        "0.53.1"
+      ],
+      "owner": "GreenGateway maintainers",
+      "expires": "2026-12-01",
+      "reason": "The windows-targets 0.52 and 0.53 packages require their matching architecture-specific native import libraries.",
+      "remediation": "Re-evaluate when the listed parent dependencies update; remove the exception once their version requirements converge.",
+      "parents": {
+        "0.52.6": [
+          "windows-targets@0.52.6"
+        ],
+        "0.53.1": [
+          "windows-targets@0.53.5"
+        ]
+      }
+    }
+  ],
+  "licenses": [
+    {
+      "crate": "notify@8.2.0",
+      "allow": [
+        "CC0-1.0"
+      ],
+      "reason": "Existing filesystem watcher. Retain its CC0 text; this exact exception does not approve new CC0 code dependencies.",
+      "owner": "GreenGateway maintainers",
+      "expires": "2026-12-01",
+      "remediation": "Review the license text and distribution obligations again before updating this exact crate version."
+    },
+    {
+      "crate": "webpki-root-certs@1.0.8",
+      "allow": [
+        "CDLA-Permissive-2.0"
+      ],
+      "reason": "Existing root-certificate data used by rustls-platform-verifier. Retain the data license when redistributing the roots.",
+      "owner": "GreenGateway maintainers",
+      "expires": "2026-12-01",
+      "remediation": "Review the license text and distribution obligations again before updating this exact crate version."
+    },
+    {
+      "crate": "winx@0.36.4",
+      "allow": [
+        "Apache-2.0 WITH LLVM-exception"
+      ],
+      "reason": "Existing Windows capability filesystem binding. Retain its Apache license and LLVM exception text.",
+      "owner": "GreenGateway maintainers",
+      "expires": "2026-12-01",
+      "remediation": "Review the license text and distribution obligations again before updating this exact crate version."
+    }
+  ]
+}
