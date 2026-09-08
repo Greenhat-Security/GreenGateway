@@ -2126,15 +2126,7 @@ pub(super) fn gateway_app_with_process_started_at_and_overrides(
         admin_login_configured: admin_auth_state.is_some(),
         admin_session: admin_auth_state
             .as_ref()
-            .and_then(|state| state.sessions.as_ref())
-            .map(|sessions| AdminSessionCapabilities {
-                storage: "standalone_memory",
-                completion_mode: "cookie",
-                login_url: format!("{}auth/login", sessions.api_prefix),
-                completion_url: format!("{}auth/callback", sessions.api_prefix),
-                logout_url: format!("{}auth/logout", sessions.api_prefix),
-                max_age_seconds: sessions.ttl_seconds(),
-            }),
+            .and_then(AdminAuthState::session_capabilities),
         csrf_cookie_name: config.csrf_cookie_name.clone(),
         csrf_header_name: config.csrf_header_name.clone(),
         max_body_size: config.max_body_size,

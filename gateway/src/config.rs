@@ -2668,9 +2668,11 @@ impl Config {
             }
             // Logout is usable after expiry, but always checks its own exact
             // origin and configured CSRF pair before revoking/clearing anything.
-            let logout = format!("{api_prefix}/auth/logout");
-            auth_exempt_paths.push(logout.clone());
-            rbac_exempt_paths.push(logout);
+            for route in ["logout", "config"] {
+                let path = format!("{api_prefix}/auth/{route}");
+                auth_exempt_paths.push(path.clone());
+                rbac_exempt_paths.push(path);
+            }
         }
         let upstream_url =
             parse_optional_upstream_url(UPSTREAM_URL, get_var(UPSTREAM_URL), &mut problems);

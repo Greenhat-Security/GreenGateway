@@ -1,6 +1,14 @@
 //! admin identity boundary extracted from the application composition root.
 use super::*;
 
+/// Public login capability metadata on the management origin. It exposes no
+/// active identity, credentials, cookie values or identity-provider addresses.
+pub(super) async fn admin_auth_config_endpoint(State(state): State<AdminAuthState>) -> Response {
+    record_request("/v1/admin/auth/config");
+    Json(json!({"bearer_completion": true, "admin_session": state.session_capabilities()}))
+        .into_response()
+}
+
 pub(super) async fn admin_auth_login_endpoint(
     State(state): State<AdminAuthState>,
     request: AxumRequest,

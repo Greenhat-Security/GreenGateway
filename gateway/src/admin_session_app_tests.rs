@@ -63,7 +63,7 @@ async fn admin_session_oidc_contract_preserves_csrf_origins_prefix_and_listener_
         if split {
             config.admin_listen_addr = Some("127.0.0.1:0".parse().unwrap());
         }
-        for route in ["login", "callback", "logout"] {
+        for route in ["login", "callback", "logout", "config"] {
             config
                 .auth_exempt_paths
                 .push(format!("{PREFIX}/auth/{route}"));
@@ -84,7 +84,37 @@ async fn admin_session_oidc_contract_preserves_csrf_origins_prefix_and_listener_
             GatewayApp::Unified(router) => (router, None),
             GatewayApp::Split { admin, data } => (admin, Some(data)),
         };
-        let version = admin
+        let discovery = admin
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("{PREFIX}/auth/config"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(discovery.status(), StatusCode::OK);
+        assert_eq!(discovery.headers()[header::CACHE_CONTROL], "no-store");
+        let metadata: Value =
+            serde_json::from_slice(&to_bytes(discovery.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        assert_eq!(
+            metadata,
+            json!({
+                "bearer_completion": true,
+                "admin_session": {
+                    "storage":"standalone_memory", "completion_mode":"cookie",
+                    "login_url":format!("{PREFIX}/auth/login"),
+                    "completion_url":format!("{PREFIX}/auth/callback"),
+                    "logout_url":format!("{PREFIX}/auth/logout"),
+                    "max_age_seconds":60
+                }
+            })
+        );
+        let version = data
+            .as_ref()
+            .unwrap_or(&admin)
             .clone()
             .oneshot(
                 Request::builder()
@@ -94,6 +124,7 @@ async fn admin_session_oidc_contract_preserves_csrf_origins_prefix_and_listener_
             )
             .await
             .unwrap();
+        assert_eq!(version.status(), StatusCode::OK);
         let version: Value =
             serde_json::from_slice(&to_bytes(version.into_body(), usize::MAX).await.unwrap())
                 .unwrap();
@@ -228,6 +259,7 @@ async fn admin_session_oidc_contract_preserves_csrf_origins_prefix_and_listener_
         }
         if let Some(data) = data {
             let response = data
+                .clone()
                 .oneshot(request(
                     Method::GET,
                     &format!("{PREFIX}/status"),
@@ -239,6 +271,16 @@ async fn admin_session_oidc_contract_preserves_csrf_origins_prefix_and_listener_
                 .await
                 .unwrap();
             assert!(!response.status().is_success());
+            let response = data
+                .oneshot(
+                    Request::builder()
+                        .uri(format!("{PREFIX}/auth/config"))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::NOT_FOUND);
         }
         let denied = admin
             .clone()
@@ -308,4 +350,44 @@ async fn admin_session_oidc_contract_preserves_csrf_origins_prefix_and_listener_
         oidc.finish();
         token_endpoint.abort();
     }
+}
+
+#[tokio::test]
+async fn admin_session_discovery_is_absent_when_mode_is_disabled() {
+    let jwks_addr = spawn_test_jwks_server().await;
+    let oidc = spawn_mock_oidc_discovery_endpoint(None);
+    let mut config = admin_oidc_login_config(&oidc.issuer);
+    config.admin_prefix = "/operations".to_owned();
+    config.auth_providers[0].jwks_url =
+        Some(format!("http://127.0.0.1:{}/jwks.json", jwks_addr.port()));
+    config.auth_providers[0].redirect_uri = Some(format!("{ORIGIN}{PREFIX}/auth/callback"));
+    let router = admin_oidc_login_router_from_config(config);
+    let version = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/version")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(version.status(), StatusCode::OK);
+    let metadata: Value =
+        serde_json::from_slice(&to_bytes(version.into_body(), usize::MAX).await.unwrap()).unwrap();
+    assert_eq!(metadata["admin_login_configured"], true);
+    assert!(metadata.get("admin_session").is_none());
+    let bearer = signed_token_with_issuer("admin-operator", &["admin"], &oidc.issuer);
+    let response = router
+        .oneshot(
+            Request::builder()
+                .uri(format!("{PREFIX}/auth/config"))
+                .header(header::AUTHORIZATION, format!("Bearer {bearer}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    oidc.finish();
 }

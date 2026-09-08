@@ -478,6 +478,19 @@ pub(super) struct AdminAuthState {
 }
 
 impl AdminAuthState {
+    pub(super) fn session_capabilities(&self) -> Option<AdminSessionCapabilities> {
+        self.sessions
+            .as_ref()
+            .map(|sessions| AdminSessionCapabilities {
+                storage: "standalone_memory",
+                completion_mode: "cookie",
+                login_url: format!("{}auth/login", sessions.api_prefix),
+                completion_url: format!("{}auth/callback", sessions.api_prefix),
+                logout_url: format!("{}auth/logout", sessions.api_prefix),
+                max_age_seconds: sessions.ttl_seconds(),
+            })
+    }
+
     pub(super) fn record(
         &self,
         parts: &http::request::Parts,

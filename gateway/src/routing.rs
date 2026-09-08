@@ -537,10 +537,15 @@ pub(super) fn admin_auth_router(routes: &GatewayRoutes, state: Option<AdminAuthS
     };
 
     let router = if state.sessions.is_some() {
-        Router::new().route(
-            format!("/v1{}/auth/logout", state.admin_prefix).as_str(),
-            post(admin_auth_logout_endpoint),
-        )
+        Router::new()
+            .route(
+                format!("/v1{}/auth/logout", state.admin_prefix).as_str(),
+                post(admin_auth_logout_endpoint),
+            )
+            .route(
+                format!("/v1{}/auth/config", state.admin_prefix).as_str(),
+                get(admin_auth_config_endpoint),
+            )
     } else {
         Router::new()
     };

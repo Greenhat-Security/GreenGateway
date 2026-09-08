@@ -2406,6 +2406,12 @@ fn admin_session_config_is_explicit_bounded_and_standalone_only() {
     assert!(config
         .auth_exempt_paths
         .contains(&"/v1/operations/auth/logout".to_owned()));
+    assert!(config
+        .auth_exempt_paths
+        .contains(&"/v1/operations/auth/config".to_owned()));
+    assert!(config
+        .rbac_exempt_paths
+        .contains(&"/v1/operations/auth/config".to_owned()));
     for (key, value, expected) in [
         ("STATE_BACKEND", "postgres", "no process-local HA fallback"),
         (
