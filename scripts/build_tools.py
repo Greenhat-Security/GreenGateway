@@ -161,6 +161,8 @@ def check(root=ROOT):
             errors.append("Buildx setup must use the verified installer")
         for path in (root / ".github/workflows").glob("*.y*ml"):
             doc = yaml.load(path.read_text(), Loader=yaml.BaseLoader)
+            if path.name == "ci.yml" and "cargo-policy" not in doc.get("jobs", {}):
+                errors.append("CI must retain the required Cargo policy job")
             for job_name, job in doc.get("jobs", {}).items():
                 if "uses" in job:
                     continue
@@ -184,6 +186,12 @@ def check(root=ROOT):
                     errors.append(f"{job_name}: Cargo uses an undeclared compiler")
                 if re.search(r"\b(node|npm|npx)\b|\bcargo (build|test|clippy|llvm-cov)\b", commands) and config.get("node") != "true":
                     errors.append(f"{job_name}: Node/npm setup required before building")
+                if job_name == "cargo-policy":
+                    if job.get("strategy", {}).get("matrix", {}).get("os") != ["ubuntu-latest", "windows-latest"]:
+                        errors.append("Cargo policy requires Linux and Windows qualification")
+                    for required_command in ["python scripts/cargo_policy.py install", "python scripts/cargo_policy.py check", "test_cargo_policy.py"]:
+                        if required_command not in commands:
+                            errors.append("Cargo policy must retain verified installer, full-graph check and rejection fixtures")
                 for s in steps:
                     use, opts, run = s.get("uses", ""), s.get("with", {}), s.get("run", "")
                     if any(use.startswith(x) for x in ["actions/setup-node@", "actions/setup-python@", "dtolnay/rust-toolchain@"]):

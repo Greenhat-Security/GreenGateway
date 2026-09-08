@@ -3,6 +3,7 @@ import argparse
 from collections import defaultdict
 from datetime import date, datetime, timezone
 import io
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -31,10 +32,10 @@ def read_json(path):
 def review_metadata(entry, today):
     for field in ["owner", "reason", "remediation"]:
         if not isinstance(entry.get(field), str) or len(entry[field].strip()) < 8:
-            raise ValueError(f"exception needs substantive {field}")
+            raise ValueError(f"{entry.get('crate', entry.get('name'))}: exception needs substantive {field}")
     expiry = date.fromisoformat(entry["expires"])
     if not 0 < (expiry - today).days <= 90:
-        raise ValueError("exception expired or exceeds 90-day review horizon")
+        raise ValueError(f"{entry.get('crate', entry.get('name'))}: exception expired or exceeds 90-day review horizon")
 
 
 def expected_config(exceptions):
@@ -114,7 +115,7 @@ def lock_inventory(root=ROOT):
 
 def validate_graph(metadata, locked, exceptions):
     packages = metadata["packages"]
-    if {(p["name"], p["version"], p.get("source")) for p in packages} != locked:
+    if len(packages) != len(locked) or {(p["name"], p["version"], p.get("source")) for p in packages} != locked:
         raise ValueError("metadata does not cover the entire locked package graph")
     members = set(metadata["workspace_members"])
     byid = {p["id"]: p for p in packages}
@@ -195,7 +196,9 @@ def check(root=ROOT):
         raw = subprocess.check_output(["cargo", "metadata", "--locked", "--all-features", "--format-version", "1"], cwd=root)
         metadata = json.loads(raw)
         validate_graph(metadata, locked, exceptions)
-        report.update(stage="native-policy", packages=len(metadata["packages"]), exceptions=exceptions)
+        report.update(stage="native-policy", packages=len(metadata["packages"]), exceptions=exceptions,
+                      input_sha256={file: hashlib.sha256((root / file).read_bytes()).hexdigest()
+                                    for file in ["Cargo.lock", "deny.toml", "cargo-policy-exceptions.json", "build-tools.json"]})
         # Deliberately no metadata-path, target, feature pruning or lint override:
         # the real tool independently resolves the locked all-feature workspace.
         result = subprocess.run([str(executable(root)), "--locked", "--all-features", "--workspace",
@@ -206,6 +209,9 @@ def check(root=ROOT):
             raise ValueError("cargo-deny rejected the graph; see target/cargo-policy/diagnostics.jsonl")
         report.update(status="passed", stage="complete", tool_version=versions(root)["cargo_deny"])
         print(f"Cargo policy passed: {len(locked)} packages; exact exceptions retained in report.")
+    except Exception as error:
+        report["error"] = str(error)
+        raise
     finally:
         (output / "decision.json").write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
 
