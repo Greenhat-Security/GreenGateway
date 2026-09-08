@@ -12,6 +12,7 @@ use crate::{
         decision::{PolicyDecision, PolicyDecisionOutcome},
         rbac::{rbac_middleware, RbacState},
     },
+    upstream_route::ProxyRouteClassificationCompleted,
 };
 
 fn compile(value: Value) -> CompiledPolicy {
@@ -123,6 +124,9 @@ async fn http_lane_matches_current_middleware_decisions_reasons_order_and_shadow
                                     .uri(path)
                                     .body(Body::empty())
                                     .unwrap();
+                                request
+                                    .extensions_mut()
+                                    .insert(ProxyRouteClassificationCompleted);
                                 if let Some(identity) = identity {
                                     request.extensions_mut().insert(identity);
                                 }
