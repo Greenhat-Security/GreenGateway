@@ -198,9 +198,12 @@ pub(crate) struct ClusterReadout {
     /// Whether this replica holds the maintenance lease right now.
     pub leading: bool,
     pub pool: Option<PoolFacts>,
-    /// How many migrations the authority's ledger carries, as the
-    /// readiness probe last observed it.
+    /// The last ledger version in the readiness probe's bounded sample.
+    /// For valid history this is also its number of applied migrations.
     pub schema_ledger_version: Option<i32>,
+    /// The full history/read-write verdict from the same cached observation.
+    /// A matching version number alone does not establish compatibility.
+    pub schema_ledger_compatible: Option<bool>,
 }
 
 /// What this process knows about itself without reading anything.
@@ -484,16 +487,19 @@ pub(crate) fn cluster_status(
             current_version: readout.schema_ledger_version,
             binary_min: local.schema_versions.0,
             binary_max: local.schema_versions.1,
-            compatible: match readout.schema_ledger_version {
-                Some(version) => {
-                    version >= local.schema_versions.0 && version <= local.schema_versions.1
-                }
-                // Standalone has no shared ledger to disagree with, and a
-                // ledger this replica could not read is not evidence of
-                // disagreement -- `storage_unavailable` is what reports
-                // that, on `/readyz` and in `reason`.
-                None => true,
-            },
+            compatible: readout
+                .schema_ledger_compatible
+                .unwrap_or(readout.schema_ledger_version.is_none())
+                && match readout.schema_ledger_version {
+                    Some(version) => {
+                        version >= local.schema_versions.0 && version <= local.schema_versions.1
+                    }
+                    // Standalone has no shared ledger to disagree with, and a
+                    // ledger this replica could not read is not evidence of
+                    // disagreement -- `storage_unavailable` is what reports
+                    // that, on `/readyz` and in `reason`.
+                    None => true,
+                },
         },
         replicas: ReplicaCounts {
             ready: ready_count,
@@ -952,6 +958,7 @@ impl ClusterStatusSource for PostgresClusterStatusSource {
             // Filled in by the caller from the readiness probe's cached
             // observation, not by a second query of our own.
             schema_ledger_version: None,
+            schema_ledger_compatible: None,
         }
     }
 }
@@ -1030,6 +1037,7 @@ pub(crate) mod test_support {
                 timeouts_total: 0,
             }),
             schema_ledger_version: None,
+            schema_ledger_compatible: None,
         }
     }
 }
@@ -1141,6 +1149,7 @@ mod tests {
                 timeouts_total: 0,
             }),
             schema_ledger_version: Some(10),
+            schema_ledger_compatible: Some(true),
         }
     }
 
@@ -1371,6 +1380,17 @@ mod tests {
                 "a ledger of {ledger} is outside 10..=10"
             );
         }
+    }
+
+    #[test]
+    fn a_matching_version_with_invalid_history_is_not_compatible() {
+        let readout = ClusterReadout {
+            schema_ledger_compatible: Some(false),
+            ..two_live_members()
+        };
+        let status = cluster_status(&local_facts(), &readout);
+        assert_eq!(status.schema.current_version, Some(10));
+        assert!(!status.schema.compatible);
     }
 
     // --- redaction ---
