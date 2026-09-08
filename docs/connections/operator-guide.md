@@ -719,6 +719,32 @@ data, and bounded latency where applicable. They must not contain resolved
 values, secret locators, token responses, certificate contents, arguments,
 results, upstream bodies, DNS answers, or raw transport errors.
 
+Executor work failures retain `reason: "work_error"` for existing consumers and
+add `failure_reason`, for example `invalid_params`, `host_not_allowed`,
+`catalog_stale`, or `internal_configuration_error`. A warning log records the
+tool name and this category, without the display error or arguments.
+
+Input-schema failures also include at most 16 `problems` entries with `path`,
+`keyword`, and `message`. Paths and keywords are capped at 64 characters;
+messages are capped at 128. Paths preserve schema-defined property names and
+array indices. Caller-selected map keys and ambiguous schema traversal become
+`*`, and messages use fixed descriptions. Enum choices and unexpected property
+names remain in the caller's existing error response, but are omitted from
+audit evidence because they can contain caller or upstream data.
+
+Query a specific failure through the authenticated admin audit API:
+
+```text
+GET /v1/admin/audit?event_type=tool.invoke_failure&reason=invalid_params
+```
+
+The `reason` filter matches either top-level `reason` or `failure_reason` exactly
+and composes with the existing filters and `before_id` cursor. Thus
+`reason=work_error` still selects the umbrella category, including older rows;
+older rows without a detailed failure reason cannot be reconstructed. The
+filter accepts 1–64 lowercase ASCII letters, digits, or underscores. Use the
+configured admin prefix when it differs from `/v1/admin`.
+
 Prometheus metrics remain available at `/metrics`. At minimum, monitor normal
 request outcomes for the Connection admin/test/refresh routes and
 `connection_oauth_token_refresh_total` by its bounded `result` and `reason`

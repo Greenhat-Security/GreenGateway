@@ -38,6 +38,8 @@ pub struct AuditQueryFilters {
     pub from: Option<String>,
     pub to: Option<String>,
     pub event_type: Option<String>,
+    /// Exact match against either top-level string `reason` or `failure_reason`.
+    pub reason: Option<String>,
     pub actor: Option<String>,
     pub actor_issuer: Option<String>,
     pub actor_auth_mode: Option<String>,
@@ -965,6 +967,14 @@ fn build_query(filters: &AuditQueryFilters) -> (String, Vec<SqlValue>) {
         clauses.push("event_type = ?");
         params.push(SqlValue::Text(event_type.clone()));
     }
+    if let Some(reason) = &filters.reason {
+        clauses.push(
+            "((json_type(payload_json, '$.reason') = 'text' AND json_extract(payload_json, '$.reason') = ?) \
+             OR (json_type(payload_json, '$.failure_reason') = 'text' AND json_extract(payload_json, '$.failure_reason') = ?))",
+        );
+        params.push(SqlValue::Text(reason.clone()));
+        params.push(SqlValue::Text(reason.clone()));
+    }
     if let Some(actor) = &filters.actor {
         clauses.push("actor_user_id = ?");
         params.push(SqlValue::Text(actor.clone()));
@@ -1614,6 +1624,7 @@ mod tests {
                 path: None,
                 status: None,
                 matched_rule_id: None,
+                reason: None,
                 limit: 10,
                 before_id: None,
             })
@@ -1682,6 +1693,7 @@ mod tests {
                 path: None,
                 status: None,
                 matched_rule_id: None,
+                reason: None,
                 limit: 10,
                 before_id: None,
             })
@@ -2163,6 +2175,7 @@ mod tests {
                 path: None,
                 status: None,
                 matched_rule_id: None,
+                reason: None,
                 limit: 100,
                 before_id: None,
             },
@@ -2182,6 +2195,7 @@ mod tests {
                 path: Some("/benchmark/123".to_owned()),
                 status: None,
                 matched_rule_id: None,
+                reason: None,
                 limit: 100,
                 before_id: None,
             },
@@ -2201,6 +2215,7 @@ mod tests {
                 path: None,
                 status: Some(204),
                 matched_rule_id: None,
+                reason: None,
                 limit: 100,
                 before_id: None,
             },
@@ -2220,6 +2235,7 @@ mod tests {
                 path: None,
                 status: None,
                 matched_rule_id: None,
+                reason: None,
                 limit: 100,
                 before_id: Some(500_000),
             },
