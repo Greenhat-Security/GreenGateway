@@ -8,7 +8,6 @@ use tower::ServiceExt;
 use super::*;
 use crate::{
     audit::{sink::tests::CaptureSink, AuditLog, AuditSink},
-    client_ip::ClientIpPolicy,
     middleware::{
         decision::{PolicyDecision, PolicyDecisionOutcome},
         rbac::{rbac_middleware, RbacState},
@@ -85,12 +84,7 @@ async fn http_lane_matches_current_middleware_decisions_reasons_order_and_shadow
                     let policy = Policy::validate_json_value(value).unwrap();
                     let capture = CaptureSink::new();
                     let audit = AuditLog::new(Arc::new(capture.clone()) as Arc<dyn AuditSink>);
-                    let state = RbacState::new(
-                        policy.clone(),
-                        Vec::new(),
-                        ClientIpPolicy::default(),
-                        audit.clone(),
-                    );
+                    let state = RbacState::new(policy.clone(), Vec::new(), false, audit.clone());
                     let router = Router::new()
                         .fallback(any(|| async { "local" }))
                         .layer(from_fn_with_state(state, rbac_middleware));
