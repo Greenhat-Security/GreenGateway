@@ -1309,14 +1309,15 @@ impl ClusterAdminState {
             Some(source) => source.read().await,
             None => cluster_status::ClusterReadout::default(),
         };
-        // The ledger's extent comes from the readiness probe's cached
-        // observation, so this endpoint reports the number `/readyz`
-        // judged `schema_incompatible` on rather than a second, possibly
-        // different, read.
-        readout.schema_ledger_version = match self.readiness_probe.as_ref() {
-            Some(probe) => probe.observed_schema_version().await,
+        // Keep the full compatibility verdict and extent from one cached
+        // observation; a recognized version with a changed checksum is
+        // incompatible on both the status endpoint and `/readyz`.
+        let schema = match self.readiness_probe.as_ref() {
+            Some(probe) => probe.observed_schema().await,
             None => None,
         };
+        readout.schema_ledger_version = schema.map(|(version, _)| version);
+        readout.schema_ledger_compatible = schema.map(|(_, compatible)| compatible);
         let local = cluster_status::LocalFacts {
             cluster_mode: self.cluster_mode,
             instance_id: self.identity.instance_id(),
