@@ -1414,7 +1414,7 @@ pub(crate) mod postgres_audit_tests {
             .expect("the ledger row should delete");
         assert_eq!(
             authority.observe().await,
-            AuthorityObservation::Writable {
+            AuthorityObservation::IncompatibleSchema {
                 schema_version: schema_maximum - 1
             }
         );
@@ -1472,7 +1472,7 @@ pub(crate) mod postgres_audit_tests {
             .expect("the ledger should drop");
         assert_eq!(
             authority.observe().await,
-            AuthorityObservation::Writable { schema_version: 0 }
+            AuthorityObservation::IncompatibleSchema { schema_version: 0 }
         );
         assert_eq!(probe.blocked_reason().await, Some(SCHEMA_INCOMPATIBLE));
 
