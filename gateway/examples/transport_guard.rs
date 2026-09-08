@@ -124,7 +124,7 @@ impl Tree {
             )
             .into());
         }
-        let source = syn::parse_file(&fs::read_to_string(&absolute)?)?;
+        let source = syn::parse_file(&fs::read_to_string(&absolute)?.replace("\r\n", "\n"))?;
         let test = test || test_only(&source.attrs);
         self.files.insert(
             relative.clone(),
