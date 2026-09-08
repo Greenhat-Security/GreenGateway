@@ -27,6 +27,70 @@ fn test_router(config: CsrfConfig) -> Router {
         .layer(from_fn_with_state(config, csrf_middleware))
 }
 
+#[test]
+fn admin_session_csrf_requires_enabled_config_and_its_configured_names() {
+    let mut config = test_config(true);
+    config.cookie_name = "ops_csrf".to_owned();
+    config.header_name = "x-ops-csrf".to_owned();
+    let mut headers = HeaderMap::new();
+    headers.insert(COOKIE, HeaderValue::from_static("ops_csrf=csrf-fixture"));
+    headers.insert("x-ops-csrf", HeaderValue::from_static("csrf-fixture"));
+    assert!(admin_session_csrf_matches(&config, &headers));
+    assert!(!admin_session_csrf_matches(&test_config(true), &headers));
+
+    config.enabled = false;
+    assert!(!admin_session_csrf_matches(&config, &headers));
+}
+
+#[test]
+fn admin_session_csrf_rejects_missing_empty_mismatched_or_ambiguous_tokens() {
+    let config = test_config(true);
+    for (cookies, tokens) in [
+        (vec![], vec!["csrf-fixture"]),
+        (vec!["other=value"], vec!["csrf-fixture"]),
+        (vec!["csrf_token="], vec!["csrf-fixture"]),
+        (vec!["csrf_token=csrf-fixture"], vec![]),
+        (vec!["csrf_token=csrf-fixture"], vec![""]),
+        (vec!["csrf_token=csrf-fixture"], vec!["different-fixture"]),
+        (
+            vec!["csrf_token=csrf-fixture; csrf_token=csrf-fixture"],
+            vec!["csrf-fixture"],
+        ),
+        (
+            vec!["csrf_token=csrf-fixture", "csrf_token=csrf-fixture"],
+            vec!["csrf-fixture"],
+        ),
+        (
+            vec!["csrf_token=csrf-fixture"],
+            vec!["csrf-fixture", "csrf-fixture"],
+        ),
+    ] {
+        let mut headers = HeaderMap::new();
+        // Issued-session lifecycle checks stay mandatory with a bearer header.
+        headers.insert(AUTHORIZATION, HeaderValue::from_static("Bearer fixture"));
+        for cookie in &cookies {
+            headers.append(COOKIE, HeaderValue::from_str(cookie).unwrap());
+        }
+        for token in &tokens {
+            headers.append("x-csrf-token", HeaderValue::from_str(token).unwrap());
+        }
+        assert!(
+            !admin_session_csrf_matches(&config, &headers),
+            "cookies={cookies:?}, tokens={tokens:?}"
+        );
+    }
+
+    let mut headers = HeaderMap::new();
+    headers.insert(COOKIE, HeaderValue::from_static("csrf_token=csrf-fixture"));
+    headers.insert("x-csrf-token", HeaderValue::from_bytes(&[0xff]).unwrap());
+    assert!(!admin_session_csrf_matches(&config, &headers));
+    headers.insert("x-csrf-token", HeaderValue::from_static("csrf-fixture"));
+    headers.append(COOKIE, HeaderValue::from_static("unrelated=fixture"));
+    assert!(admin_session_csrf_matches(&config, &headers));
+    headers.insert(COOKIE, HeaderValue::from_bytes(&[0xff]).unwrap());
+    assert!(!admin_session_csrf_matches(&config, &headers));
+}
+
 #[tokio::test]
 async fn disabled_post_without_token_passes_through() {
     let response = test_router(test_config(false))
