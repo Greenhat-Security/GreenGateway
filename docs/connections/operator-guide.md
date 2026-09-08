@@ -683,7 +683,10 @@ the actual HTTP response status. Other top-level keys are removed.
 
 For example, a NestJS-style 400 response can preserve
 `{"statusCode":400,"error":"BadRequestException","messages":["filter must use a supported comparison operator"]}`.
-Each string is capped at 512 characters before redaction, with
+Free-form diagnostics naming Authorization, Bearer, or Basic authentication
+are withheld as `[redacted]`, including opaque credentials without a recognizable
+prefix. This conservative context check runs before truncation. Other strings
+are capped at 512 characters before token redaction, with
 `...[truncated]` appended when shortened. Existing URL, internal-hostname, and
 credential-token redaction applies to every retained string, including
 `messages` entries. Other retained values keep the existing limits of eight

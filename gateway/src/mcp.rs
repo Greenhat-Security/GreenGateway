@@ -451,6 +451,20 @@ fn sanitize_error_json_value(key: &str, value: &Value, depth: usize) -> Value {
 }
 
 fn sanitize_error_text(value: &str, max_chars: usize) -> String {
+    // An opaque credential has no recognizable prefix. Withhold diagnostics
+    // naming authorization or common credential schemes instead of guessing
+    // where an upstream's free-form credential value ends. Inspect before
+    // truncating so the context cannot be separated from an earlier value.
+    if value
+        .split(|ch: char| !ch.is_ascii_alphabetic())
+        .any(|word| {
+            word.eq_ignore_ascii_case("authorization")
+                || word.eq_ignore_ascii_case("bearer")
+                || word.eq_ignore_ascii_case("basic")
+        })
+    {
+        return REDACTED.to_owned();
+    }
     let (truncated, was_truncated) = truncate_chars(value, max_chars);
     let redacted = redact_sensitive_tokens(&truncated);
 
@@ -942,6 +956,36 @@ mod tests {
         for discarded in ["discarded", "api.example.test", "FAKE_error_token"] {
             assert!(!content.to_string().contains(discarded));
             assert!(!serialized.contains(discarded));
+        }
+    }
+
+    #[test]
+    fn http_error_authorization_diagnostics_are_withheld_in_both_result_forms() {
+        let canary = uuid::Uuid::new_v4().simple().to_string();
+        for diagnostic in [
+            format!("Authorization: Bearer {canary}"),
+            format!("proxy-AUTHORIZATION: Basic {canary}"),
+            format!("rejected bEaReR\t{canary}"),
+            format!("{canary}{} authorization diagnostic", "x".repeat(600)),
+        ] {
+            let result = call_tool_result_from_http_execution(HttpToolExecutionResult {
+                response: error_response(json!({
+                    "messages": [diagnostic, "filter must be an object"],
+                    "message": diagnostic,
+                    "statusCode": 400
+                })),
+                warnings: Vec::new(),
+            });
+            let body = &result.structured_content.as_ref().unwrap()["body"];
+            assert_eq!(
+                body["messages"],
+                json!([REDACTED, "filter must be an object"])
+            );
+            assert_eq!(body["message"], json!(REDACTED));
+            assert!(!body.to_string().contains(&canary));
+            assert!(!serde_json::to_string(&result.content)
+                .unwrap()
+                .contains(&canary));
         }
     }
 
