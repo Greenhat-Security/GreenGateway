@@ -1,0 +1,71 @@
+# Reviewed dependency policy for #431. See docs/deployment/cargo-dependency-policy.md.
+[graph]
+all-features = true
+no-default-features = false
+exclude-dev = false
+exclude-unpublished = false
+targets = []
+exclude = []
+
+[licenses]
+confidence-threshold = 0.95
+unused-allowed-license = "deny"
+allow = ["Apache-2.0", "MIT", "MIT-0", "ISC", "BSD-3-Clause", "Unicode-3.0", "Zlib"]
+exceptions = [
+  { crate = "notify@8.2.0", allow = ["CC0-1.0"] },
+  { crate = "webpki-root-certs@1.0.8", allow = ["CDLA-Permissive-2.0"] },
+  { crate = "winx@0.36.4", allow = ["Apache-2.0 WITH LLVM-exception"] },
+]
+
+[licenses.private]
+ignore = false
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []
+
+[bans]
+multiple-versions = "deny"
+wildcards = "deny"
+deny = [
+  { crate = "openssl", reason = "Gateway transport and credential TLS must use the reviewed rustls stack." },
+  { crate = "openssl-sys", reason = "Gateway transport and credential TLS must use the reviewed rustls stack." },
+  { crate = "native-tls", reason = "Gateway transport and credential TLS must use the reviewed rustls stack." },
+  { crate = "tokio-native-tls", reason = "Gateway transport and credential TLS must use the reviewed rustls stack." },
+  { crate = "hyper-tls", reason = "Gateway transport and credential TLS must use the reviewed rustls stack." },
+]
+skip = [
+  { crate = "block-buffer@0.10.4", reason = "The 0.10 and 0.11 digest families use incompatible buffer APIs." },
+  { crate = "const-oid@0.9.6", reason = "DER/X509 still use 0.9 while the newer digest family requires 0.10." },
+  { crate = "cpufeatures@0.2.17", reason = "SHA1/older SHA2 and current ChaCha/Poly1305 require different CPU feature APIs." },
+  { crate = "crypto-common@0.1.7", reason = "The existing HMAC/SHA and current AEAD/cipher implementations use incompatible RustCrypto generations." },
+  { crate = "digest@0.10.7", reason = "Gateway HMAC/SHA1/SHA2 and PostgreSQL protocol crypto use different digest generations." },
+  { crate = "fallible-iterator@0.2.0", reason = "PostgreSQL and bundled SQLite require different fallible iterator interfaces." },
+  { crate = "getrandom@0.2.17", reason = "TLS, random generators, schema tooling and current UUID/tempfile use three incompatible generations." },
+  { crate = "getrandom@0.3.4", reason = "TLS, random generators, schema tooling and current UUID/tempfile use three incompatible generations." },
+  { crate = "hashbrown@0.14.5", reason = "SQLite hashlink, metrics/schema references and indexmap require distinct table APIs." },
+  { crate = "hashbrown@0.16.1", reason = "SQLite hashlink, metrics/schema references and indexmap require distinct table APIs." },
+  { crate = "hmac@0.12.1", reason = "Gateway request authentication uses 0.12 while PostgreSQL protocol uses 0.13." },
+  { crate = "io-lifetimes@2.0.4", reason = "File timestamp support and capability filesystem APIs have different interface generations." },
+  { crate = "r-efi@5.3.0", reason = "The 0.3 and 0.4 getrandom generations require different UEFI bindings." },
+  { crate = "rand@0.9.4", reason = "Metrics/properties/QUIC/WebSocket and PostgreSQL/MCP require different random-generator APIs." },
+  { crate = "rand_core@0.6.4", reason = "Signature, property/QUIC generators and current crypto require distinct rand_core traits." },
+  { crate = "rand_core@0.9.5", reason = "Signature, property/QUIC generators and current crypto require distinct rand_core traits." },
+  { crate = "sha2@0.10.9", reason = "Gateway/embedded asset hashing and current PostgreSQL crypto use different digest APIs." },
+  { crate = "untrusted@0.7.1", reason = "AWS-LC and ring/webpki select distinct parsing interfaces; changing TLS backends is out of scope." },
+  { crate = "wasi@0.11.1+wasi-snapshot-preview1", reason = "Existing socket/randomness support and wasite use separate WASI interface generations." },
+  { crate = "windows-sys@0.52.0", reason = "Filesystem, notifications and TLS/runtime dependencies select distinct Windows ABI binding generations." },
+  { crate = "windows-sys@0.60.2", reason = "Filesystem, notifications and TLS/runtime dependencies select distinct Windows ABI binding generations." },
+  { crate = "windows-targets@0.52.6", reason = "windows-sys 0.52 and 0.60 require their matching native import libraries." },
+  { crate = "windows_aarch64_gnullvm@0.52.6", reason = "The windows-targets 0.52 and 0.53 packages require their matching architecture-specific native import libraries." },
+  { crate = "windows_aarch64_msvc@0.52.6", reason = "The windows-targets 0.52 and 0.53 packages require their matching architecture-specific native import libraries." },
+  { crate = "windows_i686_gnu@0.52.6", reason = "The windows-targets 0.52 and 0.53 packages require their matching architecture-specific native import libraries." },
+  { crate = "windows_i686_gnullvm@0.52.6", reason = "The windows-targets 0.52 and 0.53 packages require their matching architecture-specific native import libraries." },
+  { crate = "windows_i686_msvc@0.52.6", reason = "The windows-targets 0.52 and 0.53 packages require their matching architecture-specific native import libraries." },
+  { crate = "windows_x86_64_gnu@0.52.6", reason = "The windows-targets 0.52 and 0.53 packages require their matching architecture-specific native import libraries." },
+  { crate = "windows_x86_64_gnullvm@0.52.6", reason = "The windows-targets 0.52 and 0.53 packages require their matching architecture-specific native import libraries." },
+  { crate = "windows_x86_64_msvc@0.52.6", reason = "The windows-targets 0.52 and 0.53 packages require their matching architecture-specific native import libraries." },
+]
+skip-tree = []
