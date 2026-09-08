@@ -3129,6 +3129,7 @@ paths:
             ))
             .layer(from_fn_with_state(
                 auth::AuthState {
+                    admin_sessions: None,
                     validator: Some(validator),
                     mode: crate::config::AuthMode::Required,
                     cookie_name: "session".to_owned(),

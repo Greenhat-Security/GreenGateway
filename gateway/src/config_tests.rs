@@ -2380,6 +2380,70 @@ fn admin_login_provider_parses_oidc_client_settings() {
 }
 
 #[test]
+fn admin_session_config_is_explicit_bounded_and_standalone_only() {
+    let provider = r#"[{"name":"primary","type":"jwt","issuer":"https://issuer.example.test","client_id":"admin-ui","client_secret":"generated-fixture-placeholder","redirect_uri":"https://management.example.test/v1/operations/auth/callback"}]"#;
+    let parse = |extra: Option<(&str, &str)>| {
+        Config::from_env_vars(|name| {
+            if let Some((key, value)) = extra {
+                if name == key {
+                    return Ok(value.to_owned());
+                }
+            }
+            match name {
+                "ADMIN_LOGIN_PROVIDER" => Ok("primary".to_owned()),
+                "AUTH_PROVIDERS" => Ok(provider.to_owned()),
+                "ADMIN_PREFIX" => Ok("/operations".to_owned()),
+                "ADMIN_SESSION_MODE" => Ok("standalone_memory".to_owned()),
+                _ => Err(VarError::NotPresent),
+            }
+        })
+    };
+    let config = parse(None).unwrap();
+    assert_eq!(
+        config.admin_session.unwrap().ttl,
+        std::time::Duration::from_secs(3600)
+    );
+    assert!(config
+        .auth_exempt_paths
+        .contains(&"/v1/operations/auth/logout".to_owned()));
+    for (key, value, expected) in [
+        ("STATE_BACKEND", "postgres", "no process-local HA fallback"),
+        (
+            "ADMIN_SESSION_MODE",
+            "shared",
+            "shared HA sessions are not supported",
+        ),
+        ("AUTH_ENABLED", "false", "requires ADMIN_LOGIN_PROVIDER"),
+        ("AUTH_MODE", "observe", "requires ADMIN_LOGIN_PROVIDER"),
+        ("CSRF_ENABLED", "false", "requires ADMIN_LOGIN_PROVIDER"),
+        (
+            "CSRF_EXEMPT_PATHS",
+            "/v1/operations/policy/validate",
+            "cannot exempt admin API routes",
+        ),
+        ("ADMIN_SESSION_TTL_SECS", "86401", "ADMIN_SESSION_TTL_SECS"),
+        (
+            "ADMIN_SESSION_MAX_ENTRIES",
+            "0",
+            "ADMIN_SESSION_MAX_ENTRIES",
+        ),
+    ] {
+        assert!(
+            parse(Some((key, value)))
+                .unwrap_err()
+                .to_string()
+                .contains(expected),
+            "{key}"
+        );
+    }
+    let insecure_provider = provider.replace("https://management", "http://management");
+    assert!(parse(Some(("AUTH_PROVIDERS", &insecure_provider)))
+        .unwrap_err()
+        .to_string()
+        .contains("requires an HTTPS"));
+}
+
+#[test]
 fn admin_login_pending_limits_parse() {
     let config = Config::from_env_vars(|name| match name {
         "ADMIN_LOGIN_PENDING_TTL_SECS" => Ok("45".to_owned()),

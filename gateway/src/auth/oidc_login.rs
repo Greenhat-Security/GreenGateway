@@ -1,8 +1,9 @@
 //! OIDC authorization-code + PKCE login support for the admin UI.
 //!
 //! This module initiates an OAuth client flow only for the admin UI. The
-//! resulting access token is still used by the existing bearer-token validator;
-//! this module does not create a parallel server-side session.
+//! resulting access token is still judged by the existing bearer-token
+//! validator. The admin completion handler can retain it in an explicitly
+//! configured server session; this transaction cookie is never authentication.
 
 use std::{
     collections::HashMap,
@@ -91,9 +92,17 @@ pub struct LoginStart {
     pub browser_binding: String,
 }
 
-#[derive(Debug)]
 pub struct TokenExchange {
     pub access_token: String,
+}
+
+impl fmt::Debug for TokenExchange {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("TokenExchange")
+            .field("access_token", &"<redacted>")
+            .finish()
+    }
 }
 
 /// The pending-login store could not be consulted (issue #241, PR 9).

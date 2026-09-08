@@ -1424,6 +1424,7 @@ fn test_config(jwks_url: Option<&str>) -> Config {
         admin_client_cert_auth: None,
         admin_prefix: "/admin".to_owned(),
         admin_login_provider: None,
+        admin_session: None,
         admin_login_pending_ttl_secs: crate::config::DEFAULT_ADMIN_LOGIN_PENDING_TTL_SECS,
         admin_login_pending_max_entries: crate::config::DEFAULT_ADMIN_LOGIN_PENDING_MAX_ENTRIES,
         admin_login_pending_max_per_ip: crate::config::DEFAULT_ADMIN_LOGIN_PENDING_MAX_PER_IP,

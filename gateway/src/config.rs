@@ -229,6 +229,9 @@ const GRPC_LISTEN_ADDR: &str = "GRPC_LISTEN_ADDR";
 const GRPC_MAX_CONCURRENT_STREAMS: &str = "GRPC_MAX_CONCURRENT_STREAMS";
 const GRPC_MAX_METADATA_BYTES: &str = "GRPC_MAX_METADATA_BYTES";
 const ADMIN_LOGIN_PROVIDER: &str = "ADMIN_LOGIN_PROVIDER";
+const ADMIN_SESSION_MODE: &str = "ADMIN_SESSION_MODE";
+const ADMIN_SESSION_TTL_SECS: &str = "ADMIN_SESSION_TTL_SECS";
+const ADMIN_SESSION_MAX_ENTRIES: &str = "ADMIN_SESSION_MAX_ENTRIES";
 const ADMIN_LOGIN_PENDING_TTL_SECS: &str = "ADMIN_LOGIN_PENDING_TTL_SECS";
 const ADMIN_LOGIN_PENDING_MAX_ENTRIES: &str = "ADMIN_LOGIN_PENDING_MAX_ENTRIES";
 const ADMIN_LOGIN_PENDING_MAX_PER_IP: &str = "ADMIN_LOGIN_PENDING_MAX_PER_IP";
@@ -405,6 +408,7 @@ pub struct Config {
     pub admin_client_cert_auth: Option<InboundClientAuthConfig>,
     pub admin_prefix: String,
     pub admin_login_provider: Option<String>,
+    pub admin_session: Option<crate::auth::admin_session::AdminSessionConfig>,
     pub admin_login_pending_ttl_secs: u64,
     pub admin_login_pending_max_entries: usize,
     pub admin_login_pending_max_per_ip: usize,
@@ -1741,6 +1745,52 @@ impl Config {
             get_var(ADMIN_LOGIN_PROVIDER),
             &mut problems,
         );
+        let admin_session_mode = parse_optional_string(
+            ADMIN_SESSION_MODE,
+            get_var(ADMIN_SESSION_MODE),
+            &mut problems,
+        );
+        let admin_session = match admin_session_mode.as_deref() {
+            None | Some("disabled") => None,
+            Some("standalone_memory") => Some(crate::auth::admin_session::AdminSessionConfig {
+                ttl: std::time::Duration::from_secs(validate_positive_bounded_u64(
+                    ADMIN_SESSION_TTL_SECS,
+                    parse_optional_var(
+                        ADMIN_SESSION_TTL_SECS,
+                        get_var(ADMIN_SESSION_TTL_SECS),
+                        "second duration",
+                        &mut problems,
+                    )
+                    .unwrap_or(3600),
+                    86_400,
+                    3600,
+                    &mut problems,
+                )),
+                max_entries: validate_positive_bounded_u64(
+                    ADMIN_SESSION_MAX_ENTRIES,
+                    parse_optional_var(
+                        ADMIN_SESSION_MAX_ENTRIES,
+                        get_var(ADMIN_SESSION_MAX_ENTRIES),
+                        "entry count",
+                        &mut problems,
+                    )
+                    .unwrap_or(1024),
+                    100_000,
+                    1024,
+                    &mut problems,
+                ) as usize,
+            }),
+            Some(_) => {
+                problems.push(format!("{ADMIN_SESSION_MODE} must be disabled or standalone_memory; shared HA sessions are not supported"));
+                None
+            }
+        };
+        if admin_session.is_none()
+            && (is_var_set(get_var(ADMIN_SESSION_TTL_SECS))
+                || is_var_set(get_var(ADMIN_SESSION_MAX_ENTRIES)))
+        {
+            problems.push(format!("{ADMIN_SESSION_TTL_SECS} and {ADMIN_SESSION_MAX_ENTRIES} require {ADMIN_SESSION_MODE}=standalone_memory"));
+        }
         let admin_login_pending_ttl_secs = validate_positive_u64(
             ADMIN_LOGIN_PENDING_TTL_SECS,
             parse_var(
@@ -2589,6 +2639,39 @@ impl Config {
             &default_paths(DEFAULT_CSRF_EXEMPT_PATHS),
             &mut problems,
         );
+        if admin_session.is_some() {
+            if admin_login_provider.is_none()
+                || !auth_enabled
+                || auth_mode != AuthMode::Required
+                || !csrf_enabled
+            {
+                problems.push(format!("{ADMIN_SESSION_MODE}=standalone_memory requires {ADMIN_LOGIN_PROVIDER}, {AUTH_ENABLED}=true, {AUTH_MODE}=required and {CSRF_ENABLED}=true"));
+            }
+            if let Some(provider) = auth_providers
+                .iter()
+                .find(|provider| Some(provider.name.as_str()) == admin_login_provider.as_deref())
+            {
+                if !provider
+                    .redirect_uri
+                    .as_deref()
+                    .is_some_and(|uri| uri.starts_with("https://"))
+                {
+                    problems.push(format!("{ADMIN_SESSION_MODE}=standalone_memory requires an HTTPS admin login redirect_uri"));
+                }
+            }
+            let api_prefix = format!("/v1{admin_prefix}");
+            if csrf_exempt_paths
+                .iter()
+                .any(|path| path == &api_prefix || path.starts_with(&format!("{api_prefix}/")))
+            {
+                problems.push(format!("{CSRF_EXEMPT_PATHS} cannot exempt admin API routes while {ADMIN_SESSION_MODE}=standalone_memory"));
+            }
+            // Logout is usable after expiry, but always checks its own exact
+            // origin and configured CSRF pair before revoking/clearing anything.
+            let logout = format!("{api_prefix}/auth/logout");
+            auth_exempt_paths.push(logout.clone());
+            rbac_exempt_paths.push(logout);
+        }
         let upstream_url =
             parse_optional_upstream_url(UPSTREAM_URL, get_var(UPSTREAM_URL), &mut problems);
         let upstream_routes =
@@ -2907,6 +2990,9 @@ impl Config {
         // namespace that does not exist in standalone mode.
         match state_backend {
             StateBackend::Postgres => {
+                if admin_session.is_some() {
+                    problems.push(format!("{ADMIN_SESSION_MODE}=standalone_memory is unsupported with {STATE_BACKEND}=postgres; no process-local HA fallback is provided"));
+                }
                 if admin_login_provider.is_some() && admin_login_keyring.is_empty() {
                     problems.push(format!(
                         "{ADMIN_LOGIN_KEYRING} is required when {STATE_BACKEND}=postgres and {ADMIN_LOGIN_PROVIDER} is set; pending admin logins are sealed in the database under it"
@@ -3030,6 +3116,7 @@ impl Config {
                 admin_client_cert_auth,
                 admin_prefix,
                 admin_login_provider,
+                admin_session,
                 admin_login_pending_ttl_secs,
                 admin_login_pending_max_entries,
                 admin_login_pending_max_per_ip,

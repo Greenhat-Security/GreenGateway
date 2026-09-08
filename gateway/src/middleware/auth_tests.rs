@@ -115,6 +115,7 @@ fn test_state_with_mode_and_mcp_route_paths(
 
     (
         AuthState {
+            admin_sessions: None,
             validator,
             mode,
             cookie_name: "session".to_owned(),

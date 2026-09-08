@@ -1,4 +1,6 @@
 use super::*;
+#[path = "admin_session_app_tests.rs"]
+mod admin_session_app_tests;
 use crate::auth::TokenStore;
 use axum::{body::Body, http::StatusCode};
 use futures_util::StreamExt;
@@ -103,6 +105,7 @@ fn test_config(cors_allow_origins: Vec<&str>) -> config::Config {
         admin_client_cert_auth: None,
         admin_prefix: config::DEFAULT_ADMIN_PREFIX.to_owned(),
         admin_login_provider: None,
+        admin_session: None,
         admin_login_pending_ttl_secs: config::DEFAULT_ADMIN_LOGIN_PENDING_TTL_SECS,
         admin_login_pending_max_entries: config::DEFAULT_ADMIN_LOGIN_PENDING_MAX_ENTRIES,
         admin_login_pending_max_per_ip: config::DEFAULT_ADMIN_LOGIN_PENDING_MAX_PER_IP,

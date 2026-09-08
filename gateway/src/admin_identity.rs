@@ -12,6 +12,24 @@ pub(super) async fn admin_auth_login_endpoint(
 
     match state.login.begin_login(&source_ip).await {
         Ok(start) => {
+            if let Some(sessions) = &state.sessions {
+                if sessions
+                    .begin_login(
+                        &start.browser_binding,
+                        Duration::from_secs(state.cookie_max_age),
+                        &parts.headers,
+                    )
+                    .is_err()
+                {
+                    state.record(
+                        &parts,
+                        "start",
+                        "unavailable",
+                        "session_authority_unavailable",
+                    );
+                    return service_unavailable("admin session authority is unavailable");
+                }
+            }
             state.record(&parts, "start", "accepted", "transaction_created");
             let mut response = found_redirect(start.authorization_url);
             state.set_browser_cookie(&mut response, &start.browser_binding, state.cookie_max_age);
@@ -91,6 +109,26 @@ pub(super) async fn admin_auth_completion_endpoint(
     Json(params): Json<AdminAuthCompletionParams>,
 ) -> Response {
     record_request(ADMIN_AUTH_CALLBACK_ROUTE);
+    if params.mode == AdminAuthCompletionMode::Cookie {
+        let Some(sessions) = &state.sessions else {
+            state.record(&parts, "session", "denied", "cookie_completion_unavailable");
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({"error": "cookie_session_unavailable"})),
+            )
+                .into_response();
+        };
+        if !sessions.origin_matches(&parts.headers)
+            || !middleware::csrf::admin_session_csrf_matches(&state.csrf, &parts.headers)
+        {
+            state.record(&parts, "session", "denied", "invalid_origin_or_csrf");
+            return (
+                StatusCode::FORBIDDEN,
+                Json(json!({"error": "invalid_origin_or_csrf"})),
+            )
+                .into_response();
+        }
+    }
     let origin = state.login.redirect_origin();
     if origin.is_empty()
         || parts
@@ -130,9 +168,44 @@ pub(super) async fn admin_auth_completion_endpoint(
         .await
     {
         Ok(exchange) => {
-            state.record(&parts, "completion", "accepted", "token_exchanged");
-            tracing::info!(outcome = "success", "admin OIDC completion exchanged");
-            Json(json!({"access_token": exchange.access_token})).into_response()
+            if params.mode == AdminAuthCompletionMode::Cookie {
+                match &state.sessions {
+                    Some(sessions) => match sessions
+                        .issue(exchange.access_token, &parts.headers, &binding)
+                        .await
+                    {
+                        Ok(issued) => {
+                            state.record(&parts, "session", "accepted", "session_issued");
+                            let mut response = Json(
+                                json!({"authenticated": true, "expires_in": issued.expires_in}),
+                            )
+                            .into_response();
+                            response
+                                .headers_mut()
+                                .append(header::SET_COOKIE, issued.cookie);
+                            response
+                        }
+                        Err(auth::AuthError::InvalidSession(_)) => {
+                            state.record(&parts, "session", "denied", "access_token_rejected");
+                            unauthorized()
+                        }
+                        Err(auth::AuthError::Upstream(_)) => {
+                            state.record(
+                                &parts,
+                                "session",
+                                "unavailable",
+                                "session_authority_unavailable",
+                            );
+                            service_unavailable("admin session authority is unavailable")
+                        }
+                    },
+                    None => service_unavailable("admin session authority is unavailable"),
+                }
+            } else {
+                state.record(&parts, "completion", "accepted", "token_exchanged");
+                tracing::info!(outcome = "success", "admin OIDC completion exchanged");
+                Json(json!({"access_token": exchange.access_token})).into_response()
+            }
         }
         // A store that cannot be consulted is a dependency failure: 503,
         // never "unknown state" -- "cannot check" is not "checked and
@@ -163,6 +236,53 @@ pub(super) async fn admin_auth_completion_endpoint(
     };
     state.set_browser_cookie(&mut response, "", 0);
     response
+}
+
+/// Idempotent local session termination. This route is authentication-exempt
+/// so an expired/revoked session can be cleared, but it independently enforces
+/// exact Origin and the configured CSRF pair before mutating the store.
+pub(super) async fn admin_auth_logout_endpoint(
+    State(state): State<AdminAuthState>,
+    parts: http::request::Parts,
+) -> Response {
+    record_request("/v1/admin/auth/logout");
+    let Some(sessions) = &state.sessions else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    if !sessions.origin_matches(&parts.headers)
+        || !middleware::csrf::admin_session_csrf_matches(&state.csrf, &parts.headers)
+    {
+        state.record(&parts, "logout", "denied", "invalid_origin_or_csrf");
+        return (
+            StatusCode::FORBIDDEN,
+            Json(json!({"error": "invalid_origin_or_csrf"})),
+        )
+            .into_response();
+    }
+    let binding = state.browser_binding(&parts.headers);
+    let response = sessions
+        .revoke(&parts.headers, binding.as_deref())
+        .and_then(|()| sessions.expired_cookie());
+    match response {
+        Ok(cookie) => {
+            state.record(&parts, "logout", "accepted", "session_revoked");
+            let mut response = StatusCode::NO_CONTENT.into_response();
+            response.headers_mut().append(header::SET_COOKIE, cookie);
+            // Also terminate a pending login; a later completion cannot restore
+            // this browser's identity after logout cleared its binding.
+            state.set_browser_cookie(&mut response, "", 0);
+            response
+        }
+        Err(_) => {
+            state.record(
+                &parts,
+                "logout",
+                "unavailable",
+                "session_authority_unavailable",
+            );
+            service_unavailable("admin session authority is unavailable")
+        }
+    }
 }
 
 pub(super) fn found_redirect(location: String) -> Response {

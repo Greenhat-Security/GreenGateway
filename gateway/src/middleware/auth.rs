@@ -6,7 +6,7 @@
 use std::sync::Arc;
 
 use axum::{
-    extract::{Request, State},
+    extract::{MatchedPath, Request, State},
     middleware::Next,
     response::{IntoResponse, Response},
     Json,
@@ -37,6 +37,7 @@ const AUTH_FAILURE: &str = "auth.failure";
 #[derive(Clone)]
 pub struct AuthState {
     pub validator: Option<Arc<dyn SessionValidator>>,
+    pub admin_sessions: Option<Arc<crate::auth::admin_session::AdminSessions>>,
     pub mode: AuthMode,
     pub cookie_name: String,
     pub exempt_paths: Vec<String>,
@@ -92,6 +93,7 @@ impl AuthState {
             protected_resource::ProtectedResourceMetadataConfig::from_config(config);
         Self {
             validator,
+            admin_sessions: None,
             mode: config.auth_mode,
             cookie_name: config.auth_cookie_name.clone(),
             exempt_paths: config.auth_exempt_paths.clone(),
@@ -110,6 +112,14 @@ impl AuthState {
 }
 
 impl AuthState {
+    pub fn with_admin_sessions(
+        mut self,
+        sessions: Option<Arc<crate::auth::admin_session::AdminSessions>>,
+    ) -> Self {
+        self.admin_sessions = sessions;
+        self
+    }
+
     fn is_mcp_route_path(&self, path: &str) -> bool {
         self.mcp_route_paths
             .iter()
@@ -153,7 +163,44 @@ pub async fn auth_middleware(
 
     let resource = state.mcp_resource_for_path(&path);
     let audit = audit_context(&req, path, &state.client_ip_policy);
-    let Some(credential) = request_credential(&req, &state.cookie_name) else {
+    // Only concrete admin API routes receive gateway-issued sessions. A
+    // proxy fallback, data-only management boundary, gRPC or MCP route can
+    // never turn this cookie into authority, even under a matching prefix.
+    let admin_session = state
+        .admin_sessions
+        .as_ref()
+        .filter(|sessions| {
+            !is_mcp_route
+                && bearer_token(req.headers()).is_none()
+                && req
+                    .extensions()
+                    .get::<MatchedPath>()
+                    .is_some_and(|route| route.as_str().starts_with(&sessions.api_prefix))
+        })
+        .and_then(|sessions| {
+            sessions
+                .credential(req.headers())
+                .map(|value| (Arc::clone(sessions), value))
+        });
+    if let Some((sessions, _)) = &admin_session {
+        if !matches!(
+            *req.method(),
+            http::Method::GET | http::Method::HEAD | http::Method::OPTIONS
+        ) && !sessions.origin_matches(req.headers())
+        {
+            emit_failure(&state, &audit, "admin_session_origin_mismatch");
+            return (
+                StatusCode::FORBIDDEN,
+                Json(json!({"error": "invalid_origin"})),
+            )
+                .into_response();
+        }
+    }
+    let credential = admin_session
+        .as_ref()
+        .map(|(_, value)| SessionCredential::Cookie(value.clone()))
+        .or_else(|| request_credential(&req, &state.cookie_name));
+    let Some(credential) = credential else {
         return auth_failure_response(
             &state,
             &audit,
@@ -165,7 +212,10 @@ pub async fn auth_middleware(
         .await;
     };
 
-    let Some(validator) = state.validator.as_ref().map(Arc::clone) else {
+    let validator = admin_session
+        .map(|(sessions, _)| sessions as Arc<dyn SessionValidator>)
+        .or_else(|| state.validator.as_ref().map(Arc::clone));
+    let Some(validator) = validator else {
         return auth_failure_response(
             &state,
             &audit,

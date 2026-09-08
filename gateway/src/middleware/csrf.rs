@@ -137,6 +137,18 @@ pub async fn csrf_middleware(
     response
 }
 
+/// Mandatory check for issued-session lifecycle endpoints, including when a
+/// caller sends an Authorization header. Configured names remain authoritative.
+pub(crate) fn admin_session_csrf_matches(config: &CsrfConfig, headers: &HeaderMap) -> bool {
+    let cookies = all_cookie_values(headers, &config.cookie_name);
+    let mut values = headers.get_all(config.header_name.as_str()).iter();
+    let header = values.next().and_then(header_value_to_str);
+    config.enabled
+        && cookies.len() == 1
+        && values.next().is_none()
+        && csrf_token_matches(&cookies, header)
+}
+
 fn csrf_token_matches(cookie_tokens: &[String], header_token: Option<&str>) -> bool {
     match header_token {
         Some(header_token) if !header_token.is_empty() => cookie_tokens
