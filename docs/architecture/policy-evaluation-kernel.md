@@ -24,7 +24,9 @@ The immutable compiled object owns its policy and matcher. Evaluation accepts no
 runtime, resolver, store, provider, audit sink or arbitrary callback. It has no
 async operation. Input and output formatting never includes policy or context
 values. Input size/count limits, the JSON parser's nesting limit and bounded
-result traces bound the new API. Evaluation does not validate credential
+result traces bound the new API's inputs and output. There is no independent
+rule-count or evaluation-work budget yet; apply one before exposing this API
+through a service. Evaluation does not validate credential
 freshness or perform a live cluster-revision check.
 
 | Lane | Existing source | This slice |

@@ -464,6 +464,30 @@ fn strict_offline_compiler_rejects_ambiguous_or_future_sources_with_safe_errors(
 }
 
 #[test]
+fn offline_compiler_preserves_fractional_and_exponent_numeric_fields() {
+    for rate in ["0.5", "1.0", "1e1"] {
+        let source = format!(
+            r#"{{"schema_version":"0.1.0","rate_limits":[{{"requests_per_second":{rate},"burst":2}}]}}"#
+        );
+        let compiled =
+            CompiledPolicy::compile(source.as_bytes(), PolicyAuthority::Standalone).unwrap();
+        let legacy =
+            Policy::validate_json_value(serde_json::from_slice(source.as_bytes()).unwrap())
+                .unwrap();
+        assert_eq!(compiled.engine.policy(), &legacy);
+        assert_eq!(
+            compiled.evaluate(&context(&compiled)).unwrap().reason,
+            Reason::DefaultDeny
+        );
+    }
+    let object_number = br#"{"schema_version":"0.1.0","rate_limits":[{"requests_per_second":{"$serde_json::private::Number":"0.5"},"burst":2}]}"#;
+    assert_eq!(
+        CompiledPolicy::compile(object_number, PolicyAuthority::Standalone).unwrap_err(),
+        CompileError::InvalidPolicy
+    );
+}
+
+#[test]
 fn direct_principal_constraints_use_existing_identity_and_method_semantics() {
     let compiled = compile(json!({"schema_version":"0.1.0", "rules":[{
         "path":"/**", "action":"allow", "principal":{
