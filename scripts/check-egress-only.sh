@@ -63,6 +63,12 @@ matches="$(
 ' "$rust_files" |
         while IFS= read -r file; do
             case "$file" in
+                # Dev-only syntax analyzer: these are inert API-name literals,
+                # not a client linked into the gateway. Cargo target enumeration
+                # in transport_guard.py independently verifies nonproduction use.
+                gateway/examples/transport_guard.rs)
+                    continue
+                    ;;
                 "$EGRESS_FILE" | gateway/src/egress/*.rs)
                     continue
                     ;;
