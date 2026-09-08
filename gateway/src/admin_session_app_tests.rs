@@ -72,10 +72,13 @@ async fn admin_session_oidc_contract_preserves_csrf_origins_prefix_and_listener_
                 .push(format!("{PREFIX}/auth/{route}"));
         }
         let recorder = PrometheusBuilder::new().build_recorder();
+        let capture = audit::sink::tests::CaptureSink::new();
+        let audit_log =
+            audit::AuditLog::new(Arc::new(capture.clone()) as Arc<dyn audit::AuditSink>);
         let apps = gateway_app_with_process_started_at(
             config,
             recorder.handle(),
-            test_audit_log(),
+            audit_log,
             test_audit_event_sender(),
             Instant::now(),
         )
@@ -295,16 +298,73 @@ async fn admin_session_oidc_contract_preserves_csrf_origins_prefix_and_listener_
             .await
             .unwrap();
         assert_eq!(denied.status(), StatusCode::FORBIDDEN);
+        for csrf_header in [None, Some("wrong")] {
+            let denied = admin
+                .clone()
+                .oneshot(request(
+                    Method::POST,
+                    &format!("{PREFIX}/auth/callback"),
+                    &cookies,
+                    csrf_header,
+                    Some(ORIGIN),
+                    json!({"mode":"cookie", "completion_code":"unused-fixture"}),
+                ))
+                .await
+                .unwrap();
+            assert_eq!(denied.status(), StatusCode::FORBIDDEN);
+        }
+        assert_eventually(Duration::from_secs(1), || {
+            capture
+                .events()
+                .iter()
+                .filter(|event| {
+                    event.event_type == "admin_login.transaction"
+                        && event.payload["reason"] == "csrf_rejected"
+                })
+                .count()
+                == 4
+        });
+        let csrf_events: Vec<_> = capture
+            .events()
+            .into_iter()
+            .filter(|event| {
+                event.event_type == "admin_login.transaction"
+                    && event.payload["reason"] == "csrf_rejected"
+            })
+            .collect();
+        assert_eq!(
+            csrf_events
+                .iter()
+                .filter(|event| event.payload["phase"] == "completion")
+                .count(),
+            3
+        );
+        assert_eq!(
+            csrf_events
+                .iter()
+                .filter(|event| event.payload["phase"] == "logout")
+                .count(),
+            1
+        );
+        for event in csrf_events {
+            assert_eq!(event.payload.as_object().unwrap().len(), 3);
+            assert_eq!(event.payload["outcome"], "denied");
+            assert!(event.actor.is_none());
+            assert!(!serde_json::to_string(&event).unwrap().contains(&access));
+            assert!(!serde_json::to_string(&event).unwrap().contains(&csrf));
+        }
         let logout = admin
             .clone()
-            .oneshot(request(
-                Method::POST,
-                &format!("{PREFIX}/auth/logout"),
-                &cookies,
-                Some(&csrf),
-                Some(ORIGIN),
-                Value::Null,
-            ))
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(format!("{PREFIX}/auth/logout"))
+                    .header(header::COOKIE, &cookies)
+                    .header("x-ops-csrf", &csrf)
+                    .header(header::ORIGIN, ORIGIN)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
             .await
             .unwrap();
         assert_eq!(logout.status(), StatusCode::NO_CONTENT);

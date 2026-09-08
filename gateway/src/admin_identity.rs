@@ -1,6 +1,56 @@
 //! admin identity boundary extracted from the application composition root.
 use super::*;
 
+/// The global CSRF layer can reject before the lifecycle handler records its
+/// outcome. Observe only that explicit rejection signal to avoid duplicate
+/// handler events or treating unrelated 403 responses as CSRF failures.
+pub(super) async fn admin_session_csrf_audit_middleware(
+    State((config, audit)): State<(config::Config, audit::AuditLog)>,
+    request: AxumRequest,
+    next: axum::middleware::Next,
+) -> Response {
+    let path = request.uri().path();
+    let phase = if request.method() != Method::POST
+        || request
+            .extensions()
+            .get::<axum::extract::MatchedPath>()
+            .map(|matched| matched.as_str())
+            != Some(path)
+    {
+        None
+    } else if path == format!("/v1{}/auth/callback", config.admin_prefix) {
+        Some("completion")
+    } else if path == format!("/v1{}/auth/logout", config.admin_prefix) {
+        Some("logout")
+    } else {
+        None
+    };
+    let event = phase.map(|phase| {
+        audit::AuditEvent::new(
+            "admin_login.transaction",
+            client_ip::request_id(request.headers(), request.extensions()),
+            client_ip::canonical_client_ip(
+                request.headers(),
+                request.extensions(),
+                &client_ip::ClientIpPolicy::from_config(&config),
+            ),
+            None,
+            json!({"phase": phase, "outcome": "denied", "reason": "csrf_rejected"}),
+        )
+    });
+    let response = next.run(request).await;
+    if response
+        .extensions()
+        .get::<middleware::csrf::CsrfRejection>()
+        .is_some()
+    {
+        if let Some(event) = event {
+            audit.emit(event);
+        }
+    }
+    response
+}
+
 /// Public login capability metadata on the management origin. It exposes no
 /// active identity, credentials, cookie values or identity-provider addresses.
 pub(super) async fn admin_auth_config_endpoint(State(state): State<AdminAuthState>) -> Response {

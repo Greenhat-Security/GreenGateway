@@ -60,11 +60,24 @@ pub async fn validate_request(State(config): State<Config>, req: Request, next: 
     if is_mutating(req.method())
         && !is_allowed_content_type(req.headers(), &config)
         && !is_openapi_preview_content_type(req.uri().path(), req.headers(), &config)
+        && !is_empty_admin_logout(&req, &config)
     {
         return unsupported_media_type(&config.validation_allowed_content_types);
     }
 
     next.run(req).await
+}
+
+fn is_empty_admin_logout(req: &Request, config: &Config) -> bool {
+    config.admin_session.is_some()
+        && req.method() == Method::POST
+        && req.uri().path() == format!("/v1{}/auth/logout", config.admin_prefix)
+        && req
+            .extensions()
+            .get::<axum::extract::MatchedPath>()
+            .map(|matched| matched.as_str())
+            == Some(req.uri().path())
+        && hyper::body::Body::is_end_stream(req.body())
 }
 
 fn content_length(headers: &HeaderMap) -> Option<usize> {

@@ -45,6 +45,10 @@ struct CsrfForbiddenBody {
     error: &'static str,
 }
 
+/// Internal signal for lifecycle audit middleware; never serialized to clients.
+#[derive(Clone, Copy)]
+pub(crate) struct CsrfRejection;
+
 impl CsrfConfig {
     pub fn from_config(config: &Config) -> Self {
         Self {
@@ -116,7 +120,9 @@ pub async fn csrf_middleware(
                 reason = reason,
                 "CSRF validation failed"
             );
-            return csrf_forbidden();
+            let mut response = csrf_forbidden();
+            response.extensions_mut().insert(CsrfRejection);
+            return response;
         }
     }
 

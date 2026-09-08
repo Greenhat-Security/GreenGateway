@@ -609,11 +609,19 @@ pub(super) fn apply_middleware(
         router
     };
 
-    let router = router
-        .layer(axum::middleware::from_fn_with_state(
-            stack.csrf_config.clone(),
-            middleware::csrf::csrf_middleware,
+    let router = router.layer(axum::middleware::from_fn_with_state(
+        stack.csrf_config.clone(),
+        middleware::csrf::csrf_middleware,
+    ));
+    let router = if stack.config.admin_session.is_some() {
+        router.layer(axum::middleware::from_fn_with_state(
+            (stack.config.clone(), stack.audit_log.clone()),
+            admin_session_csrf_audit_middleware,
         ))
+    } else {
+        router
+    };
+    let router = router
         .layer(axum::middleware::from_fn_with_state(
             stack.config.clone(),
             middleware::validate::validate_request,
