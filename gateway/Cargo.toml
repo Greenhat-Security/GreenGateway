@@ -60,6 +60,10 @@ yaml_serde.workspace = true
 zeroize.workspace = true
 
 [dev-dependencies]
+# Syntax-only transport ownership guard; both crates already exist in Cargo.lock.
+syn = { version = "2.0.118", features = ["full", "visit"] }
+quote = "1.0.46"
+proc-macro2 = "1.0.106"
 proptest.workspace = true
 rcgen.workspace = true
 rustix.workspace = true

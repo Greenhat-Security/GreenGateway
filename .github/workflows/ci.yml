@@ -107,7 +107,7 @@ jobs:
   egress-only:
     name: egress-only
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 20
     steps:
       - name: Checkout
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
@@ -119,6 +119,15 @@ jobs:
           node: 'true'
       - name: Enforce egress-only outbound HTTP
         run: bash scripts/check-egress-only.sh
+      - name: Enforce structural transport ownership
+        run: python scripts/transport_guard.py check
+      - name: Upload transport ownership decision
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: transport-ownership
+          path: target/transport-guard/
+          if-no-files-found: error
 
   fmt:
     name: fmt
