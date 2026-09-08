@@ -13,10 +13,10 @@
 //!   transaction together with its ledger row: a migration that fails rolls
 //!   back completely, so the ledger is never mid-flight and a "dirty"
 //!   database cannot exist. Destructive changes are a later, explicit
-//!   finalization step, never smuggled into a migration -- that is what lets
-//!   version N and N+1 binaries coexist during a rolling deployment (expand
-//!   first, contract in a later release).
-//! - **The ledger must be a prefix of the embedded manifest, checksums
+//!   finalization step, never smuggled into a migration. Additive SQL alone
+//!   does not establish rolling compatibility: issue #426 requires an
+//!   explicitly prepared and qualified adjacent release pair.
+//! - **The ledger must be a prefix of the compiled history, checksums
 //!   matching.** Anything else -- an unknown version (written by a newer
 //!   gateway), a checksum mismatch (edited migration files), a gap or
 //!   reorder (manual tampering) -- is refused by `check` and by startup.
@@ -234,19 +234,48 @@ static MANIFEST: LazyLock<Vec<Migration>> = LazyLock::new(|| {
     ]
 });
 
-/// The schema-version range this binary accepts, as a cluster member
-/// advertises it (issue #241, PR 13): `(min, max)` in manifest versions.
-///
-/// Both ends are the manifest length. The ledger rules above admit exactly
-/// one shape -- a checksum-matching prefix covering the whole manifest --
-/// so a serving replica tolerates neither a ledger behind its manifest
-/// (it refuses to serve until migrated) nor one ahead of it (written by a
-/// newer gateway). The range is still advertised as a pair so PR 14's
-/// status view and a future expand/contract release that widens the
-/// tolerated window need no schema change to say so.
+/// An additive migration recognized by a prepared binary, but not executable
+/// by that binary's migrator. Recognition pins the exact reviewed SQL digest;
+/// a version range alone never authorizes an unknown migration.
+#[derive(Clone, Copy)]
+struct ApprovedExtension {
+    version: i64,
+    checksum: &'static str,
+}
+
+/// Serving requires BOTH contracts after validating the complete history.
+/// These bounds are deliberately independent of the executable manifest:
+/// adding SQL must not implicitly declare existing readers/writers compatible.
+struct SchemaCompatibility {
+    read: (i32, i32),
+    write: (i32, i32),
+    approved_extensions: &'static [ApprovedExtension],
+}
+
+impl SchemaCompatibility {
+    fn serving_range(&self) -> (i32, i32) {
+        (self.read.0.max(self.write.0), self.read.1.min(self.write.1))
+    }
+
+    fn permits(&self, version: i64) -> bool {
+        let (minimum, maximum) = self.serving_range();
+        version >= i64::from(minimum) && version <= i64::from(maximum)
+    }
+}
+
+// No adjacent release pair has been qualified. Do not widen these bounds or
+// add an extension without the pinned SQL and two-binary gate in issue #426.
+const BINARY_SCHEMA_COMPATIBILITY: SchemaCompatibility = SchemaCompatibility {
+    read: (15, 15),
+    write: (15, 15),
+    approved_extensions: &[],
+};
+
+/// The intersection of the explicit read/write contracts, advertised to the
+/// roster. This is a summary, not proof of ledger integrity or permission to
+/// contract the schema. The shipped contract still accepts only schema 15.
 pub(crate) fn schema_version_range() -> (i32, i32) {
-    let len = i32::try_from(MANIFEST.len()).unwrap_or(i32::MAX);
-    (len, len)
+    BINARY_SCHEMA_COMPATIBILITY.serving_range()
 }
 
 /// What `check` (and startup validation) concluded about the schema.
@@ -275,6 +304,8 @@ pub(crate) enum LedgerProblem {
     /// The ledger's versions do not form an increasing, gap-free prefix of
     /// the manifest: rows were deleted or reordered by hand.
     NotAPrefix,
+    /// History is recognized, but this binary cannot both read and write it.
+    ReadWriteIncompatible,
 }
 
 impl fmt::Display for LedgerProblem {
@@ -293,6 +324,10 @@ impl fmt::Display for LedgerProblem {
                 "the schema ledger is not an ordered, gap-free prefix of this build's \
                  migrations; it was modified outside the migrator — restore it from backup",
             ),
+            Self::ReadWriteIncompatible => formatter.write_str(
+                "the recognized schema is outside this build's read/write compatibility contract; \
+                 use a compatible gateway build without rewinding security state",
+            ),
         }
     }
 }
@@ -305,23 +340,7 @@ pub(crate) fn validate_ledger(
     applied: &[(i64, String)],
     manifest: &[Migration],
 ) -> Result<SchemaStatus, LedgerProblem> {
-    for (index, (version, checksum)) in applied.iter().enumerate() {
-        let Some(migration) = manifest.get(index) else {
-            // More ledger rows than manifest entries: the extra versions
-            // are unknown no matter their numbering.
-            return Err(LedgerProblem::UnknownVersion);
-        };
-        if *version != migration.version {
-            if manifest.iter().any(|m| m.version == *version) {
-                // A known version in the wrong place: reordered or gapped.
-                return Err(LedgerProblem::NotAPrefix);
-            }
-            return Err(LedgerProblem::UnknownVersion);
-        }
-        if checksum != migration.current_checksum() {
-            return Err(LedgerProblem::ChecksumMismatch);
-        }
-    }
+    validate_history(applied, manifest, &[])?;
     if applied.len() == manifest.len() {
         Ok(SchemaStatus::Current)
     } else {
@@ -330,6 +349,81 @@ pub(crate) fn validate_ledger(
             missing: manifest.len() - applied.len(),
         })
     }
+}
+
+/// Integrity is independent of whether this binary is permitted to serve.
+/// Even an explicitly approved extension remains unavailable to `migrate up`,
+/// which calls `validate_ledger` against executable SQL only.
+fn validate_history(
+    applied: &[(i64, String)],
+    manifest: &[Migration],
+    extensions: &[ApprovedExtension],
+) -> Result<(), LedgerProblem> {
+    for (index, (version, checksum)) in applied.iter().enumerate() {
+        let expected = manifest
+            .get(index)
+            .map(|migration| (migration.version, migration.current_checksum()))
+            .or_else(|| {
+                index.checked_sub(manifest.len()).and_then(|index| {
+                    extensions
+                        .get(index)
+                        .map(|entry| (entry.version, entry.checksum))
+                })
+            });
+        let Some((expected_version, expected_checksum)) = expected else {
+            return Err(LedgerProblem::UnknownVersion);
+        };
+        if *version != expected_version {
+            if manifest.iter().any(|m| m.version == *version)
+                || extensions.iter().any(|entry| entry.version == *version)
+            {
+                // A known version in the wrong place: reordered or gapped.
+                return Err(LedgerProblem::NotAPrefix);
+            }
+            return Err(LedgerProblem::UnknownVersion);
+        }
+        // Check contiguity even if a compiled extension is misnumbered.
+        if *version != i64::try_from(index + 1).unwrap_or(i64::MAX) {
+            return Err(LedgerProblem::NotAPrefix);
+        }
+        if checksum != expected_checksum {
+            return Err(LedgerProblem::ChecksumMismatch);
+        }
+    }
+    Ok(())
+}
+
+fn validate_runtime_contract(
+    applied: &[(i64, String)],
+    manifest: &[Migration],
+    contract: &SchemaCompatibility,
+) -> Result<SchemaStatus, LedgerProblem> {
+    validate_history(applied, manifest, contract.approved_extensions)?;
+    let version = applied.last().map_or(0, |(version, _)| *version);
+    if contract.permits(version) {
+        Ok(SchemaStatus::Current)
+    } else if applied.len() < manifest.len() {
+        Ok(SchemaStatus::NeedsUpgrade {
+            applied: applied.len(),
+            missing: manifest.len() - applied.len(),
+        })
+    } else {
+        Err(LedgerProblem::ReadWriteIncompatible)
+    }
+}
+
+/// Startup and readiness share this verdict; neither trusts ledger extent
+/// without the exact compiled checksums and both read/write bounds.
+pub(crate) fn validate_runtime_ledger(
+    applied: &[(i64, String)],
+) -> Result<SchemaStatus, LedgerProblem> {
+    validate_runtime_contract(applied, &MANIFEST, &BINARY_SCHEMA_COMPATIBILITY)
+}
+
+/// One extra row is enough to reject any history beyond the compiled list.
+#[cfg(feature = "postgres")]
+pub(crate) fn runtime_ledger_row_limit() -> usize {
+    MANIFEST.len() + BINARY_SCHEMA_COMPATIBILITY.approved_extensions.len() + 1
 }
 
 // --- the CLI -----------------------------------------------------------------
@@ -575,17 +669,34 @@ async fn refuse_other_deployment_read_only(
     }
 }
 
-/// Read the ledger from a pool and validate it against this binary's
-/// manifest. This is also the startup-validation entry point.
+/// Read the ledger against executable migrations for CLI/import preflight.
 #[cfg(feature = "postgres")]
 pub(crate) async fn read_and_validate(
     pool: &deadpool_postgres::Pool,
 ) -> Result<SchemaStatus, MigrateError> {
+    read_schema(pool, |rows| validate_ledger(rows, &MANIFEST)).await
+}
+
+/// Startup validates history and the serving contract, separately from what
+/// this binary's migrator can apply. Application replicas perform no DDL.
+#[cfg(feature = "postgres")]
+pub(crate) async fn read_and_validate_runtime(
+    pool: &deadpool_postgres::Pool,
+) -> Result<SchemaStatus, MigrateError> {
+    read_schema(pool, validate_runtime_ledger).await
+}
+
+#[cfg(feature = "postgres")]
+type LedgerValidator = fn(&[(i64, String)]) -> Result<SchemaStatus, LedgerProblem>;
+
+#[cfg(feature = "postgres")]
+async fn read_schema(
+    pool: &deadpool_postgres::Pool,
+    validate: LedgerValidator,
+) -> Result<SchemaStatus, MigrateError> {
     let client = acquire(pool).await?;
     let outcome = match read_ledger(&client).await? {
-        LedgerRead::Table(rows) => {
-            validate_ledger(&rows, &MANIFEST).map_err(MigrateError::LedgerInvalid)
-        }
+        LedgerRead::Table(rows) => validate(&rows).map_err(MigrateError::LedgerInvalid),
         LedgerRead::TableMissing => Ok(SchemaStatus::NotInitialized),
     };
     // A ledger that was read and judged publishes the verdict; a ledger
@@ -939,6 +1050,123 @@ mod tests {
     }
 
     #[test]
+    fn the_shipped_contract_has_no_unproved_overlap() {
+        assert_eq!(
+            MANIFEST.len(),
+            15,
+            "review the compatibility contract when adding SQL"
+        );
+        assert_eq!(schema_version_range(), (15, 15));
+        assert!(BINARY_SCHEMA_COMPATIBILITY.approved_extensions.is_empty());
+        assert_eq!(
+            validate_runtime_ledger(&ledger_for(&MANIFEST, MANIFEST.len(), "")),
+            Ok(SchemaStatus::Current)
+        );
+    }
+
+    fn prepared_fixture() -> SchemaCompatibility {
+        let checksum: &'static str =
+            Box::leak(hex_checksum("-- approved additive fixture").into_boxed_str());
+        SchemaCompatibility {
+            read: (3, 4),
+            write: (3, 4),
+            approved_extensions: Box::leak(
+                vec![ApprovedExtension {
+                    version: 4,
+                    checksum,
+                }]
+                .into_boxed_slice(),
+            ),
+        }
+    }
+
+    #[test]
+    fn a_prepared_reader_recognizes_only_the_exact_compiled_extension() {
+        let manifest = synthetic_manifest();
+        let contract = prepared_fixture();
+        let mut applied = ledger_for(&manifest, 3, "");
+        applied.push((4, contract.approved_extensions[0].checksum.to_owned()));
+        assert_eq!(
+            validate_runtime_contract(&applied, &manifest, &contract),
+            Ok(SchemaStatus::Current)
+        );
+        // Recognition grants serving compatibility, never executable SQL to
+        // the prepared migrator. It cannot apply or manage its successor.
+        assert_eq!(
+            validate_ledger(&applied, &manifest),
+            Err(LedgerProblem::UnknownVersion)
+        );
+        applied[3].1 = hex_checksum("-- different extension");
+        assert_eq!(
+            validate_runtime_contract(&applied, &manifest, &contract),
+            Err(LedgerProblem::ChecksumMismatch)
+        );
+    }
+
+    #[test]
+    fn wider_bounds_do_not_authorize_unknown_history_or_ledger_gaps() {
+        let manifest = synthetic_manifest();
+        let mut contract = prepared_fixture();
+        let mut applied = ledger_for(&manifest, 3, "");
+        applied.push((4, contract.approved_extensions[0].checksum.to_owned()));
+        contract.approved_extensions = &[];
+        assert_eq!(
+            validate_runtime_contract(&applied, &manifest, &contract),
+            Err(LedgerProblem::UnknownVersion)
+        );
+        let contract = prepared_fixture();
+        applied.remove(1);
+        assert_eq!(
+            validate_runtime_contract(&applied, &manifest, &contract),
+            Err(LedgerProblem::NotAPrefix)
+        );
+    }
+
+    #[test]
+    fn recognized_history_must_satisfy_both_read_and_write_contracts() {
+        let manifest = synthetic_manifest();
+        let mut contract = prepared_fixture();
+        let mut applied = ledger_for(&manifest, 3, "");
+        applied.push((4, contract.approved_extensions[0].checksum.to_owned()));
+        contract.write = (3, 3);
+        assert_eq!(contract.serving_range(), (3, 3));
+        assert_eq!(
+            validate_runtime_contract(&applied, &manifest, &contract),
+            Err(LedgerProblem::ReadWriteIncompatible)
+        );
+        contract.read = (3, 3);
+        contract.write = (3, 4);
+        assert_eq!(
+            validate_runtime_contract(&applied, &manifest, &contract),
+            Err(LedgerProblem::ReadWriteIncompatible)
+        );
+    }
+
+    #[test]
+    fn an_approved_extension_cannot_skip_a_migration_number() {
+        let manifest = synthetic_manifest();
+        let checksum: &'static str =
+            Box::leak(hex_checksum("-- gapped extension fixture").into_boxed_str());
+        let contract = SchemaCompatibility {
+            read: (3, 5),
+            write: (3, 5),
+            approved_extensions: Box::leak(
+                vec![ApprovedExtension {
+                    version: 5,
+                    checksum,
+                }]
+                .into_boxed_slice(),
+            ),
+        };
+        let mut applied = ledger_for(&manifest, 3, "");
+        applied.push((5, checksum.to_owned()));
+        assert_eq!(
+            validate_runtime_contract(&applied, &manifest, &contract),
+            Err(LedgerProblem::NotAPrefix)
+        );
+    }
+
+    #[test]
     fn an_empty_ledger_needs_upgrade() {
         let manifest = synthetic_manifest();
         assert_eq!(
@@ -1262,6 +1490,76 @@ mod tests {
             .batch_execute("DROP SCHEMA IF EXISTS greengateway CASCADE")
             .await
             .expect("cleanup should drop the gateway schema");
+    }
+
+    #[tokio::test]
+    async fn readiness_rechecks_checksums_and_gaps_after_successful_startup() {
+        use crate::ha_status::{
+            AuthorityObservation, PostgresReadinessAuthority, ReadinessAuthority,
+        };
+
+        let Some(dsn) = real_dsn() else {
+            eprintln!("skipping: no test database locator; CI runs this test");
+            return;
+        };
+        let _guard = REAL_DATABASE.lock().await;
+        let dsn_file = write_dsn_file(&dsn);
+        let config = migration_config(&dsn_file);
+        let foundation = establish(&config).await;
+        clean_database(foundation.pool()).await;
+        apply_missing(foundation.pool(), &test_settings())
+            .await
+            .expect("migrate fixture");
+        assert_eq!(
+            read_and_validate_runtime(foundation.pool()).await,
+            Ok(SchemaStatus::Current)
+        );
+
+        let authority = PostgresReadinessAuthority::new(foundation.pool().clone());
+        assert_eq!(
+            authority.observe().await,
+            AuthorityObservation::Writable { schema_version: 15 }
+        );
+        let client = foundation.pool().get().await.expect("fixture client");
+        client
+            .execute(
+                "UPDATE greengateway.schema_migrations SET checksum = $1 WHERE version = 1",
+                &[&format!("{}suffix", MANIFEST[0].current_checksum())],
+            )
+            .await
+            .expect("change fixture checksum without changing extent");
+        assert_eq!(
+            authority.observe().await,
+            AuthorityObservation::IncompatibleSchema { schema_version: 15 }
+        );
+        client
+            .execute(
+                "UPDATE greengateway.schema_migrations SET checksum = $1 WHERE version = 1",
+                &[&MANIFEST[0].current_checksum()],
+            )
+            .await
+            .expect("restore fixture checksum");
+        assert_eq!(
+            authority.observe().await,
+            AuthorityObservation::Writable { schema_version: 15 }
+        );
+        client
+            .execute(
+                "DELETE FROM greengateway.schema_migrations WHERE version = 1",
+                &[],
+            )
+            .await
+            .expect("remove a fixture history row");
+        assert_eq!(
+            authority.observe().await,
+            AuthorityObservation::IncompatibleSchema { schema_version: 15 }
+        );
+        drop(client);
+        clean_database(foundation.pool()).await;
+        assert_eq!(
+            authority.observe().await,
+            AuthorityObservation::IncompatibleSchema { schema_version: 0 }
+        );
     }
 
     #[tokio::test]

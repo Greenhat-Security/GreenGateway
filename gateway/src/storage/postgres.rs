@@ -279,7 +279,7 @@ impl PostgresFoundation {
                 .await
                 .map_err(super::migrations::startup_migration_failure)?;
         }
-        match super::migrations::read_and_validate(foundation.pool()).await {
+        match super::migrations::read_and_validate_runtime(foundation.pool()).await {
             Ok(super::migrations::SchemaStatus::Current) => {}
             Ok(super::migrations::SchemaStatus::NeedsUpgrade { applied, missing }) => {
                 return Err(PostgresFoundationError::SchemaNotReady {
