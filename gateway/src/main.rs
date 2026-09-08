@@ -103,6 +103,7 @@ mod mcp;
 mod metrics;
 mod middleware;
 mod path_match;
+mod policy_eval;
 mod proxy;
 mod rbac;
 #[cfg(feature = "postgres")]
