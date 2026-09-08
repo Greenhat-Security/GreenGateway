@@ -963,10 +963,12 @@ mod tests {
     }
     #[test]
     fn checkout_line_endings_do_not_change_syntax_fingerprint() {
-        let source="fn f() { let query = \"first\nsecond\"; reqwest::Client::new(); }\n";
-        let unix=FixtureDirectory::new(&[("main.rs",source)]);
-        let windows=FixtureDirectory::new(&[("main.rs",&source.replace('\n',"\r\n"))]);
-        assert_eq!(facts(&unix.tree().expect("LF source"))[0].sha256,facts(&windows.tree().expect("CRLF source"))[0].sha256);
+        let source = "fn f() { let query = \"first\nsecond\"; reqwest::Client::new(); }\n";
+        let unix = FixtureDirectory::new(&[("main.rs", source)]);
+        let windows = FixtureDirectory::new(&[("main.rs", &source.replace('\n', "\r\n"))]);
+        assert_eq!(
+            facts(&unix.tree().expect("LF source"))[0].sha256,
+            facts(&windows.tree().expect("CRLF source"))[0].sha256
+        );
     }
-
 }

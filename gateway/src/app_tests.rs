@@ -5945,7 +5945,11 @@ async fn mcp_real_client_connects_lists_calls_and_records_observability() {
         }))
     );
 
-    assert_eventually(Duration::from_secs(2), || {
+    // Audit/discovery completion may still be queued on this current-thread
+    // runtime after the SDK receives its response. A blocking polling helper
+    // prevents that work from progressing, especially under instrumentation.
+    let observation_deadline = Instant::now() + Duration::from_secs(10);
+    loop {
         let events = harness.capture.events();
         let has_start = events.iter().any(|event| {
             event.event_type == audit::event::TOOL_INVOKE_START
@@ -5965,8 +5969,15 @@ async fn mcp_real_client_connects_lists_calls_and_records_observability() {
                 && event.payload["status"] == json!(200)
         });
 
-        has_start && has_success && has_tool_observation
-    });
+        if has_start && has_success && has_tool_observation {
+            break;
+        }
+        assert!(
+            Instant::now() < observation_deadline,
+            "MCP start, success and observation events did not all arrive"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
 
     let row =
         wait_for_mcp_tool_inventory_row(&harness.router, &harness.admin_token, "echo", |row| {
@@ -27680,6 +27691,9 @@ async fn wait_for_mcp_tool_inventory_row(
     tool_name: &str,
     condition: impl Fn(&Value) -> bool,
 ) -> Value {
+    // This asserts eventual persistence, not a two-second throughput SLO.
+    // Keep a finite bound while allowing instrumented Windows SQLite workers
+    // to drain all observations; the exact row/count assertions stay unchanged.
     let started = Instant::now();
 
     loop {
@@ -27689,7 +27703,7 @@ async fn wait_for_mcp_tool_inventory_row(
         }
 
         assert!(
-            started.elapsed() < Duration::from_secs(2),
+            started.elapsed() < Duration::from_secs(10),
             "MCP tool inventory row did not match condition: {rows:?}"
         );
         tokio::time::sleep(Duration::from_millis(25)).await;
