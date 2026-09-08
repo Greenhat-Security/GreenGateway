@@ -24,9 +24,12 @@ Playwright configuration previously enabled an HTML reporter; merely naming
 directory are counts-only JSON summaries, not HTML or raw test output. No new
 assertion requires credentials, sensitive traces or local secret files.
 
-Offline validation runs with the existing suite:
+Offline validation requires the Python and PyYAML versions pinned in
+`build-tools.json` (Python 3.13.15 and PyYAML 6.0.3). Install the dependency before
+running the existing suite; CI uses the same pin:
 
 ```sh
+python -m pip install PyYAML==6.0.3
 python scripts/test_security_gates.py
 ```
 

@@ -15,7 +15,11 @@ even when a floor fails, and image promotion depends on the coverage job.
 
 Reproduce on the same compiler/platform:
 
+Use the Python 3.13.15 and PyYAML 6.0.3 versions pinned in `build-tools.json`.
+The offline gate regression suite imports PyYAML to inspect the CI workflow.
+
 ```powershell
+python -m pip install PyYAML==6.0.3
 rustup toolchain install nightly-2026-09-01 --profile minimal --component llvm-tools-preview
 cargo install cargo-llvm-cov --version 0.9.0 --locked
 cargo +nightly-2026-09-01 llvm-cov --no-rustc-wrapper --branch --json --output-path target/security-coverage.json -p gateway --bin gateway --locked --jobs 2 -- --test-threads=8 --skip audit::sqlite_sink::tests::moderate_scale_batched_inserts_complete_quickly
