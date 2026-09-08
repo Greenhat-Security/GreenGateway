@@ -5691,6 +5691,12 @@ async fn mcp_tools_call_sanitizes_non_success_upstream_error_body() {
         StatusCode::BAD_REQUEST,
         "application/json",
         json!({
+            "statusCode": 400,
+            "error": "BadRequestException",
+            "messages": [
+                "filter must use a supported comparison operator",
+                "validation failed against https://api.example.test/check?token=gg_test_fake_secret_400"
+            ],
             "message": "validation failed against api.internal.example.test",
             "errors": [
                 {
@@ -5731,6 +5737,21 @@ async fn mcp_tools_call_sanitizes_non_success_upstream_error_body() {
     assert_eq!(body["result"]["isError"], json!(true));
     assert_eq!(body["result"]["structuredContent"]["status"], json!(400));
     assert_eq!(
+        body["result"]["structuredContent"]["body"]["statusCode"],
+        json!(400)
+    );
+    assert_eq!(
+        body["result"]["structuredContent"]["body"]["error"],
+        json!("BadRequestException")
+    );
+    assert_eq!(
+        body["result"]["structuredContent"]["body"]["messages"],
+        json!([
+            "filter must use a supported comparison operator",
+            "validation failed against [redacted]"
+        ])
+    );
+    assert_eq!(
         body["result"]["structuredContent"]["body"]["message"],
         json!("validation failed against [redacted]")
     );
@@ -5740,6 +5761,7 @@ async fn mcp_tools_call_sanitizes_non_success_upstream_error_body() {
     );
     let body_string = body.to_string();
     assert!(!body_string.contains("api.internal.example.test"));
+    assert!(!body_string.contains("https://api.example.test"));
     assert!(!body_string.contains("gg_test_fake_secret_400"));
     assert!(!body_string.contains("stack trace"));
     assert!(!mcp_content_text(&body).contains("api.internal.example.test"));

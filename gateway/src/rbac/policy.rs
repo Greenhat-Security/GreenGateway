@@ -19,7 +19,7 @@ use super::rule::{
 };
 use crate::{auth::principal::canonical_issuer, auth::Principal, config::Config};
 
-const KNOWN_TOP_LEVEL_KEYS: &[&str] = &[
+pub(crate) const KNOWN_TOP_LEVEL_KEYS: &[&str] = &[
     "schema_version",
     "id",
     "default_action",

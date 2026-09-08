@@ -40,17 +40,27 @@ jobs:
       - name: Install the pinned coverage tool
         run: cargo install cargo-llvm-cov --version 0.9.0 --locked
       - name: Measure security branches
+        id: coverage
         # The mandatory uninstrumented test job enforces the SQLite wall-clock
         # budget. Instrumentation changes that measurement on hosted Windows.
         run: cargo llvm-cov --no-rustc-wrapper --branch --json --output-path target/security-coverage.json -p gateway --bin gateway --locked --jobs 2 -- --test-threads=8 --skip audit::sqlite_sink::tests::moderate_scale_batched_inserts_complete_quickly
       - name: Enforce production-code coverage floors
+        if: ${{ always() && steps.coverage.outcome == 'success' }}
         run: python scripts/check-security-coverage.py target/security-coverage.json
       - name: Preserve coverage evidence
-        if: always()
+        if: ${{ always() && steps.coverage.outcome == 'success' }}
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: security-coverage
           path: target/security-coverage.json
+          if-no-files-found: error
+      - name: Preserve available coverage failure diagnostics
+        if: ${{ always() && steps.coverage.outcome != 'success' }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: security-coverage-diagnostics
+          path: target/security-coverage.json
+          if-no-files-found: ignore
 
   supply-chain:
     name: supply-chain
@@ -312,22 +322,57 @@ jobs:
         run: npx --no-install playwright install --with-deps chromium
 
       - name: Test live Connection admin UI
+        id: live-ui
         working-directory: admin-ui
-        run: npx --no-install playwright test --config playwright.issue240.config.ts
+        env:
+          PLAYWRIGHT_JSON_OUTPUT_NAME: ${{ runner.temp }}/admin-ui-live.json
+        run: npx --no-install playwright test --config playwright.issue240.config.ts --reporter=line,json
+
+      - name: Validate live admin UI evidence
+        if: ${{ always() && steps.live-ui.outcome == 'success' }}
+        run: python scripts/check-test-evidence.py playwright "${{ runner.temp }}/admin-ui-live.json" admin-ui/playwright-report/live-summary.json
+
+      - name: Retain live admin UI evidence
+        if: ${{ always() && steps.live-ui.outcome == 'success' }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: admin-ui-live-evidence
+          path: admin-ui/playwright-report/live-summary.json
+          if-no-files-found: error
+          retention-days: 7
 
       - name: Test admin UI screenshots
+        id: screenshots
         working-directory: admin-ui
-        run: npm run screenshots
+        env:
+          PLAYWRIGHT_JSON_OUTPUT_NAME: ${{ runner.temp }}/admin-ui-screenshots.json
+        run: npm run screenshots -- --reporter=line,json
 
-      - name: Retain admin UI test artifacts
+      - name: Validate screenshot and report groups
+        if: ${{ always() && steps.screenshots.outcome == 'success' }}
+        run: python scripts/check-test-evidence.py playwright "${{ runner.temp }}/admin-ui-screenshots.json" admin-ui/playwright-report/screenshots-summary.json --screenshots admin-ui/.screenshots
+
+      - name: Retain required screenshot evidence
+        if: ${{ always() && steps.screenshots.outcome == 'success' }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: admin-ui-screenshot-evidence
+          path: |
+            admin-ui/.screenshots/**/*.png
+            admin-ui/playwright-report/screenshots-summary.json
+          include-hidden-files: true
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: Retain available admin UI diagnostics
         if: ${{ always() }}
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
-          name: admin-ui-test-artifacts
+          name: admin-ui-test-diagnostics
           path: |
-            admin-ui/.screenshots/
-            admin-ui/playwright-report/
+            admin-ui/.screenshots/**/*.png
             admin-ui/test-results/
+          include-hidden-files: true
           if-no-files-found: ignore
           retention-days: 7
 
@@ -447,6 +492,7 @@ jobs:
       - name: Set up verified Buildx and pinned BuildKit
         uses: ./.github/actions/buildx
       - name: Run dev traffic smoke test
+        id: dev-smoke
         shell: bash
         run: |
           set -eu
@@ -515,6 +561,19 @@ jobs:
           fi
 
           exit "$smoke_status"
+
+      - name: Validate stream evidence
+        if: ${{ always() && steps.dev-smoke.outcome == 'success' }}
+        run: python scripts/check-test-evidence.py stream artifacts/proxy-load/ci-stream.json artifacts/proxy-load/ci-stream-summary.json
+
+      - name: Retain stream evidence
+        if: ${{ always() && steps.dev-smoke.outcome == 'success' }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: dev-stream-evidence
+          path: artifacts/proxy-load/ci-stream-summary.json
+          if-no-files-found: error
+          retention-days: 7
 
   audit:
     name: audit

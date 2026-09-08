@@ -364,13 +364,32 @@ fn sanitized_error_body_value(response: &EgressResponse) -> Value {
                         "error",
                         "error_code",
                         "message",
+                        "messages",
+                        "statusCode",
                         "detail",
                         "details",
                         "errors",
                     ] {
                         if let Some(value) = body.get(key) {
-                            sanitized
-                                .insert(key.to_owned(), sanitize_error_json_value(key, value, 0));
+                            let value = match (key, value) {
+                                ("messages", Value::Array(values)) => Value::Array(
+                                    values
+                                        .iter()
+                                        .take(MAX_ERROR_ARRAY_ITEMS)
+                                        .filter_map(Value::as_str)
+                                        .map(|value| {
+                                            Value::String(sanitize_error_text(
+                                                value,
+                                                MAX_ERROR_TEXT_CHARS,
+                                            ))
+                                        })
+                                        .collect(),
+                                ),
+                                ("statusCode", Value::Number(_)) => value.clone(),
+                                ("messages" | "statusCode", _) => continue,
+                                _ => sanitize_error_json_value(key, value, 0),
+                            };
+                            sanitized.insert(key.to_owned(), value);
                         }
                     }
 
@@ -432,6 +451,20 @@ fn sanitize_error_json_value(key: &str, value: &Value, depth: usize) -> Value {
 }
 
 fn sanitize_error_text(value: &str, max_chars: usize) -> String {
+    // An opaque credential has no recognizable prefix. Withhold diagnostics
+    // naming authorization or common credential schemes instead of guessing
+    // where an upstream's free-form credential value ends. Inspect before
+    // truncating so the context cannot be separated from an earlier value.
+    if value
+        .split(|ch: char| !ch.is_ascii_alphabetic())
+        .any(|word| {
+            word.eq_ignore_ascii_case("authorization")
+                || word.eq_ignore_ascii_case("bearer")
+                || word.eq_ignore_ascii_case("basic")
+        })
+    {
+        return REDACTED.to_owned();
+    }
     let (truncated, was_truncated) = truncate_chars(value, max_chars);
     let redacted = redact_sensitive_tokens(&truncated);
 
@@ -878,6 +911,117 @@ mod tests {
             executor.is_some(),
             "the registry can gain tools through hot reload, so the executor must exist even when startup sees none"
         );
+    }
+
+    #[test]
+    fn http_error_messages_keep_string_and_array_limits_and_redaction() {
+        let long_message = format!("{}discarded tail", "é".repeat(MAX_ERROR_TEXT_CHARS));
+        let mut messages = vec![json!(long_message); MAX_ERROR_ARRAY_ITEMS + 1];
+        messages[0] =
+            json!("filter failed at https://api.example.test with secret=FAKE_error_token");
+        messages[MAX_ERROR_ARRAY_ITEMS] = json!("discarded ninth message");
+        let result = call_tool_result_from_http_execution(HttpToolExecutionResult {
+            response: error_response(json!({
+                "statusCode": 422,
+                "error": "BadRequestException",
+                "messages": messages,
+                "debug": "discarded diagnostics"
+            })),
+            warnings: Vec::new(),
+        });
+
+        assert_eq!(result.is_error, Some(true));
+        let content = result.structured_content.expect("structured error result");
+        assert_eq!(content["status"], json!(400));
+        assert_eq!(content["body"]["statusCode"], json!(422));
+        assert_eq!(content["body"]["error"], json!("BadRequestException"));
+        let messages = content["body"]["messages"]
+            .as_array()
+            .expect("messages array");
+        assert_eq!(messages.len(), MAX_ERROR_ARRAY_ITEMS);
+        assert_eq!(
+            messages[0],
+            json!("filter failed at [redacted] with [redacted]")
+        );
+        for message in &messages[1..] {
+            assert_eq!(
+                message,
+                &json!(format!(
+                    "{}...[truncated]",
+                    "é".repeat(MAX_ERROR_TEXT_CHARS)
+                ))
+            );
+        }
+        let serialized = serde_json::to_string(&result.content).expect("text content serializes");
+        for discarded in ["discarded", "api.example.test", "FAKE_error_token"] {
+            assert!(!content.to_string().contains(discarded));
+            assert!(!serialized.contains(discarded));
+        }
+    }
+
+    #[test]
+    fn http_error_authorization_diagnostics_are_withheld_in_both_result_forms() {
+        let canary = uuid::Uuid::new_v4().simple().to_string();
+        for diagnostic in [
+            format!("Authorization: Bearer {canary}"),
+            format!("proxy-AUTHORIZATION: Basic {canary}"),
+            format!("rejected bEaReR\t{canary}"),
+            format!("{canary}{} authorization diagnostic", "x".repeat(600)),
+        ] {
+            let result = call_tool_result_from_http_execution(HttpToolExecutionResult {
+                response: error_response(json!({
+                    "messages": [diagnostic, "filter must be an object"],
+                    "message": diagnostic,
+                    "statusCode": 400
+                })),
+                warnings: Vec::new(),
+            });
+            let body = &result.structured_content.as_ref().unwrap()["body"];
+            assert_eq!(
+                body["messages"],
+                json!([REDACTED, "filter must be an object"])
+            );
+            assert_eq!(body["message"], json!(REDACTED));
+            assert!(!body.to_string().contains(&canary));
+            assert!(!serde_json::to_string(&result.content)
+                .unwrap()
+                .contains(&canary));
+        }
+    }
+
+    #[test]
+    fn http_error_messages_and_status_code_drop_unexpected_types() {
+        let sanitized = sanitized_error_body_value(&error_response(json!({
+            "messages": ["valid", {"message": "nested"}, ["nested"], null, true, 400, "also valid"],
+            "statusCode": {"message": "nested status"}
+        })));
+        assert_eq!(sanitized, json!({"messages": ["valid", "also valid"]}));
+
+        for malformed in [
+            Value::Null,
+            json!(true),
+            json!("400"),
+            json!([400]),
+            json!({}),
+        ] {
+            let sanitized = sanitized_error_body_value(&error_response(json!({
+                "messages": "not an array",
+                "statusCode": malformed,
+                "debug": "discarded diagnostics"
+            })));
+            assert_eq!(sanitized, generic_upstream_error_body());
+        }
+    }
+
+    fn error_response(body: Value) -> EgressResponse {
+        EgressResponse {
+            status: http::StatusCode::BAD_REQUEST,
+            headers: http::HeaderMap::from_iter([(
+                header::CONTENT_TYPE,
+                http::HeaderValue::from_static(JSON_MIME),
+            )]),
+            body: serde_json::to_vec(&body).expect("error body serializes"),
+        }
     }
 
     #[test]

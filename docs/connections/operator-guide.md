@@ -671,6 +671,30 @@ rich-text shape must therefore chain `markdown_blocks` and then `json_string`.
 For exact currency values, `decimal_scale` operates on the JSON number token
 and never through floating-point multiplication.
 
+## HTTP Tool Error Bodies
+
+An HTTP-rendered tool's non-2xx response becomes an MCP error result with
+`{status, body}`. For JSON objects, the body retains only these top-level keys:
+`type`, `title`, `code`, `error`, `error_code`, `message`, `messages`,
+`statusCode`, `detail`, `details`, and `errors`. `messages` must be an array;
+only string entries among its first eight items survive. `statusCode` must be
+a JSON number and is upstream-provided metadata; the outer `status` records
+the actual HTTP response status. Other top-level keys are removed.
+
+For example, a NestJS-style 400 response can preserve
+`{"statusCode":400,"error":"BadRequestException","messages":["filter must use a supported comparison operator"]}`.
+Free-form diagnostics naming Authorization, Bearer, or Basic authentication
+are withheld as `[redacted]`, including opaque credentials without a recognizable
+prefix. This conservative context check runs before truncation. Other strings
+are capped at 512 characters before token redaction, with
+`...[truncated]` appended when shortened. Existing URL, internal-hostname, and
+credential-token redaction applies to every retained string, including
+`messages` entries. Other retained values keep the existing limits of eight
+array items, 16 fields per nested object, and four nesting levels; sensitive
+nested keys have their values redacted. The configured
+[`EGRESS_MAX_RESPONSE_BYTES`](../configuration.md#egress_max_response_bytes)
+limit still bounds the upstream response body before sanitization.
+
 ## Observability and Alerts
 
 The audit stream records bounded, payload-free events for Connection and
