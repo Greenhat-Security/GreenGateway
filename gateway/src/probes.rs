@@ -125,6 +125,7 @@ pub(super) async fn version(State(state): State<AppState>) -> Json<VersionRespon
     Json(VersionResponse {
         version: env!("CARGO_PKG_VERSION"),
         admin_login_configured: state.admin_login_configured,
+        admin_session: state.admin_session,
     })
 }
 

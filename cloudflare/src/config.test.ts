@@ -77,11 +77,14 @@ describe("buildGreenGatewayContainerEnv", () => {
     });
   });
 
-  it("forwards bounded login, discovery, and NAT64 settings", () => {
+  it("forwards bounded login, session, discovery, and NAT64 settings", () => {
     const env = buildGreenGatewayContainerEnv({
       ADMIN_LOGIN_PENDING_TTL_SECS: "600",
       ADMIN_LOGIN_PENDING_MAX_ENTRIES: "1024",
       ADMIN_LOGIN_PENDING_MAX_PER_IP: "8",
+      ADMIN_SESSION_MODE: "standalone_memory",
+      ADMIN_SESSION_TTL_SECS: "3600",
+      ADMIN_SESSION_MAX_ENTRIES: "1024",
       DISCOVERY_ENDPOINT_LIMIT: "10000",
       EGRESS_NAT64_PREFIXES: "64:ff9b::/96",
     });
@@ -90,6 +93,9 @@ describe("buildGreenGatewayContainerEnv", () => {
       ADMIN_LOGIN_PENDING_TTL_SECS: "600",
       ADMIN_LOGIN_PENDING_MAX_ENTRIES: "1024",
       ADMIN_LOGIN_PENDING_MAX_PER_IP: "8",
+      ADMIN_SESSION_MODE: "standalone_memory",
+      ADMIN_SESSION_TTL_SECS: "3600",
+      ADMIN_SESSION_MAX_ENTRIES: "1024",
       DISCOVERY_ENDPOINT_LIMIT: "10000",
       EGRESS_NAT64_PREFIXES: "64:ff9b::/96",
     });

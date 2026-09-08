@@ -91,6 +91,7 @@ pub(super) fn grpc_app(
         }),
         auth_state: middleware_stack.auth_state.clone().map(|mut state| {
             state.exempt_paths = Vec::new();
+            state.admin_sessions = None;
             state
         }),
         proxy_dispatch_state: middleware_stack.proxy_dispatch_state.clone(),
@@ -535,7 +536,20 @@ pub(super) fn admin_auth_router(routes: &GatewayRoutes, state: Option<AdminAuthS
         return Router::new();
     };
 
-    Router::new()
+    let router = if state.sessions.is_some() {
+        Router::new()
+            .route(
+                format!("/v1{}/auth/logout", state.admin_prefix).as_str(),
+                post(admin_auth_logout_endpoint),
+            )
+            .route(
+                format!("/v1{}/auth/config", state.admin_prefix).as_str(),
+                get(admin_auth_config_endpoint),
+            )
+    } else {
+        Router::new()
+    };
+    router
         .route(
             routes.admin.auth_login_route.as_str(),
             get(admin_auth_login_endpoint),
@@ -595,11 +609,19 @@ pub(super) fn apply_middleware(
         router
     };
 
-    let router = router
-        .layer(axum::middleware::from_fn_with_state(
-            stack.csrf_config.clone(),
-            middleware::csrf::csrf_middleware,
+    let router = router.layer(axum::middleware::from_fn_with_state(
+        stack.csrf_config.clone(),
+        middleware::csrf::csrf_middleware,
+    ));
+    let router = if stack.config.admin_session.is_some() {
+        router.layer(axum::middleware::from_fn_with_state(
+            (stack.config.clone(), stack.audit_log.clone()),
+            admin_session_csrf_audit_middleware,
         ))
+    } else {
+        router
+    };
+    let router = router
         .layer(axum::middleware::from_fn_with_state(
             stack.config.clone(),
             middleware::validate::validate_request,

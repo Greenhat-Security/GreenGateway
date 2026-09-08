@@ -64,18 +64,18 @@ fn env_example_exempt_paths_are_not_hardcoded() {
 
 /// Every published claim that an explicit `AUTH_EXEMPT_PATHS` /
 /// `RBAC_EXEMPT_PATHS` value replaces the whole default must also disclose the
-/// one pair the code appends anyway.
+/// admin authentication routes the code appends anyway.
 ///
 /// `append_admin_login_exempt_paths` in gateway/src/config.rs runs
 /// unconditionally after the parse whenever `ADMIN_LOGIN_PROVIDER` is set, so
 /// `/v1{ADMIN_PREFIX}/auth/login` and `/v1{ADMIN_PREFIX}/auth/callback` stay
-/// exempt even for an operator who supplied an explicit list. Both routes have
-/// to be anonymous for the OIDC authorization-code flow to complete, so the
-/// behavior is deliberate; leaving it out of the documented contract is what
-/// made an operator's own configuration audit come to a false conclusion about
-/// their exempt surface.
+/// exempt even for an operator who supplied an explicit list. Enabling
+/// `ADMIN_SESSION_MODE=standalone_memory` also appends `/v1{ADMIN_PREFIX}/auth/config`
+/// and `/v1{ADMIN_PREFIX}/auth/logout` for pre-login discovery and logout after
+/// session expiry. Logout still enforces its own exact-origin and CSRF checks.
+/// These deliberate exceptions must remain visible in the operator contract.
 #[test]
-fn exempt_path_replacement_claims_disclose_the_forced_admin_login_pair() {
+fn exempt_path_replacement_claims_disclose_the_forced_admin_auth_routes() {
     const DISCLOSURE: &str = "remain exempt even when";
 
     let gateway_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
@@ -120,9 +120,25 @@ fn exempt_path_replacement_claims_disclose_the_forced_admin_login_pair() {
                  append_admin_login_exempt_paths in gateway/src/config.rs to match the claim.\n\n{block}",
                 path.display()
             );
+            for route in ["login", "callback", "config", "logout"] {
+                assert!(
+                    block.contains(&format!("/v1{{ADMIN_PREFIX}}/auth/{route}")),
+                    "{} should name the appended admin auth route {route}:\n\n{block}",
+                    path.display()
+                );
+            }
             assert!(
-                block.contains("/auth/login") && block.contains("/auth/callback"),
-                "{} should name both always-appended routes:\n\n{block}",
+                block.contains("ADMIN_LOGIN_PROVIDER")
+                    && block.contains("ADMIN_SESSION_MODE=standalone_memory")
+                    && block.contains("session routes are added only in that mode"),
+                "{} should disclose the provider condition and opt-in session condition:\n\n{block}",
+                path.display()
+            );
+            assert!(
+                block.contains(
+                    "Logout still requires the exact management origin and configured CSRF pair"
+                ),
+                "{} should disclose that logout retains its origin and CSRF checks:\n\n{block}",
                 path.display()
             );
         }

@@ -135,6 +135,7 @@ pub(super) struct AppState {
     pub(super) routes: GatewayRoutes,
     pub(super) client_ip_policy: client_ip::ClientIpPolicy,
     pub(super) admin_login_configured: bool,
+    pub(super) admin_session: Option<AdminSessionCapabilities>,
     pub(super) csrf_cookie_name: String,
     pub(super) csrf_header_name: String,
     pub(super) max_body_size: usize,
@@ -468,6 +469,8 @@ pub(super) struct ToolAdminState {
 #[derive(Clone)]
 pub(super) struct AdminAuthState {
     pub(super) login: auth::OidcLoginState,
+    pub(super) sessions: Option<Arc<auth::admin_session::AdminSessions>>,
+    pub(super) csrf: middleware::csrf::CsrfConfig,
     pub(super) audit: audit::AuditLog,
     pub(super) admin_prefix: String,
     pub(super) cookie_max_age: u64,
@@ -475,6 +478,19 @@ pub(super) struct AdminAuthState {
 }
 
 impl AdminAuthState {
+    pub(super) fn session_capabilities(&self) -> Option<AdminSessionCapabilities> {
+        self.sessions
+            .as_ref()
+            .map(|sessions| AdminSessionCapabilities {
+                storage: "standalone_memory",
+                completion_mode: "cookie",
+                login_url: format!("{}auth/login", sessions.api_prefix),
+                completion_url: format!("{}auth/callback", sessions.api_prefix),
+                logout_url: format!("{}auth/logout", sessions.api_prefix),
+                max_age_seconds: sessions.ttl_seconds(),
+            })
+    }
+
     pub(super) fn record(
         &self,
         parts: &http::request::Parts,

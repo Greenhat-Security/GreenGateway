@@ -1522,6 +1522,57 @@ pub(super) fn gateway_app_with_process_started_at_and_overrides(
         pending_login_backend,
         Some(&lifecycle),
     )?;
+    let admin_auth_state = if let Some(mut state) = admin_auth_state {
+        if let Some(session_config) = config.admin_session.clone() {
+            if config.state_backend != config::StateBackend::Sqlite
+                || !config.auth_enabled
+                || config.auth_mode != config::AuthMode::Required
+                || !config.csrf_enabled
+            {
+                return Err(auth::AuthError::Upstream(
+                    "admin sessions require standalone mode, required authentication and CSRF"
+                        .to_owned(),
+                )
+                .into());
+            }
+            // Restrict validation to the selected login provider. In particular,
+            // never submit OIDC tokens to an external cookie introspector or
+            // allow a different provider in the global chain to own the identity.
+            let mut authority_config = config.clone();
+            authority_config.auth_providers.retain(|provider| {
+                Some(provider.name.as_str()) == config.admin_login_provider.as_deref()
+            });
+            let authority = auth_validator_from_config(
+                &authority_config,
+                Arc::clone(&egress_client),
+                None,
+                &discovered_oidc.jwks_urls,
+                jwt_revocation,
+                Some(&lifecycle),
+            )?
+            .ok_or_else(|| {
+                auth::AuthError::Upstream("admin session authority is not configured".to_owned())
+            })?;
+            let sessions = auth::admin_session::AdminSessions::new(
+                session_config,
+                authority,
+                &config.admin_prefix,
+                state.login.redirect_origin(),
+            )?;
+            if sessions.cookie_name == config.auth_cookie_name
+                || sessions.cookie_name == config.csrf_cookie_name
+            {
+                return Err(auth::AuthError::Upstream(
+                    "admin session cookie name conflicts with another credential cookie".to_owned(),
+                )
+                .into());
+            }
+            state.sessions = Some(Arc::new(sessions));
+        }
+        Some(state)
+    } else {
+        None
+    };
     let principal_directory = auth::PrincipalDirectory::from_config(&config)?;
     let rbac_status = RbacStatus {
         policy_loaded: loaded_policy.is_some(),
@@ -2038,12 +2089,19 @@ pub(super) fn gateway_app_with_process_started_at_and_overrides(
     }
 
     let auth_state = if config.auth_enabled {
-        Some(middleware::auth::AuthState::from_config(
-            &config,
-            validator,
-            audit_log.clone(),
-            principal_directory.clone(),
-        ))
+        Some(
+            middleware::auth::AuthState::from_config(
+                &config,
+                validator,
+                audit_log.clone(),
+                principal_directory.clone(),
+            )
+            .with_admin_sessions(
+                admin_auth_state
+                    .as_ref()
+                    .and_then(|state| state.sessions.clone()),
+            ),
+        )
     } else {
         None
     };
@@ -2066,6 +2124,9 @@ pub(super) fn gateway_app_with_process_started_at_and_overrides(
         routes: routes.clone(),
         client_ip_policy: client_ip_policy.clone(),
         admin_login_configured: admin_auth_state.is_some(),
+        admin_session: admin_auth_state
+            .as_ref()
+            .and_then(AdminAuthState::session_capabilities),
         csrf_cookie_name: config.csrf_cookie_name.clone(),
         csrf_header_name: config.csrf_header_name.clone(),
         max_body_size: config.max_body_size,
@@ -2331,6 +2392,8 @@ pub(super) fn admin_auth_state_from_config(
 
     Ok(Some(AdminAuthState {
         login,
+        sessions: None,
+        csrf: middleware::csrf::CsrfConfig::from_config(config),
         audit,
         admin_prefix: config.admin_prefix.clone(),
         cookie_max_age: config.admin_login_pending_ttl_secs,

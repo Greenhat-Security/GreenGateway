@@ -7,6 +7,84 @@ use axum::{
 };
 use tower::ServiceExt;
 
+#[tokio::test]
+async fn bodyless_logout_exception_requires_enabled_exact_registered_post() {
+    for (enabled, method, path, registered, body, expected) in [
+        (
+            true,
+            Method::POST,
+            "/v1/operations/auth/logout",
+            true,
+            "",
+            StatusCode::OK,
+        ),
+        (
+            false,
+            Method::POST,
+            "/v1/operations/auth/logout",
+            true,
+            "",
+            StatusCode::UNSUPPORTED_MEDIA_TYPE,
+        ),
+        (
+            true,
+            Method::PUT,
+            "/v1/operations/auth/logout",
+            true,
+            "",
+            StatusCode::UNSUPPORTED_MEDIA_TYPE,
+        ),
+        (
+            true,
+            Method::POST,
+            "/v1/admin/auth/logout",
+            true,
+            "",
+            StatusCode::UNSUPPORTED_MEDIA_TYPE,
+        ),
+        (
+            true,
+            Method::POST,
+            "/v1/operations/auth/logout",
+            false,
+            "",
+            StatusCode::UNSUPPORTED_MEDIA_TYPE,
+        ),
+        (
+            true,
+            Method::POST,
+            "/v1/operations/auth/logout",
+            true,
+            "nonempty",
+            StatusCode::UNSUPPORTED_MEDIA_TYPE,
+        ),
+    ] {
+        let mut config = test_config(1024, vec!["application/json"]);
+        config.admin_prefix = "/operations".to_owned();
+        config.admin_session = enabled.then_some(crate::auth::admin_session::AdminSessionConfig {
+            ttl: std::time::Duration::from_secs(60),
+            max_entries: 8,
+        });
+        let router = if registered {
+            Router::new().route(path, any(|| async { StatusCode::OK }))
+        } else {
+            Router::new().fallback(|| async { StatusCode::OK })
+        }
+        .layer(from_fn_with_state(config, validate_request));
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .method(method)
+                    .uri(path)
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), expected);
+    }
+}
+
 fn test_config(max_body_size: usize, validation_allowed_content_types: Vec<&str>) -> Config {
     Config {
         listen_addr: "127.0.0.1:0"
@@ -27,6 +105,7 @@ fn test_config(max_body_size: usize, validation_allowed_content_types: Vec<&str>
         admin_client_cert_auth: None,
         admin_prefix: "/admin".to_owned(),
         admin_login_provider: None,
+        admin_session: None,
         admin_login_pending_ttl_secs: crate::config::DEFAULT_ADMIN_LOGIN_PENDING_TTL_SECS,
         admin_login_pending_max_entries: crate::config::DEFAULT_ADMIN_LOGIN_PENDING_MAX_ENTRIES,
         admin_login_pending_max_per_ip: crate::config::DEFAULT_ADMIN_LOGIN_PENDING_MAX_PER_IP,

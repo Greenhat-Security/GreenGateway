@@ -1,3 +1,4 @@
+pub mod admin_session;
 pub mod chain;
 pub mod claims;
 pub mod client_certificate;

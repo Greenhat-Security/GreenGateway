@@ -45,6 +45,10 @@ struct CsrfForbiddenBody {
     error: &'static str,
 }
 
+/// Internal signal for lifecycle audit middleware; never serialized to clients.
+#[derive(Clone, Copy)]
+pub(crate) struct CsrfRejection;
+
 impl CsrfConfig {
     pub fn from_config(config: &Config) -> Self {
         Self {
@@ -116,7 +120,9 @@ pub async fn csrf_middleware(
                 reason = reason,
                 "CSRF validation failed"
             );
-            return csrf_forbidden();
+            let mut response = csrf_forbidden();
+            response.extensions_mut().insert(CsrfRejection);
+            return response;
         }
     }
 
@@ -135,6 +141,18 @@ pub async fn csrf_middleware(
     }
 
     response
+}
+
+/// Mandatory check for issued-session lifecycle endpoints, including when a
+/// caller sends an Authorization header. Configured names remain authoritative.
+pub(crate) fn admin_session_csrf_matches(config: &CsrfConfig, headers: &HeaderMap) -> bool {
+    let cookies = all_cookie_values(headers, &config.cookie_name);
+    let mut values = headers.get_all(config.header_name.as_str()).iter();
+    let header = values.next().and_then(header_value_to_str);
+    config.enabled
+        && cookies.len() == 1
+        && values.next().is_none()
+        && csrf_token_matches(&cookies, header)
 }
 
 fn csrf_token_matches(cookie_tokens: &[String], header_token: Option<&str>) -> bool {

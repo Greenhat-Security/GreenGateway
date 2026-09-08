@@ -62,6 +62,18 @@ pub(super) struct ProbeResponse {
 pub(super) struct VersionResponse {
     pub(super) version: &'static str,
     pub(super) admin_login_configured: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) admin_session: Option<AdminSessionCapabilities>,
+}
+
+#[derive(Clone, Serialize)]
+pub(super) struct AdminSessionCapabilities {
+    pub(super) storage: &'static str,
+    pub(super) completion_mode: &'static str,
+    pub(super) login_url: String,
+    pub(super) completion_url: String,
+    pub(super) logout_url: String,
+    pub(super) max_age_seconds: u64,
 }
 
 #[derive(Clone, Serialize)]
@@ -146,6 +158,16 @@ pub(super) struct AdminAuthCallbackParams {
 pub(super) struct AdminAuthCompletionParams {
     pub(super) code: String,
     pub(super) state: String,
+    #[serde(default)]
+    pub(super) mode: AdminAuthCompletionMode,
+}
+
+#[derive(Default, Deserialize, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub(super) enum AdminAuthCompletionMode {
+    #[default]
+    Bearer,
+    Cookie,
 }
 
 #[derive(Deserialize)]
