@@ -119,5 +119,35 @@ The `cargo-policy` job is a required promotion dependency. It preserves
 metadata, tool and policy failures cannot produce a passed report. Exception
 metadata is included in every passing report.
 
-Executable negative fixtures and dependency-update guidance are completed in
-slice 3 of #431.
+## Updating dependencies and exceptions
+
+1. Update the lockfile with the pinned compiler, keeping the full workspace and
+   shipped features represented. Do not edit lock checksums manually.
+2. Run the policy checker. Review new sources, license expressions and duplicate
+   groups. A newly banned TLS stack requires an architecture decision, not a
+   routine exception. Registry/Git origins remain closed by default.
+3. For unavoidable duplicate changes, inspect `cargo tree --locked --all-features
+   --target all --invert NAME@VERSION` and the metadata parent edges. Update only
+   the exact version group and parents, explain why they cannot converge yet,
+   assign maintainer ownership and a concrete remediation condition, and choose
+   an expiry no more than 90 days ahead. Remove stale entries instead of
+   carrying them forward. Renewals require substantive review.
+4. License exceptions must pin one crate/version and its selected license IDs.
+   Preserve applicable notices. New licensing outside the existing acceptance
+   policy remains an explicit maintainer decision; do not broaden allowances to
+   silence a failed check. Update the corresponding `deny.toml` entries in the
+   same reviewed PR. Undeclared hidden exception files are rejected.
+5. Run `python -m unittest discover -s scripts -p 'test_cargo_policy.py' -v`,
+   `python scripts/cargo_policy.py check`, the security-gate tests and publication
+   tests. CI performs these policy checks on Linux and Windows with the same
+   verified executable version. Normal Cargo audits and image scans remain
+   required independently.
+
+The native fixtures edit disposable metadata only. They prove the actual pinned
+cargo-deny rejects an unapproved license, a banned crate and unknown registry/Git
+sources, with networking disabled and no dependency files changed or compiled.
+A clean native control prevents a broken fixture from masquerading as rejection.
+Other regressions cover expired/unowned/broad/stale exceptions, duplicate-parent
+changes, graph pruning, hidden overrides, missing tools/config, and required CI
+wiring. Reports bind their lockfile, config, review metadata and tool contract by
+SHA-256 and retain exact exceptions, including their ownership and expiry.
