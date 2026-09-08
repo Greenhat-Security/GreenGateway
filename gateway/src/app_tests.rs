@@ -19718,6 +19718,98 @@ async fn audit_query_admin_principal_filters_events() {
 }
 
 #[tokio::test]
+async fn audit_query_reason_filter_reaches_storage_and_preserves_pagination() {
+    let db = TempDb::new("audit-query-reason");
+    create_audit_schema(&db.path);
+    for (event_id, event_type, mut payload) in [
+        (
+            "direct",
+            "tool.invoke_failure",
+            json!({"reason": "invalid_params"}),
+        ),
+        (
+            "detailed",
+            "tool.invoke_failure",
+            json!({"reason": "work_error", "failure_reason": "invalid_params"}),
+        ),
+        (
+            "both",
+            "tool.invoke_failure",
+            json!({"reason": "invalid_params", "failure_reason": "invalid_params"}),
+        ),
+        ("missing", "tool.invoke_failure", json!({})),
+        (
+            "unrelated",
+            "tool.invoke_failure",
+            json!({"message": "invalid_params", "data": {"reason": "invalid_params"}}),
+        ),
+        (
+            "other-type",
+            "audit.other",
+            json!({"failure_reason": "invalid_params"}),
+        ),
+    ] {
+        insert_audit_event(
+            &db.path,
+            SeedAuditEvent {
+                event_id,
+                event_type,
+                timestamp: "2024-06-01T12:00:00Z",
+                actor_user_id: "admin-user",
+                path: "/tools",
+                status: 400,
+            },
+        );
+        payload["path"] = json!("/tools");
+        payload["status"] = json!(400);
+        Connection::open(&db.path)
+            .expect("test database should open")
+            .execute(
+                "UPDATE audit_events SET payload_json = ?1 WHERE event_id = ?2",
+                params![payload.to_string(), event_id],
+            )
+            .expect("reason payload should update");
+    }
+    let (router, _policy) = audit_query_router(Some(&db.path));
+    let query = "/v1/admin/audit?event_type=tool.invoke_failure&reason=invalid_params&limit=2";
+    let first = router
+        .clone()
+        .oneshot(audit_query_request(query, Some(test_principal(&["admin"]))))
+        .await
+        .expect("first reason-filtered request should complete");
+    assert_eq!(first.status(), StatusCode::OK);
+    let first = json_body(first).await;
+    assert_eq!(event_ids_from_body(&first), ["both", "detailed"]);
+    let cursor = first["next_cursor"]
+        .as_i64()
+        .expect("first page has a cursor");
+
+    let second = router
+        .clone()
+        .oneshot(audit_query_request(
+            &format!("{query}&before_id={cursor}"),
+            Some(test_principal(&["admin"])),
+        ))
+        .await
+        .expect("second reason-filtered request should complete");
+    assert_eq!(second.status(), StatusCode::OK);
+    let second = json_body(second).await;
+    assert_eq!(event_ids_from_body(&second), ["direct"]);
+    assert!(second["next_cursor"].is_null());
+    assert_eq!(
+        audit_event_ids(router.clone(), "/v1/admin/audit?reason=work_error").await,
+        ["detailed"]
+    );
+    for reason in ["invalid", "a", &"a".repeat(64), "upstream_http_4xx"] {
+        assert!(
+            audit_event_ids(router.clone(), &format!("/v1/admin/audit?reason={reason}"))
+                .await
+                .is_empty()
+        );
+    }
+}
+
+#[tokio::test]
 async fn audit_query_paginates_with_keyset_cursor_without_gaps() {
     let db = TempDb::new("audit-query-pagination");
     create_audit_schema(&db.path);
@@ -19808,6 +19900,15 @@ async fn audit_query_malformed_params_return_bad_request() {
         ("/v1/admin/audit?before_id=-1", "before_id"),
         ("/v1/admin/audit?before_id=not-a-number", "before_id"),
         ("/v1/admin/audit?limit=0", "limit"),
+        ("/v1/admin/audit?reason=", "reason"),
+        ("/v1/admin/audit?reason=INVALID_PARAMS", "reason"),
+        ("/v1/admin/audit?reason=invalid%20params", "reason"),
+        ("/v1/admin/audit?reason=invalid%0Aparams", "reason"),
+        ("/v1/admin/audit?reason=%C3%A9", "reason"),
+        (
+            "/v1/admin/audit?reason=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "reason",
+        ),
     ] {
         let response = router
             .clone()
