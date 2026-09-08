@@ -38,6 +38,18 @@ export const OPERATIONS = [
   "tools.publish"
 ];
 const MODES = ["postgres", "standalone"];
+const REVISION_OPERATIONS = {
+  create: ["connection.create", "secret.create", "service_token.issue"],
+  advance: ["connection.replace", "credential.binding_change", "catalog.overlay.delete", "catalog.overlay.replace",
+    "policy.rollback", "policy.rule.create", "policy.rule.delete", "policy.rule.reorder", "policy.rule.update", "policy.suggestion.accept",
+    "secret.rotate", "secret.external_rotate", "service_token.rotate", "service_token.revoke"],
+  publish: ["catalog.mcp.publish", "catalog.openapi.publish", "configuration.activate", "configuration.import",
+    "jwt.revoke", "policy.file_reload", "policy.publish", "tools.publish"],
+  delete: ["connection.delete", "secret.delete"],
+  export: ["configuration.export"],
+  maintenance: ["secret.reencrypt"],
+};
+assert.deepEqual(Object.values(REVISION_OPERATIONS).flat().sort(), [...OPERATIONS].sort(), "every operation needs exactly one revision contract");
 const DISPOSITIONS = new Set(["already_sufficient", "missing_metadata", "missing_delivery", "unsupported_future_operation"]);
 const ADMIN_FILES = ["admin_policy.rs", "admin_tools.rs", "admin_connections.rs", "admin_tokens.rs"];
 const SCHEMA_KEYWORDS = new Set(["$schema", "title", "description", "type", "const", "enum", "anyOf", "pattern", "maxLength", "additionalProperties", "required", "properties"]);
@@ -113,15 +125,17 @@ export function validateEvent(event) {
   }
   const { before, after, security, axis } = event.revision;
   if (security !== null) check(BigInt(security) > 0n, "shared security revision must be positive");
-  const deletion = ["connection.delete", "secret.delete"].includes(event.operation);
-  if (deletion) check(before !== null && after === null, "deletion requires previous revision and tombstone");
-  else if (event.operation === "configuration.export") {
+  const transition = Object.entries(REVISION_OPERATIONS).find(([, operations]) => operations.includes(event.operation))[0];
+  if (transition === "delete") check(before !== null && BigInt(before) > 0n && after === null, "deletion requires previous revision and tombstone");
+  else if (transition === "export") {
     check(before !== null && BigInt(before) > 0n && after === before, "export must bind an unchanged authority revision");
   }
-  else if (event.operation === "secret.reencrypt") {
+  else if (transition === "maintenance") {
     check(axis === "maintenance" && before === null && after === null, "re-encryption must not invent an authority revision");
   } else {
     check(after !== null && BigInt(after) > 0n, "committed mutation needs an authority revision");
+    if (transition === "create") check(before === null, "creation must not claim a previous revision");
+    if (transition === "advance") check(before !== null, "operation requires an existing revision");
     // JWT outbox values are a fixed sentinel, not a version chain. A new
     // authority event uses its security revision as the revocation axis.
     if (before !== null) check(BigInt(after) > BigInt(before), "revision must advance");
@@ -195,7 +209,7 @@ export function validateInventory(inventory, readSource = (path) => readFileSync
   for (const file of ADMIN_FILES) {
     const path = `gateway/src/${file}`;
     for (const match of source(path).matchAll(/pub\(super\) async fn ([a-z0-9_]+_endpoint)\(/g)) {
-      if (/(?:create|put|post|patch|delete|rollback|register|rotate|revoke|refresh)_endpoint$/.test(match[1])) {
+      if (/(?:create|put|post|patch|delete|rollback|register|rotate|revoke|refresh|accept)_endpoint$/.test(match[1])) {
         check(coveredEntries.has(`${path}::${match[1]}`), `unreviewed mutation entrypoint ${path}::${match[1]}`);
       }
     }

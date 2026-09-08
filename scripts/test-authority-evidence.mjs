@@ -33,9 +33,35 @@ test("deleting a mode or duplicating its coverage cannot silently pass", () => {
 });
 
 test("new mutation endpoint in a reviewed admin surface requires inventory review", () => {
-  assert.throws(() => validateInventory(inventory(), (path) =>
-    source(path) + (path.endsWith("/admin_policy.rs") ? "\npub(super) async fn policy_bulk_put_endpoint(" : "")
-  ), /unreviewed mutation entrypoint.*policy_bulk_put_endpoint/);
+  for (const endpoint of ["policy_bulk_put_endpoint", "policy_bulk_accept_endpoint"]) {
+    assert.throws(() => validateInventory(inventory(), (path) =>
+      source(path) + (path.endsWith("/admin_policy.rs") ? `\npub(super) async fn ${endpoint}(` : "")
+    ), /unreviewed mutation entrypoint/);
+  }
+});
+
+test("resource creation and replacement retain distinct revision histories", () => {
+  for (const [operation, kind, axis, creates] of [
+    ["connection.create", "connection", "connection", true],
+    ["secret.create", "local_secret", "secret", true],
+    ["service_token.issue", "service_token", "token", true],
+    ["connection.replace", "connection", "connection", false],
+    ["credential.binding_change", "credential_binding", "credential", false],
+    ["secret.rotate", "local_secret", "secret", false],
+    ["service_token.rotate", "service_token", "token", false],
+    ["service_token.revoke", "service_token", "token", false],
+    ["policy.rule.create", "policy", "policy", false],
+  ]) {
+    const value = fixture();
+    value.operation = operation; value.resource.kind = kind;
+    value.revision = { axis, before: creates ? null : "1", after: "2", security: "3" };
+    assert.doesNotThrow(() => validateEvent(value), operation);
+    value.revision.before = creates ? "1" : null;
+    assert.throws(() => validateEvent(value), /creation must not claim|requires an existing revision/, operation);
+  }
+  // Publication can initialize an authority or advance an existing snapshot.
+  const firstPublish = fixture(); firstPublish.revision.before = null;
+  assert.doesNotThrow(() => validateEvent(firstPublish));
 });
 
 test("stale code and regression anchors fail with an actionable location", () => {

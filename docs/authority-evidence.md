@@ -97,6 +97,15 @@ define a **proposed** safe projection. Current `security_outbox` rows and
 identity derivation, persistence and dispatcher integration belong to later
 slices.
 
+Revision transitions are operation-specific. Resource creation (`connection.create`,
+`secret.create`, `service_token.issue`) has no prior revision; replacement,
+rotation, revocation and edits to existing authority require one. In particular,
+creating a policy rule advances its containing policy rather than creating a new
+policy authority. Publication and activation may initialize or advance a snapshot.
+Deletion requires a positive prior revision and a null successor, export binds
+an unchanged revision, and re-encryption uses the maintenance shape. The checker
+assigns every operation exactly one transition contract.
+
 | Field | Contract |
 | --- | --- |
 | `schema_version` | Exact `authority_event.v1`; future changes require explicit compatibility handling |
