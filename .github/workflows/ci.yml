@@ -77,6 +77,8 @@ jobs:
       - run: python -m unittest discover -s scripts -p 'test_build_tools.py' -v
       - run: node scripts/npm-script-policy.mjs check
       - run: node --test scripts/test-npm-script-policy.mjs
+      - run: node scripts/check-authority-evidence.mjs
+      - run: node --test scripts/test-authority-evidence.mjs
       - run: python -m unittest discover -s scripts -p 'test_npm_script_policy.py' -v
       - run: python3 scripts/check-supply-chain.py
       - run: python3 scripts/test_security_gates.py

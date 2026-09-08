@@ -1,0 +1,1314 @@
+{
+  "version": 1,
+  "issue": 425,
+  "reviewed_revision": "4314d63373539700dffb303bc4e2d385ceb53295",
+  "storage_modes": [
+    "postgres",
+    "standalone"
+  ],
+  "required_durability_mode": "not_implemented",
+  "delivery_profiles": {
+    "post_commit_telemetry": {
+      "description": "HTTP handlers emit ordinary audit after mutation; stdout/file/SQLite/PostgreSQL request sinks remain optional/bounded asynchronous telemetry. Some CLI/startup operations only print or trace. security_outbox has a bounded read API, but no production dispatcher with persisted consumer cursor exists.",
+      "sources": [
+        {
+          "path": "gateway/src/audit/postgres_sink.rs",
+          "anchor": "then DROPPED and counted"
+        },
+        {
+          "path": "gateway/src/audit/sqlite_sink.rs",
+          "anchor": "pub struct SqliteSink"
+        },
+        {
+          "path": "gateway/src/storage/postgres_policy.rs",
+          "anchor": "pub async fn outbox_after("
+        }
+      ]
+    },
+    "operator_output": {
+      "description": "One-shot operator command prints bounded result or report; it does not dispatch durable authority events. Existing outbox rows are separate from that output.",
+      "sources": [
+        {
+          "path": "gateway/src/bootstrap.rs",
+          "anchor": "operator:revoke-jwt"
+        },
+        {
+          "path": "gateway/src/import/mod.rs",
+          "anchor": "impl fmt::Display for ImportReport"
+        }
+      ]
+    },
+    "unsupported_no_delivery": {
+      "description": "No corresponding gateway-owned operation/delivery is shipped in this mode; required authority-event delivery cannot be inferred from provider audit or future plans.",
+      "sources": [
+        {
+          "path": "gateway/src/config.rs",
+          "anchor": "fn reject_local_authority_in_postgres_mode("
+        }
+      ]
+    }
+  },
+  "groups": [
+    {
+      "id": "policy_postgres",
+      "operations": [
+        "policy.publish",
+        "policy.rollback",
+        "policy.rule.create",
+        "policy.rule.update",
+        "policy.rule.delete",
+        "policy.rule.reorder",
+        "policy.suggestion.accept"
+      ],
+      "modes": [
+        "postgres"
+      ],
+      "entrypoints": [
+        {
+          "path": "gateway/src/admin_policy.rs",
+          "anchor": "async fn policy_put_endpoint("
+        },
+        {
+          "path": "gateway/src/admin_policy.rs",
+          "anchor": "async fn policy_rollback_endpoint("
+        },
+        {
+          "path": "gateway/src/admin_policy.rs",
+          "anchor": "async fn policy_rule_post_endpoint("
+        },
+        {
+          "path": "gateway/src/admin_policy.rs",
+          "anchor": "async fn policy_rule_patch_endpoint("
+        },
+        {
+          "path": "gateway/src/admin_policy.rs",
+          "anchor": "async fn policy_rule_delete_endpoint("
+        },
+        {
+          "path": "gateway/src/admin_policy.rs",
+          "anchor": "async fn policy_rules_order_put_endpoint("
+        }
+      ],
+      "boundary": "persist_policy_mutation -> PolicyControlPlane::commit -> commit_policy_in / postgres_documents::commit_in; active row lock and expected ETag guard; document/history, shared revision, active pointer and security_outbox commit together. Discovery acceptance invokes commit_policy_in inside its suggestion transaction.",
+      "record": "Immutable policy_documents retain actor, diff/action, document ETag and version. security_outbox retains committed revision/from/to; history is already an atomic record.",
+      "actor": "actor_user_id retained per document; issuer/auth method and an unambiguous operation identity are not captured by the shared commit request.",
+      "identity": "Version + deployment-scoped security revision identify committed authority; diff_summary carries handler action (including rollback). No persisted client operation/idempotency ID.",
+      "delivery": "post_commit_telemetry",
+      "disposition": [
+        "missing_metadata",
+        "missing_delivery"
+      ],
+      "follow_up": "PR2: add scoped actor and stable operation/event identity at the existing document transaction boundary; preserve suggestion transaction composition. PR3: delivery cursor and retention contract.",
+      "sources": [
+        {
+          "path": "gateway/src/admin_policy.rs",
+          "anchor": "async fn persist_policy_mutation("
+        },
+        {
+          "path": "gateway/src/storage/postgres_documents.rs",
+          "anchor": "INSERT INTO greengateway.security_outbox"
+        },
+        {
+          "path": "gateway/src/storage/postgres_discovery_lifecycle.rs",
+          "anchor": "commit_policy_in"
+        }
+      ],
+      "tests": [
+        {
+          "path": "gateway/src/storage/contract_tests.rs",
+          "anchor": "async fn policy_control_plane_initialize_commits_version_revision_and_outbox_atomically("
+        },
+        {
+          "path": "gateway/src/storage/contract_tests.rs",
+          "anchor": "async fn policy_control_plane_concurrent_same_etag_commits_produce_exactly_one_winner("
+        },
+        {
+          "path": "gateway/src/storage/contract_tests.rs",
+          "anchor": "async fn policy_control_plane_aborted_commit_writes_nothing("
+        }
+      ],
+      "required_durability_supported": false,
+      "test_claim": "Existing behavior regression anchors only; these tests do not certify the proposed authority-event contract or delivery."
+    },
+    {
+      "id": "policy_standalone",
+      "operations": [
+        "policy.publish",
+        "policy.rollback",
+        "policy.rule.create",
+        "policy.rule.update",
+        "policy.rule.delete",
+        "policy.rule.reorder",
+        "policy.suggestion.accept"
+      ],
+      "modes": [
+        "standalone"
+      ],
+      "entrypoints": [
+        {
+          "path": "gateway/src/admin_policy.rs",
+          "anchor": "async fn policy_put_endpoint("
+        },
+        {
+          "path": "gateway/src/admin_policy.rs",
+          "anchor": "async fn policy_rollback_endpoint("
+        },
+        {
+          "path": "gateway/src/admin_policy.rs",
+          "anchor": "async fn policy_rule_post_endpoint("
+        },
+        {
+          "path": "gateway/src/admin_policy.rs",
+          "anchor": "async fn policy_rule_patch_endpoint("
+        },
+        {
+          "path": "gateway/src/admin_policy.rs",
+          "anchor": "async fn policy_rule_delete_endpoint("
+        },
+        {
+          "path": "gateway/src/admin_policy.rs",
+          "anchor": "async fn policy_rules_order_put_endpoint("
+        }
+      ],
+      "boundary": "persist_to_file writes temporary file and renames; reload swaps runtime; append_policy_version_after_commit writes a separately configured SQLite history database afterward.",
+      "record": "Policy file survives successful persistence; SQLite policy history is separate and may fail after success. Neither optional telemetry nor the separate history write is an atomic authority/evidence boundary.",
+      "actor": "History has actor_user_id if append succeeds; file has none.",
+      "identity": "File semantic ETag; independent SQLite history version. No common authoritative revision or operation ID across commits.",
+      "delivery": "post_commit_telemetry",
+      "disposition": [
+        "unsupported_future_operation"
+      ],
+      "follow_up": "PR4 depends on #242: introduce/reuse its crash-safe standalone revision ledger, bind file digest + activation + history + evidence, recover interrupted activation; keep required-durability policy mutations unsupported until proven.",
+      "sources": [
+        {
+          "path": "gateway/src/rbac/policy.rs",
+          "anchor": "fn persist_to_file_with_rename"
+        },
+        {
+          "path": "gateway/src/admin_policy.rs",
+          "anchor": "async fn append_policy_version_after_commit("
+        },
+        {
+          "path": "gateway/src/rbac/policy_history.rs",
+          "anchor": "pub fn append_version("
+        }
+      ],
+      "tests": [
+        {
+          "path": "gateway/src/app_tests.rs",
+          "anchor": "async fn policy_put_succeeds_with_warning_when_history_append_fails_after_commit("
+        },
+        {
+          "path": "gateway/src/app_tests.rs",
+          "anchor": "async fn policy_history_records_every_policy_mutation_path_once("
+        },
+        {
+          "path": "gateway/src/rbac/policy.rs",
+          "anchor": "fn persist_to_file_rename_failure_leaves_existing_policy_and_cleans_temp_file("
+        }
+      ],
+      "required_durability_supported": false,
+      "test_claim": "Existing behavior regression anchors only; these tests do not certify the proposed authority-event contract or delivery."
+    },
+    {
+      "id": "policy_reload",
+      "operations": [
+        "policy.file_reload"
+      ],
+      "modes": [
+        "standalone"
+      ],
+      "entrypoints": [],
+      "boundary": "File watcher/SIGHUP -> reload_policy_from_file_locked validates file and replaces process snapshot, then emits reload telemetry; it does not append policy history.",
+      "record": "Operator-owned file and process snapshot; no atomic activation/evidence record.",
+      "actor": "Reload event does not authenticate an editing operator.",
+      "identity": "No ledger revision binds the accepted file to activation or identifies the operation.",
+      "delivery": "post_commit_telemetry",
+      "disposition": [
+        "unsupported_future_operation"
+      ],
+      "follow_up": "#242/#425 PR4 must route watcher, SIGHUP and startup activation through the same ledger as admin publication; testing only admin endpoints is insufficient.",
+      "sources": [
+        {
+          "path": "gateway/src/middleware/rbac.rs",
+          "anchor": "fn reload_policy_from_file_locked("
+        },
+        {
+          "path": "gateway/src/middleware/rbac.rs",
+          "anchor": "fn spawn_policy_reload_tasks_inner("
+        }
+      ],
+      "tests": [
+        {
+          "path": "gateway/src/rbac/policy.rs",
+          "anchor": "fn persist_to_file_rename_failure_leaves_existing_policy_and_cleans_temp_file("
+        }
+      ],
+      "required_durability_supported": false,
+      "test_claim": "Existing behavior regression anchors only; these tests do not certify the proposed authority-event contract or delivery."
+    },
+    {
+      "id": "policy_reload_postgres",
+      "operations": [
+        "policy.file_reload"
+      ],
+      "modes": [
+        "postgres"
+      ],
+      "entrypoints": [],
+      "boundary": "Config rejects POLICY_FILE in PostgreSQL mode; replicas install authoritative database revisions.",
+      "record": "No file authority is supported in this mode.",
+      "actor": "Not applicable.",
+      "identity": "Security revision belongs to database publication, not a file reload.",
+      "delivery": "unsupported_no_delivery",
+      "disposition": [
+        "unsupported_future_operation"
+      ],
+      "follow_up": "Keep this operation refused; do not introduce a local file authority fallback.",
+      "sources": [
+        {
+          "path": "gateway/src/config.rs",
+          "anchor": "fn reject_local_authority_in_postgres_mode("
+        }
+      ],
+      "tests": [
+        {
+          "path": "gateway/src/config_tests.rs",
+          "anchor": "fn postgres_mode_rejects_writable_local_authority_settings("
+        }
+      ],
+      "required_durability_supported": false,
+      "test_claim": "Existing behavior regression anchors only; these tests do not certify the proposed authority-event contract or delivery."
+    },
+    {
+      "id": "tools_postgres",
+      "operations": [
+        "tools.publish"
+      ],
+      "modes": [
+        "postgres"
+      ],
+      "entrypoints": [
+        {
+          "path": "gateway/src/admin_tools.rs",
+          "anchor": "async fn tools_openapi_register_endpoint("
+        }
+      ],
+      "boundary": "register_tools_via_control_plane -> commit_tools -> shared document transaction with CAS, name reservations, immutable version, pointer, revision and outbox.",
+      "record": "tool_documents retain actor and action/diff with version and ETag; outbox is atomic. A later failed local install does not undo that commit.",
+      "actor": "actor_user_id per immutable version; no issuer/auth method.",
+      "identity": "tools version and security revision, action openapi_tools_registered; no operation ID.",
+      "delivery": "post_commit_telemetry",
+      "disposition": [
+        "missing_metadata",
+        "missing_delivery"
+      ],
+      "follow_up": "PR2: extend shared document contract once for policy/tools; preserve tool-name locks and committed-but-not-locally-installed semantics.",
+      "sources": [
+        {
+          "path": "gateway/src/admin_tools.rs",
+          "anchor": "async fn register_tools_via_control_plane("
+        },
+        {
+          "path": "gateway/src/storage/postgres_tools.rs",
+          "anchor": "async fn commit_tools("
+        },
+        {
+          "path": "gateway/src/storage/migrations/0005_tools_control_plane.sql",
+          "anchor": "CREATE TABLE greengateway.tool_documents"
+        }
+      ],
+      "tests": [
+        {
+          "path": "gateway/src/app_tests.rs",
+          "anchor": "async fn tools_control_plane_seeds_once_and_commits_with_cas("
+        },
+        {
+          "path": "gateway/src/app_tests.rs",
+          "anchor": "async fn a_stale_tools_install_never_rolls_the_live_lane_back("
+        }
+      ],
+      "required_durability_supported": false,
+      "test_claim": "Existing behavior regression anchors only; these tests do not certify the proposed authority-event contract or delivery."
+    },
+    {
+      "id": "tools_standalone",
+      "operations": [
+        "tools.publish"
+      ],
+      "modes": [
+        "standalone"
+      ],
+      "entrypoints": [
+        {
+          "path": "gateway/src/admin_tools.rs",
+          "anchor": "async fn tools_openapi_register_endpoint("
+        }
+      ],
+      "boundary": "Admin publication calls registry replace_local_definitions_with_persist with fs::write, then installs definitions. File watcher/SIGHUP reloads definitions into the registry and emits loaded telemetry without a history transaction.",
+      "record": "Tools file holds current document; no durable publication history/evidence transaction.",
+      "actor": "Authenticated actor only in separate telemetry.",
+      "identity": "Current tools ETag; no durable operation or history revision.",
+      "delivery": "post_commit_telemetry",
+      "disposition": [
+        "unsupported_future_operation"
+      ],
+      "follow_up": "#242/#425 PR4: include tools-file writes and watcher/startup paths in ledger integration; current fs::write must not be described as an atomic evidence transaction.",
+      "sources": [
+        {
+          "path": "gateway/src/admin_tools.rs",
+          "anchor": "|| fs::write(tools_file, &merged.candidate_contents)"
+        },
+        {
+          "path": "gateway/src/tools/definitions.rs",
+          "anchor": "fn reload_tool_registry_from_file_with_optional_mcp_proxy_definitions("
+        }
+      ],
+      "tests": [
+        {
+          "path": "gateway/src/app_tests.rs",
+          "anchor": "async fn openapi_tools_register_persists_selection_reloads_registry_and_audits("
+        },
+        {
+          "path": "gateway/src/tools/definitions.rs",
+          "anchor": "async fn file_watch_reload_applies_valid_tools_update("
+        }
+      ],
+      "required_durability_supported": false,
+      "test_claim": "Existing behavior regression anchors only; these tests do not certify the proposed authority-event contract or delivery."
+    },
+    {
+      "id": "connection_postgres",
+      "operations": [
+        "connection.create",
+        "connection.replace",
+        "credential.binding_change"
+      ],
+      "modes": [
+        "postgres"
+      ],
+      "entrypoints": [
+        {
+          "path": "gateway/src/admin_connections.rs",
+          "anchor": "async fn connection_create_endpoint("
+        },
+        {
+          "path": "gateway/src/admin_connections.rs",
+          "anchor": "async fn connection_put_endpoint("
+        }
+      ],
+      "boundary": "PostgresConnectionStore::create/replace locks shared Connection state, checks collection/object CAS, writes records, credential bindings, immutable version, shared revision and outbox in one transaction. Credential/TLS revisions derive from replacement.",
+      "record": "connection_versions actor/diff and outbox from/to are atomic; history cascades when Connection is deleted.",
+      "actor": "actor_user_id retained while parent exists; issuer/auth method absent.",
+      "identity": "Connection ID, connection/credential/TLS revisions and shared revision. Identical replace is a no-op; no operation ID.",
+      "delivery": "post_commit_telemetry",
+      "disposition": [
+        "missing_metadata",
+        "missing_delivery"
+      ],
+      "follow_up": "PR2: preserve safe per-operation evidence independently of cascading Connection history; record credential changes by Connection identity/revision only, never binding IDs or locators.",
+      "sources": [
+        {
+          "path": "gateway/src/connections/pg_store.rs",
+          "anchor": "pub async fn create("
+        },
+        {
+          "path": "gateway/src/connections/pg_store.rs",
+          "anchor": "pub async fn replace("
+        },
+        {
+          "path": "gateway/src/connections/pg_store.rs",
+          "anchor": "async fn append_version("
+        }
+      ],
+      "tests": [
+        {
+          "path": "gateway/src/connections/pg_store_tests.rs",
+          "anchor": "async fn records_create_replace_delete_with_cas_and_shared_state_bumps("
+        },
+        {
+          "path": "gateway/src/connections/pg_store_tests.rs",
+          "anchor": "async fn additional_header_bindings_round_trip_and_advance_the_credential_axis("
+        },
+        {
+          "path": "gateway/src/connections/pg_store_tests.rs",
+          "anchor": "async fn concurrent_same_etag_replaces_produce_exactly_one_winner("
+        }
+      ],
+      "required_durability_supported": false,
+      "test_claim": "Existing behavior regression anchors only; these tests do not certify the proposed authority-event contract or delivery."
+    },
+    {
+      "id": "connection_standalone",
+      "operations": [
+        "connection.create",
+        "connection.replace",
+        "credential.binding_change"
+      ],
+      "modes": [
+        "standalone"
+      ],
+      "entrypoints": [
+        {
+          "path": "gateway/src/admin_connections.rs",
+          "anchor": "async fn connection_create_endpoint("
+        },
+        {
+          "path": "gateway/src/admin_connections.rs",
+          "anchor": "async fn connection_put_endpoint("
+        }
+      ],
+      "boundary": "SqliteConnectionStore::create/replace uses an Immediate transaction for record and binding updates, then control plane publishes runtime snapshot.",
+      "record": "Current records and revisions are atomic; no per-mutation actor/history event is stored by these methods.",
+      "actor": "SQLite ConnectionStore create/replace accept no actor; admin handler emits actor separately.",
+      "identity": "Connection ID and per-axis revisions; no immutable operation identity.",
+      "delivery": "post_commit_telemetry",
+      "disposition": [
+        "missing_metadata",
+        "missing_delivery"
+      ],
+      "follow_up": "PR4: append bounded evidence in the same Connections SQLite transaction; no separate audit database commit. Wire actor context through the managed-store adapter.",
+      "sources": [
+        {
+          "path": "gateway/src/connections/store.rs",
+          "anchor": "fn create(&self, candidate:"
+        },
+        {
+          "path": "gateway/src/connections/store.rs",
+          "anchor": "fn replace("
+        },
+        {
+          "path": "gateway/src/connections/control_plane.rs",
+          "anchor": "pub async fn create_managed("
+        }
+      ],
+      "tests": [
+        {
+          "path": "gateway/src/connections/control_plane.rs",
+          "anchor": "async fn successful_mutations_publish_one_atomic_runtime_snapshot("
+        },
+        {
+          "path": "gateway/src/connections/control_plane.rs",
+          "anchor": "async fn failed_mutation_preserves_runtime_and_persisted_state("
+        }
+      ],
+      "required_durability_supported": false,
+      "test_claim": "Existing behavior regression anchors only; these tests do not certify the proposed authority-event contract or delivery."
+    },
+    {
+      "id": "connection_delete_postgres",
+      "operations": [
+        "connection.delete"
+      ],
+      "modes": [
+        "postgres"
+      ],
+      "entrypoints": [
+        {
+          "path": "gateway/src/admin_connections.rs",
+          "anchor": "async fn connection_delete_endpoint("
+        }
+      ],
+      "boundary": "delete checks ETag and dependencies, appends outbox tombstone to_version=0, releases names, deletes parent and commits.",
+      "record": "Outbox tombstone remains; connection_versions and bindings cascade. Existing durable deletion record already names resource and prior revision.",
+      "actor": "delete accepts _actor_user_id but does not persist it; attribution exists only in post-commit audit emission.",
+      "identity": "Shared revision, Connection ID, previous version and deletion sentinel; no operation ID.",
+      "delivery": "post_commit_telemetry",
+      "disposition": [
+        "missing_metadata",
+        "missing_delivery"
+      ],
+      "follow_up": "PR2 first narrow storage slice: retain deletion actor/action/event identity in existing transaction without changing outbox tombstone semantics; test evidence survives parent cascade and rolls back on failed CAS.",
+      "sources": [
+        {
+          "path": "gateway/src/connections/pg_store.rs",
+          "anchor": "_actor_user_id: &str"
+        },
+        {
+          "path": "gateway/src/connections/pg_store.rs",
+          "anchor": "version 0 marks a"
+        }
+      ],
+      "tests": [
+        {
+          "path": "gateway/src/connections/pg_store_tests.rs",
+          "anchor": "async fn records_create_replace_delete_with_cas_and_shared_state_bumps("
+        }
+      ],
+      "required_durability_supported": false,
+      "test_claim": "Existing behavior regression anchors only; these tests do not certify the proposed authority-event contract or delivery."
+    },
+    {
+      "id": "connection_delete_standalone",
+      "operations": [
+        "connection.delete"
+      ],
+      "modes": [
+        "standalone"
+      ],
+      "entrypoints": [
+        {
+          "path": "gateway/src/admin_connections.rs",
+          "anchor": "async fn connection_delete_endpoint("
+        }
+      ],
+      "boundary": "SQLite Immediate transaction checks dependencies and ETag, then deletes current record and cascades children.",
+      "record": "No durable tombstone/event after successful deletion.",
+      "actor": "No actor parameter at SQLite delete boundary; post-commit audit only.",
+      "identity": "Response uses prior Connection identity/revision; deleted record cannot reconcile an ambiguous response.",
+      "delivery": "post_commit_telemetry",
+      "disposition": [
+        "missing_metadata",
+        "missing_delivery"
+      ],
+      "follow_up": "PR4: non-cascading tombstone evidence in the same Connections database transaction; test after restart and dependency/CAS rejection.",
+      "sources": [
+        {
+          "path": "gateway/src/connections/store.rs",
+          "anchor": "fn delete("
+        },
+        {
+          "path": "gateway/src/admin_connections.rs",
+          "anchor": "emit_connection_changed("
+        }
+      ],
+      "tests": [
+        {
+          "path": "gateway/src/connections/store_tests.rs",
+          "anchor": "fn empty_openapi_catalog_is_removed_on_incompatible_update_and_delete_cascades("
+        }
+      ],
+      "required_durability_supported": false,
+      "test_claim": "Existing behavior regression anchors only; these tests do not certify the proposed authority-event contract or delivery."
+    },
+    {
+      "id": "catalog_postgres",
+      "operations": [
+        "catalog.mcp.publish",
+        "catalog.openapi.publish",
+        "catalog.overlay.replace",
+        "catalog.overlay.delete"
+      ],
+      "modes": [
+        "postgres"
+      ],
+      "entrypoints": [
+        {
+          "path": "gateway/src/admin_connections.rs",
+          "anchor": "async fn connection_refresh_endpoint("
+        },
+        {
+          "path": "gateway/src/admin_connections.rs",
+          "anchor": "async fn connection_openapi_register_endpoint("
+        },
+        {
+          "path": "gateway/src/admin_connections.rs",
+          "anchor": "async fn connection_openapi_overlay_put_endpoint("
+        },
+        {
+          "path": "gateway/src/admin_connections.rs",
+          "anchor": "async fn connection_openapi_overlay_delete_endpoint("
+        }
+      ],
+      "boundary": "MCP/OpenAPI replacements and overlay updates share Connection-state transaction and revision/CAS checks; entries, reservations, dependencies and outbox commit together. Includes scheduled refresh through store methods.",
+      "record": "Current catalogs/overlay actor fields and catalog-specific outbox revisions; replacing catalogs deletes old rows and deleting Connection cascades them.",
+      "actor": "Actor supplied to catalog writers; replaced/deleted current rows do not retain historical actor linkage.",
+      "identity": "Connection ID, catalog revision (distinct from specification revision), shared revision; no operation ID.",
+      "delivery": "post_commit_telemetry",
+      "disposition": [
+        "missing_metadata",
+        "missing_delivery"
+      ],
+      "follow_up": "PR2: preserve actor/action/revision evidence before replacement/cascade, including system refresh attribution; keep catalog outbox resource_type and version axis unchanged.",
+      "sources": [
+        {
+          "path": "gateway/src/connections/pg_store.rs",
+          "anchor": "pub async fn replace_mcp_catalog("
+        },
+        {
+          "path": "gateway/src/connections/pg_store.rs",
+          "anchor": "pub async fn replace_openapi_catalog_with_overlay_and_enum_values("
+        },
+        {
+          "path": "gateway/src/connections/pg_store.rs",
+          "anchor": "async fn write_openapi_overlay("
+        }
+      ],
+      "tests": [
+        {
+          "path": "gateway/src/connections/pg_store_tests.rs",
+          "anchor": "async fn mcp_catalog_replaces_with_cas_revisions_dependencies_and_outbox("
+        },
+        {
+          "path": "gateway/src/connections/pg_store_tests.rs",
+          "anchor": "async fn openapi_overlay_catalog_cas_prune_and_restart_are_atomic("
+        }
+      ],
+      "required_durability_supported": false,
+      "test_claim": "Existing behavior regression anchors only; these tests do not certify the proposed authority-event contract or delivery."
+    },
+    {
+      "id": "catalog_standalone",
+      "operations": [
+        "catalog.mcp.publish",
+        "catalog.openapi.publish",
+        "catalog.overlay.replace",
+        "catalog.overlay.delete"
+      ],
+      "modes": [
+        "standalone"
+      ],
+      "entrypoints": [
+        {
+          "path": "gateway/src/admin_connections.rs",
+          "anchor": "async fn connection_refresh_endpoint("
+        },
+        {
+          "path": "gateway/src/admin_connections.rs",
+          "anchor": "async fn connection_openapi_register_endpoint("
+        },
+        {
+          "path": "gateway/src/admin_connections.rs",
+          "anchor": "async fn connection_openapi_overlay_put_endpoint("
+        },
+        {
+          "path": "gateway/src/admin_connections.rs",
+          "anchor": "async fn connection_openapi_overlay_delete_endpoint("
+        }
+      ],
+      "boundary": "Immediate SQLite catalog transaction checks Connection/catalog/overlay CAS and writes catalogs, dependencies and overlay together.",
+      "record": "Current catalog revisions/entries; overlay retains current actor, ordinary catalog replacement has no immutable actor/event history.",
+      "actor": "Admin telemetry and current overlay actor cannot establish actor for every retained historical change.",
+      "identity": "Connection/catalog/overlay revisions; no common operation ID or durable deletion evidence.",
+      "delivery": "post_commit_telemetry",
+      "disposition": [
+        "missing_metadata",
+        "missing_delivery"
+      ],
+      "follow_up": "PR4: append evidence within the catalog transaction, including scheduled refresh and overlay removal; exclude enum-value refresh and status observations unless they change publication authority.",
+      "sources": [
+        {
+          "path": "gateway/src/connections/store.rs",
+          "anchor": "pub fn replace_mcp_catalog_expecting("
+        },
+        {
+          "path": "gateway/src/connections/store.rs",
+          "anchor": "pub fn replace_openapi_catalog_with_overlay_and_enum_values("
+        }
+      ],
+      "tests": [
+        {
+          "path": "gateway/src/connections/store_tests.rs",
+          "anchor": "fn mcp_catalog_replacement_is_atomic_revisioned_and_dependency_aware("
+        },
+        {
+          "path": "gateway/src/connections/store_tests.rs",
+          "anchor": "fn openapi_overlay_catalog_reports_and_enum_prune_are_one_atomic_revision("
+        }
+      ],
+      "required_durability_supported": false,
+      "test_claim": "Existing behavior regression anchors only; these tests do not certify the proposed authority-event contract or delivery."
+    },
+    {
+      "id": "local_secrets",
+      "operations": [
+        "secret.create",
+        "secret.rotate",
+        "secret.delete",
+        "secret.reencrypt"
+      ],
+      "modes": [
+        "standalone"
+      ],
+      "entrypoints": [
+        {
+          "path": "gateway/src/admin_connections.rs",
+          "anchor": "async fn connection_secret_create_endpoint("
+        },
+        {
+          "path": "gateway/src/admin_connections.rs",
+          "anchor": "async fn connection_secret_rotate_endpoint("
+        },
+        {
+          "path": "gateway/src/admin_connections.rs",
+          "anchor": "async fn connection_secret_delete_endpoint("
+        }
+      ],
+      "boundary": "LocalSecretStore create/rotate/delete and reencrypt_batch use Immediate transactions in Connections SQLite; control-plane preflights and runtime publication surround rotation. CLI reencrypt executes one bounded batch.",
+      "record": "Current sealed record, version and timestamps; rotation replaces material and deletion removes it. Key re-encryption updates envelopes without semantic credential-version change.",
+      "actor": "Local secret store methods accept no actor; HTTP audit follows write, CLI emits safe counts only.",
+      "identity": "Secret version is current state, not safe exported resource identity; no durable operation/event identity.",
+      "delivery": "post_commit_telemetry",
+      "disposition": [
+        "missing_metadata",
+        "missing_delivery"
+      ],
+      "follow_up": "PR4: atomic non-secret event metadata in the same SQLite store; use generated event/operation identity and safe Connection linkage where allowed, never secret ID/binding/locator/ciphertext/key ID. Re-encryption needs batch operation evidence, not fake credential revision bumps.",
+      "sources": [
+        {
+          "path": "gateway/src/connections/local_secret.rs",
+          "anchor": "pub fn rotate("
+        },
+        {
+          "path": "gateway/src/connections/local_secret.rs",
+          "anchor": "pub fn delete("
+        },
+        {
+          "path": "gateway/src/connection_secret_maintenance.rs",
+          "anchor": "fn execute("
+        }
+      ],
+      "tests": [
+        {
+          "path": "gateway/src/connections/local_secret.rs",
+          "anchor": "async fn create_rotate_resolve_and_delete_return_metadata_only("
+        },
+        {
+          "path": "gateway/src/connections/local_secret.rs",
+          "anchor": "async fn master_key_rotation_is_bounded_transactional_and_allows_verified_removal("
+        },
+        {
+          "path": "gateway/src/connection_secret_maintenance.rs",
+          "anchor": "fn one_batch_per_command_is_bounded_resumable_and_reports_progress("
+        }
+      ],
+      "required_durability_supported": false,
+      "test_claim": "Existing behavior regression anchors only; these tests do not certify the proposed authority-event contract or delivery."
+    },
+    {
+      "id": "local_secrets_postgres",
+      "operations": [
+        "secret.create",
+        "secret.rotate",
+        "secret.delete",
+        "secret.reencrypt"
+      ],
+      "modes": [
+        "postgres"
+      ],
+      "entrypoints": [
+        {
+          "path": "gateway/src/admin_connections.rs",
+          "anchor": "async fn connection_secret_create_endpoint("
+        },
+        {
+          "path": "gateway/src/admin_connections.rs",
+          "anchor": "async fn connection_secret_rotate_endpoint("
+        },
+        {
+          "path": "gateway/src/admin_connections.rs",
+          "anchor": "async fn connection_secret_delete_endpoint("
+        }
+      ],
+      "boundary": "Configuration rejects local secret keyring in PostgreSQL mode; no shared local-secret table.",
+      "record": "No gateway-owned secret-value mutation.",
+      "actor": "Not applicable.",
+      "identity": "Not applicable.",
+      "delivery": "unsupported_no_delivery",
+      "disposition": [
+        "unsupported_future_operation"
+      ],
+      "follow_up": "Keep local-secret administration unavailable in cluster mode; external provider rotation is a separate authority and cannot share the gateway transaction.",
+      "sources": [
+        {
+          "path": "gateway/src/config.rs",
+          "anchor": "CONNECTION_LOCAL_SECRET_KEYRING,"
+        },
+        {
+          "path": "gateway/src/connections/control_plane.rs",
+          "anchor": "Cluster mode has no `connection_local_secrets` table"
+        }
+      ],
+      "tests": [
+        {
+          "path": "gateway/src/config_tests.rs",
+          "anchor": "fn postgres_mode_rejects_writable_local_authority_settings("
+        }
+      ],
+      "required_durability_supported": false,
+      "test_claim": "Existing behavior regression anchors only; these tests do not certify the proposed authority-event contract or delivery."
+    },
+    {
+      "id": "external_rotation",
+      "operations": [
+        "secret.external_rotate"
+      ],
+      "modes": [
+        "postgres",
+        "standalone"
+      ],
+      "entrypoints": [],
+      "boundary": "External operators/providers own secret-value rotation; GreenGateway resolver reads versions/material after authorization and preflight. Gateway changes to a binding belong to credential.binding_change.",
+      "record": "No gateway transaction can atomically commit a provider's independent rotation.",
+      "actor": "Provider-owned audit linkage; no authenticated gateway actor for an out-of-process rotation.",
+      "identity": "Provider-specific resolution versions are runtime cache inputs, not a gateway operation ledger.",
+      "delivery": "unsupported_no_delivery",
+      "disposition": [
+        "unsupported_future_operation"
+      ],
+      "follow_up": "Document external evidence correlation and provider ownership; do not claim gateway-required durability for provider writes or export locators into gateway evidence.",
+      "sources": [
+        {
+          "path": "gateway/src/connections/secret.rs",
+          "anchor": "pub trait SecretResolver"
+        },
+        {
+          "path": "gateway/src/connections/control_plane.rs",
+          "anchor": "pub fn activate_network_secret_providers("
+        }
+      ],
+      "tests": [
+        {
+          "path": "gateway/src/connections/control_plane.rs",
+          "anchor": "async fn network_alias_defers_before_activation_and_routes_to_owning_provider_after("
+        }
+      ],
+      "required_durability_supported": false,
+      "test_claim": "Existing behavior regression anchors only; these tests do not certify the proposed authority-event contract or delivery."
+    },
+    {
+      "id": "token_issue_postgres",
+      "operations": [
+        "service_token.issue"
+      ],
+      "modes": [
+        "postgres"
+      ],
+      "entrypoints": [
+        {
+          "path": "gateway/src/admin_tokens.rs",
+          "anchor": "async fn token_create_endpoint("
+        }
+      ],
+      "boundary": "create locks token resource state, inserts token, advances shared revision/high-water and appends outbox in one transaction.",
+      "record": "Token created_by/created_at and immutable create outbox revision survive token rotate/revoke; raw token never stored in event/outbox.",
+      "actor": "created_by retains creating subject; issuer/auth mode absent.",
+      "identity": "Token ID and row revision 1 plus security revision; no operation ID.",
+      "delivery": "post_commit_telemetry",
+      "disposition": [
+        "missing_metadata",
+        "missing_delivery"
+      ],
+      "follow_up": "PR2: retain scoped creator/action/event identity at existing create transaction; returned plaintext must not enter evidence.",
+      "sources": [
+        {
+          "path": "gateway/src/storage/postgres_service_tokens.rs",
+          "anchor": "async fn create("
+        },
+        {
+          "path": "gateway/src/storage/postgres_service_tokens.rs",
+          "anchor": "async fn record_revision("
+        }
+      ],
+      "tests": [
+        {
+          "path": "gateway/src/storage/contract_tests.rs",
+          "anchor": "async fn service_token_mutations_advance_the_shared_revision_and_set_the_high_water_mark("
+        }
+      ],
+      "required_durability_supported": false,
+      "test_claim": "Existing behavior regression anchors only; these tests do not certify the proposed authority-event contract or delivery."
+    },
+    {
+      "id": "token_issue_standalone",
+      "operations": [
+        "service_token.issue"
+      ],
+      "modes": [
+        "standalone"
+      ],
+      "entrypoints": [
+        {
+          "path": "gateway/src/admin_tokens.rs",
+          "anchor": "async fn token_create_endpoint("
+        }
+      ],
+      "boundary": "SQLite INSERT persists hashed token and creator; async adapter delegates to that store.",
+      "record": "Current token row retains creator/time; no independent authority-event record.",
+      "actor": "created_by only, not issuer/auth context.",
+      "identity": "Token ID; SQLite token rows do not expose PostgreSQL shared/row revision counters.",
+      "delivery": "post_commit_telemetry",
+      "disposition": [
+        "missing_metadata",
+        "missing_delivery"
+      ],
+      "follow_up": "PR4: wrap token insert and bounded evidence in one SERVICE_TOKEN_SQLITE_PATH transaction; no audit database dual write.",
+      "sources": [
+        {
+          "path": "gateway/src/auth/tokens.rs",
+          "anchor": "fn create(&self, request:"
+        }
+      ],
+      "tests": [
+        {
+          "path": "gateway/src/auth/tokens.rs",
+          "anchor": "fn create_returns_plaintext_once_and_never_exposes_hash_or_plaintext_again("
+        },
+        {
+          "path": "gateway/src/storage/contract_tests.rs",
+          "anchor": "async fn sqlite_service_token_store_satisfies_the_contract("
+        }
+      ],
+      "required_durability_supported": false,
+      "test_claim": "Existing behavior regression anchors only; these tests do not certify the proposed authority-event contract or delivery."
+    },
+    {
+      "id": "token_change_postgres",
+      "operations": [
+        "service_token.rotate",
+        "service_token.revoke"
+      ],
+      "modes": [
+        "postgres"
+      ],
+      "entrypoints": [
+        {
+          "path": "gateway/src/admin_tokens.rs",
+          "anchor": "async fn token_rotate_endpoint("
+        },
+        {
+          "path": "gateway/src/admin_tokens.rs",
+          "anchor": "async fn token_revoke_endpoint("
+        }
+      ],
+      "boundary": "rotate/revoke serializes token state/row, changes token row, reserves revision and appends outbox in one transaction. Repeated revoke does not advance revision or emit another outbox row.",
+      "record": "Outbox revision chain is already durable. Token row keeps creator, current revision and latest revoked_at, but does not identify each rotate/revoke actor/action.",
+      "actor": "Store rotate/revoke accept ID only; created_by is the original creator, not the rotating/revoking actor.",
+      "identity": "Token ID + from/to row versions + shared revision; rotate and revoke are not distinguished by resource_type alone; no operation ID.",
+      "delivery": "post_commit_telemetry",
+      "disposition": [
+        "missing_metadata",
+        "missing_delivery"
+      ],
+      "follow_up": "PR2: thread mutation actor/action through ServiceTokenStore and both adapters, add immutable evidence in existing PostgreSQL transaction; preserve repeat-revoke and races.",
+      "sources": [
+        {
+          "path": "gateway/src/storage/service_token.rs",
+          "anchor": "async fn revoke("
+        },
+        {
+          "path": "gateway/src/storage/postgres_service_tokens.rs",
+          "anchor": "async fn rotate("
+        }
+      ],
+      "tests": [
+        {
+          "path": "gateway/src/storage/contract_tests.rs",
+          "anchor": "async fn service_token_mutations_advance_the_shared_revision_and_set_the_high_water_mark("
+        },
+        {
+          "path": "gateway/src/storage/contract_tests.rs",
+          "anchor": "async fn concurrent_rotations_serialize_and_leave_exactly_one_live_plaintext("
+        },
+        {
+          "path": "gateway/src/storage/contract_tests.rs",
+          "anchor": "async fn revoke_and_rotate_race_never_leaves_a_live_plaintext("
+        }
+      ],
+      "required_durability_supported": false,
+      "test_claim": "Existing behavior regression anchors only; these tests do not certify the proposed authority-event contract or delivery."
+    },
+    {
+      "id": "token_change_standalone",
+      "operations": [
+        "service_token.rotate",
+        "service_token.revoke"
+      ],
+      "modes": [
+        "standalone"
+      ],
+      "entrypoints": [
+        {
+          "path": "gateway/src/admin_tokens.rs",
+          "anchor": "async fn token_rotate_endpoint("
+        },
+        {
+          "path": "gateway/src/admin_tokens.rs",
+          "anchor": "async fn token_revoke_endpoint("
+        }
+      ],
+      "boundary": "SQLite token mutex protects a read-time revoked guard, then an UPDATE and reload; no separate evidence transaction. The mutation SQL itself is keyed by ID.",
+      "record": "Current hash/revoked_at replaces earlier state; creator remains unchanged.",
+      "actor": "Mutation store takes token ID only; rotating/revoking actor exists in post-write HTTP telemetry.",
+      "identity": "Token ID, current timestamp; no persisted operation or revision chain.",
+      "delivery": "post_commit_telemetry",
+      "disposition": [
+        "missing_metadata",
+        "missing_delivery"
+      ],
+      "follow_up": "PR4: same SQLite transaction for guarded token update and evidence, with actor context from shared interface; no events for ineffective repeated revoke.",
+      "sources": [
+        {
+          "path": "gateway/src/auth/tokens.rs",
+          "anchor": "fn revoke(&self, id:"
+        },
+        {
+          "path": "gateway/src/auth/tokens.rs",
+          "anchor": "fn rotate(&self, id:"
+        }
+      ],
+      "tests": [
+        {
+          "path": "gateway/src/auth/tokens.rs",
+          "anchor": "fn revoke_is_idempotent_and_does_not_double_write_revoked_at("
+        },
+        {
+          "path": "gateway/src/auth/tokens.rs",
+          "anchor": "fn rotate_preserves_record_metadata_and_invalidates_old_plaintext("
+        }
+      ],
+      "required_durability_supported": false,
+      "test_claim": "Existing behavior regression anchors only; these tests do not certify the proposed authority-event contract or delivery."
+    },
+    {
+      "id": "jwt_postgres",
+      "operations": [
+        "jwt.revoke"
+      ],
+      "modes": [
+        "postgres"
+      ],
+      "entrypoints": [],
+      "boundary": "CLI revoke-jwt -> PostgresJwtRevocationStore::revoke; revoke row, shared revision and outbox commit together; already-effective duplicate rolls back reserved revision.",
+      "record": "Outbox keeps scoped JTI digest/revision; revocation row actor can be overwritten when extension/reactivation occurs and row is deleted after expiry.",
+      "actor": "CLI persists literal operator:revoke-jwt (system action, not authenticated human identity). Store supports actor_user_id but prior actor is not retained through later changes/cleanup.",
+      "identity": "Deployment+issuer-scoped JTI digest and security revision; outbox to_version=1 is not a per-JWT version chain; no operation ID.",
+      "delivery": "operator_output",
+      "disposition": [
+        "missing_metadata",
+        "missing_delivery"
+      ],
+      "follow_up": "PR2: immutable bounded revocation event in existing transaction, retain action/scoped operator provenance after expiry cleanup; no raw JTI. Do not pretend the CLI authenticates a named operator.",
+      "sources": [
+        {
+          "path": "gateway/src/bootstrap.rs",
+          "anchor": ".revoke(&jti, expires_at.as_deref(), \"operator:revoke-jwt\")"
+        },
+        {
+          "path": "gateway/src/storage/postgres_jwt_revocations.rs",
+          "anchor": "actor_user_id = EXCLUDED.actor_user_id"
+        },
+        {
+          "path": "gateway/src/storage/postgres_jwt_revocations.rs",
+          "anchor": "pub async fn cleanup_expired("
+        }
+      ],
+      "tests": [
+        {
+          "path": "gateway/src/storage/contract_tests.rs",
+          "anchor": "async fn jwt_revocations_are_shared_issuer_scoped_and_expire_on_database_time("
+        },
+        {
+          "path": "gateway/src/storage/contract_tests.rs",
+          "anchor": "async fn a_repeat_revoke_reactivates_a_lapsed_row_and_extends_a_shorter_one("
+        },
+        {
+          "path": "gateway/src/storage/contract_tests.rs",
+          "anchor": "async fn a_revoke_that_lapses_during_the_lock_wait_is_refused("
+        }
+      ],
+      "required_durability_supported": false,
+      "test_claim": "Existing behavior regression anchors only; these tests do not certify the proposed authority-event contract or delivery."
+    },
+    {
+      "id": "jwt_standalone",
+      "operations": [
+        "jwt.revoke"
+      ],
+      "modes": [
+        "standalone"
+      ],
+      "entrypoints": [],
+      "boundary": "CLI requires STATE_BACKEND=postgres; standalone JWT validation uses no-op revocation store.",
+      "record": "No standalone JWT revocation authority.",
+      "actor": "Not applicable.",
+      "identity": "Not applicable.",
+      "delivery": "unsupported_no_delivery",
+      "disposition": [
+        "unsupported_future_operation"
+      ],
+      "follow_up": "Keep required-durability JWT revocation unsupported until an actual standalone authority and atomic evidence exist.",
+      "sources": [
+        {
+          "path": "gateway/src/bootstrap.rs",
+          "anchor": "gateway revoke-jwt requires STATE_BACKEND=postgres"
+        },
+        {
+          "path": "gateway/src/auth/jwt.rs",
+          "anchor": "NoopRevocationStore"
+        }
+      ],
+      "tests": [
+        {
+          "path": "gateway/src/config_tests.rs",
+          "anchor": "fn sqlite_mode_rejects_postgres_material("
+        }
+      ],
+      "required_durability_supported": false,
+      "test_claim": "Existing behavior regression anchors only; these tests do not certify the proposed authority-event contract or delivery."
+    },
+    {
+      "id": "configuration_activation",
+      "operations": [
+        "configuration.activate"
+      ],
+      "modes": [
+        "postgres",
+        "standalone"
+      ],
+      "entrypoints": [],
+      "boundary": "Config::from_env startup validation selects authorities; serving bootstrap assembles runtime state. PostgreSQL document seeding uses normal document commits but does not establish a revisioned whole-configuration authority.",
+      "record": "No common configuration activation manifest/event transaction. File/environment configuration remains operator-owned; revisioned policy/tools records cover only their own resources.",
+      "actor": "Startup system process; no authenticated changing operator.",
+      "identity": "No authoritative whole-configuration operation/revision identity.",
+      "delivery": "post_commit_telemetry",
+      "disposition": [
+        "unsupported_future_operation"
+      ],
+      "follow_up": "#242 configuration ledger/activation contract first; bind validated safe manifest digest, parent revision, activation intent/result and required evidence before enabling required-durability configuration activation. Never hash/export raw secrets as a substitute for redaction.",
+      "sources": [
+        {
+          "path": "gateway/src/bootstrap.rs",
+          "anchor": "pub(super) async fn run("
+        },
+        {
+          "path": "gateway/src/config.rs",
+          "anchor": "pub fn from_env("
+        }
+      ],
+      "tests": [
+        {
+          "path": "gateway/src/config_tests.rs",
+          "anchor": "fn a_valid_postgres_mode_configuration_parses("
+        },
+        {
+          "path": "gateway/src/config_tests.rs",
+          "anchor": "fn the_env_example_boots_verbatim_in_standalone_mode("
+        }
+      ],
+      "required_durability_supported": false,
+      "test_claim": "Existing behavior regression anchors only; these tests do not certify the proposed authority-event contract or delivery."
+    },
+    {
+      "id": "configuration_export",
+      "operations": [
+        "configuration.export"
+      ],
+      "modes": [
+        "postgres",
+        "standalone"
+      ],
+      "entrypoints": [],
+      "boundary": "No unified revision-ledger configuration export/release operation is shipped. import::exports builds internal canonical projections for import comparisons; it is not a redacted configuration-export authority.",
+      "record": "No atomic export-intent/release record or whole-configuration manifest.",
+      "actor": "No configuration-export actor contract.",
+      "identity": "No authoritative export operation/artifact identity.",
+      "delivery": "unsupported_no_delivery",
+      "disposition": [
+        "unsupported_future_operation"
+      ],
+      "follow_up": "#242/#425 PR4: define authorized redacted artifact release bound to ledger revision, artifact digest and durable export event before release; keep unsupported. Internal import projections include sensitive state and must never become authority-event payloads.",
+      "sources": [
+        {
+          "path": "gateway/src/import/exports.rs",
+          "anchor": "pub(super) fn service_tokens_export("
+        },
+        {
+          "path": "gateway/src/import/exports.rs",
+          "anchor": "pub(super) fn connections_export("
+        },
+        {
+          "path": "gateway/src/import/mod.rs",
+          "anchor": "pub(crate) struct ImportReport"
+        }
+      ],
+      "tests": [
+        {
+          "path": "gateway/src/import/tests.rs",
+          "anchor": "fn the_default_mode_is_a_dry_run_and_apply_resume_are_explicit("
+        }
+      ],
+      "required_durability_supported": false,
+      "test_claim": "Existing behavior regression anchors only; these tests do not certify the proposed authority-event contract or delivery."
+    },
+    {
+      "id": "configuration_import",
+      "operations": [
+        "configuration.import"
+      ],
+      "modes": [
+        "postgres"
+      ],
+      "entrypoints": [],
+      "boundary": "import-standalone apply is offline and commits each section separately. Policy/tools activation reuse document transactions; Connection/token imports preserve state and intentionally do not replay old outbox entries.",
+      "record": "Imported durable state and policy/tools activation records; JSON stdout report carries section counts/checksums. The entire import/report has no single transaction or immutable operator-operation ledger.",
+      "actor": "IMPORT_ACTOR marks migration provenance; historic actors retained for imported policy history. It is not authenticated human attribution.",
+      "identity": "Natural-key idempotence per section and canonical checksums support resume; report has no persisted whole-import operation ID.",
+      "delivery": "operator_output",
+      "disposition": [
+        "missing_metadata",
+        "missing_delivery"
+      ],
+      "follow_up": "Treat import as multiple section operations: persist resumable section evidence with each owning transaction and a final verified manifest. Retain existing no-replay outbox semantics; do not publish sensitive canonical export bodies as evidence.",
+      "sources": [
+        {
+          "path": "gateway/src/import/sections.rs",
+          "anchor": "commit_policy_in"
+        },
+        {
+          "path": "gateway/src/import/mod.rs",
+          "anchor": "pub(crate) async fn run("
+        },
+        {
+          "path": "gateway/src/storage/postgres_service_tokens.rs",
+          "anchor": "pub(crate) async fn import_service_tokens_in("
+        }
+      ],
+      "tests": [
+        {
+          "path": "gateway/src/import/tests.rs",
+          "anchor": "fn every_runtime_table_the_report_disclaims_is_one_the_validation_proves_empty("
+        },
+        {
+          "path": "gateway/src/import/tests.rs",
+          "anchor": "async fn the_discovery_and_principal_sections_carry_the_inventory_signals_and_token_hashes("
+        }
+      ],
+      "required_durability_supported": false,
+      "test_claim": "Existing behavior regression anchors only; these tests do not certify the proposed authority-event contract or delivery."
+    },
+    {
+      "id": "configuration_import_standalone",
+      "operations": [
+        "configuration.import"
+      ],
+      "modes": [
+        "standalone"
+      ],
+      "entrypoints": [],
+      "boundary": "import-standalone targets PostgreSQL; a standalone configuration is only its source.",
+      "record": "No standalone import target operation.",
+      "actor": "Not applicable.",
+      "identity": "Not applicable.",
+      "delivery": "unsupported_no_delivery",
+      "disposition": [
+        "unsupported_future_operation"
+      ],
+      "follow_up": "Keep unsupported; do not infer a reverse import or merge operation from canonical comparison exports.",
+      "sources": [
+        {
+          "path": "gateway/src/import/mod.rs",
+          "anchor": "one-way standalone-to-cluster import"
+        }
+      ],
+      "tests": [
+        {
+          "path": "gateway/src/import/tests.rs",
+          "anchor": "fn a_cluster_configuration_as_the_source_is_refused("
+        }
+      ],
+      "required_durability_supported": false,
+      "test_claim": "Existing behavior regression anchors only; these tests do not certify the proposed authority-event contract or delivery."
+    }
+  ]
+}
