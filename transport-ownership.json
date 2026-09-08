@@ -5910,7 +5910,7 @@
         "network-or-process-reference"
       ],
       "scope": "gateway::bootstrap::run#1",
-      "sha256": "64486243fb36ef306c6b67dee55670929c73149317f7a697e4b6e746be4ad99c",
+      "sha256": "8873a5a0fcf49a59a618ff17ab0ee7bb49634e2c2f8af135291540c14f0d8be3",
       "owner": "GreenGateway maintainers",
       "purpose": "Existing application transport references or syntax in this exact item; new or changed authority requires explicit review."
     },
@@ -6310,7 +6310,7 @@
         "unexpanded-attribute"
       ],
       "scope": "gateway::audit::query::impl  AuditQueryStore::events_after#1",
-      "sha256": "47ca95bdf7d652653a1b35c5f2391523d8d40491166754537340a94fce0610be",
+      "sha256": "323e531039c96df235ca56df707d0ca1c36702cb1cde911b23e8c2d480e308c1",
       "owner": "GreenGateway maintainers",
       "purpose": "Audit/storage operations and instrumentation with existing shared backend authority."
     },
@@ -6330,7 +6330,7 @@
         "capability-in-macro-input"
       ],
       "scope": "gateway::audit::query::build_request_observation_query#1",
-      "sha256": "43024e5018cf04ce3820f49d9f04350b6d6ff3393f186b686ae1643e1ae8cc89",
+      "sha256": "101cc31cc7e0182efa01d146962ef541eb1e0d4ef87c80de3b661068770d4c3a",
       "owner": "GreenGateway maintainers",
       "purpose": "Audit/storage operations and instrumentation with existing shared backend authority."
     },
@@ -6570,7 +6570,7 @@
         "capability-in-macro-input"
       ],
       "scope": "gateway::auth::jwt::impl  JwtValidator::spawn_background_refresh_every#1",
-      "sha256": "f8c010f8518b7d1ec591181f86fbb0dff04d221bbf669115cf1d2602f3d7bfd8",
+      "sha256": "4336aae09bacedd3e382bfb51fd496431f220aaf1a85cd81bd28597dbedadc14",
       "owner": "GreenGateway maintainers",
       "purpose": "Authentication state or protocol handling; network requests consume the checked EgressClient API."
     },
@@ -7421,7 +7421,7 @@
         "unexpanded-attribute"
       ],
       "scope": "gateway::connections::pg_store::impl  PostgresConnectionStore::exported_statuses#1",
-      "sha256": "e4a0b83c789a5383d3015980c7ffc5aaea4e4e4b29175ebad77a7270b79e8d55",
+      "sha256": "ef93f80edff49c58187e29fb38619f968e4b4a39ccec97680cd191ed540a42fb",
       "owner": "GreenGateway maintainers",
       "purpose": "PostgreSQL repository operations through the shared infrastructure pool; no caller-selected HTTP authority."
     },
@@ -7431,7 +7431,7 @@
         "network-or-process-reference"
       ],
       "scope": "gateway::connections::pg_store::impl  PostgresConnectionStore::validate_within#1",
-      "sha256": "c34ff2c89e4746753253f4d6ef0dec9ade567c1558953e9819faaa818a14b5f5",
+      "sha256": "c6fc3563f1f59bb5d2c44567a28a213d26cf4e2bd23a873c316591a880399e69",
       "owner": "GreenGateway maintainers",
       "purpose": "PostgreSQL repository operations through the shared infrastructure pool; no caller-selected HTTP authority."
     },
@@ -7461,7 +7461,7 @@
         "network-or-process-reference"
       ],
       "scope": "gateway::connections::pg_store::validate_activity_rows#1",
-      "sha256": "67f7269b7c76b0d500ac0baf282ae059763a0cd4d8ebcbd1fa48225fc625fe26",
+      "sha256": "74561c8673f570c9493c2719d257aae642228464a8e8d620c70c020a2eb61870",
       "owner": "GreenGateway maintainers",
       "purpose": "PostgreSQL repository operations through the shared infrastructure pool; no caller-selected HTTP authority."
     },
@@ -7482,7 +7482,7 @@
         "network-or-process-reference"
       ],
       "scope": "gateway::connections::pg_store::validate_status_rows#1",
-      "sha256": "2df3836dcae0f1fbe4aa78d2a813222fce6428bcefb14f534c1cd8d946a4e629",
+      "sha256": "238c9da9c3a120dba29bdcdb713a628f5e691c45ea3a2cd65e742174c2df9d7b",
       "owner": "GreenGateway maintainers",
       "purpose": "PostgreSQL repository operations through the shared infrastructure pool; no caller-selected HTTP authority."
     },
@@ -7492,7 +7492,7 @@
         "network-or-process-reference"
       ],
       "scope": "gateway::connections::pg_store::validate_managed_catalog_dependencies#1",
-      "sha256": "eea45fe3fe8b8a1afd2d204b1af94b76f09a0d765f50eb6e3c7ed9d80339af4f",
+      "sha256": "df00defbfa08da6da6387c8e43009ea2d8c289280fc25be0b668e3b57bf511a0",
       "owner": "GreenGateway maintainers",
       "purpose": "PostgreSQL repository operations through the shared infrastructure pool; no caller-selected HTTP authority."
     },
@@ -7512,7 +7512,7 @@
         "network-or-process-reference"
       ],
       "scope": "gateway::connections::pg_store::mcp_catalog_bytes#1",
-      "sha256": "719a2c411ca3f8b5ba2e187bd73ff682409cfc80bbf4165757653e4c58a279be",
+      "sha256": "f29707ce21b40d2580da2a549d3f45c22025a061a24d8c56536923822d84c959",
       "owner": "GreenGateway maintainers",
       "purpose": "PostgreSQL repository operations through the shared infrastructure pool; no caller-selected HTTP authority."
     },
@@ -7522,7 +7522,7 @@
         "network-or-process-reference"
       ],
       "scope": "gateway::connections::pg_store::openapi_definition_bytes#1",
-      "sha256": "33d2d243ad0842e7640cf6077251994d116afabad9eda7dbf5c5eda81e6ad9f5",
+      "sha256": "feb582d2191aa430332b316597ceecda9a76e8f38fa76da414f5485afc9713f4",
       "owner": "GreenGateway maintainers",
       "purpose": "PostgreSQL repository operations through the shared infrastructure pool; no caller-selected HTTP authority."
     },
@@ -7532,7 +7532,7 @@
         "network-or-process-reference"
       ],
       "scope": "gateway::connections::pg_store::load_mcp_catalogs#1",
-      "sha256": "a91b24d7584706c0c9a05e6368af176e5499c0426a0cddf4da319fef555f0f13",
+      "sha256": "a167dcb0d794cf279c7c53686e009accfdfef49254ee69673f60fb5196ec7719",
       "owner": "GreenGateway maintainers",
       "purpose": "PostgreSQL repository operations through the shared infrastructure pool; no caller-selected HTTP authority."
     },
@@ -7542,7 +7542,7 @@
         "network-or-process-reference"
       ],
       "scope": "gateway::connections::pg_store::load_openapi_overlays#1",
-      "sha256": "411841bd9c0804dfa374822a468b403e683138cedc5742ea364cf80d5938186e",
+      "sha256": "ac4fea8dba7d755cb77bb50893a3897f00c7e39f6e9beb16f8fcbae2243db927",
       "owner": "GreenGateway maintainers",
       "purpose": "PostgreSQL repository operations through the shared infrastructure pool; no caller-selected HTTP authority."
     },
@@ -7552,7 +7552,7 @@
         "network-or-process-reference"
       ],
       "scope": "gateway::connections::pg_store::load_enum_source_revisions#1",
-      "sha256": "49385c48eed0b8f46b534f8915e0f6c981b609e6db537d6870ea8747bf30fd3b",
+      "sha256": "3f0a686c2c8c778e1b4c799f03519a21f172878cd4f1e92fb6c6589c56b0ee3a",
       "owner": "GreenGateway maintainers",
       "purpose": "PostgreSQL repository operations through the shared infrastructure pool; no caller-selected HTTP authority."
     },
@@ -7562,7 +7562,7 @@
         "network-or-process-reference"
       ],
       "scope": "gateway::connections::pg_store::load_enum_source_values#1",
-      "sha256": "e58ccc63b361b3a0aa2cd0f1c491d7c65e3dc2513cd05b2e431577d11dd3e625",
+      "sha256": "46dbe3b44d427c227bfba5230dce70380c94a3cdb3036de6ba2219e7b81711ed",
       "owner": "GreenGateway maintainers",
       "purpose": "PostgreSQL repository operations through the shared infrastructure pool; no caller-selected HTTP authority."
     },
@@ -7572,7 +7572,7 @@
         "network-or-process-reference"
       ],
       "scope": "gateway::connections::pg_store::load_enum_source_value#1",
-      "sha256": "ac11347a41b8af78fe6986b364d40da209090c28cd37b3288d95d77ddfaeb1d7",
+      "sha256": "e7e7cf37b602cd50e936900f00da466bff7f8ff7395972539f647342fdbe2bc0",
       "owner": "GreenGateway maintainers",
       "purpose": "PostgreSQL repository operations through the shared infrastructure pool; no caller-selected HTTP authority."
     },
@@ -7592,7 +7592,7 @@
         "network-or-process-reference"
       ],
       "scope": "gateway::connections::pg_store::write_catalog_enum_source_values#1",
-      "sha256": "dc477c719f507874e63f71ef0d40d2c895769afb7835885cbb94d50b332ef56d",
+      "sha256": "ef29b34687c9c17f30bd5fbc7371b9e344385cf05e46cb25ff5a493eac5d1596",
       "owner": "GreenGateway maintainers",
       "purpose": "PostgreSQL repository operations through the shared infrastructure pool; no caller-selected HTTP authority."
     },
@@ -7602,7 +7602,7 @@
         "network-or-process-reference"
       ],
       "scope": "gateway::connections::pg_store::write_openapi_overlay#1",
-      "sha256": "610cbeae2866f4c69999ec555cf398598e9777e2ecc2c2bf5ee90ee559180831",
+      "sha256": "aa431ac402d573dabb0939e8536a392583e5f748c3f9e9b67b860092bc012d20",
       "owner": "GreenGateway maintainers",
       "purpose": "PostgreSQL repository operations through the shared infrastructure pool; no caller-selected HTTP authority."
     },
@@ -7612,7 +7612,7 @@
         "network-or-process-reference"
       ],
       "scope": "gateway::connections::pg_store::load_openapi_catalogs#1",
-      "sha256": "bc4cfea58e93dcf065ab568afb4b40558c5932cecb9987df838b395f2422567a",
+      "sha256": "448201a1d490e80cf67bd2fea47990f3a7fc31a26fe31d992c008cb2ec43e5f0",
       "owner": "GreenGateway maintainers",
       "purpose": "PostgreSQL repository operations through the shared infrastructure pool; no caller-selected HTTP authority."
     },
@@ -7622,7 +7622,7 @@
         "network-or-process-reference"
       ],
       "scope": "gateway::connections::pg_store::load_mcp_entries#1",
-      "sha256": "16fead8e67e4e50a92e85cab3f3ad3cf6c650989c247bc38c4e7676faa64224e",
+      "sha256": "c2aa56395dce0a6bc935c62b04c6dc69e20a023625dd4ab0bac144d409dc1f81",
       "owner": "GreenGateway maintainers",
       "purpose": "PostgreSQL repository operations through the shared infrastructure pool; no caller-selected HTTP authority."
     },
@@ -7632,7 +7632,7 @@
         "network-or-process-reference"
       ],
       "scope": "gateway::connections::pg_store::load_mcp_resources#1",
-      "sha256": "e1d660a7ffb0ad50169731621e6df044f45d13d902c334784379bc7d0745b2b9",
+      "sha256": "dc34ab85e5b9dd02cd4370c2e9b8992a21214c2b26d84a435756f4fcc78ae756",
       "owner": "GreenGateway maintainers",
       "purpose": "PostgreSQL repository operations through the shared infrastructure pool; no caller-selected HTTP authority."
     },
@@ -7642,7 +7642,7 @@
         "network-or-process-reference"
       ],
       "scope": "gateway::connections::pg_store::load_mcp_resource_templates#1",
-      "sha256": "282ba5c618891cb92755b16318579c5f3d68817a2f613ea6878acf1eebd6553d",
+      "sha256": "a4e9e2be491cf763e684fd1e7bd8ebef18193740bfb1e0cf39e23ad098084847",
       "owner": "GreenGateway maintainers",
       "purpose": "PostgreSQL repository operations through the shared infrastructure pool; no caller-selected HTTP authority."
     },
@@ -7652,7 +7652,7 @@
         "network-or-process-reference"
       ],
       "scope": "gateway::connections::pg_store::load_openapi_entries#1",
-      "sha256": "1ec71ce17ef971ef418b299300f035881657762e13eab5f0a3a6d1fcc4d9f0b1",
+      "sha256": "cfae4693bd5c4f3fe1b2705f4f2a76b33ded92412da7c4ffe1dbc480bfc01ebc",
       "owner": "GreenGateway maintainers",
       "purpose": "PostgreSQL repository operations through the shared infrastructure pool; no caller-selected HTTP authority."
     },
@@ -7672,7 +7672,7 @@
         "network-or-process-reference"
       ],
       "scope": "gateway::connections::pg_store::load_dependencies#1",
-      "sha256": "2bf4f8b0922f79f2e5892714cce1ea664c4aea4c84edb5abcbfa241bdf60e555",
+      "sha256": "15898f488ac91f1b81a9ea24f40753655d0cfec0fbd64bb4721358364769618c",
       "owner": "GreenGateway maintainers",
       "purpose": "PostgreSQL repository operations through the shared infrastructure pool; no caller-selected HTTP authority."
     },
@@ -7692,7 +7692,7 @@
         "network-or-process-reference"
       ],
       "scope": "gateway::connections::pg_store::load_all_records#1",
-      "sha256": "208b40714f9594cf19c745694a19b3408a9c6223064a1d8d1c765e1ad2821862",
+      "sha256": "106f1d4a12c14885d10cc1276ee46cff31b6d82322486a1c2688c6565383dbaf",
       "owner": "GreenGateway maintainers",
       "purpose": "PostgreSQL repository operations through the shared infrastructure pool; no caller-selected HTTP authority."
     },
@@ -7722,7 +7722,7 @@
         "network-or-process-reference"
       ],
       "scope": "gateway::connections::pg_store::validate_bindings#1",
-      "sha256": "2be064a718a75e8311a67eafc71ad679112e6e7d7fc9790a3c6fd0290537f71c",
+      "sha256": "38be3a9e3ccd34712ac0d88e4bfa9aa220e902f3c890721d34dff9030a78ae67",
       "owner": "GreenGateway maintainers",
       "purpose": "PostgreSQL repository operations through the shared infrastructure pool; no caller-selected HTTP authority."
     },
@@ -7732,7 +7732,7 @@
         "network-or-process-reference"
       ],
       "scope": "gateway::connections::pg_store::replace_bindings#1",
-      "sha256": "7405f46357cc904bdf08c7e2078ecbae2e127ef14788baef41da6ff1ebe26a79",
+      "sha256": "b864547ee28c46a7957f4daefe62ebca875e47063dd204a680569d2282a7f3b1",
       "owner": "GreenGateway maintainers",
       "purpose": "PostgreSQL repository operations through the shared infrastructure pool; no caller-selected HTTP authority."
     },
@@ -7752,7 +7752,7 @@
         "network-or-process-reference"
       ],
       "scope": "gateway::connections::pg_store::append_version#1",
-      "sha256": "8e376dd98c0e9aa0cc7f0342be64bc3efb632ccc4f10ef7551902f52afbf74c9",
+      "sha256": "76b79cae6ef9403e3731efcbbbe8a430b80d3e700f15b4c16b3bb0d5f3c584d9",
       "owner": "GreenGateway maintainers",
       "purpose": "PostgreSQL repository operations through the shared infrastructure pool; no caller-selected HTTP authority."
     },
@@ -7762,7 +7762,7 @@
         "network-or-process-reference"
       ],
       "scope": "gateway::connections::pg_store::bump_connection_state#1",
-      "sha256": "dea3218b817c7a00810e9918a0a2df535cde98e636f467479fd08107ff852588",
+      "sha256": "38943aec0f8a3659b3ba6f67521be76760fdd4e87adb7561694a2b092e5c7fac",
       "owner": "GreenGateway maintainers",
       "purpose": "PostgreSQL repository operations through the shared infrastructure pool; no caller-selected HTTP authority."
     },
@@ -7782,7 +7782,7 @@
         "network-or-process-reference"
       ],
       "scope": "gateway::connections::pg_store::lock_connection_state#1",
-      "sha256": "94fe1238d32d03472b1c1735c90aed2d790b59d621716c18b28f57e6c60c3b30",
+      "sha256": "d3bd26064a5d04c99632823c2f62b15377b2ec821fa8db8be2bf993cb6cbc9ad",
       "owner": "GreenGateway maintainers",
       "purpose": "PostgreSQL repository operations through the shared infrastructure pool; no caller-selected HTTP authority."
     },
@@ -7832,7 +7832,7 @@
         "network-or-process-reference"
       ],
       "scope": "gateway::connections::pg_store::import_connections_in#1",
-      "sha256": "762ec06e838669c87a716c997b3a266184386a7c0d04b246a22155651d4883a3",
+      "sha256": "2ffe7654f35541ce14c32a84eb48aeecc411af5ff02c02391ecbcffe7356134d",
       "owner": "GreenGateway maintainers",
       "purpose": "PostgreSQL repository operations through the shared infrastructure pool; no caller-selected HTTP authority."
     },
@@ -7852,7 +7852,7 @@
         "network-or-process-reference"
       ],
       "scope": "gateway::connections::pg_store::import_mcp_catalog#1",
-      "sha256": "626c24a658768032efc44c629e67fc9d42a9fb933bd8698505dbd11d97b689c0",
+      "sha256": "87646e35d2d66105500708a251442f05c9811ea4739bc2f330e019b494f25bea",
       "owner": "GreenGateway maintainers",
       "purpose": "PostgreSQL repository operations through the shared infrastructure pool; no caller-selected HTTP authority."
     },
@@ -7862,7 +7862,7 @@
         "network-or-process-reference"
       ],
       "scope": "gateway::connections::pg_store::import_openapi_catalog#1",
-      "sha256": "5762425821405e76833fb506ee957a3bff46f01ec1d0fdb65b3cda89650e253a",
+      "sha256": "9e46f837d17c66184f89586be73d7f3e1ee5c4444c62ba6e89c4a89c2e5064f7",
       "owner": "GreenGateway maintainers",
       "purpose": "PostgreSQL repository operations through the shared infrastructure pool; no caller-selected HTTP authority."
     },
@@ -7872,7 +7872,7 @@
         "network-or-process-reference"
       ],
       "scope": "gateway::connections::pg_store::import_openapi_overlay#1",
-      "sha256": "d9e9e2cc998a48326603b6b92e5b46a47f73a8b0dab14f10bf5ddc237fa38fd2",
+      "sha256": "d5d4edf99cee48be94863002755063015799f60d094f2f6a0ee56efb32c21c86",
       "owner": "GreenGateway maintainers",
       "purpose": "PostgreSQL repository operations through the shared infrastructure pool; no caller-selected HTTP authority."
     },
@@ -7882,7 +7882,7 @@
         "network-or-process-reference"
       ],
       "scope": "gateway::connections::pg_store::import_enum_source_values#1",
-      "sha256": "fcf7851082b9d1d5031466da031bb9e8f13d3897c71436225f7c1bb7cf61b7eb",
+      "sha256": "78f8639a515bf2d29f1c1782e93d775ee3e48ce33a5e23df0944aa516c3b2c9c",
       "owner": "GreenGateway maintainers",
       "purpose": "PostgreSQL repository operations through the shared infrastructure pool; no caller-selected HTTP authority."
     },
@@ -7962,7 +7962,7 @@
         "network-or-process-reference"
       ],
       "scope": "gateway::connections::store::load_openapi_overlays#1",
-      "sha256": "c80af7fbc9fe5532008073a326ff51474e6a033c859d48bd85d39b7a1e785a5f",
+      "sha256": "9ec46777552d2fa0f01839c8a21990a000e85ac23459e8af7a20020ee22c11b1",
       "owner": "GreenGateway maintainers",
       "purpose": "Connection configuration, shared storage or checked provider/MCP protocol handling in this exact scope."
     },
@@ -7982,7 +7982,7 @@
         "network-or-process-reference"
       ],
       "scope": "gateway::connections::store::load_openapi_catalogs#1",
-      "sha256": "b29c5bd40f6bc6c3cef62d282ea046df08f14105b429263b0e6c30f447057d0c",
+      "sha256": "b1df4d07eb258b72338b94ee0a586da142e515b7c5204dc16ffb9b74f0edac58",
       "owner": "GreenGateway maintainers",
       "purpose": "Connection configuration, shared storage or checked provider/MCP protocol handling in this exact scope."
     },
@@ -8806,7 +8806,7 @@
         "network-or-process-reference"
       ],
       "scope": "gateway::ha_status::impl  PostgresReadinessAuthority::session_is_read_only#1",
-      "sha256": "c051c83757082ef69c32a18fe16525f6bc9b1b1a88c3cd9237088154995dddd0",
+      "sha256": "cc267d6d9201f2bb7ede57446be204a7fad1a3daa0bb52db6dee9549f56039be",
       "owner": "GreenGateway maintainers",
       "purpose": "Existing application transport references or syntax in this exact item; new or changed authority requires explicit review."
     },
@@ -8826,7 +8826,7 @@
         "network-or-process-reference"
       ],
       "scope": "gateway::import::preflight::verify_target#1",
-      "sha256": "f2f2ac6b201a6794da0f7010c0d745775f154eefd808a74610bf37f720b64284",
+      "sha256": "2414f717bf5b1d5097ea21ba51f6dea888350c6d99f3550e38296dcf09a96508",
       "owner": "GreenGateway maintainers",
       "purpose": "Existing application transport references or syntax in this exact item; new or changed authority requires explicit review."
     },
@@ -8836,7 +8836,7 @@
         "network-or-process-reference"
       ],
       "scope": "gateway::import::preflight::occupied_namespace#1",
-      "sha256": "73c7235c35c0652f8b851a56cdc0b9585a1e8c3ed43820c8023c70d5fbca9422",
+      "sha256": "8c52c8e9d5c89675a1e01d2a94114baca8c41bb8a187a77b054e17389442e1cc",
       "owner": "GreenGateway maintainers",
       "purpose": "Existing application transport references or syntax in this exact item; new or changed authority requires explicit review."
     },
@@ -8896,7 +8896,7 @@
         "network-or-process-reference"
       ],
       "scope": "gateway::import::sections::impl  DiscoverySection < 'a >::apply#1",
-      "sha256": "fbb4dedbd111afc7633c4fa115c6ca6dc771919ce1fc0a8f8060a3ed389bcd08",
+      "sha256": "23b8fe6612ab5dd160b30e9f1970a632450756c12335d6a6c50df861e50cb332",
       "owner": "GreenGateway maintainers",
       "purpose": "Existing application transport references or syntax in this exact item; new or changed authority requires explicit review."
     },
@@ -8926,7 +8926,7 @@
         "network-or-process-reference"
       ],
       "scope": "gateway::import::sections::stream_state#1",
-      "sha256": "4f7a95a08fc028c331ea6b081620b59969cbaa1e4852b73ad445a1166f48a7c5",
+      "sha256": "fba9456d6e28adc29fa57c1ae79fa80e085457e2c01712a16da8c32c6c90693c",
       "owner": "GreenGateway maintainers",
       "purpose": "Existing application transport references or syntax in this exact item; new or changed authority requires explicit review."
     },
@@ -8966,7 +8966,7 @@
         "network-or-process-reference"
       ],
       "scope": "gateway::import::validation::target_checksums#1",
-      "sha256": "669f7af7e74832477fedcf0cdc26385a50a9e1db6f4a29a9094caba353dde3a9",
+      "sha256": "faa8ec368adc8c7e06540f8aaeaf65d5aaba1ad837a4073f5f731cff14205e98",
       "owner": "GreenGateway maintainers",
       "purpose": "Existing application transport references or syntax in this exact item; new or changed authority requires explicit review."
     },
@@ -9006,7 +9006,7 @@
         "network-or-process-reference"
       ],
       "scope": "gateway::import::validation::constraints_validated#1",
-      "sha256": "a01644774fabde1ed644f8043b38664a6b8a39a74d0e5c5dbfc7401f400e6180",
+      "sha256": "86d8fca2f4f5e3a0506160bba4b064037570ea340ae8b980a6c68e9e520a2435",
       "owner": "GreenGateway maintainers",
       "purpose": "Existing application transport references or syntax in this exact item; new or changed authority requires explicit review."
     },
@@ -9016,7 +9016,7 @@
         "network-or-process-reference"
       ],
       "scope": "gateway::import::validation::referential_integrity#1",
-      "sha256": "db231be6e2940679daf91a412287e071296eb61c9ff3dc3344354b02604a7f63",
+      "sha256": "0bde457b38edc5445d83eac0f63a31713c17d1e936dc7b6f1061bf92d1ce1f53",
       "owner": "GreenGateway maintainers",
       "purpose": "Existing application transport references or syntax in this exact item; new or changed authority requires explicit review."
     },
@@ -9046,7 +9046,7 @@
         "network-or-process-reference"
       ],
       "scope": "gateway::import::validation::checkpoint_at_stream_head#1",
-      "sha256": "940ec8a1caf26db758e36d63729b1db3e8e7be37d5c60557ce0591c36d78df27",
+      "sha256": "c729e72cf66e28a264eb52cf35d8426ee0bec3428240ad52a618ad8329ac70f7",
       "owner": "GreenGateway maintainers",
       "purpose": "Existing application transport references or syntax in this exact item; new or changed authority requires explicit review."
     },
@@ -10334,7 +10334,7 @@
         "network-or-process-reference"
       ],
       "scope": "gateway::storage::migrations::bootstrap_ledger#1",
-      "sha256": "321853ec7185e69626017124d6601a4286e16703844369531524228139a92b98",
+      "sha256": "b4adc6b6f32d67d9092a42402d5c9b96adebcece8d404d205ed7b272a99e6304",
       "owner": "GreenGateway maintainers",
       "purpose": "Audit/storage operations and instrumentation with existing shared backend authority."
     },
@@ -10484,7 +10484,7 @@
         "network-or-process-reference"
       ],
       "scope": "gateway::storage::postgres::validated_dsn_config#1",
-      "sha256": "fc8d6b34a4510d451e923f508a92a138927be3f2ee5830cd09a978310fe48ba9",
+      "sha256": "39ebb332227be45d59fe73ff3d0ba0841fbe3f969e7d9cfa2d7c43a8a12fdc6a",
       "owner": "GreenGateway maintainers",
       "purpose": "Operator-configured PostgreSQL foundation: verified connector, bounded shared pool and connection lifecycle."
     },
@@ -10494,7 +10494,7 @@
         "network-or-process-reference"
       ],
       "scope": "gateway::storage::postgres::enforce_tls_policy#1",
-      "sha256": "42cd6315c579f5b54a3a2aaf4aca925be58fc35c50f9ce4e5ca389dec0edf037",
+      "sha256": "feb98af91dda63cadd3a7618c4f1b2984b91535195ad449e3b13c0409eb7498a",
       "owner": "GreenGateway maintainers",
       "purpose": "Operator-configured PostgreSQL foundation: verified connector, bounded shared pool and connection lifecycle."
     },
@@ -10514,7 +10514,7 @@
         "network-or-process-reference"
       ],
       "scope": "gateway::storage::postgres::apply_session_settings#1",
-      "sha256": "f8b1383cf5b34f5bd4b847e8de352656dde0b7bd447db2908a69ce28700b30bf",
+      "sha256": "c0e351ffd884ceb82b367ff16a27692c25310dd3f4d5f23d2a1bf1647d5dec83",
       "owner": "GreenGateway maintainers",
       "purpose": "Operator-configured PostgreSQL foundation: verified connector, bounded shared pool and connection lifecycle."
     },
@@ -10544,7 +10544,7 @@
         "network-or-process-reference"
       ],
       "scope": "gateway::storage::postgres::bind_deployment#1",
-      "sha256": "1abbaa5a046d114d58741e4a295e040487f6426d612da18fd8da1b3dc4185d95",
+      "sha256": "0ad9ceb1f0685c10b6e408c4fd18ce6a1758d10439bc50259ec4c8b3920cd480",
       "owner": "GreenGateway maintainers",
       "purpose": "Operator-configured PostgreSQL foundation: verified connector, bounded shared pool and connection lifecycle."
     },
@@ -10656,7 +10656,7 @@
         "unexpanded-macro"
       ],
       "scope": "gateway::storage::postgres_audit::impl  PostgresAuditEventStore::observed_role_endpoint_matrix#1",
-      "sha256": "cc6acdb0be5af459fccde39458b528af89d887ff8dc1617fbcfc42e040f1c617",
+      "sha256": "61f53dd431fd049938377ec97036a7deb61f009f04632db76e0e6c02ca1a01c7",
       "owner": "GreenGateway maintainers",
       "purpose": "PostgreSQL repository operations through the shared infrastructure pool; no caller-selected HTTP authority."
     },
@@ -10736,7 +10736,7 @@
         "network-or-process-reference"
       ],
       "scope": "gateway::storage::postgres_discovery::flush_transaction#1",
-      "sha256": "24b541d678167862bdbd6fa192a98a1624d8ad6ce755a677c667b70a3716de75",
+      "sha256": "707502d87565268cf8080fecf49884d38c037f5cb9db4e4fd450c314ddfa3e1a",
       "owner": "GreenGateway maintainers",
       "purpose": "PostgreSQL repository operations through the shared infrastructure pool; no caller-selected HTTP authority."
     },
@@ -10746,7 +10746,7 @@
         "network-or-process-reference"
       ],
       "scope": "gateway::storage::postgres_discovery::delete_by_keys#1",
-      "sha256": "0d74d2df300004cf6a5754ef9ccfa3c4d4fac849e35f5811859b5dad25a28f68",
+      "sha256": "5f970085456ffc89504bda49d29a8ef19d8dcc2243ba60ea9a7b0cb69ba7f6b3",
       "owner": "GreenGateway maintainers",
       "purpose": "PostgreSQL repository operations through the shared infrastructure pool; no caller-selected HTTP authority."
     },
@@ -10756,7 +10756,7 @@
         "network-or-process-reference"
       ],
       "scope": "gateway::storage::postgres_discovery::delete_signals_for_keys#1",
-      "sha256": "f950e2fff8421fc99dd336f0745b34a7dd3dd35625287ea8baa5c5ff028b76d7",
+      "sha256": "2e2b4659e8b6908d905af24ee4c11688910713be03f73a33f925572d681f1c56",
       "owner": "GreenGateway maintainers",
       "purpose": "PostgreSQL repository operations through the shared infrastructure pool; no caller-selected HTTP authority."
     },
@@ -10766,7 +10766,7 @@
         "network-or-process-reference"
       ],
       "scope": "gateway::storage::postgres_discovery::upsert_aggregates#1",
-      "sha256": "4147d65ea8f24edf8444e689e2ce0f43624950a10b47836987e24cba32dae842",
+      "sha256": "f3be7950be68849e4295dfa0c17484e80d0c904897d97249913ba457101b0289",
       "owner": "GreenGateway maintainers",
       "purpose": "PostgreSQL repository operations through the shared infrastructure pool; no caller-selected HTTP authority."
     },
@@ -10776,7 +10776,7 @@
         "network-or-process-reference"
       ],
       "scope": "gateway::storage::postgres_discovery::insert_status_counts#1",
-      "sha256": "0cf528d82384eb090751051ca015e2db3cf2b012cf548291822bc5c0eb81ede7",
+      "sha256": "bbc3b3066c464ebf6bee99004440afcd06818a6b87bc0f561edda979f0a857b2",
       "owner": "GreenGateway maintainers",
       "purpose": "PostgreSQL repository operations through the shared infrastructure pool; no caller-selected HTTP authority."
     },
@@ -10786,7 +10786,7 @@
         "network-or-process-reference"
       ],
       "scope": "gateway::storage::postgres_discovery::insert_principals#1",
-      "sha256": "ba4c1bd880c38c918f90eb6559be4578e31ceab822e61e3725d2c03b62965875",
+      "sha256": "f056dbe84f4a3d68c7fff877f84cdb831efdc652f4f220794e5bf232f2577e7d",
       "owner": "GreenGateway maintainers",
       "purpose": "PostgreSQL repository operations through the shared infrastructure pool; no caller-selected HTTP authority."
     },
@@ -10796,7 +10796,7 @@
         "network-or-process-reference"
       ],
       "scope": "gateway::storage::postgres_discovery::insert_routing_contexts#1",
-      "sha256": "fde516b4dcc38ab23d8d295b05407d4d6474d22795a24f23ab10d6298a7f1af6",
+      "sha256": "d04d23a94784ca828f776f0a05a56d31b8918d62d9a6379c6249829bccce81d4",
       "owner": "GreenGateway maintainers",
       "purpose": "PostgreSQL repository operations through the shared infrastructure pool; no caller-selected HTTP authority."
     },
@@ -10806,7 +10806,7 @@
         "network-or-process-reference"
       ],
       "scope": "gateway::storage::postgres_discovery::insert_routing_principals#1",
-      "sha256": "e21f43cb82b305e2bf07a1061878c6a8e23a9aa00c348d35ef39e845ecffe55d",
+      "sha256": "62c8cd07e9fb8d1528f32da7cc16b01e3afa4297e886cef660d19f375ef3d077",
       "owner": "GreenGateway maintainers",
       "purpose": "PostgreSQL repository operations through the shared infrastructure pool; no caller-selected HTTP authority."
     },
@@ -10816,7 +10816,7 @@
         "network-or-process-reference"
       ],
       "scope": "gateway::storage::postgres_discovery::insert_routing_classifications#1",
-      "sha256": "ffafb1a588d99d6faf9bac15e4ee776efdb4c379be93b81ad8a583f7b6020d18",
+      "sha256": "ab0833d3b6e1bd5d77aa1878038479c030d07a52a9e8417fdfd59fc37e16606e",
       "owner": "GreenGateway maintainers",
       "purpose": "PostgreSQL repository operations through the shared infrastructure pool; no caller-selected HTTP authority."
     },
@@ -10826,7 +10826,7 @@
         "network-or-process-reference"
       ],
       "scope": "gateway::storage::postgres_discovery::insert_classified_signal_stats#1",
-      "sha256": "74745ea9c517d331c42ee1871723b80a93632cac3c1599726588312698834bf8",
+      "sha256": "a4d2ff9507df914c07a0b60116d4fd0e1764496429cb4ff7c5597e536a19dca7",
       "owner": "GreenGateway maintainers",
       "purpose": "PostgreSQL repository operations through the shared infrastructure pool; no caller-selected HTTP authority."
     },
@@ -10836,7 +10836,7 @@
         "network-or-process-reference"
       ],
       "scope": "gateway::storage::postgres_discovery::insert_classified_signal_principals#1",
-      "sha256": "228ef40d03469ba0f535ab762a5d7afd9238c37f05c6e12bf0cd0034460060ff",
+      "sha256": "82a2eae1190db242eb1b70dc4c1bac8c58471f085f826589c755de7122b66407",
       "owner": "GreenGateway maintainers",
       "purpose": "PostgreSQL repository operations through the shared infrastructure pool; no caller-selected HTTP authority."
     },
@@ -10846,7 +10846,7 @@
         "network-or-process-reference"
       ],
       "scope": "gateway::storage::postgres_discovery::insert_payload_shapes#1",
-      "sha256": "5d727a3f17b372b6899bec5e32e1404b45ca7876ad6728dedaf006a5df15018b",
+      "sha256": "29171b326a82e0b91d7ef4e3cb41c2a56edd9a624f831068beb93aa7332371b0",
       "owner": "GreenGateway maintainers",
       "purpose": "PostgreSQL repository operations through the shared infrastructure pool; no caller-selected HTTP authority."
     },
@@ -10856,7 +10856,7 @@
         "network-or-process-reference"
       ],
       "scope": "gateway::storage::postgres_discovery::upsert_detector_states#1",
-      "sha256": "d72760b85c124d13c5cdf38b874afc5c43867f4db33f383c8e86e53ed4931105",
+      "sha256": "2616b7e8082a6da1dd1190cb6d2e6be84ca2eb80bff23d6802e0fe23264a4513",
       "owner": "GreenGateway maintainers",
       "purpose": "PostgreSQL repository operations through the shared infrastructure pool; no caller-selected HTTP authority."
     },
@@ -10866,7 +10866,7 @@
         "network-or-process-reference"
       ],
       "scope": "gateway::storage::postgres_discovery::upsert_template_groups#1",
-      "sha256": "8122502d19678443f1504f89aa6db80f64d6011ebee9ec002d65b051c1ca3c59",
+      "sha256": "733ee023c3a31696e92335d890b3546e45b575f235a10009170593e681a1bced",
       "owner": "GreenGateway maintainers",
       "purpose": "PostgreSQL repository operations through the shared infrastructure pool; no caller-selected HTTP authority."
     },
@@ -10876,7 +10876,7 @@
         "network-or-process-reference"
       ],
       "scope": "gateway::storage::postgres_discovery::insert_signals#1",
-      "sha256": "88461f158ee2e2a5df1a493a2f1b9d5d6fcbcd2e445ba635b26225293cd04b1b",
+      "sha256": "04025e4efac84e99b40d0fa9a83880252c5b096b8c04260b9ef40f6426fdd0c4",
       "owner": "GreenGateway maintainers",
       "purpose": "PostgreSQL repository operations through the shared infrastructure pool; no caller-selected HTTP authority."
     },
@@ -10896,7 +10896,7 @@
         "network-or-process-reference"
       ],
       "scope": "gateway::storage::postgres_discovery::import_discovery_in#1",
-      "sha256": "da7f75f11299230cbbb26c0360f207f4ad3c8982d1f0d9460d97bb0ef41c153b",
+      "sha256": "c2b1a26b3700bc9da4453fde6d3213120f4bb19ce44099faf4514232eb20e8e3",
       "owner": "GreenGateway maintainers",
       "purpose": "PostgreSQL repository operations through the shared infrastructure pool; no caller-selected HTTP authority."
     },
@@ -10906,7 +10906,7 @@
         "network-or-process-reference"
       ],
       "scope": "gateway::storage::postgres_discovery::import_signals#1",
-      "sha256": "142449ae02c027cc63b8a12e7cfc6eb689332dbd69303511ea283833100cb3ff",
+      "sha256": "1e3832af0da2e93380080febaec90d6b2a0ef4585206aeeb1275ea7ce5029c85",
       "owner": "GreenGateway maintainers",
       "purpose": "PostgreSQL repository operations through the shared infrastructure pool; no caller-selected HTTP authority."
     },
@@ -10916,7 +10916,7 @@
         "network-or-process-reference"
       ],
       "scope": "gateway::storage::postgres_discovery::import_suggestions#1",
-      "sha256": "0a63366cbc811fc8d2186a2440904273befa02403c86c8982bec4e2e705b6ab7",
+      "sha256": "c668651b931b21777af64ad8f177fdd7879760a966899cb65670359458332a06",
       "owner": "GreenGateway maintainers",
       "purpose": "PostgreSQL repository operations through the shared infrastructure pool; no caller-selected HTTP authority."
     },
@@ -10926,7 +10926,7 @@
         "network-or-process-reference"
       ],
       "scope": "gateway::storage::postgres_discovery::import_reviews#1",
-      "sha256": "5341c4aa8b4f374df40ffb13c59840d76bbfb69d2af2bf306eafb42035deed28",
+      "sha256": "d620e0164f3e781148b182cc5c677489df1541d1370d77d7ef29b5ac19ee0e8f",
       "owner": "GreenGateway maintainers",
       "purpose": "PostgreSQL repository operations through the shared infrastructure pool; no caller-selected HTTP authority."
     },
@@ -10986,7 +10986,7 @@
         "network-or-process-reference"
       ],
       "scope": "gateway::storage::postgres_discovery_lifecycle::transition_suggestion_with#1",
-      "sha256": "2e7d5f8cea5406186270a75dd5e8494b5641732cd437267072de07fce539e022",
+      "sha256": "e57044d7e9d8aa00664d8829a472e08753208f630230bc85c639f5d05a6a5778",
       "owner": "GreenGateway maintainers",
       "purpose": "PostgreSQL repository operations through the shared infrastructure pool; no caller-selected HTTP authority."
     },
@@ -10996,7 +10996,7 @@
         "network-or-process-reference"
       ],
       "scope": "gateway::storage::postgres_discovery_lifecycle::accept_suggestion_in#1",
-      "sha256": "0c0ee4f81fa293deb71a272a82c110cd3626e4fa5d260af7ffabd69593e471d5",
+      "sha256": "a44e0abfab5b85bdbe149e97117fa5079a0e17cbeed7f117b1ff4422265ce1e3",
       "owner": "GreenGateway maintainers",
       "purpose": "PostgreSQL repository operations through the shared infrastructure pool; no caller-selected HTTP authority."
     },
@@ -11006,7 +11006,7 @@
         "unresolved-transport-method"
       ],
       "scope": "gateway::storage::postgres_discovery_lifecycle::build_suggestion_list_query#1",
-      "sha256": "35758780da129dcbb1aac299dbb8085f4b57208aa66410fa2ca40ce9cb7b5a0e",
+      "sha256": "bb971ba69f15fc7190c8a260f5a868621025b211ab51fef7e9d837b393d2b3ad",
       "owner": "GreenGateway maintainers",
       "purpose": "PostgreSQL repository operations through the shared infrastructure pool; no caller-selected HTTP authority."
     },
@@ -11016,7 +11016,7 @@
         "network-or-process-reference"
       ],
       "scope": "gateway::storage::postgres_discovery_lifecycle::load_suggestion#1",
-      "sha256": "6e96bfd19e2b1460c1c91f537bd0397ea4c06e68dedbf327aa8e2d7b4099209c",
+      "sha256": "88135ce4348cde86e534ead1ec411e74c96e86d4915eff21dda596eedbcb0b3c",
       "owner": "GreenGateway maintainers",
       "purpose": "PostgreSQL repository operations through the shared infrastructure pool; no caller-selected HTTP authority."
     },
@@ -11106,7 +11106,7 @@
         "unexpanded-attribute"
       ],
       "scope": "gateway::storage::postgres_discovery_read::impl  PostgresDiscoveryReadStore::exported_reviews#1",
-      "sha256": "c2d7eec77b9c8b880d016d433b02c412bd2e7f8d4b0879d1b26f9217b66f03f2",
+      "sha256": "49e1dbe0915950a1404f637a893480a241863156a5904e3795a9ebd6ee05a492",
       "owner": "GreenGateway maintainers",
       "purpose": "PostgreSQL repository operations through the shared infrastructure pool; no caller-selected HTTP authority."
     },
@@ -11116,7 +11116,7 @@
         "network-or-process-reference"
       ],
       "scope": "gateway::storage::postgres_discovery_read::set_endpoint_review_transaction#1",
-      "sha256": "dddbeb2c1063eb67168917c22f61f5a3dcb402f10c73e65f34929918adf3ad3b",
+      "sha256": "0bddc49ef8c3b52d0b8e8f8ed97e88ed78ade9cf55ea795e029c23536d60e4bc",
       "owner": "GreenGateway maintainers",
       "purpose": "PostgreSQL repository operations through the shared infrastructure pool; no caller-selected HTTP authority."
     },
@@ -11126,7 +11126,7 @@
         "network-or-process-reference"
       ],
       "scope": "gateway::storage::postgres_discovery_read::load_review#1",
-      "sha256": "98dfba0c51f93a198a749e4f7eb872c146624a98dc746daf951c4dceee06465a",
+      "sha256": "41a0b1872f01c3f8a7b88a19636f8748374787e66cb802ce8dd276ba569005fa",
       "owner": "GreenGateway maintainers",
       "purpose": "PostgreSQL repository operations through the shared infrastructure pool; no caller-selected HTTP authority."
     },
@@ -11166,7 +11166,7 @@
         "unresolved-transport-method"
       ],
       "scope": "gateway::storage::postgres_discovery_read::build_endpoint_list_query#1",
-      "sha256": "cb116ca63325c39891c3e5c4c083817e0df56ec9559a84e6b581652ed30b6182",
+      "sha256": "93c0c746d1554219807c40f8f6e9941bee73888b520e9347ef634f0f2f46acb4",
       "owner": "GreenGateway maintainers",
       "purpose": "PostgreSQL repository operations through the shared infrastructure pool; no caller-selected HTTP authority."
     },
@@ -11176,7 +11176,7 @@
         "unresolved-transport-method"
       ],
       "scope": "gateway::storage::postgres_discovery_read::build_principal_query#1",
-      "sha256": "0fa0bc8b6a0b53243ed1b502517cb89f2dccb2552c92aa75bc0f535763479158",
+      "sha256": "43937a1cf2837d6408ddd63ec90ad8fca28cd8e03306ff4c3a473566ba75913e",
       "owner": "GreenGateway maintainers",
       "purpose": "PostgreSQL repository operations through the shared infrastructure pool; no caller-selected HTTP authority."
     },
@@ -11186,7 +11186,7 @@
         "unresolved-transport-method"
       ],
       "scope": "gateway::storage::postgres_discovery_read::build_signal_list_query#1",
-      "sha256": "64fbd66252b2b1eeff3570eb5ccf6008376910fcb38cb95ad3bdaa0cb194b1de",
+      "sha256": "cfd3dea57405cfeb41c197021e9693a133a8d2a842b7ab43d4e42f5f65391921",
       "owner": "GreenGateway maintainers",
       "purpose": "PostgreSQL repository operations through the shared infrastructure pool; no caller-selected HTTP authority."
     },
@@ -11196,7 +11196,7 @@
         "network-or-process-reference"
       ],
       "scope": "gateway::storage::postgres_discovery_read::load_status_counts#1",
-      "sha256": "50b9416c2809481b05847edfd0b1a5f0efca4037a20050b78e7867191d1ba074",
+      "sha256": "afaf938f6452cc72a69df9f749457702d9dd72ebd340ba10febecce5234a7c8b",
       "owner": "GreenGateway maintainers",
       "purpose": "PostgreSQL repository operations through the shared infrastructure pool; no caller-selected HTTP authority."
     },
@@ -11206,7 +11206,7 @@
         "network-or-process-reference"
       ],
       "scope": "gateway::storage::postgres_discovery_read::load_routing_contexts#1",
-      "sha256": "6ba630738f614874732ed4d086d4e38a408aa512803277674ab6f4e70e4f5640",
+      "sha256": "3d0ee0ac9c4199be838fc6aa21cd39787d948357978ba5202adb3094e626137a",
       "owner": "GreenGateway maintainers",
       "purpose": "PostgreSQL repository operations through the shared infrastructure pool; no caller-selected HTTP authority."
     },
@@ -11216,7 +11216,7 @@
         "network-or-process-reference"
       ],
       "scope": "gateway::storage::postgres_discovery_read::load_routing_context_known_since#1",
-      "sha256": "518573daa6cca3e65d1c72e6a6344084bdbc0122d4d117ac98ef0af1db247850",
+      "sha256": "ce752b7a32c93f82fa0533cad614eadc99cc474e9e7723b0e967a65a0e75dff2",
       "owner": "GreenGateway maintainers",
       "purpose": "PostgreSQL repository operations through the shared infrastructure pool; no caller-selected HTTP authority."
     },
@@ -11226,7 +11226,7 @@
         "network-or-process-reference"
       ],
       "scope": "gateway::storage::postgres_discovery_read::load_open_signal_summaries#1",
-      "sha256": "67d88987421a3709e202dac46403f09e1423933043208fe503e0d48d25436b84",
+      "sha256": "a7d3b72e89582965dbd5b0a135f24f47dc39c8a199050deef44088a93e763e6e",
       "owner": "GreenGateway maintainers",
       "purpose": "PostgreSQL repository operations through the shared infrastructure pool; no caller-selected HTTP authority."
     },
@@ -11296,7 +11296,7 @@
         "network-or-process-reference"
       ],
       "scope": "gateway::storage::postgres_documents::read_active#1",
-      "sha256": "858200fdbe76232574d5ab81b289a8f05cedb5addf1c4f232644eeef65507eef",
+      "sha256": "e626f70699377170d4583c68dcaeed060e0365f27fa08544c6bdf10b9c90d342",
       "owner": "GreenGateway maintainers",
       "purpose": "PostgreSQL repository operations through the shared infrastructure pool; no caller-selected HTTP authority."
     },
@@ -11336,7 +11336,7 @@
         "network-or-process-reference"
       ],
       "scope": "gateway::storage::postgres_documents::commit_in#1",
-      "sha256": "675ba90c9bb7823bd5401027d9afc2a55537ae02de4231a0c4e49d73e9076c47",
+      "sha256": "8685889c1e82dcdaeb8b662b3ede0cc4cae76375b3f68b00d0dac28e4744211e",
       "owner": "GreenGateway maintainers",
       "purpose": "PostgreSQL repository operations through the shared infrastructure pool; no caller-selected HTTP authority."
     },
@@ -11366,7 +11366,7 @@
         "network-or-process-reference"
       ],
       "scope": "gateway::storage::postgres_execution_leases::impl  PostgresExecutionLeaseStore::reap_expired_with#1",
-      "sha256": "7a8f0d3f61ab4f8f07344f22f17394bcbfb19486c54e6bb1edaf4899801ada9c",
+      "sha256": "2de31189d933169cc88550dbdf74d70e279c1bbe2ffc576e95351a61253aaba5",
       "owner": "GreenGateway maintainers",
       "purpose": "PostgreSQL repository operations through the shared infrastructure pool; no caller-selected HTTP authority."
     },
@@ -11406,7 +11406,7 @@
         "network-or-process-reference"
       ],
       "scope": "gateway::storage::postgres_jwt_revocations::impl  PostgresJwtRevocationStore::cleanup_expired_with#1",
-      "sha256": "b252381349f332d1d194d661972a582417b5b3135ececa0e4e5dfc61eed02bae",
+      "sha256": "d7a1ccb88a33f0a869d8a694b272cedd3986f4677340fbe427463bf5a52bd8d5",
       "owner": "GreenGateway maintainers",
       "purpose": "PostgreSQL repository operations through the shared infrastructure pool; no caller-selected HTTP authority."
     },
@@ -11456,7 +11456,7 @@
         "network-or-process-reference"
       ],
       "scope": "gateway::storage::postgres_membership::impl  PostgresMembershipStore::members_with_inner#1",
-      "sha256": "048dbbce1046f20b3e96740630f802b0af788e201d79da1339d5931b87567293",
+      "sha256": "7ffc604d0da26ced22bf40f22df19baa0ac0eca7c543bd03c1982c84869323dc",
       "owner": "GreenGateway maintainers",
       "purpose": "PostgreSQL repository operations through the shared infrastructure pool; no caller-selected HTTP authority."
     },
@@ -11476,7 +11476,7 @@
         "network-or-process-reference"
       ],
       "scope": "gateway::storage::postgres_membership::impl  PostgresMembershipStore::sweep_stale_with_inner#1",
-      "sha256": "4049e9701c4ef633c9e374f4e95b228e204d6a51c4ee2dcc68d4d13b9f93fdbe",
+      "sha256": "68676d1b204dbe251c0cc789a18c2886039fd21a761bfaec3a219998fbaa068a",
       "owner": "GreenGateway maintainers",
       "purpose": "PostgreSQL repository operations through the shared infrastructure pool; no caller-selected HTTP authority."
     },
@@ -11646,7 +11646,7 @@
         "network-or-process-reference"
       ],
       "scope": "gateway::storage::postgres_policy::insert_imported_policy_versions_in#1",
-      "sha256": "093612a352020451670555e561037c8585933cf26574970b83b8a6738cd974f1",
+      "sha256": "fe0d8cf4728f92be572a515b80fff8c00f4ca2fc1f2ec395d95eaeedbfad6af9",
       "owner": "GreenGateway maintainers",
       "purpose": "PostgreSQL repository operations through the shared infrastructure pool; no caller-selected HTTP authority."
     },
@@ -11706,7 +11706,7 @@
         "network-or-process-reference"
       ],
       "scope": "gateway::storage::postgres_rate_limits::impl  PostgresRateLimitStore::cleanup_idle_with#1",
-      "sha256": "38bd919336a3b797831c8ec76fc9a09f8a0079b0b04a324a011e85ef39d28c22",
+      "sha256": "39bfb8f51e485b9d622f8e7acd1b5aca76d03f4bbbb96c591cac94a596672829",
       "owner": "GreenGateway maintainers",
       "purpose": "PostgreSQL repository operations through the shared infrastructure pool; no caller-selected HTTP authority."
     },
@@ -11776,7 +11776,7 @@
         "network-or-process-reference"
       ],
       "scope": "gateway::storage::postgres_service_tokens::begin_mutation#1",
-      "sha256": "ba7c4c55491d28b5d68191dbd2456252b228b3036914efca01782fc32d725666",
+      "sha256": "df16c8ad7ed5997429217334e1d6dd23ea8c4277142a58d5448dcb5c1dadd9bc",
       "owner": "GreenGateway maintainers",
       "purpose": "PostgreSQL repository operations through the shared infrastructure pool; no caller-selected HTTP authority."
     },
@@ -11786,7 +11786,7 @@
         "network-or-process-reference"
       ],
       "scope": "gateway::storage::postgres_service_tokens::reserve_shared_revision#1",
-      "sha256": "832c9ace6ab295b60e70192ea8fefdc0d24982fd6de82f42f79cbf4e893eafba",
+      "sha256": "db848daf52c1ddb49191afd60498ce53b4c20b7f9b6d2325f05c3bb8e8982d0e",
       "owner": "GreenGateway maintainers",
       "purpose": "PostgreSQL repository operations through the shared infrastructure pool; no caller-selected HTTP authority."
     },
@@ -11796,7 +11796,7 @@
         "network-or-process-reference"
       ],
       "scope": "gateway::storage::postgres_service_tokens::record_revision#1",
-      "sha256": "a98ba7772f6995dae3a93367fa990a4fde23962dccc1dba0444e7347f009536e",
+      "sha256": "2cc811531e2dbec5584e7d59c27d525c7bb11f2e32669cb352dcf9e8bdb8e551",
       "owner": "GreenGateway maintainers",
       "purpose": "PostgreSQL repository operations through the shared infrastructure pool; no caller-selected HTTP authority."
     },
@@ -11856,7 +11856,7 @@
         "network-or-process-reference"
       ],
       "scope": "gateway::storage::postgres_service_tokens::import_service_tokens_in#1",
-      "sha256": "e500e9b7937a53cdcc2cb306d9d79d83fe3114671f985f5f87aba88686e4aa2e",
+      "sha256": "8b61d4907f7c346ed12486d54ed280073751aec1476e9375a24bd70a04df861d",
       "owner": "GreenGateway maintainers",
       "purpose": "PostgreSQL repository operations through the shared infrastructure pool; no caller-selected HTTP authority."
     },
@@ -11866,7 +11866,7 @@
         "network-or-process-reference"
       ],
       "scope": "gateway::storage::postgres_service_tokens::exported_tokens#1",
-      "sha256": "42ed73b0deff0bed7b1715a21a6bfccfe8176631124d776ef5aee540ceadcbe3",
+      "sha256": "6c808ef885f5268982756c3d784e896e880d7dbcbcaeef39765579d363dd2676",
       "owner": "GreenGateway maintainers",
       "purpose": "PostgreSQL repository operations through the shared infrastructure pool; no caller-selected HTTP authority."
     },
@@ -11946,7 +11946,7 @@
         "network-or-process-reference"
       ],
       "scope": "gateway::storage::postgres_tool_names::reserve_tool_names#1",
-      "sha256": "463c9ea1606beddf3fd96543294872cf368fd34359f1c357be6fbc43598d39ce",
+      "sha256": "db046f70576a011cfe3fdae115aff57892ccf35726ae7b023756a5d0e003036a",
       "owner": "GreenGateway maintainers",
       "purpose": "PostgreSQL repository operations through the shared infrastructure pool; no caller-selected HTTP authority."
     },
