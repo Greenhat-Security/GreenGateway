@@ -624,6 +624,39 @@ impl<'ast> Visit<'ast> for Scan<'_> {
             self.reason("unexpanded-attribute");
         }
     }
+    fn visit_signature(&mut self, signature: &'ast syn::Signature) {
+        if signature.unsafety.is_some() {
+            self.reason("unsafe-code");
+        }
+        if signature.abi.is_some() {
+            self.reason("foreign-code");
+        }
+        visit::visit_signature(self, signature);
+    }
+    fn visit_item_impl(&mut self, item: &'ast syn::ItemImpl) {
+        if item.unsafety.is_some() {
+            self.reason("unsafe-code");
+        }
+        visit::visit_item_impl(self, item);
+    }
+    fn visit_expr(&mut self, expression: &'ast syn::Expr) {
+        if matches!(expression, syn::Expr::Verbatim(_)) {
+            self.reason("unexamined-syntax");
+        }
+        visit::visit_expr(self, expression);
+    }
+    fn visit_type(&mut self, ty: &'ast syn::Type) {
+        if matches!(ty, syn::Type::Verbatim(_)) {
+            self.reason("unexamined-syntax");
+        }
+        visit::visit_type(self, ty);
+    }
+    fn visit_pat(&mut self, pattern: &'ast syn::Pat) {
+        if matches!(pattern, syn::Pat::Verbatim(_)) {
+            self.reason("unexamined-syntax");
+        }
+        visit::visit_pat(self, pattern);
+    }
     fn visit_expr_unsafe(&mut self, e: &'ast syn::ExprUnsafe) {
         self.reason("unsafe-code");
         visit::visit_expr_unsafe(self, e);
@@ -970,5 +1003,26 @@ mod tests {
             facts(&unix.tree().expect("LF source"))[0].sha256,
             facts(&windows.tree().expect("CRLF source"))[0].sha256
         );
+    }
+    #[test]
+    fn unsafe_signatures_and_impls_require_review_without_an_explicit_block() {
+        assert!(has(&scan("unsafe fn f() { operation(); }"), "unsafe-code"));
+        assert!(has(
+            &scan("unsafe impl Contract for Thing {}"),
+            "unsafe-code"
+        ));
+    }
+    #[test]
+    fn verbatim_syntax_is_unexamined_instead_of_empty() {
+        let aliases = BTreeSet::new();
+        let mut scanner = Scan {
+            aliases: &aliases,
+            reasons: BTreeSet::new(),
+        };
+        scanner.visit_expr(&syn::Expr::Verbatim(quote::quote!(future_syntax)));
+        assert!(scanner.reasons.contains("unexamined-syntax"));
+        scanner.reasons.clear();
+        scanner.visit_type(&syn::Type::Verbatim(quote::quote!(FutureType)));
+        assert!(scanner.reasons.contains("unexamined-syntax"));
     }
 }
