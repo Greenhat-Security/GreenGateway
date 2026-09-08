@@ -8746,9 +8746,9 @@
         "unexpanded-attribute"
       ],
       "scope": "gateway::ha_status::AuthorityObservation#1",
-      "sha256": "582d7545a053564356524eb2bf15318d5d94ba4d3050fc5d09d788926669a064",
+      "sha256": "a4168ecbc8833043ee7633f4e9193e97c7b989a5e3b8521123474bd452a9711f",
       "owner": "GreenGateway maintainers",
-      "purpose": "Existing macro/attribute inputs for this exact application item; changed expansion inputs require explicit review."
+      "purpose": "HA readiness outcome data and its existing cfg_attr annotation; adds an explicit incompatible-history result without constructing transport or changing attribute behavior."
     },
     {
       "file": "gateway/src/ha_status.rs",
@@ -8796,9 +8796,9 @@
         "network-or-process-reference"
       ],
       "scope": "gateway::ha_status::impl  PostgresReadinessAuthority::observe_client#1",
-      "sha256": "eb42be50b8159c172e81ebbde9f63294b24da6a760258cc9064f9b005e0c79d0",
+      "sha256": "a0c172242c24c764ab96c16e5bdc293389746aeb1fa7e536bbb0db0e8a9784a8",
       "owner": "GreenGateway maintainers",
-      "purpose": "Existing application transport references or syntax in this exact item; new or changed authority requires explicit review."
+      "purpose": "HA readiness borrows the existing bounded PostgreSQL foundation session, reads bounded ledger/checksum metadata and preserves read-only/outage classification; no new DSN or transport owner."
     },
     {
       "file": "gateway/src/ha_status.rs",
@@ -10274,9 +10274,29 @@
         "network-or-process-reference"
       ],
       "scope": "gateway::storage::migrations::read_and_validate#1",
-      "sha256": "c83dfb5b14b350412bdbbfaee1f7e48a854d95185c30f52ad4f148b472bb6d7e",
+      "sha256": "c4565a9fc7f0913801cdf96ea903d799b46898309bb81ff581f654da6379b5e3",
       "owner": "GreenGateway maintainers",
-      "purpose": "Audit/storage operations and instrumentation with existing shared backend authority."
+      "purpose": "Migration CLI and import preflight delegate strict executable-manifest validation over the existing PostgreSQL foundation pool; no new connection construction."
+    },
+    {
+      "file": "gateway/src/storage/migrations.rs",
+      "reasons": [
+        "network-or-process-reference"
+      ],
+      "scope": "gateway::storage::migrations::read_and_validate_runtime#1",
+      "sha256": "8f72bdae38954cd7c8f1bf62dde958151cf23768ed9fc7905520724df0c5f9a7",
+      "owner": "GreenGateway maintainers",
+      "purpose": "Serving startup delegates compiled history and read/write compatibility validation over the existing PostgreSQL foundation pool; no DDL or new transport authority."
+    },
+    {
+      "file": "gateway/src/storage/migrations.rs",
+      "reasons": [
+        "network-or-process-reference"
+      ],
+      "scope": "gateway::storage::migrations::read_schema#1",
+      "sha256": "4901d48f5ae259dd6c830e88038cb403468759fc9fbee312899da0c27567185f",
+      "owner": "GreenGateway maintainers",
+      "purpose": "Schema validation borrows the shared PostgreSQL pool, reads the migration ledger and records its compatibility metric; the callback selects a reviewed pure validator, with no new transport construction."
     },
     {
       "file": "gateway/src/storage/migrations.rs",

@@ -687,9 +687,12 @@ pub(crate) async fn read_and_validate_runtime(
 }
 
 #[cfg(feature = "postgres")]
+type LedgerValidator = fn(&[(i64, String)]) -> Result<SchemaStatus, LedgerProblem>;
+
+#[cfg(feature = "postgres")]
 async fn read_schema(
     pool: &deadpool_postgres::Pool,
-    validate: fn(&[(i64, String)]) -> Result<SchemaStatus, LedgerProblem>,
+    validate: LedgerValidator,
 ) -> Result<SchemaStatus, MigrateError> {
     let client = acquire(pool).await?;
     let outcome = match read_ledger(&client).await? {
