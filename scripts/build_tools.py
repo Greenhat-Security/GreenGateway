@@ -163,6 +163,8 @@ def check(root=ROOT):
             doc = yaml.load(path.read_text(), Loader=yaml.BaseLoader)
             if path.name == "ci.yml" and "cargo-policy" not in doc.get("jobs", {}):
                 errors.append("CI must retain the required Cargo policy job")
+            if path.name == "ci.yml" and "egress-only" not in doc.get("jobs", {}):
+                errors.append("CI must retain structural transport ownership")
             for job_name, job in doc.get("jobs", {}).items():
                 if "uses" in job:
                     continue
@@ -186,6 +188,10 @@ def check(root=ROOT):
                     errors.append(f"{job_name}: Cargo uses an undeclared compiler")
                 if re.search(r"\b(node|npm|npx)\b|\bcargo (build|test|clippy|llvm-cov)\b", commands) and config.get("node") != "true":
                     errors.append(f"{job_name}: Node/npm setup required before building")
+                if job_name == "egress-only":
+                    for required_command in ["bash scripts/check-egress-only.sh", "python scripts/transport_guard.py check", "cargo test --locked --example transport_guard", "test_transport_guard.py"]:
+                        if required_command not in commands:
+                            errors.append("Transport ownership must retain protocol guard, structural check and rejection fixtures")
                 if job_name == "cargo-policy":
                     if job.get("strategy", {}).get("matrix", {}).get("os") != ["ubuntu-latest", "windows-latest"]:
                         errors.append("Cargo policy requires Linux and Windows qualification")

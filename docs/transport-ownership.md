@@ -97,3 +97,17 @@ passing check. Review the graph and changed source scopes, explain each owner an
 purpose, and edit the exact policy records in the same PR. Do not copy the candidate
 over policy without reviewing it; the candidate deliberately lacks scope approvals.
 Never add a file-wide bypass or regenerate policy automatically in CI.
+
+## Regression evidence
+
+`cargo test --locked --example transport_guard` parses harmless source fixtures for
+direct sockets, chained imports/reexports, type aliases, function pointers, glob
+imports, unresolved receivers, macro inputs, custom expansion, cfg variants and
+foreign/unsafe code. It never executes the represented networking expressions.
+
+`python -m unittest discover -s scripts -p test_transport_guard.py -v` rejects broad
+or missing approvals, changed/new/stale scopes and failed enumeration. Inert Cargo
+metadata fixtures prove new packages/features and changed build scripts fail before
+tool compilation, and an unknown registry fails before metadata fetching. Both
+suites are required by the egress job. Existing local MCP, egress and gRPC suites
+continue checking runtime behavior; syntax fixtures do not substitute for them.
