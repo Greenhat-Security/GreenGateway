@@ -341,6 +341,15 @@ exception are enforced — the file is named in an explicit allowlist in
 the check fails if the pinning call disappears from the function that builds
 the client.
 
+## Transport construction ownership
+
+The production transport review is recorded in
+[the transport ownership inventory](transport-ownership.md). Request handlers use
+checked egress APIs; database pools and inbound listeners have distinct operator
+configuration authorities. Moving a constructor into a Rust module does not remove
+ambient socket access. Syntax and dependency review supplement the behavioral
+pinning, TLS, protocol, and listener-isolation tests.
+
 ## Audit and diagnostic confidentiality
 
 Security events use stable IDs, revisions, bounded action/outcome/reason values,
