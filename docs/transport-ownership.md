@@ -76,7 +76,8 @@ conditional module paths, escaping paths and parse errors fail. Generated Rust
 cannot quietly become an unowned source file; supporting a generator requires a
 reviewed extension to enumeration and its input contract.
 
-Raw client/socket/process/FFI references, conservative unresolved connection methods,
+Raw client/socket/process/FFI references, calls to the two concrete MCP client factories
+(including inferred local types), conservative unresolved connection methods,
 capability imports and glob/renamed imports receive exact review records. PostgreSQL
 pool consumers and stream adapters can appear in the records without being socket
 constructors. Their purpose labels distinguish them from request egress.

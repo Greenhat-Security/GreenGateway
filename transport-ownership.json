@@ -12285,6 +12285,16 @@
       "reasons": [
         "network-or-process-reference"
       ],
+      "scope": "gateway::tools::mcp_upstream::probe_connection_protocol_before#1",
+      "sha256": "193b2ce88844a957334c9aa496cb7f4d03afaca030c583f54232d359baa1c640",
+      "owner": "GreenGateway maintainers",
+      "purpose": "Bounded managed MCP protocol probe: validate connection etag, checked destination and prepared transport before acquiring the concrete client; use it only in the deadline-controlled limited probe with credential and cleanup checks."
+    },
+    {
+      "file": "gateway/src/tools/mcp_upstream.rs",
+      "reasons": [
+        "network-or-process-reference"
+      ],
       "scope": "gateway::tools::mcp_upstream::run_bounded_protocol_probe#1",
       "sha256": "81aabfe8e5ffdf4f3e051ff93589dc5aaefbcb9d146f5c274bfcee12dd4c2a4f",
       "owner": "GreenGateway maintainers",

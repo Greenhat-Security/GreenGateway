@@ -322,6 +322,10 @@ fn capability(path: &[String], aliases: &BTreeSet<String>) -> bool {
         "Command",
         "Client",
         "ClientBuilder",
+        // These checked factories expose a concrete client to protocol adapters.
+        // New callers still require review even when their local type is inferred.
+        "mcp_http_client",
+        "mcp_reqwest_client_at_checked_destination",
         "TlsConnector",
     ];
     path.iter()
@@ -478,6 +482,9 @@ impl<'ast> Visit<'ast> for Scan<'_> {
         }
     }
     fn visit_expr_method_call(&mut self, e: &'ast syn::ExprMethodCall) {
+        if e.method == "mcp_reqwest_client_at_checked_destination" {
+            self.reason("network-or-process-reference");
+        }
         if [
             "connect",
             "connect_raw",
@@ -1024,5 +1031,21 @@ mod tests {
         scanner.reasons.clear();
         scanner.visit_type(&syn::Type::Verbatim(quote::quote!(FutureType)));
         assert!(scanner.reasons.contains("unexamined-syntax"));
+    }
+    #[test]
+    fn aliased_raw_client_factory_call_requires_review_without_a_type_annotation() {
+        let scopes=scan("use crate::egress::mcp_http_client as prepared; fn f() { let client = prepared(PLACEHOLDER); }");
+        assert!(scopes.iter().any(
+            |s| s.scope.contains("::f#") && s.reasons.contains("network-or-process-reference")
+        ));
+    }
+    #[test]
+    fn raw_client_factory_method_requires_review_beyond_checked_wrapper_usage() {
+        for source in [
+            "fn f(egress: &EgressClient) { let client = egress.mcp_reqwest_client_at_checked_destination(PLACEHOLDER); }",
+            "fn f(egress: &EgressClient) { let client = EgressClient::mcp_reqwest_client_at_checked_destination(egress, PLACEHOLDER); }",
+        ] {
+            assert!(has(&scan(source), "network-or-process-reference"));
+        }
     }
 }
