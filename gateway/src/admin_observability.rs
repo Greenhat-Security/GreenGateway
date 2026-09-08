@@ -1840,6 +1840,7 @@ pub(super) fn principal_audit_summary(
         from: None,
         to: None,
         event_type: Some("http.request_observed".to_owned()),
+        reason: None,
         actor: Some(subject.to_owned()),
         actor_issuer: Some(issuer.to_owned()),
         actor_auth_mode: Some(principal_directory_audit_auth_mode(auth_method).to_owned()),
