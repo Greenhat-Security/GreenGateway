@@ -473,16 +473,40 @@ pub(crate) struct Evaluation {
     binding: InputBinding,
     domain: &'static str,
     not_evaluated: &'static [&'static str],
-    pub(crate) logical: LogicalDecision,
-    pub(crate) effect: PolicyEffect,
-    pub(crate) reason: Reason,
-    pub(crate) matched: Option<RuleReference>,
+    logical: LogicalDecision,
+    effect: PolicyEffect,
+    reason: Reason,
+    matched: Option<RuleReference>,
     /// Complete only for the named contextless HTTP policy domain.
-    pub(crate) complete: bool,
-    pub(crate) limitation: Option<Limitation>,
+    complete: bool,
+    limitation: Option<Limitation>,
 }
 
 impl Evaluation {
+    pub(crate) fn logical(&self) -> LogicalDecision {
+        self.logical
+    }
+
+    pub(crate) fn effect(&self) -> PolicyEffect {
+        self.effect
+    }
+
+    pub(crate) fn reason(&self) -> Reason {
+        self.reason
+    }
+
+    pub(crate) fn matched(&self) -> Option<RuleReference> {
+        self.matched
+    }
+
+    pub(crate) fn is_complete(&self) -> bool {
+        self.complete
+    }
+
+    pub(crate) fn limitation(&self) -> Option<Limitation> {
+        self.limitation
+    }
+
     fn complete(
         binding: InputBinding,
         logical: LogicalDecision,
