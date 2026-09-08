@@ -776,6 +776,14 @@ impl AuditEventStore for PostgresAuditEventStore {
             params.push(Box::new(event_type.to_owned()));
             clauses.push(format!("event_type = ${}", params.len()));
         }
+        if let Some(reason) = filters.reason.as_deref() {
+            params.push(Box::new(reason.to_owned()));
+            clauses.push(format!(
+                "((jsonb_typeof(payload_json->'reason') = 'string' AND payload_json->>'reason' = ${0}) \
+                 OR (jsonb_typeof(payload_json->'failure_reason') = 'string' AND payload_json->>'failure_reason' = ${0}))",
+                params.len()
+            ));
+        }
         if let Some(actor) = filters.actor.as_deref() {
             params.push(Box::new(actor.to_owned()));
             clauses.push(format!("actor_user_id = ${}", params.len()));

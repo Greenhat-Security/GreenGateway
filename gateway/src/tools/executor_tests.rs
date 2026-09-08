@@ -2523,6 +2523,199 @@ async fn schema_validation_rejects_args_before_network() {
 }
 
 #[tokio::test]
+async fn validation_failure_audit_contains_only_safe_problem_metadata() {
+    let mut tool = echo_tool();
+    tool["input_json_schema"] = json!({
+        "type": "object",
+        "properties": {
+            "message": {"enum": ["enum-value-canary"]},
+            "labels": {"type": "object", "additionalProperties": {"type": "integer"}}
+        },
+        "additionalProperties": false
+    });
+    let (executor, capture) = executor_for_tools(
+        socket_addr(1),
+        [tool],
+        runtime_config([("echo", enabled_tool(500, 1))], 2, 1, 100),
+    );
+    let error = executor
+        .execute(
+            "echo",
+            json!({
+                "message": "rejected-value-canary",
+                "labels": {"dynamic-field-canary": "nested-value-canary"},
+                "unexpected-field-canary": "unexpected-value-canary"
+            }),
+            invocation_context(),
+            CancellationToken::new(),
+        )
+        .await
+        .expect_err("invalid input should be rejected");
+    let ToolRuntimeError::WorkFailed {
+        details: Some(details),
+        ..
+    } = error
+    else {
+        panic!("caller must retain validation details");
+    };
+    assert!(details["problems"]
+        .as_array()
+        .expect("caller problems should be present")
+        .iter()
+        .any(|problem| problem["allowed"] == json!(["enum-value-canary"])));
+
+    let events = audit_events(&capture, 3).await;
+    let failure = events
+        .iter()
+        .find(|event| event.event_type == audit::event::TOOL_INVOKE_FAILURE)
+        .expect("failure should be audited");
+    assert_eq!(failure.payload["reason"], "work_error");
+    assert_eq!(failure.payload["failure_reason"], "invalid_params");
+    let mut problems = failure.payload["problems"]
+        .as_array()
+        .expect("audit problems should be present")
+        .clone();
+    problems.sort_by_key(|problem| {
+        problem["path"]
+            .as_str()
+            .expect("problem path should be a string")
+            .to_owned()
+    });
+    assert_eq!(
+        problems,
+        vec![
+            json!({"path": "", "keyword": "additionalProperties", "message": "unexpected arguments are not allowed"}),
+            json!({"path": "/labels/*", "keyword": "type", "message": "value has the wrong JSON type"}),
+            json!({"path": "/message", "keyword": "enum", "message": "value is not one of the allowed values"}),
+        ]
+    );
+    let evidence = serde_json::to_string(&events).expect("audit events should serialize");
+    for canary in [
+        "enum-value-canary",
+        "rejected-value-canary",
+        "dynamic-field-canary",
+        "nested-value-canary",
+        "unexpected-field-canary",
+        "unexpected-value-canary",
+    ] {
+        assert!(
+            !evidence.contains(canary),
+            "validation audit must omit {canary}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn validation_failure_audit_bounds_problem_count_and_path_lengths() {
+    let properties: Map<String, Value> = (0..32)
+        .map(|index| {
+            (
+                format!("field_{index}_{}", "界".repeat(80)),
+                json!({"type": "integer"}),
+            )
+        })
+        .collect();
+    let args: Map<String, Value> = properties
+        .keys()
+        .map(|key| (key.clone(), json!("argument-canary")))
+        .collect();
+    let mut tool = echo_tool();
+    tool["input_json_schema"] =
+        json!({"type": "object", "properties": properties, "additionalProperties": false});
+    let (executor, capture) = executor_for_tools(
+        socket_addr(1),
+        [tool],
+        runtime_config([("echo", enabled_tool(500, 1))], 2, 1, 100),
+    );
+    executor
+        .execute(
+            "echo",
+            Value::Object(args),
+            invocation_context(),
+            CancellationToken::new(),
+        )
+        .await
+        .expect_err("invalid input should be rejected");
+    let events = audit_events(&capture, 3).await;
+    let failure = events
+        .iter()
+        .find(|event| event.event_type == audit::event::TOOL_INVOKE_FAILURE)
+        .expect("failure should be audited");
+    let problems = failure.payload["problems"]
+        .as_array()
+        .expect("audit problems should be present");
+    assert_eq!(problems.len(), MAX_VALIDATION_PROBLEMS);
+    for problem in problems {
+        assert!(
+            problem["path"]
+                .as_str()
+                .expect("path should be a string")
+                .chars()
+                .count()
+                <= 64
+        );
+        assert!(
+            problem["keyword"]
+                .as_str()
+                .expect("keyword should be a string")
+                .chars()
+                .count()
+                <= 64
+        );
+        assert!(
+            problem["message"]
+                .as_str()
+                .expect("message should be a string")
+                .chars()
+                .count()
+                <= 128
+        );
+        assert!(problem.get("allowed").is_none());
+    }
+    assert!(!serde_json::to_string(&events)
+        .expect("audit should serialize")
+        .contains("argument-canary"));
+}
+
+#[test]
+fn validation_failure_audit_paths_preserve_schema_properties_and_hide_dynamic_keys() {
+    let schema = json!({
+        "type": "object",
+        "properties": {
+            "a/b~c": {"type": "array", "items": {"type": "object", "properties": {"name": {"type": "string"}}}},
+            "map": {"type": "object", "additionalProperties": {"type": "string"}},
+            "reference": {"$ref": "#/definitions/item"}
+        }
+    });
+    let instance = json!({
+        "a/b~c": [{"name": false}],
+        "map": {"caller-key-canary": false},
+        "reference": {"caller-key-canary": false}
+    });
+    assert_eq!(
+        audit_validation_path(&schema, &instance, "/a~1b~0c/0/name"),
+        "/a~1b~0c/0/name"
+    );
+    assert_eq!(
+        audit_validation_path(&schema, &instance, "/map/caller-key-canary"),
+        "/map/*"
+    );
+    assert_eq!(
+        audit_validation_path(&schema, &instance, "/reference/caller-key-canary"),
+        "/reference/*"
+    );
+    assert_eq!(
+        audit_validation_path(
+            &json!({"type": "array", "items": {"type": "integer"}, "additionalProperties": {"type": "integer"}}),
+            &json!({"12345": "value"}),
+            "/12345",
+        ),
+        "/*",
+        "an invalid object must not turn caller-selected numeric keys into array indices"
+    );
+}
+
+#[tokio::test]
 async fn schema_validation_rejects_unexpected_args_by_default_before_network() {
     let (addr, server) = one_request_server(StatusCode::OK, b"should-not-run").await;
     let (executor, _capture) = executor_for_tools(
