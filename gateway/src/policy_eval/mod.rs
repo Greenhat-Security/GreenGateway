@@ -16,7 +16,7 @@ use std::fmt;
 
 use http::Method;
 use serde::Serialize;
-use sha2::{Digest as _, Sha256};
+use sha2::{Digest, Sha256};
 
 use crate::{
     auth::{AuthMethod, Principal},
