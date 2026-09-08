@@ -1619,16 +1619,16 @@ async fn hop_by_hop_names_are_stripped_from_upstream_trailers() {
 
 #[tokio::test]
 async fn an_unreachable_endpoint_becomes_unavailable_and_not_a_successful_envelope() {
-    // A port nothing is listening on. The connect fails inside the egress
-    // transport, which is the one failure mode that happens after every policy
-    // check has passed.
-    let listener = TcpListener::bind(("127.0.0.1", 0))
-        .await
-        .expect("probe listener should bind");
-    let address = listener
+    // Reserve a TCP port without listening. Dropping a probe listener here
+    // lets another parallel test take that port before this call, so the test
+    // can accidentally reach a real peer instead of exercising connect failure.
+    let reservation = tokio::net::TcpSocket::new_v4().expect("probe socket should open");
+    reservation
+        .bind(std::net::SocketAddr::from(([127, 0, 0, 1], 0)))
+        .expect("probe socket should reserve a port");
+    let address = reservation
         .local_addr()
         .expect("probe address should be available");
-    drop(listener);
 
     let harness = harness(address, |settings| settings.connect_timeout_ms = 500);
     let response = call(
@@ -1653,6 +1653,7 @@ async fn an_unreachable_endpoint_becomes_unavailable_and_not_a_successful_envelo
         response.grpc_message()
     );
     assert!(response.data.is_empty());
+    drop(reservation);
 }
 
 // ---------------------------------------------------------------------------

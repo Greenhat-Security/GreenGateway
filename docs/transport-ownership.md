@@ -8,7 +8,7 @@ network access. Function names below are stable review anchors; line numbers dri
 | --- | --- | --- |
 | HTTP proxy, ordinary API tools, OpenAPI fetches, SSE and health probes to upstreams | `egress.rs`: `base_client_builder_for_profile`, `pinned_client_with_profile`, checked request methods; `egress/client_cache.rs` stores clients | `EgressClient` validates URL, host, port, current DNS answers and address policy, then pins the checked socket. Cache identity includes destination, TLS and protocol profile; reuse does not bypass current preflight. Proxies and automatic redirects are disabled. |
 | DNS | `egress.rs`: `SystemDnsResolver::resolve` | System resolver supplies candidates to the checked-destination policy; it does not itself authorize a connection. |
-| MCP streamable HTTP | `tools/mcp_upstream.rs`: `mcp_http_client`, called by checked-target preparation and managed transport code | Existing exception: a concrete reqwest client for rmcp. Checked host/address, no proxy or redirects, explicit HTTP/1, request/read/connect timeouts. The planned migration moves this exact factory into `egress` and retains the wrapper's URL/session/body/deadline checks. |
+| MCP streamable HTTP | `egress.rs`: `mcp_http_client` for the legacy adapter; `EgressClient::mcp_reqwest_client_at_checked_destination` for managed connections | Concrete reqwest clients for rmcp are constructed inside egress. Checked host/address, no proxy or redirects, explicit HTTP/1, request/read/connect timeouts. The adapter retains its URL/session/body/deadline checks; managed connections retain configuration-aware TLS/profile revalidation. |
 | gRPC upstream | `egress/grpc.rs`: `EgressClient::connect_grpc`, `handshake_grpc` | Revalidates the checked destination and configuration generation, connects TCP to the pinned address, verifies TLS against the original server name, then builds the dedicated hyper HTTP/2 client. Pool and deadlines remain bounded. |
 | WebSocket upstream | `egress.rs` HTTP upgrade path; `proxy/websocket.rs`: `attempt_upgrade` | Checked, pinned HTTP/1 handshake supplies `EgressUpgradedStream`. `WebSocketStream::from_raw_socket` wraps that already-established stream; it does not select or dial another destination. Frame, message, idle and lifetime bounds remain in the bridge. |
 | OIDC discovery, token exchange, JWKS, external cookie-session validation, connection authentication/token exchange | `auth/oidc.rs`, `auth/oidc_login.rs`, `auth/jwt.rs`, `auth/cookie_session_validator.rs` and connection auth code consume `EgressClient` | Authentication/provider code is a consumer of checked HTTP, not an independent client factory. Configured identity/provider endpoints still traverse destination policy. |
@@ -23,12 +23,12 @@ network access. Function names below are stable review anchors; line numbers dri
 
 Keep the existing egress module. A new crate would still have access to std/tokio
 sockets and would add dependency/build churn without creating an OS capability
-boundary. Move the MCP client factory into the existing checked transport owner;
+boundary. The MCP client factory now belongs to the existing checked transport owner;
 keep protocol adaptation in the MCP and WebSocket consumers. Inbound listeners
 and the shared PostgreSQL foundation retain their separate construction owners.
 
 The existing `scripts/check-egress-only.sh` remains enforced while the syntax gate
-is added. Preserve its reqwest/alias confinement, pinned MCP factory, separate h2
+is added. Preserve its reqwest/alias confinement, pinned MCP factory inside egress, separate h2
 client/server ownership and forbidden `http2` features on reqwest, axum and
 hyper-util. The presence of hyper's own HTTP/2 feature is intentional.
 
@@ -76,7 +76,8 @@ conditional module paths, escaping paths and parse errors fail. Generated Rust
 cannot quietly become an unowned source file; supporting a generator requires a
 reviewed extension to enumeration and its input contract.
 
-Raw client/socket/process/FFI references, conservative unresolved connection methods,
+Raw client/socket/process/FFI references, calls to the two concrete MCP client factories
+(including inferred local types), conservative unresolved connection methods,
 capability imports and glob/renamed imports receive exact review records. PostgreSQL
 pool consumers and stream adapters can appear in the records without being socket
 constructors. Their purpose labels distinguish them from request egress.
@@ -97,3 +98,17 @@ passing check. Review the graph and changed source scopes, explain each owner an
 purpose, and edit the exact policy records in the same PR. Do not copy the candidate
 over policy without reviewing it; the candidate deliberately lacks scope approvals.
 Never add a file-wide bypass or regenerate policy automatically in CI.
+
+## Regression evidence
+
+`cargo test --locked --example transport_guard` parses harmless source fixtures for
+direct sockets, chained imports/reexports, type aliases, function pointers, glob
+imports, unresolved receivers, macro inputs, custom expansion, cfg variants and
+foreign/unsafe code. It never executes the represented networking expressions.
+
+`python -m unittest discover -s scripts -p test_transport_guard.py -v` rejects broad
+or missing approvals, changed/new/stale scopes and failed enumeration. Inert Cargo
+metadata fixtures prove new packages/features and changed build scripts fail before
+tool compilation, and an unknown registry fails before metadata fetching. Both
+suites are required by the egress job. Existing local MCP, egress and gRPC suites
+continue checking runtime behavior; syntax fixtures do not substitute for them.

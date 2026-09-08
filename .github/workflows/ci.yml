@@ -121,6 +121,10 @@ jobs:
         run: bash scripts/check-egress-only.sh
       - name: Enforce structural transport ownership
         run: python scripts/transport_guard.py check
+      - name: Test structural transport guard
+        run: |
+          cargo test --locked --example transport_guard
+          python -m unittest discover -s scripts -p test_transport_guard.py -v
       - name: Upload transport ownership decision
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4

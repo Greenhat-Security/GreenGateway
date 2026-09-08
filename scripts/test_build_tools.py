@@ -92,6 +92,15 @@ class ToolContractTests(unittest.TestCase):
         self.replace(".github/workflows/ci.yml", "os: [ubuntu-latest, windows-latest]", "os: [ubuntu-latest]")
         self.rejects("Linux and Windows qualification")
 
+    def test_transport_guard_or_fixtures_cannot_be_removed(self):
+        for command in ["bash scripts/check-egress-only.sh", "python scripts/transport_guard.py check", "cargo test --locked --example transport_guard", "test_transport_guard.py"]:
+            with self.subTest(command=command):
+                path = self.root / ".github/workflows/ci.yml"
+                original = path.read_text()
+                self.replace(".github/workflows/ci.yml", command, "echo skipped")
+                self.rejects("Transport ownership must retain")
+                path.write_text(original)
+
     def test_cargo_policy_tool_requires_exact_version_and_checksum(self):
         self.replace("build-tools.json", '"cargo_deny": "0.20.2"', '"cargo_deny": "latest"')
         self.rejects("exact version")

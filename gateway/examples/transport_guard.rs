@@ -322,6 +322,10 @@ fn capability(path: &[String], aliases: &BTreeSet<String>) -> bool {
         "Command",
         "Client",
         "ClientBuilder",
+        // These checked factories expose a concrete client to protocol adapters.
+        // New callers still require review even when their local type is inferred.
+        "mcp_http_client",
+        "mcp_reqwest_client_at_checked_destination",
         "TlsConnector",
     ];
     path.iter()
@@ -478,6 +482,9 @@ impl<'ast> Visit<'ast> for Scan<'_> {
         }
     }
     fn visit_expr_method_call(&mut self, e: &'ast syn::ExprMethodCall) {
+        if e.method == "mcp_reqwest_client_at_checked_destination" {
+            self.reason("network-or-process-reference");
+        }
         if [
             "connect",
             "connect_raw",
@@ -624,6 +631,39 @@ impl<'ast> Visit<'ast> for Scan<'_> {
             self.reason("unexpanded-attribute");
         }
     }
+    fn visit_signature(&mut self, signature: &'ast syn::Signature) {
+        if signature.unsafety.is_some() {
+            self.reason("unsafe-code");
+        }
+        if signature.abi.is_some() {
+            self.reason("foreign-code");
+        }
+        visit::visit_signature(self, signature);
+    }
+    fn visit_item_impl(&mut self, item: &'ast syn::ItemImpl) {
+        if item.unsafety.is_some() {
+            self.reason("unsafe-code");
+        }
+        visit::visit_item_impl(self, item);
+    }
+    fn visit_expr(&mut self, expression: &'ast syn::Expr) {
+        if matches!(expression, syn::Expr::Verbatim(_)) {
+            self.reason("unexamined-syntax");
+        }
+        visit::visit_expr(self, expression);
+    }
+    fn visit_type(&mut self, ty: &'ast syn::Type) {
+        if matches!(ty, syn::Type::Verbatim(_)) {
+            self.reason("unexamined-syntax");
+        }
+        visit::visit_type(self, ty);
+    }
+    fn visit_pat(&mut self, pattern: &'ast syn::Pat) {
+        if matches!(pattern, syn::Pat::Verbatim(_)) {
+            self.reason("unexamined-syntax");
+        }
+        visit::visit_pat(self, pattern);
+    }
     fn visit_expr_unsafe(&mut self, e: &'ast syn::ExprUnsafe) {
         self.reason("unsafe-code");
         visit::visit_expr_unsafe(self, e);
@@ -717,5 +757,295 @@ fn main() {
     if let Err(error) = run() {
         eprintln!("transport syntax guard: {error}");
         std::process::exit(1);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn scan(source: &str) -> Vec<Scope> {
+        let parsed = syn::parse_file(source).expect("fixture parses");
+        let mut tree = Tree::default();
+        tree.items(
+            Path::new("."),
+            "fixture.rs",
+            Path::new("."),
+            Path::new("."),
+            "fixture",
+            false,
+            parsed.items,
+        )
+        .expect("fixture module graph");
+        facts(&tree)
+    }
+    fn has(scopes: &[Scope], reason: &str) -> bool {
+        scopes.iter().any(|s| s.reasons.contains(reason))
+    }
+    #[test]
+    fn ordinary_checked_api_consumer_does_not_claim_raw_authority() {
+        assert!(scan(
+            "fn call(client: &EgressClient) { client.checked_destination(PLACEHOLDER); }"
+        )
+        .is_empty());
+    }
+    #[test]
+    fn direct_socket_is_reviewed_without_executing_it() {
+        assert!(has(
+            &scan("fn new_path() { std::net::TcpStream::connect(PLACEHOLDER); }"),
+            "network-or-process-reference"
+        ));
+    }
+    #[test]
+    fn renamed_crate_and_chained_reexport_reach_constructor() {
+        let s=scan("use reqwest as first; pub use first as second; use second::Client as Quiet; fn new_path() { Quiet::new(); }");
+        assert!(s
+            .iter()
+            .any(|s| s.scope.contains("new_path")
+                && s.reasons.contains("network-or-process-reference")));
+    }
+    #[test]
+    fn renamed_std_module_reaches_socket() {
+        let s=scan("use std::net as channel; use channel::TcpStream as Pipe; fn new_path() { Pipe::connect(PLACEHOLDER); }");
+        assert!(s
+            .iter()
+            .any(|s| s.scope.contains("new_path")
+                && s.reasons.contains("network-or-process-reference")));
+    }
+    #[test]
+    fn type_alias_and_function_pointer_are_reviewed() {
+        let s = scan("type Quiet = reqwest::Client; fn new_path() { let factory = Quiet::new; }");
+        assert!(s
+            .iter()
+            .any(|s| s.scope.contains("new_path")
+                && s.reasons.contains("network-or-process-reference")));
+    }
+    #[test]
+    fn foreign_alias_requires_review() {
+        assert!(has(
+            &scan("extern crate reqwest as quiet; fn new_path() { quiet::Client::new(); }"),
+            "external-crate-alias"
+        ));
+    }
+    #[test]
+    fn glob_is_not_a_construction_bypass() {
+        assert!(has(
+            &scan("use crate::unknown::*;"),
+            "capability-import-or-glob"
+        ));
+    }
+    #[test]
+    fn unresolved_receiver_connect_requires_review() {
+        assert!(has(
+            &scan("fn new_path(receiver: Thing) { receiver.connect(PLACEHOLDER); }"),
+            "unresolved-transport-method"
+        ));
+    }
+    #[test]
+    fn macro_input_containing_network_alias_requires_review() {
+        let s=scan("use reqwest::Client as Quiet; fn new_path() { serde_json::json!({\"value\": Quiet::new()}); }");
+        assert!(has(&s, "capability-in-macro-input"));
+    }
+    #[test]
+    fn trusted_macro_still_checks_nested_tokens() {
+        assert!(has(&scan("fn new_path() { tokio::select! { x = async { std::net::TcpStream::connect(PLACEHOLDER) } => {} } }"),"capability-in-macro-input"));
+    }
+    #[test]
+    fn unknown_macro_and_generated_include_are_not_assumed_safe() {
+        for source in [
+            "fn f() { custom!(); }",
+            "include!(concat!(env!(\"OUT_DIR\"), \"/generated.rs\"));",
+            "fn f() { external::json!({}); }",
+        ] {
+            assert!(has(&scan(source), "unexpanded-macro"));
+        }
+    }
+    #[test]
+    fn custom_macro_definition_requires_exact_review() {
+        assert!(has(
+            &scan("macro_rules! hidden { () => { something() } }"),
+            "unexpanded-macro"
+        ));
+    }
+    #[test]
+    fn unknown_attribute_requires_exact_review() {
+        assert!(has(&scan("#[custom] fn f() {}"), "unexpanded-attribute"));
+    }
+    #[test]
+    fn expression_macro_and_standard_derive_control_passes() {
+        assert!(scan(
+            "#[derive(Clone, Debug)] struct Data { value: u8 } fn f() { format!(\"{}\", 1); }"
+        )
+        .is_empty());
+    }
+    #[test]
+    fn test_only_modules_are_excluded_by_cfg_not_name() {
+        assert!(
+            scan("#[cfg(test)] mod fixtures { fn f() { reqwest::Client::new(); } }").is_empty()
+        );
+        assert!(has(
+            &scan("mod tests { fn f() { reqwest::Client::new(); } }"),
+            "network-or-process-reference"
+        ));
+    }
+    #[test]
+    fn feature_and_platform_alternatives_remain_in_scope() {
+        for cfg in [
+            "any(test, feature = \"optional\")",
+            "not(test)",
+            "windows",
+            "unix",
+            "all(feature = \"one\", feature = \"two\")",
+        ] {
+            let s = scan(&format!(
+                "#[cfg({cfg})] fn f() {{ reqwest::Client::new(); }}"
+            ));
+            assert!(has(&s, "network-or-process-reference"), "{cfg}");
+        }
+        assert!(scan(
+            "#[cfg(all(test, feature = \"optional\"))] fn f() { reqwest::Client::new(); }"
+        )
+        .is_empty());
+    }
+    #[test]
+    fn changed_constructor_settings_change_review_fingerprint() {
+        let a = scan("fn f() { reqwest::Client::builder().no_proxy().build(); }");
+        let b = scan("fn f() { reqwest::Client::builder().build(); }");
+        assert_ne!(a[0].sha256, b[0].sha256);
+        let whitespace = scan("fn f(){reqwest::Client::builder().no_proxy().build();}");
+        assert_eq!(a[0].sha256, whitespace[0].sha256);
+    }
+    #[test]
+    fn unsafe_and_ffi_have_explicit_review() {
+        assert!(has(
+            &scan("fn f() { unsafe { operation(); } }"),
+            "unsafe-code"
+        ));
+        assert!(has(&scan("extern \"C\" { fn opaque(); }"), "foreign-code"));
+    }
+    #[test]
+    fn malformed_source_never_yields_empty_success() {
+        assert!(syn::parse_file("fn incomplete(").is_err());
+    }
+    struct FixtureDirectory(PathBuf);
+    impl FixtureDirectory {
+        fn new(files: &[(&str, &str)]) -> Self {
+            let path = env::temp_dir().join(format!(
+                "greengateway-transport-fixture-{}",
+                uuid::Uuid::new_v4()
+            ));
+            fs::create_dir(&path).expect("isolated fixture directory");
+            for (name, source) in files {
+                let file = path.join(name);
+                fs::create_dir_all(file.parent().expect("fixture parent"))
+                    .expect("fixture parents");
+                fs::write(file, source).expect("write inert fixture source");
+            }
+            Self(path.canonicalize().expect("fixture root"))
+        }
+        fn tree(&self) -> Result<Tree> {
+            let mut tree = Tree::default();
+            tree.file(&self.0, &self.0.join("main.rs"), "fixture", false)?;
+            Ok(tree)
+        }
+    }
+    impl Drop for FixtureDirectory {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+    #[test]
+    fn file_name_does_not_exclude_a_production_module() {
+        let dir = FixtureDirectory::new(&[
+            ("main.rs", "mod innocuous_tests;"),
+            ("innocuous_tests.rs", "fn f() { reqwest::Client::new(); }"),
+        ]);
+        let tree = dir.tree().expect("module graph");
+        assert_eq!(tree.files["innocuous_tests.rs"], "production");
+        assert!(has(&facts(&tree), "network-or-process-reference"));
+    }
+    #[test]
+    fn test_cfg_propagates_into_external_module() {
+        let dir = FixtureDirectory::new(&[
+            ("main.rs", "#[cfg(test)] mod fixtures;"),
+            ("fixtures.rs", "fn f() { reqwest::Client::new(); }"),
+        ]);
+        let tree = dir.tree().expect("module graph");
+        assert_eq!(tree.files["fixtures.rs"], "nonproduction");
+        assert!(facts(&tree).is_empty());
+    }
+    #[test]
+    fn missing_module_and_conditional_path_fail() {
+        for source in [
+            "mod missing;",
+            "#[cfg_attr(windows,path=\"alternate.rs\")] mod missing;",
+        ] {
+            let dir = FixtureDirectory::new(&[("main.rs", source)]);
+            assert!(dir.tree().is_err());
+        }
+    }
+    #[test]
+    fn explicit_path_is_scanned_and_ambiguous_paths_fail() {
+        let dir = FixtureDirectory::new(&[
+            ("main.rs", "#[path=\"alternate.rs\"] mod hidden;"),
+            ("alternate.rs", "fn f() { reqwest::Client::new(); }"),
+        ]);
+        assert!(has(
+            &facts(&dir.tree().expect("explicit module")),
+            "network-or-process-reference"
+        ));
+        let dir = FixtureDirectory::new(&[
+            ("main.rs", "mod ambiguous;"),
+            ("ambiguous.rs", ""),
+            ("ambiguous/mod.rs", ""),
+        ]);
+        assert!(dir.tree().is_err());
+    }
+    #[test]
+    fn checkout_line_endings_do_not_change_syntax_fingerprint() {
+        let source = "fn f() { let query = \"first\nsecond\"; reqwest::Client::new(); }\n";
+        let unix = FixtureDirectory::new(&[("main.rs", source)]);
+        let windows = FixtureDirectory::new(&[("main.rs", &source.replace('\n', "\r\n"))]);
+        assert_eq!(
+            facts(&unix.tree().expect("LF source"))[0].sha256,
+            facts(&windows.tree().expect("CRLF source"))[0].sha256
+        );
+    }
+    #[test]
+    fn unsafe_signatures_and_impls_require_review_without_an_explicit_block() {
+        assert!(has(&scan("unsafe fn f() { operation(); }"), "unsafe-code"));
+        assert!(has(
+            &scan("unsafe impl Contract for Thing {}"),
+            "unsafe-code"
+        ));
+    }
+    #[test]
+    fn verbatim_syntax_is_unexamined_instead_of_empty() {
+        let aliases = BTreeSet::new();
+        let mut scanner = Scan {
+            aliases: &aliases,
+            reasons: BTreeSet::new(),
+        };
+        scanner.visit_expr(&syn::Expr::Verbatim(quote::quote!(future_syntax)));
+        assert!(scanner.reasons.contains("unexamined-syntax"));
+        scanner.reasons.clear();
+        scanner.visit_type(&syn::Type::Verbatim(quote::quote!(FutureType)));
+        assert!(scanner.reasons.contains("unexamined-syntax"));
+    }
+    #[test]
+    fn aliased_raw_client_factory_call_requires_review_without_a_type_annotation() {
+        let scopes=scan("use crate::egress::mcp_http_client as prepared; fn f() { let client = prepared(PLACEHOLDER); }");
+        assert!(scopes.iter().any(
+            |s| s.scope.contains("::f#") && s.reasons.contains("network-or-process-reference")
+        ));
+    }
+    #[test]
+    fn raw_client_factory_method_requires_review_beyond_checked_wrapper_usage() {
+        for source in [
+            "fn f(egress: &EgressClient) { let client = egress.mcp_reqwest_client_at_checked_destination(PLACEHOLDER); }",
+            "fn f(egress: &EgressClient) { let client = EgressClient::mcp_reqwest_client_at_checked_destination(egress, PLACEHOLDER); }",
+        ] {
+            assert!(has(&scan(source), "network-or-process-reference"));
+        }
     }
 }

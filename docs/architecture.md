@@ -330,16 +330,12 @@ modules include:
 HTTP must not be added outside `egress.rs`; CI enforces the primitive boundary
 with `scripts/check-egress-only.sh`.
 
-There is one deliberate exception. The MCP upstream transport needs a client of
-a concrete type it can hand to `rmcp`, so `egress.rs` re-exports the HTTP crate
-and `tools/mcp_upstream.rs` builds a client from that re-export. That client is
-still constrained to what `checked_destination()` validated: proxies and
-redirects are disabled and the checked address is pinned with `.resolve()`, so
-it cannot resolve a different address at request time. Both halves of that
-exception are enforced — the file is named in an explicit allowlist in
-`scripts/check-egress-only.sh`, so no other module can use the re-export, and
-the check fails if the pinning call disappears from the function that builds
-the client.
+The MCP protocol adapter names the concrete HTTP types exposed by egress, while
+its legacy checked-destination factory now lives in `egress::mcp_http_client`.
+Managed MCP keeps the existing configuration-aware checked client API. The syntax
+and dependency gate requires exact review of construction scopes and detects new
+raw socket/client references beyond the original textual checks. Both paths retain
+pinning, no proxy/redirect behavior, HTTP/1 and their existing timeout semantics.
 
 ## Transport construction ownership
 

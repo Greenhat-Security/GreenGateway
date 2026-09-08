@@ -53,7 +53,7 @@ use crate::{
         store::{validate_mcp_resource_metadata, StoredMcpResource, StoredMcpResourceTemplate},
         test::{ConnectionTestReason, ConnectionTestStageName},
     },
-    egress::{rmcp_http, CheckedEgressDestination, EgressClient, EgressError},
+    egress::{mcp_http_client, rmcp_http, CheckedEgressDestination, EgressClient, EgressError},
     tools::definitions::ToolDefinition,
 };
 
@@ -1698,7 +1698,8 @@ async fn connect_endpoint(
     managed_authentication: Option<ManagedMcpAuthentication>,
     discovery_response_budget: Option<DiscoveryResponseByteBudget>,
 ) -> Result<rmcp::service::RunningService<rmcp::RoleClient, ()>, McpUpstreamCallError> {
-    let client = mcp_http_client(timeout, response_idle_timeout, connect_timeout, destination)?;
+    let client = mcp_http_client(timeout, response_idle_timeout, connect_timeout, destination)
+        .map_err(|_| McpUpstreamCallError::ClientBuild)?;
     connect_endpoint_with_client(
         server_name,
         url,
@@ -1758,30 +1759,6 @@ async fn connect_endpoint_with_client(
         "MCP upstream client initialized"
     );
     result.map_err(|error| mcp_service_error(error, McpUpstreamCallError::Connect))
-}
-
-fn mcp_http_client(
-    timeout: Duration,
-    response_idle_timeout: Duration,
-    connect_timeout: Duration,
-    destination: &CheckedEgressDestination,
-) -> Result<rmcp_http::Client, McpUpstreamCallError> {
-    rmcp_http::Client::builder()
-        .no_proxy()
-        .timeout(timeout)
-        .read_timeout(response_idle_timeout)
-        .connect_timeout(connect_timeout)
-        .redirect(rmcp_http::redirect::Policy::none())
-        // This client is built here rather than through
-        // `base_client_builder_for_profile`, so it does not inherit that
-        // function's protocol pin and has to carry its own. Without it, turning
-        // on the HTTP client's `http2` feature would flip every MCP upstream to
-        // h2 silently -- and because this path is outside the profile system,
-        // pinning the profiles alone would not cover it.
-        .http1_only()
-        .resolve(&destination.host, destination.pinned_addr)
-        .build()
-        .map_err(|_| McpUpstreamCallError::ClientBuild)
 }
 
 #[derive(Clone)]

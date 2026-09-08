@@ -8525,6 +8525,16 @@
       "reasons": [
         "network-or-process-reference"
       ],
+      "scope": "gateway::egress::mcp_http_client#1",
+      "sha256": "21e63003b339159c3a5e7da9ef0ee13fcacc4fab0bb974ae2a2971fba0b83ea5",
+      "owner": "GreenGateway maintainers",
+      "purpose": "MCP factory migration into egress; same checked-address pin, no proxy/redirects, HTTP/1 and timeout settings; adapter preserves sanitized client-build error mapping."
+    },
+    {
+      "file": "gateway/src/egress.rs",
+      "reasons": [
+        "network-or-process-reference"
+      ],
       "scope": "gateway::egress::check_local_health#1",
       "sha256": "4abbea8ac105bf81466c8581bf31244117719492f4844a06acf9e7e652fb490f",
       "owner": "GreenGateway maintainers",
@@ -12255,10 +12265,10 @@
       "reasons": [
         "capability-import-or-glob"
       ],
-      "scope": "gateway::tools::mcp_upstream::use crate :: { config :: { Config , McpUpstreamServerConfig } , connections :: { http :: { ConnectionHttpError , ConnectionHttpRuntime , ConnectionHttpTarget , ResolvedConnectionCredential , } , model :: MAX_CATALOG_ENTRIES , status :: { ConnectionOperationalState , ConnectionStatusReason } , store :: { validate_mcp_resource_metadata , StoredMcpResource , StoredMcpResourceTemplate } , test :: { ConnectionTestReason , ConnectionTestStageName } , } , egress :: { rmcp_http , CheckedEgressDestination , EgressClient , EgressError } , tools :: definitions :: ToolDefinition , }#1",
-      "sha256": "e3154c0f19d235f4e07be33caefe4b27b0a0e8d450ec9e36a5f0b32c2500bac6",
+      "scope": "gateway::tools::mcp_upstream::use crate :: { config :: { Config , McpUpstreamServerConfig } , connections :: { http :: { ConnectionHttpError , ConnectionHttpRuntime , ConnectionHttpTarget , ResolvedConnectionCredential , } , model :: MAX_CATALOG_ENTRIES , status :: { ConnectionOperationalState , ConnectionStatusReason } , store :: { validate_mcp_resource_metadata , StoredMcpResource , StoredMcpResourceTemplate } , test :: { ConnectionTestReason , ConnectionTestStageName } , } , egress :: { mcp_http_client , rmcp_http , CheckedEgressDestination , EgressClient , EgressError } , tools :: definitions :: ToolDefinition , }#1",
+      "sha256": "d3ca8cf019a52aad7bbaf51f4469de9b4a9ff520625486ea4ad505ab103e332c",
       "owner": "GreenGateway maintainers",
-      "purpose": "Reviewed exact import/reexport or alias for this module; constructor bodies require separate scope review."
+      "purpose": "MCP factory migration into egress; same checked-address pin, no proxy/redirects, HTTP/1 and timeout settings; adapter preserves sanitized client-build error mapping."
     },
     {
       "file": "gateway/src/tools/mcp_upstream.rs",
@@ -12269,6 +12279,16 @@
       "sha256": "b1844fda2e373ce4c7a59250a8cb8917ae35569415f96e2fa397beb1d5a4ecad",
       "owner": "GreenGateway maintainers",
       "purpose": "MCP protocol adaptation over checked destinations; preserve session, URL, body and deadline checks."
+    },
+    {
+      "file": "gateway/src/tools/mcp_upstream.rs",
+      "reasons": [
+        "network-or-process-reference"
+      ],
+      "scope": "gateway::tools::mcp_upstream::probe_connection_protocol_before#1",
+      "sha256": "193b2ce88844a957334c9aa496cb7f4d03afaca030c583f54232d359baa1c640",
+      "owner": "GreenGateway maintainers",
+      "purpose": "Bounded managed MCP protocol probe: validate connection etag, checked destination and prepared transport before acquiring the concrete client; use it only in the deadline-controlled limited probe with credential and cleanup checks."
     },
     {
       "file": "gateway/src/tools/mcp_upstream.rs",
@@ -12447,9 +12467,9 @@
         "network-or-process-reference"
       ],
       "scope": "gateway::tools::mcp_upstream::connect_endpoint#1",
-      "sha256": "de3c34317a3ebb6dc8e16d960a166db7f2eb00273a7f241180129df6793c92b4",
+      "sha256": "b324cdb845209a0f20d038fdc5f0741d2da2690439793394cd940fa9edda77c2",
       "owner": "GreenGateway maintainers",
-      "purpose": "MCP protocol adaptation over checked destinations; preserve session, URL, body and deadline checks."
+      "purpose": "MCP factory migration into egress; same checked-address pin, no proxy/redirects, HTTP/1 and timeout settings; adapter preserves sanitized client-build error mapping."
     },
     {
       "file": "gateway/src/tools/mcp_upstream.rs",
@@ -12460,16 +12480,6 @@
       "sha256": "6f01cf61abf3bfd35bf57f4804b0c90f46b5adb607f2894b4d5dc662e14733bb",
       "owner": "GreenGateway maintainers",
       "purpose": "MCP protocol adaptation over checked destinations; preserve session, URL, body and deadline checks."
-    },
-    {
-      "file": "gateway/src/tools/mcp_upstream.rs",
-      "reasons": [
-        "network-or-process-reference"
-      ],
-      "scope": "gateway::tools::mcp_upstream::mcp_http_client#1",
-      "sha256": "0873628568b3bb4af09a12e06273b2392b47f57363fccbc2182a58d50c28dc81",
-      "owner": "GreenGateway maintainers",
-      "purpose": "Temporary MCP factory owner: checked destination, explicit pinned address, no proxy/redirects, HTTP/1 and bounded timeouts; migrate in #432 PR 3."
     },
     {
       "file": "gateway/src/tools/mcp_upstream.rs",
