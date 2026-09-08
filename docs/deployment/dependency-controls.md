@@ -206,3 +206,11 @@ high/critical/unknown findings, without suppressions. Lower-severity findings
 remain visible in raw evidence. This is a dated scan result, not a permanent
 vulnerability-free guarantee: every release refreshes advisory data, and base
 image digest updates must pass these same checks.
+
+## Cargo source, license and architecture policy
+
+Run `python scripts/cargo_policy.py install` and
+`python scripts/cargo_policy.py check` for the locked full workspace.
+The [Cargo policy guide](cargo-dependency-policy.md) records the reviewed
+license/source rules, exact duplicate exceptions and report format. This check
+also gates promotion; cargo-audit and dependency review remain independent.

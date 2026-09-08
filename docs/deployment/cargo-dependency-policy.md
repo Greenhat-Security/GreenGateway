@@ -79,8 +79,8 @@ interfaces cannot be forcibly unified through a lockfile edit.
 
 Re-evaluate each exception when its listed parents update; remove it when their
 requirements converge. Do not extend an expiry merely because CI becomes red.
-The enforcement and update-gate slices of #431 validate exception scope/expiry
-and current graph identities before executing the pinned tool.
+The policy runner validates exception scope/expiry and current graph identities
+before executing the pinned tool.
 
 ## Pinned executable proof
 
@@ -97,5 +97,27 @@ whose Apache license text it successfully recognizes, and a locked but inactive
 rand_core 0.6.4 skip entry. Neither warning suppresses a license, source or ban
 finding. The repository's separate RustSec warning policy remains unchanged.
 
-Required CI installation, executable negative fixtures and machine-enforced
-exception lifecycle are delivered in the subsequent focused slices of #431.
+Install and run the same gate used by CI:
+
+```sh
+python scripts/cargo_policy.py install
+python scripts/cargo_policy.py check
+```
+
+`build-tools.json` pins cargo-deny and the official Linux/Windows x86_64 archive
+checksums. Installation verifies bytes before extracting only the executable;
+checking verifies its actual version. A missing tool is an error, not an install
+fallback. The runner invokes the locked all-feature workspace with no target,
+package, unpublished-package or development-dependency exclusions.
+
+Before native checks it compares resolved package identities with Cargo.lock,
+verifies exact duplicate versions and parent chains, and rejects stale license
+exceptions, broad or expired exceptions, hidden policy overrides and policy
+configuration drift. Unapproved lockfile sources fail before metadata fetching.
+The `cargo-policy` job is a required promotion dependency. It preserves
+`target/cargo-policy/decision.json` and native `diagnostics.jsonl`; configuration,
+metadata, tool and policy failures cannot produce a passed report. Exception
+metadata is included in every passing report.
+
+Executable negative fixtures and dependency-update guidance are completed in
+slice 3 of #431.
