@@ -50,6 +50,30 @@ mod tls;
 #[cfg(test)]
 mod tls_tests;
 
+/// Builds the legacy MCP adapter's concrete client from a checked destination.
+/// Destination selection stays in egress preflight; the adapter retains its URL,
+/// session, response-budget and deadline checks. Managed connection MCP continues
+/// to use `EgressClient::mcp_reqwest_client_at_checked_destination` so TLS/profile
+/// policy and configuration-generation revalidation stay on that existing path.
+pub(crate) fn mcp_http_client(
+    timeout: Duration,
+    response_idle_timeout: Duration,
+    connect_timeout: Duration,
+    destination: &CheckedEgressDestination,
+) -> Result<reqwest::Client, reqwest::Error> {
+    reqwest::Client::builder()
+        .no_proxy()
+        .timeout(timeout)
+        .read_timeout(response_idle_timeout)
+        .connect_timeout(connect_timeout)
+        .redirect(reqwest::redirect::Policy::none())
+        // MCP has its own timeouts and HTTP/1 profile; it uses the same checked
+        // destination token as the existing protocol adapter.
+        .http1_only()
+        .resolve(&destination.host, destination.pinned_addr)
+        .build()
+}
+
 /// One-shot container probe. Never follows redirects, uses a proxy, initializes
 /// gateway state, or accepts an arbitrary destination. HTTPS uses normal trust
 /// validation; there is intentionally no insecure certificate bypass.
