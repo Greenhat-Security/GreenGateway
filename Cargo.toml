@@ -78,7 +78,7 @@ time = { version = "0.3.53", features = ["formatting", "parsing"] }
 # always resolved into the graph through tokio-rustls and tokio-util, and a
 # transitive feature is exactly the kind of thing that disappears on a bump.
 tokio = { version = "1.52.3", features = ["io-util", "macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
-tokio-tungstenite = "0.29"
+tokio-tungstenite = "0.30"
 # Same tokio-postgres 0.7.x the pool and the rustls adapter build on. Default
 # features keep `runtime` (tokio-based connect); the DSN is always a
 # `postgres://` URL because that is the only form `Config::from_str` parses.
