@@ -7230,6 +7230,16 @@
       "purpose": "Connection configuration, shared storage or checked provider/MCP protocol handling in this exact scope."
     },
     {
+      "file": "gateway/src/connections/caller_assertion.rs",
+      "reasons": [
+        "capability-import-or-glob"
+      ],
+      "scope": "gateway::connections::caller_assertion::use base64 :: Engine as _#1",
+      "sha256": "0ec0fcd621234deae72cc8e26ec92c979612a11b70a23cad219f03df96f033fb",
+      "owner": "GreenGateway maintainers",
+      "purpose": "Reviewed exact import/reexport or alias for this module; constructor bodies require separate scope review."
+    },
+    {
       "file": "gateway/src/connections/control_plane.rs",
       "reasons": [
         "capability-import-or-glob"
