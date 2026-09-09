@@ -6,9 +6,10 @@ use sha2::{Digest, Sha256};
 use super::{
     control_plane::ConnectionRuntimeSnapshot,
     model::{
-        ConnectionAuthentication, ConnectionEndpoint, ConnectionId, ConnectionKind,
-        ConnectionManagementSource, ConnectionTestProfile, ConnectionTimeouts, ConnectionWrite,
-        DiscoveryConfig, OAuthClientAuthMethod,
+        CallerAssertionAlgorithm, CallerAssertionClaim, ConnectionAuthentication,
+        ConnectionEndpoint, ConnectionId, ConnectionKind, ConnectionManagementSource,
+        ConnectionTestProfile, ConnectionTimeouts, ConnectionWrite, DiscoveryConfig,
+        OAuthClientAuthMethod,
     },
     secret::{SecretAliasMetadata, SecretProviderKind, SecretPurpose},
     status::{ConnectionOperationalState, SafeConnectionStatus, SafeConnectionSummary},
@@ -274,6 +275,8 @@ pub struct SafeConnectionConfiguration {
     pub description: Option<String>,
     pub endpoint: ConnectionEndpoint,
     pub authentication: SafeConnectionAuthentication,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub caller_assertion: Option<SafeCallerAssertion>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub additional_headers: Vec<SafeAdditionalHeader>,
     pub tls: SafeTlsConfiguration,
@@ -294,6 +297,29 @@ pub struct SafeAdditionalHeader {
     pub secret_configured: bool,
 }
 
+/// Caller attestation as the admin API shows it.
+///
+/// Everything but the secret alias, which becomes a boolean like the other
+/// secret-backed fields. The issuer, audience, key ID and header name are not
+/// secrets -- the upstream is told all four, and the key ID is published in the
+/// JWKS -- and hiding them would only make a misconfiguration harder to see.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct SafeCallerAssertion {
+    pub signing_key_configured: bool,
+    pub kid: String,
+    pub algorithm: CallerAssertionAlgorithm,
+    pub issuer: String,
+    pub audience: String,
+    pub token_type: String,
+    pub header_name: String,
+    pub lifetime_seconds: u32,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub claims: Vec<CallerAssertionClaim>,
+    pub bind_request: bool,
+    pub bind_approval: bool,
+}
+
 impl SafeConnectionConfiguration {
     fn from_write(write: &ConnectionWrite) -> Self {
         Self {
@@ -302,6 +328,21 @@ impl SafeConnectionConfiguration {
             authentication: SafeConnectionAuthentication::from_authentication(
                 &write.authentication,
             ),
+            caller_assertion: write.caller_assertion.as_ref().map(|assertion| {
+                SafeCallerAssertion {
+                    signing_key_configured: !assertion.signing_key_id.is_empty(),
+                    kid: assertion.kid.clone(),
+                    algorithm: assertion.algorithm,
+                    issuer: assertion.issuer.clone(),
+                    audience: assertion.audience.clone(),
+                    token_type: assertion.token_type.clone(),
+                    header_name: assertion.header_name.clone(),
+                    lifetime_seconds: assertion.lifetime_seconds,
+                    claims: assertion.claims.clone(),
+                    bind_request: assertion.bind_request,
+                    bind_approval: assertion.bind_approval,
+                }
+            }),
             additional_headers: write
                 .additional_headers
                 .iter()
@@ -644,6 +685,9 @@ pub fn changed_connection_fields(
             if before.authentication != after.authentication {
                 fields.push("authentication");
             }
+            if before.caller_assertion != after.caller_assertion {
+                fields.push("caller_assertion");
+            }
             if before.additional_headers != after.additional_headers {
                 fields.push("additional_headers");
             }
@@ -668,6 +712,7 @@ pub fn changed_connection_fields(
                 "kind",
                 "endpoint",
                 "authentication",
+                "caller_assertion",
                 "additional_headers",
                 "tls",
                 "timeouts",

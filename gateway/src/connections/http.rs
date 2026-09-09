@@ -1948,6 +1948,7 @@ mod tests {
                     base_path: base_path.to_owned(),
                 },
                 authentication: ConnectionAuthentication::None,
+                caller_assertion: None,
                 additional_headers: Vec::new(),
                 tls: TlsProfile::default(),
                 timeouts: Some(ConnectionTimeouts::default()),
