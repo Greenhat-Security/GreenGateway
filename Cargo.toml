@@ -71,7 +71,7 @@ rustls-platform-verifier = { version = "0.7.0", default-features = false }
 rustls-webpki = { version = "0.103.13", default-features = false, features = ["std"] }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = { version = "1.0.150", features = ["arbitrary_precision"] }
-sha2 = "0.10.9"
+sha2 = "0.11.0"
 time = { version = "0.3.53", features = ["formatting", "parsing"] }
 # `io-util` is named explicitly rather than inherited: `gateway/src/proxy/grpc/listen.rs`
 # reads the HTTP/2 connection preface itself, which needs `AsyncReadExt`. It has
@@ -79,6 +79,8 @@ time = { version = "0.3.53", features = ["formatting", "parsing"] }
 # transitive feature is exactly the kind of thing that disappears on a bump.
 tokio = { version = "1.52.3", features = ["io-util", "macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
 tokio-tungstenite = "0.30"
+# Axum 0.8 uses tungstenite 0.29; preserve typed downstream error classification.
+axum-tungstenite = { package = "tungstenite", version = "0.29", default-features = false }
 # Same tokio-postgres 0.7.x the pool and the rustls adapter build on. Default
 # features keep `runtime` (tokio-based connect); the DSN is always a
 # `postgres://` URL because that is the only form `Config::from_str` parses.

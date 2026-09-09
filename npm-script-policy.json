@@ -82,26 +82,6 @@
           "package/fsevents.js": "1d75660f48786792f0e98d6dabfd301883c8f2a8f61aa690cbf58fb4386c0f1a"
         },
         "reason": "Optional Darwin watcher; published tarball has no install lifecycle hook or binding.gyp despite lock metadata."
-      },
-      "node_modules/playwright/node_modules/fsevents": {
-        "version": "2.3.2",
-        "resolved": "https://registry.npmjs.org/fsevents/-/fsevents-2.3.2.tgz",
-        "integrity": "sha512-xiqMQR4xAeHTuB9uWm+fFRcIOgKBMiOBP+eXiyT7jsgVCq1bkVygt00oASowB7EdtpOHaaPgKt812P9ab+DDKA==",
-        "optional": true,
-        "os": [
-          "darwin"
-        ],
-        "allow": false,
-        "scripts": {
-          "clean": "node-gyp clean && rm -f fsevents.node",
-          "build": "node-gyp clean && rm -f fsevents.node && node-gyp rebuild && node-gyp clean",
-          "test": "/bin/bash ./test.sh 2>/dev/null",
-          "prepublishOnly": "npm run build"
-        },
-        "source_sha256": {
-          "package/fsevents.js": "f51b1bd9058d7a989c595e806fedbbd16a3bb34da5209c2804f97ab84050902a"
-        },
-        "reason": "Optional Darwin watcher; published tarball has no install lifecycle hook or binding.gyp despite lock metadata."
       }
     }
   }

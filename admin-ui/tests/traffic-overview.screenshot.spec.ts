@@ -13,11 +13,11 @@ for (const theme of ['light', 'dark']) {
     const overview = page.getByRole('region', { name: 'Traffic overview', exact: true });
     await expect(overview.getByRole('img')).toBeVisible();
     await overview.screenshot({ path: `.screenshots/traffic-overview-${theme}.png` });
-    await overview.getByLabel('Method', { exact: true }).selectOption('MCP');
+    await overview.getByRole('combobox', { name: 'Method', exact: true }).selectOption('MCP');
     await overview.getByRole('button', { name: 'Table', exact: true }).click();
     await expect(overview.getByRole('table')).toContainText('5,400');
     await expect(overview.getByRole('table')).not.toContainText('GET');
-    await overview.getByLabel('Method', { exact: true }).selectOption('');
+    await overview.getByRole('combobox', { name: 'Method', exact: true }).selectOption('');
     await page.setViewportSize({ width: 390, height: 844 });
     await expect(overview.getByRole('table')).toBeVisible();
     await overview.screenshot({ path: `.screenshots/traffic-overview-${theme}-mobile.png` });

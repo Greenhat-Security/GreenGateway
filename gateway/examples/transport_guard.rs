@@ -15,10 +15,9 @@ use syn::{
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 
 fn hash(tokens: impl ToTokens) -> String {
-    format!(
-        "{:x}",
-        Sha256::digest(tokens.to_token_stream().to_string().as_bytes())
-    )
+    hex::encode(Sha256::digest(
+        tokens.to_token_stream().to_string().as_bytes(),
+    ))
 }
 
 // Possible truth values with test=false; every other cfg atom remains unknown.

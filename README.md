@@ -180,6 +180,9 @@ Use GreenGateway as a security layer in front of existing HTTP APIs.
 
 It can proxy traffic, observe endpoint usage, build an endpoint inventory, and help convert real traffic into identity-aware access rules.
 
+The [traffic overview](docs/traffic-overview.md) visualizes request flow into
+upstream destinations, with filters, current rule coverage and endpoint links.
+
 ### Roll Out API Firewall Rules Safely
 
 Start in observe or shadow mode, review what would have been denied, and then promote rules once you are confident.

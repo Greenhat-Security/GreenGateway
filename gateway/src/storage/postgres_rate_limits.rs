@@ -36,7 +36,7 @@
 //! middleware answers `503` with zero upstream attempts. It is never a
 //! silent allow and never a `429`.
 
-use hmac::{Hmac, Mac};
+use hmac::{Hmac, KeyInit, Mac};
 use sha2::Sha256;
 
 use crate::connections::local_secret::LocalSecretKeyring;

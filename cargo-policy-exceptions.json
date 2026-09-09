@@ -24,8 +24,8 @@
     {
       "name": "const-oid",
       "versions": [
-        "0.9.6",
-        "0.10.2"
+        "0.10.2",
+        "0.9.6"
       ],
       "owner": "GreenGateway maintainers",
       "expires": "2026-12-01",
@@ -59,6 +59,7 @@
         "0.3.0": [
           "chacha20@0.10.2",
           "poly1305@0.9.1",
+          "sha1@0.11.0",
           "sha2@0.11.0"
         ]
       }
@@ -97,13 +98,13 @@
       "remediation": "Re-evaluate when the listed parent dependencies update; remove the exception once their version requirements converge.",
       "parents": {
         "0.10.7": [
-          "hmac@0.12.1",
           "sha1@0.10.7",
           "sha2@0.10.9"
         ],
         "0.11.3": [
           "hmac@0.13.0",
           "md-5@0.11.0",
+          "sha1@0.11.0",
           "sha2@0.11.0"
         ]
       }
@@ -189,25 +190,6 @@
       }
     },
     {
-      "name": "hmac",
-      "versions": [
-        "0.12.1",
-        "0.13.0"
-      ],
-      "owner": "GreenGateway maintainers",
-      "expires": "2026-12-01",
-      "reason": "Gateway request authentication uses 0.12 while PostgreSQL protocol uses 0.13.",
-      "remediation": "Re-evaluate when the listed parent dependencies update; remove the exception once their version requirements converge.",
-      "parents": {
-        "0.12.1": [
-          "gateway@1.0.1"
-        ],
-        "0.13.0": [
-          "postgres-protocol@0.6.12"
-        ]
-      }
-    },
-    {
       "name": "io-lifetimes",
       "versions": [
         "2.0.4",
@@ -251,8 +233,8 @@
     {
       "name": "rand",
       "versions": [
-        "0.9.4",
-        "0.10.2"
+        "0.10.2",
+        "0.9.4"
       ],
       "owner": "GreenGateway maintainers",
       "expires": "2026-12-01",
@@ -268,16 +250,17 @@
         "0.10.2": [
           "postgres-protocol@0.6.12",
           "rmcp@2.1.0",
-          "tokio-postgres@0.7.18"
+          "tokio-postgres@0.7.18",
+          "tungstenite@0.30.0"
         ]
       }
     },
     {
       "name": "rand_core",
       "versions": [
+        "0.10.1",
         "0.6.4",
-        "0.9.5",
-        "0.10.1"
+        "0.9.5"
       ],
       "owner": "GreenGateway maintainers",
       "expires": "2026-12-01",
@@ -302,6 +285,26 @@
       }
     },
     {
+      "name": "sha1",
+      "owner": "GreenGateway maintainers",
+      "expires": "2026-12-01",
+      "reason": "Axum WebSockets use tungstenite 0.29/SHA1 0.10; upstream tungstenite 0.30 uses SHA1 0.11 solely for the RFC 6455 handshake.",
+      "remediation": "Remove the older WebSocket and SHA1 versions when Axum adopts tungstenite 0.30; recheck the exact downstream error type during that update.",
+      "versions": [
+        "0.10.7",
+        "0.11.0"
+      ],
+      "parents": {
+        "0.10.7": [
+          "axum@0.8.9",
+          "tungstenite@0.29.0"
+        ],
+        "0.11.0": [
+          "tungstenite@0.30.0"
+        ]
+      }
+    },
+    {
       "name": "sha2",
       "versions": [
         "0.10.9",
@@ -313,12 +316,51 @@
       "remediation": "Re-evaluate when the listed parent dependencies update; remove the exception once their version requirements converge.",
       "parents": {
         "0.10.9": [
-          "gateway@1.0.1",
           "rust-embed-utils@8.11.0"
         ],
         "0.11.0": [
+          "gateway@1.0.1",
           "postgres-protocol@0.6.12",
           "tokio-postgres-rustls@0.14.0"
+        ]
+      }
+    },
+    {
+      "name": "tokio-tungstenite",
+      "owner": "GreenGateway maintainers",
+      "expires": "2026-12-01",
+      "reason": "Axum 0.8.9 pins its downstream WebSocket adapter to 0.29 while the gateway upstream adapter uses 0.30.",
+      "remediation": "Remove the older WebSocket and SHA1 versions when Axum adopts tungstenite 0.30; recheck the exact downstream error type during that update.",
+      "versions": [
+        "0.29.0",
+        "0.30.0"
+      ],
+      "parents": {
+        "0.29.0": [
+          "axum@0.8.9"
+        ],
+        "0.30.0": [
+          "gateway@1.0.1"
+        ]
+      }
+    },
+    {
+      "name": "tungstenite",
+      "owner": "GreenGateway maintainers",
+      "expires": "2026-12-01",
+      "reason": "Axum downstream WebSockets still use 0.29; upstream sockets use 0.30. The explicit 0.29 alias preserves downstream typed error classification.",
+      "remediation": "Remove the older WebSocket and SHA1 versions when Axum adopts tungstenite 0.30; recheck the exact downstream error type during that update.",
+      "versions": [
+        "0.29.0",
+        "0.30.0"
+      ],
+      "parents": {
+        "0.29.0": [
+          "gateway@1.0.1",
+          "tokio-tungstenite@0.29.0"
+        ],
+        "0.30.0": [
+          "tokio-tungstenite@0.30.0"
         ]
       }
     },
@@ -334,11 +376,11 @@
       "remediation": "Re-evaluate when the listed parent dependencies update; remove the exception once their version requirements converge.",
       "parents": {
         "0.7.1": [
-          "aws-lc-rs@1.17.1"
+          "aws-lc-rs@1.18.1"
         ],
         "0.9.0": [
           "ring@0.17.14",
-          "rustls-webpki@0.103.13"
+          "rustls-webpki@0.103.15"
         ]
       }
     },
@@ -376,29 +418,29 @@
       "remediation": "Re-evaluate when the listed parent dependencies update; remove the exception once their version requirements converge.",
       "parents": {
         "0.52.0": [
+          "errno@0.3.14",
           "fs-set-times@0.20.3",
           "ring@0.17.14",
+          "rustix@1.1.4",
+          "rustls-platform-verifier@0.7.0",
+          "tempfile@3.27.0",
+          "winapi-util@0.1.11",
           "winx@0.36.4"
         ],
         "0.60.2": [
-          "io-extras@0.19.0",
-          "notify@8.2.0",
-          "quinn-udp@0.5.14"
-        ],
-        "0.61.2": [
           "cap-fs-ext@4.0.2",
           "cap-primitives@4.0.2",
-          "errno@0.3.14",
+          "io-extras@0.19.0",
+          "notify@8.2.0",
+          "nu-ansi-term@0.50.3",
+          "quinn-udp@0.5.14",
+          "socket2@0.6.4"
+        ],
+        "0.61.2": [
           "gateway@1.0.1",
           "mio@1.2.1",
-          "nu-ansi-term@0.50.3",
-          "rustix@1.1.4",
-          "rustls-platform-verifier@0.7.0",
           "schannel@0.1.29",
-          "socket2@0.6.4",
-          "tempfile@3.27.0",
-          "tokio@1.52.3",
-          "winapi-util@0.1.11"
+          "tokio@1.53.1"
         ]
       }
     },

@@ -13,7 +13,7 @@ it('filters flow and table counts and links to endpoint details', async () => {
   vi.mocked(fetchTrafficEndpoints).mockResolvedValue({ endpoints: [observation(), observation('POST', '/api/search', 40, 'https://search.example.test', false)], next_cursor: null });
   mount(); await screen.findByRole('img', { name: 'Request flow by method and destination' });
   fireEvent.change(screen.getByLabelText('Method'), { target: { value: 'POST' } });
-  fireEvent.click(screen.getByRole('button', { name: 'Table', exact: true }));
+  fireEvent.click(screen.getByRole('button', { name: /^Table$/ }));
   expect(screen.getByRole('table').textContent).toContain('40');
   expect(screen.getByRole('table').textContent).not.toContain('120');
   fireEvent.click(screen.getByRole('button', { name: /https:\/\/search.example.test/ }));

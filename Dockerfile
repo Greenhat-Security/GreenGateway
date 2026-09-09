@@ -16,7 +16,7 @@ COPY .node-version .npm-version build-tools.json npm-script-policy.json ./
 COPY scripts/npm-script-policy.mjs scripts/npm-script-policy.mjs
 RUN test "$(node --version)" = "v$(cat .node-version)" \
     && test "$(npm --version)" = "$(cat .npm-version)" \
-    && rustc --version | grep -E '^rustc 1\.88\.0 '
+    && rustc --version | grep -E '^rustc 1\.98\.0 '
 COPY gateway/Cargo.toml gateway/Cargo.toml
 
 RUN mkdir -p gateway/src \

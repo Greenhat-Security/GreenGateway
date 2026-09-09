@@ -20,8 +20,10 @@ export function trafficFlows(endpoints: TrafficEndpoint[]): Flow[] {
       const amount = Math.min(remaining, count(context.call_count));
       if (!amount) continue;
       remaining -= amount;
-      const coverage: Coverage = ['unknown', 'mixed'].includes(context.coverage_scope) || !context.coverage_scope
-        ? 'unknown' : context.covered_by_rule ? 'covered' : 'uncovered';
+      // Principal-scoped rules cover only some callers; do not label them as
+      // either endpoint-wide coverage or the absence of a matching rule.
+      const coverage: Coverage = context.coverage_scope === 'endpoint' && context.covered_by_rule
+        ? 'covered' : context.coverage_scope === 'none' ? 'uncovered' : 'unknown';
       flows.push({ source: endpoint.method, destination: destinationLabel(context.upstream_origin), count: amount, coverage, endpoint });
     }
     if (remaining) flows.push({ source: endpoint.method, destination: UNKNOWN_DESTINATION, count: remaining, coverage: 'unknown', endpoint });

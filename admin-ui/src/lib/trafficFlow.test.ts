@@ -17,6 +17,13 @@ describe('traffic flow accounting', () => {
     const [summary] = summarizeDestinations(trafficFlows([endpoint]));
     expect([summary.total, summary.covered, summary.uncovered, summary.endpoints.size]).toEqual([120, 60, 60, 1]);
   });
+  it('keeps principal-scoped coverage out of endpoint-wide and no-rule totals', () => {
+    const endpoint = observation();
+    endpoint.routing_contexts[0].coverage_scope = 'principal';
+    endpoint.routing_contexts[0].covered_by_rule = false;
+    const [summary] = summarizeDestinations(trafficFlows([endpoint]));
+    expect([summary.covered, summary.uncovered, summary.unknown]).toEqual([0, 0, 120]);
+  });
   it('never draws negative, nonfinite, or excess request counts', () => {
     expect(trafficFlows([observation('GET', '/a', -1), observation('GET', '/b', NaN)])).toEqual([]);
     const endpoint = observation(); endpoint.routing_contexts[0].call_count = 999;
