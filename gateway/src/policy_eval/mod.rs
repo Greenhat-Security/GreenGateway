@@ -42,6 +42,7 @@ mod input;
 mod tests;
 
 use std::fmt;
+use std::net::Ipv6Addr;
 
 use http::Method;
 use serde::Serialize;
@@ -194,9 +195,10 @@ impl CompiledPolicy {
         };
 
         let dispatch = context.dispatch.as_ref();
-        // A selected virtual upstream. Its presence, not the mere existence of a
+        // A selected virtual upstream, which production identifies by the route
+        // carrying a bound host. Its presence, not the mere existence of a
         // classified dispatch, is what makes a route's host binding mandatory.
-        let required_host = dispatch.and_then(|facts| facts.required_host.as_deref());
+        let required_host = dispatch.and_then(|facts| facts.route_host.as_deref());
         let host_binding_required = required_host.is_some();
         // The host routes are matched against: the selected upstream's when one
         // was chosen, otherwise the request's own.
@@ -222,7 +224,7 @@ impl CompiledPolicy {
                     facts.route_id.as_deref(),
                     facts.route_host.as_deref(),
                     facts.route_path_prefix.as_deref(),
-                    facts.upstream_origin.as_deref(),
+                    Some(facts.upstream_origin.as_str()),
                 )
             }
             _ => return Err(EvaluationError::InternalInvariant),
@@ -334,6 +336,25 @@ impl CompiledPolicy {
     }
 }
 
+/// Whether a value is a host with its port and brackets already removed, the
+/// form `upstream_route::request_host_without_port` produces.
+///
+/// Colons cannot simply be refused. That helper strips the brackets from
+/// `[2001:db8::1]:8443` and returns `2001:db8::1`, so rejecting every colon
+/// would make the kernel unable to answer for an IPv6-addressed request at all
+/// -- including one whose policy has no host-qualified routes and for which the
+/// host could not have changed the decision. A bare IPv6 literal is recognized
+/// by parsing it, rather than by guessing at colon counts.
+fn is_bare_host(host: &str) -> bool {
+    if host.is_empty() || host.contains('/') {
+        return false;
+    }
+    if host.contains(':') {
+        return host.parse::<Ipv6Addr>().is_ok();
+    }
+    true
+}
+
 /// Whether a route's host binding admits this request.
 ///
 /// An unbound route serves any host, but only while no virtual upstream was
@@ -418,15 +439,30 @@ pub(crate) enum HostFact {
 ///
 /// Every field is supplied by the caller. The kernel resolves nothing: it does
 /// not parse an origin, consult routing tables, or select an upstream.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+///
+/// The shape mirrors `ProxyRouteObservationContext`, which is the single place
+/// production establishes these, deliberately closely. Two earlier differences
+/// both turned out to be ways to fail open:
+///
+/// - A separate `required_host` field. Production derives the required host from
+///   `route_host` alone -- `authorization_context()` yields one exactly when
+///   `route_host` is set -- so carrying it twice let a caller supply the route
+///   host without it, leaving host binding unenforced and a broad allow or a
+///   permissive default free to authorize a virtual upstream. The host binding
+///   is now derived here too, so the two cannot disagree.
+/// - An optional `upstream_origin`. A classified dispatch always has one, and
+///   making it optional created a dispatch with no identity at all, which
+///   `kind: contextless` rules match -- so a contextless-only allow could
+///   authorize what the caller labeled a proxy dispatch. It is required, as it
+///   is in production.
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct DispatchFacts {
     pub(crate) route_id: Option<String>,
+    /// The route's bound host. Its presence is what makes a virtual upstream
+    /// selected, and therefore a route's own host binding mandatory.
     pub(crate) route_host: Option<String>,
     pub(crate) route_path_prefix: Option<String>,
-    pub(crate) upstream_origin: Option<String>,
-    /// The virtual upstream host this request was bound to, when one was
-    /// selected. Its presence makes a route's host binding mandatory.
-    pub(crate) required_host: Option<String>,
+    pub(crate) upstream_origin: String,
 }
 
 #[derive(Clone)]
@@ -515,14 +551,14 @@ impl PolicyEvaluationContext {
             if host.len() > 4096 {
                 return Err(EvaluationError::ContextTooLarge);
             }
-            if host.is_empty() || host.contains([':', '/']) {
+            if !is_bare_host(host) {
                 return Err(EvaluationError::InvalidHost);
             }
         }
         if let Some(facts) = &self.dispatch {
             // Dispatch facts on a target that does not evaluate them would be
-            // read by one and ignored by the other, and a `required_host` is
-            // exactly the fact whose loss turns a refusal into an allow.
+            // read by one and ignored by the other, and `route_host` is exactly
+            // the fact whose loss turns a refusal into an allow.
             if self.target != HttpTarget::ProxyDispatch {
                 return Err(EvaluationError::InconsistentContext);
             }
@@ -530,8 +566,7 @@ impl PolicyEvaluationContext {
                 facts.route_id.as_deref(),
                 facts.route_host.as_deref(),
                 facts.route_path_prefix.as_deref(),
-                facts.upstream_origin.as_deref(),
-                facts.required_host.as_deref(),
+                Some(facts.upstream_origin.as_str()),
             ]
             .into_iter()
             .flatten()
@@ -540,12 +575,15 @@ impl PolicyEvaluationContext {
                     return Err(EvaluationError::ContextTooLarge);
                 }
             }
-            // A selected upstream with no host is internally inconsistent: host
-            // binding would be demanded with nothing to bind against.
+            // A classified dispatch always has an origin; an empty one would
+            // leave it with no identity, which `kind: contextless` rules match.
+            if facts.upstream_origin.is_empty() {
+                return Err(EvaluationError::InconsistentContext);
+            }
             if facts
-                .required_host
+                .route_host
                 .as_ref()
-                .is_some_and(|host| host.is_empty() || host.contains([':', '/']))
+                .is_some_and(|host| !is_bare_host(host))
             {
                 return Err(EvaluationError::InvalidHost);
             }
@@ -589,7 +627,6 @@ impl PolicyEvaluationContext {
                 &facts.route_host,
                 &facts.route_path_prefix,
                 &facts.upstream_origin,
-                &facts.required_host,
             )
         });
         let bytes = serde_json::to_vec(&(

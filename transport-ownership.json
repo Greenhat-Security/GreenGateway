@@ -9769,6 +9769,16 @@
       "purpose": "Inspect the existing request body end-of-stream flag for an enabled, exact registered POST logout route; creates no client, connection, listener or task."
     },
     {
+      "file": "gateway/src/policy_eval/mod.rs",
+      "reasons": [
+        "capability-import-or-glob"
+      ],
+      "scope": "gateway::policy_eval::use std :: net :: Ipv6Addr#1",
+      "sha256": "c8fa1ddb1e0795ac76c1fda2deeab25c49d041d78fc2f5216bfa2aaf73740244",
+      "owner": "GreenGateway maintainers",
+      "purpose": "Recognize a bare IPv6 literal as a request host in the pure policy kernel. request_host_without_port strips the brackets from [2001:db8::1]:8443, so the retained colons must be told apart from a host that still carries a port; parsing with the standard type avoids hand-rolling that distinction."
+    },
+    {
       "file": "gateway/src/proxy/admission.rs",
       "reasons": [
         "unexpanded-macro"

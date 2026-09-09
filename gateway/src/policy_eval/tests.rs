@@ -623,10 +623,7 @@ async fn routing_lane_matches_current_middleware_for_host_bound_and_dispatch_sco
                                 route_id: Some("route-1".to_owned()),
                                 route_host: route_host.map(str::to_owned),
                                 route_path_prefix: Some("/".to_owned()),
-                                upstream_origin: Some(UPSTREAM.to_owned()),
-                                required_host: authorization
-                                    .as_ref()
-                                    .map(|context| context.host.clone()),
+                                upstream_origin: UPSTREAM.to_owned(),
                             });
                             input.principal =
                                 identity
@@ -752,8 +749,7 @@ async fn a_direct_allow_cannot_authorize_a_selected_upstream_but_a_deny_still_bl
             route_id: None,
             route_host: Some("api.example.test".to_owned()),
             route_path_prefix: Some("/".to_owned()),
-            upstream_origin: Some(UPSTREAM.to_owned()),
-            required_host: Some("api.example.test".to_owned()),
+            upstream_origin: UPSTREAM.to_owned(),
         });
         let result = compiled.evaluate(&input).unwrap();
         assert_eq!(result.effect, expected, "{action}");
@@ -796,8 +792,7 @@ fn a_permissive_default_does_not_authorize_an_unrouted_virtual_upstream() {
             route_id: None,
             route_host: Some("api.example.test".to_owned()),
             route_path_prefix: Some("/".to_owned()),
-            upstream_origin: Some("https://upstream.internal.test".to_owned()),
-            required_host: Some("api.example.test".to_owned()),
+            upstream_origin: "https://upstream.internal.test".to_owned(),
         });
         let result = compiled.evaluate(&input).unwrap();
         assert_eq!(result.logical, LogicalDecision::Deny, "{mode}");
@@ -819,7 +814,7 @@ fn a_permissive_default_does_not_authorize_an_unrouted_virtual_upstream() {
 fn dispatch_facts_on_a_non_dispatch_target_are_rejected_rather_than_ignored() {
     // Two readings of one context is the bug: the target says there is no
     // dispatch, the facts say a virtual upstream was selected. Ignoring the
-    // facts would drop the `required_host` that makes a refusal a refusal.
+    // facts would drop the `route_host` that makes a refusal a refusal.
     let compiled = compile(json!({
         "schema_version":"0.1.0","default_action":"allow",
         "routes":[{"hosts":["other.example.test"],"path_prefix":"/data","permission":"read"}]
@@ -828,8 +823,7 @@ fn dispatch_facts_on_a_non_dispatch_target_are_rejected_rather_than_ignored() {
         route_id: None,
         route_host: Some("api.example.test".to_owned()),
         route_path_prefix: Some("/".to_owned()),
-        upstream_origin: Some("https://upstream.internal.test".to_owned()),
-        required_host: Some("api.example.test".to_owned()),
+        upstream_origin: "https://upstream.internal.test".to_owned(),
     };
     for target in [
         HttpTarget::Contextless,
@@ -853,31 +847,160 @@ fn dispatch_facts_on_a_non_dispatch_target_are_rejected_rather_than_ignored() {
     assert!(compiled.evaluate(&input).is_ok());
 }
 
+fn dispatch_with_host(route_host: Option<&str>) -> DispatchFacts {
+    DispatchFacts {
+        route_id: None,
+        route_host: route_host.map(str::to_owned),
+        route_path_prefix: Some("/".to_owned()),
+        upstream_origin: "https://upstream.internal.test".to_owned(),
+    }
+}
+
 #[test]
 fn a_host_that_is_not_a_bare_hostname_is_rejected() {
-    // The routing lane compares bare hostnames. A value still carrying a port
-    // or a path would silently fail every host comparison, which looks like a
-    // policy decision rather than the malformed input it is.
+    // The routing lane compares hosts with port and brackets already stripped.
+    // A value still carrying either would silently fail every comparison, which
+    // looks like a policy decision rather than the malformed input it is.
     let compiled = compile(basic_policy());
-    for host in ["", "api.example.test:8443", "api.example.test/data"] {
+    // Note `2001:db8::1:8443` is absent on purpose: it is a valid IPv6 address,
+    // indistinguishable from a host with a port, and the helper never strips a
+    // port from an unbracketed value. Refusing it would refuse a real host.
+    for host in [
+        "",
+        "api.example.test:8443",
+        "api.example.test/data",
+        "[2001:db8::1]",
+        "[2001:db8::1]:8443",
+    ] {
         let mut input = context(&compiled);
         input.request_host = HostFact::Present(host.to_owned());
         assert_eq!(
             compiled.evaluate(&input),
             Err(EvaluationError::InvalidHost),
-            "{host}"
+            "request host {host}"
         );
 
         let mut input = context(&compiled);
         input.target = HttpTarget::ProxyDispatch;
-        input.dispatch = Some(DispatchFacts {
-            required_host: Some(host.to_owned()),
-            ..DispatchFacts::default()
-        });
+        input.dispatch = Some(dispatch_with_host(Some(host)));
         assert_eq!(
             compiled.evaluate(&input),
             Err(EvaluationError::InvalidHost),
-            "{host}"
+            "route host {host}"
         );
     }
+}
+
+#[test]
+fn an_ipv6_request_host_is_evaluated_rather_than_refused_as_malformed() {
+    // `request_host_without_port` turns `[2001:db8::1]:8443` into the bare
+    // literal, colons intact. Refusing every colon would leave the kernel unable
+    // to answer for an IPv6 request at all -- including one whose policy has no
+    // host-qualified route, where the host could not have changed the decision.
+    //
+    // A policy cannot bind a route to an IPv6 literal: route hosts must be DNS
+    // hostnames (`is_valid_hostname_without_port`). So the request host is the
+    // only place such a value appears, and the decision it must not break is the
+    // ordinary direct-rule, unbound-route or default one.
+    let compiled = compile(json!({
+        "schema_version":"0.1.0","default_action":"deny",
+        "roles":{"reader":{"permissions":["read"]}},
+        "routes":[
+            {"hosts":["api.example.test"],"path_prefix":"/bound","permission":"read"},
+            {"path_prefix":"/data","permission":"read"}
+        ],
+        "rules":[{"id":"broad","path":"/direct/**","action":"allow"}]
+    }));
+    for host in [
+        "2001:db8::1",
+        "::1",
+        "2001:DB8::1",
+        "fe80::1ff:fe23:4567:890a",
+    ] {
+        for (path, expected) in [
+            ("/direct/item", Some(RuleReference::Direct(0))),
+            ("/data/item", Some(RuleReference::Route(1))),
+            ("/elsewhere", None),
+        ] {
+            let mut input = context(&compiled);
+            input.path = Some(path.to_owned());
+            input.request_host = HostFact::Present(host.to_owned());
+            let result = compiled
+                .evaluate(&input)
+                .unwrap_or_else(|error| panic!("{host} {path} rejected as {error:?}"));
+            assert!(result.complete, "{host} {path}");
+            assert_eq!(result.matched, expected, "{host} {path}");
+        }
+
+        // The host-qualified route simply does not match, which is a decision
+        // rather than an error -- the distinction this whole fix is about.
+        let mut input = context(&compiled);
+        input.path = Some("/bound/item".to_owned());
+        input.request_host = HostFact::Present(host.to_owned());
+        let result = compiled.evaluate(&input).unwrap();
+        assert_eq!(result.matched, None, "{host}");
+        assert_eq!(result.reason, Reason::DefaultDeny, "{host}");
+    }
+}
+
+#[test]
+fn a_classified_dispatch_with_no_upstream_identity_is_rejected() {
+    // An origin-less dispatch has no identity at all, and a `kind: contextless`
+    // rule matches exactly that shape -- so a contextless-only allow would
+    // authorize what the caller labeled a proxy dispatch. Production's
+    // observation context always carries an origin; so must this.
+    let compiled = compile(json!({
+        "schema_version":"0.1.0","default_action":"deny",
+        "rules":[{"id":"ctx","path":"/**","dispatch":{"kind":"contextless"},"action":"allow"}]
+    }));
+    let mut input = context(&compiled);
+    input.target = HttpTarget::ProxyDispatch;
+    input.dispatch = Some(DispatchFacts {
+        route_id: None,
+        route_host: None,
+        route_path_prefix: None,
+        upstream_origin: String::new(),
+    });
+    assert_eq!(
+        compiled.evaluate(&input),
+        Err(EvaluationError::InconsistentContext)
+    );
+
+    // With an origin the same rule correctly does not match, because the
+    // dispatch is no longer contextless.
+    let mut input = context(&compiled);
+    input.target = HttpTarget::ProxyDispatch;
+    input.dispatch = Some(dispatch_with_host(None));
+    let result = compiled.evaluate(&input).unwrap();
+    assert_eq!(result.matched, None);
+    assert_eq!(result.reason, Reason::DefaultDeny);
+}
+
+#[test]
+fn a_route_host_alone_makes_the_host_binding_mandatory() {
+    // The host binding is derived from `route_host`, never carried twice, so a
+    // caller cannot supply the route host and omit the fact that enforces it.
+    let compiled = compile(json!({
+        "schema_version":"0.1.0","default_action":"allow",
+        "routes":[{"hosts":["other.example.test"],"path_prefix":"/data","permission":"read"}],
+        "rules":[{"id":"broad","path":"/data/**","action":"allow"}]
+    }));
+    let mut input = context(&compiled);
+    input.path = Some("/data/item".to_owned());
+    input.target = HttpTarget::ProxyDispatch;
+    input.request_host = HostFact::Present("api.example.test".to_owned());
+    input.dispatch = Some(dispatch_with_host(Some("api.example.test")));
+    let result = compiled.evaluate(&input).unwrap();
+    assert_eq!(result.reason, Reason::HostPolicyRequired);
+    assert_eq!(result.effect, PolicyEffect::Block);
+
+    // No bound route host is no selected upstream, so the broad allow decides.
+    let mut input = context(&compiled);
+    input.path = Some("/data/item".to_owned());
+    input.target = HttpTarget::ProxyDispatch;
+    input.request_host = HostFact::Present("api.example.test".to_owned());
+    input.dispatch = Some(dispatch_with_host(None));
+    let result = compiled.evaluate(&input).unwrap();
+    assert_eq!(result.matched, Some(RuleReference::Direct(0)));
+    assert_eq!(result.effect, PolicyEffect::Allow);
 }
