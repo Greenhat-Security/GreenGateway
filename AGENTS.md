@@ -21,16 +21,22 @@ Prefer `git log`, open issues, and open pull requests over this document for str
 The workspace exists: a `gateway` binary crate and the `admin-ui` front end. The commands CI runs, and the ones to run before opening a pull request, are:
 
 ```sh
+# Select the CI toolchain first. RUSTUP_TOOLCHAIN overrides rust-toolchain.toml,
+# which is what the build-tools action does on every CI job.
+export RUSTUP_TOOLCHAIN="$(python -c "import json;print(json.load(open('build-tools.json'))['rust_ci'])")"
+rustup toolchain install "$RUSTUP_TOOLCHAIN" --component rustfmt --component clippy
+
 cargo fmt --check
 cargo clippy --workspace --locked -- -D warnings
 cargo test --workspace --locked
 python scripts/transport_guard.py check
+python scripts/cargo_policy.py install   # `check` execs the pinned cargo-deny directly
 python scripts/cargo_policy.py check
 ```
 
 Four things about this repository surprise people, human and agent alike, and each costs a red CI run to discover.
 
-**Build-tool versions are pinned exactly, and they are not the ones in `rust-toolchain.toml`.** `build-tools.json` at the repository root is the source of truth, read by `scripts/build_tools.py` and the `.github/actions/build-tools` composite action. It declares `rust_ci` (what CI lints and tests with), `rust_production` (what the shipped binary is built with), `rust_coverage`, `node`, `npm` and `python`. When those differ, lint locally with the CI one — `cargo +<rust_ci> clippy ...` — or you will chase lints CI does not enforce and miss ones it does. Re-read `build-tools.json` after every pull; the pins move.
+**Build-tool versions are pinned exactly, and they are not the ones in `rust-toolchain.toml`.** `build-tools.json` at the repository root is the source of truth, read by `scripts/build_tools.py` and the `.github/actions/build-tools` composite action. It declares `rust_ci` (what CI lints and tests with), `rust_production` (what the shipped binary is built with), `rust_coverage`, `node`, `npm` and `python`. `rust_ci` and `rust-toolchain.toml` currently differ, so a bare `cargo clippy` lints with the wrong compiler: export `RUSTUP_TOOLCHAIN` as above, or you will chase lints CI does not enforce and miss ones it does. Re-read `build-tools.json` after every pull; the pins move.
 
 **`gateway/build.rs` enforces the Node and npm pins exactly and builds `admin-ui` on every compile.** There is no skip flag. A Node that is even a patch version off fails with `build tool differs from repository version contract` before any Rust compiles, so keep the declared version on `PATH`.
 
