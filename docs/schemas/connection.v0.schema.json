@@ -150,7 +150,7 @@
       "description": "Attest the calling principal to the upstream alongside the primary credential rather than instead of it: the credential says which system is calling, the assertion says on whose behalf, so an upstream the operator controls can apply its own per-user checks. The gateway signs a short-lived JWT naming the validated principal and sends it in the named header; the upstream verifies it against the gateway's published JWKS. Omit to send only the credential.",
       "required": [
         "signing_key_id",
-        "key_id",
+        "kid",
         "algorithm",
         "issuer",
         "audience",
@@ -160,7 +160,7 @@
       ],
       "properties": {
         "signing_key_id": { "type": "string", "minLength": 1, "maxLength": 128, "description": "Secret alias holding the PKCS#8 private key." },
-        "key_id": { "type": "string", "minLength": 1, "maxLength": 128, "description": "kid published in the JWKS, so an upstream can select the right key and keys can rotate without a flag day." },
+        "kid": { "type": "string", "minLength": 1, "maxLength": 128, "description": "JOSE kid, published in the JWKS, so an upstream can select the right key and keys can rotate without a flag day." },
         "algorithm": { "enum": ["es256", "rs256"], "description": "Signature algorithm. Both are offered because verifier libraries and platform documentation differ on which is convenient." },
         "issuer": { "type": "string", "minLength": 1, "maxLength": 512 },
         "audience": { "type": "string", "minLength": 1, "maxLength": 512 },

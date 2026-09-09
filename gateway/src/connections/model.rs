@@ -214,9 +214,11 @@ pub struct CallerAssertionSettings {
     /// Secret alias holding the PKCS#8 private key, like the other
     /// secret-backed fields.
     pub signing_key_id: String,
-    /// `kid` published in the JWKS, so an upstream can select the right key and
-    /// so keys can rotate without a flag day.
-    pub key_id: String,
+    /// The JOSE `kid`, published in the JWKS, so an upstream can select the
+    /// right key and keys can rotate without a flag day. Named `kid` rather
+    /// than `key_id` because it identifies a public key: the admin contract
+    /// reserves `key_id` for secret handles and rejects it in any response.
+    pub kid: String,
     pub algorithm: CallerAssertionAlgorithm,
     pub issuer: String,
     pub audience: String,
@@ -555,7 +557,7 @@ fn validate_caller_assertion(
     );
 
     for (field, value, max) in [
-        ("caller_assertion.key_id", &settings.key_id, 128usize),
+        ("caller_assertion.kid", &settings.kid, 128usize),
         ("caller_assertion.issuer", &settings.issuer, 512),
         ("caller_assertion.audience", &settings.audience, 512),
         ("caller_assertion.token_type", &settings.token_type, 128),
@@ -1295,7 +1297,7 @@ mod tests {
         let mut connection = example();
         let mut assertion = json!({
             "signing_key_id": "assertion-signing-key",
-            "key_id": "gw-2026-09",
+            "kid": "gw-2026-09",
             "algorithm": "es256",
             "issuer": "https://gateway.example.test",
             "audience": "https://internal.example.test/api",

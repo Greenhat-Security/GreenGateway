@@ -307,7 +307,7 @@ pub struct SafeAdditionalHeader {
 #[serde(deny_unknown_fields)]
 pub struct SafeCallerAssertion {
     pub signing_key_configured: bool,
-    pub key_id: String,
+    pub kid: String,
     pub algorithm: CallerAssertionAlgorithm,
     pub issuer: String,
     pub audience: String,
@@ -331,7 +331,7 @@ impl SafeConnectionConfiguration {
             caller_assertion: write.caller_assertion.as_ref().map(|assertion| {
                 SafeCallerAssertion {
                     signing_key_configured: !assertion.signing_key_id.is_empty(),
-                    key_id: assertion.key_id.clone(),
+                    kid: assertion.kid.clone(),
                     algorithm: assertion.algorithm,
                     issuer: assertion.issuer.clone(),
                     audience: assertion.audience.clone(),
