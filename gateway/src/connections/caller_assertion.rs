@@ -16,6 +16,21 @@
 //! upstreams the operator controls, and needs no wallet, no IdP integration and no storage of
 //! anybody's access token -- only a signing key.
 //!
+//! ## The asserted subject is scoped to the provider that issued it
+//!
+//! `iss` on these tokens is this gateway, not the caller's identity provider, and RFC 7519 requires
+//! `sub` to be unique within the issuer's own namespace. A gateway can have several providers
+//! configured, and nothing stops two of them issuing the same `sub` for two different people, so the
+//! asserted `sub` is `<provider issuer>#<provider subject>`. Without that, an upstream applying
+//! per-user ownership checks would treat a caller from one provider as the identically named caller
+//! from another -- the precise confusion this module exists to prevent. `Principal` keeps the issuer
+//! for the same reason, and audit actors record it.
+//!
+//! The unscoped halves ride along as `caller_iss` and `caller_sub`, so an upstream matching its own
+//! user records reads those and never parses the composite. This is the same rule OpenID Connect
+//! states as `(iss, sub)` being the only stable identifier for an end user, and the same shape Istio
+//! uses when it attests a caller across issuers.
+//!
 //! ## Request binding hashes the bytes on the wire
 //!
 //! `bind_request` covers the exact body sent upstream, not a canonical rewriting of it. That is a
@@ -222,9 +237,38 @@ pub struct CallerAssertionConfig<'a> {
 
 /// The validated caller. Every field comes from the authenticated principal, never from arguments.
 pub struct CallerIdentity<'a> {
+    /// The identity provider that authenticated this caller, in canonical form.
+    ///
+    /// Required, and deliberately not an `Option`: a subject on its own does not identify anybody,
+    /// because two configured providers can issue the same `sub` for two different people.
+    /// [`Principal`](crate::auth::principal::Principal) keeps the issuer for exactly this reason and
+    /// every audit actor carries it. A provider configured without an issuer URL still has a label
+    /// here -- `auth::principal::provider_issuer` produces one.
+    pub issuer: &'a str,
     pub subject: &'a str,
     pub email: Option<&'a str>,
     pub roles: &'a [String],
+}
+
+/// The `sub` this gateway asserts for a caller: the provider issuer, `#`, then the provider subject.
+///
+/// RFC 7519 requires `sub` to be locally unique within the issuer's namespace, and the `iss` of
+/// these tokens is *this gateway*, not the caller's provider. A raw provider subject therefore does
+/// not satisfy it once a second provider is configured: two providers issuing `alice` would produce
+/// one asserted identity, and an upstream doing per-user ownership checks would treat them as the
+/// same person. Scoping the subject is what makes the guarantee in this module's name true.
+///
+/// `#` is a safe separator in one direction, which is the direction that matters: OpenID Connect
+/// forbids a fragment in an issuer identifier, and [`caller_issuer_is_scopeable`] enforces that, so
+/// the first `#` always ends the issuer. Nothing needs to parse this anyway -- the parts travel
+/// alongside it as `caller_iss` and `caller_sub`.
+fn scoped_subject(issuer: &str, subject: &str) -> String {
+    format!("{issuer}#{subject}")
+}
+
+/// Whether an issuer label can scope a subject unambiguously.
+fn caller_issuer_is_scopeable(issuer: &str) -> bool {
+    is_printable_claim(issuer, 512) && !issuer.contains('#')
 }
 
 /// The request being attested, when `bind_request` is on.
@@ -284,6 +328,9 @@ pub fn sign_caller_assertion(
     if !is_printable_claim(caller.subject, 256) {
         return Err(CallerAssertionError::InvalidClaim("sub"));
     }
+    if !caller_issuer_is_scopeable(caller.issuer) {
+        return Err(CallerAssertionError::InvalidClaim("caller_iss"));
+    }
     if !is_printable_claim(config.issuer, 512) {
         return Err(CallerAssertionError::InvalidClaim("iss"));
     }
@@ -305,9 +352,21 @@ pub fn sign_caller_assertion(
 
     let mut extra = Map::new();
 
+    // The two halves of the identity, unscoped, so an upstream matching its own records never has to
+    // take the composite `sub` apart. Always present: an upstream that reads these instead of `sub`
+    // must not have to care which Connection or which provider the call arrived through.
+    extra.insert(
+        "caller_iss".to_owned(),
+        Value::String(caller.issuer.to_owned()),
+    );
+    extra.insert(
+        "caller_sub".to_owned(),
+        Value::String(caller.subject.to_owned()),
+    );
+
     for claim in config.claims {
         match claim {
-            // Always emitted as `sub`; listing it changes nothing.
+            // Always emitted, scoped as `sub` and raw as `caller_sub`; listing it changes nothing.
             PrincipalClaim::Subject => {}
             PrincipalClaim::Email => {
                 if let Some(email) = caller.email {
@@ -363,10 +422,11 @@ pub fn sign_caller_assertion(
         );
     }
 
+    let scoped = scoped_subject(caller.issuer, caller.subject);
     let claims = AssertionClaims {
         iss: config.issuer,
         aud: config.audience,
-        sub: caller.subject,
+        sub: &scoped,
         iat: issued_at,
         exp: expires_at,
         jti: request_id,
@@ -385,6 +445,46 @@ pub fn sign_caller_assertion(
     Ok(token)
 }
 
+/// Whether `(x, y)` satisfies the P-256 curve equation `y^2 = x^3 - 3x + b (mod p)`.
+///
+/// A point that is merely 65 bytes starting with `0x04` can still be off the curve -- a truncated
+/// read, a coordinate pair taken from the wrong key, or a transcription slip all produce one. The
+/// resulting JWK is syntactically perfect and cryptographically useless: this gateway keeps signing
+/// while every upstream rejects the key, and the operator sees an authentication failure rather than
+/// a configuration error. Refusing at load turns that into the second thing.
+///
+/// Public data only, so this is deliberately plain arithmetic with no constant-time requirement.
+fn is_on_p256(x: &[u8], y: &[u8]) -> bool {
+    use num_bigint::BigUint;
+
+    // FIPS 186-4 P-256: p = 2^256 - 2^224 + 2^192 + 2^96 - 1, and the curve's b coefficient.
+    let Some(prime) = BigUint::parse_bytes(
+        b"ffffffff00000001000000000000000000000000ffffffffffffffffffffffff",
+        16,
+    ) else {
+        return false;
+    };
+    let Some(coefficient_b) = BigUint::parse_bytes(
+        b"5ac635d8aa3a93e7b3ebbd55769886bc651d06b0cc53b0f63bce3c3e27d2604b",
+        16,
+    ) else {
+        return false;
+    };
+
+    let x = BigUint::from_bytes_be(x);
+    let y = BigUint::from_bytes_be(y);
+    // A coordinate at or above the field prime is not a field element, whatever it satisfies.
+    if x >= prime || y >= prime {
+        return false;
+    }
+
+    // -3 as a field element, so the whole comparison stays in the non-negative naturals.
+    let a = &prime - BigUint::from(3u32);
+    let left = (&y * &y) % &prime;
+    let right = (&x * &x % &prime * &x + a * &x + coefficient_b) % &prime;
+    left == right
+}
+
 /// The public JWK for an ES256 signing key, from its uncompressed SEC1 point.
 pub fn es256_public_jwk(
     key_id: &str,
@@ -395,6 +495,9 @@ pub fn es256_public_jwk(
     }
     // 0x04, then the two 32-byte coordinates.
     if uncompressed_point.len() != 65 || uncompressed_point[0] != 0x04 {
+        return Err(CallerAssertionError::KeyUnusable);
+    }
+    if !is_on_p256(&uncompressed_point[1..33], &uncompressed_point[33..65]) {
         return Err(CallerAssertionError::KeyUnusable);
     }
     let encoder = base64::engine::general_purpose::URL_SAFE_NO_PAD;

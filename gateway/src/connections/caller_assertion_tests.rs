@@ -16,6 +16,8 @@ use super::*;
 const ISSUER: &str = "https://gateway.example";
 const AUDIENCE: &str = "https://internal.example/api";
 const REQUEST_ID: &str = "req-01hz-example-0000";
+/// The provider that authenticated the caller, which is not this gateway.
+const CALLER_ISSUER: &str = "https://idp.example";
 
 fn es256_pair() -> rcgen::KeyPair {
     rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).expect("P-256 key generates")
@@ -28,6 +30,12 @@ fn es256_key(pair: &rcgen::KeyPair) -> AssertionSigningKey {
         pair.serialize_pem().as_bytes(),
     )
     .expect("generated key loads")
+}
+
+/// The uncompressed SEC1 point of a generated key: the trailing 65 bytes of its SPKI DER.
+fn es256_public_point(pair: &rcgen::KeyPair) -> Vec<u8> {
+    let der = pair.public_key_der();
+    der[der.len() - 65..].to_vec()
 }
 
 fn config() -> CallerAssertionConfig<'static> {
@@ -44,6 +52,7 @@ fn config() -> CallerAssertionConfig<'static> {
 
 fn caller() -> CallerIdentity<'static> {
     CallerIdentity {
+        issuer: CALLER_ISSUER,
         subject: "user-1",
         email: Some("someone@example.com"),
         roles: &[],
@@ -87,7 +96,7 @@ fn an_assertion_carries_the_claims_an_upstream_verifies_on() {
     assert_eq!(header["kid"], "gw-test-1");
     assert_eq!(claims["iss"], ISSUER);
     assert_eq!(claims["aud"], AUDIENCE);
-    assert_eq!(claims["sub"], "user-1");
+    assert_eq!(claims["sub"], "https://idp.example#user-1");
     assert_eq!(claims["jti"], REQUEST_ID);
     assert_eq!(
         claims["exp"].as_u64().unwrap() - claims["iat"].as_u64().unwrap(),
@@ -123,6 +132,7 @@ fn configured_principal_claims_are_included_and_others_are_not() {
     let pair = es256_pair();
     let roles = vec!["member".to_owned(), "admin".to_owned()];
     let caller = CallerIdentity {
+        issuer: CALLER_ISSUER,
         subject: "user-1",
         email: Some("someone@example.com"),
         roles: &roles,
@@ -285,6 +295,7 @@ fn control_characters_in_a_claim_are_refused_rather_than_escaped() {
     let pair = es256_pair();
     let key = es256_key(&pair);
     let caller = CallerIdentity {
+        issuer: CALLER_ISSUER,
         subject: "user\n1",
         email: None,
         roles: &[],
@@ -326,13 +337,13 @@ fn an_es256_assertion_verifies_against_the_published_key() {
 
     let public = DecodingKey::from_ec_pem(pair.public_key_pem().as_bytes()).expect("public key");
     let decoded = decode::<Value>(&token, &public, &validation).expect("verifies");
-    assert_eq!(decoded.claims["sub"], "user-1");
+    assert_eq!(decoded.claims["sub"], "https://idp.example#user-1");
 }
 
 #[test]
 fn the_published_es256_jwk_has_the_members_a_verifier_needs() {
-    let point = [vec![0x04u8], vec![0x11u8; 32], vec![0x22u8; 32]].concat();
-    let jwk = es256_public_jwk("gw-test-1", &point).expect("valid point");
+    let pair = es256_pair();
+    let jwk = es256_public_jwk("gw-test-1", &es256_public_point(&pair)).expect("valid point");
     assert_eq!(jwk["kty"], "EC");
     assert_eq!(jwk["crv"], "P-256");
     assert_eq!(jwk["alg"], "ES256");
@@ -356,6 +367,130 @@ fn a_malformed_public_point_is_refused() {
     assert_eq!(
         es256_public_jwk("gw-test-1", &compressed),
         Err(CallerAssertionError::KeyUnusable)
+    );
+}
+
+#[test]
+fn a_public_point_that_is_not_on_the_curve_is_refused() {
+    // Right length, right prefix, wrong point. A truncated read or a coordinate pair taken from the
+    // wrong key looks exactly like this, and the JWK it produces is syntactically perfect and
+    // cryptographically useless: the gateway keeps signing while every upstream rejects the key.
+    let arbitrary = [vec![0x04u8], vec![0x11u8; 32], vec![0x22u8; 32]].concat();
+    assert_eq!(
+        es256_public_jwk("gw-test-1", &arbitrary),
+        Err(CallerAssertionError::KeyUnusable)
+    );
+
+    // One flipped byte of a real key's y coordinate leaves the curve.
+    let pair = es256_pair();
+    let mut corrupted = es256_public_point(&pair);
+    corrupted[64] ^= 0x01;
+    assert_eq!(
+        es256_public_jwk("gw-test-1", &corrupted),
+        Err(CallerAssertionError::KeyUnusable)
+    );
+
+    // A coordinate at or above the field prime is not a field element at all.
+    let too_large = [vec![0x04u8], vec![0xffu8; 32], vec![0xffu8; 32]].concat();
+    assert_eq!(
+        es256_public_jwk("gw-test-1", &too_large),
+        Err(CallerAssertionError::KeyUnusable)
+    );
+
+    // The generated key itself still passes, so the check is not simply refusing everything.
+    assert!(es256_public_jwk("gw-test-1", &es256_public_point(&pair)).is_ok());
+}
+
+#[test]
+fn two_providers_issuing_the_same_subject_are_not_the_same_caller() {
+    // The whole point of the mechanism: an upstream doing per-user ownership checks must never treat
+    // a caller from one provider as the identically named caller from another. `iss` on the token is
+    // this gateway, so `sub` has to carry the provider that actually authenticated the caller.
+    let pair = es256_pair();
+    let key = es256_key(&pair);
+    let sign = |issuer: &str| {
+        let caller = CallerIdentity {
+            issuer,
+            subject: "alice",
+            email: None,
+            roles: &[],
+        };
+        let token = sign_caller_assertion(
+            &key,
+            &config(),
+            Some(&caller),
+            REQUEST_ID,
+            1_757_000_000,
+            None,
+            None,
+        )
+        .expect("signs");
+        decode_unverified(&token).1
+    };
+
+    let first = sign("https://idp-a.example");
+    let second = sign("https://idp-b.example");
+    assert_ne!(first["sub"], second["sub"]);
+    assert_eq!(first["sub"], "https://idp-a.example#alice");
+    assert_eq!(second["sub"], "https://idp-b.example#alice");
+}
+
+#[test]
+fn the_unscoped_identity_halves_travel_beside_the_scoped_subject() {
+    // An upstream matching its own user records reads these rather than taking `sub` apart.
+    let pair = es256_pair();
+    let token = sign_caller_assertion(
+        &es256_key(&pair),
+        &config(),
+        Some(&caller()),
+        REQUEST_ID,
+        1_757_000_000,
+        None,
+        None,
+    )
+    .expect("signs");
+    let (_, claims) = decode_unverified(&token);
+    assert_eq!(claims["caller_iss"], CALLER_ISSUER);
+    assert_eq!(claims["caller_sub"], "user-1");
+    assert_eq!(claims["sub"], "https://idp.example#user-1");
+}
+
+#[test]
+fn an_issuer_that_would_make_the_subject_ambiguous_is_refused() {
+    let pair = es256_pair();
+    let key = es256_key(&pair);
+    let refuse = |issuer: &str| {
+        let caller = CallerIdentity {
+            issuer,
+            subject: "user-1",
+            email: None,
+            roles: &[],
+        };
+        sign_caller_assertion(
+            &key,
+            &config(),
+            Some(&caller),
+            REQUEST_ID,
+            1_757_000_000,
+            None,
+            None,
+        )
+    };
+
+    // OpenID Connect forbids a fragment in an issuer identifier. Honouring that is what keeps the
+    // first `#` the end of the issuer, so an issuer carrying one is refused rather than encoded.
+    assert_eq!(
+        refuse("https://idp.example#not-an-issuer"),
+        Err(CallerAssertionError::InvalidClaim("caller_iss"))
+    );
+    // No issuer means no identity boundary, and this gateway will not guess one.
+    assert_eq!(
+        refuse(""),
+        Err(CallerAssertionError::InvalidClaim("caller_iss"))
+    );
+    assert_eq!(
+        refuse("https://idp.example\n"),
+        Err(CallerAssertionError::InvalidClaim("caller_iss"))
     );
 }
 

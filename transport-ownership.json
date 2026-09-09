@@ -1085,6 +1085,7 @@
           "metrics@0.24.6|registry+https://github.com/rust-lang/crates.io-index",
           "mime_guess@2.0.5|registry+https://github.com/rust-lang/crates.io-index",
           "notify@8.2.0|registry+https://github.com/rust-lang/crates.io-index",
+          "num-bigint@0.4.8|registry+https://github.com/rust-lang/crates.io-index",
           "percent-encoding@2.3.2|registry+https://github.com/rust-lang/crates.io-index",
           "proc-macro2@1.0.106|registry+https://github.com/rust-lang/crates.io-index",
           "proptest@1.11.0|registry+https://github.com/rust-lang/crates.io-index",
@@ -5498,6 +5499,17 @@
             "req": "^8.2.0",
             "optional": false,
             "uses_default_features": true,
+            "features": [],
+            "source": "registry+https://github.com/rust-lang/crates.io-index"
+          },
+          {
+            "name": "num-bigint",
+            "rename": null,
+            "kind": null,
+            "target": null,
+            "req": "^0.4.8",
+            "optional": false,
+            "uses_default_features": false,
             "features": [],
             "source": "registry+https://github.com/rust-lang/crates.io-index"
           },

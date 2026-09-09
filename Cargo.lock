@@ -892,6 +892,7 @@ dependencies = [
  "metrics-exporter-prometheus",
  "mime_guess",
  "notify",
+ "num-bigint",
  "percent-encoding",
  "proc-macro2",
  "proptest",
