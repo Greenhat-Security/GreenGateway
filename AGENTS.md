@@ -18,18 +18,27 @@ Prefer `git log`, open issues, and open pull requests over this document for str
 
 ## Build, Test, And Lint Commands
 
-There is nothing to build yet until the Rust workspace lands in issue #3.
-
-Once the workspace exists, the expected standard commands are:
+The workspace exists: a `gateway` binary crate and the `admin-ui` front end. The commands CI runs, and the ones to run before opening a pull request, are:
 
 ```sh
-cargo build
-cargo test
 cargo fmt --check
-cargo clippy -- -D warnings
+cargo clippy --workspace --locked -- -D warnings
+cargo test --workspace --locked
+python scripts/transport_guard.py check
+python scripts/cargo_policy.py check
 ```
 
-Treat these commands as the project convention now so new code, CI, and contributor workflows converge on the same baseline.
+Four things about this repository surprise people, human and agent alike, and each costs a red CI run to discover.
+
+**Build-tool versions are pinned exactly, and they are not the ones in `rust-toolchain.toml`.** `build-tools.json` at the repository root is the source of truth, read by `scripts/build_tools.py` and the `.github/actions/build-tools` composite action. It declares `rust_ci` (what CI lints and tests with), `rust_production` (what the shipped binary is built with), `rust_coverage`, `node`, `npm` and `python`. When those differ, lint locally with the CI one — `cargo +<rust_ci> clippy ...` — or you will chase lints CI does not enforce and miss ones it does. Re-read `build-tools.json` after every pull; the pins move.
+
+**`gateway/build.rs` enforces the Node and npm pins exactly and builds `admin-ui` on every compile.** There is no skip flag. A Node that is even a patch version off fails with `build tool differs from repository version contract` before any Rust compiles, so keep the declared version on `PATH`.
+
+**The `gateway` crate has no lib target.** `cargo test -p gateway` works, and so does `cargo test --workspace`, but anything expecting a library target does not. Unit tests live beside their modules with `#[path = "..._tests.rs"] mod`.
+
+**Two fail-closed policy gates run in CI and are easy to trip.** `scripts/transport_guard.py` reviews production transport authority: every aliased or glob import, and every unexpanded macro or attribute input, needs an entry in `transport-ownership.json` recording its file, scope, hash, owner and purpose. Adding `use foo::Trait as _;` fails CI until it is registered, which is the point — a new capability should appear in review rather than arrive unnoticed. Do not hand-write the entry: run `python scripts/transport_guard.py inventory`, take the computed record from `target/transport-guard/candidate.json`, add `owner` and `purpose`, and insert it at the position the candidate file shows. `scripts/cargo_policy.py` does the equivalent for the dependency graph.
+
+**Secret scanning reads the whole history.** CI runs `gitleaks detect --source . --no-git=false`, so a credential-shaped string is a finding for as long as it is reachable, and fixing it in the working tree is not enough — the commit has to be rewritten. Keep test fixtures obviously fake and low-entropy: a realistic-looking token next to a name like `api_key` trips the generic rule on shape alone, and the scanner is right to flag it. `.gitleaksignore` is for reviewed historical exceptions pinned to a commit, not a way past a new avoidable finding. Note that a local scan in a shared worktree also sees other branches' commits, which CI would never fetch; before believing a finding, check whether the commit is actually an ancestor of your branch.
 
 ## Code Conventions
 
