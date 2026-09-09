@@ -126,6 +126,13 @@ pub struct ConnectionWrite {
     /// motivating case; `authentication` stays the upstream's own credential.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub additional_headers: Vec<AdditionalHeader>,
+    /// Attest the calling principal to the upstream, alongside `authentication`
+    /// rather than instead of it: the credential says which system is calling,
+    /// the assertion says on whose behalf. An upstream the operator controls can
+    /// then apply its own per-user checks, which a single shared credential
+    /// makes impossible. Absent means the upstream sees only the credential.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub caller_assertion: Option<CallerAssertionSettings>,
     #[serde(default, skip_serializing_if = "TlsProfile::is_empty")]
     pub tls: TlsProfile,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -194,6 +201,57 @@ pub struct AdditionalHeader {
 #[serde(rename_all = "snake_case")]
 pub enum OAuthClientAuthMethod {
     ClientSecretBasic,
+}
+
+/// How a Connection attests its caller to the upstream.
+///
+/// Every field is the operator's: this gateway holds no opinion about an
+/// upstream's issuer, audience or header name, and hardcoding any of them would
+/// make the feature usable by exactly one deployment.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct CallerAssertionSettings {
+    /// Secret alias holding the PKCS#8 private key, like the other
+    /// secret-backed fields.
+    pub signing_key_id: String,
+    /// `kid` published in the JWKS, so an upstream can select the right key and
+    /// so keys can rotate without a flag day.
+    pub key_id: String,
+    pub algorithm: CallerAssertionAlgorithm,
+    pub issuer: String,
+    pub audience: String,
+    /// JOSE `typ`. Naming the intended use stops a token minted for one upstream
+    /// being replayed at another that trusts the same keys.
+    pub token_type: String,
+    pub header_name: String,
+    pub lifetime_seconds: u32,
+    /// Principal fields to attest beyond `sub`, which is always present.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub claims: Vec<CallerAssertionClaim>,
+    /// Include the method, path and a digest of the body actually sent.
+    #[serde(default)]
+    pub bind_request: bool,
+    /// Require, and include, the approval that authorised a mutation.
+    #[serde(default)]
+    pub bind_approval: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum CallerAssertionAlgorithm {
+    Es256,
+    Rs256,
+}
+
+/// Principal fields an operator may attest.
+///
+/// A closed set rather than free-form templating, so a configuration mistake
+/// cannot attest something a caller supplied.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum CallerAssertionClaim {
+    Email,
+    Roles,
 }
 
 #[derive(Debug, Default, Clone, PartialEq, Eq, Deserialize, Serialize)]
@@ -329,6 +387,11 @@ impl ConnectionWrite {
         }
 
         validate_authentication(&mut self.authentication, self.enabled, &mut errors);
+        validate_caller_assertion(
+            self.caller_assertion.as_mut(),
+            &self.authentication,
+            &mut errors,
+        );
         validate_additional_headers(
             &mut self.additional_headers,
             &self.authentication,
@@ -468,6 +531,92 @@ impl ConnectionWrite {
 
 pub fn is_valid_connection_id(value: &str) -> bool {
     is_valid_stable_id(value, MAX_CONNECTION_ID_BYTES)
+}
+
+/// Longest assertion lifetime an operator may configure.
+///
+/// An assertion is a bearer credential for as long as it is valid, so the
+/// ceiling is a replay window, not a convenience setting.
+pub const MAX_CALLER_ASSERTION_LIFETIME_SECONDS: u32 = 300;
+
+fn validate_caller_assertion(
+    settings: Option<&mut CallerAssertionSettings>,
+    authentication: &ConnectionAuthentication,
+    errors: &mut Vec<ConnectionValidationError>,
+) {
+    let Some(settings) = settings else {
+        return;
+    };
+
+    validate_secret_id(
+        "caller_assertion.signing_key_id",
+        &settings.signing_key_id,
+        errors,
+    );
+
+    for (field, value, max) in [
+        ("caller_assertion.key_id", &settings.key_id, 128usize),
+        ("caller_assertion.issuer", &settings.issuer, 512),
+        ("caller_assertion.audience", &settings.audience, 512),
+        ("caller_assertion.token_type", &settings.token_type, 128),
+    ] {
+        if value.is_empty() || value.len() > max || value.chars().any(char::is_control) {
+            errors.push(ConnectionValidationError::new(
+                field,
+                "invalid_value",
+                format!("must be 1 to {max} bytes and contain no control characters"),
+            ));
+        }
+    }
+
+    // The assertion travels in its own header, so it must not overwrite one the
+    // Connection already owns or one a lane strips. Reusing `authorization`
+    // would also silently replace the upstream's credential.
+    if settings.header_name.is_empty()
+        || settings.header_name.len() > MAX_HEADER_NAME_BYTES
+        || HeaderName::from_str(&settings.header_name).is_err()
+        || is_reserved_credential_header(&settings.header_name)
+    {
+        errors.push(ConnectionValidationError::new(
+            "caller_assertion.header_name",
+            "invalid_header_name",
+            "must be a valid non-reserved HTTP header name of at most 64 bytes",
+        ));
+    } else {
+        settings.header_name = settings.header_name.to_ascii_lowercase();
+        if let ConnectionAuthentication::HeaderApiKey { header_name, .. } = authentication {
+            if header_name.eq_ignore_ascii_case(&settings.header_name) {
+                errors.push(ConnectionValidationError::new(
+                    "caller_assertion.header_name",
+                    "duplicate_header_name",
+                    "must differ from the header the primary credential uses",
+                ));
+            }
+        }
+    }
+
+    if settings.lifetime_seconds == 0
+        || settings.lifetime_seconds > MAX_CALLER_ASSERTION_LIFETIME_SECONDS
+    {
+        errors.push(ConnectionValidationError::new(
+            "caller_assertion.lifetime_seconds",
+            "invalid_lifetime",
+            format!("must be 1 to {MAX_CALLER_ASSERTION_LIFETIME_SECONDS} seconds"),
+        ));
+    }
+
+    let mut seen = Vec::with_capacity(settings.claims.len());
+    for claim in &settings.claims {
+        if seen.contains(claim) {
+            errors.push(ConnectionValidationError::new(
+                "caller_assertion.claims",
+                "duplicate_claim",
+                "each claim may be listed once",
+            ));
+            break;
+        }
+        seen.push(*claim);
+    }
 }
 
 fn validate_authentication(
@@ -1138,6 +1287,139 @@ mod tests {
                 "expected_statuses": [200, 204]
             }
         })
+    }
+
+    /// A connection that attests its caller, valid against both the published
+    /// schema and the Rust validator.
+    fn with_caller_assertion(overrides: Value) -> Value {
+        let mut connection = example();
+        let mut assertion = json!({
+            "signing_key_id": "assertion-signing-key",
+            "key_id": "gw-2026-09",
+            "algorithm": "es256",
+            "issuer": "https://gateway.example.test",
+            "audience": "https://internal.example.test/api",
+            "token_type": "at+jwt",
+            "header_name": "X-Caller-Assertion",
+            "lifetime_seconds": 60
+        });
+        for (key, value) in overrides.as_object().expect("overrides object") {
+            assertion[key] = value.clone();
+        }
+        connection["caller_assertion"] = assertion;
+        connection
+    }
+
+    fn assertion_errors(overrides: Value) -> Vec<ConnectionValidationError> {
+        let candidate: ConnectionWrite = serde_json::from_value(with_caller_assertion(overrides))
+            .expect("candidate should deserialize");
+        candidate
+            .validated()
+            .expect_err("candidate should be rejected")
+    }
+
+    #[test]
+    fn caller_assertion_matches_schema_and_normalizes_its_header() {
+        let document = with_caller_assertion(json!({}));
+        connection_schema_validator()
+            .validate(&document)
+            .expect("published schema should accept a caller assertion");
+
+        let validated = serde_json::from_value::<ConnectionWrite>(document)
+            .expect("should deserialize")
+            .validated()
+            .expect("should validate");
+        let assertion = validated.caller_assertion.expect("assertion retained");
+        // Header names are compared lowercase everywhere else, so store them that way.
+        assert_eq!(assertion.header_name, "x-caller-assertion");
+        assert!(assertion.claims.is_empty());
+        assert!(!assertion.bind_request);
+    }
+
+    #[test]
+    fn a_connection_without_a_caller_assertion_is_unchanged() {
+        // The field is additive: every existing connection must keep validating,
+        // and must not start sending a header it never asked for.
+        let validated = serde_json::from_value::<ConnectionWrite>(example())
+            .expect("should deserialize")
+            .validated()
+            .expect("should validate");
+        assert!(validated.caller_assertion.is_none());
+    }
+
+    #[test]
+    fn the_assertion_header_may_not_be_reserved_or_the_credential_s_own() {
+        // Sending it as `authorization` would silently replace the upstream's
+        // credential rather than accompany it.
+        let errors = assertion_errors(json!({ "header_name": "Authorization" }));
+        assert!(errors
+            .iter()
+            .any(|error| error.field == "caller_assertion.header_name"));
+
+        // And it must not collide with a header-api-key credential's own header,
+        // which would overwrite one with the other depending on injection order.
+        let mut document = with_caller_assertion(json!({ "header_name": "X-Api-Key" }));
+        document["authentication"] = json!({
+            "type": "header_api_key",
+            "header_name": "X-Api-Key",
+            "secret_id": "billing-api-key"
+        });
+        let errors = serde_json::from_value::<ConnectionWrite>(document)
+            .expect("should deserialize")
+            .validated()
+            .expect_err("colliding header should be rejected");
+        assert!(errors
+            .iter()
+            .any(|error| error.code == "duplicate_header_name"));
+    }
+
+    #[test]
+    fn the_assertion_lifetime_is_bounded() {
+        // The assertion is a bearer credential for as long as it is valid, so the
+        // ceiling is a replay window rather than a preference.
+        for lifetime in [json!(0), json!(MAX_CALLER_ASSERTION_LIFETIME_SECONDS + 1)] {
+            let errors = assertion_errors(json!({ "lifetime_seconds": lifetime }));
+            assert!(errors
+                .iter()
+                .any(|error| error.field == "caller_assertion.lifetime_seconds"));
+        }
+    }
+
+    #[test]
+    fn assertion_identifiers_are_bounded_and_free_of_control_characters() {
+        for (field, value) in [
+            ("issuer", json!("")),
+            (
+                "audience",
+                json!(
+                    "has
+newline"
+                ),
+            ),
+            ("token_type", json!("x".repeat(129))),
+        ] {
+            let errors = assertion_errors(json!({ field: value }));
+            assert!(
+                errors
+                    .iter()
+                    .any(|error| error.field == format!("caller_assertion.{field}")),
+                "{field} should be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn a_claim_may_be_listed_once() {
+        let errors = assertion_errors(json!({ "claims": ["email", "email"] }));
+        assert!(errors.iter().any(|error| error.code == "duplicate_claim"));
+    }
+
+    #[test]
+    fn the_schema_refuses_an_unknown_assertion_field() {
+        // additionalProperties is false, so a typo is a rejection rather than a
+        // setting that silently does nothing.
+        let document = with_caller_assertion(json!({ "bind_requests": true }));
+        assert!(connection_schema_validator().validate(&document).is_err());
     }
 
     #[test]
