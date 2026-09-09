@@ -12,7 +12,7 @@ use crate::{
         decision::{PolicyDecision, PolicyDecisionOutcome},
         rbac::{rbac_middleware, RbacState},
     },
-    upstream_route::ProxyRouteClassificationCompleted,
+    upstream_route::{ProxyRouteClassificationCompleted, ProxyRouteObservationContext},
 };
 
 fn compile(value: Value) -> CompiledPolicy {
@@ -47,6 +47,8 @@ fn context(compiled: &CompiledPolicy) -> PolicyEvaluationContext {
         path: Some("/data/item".to_owned()),
         principal: PrincipalFact::Anonymous,
         target: HttpTarget::Contextless,
+        request_host: HostFact::Absent,
+        dispatch: None,
     }
 }
 
@@ -223,11 +225,13 @@ fn missing_facts_are_indeterminate_and_never_reusable_or_permitted() {
     let mut input = baseline.clone();
     input.target = HttpTarget::Missing;
     cases.push((input, Limitation::MissingDispatchFact));
-    for target in [HttpTarget::ProxyDispatch, HttpTarget::McpAlias] {
-        let mut input = baseline.clone();
-        input.target = target;
-        cases.push((input, Limitation::UnsupportedTarget));
-    }
+    // A classified dispatch is supported now, but only with its facts supplied.
+    let mut input = baseline.clone();
+    input.target = HttpTarget::ProxyDispatch;
+    cases.push((input, Limitation::MissingDispatchFact));
+    let mut input = baseline.clone();
+    input.target = HttpTarget::McpAlias;
+    cases.push((input, Limitation::UnsupportedTarget));
     for (input, limitation) in cases {
         let result = compiled.evaluate(&input).unwrap();
         assert_eq!(result.logical, LogicalDecision::Indeterminate);
@@ -243,24 +247,61 @@ fn missing_facts_are_indeterminate_and_never_reusable_or_permitted() {
 }
 
 #[test]
-fn routing_contracts_remain_explicitly_unsupported_even_with_permissive_defaults() {
-    for extra in [
-        json!({"routes":[{"hosts":["api.example.test"],"path_prefix":"/","permission":"read"}]}),
-        json!({"rules":[{"path":"/**","dispatch":{"kind":"contextless"},"action":"allow"}]}),
-    ] {
-        let mut value = json!({"schema_version":"0.1.0","default_action":"allow"});
-        value
-            .as_object_mut()
-            .unwrap()
-            .extend(extra.as_object().unwrap().clone());
-        let compiled = compile(value);
-        let result = compiled.evaluate(&context(&compiled)).unwrap();
-        assert_eq!(
-            result.limitation,
-            Some(Limitation::UnsupportedRoutingPolicy)
-        );
-        assert_eq!(result.effect, PolicyEffect::Block);
-    }
+fn an_uncaptured_host_is_unanswerable_only_when_a_route_could_turn_on_it() {
+    // A host-qualified route makes the request host decisive, so not having it
+    // is a question this kernel cannot answer -- even under `default_action:
+    // allow`, where guessing would be the permissive direction.
+    let compiled = compile(json!({
+        "schema_version":"0.1.0","default_action":"allow",
+        "routes":[{"hosts":["api.example.test"],"path_prefix":"/","permission":"read"}]
+    }));
+    let mut input = context(&compiled);
+    input.request_host = HostFact::Missing;
+    let result = compiled.evaluate(&input).unwrap();
+    assert_eq!(result.limitation, Some(Limitation::MissingHostFact));
+    assert_eq!(result.logical, LogicalDecision::Indeterminate);
+    assert_eq!(result.effect, PolicyEffect::Block);
+    assert!(!result.complete);
+
+    // The same absent fact against a policy no route binds on is not a
+    // limitation at all: it cannot change the answer, so it is not demanded.
+    let unbound = compile(json!({
+        "schema_version":"0.1.0","default_action":"allow",
+        "routes":[{"path_prefix":"/","permission":"read"}]
+    }));
+    let mut input = context(&unbound);
+    input.request_host = HostFact::Missing;
+    let result = unbound.evaluate(&input).unwrap();
+    assert_eq!(result.limitation, None);
+    assert!(result.complete);
+}
+
+#[test]
+fn a_classified_dispatch_without_its_facts_is_indeterminate() {
+    let compiled = compile(json!({
+        "schema_version":"0.1.0","default_action":"allow",
+        "rules":[{"path":"/**","dispatch":{"kind":"contextless"},"action":"allow"}]
+    }));
+    let mut input = context(&compiled);
+    input.target = HttpTarget::ProxyDispatch;
+    input.dispatch = None;
+    let result = compiled.evaluate(&input).unwrap();
+    assert_eq!(result.limitation, Some(Limitation::MissingDispatchFact));
+    assert_eq!(result.effect, PolicyEffect::Block);
+
+    // Routing that was never classified stays unanswerable: a dispatch-scoped
+    // rule would silently not apply, which is not the same as not matching.
+    let mut input = context(&compiled);
+    input.target = HttpTarget::Missing;
+    let result = compiled.evaluate(&input).unwrap();
+    assert_eq!(result.limitation, Some(Limitation::MissingDispatchFact));
+
+    // MCP aliases still need their raw and canonical identities evaluated
+    // together, and that lane is not this one.
+    let mut input = context(&compiled);
+    input.target = HttpTarget::McpAlias;
+    let result = compiled.evaluate(&input).unwrap();
+    assert_eq!(result.limitation, Some(Limitation::UnsupportedTarget));
 }
 
 #[test]
@@ -392,7 +433,7 @@ fn pure_evaluation_is_thread_safe_deterministic_bounded_and_redacted_without_a_r
     assert!(!String::from_utf8(bytes.clone()).unwrap().contains(canary));
     assert!(!format!("{compiled:?} {input:?} {expected:?}").contains(canary));
     let trace: Value = serde_json::from_slice(&bytes).unwrap();
-    assert_eq!(trace["domain"], "http_contextless_v1");
+    assert_eq!(trace["domain"], HTTP_DOMAIN);
     for stage in [
         "authentication",
         "csrf",
@@ -518,6 +559,325 @@ fn direct_principal_constraints_use_existing_identity_and_method_semantics() {
         assert_eq!(
             compiled.evaluate(&input).unwrap().reason,
             Reason::DefaultDeny
+        );
+    }
+}
+
+#[tokio::test]
+async fn routing_lane_matches_current_middleware_for_host_bound_and_dispatch_scoped_requests() {
+    // Same discipline as the contextless lane: the authoritative middleware is
+    // the oracle. A second hand-written evaluator would only prove the kernel
+    // agrees with a copy of itself, and the asymmetry under test -- a direct
+    // allow losing its authority once an upstream is selected -- is exactly the
+    // kind of rule a copy quietly gets wrong.
+    const UPSTREAM: &str = "https://upstream.internal.test";
+    for default in ["allow", "deny"] {
+        for direct in [None, Some("allow"), Some("deny"), Some("shadow")] {
+            let mut value = json!({
+                "schema_version":"0.1.0","default_action":default,
+                "roles":{"reader":{"permissions":["read"]}},
+                "routes":[
+                    {"hosts":["api.example.test"],"path_prefix":"/data","permission":"read"},
+                    {"path_prefix":"/data","permission":"read"}
+                ],
+                "rules":[
+                    {"id":"scoped","path":"/scoped/**","dispatch":{"kind":"route","route_id":"route-1"},"action":"deny"}
+                ]
+            });
+            if let Some(action) = direct {
+                value["rules"]
+                    .as_array_mut()
+                    .unwrap()
+                    .push(json!({"id":"broad","path":"/data/**","action":action}));
+            }
+            let compiled = compile(value.clone());
+            let policy = Policy::validate_json_value(value).unwrap();
+            let capture = CaptureSink::new();
+            let audit = AuditLog::new(Arc::new(capture.clone()) as Arc<dyn AuditSink>);
+            let state = RbacState::new(policy.clone(), Vec::new(), false, audit.clone());
+            let router = Router::new()
+                .fallback(any(|| async { "local" }))
+                .layer(from_fn_with_state(state, rbac_middleware));
+
+            let mut expected_events = Vec::new();
+            for route_host in [None, Some("api.example.test"), Some("other.example.test")] {
+                for request_host in ["api.example.test", "API.EXAMPLE.TEST", "other.example.test"] {
+                    for path in ["/data/item", "/scoped/item"] {
+                        for identity in [None, Some(principal(&["reader"]))] {
+                            let observation = ProxyRouteObservationContext::new_with_route_id(
+                                "route-1".to_owned(),
+                                route_host.map(str::to_owned),
+                                Some("/".to_owned()),
+                                UPSTREAM.to_owned(),
+                            );
+                            // Production derives the authorization context from
+                            // the observation context, so a bound route host is
+                            // what makes a virtual upstream selected.
+                            let authorization = observation.authorization_context();
+
+                            let mut input = context(&compiled);
+                            input.path = Some(path.to_owned());
+                            input.target = HttpTarget::ProxyDispatch;
+                            input.request_host = HostFact::Present(request_host.to_owned());
+                            input.dispatch = Some(DispatchFacts {
+                                route_id: Some("route-1".to_owned()),
+                                route_host: route_host.map(str::to_owned),
+                                route_path_prefix: Some("/".to_owned()),
+                                upstream_origin: Some(UPSTREAM.to_owned()),
+                                required_host: authorization
+                                    .as_ref()
+                                    .map(|context| context.host.clone()),
+                            });
+                            input.principal =
+                                identity
+                                    .as_ref()
+                                    .map_or(PrincipalFact::Anonymous, |identity| {
+                                        PrincipalFact::Authenticated(
+                                            PrincipalIdentity::from_principal(identity),
+                                        )
+                                    });
+                            let result = compiled.evaluate(&input).unwrap();
+
+                            let mut request = Request::builder()
+                                .method(Method::GET)
+                                .uri(path)
+                                .header("host", request_host)
+                                .body(Body::empty())
+                                .unwrap();
+                            request
+                                .extensions_mut()
+                                .insert(ProxyRouteClassificationCompleted);
+                            request.extensions_mut().insert(observation);
+                            if let Some(authorization) = authorization {
+                                request.extensions_mut().insert(authorization);
+                            }
+                            if let Some(identity) = identity {
+                                request.extensions_mut().insert(identity);
+                            }
+                            let response = router.clone().oneshot(request).await.unwrap();
+                            let live = response.extensions().get::<PolicyDecision>().unwrap();
+
+                            let label = format!(
+                                "{default}/{direct:?} route_host={route_host:?} request_host={request_host} {path}"
+                            );
+                            let (outcome, status, event) = match result.effect {
+                                PolicyEffect::Allow => (
+                                    PolicyDecisionOutcome::Allowed,
+                                    StatusCode::OK,
+                                    "authz.allowed",
+                                ),
+                                PolicyEffect::Observe => (
+                                    PolicyDecisionOutcome::WouldDeny,
+                                    StatusCode::OK,
+                                    "authz.would_deny",
+                                ),
+                                PolicyEffect::Block => (
+                                    PolicyDecisionOutcome::Denied,
+                                    StatusCode::FORBIDDEN,
+                                    "authz.denied",
+                                ),
+                            };
+                            assert_eq!(live.outcome, outcome, "{label}");
+                            assert_eq!(response.status(), status, "{label}");
+                            assert_eq!(live.reason, result.reason.as_str(), "{label}");
+                            match result.matched {
+                                Some(RuleReference::Direct(index)) => assert_eq!(
+                                    live.matched_rule_id,
+                                    Some(
+                                        policy.rules[index]
+                                            .id
+                                            .clone()
+                                            .unwrap_or_else(|| index.to_string())
+                                    ),
+                                    "{label}"
+                                ),
+                                Some(RuleReference::Route(index)) => {
+                                    assert_eq!(
+                                        live.permission.as_deref(),
+                                        Some(policy.routes[index].permission.as_str()),
+                                        "{label}"
+                                    );
+                                    assert_eq!(
+                                        live.path_prefix.as_deref(),
+                                        Some(policy.routes[index].path_prefix.as_str()),
+                                        "{label}"
+                                    );
+                                }
+                                None => {
+                                    assert_eq!(live.matched_rule_id, None, "{label}");
+                                    assert_eq!(live.permission, None, "{label}");
+                                }
+                            }
+                            assert!(result.complete, "{label}");
+                            // A shadow rule the host binding stripped of its
+                            // authority still records a would-deny first.
+                            if result.observation.is_some() {
+                                expected_events.push("authz.would_deny");
+                            }
+                            expected_events.push(event);
+                        }
+                    }
+                }
+            }
+            audit.close_and_drain(Duration::from_secs(5)).await.unwrap();
+            let events = capture.events();
+            let observed: Vec<&str> = events
+                .iter()
+                .map(|event| event.event_type.as_str())
+                .collect();
+            assert_eq!(observed, expected_events, "{default}/{direct:?}");
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_direct_allow_cannot_authorize_a_selected_upstream_but_a_deny_still_blocks() {
+    // The asymmetry stated plainly, so a future simplification that collapses
+    // it fails here with an obvious name rather than deep inside a matrix.
+    const UPSTREAM: &str = "https://upstream.internal.test";
+    for (action, expected) in [
+        (json!("allow"), PolicyEffect::Block),
+        (json!("deny"), PolicyEffect::Block),
+    ] {
+        let compiled = compile(json!({
+            "schema_version":"0.1.0","default_action":"deny",
+            "routes":[{"hosts":["other.example.test"],"path_prefix":"/data","permission":"read"}],
+            "rules":[{"id":"broad","path":"/data/**","action":action}]
+        }));
+        let mut input = context(&compiled);
+        input.path = Some("/data/item".to_owned());
+        input.target = HttpTarget::ProxyDispatch;
+        input.request_host = HostFact::Present("api.example.test".to_owned());
+        input.dispatch = Some(DispatchFacts {
+            route_id: None,
+            route_host: Some("api.example.test".to_owned()),
+            route_path_prefix: Some("/".to_owned()),
+            upstream_origin: Some(UPSTREAM.to_owned()),
+            required_host: Some("api.example.test".to_owned()),
+        });
+        let result = compiled.evaluate(&input).unwrap();
+        assert_eq!(result.effect, expected, "{action}");
+        // The allow did not decide, and no host-bound route authorized the
+        // selected upstream, so the refusal is the host-binding one rather than
+        // the policy default -- which here would have been the same answer, and
+        // under `default_action: allow` would not have been.
+        if action == json!("allow") {
+            assert_eq!(result.matched, None);
+            assert_eq!(result.reason, Reason::HostPolicyRequired);
+        } else {
+            assert_eq!(result.matched, Some(RuleReference::Direct(0)));
+        }
+
+        // Without a selected upstream the same allow decides, as it always has.
+        let mut unbound = input.clone();
+        unbound.target = HttpTarget::Contextless;
+        unbound.dispatch = None;
+        let result = compiled.evaluate(&unbound).unwrap();
+        assert_eq!(result.matched, Some(RuleReference::Direct(0)));
+    }
+}
+
+#[test]
+fn a_permissive_default_does_not_authorize_an_unrouted_virtual_upstream() {
+    // The case where the host-binding refusal is not merely the same answer the
+    // default would have given. `default_action: allow` means "allow what this
+    // gateway serves directly", not "allow any virtual host reachable through
+    // it", and shadow enforcement must not forward on that basis either.
+    for mode in ["enforce", "shadow"] {
+        let compiled = compile(json!({
+            "schema_version":"0.1.0","default_action":"allow","enforcement_mode":mode,
+            "routes":[{"hosts":["other.example.test"],"path_prefix":"/data","permission":"read"}]
+        }));
+        let mut input = context(&compiled);
+        input.path = Some("/data/item".to_owned());
+        input.target = HttpTarget::ProxyDispatch;
+        input.request_host = HostFact::Present("api.example.test".to_owned());
+        input.dispatch = Some(DispatchFacts {
+            route_id: None,
+            route_host: Some("api.example.test".to_owned()),
+            route_path_prefix: Some("/".to_owned()),
+            upstream_origin: Some("https://upstream.internal.test".to_owned()),
+            required_host: Some("api.example.test".to_owned()),
+        });
+        let result = compiled.evaluate(&input).unwrap();
+        assert_eq!(result.logical, LogicalDecision::Deny, "{mode}");
+        assert_eq!(result.effect, PolicyEffect::Block, "{mode}");
+        assert_eq!(result.reason, Reason::HostPolicyRequired, "{mode}");
+        assert!(result.complete, "{mode}");
+
+        // The identical request with no upstream selected takes the default.
+        let mut direct = input.clone();
+        direct.target = HttpTarget::Contextless;
+        direct.dispatch = None;
+        let result = compiled.evaluate(&direct).unwrap();
+        assert_eq!(result.logical, LogicalDecision::Allow, "{mode}");
+        assert_eq!(result.reason, Reason::DefaultAllow, "{mode}");
+    }
+}
+
+#[test]
+fn dispatch_facts_on_a_non_dispatch_target_are_rejected_rather_than_ignored() {
+    // Two readings of one context is the bug: the target says there is no
+    // dispatch, the facts say a virtual upstream was selected. Ignoring the
+    // facts would drop the `required_host` that makes a refusal a refusal.
+    let compiled = compile(json!({
+        "schema_version":"0.1.0","default_action":"allow",
+        "routes":[{"hosts":["other.example.test"],"path_prefix":"/data","permission":"read"}]
+    }));
+    let facts = DispatchFacts {
+        route_id: None,
+        route_host: Some("api.example.test".to_owned()),
+        route_path_prefix: Some("/".to_owned()),
+        upstream_origin: Some("https://upstream.internal.test".to_owned()),
+        required_host: Some("api.example.test".to_owned()),
+    };
+    for target in [
+        HttpTarget::Contextless,
+        HttpTarget::Missing,
+        HttpTarget::McpAlias,
+    ] {
+        let mut input = context(&compiled);
+        input.target = target;
+        input.dispatch = Some(facts.clone());
+        assert_eq!(
+            compiled.evaluate(&input),
+            Err(EvaluationError::InconsistentContext),
+            "{target:?}"
+        );
+    }
+
+    // The same facts under the target that evaluates them are accepted.
+    let mut input = context(&compiled);
+    input.target = HttpTarget::ProxyDispatch;
+    input.dispatch = Some(facts);
+    assert!(compiled.evaluate(&input).is_ok());
+}
+
+#[test]
+fn a_host_that_is_not_a_bare_hostname_is_rejected() {
+    // The routing lane compares bare hostnames. A value still carrying a port
+    // or a path would silently fail every host comparison, which looks like a
+    // policy decision rather than the malformed input it is.
+    let compiled = compile(basic_policy());
+    for host in ["", "api.example.test:8443", "api.example.test/data"] {
+        let mut input = context(&compiled);
+        input.request_host = HostFact::Present(host.to_owned());
+        assert_eq!(
+            compiled.evaluate(&input),
+            Err(EvaluationError::InvalidHost),
+            "{host}"
+        );
+
+        let mut input = context(&compiled);
+        input.target = HttpTarget::ProxyDispatch;
+        input.dispatch = Some(DispatchFacts {
+            required_host: Some(host.to_owned()),
+            ..DispatchFacts::default()
+        });
+        assert_eq!(
+            compiled.evaluate(&input),
+            Err(EvaluationError::InvalidHost),
+            "{host}"
         );
     }
 }

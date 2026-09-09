@@ -1,6 +1,35 @@
-//! Pure policy foundation for issue #421, PR 1. Production adapters stay in
-//! middleware until #422 proves each cutover. This slice supports contextless
-//! HTTP direct rules, ordinary permission routes, and defaults only.
+//! Pure policy foundation for issue #421. Production adapters stay in
+//! middleware until #422 proves each cutover.
+//!
+//! PR 1 supported contextless HTTP direct rules, ordinary permission routes and
+//! defaults. This slice adds the routing lane: host-qualified routes and
+//! dispatch-scoped direct rules, for both contextless requests and a classified
+//! proxy dispatch.
+//!
+//! ## Host qualification is the one place a direct allow does not decide
+//!
+//! Direct rules otherwise run before, and win over, the route/permission model.
+//! When a virtual upstream has been selected, that inverts: a direct deny still
+//! blocks, but a direct allow or shadow cannot authorize the selected upstream,
+//! and authorization must come from a host-bound route. Losing that asymmetry
+//! would let a broad `/**` allow authorize every virtual host on the gateway,
+//! so the kernel reproduces it rather than simplifying it.
+//!
+//! A first-matching shadow rule on such a request still records a would-deny
+//! observation before the route decides. That observation is a second, separate
+//! output, reported as [`Evaluation::observation`]: the kernel emits nothing
+//! itself, and an adapter that dropped it would silently lose telemetry the
+//! live path produces today.
+//!
+//! ## Facts, not guesses
+//!
+//! A fact this lane needs and does not have is [`LogicalDecision::Indeterminate`]
+//! with a stable limitation, never a default. The request host is a three-state
+//! [`HostFact`] for that reason: a request that genuinely carried no `Host`
+//! header is a different input from one whose host was never captured, and only
+//! the second is unanswerable. The host fact is required only when the compiled
+//! policy actually has host-qualified routes, so a caller is never asked for a
+//! fact that cannot change the result.
 //!
 //! No runtime handle, store, audit sink, provider, resolver, or callback enters
 //! this API. Principal inputs contain only policy facts, never credentials.
@@ -22,13 +51,17 @@ use crate::{
     auth::{AuthMethod, Principal},
     path_match::{is_unsafe_request_path, path_prefix_matches},
     rbac::{
-        matcher::method_matches, policy::KNOWN_TOP_LEVEL_KEYS, DefaultAction, EnforcementMode,
-        Policy, PolicyEngine, RuleAction, RuleMatcher,
+        matcher::{method_matches, RuleDispatchContext},
+        policy::KNOWN_TOP_LEVEL_KEYS,
+        DefaultAction, EnforcementMode, Policy, PolicyEngine, RuleAction, RuleMatcher,
     },
 };
 
-pub(crate) const CONTEXT_VERSION: u16 = 1;
-pub(crate) const HTTP_SEMANTICS_VERSION: &str = "gg-http-contextless-v1";
+/// The routing lane adds required facts to the context, so a context built for
+/// the previous version is not silently reinterpreted under this one.
+pub(crate) const CONTEXT_VERSION: u16 = 2;
+pub(crate) const HTTP_SEMANTICS_VERSION: &str = "gg-http-routing-v1";
+pub(crate) const HTTP_DOMAIN: &str = "http_routing_v1";
 pub(crate) const MAX_TRACE_BYTES: usize = 2048;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
@@ -54,7 +87,9 @@ pub(crate) struct CompiledPolicy {
     engine: PolicyEngine,
     matcher: RuleMatcher,
     snapshot: ResourceSnapshot,
-    unsupported_routing: bool,
+    /// Whether any route is host-qualified. Only then does the request host
+    /// change a result, and only then is the caller asked to supply it.
+    host_qualified_routes: bool,
 }
 
 impl fmt::Debug for CompiledPolicy {
@@ -101,8 +136,7 @@ impl CompiledPolicy {
         // Reuse the existing normalizer and semantic validator. All top-level
         // keys have been checked, so its unknown-key warning cannot be emitted.
         let policy = Policy::validate_json_value(value).map_err(|_| CompileError::InvalidPolicy)?;
-        let unsupported_routing = policy.routes.iter().any(|route| !route.hosts.is_empty())
-            || policy.rules.iter().any(|rule| rule.dispatch.is_some());
+        let host_qualified_routes = policy.routes.iter().any(|route| !route.hosts.is_empty());
         let snapshot = ResourceSnapshot {
             source_digest: framed_digest("source", "application/json", "0.1.0", source),
             authority,
@@ -113,7 +147,7 @@ impl CompiledPolicy {
             matcher: RuleMatcher::new(&policy.rules),
             engine: PolicyEngine::new(policy),
             snapshot,
-            unsupported_routing,
+            host_qualified_routes,
         })
     }
 
@@ -137,19 +171,18 @@ impl CompiledPolicy {
             match context.target {
                 HttpTarget::Missing => Some(Limitation::MissingDispatchFact),
                 HttpTarget::Contextless => None,
-                HttpTarget::ProxyDispatch | HttpTarget::McpAlias => {
-                    Some(Limitation::UnsupportedTarget)
+                HttpTarget::ProxyDispatch if context.dispatch.is_none() => {
+                    Some(Limitation::MissingDispatchFact)
                 }
+                HttpTarget::ProxyDispatch => None,
+                // Raw and canonical identities must be evaluated together; that
+                // lane is not this one, and guessing one identity would let a
+                // deny on the other be suppressed.
+                HttpTarget::McpAlias => Some(Limitation::UnsupportedTarget),
             }
         };
         if let Some(limitation) = missing {
             return Ok(Evaluation::indeterminate(binding, limitation));
-        }
-        if self.unsupported_routing {
-            return Ok(Evaluation::indeterminate(
-                binding,
-                Limitation::UnsupportedRoutingPolicy,
-            ));
         }
         let (Some(method), Some(path)) = (&context.method, &context.path) else {
             return Err(EvaluationError::InternalInvariant);
@@ -159,7 +192,64 @@ impl CompiledPolicy {
             PrincipalFact::Anonymous => None,
             PrincipalFact::Missing => return Err(EvaluationError::InternalInvariant),
         };
-        if let Some(decision) = self.matcher.evaluate(method.as_str(), path, principal) {
+
+        let dispatch = context.dispatch.as_ref();
+        // A selected virtual upstream. Its presence, not the mere existence of a
+        // classified dispatch, is what makes a route's host binding mandatory.
+        let required_host = dispatch.and_then(|facts| facts.required_host.as_deref());
+        let host_binding_required = required_host.is_some();
+        // The host routes are matched against: the selected upstream's when one
+        // was chosen, otherwise the request's own.
+        let effective_host = match (required_host, &context.request_host) {
+            (Some(host), _) => Some(host),
+            (None, HostFact::Present(host)) => Some(host.as_str()),
+            (None, HostFact::Absent) => None,
+            (None, HostFact::Missing) => {
+                // Only unanswerable when a route could actually turn on it.
+                if self.host_qualified_routes {
+                    return Ok(Evaluation::indeterminate(
+                        binding,
+                        Limitation::MissingHostFact,
+                    ));
+                }
+                None
+            }
+        };
+        let dispatch_context = match (context.target, dispatch) {
+            (HttpTarget::Contextless, _) => RuleDispatchContext::contextless(),
+            (HttpTarget::ProxyDispatch, Some(facts)) => {
+                RuleDispatchContext::classified_with_route_id(
+                    facts.route_id.as_deref(),
+                    facts.route_host.as_deref(),
+                    facts.route_path_prefix.as_deref(),
+                    facts.upstream_origin.as_deref(),
+                )
+            }
+            _ => return Err(EvaluationError::InternalInvariant),
+        };
+
+        // Direct rules first, except that a selected upstream narrows them to
+        // denies: an allow or shadow must not authorize a virtual host. The
+        // first match is still computed, because a shadow among the rules an
+        // upstream-bound request skips is still recorded as a would-deny.
+        let first_direct =
+            self.matcher
+                .evaluate_with_dispatch(method.as_str(), path, principal, dispatch_context);
+        let observation = first_direct.as_ref().and_then(|decision| {
+            (host_binding_required && decision.action == RuleAction::Shadow)
+                .then_some(RuleReference::Direct(decision.rule_index))
+        });
+        let deciding_direct = if host_binding_required {
+            self.matcher.evaluate_denies_with_dispatch(
+                method.as_str(),
+                path,
+                principal,
+                dispatch_context,
+            )
+        } else {
+            first_direct
+        };
+        if let Some(decision) = deciding_direct {
             let (logical, effect) = match decision.action {
                 RuleAction::Allow => (LogicalDecision::Allow, PolicyEffect::Allow),
                 RuleAction::Deny => (LogicalDecision::Deny, PolicyEffect::Block),
@@ -171,6 +261,7 @@ impl CompiledPolicy {
                 effect,
                 Reason::MatchedRule,
                 Some(RuleReference::Direct(decision.rule_index)),
+                observation,
             ));
         }
         let policy = self.engine.policy();
@@ -179,6 +270,7 @@ impl CompiledPolicy {
         if let Some((index, route)) = policy.routes.iter().enumerate().find(|(_, route)| {
             path_prefix_matches(path, &route.path_prefix)
                 && method_matches(&route.methods, method.as_str())
+                && route_host_matches(&route.hosts, effective_host, host_binding_required)
         }) {
             let allowed = principal.is_some_and(|principal| {
                 self.engine
@@ -204,6 +296,22 @@ impl CompiledPolicy {
                 ),
                 reason,
                 Some(RuleReference::Route(index)),
+                observation,
+            ));
+        }
+        // A selected upstream that no host-bound route authorizes is refused
+        // outright. The policy default does not apply and shadow enforcement
+        // does not soften it: `default_action: allow` must not become blanket
+        // authorization for every virtual host the gateway can reach, and a
+        // gateway in shadow mode must not forward to one on that basis.
+        if host_binding_required {
+            return Ok(Evaluation::complete(
+                binding,
+                LogicalDecision::Deny,
+                PolicyEffect::Block,
+                Reason::HostPolicyRequired,
+                None,
+                observation,
             ));
         }
         let allowed = policy.default_action == DefaultAction::Allow;
@@ -221,8 +329,30 @@ impl CompiledPolicy {
                 Reason::DefaultDeny
             },
             None,
+            observation,
         ))
     }
+}
+
+/// Whether a route's host binding admits this request.
+///
+/// An unbound route serves any host, but only while no virtual upstream was
+/// selected: once one is, an unbound route can no longer authorize it. Bound
+/// routes compare ASCII-case-insensitively, matching how hosts are compared
+/// everywhere else.
+fn route_host_matches(
+    hosts: &[String],
+    request_host: Option<&str>,
+    binding_required: bool,
+) -> bool {
+    if hosts.is_empty() {
+        return !binding_required;
+    }
+    request_host.is_some_and(|request_host| {
+        hosts
+            .iter()
+            .any(|host| host.eq_ignore_ascii_case(request_host))
+    })
 }
 
 fn effect(allowed: bool, mode: EnforcementMode) -> PolicyEffect {
@@ -261,13 +391,42 @@ pub(crate) enum PrincipalFact {
     Authenticated(PrincipalIdentity),
 }
 
-#[derive(Clone, Copy, Debug, Serialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum HttpTarget {
+    /// Routing was never classified for this request, so a dispatch-scoped rule
+    /// would silently not apply. Unanswerable rather than answered permissively.
     Missing,
     Contextless,
     ProxyDispatch,
     McpAlias,
+}
+
+/// The request host, distinguishing "no `Host` header" from "never captured".
+///
+/// Collapsing the two would let an uncaptured host be answered as though the
+/// request had none, which for a host-qualified route is the difference between
+/// no match and an unanswerable question.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum HostFact {
+    Missing,
+    Absent,
+    Present(String),
+}
+
+/// Trusted routing facts established before policy evaluation.
+///
+/// Every field is supplied by the caller. The kernel resolves nothing: it does
+/// not parse an origin, consult routing tables, or select an upstream.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct DispatchFacts {
+    pub(crate) route_id: Option<String>,
+    pub(crate) route_host: Option<String>,
+    pub(crate) route_path_prefix: Option<String>,
+    pub(crate) upstream_origin: Option<String>,
+    /// The virtual upstream host this request was bound to, when one was
+    /// selected. Its presence makes a route's host binding mandatory.
+    pub(crate) required_host: Option<String>,
 }
 
 #[derive(Clone)]
@@ -279,6 +438,12 @@ pub(crate) struct PolicyEvaluationContext {
     pub(crate) path: Option<String>,
     pub(crate) principal: PrincipalFact,
     pub(crate) target: HttpTarget,
+    /// Host header value without port, as the routing lane compares it.
+    pub(crate) request_host: HostFact,
+    /// Required when `target` is [`HttpTarget::ProxyDispatch`], and rejected on
+    /// any other target rather than ignored: facts that would change the answer
+    /// must never be silently discarded because a tag disagrees with them.
+    pub(crate) dispatch: Option<DispatchFacts>,
 }
 
 impl fmt::Debug for PolicyEvaluationContext {
@@ -296,6 +461,8 @@ pub(crate) enum EvaluationError {
     MalformedPath,
     ContextTooLarge,
     InvalidPrincipal,
+    InvalidHost,
+    InconsistentContext,
     InternalInvariant,
     TraceEncoding,
     TraceTooLarge,
@@ -344,6 +511,45 @@ impl PolicyEvaluationContext {
                 return Err(EvaluationError::InvalidPrincipal);
             }
         }
+        if let HostFact::Present(host) = &self.request_host {
+            if host.len() > 4096 {
+                return Err(EvaluationError::ContextTooLarge);
+            }
+            if host.is_empty() || host.contains([':', '/']) {
+                return Err(EvaluationError::InvalidHost);
+            }
+        }
+        if let Some(facts) = &self.dispatch {
+            // Dispatch facts on a target that does not evaluate them would be
+            // read by one and ignored by the other, and a `required_host` is
+            // exactly the fact whose loss turns a refusal into an allow.
+            if self.target != HttpTarget::ProxyDispatch {
+                return Err(EvaluationError::InconsistentContext);
+            }
+            for value in [
+                facts.route_id.as_deref(),
+                facts.route_host.as_deref(),
+                facts.route_path_prefix.as_deref(),
+                facts.upstream_origin.as_deref(),
+                facts.required_host.as_deref(),
+            ]
+            .into_iter()
+            .flatten()
+            {
+                if value.len() > 4096 {
+                    return Err(EvaluationError::ContextTooLarge);
+                }
+            }
+            // A selected upstream with no host is internally inconsistent: host
+            // binding would be demanded with nothing to bind against.
+            if facts
+                .required_host
+                .as_ref()
+                .is_some_and(|host| host.is_empty() || host.contains([':', '/']))
+            {
+                return Err(EvaluationError::InvalidHost);
+            }
+        }
         Ok(())
     }
 
@@ -370,17 +576,40 @@ impl PolicyEvaluationContext {
                 )
             }
         };
+        let host = match &self.request_host {
+            HostFact::Missing => ("missing", None),
+            HostFact::Absent => ("absent", None),
+            HostFact::Present(host) => ("present", Some(host)),
+        };
+        // Every routing fact binds the result. A dispatch that differs in any
+        // field is a different question, so a prior answer cannot be reused.
+        let dispatch = self.dispatch.as_ref().map(|facts| {
+            (
+                &facts.route_id,
+                &facts.route_host,
+                &facts.route_path_prefix,
+                &facts.upstream_origin,
+                &facts.required_host,
+            )
+        });
         let bytes = serde_json::to_vec(&(
             self.version,
             self.target,
             self.method.as_ref().map(Method::as_str),
             &self.path,
             principal,
+            host,
+            dispatch,
         ))
         .map_err(|_| EvaluationError::TraceEncoding)?;
         Ok(InputBinding {
             snapshot: self.snapshot,
-            context_digest: framed_digest("context", "application/json", "1", &bytes),
+            context_digest: framed_digest(
+                "context",
+                "application/json",
+                &CONTEXT_VERSION.to_string(),
+                &bytes,
+            ),
         })
     }
 }
@@ -423,6 +652,8 @@ pub(crate) enum Reason {
     MissingPrincipal,
     DefaultAllow,
     DefaultDeny,
+    /// A virtual upstream was selected and no host-bound route authorized it.
+    HostPolicyRequired,
     Incomplete,
 }
 
@@ -434,6 +665,7 @@ impl Reason {
             Self::MissingPrincipal => "missing_principal",
             Self::DefaultAllow => "default_allow",
             Self::DefaultDeny => "default_deny",
+            Self::HostPolicyRequired => "host_policy_required",
             Self::Incomplete => "incomplete",
         }
     }
@@ -446,8 +678,8 @@ pub(crate) enum Limitation {
     MissingPath,
     MissingPrincipalFact,
     MissingDispatchFact,
+    MissingHostFact,
     UnsupportedTarget,
-    UnsupportedRoutingPolicy,
 }
 
 pub(crate) const NOT_EVALUATED: &[&str] = &[
@@ -457,7 +689,6 @@ pub(crate) const NOT_EVALUATED: &[&str] = &[
     "management_permissions",
     "mcp",
     "tools",
-    "routing",
     "rate_selection",
     "mutable_capacity",
     "egress",
@@ -477,7 +708,11 @@ pub(crate) struct Evaluation {
     effect: PolicyEffect,
     reason: Reason,
     matched: Option<RuleReference>,
-    /// Complete only for the named contextless HTTP policy domain.
+    /// A rule that recorded a would-deny observation without deciding: a
+    /// first-matching shadow on a request bound to a virtual upstream. Separate
+    /// from `matched`, which is the rule that actually decided.
+    observation: Option<RuleReference>,
+    /// Complete only for the named HTTP routing policy domain.
     complete: bool,
     limitation: Option<Limitation>,
 }
@@ -499,6 +734,12 @@ impl Evaluation {
         self.matched
     }
 
+    /// The would-deny observation this evaluation also produced, if any. An
+    /// adapter that ignores it loses telemetry the live path records today.
+    pub(crate) fn observation(&self) -> Option<RuleReference> {
+        self.observation
+    }
+
     pub(crate) fn is_complete(&self) -> bool {
         self.complete
     }
@@ -513,15 +754,17 @@ impl Evaluation {
         effect: PolicyEffect,
         reason: Reason,
         matched: Option<RuleReference>,
+        observation: Option<RuleReference>,
     ) -> Self {
         Self {
             binding,
-            domain: "http_contextless_v1",
+            domain: HTTP_DOMAIN,
             not_evaluated: NOT_EVALUATED,
             logical,
             effect,
             reason,
             matched,
+            observation,
             complete: true,
             limitation: None,
         }
@@ -530,12 +773,13 @@ impl Evaluation {
     fn indeterminate(binding: InputBinding, limitation: Limitation) -> Self {
         Self {
             binding,
-            domain: "http_contextless_v1",
+            domain: HTTP_DOMAIN,
             not_evaluated: NOT_EVALUATED,
             logical: LogicalDecision::Indeterminate,
             effect: PolicyEffect::Block,
             reason: Reason::Incomplete,
             matched: None,
+            observation: None,
             complete: false,
             limitation: Some(limitation),
         }
