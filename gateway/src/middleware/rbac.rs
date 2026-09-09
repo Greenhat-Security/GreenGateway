@@ -383,7 +383,7 @@ impl RbacState {
         )
     }
 
-    fn new_with_mcp_route_paths(
+    pub(crate) fn new_with_mcp_route_paths(
         policy: Policy,
         exempt_paths: Vec<String>,
         client_ip_policy: ClientIpPolicy,
