@@ -34474,3 +34474,67 @@ mod cluster_discovery_tests {
         assert_eq!(retried.suggestion_revision, 2);
     }
 }
+
+/// The RBAC lane treats "routing was never classified" as a fact it does not
+/// have, and refuses rather than guessing -- a dispatch-scoped rule silently not
+/// applying is not the same as it not matching. That refusal is only safe because
+/// classification always completes first, which makes it unreachable in
+/// production. This holds the half of that guarantee living in the middleware:
+/// classification is marked completed unconditionally, for every path, before
+/// anything can quietly make it conditional again.
+///
+/// The other half is layer order in `apply_middleware`, where this middleware is
+/// added after the RBAC layer precisely so that it runs before it.
+#[tokio::test]
+async fn route_classification_is_marked_completed_for_every_path() {
+    async fn classified(request: Request<Body>) -> &'static str {
+        if request
+            .extensions()
+            .get::<upstream_route::ProxyRouteClassificationCompleted>()
+            .is_some()
+        {
+            "classified"
+        } else {
+            "unclassified"
+        }
+    }
+
+    let config = test_config(Vec::new());
+    for path in [
+        // A proxy path, which also receives an observation context.
+        "/data/items",
+        // Gateway-owned paths. Classification skips the route lookup for these,
+        // and must still mark itself completed: skipping the work is not the same
+        // as never having run, and RBAC can only tell those apart by this marker.
+        "/health",
+        "/metrics",
+        crate::auth::protected_resource::MCP_RESOURCE_PATH,
+    ] {
+        let router = Router::new()
+            .fallback(axum::routing::get(classified))
+            .layer(axum::middleware::from_fn_with_state(
+                ProxyDispatchState {
+                    classifier: None,
+                    routes: GatewayRoutes::from_config(&config),
+                },
+                crate::routing::proxy_dispatch_context_middleware,
+            ));
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .uri(path)
+                    .body(Body::empty())
+                    .expect("request builds"),
+            )
+            .await
+            .expect("router responds");
+        let body = axum::body::to_bytes(response.into_body(), 64)
+            .await
+            .expect("body reads");
+        assert_eq!(
+            String::from_utf8_lossy(&body),
+            "classified",
+            "{path} reached the handler without classification being marked"
+        );
+    }
+}

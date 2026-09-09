@@ -56,12 +56,35 @@ identity as not evaluated. Allow/Observe is no promise that a request forwards.
 
 ## Bindings, digests and traces
 
-The source digest implements ADR-0004's `GGDIGEST` length-delimited SHA-256 frame
-with kind `source`, media type `application/json`, schema `0.1.0` and the exact
-accepted input bytes. Whitespace changes therefore change the binding.
-**No semantic digest is exposed.** Existing normalization and the ad hoc policy
-ETag are not relabeled RFC 8785/JCS. A future semantic digest requires the ADR's
-normalization and JCS contract, including the other resource lanes.
+A snapshot binds one of two digests, and which one is part of the binding.
+
+`PolicyDigest::Source` implements ADR-0004's `GGDIGEST` length-delimited SHA-256
+frame with kind `source`, media type `application/json`, schema `0.1.0` and the
+exact accepted input bytes. Whitespace changes therefore change the binding. It is
+available only to the offline compiler, which is the only caller holding bytes.
+
+`PolicyDigest::ValidatedPolicy` covers an install path that never held them. The
+live gateway hands over an already-parsed `Policy`, and loading canonicalizes
+(issuer trailing slashes, among others), so the source bytes cannot be
+reconstructed from it; reporting a reconstruction as a source digest would break
+the guarantee that identical pinned inputs produce identical trace bytes, and
+would break it invisibly until someone diffed an offline trace against a
+production one. This digest is over a deterministic encoding of the validated
+policy, with object keys sorted explicitly rather than relying on
+`serde_json::Map` ordering — `Policy::roles` is a `HashMap`, and `preserve_order`
+is a feature-unification accident away from being enabled.
+
+**Still no semantic digest is exposed.** `ValidatedPolicy` carries its own frame
+kind, `gg.validated-policy.v1`, deliberately outside ADR-0004's reserved
+`source`/`semantic` namespace. It is not RFC 8785/JCS and cannot become JCS by
+adding a validation step: its key order is byte-wise UTF-8 where JCS mandates
+UTF-16 code units, and numbers defer to `serde_json` rather than ECMAScript
+shortest-representation. Both differences are reachable with operator-authored
+keys. Framing it as `semantic` would place a different value under the frame the
+real JCS digest will use, with nothing in the frame to tell them apart. Existing
+normalization and the ad hoc policy ETag are likewise not relabeled. A semantic
+digest requires the ADR's normalization and JCS contract across the other
+resource lanes.
 
 A standalone snapshot binds that source without inventing a persistent revision.
 A PostgreSQL snapshot additionally binds a nonnegative security watermark (zero
