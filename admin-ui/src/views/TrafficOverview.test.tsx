@@ -4,11 +4,49 @@ import { afterEach, beforeEach, expect, it, vi } from 'vitest';
 import { observation } from '../../tests/fixtures/traffic-overview';
 import { AdminApiError } from '../lib/api';
 import { fetchTrafficEndpoints } from '../lib/traffic';
-import { TrafficOverviewData } from './TrafficOverview';
+import { TrafficOverview, TrafficOverviewData } from './TrafficOverview';
+import { useAdminCapabilities, useAdminIdentityVersion } from '../lib/adminCapabilities';
 vi.mock('../lib/traffic', async original => ({ ...await original<typeof import('../lib/traffic')>(), fetchTrafficEndpoints: vi.fn() }));
-beforeEach(() => vi.mocked(fetchTrafficEndpoints).mockReset());
+vi.mock('../lib/adminCapabilities', async original => ({ ...await original<typeof import('../lib/adminCapabilities')>(), useAdminCapabilities: vi.fn(), useAdminIdentityVersion: vi.fn() }));
+beforeEach(() => {
+  vi.mocked(fetchTrafficEndpoints).mockReset();
+  vi.mocked(useAdminCapabilities).mockReturnValue({ status: 'ready', permissions: ['admin:traffic:read'] });
+  vi.mocked(useAdminIdentityVersion).mockReturnValue(1);
+});
 afterEach(cleanup);
 const mount = () => render(<MemoryRouter><TrafficOverviewData /></MemoryRouter>);
+it('conceals data while checking permissions and preserves the view after renewal', async () => {
+  vi.mocked(fetchTrafficEndpoints).mockResolvedValue({ endpoints: [observation()], next_cursor: null });
+  const { rerender } = render(<MemoryRouter><TrafficOverview /></MemoryRouter>);
+  await screen.findByRole('img');
+  fireEvent.change(screen.getByLabelText('Method'), { target: { value: 'GET' } });
+  fireEvent.click(screen.getByRole('button', { name: /^Table$/ }));
+  vi.mocked(useAdminCapabilities).mockReturnValue({ status: 'loading', permissions: [] });
+  rerender(<MemoryRouter><TrafficOverview /></MemoryRouter>);
+  expect(screen.queryByRole('table')).toBeNull();
+  vi.mocked(useAdminCapabilities).mockReturnValue({ status: 'ready', permissions: ['admin:traffic:read'] });
+  rerender(<MemoryRouter><TrafficOverview /></MemoryRouter>);
+  expect(screen.getByRole('table')).toBeTruthy();
+  expect((screen.getByLabelText('Method') as HTMLSelectElement).value).toBe('GET');
+  expect(fetchTrafficEndpoints).toHaveBeenCalledTimes(1);
+  vi.mocked(useAdminCapabilities).mockReturnValue({ status: 'forbidden', permissions: [] });
+  rerender(<MemoryRouter><TrafficOverview /></MemoryRouter>);
+  expect(screen.queryByRole('table', { hidden: true })).toBeNull();
+});
+it('drops retained observations when identity changes during a permission check', async () => {
+  vi.mocked(fetchTrafficEndpoints).mockResolvedValueOnce({ endpoints: [observation()], next_cursor: null })
+    .mockResolvedValueOnce({ endpoints: [], next_cursor: null });
+  const { rerender } = render(<MemoryRouter><TrafficOverview /></MemoryRouter>);
+  await screen.findByRole('img');
+  vi.mocked(useAdminCapabilities).mockReturnValue({ status: 'loading', permissions: [] });
+  vi.mocked(useAdminIdentityVersion).mockReturnValue(2);
+  rerender(<MemoryRouter><TrafficOverview /></MemoryRouter>);
+  expect(screen.queryByRole('img', { hidden: true })).toBeNull();
+  vi.mocked(useAdminCapabilities).mockReturnValue({ status: 'ready', permissions: ['admin:traffic:read'] });
+  rerender(<MemoryRouter><TrafficOverview /></MemoryRouter>);
+  await screen.findByText('No traffic observed yet');
+  expect(fetchTrafficEndpoints).toHaveBeenCalledTimes(2);
+});
 it('filters flow and table counts and links to endpoint details', async () => {
   vi.mocked(fetchTrafficEndpoints).mockResolvedValue({ endpoints: [observation(), observation('POST', '/api/search', 40, 'https://search.example.test', false)], next_cursor: null });
   mount(); await screen.findByRole('img', { name: 'Request flow by method and destination' });

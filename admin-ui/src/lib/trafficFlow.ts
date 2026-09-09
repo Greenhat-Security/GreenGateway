@@ -3,7 +3,9 @@ import type { TrafficEndpoint } from './traffic';
 export type Coverage = 'covered' | 'uncovered' | 'unknown';
 export type Flow = { source: string; destination: string; count: number; coverage: Coverage; endpoint: TrafficEndpoint };
 export const UNKNOWN_DESTINATION = 'Destination not recorded';
+export const NO_PROXY_DISPATCH = 'No proxy dispatch';
 export function destinationLabel(value: string | null): string {
+  if (value === null) return NO_PROXY_DISPATCH;
   if (!value) return UNKNOWN_DESTINATION;
   try { const url = new URL(value); return ['http:', 'https:'].includes(url.protocol) ? url.origin : UNKNOWN_DESTINATION; }
   catch { return UNKNOWN_DESTINATION; }
@@ -22,7 +24,7 @@ export function trafficFlows(endpoints: TrafficEndpoint[]): Flow[] {
       remaining -= amount;
       // Principal-scoped rules cover only some callers; do not label them as
       // either endpoint-wide coverage or the absence of a matching rule.
-      const coverage: Coverage = context.coverage_scope === 'endpoint' && context.covered_by_rule
+      const coverage: Coverage = !endpoint.routing_context_known ? 'unknown' : context.coverage_scope === 'endpoint' && context.covered_by_rule
         ? 'covered' : context.coverage_scope === 'none' ? 'uncovered' : 'unknown';
       flows.push({ source: endpoint.method, destination: destinationLabel(context.upstream_origin), count: amount, coverage, endpoint });
     }

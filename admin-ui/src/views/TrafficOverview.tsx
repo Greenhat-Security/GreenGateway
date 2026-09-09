@@ -13,10 +13,20 @@ const MAX_ENDPOINTS = 500;
 export function TrafficOverview() {
   const capabilities = useAdminCapabilities();
   const identity = useAdminIdentityVersion();
+  const granted = hasAdminPermission(capabilities, 'admin:traffic:read');
+  const [grantedIdentity, setGrantedIdentity] = useState<number | null>(null);
+  useEffect(() => {
+    if (granted) setGrantedIdentity(identity);
+    else if (capabilities.status !== 'loading') setGrantedIdentity(null);
+  }, [granted, identity, capabilities.status]);
+  // Preserve filters/pages during a background check, but conceal observations
+  // until the grant is confirmed. Identity changes and denials drop the data.
+  const retain = granted || (capabilities.status === 'loading' && grantedIdentity === identity);
   return <section className="panel traffic-overview" aria-label="Traffic overview">
     <div className="flow-heading"><div><p className="eyebrow">Observe your gateway</p><h2 id="traffic-overview-heading">Traffic overview</h2>
       <p className="body-copy">See where requests go and where rules match.</p></div><Link to="/traffic">Explore inventory →</Link></div>
-    {hasAdminPermission(capabilities, 'admin:traffic:read') ? <TrafficOverviewData key={identity} /> :
+    {retain && <div hidden={!granted}><TrafficOverviewData key={identity} /></div>}
+    {!granted &&
       <p role="status" className="flow-notice">{capabilities.status === 'loading' ? 'Checking traffic permissions…' : capabilities.status === 'unavailable'
         ? 'Traffic permissions are temporarily unavailable.' : 'Sign in with traffic read permission to view gateway observations.'}</p>}
   </section>;

@@ -16,6 +16,11 @@ with the 50 busiest endpoints; Load more adds pages up to 500. Counts cover
 lifetime observations for the loaded endpoints and active filters, not the
 whole installation or a selected time window. Refresh fetches a new first
 page. Missing routing context stays visible as Destination not recorded.
+Explicit context records with a null origin appear as No proxy dispatch.
+Incomplete routing history retains unknown coverage because the API has not
+evaluated its rule matches. Background permission checks conceal the overview
+and preserve filters and loaded pages when the same identity's grant returns;
+denials and identity changes discard the observations.
 The diagram groups destinations after the largest six into Other destinations;
 the breakdown retains each destination. Origins omit credentials, paths and
 query strings. Requests are not unique users, byte volumes or data categories.
