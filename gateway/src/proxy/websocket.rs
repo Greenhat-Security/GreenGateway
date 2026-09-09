@@ -1314,13 +1314,26 @@ async fn send_to_client(
 }
 
 fn client_termination(error: axum::Error) -> Termination {
-    match error.into_inner().downcast::<tungstenite::Error>() {
+    match error.into_inner().downcast::<axum_tungstenite::Error>() {
         Ok(error) => {
-            let (outcome, code) = classify_tungstenite_error(&error, Side::Client);
+            let (outcome, code) = classify_client_websocket_error(&error);
             Termination::gateway(outcome, code)
         }
         Err(_) => Termination::gateway("client_error", CLOSE_INTERNAL_ERROR),
     }
+}
+
+// The client socket is owned by Axum and carries its tungstenite version.
+// Upstream sockets use the newer version directly; their error types differ.
+fn classify_client_websocket_error(error: &axum_tungstenite::Error) -> (&'static str, u16) {
+    use axum_tungstenite::Error;
+    let code = match error {
+        Error::ConnectionClosed | Error::AlreadyClosed => CLOSE_NORMAL,
+        Error::Capacity(_) | Error::WriteBufferFull(_) => CLOSE_TOO_LARGE,
+        Error::Protocol(_) | Error::Utf8(_) | Error::AttackAttempt => CLOSE_PROTOCOL_ERROR,
+        _ => CLOSE_INTERNAL_ERROR,
+    };
+    classify_close_code(code, Side::Client)
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1329,41 +1342,31 @@ enum Side {
     Upstream,
 }
 
-/// Maps a transport failure to a bounded outcome and the close code the peers
-/// are told.
+fn classify_close_code(code: u16, side: Side) -> (&'static str, u16) {
+    let outcome = match (side, code) {
+        (Side::Client, CLOSE_NORMAL) => "client_close",
+        (Side::Upstream, CLOSE_NORMAL) => "upstream_close",
+        (Side::Client, CLOSE_TOO_LARGE) => "client_capacity",
+        (Side::Upstream, CLOSE_TOO_LARGE) => "upstream_capacity",
+        (Side::Client, CLOSE_PROTOCOL_ERROR) => "client_protocol",
+        (Side::Upstream, CLOSE_PROTOCOL_ERROR) => "upstream_protocol",
+        (Side::Client, _) => "client_error",
+        (Side::Upstream, _) => "upstream_error",
+    };
+    (outcome, code)
+}
+
+/// Maps upstream transport failures to the same bounded outcome categories.
 fn classify_tungstenite_error(error: &tungstenite::Error, side: Side) -> (&'static str, u16) {
-    match error {
-        tungstenite::Error::ConnectionClosed | tungstenite::Error::AlreadyClosed => (
-            match side {
-                Side::Client => "client_close",
-                Side::Upstream => "upstream_close",
-            },
-            CLOSE_NORMAL,
-        ),
-        tungstenite::Error::Capacity(_) | tungstenite::Error::WriteBufferFull(_) => (
-            match side {
-                Side::Client => "client_capacity",
-                Side::Upstream => "upstream_capacity",
-            },
-            CLOSE_TOO_LARGE,
-        ),
+    let code = match error {
+        tungstenite::Error::ConnectionClosed | tungstenite::Error::AlreadyClosed => CLOSE_NORMAL,
+        tungstenite::Error::Capacity(_) | tungstenite::Error::WriteBufferFull(_) => CLOSE_TOO_LARGE,
         tungstenite::Error::Protocol(_)
         | tungstenite::Error::Utf8(_)
-        | tungstenite::Error::AttackAttempt => (
-            match side {
-                Side::Client => "client_protocol",
-                Side::Upstream => "upstream_protocol",
-            },
-            CLOSE_PROTOCOL_ERROR,
-        ),
-        _ => (
-            match side {
-                Side::Client => "client_error",
-                Side::Upstream => "upstream_error",
-            },
-            CLOSE_INTERNAL_ERROR,
-        ),
-    }
+        | tungstenite::Error::AttackAttempt => CLOSE_PROTOCOL_ERROR,
+        _ => CLOSE_INTERNAL_ERROR,
+    };
+    classify_close_code(code, side)
 }
 
 fn message_payload_len(message: &AxumMessage) -> usize {
@@ -2099,6 +2102,40 @@ mod tests {
         assert!(truncated.len() <= MAX_CLOSE_REASON_BYTES);
         assert_eq!(truncated, "y".repeat(MAX_CLOSE_REASON_BYTES - 1));
         assert!(std::str::from_utf8(truncated.as_bytes()).is_ok());
+    }
+
+    #[test]
+    fn axum_client_errors_keep_their_transport_classification() {
+        use axum_tungstenite::{
+            error::{CapacityError, ProtocolError},
+            Error,
+        };
+        for (error, outcome, code) in [
+            (Error::ConnectionClosed, "client_close", CLOSE_NORMAL),
+            (
+                Error::Capacity(CapacityError::MessageTooLong {
+                    size: 2,
+                    max_size: 1,
+                }),
+                "client_capacity",
+                CLOSE_TOO_LARGE,
+            ),
+            (
+                Error::Protocol(ProtocolError::ResetWithoutClosingHandshake),
+                "client_protocol",
+                CLOSE_PROTOCOL_ERROR,
+            ),
+            (
+                Error::Io(std::io::Error::other("synthetic I/O failure")),
+                "client_error",
+                CLOSE_INTERNAL_ERROR,
+            ),
+        ] {
+            let termination = client_termination(axum::Error::new(error));
+            assert_eq!(termination.outcome, outcome);
+            assert_eq!(termination.close_code, Some(code));
+            assert_eq!(termination.propagate, Some(code));
+        }
     }
 
     #[test]

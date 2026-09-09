@@ -45,7 +45,7 @@ use std::{
 use async_trait::async_trait;
 use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
 use cap_std::{ambient_authority, fs::Dir};
-use hmac::{Hmac, Mac};
+use hmac::{Hmac, KeyInit, Mac};
 use http::{
     header::{ACCEPT, AUTHORIZATION, CONTENT_TYPE},
     HeaderMap, HeaderName, HeaderValue, Method, StatusCode,
@@ -2153,7 +2153,7 @@ fn is_expected_content_type(value: Option<&HeaderValue>, expected: &str) -> bool
 // --- SigV4 -------------------------------------------------------------------
 
 fn hmac_sha256(key: &[u8], data: &[u8]) -> [u8; 32] {
-    let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(key)
+    let mut mac = <Hmac<Sha256> as KeyInit>::new_from_slice(key)
         .expect("HMAC-SHA256 accepts a key of any length");
     mac.update(data);
     mac.finalize().into_bytes().into()
@@ -4379,7 +4379,7 @@ mod tests {
             // Independent reference computation, step by step per the SigV4
             // specification, without the production signing helpers.
             let reference_hmac = |key: &[u8], data: &[u8]| -> Vec<u8> {
-                let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(key)
+                let mut mac = <Hmac<Sha256> as KeyInit>::new_from_slice(key)
                     .expect("reference HMAC accepts any key length");
                 mac.update(data);
                 mac.finalize().into_bytes().to_vec()

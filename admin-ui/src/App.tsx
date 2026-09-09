@@ -39,6 +39,7 @@ import { SignalsView } from './views/SignalsView';
 import { StatusPage } from './views/StatusPage';
 import { TrafficEndpointDetail } from './views/TrafficEndpointDetail';
 import { TrafficInventory } from './views/TrafficInventory';
+import { TrafficOverview } from './views/TrafficOverview';
 import { TokensView } from './views/TokensView';
 import { ToolPlayground } from './views/ToolPlayground';
 
@@ -253,6 +254,7 @@ function Dashboard({
 }) {
   return (
     <main className="content-grid page-content">
+      <TrafficOverview />
       <TokenPanel
         authRefreshKey={authRefreshKey}
         authCompletionStatus={authCompletionStatus}

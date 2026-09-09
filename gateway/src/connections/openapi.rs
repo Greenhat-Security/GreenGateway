@@ -2757,7 +2757,7 @@ fn definition_digest(definition: &ToolDefinition) -> Result<[u8; 32], Connection
 }
 
 fn spec_digest(spec: &str) -> String {
-    format!("{:x}", Sha256::digest(spec.as_bytes()))
+    hex::encode(Sha256::digest(spec.as_bytes()))
 }
 
 fn validate_spec_size(spec: &str) -> Result<(), OpenApiCatalogError> {

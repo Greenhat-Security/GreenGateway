@@ -170,7 +170,7 @@ impl PostgresPendingLoginStore {
     /// The per-client quota key: an HMAC under the primary login key over
     /// the deployment ID and the canonical client address.
     fn client_key(&self, client_ip: &str) -> Result<String, RepositoryError> {
-        use hmac::{Hmac, Mac};
+        use hmac::{Hmac, KeyInit, Mac};
         let key = self
             .keyring
             .key(self.keyring.primary_id())

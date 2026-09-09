@@ -53,7 +53,7 @@ class ToolContractTests(unittest.TestCase):
         self.rejects(".node-version disagrees")
 
     def test_docker_version_or_lock_drift_fails(self):
-        self.replace("Dockerfile", "node:24.20.0-", "node:24-")
+        self.replace("Dockerfile", f"node:{build_tools.versions()['node']}-", "node:26-")
         self.replace("Dockerfile", "cargo build --locked", "cargo build")
         self.rejects("Docker Node")
         self.rejects("must be locked")

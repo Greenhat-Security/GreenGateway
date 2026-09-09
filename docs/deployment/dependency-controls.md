@@ -62,16 +62,26 @@ and the Dockerfile must agree with it. `scripts/build_tools.py check` rejects
 missing declarations, version drift, unpinned installs and implicit npx downloads.
 CI uses the shared `.github/actions/build-tools` action before any build.
 
-The production/default compiler remains Rust 1.88.0, matching the existing
-Docker image and the maximum declared MSRV in the locked dependency graph.
+The production/default compiler is Rust 1.98.0, matching the reviewed
+Docker image update.
 The required `production-compiler` job checks all targets with that compiler;
 ordinary CI uses the previously passing Rust 1.98.1. Coverage remains on
 nightly-2026-09-01 with cargo-llvm-cov 0.9.0 and unchanged floors. Its dated
 compiler is deliberate, not an invitation to follow nightly updates.
-Node 24.20.0 and bundled npm 11.19.0 match the current pinned Node image.
+Node 26.8.1 and bundled npm 11.19.0 match the current pinned Node image.
 Gateway builds verify the actual Node/npm executable versions before installing
 UI dependencies, and Docker additionally checks its actual Rust version.
 Cargo builds use the existing lockfile without resolution updates.
+
+The September dependency refresh migrates gateway HMAC-SHA256 to hmac 0.13
+and sha2 0.11 together. Existing signing-vector tests verify the serialized
+signatures remain compatible. Axum 0.8.9 still owns tungstenite 0.29 client
+sockets while the upstream connector uses 0.30. The explicit
+`axum-tungstenite` alias preserves typed downstream error classification;
+tests check close, capacity, protocol and internal-error outcomes. Exact
+duplicate versions and parent chains are recorded in the Cargo policy with
+maintainer ownership and a 2026-12-01 expiry. Remove the old transport group
+when Axum converges; no license or advisory allowances are added.
 
 Buildx is selected explicitly and its BuildKit daemon image is digest-pinned,
 including CI Compose builds. Action pins and the exact cargo-audit version
