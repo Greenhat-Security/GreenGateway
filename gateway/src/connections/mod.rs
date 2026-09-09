@@ -12,6 +12,7 @@
 pub mod admin;
 pub mod aws_secret;
 pub mod azure_secret;
+pub mod caller_assertion;
 pub mod control_plane;
 pub mod gcp_secret;
 pub mod http;

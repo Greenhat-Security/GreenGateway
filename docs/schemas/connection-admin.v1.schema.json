@@ -5,6 +5,62 @@
   "description": "Strict request and safe response contracts used by the Connection, secret-alias, managed OpenAPI, capability inventory, and constrained playground admin APIs. Response definitions intentionally exclude secret IDs, provider locators, ciphertext, nonces, key material, raw upstream topology, and private-key material.",
   "$ref": "#/$defs/ConnectionDetail",
   "$defs": {
+    "CallerAssertion": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "Attest the calling principal to the upstream alongside the primary credential rather than instead of it: the credential says which system is calling, the assertion says on whose behalf, so an upstream the operator controls can apply its own per-user checks. The gateway signs a short-lived JWT naming the validated principal and sends it in the named header; the upstream verifies it against the gateway's published JWKS. Omit to send only the credential.",
+      "required": [
+        "signing_key_id",
+        "kid",
+        "algorithm",
+        "issuer",
+        "audience",
+        "token_type",
+        "header_name",
+        "lifetime_seconds"
+      ],
+      "properties": {
+        "signing_key_id": { "type": "string", "minLength": 1, "maxLength": 128, "description": "Secret alias holding the PKCS#8 private key." },
+        "kid": { "type": "string", "minLength": 1, "maxLength": 128, "description": "JOSE kid, published in the JWKS, so an upstream can select the right key and keys can rotate without a flag day." },
+        "algorithm": { "enum": ["es256", "rs256"], "description": "Signature algorithm. Both are offered because verifier libraries and platform documentation differ on which is convenient." },
+        "issuer": { "type": "string", "minLength": 1, "maxLength": 512 },
+        "audience": { "type": "string", "minLength": 1, "maxLength": 512 },
+        "token_type": { "type": "string", "minLength": 1, "maxLength": 128, "description": "JOSE typ. Naming the intended use stops a token minted for one upstream being replayed at another that trusts the same keys." },
+        "header_name": { "type": "string", "minLength": 1, "maxLength": 64, "description": "Header carrying the assertion. Must be a non-reserved HTTP header name and must differ from the header the primary credential uses; normalized to lowercase." },
+        "lifetime_seconds": { "type": "integer", "minimum": 1, "maximum": 300, "description": "An assertion is a bearer credential for as long as it is valid, so this is a replay window rather than a convenience setting." },
+        "claims": { "type": "array", "maxItems": 2, "uniqueItems": true, "items": { "enum": ["email", "roles"] }, "description": "Principal fields to attest beyond sub, which is always present. A closed set rather than free-form templating, so a configuration mistake cannot attest something a caller supplied." },
+        "bind_request": { "type": "boolean", "description": "Include the method, path and a SHA-256 of the body actually sent, so an assertion cannot be lifted onto different arguments. The digest covers the transmitted bytes, not a canonical form, so an upstream verifies it with its standard library." },
+        "bind_approval": { "type": "boolean", "description": "Require, and include, the approval that authorised a mutation." }
+      }
+    },
+    "SafeCallerAssertion": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "Attest the calling principal to the upstream alongside the primary credential rather than instead of it: the credential says which system is calling, the assertion says on whose behalf, so an upstream the operator controls can apply its own per-user checks. The gateway signs a short-lived JWT naming the validated principal and sends it in the named header; the upstream verifies it against the gateway's published JWKS. Omit to send only the credential.",
+      "required": [
+        "signing_key_configured",
+        "kid",
+        "algorithm",
+        "issuer",
+        "audience",
+        "token_type",
+        "header_name",
+        "lifetime_seconds"
+      ],
+      "properties": {
+        "signing_key_configured": { "type": "boolean", "description": "Whether a signing key is bound. The alias itself is never returned." },
+        "kid": { "type": "string", "minLength": 1, "maxLength": 128, "description": "JOSE kid, published in the JWKS, so an upstream can select the right key and keys can rotate without a flag day." },
+        "algorithm": { "enum": ["es256", "rs256"], "description": "Signature algorithm. Both are offered because verifier libraries and platform documentation differ on which is convenient." },
+        "issuer": { "type": "string", "minLength": 1, "maxLength": 512 },
+        "audience": { "type": "string", "minLength": 1, "maxLength": 512 },
+        "token_type": { "type": "string", "minLength": 1, "maxLength": 128, "description": "JOSE typ. Naming the intended use stops a token minted for one upstream being replayed at another that trusts the same keys." },
+        "header_name": { "type": "string", "minLength": 1, "maxLength": 64, "description": "Header carrying the assertion. Must be a non-reserved HTTP header name and must differ from the header the primary credential uses; normalized to lowercase." },
+        "lifetime_seconds": { "type": "integer", "minimum": 1, "maximum": 300, "description": "An assertion is a bearer credential for as long as it is valid, so this is a replay window rather than a convenience setting." },
+        "claims": { "type": "array", "maxItems": 2, "uniqueItems": true, "items": { "enum": ["email", "roles"] }, "description": "Principal fields to attest beyond sub, which is always present. A closed set rather than free-form templating, so a configuration mistake cannot attest something a caller supplied." },
+        "bind_request": { "type": "boolean", "description": "Include the method, path and a SHA-256 of the body actually sent, so an assertion cannot be lifted onto different arguments. The digest covers the transmitted bytes, not a canonical form, so an upstream verifies it with its standard library." },
+        "bind_approval": { "type": "boolean", "description": "Require, and include, the approval that authorised a mutation." }
+      }
+    },
     "StableId": {
       "type": "string",
       "minLength": 1,
@@ -439,6 +495,7 @@
         "endpoint": {
           "$ref": "#/$defs/Endpoint"
         },
+        "caller_assertion": { "$ref": "#/$defs/CallerAssertion" },
         "authentication": {
           "$ref": "#/$defs/CreateAuthentication"
         },
@@ -541,6 +598,7 @@
         "endpoint": {
           "$ref": "#/$defs/Endpoint"
         },
+        "caller_assertion": { "$ref": "#/$defs/CallerAssertion" },
         "authentication": {
           "$ref": "#/$defs/MutationAuthentication"
         },
@@ -1005,6 +1063,7 @@
         "endpoint": {
           "$ref": "#/$defs/Endpoint"
         },
+        "caller_assertion": { "$ref": "#/$defs/SafeCallerAssertion" },
         "authentication": {
           "$ref": "#/$defs/SafeAuthentication"
         },

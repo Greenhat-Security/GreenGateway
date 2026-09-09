@@ -5740,6 +5740,7 @@ impl TemporaryStaticAuthRuntime {
                         header_name: "x-api-key".to_owned(),
                         secret_id: Some("billing-api-key".to_owned()),
                     },
+                    caller_assertion: None,
                     additional_headers: additional
                         .iter()
                         .map(|(header_name, alias_id, _)| AdditionalHeader {
@@ -5840,6 +5841,7 @@ impl TemporaryStaticAuthRuntime {
                         resource: None,
                         client_auth_method: OAuthClientAuthMethod::ClientSecretBasic,
                     },
+                    caller_assertion: None,
                     additional_headers: Vec::new(),
                     tls: TlsProfile::default(),
                     timeouts: None,

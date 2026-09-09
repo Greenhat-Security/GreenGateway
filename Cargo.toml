@@ -46,6 +46,12 @@ metrics = "0.24.6"
 metrics-exporter-prometheus = { version = "0.18.3", default-features = false }
 mime_guess = "2"
 notify = "8.2.0"
+# Already in the graph transitively: jsonwebtoken's `simple_asn1` depends on it,
+# and this is the same 0.4.x it resolves. Naming it directly adds a dependency
+# edge, not a crate, and lets `caller_assertion.rs` check that a configured
+# ES256 public point is actually on P-256 rather than merely the right length,
+# without hand-rolling 256-bit modular arithmetic.
+num-bigint = { version = "0.4.8", default-features = false }
 percent-encoding = "2.3.2"
 pulldown-cmark = { version = "0.13.0", default-features = false }
 proptest = "1.9.0"
