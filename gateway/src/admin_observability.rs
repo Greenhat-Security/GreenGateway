@@ -695,7 +695,7 @@ pub(super) async fn accept_suggestion_in_cluster(
     // Committed. Install the authority's snapshot before answering, as
     // every other cluster-mode policy mutation does, then emit the two
     // changes this request made.
-    rbac_state.install_revision_snapshot_locked(
+    let installed = rbac_state.install_revision_snapshot_locked(
         accepted.policy.policy.clone(),
         accepted.policy.security_revision,
         &_policy_write_guard,
@@ -716,6 +716,13 @@ pub(super) async fn accept_suggestion_in_cluster(
         prepared.diff_summary,
     );
     emit_suggestion_lifecycle_changed(state, parts, principal, &accepted.suggestion);
+    // Both changes are durable, so both are audited, even when this replica
+    // cannot serve under the revision it just committed. Reporting the install
+    // failure first would leave two security changes that actually happened
+    // missing from the audit stream.
+    if installed.is_err() {
+        return policy_snapshot_not_installable();
+    }
 
     // No history warning header: cluster mode writes the history row
     // inside the same transaction, so an acceptance cannot succeed

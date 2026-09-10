@@ -300,6 +300,26 @@ pub(crate) struct RbacPolicyState {
     /// regress it.
     #[cfg_attr(not(feature = "postgres"), allow(dead_code))]
     security_revision: i64,
+    /// The same policy compiled for the pure kernel, built once per install.
+    ///
+    /// It lives here rather than on [`RbacState`] deliberately. A request is
+    /// judged by the snapshot the revision gate admitted -- `bundle.policy`, not
+    /// `state.policy` -- so a compiled policy held one level up could be the
+    /// wrong one under a concurrent reconcile, which is exactly the
+    /// facts-from-two-snapshots mistake #422 forbids. Held here it cannot
+    /// disagree with the snapshot it belongs to, and compiling once per install
+    /// keeps three parses and a digest off the request path.
+    ///
+    /// Nothing consults it for a decision yet; #422's adapter is the cutover.
+    ///
+    /// `expect` rather than `allow` deliberately: when the adapter reads this,
+    /// the expectation goes unfulfilled and CI says so, instead of an `allow`
+    /// quietly outliving the reason for it.
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "read by #422's adapter; tests consult it now")
+    )]
+    compiled: crate::policy_eval::CompiledPolicy,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -436,6 +456,19 @@ impl RbacState {
 
     /// The policy snapshot this request is judged by: the one the gate
     /// pinned at admission (cluster mode), else the live lane.
+    /// The compiled kernel of the snapshot a request would be judged by right
+    /// now, for the differential tests.
+    ///
+    /// They compare the kernel against the live middleware, and this is what
+    /// makes the claim about the instance production consults rather than about a
+    /// separately compiled copy of the same policy. A copy would agree with the
+    /// middleware while the installed one diverged, and the tests would not say
+    /// so.
+    #[cfg(test)]
+    pub(crate) fn installed_compiled_policy(&self) -> Arc<RbacPolicyState> {
+        self.effective_policy()
+    }
+
     fn effective_policy(&self) -> Arc<RbacPolicyState> {
         #[cfg(feature = "postgres")]
         if let Ok(pinned) = PINNED_POLICY.try_with(Arc::clone) {
@@ -471,9 +504,13 @@ impl RbacState {
     /// hold that lane call [`RbacState::install_revision_snapshot_locked`]
     /// instead, avoiding a recursive lock acquisition.
     #[cfg(feature = "postgres")]
-    pub(crate) async fn install_revision_snapshot(&self, policy: Policy, security_revision: i64) {
+    pub(crate) async fn install_revision_snapshot(
+        &self,
+        policy: Policy,
+        security_revision: i64,
+    ) -> Result<(), crate::policy_eval::CompileError> {
         let guard = self.policy_write_guard().await;
-        self.install_revision_snapshot_locked(policy, security_revision, &guard);
+        self.install_revision_snapshot_locked(policy, security_revision, &guard)
     }
 
     /// Key the initial cluster snapshot before the state is shared or the
@@ -486,7 +523,10 @@ impl RbacState {
             .policy_write_lock
             .try_lock()
             .expect("initial policy snapshot must be installed before the state is shared");
-        self.install_revision_snapshot_locked(policy, security_revision, &guard);
+        // Refusing to start beats starting into a gate that answers 503 forever
+        // with nothing saying why: a corrupt authority row is a wiring failure.
+        self.install_revision_snapshot_locked(policy, security_revision, &guard)
+            .expect("the authority's initial revision must be installable");
     }
 
     /// Install an authoritative revision while the caller keeps the policy
@@ -497,16 +537,20 @@ impl RbacState {
         policy: Policy,
         security_revision: i64,
         _guard: &PolicyWriteGuard<'_>,
-    ) {
+    ) -> Result<(), crate::policy_eval::CompileError> {
         // One candidate Arc built up front: `Arc::ptr_eq` against the rcu's
         // result then distinguishes "this call installed the snapshot" from
         // "another install already held this revision", so a duplicate
         // install does not re-run `replace_policy` and gratuitously reset
         // the policy-lane rate-limit buckets.
+        // A candidate that cannot be compiled is refused before the swap, so the
+        // installed snapshot keeps serving. The monotonic guard below would have
+        // discarded an impossible revision anyway; refusing here is what makes
+        // that visible to the caller instead of silent.
         let candidate = Arc::new(RbacPolicyState::from_policy_at_revision(
             policy.clone(),
             security_revision,
-        ));
+        )?);
         let installed = self.policy.rcu(|current| {
             if security_revision <= current.security_revision {
                 // Already at or past this revision (another install won the
@@ -520,6 +564,7 @@ impl RbacState {
                 rate_limit.replace_policy(&policy);
             }
         }
+        Ok(())
     }
 
     /// The security revision the currently installed snapshot is keyed by.
@@ -690,6 +735,10 @@ impl RbacPolicyState {
             .map(|(rule_index, rule)| rule.id.clone().unwrap_or_else(|| rule_index.to_string()))
             .collect();
         let rule_matcher = RuleMatcher::new(&policy.rules);
+        let compiled = crate::policy_eval::CompiledPolicy::from_validated_policy(
+            policy.clone(),
+            crate::policy_eval::PolicyAuthority::Standalone,
+        );
 
         Self {
             engine: PolicyEngine::new(policy),
@@ -699,13 +748,26 @@ impl RbacPolicyState {
             enforcement_mode,
             routes,
             security_revision: 0,
+            // Infallible here: the only rejection `from_validated_policy` makes
+            // is of an impossible watermark, and a standalone snapshot has none.
+            compiled: compiled.expect("a standalone authority is always valid"),
         }
     }
 
     /// The cluster-mode constructor: a compiled snapshot keyed by the
     /// authoritative security revision it was built for.
+    ///
+    /// Fallible, unlike the standalone one, because the revision is the caller's
+    /// and `policy_active.security_revision` carries no database CHECK: a corrupt
+    /// or out-of-band-edited row arrives here as a watermark that cannot exist.
+    /// Such a candidate was already discarded by the monotonic install guard, so
+    /// refusing to build it changes which snapshots install not at all -- it turns
+    /// a silently dropped candidate into a refusal the caller can report.
     #[cfg(feature = "postgres")]
-    fn from_policy_at_revision(policy: Policy, security_revision: i64) -> Self {
+    fn from_policy_at_revision(
+        policy: Policy,
+        security_revision: i64,
+    ) -> Result<Self, crate::policy_eval::CompileError> {
         let default_action = policy.default_action.clone();
         let enforcement_mode = policy.enforcement_mode;
         let routes = policy.routes.clone();
@@ -716,8 +778,12 @@ impl RbacPolicyState {
             .map(|(rule_index, rule)| rule.id.clone().unwrap_or_else(|| rule_index.to_string()))
             .collect();
         let rule_matcher = RuleMatcher::new(&policy.rules);
+        let compiled = crate::policy_eval::CompiledPolicy::from_validated_policy(
+            policy.clone(),
+            crate::policy_eval::PolicyAuthority::PostgreSql { security_revision },
+        )?;
 
-        Self {
+        Ok(Self {
             engine: PolicyEngine::new(policy),
             rule_matcher,
             rule_ids,
@@ -725,7 +791,18 @@ impl RbacPolicyState {
             enforcement_mode,
             routes,
             security_revision,
-        }
+            compiled,
+        })
+    }
+
+    /// The pure kernel's view of this snapshot: the same policy, compiled once at
+    /// install, pinned to the revision this snapshot serves under.
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "read by #422's adapter; tests consult it now")
+    )]
+    pub(crate) fn compiled(&self) -> &crate::policy_eval::CompiledPolicy {
+        &self.compiled
     }
 
     fn rule_id(&self, rule_index: usize) -> String {

@@ -2106,7 +2106,10 @@ async fn gated_state(
     gate: Result<i64, SecurityRevisionCheckError>,
 ) -> (RbacState, Arc<crate::audit::sink::tests::CaptureSink>) {
     let (state, capture) = test_state(policy.clone(), &[]);
-    state.install_revision_snapshot(policy, revision).await;
+    state
+        .install_revision_snapshot(policy, revision)
+        .await
+        .expect("the revision installs");
     (
         state.with_revision_gate(Arc::new(MockRevisionGate(gate))),
         Arc::new(capture),
@@ -2167,7 +2170,10 @@ async fn an_admitted_request_is_judged_by_the_bundles_policy_not_the_live_lane()
 
     // The live lane denies (swapped after admission); the bundle allows.
     let (state, _capture) = test_state(denying.clone(), &[]);
-    state.install_revision_snapshot(denying.clone(), 7).await;
+    state
+        .install_revision_snapshot(denying.clone(), 7)
+        .await
+        .expect("the revision installs");
     let state = state.with_revision_gate(Arc::new(BundleGate(bundle_with_policy(
         allowing.clone(),
         7,
@@ -2184,7 +2190,10 @@ async fn an_admitted_request_is_judged_by_the_bundles_policy_not_the_live_lane()
 
     // The inverse: the live lane allows, the bundle denies.
     let (state, _capture) = test_state(allowing.clone(), &[]);
-    state.install_revision_snapshot(allowing, 7).await;
+    state
+        .install_revision_snapshot(allowing, 7)
+        .await
+        .expect("the revision installs");
     let state = state.with_revision_gate(Arc::new(BundleGate(bundle_with_policy(denying, 7))));
     let response = test_router(state, Some(test_principal(&["reader"])))
         .oneshot(request(Method::GET, "/data/items"))
@@ -2296,7 +2305,8 @@ async fn install_revision_snapshot_never_regresses_the_compiled_state() {
             test_policy(DefaultAction::Deny, &[("reader", &["data:read"])], &[]),
             5,
         )
-        .await;
+        .await
+        .expect("the revision installs");
     assert_eq!(state.snapshot_security_revision(), 5);
     // A stale reconciler delivering an older revision must not
     // overwrite a newer compiled snapshot.
@@ -2305,14 +2315,16 @@ async fn install_revision_snapshot_never_regresses_the_compiled_state() {
             test_policy(DefaultAction::Deny, &[("reader", &["data:read"])], &[]),
             3,
         )
-        .await;
+        .await
+        .expect("the revision installs");
     assert_eq!(state.snapshot_security_revision(), 5);
     state
         .install_revision_snapshot(
             test_policy(DefaultAction::Deny, &[("reader", &["data:read"])], &[]),
             9,
         )
-        .await;
+        .await
+        .expect("the revision installs");
     assert_eq!(state.snapshot_security_revision(), 9);
 }
 
@@ -2333,7 +2345,8 @@ async fn revision_snapshot_install_waits_for_the_policy_write_guard() {
                 test_policy(DefaultAction::Allow, &[("reader", &["data:read"])], &[]),
                 7,
             )
-            .await;
+            .await
+            .expect("the revision installs");
     });
 
     started_rx.await.expect("install task should start");
@@ -2369,14 +2382,16 @@ async fn concurrent_snapshot_installs_converge_on_the_higher_revision() {
                 test_policy(DefaultAction::Deny, &[("reader", &["data:read"])], &[]),
                 7,
             )
-            .await;
+            .await
+            .expect("the revision installs");
         }),
         tokio::spawn(async move {
             high.install_revision_snapshot(
                 test_policy(DefaultAction::Deny, &[("reader", &["data:read"])], &[]),
                 8,
             )
-            .await;
+            .await
+            .expect("the revision installs");
         })
     );
     low.expect("low install should join");
@@ -2829,4 +2844,57 @@ impl Drop for TempPolicyFile {
     fn drop(&mut self) {
         let _ = fs::remove_file(&self.path);
     }
+}
+
+#[cfg(feature = "postgres")]
+#[tokio::test]
+async fn a_revision_that_cannot_exist_is_refused_and_the_installed_snapshot_keeps_serving() {
+    // `policy_active.security_revision` carries no database CHECK, so a corrupt
+    // or out-of-band-edited row reaches the install path as a watermark that
+    // cannot exist. The monotonic guard would have discarded such a candidate
+    // anyway; refusing to build it is what makes that visible rather than silent.
+    let (state, _capture) = test_state(
+        test_policy(DefaultAction::Deny, &[("reader", &["data:read"])], &[]),
+        &[],
+    );
+    state
+        .install_revision_snapshot(
+            test_policy(DefaultAction::Allow, &[("reader", &["data:read"])], &[]),
+            4,
+        )
+        .await
+        .expect("a valid revision installs");
+    assert_eq!(state.snapshot_security_revision(), 4);
+    let before = state.current_policy().default_action.clone();
+
+    let refused = state
+        .install_revision_snapshot(
+            test_policy(DefaultAction::Deny, &[("reader", &["data:read"])], &[]),
+            -1,
+        )
+        .await;
+    assert_eq!(
+        refused,
+        Err(crate::policy_eval::CompileError::InvalidRevision)
+    );
+
+    // The previous snapshot still serves, unchanged in both its revision and the
+    // policy it decides by.
+    assert_eq!(state.snapshot_security_revision(), 4);
+    assert_eq!(state.current_policy().default_action, before);
+
+    // And the kernel the snapshot carries is still keyed to the revision that
+    // installed it, not to the refused one.
+    let installed = state.installed_compiled_policy();
+    assert_eq!(
+        installed.compiled().snapshot(),
+        crate::policy_eval::CompiledPolicy::from_validated_policy(
+            test_policy(DefaultAction::Allow, &[("reader", &["data:read"])], &[]),
+            crate::policy_eval::PolicyAuthority::PostgreSql {
+                security_revision: 4
+            },
+        )
+        .expect("the installed revision recompiles")
+        .snapshot()
+    );
 }

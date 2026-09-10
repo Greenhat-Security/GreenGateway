@@ -52,6 +52,25 @@ pub(super) fn not_found(error: &str) -> Response {
         .into_response()
 }
 
+/// The authority committed the policy, but this replica could not compile the
+/// snapshot it just wrote -- a security revision that cannot exist.
+///
+/// The write stands; what failed is this replica's ability to serve under it. A
+/// 503 rather than a 200 because answering success would report a snapshot that
+/// is not installed, and rather than a 500 because the revision gate already
+/// answers 503 for exactly this state: the replica is behind the authority.
+#[cfg(feature = "postgres")]
+pub(super) fn policy_snapshot_not_installable() -> Response {
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        Json(ErrorResponse {
+            error: "policy was committed but its snapshot could not be installed on this replica"
+                .to_owned(),
+        }),
+    )
+        .into_response()
+}
+
 pub(super) fn policy_not_configured() -> Response {
     (
         StatusCode::NOT_FOUND,

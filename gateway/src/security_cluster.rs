@@ -628,9 +628,23 @@ impl PolicyResource {
         // installed snapshot includes every policy change at or below it.
         // The runtime's compiled-revision watermark -- not this per-resource
         // key -- is what the gate compares against the global counter.
-        self.rbac_state
-            .install_revision_snapshot(active.policy, active.security_revision)
-            .await;
+        let revision = active.security_revision;
+        if self
+            .rbac_state
+            .install_revision_snapshot(active.policy, revision)
+            .await
+            .is_err()
+        {
+            // The authority handed us a revision that cannot exist. Treated as a
+            // bad document, like the route and egress mismatches above: the
+            // previous snapshot keeps serving and the gate answers 503 with zero
+            // upstream attempts rather than allowing under an unkeyed snapshot.
+            tracing::error!(
+                security_revision = revision,
+                "policy reconciliation rejected: the active document carries a                  security revision that cannot be compiled"
+            );
+            return Err(SecurityRevisionCheckError::InvalidDocument);
+        }
         Ok(())
     }
 }

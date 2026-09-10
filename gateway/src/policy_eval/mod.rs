@@ -73,7 +73,10 @@
 //! No runtime handle, store, audit sink, provider, resolver, or callback enters
 //! this API. Principal inputs contain only policy facts, never credentials.
 
-// The compiled API intentionally has no production caller before #422.
+// No production caller until #422's adapter consumes this, at which point the
+// allow comes off and each item that is still unused is annotated individually
+// with the reason -- a module-level allow is why an unused addition can arrive
+// unnoticed, so it should not outlive the cutover.
 #![allow(dead_code)]
 
 mod input;
@@ -226,8 +229,10 @@ impl CompiledPolicy {
     /// today. Narrowing what production accepts is not a change to smuggle in as
     /// a side effect of reusing a constructor.
     ///
-    /// Infallible by construction: every rejection `compile` performs is a
-    /// judgement about untrusted bytes, and this caller has none.
+    /// Fallible only in the authority. Every rejection `compile` performs is a
+    /// judgement about untrusted bytes and this caller has none -- but the
+    /// authority is not bytes, it is a caller-supplied watermark, so it is
+    /// checked here exactly as it is there.
     pub(crate) fn from_validated_policy(
         policy: Policy,
         authority: PolicyAuthority,
@@ -1021,6 +1026,18 @@ impl Reason {
     }
 }
 
+/// Why an evaluation could not complete, as a stable code.
+///
+/// Every variant now shares the `Missing` prefix, because every one of them is a
+/// fact that was not supplied -- the kernel has no "unsupported" limitation left
+/// to report since every target is evaluated. The names are not free to change:
+/// they serialize into the trace as the stable limitation codes ADR-0004
+/// requires, so dropping the prefix to satisfy a naming lint would edit a
+/// published contract for cosmetic reasons.
+#[allow(
+    clippy::enum_variant_names,
+    reason = "variant names are the stable limitation codes in the trace"
+)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum Limitation {
@@ -1029,7 +1046,6 @@ pub(crate) enum Limitation {
     MissingPrincipalFact,
     MissingDispatchFact,
     MissingHostFact,
-    UnsupportedTarget,
 }
 
 pub(crate) const NOT_EVALUATED: &[&str] = &[
