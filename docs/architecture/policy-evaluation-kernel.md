@@ -1,8 +1,14 @@
 # Pure policy evaluation foundation
 
-Issue #421 PR 1 introduces `gateway/src/policy_eval/`. It has no production caller.
+Issue #421 introduces `gateway/src/policy_eval/`. **It has no production caller.**
 Live HTTP/RBAC middleware, MCP/tool admission, rate selection and egress remain
 authoritative. Issue #422 owns adapter cutover after differential parity.
+
+It now covers contextless HTTP direct rules and permission routes, host-qualified
+routes and dispatch-scoped direct rules, MCP alias identities, and rate-lane
+selection. Tool admission and static egress are not implemented.
+[policy-evaluation-parity.md](policy-evaluation-parity.md) is the per-lane
+inventory: legacy entry point, normalization, default, trace reason, authority.
 
 ## Supported contract
 
@@ -12,8 +18,11 @@ normalizer/validator, direct `RuleMatcher`, role `PolicyEngine`, method matcher
 and segment-boundary prefix matcher. The legacy startup/parser's broader `0.x`
 acceptance behavior is unchanged. No future schema or field is inferred.
 
-The version-1 context supplies a pinned `ResourceSnapshot`, method, exact URI
-path, principal facts, and a contextless HTTP classification. Missing identity
+The context is at version 3; each lane that added a required fact bumped it, so a
+context built for an earlier shape is refused rather than reinterpreted. It
+supplies a pinned `ResourceSnapshot`, method, exact URI path, principal facts, an
+HTTP classification, a three-state request host, and routing facts when a dispatch
+was classified. Missing identity
 facts differ from a known anonymous caller. The principal projection copies
 only user ID, issuer, roles and auth method; it drops session ID, email and
 organization and cannot carry headers, tokens or credentials. Authentication
@@ -34,22 +43,27 @@ freshness or perform a live cluster-revision check.
 | Ordinary direct HTTP rules | `RuleMatcher::evaluate_with_dispatch`, RBAC middleware direct branch | First enabled HTTP match in source order; original rule ordinal; Allow, Deny and Shadow remain independent of global mode |
 | Ordinary permission routes | RBAC `matching_route_with_host`, `PolicyEngine::principal_has_permission` | First prefix/method match; exact/wildcard permission; role issuer/auth-method activation; route override inherits global mode |
 | Default and observe behavior | RBAC default branches | Default allow or deny; shadow converts a logical deny to observation within this lane |
-| Host/dispatch-qualified rules | RBAC matching/direct/host helpers | Explicitly unsupported, including contextless dispatch matchers, until PR 2 |
-| MCP raw/canonical aliases, tools, rate selection, static egress | Existing respective authorities | Not evaluated; PR 2 owns extraction |
+| Host/dispatch-qualified rules | RBAC matching/direct/host helpers | Host-bound routes and dispatch-scoped rules evaluated; a selected upstream narrows direct rules to denies and is refused outright when no host-bound route authorizes it |
+| MCP raw/canonical aliases | `evaluate_equivalent_paths_with_dispatch`, exact-then-prefix route search | Both identities decide, under action-major precedence; the request path is matched exactly and only the canonical identity by prefix |
+| Rate lane selection | `policy_rate_limit_request` guard, `RateLimitState::matching_limiter` | First matching override; anonymous reaches none, reproducing the live early return; enforcement and buckets untouched |
+| Tools, static egress | Existing respective authorities | Not evaluated; #421 PR 2 owns extraction |
 
-Policies containing host-qualified routes or dispatch-bound direct rules return
-`indeterminate/unsupported_routing_policy` conservatively, including when an
-earlier rule appears sufficient. A proxy or MCP target returns
-`indeterminate/unsupported_target`. Missing supported facts have distinct stable
-limitation codes. Indeterminate always carries Block and cannot be reused.
+Every target is evaluated, so there is no `unsupported_target` limitation and no
+`unsupported_routing_policy`; both are gone. What remains is facts: each missing
+supported fact has its own stable limitation code, and the request host is
+demanded only when the compiled policy actually has a host-qualified route, so a
+caller is never asked for a fact that cannot change the answer. Indeterminate always carries Block and cannot be reused.
 Malformed paths, unsupported context versions and mismatched snapshots reject
 evaluation; internal invariant/encoding errors remain distinct errors. These
 errors are not normal denials and cannot be converted to an empty successful
 analysis. The caller must map every error to failed analysis/effective block.
 
 The result distinguishes logical Allow/Deny/Indeterminate from the lane effect
-Allow/Block/Observe. `complete` means complete for **contextless HTTP policy**,
-never for a whole request. Every trace enumerates authentication, CSRF, request
+Allow/Block/Observe. `complete` means complete for the **named HTTP policy
+domain**, never for a whole request. A host-bound request whose first matching
+direct rule is a shadow also reports that observation separately from the rule
+that decided, because the live path records it and an adapter dropping it would
+lose telemetry. Every trace enumerates authentication, CSRF, request
 admission, management permissions, other policy lanes, mutable capacity, DNS,
 transport, upstream execution, live revision freshness and exact gateway build
 identity as not evaluated. Allow/Observe is no promise that a request forwards.
@@ -108,22 +122,37 @@ evidence envelope. Privacy projections and historical evidence remain #243.
 
 ## Verification and handoff
 
-Run `cargo test -p gateway --bin gateway policy_eval::` for this slice. The
-in-process middleware differential matrix compares 2,304 synthetic requests over
-global/route enforcement, defaults, direct actions, order, path boundaries,
-methods, anonymous/active/inactive principals and wildcard roles. It compares
-final decision, reason, matched rule/route attribution, HTTP status and emitted
-allow/deny/would-deny event types. No listener or upstream is used.
+Run `cargo test -p gateway --bin gateway policy_eval::` for the kernel's own
+tests, plus the RBAC suite. CI gates on two distinct Clippy invocations --
+`cargo clippy --workspace --locked` and
+`cargo clippy -p gateway --no-default-features --all-targets` -- which differ in
+whether `cfg(test)` and the `postgres` feature are on, so run both rather than a
+superset of them. The structural transport and dependency gates must pass too.
 
-Additional tests cover missing versus anonymous facts, unsupported lanes,
-malformed/bounded inputs, exact source/revision/context/semantics binding,
-duplicate/future source rejection, redaction, principal constraints and
-deterministic concurrent evaluation without an async runtime. Run the existing
-RBAC tests, formatter, workspace Clippy and structural transport/security gates
-as well. This PR does not mark #421 PR 2/3 or any #422 cutover complete.
+**The differential tests drive the real `rbac_middleware` and compare against it,
+never a second hand-written evaluator.** That is the method, not a detail: it
+caught a semantic the kernel had wrong -- a selected virtual upstream with no
+host-bound route is refused outright, and neither the policy default nor shadow
+enforcement softens it -- where a second evaluator would have encoded the same
+wrong assumption twice and agreed with itself. Two corollaries, both found the
+hard way and both recorded in
+[policy-evaluation-parity.md](policy-evaluation-parity.md): the oracle must
+include any guard that runs before the extracted function, and it must compare the
+compiled instance the state actually installed rather than a separately compiled
+copy of the same policy.
 
-PR 2 must extend the context/resource contracts before supporting dispatch and
-MCP precedence. In particular host-qualified requests can emit a direct-shadow
-observation and then reach a different final route/direct decision; a single
-final outcome cannot represent their complete trace. PR 3 supplies the full
-lane/normalization/authority inventory and broader side-effect evidence.
+The matrices cover contextless HTTP over enforcement modes, defaults, direct
+actions, order, path boundaries, methods and principal activation; host-bound and
+dispatch-scoped requests including the direct-shadow observation that precedes a
+route decision; MCP aliases over rulebases where the two precedence orders
+disagree; and rate-lane selection against the live selector with its guard.
+Further tests cover missing versus anonymous facts, malformed and oversized
+inputs, exact digest/revision/context/semantics binding, duplicate and future
+source rejection, redaction, and deterministic concurrent evaluation with no async
+runtime present. Purity is asserted rather than assumed: evaluation through a
+capturing audit sink must leave it empty.
+
+Nothing here marks any #422 cutover complete. The remaining #421 PR 2 lanes are
+tool admission and static egress; static egress needs its trusted-fact boundary
+established before any of it is pure, since its acceptance criterion is that a
+denied request makes zero DNS calls.

@@ -2898,3 +2898,76 @@ async fn a_revision_that_cannot_exist_is_refused_and_the_installed_snapshot_keep
         .snapshot()
     );
 }
+/// Evaluating a policy emits nothing.
+///
+/// ADR-0004 forbids every pure path from emitting normal data-plane
+/// authorization events, and the kernel is meant to hand a decision back for a
+/// caller to act on rather than act itself. It holds no audit sink, so this is
+/// structural -- but structure is what changes when somebody adds a field, and
+/// the observation output exists precisely because a caller is expected to emit
+/// on the kernel's behalf, which is the shape that invites emitting here instead.
+#[tokio::test]
+async fn evaluating_a_policy_emits_no_audit_events() {
+    let policy = test_policy_with_rules(
+        DefaultAction::Deny,
+        &[("reader", &["data:read"])],
+        &[route(&["GET"], "/data", "data:read")],
+        &[direct_rule(
+            Some("shadowed"),
+            &["GET"],
+            "/data/**",
+            RuleAction::Shadow,
+        )],
+    );
+    let capture = CaptureSink::new();
+    let audit = AuditLog::new(Arc::new(capture.clone()) as Arc<dyn AuditSink>);
+    let state = RbacState::new(policy, Vec::new(), false, audit.clone());
+    let installed = state.installed_compiled_policy();
+    let compiled = installed.compiled();
+
+    // Decisions of every shape: allowed, denied, observed, and indeterminate.
+    for path in ["/data/items", "/elsewhere"] {
+        for identity in [None, Some(test_principal(&["reader"]))] {
+            let mut input = crate::policy_eval::PolicyEvaluationContext {
+                version: crate::policy_eval::CONTEXT_VERSION,
+                snapshot: compiled.snapshot(),
+                method: Some(Method::GET),
+                path: Some(path.to_owned()),
+                principal: identity.as_ref().map_or(
+                    crate::policy_eval::PrincipalFact::Anonymous,
+                    |identity| {
+                        crate::policy_eval::PrincipalFact::Authenticated(
+                            crate::policy_eval::PrincipalIdentity::from_principal(identity),
+                        )
+                    },
+                ),
+                target: crate::policy_eval::HttpTarget::Contextless,
+                request_host: crate::policy_eval::HostFact::Absent,
+                dispatch: None,
+            };
+            let evaluation = compiled.evaluate(&input).expect("evaluates");
+            // A shadow observation is reported, not emitted: the caller owns that.
+            let _ = evaluation.observation();
+            let _ = compiled.select_rate_lane(&input).expect("selects");
+
+            // And the indeterminate path emits nothing either.
+            input.target = crate::policy_eval::HttpTarget::Missing;
+            let _ = compiled.evaluate(&input).expect("evaluates");
+        }
+    }
+
+    audit
+        .close_and_drain(Duration::from_secs(5))
+        .await
+        .expect("audit drains");
+    let events = capture.events();
+    assert!(
+        events.is_empty(),
+        "evaluation emitted {} audit event(s): {:?}",
+        events.len(),
+        events
+            .iter()
+            .map(|event| event.event_type.clone())
+            .collect::<Vec<_>>()
+    );
+}
