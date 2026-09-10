@@ -715,16 +715,16 @@ impl PolicyEvaluationContext {
             return Err(EvaluationError::SnapshotMismatch);
         }
         if let Some(path) = &self.path {
-            if path.len() > 8192 {
-                return Err(EvaluationError::ContextTooLarge);
-            }
-            if !path.starts_with('/')
-                || path.contains(['?', '#'])
-                || path.bytes().any(|byte| byte <= b' ' || byte == 127)
-                || is_unsafe_request_path(path)
-            {
-                return Err(EvaluationError::MalformedPath);
-            }
+            validate_path(path)?;
+        }
+        // The canonical identity is a path that decides, matched against direct
+        // rules and routes exactly as the request path is, so it is checked
+        // exactly as the request path is. Validating only the first identity
+        // would let a malformed or oversized second one reach matching, produce
+        // a complete decision -- an allow, under a permissive default -- and
+        // escape the bound the context size limit exists to impose.
+        if let HttpTarget::McpAlias { canonical_path } = &self.target {
+            validate_path(canonical_path)?;
         }
         if self
             .method
@@ -1042,6 +1042,24 @@ impl Evaluation {
                 .binding()
                 .is_ok_and(|binding| binding == self.binding)
     }
+}
+
+/// Rejects a path that is not an exact, already-separated request path.
+///
+/// Shared by every path identity in a context. A check that covered only the
+/// first one would be a check the others are missing, and each of them decides.
+fn validate_path(path: &str) -> Result<(), EvaluationError> {
+    if path.len() > 8192 {
+        return Err(EvaluationError::ContextTooLarge);
+    }
+    if !path.starts_with('/')
+        || path.contains(['?', '#'])
+        || path.bytes().any(|byte| byte <= b' ' || byte == 127)
+        || is_unsafe_request_path(path)
+    {
+        return Err(EvaluationError::MalformedPath);
+    }
+    Ok(())
 }
 
 /// Rejects an authority that cannot be a real watermark.

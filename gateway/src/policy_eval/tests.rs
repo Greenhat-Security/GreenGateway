@@ -1487,3 +1487,46 @@ fn an_alias_never_inherits_a_broad_prefix_permission_from_its_request_path() {
     assert_eq!(result.matched, Some(RuleReference::Route(0)));
     assert_eq!(result.logical, LogicalDecision::Allow);
 }
+
+#[test]
+fn a_canonical_alias_identity_is_checked_exactly_as_the_request_path_is() {
+    // The second identity is matched against direct rules and routes just as the
+    // first one is, so validating only the first would let a malformed or
+    // oversized second identity reach matching and produce a complete decision --
+    // an allow, under a permissive default -- and escape the context size bound.
+    let compiled = compile(json!({"schema_version":"0.1.0","default_action":"allow"}));
+    for (canonical, expected) in [
+        ("", EvaluationError::MalformedPath),
+        ("mcp", EvaluationError::MalformedPath),
+        ("/mcp?x=1", EvaluationError::MalformedPath),
+        ("/mcp#frag", EvaluationError::MalformedPath),
+        ("/mcp\n", EvaluationError::MalformedPath),
+        ("/../mcp", EvaluationError::MalformedPath),
+    ] {
+        let mut input = context(&compiled);
+        input.target = HttpTarget::McpAlias {
+            canonical_path: canonical.to_owned(),
+        };
+        assert_eq!(
+            compiled.evaluate(&input),
+            Err(expected),
+            "canonical {canonical:?} was accepted"
+        );
+    }
+
+    let mut oversized = context(&compiled);
+    oversized.target = HttpTarget::McpAlias {
+        canonical_path: format!("/{}", "a".repeat(8192)),
+    };
+    assert_eq!(
+        compiled.evaluate(&oversized),
+        Err(EvaluationError::ContextTooLarge)
+    );
+
+    // A well-formed canonical identity still evaluates.
+    let mut valid = context(&compiled);
+    valid.target = HttpTarget::McpAlias {
+        canonical_path: "/mcp".to_owned(),
+    };
+    assert!(compiled.evaluate(&valid).unwrap().complete);
+}
