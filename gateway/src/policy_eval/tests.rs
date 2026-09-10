@@ -229,9 +229,6 @@ fn missing_facts_are_indeterminate_and_never_reusable_or_permitted() {
     let mut input = baseline.clone();
     input.target = HttpTarget::ProxyDispatch;
     cases.push((input, Limitation::MissingDispatchFact));
-    let mut input = baseline.clone();
-    input.target = HttpTarget::McpAlias;
-    cases.push((input, Limitation::UnsupportedTarget));
     for (input, limitation) in cases {
         let result = compiled.evaluate(&input).unwrap();
         assert_eq!(result.logical, LogicalDecision::Indeterminate);
@@ -296,12 +293,15 @@ fn a_classified_dispatch_without_its_facts_is_indeterminate() {
     let result = compiled.evaluate(&input).unwrap();
     assert_eq!(result.limitation, Some(Limitation::MissingDispatchFact));
 
-    // MCP aliases still need their raw and canonical identities evaluated
-    // together, and that lane is not this one.
+    // An MCP alias is answered now: it names its canonical identity in the
+    // target, so both identities are present and nothing has to be guessed.
     let mut input = context(&compiled);
-    input.target = HttpTarget::McpAlias;
+    input.target = HttpTarget::McpAlias {
+        canonical_path: "/mcp".to_owned(),
+    };
     let result = compiled.evaluate(&input).unwrap();
-    assert_eq!(result.limitation, Some(Limitation::UnsupportedTarget));
+    assert_eq!(result.limitation, None);
+    assert!(result.complete);
 }
 
 #[test]
@@ -828,10 +828,12 @@ fn dispatch_facts_on_a_non_dispatch_target_are_rejected_rather_than_ignored() {
     for target in [
         HttpTarget::Contextless,
         HttpTarget::Missing,
-        HttpTarget::McpAlias,
+        HttpTarget::McpAlias {
+            canonical_path: "/mcp".to_owned(),
+        },
     ] {
         let mut input = context(&compiled);
-        input.target = target;
+        input.target = target.clone();
         input.dispatch = Some(facts.clone());
         assert_eq!(
             compiled.evaluate(&input),
@@ -1208,4 +1210,323 @@ fn the_digest_frame_carries_the_policy_its_own_schema_version() {
             assert_ne!(left, right, "two schema versions shared one digest");
         }
     }
+}
+#[tokio::test]
+async fn alias_lane_matches_current_middleware_including_its_two_precedence_orders() {
+    // The alias pair and the single identity use different precedence orders, so
+    // this matrix deliberately includes rulebases where they disagree: a policy
+    // whose first matching rule allows while a later rule denies answers `allow`
+    // for a single path and `deny` for a pair. Only the real middleware settles
+    // which applies where, which is why it is the oracle again.
+    const MCP: &str = "/mcp";
+    for default in ["allow", "deny"] {
+        for rules in [
+            // No direct rules: the route lane decides, exercising the
+            // exact-then-canonical-prefix asymmetry on its own.
+            json!([]),
+            // Allow before deny, both on the alias path. Rule-index-major says
+            // allow; action-major says deny.
+            json!([
+                {"id":"allow-alias","path":"/base/mcp","action":"allow"},
+                {"id":"deny-alias","path":"/base/mcp","action":"deny"}
+            ]),
+            // The same inversion split across the two identities, which is the
+            // case the pair exists for: an allow written against one identity
+            // must not suppress a deny written against the other.
+            json!([
+                {"id":"allow-alias","path":"/base/mcp","action":"allow"},
+                {"id":"deny-canonical","path":"/mcp","action":"deny"}
+            ]),
+            // Shadow on one identity, allow on the other: shadow outranks allow.
+            json!([
+                {"id":"allow-alias","path":"/base/mcp","action":"allow"},
+                {"id":"shadow-canonical","path":"/mcp","action":"shadow"}
+            ]),
+            // A deny on the canonical identity only.
+            json!([{"id":"deny-canonical","path":"/mcp","action":"deny"}]),
+        ] {
+            let value = json!({
+                "schema_version":"0.1.0","default_action":default,
+                "roles":{
+                    "base-reader":{"permissions":["base:read"]},
+                    "mcp-user":{"permissions":["admin:mcp:use"]}
+                },
+                // A broad public prefix route whose permission the MCP endpoint
+                // underneath it must not inherit, then the canonical MCP route.
+                "routes":[
+                    {"methods":["POST"],"path_prefix":"/base","permission":"base:read"},
+                    {"methods":["POST"],"path_prefix":"/mcp","permission":"admin:mcp:use"}
+                ],
+                "rules":rules
+            });
+            let compiled = compile(value.clone());
+            let policy = Policy::validate_json_value(value).unwrap();
+            let capture = CaptureSink::new();
+            let audit = AuditLog::new(Arc::new(capture.clone()) as Arc<dyn AuditSink>);
+            let state = RbacState::new_with_mcp_route_paths(
+                policy.clone(),
+                Vec::new(),
+                crate::client_ip::ClientIpPolicy::default(),
+                audit.clone(),
+                vec![MCP.to_owned(), "/base/mcp".to_owned()],
+            );
+            let router = Router::new()
+                .fallback(any(|| async { "local" }))
+                .layer(from_fn_with_state(state, rbac_middleware));
+
+            let mut expected_events = Vec::new();
+            for path in [
+                // The alias: policy identity is `/mcp`, request path is this.
+                "/base/mcp",
+                // The canonical path itself, which is not an alias.
+                MCP,
+                // A subpath of the alias, which is not an MCP route at all and
+                // must keep taking the broad prefix route.
+                "/base/mcp/assets",
+            ] {
+                for identity in [
+                    None,
+                    Some(principal(&["base-reader"])),
+                    Some(principal(&["mcp-user"])),
+                ] {
+                    let mut input = context(&compiled);
+                    input.method = Some(Method::POST);
+                    input.path = Some(path.to_owned());
+                    // Production maps an MCP route path to the canonical identity
+                    // and leaves everything else alone; mirror exactly that.
+                    input.target = if path == "/base/mcp" {
+                        HttpTarget::McpAlias {
+                            canonical_path: MCP.to_owned(),
+                        }
+                    } else {
+                        HttpTarget::Contextless
+                    };
+                    input.principal =
+                        identity
+                            .as_ref()
+                            .map_or(PrincipalFact::Anonymous, |identity| {
+                                PrincipalFact::Authenticated(PrincipalIdentity::from_principal(
+                                    identity,
+                                ))
+                            });
+                    let result = compiled.evaluate(&input).unwrap();
+
+                    let mut request = Request::builder()
+                        .method(Method::POST)
+                        .uri(path)
+                        .body(Body::empty())
+                        .unwrap();
+                    request
+                        .extensions_mut()
+                        .insert(ProxyRouteClassificationCompleted);
+                    if let Some(identity) = identity {
+                        request.extensions_mut().insert(identity);
+                    }
+                    let response = router.clone().oneshot(request).await.unwrap();
+                    let live = response.extensions().get::<PolicyDecision>().unwrap();
+
+                    let label = format!("{default} {rules} {path}");
+                    let (outcome, status, event) = match result.effect {
+                        PolicyEffect::Allow => (
+                            PolicyDecisionOutcome::Allowed,
+                            StatusCode::OK,
+                            "authz.allowed",
+                        ),
+                        PolicyEffect::Observe => (
+                            PolicyDecisionOutcome::WouldDeny,
+                            StatusCode::OK,
+                            "authz.would_deny",
+                        ),
+                        PolicyEffect::Block => (
+                            PolicyDecisionOutcome::Denied,
+                            StatusCode::FORBIDDEN,
+                            "authz.denied",
+                        ),
+                    };
+                    assert_eq!(live.outcome, outcome, "{label}");
+                    assert_eq!(response.status(), status, "{label}");
+                    assert_eq!(live.reason, result.reason.as_str(), "{label}");
+                    match result.matched {
+                        Some(RuleReference::Direct(index)) => assert_eq!(
+                            live.matched_rule_id,
+                            Some(
+                                policy.rules[index]
+                                    .id
+                                    .clone()
+                                    .unwrap_or_else(|| index.to_string())
+                            ),
+                            "{label}"
+                        ),
+                        Some(RuleReference::Route(index)) => {
+                            assert_eq!(
+                                live.permission.as_deref(),
+                                Some(policy.routes[index].permission.as_str()),
+                                "{label}"
+                            );
+                            assert_eq!(
+                                live.path_prefix.as_deref(),
+                                Some(policy.routes[index].path_prefix.as_str()),
+                                "{label}"
+                            );
+                        }
+                        None => {
+                            assert_eq!(live.matched_rule_id, None, "{label}");
+                            assert_eq!(live.permission, None, "{label}");
+                        }
+                    }
+                    assert!(result.complete, "{label}");
+                    expected_events.push(event);
+                }
+            }
+            audit.close_and_drain(Duration::from_secs(5)).await.unwrap();
+            let events = capture.events();
+            let observed: Vec<&str> = events
+                .iter()
+                .map(|event| event.event_type.as_str())
+                .collect();
+            assert_eq!(observed, expected_events, "{default} {rules}");
+        }
+    }
+}
+
+#[test]
+fn an_alias_uses_the_most_restrictive_action_across_both_identities() {
+    // The pair's precedence order, stated on its own so a future simplification
+    // to "evaluate the canonical path instead" fails here by name. Rule order is
+    // allow-first in every case; only action-major precedence makes these denies.
+    for (rules, expected) in [
+        (
+            json!([
+                {"id":"allow-alias","path":"/base/mcp","action":"allow"},
+                {"id":"deny-canonical","path":"/mcp","action":"deny"}
+            ]),
+            (PolicyEffect::Block, 1usize),
+        ),
+        (
+            json!([
+                {"id":"allow-canonical","path":"/mcp","action":"allow"},
+                {"id":"deny-alias","path":"/base/mcp","action":"deny"}
+            ]),
+            (PolicyEffect::Block, 1),
+        ),
+        (
+            json!([
+                {"id":"allow-alias","path":"/base/mcp","action":"allow"},
+                {"id":"shadow-canonical","path":"/mcp","action":"shadow"}
+            ]),
+            (PolicyEffect::Observe, 1),
+        ),
+    ] {
+        let compiled = compile(json!({
+            "schema_version":"0.1.0","default_action":"deny","rules":rules
+        }));
+        let mut input = context(&compiled);
+        input.path = Some("/base/mcp".to_owned());
+        input.target = HttpTarget::McpAlias {
+            canonical_path: "/mcp".to_owned(),
+        };
+        let result = compiled.evaluate(&input).unwrap();
+        assert_eq!(result.effect, expected.0, "{rules}");
+        assert_eq!(
+            result.matched,
+            Some(RuleReference::Direct(expected.1)),
+            "{rules}"
+        );
+
+        // The same rulebase on a single identity keeps rule-index-major order, so
+        // the earlier allow wins. The two orders genuinely differ.
+        let mut single = context(&compiled);
+        single.path = Some("/base/mcp".to_owned());
+        let result = compiled.evaluate(&single).unwrap();
+        if rules[0]["path"] == json!("/base/mcp") {
+            assert_eq!(result.effect, PolicyEffect::Allow, "{rules}");
+            assert_eq!(result.matched, Some(RuleReference::Direct(0)), "{rules}");
+        }
+    }
+}
+
+#[test]
+fn an_alias_never_inherits_a_broad_prefix_permission_from_its_request_path() {
+    // `/base/mcp` sits under a `/base` route granting something weaker. Prefix
+    // matching the request path would hand the MCP endpoint the `/base`
+    // permission and quietly widen who may reach it, so the request path is only
+    // ever matched exactly and the prefix search runs on the canonical identity.
+    let compiled = compile(json!({
+        "schema_version":"0.1.0","default_action":"deny",
+        "roles":{"base-reader":{"permissions":["base:read"]}},
+        "routes":[
+            {"methods":["POST"],"path_prefix":"/base","permission":"base:read"},
+            {"methods":["POST"],"path_prefix":"/mcp","permission":"admin:mcp:use"}
+        ]
+    }));
+    let mut input = context(&compiled);
+    input.method = Some(Method::POST);
+    input.path = Some("/base/mcp".to_owned());
+    input.target = HttpTarget::McpAlias {
+        canonical_path: "/mcp".to_owned(),
+    };
+    input.principal =
+        PrincipalFact::Authenticated(PrincipalIdentity::from_principal(&principal(&[
+            "base-reader",
+        ])));
+    let result = compiled.evaluate(&input).unwrap();
+    // The canonical MCP route, not the broad one, and `base:read` does not satisfy it.
+    assert_eq!(result.matched, Some(RuleReference::Route(1)));
+    assert_eq!(result.logical, LogicalDecision::Deny);
+    assert_eq!(result.reason, Reason::MissingPermission);
+
+    // A non-MCP subpath is not an alias and does take the broad prefix route.
+    let mut subpath = context(&compiled);
+    subpath.method = Some(Method::POST);
+    subpath.path = Some("/base/mcp/assets".to_owned());
+    subpath.principal =
+        PrincipalFact::Authenticated(PrincipalIdentity::from_principal(&principal(&[
+            "base-reader",
+        ])));
+    let result = compiled.evaluate(&subpath).unwrap();
+    assert_eq!(result.matched, Some(RuleReference::Route(0)));
+    assert_eq!(result.logical, LogicalDecision::Allow);
+}
+
+#[test]
+fn a_canonical_alias_identity_is_checked_exactly_as_the_request_path_is() {
+    // The second identity is matched against direct rules and routes just as the
+    // first one is, so validating only the first would let a malformed or
+    // oversized second identity reach matching and produce a complete decision --
+    // an allow, under a permissive default -- and escape the context size bound.
+    let compiled = compile(json!({"schema_version":"0.1.0","default_action":"allow"}));
+    for (canonical, expected) in [
+        ("", EvaluationError::MalformedPath),
+        ("mcp", EvaluationError::MalformedPath),
+        ("/mcp?x=1", EvaluationError::MalformedPath),
+        ("/mcp#frag", EvaluationError::MalformedPath),
+        ("/mcp\n", EvaluationError::MalformedPath),
+        ("/../mcp", EvaluationError::MalformedPath),
+    ] {
+        let mut input = context(&compiled);
+        input.target = HttpTarget::McpAlias {
+            canonical_path: canonical.to_owned(),
+        };
+        assert_eq!(
+            compiled.evaluate(&input),
+            Err(expected),
+            "canonical {canonical:?} was accepted"
+        );
+    }
+
+    let mut oversized = context(&compiled);
+    oversized.target = HttpTarget::McpAlias {
+        canonical_path: format!("/{}", "a".repeat(8192)),
+    };
+    assert_eq!(
+        compiled.evaluate(&oversized),
+        Err(EvaluationError::ContextTooLarge)
+    );
+
+    // A well-formed canonical identity still evaluates.
+    let mut valid = context(&compiled);
+    valid.target = HttpTarget::McpAlias {
+        canonical_path: "/mcp".to_owned(),
+    };
+    assert!(compiled.evaluate(&valid).unwrap().complete);
 }

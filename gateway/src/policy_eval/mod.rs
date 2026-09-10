@@ -2,9 +2,31 @@
 //! middleware until #422 proves each cutover.
 //!
 //! PR 1 supported contextless HTTP direct rules, ordinary permission routes and
-//! defaults. This slice adds the routing lane: host-qualified routes and
-//! dispatch-scoped direct rules, for both contextless requests and a classified
-//! proxy dispatch.
+//! defaults. The routing lane added host-qualified routes and dispatch-scoped
+//! direct rules, for both contextless requests and a classified proxy dispatch.
+//! This slice adds MCP alias identities.
+//!
+//! ## An alias decides under a different precedence order
+//!
+//! An MCP endpoint reachable by a path that is not its canonical policy identity
+//! has *two* identities, and both decide. They are not evaluated twice and the
+//! results combined, because the combination is not expressible that way: the
+//! pair uses action-major precedence -- the most restrictive action present
+//! anywhere in the rulebase wins, scanned over the union of both paths -- while a
+//! single identity uses rule-index-major, the first matching rule in source
+//! order whatever its action.
+//!
+//! Those orders disagree. Given `[allow /x, deny /x]` the single identity answers
+//! allow and the pair answers deny. Action-major is what stops an allow written
+//! against one identity from suppressing a deny or shadow written against the
+//! other, so the kernel carries both orders rather than deriving one from the
+//! other; see [`CompiledPolicy::match_direct`].
+//!
+//! The route lane is asymmetric for the same reason, in the other direction: an
+//! alias matches a route's `path_prefix` *exactly* on the request path, and only
+//! then by prefix on the canonical identity. Prefix-matching the request path
+//! would let an MCP endpoint mounted under a public prefix inherit that prefix's
+//! weaker permission. See [`CompiledPolicy::match_route`].
 //!
 //! ## Host qualification is the one place a direct allow does not decide
 //!
@@ -53,17 +75,17 @@ use crate::{
     auth::{AuthMethod, Principal},
     path_match::{is_unsafe_request_path, path_prefix_matches},
     rbac::{
-        matcher::{method_matches, RuleDispatchContext},
-        policy::KNOWN_TOP_LEVEL_KEYS,
+        matcher::{method_matches, RuleDecision, RuleDispatchContext},
+        policy::{RouteRule, KNOWN_TOP_LEVEL_KEYS},
         DefaultAction, EnforcementMode, Policy, PolicyEngine, RuleAction, RuleMatcher,
     },
 };
 
-/// The routing lane adds required facts to the context, so a context built for
-/// the previous version is not silently reinterpreted under this one.
-pub(crate) const CONTEXT_VERSION: u16 = 2;
-pub(crate) const HTTP_SEMANTICS_VERSION: &str = "gg-http-routing-v1";
-pub(crate) const HTTP_DOMAIN: &str = "http_routing_v1";
+/// Each lane that adds a required fact bumps this, so a context built for an
+/// earlier shape is refused rather than silently reinterpreted under a later one.
+pub(crate) const CONTEXT_VERSION: u16 = 3;
+pub(crate) const HTTP_SEMANTICS_VERSION: &str = "gg-http-alias-v1";
+pub(crate) const HTTP_DOMAIN: &str = "http_alias_v1";
 pub(crate) const MAX_TRACE_BYTES: usize = 2048;
 /// Frame kind for the in-memory install path's digest. Outside ADR-0004's
 /// reserved `source`/`semantic` namespace on purpose; see [`PolicyDigest`].
@@ -224,6 +246,98 @@ impl CompiledPolicy {
         self.snapshot
     }
 
+    /// First deciding direct rule, over one path identity or an alias pair.
+    ///
+    /// The two cases use **different precedence orders**, and neither is a
+    /// special case of the other:
+    ///
+    /// - One identity is *rule-index-major*: the first rule in source order that
+    ///   matches, whatever its action.
+    /// - An alias pair is *action-major*: the most restrictive action present
+    ///   anywhere in the rulebase wins -- deny, then shadow, then allow -- each
+    ///   scanned over the union of both identities.
+    ///
+    /// They disagree, and not only in theory. Given `[allow /x, deny /x]` the
+    /// single-identity order answers allow and the pair answers deny. Action-major
+    /// is what stops an allow written against one identity from suppressing a deny
+    /// or shadow written against the other, which is the whole reason an alias
+    /// evaluates as a pair rather than twice. Collapsing them into one rule would
+    /// silently change one of the two.
+    ///
+    /// Narrowing to denies composes with either: the action set shrinks to
+    /// `[deny]`, and over a single action the two orders coincide.
+    fn match_direct(
+        &self,
+        method: &str,
+        path: &str,
+        canonical_path: Option<&str>,
+        principal: Option<&Principal>,
+        dispatch_context: RuleDispatchContext<'_>,
+        denies_only: bool,
+    ) -> Option<RuleDecision> {
+        match canonical_path {
+            Some(canonical) => self.matcher.evaluate_equivalent_paths_with_dispatch(
+                method,
+                &[canonical, path],
+                principal,
+                dispatch_context,
+                denies_only,
+            ),
+            None if denies_only => self.matcher.evaluate_denies_with_dispatch(
+                method,
+                path,
+                principal,
+                dispatch_context,
+            ),
+            None => self
+                .matcher
+                .evaluate_with_dispatch(method, path, principal, dispatch_context),
+        }
+    }
+
+    /// First matching route, over one path identity or an alias pair.
+    ///
+    /// For a single identity this is prefix matching in source order. For an
+    /// alias it is deliberately asymmetric: an **exact** `path_prefix` match on
+    /// the request path, and only then a **prefix** match on the canonical
+    /// identity. The request path is never prefix-matched.
+    ///
+    /// That asymmetry is load-bearing. An MCP endpoint mounted under a public
+    /// prefix -- `/base/mcp` where a `/base` route grants something weaker --
+    /// must not inherit the broad route's permission by prefix. Prefix-matching
+    /// the request path would hand `/base/mcp` the `/base` permission and quietly
+    /// widen who may reach the MCP endpoint.
+    fn match_route(
+        &self,
+        method: &str,
+        path: &str,
+        canonical_path: Option<&str>,
+        host: Option<&str>,
+        host_binding_required: bool,
+    ) -> Option<(usize, &RouteRule)> {
+        let routes = &self.engine.policy().routes;
+        let admissible = |route: &RouteRule| {
+            method_matches(&route.methods, method)
+                && route_host_matches(&route.hosts, host, host_binding_required)
+        };
+        match canonical_path {
+            Some(canonical) => routes
+                .iter()
+                .enumerate()
+                .find(|(_, route)| route.path_prefix == path && admissible(route))
+                .or_else(|| {
+                    routes.iter().enumerate().find(|(_, route)| {
+                        path_prefix_matches(canonical, &route.path_prefix) && admissible(route)
+                    })
+                }),
+            // The existing prefix and method matchers preserve segment
+            // boundaries, wildcard methods and case folding.
+            None => routes.iter().enumerate().find(|(_, route)| {
+                path_prefix_matches(path, &route.path_prefix) && admissible(route)
+            }),
+        }
+    }
+
     pub(crate) fn evaluate(
         &self,
         context: &PolicyEvaluationContext,
@@ -237,17 +351,13 @@ impl CompiledPolicy {
         } else if matches!(context.principal, PrincipalFact::Missing) {
             Some(Limitation::MissingPrincipalFact)
         } else {
-            match context.target {
+            match &context.target {
                 HttpTarget::Missing => Some(Limitation::MissingDispatchFact),
-                HttpTarget::Contextless => None,
+                HttpTarget::Contextless | HttpTarget::McpAlias { .. } => None,
                 HttpTarget::ProxyDispatch if context.dispatch.is_none() => {
                     Some(Limitation::MissingDispatchFact)
                 }
                 HttpTarget::ProxyDispatch => None,
-                // Raw and canonical identities must be evaluated together; that
-                // lane is not this one, and guessing one identity would let a
-                // deny on the other be suppressed.
-                HttpTarget::McpAlias => Some(Limitation::UnsupportedTarget),
             }
         };
         if let Some(limitation) = missing {
@@ -285,8 +395,10 @@ impl CompiledPolicy {
                 None
             }
         };
-        let dispatch_context = match (context.target, dispatch) {
-            (HttpTarget::Contextless, _) => RuleDispatchContext::contextless(),
+        let dispatch_context = match (&context.target, dispatch) {
+            (HttpTarget::Contextless | HttpTarget::McpAlias { .. }, _) => {
+                RuleDispatchContext::contextless()
+            }
             (HttpTarget::ProxyDispatch, Some(facts)) => {
                 RuleDispatchContext::classified_with_route_id(
                     facts.route_id.as_deref(),
@@ -297,24 +409,37 @@ impl CompiledPolicy {
             }
             _ => return Err(EvaluationError::InternalInvariant),
         };
+        // The canonical policy identity, when this request reached an MCP
+        // endpoint by another path. Both identities decide together.
+        let canonical_path = match &context.target {
+            HttpTarget::McpAlias { canonical_path } => Some(canonical_path.as_str()),
+            _ => None,
+        };
 
         // Direct rules first, except that a selected upstream narrows them to
         // denies: an allow or shadow must not authorize a virtual host. The
         // first match is still computed, because a shadow among the rules an
         // upstream-bound request skips is still recorded as a would-deny.
-        let first_direct =
-            self.matcher
-                .evaluate_with_dispatch(method.as_str(), path, principal, dispatch_context);
+        let first_direct = self.match_direct(
+            method.as_str(),
+            path,
+            canonical_path,
+            principal,
+            dispatch_context,
+            false,
+        );
         let observation = first_direct.as_ref().and_then(|decision| {
             (host_binding_required && decision.action == RuleAction::Shadow)
                 .then_some(RuleReference::Direct(decision.rule_index))
         });
         let deciding_direct = if host_binding_required {
-            self.matcher.evaluate_denies_with_dispatch(
+            self.match_direct(
                 method.as_str(),
                 path,
+                canonical_path,
                 principal,
                 dispatch_context,
+                true,
             )
         } else {
             first_direct
@@ -335,13 +460,13 @@ impl CompiledPolicy {
             ));
         }
         let policy = self.engine.policy();
-        // First match in source order; the existing prefix and method matchers
-        // preserve segment boundaries, wildcard methods and case folding.
-        if let Some((index, route)) = policy.routes.iter().enumerate().find(|(_, route)| {
-            path_prefix_matches(path, &route.path_prefix)
-                && method_matches(&route.methods, method.as_str())
-                && route_host_matches(&route.hosts, effective_host, host_binding_required)
-        }) {
+        if let Some((index, route)) = self.match_route(
+            method.as_str(),
+            path,
+            canonical_path,
+            effective_host,
+            host_binding_required,
+        ) {
             let allowed = principal.is_some_and(|principal| {
                 self.engine
                     .principal_has_permission(principal, &route.permission)
@@ -480,7 +605,7 @@ pub(crate) enum PrincipalFact {
     Authenticated(PrincipalIdentity),
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum HttpTarget {
     /// Routing was never classified for this request, so a dispatch-scoped rule
@@ -488,7 +613,16 @@ pub(crate) enum HttpTarget {
     Missing,
     Contextless,
     ProxyDispatch,
-    McpAlias,
+    /// An MCP endpoint reached by a path that is not its canonical policy
+    /// identity. Both identities decide together; see [`AliasPrecedence`].
+    ///
+    /// The canonical path lives in the variant so that naming this target
+    /// without supplying the second identity is not expressible. A separate
+    /// optional field would be meaningful for exactly one target, which is the
+    /// shape a later caller forgets to populate.
+    McpAlias {
+        canonical_path: String,
+    },
 }
 
 /// The request host, distinguishing "no `Host` header" from "never captured".
@@ -581,16 +715,16 @@ impl PolicyEvaluationContext {
             return Err(EvaluationError::SnapshotMismatch);
         }
         if let Some(path) = &self.path {
-            if path.len() > 8192 {
-                return Err(EvaluationError::ContextTooLarge);
-            }
-            if !path.starts_with('/')
-                || path.contains(['?', '#'])
-                || path.bytes().any(|byte| byte <= b' ' || byte == 127)
-                || is_unsafe_request_path(path)
-            {
-                return Err(EvaluationError::MalformedPath);
-            }
+            validate_path(path)?;
+        }
+        // The canonical identity is a path that decides, matched against direct
+        // rules and routes exactly as the request path is, so it is checked
+        // exactly as the request path is. Validating only the first identity
+        // would let a malformed or oversized second one reach matching, produce
+        // a complete decision -- an allow, under a permissive default -- and
+        // escape the bound the context size limit exists to impose.
+        if let HttpTarget::McpAlias { canonical_path } = &self.target {
+            validate_path(canonical_path)?;
         }
         if self
             .method
@@ -699,7 +833,7 @@ impl PolicyEvaluationContext {
         });
         let bytes = serde_json::to_vec(&(
             self.version,
-            self.target,
+            &self.target,
             self.method.as_ref().map(Method::as_str),
             &self.path,
             principal,
@@ -908,6 +1042,24 @@ impl Evaluation {
                 .binding()
                 .is_ok_and(|binding| binding == self.binding)
     }
+}
+
+/// Rejects a path that is not an exact, already-separated request path.
+///
+/// Shared by every path identity in a context. A check that covered only the
+/// first one would be a check the others are missing, and each of them decides.
+fn validate_path(path: &str) -> Result<(), EvaluationError> {
+    if path.len() > 8192 {
+        return Err(EvaluationError::ContextTooLarge);
+    }
+    if !path.starts_with('/')
+        || path.contains(['?', '#'])
+        || path.bytes().any(|byte| byte <= b' ' || byte == 127)
+        || is_unsafe_request_path(path)
+    {
+        return Err(EvaluationError::MalformedPath);
+    }
+    Ok(())
 }
 
 /// Rejects an authority that cannot be a real watermark.
