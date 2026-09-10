@@ -1571,8 +1571,14 @@ fn rate_lane_selection_matches_the_live_selector() {
                     });
                 let selection = compiled.select_rate_lane(&input).unwrap();
 
-                let expected =
-                    live.selected_override_limit(method.as_str(), path, identity.as_ref());
+                // The oracle is the live path's behaviour, guard included:
+                // `policy_rate_limit_request` returns before consulting the
+                // selector when a request carries no principal, so an anonymous
+                // caller reaches no override however permissive the rules are.
+                // Comparing against the bare selector is what hid that.
+                let expected = identity.as_ref().and_then(|identity| {
+                    live.selected_override_limit(method.as_str(), path, Some(identity))
+                });
                 let label = format!("{method} {path} {:?}", identity.as_ref().map(|p| &p.roles));
                 match expected {
                     Some((index, requests_per_second, burst)) => {
@@ -1600,22 +1606,70 @@ fn the_rate_lane_refuses_to_select_without_the_facts_it_matches_on() {
         "schema_version":"0.1.0","default_action":"allow",
         "rate_limits":[{"requests_per_second":1.0,"burst":1}]
     }));
-    for mutate in [
-        (|input: &mut PolicyEvaluationContext| input.method = None) as fn(&mut _),
-        |input: &mut PolicyEvaluationContext| input.path = None,
-        |input: &mut PolicyEvaluationContext| input.principal = PrincipalFact::Missing,
+    for (mutate, expected) in [
+        (
+            (|input: &mut PolicyEvaluationContext| input.method = None) as fn(&mut _),
+            Limitation::MissingMethod,
+        ),
+        (
+            |input: &mut PolicyEvaluationContext| input.path = None,
+            Limitation::MissingPath,
+        ),
+        (
+            |input: &mut PolicyEvaluationContext| input.principal = PrincipalFact::Missing,
+            Limitation::MissingPrincipalFact,
+        ),
     ] {
         let mut input = context(&compiled);
         mutate(&mut input);
-        assert_eq!(
-            compiled.select_rate_lane(&input),
-            Err(EvaluationError::MissingRateFact)
-        );
+        let selection = compiled
+            .select_rate_lane(&input)
+            .expect("an unavailable fact is an incomplete result, not an evaluator error");
+        assert_eq!(selection.limitation(), Some(expected));
+        assert_eq!(selection.matched(), None);
+        // Never reusable: it is the absence of an answer, and the facts may
+        // since have arrived.
+        assert!(!selection.reusable_for(&input));
     }
 
-    // With every fact present the same policy selects its single lane.
-    let selection = compiled.select_rate_lane(&context(&compiled)).unwrap();
+    // With every fact present, and an authenticated caller, the single lane is
+    // selected. Anonymous reaches no override at all -- the live bypass.
+    let mut authenticated = context(&compiled);
+    authenticated.principal =
+        PrincipalFact::Authenticated(PrincipalIdentity::from_principal(&principal(&["reader"])));
+    let selection = compiled.select_rate_lane(&authenticated).unwrap();
     assert_eq!(selection.matched(), Some(0));
+    assert!(selection.reusable_for(&authenticated));
+
+    let anonymous = compiled.select_rate_lane(&context(&compiled)).unwrap();
+    assert_eq!(anonymous.outcome(), RateLaneOutcome::NoOverride);
+}
+
+#[test]
+fn an_anonymous_caller_reaches_no_rate_override_however_permissive_the_rules() {
+    // The live path returns before consulting the selector when a request has no
+    // principal, so an unconstrained override does not govern anonymous traffic.
+    // Matching one here would have simulation and replay report a lane governing
+    // traffic production never rate-limits.
+    let compiled = compile(json!({
+        "schema_version":"0.1.0","default_action":"allow",
+        "rate_limits":[
+            {"requests_per_second":1.0,"burst":1},
+            {"path":"/**","requests_per_second":2.0,"burst":2}
+        ]
+    }));
+    let anonymous = compiled.select_rate_lane(&context(&compiled)).unwrap();
+    assert_eq!(anonymous.outcome(), RateLaneOutcome::NoOverride);
+    assert!(anonymous.limit().is_none());
+
+    // The same request authenticated does reach the first override.
+    let mut authenticated = context(&compiled);
+    authenticated.principal =
+        PrincipalFact::Authenticated(PrincipalIdentity::from_principal(&principal(&["reader"])));
+    assert_eq!(
+        compiled.select_rate_lane(&authenticated).unwrap().matched(),
+        Some(0)
+    );
 }
 
 #[test]
@@ -1630,10 +1684,21 @@ fn rate_lane_selection_is_pinned_to_its_snapshot_like_every_other_lane() {
         "schema_version":"0.1.0","default_action":"allow",
         "rate_limits":[{"requests_per_second":2.0,"burst":2}]
     }));
-    let input = context(&first);
-    assert!(first.select_rate_lane(&input).is_ok());
+    let mut input = context(&first);
+    input.principal =
+        PrincipalFact::Authenticated(PrincipalIdentity::from_principal(&principal(&["reader"])));
+    let selection = first.select_rate_lane(&input).unwrap();
+    assert_eq!(selection.matched(), Some(0));
     assert_eq!(
         second.select_rate_lane(&input),
         Err(EvaluationError::SnapshotMismatch)
     );
+
+    // And the selection itself refuses to be applied under the other policy,
+    // which is the case validating the context before producing it cannot cover.
+    let mut under_second = context(&second);
+    under_second.principal =
+        PrincipalFact::Authenticated(PrincipalIdentity::from_principal(&principal(&["reader"])));
+    assert!(selection.reusable_for(&input));
+    assert!(!selection.reusable_for(&under_second));
 }

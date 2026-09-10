@@ -55,7 +55,10 @@
 //!
 //! Alias identities do not participate: the live selector matches the request
 //! path only, so consulting a canonical identity here would invent a second
-//! behaviour rather than mirror the existing one.
+//! behaviour rather than mirror the existing one. An anonymous caller reaches no
+//! override at all, because `policy_rate_limit_request` returns before consulting
+//! the selector when a request carries no principal -- that is the live bypass
+//! reproduced, and changing it is a cutover decision taken in both paths at once.
 //!
 //! ## Facts, not guesses
 //!
@@ -325,20 +328,54 @@ impl CompiledPolicy {
     /// Alias identities do not apply: the live selector matches the request path
     /// only, so reading a canonical identity here would invent a second
     /// behaviour rather than mirror one.
+    ///
+    /// An anonymous caller reaches no override at all. That is the live bypass,
+    /// not a simplification: `policy_rate_limit_request` returns before consulting
+    /// the selector when a request carries no `Principal`, so it only ever selects
+    /// for an authenticated one. Passing `None` to the matcher here instead would
+    /// let an unconstrained override match, and simulation and replay would report
+    /// a lane governing traffic that live never rate-limits. Changing that is a
+    /// deliberate decision for the cutover, in both paths at once.
     pub(crate) fn select_rate_lane(
         &self,
         context: &PolicyEvaluationContext,
     ) -> Result<RateLaneSelection, EvaluationError> {
         context.validate(self.snapshot)?;
-        let (Some(method), Some(path)) = (&context.method, &context.path) else {
-            return Err(EvaluationError::MissingRateFact);
-        };
-        let principal = match &context.principal {
-            PrincipalFact::Authenticated(identity) => Some(&identity.0),
-            PrincipalFact::Anonymous => None,
+        let binding = context.binding()?;
+        // A fact this lane matches on that was not supplied is an incomplete
+        // result, not an evaluator error: ordinary replay over retained data is
+        // missing facts routinely, and failing the run would turn "we did not
+        // record that" into "the analysis is broken".
+        let limitation = if context.method.is_none() {
+            Some(Limitation::MissingMethod)
+        } else if context.path.is_none() {
+            Some(Limitation::MissingPath)
+        } else if matches!(context.principal, PrincipalFact::Missing) {
             // A rule may constrain the principal, so not knowing it is not the
             // same as there being none.
-            PrincipalFact::Missing => return Err(EvaluationError::MissingRateFact),
+            Some(Limitation::MissingPrincipalFact)
+        } else {
+            None
+        };
+        if let Some(limitation) = limitation {
+            return Ok(RateLaneSelection {
+                binding,
+                outcome: RateLaneOutcome::Indeterminate(limitation),
+            });
+        }
+        let (Some(method), Some(path)) = (&context.method, &context.path) else {
+            return Err(EvaluationError::InternalInvariant);
+        };
+        let principal = match &context.principal {
+            PrincipalFact::Authenticated(identity) => &identity.0,
+            // The live bypass, above.
+            PrincipalFact::Anonymous => {
+                return Ok(RateLaneSelection {
+                    binding,
+                    outcome: RateLaneOutcome::NoOverride,
+                })
+            }
+            PrincipalFact::Missing => return Err(EvaluationError::InternalInvariant),
         };
         let selected = self
             .engine
@@ -347,7 +384,7 @@ impl CompiledPolicy {
             .iter()
             .enumerate()
             .find(|(_, rule)| {
-                rule.principal.matches(principal)
+                rule.principal.matches(Some(principal))
                     && method_matches(&rule.methods, method.as_str())
                     && rule
                         .path
@@ -355,11 +392,17 @@ impl CompiledPolicy {
                         .is_none_or(|pattern| path_pattern_matches(pattern, path))
             });
         Ok(RateLaneSelection {
-            matched: selected.map(|(index, _)| index),
-            limit: selected.map(|(_, rule)| RateLimit {
-                requests_per_second: rule.requests_per_second,
-                burst: rule.burst,
-            }),
+            binding,
+            outcome: match selected {
+                Some((index, rule)) => RateLaneOutcome::Override {
+                    index,
+                    limit: RateLimit {
+                        requests_per_second: rule.requests_per_second,
+                        burst: rule.burst,
+                    },
+                },
+                None => RateLaneOutcome::NoOverride,
+            },
         })
     }
 
@@ -769,10 +812,6 @@ pub(crate) enum EvaluationError {
     InvalidPrincipal,
     InvalidHost,
     InconsistentContext,
-    /// A fact the rate lane needs was not supplied. Distinct from the HTTP
-    /// lane's limitations: this lane reports no decision at all, so there is no
-    /// `indeterminate` result to carry one.
-    MissingRateFact,
     InternalInvariant,
     TraceEncoding,
     TraceTooLarge,
@@ -1250,13 +1289,34 @@ fn framed_digest(kind: &str, media_type: &str, version: &str, payload: &[u8]) ->
 /// the pure verdict. A selection is a statement about policy, not about whether
 /// a request will be admitted -- `NOT_EVALUATED` keeps listing `mutable_capacity`
 /// for exactly that reason.
+/// It carries its input binding for the same reason [`Evaluation`] does. A bare
+/// index and a pair of numbers are indistinguishable from the same index and
+/// numbers produced under a replacement policy, so a selection retained or
+/// serialized across a reload could be applied with stale rates and nothing in
+/// the value would say so. Validating the context before producing the value
+/// protects the production of it, not its later use.
 #[derive(Clone, Copy, Debug, PartialEq, Serialize)]
 pub(crate) struct RateLaneSelection {
-    /// Index of the first matching override in source order, or `None` for the
-    /// default lane.
-    matched: Option<usize>,
-    /// The limit that override declares. Policy data, not a live budget.
-    limit: Option<RateLimit>,
+    binding: InputBinding,
+    outcome: RateLaneOutcome,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum RateLaneOutcome {
+    /// No configured override governs this request: either none matched, or the
+    /// caller is anonymous and the live path never consults an override for one.
+    NoOverride,
+    Override {
+        /// First match in source order.
+        index: usize,
+        /// What that override declares. Policy data, not a live budget.
+        limit: RateLimit,
+    },
+    /// A fact this lane matches on was not supplied. Not an evaluator error:
+    /// replay over retained data is routinely missing facts, and failing the run
+    /// would turn "we did not record that" into "the analysis is broken".
+    Indeterminate(Limitation),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Serialize)]
@@ -1266,12 +1326,43 @@ pub(crate) struct RateLimit {
 }
 
 impl RateLaneSelection {
+    pub(crate) fn outcome(&self) -> RateLaneOutcome {
+        self.outcome
+    }
+
+    /// The override index, for a selection that found one.
     pub(crate) fn matched(&self) -> Option<usize> {
-        self.matched
+        match self.outcome {
+            RateLaneOutcome::Override { index, .. } => Some(index),
+            _ => None,
+        }
     }
 
     pub(crate) fn limit(&self) -> Option<RateLimit> {
-        self.limit
+        match self.outcome {
+            RateLaneOutcome::Override { limit, .. } => Some(limit),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn limitation(&self) -> Option<Limitation> {
+        match self.outcome {
+            RateLaneOutcome::Indeterminate(limitation) => Some(limitation),
+            _ => None,
+        }
+    }
+
+    /// Whether this selection may be applied to `context`.
+    ///
+    /// An indeterminate selection is never reusable: it is the absence of an
+    /// answer, and reusing it would hand a caller a stale "no lane" where the
+    /// facts may since have arrived.
+    pub(crate) fn reusable_for(&self, context: &PolicyEvaluationContext) -> bool {
+        !matches!(self.outcome, RateLaneOutcome::Indeterminate(_))
+            && context.validate(self.binding.snapshot).is_ok()
+            && context
+                .binding()
+                .is_ok_and(|binding| binding == self.binding)
     }
 }
 
