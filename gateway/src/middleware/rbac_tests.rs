@@ -2898,3 +2898,131 @@ async fn a_revision_that_cannot_exist_is_refused_and_the_installed_snapshot_keep
         .snapshot()
     );
 }
+/// Evaluating a policy emits nothing.
+///
+/// ADR-0004 forbids every pure path from emitting normal data-plane
+/// authorization events, and the kernel is meant to hand a decision back for a
+/// caller to act on rather than act itself. It holds no audit sink, so this is
+/// structural -- but structure is what changes when somebody adds a field, and
+/// the observation output exists precisely because a caller is expected to emit
+/// on the kernel's behalf, which is the shape that invites emitting here instead.
+///
+/// The outcomes reached are asserted rather than asserted-in-a-comment. An
+/// earlier version of this test claimed four decision shapes and reached two,
+/// with no rate override at all, so an emission added specifically to the allow
+/// branch or the matched-override branch would have left it passing.
+#[tokio::test]
+async fn evaluating_a_policy_emits_no_audit_events() {
+    let mut policy = test_policy_with_rules(
+        DefaultAction::Deny,
+        &[("reader", &["data:read"])],
+        &[route(&["GET"], "/data", "data:read")],
+        // Scoped to its own prefix, so it observes without shadowing the route
+        // the allow case needs.
+        &[direct_rule(
+            Some("shadowed"),
+            &["GET"],
+            "/shadow/**",
+            RuleAction::Shadow,
+        )],
+    );
+    policy.rate_limits = vec![crate::rbac::policy::RateLimitRule {
+        principal: PrincipalMatcher::default(),
+        methods: Vec::new(),
+        path: Some("/data/**".to_owned()),
+        requests_per_second: 1.0,
+        burst: 1,
+    }];
+    let capture = CaptureSink::new();
+    let audit = AuditLog::new(Arc::new(capture.clone()) as Arc<dyn AuditSink>);
+    let state = RbacState::new(policy, Vec::new(), false, audit.clone());
+    let installed = state.installed_compiled_policy();
+    let compiled = installed.compiled();
+
+    let mut effects = Vec::new();
+    let mut rate_outcomes = Vec::new();
+    let mut limitations = Vec::new();
+    for path in ["/data/items", "/shadow/item", "/elsewhere"] {
+        for identity in [None, Some(test_principal(&["reader"]))] {
+            let mut input = crate::policy_eval::PolicyEvaluationContext {
+                version: crate::policy_eval::CONTEXT_VERSION,
+                snapshot: compiled.snapshot(),
+                method: Some(Method::GET),
+                path: Some(path.to_owned()),
+                principal: identity.as_ref().map_or(
+                    crate::policy_eval::PrincipalFact::Anonymous,
+                    |identity| {
+                        crate::policy_eval::PrincipalFact::Authenticated(
+                            crate::policy_eval::PrincipalIdentity::from_principal(identity),
+                        )
+                    },
+                ),
+                target: crate::policy_eval::HttpTarget::Contextless,
+                request_host: crate::policy_eval::HostFact::Absent,
+                dispatch: None,
+            };
+            let evaluation = compiled.evaluate(&input).expect("evaluates");
+            effects.push(evaluation.effect());
+            // A shadow observation is reported, not emitted: the caller owns that.
+            let _ = evaluation.observation();
+            rate_outcomes.push(
+                compiled
+                    .select_rate_lane(&input)
+                    .expect("selects")
+                    .outcome(),
+            );
+
+            // And the indeterminate path emits nothing either.
+            input.target = crate::policy_eval::HttpTarget::Missing;
+            let indeterminate = compiled.evaluate(&input).expect("evaluates");
+            limitations.push(indeterminate.limitation());
+        }
+    }
+
+    // The branches this test claims to cover are the ones it actually reached.
+    for effect in [
+        crate::policy_eval::PolicyEffect::Allow,
+        crate::policy_eval::PolicyEffect::Block,
+        crate::policy_eval::PolicyEffect::Observe,
+    ] {
+        assert!(
+            effects.contains(&effect),
+            "no evaluation produced {effect:?}"
+        );
+    }
+    assert!(
+        rate_outcomes.iter().any(|outcome| matches!(
+            outcome,
+            crate::policy_eval::RateLaneOutcome::Override { .. }
+        )),
+        "no rate selection matched an override"
+    );
+    assert!(
+        rate_outcomes
+            .iter()
+            .any(|outcome| matches!(outcome, crate::policy_eval::RateLaneOutcome::NoOverride)),
+        "no rate selection fell through to the default lane"
+    );
+    assert!(
+        limitations
+            .iter()
+            .all(|limitation| *limitation
+                == Some(crate::policy_eval::Limitation::MissingDispatchFact)),
+        "the indeterminate branch was not reached for every case"
+    );
+
+    audit
+        .close_and_drain(Duration::from_secs(5))
+        .await
+        .expect("audit drains");
+    let events = capture.events();
+    assert!(
+        events.is_empty(),
+        "evaluation emitted {} audit event(s): {:?}",
+        events.len(),
+        events
+            .iter()
+            .map(|event| event.event_type.clone())
+            .collect::<Vec<_>>()
+    );
+}

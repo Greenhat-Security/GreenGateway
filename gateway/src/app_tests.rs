@@ -34538,3 +34538,52 @@ async fn route_classification_is_marked_completed_for_every_path() {
         );
     }
 }
+
+/// Every MCP route path is gateway-owned, so a request can never be both an MCP
+/// alias and a classified proxy dispatch.
+///
+/// The kernel's alias lane depends on this. `HttpTarget::McpAlias` and
+/// `HttpTarget::ProxyDispatch` are mutually exclusive variants, and the kernel
+/// evaluates an alias under `RuleDispatchContext::contextless()`. The legacy path
+/// instead threads the real dispatch context into its alias branch. If a request
+/// were ever both, the two would diverge in both directions -- legacy matching
+/// dispatch-scoped rules where the kernel matches `kind: contextless` ones -- in
+/// live authorization.
+///
+/// It cannot happen, because `proxy_dispatch_context_middleware` computes an
+/// observation context only for paths that are not gateway-owned, and
+/// `GatewayRoutes::from_config` puts every `mcp_route_paths` entry into
+/// `prefix_owned_paths`. Both lists come from the same function, so they agree by
+/// shared derivation and nothing else -- which is worth an assertion rather than
+/// a comment, because the derivation is two call sites that could drift.
+#[test]
+fn every_mcp_route_path_is_gateway_owned_so_an_alias_is_never_a_classified_dispatch() {
+    for prefix in ["/admin", "/control", "/admin/nested"] {
+        let mut config = test_config(Vec::new());
+        config.admin_prefix = prefix.to_owned();
+        // A public URL carrying a path gives the gateway a second MCP route
+        // path under it -- the alias case -- so vary that too.
+        for resource in [
+            None,
+            Some("https://gateway.example.test"),
+            Some("https://gateway.example.test/base"),
+            Some("https://gateway.example.test/deep/nested"),
+        ] {
+            config.gateway_public_url = resource.map(str::to_owned);
+            let routes = GatewayRoutes::from_config(&config);
+            let mcp_paths = crate::auth::protected_resource::mcp_route_paths(&config);
+            assert!(
+                !mcp_paths.is_empty(),
+                "a gateway always serves at least the canonical MCP path"
+            );
+            for path in &mcp_paths {
+                assert!(
+                    routes.is_gateway_owned_path(path),
+                    "{path} is an MCP route but not gateway-owned, so it could be \
+                     classified as a proxy dispatch while also being an alias \
+                     (admin_prefix={prefix}, mcp_resource_path={resource:?})"
+                );
+            }
+        }
+    }
+}
