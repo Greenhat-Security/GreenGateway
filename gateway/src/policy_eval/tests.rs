@@ -1020,7 +1020,8 @@ fn the_in_memory_constructor_accepts_what_production_accepts() {
     );
 
     let policy = Policy::validate_json_value(value).expect("the live parser accepts any 0.x");
-    let compiled = CompiledPolicy::from_validated_policy(policy, PolicyAuthority::Standalone);
+    let compiled =
+        CompiledPolicy::from_validated_policy(policy, PolicyAuthority::Standalone).unwrap();
     let result = compiled.evaluate(&context(&compiled)).unwrap();
     assert!(result.complete);
     assert_eq!(result.logical, LogicalDecision::Allow);
@@ -1043,7 +1044,9 @@ fn an_in_memory_policy_digest_is_stable_across_role_map_iteration_order() {
                 "schema_version":"0.1.0","default_action":"deny","roles":roles
             }))
             .expect("policy validates");
-            CompiledPolicy::from_validated_policy(policy, PolicyAuthority::Standalone).snapshot()
+            CompiledPolicy::from_validated_policy(policy, PolicyAuthority::Standalone)
+                .unwrap()
+                .snapshot()
         })
         .collect();
     assert!(
@@ -1058,7 +1061,9 @@ fn an_in_memory_policy_digest_is_stable_across_role_map_iteration_order() {
         }))
         .unwrap();
         assert_eq!(
-            CompiledPolicy::from_validated_policy(policy, PolicyAuthority::Standalone).snapshot(),
+            CompiledPolicy::from_validated_policy(policy, PolicyAuthority::Standalone)
+                .unwrap()
+                .snapshot(),
             digests[0]
         );
     }
@@ -1069,7 +1074,9 @@ fn an_in_memory_policy_digest_is_stable_across_role_map_iteration_order() {
     }))
     .unwrap();
     assert_ne!(
-        CompiledPolicy::from_validated_policy(different, PolicyAuthority::Standalone).snapshot(),
+        CompiledPolicy::from_validated_policy(different, PolicyAuthority::Standalone)
+            .unwrap()
+            .snapshot(),
         digests[0]
     );
 }
@@ -1090,7 +1097,8 @@ fn a_source_digest_and_an_in_memory_digest_never_stand_in_for_each_other() {
     let from_memory = CompiledPolicy::from_validated_policy(
         Policy::validate_json_value(value).unwrap(),
         PolicyAuthority::Standalone,
-    );
+    )
+    .unwrap();
     assert_ne!(from_bytes.snapshot(), from_memory.snapshot());
 
     // A context pinned to one is rejected by the other rather than answered.
@@ -1113,7 +1121,8 @@ fn the_published_trace_names_which_digest_it_bound() {
     // The trace has to say which kind it carries. Two digests under one label,
     // with nothing to tell them apart, is the failure this split exists to avoid.
     let policy = Policy::validate_json_value(basic_policy()).unwrap();
-    let compiled = CompiledPolicy::from_validated_policy(policy, PolicyAuthority::Standalone);
+    let compiled =
+        CompiledPolicy::from_validated_policy(policy, PolicyAuthority::Standalone).unwrap();
     let bytes = compiled
         .evaluate(&context(&compiled))
         .unwrap()
@@ -1128,4 +1137,75 @@ fn the_published_trace_names_which_digest_it_bound() {
     // Never under the reserved name: that belongs to the RFC 8785 contract.
     assert!(digest.get("semantic").is_none());
     assert!(digest.get("source").is_none());
+}
+
+#[test]
+fn both_constructors_refuse_a_revision_that_cannot_be_a_watermark() {
+    // The policy is validated before either constructor sees it; the authority is
+    // not. It is a caller-supplied integer and `policy_active.security_revision`
+    // carries no database CHECK, so a corrupt or out-of-band-edited row arrives
+    // here as a negative watermark. A constructor that accepted it would produce
+    // a complete allow bound to an invalid revision -- and the adapter uses the
+    // in-memory one, so it is the path that must not be the lenient one.
+    let value = basic_policy();
+    let source = serde_json::to_vec(&value).unwrap();
+    let invalid = PolicyAuthority::PostgreSql {
+        security_revision: -1,
+    };
+    assert_eq!(
+        CompiledPolicy::compile(&source, invalid).unwrap_err(),
+        CompileError::InvalidRevision
+    );
+    assert_eq!(
+        CompiledPolicy::from_validated_policy(
+            Policy::validate_json_value(value.clone()).unwrap(),
+            invalid
+        )
+        .unwrap_err(),
+        CompileError::InvalidRevision
+    );
+
+    // Zero is the initialized ledger value, not an error.
+    for revision in [0, 1, i64::MAX] {
+        let authority = PolicyAuthority::PostgreSql {
+            security_revision: revision,
+        };
+        assert!(
+            CompiledPolicy::compile(&source, authority).is_ok(),
+            "{revision}"
+        );
+        assert!(
+            CompiledPolicy::from_validated_policy(
+                Policy::validate_json_value(value.clone()).unwrap(),
+                authority
+            )
+            .is_ok(),
+            "{revision}"
+        );
+    }
+}
+
+#[test]
+fn the_digest_frame_carries_the_policy_its_own_schema_version() {
+    // This path serves any `0.x`, and the frame's schema-version field is defined
+    // as the exact schema version. Framing a `0.2.0` policy as `0.1.0` would make
+    // two policies that differ only by version share one identity, and would make
+    // the trace misdescribe its own input.
+    let snapshots: Vec<_> = ["0.1.0", "0.2.0", "0.1.1"]
+        .iter()
+        .map(|version| {
+            let policy = Policy::validate_json_value(json!({
+                "schema_version": version, "default_action":"deny"
+            }))
+            .expect("the live parser accepts any 0.x");
+            CompiledPolicy::from_validated_policy(policy, PolicyAuthority::Standalone)
+                .unwrap()
+                .snapshot()
+        })
+        .collect();
+    for (index, left) in snapshots.iter().enumerate() {
+        for right in snapshots.iter().skip(index + 1) {
+            assert_ne!(left, right, "two schema versions shared one digest");
+        }
+    }
 }

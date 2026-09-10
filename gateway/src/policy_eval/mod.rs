@@ -149,10 +149,7 @@ pub(crate) enum CompileError {
 
 impl CompiledPolicy {
     pub(crate) fn compile(source: &[u8], authority: PolicyAuthority) -> Result<Self, CompileError> {
-        if matches!(authority, PolicyAuthority::PostgreSql { security_revision } if security_revision < 0)
-        {
-            return Err(CompileError::InvalidRevision);
-        }
+        validate_authority(authority)?;
         let value = input::parse(source)?;
         let object = value.as_object().ok_or(CompileError::InvalidPolicy)?;
         if object
@@ -192,9 +189,19 @@ impl CompiledPolicy {
     ///
     /// Infallible by construction: every rejection `compile` performs is a
     /// judgement about untrusted bytes, and this caller has none.
-    pub(crate) fn from_validated_policy(policy: Policy, authority: PolicyAuthority) -> Self {
+    pub(crate) fn from_validated_policy(
+        policy: Policy,
+        authority: PolicyAuthority,
+    ) -> Result<Self, CompileError> {
+        // The policy is already validated; the authority is not. It is a caller
+        // supplied integer, and `policy_active.security_revision` carries no
+        // database CHECK, so a corrupt or out-of-band-edited row reaches here as
+        // a negative watermark. `compile` already refuses that, and the adapter
+        // this constructor exists for must not be the one path that accepts it:
+        // the result would be a complete allow bound to an invalid revision.
+        validate_authority(authority)?;
         let digest = PolicyDigest::ValidatedPolicy(validated_policy_digest(&policy));
-        Self::assemble(policy, digest, authority)
+        Ok(Self::assemble(policy, digest, authority))
     }
 
     fn assemble(policy: Policy, digest: PolicyDigest, authority: PolicyAuthority) -> Self {
@@ -900,6 +907,19 @@ impl Evaluation {
             && context
                 .binding()
                 .is_ok_and(|binding| binding == self.binding)
+    }
+}
+
+/// Rejects an authority that cannot be a real watermark.
+///
+/// Shared by both constructors on purpose: a revision check that lives in only
+/// one of them is a revision check the other path is missing.
+fn validate_authority(authority: PolicyAuthority) -> Result<(), CompileError> {
+    match authority {
+        PolicyAuthority::PostgreSql { security_revision } if security_revision < 0 => {
+            Err(CompileError::InvalidRevision)
+        }
+        _ => Ok(()),
     }
 }
 
