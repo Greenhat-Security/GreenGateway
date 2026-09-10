@@ -46,6 +46,7 @@ use std::net::Ipv6Addr;
 
 use http::Method;
 use serde::Serialize;
+use serde_json::Value;
 use sha2::{Digest, Sha256};
 
 use crate::{
@@ -64,6 +65,9 @@ pub(crate) const CONTEXT_VERSION: u16 = 2;
 pub(crate) const HTTP_SEMANTICS_VERSION: &str = "gg-http-routing-v1";
 pub(crate) const HTTP_DOMAIN: &str = "http_routing_v1";
 pub(crate) const MAX_TRACE_BYTES: usize = 2048;
+/// Frame kind for the in-memory install path's digest. Outside ADR-0004's
+/// reserved `source`/`semantic` namespace on purpose; see [`PolicyDigest`].
+const VALIDATED_POLICY_DIGEST_KIND: &str = "gg.validated-policy.v1";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -74,11 +78,43 @@ pub(crate) enum PolicyAuthority {
     PostgreSql { security_revision: i64 },
 }
 
+/// How a compiled policy's identity was established.
+///
+/// The ADR requires both a source-document digest and a normalized semantic one,
+/// and requires a result that lacks the digest it needs to be unreusable rather
+/// than reused under a guessed value. Keeping them as distinct variants is what
+/// makes that honest: the live install paths hand over an already-parsed
+/// `Policy`, never the bytes it came from, and `Policy` canonicalizes as it loads
+/// (issuer trailing slashes, for one), so bytes cannot be reconstructed from it.
+/// Reporting a reconstruction as a source digest would quietly break the
+/// guarantee that identical pinned inputs produce identical trace bytes, and the
+/// break would only surface when somebody diffed an offline trace against a
+/// production one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum PolicyDigest {
+    /// Over the exact accepted source-document bytes.
+    Source([u8; 32]),
+    /// Over a deterministic encoding of the already-validated policy, for an
+    /// install path that never held the source bytes.
+    ///
+    /// Deliberately *not* called semantic. ADR-0004 reserves that word for the
+    /// RFC 8785 canonical byte sequence, says a version without normative
+    /// normalization has no semantic digest, and rejects "ad hoc key sorting or
+    /// implementation-dependent map iteration for digests" by name -- which is
+    /// exactly what this is. Framing it as `semantic` would put a different value
+    /// under the frame the real JCS digest will use, with nothing in the frame to
+    /// tell the two apart: the same hazard as a fabricated source digest, in the
+    /// same place, found the same way. Its own frame kind keeps that namespace
+    /// free for the digest slice that earns it.
+    ValidatedPolicy([u8; 32]),
+}
+
 /// The complete immutable resource domain for this slice is the policy itself.
 /// Routing, tools, Connections and configuration are deliberately not guessed.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 pub(crate) struct ResourceSnapshot {
-    source_digest: [u8; 32],
+    digest: PolicyDigest,
     authority: PolicyAuthority,
     context_version: u16,
     semantics_version: &'static str,
@@ -113,10 +149,7 @@ pub(crate) enum CompileError {
 
 impl CompiledPolicy {
     pub(crate) fn compile(source: &[u8], authority: PolicyAuthority) -> Result<Self, CompileError> {
-        if matches!(authority, PolicyAuthority::PostgreSql { security_revision } if security_revision < 0)
-        {
-            return Err(CompileError::InvalidRevision);
-        }
+        validate_authority(authority)?;
         let value = input::parse(source)?;
         let object = value.as_object().ok_or(CompileError::InvalidPolicy)?;
         if object
@@ -137,19 +170,54 @@ impl CompiledPolicy {
         // Reuse the existing normalizer and semantic validator. All top-level
         // keys have been checked, so its unknown-key warning cannot be emitted.
         let policy = Policy::validate_json_value(value).map_err(|_| CompileError::InvalidPolicy)?;
+        Ok(Self::assemble(
+            policy,
+            PolicyDigest::Source(framed_digest("source", "application/json", "0.1.0", source)),
+            authority,
+        ))
+    }
+
+    /// Compiles a policy the gateway has already parsed and validated.
+    ///
+    /// The live install paths hold a `Policy`, not the document it came from, so
+    /// this is how the kernel becomes reachable from them. It deliberately does
+    /// not reuse [`Self::compile`]: that path has exact `0.1.0` schema dispatch
+    /// and rejects unknown top-level keys, which is right for an offline caller
+    /// handed arbitrary bytes but would fail-close policies this gateway accepts
+    /// today. Narrowing what production accepts is not a change to smuggle in as
+    /// a side effect of reusing a constructor.
+    ///
+    /// Infallible by construction: every rejection `compile` performs is a
+    /// judgement about untrusted bytes, and this caller has none.
+    pub(crate) fn from_validated_policy(
+        policy: Policy,
+        authority: PolicyAuthority,
+    ) -> Result<Self, CompileError> {
+        // The policy is already validated; the authority is not. It is a caller
+        // supplied integer, and `policy_active.security_revision` carries no
+        // database CHECK, so a corrupt or out-of-band-edited row reaches here as
+        // a negative watermark. `compile` already refuses that, and the adapter
+        // this constructor exists for must not be the one path that accepts it:
+        // the result would be a complete allow bound to an invalid revision.
+        validate_authority(authority)?;
+        let digest = PolicyDigest::ValidatedPolicy(validated_policy_digest(&policy));
+        Ok(Self::assemble(policy, digest, authority))
+    }
+
+    fn assemble(policy: Policy, digest: PolicyDigest, authority: PolicyAuthority) -> Self {
         let host_qualified_routes = policy.routes.iter().any(|route| !route.hosts.is_empty());
         let snapshot = ResourceSnapshot {
-            source_digest: framed_digest("source", "application/json", "0.1.0", source),
+            digest,
             authority,
             context_version: CONTEXT_VERSION,
             semantics_version: HTTP_SEMANTICS_VERSION,
         };
-        Ok(Self {
+        Self {
             matcher: RuleMatcher::new(&policy.rules),
             engine: PolicyEngine::new(policy),
             snapshot,
             host_qualified_routes,
-        })
+        }
     }
 
     pub(crate) fn snapshot(&self) -> ResourceSnapshot {
@@ -839,6 +907,98 @@ impl Evaluation {
             && context
                 .binding()
                 .is_ok_and(|binding| binding == self.binding)
+    }
+}
+
+/// Rejects an authority that cannot be a real watermark.
+///
+/// Shared by both constructors on purpose: a revision check that lives in only
+/// one of them is a revision check the other path is missing.
+fn validate_authority(authority: PolicyAuthority) -> Result<(), CompileError> {
+    match authority {
+        PolicyAuthority::PostgreSql { security_revision } if security_revision < 0 => {
+            Err(CompileError::InvalidRevision)
+        }
+        _ => Ok(()),
+    }
+}
+
+/// Digest over a deterministic encoding of an already-validated policy.
+///
+/// `Policy::roles` is a `HashMap`, so serializing it straight to JSON gives a
+/// different byte string per process and a digest that identifies nothing. Object
+/// keys are therefore sorted explicitly rather than trusting `serde_json::Map` to
+/// be ordered -- it is a `BTreeMap` only while nothing in the dependency graph
+/// turns on `preserve_order`, which is a feature-unification accident away from
+/// being false and would fail silently if it happened.
+///
+/// This is deterministic, not canonical in the ADR's sense: key order here is
+/// byte-wise UTF-8 where JCS mandates UTF-16 code units, and numbers defer to
+/// serde_json rather than ECMAScript shortest-representation. Both differences are
+/// reachable with operator-authored keys, so this cannot be relabelled JCS later
+/// by adding a validation step -- it is a different algorithm, which is why it
+/// carries its own frame kind.
+fn validated_policy_digest(policy: &Policy) -> [u8; 32] {
+    let mut payload = Vec::new();
+    match serde_json::to_value(policy) {
+        Ok(value) => write_canonical(&value, &mut payload),
+        // A policy that will not serialize cannot be given a stable identity, and
+        // a constant would make two different policies share one. Make the digest
+        // unique to this failure instead, so nothing can be reused across it.
+        Err(error) => {
+            payload.extend_from_slice(b"unserializable\0");
+            payload.extend_from_slice(error.to_string().as_bytes());
+        }
+    }
+    framed_digest(
+        VALIDATED_POLICY_DIGEST_KIND,
+        "application/json",
+        "0.1.0",
+        &payload,
+    )
+}
+
+/// Writes `value` with object keys in sorted order.
+fn write_canonical(value: &Value, out: &mut Vec<u8>) {
+    match value {
+        Value::Object(map) => {
+            out.push(b'{');
+            let mut keys: Vec<&String> = map.keys().collect();
+            keys.sort();
+            for (index, key) in keys.iter().enumerate() {
+                if index > 0 {
+                    out.push(b',');
+                }
+                write_json_scalar(&Value::String((*key).clone()), out);
+                out.push(b':');
+                match map.get(*key) {
+                    Some(member) => write_canonical(member, out),
+                    // Unreachable: the key came from this map.
+                    None => out.extend_from_slice(b"null"),
+                }
+            }
+            out.push(b'}');
+        }
+        Value::Array(items) => {
+            out.push(b'[');
+            for (index, item) in items.iter().enumerate() {
+                if index > 0 {
+                    out.push(b',');
+                }
+                write_canonical(item, out);
+            }
+            out.push(b']');
+        }
+        scalar => write_json_scalar(scalar, out),
+    }
+}
+
+fn write_json_scalar(value: &Value, out: &mut Vec<u8>) {
+    match serde_json::to_string(value) {
+        Ok(text) => out.extend_from_slice(text.as_bytes()),
+        // Scalars do not fail to serialize; a marker still keeps the digest
+        // defined rather than silently dropping a field.
+        Err(_) => out.extend_from_slice(b"\"\\u0000unencodable\""),
     }
 }
 

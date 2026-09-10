@@ -1004,3 +1004,208 @@ fn a_route_host_alone_makes_the_host_binding_mandatory() {
     assert_eq!(result.matched, Some(RuleReference::Direct(0)));
     assert_eq!(result.effect, PolicyEffect::Allow);
 }
+
+#[test]
+fn the_in_memory_constructor_accepts_what_production_accepts() {
+    // Trap this deliberately: `compile` has exact `0.1.0` dispatch and rejects
+    // unknown top-level keys, which is right for untrusted bytes. The live parser
+    // accepts any `0.x`. Routing production through `compile` would therefore
+    // fail-close policies this gateway serves today -- narrowing what production
+    // accepts, as a side effect of reusing a constructor.
+    let value = json!({"schema_version":"0.2.0","default_action":"allow"});
+    let source = serde_json::to_vec(&value).unwrap();
+    assert_eq!(
+        CompiledPolicy::compile(&source, PolicyAuthority::Standalone).unwrap_err(),
+        CompileError::UnsupportedSchema
+    );
+
+    let policy = Policy::validate_json_value(value).expect("the live parser accepts any 0.x");
+    let compiled =
+        CompiledPolicy::from_validated_policy(policy, PolicyAuthority::Standalone).unwrap();
+    let result = compiled.evaluate(&context(&compiled)).unwrap();
+    assert!(result.complete);
+    assert_eq!(result.logical, LogicalDecision::Allow);
+}
+
+#[test]
+fn an_in_memory_policy_digest_is_stable_across_role_map_iteration_order() {
+    // `Policy::roles` is a `HashMap`, so a digest that inherited its iteration
+    // order would identify nothing and differ per process. Build the same policy
+    // from role sets written in different orders and require one digest.
+    let orders = [
+        json!({"alpha":{"permissions":["read"]},"beta":{"permissions":["write"]},"gamma":{"permissions":["*"]}}),
+        json!({"gamma":{"permissions":["*"]},"alpha":{"permissions":["read"]},"beta":{"permissions":["write"]}}),
+        json!({"beta":{"permissions":["write"]},"gamma":{"permissions":["*"]},"alpha":{"permissions":["read"]}}),
+    ];
+    let digests: Vec<_> = orders
+        .iter()
+        .map(|roles| {
+            let policy = Policy::validate_json_value(json!({
+                "schema_version":"0.1.0","default_action":"deny","roles":roles
+            }))
+            .expect("policy validates");
+            CompiledPolicy::from_validated_policy(policy, PolicyAuthority::Standalone)
+                .unwrap()
+                .snapshot()
+        })
+        .collect();
+    assert!(
+        digests.windows(2).all(|pair| pair[0] == pair[1]),
+        "role map order changed the snapshot"
+    );
+
+    // Repeating one of them many times would also catch a per-process hash seed.
+    for _ in 0..32 {
+        let policy = Policy::validate_json_value(json!({
+            "schema_version":"0.1.0","default_action":"deny","roles":orders[0]
+        }))
+        .unwrap();
+        assert_eq!(
+            CompiledPolicy::from_validated_policy(policy, PolicyAuthority::Standalone)
+                .unwrap()
+                .snapshot(),
+            digests[0]
+        );
+    }
+
+    // And a policy that decides differently must not share the digest.
+    let different = Policy::validate_json_value(json!({
+        "schema_version":"0.1.0","default_action":"allow","roles":orders[0]
+    }))
+    .unwrap();
+    assert_ne!(
+        CompiledPolicy::from_validated_policy(different, PolicyAuthority::Standalone)
+            .unwrap()
+            .snapshot(),
+        digests[0]
+    );
+}
+
+#[test]
+fn a_source_digest_and_an_in_memory_digest_never_stand_in_for_each_other() {
+    // The two paths produce different identities for the same policy on purpose:
+    // the in-memory one cannot reconstruct the bytes, because loading a `Policy`
+    // canonicalizes. A result bound to one must not be reusable under the other,
+    // or an offline trace and a production trace would silently claim to be the
+    // same evaluation.
+    let value = json!({
+        "schema_version":"0.1.0","default_action":"deny",
+        "roles":{"reader":{"permissions":["read"],"issuers":["https://idp.example.test/"]}}
+    });
+    let source = serde_json::to_vec(&value).unwrap();
+    let from_bytes = CompiledPolicy::compile(&source, PolicyAuthority::Standalone).unwrap();
+    let from_memory = CompiledPolicy::from_validated_policy(
+        Policy::validate_json_value(value).unwrap(),
+        PolicyAuthority::Standalone,
+    )
+    .unwrap();
+    assert_ne!(from_bytes.snapshot(), from_memory.snapshot());
+
+    // A context pinned to one is rejected by the other rather than answered.
+    let mut input = context(&from_bytes);
+    assert!(from_bytes.evaluate(&input).is_ok());
+    assert_eq!(
+        from_memory.evaluate(&input),
+        Err(EvaluationError::SnapshotMismatch)
+    );
+
+    // And a completed result is not reusable across the boundary either.
+    let evaluation = from_bytes.evaluate(&input).unwrap();
+    assert!(evaluation.reusable_for(&input));
+    input.snapshot = from_memory.snapshot();
+    assert!(!evaluation.reusable_for(&input));
+}
+
+#[test]
+fn the_published_trace_names_which_digest_it_bound() {
+    // The trace has to say which kind it carries. Two digests under one label,
+    // with nothing to tell them apart, is the failure this split exists to avoid.
+    let policy = Policy::validate_json_value(basic_policy()).unwrap();
+    let compiled =
+        CompiledPolicy::from_validated_policy(policy, PolicyAuthority::Standalone).unwrap();
+    let bytes = compiled
+        .evaluate(&context(&compiled))
+        .unwrap()
+        .canonical_trace_bytes()
+        .unwrap();
+    let trace: Value = serde_json::from_slice(&bytes).unwrap();
+    let digest = &trace["binding"]["snapshot"]["digest"];
+    assert!(
+        digest.get("validated_policy").is_some(),
+        "trace did not name the digest kind: {digest}"
+    );
+    // Never under the reserved name: that belongs to the RFC 8785 contract.
+    assert!(digest.get("semantic").is_none());
+    assert!(digest.get("source").is_none());
+}
+
+#[test]
+fn both_constructors_refuse_a_revision_that_cannot_be_a_watermark() {
+    // The policy is validated before either constructor sees it; the authority is
+    // not. It is a caller-supplied integer and `policy_active.security_revision`
+    // carries no database CHECK, so a corrupt or out-of-band-edited row arrives
+    // here as a negative watermark. A constructor that accepted it would produce
+    // a complete allow bound to an invalid revision -- and the adapter uses the
+    // in-memory one, so it is the path that must not be the lenient one.
+    let value = basic_policy();
+    let source = serde_json::to_vec(&value).unwrap();
+    let invalid = PolicyAuthority::PostgreSql {
+        security_revision: -1,
+    };
+    assert_eq!(
+        CompiledPolicy::compile(&source, invalid).unwrap_err(),
+        CompileError::InvalidRevision
+    );
+    assert_eq!(
+        CompiledPolicy::from_validated_policy(
+            Policy::validate_json_value(value.clone()).unwrap(),
+            invalid
+        )
+        .unwrap_err(),
+        CompileError::InvalidRevision
+    );
+
+    // Zero is the initialized ledger value, not an error.
+    for revision in [0, 1, i64::MAX] {
+        let authority = PolicyAuthority::PostgreSql {
+            security_revision: revision,
+        };
+        assert!(
+            CompiledPolicy::compile(&source, authority).is_ok(),
+            "{revision}"
+        );
+        assert!(
+            CompiledPolicy::from_validated_policy(
+                Policy::validate_json_value(value.clone()).unwrap(),
+                authority
+            )
+            .is_ok(),
+            "{revision}"
+        );
+    }
+}
+
+#[test]
+fn the_digest_frame_carries_the_policy_its_own_schema_version() {
+    // This path serves any `0.x`, and the frame's schema-version field is defined
+    // as the exact schema version. Framing a `0.2.0` policy as `0.1.0` would make
+    // two policies that differ only by version share one identity, and would make
+    // the trace misdescribe its own input.
+    let snapshots: Vec<_> = ["0.1.0", "0.2.0", "0.1.1"]
+        .iter()
+        .map(|version| {
+            let policy = Policy::validate_json_value(json!({
+                "schema_version": version, "default_action":"deny"
+            }))
+            .expect("the live parser accepts any 0.x");
+            CompiledPolicy::from_validated_policy(policy, PolicyAuthority::Standalone)
+                .unwrap()
+                .snapshot()
+        })
+        .collect();
+    for (index, left) in snapshots.iter().enumerate() {
+        for right in snapshots.iter().skip(index + 1) {
+            assert_ne!(left, right, "two schema versions shared one digest");
+        }
+    }
+}

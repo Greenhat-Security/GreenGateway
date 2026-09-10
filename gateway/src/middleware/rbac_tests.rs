@@ -6,7 +6,12 @@ use std::{
     time::{Duration, Instant},
 };
 
-use axum::{body::Body, middleware::from_fn_with_state, routing::any, Router};
+use axum::{
+    body::Body,
+    middleware::{from_fn, from_fn_with_state},
+    routing::any,
+    Router,
+};
 use http::Request;
 use serde_json::{json, Value};
 use tower::ServiceExt;
@@ -2065,6 +2070,20 @@ fn test_router(state: RbacState, principal: Option<Principal>) -> Router {
         .fallback(any(ok))
         .layer(from_fn_with_state(state, rbac_middleware))
         .layer(from_fn_with_state(principal, inject_principal))
+        // Later axum layers run earlier, so this runs first. Production always
+        // completes proxy-route classification before RBAC can short-circuit a
+        // request -- `proxy_dispatch_context_middleware` is layered after the RBAC
+        // layer in `routing.rs` precisely so it runs before it -- and
+        // `routing_classification_completes_before_rbac_in_the_production_stack`
+        // holds that ordering in place. Without this the suite would be asserting
+        // behavior for an unclassified request, a state production cannot produce.
+        .layer(from_fn(mark_routing_classified))
+}
+
+async fn mark_routing_classified(mut req: Request<Body>, next: Next) -> Response {
+    req.extensions_mut()
+        .insert(upstream_route::ProxyRouteClassificationCompleted);
+    next.run(req).await
 }
 
 /// A deterministic revision gate for the middleware's cluster-mode
