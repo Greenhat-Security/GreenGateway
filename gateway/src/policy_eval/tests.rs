@@ -83,11 +83,16 @@ async fn http_lane_matches_current_middleware_decisions_reasons_order_and_shadow
                             json!({"id":"later-deny","path":"/direct/**","action":"deny"}),
                         ]);
                     }
-                    let compiled = compile(value.clone());
                     let policy = Policy::validate_json_value(value).unwrap();
                     let capture = CaptureSink::new();
                     let audit = AuditLog::new(Arc::new(capture.clone()) as Arc<dyn AuditSink>);
                     let state = RbacState::new(policy.clone(), Vec::new(), false, audit.clone());
+                    // Compare the kernel instance this state installed, not a
+                    // separately compiled copy of the same policy: a copy could
+                    // agree with the middleware while the installed one diverged,
+                    // and the comparison would not notice.
+                    let installed = state.installed_compiled_policy();
+                    let compiled = installed.compiled();
                     let router = Router::new()
                         .fallback(any(|| async { "local" }))
                         .layer(from_fn_with_state(state, rbac_middleware));
@@ -109,7 +114,7 @@ async fn http_lane_matches_current_middleware_decisions_reasons_order_and_shadow
                                 Some(principal(&["admin"])),
                                 Some(inactive),
                             ] {
-                                let mut input = context(&compiled);
+                                let mut input = context(compiled);
                                 input.method = Some(method.clone());
                                 input.path = Some(path.to_owned());
                                 input.principal = identity.as_ref().map_or(
@@ -590,11 +595,12 @@ async fn routing_lane_matches_current_middleware_for_host_bound_and_dispatch_sco
                     .unwrap()
                     .push(json!({"id":"broad","path":"/data/**","action":action}));
             }
-            let compiled = compile(value.clone());
             let policy = Policy::validate_json_value(value).unwrap();
             let capture = CaptureSink::new();
             let audit = AuditLog::new(Arc::new(capture.clone()) as Arc<dyn AuditSink>);
             let state = RbacState::new(policy.clone(), Vec::new(), false, audit.clone());
+            let installed = state.installed_compiled_policy();
+            let compiled = installed.compiled();
             let router = Router::new()
                 .fallback(any(|| async { "local" }))
                 .layer(from_fn_with_state(state, rbac_middleware));
@@ -615,7 +621,7 @@ async fn routing_lane_matches_current_middleware_for_host_bound_and_dispatch_sco
                             // what makes a virtual upstream selected.
                             let authorization = observation.authorization_context();
 
-                            let mut input = context(&compiled);
+                            let mut input = context(compiled);
                             input.path = Some(path.to_owned());
                             input.target = HttpTarget::ProxyDispatch;
                             input.request_host = HostFact::Present(request_host.to_owned());
@@ -1259,7 +1265,6 @@ async fn alias_lane_matches_current_middleware_including_its_two_precedence_orde
                 ],
                 "rules":rules
             });
-            let compiled = compile(value.clone());
             let policy = Policy::validate_json_value(value).unwrap();
             let capture = CaptureSink::new();
             let audit = AuditLog::new(Arc::new(capture.clone()) as Arc<dyn AuditSink>);
@@ -1270,6 +1275,8 @@ async fn alias_lane_matches_current_middleware_including_its_two_precedence_orde
                 audit.clone(),
                 vec![MCP.to_owned(), "/base/mcp".to_owned()],
             );
+            let installed = state.installed_compiled_policy();
+            let compiled = installed.compiled();
             let router = Router::new()
                 .fallback(any(|| async { "local" }))
                 .layer(from_fn_with_state(state, rbac_middleware));
@@ -1289,7 +1296,7 @@ async fn alias_lane_matches_current_middleware_including_its_two_precedence_orde
                     Some(principal(&["base-reader"])),
                     Some(principal(&["mcp-user"])),
                 ] {
-                    let mut input = context(&compiled);
+                    let mut input = context(compiled);
                     input.method = Some(Method::POST);
                     input.path = Some(path.to_owned());
                     // Production maps an MCP route path to the canonical identity

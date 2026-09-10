@@ -1370,11 +1370,17 @@ pub(super) async fn persist_policy_mutation(
             .await;
         return match commit {
             Ok(active) => {
-                context.rbac_state.install_revision_snapshot_locked(
-                    active.policy.clone(),
-                    active.security_revision,
-                    context.policy_write_guard,
-                );
+                if context
+                    .rbac_state
+                    .install_revision_snapshot_locked(
+                        active.policy.clone(),
+                        active.security_revision,
+                        context.policy_write_guard,
+                    )
+                    .is_err()
+                {
+                    return Err(Box::new(policy_snapshot_not_installable()));
+                }
                 emit_policy_rule_changed(
                     context.state,
                     context.parts,

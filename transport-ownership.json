@@ -9734,9 +9734,19 @@
         "unexpanded-attribute"
       ],
       "scope": "gateway::middleware::rbac::RbacPolicyState#1",
-      "sha256": "cf34af9e31334cd0aa15531b5a602946c47155f63965d34dad474df085e9214b",
+      "sha256": "0afd513f17efea9bac7c211a87b43947d93832d860650d77e2afa9a3cf9e9b85",
       "owner": "GreenGateway maintainers",
       "purpose": "Existing macro/attribute inputs for this exact application item; changed expansion inputs require explicit review."
+    },
+    {
+      "file": "gateway/src/middleware/rbac.rs",
+      "reasons": [
+        "unexpanded-attribute"
+      ],
+      "scope": "gateway::middleware::rbac::impl  RbacPolicyState::compiled#1",
+      "sha256": "95c2d4b28819ed0e935f6bee53a2c5354e8674f68edfd1b39f02dc5e4ff0c42a",
+      "owner": "GreenGateway maintainers",
+      "purpose": "Expose the compiled policy kernel an installed RBAC snapshot carries, so #422 adapter work and the differential tests consult the instance a request is judged by rather than a separately compiled copy of the same policy. The cfg_attr(not(test), expect(dead_code)) is the unexpanded attribute: it keeps CI reporting when the adapter starts reading this."
     },
     {
       "file": "gateway/src/middleware/rbac.rs",
