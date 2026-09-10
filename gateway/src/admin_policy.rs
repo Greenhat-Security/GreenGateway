@@ -1370,17 +1370,15 @@ pub(super) async fn persist_policy_mutation(
             .await;
         return match commit {
             Ok(active) => {
-                if context
-                    .rbac_state
-                    .install_revision_snapshot_locked(
-                        active.policy.clone(),
-                        active.security_revision,
-                        context.policy_write_guard,
-                    )
-                    .is_err()
-                {
-                    return Err(Box::new(policy_snapshot_not_installable()));
-                }
+                let installed = context.rbac_state.install_revision_snapshot_locked(
+                    active.policy.clone(),
+                    active.security_revision,
+                    context.policy_write_guard,
+                );
+                // The commit is durable either way, so the change is audited
+                // either way. Returning the install failure first would leave a
+                // security change that actually happened absent from the audit
+                // stream, which is a worse outcome than the failure it reports.
                 emit_policy_rule_changed(
                     context.state,
                     context.parts,
@@ -1389,6 +1387,9 @@ pub(super) async fn persist_policy_mutation(
                     &active.policy,
                     diff_summary,
                 );
+                if installed.is_err() {
+                    return Err(Box::new(policy_snapshot_not_installable()));
+                }
                 Ok(PolicyMutationCommitResult {
                     after_policy: active.policy,
                     new_etag: active.etag,
