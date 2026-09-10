@@ -126,7 +126,7 @@ struct TokenBucket {
     referenced: bool,
 }
 
-struct RateLimitPolicyState {
+pub(crate) struct RateLimitPolicyState {
     overrides: Vec<RateLimitOverride>,
 }
 
@@ -452,6 +452,11 @@ impl BucketStore {
 }
 
 impl RateLimitPolicyState {
+    #[cfg(test)]
+    pub(crate) fn for_selection_parity(policy: &Policy) -> Self {
+        Self::from_policy(Some(policy), 1, Duration::from_secs(1))
+    }
+
     fn from_policy(
         policy: Option<&Policy>,
         bucket_capacity: usize,
@@ -480,6 +485,32 @@ impl RateLimitPolicyState {
                 })
                 .unwrap_or_default(),
         }
+    }
+
+    /// The limit the first matching override declares, without touching a
+    /// limiter or a bucket.
+    ///
+    /// Exists so the pure kernel's rate-lane selection can be compared against
+    /// this selector directly, rather than inferred from whether a burst was
+    /// exhausted. Selection and enforcement stay separate either way.
+    #[cfg(test)]
+    pub(crate) fn selected_override_limit(
+        &self,
+        method: &str,
+        path: &str,
+        principal: Option<&auth::Principal>,
+    ) -> Option<(usize, f64, u32)> {
+        self.overrides
+            .iter()
+            .enumerate()
+            .find(|(_, override_rule)| override_rule.matches(method, path, principal))
+            .map(|(index, override_rule)| {
+                (
+                    index,
+                    override_rule.rule.requests_per_second,
+                    override_rule.rule.burst,
+                )
+            })
     }
 
     fn matching_limiter(

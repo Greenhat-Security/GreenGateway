@@ -1530,3 +1530,110 @@ fn a_canonical_alias_identity_is_checked_exactly_as_the_request_path_is() {
     };
     assert!(compiled.evaluate(&valid).unwrap().complete);
 }
+
+#[test]
+fn rate_lane_selection_matches_the_live_selector() {
+    // Compared against the live selector directly rather than inferred from
+    // whether a burst was exhausted: the question is which override governs a
+    // request, and exhaustion only reveals that indirectly and after the fact.
+    let value = json!({
+        "schema_version":"0.1.0","default_action":"allow",
+        "roles":{"reader":{"permissions":["read"]},"admin":{"permissions":["*"]}},
+        "rate_limits":[
+            // Principal-constrained, so an anonymous caller skips it.
+            {"principal":{"roles":["admin"]},"requests_per_second":1.0,"burst":1},
+            // Method- and path-constrained.
+            {"methods":["GET"],"path":"/first/**","requests_per_second":2.0,"burst":2},
+            // Same path, later in source order: the earlier one must win.
+            {"methods":["GET"],"path":"/first/**","requests_per_second":3.0,"burst":3},
+            // No path at all, which matches any path.
+            {"methods":["POST"],"requests_per_second":4.0,"burst":4}
+        ]
+    });
+    let compiled = compile(value.clone());
+    let policy = Policy::validate_json_value(value).unwrap();
+    let live = crate::middleware::rate_limit::RateLimitPolicyState::for_selection_parity(&policy);
+
+    for path in ["/first/item", "/first", "/elsewhere", "/"] {
+        for method in [Method::GET, Method::POST, Method::DELETE] {
+            for identity in [
+                None,
+                Some(principal(&["reader"])),
+                Some(principal(&["admin"])),
+            ] {
+                let mut input = context(&compiled);
+                input.method = Some(method.clone());
+                input.path = Some(path.to_owned());
+                input.principal = identity
+                    .as_ref()
+                    .map_or(PrincipalFact::Anonymous, |identity| {
+                        PrincipalFact::Authenticated(PrincipalIdentity::from_principal(identity))
+                    });
+                let selection = compiled.select_rate_lane(&input).unwrap();
+
+                let expected =
+                    live.selected_override_limit(method.as_str(), path, identity.as_ref());
+                let label = format!("{method} {path} {:?}", identity.as_ref().map(|p| &p.roles));
+                match expected {
+                    Some((index, requests_per_second, burst)) => {
+                        assert_eq!(selection.matched(), Some(index), "{label}");
+                        let limit = selection.limit().expect("a matched lane declares a limit");
+                        assert_eq!(limit.requests_per_second(), requests_per_second, "{label}");
+                        assert_eq!(limit.burst(), burst, "{label}");
+                    }
+                    None => {
+                        assert_eq!(selection.matched(), None, "{label}");
+                        assert!(selection.limit().is_none(), "{label}");
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn the_rate_lane_refuses_to_select_without_the_facts_it_matches_on() {
+    // A rule may constrain the principal, so not knowing the principal is not the
+    // same as there being none -- and guessing "anonymous" would silently pick a
+    // different lane. No decision at all is the honest answer.
+    let compiled = compile(json!({
+        "schema_version":"0.1.0","default_action":"allow",
+        "rate_limits":[{"requests_per_second":1.0,"burst":1}]
+    }));
+    for mutate in [
+        (|input: &mut PolicyEvaluationContext| input.method = None) as fn(&mut _),
+        |input: &mut PolicyEvaluationContext| input.path = None,
+        |input: &mut PolicyEvaluationContext| input.principal = PrincipalFact::Missing,
+    ] {
+        let mut input = context(&compiled);
+        mutate(&mut input);
+        assert_eq!(
+            compiled.select_rate_lane(&input),
+            Err(EvaluationError::MissingRateFact)
+        );
+    }
+
+    // With every fact present the same policy selects its single lane.
+    let selection = compiled.select_rate_lane(&context(&compiled)).unwrap();
+    assert_eq!(selection.matched(), Some(0));
+}
+
+#[test]
+fn rate_lane_selection_is_pinned_to_its_snapshot_like_every_other_lane() {
+    // Selecting a lane under one policy and applying it under another is the
+    // same class of mistake as reusing a decision across snapshots.
+    let first = compile(json!({
+        "schema_version":"0.1.0","default_action":"allow",
+        "rate_limits":[{"requests_per_second":1.0,"burst":1}]
+    }));
+    let second = compile(json!({
+        "schema_version":"0.1.0","default_action":"allow",
+        "rate_limits":[{"requests_per_second":2.0,"burst":2}]
+    }));
+    let input = context(&first);
+    assert!(first.select_rate_lane(&input).is_ok());
+    assert_eq!(
+        second.select_rate_lane(&input),
+        Err(EvaluationError::SnapshotMismatch)
+    );
+}

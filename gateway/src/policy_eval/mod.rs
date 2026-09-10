@@ -43,6 +43,20 @@
 //! itself, and an adapter that dropped it would silently lose telemetry the
 //! live path produces today.
 //!
+//! ## Selecting a rate lane is not deciding one
+//!
+//! [`CompiledPolicy::select_rate_lane`] answers which configured override governs
+//! a request, first match in source order. It does not answer whether the request
+//! fits inside that lane, and the split is the point: which lane applies is a
+//! policy question and deterministic, while remaining capacity is mutable state
+//! that ADR-0004 puts outside the pure verdict. The limiter, its token buckets
+//! and their capacity stay where they are, and `mutable_capacity` stays listed as
+//! not evaluated.
+//!
+//! Alias identities do not participate: the live selector matches the request
+//! path only, so consulting a canonical identity here would invent a second
+//! behaviour rather than mirror the existing one.
+//!
 //! ## Facts, not guesses
 //!
 //! A fact this lane needs and does not have is [`LogicalDecision::Indeterminate`]
@@ -75,7 +89,7 @@ use crate::{
     auth::{AuthMethod, Principal},
     path_match::{is_unsafe_request_path, path_prefix_matches},
     rbac::{
-        matcher::{method_matches, RuleDecision, RuleDispatchContext},
+        matcher::{method_matches, path_pattern_matches, RuleDecision, RuleDispatchContext},
         policy::{RouteRule, KNOWN_TOP_LEVEL_KEYS},
         DefaultAction, EnforcementMode, Policy, PolicyEngine, RuleAction, RuleMatcher,
     },
@@ -293,6 +307,60 @@ impl CompiledPolicy {
                 .matcher
                 .evaluate_with_dispatch(method, path, principal, dispatch_context),
         }
+    }
+
+    /// Which configured rate-limit override governs a request.
+    ///
+    /// First match in source order over method, path pattern and principal --
+    /// the same three predicates the live selector uses, over the same matchers,
+    /// so the pattern syntax and method folding cannot drift apart from it.
+    ///
+    /// Selection only, and the distinction is the point: which lane applies is a
+    /// policy question and deterministic, while whether this request fits inside
+    /// that lane is mutable state. ADR-0004 puts dynamic rate capacity outside
+    /// the pure verdict, so the limiter, its buckets and their capacity stay
+    /// exactly where they are. An allow here is not a statement that a request
+    /// will be admitted.
+    ///
+    /// Alias identities do not apply: the live selector matches the request path
+    /// only, so reading a canonical identity here would invent a second
+    /// behaviour rather than mirror one.
+    pub(crate) fn select_rate_lane(
+        &self,
+        context: &PolicyEvaluationContext,
+    ) -> Result<RateLaneSelection, EvaluationError> {
+        context.validate(self.snapshot)?;
+        let (Some(method), Some(path)) = (&context.method, &context.path) else {
+            return Err(EvaluationError::MissingRateFact);
+        };
+        let principal = match &context.principal {
+            PrincipalFact::Authenticated(identity) => Some(&identity.0),
+            PrincipalFact::Anonymous => None,
+            // A rule may constrain the principal, so not knowing it is not the
+            // same as there being none.
+            PrincipalFact::Missing => return Err(EvaluationError::MissingRateFact),
+        };
+        let selected = self
+            .engine
+            .policy()
+            .rate_limits
+            .iter()
+            .enumerate()
+            .find(|(_, rule)| {
+                rule.principal.matches(principal)
+                    && method_matches(&rule.methods, method.as_str())
+                    && rule
+                        .path
+                        .as_ref()
+                        .is_none_or(|pattern| path_pattern_matches(pattern, path))
+            });
+        Ok(RateLaneSelection {
+            matched: selected.map(|(index, _)| index),
+            limit: selected.map(|(_, rule)| RateLimit {
+                requests_per_second: rule.requests_per_second,
+                burst: rule.burst,
+            }),
+        })
     }
 
     /// First matching route, over one path identity or an alias pair.
@@ -701,6 +769,10 @@ pub(crate) enum EvaluationError {
     InvalidPrincipal,
     InvalidHost,
     InconsistentContext,
+    /// A fact the rate lane needs was not supplied. Distinct from the HTTP
+    /// lane's limitations: this lane reports no decision at all, so there is no
+    /// `indeterminate` result to carry one.
+    MissingRateFact,
     InternalInvariant,
     TraceEncoding,
     TraceTooLarge,
@@ -1167,4 +1239,48 @@ fn framed_digest(kind: &str, media_type: &str, version: &str, payload: &[u8]) ->
         digest.update(part);
     }
     digest.finalize().into()
+}
+
+/// Which configured rate-limit override governs a request, and the limit it
+/// declares.
+///
+/// Selection only. The limiter, its token buckets, their capacity and every
+/// decision about whether *this* request fits within the limit stay where they
+/// are: those are mutable state, and ADR-0004 puts dynamic rate capacity outside
+/// the pure verdict. A selection is a statement about policy, not about whether
+/// a request will be admitted -- `NOT_EVALUATED` keeps listing `mutable_capacity`
+/// for exactly that reason.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize)]
+pub(crate) struct RateLaneSelection {
+    /// Index of the first matching override in source order, or `None` for the
+    /// default lane.
+    matched: Option<usize>,
+    /// The limit that override declares. Policy data, not a live budget.
+    limit: Option<RateLimit>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Serialize)]
+pub(crate) struct RateLimit {
+    requests_per_second: f64,
+    burst: u32,
+}
+
+impl RateLaneSelection {
+    pub(crate) fn matched(&self) -> Option<usize> {
+        self.matched
+    }
+
+    pub(crate) fn limit(&self) -> Option<RateLimit> {
+        self.limit
+    }
+}
+
+impl RateLimit {
+    pub(crate) fn requests_per_second(&self) -> f64 {
+        self.requests_per_second
+    }
+
+    pub(crate) fn burst(&self) -> u32 {
+        self.burst
+    }
 }
