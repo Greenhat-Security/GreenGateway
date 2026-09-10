@@ -43,6 +43,23 @@
 //! itself, and an adapter that dropped it would silently lose telemetry the
 //! live path produces today.
 //!
+//! ## Selecting a rate lane is not deciding one
+//!
+//! [`CompiledPolicy::select_rate_lane`] answers which configured override governs
+//! a request, first match in source order. It does not answer whether the request
+//! fits inside that lane, and the split is the point: which lane applies is a
+//! policy question and deterministic, while remaining capacity is mutable state
+//! that ADR-0004 puts outside the pure verdict. The limiter, its token buckets
+//! and their capacity stay where they are, and `mutable_capacity` stays listed as
+//! not evaluated.
+//!
+//! Alias identities do not participate: the live selector matches the request
+//! path only, so consulting a canonical identity here would invent a second
+//! behaviour rather than mirror the existing one. An anonymous caller reaches no
+//! override at all, because `policy_rate_limit_request` returns before consulting
+//! the selector when a request carries no principal -- that is the live bypass
+//! reproduced, and changing it is a cutover decision taken in both paths at once.
+//!
 //! ## Facts, not guesses
 //!
 //! A fact this lane needs and does not have is [`LogicalDecision::Indeterminate`]
@@ -75,7 +92,7 @@ use crate::{
     auth::{AuthMethod, Principal},
     path_match::{is_unsafe_request_path, path_prefix_matches},
     rbac::{
-        matcher::{method_matches, RuleDecision, RuleDispatchContext},
+        matcher::{method_matches, path_pattern_matches, RuleDecision, RuleDispatchContext},
         policy::{RouteRule, KNOWN_TOP_LEVEL_KEYS},
         DefaultAction, EnforcementMode, Policy, PolicyEngine, RuleAction, RuleMatcher,
     },
@@ -293,6 +310,100 @@ impl CompiledPolicy {
                 .matcher
                 .evaluate_with_dispatch(method, path, principal, dispatch_context),
         }
+    }
+
+    /// Which configured rate-limit override governs a request.
+    ///
+    /// First match in source order over method, path pattern and principal --
+    /// the same three predicates the live selector uses, over the same matchers,
+    /// so the pattern syntax and method folding cannot drift apart from it.
+    ///
+    /// Selection only, and the distinction is the point: which lane applies is a
+    /// policy question and deterministic, while whether this request fits inside
+    /// that lane is mutable state. ADR-0004 puts dynamic rate capacity outside
+    /// the pure verdict, so the limiter, its buckets and their capacity stay
+    /// exactly where they are. An allow here is not a statement that a request
+    /// will be admitted.
+    ///
+    /// Alias identities do not apply: the live selector matches the request path
+    /// only, so reading a canonical identity here would invent a second
+    /// behaviour rather than mirror one.
+    ///
+    /// An anonymous caller reaches no override at all. That is the live bypass,
+    /// not a simplification: `policy_rate_limit_request` returns before consulting
+    /// the selector when a request carries no `Principal`, so it only ever selects
+    /// for an authenticated one. Passing `None` to the matcher here instead would
+    /// let an unconstrained override match, and simulation and replay would report
+    /// a lane governing traffic that live never rate-limits. Changing that is a
+    /// deliberate decision for the cutover, in both paths at once.
+    pub(crate) fn select_rate_lane(
+        &self,
+        context: &PolicyEvaluationContext,
+    ) -> Result<RateLaneSelection, EvaluationError> {
+        context.validate(self.snapshot)?;
+        let binding = context.binding()?;
+        // A fact this lane matches on that was not supplied is an incomplete
+        // result, not an evaluator error: ordinary replay over retained data is
+        // missing facts routinely, and failing the run would turn "we did not
+        // record that" into "the analysis is broken".
+        let limitation = if context.method.is_none() {
+            Some(Limitation::MissingMethod)
+        } else if context.path.is_none() {
+            Some(Limitation::MissingPath)
+        } else if matches!(context.principal, PrincipalFact::Missing) {
+            // A rule may constrain the principal, so not knowing it is not the
+            // same as there being none.
+            Some(Limitation::MissingPrincipalFact)
+        } else {
+            None
+        };
+        if let Some(limitation) = limitation {
+            return Ok(RateLaneSelection {
+                binding,
+                outcome: RateLaneOutcome::Indeterminate(limitation),
+            });
+        }
+        let (Some(method), Some(path)) = (&context.method, &context.path) else {
+            return Err(EvaluationError::InternalInvariant);
+        };
+        let principal = match &context.principal {
+            PrincipalFact::Authenticated(identity) => &identity.0,
+            // The live bypass, above.
+            PrincipalFact::Anonymous => {
+                return Ok(RateLaneSelection {
+                    binding,
+                    outcome: RateLaneOutcome::NoOverride,
+                })
+            }
+            PrincipalFact::Missing => return Err(EvaluationError::InternalInvariant),
+        };
+        let selected = self
+            .engine
+            .policy()
+            .rate_limits
+            .iter()
+            .enumerate()
+            .find(|(_, rule)| {
+                rule.principal.matches(Some(principal))
+                    && method_matches(&rule.methods, method.as_str())
+                    && rule
+                        .path
+                        .as_ref()
+                        .is_none_or(|pattern| path_pattern_matches(pattern, path))
+            });
+        Ok(RateLaneSelection {
+            binding,
+            outcome: match selected {
+                Some((index, rule)) => RateLaneOutcome::Override {
+                    index,
+                    limit: RateLimit {
+                        requests_per_second: rule.requests_per_second,
+                        burst: rule.burst,
+                    },
+                },
+                None => RateLaneOutcome::NoOverride,
+            },
+        })
     }
 
     /// First matching route, over one path identity or an alias pair.
@@ -1167,4 +1278,100 @@ fn framed_digest(kind: &str, media_type: &str, version: &str, payload: &[u8]) ->
         digest.update(part);
     }
     digest.finalize().into()
+}
+
+/// Which configured rate-limit override governs a request, and the limit it
+/// declares.
+///
+/// Selection only. The limiter, its token buckets, their capacity and every
+/// decision about whether *this* request fits within the limit stay where they
+/// are: those are mutable state, and ADR-0004 puts dynamic rate capacity outside
+/// the pure verdict. A selection is a statement about policy, not about whether
+/// a request will be admitted -- `NOT_EVALUATED` keeps listing `mutable_capacity`
+/// for exactly that reason.
+/// It carries its input binding for the same reason [`Evaluation`] does. A bare
+/// index and a pair of numbers are indistinguishable from the same index and
+/// numbers produced under a replacement policy, so a selection retained or
+/// serialized across a reload could be applied with stale rates and nothing in
+/// the value would say so. Validating the context before producing the value
+/// protects the production of it, not its later use.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize)]
+pub(crate) struct RateLaneSelection {
+    binding: InputBinding,
+    outcome: RateLaneOutcome,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum RateLaneOutcome {
+    /// No configured override governs this request: either none matched, or the
+    /// caller is anonymous and the live path never consults an override for one.
+    NoOverride,
+    Override {
+        /// First match in source order.
+        index: usize,
+        /// What that override declares. Policy data, not a live budget.
+        limit: RateLimit,
+    },
+    /// A fact this lane matches on was not supplied. Not an evaluator error:
+    /// replay over retained data is routinely missing facts, and failing the run
+    /// would turn "we did not record that" into "the analysis is broken".
+    Indeterminate(Limitation),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Serialize)]
+pub(crate) struct RateLimit {
+    requests_per_second: f64,
+    burst: u32,
+}
+
+impl RateLaneSelection {
+    pub(crate) fn outcome(&self) -> RateLaneOutcome {
+        self.outcome
+    }
+
+    /// The override index, for a selection that found one.
+    pub(crate) fn matched(&self) -> Option<usize> {
+        match self.outcome {
+            RateLaneOutcome::Override { index, .. } => Some(index),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn limit(&self) -> Option<RateLimit> {
+        match self.outcome {
+            RateLaneOutcome::Override { limit, .. } => Some(limit),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn limitation(&self) -> Option<Limitation> {
+        match self.outcome {
+            RateLaneOutcome::Indeterminate(limitation) => Some(limitation),
+            _ => None,
+        }
+    }
+
+    /// Whether this selection may be applied to `context`.
+    ///
+    /// An indeterminate selection is never reusable: it is the absence of an
+    /// answer, and reusing it would hand a caller a stale "no lane" where the
+    /// facts may since have arrived.
+    pub(crate) fn reusable_for(&self, context: &PolicyEvaluationContext) -> bool {
+        !matches!(self.outcome, RateLaneOutcome::Indeterminate(_))
+            && context.validate(self.binding.snapshot).is_ok()
+            && context
+                .binding()
+                .is_ok_and(|binding| binding == self.binding)
+    }
+}
+
+impl RateLimit {
+    pub(crate) fn requests_per_second(&self) -> f64 {
+        self.requests_per_second
+    }
+
+    pub(crate) fn burst(&self) -> u32 {
+        self.burst
+    }
 }
