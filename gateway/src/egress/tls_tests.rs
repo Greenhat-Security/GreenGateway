@@ -128,7 +128,9 @@ const PUBLIC_TRUST_ANCHOR_HOST: &str = "example.com";
 
 struct Ca {
     certificate: rcgen::Certificate,
-    key: rcgen::KeyPair,
+    /// The CA's subject, key-identifier method, key usages and signing key:
+    /// everything rcgen needs to issue a leaf under this CA.
+    issuer: rcgen::Issuer<'static, rcgen::KeyPair>,
 }
 
 impl Ca {
@@ -152,7 +154,10 @@ fn certificate_authority(common_name: &str) -> Ca {
     let certificate = params
         .self_signed(&key)
         .expect("test CA certificate should build");
-    Ca { certificate, key }
+    Ca {
+        certificate,
+        issuer: rcgen::Issuer::new(params, key),
+    }
 }
 
 struct Leaf {
@@ -169,7 +174,7 @@ fn leaf(ca: &Ca, san: &str, purpose: rcgen::ExtendedKeyUsagePurpose) -> Leaf {
     params.extended_key_usages = vec![purpose];
     let key = rcgen::KeyPair::generate().expect("test leaf key should generate");
     let certificate = params
-        .signed_by(&key, &ca.certificate, &ca.key)
+        .signed_by(&key, &ca.issuer)
         .expect("test leaf certificate should build");
 
     Leaf {

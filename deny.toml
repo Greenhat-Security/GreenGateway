@@ -37,7 +37,8 @@ deny = [
   { crate = "hyper-tls", reason = "Gateway transport and credential TLS must use the reviewed rustls stack." },
 ]
 skip = [
-  { crate = "base64@0.22.1", reason = "reqwest 0.13.5 and the gateway workspace pin use base64 0.23 while axum, hyper-util, jsonwebtoken, metrics-exporter-prometheus, pem, postgres-protocol and rmcp still require 0.22." },
+  { crate = "base64@0.22.1", reason = "reqwest 0.13.5, pem 4 (via rcgen 0.14.10) and the gateway workspace pin use base64 0.23 while axum, hyper-util, jsonwebtoken, metrics-exporter-prometheus, pem 3, postgres-protocol and rmcp still require 0.22." },
+  { crate = "bit-vec@0.8.0", reason = "rcgen 0.14.10 moved to yasna 0.6, which encodes with bit-vec 0.9, while proptest 1.11 and its bit-set still use bit-vec 0.8." },
   { crate = "block-buffer@0.10.4", reason = "The 0.10 and 0.11 digest families use incompatible buffer APIs." },
   { crate = "const-oid@0.10.2", reason = "DER/X509 still use 0.9 while the newer digest family requires 0.10." },
   { crate = "cpufeatures@0.2.17", reason = "The tungstenite 0.29 SHA1 0.10 build and current ChaCha/Poly1305/SHA1/SHA2 require different CPU feature APIs." },
@@ -48,6 +49,7 @@ skip = [
   { crate = "getrandom@0.3.4", reason = "TLS, random generators, schema tooling and current UUID/tempfile use three incompatible generations." },
   { crate = "hashbrown@0.16.1", reason = "SQLite hashlink, metrics/schema references and indexmap require distinct table APIs." },
   { crate = "io-lifetimes@2.0.4", reason = "File timestamp support and capability filesystem APIs have different interface generations." },
+  { crate = "pem@3.0.6", reason = "rcgen 0.14.10 moved to pem 4 while jsonwebtoken 11.0.0 still parses PEM with pem 3." },
   { crate = "r-efi@5.3.0", reason = "The 0.3 and 0.4 getrandom generations require different UEFI bindings." },
   { crate = "rand@0.10.2", reason = "Metrics/properties/QUIC/WebSocket and PostgreSQL/MCP require different random-generator APIs." },
   { crate = "rand_core@0.10.1", reason = "Signature, property/QUIC generators and current crypto require distinct rand_core traits." },

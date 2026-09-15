@@ -1030,7 +1030,7 @@ mod tests {
         let pem = format!(
             "{}{}",
             identity.cert.pem(),
-            identity.key_pair.serialize_pem()
+            identity.signing_key.serialize_pem()
         );
         let path = std::env::temp_dir().join(format!(
             "greengateway-proxy-{name}-{}.pem",

@@ -1309,7 +1309,9 @@ mod tests {
 
     use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
     use http::StatusCode;
-    use rcgen::{BasicConstraints, CertificateParams, DistinguishedName, DnType, IsCa, SanType};
+    use rcgen::{
+        BasicConstraints, CertificateParams, DistinguishedName, DnType, IsCa, Issuer, SanType,
+    };
     use serde_json::json;
     use tokio::{
         io::{AsyncReadExt, AsyncWriteExt},
@@ -1397,7 +1399,7 @@ mod tests {
             .push(SanType::IpAddress(IpAddr::V4(Ipv4Addr::LOCALHOST)));
         let server_key = rcgen::KeyPair::generate().expect("test server key should generate");
         let server_certificate = server_params
-            .signed_by(&server_key, &ca, &ca_key)
+            .signed_by(&server_key, &Issuer::from_params(&ca_params, &ca_key))
             .expect("test server certificate should build");
         let server_config = ServerConfig::builder()
             .with_no_client_auth()
@@ -2463,7 +2465,10 @@ mod tests {
         let upstream_server_key =
             rcgen::KeyPair::generate().expect("upstream server key should generate");
         let upstream_server_certificate = upstream_server_params
-            .signed_by(&upstream_server_key, &upstream_ca, &upstream_ca_key)
+            .signed_by(
+                &upstream_server_key,
+                &Issuer::from_params(&upstream_ca_params, &upstream_ca_key),
+            )
             .expect("upstream server certificate should build");
         let upstream_server_config = ServerConfig::builder()
             .with_no_client_auth()

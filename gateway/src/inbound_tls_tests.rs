@@ -52,7 +52,7 @@ fn server_identity() -> ServerIdentity {
     params.extended_key_usages = vec![rcgen::ExtendedKeyUsagePurpose::ServerAuth];
     let key = rcgen::KeyPair::generate().expect("test server key should generate");
     let certificate = params
-        .signed_by(&key, &ca_certificate, &ca_key)
+        .signed_by(&key, &Issuer::from_params(&ca_params, &ca_key))
         .expect("test server certificate should build");
 
     ServerIdentity {
@@ -1309,9 +1309,9 @@ fn a_symlink_escaping_the_material_directory_fails_startup() {
 
 use axum::{extract::Request, http::StatusCode, middleware::from_fn};
 use rcgen::{
-    BasicConstraints, CertificateParams, CertificateRevocationListParams, DistinguishedName,
-    DnType, ExtendedKeyUsagePurpose, Ia5String, IsCa, KeyIdMethod, KeyPair, KeyUsagePurpose,
-    RevocationReason, RevokedCertParams, SanType, SerialNumber,
+    string::Ia5String, BasicConstraints, CertificateParams, CertificateRevocationListParams,
+    DistinguishedName, DnType, ExtendedKeyUsagePurpose, IsCa, Issuer, KeyIdMethod, KeyPair,
+    KeyUsagePurpose, RevocationReason, RevokedCertParams, SanType, SerialNumber,
 };
 use time::{Duration as TimeDuration, OffsetDateTime};
 use tokio_rustls::rustls::pki_types::{PrivateKeyDer, PrivatePkcs8KeyDer};
@@ -1334,8 +1334,9 @@ const OTHER_SPIFFE_ID: &str = "spiffe://gateway.test/ns/payments/sa/batch";
 
 /// A throwaway client CA, kept alive so it can sign leaves and CRLs.
 struct ClientCa {
-    certificate: rcgen::Certificate,
-    key: KeyPair,
+    /// The CA's subject, key-identifier method, key usages and signing key:
+    /// everything rcgen needs to issue a leaf or a CRL under this CA.
+    issuer: Issuer<'static, KeyPair>,
     pem: String,
 }
 
@@ -1360,8 +1361,7 @@ fn client_ca_named(common_name: &str) -> ClientCa {
     let pem = certificate.pem();
 
     ClientCa {
-        certificate,
-        key,
+        issuer: Issuer::new(params, key),
         pem,
     }
 }
@@ -1406,7 +1406,7 @@ fn issue_client_identity(ca: &ClientCa, spec: ClientIdentitySpec) -> ClientIdent
     params.serial_number = Some(serial.clone());
     let key = KeyPair::generate().expect("test client key should generate");
     let certificate = params
-        .signed_by(&key, &ca.certificate, &ca.key)
+        .signed_by(&key, &ca.issuer)
         .expect("test client certificate should build");
 
     ClientIdentity {
@@ -1444,7 +1444,7 @@ fn client_crl(
             .collect(),
         key_identifier_method: KeyIdMethod::Sha256,
     }
-    .signed_by(&ca.certificate, &ca.key)
+    .signed_by(&ca.issuer)
     .expect("test CRL should build")
     .pem()
     .expect("test CRL should encode as PEM")
@@ -3149,7 +3149,7 @@ fn server_identity_named(dns_names: &[&str], ip_sans: &[std::net::IpAddr]) -> Se
     params.extended_key_usages = vec![rcgen::ExtendedKeyUsagePurpose::ServerAuth];
     let key = rcgen::KeyPair::generate().expect("test server key should generate");
     let certificate = params
-        .signed_by(&key, &ca_certificate, &ca_key)
+        .signed_by(&key, &Issuer::from_params(&ca_params, &ca_key))
         .expect("test server certificate should build");
 
     ServerIdentity {

@@ -9,7 +9,7 @@
       ],
       "owner": "GreenGateway maintainers",
       "expires": "2026-12-01",
-      "reason": "reqwest 0.13.5 and the gateway workspace pin use base64 0.23 while axum, hyper-util, jsonwebtoken, metrics-exporter-prometheus, pem, postgres-protocol and rmcp still require 0.22.",
+      "reason": "reqwest 0.13.5, pem 4 (via rcgen 0.14.10) and the gateway workspace pin use base64 0.23 while axum, hyper-util, jsonwebtoken, metrics-exporter-prometheus, pem 3, postgres-protocol and rmcp still require 0.22.",
       "remediation": "Re-evaluate when the listed 0.22 parent dependencies update; remove the exception once their version requirements converge on 0.23.",
       "parents": {
         "0.22.1": [
@@ -23,7 +23,28 @@
         ],
         "0.23.1": [
           "gateway@1.0.1",
+          "pem@4.0.0",
           "reqwest@0.13.5"
+        ]
+      }
+    },
+    {
+      "name": "bit-vec",
+      "versions": [
+        "0.8.0",
+        "0.9.1"
+      ],
+      "owner": "GreenGateway maintainers",
+      "expires": "2026-12-01",
+      "reason": "rcgen 0.14.10 moved to yasna 0.6, which encodes with bit-vec 0.9, while proptest 1.11 and its bit-set still use bit-vec 0.8.",
+      "remediation": "Re-evaluate when the listed parent dependencies update; remove the exception once their version requirements converge.",
+      "parents": {
+        "0.8.0": [
+          "bit-set@0.8.0",
+          "proptest@1.11.0"
+        ],
+        "0.9.1": [
+          "yasna@0.6.0"
         ]
       }
     },
@@ -234,6 +255,25 @@
       }
     },
     {
+      "name": "pem",
+      "versions": [
+        "3.0.6",
+        "4.0.0"
+      ],
+      "owner": "GreenGateway maintainers",
+      "expires": "2026-12-01",
+      "reason": "rcgen 0.14.10 moved to pem 4 while jsonwebtoken 11.0.0 still parses PEM with pem 3.",
+      "remediation": "Re-evaluate when the listed parent dependencies update; remove the exception once their version requirements converge.",
+      "parents": {
+        "3.0.6": [
+          "jsonwebtoken@11.0.0"
+        ],
+        "4.0.0": [
+          "rcgen@0.14.10"
+        ]
+      }
+    },
+    {
       "name": "r-efi",
       "versions": [
         "5.3.0",
@@ -339,6 +379,8 @@
       "remediation": "Re-evaluate when the listed parent dependencies update; remove the exception once their version requirements converge.",
       "parents": {
         "2.0.119": [
+          "asn1-rs-derive@0.6.0",
+          "asn1-rs-impl@0.2.0",
           "darling_core@0.23.0",
           "darling_macro@0.23.0",
           "der_derive@0.7.3",

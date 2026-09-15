@@ -373,7 +373,10 @@ fn test_ca_signed_server_certificate() -> (String, Vec<u8>, Vec<u8>) {
         .push(rcgen::SanType::IpAddress(IpAddr::V4(Ipv4Addr::LOCALHOST)));
     let server_key = rcgen::KeyPair::generate().expect("test server key should generate");
     let server = server_params
-        .signed_by(&server_key, &ca, &ca_key)
+        .signed_by(
+            &server_key,
+            &rcgen::Issuer::from_params(&ca_params, &ca_key),
+        )
         .expect("test server certificate should build");
 
     (

@@ -494,7 +494,7 @@ mod tests {
         let mismatched = format!(
             "{}{}",
             certificate.cert.pem(),
-            unrelated.key_pair.serialize_pem()
+            unrelated.signing_key.serialize_pem()
         );
 
         let error = parse_client_identity_pem(mismatched.as_bytes())
@@ -504,7 +504,7 @@ mod tests {
         let matching = format!(
             "{}{}",
             certificate.cert.pem(),
-            certificate.key_pair.serialize_pem()
+            certificate.signing_key.serialize_pem()
         );
         let identity = parse_client_identity_pem(matching.as_bytes())
             .expect("a matching certificate and key must be accepted");
