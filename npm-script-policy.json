@@ -36,33 +36,20 @@
         "reason": "Optional Darwin watcher; published tarball has no install lifecycle hook or binding.gyp despite lock metadata."
       },
       "node_modules/workerd": {
-        "version": "1.20260903.1",
-        "resolved": "https://registry.npmjs.org/workerd/-/workerd-1.20260903.1.tgz",
-        "integrity": "sha512-xJzt2RnCy7ulOULmZy/4JLbEPg1uisp9lVoOUsEz+UVhDsTmrSQ0rBXZMGcXuhr2HCGKs89bg8nnbbzvBSX1Ig==",
+        "version": "1.20260911.1",
+        "resolved": "https://registry.npmjs.org/workerd/-/workerd-1.20260911.1.tgz",
+        "integrity": "sha512-vRr8QdBxueQOZJO1hRCI73EZlix87IAyBAcSyI3rA1VB+6oxjw3oaqzYnIV8C4IOPtUgihbdMAgzkb5GM4V7DQ==",
         "allow": false,
         "scripts": {
           "postinstall": "node install.js"
         },
         "source_sha256": {
-          "package/install.js": "c947861ce70fa08edb3c45461f502cf26af84eb60cb7d16507f678b9ebfc830b"
+          "package/install.js": "2e1db5d7e1f15dc2796a5aafa1acafd41616cb078740818cad4d31c9d62ae549"
         },
         "reason": "Native binary is supplied by the locked platform optional dependency; installer fallback downloads and binary rewrites are unnecessary for supported builds."
       }
     },
     "admin-ui": {
-      "node_modules/esbuild": {
-        "version": "0.28.1",
-        "resolved": "https://registry.npmjs.org/esbuild/-/esbuild-0.28.1.tgz",
-        "integrity": "sha512-HrJrvZv5ayxBzPfwphOoNzkzOIIlifzk0KJrGK2c8R4+LKpMtpYLQeUdjnwjWv/LZlkH2laZk+4w78pi99D4Vw==",
-        "allow": false,
-        "scripts": {
-          "postinstall": "node install.js"
-        },
-        "source_sha256": {
-          "package/install.js": "612294e278914443bdcf81cb17f54afec34dbdd2ebd999a6ee187912320cc315"
-        },
-        "reason": "Native binary is supplied by the locked platform optional dependency; installer fallback downloads and binary rewrites are unnecessary for supported builds."
-      },
       "node_modules/fsevents": {
         "version": "2.3.3",
         "resolved": "https://registry.npmjs.org/fsevents/-/fsevents-2.3.3.tgz",
