@@ -150,7 +150,7 @@
           "tokio-postgres@0.7.18"
         ],
         "0.3.0": [
-          "rusqlite@0.32.1"
+          "rusqlite@0.40.2"
         ]
       }
     },
@@ -192,7 +192,6 @@
     {
       "name": "hashbrown",
       "versions": [
-        "0.14.5",
         "0.16.1",
         "0.17.1"
       ],
@@ -201,14 +200,13 @@
       "reason": "SQLite hashlink, metrics/schema references and indexmap require distinct table APIs.",
       "remediation": "Re-evaluate when the listed parent dependencies update; remove the exception once their version requirements converge.",
       "parents": {
-        "0.14.5": [
-          "hashlink@0.9.1"
-        ],
         "0.16.1": [
           "metrics-util@0.20.4",
-          "referencing@0.46.10"
+          "referencing@0.46.10",
+          "rsqlite-vfs@0.1.1"
         ],
         "0.17.1": [
+          "hashlink@0.12.2",
           "indexmap@2.14.2"
         ]
       }
