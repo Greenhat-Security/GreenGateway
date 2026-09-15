@@ -54,7 +54,7 @@ skip = [
   { crate = "rand_core@0.10.1", reason = "Signature, property/QUIC generators and current crypto require distinct rand_core traits." },
   { crate = "rand_core@0.6.4", reason = "Signature, property/QUIC generators and current crypto require distinct rand_core traits." },
   { crate = "sha1@0.10.7", reason = "Axum WebSockets use tungstenite 0.29/SHA1 0.10; upstream tungstenite 0.30 uses SHA1 0.11 solely for the RFC 6455 handshake." },
-  { crate = "syn@2.0.119", reason = "serde_derive 1.0.229 and the other current proc-macro crates require syn 3 while the gateway transport guard example and the remaining derive crates still use syn 2." },
+  { crate = "syn@2.0.119", reason = "serde_derive 1.0.229, the gateway transport guard example and the other current proc-macro crates require syn 3 while the remaining derive crates still use syn 2." },
   { crate = "tokio-tungstenite@0.29.0", reason = "Axum 0.8.9 pins its downstream WebSocket adapter to 0.29 while the gateway upstream adapter uses 0.30." },
   { crate = "tungstenite@0.29.0", reason = "Axum downstream WebSockets still use 0.29; upstream sockets use 0.30. The explicit 0.29 alias preserves downstream typed error classification." },
   { crate = "untrusted@0.7.1", reason = "AWS-LC and ring/webpki select distinct parsing interfaces; changing TLS backends is out of scope." },

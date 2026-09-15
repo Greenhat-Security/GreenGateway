@@ -1114,7 +1114,7 @@
           "serde_json@1.0.151|registry+https://github.com/rust-lang/crates.io-index",
           "sha2@0.11.0|registry+https://github.com/rust-lang/crates.io-index",
           "sse-stream@0.2.6|registry+https://github.com/rust-lang/crates.io-index",
-          "syn@2.0.119|registry+https://github.com/rust-lang/crates.io-index",
+          "syn@3.0.5|registry+https://github.com/rust-lang/crates.io-index",
           "time@0.3.55|registry+https://github.com/rust-lang/crates.io-index",
           "tokio-postgres-rustls@0.14.0|registry+https://github.com/rust-lang/crates.io-index",
           "tokio-postgres@0.7.18|registry+https://github.com/rust-lang/crates.io-index",
@@ -5139,7 +5139,7 @@
             "rename": null,
             "kind": "dev",
             "target": null,
-            "req": "^2.0.118",
+            "req": "^3.0.5",
             "optional": false,
             "uses_default_features": true,
             "features": [

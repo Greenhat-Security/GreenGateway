@@ -233,7 +233,7 @@ impl Tree {
                         "{scope}::impl {} {}",
                         i.trait_
                             .as_ref()
-                            .map(|(_, p, _)| p.to_token_stream().to_string())
+                            .map(|(p, _)| p.to_token_stream().to_string())
                             .unwrap_or_default(),
                         i.self_ty.to_token_stream()
                     );
@@ -631,7 +631,7 @@ impl<'ast> Visit<'ast> for Scan<'_> {
         }
     }
     fn visit_signature(&mut self, signature: &'ast syn::Signature) {
-        if signature.unsafety.is_some() {
+        if matches!(signature.safety, syn::Safety::Unsafe(_)) {
             self.reason("unsafe-code");
         }
         if signature.abi.is_some() {
