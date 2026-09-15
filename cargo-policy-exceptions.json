@@ -517,7 +517,6 @@
       "name": "windows-sys",
       "versions": [
         "0.52.0",
-        "0.59.0",
         "0.60.2",
         "0.61.2"
       ],
@@ -527,10 +526,8 @@
       "remediation": "Re-evaluate when the listed parent dependencies update; remove the exception once their version requirements converge.",
       "parents": {
         "0.52.0": [
-          "ring@0.17.14"
-        ],
-        "0.59.0": [
           "fs-set-times@0.20.3",
+          "ring@0.17.14",
           "winx@0.36.4"
         ],
         "0.60.2": [
@@ -563,12 +560,11 @@
       ],
       "owner": "GreenGateway maintainers",
       "expires": "2026-12-01",
-      "reason": "windows-sys 0.52/0.59 and 0.60 require their matching native import libraries.",
+      "reason": "windows-sys 0.52 and 0.60 require their matching native import libraries.",
       "remediation": "Re-evaluate when the listed parent dependencies update; remove the exception once their version requirements converge.",
       "parents": {
         "0.52.6": [
-          "windows-sys@0.52.0",
-          "windows-sys@0.59.0"
+          "windows-sys@0.52.0"
         ],
         "0.53.5": [
           "windows-sys@0.60.2"

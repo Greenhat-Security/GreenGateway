@@ -994,7 +994,7 @@
         "dependencies": [
           "io-lifetimes@2.0.4|registry+https://github.com/rust-lang/crates.io-index",
           "rustix@1.1.4|registry+https://github.com/rust-lang/crates.io-index",
-          "windows-sys@0.59.0|registry+https://github.com/rust-lang/crates.io-index"
+          "windows-sys@0.52.0|registry+https://github.com/rust-lang/crates.io-index"
         ]
       },
       {
@@ -4745,20 +4745,6 @@
         "features": [
           "Win32",
           "Win32_Foundation",
-          "Win32_System",
-          "Win32_System_Threading",
-          "default"
-        ],
-        "dependencies": [
-          "windows-targets@0.52.6|registry+https://github.com/rust-lang/crates.io-index"
-        ]
-      },
-      {
-        "package": "windows-sys@0.59.0|registry+https://github.com/rust-lang/crates.io-index",
-        "checksum": "1e38bc4d79ed67fd075bcc251a1c39b32a1776bbe92e5bef1f0bf1f8c531853b",
-        "features": [
-          "Win32",
-          "Win32_Foundation",
           "Win32_Storage",
           "Win32_Storage_FileSystem",
           "Win32_System",
@@ -4767,6 +4753,7 @@
           "Win32_System_LibraryLoader",
           "Win32_System_Performance",
           "Win32_System_SystemServices",
+          "Win32_System_Threading",
           "default"
         ],
         "dependencies": [
@@ -4969,7 +4956,7 @@
         "features": [],
         "dependencies": [
           "bitflags@2.13.2|registry+https://github.com/rust-lang/crates.io-index",
-          "windows-sys@0.59.0|registry+https://github.com/rust-lang/crates.io-index"
+          "windows-sys@0.52.0|registry+https://github.com/rust-lang/crates.io-index"
         ]
       },
       {
