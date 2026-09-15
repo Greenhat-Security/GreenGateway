@@ -1122,7 +1122,7 @@
           "tokio-tungstenite@0.30.0|registry+https://github.com/rust-lang/crates.io-index",
           "tokio-util@0.7.19|registry+https://github.com/rust-lang/crates.io-index",
           "tokio@1.53.1|registry+https://github.com/rust-lang/crates.io-index",
-          "tower-http@0.6.11|registry+https://github.com/rust-lang/crates.io-index",
+          "tower-http@0.7.1|registry+https://github.com/rust-lang/crates.io-index",
           "tower@0.5.3|registry+https://github.com/rust-lang/crates.io-index",
           "tracing-subscriber@0.3.23|registry+https://github.com/rust-lang/crates.io-index",
           "tracing@0.1.44|registry+https://github.com/rust-lang/crates.io-index",
@@ -3900,15 +3900,9 @@
         "package": "tower-http@0.6.11|registry+https://github.com/rust-lang/crates.io-index",
         "checksum": "4cfcf7e2740e6fc6d4d688b4ef00650406bb94adf4731e43c096c3a19fe40840",
         "features": [
-          "cors",
-          "default",
           "follow-redirect",
           "futures-util",
-          "request-id",
-          "tower",
-          "trace",
-          "tracing",
-          "uuid"
+          "tower"
         ],
         "dependencies": [
           "bitflags@2.13.2|registry+https://github.com/rust-lang/crates.io-index",
@@ -3920,8 +3914,30 @@
           "tower-layer@0.3.3|registry+https://github.com/rust-lang/crates.io-index",
           "tower-service@0.3.3|registry+https://github.com/rust-lang/crates.io-index",
           "tower@0.5.3|registry+https://github.com/rust-lang/crates.io-index",
+          "url@2.5.8|registry+https://github.com/rust-lang/crates.io-index"
+        ]
+      },
+      {
+        "package": "tower-http@0.7.1|registry+https://github.com/rust-lang/crates.io-index",
+        "checksum": "08a05a66a4fdd61cbbe0a1d755ffe0ca6aba159dd4820936a0ff8a8278245b9c",
+        "features": [
+          "cors",
+          "default",
+          "request-id",
+          "trace",
+          "tracing",
+          "uuid"
+        ],
+        "dependencies": [
+          "bitflags@2.13.2|registry+https://github.com/rust-lang/crates.io-index",
+          "bytes@1.12.1|registry+https://github.com/rust-lang/crates.io-index",
+          "http-body@1.1.0|registry+https://github.com/rust-lang/crates.io-index",
+          "http@1.5.0|registry+https://github.com/rust-lang/crates.io-index",
+          "percent-encoding@2.3.2|registry+https://github.com/rust-lang/crates.io-index",
+          "pin-project-lite@0.2.17|registry+https://github.com/rust-lang/crates.io-index",
+          "tower-layer@0.3.3|registry+https://github.com/rust-lang/crates.io-index",
+          "tower-service@0.3.3|registry+https://github.com/rust-lang/crates.io-index",
           "tracing@0.1.44|registry+https://github.com/rust-lang/crates.io-index",
-          "url@2.5.8|registry+https://github.com/rust-lang/crates.io-index",
           "uuid@1.26.1|registry+https://github.com/rust-lang/crates.io-index"
         ]
       },
@@ -5081,7 +5097,7 @@
             "rename": null,
             "kind": null,
             "target": null,
-            "req": "^0.6.8",
+            "req": "^0.7.1",
             "optional": false,
             "uses_default_features": true,
             "features": [

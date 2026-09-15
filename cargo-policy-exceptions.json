@@ -394,6 +394,25 @@
       }
     },
     {
+      "name": "tower-http",
+      "versions": [
+        "0.6.11",
+        "0.7.1"
+      ],
+      "owner": "GreenGateway maintainers",
+      "expires": "2026-12-01",
+      "reason": "The gateway workspace pin uses tower-http 0.7 for its cors, request-id and trace layers while reqwest 0.13.5 still requires 0.6 for its follow-redirect middleware.",
+      "remediation": "Re-evaluate when reqwest moves its tower-http requirement to 0.7; remove the exception once the version requirements converge.",
+      "parents": {
+        "0.6.11": [
+          "reqwest@0.13.5"
+        ],
+        "0.7.1": [
+          "gateway@1.0.1"
+        ]
+      }
+    },
+    {
       "name": "tungstenite",
       "owner": "GreenGateway maintainers",
       "expires": "2026-12-01",

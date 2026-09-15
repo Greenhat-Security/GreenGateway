@@ -24820,7 +24820,7 @@ async fn bare_options_without_origin_stops_at_cors_layer_before_handler() {
     .await
     .expect("request should complete");
 
-    // tower-http 0.6.8's CorsLayer handles bare OPTIONS requests before
+    // tower-http 0.7.1's CorsLayer handles bare OPTIONS requests before
     // auth. If this reached the unauthenticated test handler, it would
     // return 204; if CorsLayer passed it through to auth, auth would fail
     // closed with 401 as proven by the auth middleware unit test.

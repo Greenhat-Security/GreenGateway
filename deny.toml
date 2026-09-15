@@ -56,6 +56,7 @@ skip = [
   { crate = "sha1@0.10.7", reason = "Axum WebSockets use tungstenite 0.29/SHA1 0.10; upstream tungstenite 0.30 uses SHA1 0.11 solely for the RFC 6455 handshake." },
   { crate = "syn@2.0.119", reason = "serde_derive 1.0.229, the gateway transport guard example and the other current proc-macro crates require syn 3 while the remaining derive crates still use syn 2." },
   { crate = "tokio-tungstenite@0.29.0", reason = "Axum 0.8.9 pins its downstream WebSocket adapter to 0.29 while the gateway upstream adapter uses 0.30." },
+  { crate = "tower-http@0.6.11", reason = "The gateway workspace pin uses tower-http 0.7 for its cors, request-id and trace layers while reqwest 0.13.5 still requires 0.6 for its follow-redirect middleware." },
   { crate = "tungstenite@0.29.0", reason = "Axum downstream WebSockets still use 0.29; upstream sockets use 0.30. The explicit 0.29 alias preserves downstream typed error classification." },
   { crate = "untrusted@0.7.1", reason = "AWS-LC and ring/webpki select distinct parsing interfaces; changing TLS backends is out of scope." },
   { crate = "wasi@0.11.1+wasi-snapshot-preview1", reason = "Existing socket/randomness support and wasite use separate WASI interface generations." },
