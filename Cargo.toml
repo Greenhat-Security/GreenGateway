@@ -10,7 +10,7 @@ license-file = "LICENSE"
 arc-swap = "1.7.1"
 async-trait = "0.1.89"
 axum = { version = "0.8.9", features = ["ws"] }
-base64 = "0.22.1"
+base64 = "0.23.1"
 # The PostgreSQL foundation of issue #241 PR 3 uses the protocol crate plus a
 # bounded pool rather than sqlx: sqlx would add its own runtime abstraction and
 # TLS stack (and a large dependency tree) to satisfy a need this repo already

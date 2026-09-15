@@ -37,7 +37,7 @@ deny = [
   { crate = "hyper-tls", reason = "Gateway transport and credential TLS must use the reviewed rustls stack." },
 ]
 skip = [
-  { crate = "base64@0.22.1", reason = "reqwest 0.13.5 moved to base64 0.23 while the gateway workspace pin and the remaining dependency graph still use 0.22." },
+  { crate = "base64@0.22.1", reason = "reqwest 0.13.5 and the gateway workspace pin use base64 0.23 while axum, hyper-util, jsonwebtoken, metrics-exporter-prometheus, pem, postgres-protocol and rmcp still require 0.22." },
   { crate = "block-buffer@0.10.4", reason = "The 0.10 and 0.11 digest families use incompatible buffer APIs." },
   { crate = "const-oid@0.10.2", reason = "DER/X509 still use 0.9 while the newer digest family requires 0.10." },
   { crate = "cpufeatures@0.2.17", reason = "The tungstenite 0.29 SHA1 0.10 build and current ChaCha/Poly1305/SHA1/SHA2 require different CPU feature APIs." },
