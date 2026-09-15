@@ -91,7 +91,7 @@ fn server_fixture() -> ServerFixture {
     params.extended_key_usages = vec![rcgen::ExtendedKeyUsagePurpose::ServerAuth];
     let key = rcgen::KeyPair::generate().expect("test server key should generate");
     let certificate = params
-        .signed_by(&key, &ca_certificate, &ca_key)
+        .signed_by(&key, &rcgen::Issuer::from_params(&ca_params, &ca_key))
         .expect("test server certificate should build");
 
     ServerFixture {

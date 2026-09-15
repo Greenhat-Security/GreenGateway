@@ -300,7 +300,7 @@ fn in_memory_tls_material_is_validated_without_retaining_or_rendering_input() {
         rcgen::generate_simple_self_signed(vec!["tls-material.example.test".to_owned()])
             .expect("test certificate should generate");
     let ca_pem = certified.cert.pem();
-    let identity_pem = format!("{}{}", ca_pem, certified.key_pair.serialize_pem());
+    let identity_pem = format!("{}{}", ca_pem, certified.signing_key.serialize_pem());
 
     let mut config = EgressConfig {
         tls_ca_bundle_path: Some(PathBuf::from("old-locator-canary.pem")),
@@ -2441,7 +2441,7 @@ fn cache_partitions_address_timeout_trust_identity_and_egress_generations() {
     let first_identity_pem = format!(
         "{}{}",
         first_identity.cert.pem(),
-        first_identity.key_pair.serialize_pem()
+        first_identity.signing_key.serialize_pem()
     );
     first_identity_config.client_identity = Some(
         tls::parse_client_identity_pem(first_identity_pem.as_bytes())
@@ -2465,7 +2465,7 @@ fn cache_partitions_address_timeout_trust_identity_and_egress_generations() {
     let second_identity_pem = format!(
         "{}{}",
         second_identity.cert.pem(),
-        second_identity.key_pair.serialize_pem()
+        second_identity.signing_key.serialize_pem()
     );
     second_identity_config.client_identity = Some(
         tls::parse_client_identity_pem(second_identity_pem.as_bytes())
@@ -2962,6 +2962,7 @@ fn test_config() -> Config {
         policy_history_sqlite_path: None,
         cors_allow_origins: Vec::new(),
         max_body_size: 1_048_576,
+        max_request_path_bytes: crate::config::DEFAULT_MAX_REQUEST_PATH_BYTES,
         rate_limit_read_rps: 50.0,
         rate_limit_read_burst: 100,
         rate_limit_write_rps: 10.0,

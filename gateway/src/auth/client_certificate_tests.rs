@@ -1,4 +1,4 @@
-use rcgen::{CertificateParams, Ia5String, KeyPair, SanType};
+use rcgen::{string::Ia5String, CertificateParams, KeyPair, SanType};
 use sha2::{Digest, Sha256};
 use tokio_rustls::rustls::pki_types::CertificateDer;
 

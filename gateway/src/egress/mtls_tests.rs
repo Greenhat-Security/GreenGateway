@@ -61,7 +61,9 @@ impl Drop for SecretFile {
 
 struct CertificateAuthority {
     certificate: rcgen::Certificate,
-    key: rcgen::KeyPair,
+    /// The CA's subject, key-identifier method, key usages and signing key:
+    /// everything rcgen needs to issue a leaf under this CA.
+    issuer: rcgen::Issuer<'static, rcgen::KeyPair>,
 }
 
 fn certificate_authority(common_name: &str) -> CertificateAuthority {
@@ -75,7 +77,10 @@ fn certificate_authority(common_name: &str) -> CertificateAuthority {
     let certificate = params
         .self_signed(&key)
         .expect("test CA certificate should build");
-    CertificateAuthority { certificate, key }
+    CertificateAuthority {
+        certificate,
+        issuer: rcgen::Issuer::new(params, key),
+    }
 }
 
 struct ServerIdentity {
@@ -91,7 +96,7 @@ fn server_identity(host: &str) -> ServerIdentity {
     params.extended_key_usages = vec![rcgen::ExtendedKeyUsagePurpose::ServerAuth];
     let key = rcgen::KeyPair::generate().expect("test server key should generate");
     let certificate = params
-        .signed_by(&key, &ca.certificate, &ca.key)
+        .signed_by(&key, &ca.issuer)
         .expect("test server certificate should build");
 
     ServerIdentity {
@@ -113,7 +118,7 @@ fn client_identity(name: &str) -> ClientIdentity {
     params.extended_key_usages = vec![rcgen::ExtendedKeyUsagePurpose::ClientAuth];
     let key = rcgen::KeyPair::generate().expect("test client key should generate");
     let certificate = params
-        .signed_by(&key, &ca.certificate, &ca.key)
+        .signed_by(&key, &ca.issuer)
         .expect("test client certificate should build");
 
     ClientIdentity {

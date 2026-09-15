@@ -118,7 +118,11 @@ impl GrpcStatus {
 pub(crate) fn grpc_status_for_http_status(status: StatusCode) -> GrpcStatus {
     match status.as_u16() {
         200 => GrpcStatus::Ok,
-        400 | 431 => GrpcStatus::Internal,
+        // 400 is what request validation answers for a `Host` that names no
+        // host, 414 for a path over the admitted length and 431 for a `Host`
+        // over it: a request head the gateway will not interpret, which the
+        // specification's table files under INTERNAL.
+        400 | 414 | 431 => GrpcStatus::Internal,
         401 => GrpcStatus::Unauthenticated,
         403 => GrpcStatus::PermissionDenied,
         404 => GrpcStatus::Unimplemented,
@@ -671,6 +675,11 @@ mod tests {
             (StatusCode::NOT_IMPLEMENTED, GrpcStatus::Unimplemented),
             (StatusCode::NOT_FOUND, GrpcStatus::Unimplemented),
             (StatusCode::BAD_REQUEST, GrpcStatus::Internal),
+            (StatusCode::URI_TOO_LONG, GrpcStatus::Internal),
+            (
+                StatusCode::REQUEST_HEADER_FIELDS_TOO_LARGE,
+                GrpcStatus::Internal,
+            ),
             (StatusCode::REQUEST_TIMEOUT, GrpcStatus::DeadlineExceeded),
             (StatusCode::SERVICE_UNAVAILABLE, GrpcStatus::Unavailable),
             (StatusCode::BAD_GATEWAY, GrpcStatus::Unavailable),

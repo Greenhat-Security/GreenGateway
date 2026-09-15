@@ -209,8 +209,7 @@ pub(super) async fn forward_request(
     request: Request<Body>,
     source_ip: &str,
 ) -> Response {
-    let path = request.uri().path();
-    let Some(upstream) = proxy.upstream_for_request(path, request.headers()) else {
+    let Some(upstream) = proxy.upstream_for_request(request.uri(), request.headers()) else {
         return StatusCode::NOT_FOUND.into_response();
     };
 
@@ -4640,7 +4639,10 @@ mod tests {
             .push(rcgen::DnType::CommonName, certificate_name);
         let server_key = rcgen::KeyPair::generate().expect("test server key should generate");
         let server = server_params
-            .signed_by(&server_key, &ca, &ca_key)
+            .signed_by(
+                &server_key,
+                &rcgen::Issuer::from_params(&ca_params, &ca_key),
+            )
             .expect("test server certificate should build");
         let server_config = tokio_rustls::rustls::ServerConfig::builder()
             .with_no_client_auth()

@@ -190,6 +190,19 @@ impl CookieSessionValidator {
             &self.cfg.roles_claim,
             self.cfg.roles_claim_delimiter.as_deref(),
         );
+        // Bounds are a verdict on the credential, cached like any other
+        // rejection: the introspection response that produced it will produce
+        // it again. It is a 401, not a provider failure -- the provider
+        // answered, and what it said does not describe a principal.
+        if let Err(problem) = crate::auth::principal::check_principal_shape(
+            &user_id,
+            self.principal_issuer.as_deref(),
+            &roles,
+        ) {
+            return Ok(CachedSessionValidation::Invalid(format!(
+                "cookie-session claims out of bounds: {problem}"
+            )));
+        }
 
         Ok(CachedSessionValidation::Valid(CachedValidSession {
             user_id,
@@ -641,6 +654,67 @@ mod tests {
             .expect("request after TTL should introspect again");
 
         assert_eq!(server.call_count(), 2);
+    }
+
+    #[tokio::test]
+    async fn introspection_claims_at_the_principal_bounds_authenticate_and_past_them_do_not() {
+        // At the bound: a 4096-byte subject and 256 roles of 256 bytes are a
+        // valid session, and the Valid verdict is cached like any other.
+        let (url, server) = introspection_server(
+            [TestResponse::json(
+                StatusLine::Ok,
+                json!({"user_id": "u".repeat(4096), "roles": vec!["r".repeat(256); 256]}),
+            )],
+            "127.0.0.1",
+        )
+        .await;
+        let at_bound = validator(config(&url));
+        for _ in 0..2 {
+            let principal = at_bound
+                .validate_session(&SessionCredential::Cookie("session-secret-123".to_owned()))
+                .await
+                .expect("claims at the bound must authenticate");
+            assert_eq!(principal.user_id.len(), 4096);
+            assert_eq!(principal.roles.len(), 256);
+            assert!(principal.roles.iter().all(|role| role.len() == 256));
+        }
+        assert_eq!(server.requests().len(), 1, "the Valid verdict is cached");
+
+        let too_many_roles = (0..257).map(|index| index.to_string()).collect::<Vec<_>>();
+        for (claims, expected) in [
+            (
+                json!({"user_id": "user-123", "roles": ["admin", ""]}),
+                "cookie-session claims out of bounds: an empty role",
+            ),
+            (
+                json!({"user_id": "user-123", "roles": too_many_roles}),
+                "cookie-session claims out of bounds: more than 256 roles",
+            ),
+            (
+                json!({"user_id": "u".repeat(4097)}),
+                "cookie-session claims out of bounds: subject longer than 4096 bytes",
+            ),
+        ] {
+            let (url, server) =
+                introspection_server([TestResponse::json(StatusLine::Ok, claims)], "127.0.0.1")
+                    .await;
+            let validator = validator(config(&url));
+
+            let error = validator
+                .validate_session(&SessionCredential::Cookie("session-secret-123".to_owned()))
+                .await
+                .expect_err("claims outside the principal bounds must be rejected");
+            assert_invalid_session(error, expected);
+
+            // A verdict, cached like any other: the second presentation is
+            // refused without asking the provider again.
+            let error = validator
+                .validate_session(&SessionCredential::Cookie("session-secret-123".to_owned()))
+                .await
+                .expect_err("the cached verdict must still reject");
+            assert_invalid_session(error, expected);
+            assert_eq!(server.requests().len(), 1, "{expected}");
+        }
     }
 
     #[tokio::test]

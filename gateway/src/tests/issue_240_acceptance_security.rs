@@ -559,7 +559,9 @@ async fn read_tls_request(
 
 struct CertificateAuthority {
     certificate: rcgen::Certificate,
-    key: rcgen::KeyPair,
+    /// The CA's subject, key-identifier method, key usages and signing key:
+    /// everything rcgen needs to issue a leaf under this CA.
+    issuer: rcgen::Issuer<'static, rcgen::KeyPair>,
 }
 
 fn certificate_authority(common_name: &str) -> CertificateAuthority {
@@ -573,7 +575,10 @@ fn certificate_authority(common_name: &str) -> CertificateAuthority {
     let certificate = params
         .self_signed(&key)
         .expect("acceptance CA certificate should build");
-    CertificateAuthority { certificate, key }
+    CertificateAuthority {
+        certificate,
+        issuer: rcgen::Issuer::new(params, key),
+    }
 }
 
 struct AcceptanceServerIdentity {
@@ -589,7 +594,7 @@ fn server_identity(host: &str) -> AcceptanceServerIdentity {
     params.extended_key_usages = vec![rcgen::ExtendedKeyUsagePurpose::ServerAuth];
     let key = rcgen::KeyPair::generate().expect("server key should generate");
     let certificate = params
-        .signed_by(&key, &ca.certificate, &ca.key)
+        .signed_by(&key, &ca.issuer)
         .expect("server certificate should build");
     AcceptanceServerIdentity {
         ca_pem: ca.certificate.pem(),
@@ -611,7 +616,7 @@ fn client_identity(name: &str) -> AcceptanceClientIdentity {
     params.extended_key_usages = vec![rcgen::ExtendedKeyUsagePurpose::ClientAuth];
     let key = rcgen::KeyPair::generate().expect("client key should generate");
     let certificate = params
-        .signed_by(&key, &ca.certificate, &ca.key)
+        .signed_by(&key, &ca.issuer)
         .expect("client certificate should build");
     AcceptanceClientIdentity {
         ca_der: ca.certificate.der().as_ref().to_vec(),

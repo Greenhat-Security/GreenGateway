@@ -312,7 +312,7 @@ async fn mcp_with_any_cookie_still_requires_csrf() {
 async fn mcp_with_client_certificate_still_requires_csrf() {
     let mut params = rcgen::CertificateParams::default();
     params.subject_alt_names = vec![rcgen::SanType::URI(
-        rcgen::Ia5String::try_from("spiffe://example.test/client").expect("URI SAN"),
+        rcgen::string::Ia5String::try_from("spiffe://example.test/client").expect("URI SAN"),
     )];
     let key = rcgen::KeyPair::generate().expect("key");
     let certificate = params.self_signed(&key).expect("certificate");

@@ -8,7 +8,7 @@ use std::{
     time::Duration,
 };
 
-use http::{HeaderMap, HeaderName, HeaderValue, Request};
+use http::{HeaderMap, HeaderName, HeaderValue, Request, Uri};
 use sha2::{Digest, Sha256};
 use url::Url;
 
@@ -73,7 +73,7 @@ impl upstream_route::RouteMatch for ClassifierRoute {
 impl ProxyClassifier {
     pub(crate) fn observation_context_for_request(
         &self,
-        path: &str,
+        uri: &Uri,
         headers: &HeaderMap,
     ) -> Option<upstream_route::ProxyRouteObservationContext> {
         match &self.routes {
@@ -89,7 +89,7 @@ impl ProxyClassifier {
                 ),
             ),
             ClassifierRoutes::RoutingTable { routes } => {
-                let route = classifier_route_for_request(routes, path, headers)?;
+                let route = classifier_route_for_request(routes, uri, headers)?;
                 Some(
                     upstream_route::ProxyRouteObservationContext::new_with_route_id(
                         route.route_id.clone(),
@@ -103,26 +103,29 @@ impl ProxyClassifier {
     }
 
     #[cfg(test)]
-    fn upstream_origin_for_request(&self, path: &str, headers: &HeaderMap) -> Option<&str> {
+    fn upstream_origin_for_request(&self, uri: &Uri, headers: &HeaderMap) -> Option<&str> {
         match &self.routes {
             ClassifierRoutes::Legacy {
                 upstream_origin, ..
             } => Some(upstream_origin),
             ClassifierRoutes::RoutingTable { routes } => {
-                classifier_route_for_request(routes, path, headers)
+                classifier_route_for_request(routes, uri, headers)
                     .map(|route| route.upstream_origin.as_str())
             }
         }
     }
 }
 
+/// The host is read from the `Host` field or the target's authority, the same
+/// derivation admission validates, so a request classified here is classified
+/// under the host it will be authorized under.
 fn classifier_route_for_request<'a>(
     routes: &'a [ClassifierRoute],
-    path: &str,
+    uri: &Uri,
     headers: &HeaderMap,
 ) -> Option<&'a ClassifierRoute> {
-    let request_host = upstream_route::request_host_without_port(headers);
-    upstream_route::matching_route(routes, path, request_host.as_deref())
+    let request_host = upstream_route::request_host_without_port(uri, headers);
+    upstream_route::matching_route(routes, uri.path(), request_host.as_deref())
 }
 
 #[derive(Clone)]
@@ -619,7 +622,7 @@ impl ProxyState {
         ProxyClassifier { routes }
     }
 
-    fn upstream_for_request(&self, path: &str, headers: &HeaderMap) -> Option<MatchedUpstream> {
+    fn upstream_for_request(&self, uri: &Uri, headers: &HeaderMap) -> Option<MatchedUpstream> {
         let upstream = match &self.routes {
             ProxyRoutes::Legacy { pool } => Some(MatchedUpstream {
                 connection_id: None,
@@ -630,8 +633,8 @@ impl ProxyState {
                 websocket: None,
                 grpc: None,
             }),
-            ProxyRoutes::RoutingTable { routes } => {
-                routing_route_for_request(routes, path, headers).map(|route| MatchedUpstream {
+            ProxyRoutes::RoutingTable { routes } => routing_route_for_request(routes, uri, headers)
+                .map(|route| MatchedUpstream {
                     connection_id: route.connection_id.clone(),
                     request_header_policy: route.request_header_policy.clone(),
                     pool: Arc::clone(&route.pool),
@@ -639,8 +642,7 @@ impl ProxyState {
                     sse: route.sse,
                     websocket: route.websocket.clone(),
                     grpc: route.grpc.clone(),
-                })
-            }
+                }),
         };
 
         #[cfg(test)]
@@ -948,11 +950,11 @@ fn validate_connection_credential_header_policy(
 
 fn routing_route_for_request<'a>(
     routes: &'a [ProxyRoute],
-    path: &str,
+    uri: &Uri,
     headers: &HeaderMap,
 ) -> Option<&'a ProxyRoute> {
-    let request_host = upstream_route::request_host_without_port(headers);
-    upstream_route::matching_route(routes, path, request_host.as_deref())
+    let request_host = upstream_route::request_host_without_port(uri, headers);
+    upstream_route::matching_route(routes, uri.path(), request_host.as_deref())
 }
 
 pub(crate) fn upstream_origin_from_url(upstream_url: &str, source: &str) -> String {
@@ -1030,7 +1032,7 @@ mod tests {
         let pem = format!(
             "{}{}",
             identity.cert.pem(),
-            identity.key_pair.serialize_pem()
+            identity.signing_key.serialize_pem()
         );
         let path = std::env::temp_dir().join(format!(
             "greengateway-proxy-{name}-{}.pem",
@@ -1294,7 +1296,8 @@ mod tests {
         };
 
         assert_eq!(
-            classifier.upstream_origin_for_request("/api/items", &HeaderMap::new()),
+            classifier
+                .upstream_origin_for_request(&Uri::from_static("/api/items"), &HeaderMap::new()),
             Some("https://first.example.test")
         );
     }
@@ -1309,7 +1312,7 @@ mod tests {
         };
 
         let context = classifier
-            .observation_context_for_request("/items", &HeaderMap::new())
+            .observation_context_for_request(&Uri::from_static("/items"), &HeaderMap::new())
             .expect("legacy route should classify");
 
         assert_eq!(
@@ -1366,7 +1369,7 @@ mod tests {
 
         let context = state
             .classifier()
-            .observation_context_for_request("/items", &HeaderMap::new());
+            .observation_context_for_request(&Uri::from_static("/items"), &HeaderMap::new());
 
         assert!(context.is_some());
         assert_eq!(resolver.calls.load(Ordering::SeqCst), 0);

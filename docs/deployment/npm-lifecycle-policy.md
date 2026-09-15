@@ -15,11 +15,12 @@ integrity and read without extracting or executing their contents.
 
 | Package | Projects | Published lifecycle behavior | Decision |
 | --- | --- | --- | --- |
-| esbuild 0.28.1 | root, admin-ui | `postinstall: node install.js`; selects a platform binary, may rewrite its launcher, validates the version, and can invoke npm or fetch a fallback binary | Deny; use the locked platform optional dependency |
-| workerd 1.20260903.1 | root | `postinstall: node install.js`; selects and validates the native binary, optimizes its launcher, and can fetch a fallback binary | Deny; use the locked platform optional dependency |
+| esbuild 0.28.1 | root | `postinstall: node install.js`; selects a platform binary, may rewrite its launcher, validates the version, and can invoke npm or fetch a fallback binary | Deny; use the locked platform optional dependency |
+| workerd 1.20260911.1 | root | `postinstall: node install.js`; selects and validates the native binary, optimizes its launcher, and can fetch a fallback binary | Deny; use the locked platform optional dependency |
 | fsevents 2.3.3 | root, admin-ui | Lockfile flags install scripts, but the published archive has no install hook or `binding.gyp`; explicit build/prepublish scripts compile the Darwin addon | Deny conservatively; optional Darwin-only watcher |
-| fsevents 2.3.2 | admin-ui, nested under playwright | Same lifecycle distinction as 2.3.3 | Deny conservatively; optional Darwin-only watcher |
 
+Esbuild is locked only by the root package since Vite 8 replaced it with
+Rolldown and Oxc in the admin UI; the admin UI inventory is fsevents alone.
 Esbuild's native dependencies cover Linux, Windows and other platforms. Workerd
 provides Linux, Darwin and Windows binaries. Keep optional dependencies enabled;
 an absent platform binary should fail the build instead of starting a second,
@@ -90,15 +91,15 @@ Explicit `npm run build`, tests and lockfile-installed tools still run normally.
 
 ## Dependency upgrades
 
-The root package overrides `miniflare@5.20260903.0-alpha`'s pinned Sharp
-dependency to `0.35.4`, the patched version for
+The root package previously overrode `miniflare@5.20260903.0-alpha`'s pinned
+Sharp dependency to `0.35.4`, the patched version for
 [GHSA-rgj7-g3m4-5g8c](https://github.com/advisories/GHSA-rgj7-g3m4-5g8c).
-The override is limited to that reviewed Miniflare version. Reassess it when
-upgrading Wrangler/Miniflare; remove it once the upstream dependency uses a
-patched Sharp version and clean installs, audits and the local runtime/image
-smoke checks pass. Both npm projects use Vitest `4.1.11` or later in the 4.x line
-for [GHSA-82fw-gwwq-j7x9](https://github.com/advisories/GHSA-82fw-gwwq-j7x9).
-These patch updates do not require dependency install hooks.
+Miniflare `5.20260911.1-alpha` (Wrangler 4.131.2) depends on Sharp `0.35.4`
+itself, so the override was removed; a future Miniflare that regresses Sharp
+would need a new, version-limited override. Both npm projects use Vitest `5.0.1`
+or later, past the fix for
+[GHSA-82fw-gwwq-j7x9](https://github.com/advisories/GHSA-82fw-gwwq-j7x9).
+These updates do not require dependency install hooks.
 
 1. Use the pinned tools and produce a proposed lockfile without running hooks:
    `npm install --package-lock-only --ignore-scripts <package>@<version>` in the

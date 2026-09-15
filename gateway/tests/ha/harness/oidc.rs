@@ -64,7 +64,7 @@ fn generate_key(kid: &str) -> TestKey {
     let pair = rcgen::KeyPair::generate_for(&rcgen::PKCS_ED25519)
         .expect("the harness Ed25519 key should generate");
     let pkcs8 = pair.serialize_der();
-    let spki = pair.public_key_der();
+    let spki = rcgen::PublicKeyData::subject_public_key_info(&pair);
     // An Ed25519 SubjectPublicKeyInfo is a 12-byte prefix over the raw
     // 32-byte key; the JWK carries the raw key as base64url `x`.
     assert!(

@@ -32,6 +32,34 @@ Each of these has been seen to fail under parallel load and pass in isolation. N
 | `proxied_mcp_tool_call_appears_as_per_tool_traffic_inventory_row` | Depends on inventory aggregation completing. |
 | `egress::tests::rejected_scheme_log_exposes_only_a_bounded_category` | Asserts on log output whose capture competes with parallel test output. |
 
+## The admin UI live acceptance test races the page's own sign-in probe
+
+`admin-ui/tests/issue-240-live.spec.ts` drives a real browser against a real
+gateway, and its `saveBearerToken` helper navigates to `/admin/`, fills the
+token field and clicks Save. On load the app requests its own capabilities with
+whatever credential it has, which on a fresh tab is none; that request answers
+`401`, and `adminSessionEnded` clears the credential field and sets the status
+to "Session ended. Sign in again." — deliberately, because a field holding a
+credential should not survive a session ending.
+
+If that `401` lands between the helper's fill and its click, Save reads an empty
+field, and the test fails waiting for "Token active in this tab until reload or
+session expiry." The captured page state proves this shape rather than a lost
+save: the token box is empty and the status reads "Session ended. Sign in
+again." Run it in isolation to confirm before concluding anything:
+
+```bash
+cd admin-ui && npx playwright test --config playwright.issue240.config.ts \
+  -g 'uses real jwt read capabilities'
+```
+
+This became easier to lose with Vite 8 (PR #507), which serves the dev bundle
+sooner and so moves the fill earlier relative to that probe; the application
+code and the test are both unchanged from before that upgrade. The durable fix
+belongs on the test side — wait for the logged-out steady state before typing,
+rather than teaching the app to keep a credential in a field across a session
+end — and is deliberately not bundled into a dependency upgrade.
+
 ## Platform coverage gaps, which are not flakiness
 
 Worth knowing separately, because they produce the *opposite* symptom — a test that silently does not run rather than one that fails.

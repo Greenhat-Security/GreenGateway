@@ -2060,7 +2060,10 @@ async fn spawn_tls_ws_upstream(certificate_name: &str) -> TlsWsUpstream {
         .push(rcgen::DnType::CommonName, certificate_name);
     let server_key = rcgen::KeyPair::generate().expect("test server key should generate");
     let server = server_params
-        .signed_by(&server_key, &ca, &ca_key)
+        .signed_by(
+            &server_key,
+            &rcgen::Issuer::from_params(&ca_params, &ca_key),
+        )
         .expect("test server certificate should build");
 
     let server_config = ServerConfig::builder()

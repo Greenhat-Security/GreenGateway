@@ -39,10 +39,10 @@ names and dependency claims that do not match the current tree. In particular:
   is not a CVE.
 - [GHSA-h395-gr6q-cpjc](https://github.com/Keats/jsonwebtoken/security/advisories/GHSA-h395-gr6q-cpjc)
   affected the runtime `jsonwebtoken` dependency. Its minimum version is now
-  10.3.0, the first patched release, and Cargo.lock selects 10.4.0. JWT validation
-  uses the AWS-LC backend already present in the TLS stack. Publish and verify a
-  new image before updating deployment digests; a previous image retains its
-  original dependencies.
+  11.0.0, well past the first patched release (10.3.0), and Cargo.lock selects
+  11.0.0. JWT validation uses the AWS-LC backend already present in the TLS
+  stack. Publish and verify a new image before updating deployment digests; a
+  previous image retains its original dependencies.
 - The npm gates and the nightly fixture/HTTP buffering fixes are included in
   the preceding production-readiness change. The five release benchmarks passed
   locally without increasing budgets; production load validation is separate.

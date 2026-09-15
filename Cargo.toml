@@ -10,7 +10,7 @@ license-file = "LICENSE"
 arc-swap = "1.7.1"
 async-trait = "0.1.89"
 axum = { version = "0.8.9", features = ["ws"] }
-base64 = "0.22.1"
+base64 = "0.23.1"
 # The PostgreSQL foundation of issue #241 PR 3 uses the protocol crate plus a
 # bounded pool rather than sqlx: sqlx would add its own runtime abstraction and
 # TLS stack (and a large dependency tree) to satisfy a need this repo already
@@ -25,7 +25,7 @@ chacha20poly1305 = { version = "0.11.0", features = ["zeroize"] }
 hex = "0.4.3"
 hmac = "0.13.0"
 futures-util = "0.3.31"
-getrandom = "0.3.4"
+getrandom = "0.4.3"
 http = "1.4.2"
 # Issue #257 needs an HTTP/2 client and server that `reqwest` and `axum::serve`
 # cannot provide. Depending on `hyper` DIRECTLY with `http2` is the whole point:
@@ -41,7 +41,7 @@ hyper = { version = "1.10.1", default-features = false, features = ["client", "s
 hyper-util = { version = "0.1.20", default-features = false, features = ["tokio", "service"] }
 ipnet = "2.11.0"
 jsonschema = { version = "0.46.9", default-features = false }
-jsonwebtoken = { version = "10.3.0", features = ["aws_lc_rs"] }
+jsonwebtoken = { version = "11.0.0", features = ["aws_lc_rs"] }
 metrics = "0.24.6"
 metrics-exporter-prometheus = { version = "0.18.3", default-features = false }
 mime_guess = "2"
@@ -55,9 +55,9 @@ num-bigint = { version = "0.4.8", default-features = false }
 percent-encoding = "2.3.2"
 pulldown-cmark = { version = "0.13.0", default-features = false }
 proptest = "1.9.0"
-rcgen = "0.13.2"
+rcgen = "0.14.10"
 reqwest = { version = "0.13.2", default-features = false, features = ["json", "rustls", "stream"] }
-rusqlite = { version = "0.32", features = ["bundled"] }
+rusqlite = { version = "0.40.2", features = ["bundled"] }
 rustix = { version = "1.1.4", features = ["fs"] }
 rust-embed = "8"
 # Already in the graph transitively: reqwest's `rustls` feature depends on it,
@@ -100,7 +100,7 @@ tokio-postgres-rustls = { version = "0.14.0", default-features = false }
 tokio-util = { version = "0.7.17", features = ["rt"] }
 tokio-rustls = { version = "0.26.4", default-features = false, features = ["ring", "tls12"] }
 tower = { version = "0.5.3", features = ["util"] }
-tower-http = { version = "0.6.8", features = ["cors", "request-id", "trace"] }
+tower-http = { version = "0.7.1", features = ["cors", "request-id", "trace"] }
 tracing = "0.1.44"
 tracing-subscriber = "0.3.23"
 url = "2.5.7"

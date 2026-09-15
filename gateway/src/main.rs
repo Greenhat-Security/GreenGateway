@@ -106,6 +106,7 @@ mod path_match;
 mod policy_eval;
 mod proxy;
 mod rbac;
+mod request_bounds;
 #[cfg(feature = "postgres")]
 mod security_cluster;
 mod storage;
