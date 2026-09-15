@@ -2,7 +2,7 @@
 
 Issue #430 covers dependency installation in both npm projects, Cargo's embedded
 UI build, Docker and CI. Node and npm versions come from `build-tools.json`;
-the capability fixture must run on that exact npm (currently 11.19.0).
+the capability fixture must run on that exact npm (currently 11.19.1).
 
 ## Reviewed inventory
 
