@@ -668,9 +668,9 @@ mod tests {
             "127.0.0.1",
         )
         .await;
-        let validator = validator(config(&url));
+        let at_bound = validator(config(&url));
         for _ in 0..2 {
-            let principal = validator
+            let principal = at_bound
                 .validate_session(&SessionCredential::Cookie("session-secret-123".to_owned()))
                 .await
                 .expect("claims at the bound must authenticate");

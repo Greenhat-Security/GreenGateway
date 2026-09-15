@@ -15401,7 +15401,6 @@ async fn token_rotate_of_a_record_with_scopes_outside_the_role_bounds_is_a_confl
             created_by: "bootstrap-admin".to_owned(),
             expires_at: None,
         })
-        .await
         .expect("fixture token should create");
 
     let rotated = router
@@ -15421,7 +15420,6 @@ async fn token_rotate_of_a_record_with_scopes_outside_the_role_bounds_is_a_confl
     );
     let unchanged = store
         .get_by_id(&created.record.id)
-        .await
         .expect("stored token should read")
         .expect("refused rotation must retain the token");
     assert_eq!(unchanged, created.record);

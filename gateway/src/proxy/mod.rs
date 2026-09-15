@@ -633,8 +633,8 @@ impl ProxyState {
                 websocket: None,
                 grpc: None,
             }),
-            ProxyRoutes::RoutingTable { routes } => {
-                routing_route_for_request(routes, uri, headers).map(|route| MatchedUpstream {
+            ProxyRoutes::RoutingTable { routes } => routing_route_for_request(routes, uri, headers)
+                .map(|route| MatchedUpstream {
                     connection_id: route.connection_id.clone(),
                     request_header_policy: route.request_header_policy.clone(),
                     pool: Arc::clone(&route.pool),
@@ -642,8 +642,7 @@ impl ProxyState {
                     sse: route.sse,
                     websocket: route.websocket.clone(),
                     grpc: route.grpc.clone(),
-                })
-            }
+                }),
         };
 
         #[cfg(test)]
@@ -1297,7 +1296,8 @@ mod tests {
         };
 
         assert_eq!(
-            classifier.upstream_origin_for_request(&Uri::from_static("/api/items"), &HeaderMap::new()),
+            classifier
+                .upstream_origin_for_request(&Uri::from_static("/api/items"), &HeaderMap::new()),
             Some("https://first.example.test")
         );
     }

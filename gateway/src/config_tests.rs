@@ -1923,7 +1923,10 @@ fn dispatch_facts_and_issuers_are_bounded_at_startup() {
     // held at startup to the bound the policy kernel and authentication apply,
     // so an operator's mistake is a refused configuration rather than an
     // evaluation error or a whole-provider outage at request time.
-    let long_prefix = format!("/{}", "p".repeat(crate::request_bounds::MAX_DISPATCH_FACT_BYTES));
+    let long_prefix = format!(
+        "/{}",
+        "p".repeat(crate::request_bounds::MAX_DISPATCH_FACT_BYTES)
+    );
     let long_url = format!(
         "https://upstream.example.test/{}",
         "u".repeat(crate::request_bounds::MAX_DISPATCH_FACT_BYTES)
@@ -1946,7 +1949,10 @@ fn dispatch_facts_and_issuers_are_bounded_at_startup() {
         "{message}"
     );
 
-    let at_bound_prefix = format!("/{}", "p".repeat(crate::request_bounds::MAX_DISPATCH_FACT_BYTES - 1));
+    let at_bound_prefix = format!(
+        "/{}",
+        "p".repeat(crate::request_bounds::MAX_DISPATCH_FACT_BYTES - 1)
+    );
     let config = Config::from_env_vars(|name| match name {
         "UPSTREAM_ROUTES" => Ok(format!(
             r#"[{{"path_prefix":"{at_bound_prefix}","upstream_url":"https://api.example.test"}}]"#
@@ -1956,7 +1962,10 @@ fn dispatch_facts_and_issuers_are_bounded_at_startup() {
     .expect("a prefix at the bound is accepted");
     assert_eq!(config.upstream_routes.len(), 1);
 
-    let long_issuer = format!("https://idp.example/{}", "i".repeat(MAX_PRINCIPAL_ISSUER_BYTES));
+    let long_issuer = format!(
+        "https://idp.example/{}",
+        "i".repeat(MAX_PRINCIPAL_ISSUER_BYTES)
+    );
     let error = Config::from_env_vars(|name| match name {
         "AUTH_PROVIDERS" => Ok(format!(
             r#"[{{"name":"idp","type":"jwt","jwks_url":"https://idp.example/jwks","issuer":"{long_issuer}"}}]"#

@@ -9760,7 +9760,7 @@
         "unexpanded-attribute"
       ],
       "scope": "gateway::middleware::rbac::rbac_middleware#1",
-      "sha256": "e1299a5fe8f38e3459c622919578acc3e9a9fbe0019dd6d755455ffc68c69c4d",
+      "sha256": "05d001744898dfefe208e617e58706ea2cc0b6c41c5d66532ae4075fd80374d6",
       "owner": "GreenGateway maintainers",
       "purpose": "Existing macro/attribute inputs for this exact application item; changed expansion inputs require explicit review."
     },
@@ -10053,7 +10053,7 @@
         "unexpanded-macro"
       ],
       "scope": "gateway::proxy::grpc::attempt_call#1",
-      "sha256": "5936a5bc4fddadb8c17fc79b41ca779874c9908c862077d3164101f837cbda9a",
+      "sha256": "3b6331323404e094c2eab34babbd876aeaf4eb1ade5b2b9ae86f2b0a06b8f82d",
       "owner": "GreenGateway maintainers",
       "purpose": "Existing macro/attribute inputs for this exact application item; changed expansion inputs require explicit review."
     },

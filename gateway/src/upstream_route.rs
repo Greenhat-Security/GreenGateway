@@ -396,10 +396,7 @@ mod tests {
         let mut headers = HeaderMap::new();
         headers.insert(header::HOST, "API.EXAMPLE.TEST:8443".parse().unwrap());
 
-        assert_eq!(
-            host_of(&headers).as_deref(),
-            Some("api.example.test")
-        );
+        assert_eq!(host_of(&headers).as_deref(), Some("api.example.test"));
     }
 
     #[test]
@@ -530,7 +527,11 @@ mod tests {
         ] {
             let mut headers = HeaderMap::new();
             headers.insert(header::HOST, disagreeing.parse().unwrap());
-            assert_eq!(host_header(&h2, &headers), HostHeader::Malformed, "{disagreeing}");
+            assert_eq!(
+                host_header(&h2, &headers),
+                HostHeader::Malformed,
+                "{disagreeing}"
+            );
         }
 
         // The authority is judged by the same rules as a Host field.
@@ -545,10 +546,17 @@ mod tests {
         let oversized = format!("http://{}.example/", "a".repeat(MAX_REQUEST_HOST_BYTES))
             .parse::<Uri>()
             .unwrap();
-        assert_eq!(host_header(&oversized, &HeaderMap::new()), HostHeader::TooLong);
+        assert_eq!(
+            host_header(&oversized, &HeaderMap::new()),
+            HostHeader::TooLong
+        );
         let mut headers = HeaderMap::new();
         headers.insert(header::HOST, "[a:b:c]".parse().unwrap());
-        assert_eq!(host_header(&h2, &headers), HostHeader::Malformed, "bad field wins");
+        assert_eq!(
+            host_header(&h2, &headers),
+            HostHeader::Malformed,
+            "bad field wins"
+        );
 
         // Origin-form: no authority, so the Host field alone decides.
         assert_eq!(classify(&HeaderMap::new()), HostHeader::Absent);
