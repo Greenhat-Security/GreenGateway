@@ -2,6 +2,53 @@
   "schema_version": 1,
   "duplicates": [
     {
+      "name": "base64",
+      "versions": [
+        "0.22.1",
+        "0.23.1"
+      ],
+      "owner": "GreenGateway maintainers",
+      "expires": "2026-12-01",
+      "reason": "reqwest 0.13.5, pem 4 (via rcgen 0.14.10) and the gateway workspace pin use base64 0.23 while axum, hyper-util, jsonwebtoken, metrics-exporter-prometheus, pem 3, postgres-protocol and rmcp still require 0.22.",
+      "remediation": "Re-evaluate when the listed 0.22 parent dependencies update; remove the exception once their version requirements converge on 0.23.",
+      "parents": {
+        "0.22.1": [
+          "axum@0.8.9",
+          "hyper-util@0.1.20",
+          "jsonwebtoken@11.0.0",
+          "metrics-exporter-prometheus@0.18.3",
+          "pem@3.0.6",
+          "postgres-protocol@0.6.12",
+          "rmcp@2.2.0"
+        ],
+        "0.23.1": [
+          "gateway@1.0.1",
+          "pem@4.0.0",
+          "reqwest@0.13.5"
+        ]
+      }
+    },
+    {
+      "name": "bit-vec",
+      "versions": [
+        "0.8.0",
+        "0.9.1"
+      ],
+      "owner": "GreenGateway maintainers",
+      "expires": "2026-12-01",
+      "reason": "rcgen 0.14.10 moved to yasna 0.6, which encodes with bit-vec 0.9, while proptest 1.11 and its bit-set still use bit-vec 0.8.",
+      "remediation": "Re-evaluate when the listed parent dependencies update; remove the exception once their version requirements converge.",
+      "parents": {
+        "0.8.0": [
+          "bit-set@0.8.0",
+          "proptest@1.11.0"
+        ],
+        "0.9.1": [
+          "yasna@0.6.0"
+        ]
+      }
+    },
+    {
       "name": "block-buffer",
       "versions": [
         "0.10.4",
@@ -45,18 +92,17 @@
       "name": "cpufeatures",
       "versions": [
         "0.2.17",
-        "0.3.0"
+        "0.3.1"
       ],
       "owner": "GreenGateway maintainers",
       "expires": "2026-12-01",
-      "reason": "SHA1/older SHA2 and current ChaCha/Poly1305 require different CPU feature APIs.",
+      "reason": "The tungstenite 0.29 SHA1 0.10 build and current ChaCha/Poly1305/SHA1/SHA2 require different CPU feature APIs.",
       "remediation": "Re-evaluate when the listed parent dependencies update; remove the exception once their version requirements converge.",
       "parents": {
         "0.2.17": [
-          "sha1@0.10.7",
-          "sha2@0.10.9"
+          "sha1@0.10.7"
         ],
-        "0.3.0": [
+        "0.3.1": [
           "chacha20@0.10.2",
           "poly1305@0.9.1",
           "sha1@0.11.0",
@@ -94,12 +140,11 @@
       ],
       "owner": "GreenGateway maintainers",
       "expires": "2026-12-01",
-      "reason": "Gateway HMAC/SHA1/SHA2 and PostgreSQL protocol crypto use different digest generations.",
+      "reason": "The tungstenite 0.29 SHA1 0.10 build and gateway HMAC/SHA2/PostgreSQL protocol crypto use different digest generations.",
       "remediation": "Re-evaluate when the listed parent dependencies update; remove the exception once their version requirements converge.",
       "parents": {
         "0.10.7": [
-          "sha1@0.10.7",
-          "sha2@0.10.9"
+          "sha1@0.10.7"
         ],
         "0.11.3": [
           "hmac@0.13.0",
@@ -126,7 +171,7 @@
           "tokio-postgres@0.7.18"
         ],
         "0.3.0": [
-          "rusqlite@0.32.1"
+          "rusqlite@0.40.2"
         ]
       }
     },
@@ -143,32 +188,31 @@
       "remediation": "Re-evaluate when the listed parent dependencies update; remove the exception once their version requirements converge.",
       "parents": {
         "0.2.17": [
-          "jsonwebtoken@10.4.0",
+          "jsonwebtoken@11.0.0",
           "rand_core@0.6.4",
           "ring@0.17.14"
         ],
         "0.3.4": [
           "ahash@0.8.12",
-          "gateway@1.0.1",
-          "jobserver@0.1.34",
-          "jsonschema@0.46.9",
-          "quinn-proto@0.11.15",
+          "jsonschema@0.46.10",
           "rand_core@0.9.5",
-          "referencing@0.46.9"
+          "referencing@0.46.10"
         ],
         "0.4.3": [
           "crypto-common@0.2.2",
           "deadpool-postgres@0.14.2",
+          "gateway@1.0.1",
+          "jobserver@0.1.35",
+          "quinn-proto@0.11.18",
           "rand@0.10.2",
           "tempfile@3.27.0",
-          "uuid@1.23.4"
+          "uuid@1.26.1"
         ]
       }
     },
     {
       "name": "hashbrown",
       "versions": [
-        "0.14.5",
         "0.16.1",
         "0.17.1"
       ],
@@ -177,15 +221,14 @@
       "reason": "SQLite hashlink, metrics/schema references and indexmap require distinct table APIs.",
       "remediation": "Re-evaluate when the listed parent dependencies update; remove the exception once their version requirements converge.",
       "parents": {
-        "0.14.5": [
-          "hashlink@0.9.1"
-        ],
         "0.16.1": [
           "metrics-util@0.20.4",
-          "referencing@0.46.9"
+          "referencing@0.46.10",
+          "rsqlite-vfs@0.1.1"
         ],
         "0.17.1": [
-          "indexmap@2.14.0"
+          "hashlink@0.12.2",
+          "indexmap@2.14.2"
         ]
       }
     },
@@ -204,10 +247,29 @@
           "fs-set-times@0.20.3"
         ],
         "3.0.1": [
-          "cap-fs-ext@4.0.2",
-          "cap-primitives@4.0.2",
-          "cap-std@4.0.2",
+          "cap-fs-ext@4.0.3",
+          "cap-primitives@4.0.3",
+          "cap-std@4.0.3",
           "io-extras@0.19.0"
+        ]
+      }
+    },
+    {
+      "name": "pem",
+      "versions": [
+        "3.0.6",
+        "4.0.0"
+      ],
+      "owner": "GreenGateway maintainers",
+      "expires": "2026-12-01",
+      "reason": "rcgen 0.14.10 moved to pem 4 while jsonwebtoken 11.0.0 still parses PEM with pem 3.",
+      "remediation": "Re-evaluate when the listed parent dependencies update; remove the exception once their version requirements converge.",
+      "parents": {
+        "3.0.6": [
+          "jsonwebtoken@11.0.0"
+        ],
+        "4.0.0": [
+          "rcgen@0.14.10"
         ]
       }
     },
@@ -234,22 +296,22 @@
       "name": "rand",
       "versions": [
         "0.10.2",
-        "0.9.4"
+        "0.9.5"
       ],
       "owner": "GreenGateway maintainers",
       "expires": "2026-12-01",
       "reason": "Metrics/properties/QUIC/WebSocket and PostgreSQL/MCP require different random-generator APIs.",
       "remediation": "Re-evaluate when the listed parent dependencies update; remove the exception once their version requirements converge.",
       "parents": {
-        "0.9.4": [
+        "0.9.5": [
           "metrics-util@0.20.4",
           "proptest@1.11.0",
-          "quinn-proto@0.11.15",
           "tungstenite@0.29.0"
         ],
         "0.10.2": [
           "postgres-protocol@0.6.12",
-          "rmcp@2.1.0",
+          "quinn-proto@0.11.18",
+          "rmcp@2.2.0",
           "tokio-postgres@0.7.18",
           "tungstenite@0.30.0"
         ]
@@ -271,7 +333,7 @@
           "signature@2.2.0"
         ],
         "0.9.5": [
-          "rand@0.9.4",
+          "rand@0.9.5",
           "rand_chacha@0.9.0",
           "rand_xorshift@0.4.0",
           "rand_xoshiro@0.7.0"
@@ -280,7 +342,8 @@
           "chacha20@0.10.2",
           "crypto-common@0.2.2",
           "getrandom@0.4.3",
-          "rand@0.10.2"
+          "rand@0.10.2",
+          "rand_pcg@0.10.2"
         ]
       }
     },
@@ -305,23 +368,49 @@
       }
     },
     {
-      "name": "sha2",
+      "name": "syn",
       "versions": [
-        "0.10.9",
-        "0.11.0"
+        "2.0.119",
+        "3.0.5"
       ],
       "owner": "GreenGateway maintainers",
       "expires": "2026-12-01",
-      "reason": "Gateway/embedded asset hashing and current PostgreSQL crypto use different digest APIs.",
+      "reason": "serde_derive 1.0.229, the gateway transport guard example and the other current proc-macro crates require syn 3 while the remaining derive crates still use syn 2.",
       "remediation": "Re-evaluate when the listed parent dependencies update; remove the exception once their version requirements converge.",
       "parents": {
-        "0.10.9": [
-          "rust-embed-utils@8.11.0"
+        "2.0.119": [
+          "asn1-rs-derive@0.6.0",
+          "asn1-rs-impl@0.2.0",
+          "darling_core@0.23.0",
+          "darling_macro@0.23.0",
+          "der_derive@0.7.3",
+          "jni-macros@0.22.4",
+          "jni-sys-macros@0.4.1",
+          "rmcp-macros@2.2.0",
+          "rust-embed-impl@8.12.0",
+          "synstructure@0.13.2",
+          "tls_codec_derive@0.4.2",
+          "tracing-attributes@0.1.31",
+          "windows-implement@0.60.2",
+          "windows-interface@0.59.3",
+          "yoke-derive@0.8.2",
+          "zerocopy-derive@0.8.57",
+          "zerofrom-derive@0.1.7",
+          "zeroize_derive@1.5.0"
         ],
-        "0.11.0": [
+        "3.0.5": [
+          "async-trait@0.1.92",
+          "displaydoc@0.2.7",
+          "futures-macro@0.3.34",
           "gateway@1.0.1",
-          "postgres-protocol@0.6.12",
-          "tokio-postgres-rustls@0.14.0"
+          "ref-cast-impl@1.0.27",
+          "schemars_derive@1.2.2",
+          "serde_derive@1.0.229",
+          "serde_derive_internals@0.30.0",
+          "thiserror-impl@2.0.20",
+          "tokio-macros@2.7.2",
+          "wasm-bindgen-macro-support@0.2.128",
+          "zerovec-derive@0.11.6"
         ]
       }
     },
@@ -340,6 +429,25 @@
           "axum@0.8.9"
         ],
         "0.30.0": [
+          "gateway@1.0.1"
+        ]
+      }
+    },
+    {
+      "name": "tower-http",
+      "versions": [
+        "0.6.11",
+        "0.7.1"
+      ],
+      "owner": "GreenGateway maintainers",
+      "expires": "2026-12-01",
+      "reason": "The gateway workspace pin uses tower-http 0.7 for its cors, request-id and trace layers while reqwest 0.13.5 still requires 0.6 for its follow-redirect middleware.",
+      "remediation": "Re-evaluate when reqwest moves its tower-http requirement to 0.7; remove the exception once the version requirements converge.",
+      "parents": {
+        "0.6.11": [
+          "reqwest@0.13.5"
+        ],
+        "0.7.1": [
           "gateway@1.0.1"
         ]
       }
@@ -397,7 +505,7 @@
       "parents": {
         "0.11.1+wasi-snapshot-preview1": [
           "getrandom@0.2.17",
-          "mio@1.2.1",
+          "mio@1.2.3",
           "quanta@0.12.6"
         ],
         "0.14.7+wasi-0.2.4": [
@@ -423,24 +531,24 @@
           "winx@0.36.4"
         ],
         "0.60.2": [
-          "cap-fs-ext@4.0.2",
-          "cap-primitives@4.0.2",
-          "errno@0.3.14",
           "io-extras@0.19.0",
-          "notify@8.2.0",
-          "nu-ansi-term@0.50.3",
-          "quinn-udp@0.5.14",
-          "rustix@1.1.4",
-          "rustls-platform-verifier@0.7.0",
-          "socket2@0.6.4",
-          "tempfile@3.27.0",
-          "winapi-util@0.1.11"
+          "notify@8.2.0"
         ],
         "0.61.2": [
+          "cap-fs-ext@4.0.3",
+          "cap-primitives@4.0.3",
+          "errno@0.3.14",
           "gateway@1.0.1",
-          "mio@1.2.1",
+          "mio@1.2.3",
+          "nu-ansi-term@0.50.3",
+          "quinn-udp@0.5.15",
+          "rustix@1.1.4",
+          "rustls-platform-verifier@0.7.0",
           "schannel@0.1.29",
-          "tokio@1.53.1"
+          "socket2@0.6.5",
+          "tempfile@3.27.0",
+          "tokio@1.53.1",
+          "winapi-util@0.1.11"
         ]
       }
     },
@@ -628,7 +736,7 @@
       "remediation": "Review the license text and distribution obligations again before updating this exact crate version."
     },
     {
-      "crate": "webpki-root-certs@1.0.8",
+      "crate": "webpki-root-certs@1.0.9",
       "allow": [
         "CDLA-Permissive-2.0"
       ],

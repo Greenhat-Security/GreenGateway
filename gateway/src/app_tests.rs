@@ -374,7 +374,10 @@ fn test_ca_signed_server_certificate() -> (String, Vec<u8>, Vec<u8>) {
         .push(rcgen::SanType::IpAddress(IpAddr::V4(Ipv4Addr::LOCALHOST)));
     let server_key = rcgen::KeyPair::generate().expect("test server key should generate");
     let server = server_params
-        .signed_by(&server_key, &ca, &ca_key)
+        .signed_by(
+            &server_key,
+            &rcgen::Issuer::from_params(&ca_params, &ca_key),
+        )
         .expect("test server certificate should build");
 
     (
@@ -24912,7 +24915,7 @@ async fn bare_options_without_origin_stops_at_cors_layer_before_handler() {
     .await
     .expect("request should complete");
 
-    // tower-http 0.6.8's CorsLayer handles bare OPTIONS requests before
+    // tower-http 0.7.1's CorsLayer handles bare OPTIONS requests before
     // auth. If this reached the unauthenticated test handler, it would
     // return 204; if CorsLayer passed it through to auth, auth would fail
     // closed with 401 as proven by the auth middleware unit test.

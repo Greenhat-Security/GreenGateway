@@ -13,7 +13,7 @@ unused-allowed-license = "deny"
 allow = ["Apache-2.0", "MIT", "MIT-0", "ISC", "BSD-3-Clause", "Unicode-3.0", "Zlib"]
 exceptions = [
   { crate = "notify@8.2.0", allow = ["CC0-1.0"] },
-  { crate = "webpki-root-certs@1.0.8", allow = ["CDLA-Permissive-2.0"] },
+  { crate = "webpki-root-certs@1.0.9", allow = ["CDLA-Permissive-2.0"] },
   { crate = "winx@0.36.4", allow = ["Apache-2.0 WITH LLVM-exception"] },
 ]
 
@@ -37,24 +37,27 @@ deny = [
   { crate = "hyper-tls", reason = "Gateway transport and credential TLS must use the reviewed rustls stack." },
 ]
 skip = [
+  { crate = "base64@0.22.1", reason = "reqwest 0.13.5, pem 4 (via rcgen 0.14.10) and the gateway workspace pin use base64 0.23 while axum, hyper-util, jsonwebtoken, metrics-exporter-prometheus, pem 3, postgres-protocol and rmcp still require 0.22." },
+  { crate = "bit-vec@0.8.0", reason = "rcgen 0.14.10 moved to yasna 0.6, which encodes with bit-vec 0.9, while proptest 1.11 and its bit-set still use bit-vec 0.8." },
   { crate = "block-buffer@0.10.4", reason = "The 0.10 and 0.11 digest families use incompatible buffer APIs." },
   { crate = "const-oid@0.10.2", reason = "DER/X509 still use 0.9 while the newer digest family requires 0.10." },
-  { crate = "cpufeatures@0.2.17", reason = "SHA1/older SHA2 and current ChaCha/Poly1305 require different CPU feature APIs." },
+  { crate = "cpufeatures@0.2.17", reason = "The tungstenite 0.29 SHA1 0.10 build and current ChaCha/Poly1305/SHA1/SHA2 require different CPU feature APIs." },
   { crate = "crypto-common@0.1.7", reason = "The existing HMAC/SHA and current AEAD/cipher implementations use incompatible RustCrypto generations." },
-  { crate = "digest@0.10.7", reason = "Gateway HMAC/SHA1/SHA2 and PostgreSQL protocol crypto use different digest generations." },
+  { crate = "digest@0.10.7", reason = "The tungstenite 0.29 SHA1 0.10 build and gateway HMAC/SHA2/PostgreSQL protocol crypto use different digest generations." },
   { crate = "fallible-iterator@0.2.0", reason = "PostgreSQL and bundled SQLite require different fallible iterator interfaces." },
   { crate = "getrandom@0.2.17", reason = "TLS, random generators, schema tooling and current UUID/tempfile use three incompatible generations." },
   { crate = "getrandom@0.3.4", reason = "TLS, random generators, schema tooling and current UUID/tempfile use three incompatible generations." },
-  { crate = "hashbrown@0.14.5", reason = "SQLite hashlink, metrics/schema references and indexmap require distinct table APIs." },
   { crate = "hashbrown@0.16.1", reason = "SQLite hashlink, metrics/schema references and indexmap require distinct table APIs." },
   { crate = "io-lifetimes@2.0.4", reason = "File timestamp support and capability filesystem APIs have different interface generations." },
+  { crate = "pem@3.0.6", reason = "rcgen 0.14.10 moved to pem 4 while jsonwebtoken 11.0.0 still parses PEM with pem 3." },
   { crate = "r-efi@5.3.0", reason = "The 0.3 and 0.4 getrandom generations require different UEFI bindings." },
   { crate = "rand@0.10.2", reason = "Metrics/properties/QUIC/WebSocket and PostgreSQL/MCP require different random-generator APIs." },
   { crate = "rand_core@0.10.1", reason = "Signature, property/QUIC generators and current crypto require distinct rand_core traits." },
   { crate = "rand_core@0.6.4", reason = "Signature, property/QUIC generators and current crypto require distinct rand_core traits." },
   { crate = "sha1@0.10.7", reason = "Axum WebSockets use tungstenite 0.29/SHA1 0.10; upstream tungstenite 0.30 uses SHA1 0.11 solely for the RFC 6455 handshake." },
-  { crate = "sha2@0.10.9", reason = "Gateway/embedded asset hashing and current PostgreSQL crypto use different digest APIs." },
+  { crate = "syn@2.0.119", reason = "serde_derive 1.0.229, the gateway transport guard example and the other current proc-macro crates require syn 3 while the remaining derive crates still use syn 2." },
   { crate = "tokio-tungstenite@0.29.0", reason = "Axum 0.8.9 pins its downstream WebSocket adapter to 0.29 while the gateway upstream adapter uses 0.30." },
+  { crate = "tower-http@0.6.11", reason = "The gateway workspace pin uses tower-http 0.7 for its cors, request-id and trace layers while reqwest 0.13.5 still requires 0.6 for its follow-redirect middleware." },
   { crate = "tungstenite@0.29.0", reason = "Axum downstream WebSockets still use 0.29; upstream sockets use 0.30. The explicit 0.29 alias preserves downstream typed error classification." },
   { crate = "untrusted@0.7.1", reason = "AWS-LC and ring/webpki select distinct parsing interfaces; changing TLS backends is out of scope." },
   { crate = "wasi@0.11.1+wasi-snapshot-preview1", reason = "Existing socket/randomness support and wasite use separate WASI interface generations." },

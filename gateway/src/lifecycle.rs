@@ -1417,7 +1417,7 @@ mod tests {
     fn test_client_identity(spiffe_id: &str) -> crate::auth::VerifiedClientIdentity {
         let mut params = rcgen::CertificateParams::default();
         params.subject_alt_names = vec![rcgen::SanType::URI(
-            rcgen::Ia5String::try_from(spiffe_id).expect("test URI SAN should be IA5"),
+            rcgen::string::Ia5String::try_from(spiffe_id).expect("test URI SAN should be IA5"),
         )];
         let key = rcgen::KeyPair::generate().expect("test key should generate");
         let certificate = params

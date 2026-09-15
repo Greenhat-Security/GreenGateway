@@ -34,7 +34,7 @@ fn es256_key(pair: &rcgen::KeyPair) -> AssertionSigningKey {
 
 /// The uncompressed SEC1 point of a generated key: the trailing 65 bytes of its SPKI DER.
 fn es256_public_point(pair: &rcgen::KeyPair) -> Vec<u8> {
-    let der = pair.public_key_der();
+    let der = rcgen::PublicKeyData::subject_public_key_info(pair);
     der[der.len() - 65..].to_vec()
 }
 

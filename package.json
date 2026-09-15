@@ -18,10 +18,10 @@
     "@cloudflare/containers": "^0.3.7"
   },
   "devDependencies": {
-    "@cloudflare/workers-types": "^5.20260910.1",
+    "@cloudflare/workers-types": "^5.20260915.1",
     "typescript": "^7.0.2",
-    "vitest": "^5.0.0",
-    "wrangler": "^4.108.0"
+    "vitest": "^5.0.1",
+    "wrangler": "^4.131.2"
   },
   "cloudflare": {
     "bindings": {
@@ -49,14 +49,9 @@
     "node": "26.8.1",
     "npm": "11.19.0"
   },
-  "overrides": {
-    "miniflare@5.20260903.0-alpha": {
-      "sharp": "0.35.4"
-    }
-  },
   "allowScripts": {
     "https://registry.npmjs.org/esbuild/-/esbuild-0.28.1.tgz": false,
     "https://registry.npmjs.org/fsevents/-/fsevents-2.3.3.tgz": false,
-    "https://registry.npmjs.org/workerd/-/workerd-1.20260903.1.tgz": false
+    "https://registry.npmjs.org/workerd/-/workerd-1.20260911.1.tgz": false
   }
 }
