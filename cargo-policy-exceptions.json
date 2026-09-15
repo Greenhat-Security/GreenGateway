@@ -418,23 +418,23 @@
       "remediation": "Re-evaluate when the listed parent dependencies update; remove the exception once their version requirements converge.",
       "parents": {
         "0.52.0": [
-          "errno@0.3.14",
           "fs-set-times@0.20.3",
           "ring@0.17.14",
-          "rustix@1.1.4",
-          "rustls-platform-verifier@0.7.0",
-          "tempfile@3.27.0",
-          "winapi-util@0.1.11",
           "winx@0.36.4"
         ],
         "0.60.2": [
           "cap-fs-ext@4.0.2",
           "cap-primitives@4.0.2",
+          "errno@0.3.14",
           "io-extras@0.19.0",
           "notify@8.2.0",
           "nu-ansi-term@0.50.3",
           "quinn-udp@0.5.14",
-          "socket2@0.6.4"
+          "rustix@1.1.4",
+          "rustls-platform-verifier@0.7.0",
+          "socket2@0.6.4",
+          "tempfile@3.27.0",
+          "winapi-util@0.1.11"
         ],
         "0.61.2": [
           "gateway@1.0.1",
