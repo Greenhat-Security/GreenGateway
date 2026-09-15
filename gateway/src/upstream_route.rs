@@ -2,7 +2,7 @@
 
 use std::net::Ipv6Addr;
 
-use http::{header, HeaderMap};
+use http::{header, HeaderMap, Uri};
 
 use crate::{path_match::path_prefix_matches, request_bounds::MAX_REQUEST_HOST_BYTES};
 
@@ -152,77 +152,128 @@ pub(crate) fn matching_route<'a, T: RouteMatch>(
     best.map(|(route, _, _)| route)
 }
 
-/// The `Host` header as request admission and routing read it.
+/// The request's host as request admission and routing read it: the `Host`
+/// field, or the request target's authority (`:authority` on HTTP/2, the
+/// absolute-form target on HTTP/1.1), which RFC 9110 section 7.2 says serves
+/// the same purpose.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum HostHeader {
-    /// No `Host` header, or one whose value is empty. RFC 9110 permits an
-    /// empty host, so an empty value names no host without being malformed.
+    /// No `Host` field and no authority, or values that are empty. RFC 9110
+    /// permits an empty host, so an empty value names no host without being
+    /// malformed.
     Absent,
-    /// Exactly one syntactically valid `Host`, reduced to its host: port and
+    /// Exactly one syntactically valid host, reduced to its host: port and
     /// IPv6 brackets removed, ASCII lower-cased.
     Present(String),
-    /// A `Host` that names no host: repeated, not visible ASCII, a bracketed
-    /// value that is not an IPv6 literal, a port that is not a port, or a
-    /// character RFC 3986 does not allow in a host.
+    /// A value that names no host: a repeated `Host` field, not visible
+    /// ASCII, a bracketed value that is not an IPv6 literal, a port that is not
+    /// a port, a character RFC 3986 does not allow in a host, or a `Host` field
+    /// that disagrees with the request target's authority (RFC 9113 section
+    /// 8.3.1).
     Malformed,
     /// A well-formed host longer than [`MAX_REQUEST_HOST_BYTES`].
     TooLong,
 }
 
-/// Classifies the request's `Host` header.
+/// Classifies the request's host from its `Host` field and its target URI.
 ///
 /// Request admission answers `Malformed` with `400` and `TooLong` with `431`,
-/// so every consumer after it -- route classification, authorization, the
-/// policy kernel -- sees either no host or a bare one within the bound. The
-/// parse is strict where its predecessor was lenient (`[a:b:c]` no longer
+/// so authorization and the policy kernel, which run after admission, see
+/// either no host or a bare one within the bound. Route classification and
+/// observation run before admission (`routing.rs` layers them after
+/// `validate_request`, so they execute first) and read
+/// [`request_host_without_port`], which answers `None` for an absent, malformed
+/// and oversized host alike; a request admission then refuses is classified and
+/// observed as a host-less request.
+///
+/// hyper places an HTTP/2 `:authority` on the URI and never copies it into a
+/// `Host` field, so reading only the field would leave the gRPC listener's
+/// host unbounded and unmatched. Both sources are judged by the same rules,
+/// and when both are present they must agree, port included: a `Host` naming a
+/// different entity from `:authority` is malformed (RFC 9113 section 8.3.1),
+/// and a disagreement is a smuggling signal rather than a client convention.
+///
+/// The parse is strict where its predecessor was lenient (`[a:b:c]` no longer
 /// yields `a:b:c`, and `host:x` no longer yields `host`), because a host that
 /// is not a host is malformed input rather than a request for the unbound
 /// routes.
-pub(crate) fn host_header(headers: &HeaderMap) -> HostHeader {
+pub(crate) fn host_header(uri: &Uri, headers: &HeaderMap) -> HostHeader {
+    let (from_field, raw_field) = host_field(headers);
+    let (from_authority, raw_authority) = match uri.authority() {
+        Some(authority) => classify_host_value(authority.as_str()),
+        None => (HostHeader::Absent, String::new()),
+    };
+    match (from_field, from_authority) {
+        (HostHeader::Malformed, _) | (_, HostHeader::Malformed) => HostHeader::Malformed,
+        (HostHeader::TooLong, _) | (_, HostHeader::TooLong) => HostHeader::TooLong,
+        (HostHeader::Present(host), HostHeader::Present(_)) => {
+            if raw_field == raw_authority {
+                HostHeader::Present(host)
+            } else {
+                HostHeader::Malformed
+            }
+        }
+        (HostHeader::Present(host), HostHeader::Absent)
+        | (HostHeader::Absent, HostHeader::Present(host)) => HostHeader::Present(host),
+        (HostHeader::Absent, HostHeader::Absent) => HostHeader::Absent,
+    }
+}
+
+/// The `Host` field alone, with its trimmed lower-cased raw value kept for the
+/// comparison against the target's authority.
+fn host_field(headers: &HeaderMap) -> (HostHeader, String) {
     let mut values = headers.get_all(header::HOST).iter();
     let Some(value) = values.next() else {
-        return HostHeader::Absent;
+        return (HostHeader::Absent, String::new());
     };
     if values.next().is_some() {
         // RFC 9110 section 7.2: more than one Host is a 400, and which one to
         // believe is exactly the question a request smuggler wants answered.
-        return HostHeader::Malformed;
+        return (HostHeader::Malformed, String::new());
     }
     let Ok(value) = value.to_str() else {
-        return HostHeader::Malformed;
+        return (HostHeader::Malformed, String::new());
     };
+    classify_host_value(value)
+}
+
+fn classify_host_value(value: &str) -> (HostHeader, String) {
     let value = value.trim();
     if value.is_empty() {
-        return HostHeader::Absent;
+        return (HostHeader::Absent, String::new());
     }
-    match parse_host_without_port(value) {
+    let classified = match parse_host_without_port(value) {
         Some(host) if host.len() > MAX_REQUEST_HOST_BYTES => HostHeader::TooLong,
         Some(host) => HostHeader::Present(host),
         None => HostHeader::Malformed,
-    }
+    };
+    (classified, value.to_ascii_lowercase())
 }
 
 /// The request host with port and brackets removed, or `None` when the request
 /// names no usable host.
 ///
 /// Callers that must tell "no host" from "not a host" read [`host_header`].
-/// Admission does, so by the time routing and authorization run the two have
-/// already been answered differently, and a `None` here is a request with no
-/// host.
-pub(crate) fn request_host_without_port(headers: &HeaderMap) -> Option<String> {
-    match host_header(headers) {
+/// Admission does, so by the time authorization runs the two have already been
+/// answered differently; classification and observation, which precede
+/// admission, see `None` for both.
+pub(crate) fn request_host_without_port(uri: &Uri, headers: &HeaderMap) -> Option<String> {
+    match host_header(uri, headers) {
         HostHeader::Present(host) => Some(host),
         HostHeader::Absent | HostHeader::Malformed | HostHeader::TooLong => None,
     }
 }
 
 /// Parses `uri-host [ ":" port ]` (RFC 9110 section 7.2) into the lower-cased
-/// host, refusing anything the grammar does not admit.
+/// host.
 ///
 /// The value returned always satisfies [`is_bare_host`]: an unbracketed host
 /// is a `reg-name` or an IPv4 literal, neither of which contains a colon or a
 /// slash, and a bracketed host is accepted only if it parses as an IPv6
-/// address. `IPvFuture` is refused rather than guessed at.
+/// address. That is one deliberate narrowing of RFC 3986's `IP-literal`:
+/// `IPvFuture` (`[v1.fe80]`) is refused rather than recognized, because no
+/// deployed protocol uses it and a future form containing colons is exactly
+/// what `is_bare_host` cannot tell from a host that kept its port.
 fn parse_host_without_port(value: &str) -> Option<String> {
     let (host, port) = if let Some(rest) = value.strip_prefix('[') {
         let end = rest.find(']')?;
@@ -310,6 +361,15 @@ mod tests {
 
     use super::*;
 
+    /// An origin-form target: no authority, so the `Host` field alone decides.
+    fn classify(headers: &HeaderMap) -> HostHeader {
+        host_header(&Uri::from_static("/"), headers)
+    }
+
+    fn host_of(headers: &HeaderMap) -> Option<String> {
+        request_host_without_port(&Uri::from_static("/"), headers)
+    }
+
     #[test]
     fn longest_prefix_and_host_specific_tiebreak_match_proxy_contract() {
         let routes = vec![
@@ -337,7 +397,7 @@ mod tests {
         headers.insert(header::HOST, "API.EXAMPLE.TEST:8443".parse().unwrap());
 
         assert_eq!(
-            request_host_without_port(&headers).as_deref(),
+            host_of(&headers).as_deref(),
             Some("api.example.test")
         );
     }
@@ -361,7 +421,7 @@ mod tests {
             headers.insert(header::HOST, raw.parse().unwrap());
 
             assert_eq!(
-                host_header(&headers),
+                classify(&headers),
                 HostHeader::Present(expected.to_owned()),
                 "{raw:?}"
             );
@@ -374,11 +434,11 @@ mod tests {
 
     #[test]
     fn host_header_tells_no_host_from_not_a_host() {
-        assert_eq!(host_header(&HeaderMap::new()), HostHeader::Absent);
+        assert_eq!(classify(&HeaderMap::new()), HostHeader::Absent);
         for raw in ["", "   "] {
             let mut headers = HeaderMap::new();
             headers.insert(header::HOST, raw.parse().unwrap());
-            assert_eq!(host_header(&headers), HostHeader::Absent, "{raw:?}");
+            assert_eq!(classify(&headers), HostHeader::Absent, "{raw:?}");
         }
 
         for raw in [
@@ -404,21 +464,21 @@ mod tests {
         ] {
             let mut headers = HeaderMap::new();
             headers.insert(header::HOST, raw.parse().unwrap());
-            assert_eq!(host_header(&headers), HostHeader::Malformed, "{raw:?}");
-            assert_eq!(request_host_without_port(&headers), None, "{raw:?}");
+            assert_eq!(classify(&headers), HostHeader::Malformed, "{raw:?}");
+            assert_eq!(host_of(&headers), None, "{raw:?}");
         }
 
         let mut headers = HeaderMap::new();
         headers.append(header::HOST, "a.example".parse().unwrap());
         headers.append(header::HOST, "b.example".parse().unwrap());
-        assert_eq!(host_header(&headers), HostHeader::Malformed, "two hosts");
+        assert_eq!(classify(&headers), HostHeader::Malformed, "two hosts");
 
         let mut headers = HeaderMap::new();
         headers.insert(
             header::HOST,
             HeaderValue::from_bytes(b"caf\xc3\xa9.example").unwrap(),
         );
-        assert_eq!(host_header(&headers), HostHeader::Malformed, "non-ASCII");
+        assert_eq!(classify(&headers), HostHeader::Malformed, "non-ASCII");
     }
 
     #[test]
@@ -426,15 +486,71 @@ mod tests {
         let at_limit = "a".repeat(MAX_REQUEST_HOST_BYTES);
         let mut headers = HeaderMap::new();
         headers.insert(header::HOST, at_limit.parse().unwrap());
-        assert_eq!(host_header(&headers), HostHeader::Present(at_limit.clone()));
+        assert_eq!(classify(&headers), HostHeader::Present(at_limit.clone()));
 
         let mut headers = HeaderMap::new();
         headers.insert(header::HOST, format!("{at_limit}:8443").parse().unwrap());
-        assert_eq!(host_header(&headers), HostHeader::Present(at_limit.clone()));
+        assert_eq!(classify(&headers), HostHeader::Present(at_limit.clone()));
 
         let mut headers = HeaderMap::new();
         headers.insert(header::HOST, format!("{at_limit}a").parse().unwrap());
-        assert_eq!(host_header(&headers), HostHeader::TooLong);
-        assert_eq!(request_host_without_port(&headers), None);
+        assert_eq!(classify(&headers), HostHeader::TooLong);
+        assert_eq!(host_of(&headers), None);
+    }
+
+    #[test]
+    fn the_target_authority_serves_as_the_host_and_must_agree_with_any_host_field() {
+        // HTTP/2 carries `:authority` on the URI and no Host field.
+        let h2 = Uri::from_static("https://API.Example.Test:8443/pkg.Service/Method");
+        assert_eq!(
+            host_header(&h2, &HeaderMap::new()),
+            HostHeader::Present("api.example.test".to_owned())
+        );
+        assert_eq!(
+            request_host_without_port(&h2, &HeaderMap::new()).as_deref(),
+            Some("api.example.test")
+        );
+
+        // An HTTP/1.1 absolute-form target with an agreeing Host field, case
+        // aside.
+        let mut headers = HeaderMap::new();
+        headers.insert(header::HOST, "api.example.test:8443".parse().unwrap());
+        assert_eq!(
+            host_header(&h2, &headers),
+            HostHeader::Present("api.example.test".to_owned())
+        );
+
+        // RFC 9113 section 8.3.1: a Host that names a different entity from
+        // the authority is malformed -- port included, since the entity is
+        // the authority.
+        for disagreeing in [
+            "other.example.test:8443",
+            "api.example.test",
+            "api.example.test:9443",
+        ] {
+            let mut headers = HeaderMap::new();
+            headers.insert(header::HOST, disagreeing.parse().unwrap());
+            assert_eq!(host_header(&h2, &headers), HostHeader::Malformed, "{disagreeing}");
+        }
+
+        // The authority is judged by the same rules as a Host field.
+        assert_eq!(
+            host_header(
+                &Uri::from_static("http://user@api.example.test/"),
+                &HeaderMap::new()
+            ),
+            HostHeader::Malformed,
+            "userinfo"
+        );
+        let oversized = format!("http://{}.example/", "a".repeat(MAX_REQUEST_HOST_BYTES))
+            .parse::<Uri>()
+            .unwrap();
+        assert_eq!(host_header(&oversized, &HeaderMap::new()), HostHeader::TooLong);
+        let mut headers = HeaderMap::new();
+        headers.insert(header::HOST, "[a:b:c]".parse().unwrap());
+        assert_eq!(host_header(&h2, &headers), HostHeader::Malformed, "bad field wins");
+
+        // Origin-form: no authority, so the Host field alone decides.
+        assert_eq!(classify(&HeaderMap::new()), HostHeader::Absent);
     }
 }

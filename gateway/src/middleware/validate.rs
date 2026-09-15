@@ -11,7 +11,7 @@ use axum::{
 };
 use http::{
     header::{CONTENT_LENGTH, CONTENT_TYPE},
-    HeaderMap, Method, StatusCode,
+    HeaderMap, Method, StatusCode, Uri,
 };
 use serde::Serialize;
 
@@ -73,23 +73,25 @@ pub(crate) enum RequestShapeProblem {
 }
 
 /// The first shape problem with a request, or `None` when its method, path and
-/// `Host` are all within the bounds the policy kernel evaluates under.
+/// host are all within the bounds the policy kernel evaluates under. The host
+/// is the `Host` field or the target's authority (`:authority` on HTTP/2), so
+/// the same check covers every listener.
 ///
 /// Kept free of the request type so that "admitted implies evaluable" is a
 /// statement about this function, which the kernel's tests call directly.
 pub(crate) fn request_shape_problem(
     method: &Method,
-    path: &str,
+    uri: &Uri,
     headers: &HeaderMap,
     max_request_path_bytes: usize,
 ) -> Option<RequestShapeProblem> {
     if method.as_str().len() > MAX_REQUEST_METHOD_BYTES {
         return Some(RequestShapeProblem::MethodTooLong);
     }
-    if path.len() > max_request_path_bytes {
+    if uri.path().len() > max_request_path_bytes {
         return Some(RequestShapeProblem::PathTooLong);
     }
-    match host_header(headers) {
+    match host_header(uri, headers) {
         HostHeader::Absent | HostHeader::Present(_) => None,
         HostHeader::Malformed => Some(RequestShapeProblem::HostMalformed),
         HostHeader::TooLong => Some(RequestShapeProblem::HostTooLong),
@@ -118,7 +120,7 @@ pub async fn validate_request(State(config): State<Config>, req: Request, next: 
     // and host bounds are not configurable. See issue #488.
     if let Some(problem) = request_shape_problem(
         req.method(),
-        req.uri().path(),
+        req.uri(),
         req.headers(),
         config.max_request_path_bytes,
     ) {

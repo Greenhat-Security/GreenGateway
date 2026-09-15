@@ -14,7 +14,9 @@ use ipnet::IpNet;
 use serde::Deserialize;
 
 use crate::{
-    auth::principal::{canonical_issuer, provider_issuer, PROVIDER_ISSUER_PREFIX},
+    auth::principal::{
+        canonical_issuer, provider_issuer, MAX_PRINCIPAL_ISSUER_BYTES, PROVIDER_ISSUER_PREFIX,
+    },
     auth::ClientCertIdentitySource,
     connections::{
         aws_secret::{
@@ -2347,6 +2349,17 @@ impl Config {
         let jwt_jwks_url =
             parse_optional_string(JWT_JWKS_URL, get_var(JWT_JWKS_URL), &mut problems);
         let jwt_issuer = parse_optional_string(JWT_ISSUER, get_var(JWT_ISSUER), &mut problems);
+        // The issuer becomes every principal's `issuer`, which authentication
+        // holds to the principal bounds; an over-long one would refuse every
+        // credential at runtime, so it is refused here instead.
+        if jwt_issuer
+            .as_deref()
+            .is_some_and(|issuer| issuer.len() > MAX_PRINCIPAL_ISSUER_BYTES)
+        {
+            problems.push(format!(
+                "{JWT_ISSUER} must be at most {MAX_PRINCIPAL_ISSUER_BYTES} bytes"
+            ));
+        }
         let jwt_audience =
             parse_optional_string(JWT_AUDIENCE, get_var(JWT_AUDIENCE), &mut problems);
         let jwt_jwks_timeout_ms = parse_var(
@@ -4217,6 +4230,14 @@ fn validate_auth_providers(
             .issuer
             .clone()
             .unwrap_or_else(|| provider_issuer(&provider.name));
+        // The effective issuer becomes every principal's `issuer`, which
+        // authentication holds to the principal bounds; over-long, it would
+        // refuse every credential from this provider at runtime.
+        if effective_issuer.len() > MAX_PRINCIPAL_ISSUER_BYTES {
+            problems.push(format!(
+                "{name}[{index}].issuer, or the provider:<name> label derived from its name, must be at most {MAX_PRINCIPAL_ISSUER_BYTES} bytes"
+            ));
+        }
         if let Some(previous_index) = seen_effective_issuers.insert(effective_issuer.clone(), index)
         {
             if validated[previous_index].name == provider.name {
@@ -6081,14 +6102,23 @@ fn normalize_route_path_prefix(
         return None;
     }
 
-    if is_valid_exempt_path(value) {
-        Some(value.to_owned())
-    } else {
+    if !is_valid_exempt_path(value) {
         problems.push(format!(
             "{name} must be a URI path prefix starting with '/', got '{value}'"
         ));
-        None
+        return None;
     }
+    // A route's prefix is a dispatch fact the policy kernel evaluates under
+    // `request_bounds::MAX_DISPATCH_FACT_BYTES`; one over it would turn every
+    // request the route serves into an evaluation error, so it is refused here.
+    if value.len() > crate::request_bounds::MAX_DISPATCH_FACT_BYTES {
+        problems.push(format!(
+            "{name} must be at most {} bytes",
+            crate::request_bounds::MAX_DISPATCH_FACT_BYTES
+        ));
+        return None;
+    }
+    Some(value.to_owned())
 }
 
 fn normalize_route_host(
@@ -6117,6 +6147,17 @@ fn validate_upstream_url(name: &str, value: &str, problems: &mut Vec<String>) ->
     let value = value.trim();
     if value.is_empty() {
         problems.push(format!("{name} must be a non-empty http or https URL"));
+        return None;
+    }
+    // The origin derived from this URL is a dispatch fact the policy kernel
+    // evaluates under `request_bounds::MAX_DISPATCH_FACT_BYTES`, and the MCP
+    // resource path derived from the public URL is a policy identity bounded
+    // like a request path; bounding the URL bounds both.
+    if value.len() > crate::request_bounds::MAX_DISPATCH_FACT_BYTES {
+        problems.push(format!(
+            "{name} must be at most {} bytes",
+            crate::request_bounds::MAX_DISPATCH_FACT_BYTES
+        ));
         return None;
     }
 

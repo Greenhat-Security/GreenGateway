@@ -15381,6 +15381,56 @@ async fn token_create_with_scopes_outside_the_role_bounds_is_a_bad_request() {
     }
 }
 
+/// Scopes are immutable through rotation, so a record outside the principal
+/// bounds -- written before the bound existed -- would be re-minted into a
+/// credential authentication refuses on first use. Rotation refuses instead,
+/// leaves the record untouched, and audits nothing as changed.
+#[tokio::test]
+async fn token_rotate_of_a_record_with_scopes_outside_the_role_bounds_is_a_conflict() {
+    let token_db = TempDb::new("token-rotate-scope-bounds");
+    let policy = TempPolicyFile::new(&token_policy_document_string());
+    let capture = audit::sink::tests::CaptureSink::new();
+    let audit_log = audit::AuditLog::new(Arc::new(capture.clone()) as Arc<dyn audit::AuditSink>);
+    let router = token_admin_router(&token_db, &policy, audit_log);
+    let store =
+        auth::tokens::SqliteTokenStore::open(&token_db.path).expect("token store should open");
+    // The store does not judge scopes; this is a record from before the bound.
+    let created = store
+        .create(auth::tokens::CreateTokenRequest {
+            scopes: vec!["probe-reader".to_owned(), String::new()],
+            created_by: "bootstrap-admin".to_owned(),
+            expires_at: None,
+        })
+        .await
+        .expect("fixture token should create");
+
+    let rotated = router
+        .oneshot(token_admin_request(
+            Method::POST,
+            &format!("{TOKENS_ADMIN_ROUTE}/{}/rotate", created.record.id),
+            Some(test_principal(&["superadmin"])),
+            None,
+        ))
+        .await
+        .expect("rotate request should complete");
+
+    assert_eq!(rotated.status(), StatusCode::CONFLICT);
+    assert_eq!(
+        body_string(rotated).await,
+        r#"{"error":"cannot rotate service token whose scopes are out of bounds: an empty role; revoke it and create a new token"}"#
+    );
+    let unchanged = store
+        .get_by_id(&created.record.id)
+        .await
+        .expect("stored token should read")
+        .expect("refused rotation must retain the token");
+    assert_eq!(unchanged, created.record);
+    assert!(!capture
+        .events()
+        .iter()
+        .any(|event| event.event_type == audit::event::SERVICE_TOKEN_CHANGED));
+}
+
 #[tokio::test]
 async fn token_create_with_malformed_expires_at_is_a_bad_request() {
     let token_db = TempDb::new("token-create-malformed-expires-at");

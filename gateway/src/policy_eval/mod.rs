@@ -98,7 +98,10 @@ use crate::{
         policy::{RouteRule, KNOWN_TOP_LEVEL_KEYS},
         DefaultAction, EnforcementMode, Policy, PolicyEngine, RuleAction, RuleMatcher,
     },
-    request_bounds::{MAX_REQUEST_HOST_BYTES, MAX_REQUEST_METHOD_BYTES, MAX_REQUEST_PATH_BYTES},
+    request_bounds::{
+        MAX_DISPATCH_FACT_BYTES, MAX_REQUEST_HOST_BYTES, MAX_REQUEST_METHOD_BYTES,
+        MAX_REQUEST_PATH_BYTES,
+    },
     upstream_route::is_bare_host,
 };
 
@@ -870,7 +873,7 @@ impl PolicyEvaluationContext {
             .into_iter()
             .flatten()
             {
-                if value.len() > 4096 {
+                if value.len() > MAX_DISPATCH_FACT_BYTES {
                     return Err(EvaluationError::ContextTooLarge);
                 }
             }

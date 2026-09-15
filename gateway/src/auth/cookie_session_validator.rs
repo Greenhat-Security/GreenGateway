@@ -657,7 +657,29 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn introspection_claims_outside_the_principal_bounds_are_an_invalid_session_and_cached() {
+    async fn introspection_claims_at_the_principal_bounds_authenticate_and_past_them_do_not() {
+        // At the bound: a 4096-byte subject and 256 roles of 256 bytes are a
+        // valid session, and the Valid verdict is cached like any other.
+        let (url, server) = introspection_server(
+            [TestResponse::json(
+                StatusLine::Ok,
+                json!({"user_id": "u".repeat(4096), "roles": vec!["r".repeat(256); 256]}),
+            )],
+            "127.0.0.1",
+        )
+        .await;
+        let validator = validator(config(&url));
+        for _ in 0..2 {
+            let principal = validator
+                .validate_session(&SessionCredential::Cookie("session-secret-123".to_owned()))
+                .await
+                .expect("claims at the bound must authenticate");
+            assert_eq!(principal.user_id.len(), 4096);
+            assert_eq!(principal.roles.len(), 256);
+            assert!(principal.roles.iter().all(|role| role.len() == 256));
+        }
+        assert_eq!(server.requests().len(), 1, "the Valid verdict is cached");
+
         let too_many_roles = (0..257).map(|index| index.to_string()).collect::<Vec<_>>();
         for (claims, expected) in [
             (

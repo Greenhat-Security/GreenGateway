@@ -1,7 +1,7 @@
 use std::{sync::Arc, time::Duration};
 
 use axum::{body::Body, middleware::from_fn_with_state, routing::any, Router};
-use http::{header, HeaderMap, HeaderValue, Request, StatusCode};
+use http::{header, HeaderMap, HeaderValue, Request, StatusCode, Uri};
 use proptest::prelude::*;
 use serde_json::{json, Value};
 use tower::ServiceExt;
@@ -882,17 +882,23 @@ fn the_kernel_bounds_are_exactly_the_bounds_admission_and_authentication_enforce
     assert_eq!(DEFAULT_MAX_REQUEST_PATH_BYTES, MAX_REQUEST_PATH_BYTES);
     let compiled = compile(basic_policy());
     let no_headers = HeaderMap::new();
+    let origin = Uri::from_static("/");
 
     let at_bound = format!("/{}", "a".repeat(MAX_REQUEST_PATH_BYTES - 1));
     let past_bound = format!("/{}", "a".repeat(MAX_REQUEST_PATH_BYTES));
     assert_eq!(
-        request_shape_problem(&Method::GET, &at_bound, &no_headers, MAX_REQUEST_PATH_BYTES),
+        request_shape_problem(
+            &Method::GET,
+            &at_bound.parse::<Uri>().unwrap(),
+            &no_headers,
+            MAX_REQUEST_PATH_BYTES
+        ),
         None
     );
     assert_eq!(
         request_shape_problem(
             &Method::GET,
-            &past_bound,
+            &past_bound.parse::<Uri>().unwrap(),
             &no_headers,
             MAX_REQUEST_PATH_BYTES
         ),
@@ -912,11 +918,11 @@ fn the_kernel_bounds_are_exactly_the_bounds_admission_and_authentication_enforce
     let past_bound =
         Method::from_bytes("M".repeat(MAX_REQUEST_METHOD_BYTES + 1).as_bytes()).unwrap();
     assert_eq!(
-        request_shape_problem(&at_bound, "/", &no_headers, MAX_REQUEST_PATH_BYTES),
+        request_shape_problem(&at_bound, &origin, &no_headers, MAX_REQUEST_PATH_BYTES),
         None
     );
     assert_eq!(
-        request_shape_problem(&past_bound, "/", &no_headers, MAX_REQUEST_PATH_BYTES),
+        request_shape_problem(&past_bound, &origin, &no_headers, MAX_REQUEST_PATH_BYTES),
         Some(RequestShapeProblem::MethodTooLong)
     );
     let mut input = context(&compiled);
@@ -933,11 +939,11 @@ fn the_kernel_bounds_are_exactly_the_bounds_admission_and_authentication_enforce
     let mut headers = HeaderMap::new();
     headers.insert(header::HOST, HeaderValue::from_str(&at_bound).unwrap());
     assert_eq!(
-        request_shape_problem(&Method::GET, "/", &headers, MAX_REQUEST_PATH_BYTES),
+        request_shape_problem(&Method::GET, &origin, &headers, MAX_REQUEST_PATH_BYTES),
         None
     );
     assert_eq!(
-        request_host_without_port(&headers).as_deref(),
+        request_host_without_port(&origin, &headers).as_deref(),
         Some(at_bound.as_str())
     );
     let mut input = context(&compiled);
@@ -948,11 +954,27 @@ fn the_kernel_bounds_are_exactly_the_bounds_admission_and_authentication_enforce
         HeaderValue::from_str(&format!("{at_bound}h")).unwrap(),
     );
     assert_eq!(
-        request_shape_problem(&Method::GET, "/", &headers, MAX_REQUEST_PATH_BYTES),
+        request_shape_problem(&Method::GET, &origin, &headers, MAX_REQUEST_PATH_BYTES),
         Some(RequestShapeProblem::HostTooLong)
     );
     let mut input = context(&compiled);
     input.request_host = HostFact::Present(format!("{at_bound}h"));
+    assert_eq!(
+        compiled.evaluate(&input),
+        Err(EvaluationError::ContextTooLarge)
+    );
+
+    // Dispatch facts are configuration, bounded at startup (`config.rs` refuses
+    // a route `path_prefix` or upstream URL over the bound); the kernel's own
+    // arm is pinned here at the same byte.
+    let mut input = context(&compiled);
+    input.target = HttpTarget::ProxyDispatch;
+    let mut facts = dispatch_with_host(None);
+    facts.route_path_prefix = Some(format!("/{}", "p".repeat(MAX_DISPATCH_FACT_BYTES - 1)));
+    input.dispatch = Some(facts.clone());
+    assert!(compiled.evaluate(&input).is_ok());
+    facts.route_path_prefix = Some(format!("/{}", "p".repeat(MAX_DISPATCH_FACT_BYTES)));
+    input.dispatch = Some(facts);
     assert_eq!(
         compiled.evaluate(&input),
         Err(EvaluationError::ContextTooLarge)
@@ -1011,6 +1033,7 @@ proptest! {
         let compiled = compile(basic_policy());
         let method = Method::from_bytes("M".repeat(method_len).as_bytes()).unwrap();
         let path = format!("/{}", "a".repeat(path_len));
+        let uri = path.parse::<Uri>().unwrap();
         let mut headers = HeaderMap::new();
         if let Some(host) = host.as_deref() {
             headers.insert(header::HOST, HeaderValue::from_str(host).unwrap());
@@ -1020,7 +1043,7 @@ proptest! {
         let issuer = "https://idp.example.test";
 
         let admitted =
-            request_shape_problem(&method, &path, &headers, DEFAULT_MAX_REQUEST_PATH_BYTES)
+            request_shape_problem(&method, &uri, &headers, DEFAULT_MAX_REQUEST_PATH_BYTES)
                 .is_none();
         let authenticated = check_principal_shape(&user_id, Some(issuer), &roles).is_ok();
         if !(admitted && authenticated) {
@@ -1041,7 +1064,7 @@ proptest! {
         input.path = Some(path);
         input.principal =
             PrincipalFact::Authenticated(PrincipalIdentity::from_principal(&identity));
-        input.request_host = match request_host_without_port(&headers) {
+        input.request_host = match request_host_without_port(&uri, &headers) {
             Some(host) => HostFact::Present(host),
             None => HostFact::Absent,
         };

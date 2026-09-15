@@ -628,7 +628,31 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn stored_scopes_outside_the_principal_bounds_are_refused_at_authentication() {
+    async fn stored_scopes_at_the_principal_bounds_authenticate_and_past_them_do_not() {
+        // At the bound: 256 distinct scopes of exactly 256 bytes are roles.
+        let db = TempDb::new("scopes-at-the-bound");
+        let store = Arc::new(SqliteTokenStore::open(&db.path).expect("token store should open"));
+        let scopes = (0..256)
+            .map(|index| {
+                let suffix = index.to_string();
+                format!("{}{suffix}", "s".repeat(256 - suffix.len()))
+            })
+            .collect::<Vec<_>>();
+        let created = store
+            .create(CreateTokenRequest {
+                scopes: scopes.clone(),
+                created_by: "creator".to_owned(),
+                expires_at: None,
+            })
+            .await
+            .expect("token should create");
+        let validator = ServiceTokenValidator::new(store, Duration::from_secs(5));
+        let principal = validator
+            .validate_session(&SessionCredential::Bearer(created.plaintext_token.clone()))
+            .await
+            .expect("scopes at the bound must authenticate");
+        assert_eq!(principal.roles, scopes);
+
         for (index, (scopes, expected)) in [
             (
                 (0..257).map(|index| format!("scope-{index}")).collect(),

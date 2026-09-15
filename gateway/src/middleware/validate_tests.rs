@@ -509,12 +509,75 @@ async fn a_host_that_names_no_host_is_400_and_an_oversized_one_is_431() {
     );
 }
 
+#[tokio::test]
+async fn the_target_authority_is_bounded_like_a_host_field_and_must_agree_with_it() {
+    use http::header::HOST;
+
+    // An HTTP/2 request carries `:authority` on the URI and no Host field,
+    // which is what the gRPC listener's requests look like by the time they
+    // reach this middleware.
+    let config = test_config(1024, vec!["application/json"]);
+    let response = test_router(config.clone())
+        .oneshot(
+            Request::builder()
+                .uri("http://api.example.test/")
+                .body(Body::empty())
+                .expect("request should build"),
+        )
+        .await
+        .expect("request should complete");
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let response = test_router(config.clone())
+        .oneshot(
+            Request::builder()
+                .uri(format!(
+                    "http://{}.example/",
+                    "h".repeat(crate::request_bounds::MAX_REQUEST_HOST_BYTES)
+                ))
+                .body(Body::empty())
+                .expect("request should build"),
+        )
+        .await
+        .expect("request should complete");
+    assert_eq!(
+        response.status(),
+        StatusCode::REQUEST_HEADER_FIELDS_TOO_LARGE
+    );
+
+    // RFC 9113 section 8.3.1: a Host field that disagrees with the authority.
+    let response = test_router(config.clone())
+        .oneshot(
+            Request::builder()
+                .uri("http://api.example.test/")
+                .header(HOST, "other.example.test")
+                .body(Body::empty())
+                .expect("request should build"),
+        )
+        .await
+        .expect("request should complete");
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(body_string(response).await, r#"{"error":"invalid host"}"#);
+
+    let response = test_router(config)
+        .oneshot(
+            Request::builder()
+                .uri("http://api.example.test/")
+                .header(HOST, "API.example.test")
+                .body(Body::empty())
+                .expect("request should build"),
+        )
+        .await
+        .expect("request should complete");
+    assert_eq!(response.status(), StatusCode::OK);
+}
+
 #[test]
 fn shape_problems_are_reported_in_request_line_order() {
     use http::header::HOST;
 
     let long_method = Method::from_bytes("M".repeat(65).as_bytes()).unwrap();
-    let long_path = format!("/{}", "a".repeat(64));
+    let long_path = format!("/{}", "a".repeat(64)).parse::<Uri>().unwrap();
     let mut bad_host = HeaderMap::new();
     bad_host.insert(HOST, "[a:b:c]".parse().unwrap());
 
@@ -527,11 +590,11 @@ fn shape_problems_are_reported_in_request_line_order() {
         Some(RequestShapeProblem::PathTooLong)
     );
     assert_eq!(
-        request_shape_problem(&Method::GET, "/", &bad_host, 32),
+        request_shape_problem(&Method::GET, &Uri::from_static("/"), &bad_host, 32),
         Some(RequestShapeProblem::HostMalformed)
     );
     assert_eq!(
-        request_shape_problem(&Method::GET, "/", &HeaderMap::new(), 32),
+        request_shape_problem(&Method::GET, &Uri::from_static("/"), &HeaderMap::new(), 32),
         None
     );
 }

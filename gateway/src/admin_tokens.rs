@@ -184,6 +184,16 @@ pub(super) async fn token_rotate_endpoint(
         Ok(None) => return not_found("service token was not found"),
         Err(error) => return token_store_error_response(error),
     };
+    // Scopes are immutable through rotation, so a record outside the principal
+    // bounds -- written before the bound existed, or around the admin API --
+    // would be re-minted into a credential the validator refuses on first use.
+    // Refuse the rotation instead: the token is unusable as stored, and the
+    // remedy is to revoke it and create a new one.
+    if let Err(problem) = auth::principal::check_roles_shape(&record.scopes) {
+        return conflict(&format!(
+            "cannot rotate service token whose scopes are out of bounds: {problem}; revoke it and create a new token"
+        ));
+    }
     let Some(rbac_state) = state.rbac_state.as_ref() else {
         return token_rbac_not_configured();
     };

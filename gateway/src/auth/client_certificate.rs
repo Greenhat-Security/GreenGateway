@@ -439,7 +439,7 @@ impl SessionValidator for ClientCertificateValidator {
             ));
         };
 
-        Ok(Principal {
+        let principal = Principal {
             user_id: identity.identity().to_owned(),
             issuer: Some(provider_issuer(CLIENT_CERTIFICATE_PROVIDER)),
             email: None,
@@ -451,7 +451,18 @@ impl SessionValidator for ClientCertificateValidator {
             roles: Vec::new(),
             session_id: identity.fingerprint().to_owned(),
             auth_method: AuthMethod::ClientCertificate,
-        })
+        };
+        // Holds by construction today (the identity bound sits under the
+        // subject bound, roles are empty, the issuer is a constant), and is
+        // judged all the same so that every validator answers to the one
+        // predicate rather than this one being the exception a later change
+        // forgets.
+        principal.check_shape().map_err(|problem| {
+            AuthError::InvalidSession(format!(
+                "client certificate identity out of bounds: {problem}"
+            ))
+        })?;
+        Ok(principal)
     }
 
     // `validate_session_for_resource` is deliberately not overridden. The
