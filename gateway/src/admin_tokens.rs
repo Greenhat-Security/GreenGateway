@@ -33,6 +33,12 @@ pub(super) async fn token_create_endpoint(
     {
         return bad_request("service-token scopes exceed the maximum serialized size");
     }
+    // Scopes become the token's roles at authentication, so they are held to
+    // the principal role bounds when written: a token the validator would
+    // refuse must not be creatable.
+    if let Err(problem) = auth::principal::check_roles_shape(&requested.scopes) {
+        return bad_request(&format!("service-token scopes out of bounds: {problem}"));
+    }
 
     let Some(rbac_state) = state.rbac_state.as_ref() else {
         return token_rbac_not_configured();

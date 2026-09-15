@@ -152,6 +152,7 @@ fn test_config(cors_allow_origins: Vec<&str>) -> config::Config {
         policy_history_sqlite_path: None,
         cors_allow_origins: cors_allow_origins.into_iter().map(str::to_owned).collect(),
         max_body_size: 1_048_576,
+        max_request_path_bytes: config::DEFAULT_MAX_REQUEST_PATH_BYTES,
         rate_limit_read_rps: 50.0,
         rate_limit_read_burst: 100,
         rate_limit_write_rps: 10.0,
@@ -15335,6 +15336,49 @@ async fn token_create_with_an_oversized_scope_list_is_a_bad_request() {
         body_string(response).await,
         r#"{"error":"service-token scopes exceed the maximum serialized size"}"#
     );
+}
+
+/// Scopes become roles at authentication, so a scope list the validator would
+/// refuse is refused when written -- before delegation is judged, which is why
+/// an unheld 257-byte scope is a `400` here and not a `403`.
+#[tokio::test]
+async fn token_create_with_scopes_outside_the_role_bounds_is_a_bad_request() {
+    for (index, (scopes, expected)) in [
+        (
+            json!(["probe-reader", ""]),
+            r#"{"error":"service-token scopes out of bounds: an empty role"}"#,
+        ),
+        (
+            json!(["r".repeat(auth::principal::MAX_PRINCIPAL_ROLE_BYTES + 1)]),
+            r#"{"error":"service-token scopes out of bounds: a role longer than 256 bytes"}"#,
+        ),
+        (
+            json!((0..=auth::principal::MAX_PRINCIPAL_ROLES)
+                .map(|index| format!("probe-reader-{index}"))
+                .collect::<Vec<_>>()),
+            r#"{"error":"service-token scopes out of bounds: more than 256 roles"}"#,
+        ),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let token_db = TempDb::new(&format!("token-create-scope-bounds-{index}"));
+        let policy = TempPolicyFile::new(&token_policy_document_string());
+        let router = token_admin_router(&token_db, &policy, test_audit_log());
+
+        let response = router
+            .oneshot(token_admin_request(
+                Method::POST,
+                TOKENS_ADMIN_ROUTE,
+                Some(test_principal(&["tokens-writer", "probe-reader"])),
+                Some(json!({ "scopes": scopes }).to_string()),
+            ))
+            .await
+            .expect("out-of-bounds scopes create request should complete");
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{expected}");
+        assert_eq!(body_string(response).await, expected);
+    }
 }
 
 #[tokio::test]

@@ -1262,6 +1262,16 @@ Default: `1048576` (1 MiB)
 
 Format and validation: must parse as a non-negative byte count that fits in `usize`. Requests with a `Content-Length` larger than this value are rejected early with `413 Payload Too Large`. Native MCP and control-plane handlers also count actual streamed bytes before parsing, so chunked, no-Length, and under-declared bodies cannot bypass the cap. Reverse-proxy and outbound tool payload limits use the separate egress body-size settings documented below.
 
+### MAX_REQUEST_PATH_BYTES
+
+Maximum request path length admitted, in bytes.
+
+Default: `8192` (8 KiB)
+
+Format and validation: must parse as an integer between `1` and `8192`. A request whose path is longer is rejected before authentication with `414 URI Too Long` and `{"error":"request path too long","max_request_path_bytes":N}`. Only the path is measured; the query string is not evaluated by policy and is bounded by the request head limit like every other header. The ceiling is the policy kernel's own path bound: evaluation refuses a longer path as an internal error, so an operator may admit shorter paths than the kernel evaluates but never longer ones. Lowering it below the length of the gateway's own routes (the admin API under `/v1{ADMIN_PREFIX}`, for instance) makes those routes unreachable.
+
+Two further request-shape limits are fixed rather than configurable, for the same reason. An HTTP method longer than 64 bytes is answered `501 Not Implemented` with `{"error":"method too long","max_request_method_bytes":64}`. The `Host` header is validated as `uri-host [":" port]` (RFC 9110 section 7.2): a repeated `Host`, a value that is not visible ASCII, a bracketed value that is not an IPv6 literal, a port that is not a port, or a character RFC 3986 does not allow in a host is answered `400 Bad Request` with `{"error":"invalid host"}`, and a host longer than 4096 bytes (port and brackets excluded) is answered `431 Request Header Fields Too Large` with `{"error":"host too long","max_request_host_bytes":4096}`. A request with no `Host`, or an empty one, is admitted and simply matches no host-qualified route. The value of a rejected `Host` is never echoed. These checks run on every listener, before rate limiting by identity, authentication, and authorization.
+
 The static cluster fingerprint includes `RATE_LIMIT_READ_RPS`, `RATE_LIMIT_READ_BURST`, `RATE_LIMIT_WRITE_RPS`, `RATE_LIMIT_WRITE_BURST`, `RATE_LIMIT_MAX_BUCKETS`, `RATE_LIMIT_BUCKET_TTL_MS`, and the `RATE_LIMIT_KEYRING` generation IDs and roles. A joining replica with different values remains unready with `config_fingerprint_mismatch`. Equivalent numeric values (including signed zero), reordered key entries, and different local key-file paths do not cause disagreement. Policy-defined rate overrides continue to use the shared policy revision.
 
 ### RATE_LIMIT_READ_RPS
@@ -1495,6 +1505,8 @@ JWT claim key or dotted claim path used to read roles for the legacy single-prov
 Default: `roles`
 
 Format and validation: must be a non-empty Unicode string. Resolution first tries the value as an exact top-level claim key, then falls back to dotted nested-object path walking only when no exact key exists and the value contains `.`. This means namespaced URL claim keys with dots remain literal keys, while paths such as `realm_access.roles` can read nested arrays. The legacy `ROLES_CLAIM` setting reads arrays of strings only; string-valued role claims require `AUTH_PROVIDERS[].roles_claim_delimiter`. Missing claims, malformed paths, non-array values, and arrays containing non-strings produce an empty role list.
+
+Principal claim bounds: whichever provider produced them, the claims that become a principal are held to fixed bounds at authentication -- at most 256 roles, each at most 256 bytes and none empty, and a subject (`sub`, or the configured `user_id_claim` for a cookie-session provider) of at most 4096 bytes. A credential outside them is a malformed credential: it is rejected with `401 Unauthorized` before any revocation lookup, and the `auth.failure` reason names the bound without the value (`principal claims out of bounds: more than 256 roles` for a JWT; `cookie-session claims out of bounds: ...` for an introspected session, where the verdict is cached like any other rejection). An empty role name can never match a policy role, so it is refused alongside the existing empty-subject check rather than carried as noise. These are the bounds the policy kernel evaluates under, so a principal that authenticates is never refused at authorization for its shape. Service-token scopes become roles and are held to the same bounds when a token is created (`400`) and again when it authenticates (`401`).
 
 ### SERVICE_TOKEN_SQLITE_PATH
 

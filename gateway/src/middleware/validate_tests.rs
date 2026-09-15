@@ -152,6 +152,7 @@ fn test_config(max_body_size: usize, validation_allowed_content_types: Vec<&str>
         policy_history_sqlite_path: None,
         cors_allow_origins: Vec::new(),
         max_body_size,
+        max_request_path_bytes: crate::config::DEFAULT_MAX_REQUEST_PATH_BYTES,
         rate_limit_read_rps: 50.0,
         rate_limit_read_burst: 100,
         rate_limit_write_rps: 10.0,
@@ -315,6 +316,231 @@ async fn allows_content_length_within_configured_max() {
         .expect("request should complete");
 
     assert_eq!(response.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn a_path_over_the_configured_bound_is_414_and_the_response_names_the_limit() {
+    let mut config = test_config(1024, vec!["application/json"]);
+    config.max_request_path_bytes = 32;
+
+    let at_bound = format!("/{}", "a".repeat(31));
+    let response = test_router_with_any_fallback(config.clone())
+        .oneshot(
+            Request::builder()
+                .uri(at_bound)
+                .body(Body::empty())
+                .expect("request should build"),
+        )
+        .await
+        .expect("request should complete");
+    assert_eq!(response.status(), StatusCode::OK);
+
+    // The query is not part of the path and is not measured.
+    let response = test_router_with_any_fallback(config.clone())
+        .oneshot(
+            Request::builder()
+                .uri(format!("/{}?{}", "a".repeat(31), "q".repeat(200)))
+                .body(Body::empty())
+                .expect("request should build"),
+        )
+        .await
+        .expect("request should complete");
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let response = test_router_with_any_fallback(config)
+        .oneshot(
+            Request::builder()
+                .uri(format!("/{}", "a".repeat(32)))
+                .body(Body::empty())
+                .expect("request should build"),
+        )
+        .await
+        .expect("request should complete");
+    assert_eq!(response.status(), StatusCode::URI_TOO_LONG);
+    assert_eq!(
+        body_string(response).await,
+        r#"{"error":"request path too long","max_request_path_bytes":32}"#
+    );
+}
+
+#[tokio::test]
+async fn the_default_path_bound_is_the_policy_kernel_bound() {
+    let config = test_config(1024, vec!["application/json"]);
+    assert_eq!(
+        config.max_request_path_bytes,
+        crate::request_bounds::MAX_REQUEST_PATH_BYTES
+    );
+
+    let response = test_router_with_any_fallback(config.clone())
+        .oneshot(
+            Request::builder()
+                .uri(format!(
+                    "/{}",
+                    "a".repeat(crate::request_bounds::MAX_REQUEST_PATH_BYTES - 1)
+                ))
+                .body(Body::empty())
+                .expect("request should build"),
+        )
+        .await
+        .expect("request should complete");
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let response = test_router_with_any_fallback(config)
+        .oneshot(
+            Request::builder()
+                .uri(format!(
+                    "/{}",
+                    "a".repeat(crate::request_bounds::MAX_REQUEST_PATH_BYTES)
+                ))
+                .body(Body::empty())
+                .expect("request should build"),
+        )
+        .await
+        .expect("request should complete");
+    assert_eq!(response.status(), StatusCode::URI_TOO_LONG);
+}
+
+#[tokio::test]
+async fn a_method_over_the_bound_is_501_and_is_not_echoed() {
+    let config = test_config(1024, vec!["application/json"]);
+    let method = |len: usize| Method::from_bytes("M".repeat(len).as_bytes()).unwrap();
+
+    let response = test_router_with_any_fallback(config.clone())
+        .oneshot(
+            Request::builder()
+                .method(method(crate::request_bounds::MAX_REQUEST_METHOD_BYTES))
+                .uri("/")
+                .body(Body::empty())
+                .expect("request should build"),
+        )
+        .await
+        .expect("request should complete");
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let response = test_router_with_any_fallback(config)
+        .oneshot(
+            Request::builder()
+                .method(method(crate::request_bounds::MAX_REQUEST_METHOD_BYTES + 1))
+                .uri("/")
+                .body(Body::empty())
+                .expect("request should build"),
+        )
+        .await
+        .expect("request should complete");
+    assert_eq!(response.status(), StatusCode::NOT_IMPLEMENTED);
+    assert_eq!(
+        body_string(response).await,
+        r#"{"error":"method too long","max_request_method_bytes":64}"#
+    );
+}
+
+#[tokio::test]
+async fn a_host_that_names_no_host_is_400_and_an_oversized_one_is_431() {
+    use http::header::HOST;
+
+    let config = test_config(1024, vec!["application/json"]);
+    let at_bound = "h".repeat(crate::request_bounds::MAX_REQUEST_HOST_BYTES);
+
+    for host in [
+        "api.example.test",
+        "api.example.test:8443",
+        "[2001:db8::1]:8443",
+        "",
+        at_bound.as_str(),
+    ] {
+        let response = test_router(config.clone())
+            .oneshot(
+                Request::builder()
+                    .uri("/")
+                    .header(HOST, host)
+                    .body(Body::empty())
+                    .expect("request should build"),
+            )
+            .await
+            .expect("request should complete");
+        assert_eq!(response.status(), StatusCode::OK, "{host:?}");
+    }
+
+    for host in ["[a:b:c]", "api.example.test:x", "api.example.test/data"] {
+        let response = test_router(config.clone())
+            .oneshot(
+                Request::builder()
+                    .uri("/")
+                    .header(HOST, host)
+                    .body(Body::empty())
+                    .expect("request should build"),
+            )
+            .await
+            .expect("request should complete");
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{host:?}");
+        assert_eq!(body_string(response).await, r#"{"error":"invalid host"}"#);
+    }
+
+    let response = test_router(config.clone())
+        .oneshot(
+            Request::builder()
+                .uri("/")
+                .header(HOST, "a.example")
+                .header(HOST, "b.example")
+                .body(Body::empty())
+                .expect("request should build"),
+        )
+        .await
+        .expect("request should complete");
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST, "two hosts");
+
+    let response = test_router(config)
+        .oneshot(
+            Request::builder()
+                .uri("/")
+                .header(HOST, format!("{at_bound}h"))
+                .body(Body::empty())
+                .expect("request should build"),
+        )
+        .await
+        .expect("request should complete");
+    assert_eq!(
+        response.status(),
+        StatusCode::REQUEST_HEADER_FIELDS_TOO_LARGE
+    );
+    assert_eq!(
+        body_string(response).await,
+        r#"{"error":"host too long","max_request_host_bytes":4096}"#
+    );
+}
+
+#[test]
+fn shape_problems_are_reported_in_request_line_order() {
+    use http::header::HOST;
+
+    let long_method = Method::from_bytes("M".repeat(65).as_bytes()).unwrap();
+    let long_path = format!("/{}", "a".repeat(64));
+    let mut bad_host = HeaderMap::new();
+    bad_host.insert(HOST, "[a:b:c]".parse().unwrap());
+
+    assert_eq!(
+        request_shape_problem(&long_method, &long_path, &bad_host, 32),
+        Some(RequestShapeProblem::MethodTooLong)
+    );
+    assert_eq!(
+        request_shape_problem(&Method::GET, &long_path, &bad_host, 32),
+        Some(RequestShapeProblem::PathTooLong)
+    );
+    assert_eq!(
+        request_shape_problem(&Method::GET, "/", &bad_host, 32),
+        Some(RequestShapeProblem::HostMalformed)
+    );
+    assert_eq!(
+        request_shape_problem(&Method::GET, "/", &HeaderMap::new(), 32),
+        None
+    );
+}
+
+async fn body_string(response: Response) -> String {
+    let bytes = axum::body::to_bytes(response.into_body(), 4096)
+        .await
+        .expect("response body should be readable");
+    String::from_utf8(bytes.to_vec()).expect("response body should be UTF-8")
 }
 
 #[tokio::test]

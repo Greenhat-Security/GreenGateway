@@ -69,6 +69,10 @@ static WELL_KNOWN_NAT64_PREFIX: LazyLock<IpNet> = LazyLock::new(|| {
         .expect("well-known NAT64 prefix should be valid")
 });
 const DEFAULT_MAX_BODY_SIZE: usize = 1_048_576;
+/// The policy kernel's path bound is both the default and the ceiling: an
+/// operator may admit shorter paths than evaluation accepts, never longer.
+pub const DEFAULT_MAX_REQUEST_PATH_BYTES: usize = crate::request_bounds::MAX_REQUEST_PATH_BYTES;
+pub const MIN_MAX_REQUEST_PATH_BYTES: usize = 1;
 const DEFAULT_RATE_LIMIT_READ_RPS: f64 = 50.0;
 const DEFAULT_RATE_LIMIT_READ_BURST: u32 = 100;
 const DEFAULT_RATE_LIMIT_WRITE_RPS: f64 = 10.0;
@@ -303,6 +307,7 @@ const JWT_JWKS_MAX_KEY_AGE_SECS: &str = "JWT_JWKS_MAX_KEY_AGE_SECS";
 const JWT_JWKS_URL: &str = "JWT_JWKS_URL";
 const JWT_REQUIRE_JTI: &str = "JWT_REQUIRE_JTI";
 const MAX_BODY_SIZE: &str = "MAX_BODY_SIZE";
+const MAX_REQUEST_PATH_BYTES: &str = "MAX_REQUEST_PATH_BYTES";
 const MCP_UPSTREAM_SERVERS: &str = "MCP_UPSTREAM_SERVERS";
 const OPENAPI_SPEC_PATH: &str = "OPENAPI_SPEC_PATH";
 const PAYLOAD_CAPTURE_ENABLED: &str = "PAYLOAD_CAPTURE_ENABLED";
@@ -461,6 +466,10 @@ pub struct Config {
     pub policy_history_sqlite_path: Option<String>,
     pub cors_allow_origins: Vec<String>,
     pub max_body_size: usize,
+    /// Longest request path admitted, in bytes; `414` beyond it. Bounded above
+    /// by the policy kernel's own path bound (`request_bounds`), which is why
+    /// the maximum is not an operator choice.
+    pub max_request_path_bytes: usize,
     pub rate_limit_read_rps: f64,
     pub rate_limit_read_burst: u32,
     pub rate_limit_write_rps: f64,
@@ -2194,6 +2203,20 @@ impl Config {
             "byte size",
             &mut problems,
         );
+        let max_request_path_bytes = validate_range_usize(
+            MAX_REQUEST_PATH_BYTES,
+            parse_var(
+                MAX_REQUEST_PATH_BYTES,
+                get_var(MAX_REQUEST_PATH_BYTES),
+                DEFAULT_MAX_REQUEST_PATH_BYTES,
+                "byte count",
+                &mut problems,
+            ),
+            MIN_MAX_REQUEST_PATH_BYTES,
+            crate::request_bounds::MAX_REQUEST_PATH_BYTES,
+            DEFAULT_MAX_REQUEST_PATH_BYTES,
+            &mut problems,
+        );
         let rate_limit_read_rps = validate_finite_non_negative(
             RATE_LIMIT_READ_RPS,
             parse_var(
@@ -3159,6 +3182,7 @@ impl Config {
                 policy_history_sqlite_path,
                 cors_allow_origins,
                 max_body_size,
+                max_request_path_bytes,
                 rate_limit_read_rps,
                 rate_limit_read_burst,
                 rate_limit_write_rps,
@@ -3702,6 +3726,24 @@ fn validate_range_u32(
     default: u32,
     problems: &mut Vec<String>,
 ) -> u32 {
+    if (minimum..=maximum).contains(&value) {
+        value
+    } else {
+        problems.push(format!(
+            "{name} must be between {minimum} and {maximum}, got {value}"
+        ));
+        default
+    }
+}
+
+fn validate_range_usize(
+    name: &str,
+    value: usize,
+    minimum: usize,
+    maximum: usize,
+    default: usize,
+    problems: &mut Vec<String>,
+) -> usize {
     if (minimum..=maximum).contains(&value) {
         value
     } else {

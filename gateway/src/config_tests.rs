@@ -1897,6 +1897,54 @@ fn invalid_max_body_size_is_rejected() {
 }
 
 #[test]
+fn max_request_path_bytes_defaults_to_the_kernel_bound_and_parses_below_it() {
+    let config = Config::from_env_vars(|_| Err(VarError::NotPresent)).expect("config should parse");
+    assert_eq!(
+        config.max_request_path_bytes,
+        DEFAULT_MAX_REQUEST_PATH_BYTES
+    );
+    assert_eq!(
+        config.max_request_path_bytes,
+        crate::request_bounds::MAX_REQUEST_PATH_BYTES
+    );
+
+    let config = Config::from_env_vars(|name| match name {
+        "MAX_REQUEST_PATH_BYTES" => Ok("2048".to_owned()),
+        _ => Err(VarError::NotPresent),
+    })
+    .expect("config should parse");
+    assert_eq!(config.max_request_path_bytes, 2048);
+}
+
+#[test]
+fn max_request_path_bytes_cannot_exceed_the_kernel_bound_or_be_zero() {
+    for (value, expected) in [
+        (
+            "8193",
+            "MAX_REQUEST_PATH_BYTES must be between 1 and 8192, got 8193",
+        ),
+        (
+            "0",
+            "MAX_REQUEST_PATH_BYTES must be between 1 and 8192, got 0",
+        ),
+        (
+            "eight",
+            "MAX_REQUEST_PATH_BYTES must be a valid byte count, got 'eight'",
+        ),
+    ] {
+        let error = Config::from_env_vars(|name| match name {
+            "MAX_REQUEST_PATH_BYTES" => Ok(value.to_owned()),
+            _ => Err(VarError::NotPresent),
+        })
+        .expect_err("config should reject a path bound the kernel cannot honour");
+
+        let message = error.to_string();
+        assert!(message.contains(expected), "{message}");
+        assert_eq!(error.problems.len(), 1, "{message}");
+    }
+}
+
+#[test]
 fn validation_allowed_content_types_defaults_to_json() {
     let config = Config::from_env_vars(|_| Err(VarError::NotPresent)).expect("config should parse");
 

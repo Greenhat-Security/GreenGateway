@@ -15,7 +15,11 @@ use http::{
 };
 use serde::Serialize;
 
-use crate::config::Config;
+use crate::{
+    config::Config,
+    request_bounds::{MAX_REQUEST_HOST_BYTES, MAX_REQUEST_METHOD_BYTES},
+    upstream_route::{host_header, HostHeader},
+};
 
 #[derive(Serialize)]
 struct PayloadTooLargeBody {
@@ -30,9 +34,66 @@ struct MethodNotSupportedBody {
 }
 
 #[derive(Serialize)]
+struct MethodTooLongBody {
+    error: &'static str,
+    max_request_method_bytes: usize,
+}
+
+#[derive(Serialize)]
+struct RequestPathTooLongBody {
+    error: &'static str,
+    max_request_path_bytes: usize,
+}
+
+#[derive(Serialize)]
+struct InvalidHostBody {
+    error: &'static str,
+}
+
+#[derive(Serialize)]
+struct HostTooLongBody {
+    error: &'static str,
+    max_request_host_bytes: usize,
+}
+
+#[derive(Serialize)]
 struct UnsupportedMediaTypeBody {
     error: &'static str,
     allowed_content_types: Vec<String>,
+}
+
+/// A request-line or `Host` shape admission refuses, judged the same way on
+/// every listener.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RequestShapeProblem {
+    MethodTooLong,
+    PathTooLong,
+    HostMalformed,
+    HostTooLong,
+}
+
+/// The first shape problem with a request, or `None` when its method, path and
+/// `Host` are all within the bounds the policy kernel evaluates under.
+///
+/// Kept free of the request type so that "admitted implies evaluable" is a
+/// statement about this function, which the kernel's tests call directly.
+pub(crate) fn request_shape_problem(
+    method: &Method,
+    path: &str,
+    headers: &HeaderMap,
+    max_request_path_bytes: usize,
+) -> Option<RequestShapeProblem> {
+    if method.as_str().len() > MAX_REQUEST_METHOD_BYTES {
+        return Some(RequestShapeProblem::MethodTooLong);
+    }
+    if path.len() > max_request_path_bytes {
+        return Some(RequestShapeProblem::PathTooLong);
+    }
+    match host_header(headers) {
+        HostHeader::Absent | HostHeader::Present(_) => None,
+        HostHeader::Malformed => Some(RequestShapeProblem::HostMalformed),
+        HostHeader::TooLong => Some(RequestShapeProblem::HostTooLong),
+    }
 }
 
 pub async fn validate_request(State(config): State<Config>, req: Request, next: Next) -> Response {
@@ -47,6 +108,28 @@ pub async fn validate_request(State(config): State<Config>, req: Request, next: 
     // from silently turning the gateway into an open tunnel.
     if req.method() == Method::CONNECT {
         return method_not_supported(req.method());
+    }
+
+    // The policy kernel evaluates under fixed bounds on the method, path and
+    // host (`request_bounds`) and answers an input over them with an internal
+    // error. Admission states each limit here, with its own status, so a
+    // served request can never reach that answer: the kernel's path bound is
+    // the ceiling `MAX_REQUEST_PATH_BYTES` may be raised to, and the method
+    // and host bounds are not configurable. See issue #488.
+    if let Some(problem) = request_shape_problem(
+        req.method(),
+        req.uri().path(),
+        req.headers(),
+        config.max_request_path_bytes,
+    ) {
+        return match problem {
+            RequestShapeProblem::MethodTooLong => method_too_long(),
+            RequestShapeProblem::PathTooLong => {
+                request_path_too_long(config.max_request_path_bytes)
+            }
+            RequestShapeProblem::HostMalformed => invalid_host(),
+            RequestShapeProblem::HostTooLong => host_too_long(),
+        };
     }
 
     // This early guard rejects declared oversize bodies before downstream
@@ -154,6 +237,58 @@ fn method_not_supported(method: &Method) -> Response {
         Json(MethodNotSupportedBody {
             error: "method not supported",
             method: method.to_string(),
+        }),
+    )
+        .into_response()
+}
+
+/// 501 for the same reason CONNECT is: no resource here implements a method
+/// this long, and there is no honest `Allow` list to send with a 405. The
+/// method is not echoed; it is the oversized thing.
+fn method_too_long() -> Response {
+    (
+        StatusCode::NOT_IMPLEMENTED,
+        Json(MethodTooLongBody {
+            error: "method too long",
+            max_request_method_bytes: MAX_REQUEST_METHOD_BYTES,
+        }),
+    )
+        .into_response()
+}
+
+/// RFC 9110 section 15.5.15: the target is longer than the server is willing
+/// to interpret. Only the path is measured; the query is not evaluated by
+/// policy and is bounded by the request head limit like every other header.
+fn request_path_too_long(max_request_path_bytes: usize) -> Response {
+    (
+        StatusCode::URI_TOO_LONG,
+        Json(RequestPathTooLongBody {
+            error: "request path too long",
+            max_request_path_bytes,
+        }),
+    )
+        .into_response()
+}
+
+/// RFC 9110 section 7.2: a `Host` field with an invalid value is a 400. The
+/// value is never echoed.
+fn invalid_host() -> Response {
+    (
+        StatusCode::BAD_REQUEST,
+        Json(InvalidHostBody {
+            error: "invalid host",
+        }),
+    )
+        .into_response()
+}
+
+/// RFC 6585 section 5: a header field too large to process is a 431.
+fn host_too_long() -> Response {
+    (
+        StatusCode::REQUEST_HEADER_FIELDS_TOO_LARGE,
+        Json(HostTooLongBody {
+            error: "host too long",
+            max_request_host_bytes: MAX_REQUEST_HOST_BYTES,
         }),
     )
         .into_response()

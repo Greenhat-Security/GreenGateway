@@ -84,7 +84,6 @@ mod input;
 mod tests;
 
 use std::fmt;
-use std::net::Ipv6Addr;
 
 use http::Method;
 use serde::Serialize;
@@ -99,6 +98,8 @@ use crate::{
         policy::{RouteRule, KNOWN_TOP_LEVEL_KEYS},
         DefaultAction, EnforcementMode, Policy, PolicyEngine, RuleAction, RuleMatcher,
     },
+    request_bounds::{MAX_REQUEST_HOST_BYTES, MAX_REQUEST_METHOD_BYTES, MAX_REQUEST_PATH_BYTES},
+    upstream_route::is_bare_host,
 };
 
 /// Each lane that adds a required fact bumps this, so a context built for an
@@ -645,25 +646,6 @@ impl CompiledPolicy {
     }
 }
 
-/// Whether a value is a host with its port and brackets already removed, the
-/// form `upstream_route::request_host_without_port` produces.
-///
-/// Colons cannot simply be refused. That helper strips the brackets from
-/// `[2001:db8::1]:8443` and returns `2001:db8::1`, so rejecting every colon
-/// would make the kernel unable to answer for an IPv6-addressed request at all
-/// -- including one whose policy has no host-qualified routes and for which the
-/// host could not have changed the decision. A bare IPv6 literal is recognized
-/// by parsing it, rather than by guessing at colon counts.
-fn is_bare_host(host: &str) -> bool {
-    if host.is_empty() || host.contains('/') {
-        return false;
-    }
-    if host.contains(':') {
-        return host.parse::<Ipv6Addr>().is_ok();
-    }
-    true
-}
-
 /// Whether a route's host binding admits this request.
 ///
 /// An unbound route serves any host, but only while no virtual upstream was
@@ -842,31 +824,30 @@ impl PolicyEvaluationContext {
         if let HttpTarget::McpAlias { canonical_path } = &self.target {
             validate_path(canonical_path)?;
         }
+        // The bounds below are the ones request admission and authentication
+        // enforce (`request_bounds`, `auth::principal`), read from the same
+        // constants and predicates, so a request the gateway served cannot
+        // reach these arms. They stay here because the kernel is pure: it
+        // states its own work limit rather than trusting a caller to have
+        // applied one.
         if self
             .method
             .as_ref()
-            .is_some_and(|method| method.as_str().len() > 64)
+            .is_some_and(|method| method.as_str().len() > MAX_REQUEST_METHOD_BYTES)
         {
             return Err(EvaluationError::ContextTooLarge);
         }
         if let PrincipalFact::Authenticated(identity) = &self.principal {
-            let principal = &identity.0;
-            if principal.roles.len() > 256
-                || principal.user_id.len() > 4096
-                || principal
-                    .issuer
-                    .as_ref()
-                    .is_some_and(|issuer| issuer.len() > 4096)
-                || principal.roles.iter().any(|role| role.len() > 256)
-            {
-                return Err(EvaluationError::ContextTooLarge);
-            }
-            if principal.user_id.is_empty() || principal.roles.iter().any(|role| role.is_empty()) {
-                return Err(EvaluationError::InvalidPrincipal);
+            if let Err(problem) = identity.0.check_shape() {
+                return Err(if problem.is_size() {
+                    EvaluationError::ContextTooLarge
+                } else {
+                    EvaluationError::InvalidPrincipal
+                });
             }
         }
         if let HostFact::Present(host) = &self.request_host {
-            if host.len() > 4096 {
+            if host.len() > MAX_REQUEST_HOST_BYTES {
                 return Err(EvaluationError::ContextTooLarge);
             }
             if !is_bare_host(host) {
@@ -1176,7 +1157,7 @@ impl Evaluation {
 /// Shared by every path identity in a context. A check that covered only the
 /// first one would be a check the others are missing, and each of them decides.
 fn validate_path(path: &str) -> Result<(), EvaluationError> {
-    if path.len() > 8192 {
+    if path.len() > MAX_REQUEST_PATH_BYTES {
         return Err(EvaluationError::ContextTooLarge);
     }
     if !path.starts_with('/')

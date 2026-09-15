@@ -281,15 +281,27 @@ impl CachedVerification {
             // this replica's wall clock never rejects a token the authority
             // accepted, and the entry's lifetime cap (measured at the
             // store) is what expires it here.
-            Self::Valid(valid) => Ok(Principal {
-                user_id: format!("service-token:{}", valid.id),
-                issuer: None,
-                email: None,
-                org_id: None,
-                roles: valid.scopes,
-                session_id: valid.id,
-                auth_method: AuthMethod::ServiceToken,
-            }),
+            Self::Valid(valid) => {
+                let principal = Principal {
+                    user_id: format!("service-token:{}", valid.id),
+                    issuer: None,
+                    email: None,
+                    org_id: None,
+                    roles: valid.scopes,
+                    session_id: valid.id,
+                    auth_method: AuthMethod::ServiceToken,
+                };
+                // Scopes are bounded when written through the admin API. A
+                // record that predates the bound, or was written around it,
+                // is still refused here so the bound holds for every
+                // principal rather than for every principal written since.
+                principal.check_shape().map_err(|problem| {
+                    AuthError::InvalidSession(format!(
+                        "service token scopes out of bounds: {problem}"
+                    ))
+                })?;
+                Ok(principal)
+            }
             Self::Invalid(failure) => Err(AuthError::InvalidSession(format!(
                 "service token is {}",
                 verification_failure_label(failure)
@@ -613,6 +625,49 @@ mod tests {
 
         assert!(validator.supports_bearer());
         assert!(!validator.supports_cookie());
+    }
+
+    #[tokio::test]
+    async fn stored_scopes_outside_the_principal_bounds_are_refused_at_authentication() {
+        for (index, (scopes, expected)) in [
+            (
+                (0..257).map(|index| format!("scope-{index}")).collect(),
+                "service token scopes out of bounds: more than 256 roles",
+            ),
+            (
+                vec!["admin:tokens:read".to_owned(), String::new()],
+                "service token scopes out of bounds: an empty role",
+            ),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let db = TempDb::new(&format!("out-of-bounds-scopes-{index}"));
+            let store =
+                Arc::new(SqliteTokenStore::open(&db.path).expect("token store should open"));
+            // The store does not judge scopes; the admin API does when a
+            // token is written, and the validator does again here so a
+            // record written around the admin API is still refused.
+            let created = store
+                .create(CreateTokenRequest {
+                    scopes,
+                    created_by: "creator".to_owned(),
+                    expires_at: None,
+                })
+                .await
+                .expect("token should create");
+            let validator = ServiceTokenValidator::new(store, Duration::from_secs(5));
+
+            let error = validator
+                .validate_session(&SessionCredential::Bearer(created.plaintext_token.clone()))
+                .await
+                .expect_err("scopes outside the principal bounds must be rejected");
+
+            assert!(
+                matches!(&error, AuthError::InvalidSession(reason) if reason == expected),
+                "{error:?}"
+            );
+        }
     }
 
     fn create_request(scopes: &[&str]) -> CreateTokenRequest {

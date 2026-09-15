@@ -58,6 +58,11 @@ pub const CLIENT_CERTIFICATE_PROVIDER: &str = "client-certificate";
 /// for every real workload identity and short enough to be a log line.
 pub const MAX_IDENTITY_BYTES: usize = 255;
 
+// A certificate identity becomes a principal subject unchanged, so it must fit
+// the subject bound every principal is held to. The validator relies on this
+// rather than re-judging a value it did not shape.
+const _: () = assert!(MAX_IDENTITY_BYTES <= crate::auth::principal::MAX_PRINCIPAL_SUBJECT_BYTES);
+
 /// Which certificate field carries the caller's identity.
 ///
 /// **Why not the subject DN.** A DN is not a string; it is a sequence of
