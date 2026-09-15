@@ -2111,7 +2111,7 @@ impl StreamableHttpClient for LimitedMcpHttpClient {
             validate_mcp_response_content_type(&response)?;
             enforce_mcp_response_content_length(&response, self.max_response_bytes)?;
 
-            let event_stream = SseStream::from_byte_stream(limited_mcp_response_stream(
+            let event_stream = SseStream::from_bytes_stream(limited_mcp_response_stream(
                 response,
                 self.max_response_bytes,
                 self.discovery_response_budget.clone(),
@@ -2299,7 +2299,7 @@ impl StreamableHttpClient for LimitedMcpHttpClient {
             match content_type.as_deref() {
                 Some(ct) if ct.as_bytes().starts_with(EVENT_STREAM_MIME.as_bytes()) => {
                     enforce_mcp_response_content_length(&response, self.max_response_bytes)?;
-                    let event_stream = SseStream::from_byte_stream(limited_mcp_response_stream(
+                    let event_stream = SseStream::from_bytes_stream(limited_mcp_response_stream(
                         response,
                         self.max_response_bytes,
                         self.discovery_response_budget.clone(),
@@ -4779,7 +4779,7 @@ mod tests {
             Ok(Bytes::from(overflow_chunk)),
         ]);
         let mut stream: BoxStream<'static, Result<Sse, SseError>> =
-            Box::pin(SseStream::from_byte_stream(limited_mcp_body_stream(
+            Box::pin(SseStream::from_bytes_stream(limited_mcp_body_stream(
                 Box::pin(body),
                 TEST_RESPONSE_LIMIT,
                 None,
