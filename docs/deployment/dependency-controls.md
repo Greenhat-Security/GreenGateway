@@ -68,7 +68,7 @@ The required `production-compiler` job checks all targets with that compiler;
 ordinary CI uses the previously passing Rust 1.98.1. Coverage remains on
 nightly-2026-09-01 with cargo-llvm-cov 0.9.0 and unchanged floors. Its dated
 compiler is deliberate, not an invitation to follow nightly updates.
-Node 26.8.1 and bundled npm 11.19.0 match the current pinned Node image.
+Node 26.8.2 and bundled npm 11.19.1 match the current pinned Node image.
 Gateway builds verify the actual Node/npm executable versions before installing
 UI dependencies, and Docker additionally checks its actual Rust version.
 Cargo builds use the existing lockfile without resolution updates.
