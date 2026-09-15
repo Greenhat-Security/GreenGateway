@@ -1,18 +1,27 @@
 use std::{sync::Arc, time::Duration};
 
 use axum::{body::Body, middleware::from_fn_with_state, routing::any, Router};
-use http::{Request, StatusCode};
+use http::{header, HeaderMap, HeaderValue, Request, StatusCode, Uri};
+use proptest::prelude::*;
 use serde_json::{json, Value};
 use tower::ServiceExt;
 
 use super::*;
 use crate::{
     audit::{sink::tests::CaptureSink, AuditLog, AuditSink},
+    auth::principal::{
+        check_principal_shape, MAX_PRINCIPAL_ROLES, MAX_PRINCIPAL_ROLE_BYTES,
+        MAX_PRINCIPAL_SUBJECT_BYTES,
+    },
+    config::DEFAULT_MAX_REQUEST_PATH_BYTES,
     middleware::{
         decision::{PolicyDecision, PolicyDecisionOutcome},
         rbac::{rbac_middleware, RbacState},
+        validate::{request_shape_problem, RequestShapeProblem},
     },
-    upstream_route::{ProxyRouteClassificationCompleted, ProxyRouteObservationContext},
+    upstream_route::{
+        request_host_without_port, ProxyRouteClassificationCompleted, ProxyRouteObservationContext,
+    },
 };
 
 fn compile(value: Value) -> CompiledPolicy {
@@ -861,6 +870,215 @@ fn dispatch_with_host(route_host: Option<&str>) -> DispatchFacts {
         route_host: route_host.map(str::to_owned),
         route_path_prefix: Some("/".to_owned()),
         upstream_origin: "https://upstream.internal.test".to_owned(),
+    }
+}
+
+#[test]
+fn the_kernel_bounds_are_exactly_the_bounds_admission_and_authentication_enforce() {
+    // Issue #488: each bound is pinned on both sides of the same byte, so a
+    // request the gateway admits and a principal it authenticates are inside
+    // what the kernel evaluates, and one byte past admission is one byte past
+    // the kernel. The ceiling of the configurable path bound is the kernel's.
+    assert_eq!(DEFAULT_MAX_REQUEST_PATH_BYTES, MAX_REQUEST_PATH_BYTES);
+    let compiled = compile(basic_policy());
+    let no_headers = HeaderMap::new();
+    let origin = Uri::from_static("/");
+
+    let at_bound = format!("/{}", "a".repeat(MAX_REQUEST_PATH_BYTES - 1));
+    let past_bound = format!("/{}", "a".repeat(MAX_REQUEST_PATH_BYTES));
+    assert_eq!(
+        request_shape_problem(
+            &Method::GET,
+            &at_bound.parse::<Uri>().unwrap(),
+            &no_headers,
+            MAX_REQUEST_PATH_BYTES
+        ),
+        None
+    );
+    assert_eq!(
+        request_shape_problem(
+            &Method::GET,
+            &past_bound.parse::<Uri>().unwrap(),
+            &no_headers,
+            MAX_REQUEST_PATH_BYTES
+        ),
+        Some(RequestShapeProblem::PathTooLong)
+    );
+    let mut input = context(&compiled);
+    input.path = Some(at_bound);
+    assert!(compiled.evaluate(&input).is_ok());
+    let mut input = context(&compiled);
+    input.path = Some(past_bound);
+    assert_eq!(
+        compiled.evaluate(&input),
+        Err(EvaluationError::ContextTooLarge)
+    );
+
+    let at_bound = Method::from_bytes("M".repeat(MAX_REQUEST_METHOD_BYTES).as_bytes()).unwrap();
+    let past_bound =
+        Method::from_bytes("M".repeat(MAX_REQUEST_METHOD_BYTES + 1).as_bytes()).unwrap();
+    assert_eq!(
+        request_shape_problem(&at_bound, &origin, &no_headers, MAX_REQUEST_PATH_BYTES),
+        None
+    );
+    assert_eq!(
+        request_shape_problem(&past_bound, &origin, &no_headers, MAX_REQUEST_PATH_BYTES),
+        Some(RequestShapeProblem::MethodTooLong)
+    );
+    let mut input = context(&compiled);
+    input.method = Some(at_bound);
+    assert!(compiled.evaluate(&input).is_ok());
+    let mut input = context(&compiled);
+    input.method = Some(past_bound);
+    assert_eq!(
+        compiled.evaluate(&input),
+        Err(EvaluationError::ContextTooLarge)
+    );
+
+    let at_bound = "h".repeat(MAX_REQUEST_HOST_BYTES);
+    let mut headers = HeaderMap::new();
+    headers.insert(header::HOST, HeaderValue::from_str(&at_bound).unwrap());
+    assert_eq!(
+        request_shape_problem(&Method::GET, &origin, &headers, MAX_REQUEST_PATH_BYTES),
+        None
+    );
+    assert_eq!(
+        request_host_without_port(&origin, &headers).as_deref(),
+        Some(at_bound.as_str())
+    );
+    let mut input = context(&compiled);
+    input.request_host = HostFact::Present(at_bound.clone());
+    assert!(compiled.evaluate(&input).is_ok());
+    headers.insert(
+        header::HOST,
+        HeaderValue::from_str(&format!("{at_bound}h")).unwrap(),
+    );
+    assert_eq!(
+        request_shape_problem(&Method::GET, &origin, &headers, MAX_REQUEST_PATH_BYTES),
+        Some(RequestShapeProblem::HostTooLong)
+    );
+    let mut input = context(&compiled);
+    input.request_host = HostFact::Present(format!("{at_bound}h"));
+    assert_eq!(
+        compiled.evaluate(&input),
+        Err(EvaluationError::ContextTooLarge)
+    );
+
+    // Dispatch facts are configuration, bounded at startup (`config.rs` refuses
+    // a route `path_prefix` or upstream URL over the bound); the kernel's own
+    // arm is pinned here at the same byte.
+    let mut input = context(&compiled);
+    input.target = HttpTarget::ProxyDispatch;
+    let mut facts = dispatch_with_host(None);
+    facts.route_path_prefix = Some(format!("/{}", "p".repeat(MAX_DISPATCH_FACT_BYTES - 1)));
+    input.dispatch = Some(facts.clone());
+    assert!(compiled.evaluate(&input).is_ok());
+    facts.route_path_prefix = Some(format!("/{}", "p".repeat(MAX_DISPATCH_FACT_BYTES)));
+    input.dispatch = Some(facts);
+    assert_eq!(
+        compiled.evaluate(&input),
+        Err(EvaluationError::ContextTooLarge)
+    );
+
+    let mut identity = principal(&[]);
+    identity.user_id = "u".repeat(MAX_PRINCIPAL_SUBJECT_BYTES);
+    identity.roles = vec!["r".repeat(MAX_PRINCIPAL_ROLE_BYTES); MAX_PRINCIPAL_ROLES];
+    assert_eq!(identity.check_shape(), Ok(()));
+    let mut input = context(&compiled);
+    input.principal = PrincipalFact::Authenticated(PrincipalIdentity::from_principal(&identity));
+    assert!(compiled.evaluate(&input).is_ok());
+    identity.roles.push("r".to_owned());
+    assert!(identity.check_shape().is_err());
+    let mut input = context(&compiled);
+    input.principal = PrincipalFact::Authenticated(PrincipalIdentity::from_principal(&identity));
+    assert_eq!(
+        compiled.evaluate(&input),
+        Err(EvaluationError::ContextTooLarge)
+    );
+}
+
+fn host_header_strategy() -> impl Strategy<Value = Option<String>> {
+    prop_oneof![
+        Just(None),
+        (0usize..=MAX_REQUEST_HOST_BYTES + 100).prop_map(|len| Some("h".repeat(len))),
+        (0usize..=MAX_REQUEST_HOST_BYTES + 100)
+            .prop_map(|len| Some(format!("{}:8443", "h".repeat(len)))),
+        Just(Some("[2001:db8::1]:8443".to_owned())),
+        Just(Some("[a:b:c]".to_owned())),
+        Just(Some("api.example.test/data".to_owned())),
+        Just(Some("api.example.test:x".to_owned())),
+        Just(Some("2001:db8::1".to_owned())),
+        Just(Some("API.Example.Test".to_owned())),
+    ]
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(256))]
+
+    /// Issue #488's acceptance criterion as a property: whatever request
+    /// admission (`request_shape_problem`) and authentication
+    /// (`check_principal_shape`) accept, the kernel never answers with
+    /// `ContextTooLarge`, `InvalidPrincipal` or `InvalidHost`. Lengths are
+    /// drawn past every bound so both sides of each are exercised, and hosts
+    /// are drawn from the forms the strict parser distinguishes.
+    #[test]
+    fn a_request_and_principal_that_pass_admission_and_authentication_cannot_be_refused_by_the_kernel_for_shape(
+        method_len in 1usize..=MAX_REQUEST_METHOD_BYTES + 16,
+        path_len in 0usize..=MAX_REQUEST_PATH_BYTES + 100,
+        host in host_header_strategy(),
+        subject_len in 0usize..=MAX_PRINCIPAL_SUBJECT_BYTES + 100,
+        role_count in 0usize..=MAX_PRINCIPAL_ROLES + 10,
+        role_len in 0usize..=MAX_PRINCIPAL_ROLE_BYTES + 10,
+    ) {
+        let compiled = compile(basic_policy());
+        let method = Method::from_bytes("M".repeat(method_len).as_bytes()).unwrap();
+        let path = format!("/{}", "a".repeat(path_len));
+        let uri = path.parse::<Uri>().unwrap();
+        let mut headers = HeaderMap::new();
+        if let Some(host) = host.as_deref() {
+            headers.insert(header::HOST, HeaderValue::from_str(host).unwrap());
+        }
+        let user_id = "u".repeat(subject_len);
+        let roles = vec!["r".repeat(role_len); role_count];
+        let issuer = "https://idp.example.test";
+
+        let admitted =
+            request_shape_problem(&method, &uri, &headers, DEFAULT_MAX_REQUEST_PATH_BYTES)
+                .is_none();
+        let authenticated = check_principal_shape(&user_id, Some(issuer), &roles).is_ok();
+        if !(admitted && authenticated) {
+            return Ok(());
+        }
+
+        let identity = Principal {
+            user_id,
+            issuer: Some(issuer.to_owned()),
+            roles,
+            auth_method: AuthMethod::Bearer,
+            email: None,
+            org_id: None,
+            session_id: String::new(),
+        };
+        let mut input = context(&compiled);
+        input.method = Some(method);
+        input.path = Some(path);
+        input.principal =
+            PrincipalFact::Authenticated(PrincipalIdentity::from_principal(&identity));
+        input.request_host = match request_host_without_port(&uri, &headers) {
+            Some(host) => HostFact::Present(host),
+            None => HostFact::Absent,
+        };
+
+        let result = compiled.evaluate(&input);
+        prop_assert!(
+            !matches!(
+                result,
+                Err(EvaluationError::ContextTooLarge
+                    | EvaluationError::InvalidPrincipal
+                    | EvaluationError::InvalidHost)
+            ),
+            "admitted and authenticated, yet refused for shape: {result:?}"
+        );
     }
 }
 

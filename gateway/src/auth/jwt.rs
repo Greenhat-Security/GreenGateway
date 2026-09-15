@@ -534,6 +534,23 @@ impl JwtValidator {
             return Err(AuthError::InvalidSession("missing sub".to_owned()));
         }
 
+        let roles = extract_roles(
+            &claims.extra,
+            &self.cfg.roles_claim,
+            self.cfg.roles_claim_delimiter.as_deref(),
+        );
+        // A credential outside the principal bounds is malformed: an
+        // authentication failure, judged before the revocation store is
+        // consulted so that it costs no round trip.
+        crate::auth::principal::check_principal_shape(
+            user_id,
+            self.principal_issuer.as_deref(),
+            &roles,
+        )
+        .map_err(|problem| {
+            AuthError::InvalidSession(format!("principal claims out of bounds: {problem}"))
+        })?;
+
         let jti = claims
             .jti
             .as_deref()
@@ -556,11 +573,6 @@ impl JwtValidator {
             .map(str::trim)
             .filter(|email| !email.is_empty())
             .map(str::to_ascii_lowercase);
-        let roles = extract_roles(
-            &claims.extra,
-            &self.cfg.roles_claim,
-            self.cfg.roles_claim_delimiter.as_deref(),
-        );
         let org_id = extract_string_claim(&claims.extra, self.cfg.org_claim.as_deref());
         let session_id = jti.unwrap_or("-").to_owned();
 

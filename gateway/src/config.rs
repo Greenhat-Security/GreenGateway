@@ -14,7 +14,9 @@ use ipnet::IpNet;
 use serde::Deserialize;
 
 use crate::{
-    auth::principal::{canonical_issuer, provider_issuer, PROVIDER_ISSUER_PREFIX},
+    auth::principal::{
+        canonical_issuer, provider_issuer, MAX_PRINCIPAL_ISSUER_BYTES, PROVIDER_ISSUER_PREFIX,
+    },
     auth::ClientCertIdentitySource,
     connections::{
         aws_secret::{
@@ -69,6 +71,10 @@ static WELL_KNOWN_NAT64_PREFIX: LazyLock<IpNet> = LazyLock::new(|| {
         .expect("well-known NAT64 prefix should be valid")
 });
 const DEFAULT_MAX_BODY_SIZE: usize = 1_048_576;
+/// The policy kernel's path bound is both the default and the ceiling: an
+/// operator may admit shorter paths than evaluation accepts, never longer.
+pub const DEFAULT_MAX_REQUEST_PATH_BYTES: usize = crate::request_bounds::MAX_REQUEST_PATH_BYTES;
+pub const MIN_MAX_REQUEST_PATH_BYTES: usize = 1;
 const DEFAULT_RATE_LIMIT_READ_RPS: f64 = 50.0;
 const DEFAULT_RATE_LIMIT_READ_BURST: u32 = 100;
 const DEFAULT_RATE_LIMIT_WRITE_RPS: f64 = 10.0;
@@ -303,6 +309,7 @@ const JWT_JWKS_MAX_KEY_AGE_SECS: &str = "JWT_JWKS_MAX_KEY_AGE_SECS";
 const JWT_JWKS_URL: &str = "JWT_JWKS_URL";
 const JWT_REQUIRE_JTI: &str = "JWT_REQUIRE_JTI";
 const MAX_BODY_SIZE: &str = "MAX_BODY_SIZE";
+const MAX_REQUEST_PATH_BYTES: &str = "MAX_REQUEST_PATH_BYTES";
 const MCP_UPSTREAM_SERVERS: &str = "MCP_UPSTREAM_SERVERS";
 const OPENAPI_SPEC_PATH: &str = "OPENAPI_SPEC_PATH";
 const PAYLOAD_CAPTURE_ENABLED: &str = "PAYLOAD_CAPTURE_ENABLED";
@@ -461,6 +468,10 @@ pub struct Config {
     pub policy_history_sqlite_path: Option<String>,
     pub cors_allow_origins: Vec<String>,
     pub max_body_size: usize,
+    /// Longest request path admitted, in bytes; `414` beyond it. Bounded above
+    /// by the policy kernel's own path bound (`request_bounds`), which is why
+    /// the maximum is not an operator choice.
+    pub max_request_path_bytes: usize,
     pub rate_limit_read_rps: f64,
     pub rate_limit_read_burst: u32,
     pub rate_limit_write_rps: f64,
@@ -2194,6 +2205,20 @@ impl Config {
             "byte size",
             &mut problems,
         );
+        let max_request_path_bytes = validate_range_usize(
+            MAX_REQUEST_PATH_BYTES,
+            parse_var(
+                MAX_REQUEST_PATH_BYTES,
+                get_var(MAX_REQUEST_PATH_BYTES),
+                DEFAULT_MAX_REQUEST_PATH_BYTES,
+                "byte count",
+                &mut problems,
+            ),
+            MIN_MAX_REQUEST_PATH_BYTES,
+            crate::request_bounds::MAX_REQUEST_PATH_BYTES,
+            DEFAULT_MAX_REQUEST_PATH_BYTES,
+            &mut problems,
+        );
         let rate_limit_read_rps = validate_finite_non_negative(
             RATE_LIMIT_READ_RPS,
             parse_var(
@@ -2324,6 +2349,17 @@ impl Config {
         let jwt_jwks_url =
             parse_optional_string(JWT_JWKS_URL, get_var(JWT_JWKS_URL), &mut problems);
         let jwt_issuer = parse_optional_string(JWT_ISSUER, get_var(JWT_ISSUER), &mut problems);
+        // The issuer becomes every principal's `issuer`, which authentication
+        // holds to the principal bounds; an over-long one would refuse every
+        // credential at runtime, so it is refused here instead.
+        if jwt_issuer
+            .as_deref()
+            .is_some_and(|issuer| issuer.len() > MAX_PRINCIPAL_ISSUER_BYTES)
+        {
+            problems.push(format!(
+                "{JWT_ISSUER} must be at most {MAX_PRINCIPAL_ISSUER_BYTES} bytes"
+            ));
+        }
         let jwt_audience =
             parse_optional_string(JWT_AUDIENCE, get_var(JWT_AUDIENCE), &mut problems);
         let jwt_jwks_timeout_ms = parse_var(
@@ -3159,6 +3195,7 @@ impl Config {
                 policy_history_sqlite_path,
                 cors_allow_origins,
                 max_body_size,
+                max_request_path_bytes,
                 rate_limit_read_rps,
                 rate_limit_read_burst,
                 rate_limit_write_rps,
@@ -3712,6 +3749,24 @@ fn validate_range_u32(
     }
 }
 
+fn validate_range_usize(
+    name: &str,
+    value: usize,
+    minimum: usize,
+    maximum: usize,
+    default: usize,
+    problems: &mut Vec<String>,
+) -> usize {
+    if (minimum..=maximum).contains(&value) {
+        value
+    } else {
+        problems.push(format!(
+            "{name} must be between {minimum} and {maximum}, got {value}"
+        ));
+        default
+    }
+}
+
 fn validate_positive_timeout_ms(
     name: &str,
     value: u64,
@@ -4175,6 +4230,14 @@ fn validate_auth_providers(
             .issuer
             .clone()
             .unwrap_or_else(|| provider_issuer(&provider.name));
+        // The effective issuer becomes every principal's `issuer`, which
+        // authentication holds to the principal bounds; over-long, it would
+        // refuse every credential from this provider at runtime.
+        if effective_issuer.len() > MAX_PRINCIPAL_ISSUER_BYTES {
+            problems.push(format!(
+                "{name}[{index}].issuer, or the provider:<name> label derived from its name, must be at most {MAX_PRINCIPAL_ISSUER_BYTES} bytes"
+            ));
+        }
         if let Some(previous_index) = seen_effective_issuers.insert(effective_issuer.clone(), index)
         {
             if validated[previous_index].name == provider.name {
@@ -6039,14 +6102,23 @@ fn normalize_route_path_prefix(
         return None;
     }
 
-    if is_valid_exempt_path(value) {
-        Some(value.to_owned())
-    } else {
+    if !is_valid_exempt_path(value) {
         problems.push(format!(
             "{name} must be a URI path prefix starting with '/', got '{value}'"
         ));
-        None
+        return None;
     }
+    // A route's prefix is a dispatch fact the policy kernel evaluates under
+    // `request_bounds::MAX_DISPATCH_FACT_BYTES`; one over it would turn every
+    // request the route serves into an evaluation error, so it is refused here.
+    if value.len() > crate::request_bounds::MAX_DISPATCH_FACT_BYTES {
+        problems.push(format!(
+            "{name} must be at most {} bytes",
+            crate::request_bounds::MAX_DISPATCH_FACT_BYTES
+        ));
+        return None;
+    }
+    Some(value.to_owned())
 }
 
 fn normalize_route_host(
@@ -6075,6 +6147,17 @@ fn validate_upstream_url(name: &str, value: &str, problems: &mut Vec<String>) ->
     let value = value.trim();
     if value.is_empty() {
         problems.push(format!("{name} must be a non-empty http or https URL"));
+        return None;
+    }
+    // The origin derived from this URL is a dispatch fact the policy kernel
+    // evaluates under `request_bounds::MAX_DISPATCH_FACT_BYTES`, and the MCP
+    // resource path derived from the public URL is a policy identity bounded
+    // like a request path; bounding the URL bounds both.
+    if value.len() > crate::request_bounds::MAX_DISPATCH_FACT_BYTES {
+        problems.push(format!(
+            "{name} must be at most {} bytes",
+            crate::request_bounds::MAX_DISPATCH_FACT_BYTES
+        ));
         return None;
     }
 

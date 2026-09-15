@@ -75,6 +75,130 @@ pub struct Principal {
     pub auth_method: AuthMethod,
 }
 
+/// Most role names a principal may carry.
+pub(crate) const MAX_PRINCIPAL_ROLES: usize = 256;
+/// Longest role name, in bytes.
+pub(crate) const MAX_PRINCIPAL_ROLE_BYTES: usize = 256;
+/// Longest subject (`user_id`), in bytes.
+pub(crate) const MAX_PRINCIPAL_SUBJECT_BYTES: usize = 4096;
+/// Longest issuer, in bytes.
+pub(crate) const MAX_PRINCIPAL_ISSUER_BYTES: usize = 4096;
+
+/// Why a principal's identity facts are outside the shape every consumer of a
+/// [`Principal`] is entitled to assume.
+///
+/// Authentication refuses a credential that would produce one of these, so a
+/// principal that reaches authorization, audit or the policy kernel never
+/// carries them. The size bounds exist so policy evaluation has a work limit no
+/// token can defeat; the emptiness rules exist because an empty subject or role
+/// name can never match a rule, so it is only ever noise or an attempt. The
+/// kernel (`policy_eval`) applies the same predicate again, which is what makes
+/// its own rejections unreachable from an authenticated principal rather than
+/// merely believed to be.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum PrincipalShapeError {
+    TooManyRoles,
+    SubjectTooLong,
+    IssuerTooLong,
+    RoleTooLong,
+    EmptySubject,
+    EmptyRole,
+}
+
+impl PrincipalShapeError {
+    /// Whether the fault is size rather than emptiness. The kernel reports the
+    /// two as different errors, and the size checks run first so a principal
+    /// with both problems is consistently reported as oversized.
+    pub(crate) fn is_size(self) -> bool {
+        !matches!(self, Self::EmptySubject | Self::EmptyRole)
+    }
+}
+
+impl std::fmt::Display for PrincipalShapeError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::TooManyRoles => write!(formatter, "more than {MAX_PRINCIPAL_ROLES} roles"),
+            Self::SubjectTooLong => write!(
+                formatter,
+                "subject longer than {MAX_PRINCIPAL_SUBJECT_BYTES} bytes"
+            ),
+            Self::IssuerTooLong => write!(
+                formatter,
+                "issuer longer than {MAX_PRINCIPAL_ISSUER_BYTES} bytes"
+            ),
+            Self::RoleTooLong => write!(
+                formatter,
+                "a role longer than {MAX_PRINCIPAL_ROLE_BYTES} bytes"
+            ),
+            Self::EmptySubject => formatter.write_str("an empty subject"),
+            Self::EmptyRole => formatter.write_str("an empty role"),
+        }
+    }
+}
+
+/// Judges the identity facts a validator is about to put in a [`Principal`].
+///
+/// Callable before the principal exists because the cookie-session validator
+/// caches its verdict, and a rejection is a verdict worth caching: the
+/// introspection response that produced it will produce it again.
+pub(crate) fn check_principal_shape(
+    user_id: &str,
+    issuer: Option<&str>,
+    roles: &[String],
+) -> Result<(), PrincipalShapeError> {
+    // Size before emptiness, deliberately; see `PrincipalShapeError::is_size`.
+    if user_id.len() > MAX_PRINCIPAL_SUBJECT_BYTES {
+        return Err(PrincipalShapeError::SubjectTooLong);
+    }
+    if issuer.is_some_and(|issuer| issuer.len() > MAX_PRINCIPAL_ISSUER_BYTES) {
+        return Err(PrincipalShapeError::IssuerTooLong);
+    }
+    check_roles_size(roles)?;
+    if user_id.is_empty() {
+        return Err(PrincipalShapeError::EmptySubject);
+    }
+    check_roles_emptiness(roles)
+}
+
+/// Judges a role list on its own, for the one place roles are stored before
+/// they become a principal: service-token scopes are authored through the admin
+/// API and become roles at authentication, so the same bound applies when they
+/// are written.
+pub(crate) fn check_roles_shape(roles: &[String]) -> Result<(), PrincipalShapeError> {
+    check_roles_size(roles)?;
+    check_roles_emptiness(roles)
+}
+
+fn check_roles_size(roles: &[String]) -> Result<(), PrincipalShapeError> {
+    if roles.len() > MAX_PRINCIPAL_ROLES {
+        return Err(PrincipalShapeError::TooManyRoles);
+    }
+    if roles
+        .iter()
+        .any(|role| role.len() > MAX_PRINCIPAL_ROLE_BYTES)
+    {
+        return Err(PrincipalShapeError::RoleTooLong);
+    }
+    Ok(())
+}
+
+fn check_roles_emptiness(roles: &[String]) -> Result<(), PrincipalShapeError> {
+    if roles.iter().any(String::is_empty) {
+        return Err(PrincipalShapeError::EmptyRole);
+    }
+    Ok(())
+}
+
+impl Principal {
+    /// Whether this principal is within the bounds [`check_principal_shape`]
+    /// states. Every validator judges the facts before constructing one, so
+    /// this holds for any principal authentication produced; the kernel checks
+    /// it again rather than trusting that.
+    pub(crate) fn check_shape(&self) -> Result<(), PrincipalShapeError> {
+        check_principal_shape(&self.user_id, self.issuer.as_deref(), &self.roles)
+    }
+}
+
 /// Converts a validated principal into an audit actor.
 ///
 /// Audit `auth_mode` values are neutral labels: `session_cookie` for cookie
@@ -160,6 +284,96 @@ mod tests {
         assert_eq!(provider_issuer("workforce"), "provider:workforce");
         assert_eq!(provider_issuer("team/red"), "provider:team%2Fred");
         assert_ne!(provider_issuer("team/red"), provider_issuer("team%2Fred"));
+    }
+
+    #[test]
+    fn principal_shape_accepts_every_bound_exactly_and_refuses_one_past_it() {
+        let roles = |count: usize, len: usize| vec!["r".repeat(len); count];
+        let issuer = "i".repeat(MAX_PRINCIPAL_ISSUER_BYTES);
+
+        let mut principal = test_principal(AuthMethod::Bearer, Vec::new());
+        principal.user_id = "u".repeat(MAX_PRINCIPAL_SUBJECT_BYTES);
+        principal.issuer = Some(issuer.clone());
+        principal.roles = roles(MAX_PRINCIPAL_ROLES, MAX_PRINCIPAL_ROLE_BYTES);
+        assert_eq!(principal.check_shape(), Ok(()));
+
+        for (user_id, issuer, roles, expected) in [
+            (
+                "u".repeat(MAX_PRINCIPAL_SUBJECT_BYTES + 1),
+                None,
+                Vec::new(),
+                PrincipalShapeError::SubjectTooLong,
+            ),
+            (
+                "user".to_owned(),
+                Some(format!("{issuer}i")),
+                Vec::new(),
+                PrincipalShapeError::IssuerTooLong,
+            ),
+            (
+                "user".to_owned(),
+                None,
+                roles(MAX_PRINCIPAL_ROLES + 1, 1),
+                PrincipalShapeError::TooManyRoles,
+            ),
+            (
+                "user".to_owned(),
+                None,
+                roles(1, MAX_PRINCIPAL_ROLE_BYTES + 1),
+                PrincipalShapeError::RoleTooLong,
+            ),
+            (
+                String::new(),
+                None,
+                Vec::new(),
+                PrincipalShapeError::EmptySubject,
+            ),
+            (
+                "user".to_owned(),
+                None,
+                vec!["admin".to_owned(), String::new()],
+                PrincipalShapeError::EmptyRole,
+            ),
+        ] {
+            assert_eq!(
+                check_principal_shape(&user_id, issuer.as_deref(), &roles),
+                Err(expected),
+                "{expected:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn size_is_judged_before_emptiness_so_the_kernel_reports_it_consistently() {
+        // A principal with both an oversized subject and an empty role is
+        // reported as oversized: the kernel maps size to ContextTooLarge and
+        // emptiness to InvalidPrincipal, and this order decides which.
+        let error = check_principal_shape(
+            &"u".repeat(MAX_PRINCIPAL_SUBJECT_BYTES + 1),
+            None,
+            &[String::new()],
+        )
+        .expect_err("out of bounds");
+        assert_eq!(error, PrincipalShapeError::SubjectTooLong);
+        assert!(error.is_size());
+        assert!(!PrincipalShapeError::EmptyRole.is_size());
+        assert!(!PrincipalShapeError::EmptySubject.is_size());
+    }
+
+    #[test]
+    fn roles_shape_is_the_role_half_of_the_principal_predicate() {
+        for roles in [
+            vec!["r".repeat(MAX_PRINCIPAL_ROLE_BYTES); MAX_PRINCIPAL_ROLES],
+            vec!["r".repeat(MAX_PRINCIPAL_ROLE_BYTES + 1)],
+            vec!["r".to_owned(); MAX_PRINCIPAL_ROLES + 1],
+            vec![String::new()],
+            Vec::new(),
+        ] {
+            assert_eq!(
+                check_roles_shape(&roles),
+                check_principal_shape("user", None, &roles)
+            );
+        }
     }
 
     fn test_principal(auth_method: AuthMethod, roles: Vec<&str>) -> Principal {

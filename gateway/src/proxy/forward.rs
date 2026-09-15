@@ -209,8 +209,7 @@ pub(super) async fn forward_request(
     request: Request<Body>,
     source_ip: &str,
 ) -> Response {
-    let path = request.uri().path();
-    let Some(upstream) = proxy.upstream_for_request(path, request.headers()) else {
+    let Some(upstream) = proxy.upstream_for_request(request.uri(), request.headers()) else {
         return StatusCode::NOT_FOUND.into_response();
     };
 

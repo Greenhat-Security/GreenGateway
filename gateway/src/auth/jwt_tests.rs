@@ -1254,6 +1254,91 @@ async fn an_aged_key_set_is_not_trusted_without_a_successful_refresh() {
     );
 }
 
+#[tokio::test]
+async fn claims_at_the_principal_bounds_authenticate_and_one_past_them_do_not() {
+    use crate::auth::principal::{
+        MAX_PRINCIPAL_ROLES, MAX_PRINCIPAL_ROLE_BYTES, MAX_PRINCIPAL_SUBJECT_BYTES,
+    };
+
+    let roles = |count: usize, len: usize| vec!["r".repeat(len); count];
+
+    let mut claims = base_claims();
+    claims["sub"] = json!("u".repeat(MAX_PRINCIPAL_SUBJECT_BYTES));
+    claims["roles"] = json!(roles(MAX_PRINCIPAL_ROLES, MAX_PRINCIPAL_ROLE_BYTES));
+    let principal = principal_for_claims(claims, default_cfg()).await;
+    assert_eq!(principal.user_id.len(), MAX_PRINCIPAL_SUBJECT_BYTES);
+    assert_eq!(principal.roles.len(), MAX_PRINCIPAL_ROLES);
+
+    for (claims, expected) in [
+        (
+            json!({"sub": "u".repeat(MAX_PRINCIPAL_SUBJECT_BYTES + 1)}),
+            "principal claims out of bounds: subject longer than 4096 bytes",
+        ),
+        (
+            json!({"roles": roles(MAX_PRINCIPAL_ROLES + 1, 1)}),
+            "principal claims out of bounds: more than 256 roles",
+        ),
+        (
+            json!({"roles": roles(1, MAX_PRINCIPAL_ROLE_BYTES + 1)}),
+            "principal claims out of bounds: a role longer than 256 bytes",
+        ),
+        (
+            json!({"roles": ["admin", ""]}),
+            "principal claims out of bounds: an empty role",
+        ),
+    ] {
+        let mut token_claims = base_claims();
+        for (name, value) in claims.as_object().expect("object") {
+            token_claims[name] = value.clone();
+        }
+        let validator = validator(
+            default_cfg(),
+            Arc::new(NoopRevocationStore),
+            TEST_PUBLIC_KEY,
+        );
+        let error = validator
+            .validate_session(&SessionCredential::Bearer(signed_token(
+                token_claims,
+                TEST_PRIVATE_KEY,
+            )))
+            .await
+            .expect_err("a credential outside the principal bounds must be rejected");
+        assert_invalid_session(error, expected);
+    }
+}
+
+#[tokio::test]
+async fn an_out_of_bounds_credential_is_refused_before_the_revocation_store_is_consulted() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[derive(Debug)]
+    struct CountingRevocation(AtomicUsize);
+
+    #[async_trait::async_trait]
+    impl RevocationStore for CountingRevocation {
+        async fn is_revoked(&self, _jti: &str) -> Result<bool, AuthError> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Ok(false)
+        }
+    }
+
+    let revocation = Arc::new(CountingRevocation(AtomicUsize::new(0)));
+    let validator = validator(default_cfg(), revocation.clone(), TEST_PUBLIC_KEY);
+    let mut claims = base_claims();
+    claims["roles"] = json!(["admin", ""]);
+
+    let error = validator
+        .validate_session(&SessionCredential::Bearer(signed_token(
+            claims,
+            TEST_PRIVATE_KEY,
+        )))
+        .await
+        .expect_err("an empty role is a malformed credential");
+
+    assert_invalid_session(error, "principal claims out of bounds: an empty role");
+    assert_eq!(revocation.0.load(Ordering::SeqCst), 0);
+}
+
 fn validator(
     cfg: JwtAuthConfig,
     revocation: Arc<dyn RevocationStore>,
@@ -1471,6 +1556,7 @@ fn test_config(jwks_url: Option<&str>) -> Config {
         policy_history_sqlite_path: None,
         cors_allow_origins: Vec::new(),
         max_body_size: 1_048_576,
+        max_request_path_bytes: crate::config::DEFAULT_MAX_REQUEST_PATH_BYTES,
         rate_limit_read_rps: 50.0,
         rate_limit_read_burst: 100,
         rate_limit_write_rps: 10.0,

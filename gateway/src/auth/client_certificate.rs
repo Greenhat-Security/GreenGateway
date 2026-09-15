@@ -58,6 +58,11 @@ pub const CLIENT_CERTIFICATE_PROVIDER: &str = "client-certificate";
 /// for every real workload identity and short enough to be a log line.
 pub const MAX_IDENTITY_BYTES: usize = 255;
 
+// A certificate identity becomes a principal subject unchanged, so it must fit
+// the subject bound every principal is held to. The validator relies on this
+// rather than re-judging a value it did not shape.
+const _: () = assert!(MAX_IDENTITY_BYTES <= crate::auth::principal::MAX_PRINCIPAL_SUBJECT_BYTES);
+
 /// Which certificate field carries the caller's identity.
 ///
 /// **Why not the subject DN.** A DN is not a string; it is a sequence of
@@ -434,7 +439,7 @@ impl SessionValidator for ClientCertificateValidator {
             ));
         };
 
-        Ok(Principal {
+        let principal = Principal {
             user_id: identity.identity().to_owned(),
             issuer: Some(provider_issuer(CLIENT_CERTIFICATE_PROVIDER)),
             email: None,
@@ -446,7 +451,18 @@ impl SessionValidator for ClientCertificateValidator {
             roles: Vec::new(),
             session_id: identity.fingerprint().to_owned(),
             auth_method: AuthMethod::ClientCertificate,
-        })
+        };
+        // Holds by construction today (the identity bound sits under the
+        // subject bound, roles are empty, the issuer is a constant), and is
+        // judged all the same so that every validator answers to the one
+        // predicate rather than this one being the exception a later change
+        // forgets.
+        principal.check_shape().map_err(|problem| {
+            AuthError::InvalidSession(format!(
+                "client certificate identity out of bounds: {problem}"
+            ))
+        })?;
+        Ok(principal)
     }
 
     // `validate_session_for_resource` is deliberately not overridden. The

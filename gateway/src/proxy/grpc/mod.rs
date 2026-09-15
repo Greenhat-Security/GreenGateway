@@ -295,7 +295,7 @@ async fn attempt_call(
     // ---------------------------------------------------------------
     // 2. Route match. Local: a table lookup over configured prefixes and hosts.
     // ---------------------------------------------------------------
-    let Some(upstream) = proxy.upstream_for_request(path, &parts.headers) else {
+    let Some(upstream) = proxy.upstream_for_request(&parts.uri, &parts.headers) else {
         return Err(Denial::denied(GrpcStatus::Unimplemented, "no_route"));
     };
     // A route without gRPC policy has no limits to enforce, so it is refused
