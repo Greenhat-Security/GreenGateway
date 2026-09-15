@@ -5256,6 +5256,7 @@ mod tests {
             policy_history_sqlite_path: None,
             cors_allow_origins: Vec::new(),
             max_body_size: 1_048_576,
+            max_request_path_bytes: crate::config::DEFAULT_MAX_REQUEST_PATH_BYTES,
             rate_limit_read_rps: 50.0,
             rate_limit_read_burst: 100,
             rate_limit_write_rps: 10.0,

@@ -783,7 +783,7 @@ pub(super) async fn proxy_dispatch_context_middleware(
     let path = request.uri().path();
     let observation_context = if !state.routes.is_gateway_owned_path(path) {
         state.classifier.as_ref().and_then(|classifier| {
-            classifier.observation_context_for_request(path, request.headers())
+            classifier.observation_context_for_request(request.uri(), request.headers())
         })
     } else {
         None

@@ -364,7 +364,7 @@ pub async fn observation_middleware(
     let start = Instant::now();
     let method = req.method().to_string();
     let path = req.uri().path().to_owned();
-    let request_host = request_host_without_port(req.headers());
+    let request_host = request_host_without_port(req.uri(), req.headers());
     let request_id = request_id(req.headers(), req.extensions());
     let source_ip = canonical_client_ip(req.headers(), req.extensions(), &state.client_ip_policy);
     let query = req.uri().query().map(str::to_owned);

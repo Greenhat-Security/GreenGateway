@@ -1175,7 +1175,7 @@ pub async fn rbac_middleware(State(state): State<RbacState>, req: Request, next:
     let mut context = audit_context(&req, &state.client_ip_policy);
     let principal = req.extensions().get::<auth::Principal>().cloned();
     let policy_path = state.policy_path_for_request(path);
-    let request_host = upstream_route::request_host_without_port(req.headers());
+    let request_host = upstream_route::request_host_without_port(req.uri(), req.headers());
     let required_upstream_host = proxy_context.as_ref().map(|context| context.host.as_str());
     let dispatch_context = if req
         .extensions()
