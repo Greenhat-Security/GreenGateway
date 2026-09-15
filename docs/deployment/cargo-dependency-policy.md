@@ -35,7 +35,7 @@ Three existing requirements are permitted only at their reviewed versions:
 | Dependency | License | Reason and distribution obligation |
 | --- | --- | --- |
 | notify 8.2.0 | CC0-1.0 | Existing file watcher; retain the supplied text. This does not approve new CC0 code dependencies or assert a patent grant. |
-| webpki-root-certs 1.0.8 | CDLA-Permissive-2.0 | Existing certificate-root data; preserve the data license when sharing the roots. |
+| webpki-root-certs 1.0.9 | CDLA-Permissive-2.0 | Existing certificate-root data; preserve the data license when sharing the roots. |
 | winx 0.36.4 | Apache-2.0 WITH LLVM-exception | Existing Windows filesystem binding; preserve the Apache license and its exception. |
 
 Keep third-party license texts, attribution, copyright notices and any applicable

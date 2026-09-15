@@ -34,9 +34,19 @@ test('both current inventories pass, including CRLF npmrc checkouts', (t) => {
 
 // Each project's own lock names the denied package the mutations below target:
 // the root still locks esbuild, while admin-ui locks only fsevents since Vite 8.
+// Resolved from the lock rather than named here so a dependency change cannot
+// leave these tests pointing at a package that is gone -- but a lock with no
+// script-bearing package at all would silently mutate `undefined` and assert
+// nothing, so that is an error rather than a skipped case.
 function deniedPackage(project) {
   const lock = JSON.parse(readFileSync(join(ROOT, project, 'package-lock.json'), 'utf8'));
-  return Object.keys(lock.packages).find((path) => path && lock.packages[path].hasInstallScript);
+  const denied = Object.keys(lock.packages).find(
+    (path) => path && lock.packages[path].hasInstallScript,
+  );
+  if (!denied) {
+    throw new Error(`${project}: lockfile has no lifecycle-script package to exercise`);
+  }
+  return denied;
 }
 
 for (const project of ['.', 'admin-ui']) {
