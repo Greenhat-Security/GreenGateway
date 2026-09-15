@@ -16,7 +16,7 @@
           "axum@0.8.9",
           "gateway@1.0.1",
           "hyper-util@0.1.20",
-          "jsonwebtoken@10.4.0",
+          "jsonwebtoken@11.0.0",
           "metrics-exporter-prometheus@0.18.3",
           "pem@3.0.6",
           "postgres-protocol@0.6.12",
@@ -167,7 +167,7 @@
       "remediation": "Re-evaluate when the listed parent dependencies update; remove the exception once their version requirements converge.",
       "parents": {
         "0.2.17": [
-          "jsonwebtoken@10.4.0",
+          "jsonwebtoken@11.0.0",
           "rand_core@0.6.4",
           "ring@0.17.14"
         ],

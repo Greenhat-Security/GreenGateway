@@ -1091,7 +1091,7 @@
           "hyper@1.11.1|registry+https://github.com/rust-lang/crates.io-index",
           "ipnet@2.12.2|registry+https://github.com/rust-lang/crates.io-index",
           "jsonschema@0.46.10|registry+https://github.com/rust-lang/crates.io-index",
-          "jsonwebtoken@10.4.0|registry+https://github.com/rust-lang/crates.io-index",
+          "jsonwebtoken@11.0.0|registry+https://github.com/rust-lang/crates.io-index",
           "metrics-exporter-prometheus@0.18.3|registry+https://github.com/rust-lang/crates.io-index",
           "metrics@0.24.6|registry+https://github.com/rust-lang/crates.io-index",
           "mime_guess@2.0.5|registry+https://github.com/rust-lang/crates.io-index",
@@ -1750,14 +1750,11 @@
         ]
       },
       {
-        "package": "jsonwebtoken@10.4.0|registry+https://github.com/rust-lang/crates.io-index",
-        "checksum": "eba32bfb4ffdeaca3e34431072faf01745c9b26d25504aa7a6cf5684334fc4fc",
+        "package": "jsonwebtoken@11.0.0|registry+https://github.com/rust-lang/crates.io-index",
+        "checksum": "881733cbc631fc9e472e24447ce32a64bedf2da498d6d8570b08edc87de71f65",
         "features": [
-          "aws-lc-rs",
           "aws_lc_rs",
           "default",
-          "pem",
-          "simple_asn1",
           "use_pem"
         ],
         "dependencies": [
@@ -5028,7 +5025,7 @@
             "rename": null,
             "kind": null,
             "target": null,
-            "req": "^10.3.0",
+            "req": "^11.0.0",
             "optional": false,
             "uses_default_features": true,
             "features": [
