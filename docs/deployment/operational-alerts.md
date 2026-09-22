@@ -146,7 +146,7 @@ condition may have been masked by the earlier one.
 | --- | --- |
 | `starting` / `draining` | Lifecycle phase; follow [Lifecycle](#lifecycle-stalls). |
 | `config_fingerprint_mismatch` | Cluster static configuration has not agreed; follow the [rollout procedure](failover.md#gateway-replica-failure). |
-| `storage_unavailable` | Cluster authority unavailable or read-only; restore one writable primary, following [failover](failover.md#database-primary-failure). |
+| `storage_unavailable` | Authority access failed or this replica's session is read-only. First distinguish replica-local pool, connectivity, grant or query failures using [Database capacity](#database-capacity); use [failover](failover.md#database-primary-failure) only after confirming primary loss or a read-only primary. |
 | `schema_incompatible` | Ledger integrity or binary/schema contract failed; follow [Cluster authority](#cluster-authority). |
 | `instance_lease_invalid` | Heartbeat age reached `CLUSTER_MEMBER_STALE_MS`; check authority access and membership. |
 | `security_revision_not_compiled` | Security admissions have been failing continuously beyond the reconcile grace; inspect current authority and reconciliation errors. Lag gauges alone cannot diagnose this. |
@@ -184,8 +184,10 @@ The platform on-call restores sink availability and capacity; the security/audit
 owner assesses any missing record window. Record the affected replica IDs,
 timestamps and fixed failure classifications in restricted incident evidence.
 Inspect sink errors and the configured storage path/primary, free space, locks
-and latency. Queue pressure can be transient, but growing oldest age means
-delivery is not progressing even when depth is small. For PostgreSQL, use
+and latency. Growing oldest age indicates increasing delivery delay even when
+depth is small; successful deliveries may continue while the sink falls behind.
+Correlate successful-flush and failure/drop counters with sink logs to distinguish
+slow progress from a stall. For PostgreSQL, use
 [pool sizing](pool-sizing.md) and [failover](failover.md); for restoration, use
 the [audit continuity checks](backup-and-recovery.md).
 
@@ -198,10 +200,12 @@ annotations and shared incident summaries.
 
 ### Database capacity
 
-The platform/database on-call checks the replica's `/readyz` reason and
-`gateway cluster-members`, then the primary's connection count and slow/blocked
-queries. Follow [pool sizing](pool-sizing.md) before raising connection limits
-or timeouts. Restore a single writable authority using [failover](failover.md);
+The platform/database on-call compares the affected replica's `/readyz` reason
+with its peers and checks `gateway cluster-members`, then the primary's connection
+count and slow/blocked queries. Check replica-local pool pressure, connectivity,
+grants and query failures; follow [pool sizing](pool-sizing.md) before raising
+connection limits or timeouts. Restore a single writable authority using
+[failover](failover.md) only after confirming primary loss or a read-only primary;
 never direct security reads to a lagging replica.
 
 ### Cluster authority
