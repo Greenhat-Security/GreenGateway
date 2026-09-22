@@ -72,4 +72,6 @@ are exercised by the dedicated PostgreSQL CI jobs.
 [Deterministic pure-parser properties](pure-parser-properties.md) complement
 these execution floors with generated assertions for address classification,
 host parsing and literal path boundaries. They preserve the existing floors and
-run in the normal workspace test gate.
+run in the normal workspace test gate. The [bounded security corpus](security-corpus.md)
+adds a mandatory promotion dependency with committed seeds, resource limits,
+redacted results and trusted scheduled exploration; it does not lower these floors.

@@ -21,6 +21,41 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  security-corpus:
+    name: security-corpus
+    # Required on every PR, main push and version tag. The runner builds the
+    # actual gateway test binary once before applying its smaller corpus budget.
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Set up pinned build tools
+        uses: ./.github/actions/build-tools
+        with:
+          rust: ci
+          node: 'true'
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      - name: Install workflow test parser
+        run: python -m pip install PyYAML==6.0.3
+      - name: Test bounded corpus runner
+        run: python scripts/test_security_corpus.py
+      - name: Verify corpus workflow contracts
+        run: python scripts/test_security_corpus_workflows.py
+      - name: Run committed corpus and fixed mutations
+        run: python scripts/security_corpus.py --mode regression --report target/security-corpus/report.json
+      - name: Preserve redacted corpus decision
+        if: ${{ always() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: security-corpus
+          path: target/security-corpus/report.json
+          if-no-files-found: error
+          retention-days: 14
+
   security-coverage:
     name: security-coverage
     # Match the pinned compiler/platform used to establish these branch floors.
@@ -1050,6 +1085,7 @@ jobs:
     # when a new check is added without also adding it to this list.
     needs:
       - production-compiler
+      - security-corpus
       - security-coverage
       - supply-chain
       - operational-alerts

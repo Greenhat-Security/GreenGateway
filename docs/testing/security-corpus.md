@@ -49,6 +49,7 @@ dependencies; no build-time network work occurs for each corpus input.
 
 ```sh
 python scripts/test_security_corpus.py
+python scripts/test_security_corpus_workflows.py
 python scripts/security_corpus.py --mode regression --report target/security-corpus/report.json
 python scripts/security_corpus.py --mode exploration --report target/security-corpus/exploration.json
 ```
@@ -87,7 +88,7 @@ CI uses the ordinary build-and-discover path.
 Linux/POSIX resource limits are required. Unsupported platforms fail rather
 than silently dropping limits.
 
-| Budget | Regression | Exploration |
+| Budget | PR regression | Scheduled/manual exploration |
 | --- | ---: | ---: |
 | Mutations per seed | 8 | 512 |
 | Worker CPU soft/hard limits | 20/21 seconds | 120/121 seconds |
@@ -96,6 +97,7 @@ than silently dropping limits.
 | Each child output/receipt file (`RLIMIT_FSIZE`) | 64 KiB | 64 KiB |
 | Core dump size | 0 | 0 |
 | Separate compile timeout | 3,600 seconds | 3,600 seconds |
+| CI job timeout including setup/build | 90 minutes | 90 minutes |
 
 Worker limits apply separately to filtered discovery and corpus execution,
 not to the entire compiler or controller. Tool-version and Git subprocesses
@@ -108,7 +110,7 @@ Limits also bound the corpus to 64 files, 16,384 bytes per file, 262,144 total
 seed bytes and 100,000 cases. Rust independently enforces input/case bounds
 and a 2 MiB job-document limit. Mutations remain within 16,384 bytes. Explicit
 CLI overrides are capped at 3,600 CPU/wall seconds, 8,192 MiB address space and
-7,200 compile seconds.
+7,200 compile seconds. CI keeps the default budgets.
 
 Reports are at most 64 KiB. They record source/lockfile/tool hashes, exact
 Rust/Cargo versions and runtime pins, executable hash/origin, corpus/manifest
@@ -118,17 +120,21 @@ JWTs, keys, panic text or child stdout/stderr are published. Temporary job files
 are private and removed after execution; core dumps are disabled. Report
 overflow itself causes a failed report and nonzero exit.
 
-## Planned CI integration
+## CI and promotion
 
-The next #435 slice adds mandatory regression and trusted scheduled/manual
-exploration jobs, workflow contract tests, and a corpus promotion dependency.
-The regression/exploration budgets above are the controller's current mode
-defaults. No corpus workflow or automatic report upload is present in this
-slice.
+The mandatory `security-corpus` job in `ci.yml` runs on every existing PR, main
+push and version-tag trigger. It tests the runner/workflow contracts and runs
+regression mode. `promote-image` requires it under the existing strict
+success/no-skipped-needs condition. The ordinary `test` job runs fixed ChaCha
+property seeds: egress `435001`, host/route `435002`, and path `435003`, each
+with 128 cases. Existing coverage thresholds remain unchanged.
 
-The ordinary `test` job already runs fixed ChaCha property seeds: egress
-`435001`, host/route `435002`, and path `435003`, each with 128 cases. Existing
-coverage thresholds and promotion dependencies remain unchanged.
+`security-corpus.yml` adds exploration at 04:23 UTC and by manual dispatch.
+Only the upstream repository's default branch can execute it, including manual
+runs. Permissions are read-only, actions are SHA-pinned, and no PR-target
+trigger or untrusted shell input is used. Both jobs upload only the redacted
+report, even on failure, retain it for 14 days and reject a missing artifact.
+Raw crash corpora are never uploaded.
 
 ## Triage, minimization and ownership
 

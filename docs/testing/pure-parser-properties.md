@@ -140,16 +140,16 @@ python scripts/cargo_policy.py check
 The first Cargo build still runs the reviewed npm installer and builds the
 embedded UI. The pure test bodies do no external I/O per input; this is not a
 claim that a fresh repository build requires no downloads. Coverage thresholds,
-transport ownership, existing test selectors and promotion dependencies remain
-unchanged.
+transport ownership and existing test selectors remain unchanged; existing
+promotion gates remain mandatory.
 
 ## Remaining #435 work
 
 The [bounded corpus harness](security-corpus.md) now adds synthetic
 JWT/policy/host/path seeds, explicit process time/memory budgets, nonempty-corpus
-checks and retained seed/corpus identity. The next slices add trusted
-scheduled/manual exploration and its mandatory regression promotion dependency,
-then generated properties for the already-available shared evaluator.
+checks and retained seed/corpus identity. Trusted scheduled/manual exploration
+and a mandatory regression promotion dependency now run in CI. The final slice
+adds generated properties for the already-available shared evaluator.
 These checks do not establish exhaustive parser safety or perform external
 target testing.
 
