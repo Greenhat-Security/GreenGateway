@@ -1449,6 +1449,25 @@ const RETAINED_OLD_EVENTS: usize = 60;
 const RETAINED_NEW_EVENTS: usize = 5;
 const EVENTS_STREAM_PATH: &str = "/v1/admin/events/stream";
 
+fn retention_preserves_positions(counter: i64, live_max: Option<i64>, old_head: i64) -> bool {
+    counter >= old_head && live_max.is_none_or(|position| counter == position)
+}
+
+#[test]
+fn retention_counter_can_outlive_every_retained_row_without_accepting_a_reset() {
+    // The observed CI failure: retention removed all 68 positions before any
+    // incidental replica audit event arrived. The durable counter survived.
+    assert!(retention_preserves_positions(68, None, 68));
+    assert!(retention_preserves_positions(70, Some(70), 68));
+
+    // Removing the live rows must not excuse a reset, and a nonempty window
+    // must still agree with the counter in either direction.
+    assert!(!retention_preserves_positions(0, None, 68));
+    assert!(!retention_preserves_positions(67, Some(67), 68));
+    assert!(!retention_preserves_positions(69, Some(68), 68));
+    assert!(!retention_preserves_positions(68, Some(69), 68));
+}
+
 /// A plain policy that grants [`ADMIN_ROLE`] everything, for the tests
 /// whose subject is not the rate limiter.
 fn plain_admin_policy() -> String {
@@ -1611,21 +1630,22 @@ async fn retention_bounds_the_replay_window_without_renumbering_or_hiding_a_gap(
 
     // The counter is not a `max(position)` read: it survived the delete.
     // It is read beside the live maximum in one statement, because the
-    // replicas keep appending: the two must agree, and neither may have
-    // fallen below the marker.
+    // replicas may keep appending. A nonempty stream must agree with its
+    // counter, but retention may have removed every row before the next
+    // append. The durable counter must preserve its floor in either case.
     let row = cluster
         .database
         .query_one(
             "SELECT last_position::bigint, \
-                    (SELECT coalesce(max(position), 0)::bigint FROM greengateway.audit_stream) \
+                    (SELECT max(position)::bigint FROM greengateway.audit_stream) \
              FROM greengateway.audit_stream_state WHERE singleton",
         )
         .await;
-    let (counter, live_max) = (row.get::<_, i64>(0), row.get::<_, i64>(1));
+    let (counter, live_max) = (row.get::<_, i64>(0), row.get::<_, Option<i64>>(1));
     assert!(
-        counter >= old_head && counter == live_max,
+        retention_preserves_positions(counter, live_max, old_head),
         "retention must not move the position counter, which it does not own; a counter at \
-         {counter} against a live maximum of {live_max} and a pre-retention head of \
+         {counter} against a live maximum of {live_max:?} and a pre-retention head of \
          {old_head} would renumber every durable cursor in the fleet"
     );
 
