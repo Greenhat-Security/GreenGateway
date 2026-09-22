@@ -83,7 +83,11 @@ impl ToolEvaluationContext {
             return Err(EvaluationError::InconsistentContext);
         }
         if let Some(path) = &self.path {
-            validate_path(path)?;
+            if self.operation == ToolOperation::RenderedHttp {
+                validate_rendered_http_path(path)?;
+            } else {
+                validate_path(path)?;
+            }
         }
         if let PrincipalFact::Authenticated(identity) = &self.principal {
             if let Err(problem) = identity.0.check_shape() {
@@ -142,6 +146,41 @@ impl ToolEvaluationContext {
             ),
         })
     }
+}
+
+/// Rendered paths may contain percent-encoded template arguments. The live
+/// executor authorizes those exact bytes after segment encoding, so this lane
+/// accepts valid escapes while retaining the same structural path guards.
+/// Inbound request paths continue to use `validate_path`, which rejects `%`.
+fn validate_rendered_http_path(path: &str) -> Result<(), EvaluationError> {
+    if path.len() > super::MAX_REQUEST_PATH_BYTES {
+        return Err(EvaluationError::ContextTooLarge);
+    }
+    let bytes = path.as_bytes();
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'%' {
+            let valid_hex = |byte: u8| byte.is_ascii_hexdigit();
+            if index + 2 >= bytes.len()
+                || !valid_hex(bytes[index + 1])
+                || !valid_hex(bytes[index + 2])
+            {
+                return Err(EvaluationError::MalformedPath);
+            }
+            index += 3;
+        } else {
+            index += 1;
+        }
+    }
+    if !path.starts_with('/')
+        || path.contains(['?', '#', '\\'])
+        || bytes.iter().any(|byte| *byte <= b' ' || *byte == 127)
+        || path.contains("//")
+        || path.split('/').any(|segment| segment == "." || segment == "..")
+    {
+        return Err(EvaluationError::MalformedPath);
+    }
+    Ok(())
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]

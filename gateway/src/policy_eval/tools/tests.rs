@@ -254,7 +254,12 @@ async fn rendered_http_matches_live_direct_rules_unknown_dispatch_and_audit_attr
             let compiled = installed.compiled();
             let mut expected = Vec::new();
             for identity in [None, Some(principal())] {
-                for path in ["/reports/42", "/reports/42/child", "/elsewhere"] {
+                for path in [
+                    "/reports/42",
+                    "/reports/private%2Frecord",
+                    "/reports/42/child",
+                    "/elsewhere",
+                ] {
                     for method in [Method::GET, Method::POST] {
                         let context = ToolInvocationContext {
                             request_id: format!("{path}-{method}-{}", identity.is_some()),
@@ -286,6 +291,28 @@ async fn rendered_http_matches_live_direct_rules_unknown_dispatch_and_audit_attr
             }
             assert_audit(audit, capture, expected).await;
         }
+    }
+}
+
+#[test]
+fn rendered_http_accepts_valid_segment_escapes_and_rejects_malformed_escapes() {
+    let compiled = compile(json!({
+        "schema_version":"0.1.0", "default_action":"deny",
+        "tools":{"reports.export":{}},
+        "rules":[{"path":"/reports/{id}","methods":["GET"],"action":"deny"}]
+    }));
+    let mut context = input(&compiled, ToolOperation::RenderedHttp, Some(&principal()));
+    context.path = Some("/reports/private%2Frecord".into());
+    let answer = compiled.evaluate_tool(&context).unwrap();
+    assert_eq!(answer.effect(), PolicyEffect::Block);
+    assert_eq!(answer.reason(), ToolReason::MatchedRule);
+
+    for path in ["/reports/private%2", "/reports/private%GG"] {
+        context.path = Some(path.into());
+        assert!(matches!(
+            compiled.evaluate_tool(&context),
+            Err(EvaluationError::MalformedPath)
+        ));
     }
 }
 
