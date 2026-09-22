@@ -21,6 +21,95 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  microbench:
+    name: microbench
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Set up pinned build tools
+        uses: ./.github/actions/build-tools
+        with:
+          rust: ci
+          node: 'false'
+      - run: python -m pip install PyYAML==6.0.3
+      - name: Resolve immutable comparison commits
+        id: revisions
+        shell: bash
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          EVENT_HEAD_SHA: ${{ github.sha }}
+          EVENT_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+          import re
+          import subprocess
+
+          def commit(value):
+              if not re.fullmatch(r"[0-9a-f]{40}", value):
+                  raise ValueError("comparison requires a full commit SHA")
+              resolved = subprocess.check_output(
+                  ["git", "rev-parse", "--verify", value + "^{commit}"], text=True
+              ).strip()
+              if resolved != value:
+                  raise ValueError("comparison SHA did not resolve to itself")
+              return value
+
+          head = commit(os.environ["EVENT_HEAD_SHA"])
+          checkout = subprocess.check_output(
+              ["git", "rev-parse", "--verify", "HEAD"], text=True
+          ).strip()
+          if checkout != head:
+              raise ValueError("checkout does not match the event commit")
+          event = os.environ["EVENT_NAME"]
+          if event == "pull_request":
+              base = commit(os.environ["EVENT_BASE_SHA"])
+              head_kind = "pull_request_merge"
+          elif event == "push":
+              base = commit(subprocess.check_output(
+                  ["git", "rev-parse", "--verify", head + "^"], text=True
+              ).strip())
+              head_kind = "push_commit"
+          else:
+              raise ValueError("unsupported microbenchmark event")
+          output = Path("target/microbench")
+          output.mkdir(parents=True, exist_ok=True)
+          (output / "workflow.json").write_text(json.dumps({
+              "schema_version": 1, "event_name": event,
+              "base_sha": base, "head_sha": head, "head_kind": head_kind,
+          }, indent=2) + "\n", encoding="utf-8")
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as stream:
+              stream.write(f"base={base}\nhead={head}\n")
+          PY
+      - name: Exercise comparison and workflow rejection fixtures
+        run: python -m unittest discover -s scripts -p 'test_microbench*.py' -v
+      - name: Check standalone benchmark formatting
+        run: rustfmt --edition 2021 --check scripts/benchmarks/pure_paths.rs
+      - name: Compare pure-path allocation budgets
+        id: benchmark
+        env:
+          BASE_SHA: ${{ steps.revisions.outputs.base }}
+          HEAD_SHA: ${{ steps.revisions.outputs.head }}
+        run: python scripts/microbench.py run --base "$BASE_SHA" --head "$HEAD_SHA" --output target/microbench
+      - name: Preserve base, head and comparison evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: microbench-${{ github.sha }}
+          path: target/microbench/
+          if-no-files-found: error
+          retention-days: 30
+
   security-corpus:
     name: security-corpus
     # Required on every PR, main push and version tag. The runner builds the
@@ -1084,6 +1173,7 @@ jobs:
     # Every validation job is a dependency. The structural test above fails
     # when a new check is added without also adding it to this list.
     needs:
+      - microbench
       - production-compiler
       - security-corpus
       - security-coverage
