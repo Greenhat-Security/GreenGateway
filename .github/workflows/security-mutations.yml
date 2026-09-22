@@ -1,0 +1,57 @@
+name: security-mutations
+
+on:
+  schedule:
+    - cron: "41 4 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: security-mutations-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  security-mutations:
+    name: security-mutations
+    if: >-
+      github.repository == 'Greenhat-Security/GreenGateway' &&
+      github.ref == format('refs/heads/{0}', github.event.repository.default_branch) &&
+      (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch')
+    runs-on: ubuntu-latest
+    # The controller bounds the complete campaign to two hours. Leave time
+    # for the pinned tool setup and the bounded report upload on failure.
+    timeout-minutes: 150
+    env:
+      CARGO_BUILD_JOBS: '1'
+      CARGO_TERM_COLOR: never
+    steps:
+      - name: Checkout the trusted event revision
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Set up pinned build tools
+        uses: ./.github/actions/build-tools
+        with:
+          rust: ci
+          node: 'true'
+      - name: Install the pinned workflow parser
+        run: python -m pip install PyYAML==6.0.3
+      - name: Check controller failure handling
+        run: python scripts/test_security_mutations.py
+      - name: Check the workflow trust boundary
+        run: python scripts/test_security_mutations_workflows.py
+      - name: Measure the reviewed mutation scope
+        # Versioned controller defaults include per-build and per-test
+        # CPU/wall limits plus the complete campaign wall limit.
+        run: python scripts/security_mutations.py --report target/security-mutations/report.json
+      - name: Preserve bounded mutation evidence
+        if: ${{ always() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: security-mutations
+          path: target/security-mutations/report.json
+          if-no-files-found: error
+          retention-days: 14
