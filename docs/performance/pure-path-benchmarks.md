@@ -14,6 +14,14 @@ standard library; it does not build the gateway, install Cargo dependencies,
 contact upstreams or run the admin UI build. Source extraction rejects an
 unrecognized layout instead of silently substituting an implementation.
 
+The transport guard registers the standalone harness as an exact, hash-reviewed
+nonproduction syntax root in `transport-ownership.json`. It still parses the file;
+otherwise-unowned Rust files fail, and importing this root into production causes a
+mixed-ownership failure. When the harness changes, generate its review record with
+`python scripts/transport_guard.py inventory --standalone-benchmark scripts/benchmarks/pure_paths.rs`
+and review the candidate hash, owner and purpose alongside the benchmark policy.
+This registration does not exempt directories or change production transport rules.
+
 Both sides use the exact CI compiler declared by the head revision. The report
 records each revision's declared pin as well as the compiler actually used.
 This permits a reviewed compiler-update PR to compare both source trees under
