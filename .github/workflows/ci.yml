@@ -88,6 +88,32 @@ jobs:
         with:
           fail-on-severity: moderate
 
+  operational-alerts:
+    name: operational-alerts
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: ./.github/actions/build-tools
+        with:
+          rust: none
+          node: 'false'
+      - run: python -m pip install PyYAML==6.0.3
+      - name: Install checksum-verified rule validator
+        run: python scripts/alert_rules.py install
+      - name: Exercise validator rejection fixtures
+        run: python -m unittest discover -s scripts -p test_alert_rules.py -v
+      - name: Validate alert rules and firing/recovery fixtures
+        run: python scripts/alert_rules.py check
+      - name: Preserve alert validation evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: operational-alerts
+          path: target/alert-rules/
+          if-no-files-found: error
+          retention-days: 30
+
   cargo-policy:
     name: cargo-policy (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
@@ -1026,6 +1052,7 @@ jobs:
       - production-compiler
       - security-coverage
       - supply-chain
+      - operational-alerts
       - cargo-policy
       - egress-only
       - fmt

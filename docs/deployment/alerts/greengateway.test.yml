@@ -1,0 +1,1262 @@
+# Synthetic contract tests: no live services or credentials.
+# Each alert has firing, hold-time and healthy/recovery assertions.
+# Anchors share fixture data only; every scenario has explicit alert expectations.
+rule_files:
+  - greengateway.rules.yml
+evaluation_interval: 30s
+tests:
+
+  # Startup ends at 2m; drain begins at 8m. Neither transition reaches its 10m hold at the checked times.
+  - name: 'ordinary standalone startup and drain; lazy counters and cluster metrics absent'
+    interval: 30s
+    input_series:
+      - &series_up_gateway_1_standalone
+        series: 'up{job="greengateway",instance="gateway-1",deployment_mode="standalone"}'
+        values: '1+0x40'
+      - &series_expected_gateway_1_standalone
+        series: 'greengateway_monitoring:target_expected{job="greengateway",instance="gateway-1",deployment_mode="standalone"}'
+        values: '1+0x40'
+      - series: 'greengateway_gateway_ready{job="greengateway",instance="gateway-1",deployment_mode="standalone"}'
+        values: '0+0x3 1+0x11 0+0x25'
+      - series: 'greengateway_gateway_draining{job="greengateway",instance="gateway-1",deployment_mode="standalone"}'
+        values: '0+0x15 1+0x24'
+      - &series_depth_gateway_1_standalone
+        series: 'greengateway_audit_queue_depth{job="greengateway",instance="gateway-1",deployment_mode="standalone"}'
+        values: '0+0x40'
+      - &series_capacity_gateway_1_standalone
+        series: 'greengateway_audit_queue_capacity{job="greengateway",instance="gateway-1",deployment_mode="standalone"}'
+        values: '100+0x40'
+      - &series_oldest_gateway_1_standalone
+        series: 'greengateway_audit_queue_oldest_age_seconds{job="greengateway",instance="gateway-1",deployment_mode="standalone"}'
+        values: '0+0x40'
+    alert_rule_test:
+      - {eval_time: 1m30s, alertname: GreenGatewayMetricsTargetDown, exp_alerts: []}
+      - {eval_time: 1m30s, alertname: GreenGatewayMetricsJobMissing, exp_alerts: []}
+      - {eval_time: 1m30s, alertname: GreenGatewayExpectedTargetsMissing, exp_alerts: []}
+      - {eval_time: 1m30s, alertname: GreenGatewayMonitoringConfigurationInvalid, exp_alerts: []}
+      - {eval_time: 1m30s, alertname: GreenGatewayMetricsMissing, exp_alerts: []}
+      - {eval_time: 1m30s, alertname: GreenGatewayStartupStalled, exp_alerts: []}
+      - {eval_time: 1m30s, alertname: GreenGatewayDrainStalled, exp_alerts: []}
+      - {eval_time: 1m30s, alertname: GreenGatewayAuditLoss, exp_alerts: []}
+      - {eval_time: 1m30s, alertname: GreenGatewayAuditBacklog, exp_alerts: []}
+      - {eval_time: 1m30s, alertname: GreenGatewayAuditFlushFailures, exp_alerts: []}
+      - {eval_time: 1m30s, alertname: GreenGatewayDatabasePoolSaturated, exp_alerts: []}
+      - {eval_time: 1m30s, alertname: GreenGatewayDatabasePoolTimeouts, exp_alerts: []}
+      - {eval_time: 1m30s, alertname: GreenGatewaySchemaIncompatible, exp_alerts: []}
+      - {eval_time: 1m30s, alertname: GreenGatewayClusterHeartbeatStale, exp_alerts: []}
+      - {eval_time: 1m30s, alertname: GreenGatewaySecurityRevisionLag, exp_alerts: []}
+      - {eval_time: 1m30s, alertname: GreenGatewayClusterConfigMismatch, exp_alerts: []}
+      - {eval_time: 1m30s, alertname: GreenGatewayClusterMetricsMissing, exp_alerts: []}
+      - {eval_time: 12m, alertname: GreenGatewayMetricsTargetDown, exp_alerts: []}
+      - {eval_time: 12m, alertname: GreenGatewayMetricsJobMissing, exp_alerts: []}
+      - {eval_time: 12m, alertname: GreenGatewayExpectedTargetsMissing, exp_alerts: []}
+      - {eval_time: 12m, alertname: GreenGatewayMonitoringConfigurationInvalid, exp_alerts: []}
+      - {eval_time: 12m, alertname: GreenGatewayMetricsMissing, exp_alerts: []}
+      - {eval_time: 12m, alertname: GreenGatewayStartupStalled, exp_alerts: []}
+      - {eval_time: 12m, alertname: GreenGatewayDrainStalled, exp_alerts: []}
+      - {eval_time: 12m, alertname: GreenGatewayAuditLoss, exp_alerts: []}
+      - {eval_time: 12m, alertname: GreenGatewayAuditBacklog, exp_alerts: []}
+      - {eval_time: 12m, alertname: GreenGatewayAuditFlushFailures, exp_alerts: []}
+      - {eval_time: 12m, alertname: GreenGatewayDatabasePoolSaturated, exp_alerts: []}
+      - {eval_time: 12m, alertname: GreenGatewayDatabasePoolTimeouts, exp_alerts: []}
+      - {eval_time: 12m, alertname: GreenGatewaySchemaIncompatible, exp_alerts: []}
+      - {eval_time: 12m, alertname: GreenGatewayClusterHeartbeatStale, exp_alerts: []}
+      - {eval_time: 12m, alertname: GreenGatewaySecurityRevisionLag, exp_alerts: []}
+      - {eval_time: 12m, alertname: GreenGatewayClusterConfigMismatch, exp_alerts: []}
+      - {eval_time: 12m, alertname: GreenGatewayClusterMetricsMissing, exp_alerts: []}
+
+  # Pool gauges exist. Optional security reconciliation and lazy failure counters need not emit series.
+  - name: 'healthy cluster; optional revision gauge and all lazy failure counters absent'
+    interval: 30s
+    input_series:
+      - &series_up_gateway_1_cluster
+        series: 'up{job="greengateway",instance="gateway-1",deployment_mode="cluster"}'
+        values: '1+0x40'
+      - &series_expected_gateway_1_cluster
+        series: 'greengateway_monitoring:target_expected{job="greengateway",instance="gateway-1",deployment_mode="cluster"}'
+        values: '1+0x40'
+      - &series_ready_gateway_1_cluster
+        series: 'greengateway_gateway_ready{job="greengateway",instance="gateway-1",deployment_mode="cluster"}'
+        values: '1+0x40'
+      - &series_draining_gateway_1_cluster
+        series: 'greengateway_gateway_draining{job="greengateway",instance="gateway-1",deployment_mode="cluster"}'
+        values: '0+0x40'
+      - &series_depth_gateway_1_cluster
+        series: 'greengateway_audit_queue_depth{job="greengateway",instance="gateway-1",deployment_mode="cluster"}'
+        values: '0+0x40'
+      - &series_capacity_gateway_1_cluster
+        series: 'greengateway_audit_queue_capacity{job="greengateway",instance="gateway-1",deployment_mode="cluster"}'
+        values: '100+0x40'
+      - &series_oldest_gateway_1_cluster
+        series: 'greengateway_audit_queue_oldest_age_seconds{job="greengateway",instance="gateway-1",deployment_mode="cluster"}'
+        values: '0+0x40'
+      - &series_size_gateway_1_cluster
+        series: 'greengateway_database_pool_size{job="greengateway",instance="gateway-1",deployment_mode="cluster"}'
+        values: '10+0x40'
+      - &series_available_gateway_1_cluster
+        series: 'greengateway_database_pool_available{job="greengateway",instance="gateway-1",deployment_mode="cluster"}'
+        values: '10+0x40'
+      - &series_waiting_gateway_1_cluster
+        series: 'greengateway_database_pool_waiting{job="greengateway",instance="gateway-1",deployment_mode="cluster"}'
+        values: '0+0x40'
+      - &series_schema_gateway_1_cluster
+        series: 'greengateway_schema_compatible{job="greengateway",instance="gateway-1",deployment_mode="cluster"}'
+        values: '1+0x40'
+      - &series_heartbeat_gateway_1_cluster
+        series: 'greengateway_cluster_heartbeat_age_seconds{job="greengateway",instance="gateway-1",deployment_mode="cluster"}'
+        values: '0+0x40'
+      - &series_mismatch_gateway_1_cluster
+        series: 'greengateway_cluster_config_mismatch{job="greengateway",instance="gateway-1",deployment_mode="cluster"}'
+        values: '0+0x40'
+    alert_rule_test:
+      - {eval_time: 12m, alertname: GreenGatewayMetricsTargetDown, exp_alerts: []}
+      - {eval_time: 12m, alertname: GreenGatewayMetricsJobMissing, exp_alerts: []}
+      - {eval_time: 12m, alertname: GreenGatewayExpectedTargetsMissing, exp_alerts: []}
+      - {eval_time: 12m, alertname: GreenGatewayMonitoringConfigurationInvalid, exp_alerts: []}
+      - {eval_time: 12m, alertname: GreenGatewayMetricsMissing, exp_alerts: []}
+      - {eval_time: 12m, alertname: GreenGatewayStartupStalled, exp_alerts: []}
+      - {eval_time: 12m, alertname: GreenGatewayDrainStalled, exp_alerts: []}
+      - {eval_time: 12m, alertname: GreenGatewayAuditLoss, exp_alerts: []}
+      - {eval_time: 12m, alertname: GreenGatewayAuditBacklog, exp_alerts: []}
+      - {eval_time: 12m, alertname: GreenGatewayAuditFlushFailures, exp_alerts: []}
+      - {eval_time: 12m, alertname: GreenGatewayDatabasePoolSaturated, exp_alerts: []}
+      - {eval_time: 12m, alertname: GreenGatewayDatabasePoolTimeouts, exp_alerts: []}
+      - {eval_time: 12m, alertname: GreenGatewaySchemaIncompatible, exp_alerts: []}
+      - {eval_time: 12m, alertname: GreenGatewayClusterHeartbeatStale, exp_alerts: []}
+      - {eval_time: 12m, alertname: GreenGatewaySecurityRevisionLag, exp_alerts: []}
+      - {eval_time: 12m, alertname: GreenGatewayClusterConfigMismatch, exp_alerts: []}
+      - {eval_time: 12m, alertname: GreenGatewayClusterMetricsMissing, exp_alerts: []}
+
+  # Only gateway-1 is faulty. Exact expected labels exclude reason, outcome, operation, actor and detail.
+  - name: 'sustained serving faults fire after holds and recover per replica'
+    interval: 30s
+    input_series:
+      - *series_up_gateway_1_cluster
+      - *series_expected_gateway_1_cluster
+      - *series_ready_gateway_1_cluster
+      - *series_draining_gateway_1_cluster
+      - &series_depth_gateway_1_cluster_2
+        series: 'greengateway_audit_queue_depth{job="greengateway",instance="gateway-1",deployment_mode="cluster"}'
+        values: '90+0x24 0+0x15'
+      - *series_capacity_gateway_1_cluster
+      - *series_oldest_gateway_1_cluster
+      - *series_size_gateway_1_cluster
+      - &series_available_gateway_1_cluster_2
+        series: 'greengateway_database_pool_available{job="greengateway",instance="gateway-1",deployment_mode="cluster"}'
+        values: '0+0x24 10+0x15'
+      - &series_waiting_gateway_1_cluster_2
+        series: 'greengateway_database_pool_waiting{job="greengateway",instance="gateway-1",deployment_mode="cluster"}'
+        values: '3+0x24 0+0x15'
+      - series: 'greengateway_schema_compatible{job="greengateway",instance="gateway-1",deployment_mode="cluster"}'
+        values: '0+0x24 1+0x15'
+      - series: 'greengateway_cluster_heartbeat_age_seconds{job="greengateway",instance="gateway-1",deployment_mode="cluster"}'
+        values: '30+0x24 0+0x15'
+      - series: 'greengateway_cluster_config_mismatch{job="greengateway",instance="gateway-1",deployment_mode="cluster"}'
+        values: '1+0x24 0+0x15'
+      - &series_revision_gateway_1_cluster
+        series: 'greengateway_security_revision_lag{job="greengateway",instance="gateway-1",deployment_mode="cluster"}'
+        values: '2+0x24 0+0x15'
+      - &series_up_gateway_2_cluster
+        series: 'up{job="greengateway",instance="gateway-2",deployment_mode="cluster"}'
+        values: '1+0x40'
+      - &series_expected_gateway_2_cluster
+        series: 'greengateway_monitoring:target_expected{job="greengateway",instance="gateway-2",deployment_mode="cluster"}'
+        values: '1+0x40'
+      - &series_ready_gateway_2_cluster
+        series: 'greengateway_gateway_ready{job="greengateway",instance="gateway-2",deployment_mode="cluster"}'
+        values: '1+0x40'
+      - &series_draining_gateway_2_cluster
+        series: 'greengateway_gateway_draining{job="greengateway",instance="gateway-2",deployment_mode="cluster"}'
+        values: '0+0x40'
+      - &series_depth_gateway_2_cluster
+        series: 'greengateway_audit_queue_depth{job="greengateway",instance="gateway-2",deployment_mode="cluster"}'
+        values: '0+0x40'
+      - &series_capacity_gateway_2_cluster
+        series: 'greengateway_audit_queue_capacity{job="greengateway",instance="gateway-2",deployment_mode="cluster"}'
+        values: '100+0x40'
+      - &series_oldest_gateway_2_cluster
+        series: 'greengateway_audit_queue_oldest_age_seconds{job="greengateway",instance="gateway-2",deployment_mode="cluster"}'
+        values: '0+0x40'
+      - &series_size_gateway_2_cluster
+        series: 'greengateway_database_pool_size{job="greengateway",instance="gateway-2",deployment_mode="cluster"}'
+        values: '10+0x40'
+      - &series_available_gateway_2_cluster
+        series: 'greengateway_database_pool_available{job="greengateway",instance="gateway-2",deployment_mode="cluster"}'
+        values: '10+0x40'
+      - &series_waiting_gateway_2_cluster
+        series: 'greengateway_database_pool_waiting{job="greengateway",instance="gateway-2",deployment_mode="cluster"}'
+        values: '0+0x40'
+      - &series_schema_gateway_2_cluster
+        series: 'greengateway_schema_compatible{job="greengateway",instance="gateway-2",deployment_mode="cluster"}'
+        values: '1+0x40'
+      - &series_heartbeat_gateway_2_cluster
+        series: 'greengateway_cluster_heartbeat_age_seconds{job="greengateway",instance="gateway-2",deployment_mode="cluster"}'
+        values: '0+0x40'
+      - &series_mismatch_gateway_2_cluster
+        series: 'greengateway_cluster_config_mismatch{job="greengateway",instance="gateway-2",deployment_mode="cluster"}'
+        values: '0+0x40'
+      - series: 'audit_events_dropped_total{job="greengateway",instance="gateway-1",deployment_mode="cluster",reason="sink_error",actor="fixture-actor"}'
+        values: '0+1x24 24+0x15'
+      - series: 'greengateway_audit_flush_total{job="greengateway",instance="gateway-1",deployment_mode="cluster",outcome="failure",detail="fixture-detail"}'
+        values: '0+1x24 24+0x15'
+      - series: 'greengateway_database_pool_timeouts_total{job="greengateway",instance="gateway-1",deployment_mode="cluster",operation="fixture-operation"}'
+        values: '0+1x24 24+0x15'
+    alert_rule_test:
+      - {eval_time: 2m, alertname: GreenGatewayAuditLoss, exp_alerts: []}
+      - eval_time: 2m30s
+        alertname: GreenGatewayAuditLoss
+        exp_alerts:
+          - &fires_audit_loss_gateway_1_cluster
+            exp_labels: {job: 'greengateway', instance: 'gateway-1', deployment_mode: 'cluster', severity: 'critical', owner: 'gateway-operations'}
+            exp_annotations: &annotations_audit_loss
+              summary: 'Gateway audit events were dropped'
+              runbook_url: 'https://github.com/Greenhat-Security/GreenGateway/blob/main/docs/deployment/operational-alerts.md#audit-delivery'
+      - {eval_time: 12m, alertname: GreenGatewayAuditLoss, exp_alerts: [*fires_audit_loss_gateway_1_cluster]}
+      - {eval_time: 18m, alertname: GreenGatewayAuditLoss, exp_alerts: []}
+      - {eval_time: 2m, alertname: GreenGatewayAuditFlushFailures, exp_alerts: []}
+      - eval_time: 2m30s
+        alertname: GreenGatewayAuditFlushFailures
+        exp_alerts:
+          - &fires_audit_flush_failures_gateway_1_cluster
+            exp_labels: {job: 'greengateway', instance: 'gateway-1', deployment_mode: 'cluster', severity: 'warning', owner: 'gateway-operations'}
+            exp_annotations: &annotations_audit_flush_failures
+              summary: 'Gateway audit sink flushes are failing'
+              runbook_url: 'https://github.com/Greenhat-Security/GreenGateway/blob/main/docs/deployment/operational-alerts.md#audit-delivery'
+      - {eval_time: 12m, alertname: GreenGatewayAuditFlushFailures, exp_alerts: [*fires_audit_flush_failures_gateway_1_cluster]}
+      - {eval_time: 18m, alertname: GreenGatewayAuditFlushFailures, exp_alerts: []}
+      - {eval_time: 2m, alertname: GreenGatewayDatabasePoolTimeouts, exp_alerts: []}
+      - eval_time: 2m30s
+        alertname: GreenGatewayDatabasePoolTimeouts
+        exp_alerts:
+          - &fires_database_pool_timeouts_gateway_1_cluster
+            exp_labels: {job: 'greengateway', instance: 'gateway-1', deployment_mode: 'cluster', severity: 'warning', owner: 'gateway-operations'}
+            exp_annotations: &annotations_database_pool_timeouts
+              summary: 'Gateway database pool acquisitions are timing out'
+              runbook_url: 'https://github.com/Greenhat-Security/GreenGateway/blob/main/docs/deployment/operational-alerts.md#database-capacity'
+      - {eval_time: 12m, alertname: GreenGatewayDatabasePoolTimeouts, exp_alerts: [*fires_database_pool_timeouts_gateway_1_cluster]}
+      - {eval_time: 18m, alertname: GreenGatewayDatabasePoolTimeouts, exp_alerts: []}
+      - {eval_time: 4m30s, alertname: GreenGatewayAuditBacklog, exp_alerts: []}
+      - eval_time: 5m
+        alertname: GreenGatewayAuditBacklog
+        exp_alerts:
+          - &fires_audit_backlog_gateway_1_cluster
+            exp_labels: {job: 'greengateway', instance: 'gateway-1', deployment_mode: 'cluster', severity: 'warning', owner: 'gateway-operations'}
+            exp_annotations: &annotations_audit_backlog
+              summary: 'Gateway audit delivery backlog is sustained'
+              runbook_url: 'https://github.com/Greenhat-Security/GreenGateway/blob/main/docs/deployment/operational-alerts.md#audit-delivery'
+      - {eval_time: 12m, alertname: GreenGatewayAuditBacklog, exp_alerts: [*fires_audit_backlog_gateway_1_cluster]}
+      - {eval_time: 13m, alertname: GreenGatewayAuditBacklog, exp_alerts: []}
+      - {eval_time: 4m30s, alertname: GreenGatewayDatabasePoolSaturated, exp_alerts: []}
+      - eval_time: 5m
+        alertname: GreenGatewayDatabasePoolSaturated
+        exp_alerts:
+          - &fires_database_pool_saturated_gateway_1_cluster
+            exp_labels: {job: 'greengateway', instance: 'gateway-1', deployment_mode: 'cluster', severity: 'warning', owner: 'gateway-operations'}
+            exp_annotations: &annotations_database_pool_saturated
+              summary: 'Gateway database callers are waiting with no free pool connections'
+              runbook_url: 'https://github.com/Greenhat-Security/GreenGateway/blob/main/docs/deployment/operational-alerts.md#database-capacity'
+      - {eval_time: 12m, alertname: GreenGatewayDatabasePoolSaturated, exp_alerts: [*fires_database_pool_saturated_gateway_1_cluster]}
+      - {eval_time: 13m, alertname: GreenGatewayDatabasePoolSaturated, exp_alerts: []}
+      - {eval_time: 0m30s, alertname: GreenGatewaySchemaIncompatible, exp_alerts: []}
+      - eval_time: 1m
+        alertname: GreenGatewaySchemaIncompatible
+        exp_alerts:
+          - &fires_schema_incompatible_gateway_1_cluster
+            exp_labels: {job: 'greengateway', instance: 'gateway-1', deployment_mode: 'cluster', severity: 'critical', owner: 'gateway-operations'}
+            exp_annotations: &annotations_schema_incompatible
+              summary: 'Gateway observed an incompatible database schema'
+              runbook_url: 'https://github.com/Greenhat-Security/GreenGateway/blob/main/docs/deployment/operational-alerts.md#cluster-authority'
+      - {eval_time: 12m, alertname: GreenGatewaySchemaIncompatible, exp_alerts: [*fires_schema_incompatible_gateway_1_cluster]}
+      - {eval_time: 13m, alertname: GreenGatewaySchemaIncompatible, exp_alerts: []}
+      - {eval_time: 0m30s, alertname: GreenGatewayClusterHeartbeatStale, exp_alerts: []}
+      - eval_time: 1m
+        alertname: GreenGatewayClusterHeartbeatStale
+        exp_alerts:
+          - &fires_cluster_heartbeat_stale_gateway_1_cluster
+            exp_labels: {job: 'greengateway', instance: 'gateway-1', deployment_mode: 'cluster', severity: 'warning', owner: 'gateway-operations'}
+            exp_annotations: &annotations_cluster_heartbeat_stale
+              summary: 'Gateway membership heartbeat has reached the example stale window'
+              runbook_url: 'https://github.com/Greenhat-Security/GreenGateway/blob/main/docs/deployment/operational-alerts.md#cluster-authority'
+      - {eval_time: 12m, alertname: GreenGatewayClusterHeartbeatStale, exp_alerts: [*fires_cluster_heartbeat_stale_gateway_1_cluster]}
+      - {eval_time: 13m, alertname: GreenGatewayClusterHeartbeatStale, exp_alerts: []}
+      - {eval_time: 4m30s, alertname: GreenGatewaySecurityRevisionLag, exp_alerts: []}
+      - eval_time: 5m
+        alertname: GreenGatewaySecurityRevisionLag
+        exp_alerts:
+          - &fires_security_revision_lag_gateway_1_cluster
+            exp_labels: {job: 'greengateway', instance: 'gateway-1', deployment_mode: 'cluster', severity: 'warning', owner: 'gateway-operations'}
+            exp_annotations: &annotations_security_revision_lag
+              summary: 'Gateway security revision lag is sustained'
+              runbook_url: 'https://github.com/Greenhat-Security/GreenGateway/blob/main/docs/deployment/operational-alerts.md#cluster-authority'
+      - {eval_time: 12m, alertname: GreenGatewaySecurityRevisionLag, exp_alerts: [*fires_security_revision_lag_gateway_1_cluster]}
+      - {eval_time: 13m, alertname: GreenGatewaySecurityRevisionLag, exp_alerts: []}
+      - {eval_time: 4m30s, alertname: GreenGatewayClusterConfigMismatch, exp_alerts: []}
+      - eval_time: 5m
+        alertname: GreenGatewayClusterConfigMismatch
+        exp_alerts:
+          - &fires_cluster_config_mismatch_gateway_1_cluster
+            exp_labels: {job: 'greengateway', instance: 'gateway-1', deployment_mode: 'cluster', severity: 'warning', owner: 'gateway-operations'}
+            exp_annotations: &annotations_cluster_config_mismatch
+              summary: 'Gateway configuration fingerprint has not converged'
+              runbook_url: 'https://github.com/Greenhat-Security/GreenGateway/blob/main/docs/deployment/operational-alerts.md#cluster-authority'
+      - {eval_time: 12m, alertname: GreenGatewayClusterConfigMismatch, exp_alerts: [*fires_cluster_config_mismatch_gateway_1_cluster]}
+      - {eval_time: 13m, alertname: GreenGatewayClusterConfigMismatch, exp_alerts: []}
+
+  - name: 'oldest queued event alerts even when queue depth is zero'
+    interval: 30s
+    input_series:
+      - *series_up_gateway_1_cluster
+      - *series_expected_gateway_1_cluster
+      - *series_ready_gateway_1_cluster
+      - *series_draining_gateway_1_cluster
+      - *series_depth_gateway_1_cluster
+      - *series_capacity_gateway_1_cluster
+      - series: 'greengateway_audit_queue_oldest_age_seconds{job="greengateway",instance="gateway-1",deployment_mode="cluster"}'
+        values: '31+0x10 30+0x29'
+      - *series_size_gateway_1_cluster
+      - *series_available_gateway_1_cluster
+      - *series_waiting_gateway_1_cluster
+      - *series_schema_gateway_1_cluster
+      - *series_heartbeat_gateway_1_cluster
+      - *series_mismatch_gateway_1_cluster
+    alert_rule_test:
+      - {eval_time: 4m30s, alertname: GreenGatewayAuditBacklog, exp_alerts: []}
+      - {eval_time: 5m, alertname: GreenGatewayAuditBacklog, exp_alerts: [*fires_audit_backlog_gateway_1_cluster]}
+      - {eval_time: 6m, alertname: GreenGatewayAuditBacklog, exp_alerts: []}
+
+  - name: 'audit queue threshold equality is healthy'
+    interval: 30s
+    input_series:
+      - *series_up_gateway_1_cluster
+      - *series_expected_gateway_1_cluster
+      - *series_ready_gateway_1_cluster
+      - *series_draining_gateway_1_cluster
+      - series: 'greengateway_audit_queue_depth{job="greengateway",instance="gateway-1",deployment_mode="cluster"}'
+        values: '80+0x40'
+      - *series_capacity_gateway_1_cluster
+      - series: 'greengateway_audit_queue_oldest_age_seconds{job="greengateway",instance="gateway-1",deployment_mode="cluster"}'
+        values: '30+0x40'
+      - *series_size_gateway_1_cluster
+      - *series_available_gateway_1_cluster
+      - *series_waiting_gateway_1_cluster
+      - *series_schema_gateway_1_cluster
+      - *series_heartbeat_gateway_1_cluster
+      - *series_mismatch_gateway_1_cluster
+    alert_rule_test:
+      - {eval_time: 12m, alertname: GreenGatewayAuditBacklog, exp_alerts: []}
+
+  # A healthy second replica must not provide readiness to the starting replica.
+  - name: 'startup allowance expires; serving-only warnings stay suppressed'
+    interval: 30s
+    input_series:
+      - *series_up_gateway_1_cluster
+      - *series_expected_gateway_1_cluster
+      - series: 'greengateway_gateway_ready{job="greengateway",instance="gateway-1",deployment_mode="cluster"}'
+        values: '0+0x24 1+0x15'
+      - *series_draining_gateway_1_cluster
+      - *series_depth_gateway_1_cluster_2
+      - *series_capacity_gateway_1_cluster
+      - *series_oldest_gateway_1_cluster
+      - *series_size_gateway_1_cluster
+      - *series_available_gateway_1_cluster_2
+      - *series_waiting_gateway_1_cluster_2
+      - *series_schema_gateway_1_cluster
+      - series: 'greengateway_cluster_heartbeat_age_seconds{job="greengateway",instance="gateway-1",deployment_mode="cluster"}'
+        values: '40+0x24 0+0x15'
+      - *series_mismatch_gateway_1_cluster
+      - *series_revision_gateway_1_cluster
+      - series: 'greengateway_database_pool_timeouts_total{job="greengateway",instance="gateway-1",deployment_mode="cluster"}'
+        values: '0+1x24 24+0x15'
+      - *series_up_gateway_2_cluster
+      - *series_expected_gateway_2_cluster
+      - *series_ready_gateway_2_cluster
+      - *series_draining_gateway_2_cluster
+      - *series_depth_gateway_2_cluster
+      - *series_capacity_gateway_2_cluster
+      - *series_oldest_gateway_2_cluster
+      - *series_size_gateway_2_cluster
+      - *series_available_gateway_2_cluster
+      - *series_waiting_gateway_2_cluster
+      - *series_schema_gateway_2_cluster
+      - *series_heartbeat_gateway_2_cluster
+      - *series_mismatch_gateway_2_cluster
+    alert_rule_test:
+      - {eval_time: 9m30s, alertname: GreenGatewayStartupStalled, exp_alerts: []}
+      - eval_time: 10m
+        alertname: GreenGatewayStartupStalled
+        exp_alerts:
+          - &fires_startup_stalled_gateway_1_cluster
+            exp_labels: {job: 'greengateway', instance: 'gateway-1', deployment_mode: 'cluster', severity: 'warning', owner: 'gateway-operations'}
+            exp_annotations: &annotations_startup_stalled
+              summary: 'Gateway lifecycle has remained in startup'
+              runbook_url: 'https://github.com/Greenhat-Security/GreenGateway/blob/main/docs/deployment/operational-alerts.md#lifecycle-stalls'
+      - {eval_time: 12m, alertname: GreenGatewayStartupStalled, exp_alerts: [*fires_startup_stalled_gateway_1_cluster]}
+      - {eval_time: 13m, alertname: GreenGatewayStartupStalled, exp_alerts: []}
+      - {eval_time: 12m, alertname: GreenGatewayDrainStalled, exp_alerts: []}
+      - {eval_time: 12m, alertname: GreenGatewayAuditBacklog, exp_alerts: []}
+      - {eval_time: 12m, alertname: GreenGatewayDatabasePoolSaturated, exp_alerts: []}
+      - {eval_time: 12m, alertname: GreenGatewayDatabasePoolTimeouts, exp_alerts: []}
+      - {eval_time: 12m, alertname: GreenGatewayClusterHeartbeatStale, exp_alerts: []}
+      - {eval_time: 12m, alertname: GreenGatewaySecurityRevisionLag, exp_alerts: []}
+
+  - name: 'drain allowance expires; observed audit loss and flush failure still fire'
+    interval: 30s
+    input_series:
+      - *series_up_gateway_1_cluster
+      - *series_expected_gateway_1_cluster
+      - &series_ready_gateway_1_cluster_2
+        series: 'greengateway_gateway_ready{job="greengateway",instance="gateway-1",deployment_mode="cluster"}'
+        values: '0+0x40'
+      - &series_draining_gateway_1_cluster_2
+        series: 'greengateway_gateway_draining{job="greengateway",instance="gateway-1",deployment_mode="cluster"}'
+        values: '1+0x40'
+      - series: 'greengateway_audit_queue_depth{job="greengateway",instance="gateway-1",deployment_mode="cluster"}'
+        values: '90+0x40'
+      - *series_capacity_gateway_1_cluster
+      - *series_oldest_gateway_1_cluster
+      - *series_size_gateway_1_cluster
+      - series: 'greengateway_database_pool_available{job="greengateway",instance="gateway-1",deployment_mode="cluster"}'
+        values: '0+0x40'
+      - &series_waiting_gateway_1_cluster_3
+        series: 'greengateway_database_pool_waiting{job="greengateway",instance="gateway-1",deployment_mode="cluster"}'
+        values: '3+0x40'
+      - *series_schema_gateway_1_cluster
+      - series: 'greengateway_cluster_heartbeat_age_seconds{job="greengateway",instance="gateway-1",deployment_mode="cluster"}'
+        values: '40+0x40'
+      - *series_mismatch_gateway_1_cluster
+      - series: 'greengateway_security_revision_lag{job="greengateway",instance="gateway-1",deployment_mode="cluster"}'
+        values: '2+0x40'
+      - *series_up_gateway_2_cluster
+      - *series_expected_gateway_2_cluster
+      - *series_ready_gateway_2_cluster
+      - *series_draining_gateway_2_cluster
+      - *series_depth_gateway_2_cluster
+      - *series_capacity_gateway_2_cluster
+      - *series_oldest_gateway_2_cluster
+      - *series_size_gateway_2_cluster
+      - *series_available_gateway_2_cluster
+      - *series_waiting_gateway_2_cluster
+      - *series_schema_gateway_2_cluster
+      - *series_heartbeat_gateway_2_cluster
+      - *series_mismatch_gateway_2_cluster
+      - series: 'audit_events_dropped_total{job="greengateway",instance="gateway-1",deployment_mode="cluster",reason="sink_error"}'
+        values: '0+1x40'
+      - series: 'greengateway_audit_flush_total{job="greengateway",instance="gateway-1",deployment_mode="cluster",outcome="failure"}'
+        values: '0+1x40'
+      - series: 'greengateway_database_pool_timeouts_total{job="greengateway",instance="gateway-1",deployment_mode="cluster"}'
+        values: '0+1x40'
+    alert_rule_test:
+      - {eval_time: 9m30s, alertname: GreenGatewayDrainStalled, exp_alerts: []}
+      - eval_time: 10m
+        alertname: GreenGatewayDrainStalled
+        exp_alerts:
+          - &fires_drain_stalled_gateway_1_cluster
+            exp_labels: {job: 'greengateway', instance: 'gateway-1', deployment_mode: 'cluster', severity: 'warning', owner: 'gateway-operations'}
+            exp_annotations: &annotations_drain_stalled
+              summary: 'Gateway lifecycle has remained in drain'
+              runbook_url: 'https://github.com/Greenhat-Security/GreenGateway/blob/main/docs/deployment/operational-alerts.md#lifecycle-stalls'
+      - {eval_time: 12m, alertname: GreenGatewayDrainStalled, exp_alerts: [*fires_drain_stalled_gateway_1_cluster]}
+      - {eval_time: 12m, alertname: GreenGatewayStartupStalled, exp_alerts: []}
+      - {eval_time: 2m, alertname: GreenGatewayAuditLoss, exp_alerts: []}
+      - {eval_time: 2m30s, alertname: GreenGatewayAuditLoss, exp_alerts: [*fires_audit_loss_gateway_1_cluster]}
+      - {eval_time: 2m, alertname: GreenGatewayAuditFlushFailures, exp_alerts: []}
+      - {eval_time: 2m30s, alertname: GreenGatewayAuditFlushFailures, exp_alerts: [*fires_audit_flush_failures_gateway_1_cluster]}
+      - {eval_time: 12m, alertname: GreenGatewayAuditBacklog, exp_alerts: []}
+      - {eval_time: 12m, alertname: GreenGatewayDatabasePoolSaturated, exp_alerts: []}
+      - {eval_time: 12m, alertname: GreenGatewayDatabasePoolTimeouts, exp_alerts: []}
+      - {eval_time: 12m, alertname: GreenGatewayClusterHeartbeatStale, exp_alerts: []}
+      - {eval_time: 12m, alertname: GreenGatewaySecurityRevisionLag, exp_alerts: []}
+
+  - name: 'drain stall clears when the process exits'
+    interval: 30s
+    input_series:
+      - series: 'up{job="greengateway",instance="gateway-1",deployment_mode="cluster"}'
+        values: '1+0x24 0+0x15'
+      - *series_expected_gateway_1_cluster
+      - *series_ready_gateway_1_cluster_2
+      - *series_draining_gateway_1_cluster_2
+      - *series_depth_gateway_1_cluster
+      - *series_capacity_gateway_1_cluster
+      - *series_oldest_gateway_1_cluster
+      - *series_size_gateway_1_cluster
+      - *series_available_gateway_1_cluster
+      - *series_waiting_gateway_1_cluster
+      - *series_schema_gateway_1_cluster
+      - *series_heartbeat_gateway_1_cluster
+      - *series_mismatch_gateway_1_cluster
+    alert_rule_test:
+      - {eval_time: 12m, alertname: GreenGatewayDrainStalled, exp_alerts: [*fires_drain_stalled_gateway_1_cluster]}
+      - {eval_time: 13m, alertname: GreenGatewayDrainStalled, exp_alerts: []}
+
+  # Exporter values retained during a failed scrape cannot borrow up=1 from gateway-2.
+  - name: 'failed scrape alerts only for the down replica and recovers'
+    interval: 30s
+    input_series:
+      - series: 'up{job="greengateway",instance="gateway-1",deployment_mode="cluster"}'
+        values: '0+0x6 1+0x33'
+      - *series_expected_gateway_1_cluster
+      - series: 'greengateway_gateway_ready{job="greengateway",instance="gateway-1",deployment_mode="cluster"}'
+        values: '0+0x6 1+0x33'
+      - series: 'greengateway_gateway_draining{job="greengateway",instance="gateway-1",deployment_mode="cluster"}'
+        values: '1+0x6 0+0x33'
+      - series: 'greengateway_audit_queue_depth{job="greengateway",instance="gateway-1",deployment_mode="cluster"}'
+        values: '90+0x6 0+0x33'
+      - *series_capacity_gateway_1_cluster
+      - *series_oldest_gateway_1_cluster
+      - *series_size_gateway_1_cluster
+      - series: 'greengateway_database_pool_available{job="greengateway",instance="gateway-1",deployment_mode="cluster"}'
+        values: '0+0x6 10+0x33'
+      - series: 'greengateway_database_pool_waiting{job="greengateway",instance="gateway-1",deployment_mode="cluster"}'
+        values: '3+0x6 0+0x33'
+      - series: 'greengateway_schema_compatible{job="greengateway",instance="gateway-1",deployment_mode="cluster"}'
+        values: '0+0x6 1+0x33'
+      - series: 'greengateway_cluster_heartbeat_age_seconds{job="greengateway",instance="gateway-1",deployment_mode="cluster"}'
+        values: '40+0x6 0+0x33'
+      - series: 'greengateway_cluster_config_mismatch{job="greengateway",instance="gateway-1",deployment_mode="cluster"}'
+        values: '1+0x6 0+0x33'
+      - series: 'greengateway_security_revision_lag{job="greengateway",instance="gateway-1",deployment_mode="cluster"}'
+        values: '2+0x6 0+0x33'
+      - *series_up_gateway_2_cluster
+      - *series_expected_gateway_2_cluster
+      - *series_ready_gateway_2_cluster
+      - *series_draining_gateway_2_cluster
+      - *series_depth_gateway_2_cluster
+      - *series_capacity_gateway_2_cluster
+      - *series_oldest_gateway_2_cluster
+      - *series_size_gateway_2_cluster
+      - *series_available_gateway_2_cluster
+      - *series_waiting_gateway_2_cluster
+      - *series_schema_gateway_2_cluster
+      - *series_heartbeat_gateway_2_cluster
+      - *series_mismatch_gateway_2_cluster
+      - series: 'audit_events_dropped_total{job="greengateway",instance="gateway-1",deployment_mode="cluster",reason="sink_error"}'
+        values: '0+1x6 6+0x33'
+      - series: 'greengateway_audit_flush_total{job="greengateway",instance="gateway-1",deployment_mode="cluster",outcome="failure"}'
+        values: '0+1x6 6+0x33'
+      - series: 'greengateway_database_pool_timeouts_total{job="greengateway",instance="gateway-1",deployment_mode="cluster"}'
+        values: '0+1x6 6+0x33'
+    alert_rule_test:
+      - {eval_time: 1m30s, alertname: GreenGatewayMetricsTargetDown, exp_alerts: []}
+      - eval_time: 2m
+        alertname: GreenGatewayMetricsTargetDown
+        exp_alerts:
+          - &fires_metrics_target_down_gateway_1_cluster
+            exp_labels: {job: 'greengateway', instance: 'gateway-1', deployment_mode: 'cluster', severity: 'critical', owner: 'gateway-operations'}
+            exp_annotations: &annotations_metrics_target_down
+              summary: 'Gateway metrics target is unavailable or missing from discovery'
+              runbook_url: 'https://github.com/Greenhat-Security/GreenGateway/blob/main/docs/deployment/operational-alerts.md#metrics-availability'
+      - {eval_time: 4m, alertname: GreenGatewayMetricsTargetDown, exp_alerts: []}
+      - {eval_time: 3m, alertname: GreenGatewayMetricsJobMissing, exp_alerts: []}
+      - {eval_time: 3m, alertname: GreenGatewayExpectedTargetsMissing, exp_alerts: []}
+      - {eval_time: 3m, alertname: GreenGatewayMonitoringConfigurationInvalid, exp_alerts: []}
+      - {eval_time: 3m, alertname: GreenGatewayMetricsMissing, exp_alerts: []}
+      - {eval_time: 3m, alertname: GreenGatewayStartupStalled, exp_alerts: []}
+      - {eval_time: 3m, alertname: GreenGatewayDrainStalled, exp_alerts: []}
+      - {eval_time: 3m, alertname: GreenGatewayAuditLoss, exp_alerts: []}
+      - {eval_time: 3m, alertname: GreenGatewayAuditBacklog, exp_alerts: []}
+      - {eval_time: 3m, alertname: GreenGatewayAuditFlushFailures, exp_alerts: []}
+      - {eval_time: 3m, alertname: GreenGatewayDatabasePoolSaturated, exp_alerts: []}
+      - {eval_time: 3m, alertname: GreenGatewayDatabasePoolTimeouts, exp_alerts: []}
+      - {eval_time: 3m, alertname: GreenGatewaySchemaIncompatible, exp_alerts: []}
+      - {eval_time: 3m, alertname: GreenGatewayClusterHeartbeatStale, exp_alerts: []}
+      - {eval_time: 3m, alertname: GreenGatewaySecurityRevisionLag, exp_alerts: []}
+      - {eval_time: 3m, alertname: GreenGatewayClusterConfigMismatch, exp_alerts: []}
+      - {eval_time: 3m, alertname: GreenGatewayClusterMetricsMissing, exp_alerts: []}
+
+  - name: 'expected replica never scraped while another replica is healthy'
+    interval: 30s
+    input_series:
+      - series: 'up{job="greengateway",instance="gateway-1",deployment_mode="cluster"}'
+        values: '_x7 1+0x33'
+      - *series_expected_gateway_1_cluster
+      - *series_ready_gateway_1_cluster
+      - *series_draining_gateway_1_cluster
+      - *series_depth_gateway_1_cluster
+      - *series_capacity_gateway_1_cluster
+      - *series_oldest_gateway_1_cluster
+      - *series_size_gateway_1_cluster
+      - *series_available_gateway_1_cluster
+      - *series_waiting_gateway_1_cluster
+      - *series_schema_gateway_1_cluster
+      - *series_heartbeat_gateway_1_cluster
+      - *series_mismatch_gateway_1_cluster
+      - *series_up_gateway_2_cluster
+      - *series_expected_gateway_2_cluster
+      - *series_ready_gateway_2_cluster
+      - *series_draining_gateway_2_cluster
+      - *series_depth_gateway_2_cluster
+      - *series_capacity_gateway_2_cluster
+      - *series_oldest_gateway_2_cluster
+      - *series_size_gateway_2_cluster
+      - *series_available_gateway_2_cluster
+      - *series_waiting_gateway_2_cluster
+      - *series_schema_gateway_2_cluster
+      - *series_heartbeat_gateway_2_cluster
+      - *series_mismatch_gateway_2_cluster
+    alert_rule_test:
+      - {eval_time: 1m30s, alertname: GreenGatewayMetricsTargetDown, exp_alerts: []}
+      - {eval_time: 2m, alertname: GreenGatewayMetricsTargetDown, exp_alerts: [*fires_metrics_target_down_gateway_1_cluster]}
+      - {eval_time: 4m, alertname: GreenGatewayMetricsTargetDown, exp_alerts: []}
+      - {eval_time: 3m, alertname: GreenGatewayMetricsJobMissing, exp_alerts: []}
+      - {eval_time: 3m, alertname: GreenGatewayMonitoringConfigurationInvalid, exp_alerts: []}
+
+  # Inventory survives discovery loss; a different healthy replica cannot hide the missing target.
+  - name: 'declared target disappears from discovery with an explicit stale marker'
+    interval: 30s
+    input_series:
+      - &series_up_gateway_1_cluster_2
+        series: 'up{job="greengateway",instance="gateway-1",deployment_mode="cluster"}'
+        values: '1+0x4 stale _x10 1+0x24'
+      - *series_expected_gateway_1_cluster
+      - *series_ready_gateway_1_cluster
+      - *series_draining_gateway_1_cluster
+      - *series_depth_gateway_1_cluster
+      - *series_capacity_gateway_1_cluster
+      - *series_oldest_gateway_1_cluster
+      - *series_size_gateway_1_cluster
+      - *series_available_gateway_1_cluster
+      - *series_waiting_gateway_1_cluster
+      - *series_schema_gateway_1_cluster
+      - *series_heartbeat_gateway_1_cluster
+      - *series_mismatch_gateway_1_cluster
+      - *series_up_gateway_2_cluster
+      - *series_expected_gateway_2_cluster
+      - *series_ready_gateway_2_cluster
+      - *series_draining_gateway_2_cluster
+      - *series_depth_gateway_2_cluster
+      - *series_capacity_gateway_2_cluster
+      - *series_oldest_gateway_2_cluster
+      - *series_size_gateway_2_cluster
+      - *series_available_gateway_2_cluster
+      - *series_waiting_gateway_2_cluster
+      - *series_schema_gateway_2_cluster
+      - *series_heartbeat_gateway_2_cluster
+      - *series_mismatch_gateway_2_cluster
+    alert_rule_test:
+      - {eval_time: 4m, alertname: GreenGatewayMetricsTargetDown, exp_alerts: []}
+      - {eval_time: 4m30s, alertname: GreenGatewayMetricsTargetDown, exp_alerts: [*fires_metrics_target_down_gateway_1_cluster]}
+      - {eval_time: 7m30s, alertname: GreenGatewayMetricsTargetDown, exp_alerts: [*fires_metrics_target_down_gateway_1_cluster]}
+      - {eval_time: 8m, alertname: GreenGatewayMetricsTargetDown, exp_alerts: []}
+      - {eval_time: 7m30s, alertname: GreenGatewayMetricsJobMissing, exp_alerts: []}
+
+  # Missing samples respect Prometheus lookback before the alert hold starts; recovery arrives at 11m.
+  - name: 'declared target stops reporting without a stale marker'
+    interval: 30s
+    input_series:
+      - series: 'up{job="greengateway",instance="gateway-1",deployment_mode="cluster"}'
+        values: '1+0x4 _x17 1+0x18'
+      - *series_expected_gateway_1_cluster
+      - *series_ready_gateway_1_cluster
+      - *series_draining_gateway_1_cluster
+      - *series_depth_gateway_1_cluster
+      - *series_capacity_gateway_1_cluster
+      - *series_oldest_gateway_1_cluster
+      - *series_size_gateway_1_cluster
+      - *series_available_gateway_1_cluster
+      - *series_waiting_gateway_1_cluster
+      - *series_schema_gateway_1_cluster
+      - *series_heartbeat_gateway_1_cluster
+      - *series_mismatch_gateway_1_cluster
+      - *series_up_gateway_2_cluster
+      - *series_expected_gateway_2_cluster
+      - *series_ready_gateway_2_cluster
+      - *series_draining_gateway_2_cluster
+      - *series_depth_gateway_2_cluster
+      - *series_capacity_gateway_2_cluster
+      - *series_oldest_gateway_2_cluster
+      - *series_size_gateway_2_cluster
+      - *series_available_gateway_2_cluster
+      - *series_waiting_gateway_2_cluster
+      - *series_schema_gateway_2_cluster
+      - *series_heartbeat_gateway_2_cluster
+      - *series_mismatch_gateway_2_cluster
+    alert_rule_test:
+      - {eval_time: 6m30s, alertname: GreenGatewayMetricsTargetDown, exp_alerts: []}
+      - {eval_time: 8m30s, alertname: GreenGatewayMetricsTargetDown, exp_alerts: []}
+      - {eval_time: 10m, alertname: GreenGatewayMetricsTargetDown, exp_alerts: [*fires_metrics_target_down_gateway_1_cluster]}
+      - {eval_time: 11m, alertname: GreenGatewayMetricsTargetDown, exp_alerts: []}
+      - {eval_time: 10m, alertname: GreenGatewayMetricsJobMissing, exp_alerts: []}
+
+  - name: 'empty job and absent target inventory have explicit coverage'
+    interval: 30s
+    input_series: []
+    alert_rule_test:
+      - {eval_time: 1m30s, alertname: GreenGatewayMetricsJobMissing, exp_alerts: []}
+      - eval_time: 2m
+        alertname: GreenGatewayMetricsJobMissing
+        exp_alerts:
+          - &fires_metrics_job_missing_job_unset
+            exp_labels: {job: 'greengateway', severity: 'critical', owner: 'gateway-operations'}
+            exp_annotations: &annotations_metrics_job_missing
+              summary: 'No gateway scrape targets are visible'
+              runbook_url: 'https://github.com/Greenhat-Security/GreenGateway/blob/main/docs/deployment/operational-alerts.md#metrics-availability'
+      - {eval_time: 1m30s, alertname: GreenGatewayExpectedTargetsMissing, exp_alerts: []}
+      - eval_time: 2m
+        alertname: GreenGatewayExpectedTargetsMissing
+        exp_alerts:
+          - &fires_expected_targets_missing_job_unset
+            exp_labels: {job: 'greengateway', severity: 'warning', owner: 'gateway-operations'}
+            exp_annotations: &annotations_expected_targets_missing
+              summary: 'Gateway expected-target inventory is missing'
+              runbook_url: 'https://github.com/Greenhat-Security/GreenGateway/blob/main/docs/deployment/operational-alerts.md#metrics-availability'
+      - {eval_time: 12m, alertname: GreenGatewayMetricsTargetDown, exp_alerts: []}
+      - {eval_time: 12m, alertname: GreenGatewayMetricsMissing, exp_alerts: []}
+
+  - name: 'job and inventory disappearance recover when monitoring returns'
+    interval: 30s
+    input_series:
+      - *series_up_gateway_1_cluster_2
+      - series: 'greengateway_monitoring:target_expected{job="greengateway",instance="gateway-1",deployment_mode="cluster"}'
+        values: '1+0x4 stale _x10 1+0x24'
+      - *series_ready_gateway_1_cluster
+      - *series_draining_gateway_1_cluster
+      - *series_depth_gateway_1_cluster
+      - *series_capacity_gateway_1_cluster
+      - *series_oldest_gateway_1_cluster
+      - *series_size_gateway_1_cluster
+      - *series_available_gateway_1_cluster
+      - *series_waiting_gateway_1_cluster
+      - *series_schema_gateway_1_cluster
+      - *series_heartbeat_gateway_1_cluster
+      - *series_mismatch_gateway_1_cluster
+    alert_rule_test:
+      - {eval_time: 4m, alertname: GreenGatewayMetricsJobMissing, exp_alerts: []}
+      - {eval_time: 4m30s, alertname: GreenGatewayMetricsJobMissing, exp_alerts: [*fires_metrics_job_missing_job_unset]}
+      - {eval_time: 8m, alertname: GreenGatewayMetricsJobMissing, exp_alerts: []}
+      - {eval_time: 4m, alertname: GreenGatewayExpectedTargetsMissing, exp_alerts: []}
+      - {eval_time: 4m30s, alertname: GreenGatewayExpectedTargetsMissing, exp_alerts: [*fires_expected_targets_missing_job_unset]}
+      - {eval_time: 8m, alertname: GreenGatewayExpectedTargetsMissing, exp_alerts: []}
+
+  - name: 'missing deployment mode is invalid even when the scrape succeeds'
+    interval: 30s
+    input_series:
+      - series: 'up{job="greengateway",instance="gateway-1"}'
+        values: '1+0x40'
+      - series: 'greengateway_monitoring:target_expected{job="greengateway",instance="gateway-1"}'
+        values: '1+0x40'
+      - series: 'greengateway_gateway_ready{job="greengateway",instance="gateway-1"}'
+        values: '1+0x40'
+      - series: 'greengateway_gateway_draining{job="greengateway",instance="gateway-1"}'
+        values: '0+0x40'
+      - series: 'greengateway_audit_queue_depth{job="greengateway",instance="gateway-1"}'
+        values: '0+0x40'
+      - series: 'greengateway_audit_queue_capacity{job="greengateway",instance="gateway-1"}'
+        values: '100+0x40'
+      - series: 'greengateway_audit_queue_oldest_age_seconds{job="greengateway",instance="gateway-1"}'
+        values: '0+0x40'
+      - *series_up_gateway_2_cluster
+      - *series_expected_gateway_2_cluster
+      - *series_ready_gateway_2_cluster
+      - *series_draining_gateway_2_cluster
+      - *series_depth_gateway_2_cluster
+      - *series_capacity_gateway_2_cluster
+      - *series_oldest_gateway_2_cluster
+      - *series_size_gateway_2_cluster
+      - *series_available_gateway_2_cluster
+      - *series_waiting_gateway_2_cluster
+      - *series_schema_gateway_2_cluster
+      - *series_heartbeat_gateway_2_cluster
+      - *series_mismatch_gateway_2_cluster
+    alert_rule_test:
+      - {eval_time: 1m30s, alertname: GreenGatewayMonitoringConfigurationInvalid, exp_alerts: []}
+      - eval_time: 2m
+        alertname: GreenGatewayMonitoringConfigurationInvalid
+        exp_alerts:
+          - &fires_monitoring_configuration_invalid_gateway_1_unset
+            exp_labels: {job: 'greengateway', instance: 'gateway-1', severity: 'warning', owner: 'gateway-operations'}
+            exp_annotations: &annotations_monitoring_configuration_invalid
+              summary: 'Gateway monitoring target does not match the reviewed inventory'
+              runbook_url: 'https://github.com/Greenhat-Security/GreenGateway/blob/main/docs/deployment/operational-alerts.md#metrics-availability'
+      - {eval_time: 3m, alertname: GreenGatewayMetricsJobMissing, exp_alerts: []}
+
+  - name: 'unsupported deployment mode is invalid'
+    interval: 30s
+    input_series:
+      - series: 'up{job="greengateway",instance="gateway-1",deployment_mode="fixture-unsupported"}'
+        values: '1+0x40'
+      - series: 'greengateway_monitoring:target_expected{job="greengateway",instance="gateway-1",deployment_mode="fixture-unsupported"}'
+        values: '1+0x40'
+      - series: 'greengateway_gateway_ready{job="greengateway",instance="gateway-1",deployment_mode="fixture-unsupported"}'
+        values: '1+0x40'
+      - series: 'greengateway_gateway_draining{job="greengateway",instance="gateway-1",deployment_mode="fixture-unsupported"}'
+        values: '0+0x40'
+      - series: 'greengateway_audit_queue_depth{job="greengateway",instance="gateway-1",deployment_mode="fixture-unsupported"}'
+        values: '0+0x40'
+      - series: 'greengateway_audit_queue_capacity{job="greengateway",instance="gateway-1",deployment_mode="fixture-unsupported"}'
+        values: '100+0x40'
+      - series: 'greengateway_audit_queue_oldest_age_seconds{job="greengateway",instance="gateway-1",deployment_mode="fixture-unsupported"}'
+        values: '0+0x40'
+      - *series_up_gateway_2_cluster
+      - *series_expected_gateway_2_cluster
+      - *series_ready_gateway_2_cluster
+      - *series_draining_gateway_2_cluster
+      - *series_depth_gateway_2_cluster
+      - *series_capacity_gateway_2_cluster
+      - *series_oldest_gateway_2_cluster
+      - *series_size_gateway_2_cluster
+      - *series_available_gateway_2_cluster
+      - *series_waiting_gateway_2_cluster
+      - *series_schema_gateway_2_cluster
+      - *series_heartbeat_gateway_2_cluster
+      - *series_mismatch_gateway_2_cluster
+    alert_rule_test:
+      - eval_time: 2m
+        alertname: GreenGatewayMonitoringConfigurationInvalid
+        exp_alerts:
+          - &fires_monitoring_configuration_invalid_gateway_1_fixture_unsupported
+            exp_labels: {job: 'greengateway', instance: 'gateway-1', deployment_mode: 'fixture-unsupported', severity: 'warning', owner: 'gateway-operations'}
+            exp_annotations: *annotations_monitoring_configuration_invalid
+
+  - name: 'scraped mode differs from reviewed cluster inventory'
+    interval: 30s
+    input_series:
+      - *series_up_gateway_1_standalone
+      - series: 'greengateway_gateway_ready{job="greengateway",instance="gateway-1",deployment_mode="standalone"}'
+        values: '1+0x40'
+      - &series_draining_gateway_1_standalone
+        series: 'greengateway_gateway_draining{job="greengateway",instance="gateway-1",deployment_mode="standalone"}'
+        values: '0+0x40'
+      - *series_depth_gateway_1_standalone
+      - *series_capacity_gateway_1_standalone
+      - *series_oldest_gateway_1_standalone
+      - *series_expected_gateway_1_cluster
+      - *series_up_gateway_2_cluster
+      - *series_expected_gateway_2_cluster
+      - *series_ready_gateway_2_cluster
+      - *series_draining_gateway_2_cluster
+      - *series_depth_gateway_2_cluster
+      - *series_capacity_gateway_2_cluster
+      - *series_oldest_gateway_2_cluster
+      - *series_size_gateway_2_cluster
+      - *series_available_gateway_2_cluster
+      - *series_waiting_gateway_2_cluster
+      - *series_schema_gateway_2_cluster
+      - *series_heartbeat_gateway_2_cluster
+      - *series_mismatch_gateway_2_cluster
+    alert_rule_test:
+      - {eval_time: 1m30s, alertname: GreenGatewayMonitoringConfigurationInvalid, exp_alerts: []}
+      - eval_time: 2m
+        alertname: GreenGatewayMonitoringConfigurationInvalid
+        exp_alerts:
+          - &fires_monitoring_configuration_invalid_gateway_1_standalone
+            exp_labels: {job: 'greengateway', instance: 'gateway-1', deployment_mode: 'standalone', severity: 'warning', owner: 'gateway-operations'}
+            exp_annotations: *annotations_monitoring_configuration_invalid
+      - {eval_time: 3m, alertname: GreenGatewayExpectedTargetsMissing, exp_alerts: []}
+
+  - name: 'partial inventory cannot be hidden by an inventoried healthy replica'
+    interval: 30s
+    input_series:
+      - *series_up_gateway_1_cluster
+      - series: 'greengateway_monitoring:target_expected{job="greengateway",instance="gateway-1",deployment_mode="cluster"}'
+        values: '_x7 1+0x33'
+      - *series_ready_gateway_1_cluster
+      - *series_draining_gateway_1_cluster
+      - *series_depth_gateway_1_cluster
+      - *series_capacity_gateway_1_cluster
+      - *series_oldest_gateway_1_cluster
+      - *series_size_gateway_1_cluster
+      - *series_available_gateway_1_cluster
+      - *series_waiting_gateway_1_cluster
+      - *series_schema_gateway_1_cluster
+      - *series_heartbeat_gateway_1_cluster
+      - *series_mismatch_gateway_1_cluster
+      - *series_up_gateway_2_cluster
+      - *series_expected_gateway_2_cluster
+      - *series_ready_gateway_2_cluster
+      - *series_draining_gateway_2_cluster
+      - *series_depth_gateway_2_cluster
+      - *series_capacity_gateway_2_cluster
+      - *series_oldest_gateway_2_cluster
+      - *series_size_gateway_2_cluster
+      - *series_available_gateway_2_cluster
+      - *series_waiting_gateway_2_cluster
+      - *series_schema_gateway_2_cluster
+      - *series_heartbeat_gateway_2_cluster
+      - *series_mismatch_gateway_2_cluster
+    alert_rule_test:
+      - {eval_time: 1m30s, alertname: GreenGatewayMonitoringConfigurationInvalid, exp_alerts: []}
+      - eval_time: 2m
+        alertname: GreenGatewayMonitoringConfigurationInvalid
+        exp_alerts:
+          - &fires_monitoring_configuration_invalid_gateway_1_cluster
+            exp_labels: {job: 'greengateway', instance: 'gateway-1', deployment_mode: 'cluster', severity: 'warning', owner: 'gateway-operations'}
+            exp_annotations: *annotations_monitoring_configuration_invalid
+      - {eval_time: 4m, alertname: GreenGatewayMonitoringConfigurationInvalid, exp_alerts: []}
+      - {eval_time: 3m, alertname: GreenGatewayExpectedTargetsMissing, exp_alerts: []}
+
+  - name: 'declared inventory value must be one'
+    interval: 30s
+    input_series:
+      - *series_up_gateway_1_cluster
+      - series: 'greengateway_monitoring:target_expected{job="greengateway",instance="gateway-1",deployment_mode="cluster"}'
+        values: '0+0x6 1+0x33'
+      - *series_ready_gateway_1_cluster
+      - *series_draining_gateway_1_cluster
+      - *series_depth_gateway_1_cluster
+      - *series_capacity_gateway_1_cluster
+      - *series_oldest_gateway_1_cluster
+      - *series_size_gateway_1_cluster
+      - *series_available_gateway_1_cluster
+      - *series_waiting_gateway_1_cluster
+      - *series_schema_gateway_1_cluster
+      - *series_heartbeat_gateway_1_cluster
+      - *series_mismatch_gateway_1_cluster
+    alert_rule_test:
+      - {eval_time: 1m30s, alertname: GreenGatewayMonitoringConfigurationInvalid, exp_alerts: []}
+      - {eval_time: 2m, alertname: GreenGatewayMonitoringConfigurationInvalid, exp_alerts: [*fires_monitoring_configuration_invalid_gateway_1_cluster]}
+      - {eval_time: 4m, alertname: GreenGatewayMonitoringConfigurationInvalid, exp_alerts: []}
+      - {eval_time: 3m, alertname: GreenGatewayMetricsTargetDown, exp_alerts: []}
+
+  # Five replicas each omit a different mandatory gauge until 3m30s; one fully healthy replica remains.
+  - name: 'each required lifecycle or audit gauge is checked independently with up one'
+    interval: 30s
+    input_series:
+      - *series_up_gateway_1_standalone
+      - *series_expected_gateway_1_standalone
+      - series: 'greengateway_gateway_ready{job="greengateway",instance="gateway-1",deployment_mode="standalone"}'
+        values: '_x7 1+0x40'
+      - *series_draining_gateway_1_standalone
+      - *series_depth_gateway_1_standalone
+      - *series_capacity_gateway_1_standalone
+      - *series_oldest_gateway_1_standalone
+      - series: 'up{job="greengateway",instance="gateway-2",deployment_mode="standalone"}'
+        values: '1+0x40'
+      - series: 'greengateway_monitoring:target_expected{job="greengateway",instance="gateway-2",deployment_mode="standalone"}'
+        values: '1+0x40'
+      - series: 'greengateway_gateway_ready{job="greengateway",instance="gateway-2",deployment_mode="standalone"}'
+        values: '1+0x40'
+      - series: 'greengateway_gateway_draining{job="greengateway",instance="gateway-2",deployment_mode="standalone"}'
+        values: '_x7 0+0x40'
+      - series: 'greengateway_audit_queue_depth{job="greengateway",instance="gateway-2",deployment_mode="standalone"}'
+        values: '0+0x40'
+      - series: 'greengateway_audit_queue_capacity{job="greengateway",instance="gateway-2",deployment_mode="standalone"}'
+        values: '100+0x40'
+      - series: 'greengateway_audit_queue_oldest_age_seconds{job="greengateway",instance="gateway-2",deployment_mode="standalone"}'
+        values: '0+0x40'
+      - series: 'up{job="greengateway",instance="gateway-3",deployment_mode="standalone"}'
+        values: '1+0x40'
+      - series: 'greengateway_monitoring:target_expected{job="greengateway",instance="gateway-3",deployment_mode="standalone"}'
+        values: '1+0x40'
+      - series: 'greengateway_gateway_ready{job="greengateway",instance="gateway-3",deployment_mode="standalone"}'
+        values: '1+0x40'
+      - series: 'greengateway_gateway_draining{job="greengateway",instance="gateway-3",deployment_mode="standalone"}'
+        values: '0+0x40'
+      - series: 'greengateway_audit_queue_depth{job="greengateway",instance="gateway-3",deployment_mode="standalone"}'
+        values: '_x7 0+0x40'
+      - series: 'greengateway_audit_queue_capacity{job="greengateway",instance="gateway-3",deployment_mode="standalone"}'
+        values: '100+0x40'
+      - series: 'greengateway_audit_queue_oldest_age_seconds{job="greengateway",instance="gateway-3",deployment_mode="standalone"}'
+        values: '0+0x40'
+      - series: 'up{job="greengateway",instance="gateway-4",deployment_mode="standalone"}'
+        values: '1+0x40'
+      - series: 'greengateway_monitoring:target_expected{job="greengateway",instance="gateway-4",deployment_mode="standalone"}'
+        values: '1+0x40'
+      - series: 'greengateway_gateway_ready{job="greengateway",instance="gateway-4",deployment_mode="standalone"}'
+        values: '1+0x40'
+      - series: 'greengateway_gateway_draining{job="greengateway",instance="gateway-4",deployment_mode="standalone"}'
+        values: '0+0x40'
+      - series: 'greengateway_audit_queue_depth{job="greengateway",instance="gateway-4",deployment_mode="standalone"}'
+        values: '0+0x40'
+      - series: 'greengateway_audit_queue_capacity{job="greengateway",instance="gateway-4",deployment_mode="standalone"}'
+        values: '_x7 100+0x40'
+      - series: 'greengateway_audit_queue_oldest_age_seconds{job="greengateway",instance="gateway-4",deployment_mode="standalone"}'
+        values: '0+0x40'
+      - series: 'up{job="greengateway",instance="gateway-5",deployment_mode="standalone"}'
+        values: '1+0x40'
+      - series: 'greengateway_monitoring:target_expected{job="greengateway",instance="gateway-5",deployment_mode="standalone"}'
+        values: '1+0x40'
+      - series: 'greengateway_gateway_ready{job="greengateway",instance="gateway-5",deployment_mode="standalone"}'
+        values: '1+0x40'
+      - series: 'greengateway_gateway_draining{job="greengateway",instance="gateway-5",deployment_mode="standalone"}'
+        values: '0+0x40'
+      - series: 'greengateway_audit_queue_depth{job="greengateway",instance="gateway-5",deployment_mode="standalone"}'
+        values: '0+0x40'
+      - series: 'greengateway_audit_queue_capacity{job="greengateway",instance="gateway-5",deployment_mode="standalone"}'
+        values: '100+0x40'
+      - series: 'greengateway_audit_queue_oldest_age_seconds{job="greengateway",instance="gateway-5",deployment_mode="standalone"}'
+        values: '_x7 0+0x40'
+      - series: 'up{job="greengateway",instance="gateway-6",deployment_mode="standalone"}'
+        values: '1+0x40'
+      - series: 'greengateway_monitoring:target_expected{job="greengateway",instance="gateway-6",deployment_mode="standalone"}'
+        values: '1+0x40'
+      - series: 'greengateway_gateway_ready{job="greengateway",instance="gateway-6",deployment_mode="standalone"}'
+        values: '1+0x40'
+      - series: 'greengateway_gateway_draining{job="greengateway",instance="gateway-6",deployment_mode="standalone"}'
+        values: '0+0x40'
+      - series: 'greengateway_audit_queue_depth{job="greengateway",instance="gateway-6",deployment_mode="standalone"}'
+        values: '0+0x40'
+      - series: 'greengateway_audit_queue_capacity{job="greengateway",instance="gateway-6",deployment_mode="standalone"}'
+        values: '100+0x40'
+      - series: 'greengateway_audit_queue_oldest_age_seconds{job="greengateway",instance="gateway-6",deployment_mode="standalone"}'
+        values: '0+0x40'
+    alert_rule_test:
+      - {eval_time: 1m30s, alertname: GreenGatewayMetricsMissing, exp_alerts: []}
+      - eval_time: 2m
+        alertname: GreenGatewayMetricsMissing
+        exp_alerts:
+          - &fires_metrics_missing_gateway_1_standalone
+            exp_labels: {job: 'greengateway', instance: 'gateway-1', deployment_mode: 'standalone', severity: 'critical', owner: 'gateway-operations'}
+            exp_annotations: &annotations_metrics_missing
+              summary: 'Successful gateway scrape is missing required gauges'
+              runbook_url: 'https://github.com/Greenhat-Security/GreenGateway/blob/main/docs/deployment/operational-alerts.md#metrics-availability'
+          - &fires_metrics_missing_gateway_2_standalone
+            exp_labels: {job: 'greengateway', instance: 'gateway-2', deployment_mode: 'standalone', severity: 'critical', owner: 'gateway-operations'}
+            exp_annotations: *annotations_metrics_missing
+          - &fires_metrics_missing_gateway_3_standalone
+            exp_labels: {job: 'greengateway', instance: 'gateway-3', deployment_mode: 'standalone', severity: 'critical', owner: 'gateway-operations'}
+            exp_annotations: *annotations_metrics_missing
+          - &fires_metrics_missing_gateway_4_standalone
+            exp_labels: {job: 'greengateway', instance: 'gateway-4', deployment_mode: 'standalone', severity: 'critical', owner: 'gateway-operations'}
+            exp_annotations: *annotations_metrics_missing
+          - &fires_metrics_missing_gateway_5_standalone
+            exp_labels: {job: 'greengateway', instance: 'gateway-5', deployment_mode: 'standalone', severity: 'critical', owner: 'gateway-operations'}
+            exp_annotations: *annotations_metrics_missing
+      - {eval_time: 4m, alertname: GreenGatewayMetricsMissing, exp_alerts: []}
+      - {eval_time: 3m, alertname: GreenGatewayClusterMetricsMissing, exp_alerts: []}
+
+  - name: 'each required pool gauge is checked independently with up one'
+    interval: 30s
+    input_series:
+      - *series_up_gateway_1_cluster
+      - *series_expected_gateway_1_cluster
+      - *series_ready_gateway_1_cluster
+      - *series_draining_gateway_1_cluster
+      - *series_depth_gateway_1_cluster
+      - *series_capacity_gateway_1_cluster
+      - *series_oldest_gateway_1_cluster
+      - series: 'greengateway_database_pool_size{job="greengateway",instance="gateway-1",deployment_mode="cluster"}'
+        values: '_x7 10+0x40'
+      - *series_available_gateway_1_cluster
+      - *series_waiting_gateway_1_cluster
+      - *series_schema_gateway_1_cluster
+      - *series_heartbeat_gateway_1_cluster
+      - *series_mismatch_gateway_1_cluster
+      - *series_up_gateway_2_cluster
+      - *series_expected_gateway_2_cluster
+      - *series_ready_gateway_2_cluster
+      - *series_draining_gateway_2_cluster
+      - *series_depth_gateway_2_cluster
+      - *series_capacity_gateway_2_cluster
+      - *series_oldest_gateway_2_cluster
+      - *series_size_gateway_2_cluster
+      - series: 'greengateway_database_pool_available{job="greengateway",instance="gateway-2",deployment_mode="cluster"}'
+        values: '_x7 10+0x40'
+      - *series_waiting_gateway_2_cluster
+      - *series_schema_gateway_2_cluster
+      - *series_heartbeat_gateway_2_cluster
+      - *series_mismatch_gateway_2_cluster
+      - series: 'up{job="greengateway",instance="gateway-3",deployment_mode="cluster"}'
+        values: '1+0x40'
+      - series: 'greengateway_monitoring:target_expected{job="greengateway",instance="gateway-3",deployment_mode="cluster"}'
+        values: '1+0x40'
+      - series: 'greengateway_gateway_ready{job="greengateway",instance="gateway-3",deployment_mode="cluster"}'
+        values: '1+0x40'
+      - series: 'greengateway_gateway_draining{job="greengateway",instance="gateway-3",deployment_mode="cluster"}'
+        values: '0+0x40'
+      - series: 'greengateway_audit_queue_depth{job="greengateway",instance="gateway-3",deployment_mode="cluster"}'
+        values: '0+0x40'
+      - series: 'greengateway_audit_queue_capacity{job="greengateway",instance="gateway-3",deployment_mode="cluster"}'
+        values: '100+0x40'
+      - series: 'greengateway_audit_queue_oldest_age_seconds{job="greengateway",instance="gateway-3",deployment_mode="cluster"}'
+        values: '0+0x40'
+      - series: 'greengateway_database_pool_size{job="greengateway",instance="gateway-3",deployment_mode="cluster"}'
+        values: '10+0x40'
+      - series: 'greengateway_database_pool_available{job="greengateway",instance="gateway-3",deployment_mode="cluster"}'
+        values: '10+0x40'
+      - series: 'greengateway_database_pool_waiting{job="greengateway",instance="gateway-3",deployment_mode="cluster"}'
+        values: '_x7 0+0x40'
+      - series: 'greengateway_schema_compatible{job="greengateway",instance="gateway-3",deployment_mode="cluster"}'
+        values: '1+0x40'
+      - series: 'greengateway_cluster_heartbeat_age_seconds{job="greengateway",instance="gateway-3",deployment_mode="cluster"}'
+        values: '0+0x40'
+      - series: 'greengateway_cluster_config_mismatch{job="greengateway",instance="gateway-3",deployment_mode="cluster"}'
+        values: '0+0x40'
+      - series: 'up{job="greengateway",instance="gateway-4",deployment_mode="cluster"}'
+        values: '1+0x40'
+      - series: 'greengateway_monitoring:target_expected{job="greengateway",instance="gateway-4",deployment_mode="cluster"}'
+        values: '1+0x40'
+      - series: 'greengateway_gateway_ready{job="greengateway",instance="gateway-4",deployment_mode="cluster"}'
+        values: '1+0x40'
+      - series: 'greengateway_gateway_draining{job="greengateway",instance="gateway-4",deployment_mode="cluster"}'
+        values: '0+0x40'
+      - series: 'greengateway_audit_queue_depth{job="greengateway",instance="gateway-4",deployment_mode="cluster"}'
+        values: '0+0x40'
+      - series: 'greengateway_audit_queue_capacity{job="greengateway",instance="gateway-4",deployment_mode="cluster"}'
+        values: '100+0x40'
+      - series: 'greengateway_audit_queue_oldest_age_seconds{job="greengateway",instance="gateway-4",deployment_mode="cluster"}'
+        values: '0+0x40'
+      - series: 'greengateway_database_pool_size{job="greengateway",instance="gateway-4",deployment_mode="cluster"}'
+        values: '10+0x40'
+      - series: 'greengateway_database_pool_available{job="greengateway",instance="gateway-4",deployment_mode="cluster"}'
+        values: '10+0x40'
+      - series: 'greengateway_database_pool_waiting{job="greengateway",instance="gateway-4",deployment_mode="cluster"}'
+        values: '0+0x40'
+      - series: 'greengateway_schema_compatible{job="greengateway",instance="gateway-4",deployment_mode="cluster"}'
+        values: '1+0x40'
+      - series: 'greengateway_cluster_heartbeat_age_seconds{job="greengateway",instance="gateway-4",deployment_mode="cluster"}'
+        values: '0+0x40'
+      - series: 'greengateway_cluster_config_mismatch{job="greengateway",instance="gateway-4",deployment_mode="cluster"}'
+        values: '0+0x40'
+    alert_rule_test:
+      - {eval_time: 1m30s, alertname: GreenGatewayClusterMetricsMissing, exp_alerts: []}
+      - eval_time: 2m
+        alertname: GreenGatewayClusterMetricsMissing
+        exp_alerts:
+          - &fires_cluster_metrics_missing_gateway_1_cluster
+            exp_labels: {job: 'greengateway', instance: 'gateway-1', deployment_mode: 'cluster', severity: 'critical', owner: 'gateway-operations'}
+            exp_annotations: &annotations_cluster_metrics_missing
+              summary: 'Cluster gateway scrape is missing database pool gauges'
+              runbook_url: 'https://github.com/Greenhat-Security/GreenGateway/blob/main/docs/deployment/operational-alerts.md#metrics-availability'
+          - &fires_cluster_metrics_missing_gateway_2_cluster
+            exp_labels: {job: 'greengateway', instance: 'gateway-2', deployment_mode: 'cluster', severity: 'critical', owner: 'gateway-operations'}
+            exp_annotations: *annotations_cluster_metrics_missing
+          - &fires_cluster_metrics_missing_gateway_3_cluster
+            exp_labels: {job: 'greengateway', instance: 'gateway-3', deployment_mode: 'cluster', severity: 'critical', owner: 'gateway-operations'}
+            exp_annotations: *annotations_cluster_metrics_missing
+      - {eval_time: 4m, alertname: GreenGatewayClusterMetricsMissing, exp_alerts: []}
+      - {eval_time: 3m, alertname: GreenGatewayMetricsMissing, exp_alerts: []}
+
+  - name: 'required gauge becomes stale on one successfully scraped replica'
+    interval: 30s
+    input_series:
+      - *series_up_gateway_1_cluster
+      - *series_expected_gateway_1_cluster
+      - *series_ready_gateway_1_cluster
+      - *series_draining_gateway_1_cluster
+      - *series_depth_gateway_1_cluster
+      - series: 'greengateway_audit_queue_capacity{job="greengateway",instance="gateway-1",deployment_mode="cluster"}'
+        values: '100+0x4 stale _x10 100+0x24'
+      - *series_oldest_gateway_1_cluster
+      - *series_size_gateway_1_cluster
+      - *series_available_gateway_1_cluster
+      - *series_waiting_gateway_1_cluster
+      - *series_schema_gateway_1_cluster
+      - *series_heartbeat_gateway_1_cluster
+      - *series_mismatch_gateway_1_cluster
+      - *series_up_gateway_2_cluster
+      - *series_expected_gateway_2_cluster
+      - *series_ready_gateway_2_cluster
+      - *series_draining_gateway_2_cluster
+      - *series_depth_gateway_2_cluster
+      - *series_capacity_gateway_2_cluster
+      - *series_oldest_gateway_2_cluster
+      - *series_size_gateway_2_cluster
+      - *series_available_gateway_2_cluster
+      - *series_waiting_gateway_2_cluster
+      - *series_schema_gateway_2_cluster
+      - *series_heartbeat_gateway_2_cluster
+      - *series_mismatch_gateway_2_cluster
+    alert_rule_test:
+      - {eval_time: 4m, alertname: GreenGatewayMetricsMissing, exp_alerts: []}
+      - eval_time: 4m30s
+        alertname: GreenGatewayMetricsMissing
+        exp_alerts:
+          - &fires_metrics_missing_gateway_1_cluster
+            exp_labels: {job: 'greengateway', instance: 'gateway-1', deployment_mode: 'cluster', severity: 'critical', owner: 'gateway-operations'}
+            exp_annotations: *annotations_metrics_missing
+      - {eval_time: 8m, alertname: GreenGatewayMetricsMissing, exp_alerts: []}
+      - {eval_time: 7m30s, alertname: GreenGatewayMetricsTargetDown, exp_alerts: []}
+
+  - name: 'pool waiting and exhaustion must occur on the same instance'
+    interval: 30s
+    input_series:
+      - *series_up_gateway_1_cluster
+      - *series_expected_gateway_1_cluster
+      - *series_ready_gateway_1_cluster
+      - *series_draining_gateway_1_cluster
+      - *series_depth_gateway_1_cluster
+      - *series_capacity_gateway_1_cluster
+      - *series_oldest_gateway_1_cluster
+      - *series_size_gateway_1_cluster
+      - series: 'greengateway_database_pool_available{job="greengateway",instance="gateway-1",deployment_mode="cluster"}'
+        values: '1+0x40'
+      - *series_waiting_gateway_1_cluster_3
+      - *series_schema_gateway_1_cluster
+      - *series_heartbeat_gateway_1_cluster
+      - *series_mismatch_gateway_1_cluster
+      - *series_up_gateway_2_cluster
+      - *series_expected_gateway_2_cluster
+      - *series_ready_gateway_2_cluster
+      - *series_draining_gateway_2_cluster
+      - *series_depth_gateway_2_cluster
+      - *series_capacity_gateway_2_cluster
+      - *series_oldest_gateway_2_cluster
+      - *series_size_gateway_2_cluster
+      - series: 'greengateway_database_pool_available{job="greengateway",instance="gateway-2",deployment_mode="cluster"}'
+        values: '0+0x40'
+      - *series_waiting_gateway_2_cluster
+      - *series_schema_gateway_2_cluster
+      - *series_heartbeat_gateway_2_cluster
+      - *series_mismatch_gateway_2_cluster
+    alert_rule_test:
+      - {eval_time: 12m, alertname: GreenGatewayDatabasePoolSaturated, exp_alerts: []}
+
+  - name: 'counter reset without any new failures must not fire'
+    interval: 30s
+    input_series:
+      - *series_up_gateway_1_cluster
+      - *series_expected_gateway_1_cluster
+      - *series_ready_gateway_1_cluster
+      - *series_draining_gateway_1_cluster
+      - *series_depth_gateway_1_cluster
+      - *series_capacity_gateway_1_cluster
+      - *series_oldest_gateway_1_cluster
+      - *series_size_gateway_1_cluster
+      - *series_available_gateway_1_cluster
+      - *series_waiting_gateway_1_cluster
+      - *series_schema_gateway_1_cluster
+      - *series_heartbeat_gateway_1_cluster
+      - *series_mismatch_gateway_1_cluster
+      - series: 'audit_events_dropped_total{job="greengateway",instance="gateway-1",deployment_mode="cluster",reason="sink_error"}'
+        values: '10+0x5 0+0x34'
+      - series: 'greengateway_audit_flush_total{job="greengateway",instance="gateway-1",deployment_mode="cluster",outcome="failure"}'
+        values: '10+0x5 0+0x34'
+      - series: 'greengateway_database_pool_timeouts_total{job="greengateway",instance="gateway-1",deployment_mode="cluster"}'
+        values: '10+0x5 0+0x34'
+    alert_rule_test:
+      - {eval_time: 2m30s, alertname: GreenGatewayAuditLoss, exp_alerts: []}
+      - {eval_time: 2m30s, alertname: GreenGatewayAuditFlushFailures, exp_alerts: []}
+      - {eval_time: 2m30s, alertname: GreenGatewayDatabasePoolTimeouts, exp_alerts: []}
+      - {eval_time: 6m, alertname: GreenGatewayAuditLoss, exp_alerts: []}
+      - {eval_time: 6m, alertname: GreenGatewayAuditFlushFailures, exp_alerts: []}
+      - {eval_time: 6m, alertname: GreenGatewayDatabasePoolTimeouts, exp_alerts: []}
+      - {eval_time: 12m, alertname: GreenGatewayAuditLoss, exp_alerts: []}
+      - {eval_time: 12m, alertname: GreenGatewayAuditFlushFailures, exp_alerts: []}
+      - {eval_time: 12m, alertname: GreenGatewayDatabasePoolTimeouts, exp_alerts: []}
+
+  # Reset at 3m is healthy; first post-reset increase at 3m30s starts the 2m hold.
+  - name: 'new failures after a counter reset still fire and later recover'
+    interval: 30s
+    input_series:
+      - *series_up_gateway_1_cluster
+      - *series_expected_gateway_1_cluster
+      - *series_ready_gateway_1_cluster
+      - *series_draining_gateway_1_cluster
+      - *series_depth_gateway_1_cluster
+      - *series_capacity_gateway_1_cluster
+      - *series_oldest_gateway_1_cluster
+      - *series_size_gateway_1_cluster
+      - *series_available_gateway_1_cluster
+      - *series_waiting_gateway_1_cluster
+      - *series_schema_gateway_1_cluster
+      - *series_heartbeat_gateway_1_cluster
+      - *series_mismatch_gateway_1_cluster
+      - series: 'audit_events_dropped_total{job="greengateway",instance="gateway-1",deployment_mode="cluster",reason="sink_error"}'
+        values: '10+0x5 0+1x14 14+0x20'
+      - series: 'greengateway_audit_flush_total{job="greengateway",instance="gateway-1",deployment_mode="cluster",outcome="failure"}'
+        values: '10+0x5 0+1x14 14+0x20'
+      - series: 'greengateway_database_pool_timeouts_total{job="greengateway",instance="gateway-1",deployment_mode="cluster"}'
+        values: '10+0x5 0+1x14 14+0x20'
+    alert_rule_test:
+      - {eval_time: 5m, alertname: GreenGatewayAuditLoss, exp_alerts: []}
+      - {eval_time: 5m30s, alertname: GreenGatewayAuditLoss, exp_alerts: [*fires_audit_loss_gateway_1_cluster]}
+      - {eval_time: 8m, alertname: GreenGatewayAuditLoss, exp_alerts: [*fires_audit_loss_gateway_1_cluster]}
+      - {eval_time: 16m, alertname: GreenGatewayAuditLoss, exp_alerts: []}
+      - {eval_time: 5m, alertname: GreenGatewayAuditFlushFailures, exp_alerts: []}
+      - {eval_time: 5m30s, alertname: GreenGatewayAuditFlushFailures, exp_alerts: [*fires_audit_flush_failures_gateway_1_cluster]}
+      - {eval_time: 8m, alertname: GreenGatewayAuditFlushFailures, exp_alerts: [*fires_audit_flush_failures_gateway_1_cluster]}
+      - {eval_time: 16m, alertname: GreenGatewayAuditFlushFailures, exp_alerts: []}
+      - {eval_time: 5m, alertname: GreenGatewayDatabasePoolTimeouts, exp_alerts: []}
+      - {eval_time: 5m30s, alertname: GreenGatewayDatabasePoolTimeouts, exp_alerts: [*fires_database_pool_timeouts_gateway_1_cluster]}
+      - {eval_time: 8m, alertname: GreenGatewayDatabasePoolTimeouts, exp_alerts: [*fires_database_pool_timeouts_gateway_1_cluster]}
+      - {eval_time: 16m, alertname: GreenGatewayDatabasePoolTimeouts, exp_alerts: []}
