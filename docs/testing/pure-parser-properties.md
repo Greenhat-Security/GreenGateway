@@ -1,7 +1,7 @@
 # Deterministic properties for pure security parsers
 
 Part of [#435](https://github.com/Greenhat-Security/GreenGateway/issues/435),
-the first property-inventory and parser-suite slice. These tests exercise the
+including the parser suites and now-available shared evaluator. These tests exercise the
 existing production helpers directly. They do not create a second parser,
 change accepted inputs, or start a gateway, DNS resolver, provider, or HTTP
 client for generated cases.
@@ -20,7 +20,7 @@ Inventory at the introduction of this suite:
 
 The three existing generated suites use Proptest's default random-seed selection.
 They remain unchanged. The admission/kernel property already exists on main;
-future #435 evaluator work should extend it rather than duplicate it.
+the generated evaluator suite below extends it rather than duplicating it.
 
 ## New invariant boundaries
 
@@ -91,8 +91,9 @@ cargo test -p gateway --locked property_tests:: -- --list
 cargo test -p gateway --locked property_tests:: -- --test-threads=1
 ```
 
-Confirm the list includes all three modules: `egress::property_tests`,
-`upstream_route::property_tests`, and `path_match::property_tests`. Cargo accepts
+Confirm the list includes all four modules: `egress::property_tests`,
+`upstream_route::property_tests`, `path_match::property_tests`, and
+`policy_eval::property_tests` (30 properties total). Cargo accepts
 an unmatched filter as an empty successful run, so do not treat an empty list
 as evidence. The normal `cargo test --workspace --locked` CI job runs these
 tests without a filter and already gates image promotion.
@@ -105,6 +106,7 @@ property, with at most 2,048 shrink iterations:
 | `egress::property_tests` | `435001` | 10 | 4/16-byte addresses; at most 12 answers; DNS labels up to 12 bytes |
 | `upstream_route::property_tests` | `435002` | 8 | Bounded host strings, IPv6 literals and small generated route lists |
 | `path_match::property_tests` | `435003` | 4 | At most eight 24-byte path segments plus fixed ambiguity markers |
+| `policy_eval::property_tests` | `435004` | 8 | At most eight rules/rate overrides; 24 generated label bytes and 16 source-whitespace bytes |
 
 Generated host strings have at most 256 Unicode
 characters (1,024 UTF-8 bytes), except the deliberate host-length test at the
@@ -143,15 +145,19 @@ claim that a fresh repository build requires no downloads. Coverage thresholds,
 transport ownership and existing test selectors remain unchanged; existing
 promotion gates remain mandatory.
 
-## Remaining #435 work
+## Evaluator and corpus integration
 
-The [bounded corpus harness](security-corpus.md) now adds synthetic
-JWT/policy/host/path seeds, explicit process time/memory budgets, nonempty-corpus
-checks and retained seed/corpus identity. Trusted scheduled/manual exploration
-and a mandatory regression promotion dependency now run in CI. The final slice
-adds generated properties for the already-available shared evaluator.
-These checks do not establish exhaustive parser safety or perform external
-target testing.
+Eight generated evaluator properties cover deterministic direct/alias
+precedence, complete/incomplete facts, source/revision/context and semantics
+bindings, captured-fact replay, bounded redacted traces and rate selection.
+Missing-fact and binding mutations are forced on every generated case. They
+exercise the pure API without runtime, store, resolver or callback handles.
+
+The [bounded corpus harness](security-corpus.md) adds committed synthetic
+JWT/policy/host/path seeds, process time/memory limits, exact nonempty execution
+checks, redacted evidence and trusted scheduled/manual exploration. Its CI job
+is an additional promotion dependency. These remain regression assertions,
+not a coverage-guided fuzz campaign or a proof that every input is safe.
 
 Triage recurring failures with the owners of the affected parser and security
 tests. Preserve the reproducing seed and toolchain, minimize to synthetic input,

@@ -126,8 +126,8 @@ The mandatory `security-corpus` job in `ci.yml` runs on every existing PR, main
 push and version-tag trigger. It tests the runner/workflow contracts and runs
 regression mode. `promote-image` requires it under the existing strict
 success/no-skipped-needs condition. The ordinary `test` job runs fixed ChaCha
-property seeds: egress `435001`, host/route `435002`, and path `435003`, each
-with 128 cases. Existing coverage thresholds remain unchanged.
+property seeds: egress `435001`, host/route `435002`, path `435003`, evaluator
+`435004`, each with 128 cases. Existing coverage thresholds remain unchanged.
 
 `security-corpus.yml` adds exploration at 04:23 UTC and by manual dispatch.
 Only the upstream repository's default branch can execute it, including manual
@@ -156,7 +156,7 @@ findings; never raise a limit or remove a failing seed merely to obtain green.
    corpus with an explanatory regression assertion. Nothing automatically
    creates public issues or publishes input bytes.
 
-The shared evaluator is available and the policy corpus uses its pure API.
-Generated evaluator properties are the remaining #435 PR 4 slice. Keep corpus
-targets on authoritative entry points if modules move.
+The now-available shared evaluator has generated determinism, completeness,
+replay/version-binding, trace-redaction and rate-selection properties alongside
+it. Keep these and corpus targets on authoritative entry points if modules move.
 This suite establishes neither live PostgreSQL/HA coverage nor exhaustive safety.
