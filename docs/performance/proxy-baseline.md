@@ -4,6 +4,11 @@ This baseline is an engineering comparison aid, not a service-level objective.
 Results are meaningful only when the same revision, release build, machine
 class, container limits, network topology, and load command are recorded.
 
+The separate [pure-path microbenchmark gate](pure-path-benchmarks.md) compares
+allocation budgets for small request, path-pattern and static host predicates
+on each PR. Its wall-clock timings are informational, and it leaves the full
+proxy load and release qualification described here in place.
+
 ## Reproduce
 
 Start the seeded three-upstream stack:
