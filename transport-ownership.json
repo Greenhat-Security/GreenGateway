@@ -9982,6 +9982,16 @@
       "purpose": "Inspect the existing request body end-of-stream flag for an enabled, exact registered POST logout route; creates no client, connection, listener or task."
     },
     {
+      "file": "gateway/src/policy_eval/mod.rs",
+      "reasons": [
+        "unexpanded-attribute"
+      ],
+      "scope": "gateway::policy_eval::tools::attributes#1",
+      "sha256": "a97782e307cca2c63218bbb7beb6f2201e8f53d757c50109077b984a8314d83b",
+      "owner": "policy evaluation tool lane (#421)",
+      "purpose": "The tools module contains pure policy evaluation only; its non-test dead-code allowance remains scoped to this offline lane until the tool adapters in #422 consume it. No transport or runtime authority is introduced."
+    },
+    {
       "file": "gateway/src/proxy/admission.rs",
       "reasons": [
         "unexpanded-macro"

@@ -6,7 +6,7 @@ authoritative. Issue #422 owns adapter cutover after differential parity.
 
 It now covers contextless HTTP direct rules and permission routes, host-qualified
 routes and dispatch-scoped direct rules, MCP alias identities, and rate-lane
-selection. Tool admission and static egress are not implemented.
+selection, plus five policy-backed tool operations. Static egress is not implemented.
 [policy-evaluation-parity.md](policy-evaluation-parity.md) is the per-lane
 inventory: legacy entry point, normalization, default, trace reason, authority.
 
@@ -46,7 +46,8 @@ freshness or perform a live cluster-revision check.
 | Host/dispatch-qualified rules | RBAC matching/direct/host helpers | Host-bound routes and dispatch-scoped rules evaluated; a selected upstream narrows direct rules to denies and is refused outright when no host-bound route authorizes it |
 | MCP raw/canonical aliases | `evaluate_equivalent_paths_with_dispatch`, exact-then-prefix route search | Both identities decide, under action-major precedence; the request path is matched exactly and only the canonical identity by prefix |
 | Rate lane selection | `policy_rate_limit_request` guard, `RateLimitState::matching_limiter` | First matching override; anonymous reaches none, reproducing the live early return; enforcement and buckets untouched |
-| Tools, static egress | Existing respective authorities | Not evaluated; #421 PR 2 owns extraction |
+| Policy-backed tools | `ToolRuntime` invocation, visibility, composite enablement, rendered HTTP rules; `RbacState::tool_policy_eligibility` | Separate pure operations preserve each consumer's precedence and shadow behavior; no live cutover |
+| Static egress | Existing egress authority | Not evaluated; #421 PR 2 still owns extraction |
 
 Every target is evaluated, so there is no `unsupported_target` limitation and no
 `unsupported_routing_policy`; both are gone. What remains is facts: each missing
@@ -67,6 +68,50 @@ lose telemetry. Every trace enumerates authentication, CSRF, request
 admission, management permissions, other policy lanes, mutable capacity, DNS,
 transport, upstream execution, live revision freshness and exact gateway build
 identity as not evaluated. Allow/Observe is no promise that a request forwards.
+
+## Tool operation contract
+
+`CompiledPolicy::evaluate_tool` accepts `ToolEvaluationContext` version 1,
+independent of HTTP context version 3. Its domain is `tool_policy_v1` and its
+semantics version is `gg-tool-policy-v1`. Each result names exactly one operation:
+
+| Operation | Policy decision | Shadow rule |
+| --- | --- | --- |
+| `Invocation` | Entry exists, enabled, caller identity matches, then first matching tool rule | Logical Deny / Observe; invocation may continue |
+| `Visibility` | Same admission conditions, returned as policy visibility only | Eligible; no observation |
+| `PolicyEligibility` | Authenticated inventory preview with existing inventory reason codes | Eligible; no observation |
+| `CompositeLeaf` | Entry exists and is enabled; caller must already have a composite grant | Tool rules and identity constraints do not participate |
+| `RenderedHttp` | First direct HTTP rule against the rendered method/path with **unknown dispatch** | Logical Deny / Observe; HTTP operation may continue |
+
+Tool entry role constraints compare exact claims; they do not activate role
+permission definitions. Policy defaults and global enforcement mode do not
+change these decisions. Rendered HTTP intentionally does not evaluate entry
+existence/enablement, HTTP routes/defaults, or contextless-only dispatch rules.
+It must not be replaced with `CompiledPolicy::evaluate`.
+
+Missing tool name, identity, rendered method or path yields an incomplete Block;
+composite enablement does not require identity. Inventory accepts authenticated
+identity only, matching its live API. Supplied malformed facts remain errors.
+No tool-name grammar is invented: names match exactly as the policy does, with
+an offline 4 KiB work bound. **Tool-name admission is not currently bounded by
+that constant.** Rendered requests also bypass inbound HTTP admission; this
+slice does not claim its path/method bounds are already enforced there. Before
+#422 can switch these callers, it must reconcile all such rejection boundaries.
+
+Adapters must capture the consumer's actual identity projection. Runtime
+currently reconstructs a principal from `Actor` only for bearer, cookie and
+service-token modes; a client-certificate actor becomes anonymous there.
+Inventory uses its full authenticated principal. Differential tests pin this
+existing difference; this extraction does not repair or expand it.
+
+Traces bind operation, tool name, projected identity, rendered method/path,
+policy digest, authority, context and semantics versions. They contain none of
+the corresponding raw values. Completeness is scoped to the named operation,
+not full tool admission. Registry existence/listing metadata, request schemas,
+composite grants, leases, capacity, credentials, egress and execution remain
+outside the decision. Non-RBAC legacy `DefaultToolPolicy::Allow` fallback and
+`SourceAuthorizer` enum-source refresh (which uses contextless deny-only rules)
+are separate contracts and are not covered by this lane.
 
 ## Bindings, digests and traces
 
@@ -152,7 +197,14 @@ source rejection, redaction, and deterministic concurrent evaluation with no asy
 runtime present. Purity is asserted rather than assumed: evaluation through a
 capturing audit sink must leave it empty.
 
-Nothing here marks any #422 cutover complete. The remaining #421 PR 2 lanes are
-tool admission and static egress; static egress needs its trusted-fact boundary
+Tool differential tests drive the unchanged live runtime and inventory authority,
+comparing policy decisions, rejection reasons, and emitted rule attribution.
+They compare the compiled instance installed by `RbacState`, use only local
+execution closures, and exercise shadow/default combinations and identity
+constraints. Additional tests assert input binding, missing/invalid facts,
+redacted bounded traces, thread determinism and no audit emission.
+
+Nothing here marks any #422 cutover complete. The remaining #421 PR 2 lane is
+static egress; it needs its trusted-fact boundary
 established before any of it is pure, since its acceptance criterion is that a
 denied request makes zero DNS calls.

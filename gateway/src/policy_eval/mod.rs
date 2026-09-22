@@ -84,6 +84,12 @@ mod input;
 mod property_tests;
 #[cfg(test)]
 mod tests;
+// This lane remains offline even after #422 switches the HTTP adapter.
+#[cfg_attr(
+    not(test),
+    allow(dead_code, reason = "tool policy adapters are a later #422 cutover")
+)]
+pub(crate) mod tools;
 
 use std::fmt;
 

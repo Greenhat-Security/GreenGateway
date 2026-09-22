@@ -16,7 +16,11 @@ Contract evidence for [#421](https://github.com/Greenhat-Security/GreenGateway/i
 | Selected virtual upstream | `required_upstream_host` branch, `host_policy_required` | `Reason::HostPolicyRequired` | Derived from `route_host`, never carried twice | **Refused outright** — the policy default does not apply and shadow does not soften it | same |
 | MCP alias identities | `evaluate_equivalent_paths_with_dispatch` + exact-then-prefix route search | `match_direct` / `match_route` with `canonical_path: Some(..)` | Request path plus the canonical policy identity, carried in `HttpTarget::McpAlias` | Action-major precedence across both identities; route matched exactly on the request path, then by prefix on the canonical one | same |
 | Rate lane selection | `policy_rate_limit_request` guard + `RateLimitState::matching_limiter` | `CompiledPolicy::select_rate_lane` | Method, path pattern, principal; **anonymous reaches no override**, reproducing the live early return | `RateLaneOutcome::NoOverride` | `InputBinding` on the selection itself |
-| Tool admission | `evaluate_tool_authorization`, `tool_policy_eligibility` (`tools/runtime.rs`, `tools/inventory.rs`) | **not implemented** | — | — | — |
+| Tool invocation | `ToolRuntime::execute_with_context` → `authorize_tool_call`, `prepare_invocation` | `evaluate_tool`, `Invocation` | Runtime Actor-projected identity; exact tool name | Enabled matching entry allows without a tool rule; absent entry denies | Policy `ResourceSnapshot` + tool context digest |
+| Tool visibility | `ToolRuntime::tool_visible_to_context` | `evaluate_tool`, `Visibility` | Same runtime identity; registry listing remains outside | Enabled matching entry visible; absent entry hidden | same, operation-bound |
+| Inventory eligibility | `RbacState::tool_policy_eligibility` via inventory | `evaluate_tool`, `PolicyEligibility` | Authenticated Principal directly | Exact existing eligible/reason pair | same, operation-bound |
+| Composite leaf enablement | `ToolRuntime::composite_leaf_enabled` | `evaluate_tool`, `CompositeLeaf` | Exact policy name; ignores identity/tool rules under an existing grant | Absent entry denies | same, operation-bound |
+| Rendered tool HTTP rules | `ToolRuntime::authorize_http_operation` | `evaluate_tool`, `RenderedHttp` | Exact separated rendered path/method; runtime identity; **unknown dispatch** | Allow; no route/default fallback | same, operation-bound |
 | Static egress | `egress.rs` | **not implemented** | — | — | — |
 
 ## Trace reasons and limitation codes
@@ -78,3 +82,37 @@ Purity is asserted rather than assumed: `pure_evaluation_is_thread_safe_determin
 `PolicyDigest::Source` covers the exact accepted source bytes and is available only to the offline compiler, the only caller that holds them. `PolicyDigest::ValidatedPolicy` covers an install path that never did: the live gateway hands over an already-parsed `Policy`, and loading canonicalizes it, so the bytes cannot be reconstructed. It carries frame kind `gg.validated-policy.v1`, deliberately outside ADR-0004's reserved `source`/`semantic` namespace — see `policy-evaluation-kernel.md` for why it is not, and cannot become, JCS.
 
 A result bound to one digest is not reusable under the other, and a context pinned to one is rejected by the other rather than answered.
+
+## Tool lane evidence and cutover limits
+
+`policy_eval::tools::tests` compares all five operations against the installed
+policy and unchanged live consumers. The admission matrix varies global mode,
+default, first-rule action, identity constraints, anonymous/authenticated callers,
+and absent/disabled entries. It checks invocation errors, work execution,
+visibility, inventory reason codes and composite enablement. Audit comparisons
+check event type and original rule attribution, including source ordinals after
+disabled and unrelated rules. Rendered HTTP fixtures distinguish unknown from
+contextless dispatch and prove that no-match allows even with a deny default,
+a permission route and no tool entry. Shadow stays visible/eligible but produces
+Observe for invocation/rendered HTTP.
+
+Tool context version 1 and semantics `gg-tool-policy-v1` are independent of the
+HTTP context version. Every result binds the operation and all supplied policy
+facts. Missing facts fail closed; malformed facts return errors. Inventory has
+no anonymous live contract, so an anonymous inventory context is inconsistent.
+Composite enablement can complete with a missing identity because it does not
+use identity. The new API is bounded, but a live adapter still needs parity at
+its rejection boundaries: policy tool names have no equivalent 4 KiB bound, and
+rendered HTTP method/path facts do not pass through inbound request admission.
+
+The runtime Actor projection accepts three auth modes and currently drops a
+client-certificate identity, whereas inventory retains it. The differential
+fixture pins both outcomes. Adapters must preserve or explicitly change that
+behavior with both authorities tested. `evaluate_tool_http_rule` currently loads
+the current policy instead of `effective_policy()`; this pure extraction accepts
+an explicit snapshot and does not change that live pinning behavior.
+
+Registry existence and listing metadata, composite grant validity, enum-source
+refresh, non-RBAC permissive fallback, transport and mutable execution state are
+outside this contract. The named operation and `not_evaluated` trace fields make
+those limits explicit. Static egress remains outstanding under #421.
