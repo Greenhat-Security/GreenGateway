@@ -63,6 +63,15 @@ fn context(compiled: &CompiledPolicy) -> PolicyEvaluationContext {
 
 #[tokio::test]
 async fn http_lane_matches_current_middleware_decisions_reasons_order_and_shadow_events() {
+    http_lane_matches_current_middleware_decisions_reasons_order_and_shadow_events_matrix(true)
+        .await;
+    http_lane_matches_current_middleware_decisions_reasons_order_and_shadow_events_matrix(false)
+        .await;
+}
+
+async fn http_lane_matches_current_middleware_decisions_reasons_order_and_shadow_events_matrix(
+    legacy: bool,
+) {
     // Exercise the actual authoritative middleware, never a second hand-written
     // expected evaluator. No listener is bound and the terminal handler is local.
     for global in ["enforce", "shadow"] {
@@ -102,9 +111,7 @@ async fn http_lane_matches_current_middleware_decisions_reasons_order_and_shadow
                     // and the comparison would not notice.
                     let installed = state.installed_compiled_policy();
                     let compiled = installed.compiled();
-                    let router = Router::new()
-                        .fallback(any(|| async { "local" }))
-                        .layer(from_fn_with_state(state, rbac_middleware));
+                    let router = parity_router(state, legacy);
                     let mut expected_events = Vec::new();
                     for path in [
                         "/data/item",
@@ -579,6 +586,19 @@ fn direct_principal_constraints_use_existing_identity_and_method_semantics() {
 
 #[tokio::test]
 async fn routing_lane_matches_current_middleware_for_host_bound_and_dispatch_scoped_requests() {
+    routing_lane_matches_current_middleware_for_host_bound_and_dispatch_scoped_requests_matrix(
+        true,
+    )
+    .await;
+    routing_lane_matches_current_middleware_for_host_bound_and_dispatch_scoped_requests_matrix(
+        false,
+    )
+    .await;
+}
+
+async fn routing_lane_matches_current_middleware_for_host_bound_and_dispatch_scoped_requests_matrix(
+    legacy: bool,
+) {
     // Same discipline as the contextless lane: the authoritative middleware is
     // the oracle. A second hand-written evaluator would only prove the kernel
     // agrees with a copy of itself, and the asymmetry under test -- a direct
@@ -610,9 +630,7 @@ async fn routing_lane_matches_current_middleware_for_host_bound_and_dispatch_sco
             let state = RbacState::new(policy.clone(), Vec::new(), false, audit.clone());
             let installed = state.installed_compiled_policy();
             let compiled = installed.compiled();
-            let router = Router::new()
-                .fallback(any(|| async { "local" }))
-                .layer(from_fn_with_state(state, rbac_middleware));
+            let router = parity_router(state, legacy);
 
             let mut expected_events = Vec::new();
             for route_host in [None, Some("api.example.test"), Some("other.example.test")] {
@@ -1437,6 +1455,13 @@ fn the_digest_frame_carries_the_policy_its_own_schema_version() {
 }
 #[tokio::test]
 async fn alias_lane_matches_current_middleware_including_its_two_precedence_orders() {
+    alias_lane_matches_current_middleware_including_its_two_precedence_orders_matrix(true).await;
+    alias_lane_matches_current_middleware_including_its_two_precedence_orders_matrix(false).await;
+}
+
+async fn alias_lane_matches_current_middleware_including_its_two_precedence_orders_matrix(
+    legacy: bool,
+) {
     // The alias pair and the single identity use different precedence orders, so
     // this matrix deliberately includes rulebases where they disagree: a policy
     // whose first matching rule allows while a later rule denies answers `allow`
@@ -1495,9 +1520,7 @@ async fn alias_lane_matches_current_middleware_including_its_two_precedence_orde
             );
             let installed = state.installed_compiled_policy();
             let compiled = installed.compiled();
-            let router = Router::new()
-                .fallback(any(|| async { "local" }))
-                .layer(from_fn_with_state(state, rbac_middleware));
+            let router = parity_router(state, legacy);
 
             let mut expected_events = Vec::new();
             for path in [
@@ -1926,4 +1949,18 @@ fn rate_lane_selection_is_pinned_to_its_snapshot_like_every_other_lane() {
         PrincipalFact::Authenticated(PrincipalIdentity::from_principal(&principal(&["reader"])));
     assert!(selection.reusable_for(&input));
     assert!(!selection.reusable_for(&under_second));
+}
+
+// Exercise the frozen original implementation and the new adapter separately
+// against the same matrices, so the kernel never becomes its own parity oracle.
+fn parity_router(state: RbacState, legacy: bool) -> Router {
+    let router = Router::new().fallback(any(|| async { "local" }));
+    if legacy {
+        router.layer(from_fn_with_state(
+            state,
+            crate::middleware::rbac::legacy::rbac_middleware,
+        ))
+    } else {
+        router.layer(from_fn_with_state(state, rbac_middleware))
+    }
 }

@@ -8,6 +8,10 @@ use serde_json::Value;
 
 use super::CompileError;
 
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "offline compiler has no service adapter yet")
+)]
 pub(super) fn parse(source: &[u8]) -> Result<Value, CompileError> {
     // serde_json also retains its default nesting limit. Diagnostics never
     // include the source, member names, or the underlying parser error.
@@ -24,6 +28,10 @@ pub(super) fn parse(source: &[u8]) -> Result<Value, CompileError> {
     serde_json::from_slice(source).map_err(|_| CompileError::InvalidJson)
 }
 
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "offline duplicate-rejecting parser")
+)]
 struct UniqueValue;
 
 impl<'de> Deserialize<'de> for UniqueValue {
