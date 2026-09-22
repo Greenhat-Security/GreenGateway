@@ -1,9 +1,13 @@
 """Offline regressions for supply-chain, coverage and test-evidence gates."""
-import base64
 import importlib.util
 import json
 from pathlib import Path
 import tempfile
+import struct
+import subprocess
+import sys
+import zlib
+from unittest.mock import patch
 import unittest
 
 import yaml
@@ -93,14 +97,24 @@ class TestEvidenceGate(unittest.TestCase):
         self.summary = self.root / 'summary.json'
         self.screenshots = self.root / '.screenshots'
         self.screenshots.mkdir()
-        # A complete one-pixel PNG, not a filename-only screenshot fixture.
-        self.png = base64.b64decode(
-            'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+aZ1kAAAAASUVORK5CYII=')
+        self.png = self.make_png()
+
+    @staticmethod
+    def chunk(kind, payload=b''):
+        return (struct.pack('>I', len(payload)) + kind + payload
+                + struct.pack('>I', zlib.crc32(kind + payload)))
+
+    def make_png(self, width=1, height=1, depth=8, color=6, interlace=0, pixels=None):
+        if pixels is None:
+            pixels = b'\0\xff\x80\0\xff'
+        header = struct.pack('>IIBBBBB', width, height, depth, color, 0, 0, interlace)
+        return (evidence.PNG_SIGNATURE + self.chunk(b'IHDR', header)
+                + self.chunk(b'IDAT', zlib.compress(pixels)) + self.chunk(b'IEND'))
 
     def report(self):
         return {'stats': {'expected': 1, 'skipped': 0, 'unexpected': 0, 'flaky': 0},
                 'errors': [], 'suites': [{'suites': [{'specs': [{'tests': [
-                    {'status': 'expected', 'results': [{'status': 'passed'}]}
+                    {'expectedStatus': 'passed', 'status': 'expected', 'results': [{'status': 'passed'}]}
                 ]}]}]}]}
 
     def write_report(self, report=None):
@@ -179,6 +193,138 @@ class TestEvidenceGate(unittest.TestCase):
         self.validate(screenshots=False)
         self.assertNotIn(canary, self.summary.read_text())
         self.assertEqual(set(json.loads(self.summary.read_text())), {'schema_version', 'producer', 'counts'})
+
+    def test_report_outcomes_must_agree_with_executed_attempts(self):
+        for results in ([{'status': 'skipped'}], [{'status': 'failed'}], [{}],
+                        ['anything'], [{'status': 'timedOut'}], [{'status': 'interrupted'}],
+                        {'status': 'passed'}, [{'status': 'fixture-sensitive-status'}]):
+            with self.subTest(results=results):
+                report = self.report()
+                report['suites'][0]['suites'][0]['specs'][0]['tests'][0]['results'] = results
+                self.write_report(report)
+                with self.assertRaises(ValueError):
+                    self.validate(screenshots=False)
+                self.assertFalse(self.summary.exists())
+        for field, value in [('expectedStatus', None), ('expectedStatus', 'invalid'),
+                             ('status', 'flaky'), ('status', 'skipped')]:
+            report = self.report()
+            report['suites'][0]['suites'][0]['specs'][0]['tests'][0][field] = value
+            self.write_report(report)
+            with self.assertRaises(ValueError):
+                self.validate(screenshots=False)
+
+    def test_expected_failures_and_actual_retry_outcomes_remain_supported(self):
+        for expected_status, results, outcome in [
+            ('failed', ['failed'], 'expected'),
+            ('passed', ['failed', 'passed'], 'flaky'),
+            ('failed', ['passed', 'failed'], 'flaky'),
+            ('skipped', ['failed', 'skipped'], 'flaky'),
+        ]:
+            with self.subTest(results=results):
+                report = self.report()
+                test = report['suites'][0]['suites'][0]['specs'][0]['tests'][0]
+                test.update(expectedStatus=expected_status, status=outcome,
+                            results=[{'status': status} for status in results])
+                report['stats'].update(expected=int(outcome == 'expected'), flaky=int(outcome == 'flaky'))
+                self.assertEqual(evidence.playwright_summary(report)['counts'], report['stats'])
+
+    def test_skipped_tests_are_not_counted_as_executed_and_interrupts_fail(self):
+        for expected_status, results in [('skipped', [{'status': 'skipped'}]), ('passed', [])]:
+            report = self.report()
+            tests = report['suites'][0]['suites'][0]['specs'][0]['tests']
+            tests.append({'expectedStatus': expected_status, 'status': 'skipped', 'results': results})
+            report['stats']['skipped'] = 1
+            self.assertEqual(evidence.playwright_summary(report)['counts']['expected'], 1)
+            # Removing the only executed test cannot leave a successful report.
+            tests.pop(0)
+            report['stats']['expected'] = 0
+            with self.assertRaises(ValueError):
+                evidence.playwright_summary(report)
+        report = self.report()
+        report['suites'][0]['suites'][0]['specs'][0]['tests'].append({
+            'expectedStatus': 'passed', 'status': 'skipped', 'results': [{'status': 'interrupted'}]})
+        report['stats']['skipped'] = 1
+        with self.assertRaisesRegex(ValueError, 'interrupted'):
+            evidence.playwright_summary(report)
+
+    def test_png_chunk_and_compressed_payload_integrity(self):
+        header = self.chunk(b'IHDR', struct.pack('>IIBBBBB', 1, 1, 8, 6, 0, 0, 0))
+        data = self.chunk(b'IDAT', zlib.compress(b'\0\xff\x80\0\xff'))
+        end = self.chunk(b'IEND')
+        invalid = {
+            'header-only': evidence.PNG_SIGNATURE + header + end,
+            'forged-markers': evidence.PNG_SIGNATURE + b'\0' * 4 + b'IHDR' + b'\0' * 17 + end,
+            'bad-crc': self.png[:29] + bytes([self.png[29] ^ 1]) + self.png[30:],
+            'zero-width': self.make_png(width=0),
+            'invalid-depth': self.make_png(depth=3),
+            'invalid-color': self.make_png(color=1),
+            'invalid-interlace': self.make_png(interlace=2),
+            'duplicate-header': evidence.PNG_SIGNATURE + header + header + data + end,
+            'wrong-order': evidence.PNG_SIGNATURE + data + header + end,
+            'unknown-critical': evidence.PNG_SIGNATURE + header + self.chunk(b'ABCD') + data + end,
+            'split-data': evidence.PNG_SIGNATURE + header + data + self.chunk(b'tEXt', b'fixture') + data + end,
+            'bad-zlib': evidence.PNG_SIGNATURE + header + self.chunk(b'IDAT', b'not compressed') + end,
+            'truncated-zlib': evidence.PNG_SIGNATURE + header + self.chunk(b'IDAT', zlib.compress(b'\0' * 5)[:-1]) + end,
+            'extra-zlib-stream': evidence.PNG_SIGNATURE + header + self.chunk(b'IDAT', zlib.compress(b'\0' * 5) * 2) + end,
+            'short-scanline': self.make_png(pixels=b'\0'),
+            'long-scanline': self.make_png(pixels=b'\0' * 6),
+            'bad-filter': self.make_png(pixels=b'\x05' + b'\0' * 4),
+            'missing-palette': self.make_png(color=3, pixels=b'\0\0'),
+            'extra-file-bytes': self.png + b'extra',
+            'truncated-chunk': evidence.PNG_SIGNATURE + header + struct.pack('>I', 1000) + b'IDAT',
+        }
+        for label, contents in invalid.items():
+            with self.subTest(label=label):
+                self.write_report()
+                (self.screenshots / 'current.png').write_bytes(contents)
+                with self.assertRaisesRegex(ValueError, 'complete PNG'):
+                    self.validate()
+                self.assertFalse(self.summary.exists())
+
+    def test_png_accepts_color_depths_filters_palette_and_adam7(self):
+        # Each tuple supplies a valid filtered row, independent of the parser's
+        # row-size calculation. This includes packed and 16-bit formats.
+        for color, depth, row in [(0, 1, b'\0\x80'), (0, 16, b'\0\xff\xff'),
+                                  (2, 8, b'\0' + b'\xff' * 3), (2, 16, b'\0' + b'\xff' * 6),
+                                  (4, 8, b'\0' + b'\xff' * 2), (6, 16, b'\0' + b'\xff' * 8)]:
+            with self.subTest(color=color, depth=depth):
+                evidence.validate_png(self.make_png(color=color, depth=depth, pixels=row))
+        for filtering in range(5):
+            evidence.validate_png(self.make_png(pixels=bytes([filtering]) + b'\0' * 4))
+        palette_header = self.chunk(b'IHDR', struct.pack('>IIBBBBB', 1, 1, 1, 3, 0, 0, 0))
+        evidence.validate_png(evidence.PNG_SIGNATURE + palette_header + self.chunk(b'PLTE', b'\0' * 6)
+                              + self.chunk(b'IDAT', zlib.compress(b'\0\x80')) + self.chunk(b'IEND'))
+        # 2x2 RGBA Adam7 has three nonempty passes: 1x1, 1x1, then 2x1.
+        evidence.validate_png(self.make_png(width=2, height=2, interlace=1, pixels=b'\0' * 19))
+        compressed = zlib.compress(b'\0' * 5)
+        header = self.chunk(b'IHDR', struct.pack('>IIBBBBB', 1, 1, 8, 6, 0, 0, 0))
+        evidence.validate_png(evidence.PNG_SIGNATURE + header + self.chunk(b'tEXt', b'fixture')
+                              + self.chunk(b'IDAT', compressed[:3]) + self.chunk(b'IDAT', compressed[3:])
+                              + self.chunk(b'IEND'))
+
+    def test_png_work_limits_fail_before_unbounded_decoding(self):
+        with patch.object(evidence, 'MAX_PNG_BYTES', len(self.png) - 1):
+            with self.assertRaises(ValueError):
+                evidence.validate_png(self.png)
+        with patch.object(evidence, 'MAX_PNG_DECODED_BYTES', 4):
+            with self.assertRaises(ValueError):
+                evidence.validate_png(self.png)
+        # The tiny compressed file claims a huge image, or expands past a tiny
+        # IHDR. Neither may allocate the claimed/expanded raster unboundedly.
+        for contents in [self.make_png(width=2**30, height=2**30), self.make_png(pixels=b'\0' * 1000000)]:
+            with self.assertRaises(ValueError):
+                evidence.validate_png(contents)
+
+    def test_invalid_attempt_diagnostics_do_not_expose_report_contents(self):
+        report = self.report()
+        report['suites'][0]['suites'][0]['specs'][0]['tests'][0]['results'] = [{'status': 'fixture-sensitive-value'}]
+        self.write_report(report)
+        result = subprocess.run([sys.executable, str(Path(evidence.__file__)), 'playwright',
+                                 str(self.source), str(self.summary)], capture_output=True, text=True)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertNotIn('fixture-sensitive-value', result.stderr + result.stdout)
+        self.assertNotIn('Traceback', result.stderr)
+        self.assertFalse(self.summary.exists())
 
     def stream_report(self):
         return {'configuration': {'requests': 3, 'base_url': 'fixture-private-locator'},
