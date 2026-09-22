@@ -1501,12 +1501,18 @@ fn rfc6052_extraction_rejects_nonzero_u_octet_for_96_prefixes() {
 fn host_glob_matching_supports_exact_and_leading_wildcard_patterns() {
     assert!(host_glob_matches("api.example.test", "api.example.test"));
     assert!(host_glob_matches("API.EXAMPLE.TEST", "api.example.test"));
+    assert!(host_glob_matches("api.example.test", "API.EXAMPLE.TEST"));
+    assert!(host_glob_matches("API.EXAMPLE.TEST", "Api.Example.Test"));
     assert!(!host_glob_matches("api.example.test", "other.example.test"));
+    assert!(!host_glob_matches("api.example.test", "OTHER.EXAMPLE.TEST"));
 
     assert!(host_glob_matches("*.example.test", "api.example.test"));
     assert!(host_glob_matches("*.example.test", "v1.api.example.test"));
+    assert!(host_glob_matches("*.example.test", "API.EXAMPLE.TEST"));
+    assert!(host_glob_matches("*.EXAMPLE.TEST", "V1.Api.Example.Test"));
     assert!(!host_glob_matches("*.example.test", "example.test"));
     assert!(!host_glob_matches("*.example.test", "badexample.test"));
+    assert!(!host_glob_matches("*.example.test", "BADEXAMPLE.TEST"));
 }
 
 #[test]

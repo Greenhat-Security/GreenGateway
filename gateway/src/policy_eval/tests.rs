@@ -1250,6 +1250,74 @@ fn a_route_host_alone_makes_the_host_binding_mandatory() {
 }
 
 #[test]
+fn an_unbound_permission_route_cannot_authorize_a_selected_virtual_host() {
+    let compiled = compile(json!({
+        "schema_version":"0.1.0","default_action":"deny",
+        "roles":{"reader":{"permissions":["read"]}},
+        "routes":[{"path_prefix":"/data","permission":"read"}]
+    }));
+    let mut input = context(&compiled);
+    input.principal =
+        PrincipalFact::Authenticated(PrincipalIdentity::from_principal(&principal(&["reader"])));
+    input.request_host = HostFact::Present("api.example.test".to_owned());
+
+    // This caller has the route permission: without a selected virtual host,
+    // the unbound route is a legitimate authorization path.
+    let result = compiled.evaluate(&input).unwrap();
+    assert_eq!(result.logical, LogicalDecision::Allow);
+    assert_eq!(result.effect, PolicyEffect::Allow);
+    assert_eq!(result.reason, Reason::MatchedRule);
+    assert_eq!(result.matched, Some(RuleReference::Route(0)));
+    assert!(result.complete);
+
+    // Selecting a virtual host requires a host-qualified permission route.
+    // Possessing the permission alone cannot supply that missing binding.
+    input.target = HttpTarget::ProxyDispatch;
+    input.dispatch = Some(dispatch_with_host(Some("api.example.test")));
+    let result = compiled.evaluate(&input).unwrap();
+    assert_eq!(result.logical, LogicalDecision::Deny);
+    assert_eq!(result.effect, PolicyEffect::Block);
+    assert_eq!(result.reason, Reason::HostPolicyRequired);
+    assert_eq!(result.matched, None);
+    assert!(result.complete);
+}
+
+#[test]
+fn a_host_qualified_permission_route_requires_a_present_matching_host() {
+    let compiled = compile(json!({
+        "schema_version":"0.1.0","default_action":"deny",
+        "roles":{"reader":{"permissions":["read"]}},
+        "routes":[{"hosts":["api.example.test"],"path_prefix":"/data","permission":"read"}]
+    }));
+    let mut input = context(&compiled);
+    input.principal =
+        PrincipalFact::Authenticated(PrincipalIdentity::from_principal(&principal(&["reader"])));
+
+    // A permission cannot make a host-qualified route match an absent or
+    // different host. Neither request may inherit that route's authority.
+    for host in [
+        HostFact::Absent,
+        HostFact::Present("other.example.test".to_owned()),
+    ] {
+        input.request_host = host;
+        let result = compiled.evaluate(&input).unwrap();
+        assert_eq!(result.logical, LogicalDecision::Deny);
+        assert_eq!(result.effect, PolicyEffect::Block);
+        assert_eq!(result.reason, Reason::DefaultDeny);
+        assert_eq!(result.matched, None);
+        assert!(result.complete);
+    }
+
+    input.request_host = HostFact::Present("api.example.test".to_owned());
+    let result = compiled.evaluate(&input).unwrap();
+    assert_eq!(result.logical, LogicalDecision::Allow);
+    assert_eq!(result.effect, PolicyEffect::Allow);
+    assert_eq!(result.reason, Reason::MatchedRule);
+    assert_eq!(result.matched, Some(RuleReference::Route(0)));
+    assert!(result.complete);
+}
+
+#[test]
 fn the_in_memory_constructor_accepts_what_production_accepts() {
     // Trap this deliberately: `compile` has exact `0.1.0` dispatch and rejects
     // unknown top-level keys, which is right for untrusted bytes. The live parser
