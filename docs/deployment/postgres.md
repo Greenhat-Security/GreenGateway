@@ -18,6 +18,7 @@ This guide explains the mode. The runbooks beside it are the procedures — exac
 | [Standalone to cluster cutover](cutover.md) | `gateway import-standalone` end to end: dry run, quiesce, back up, migrate, import, one replica, verify, scale out |
 | [The rollback boundary](rollback-boundary.md) | exactly when going back is still free, and the queries that tell you which side of the line you are on |
 | [Disaster recovery](disaster-recovery.md) | rebuilding a deployment from the database, the secret store and the static configuration |
+| [Operational alerts](operational-alerts.md) | checked Prometheus rules, signal limits, severity and ownership, and first-response procedures |
 
 An example two-replica deployment is in [`docker-compose.ha.yml`](docker-compose.ha.yml) beside them. Its PostgreSQL service is a single container and is labelled as an example only — use a managed or HA PostgreSQL in production.
 
@@ -433,7 +434,7 @@ Renaming or removing any heading in that table breaks a link an operator follows
 
 ## Metrics
 
-`/metrics` serves the Prometheus text format. The HA series below carry the `greengateway_` prefix and answer one question between them: is this replica, and the deployment it belongs to, healthy enough to be sent traffic -- and if not, which condition has to be fixed first. They are the machine-readable form of `/readyz`'s reason and of the cluster status API's `state`; the three surfaces read the same process state, so they cannot disagree.
+`/metrics` serves the Prometheus text format. The HA series below carry the `greengateway_` prefix and help diagnose this replica and its deployment. They describe different observations at different instants: the lifecycle pair does not include authority readiness, and revision watermarks do not describe whether admissions are succeeding. Use `/readyz` to decide whether a replica may receive traffic and [the signal contract](operational-alerts.md#signal-contract) to interpret metrics and their freshness.
 
 **Every label value is drawn from a fixed enum.** Nothing caller-influenced -- an instance id, a principal, a proxied route, a host, a URL, a token id, a query, an error string -- is ever a label. A metric label is unbounded state the process keeps for the life of the registry and hands to every scrape, so a caller who could steer one could both mint time series without limit and read back what they minted from an endpoint that is routinely less protected than the admin API. Where the interesting value *is* high-cardinality (which replica, which error text, which tool), it goes to the roster row, the audit event, or the log, all of which are bounded and access-controlled. A test walks the whole rendered registry after a synthetic run and fails the build if a label value has the shape of an address, a UUID, a URL, or an email, or falls outside its metric's declared vocabulary.
 
@@ -468,15 +469,15 @@ Everything except the four sampled families -- the pool gauges, the audit queue 
 
 ### Alert thresholds
 
-One row per condition worth waking someone for. Each names the series above and the `/readyz` reason or cluster-status `reason` it corresponds to, so an alert that fires and a probe that refuses are the same incident rather than two. Durations are the smallest that are not noise; lengthen them for your own deploy cadence, but the ones marked *page immediately* have no healthy transient.
+The table below is a broader diagnostic inventory, not a runnable or universally tuned alert policy. Some conditions correlate with readiness without being equivalent to it. Start with the [checked operational rule pack](operational-alerts.md#alert-policy), which specifies durations, missing-data behavior, deployment assumptions and first response. Review threshold changes against workload and recovery goals, then update the rule fixtures.
 
 | Condition | Alert when | Corresponds to |
 | --- | --- | --- |
-| This replica is not in rotation | `greengateway_gateway_ready == 0` and `greengateway_gateway_draining == 0` for longer than one deploy window | any `/readyz` reason except `draining` |
+| This replica is still starting | `greengateway_gateway_ready == 0` and `greengateway_gateway_draining == 0` for longer than one deploy window | `starting`; other readiness failures require the probe or their own signals |
 | The database was migrated out from under a serving replica | `greengateway_schema_compatible == 0` on any replica — *page immediately* | `schema_incompatible` |
 | The pool is saturated | `greengateway_database_pool_available == 0` and `greengateway_database_pool_waiting > 0` for 60 s | the precondition for `storage_unavailable` |
 | Checkouts are timing out | any increase in `greengateway_database_pool_timeouts_total` | `storage_unavailable` |
-| A replica is behind on its security revision | `greengateway_security_revision_lag > 0` for longer than 30 s (`RECONCILE_BACKGROUND_DEADLINE`) | `degraded`/`security_revision_lagging`, then `security_revision_not_compiled` |
+| A replica is behind on its security revision | sustained `greengateway_security_revision_lag > 0` | `degraded`/`security_revision_lagging`; readiness refuses only after sustained admission failure, which lag alone does not establish |
 | Reconciliation is failing rather than slow | any increase in `greengateway_reconcile_failures_total` | as above; the `reason` label says which of the three failures it is |
 | A replica has stopped heartbeating | `greengateway_cluster_heartbeat_age_seconds` above `CLUSTER_MEMBER_STALE_MS` | `instance_lease_invalid` |
 | A rollout is stalled at the fingerprint door | `greengateway_cluster_config_mismatch == 1` on any replica after the rollout should have completed | `config_fingerprint_mismatch` |

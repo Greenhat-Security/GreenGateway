@@ -81,7 +81,7 @@ Raising `DATABASE_STATEMENT_TIMEOUT_MS` above the default is almost always the w
 
 ## What to look at when it is 3am
 
-There are no pool-depth metrics on `/metrics` today. Observe the pool from the database side and from the logs. (Gap: a `greengateway_database_pool_*` gauge would make this a dashboard instead of a query.)
+`/metrics` samples `greengateway_database_pool_size`, `greengateway_database_pool_available` and `greengateway_database_pool_waiting` from this replica's pool. Zero available connections with waiting callers is pressure; `greengateway_database_pool_timeouts_total` records checkout timeouts that a later snapshot could miss. See [operational alerts](operational-alerts.md#database-capacity) for checked rules and first-response guidance. Correlate them with the database and logs:
 
 **How many connections each replica is holding, right now:**
 
