@@ -1,0 +1,57 @@
+{
+  "schema_version": 1,
+  "entries": [
+    {
+      "target": "host",
+      "path": "host/ascii.txt"
+    },
+    {
+      "target": "host",
+      "path": "host/ipv6.txt"
+    },
+    {
+      "target": "host",
+      "path": "host/malformed.txt"
+    },
+    {
+      "target": "host",
+      "path": "host/over-limit.txt"
+    },
+    {
+      "target": "jwt",
+      "path": "jwt/claims.json"
+    },
+    {
+      "target": "jwt",
+      "path": "jwt/jwk.json"
+    },
+    {
+      "target": "jwt",
+      "path": "jwt/malformed.txt"
+    },
+    {
+      "target": "path",
+      "path": "path/ambiguity.txt"
+    },
+    {
+      "target": "path",
+      "path": "path/probe.txt"
+    },
+    {
+      "target": "path",
+      "path": "path/segments.txt"
+    },
+    {
+      "target": "policy",
+      "path": "policy/allow.json"
+    },
+    {
+      "target": "policy",
+      "path": "policy/deny.json"
+    },
+    {
+      "target": "policy",
+      "path": "policy/duplicate.json"
+    }
+  ]
+}

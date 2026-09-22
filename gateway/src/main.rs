@@ -109,6 +109,9 @@ mod rbac;
 mod request_bounds;
 #[cfg(feature = "postgres")]
 mod security_cluster;
+#[cfg(test)]
+#[path = "../tests/support/security_corpus.rs"]
+mod security_corpus;
 mod storage;
 mod tools;
 mod upstream_route;

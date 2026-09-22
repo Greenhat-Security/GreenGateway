@@ -145,11 +145,13 @@ unchanged.
 
 ## Remaining #435 work
 
-This is a bounded regression-property suite, not a coverage-guided fuzz runner
-or a proof that every parser input is safe. A future slice still needs a pinned
-JWT/policy corpus harness, explicit process time/memory budgets, nonempty-corpus
-checks, and trusted scheduled/manual exploration with retained seed/corpus
-identity. Nothing here claims a fuzzing time budget or external target testing.
+The [bounded corpus harness](security-corpus.md) now adds synthetic
+JWT/policy/host/path seeds, explicit process time/memory budgets, nonempty-corpus
+checks and retained seed/corpus identity. The next slices add trusted
+scheduled/manual exploration and its mandatory regression promotion dependency,
+then generated properties for the already-available shared evaluator.
+These checks do not establish exhaustive parser safety or perform external
+target testing.
 
 Triage recurring failures with the owners of the affected parser and security
 tests. Preserve the reproducing seed and toolchain, minimize to synthetic input,
