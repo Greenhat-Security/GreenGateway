@@ -46,6 +46,8 @@ mod grpc;
 mod grpc_tests;
 #[cfg(test)]
 mod mtls_tests;
+#[cfg(test)]
+mod property_tests;
 mod tls;
 #[cfg(test)]
 mod tls_tests;
