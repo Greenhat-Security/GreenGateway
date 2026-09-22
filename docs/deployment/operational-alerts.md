@@ -135,24 +135,61 @@ a process killed before ten minutes is caught through availability monitoring,
 not the lifecycle-stall rule. Audit loss remains relevant during drain; planned
 maintenance must not suppress it merely because lifecycle readiness is zero.
 
+## Readiness diagnosis
+
+Read the affected replica's `/readyz` response, not a load-balanced response.
+Healthy output is HTTP `200` with `{"status":"ready"}`. HTTP `503` returns one
+coarse reason from the chain below; after fixing it, probe again because another
+condition may have been masked by the earlier one.
+
+| Reason, in evaluation order | Interpretation and action |
+| --- | --- |
+| `starting` / `draining` | Lifecycle phase; follow [Lifecycle](#lifecycle-stalls). |
+| `config_fingerprint_mismatch` | Cluster static configuration has not agreed; follow the [rollout procedure](failover.md#gateway-replica-failure). |
+| `storage_unavailable` | Authority access failed or this replica's session is read-only. First distinguish replica-local pool, connectivity, grant or query failures using [Database capacity](#database-capacity); use [failover](failover.md#database-primary-failure) only after confirming primary loss or a read-only primary. |
+| `schema_incompatible` | Ledger integrity or binary/schema contract failed; follow [Cluster authority](#cluster-authority). |
+| `instance_lease_invalid` | Heartbeat age reached `CLUSTER_MEMBER_STALE_MS`; check authority access and membership. |
+| `security_revision_not_compiled` | Security admissions have been failing continuously beyond the reconcile grace; inspect current authority and reconciliation errors. Lag gauges alone cannot diagnose this. |
+| `required_upstream_unavailable` | A configured required proxy pool is unavailable; follow [production data-plane health checks](production-data-plane.md#lifecycle-probes). |
+
+The cluster-specific reasons do not exist in standalone mode. No alert in this
+pack replaces the readiness probe or changes the gateway's fail-closed behavior.
+
 ## First-response runbooks
 
 ### Metrics availability
 
 The platform on-call owns scrape and rule failures. Inspect Prometheus target
 and rule health, then the affected replica's supervisor state and listener.
+Confirm the opaque instance and mode match the expected inventory; check whether
+metric relabeling removed required gauges. Restore instrumentation before
+concluding the service is healthy. Do not remove a failed target from the
+inventory to clear an alert. When replacing an instance intentionally, review
+both inventory and scrape configuration together and verify the new target.
 
 ### Lifecycle stalls
 
 The platform on-call checks startup logs, configuration validation and dependency
-reachability.
+reachability. A startup failure can occur before any HTTP endpoint binds, so also
+inspect supervisor restart/failure events. During a prolonged drain, inspect
+`greengateway_inflight_requests`, stream shutdown and audit backlog, and compare
+elapsed time with `SHUTDOWN_DRAIN_DELAY_MS`, `SHUTDOWN_TIMEOUT_MS` and the audit
+drain budget. Follow [deliberate replica maintenance](failover.md#deliberate-replica-maintenance).
 Do not force-kill solely to clear an alert: first assess unfinished work and audit
 loss and preserve the bounded shutdown outcome.
 
 ### Audit delivery
 
 The platform on-call restores sink availability and capacity; the security/audit
-owner assesses any missing record window.
+owner assesses any missing record window. Record the affected replica IDs,
+timestamps and fixed failure classifications in restricted incident evidence.
+Inspect sink errors and the configured storage path/primary, free space, locks
+and latency. Growing oldest age indicates increasing delivery delay even when
+depth is small; successful deliveries may continue while the sink falls behind.
+Correlate successful-flush and failure/drop counters with sink logs to distinguish
+slow progress from a stall. For PostgreSQL, use
+[pool sizing](pool-sizing.md) and [failover](failover.md); for restoration, use
+the [audit continuity checks](backup-and-recovery.md).
 
 A drop-counter increase is actual loss; a counter reset or clearing alert does
 not restore those events. Reconcile available durable records with the incident
@@ -163,10 +200,12 @@ annotations and shared incident summaries.
 
 ### Database capacity
 
-The platform/database on-call checks the replica's `/readyz` reason and
-`gateway cluster-members`, then the primary's connection count and slow/blocked
-queries. Follow [pool sizing](pool-sizing.md) before raising connection limits
-or timeouts. Restore a single writable authority using [failover](failover.md);
+The platform/database on-call compares the affected replica's `/readyz` reason
+with its peers and checks `gateway cluster-members`, then the primary's connection
+count and slow/blocked queries. Check replica-local pool pressure, connectivity,
+grants and query failures; follow [pool sizing](pool-sizing.md) before raising
+connection limits or timeouts. Restore a single writable authority using
+[failover](failover.md) only after confirming primary loss or a read-only primary;
 never direct security reads to a lagging replica.
 
 ### Cluster authority
@@ -184,6 +223,17 @@ authorization. For configuration mismatch, compare the newcomer to the reviewed
 configuration and either roll it back or deliberately drain the old generation
 as described in [failover](failover.md#gateway-replica-failure). Do not bypass
 fingerprint agreement to complete a rollout.
+
+### Artifact verification failure
+
+The release owner and security on-call handle provenance/SBOM/signature failures.
+Stop promotion or deployment of the affected digest, retain the verification
+result and reviewed source identity, and follow [Verifying image provenance and
+retrieving the SBOM](../RELEASING.md#verifying-image-provenance-and-retrieving-the-sbom).
+Distinguish unavailable evidence from a verified identity or digest mismatch;
+neither is permission to bypass verification. A prior approved binary is an
+option only within the documented schema/security rollback boundary. This is a
+release-system signal, not an invented gateway runtime metric.
 
 ## Remaining operational proof
 
