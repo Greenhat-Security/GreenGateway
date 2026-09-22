@@ -176,7 +176,9 @@ fn validate_rendered_http_path(path: &str) -> Result<(), EvaluationError> {
         || path.contains(['?', '#', '\\'])
         || bytes.iter().any(|byte| *byte <= b' ' || *byte == 127)
         || path.contains("//")
-        || path.split('/').any(|segment| segment == "." || segment == "..")
+        || path
+            .split('/')
+            .any(|segment| segment == "." || segment == "..")
     {
         return Err(EvaluationError::MalformedPath);
     }
