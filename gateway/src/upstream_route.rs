@@ -356,6 +356,10 @@ fn route_matches<T: RouteMatch>(route: &T, path: &str, request_host: Option<&str
 }
 
 #[cfg(test)]
+#[path = "upstream_route_property_tests.rs"]
+mod property_tests;
+
+#[cfg(test)]
 mod tests {
     use http::HeaderValue;
 

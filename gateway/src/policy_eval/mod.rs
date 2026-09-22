@@ -81,6 +81,8 @@
 
 mod input;
 #[cfg(test)]
+mod property_tests;
+#[cfg(test)]
 mod tests;
 
 use std::fmt;

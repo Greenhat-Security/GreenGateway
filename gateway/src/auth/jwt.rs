@@ -811,3 +811,7 @@ fn cached_decoding_key(key: JwksKey) -> Option<CachedDecodingKey> {
 #[cfg(test)]
 #[path = "jwt_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "jwt_corpus.rs"]
+pub(crate) mod corpus;

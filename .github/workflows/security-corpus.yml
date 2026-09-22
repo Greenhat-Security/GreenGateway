@@ -1,0 +1,55 @@
+# Longer deterministic exploration complements the mandatory regression corpus
+# in ci.yml. Both runs exercise only pure parser targets; build time is outside
+# the separately enforced corpus CPU, memory and wall-clock budgets.
+name: security-corpus-exploration
+
+"on":
+  schedule:
+    - cron: '23 4 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: security-corpus-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  security-corpus-exploration:
+    name: security-corpus-exploration
+    # A manual run on another ref or in a fork must never execute exploration.
+    # Keep context in the expression, not interpolated into shell commands.
+    if: >-
+      ${{ github.repository == 'Greenhat-Security/GreenGateway' &&
+          github.ref == format('refs/heads/{0}', github.event.repository.default_branch) &&
+          (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Set up pinned build tools
+        uses: ./.github/actions/build-tools
+        with:
+          rust: ci
+          node: 'true'
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      - name: Install workflow test parser
+        run: python -m pip install PyYAML==6.0.3
+      - name: Test bounded corpus runner
+        run: python scripts/test_security_corpus.py
+      - name: Verify corpus workflow contracts
+        run: python scripts/test_security_corpus_workflows.py
+      - name: Run bounded exploration
+        run: python scripts/security_corpus.py --mode exploration --report target/security-corpus/report.json
+      - name: Preserve redacted corpus decision
+        if: ${{ always() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: security-corpus-exploration
+          path: target/security-corpus/report.json
+          if-no-files-found: error
+          retention-days: 14

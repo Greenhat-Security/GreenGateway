@@ -69,6 +69,10 @@ pub fn is_unsafe_request_path(path: &str) -> bool {
 }
 
 #[cfg(test)]
+#[path = "path_match_property_tests.rs"]
+mod property_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
