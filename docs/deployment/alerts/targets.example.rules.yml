@@ -1,0 +1,12 @@
+# Copy and review one record per expected replica, independently of discovery.
+# Keep the record during unexpected outages; remove only on planned retirement.
+groups:
+  - name: greengateway-expected-targets-example-v1
+    interval: 30s
+    rules:
+      - record: greengateway_monitoring:target_expected
+        expr: vector(1)
+        labels:
+          job: greengateway
+          instance: gateway-1
+          deployment_mode: standalone

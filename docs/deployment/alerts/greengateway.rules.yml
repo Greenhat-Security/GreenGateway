@@ -1,0 +1,201 @@
+# Contract v1. Starting thresholds; tune with operational-alerts.md and tests.
+# Reduce alerts to operator-controlled target identity; never preserve event labels.
+groups:
+  - name: greengateway-operational-v1
+    interval: 30s
+    rules:
+      - alert: GreenGatewayMetricsTargetDown
+        expr: |
+          max by (job, instance, deployment_mode) (
+            (up{job="greengateway"} == 0)
+            or (greengateway_monitoring:target_expected{job="greengateway"} == 1
+                unless on (job, instance) (up{job="greengateway"} == 1))
+          )
+        for: 2m
+        labels: {severity: critical, owner: gateway-operations}
+        annotations:
+          summary: Gateway metrics target is unavailable or missing from discovery
+          runbook_url: https://github.com/Greenhat-Security/GreenGateway/blob/main/docs/deployment/operational-alerts.md#metrics-availability
+
+      - alert: GreenGatewayMetricsJobMissing
+        expr: absent(up{job="greengateway"})
+        for: 2m
+        labels: {severity: critical, owner: gateway-operations}
+        annotations:
+          summary: No gateway scrape targets are visible
+          runbook_url: https://github.com/Greenhat-Security/GreenGateway/blob/main/docs/deployment/operational-alerts.md#metrics-availability
+
+      - alert: GreenGatewayExpectedTargetsMissing
+        expr: absent(greengateway_monitoring:target_expected{job="greengateway"})
+        for: 2m
+        labels: {severity: warning, owner: gateway-operations}
+        annotations:
+          summary: Gateway expected-target inventory is missing
+          runbook_url: https://github.com/Greenhat-Security/GreenGateway/blob/main/docs/deployment/operational-alerts.md#metrics-availability
+
+      - alert: GreenGatewayMonitoringConfigurationInvalid
+        expr: |
+          max by (job, instance, deployment_mode) (
+            up{job="greengateway",deployment_mode!~"standalone|cluster"}
+            or greengateway_monitoring:target_expected{job="greengateway",deployment_mode!~"standalone|cluster"}
+            or (greengateway_monitoring:target_expected{job="greengateway"} != 1)
+            or (up{job="greengateway"}
+                unless on (job, instance, deployment_mode)
+                  (greengateway_monitoring:target_expected{job="greengateway"} == 1))
+          )
+        for: 2m
+        labels: {severity: warning, owner: gateway-operations}
+        annotations:
+          summary: Gateway monitoring target does not match the reviewed inventory
+          runbook_url: https://github.com/Greenhat-Security/GreenGateway/blob/main/docs/deployment/operational-alerts.md#metrics-availability
+
+      - alert: GreenGatewayMetricsMissing
+        expr: |
+          max by (job, instance, deployment_mode) (up{job="greengateway"} == 1)
+          unless on (job, instance) (
+            greengateway_gateway_ready{job="greengateway"}
+            and on (job, instance) greengateway_gateway_draining{job="greengateway"}
+            and on (job, instance) greengateway_audit_queue_depth{job="greengateway"}
+            and on (job, instance) greengateway_audit_queue_capacity{job="greengateway"}
+            and on (job, instance) greengateway_audit_queue_oldest_age_seconds{job="greengateway"}
+          )
+        for: 2m
+        labels: {severity: critical, owner: gateway-operations}
+        annotations:
+          summary: Successful gateway scrape is missing required gauges
+          runbook_url: https://github.com/Greenhat-Security/GreenGateway/blob/main/docs/deployment/operational-alerts.md#metrics-availability
+
+      - alert: GreenGatewayStartupStalled
+        expr: |
+          max by (job, instance, deployment_mode) (greengateway_gateway_ready{job="greengateway"} == 0)
+          and on (job, instance) (greengateway_gateway_draining{job="greengateway"} == 0)
+          and on (job, instance) (up{job="greengateway"} == 1)
+        for: 10m
+        labels: {severity: warning, owner: gateway-operations}
+        annotations:
+          summary: Gateway lifecycle has remained in startup
+          runbook_url: https://github.com/Greenhat-Security/GreenGateway/blob/main/docs/deployment/operational-alerts.md#lifecycle-stalls
+
+      - alert: GreenGatewayDrainStalled
+        expr: |
+          max by (job, instance, deployment_mode) (greengateway_gateway_draining{job="greengateway"} == 1)
+          and on (job, instance) (up{job="greengateway"} == 1)
+        for: 10m
+        labels: {severity: warning, owner: gateway-operations}
+        annotations:
+          summary: Gateway lifecycle has remained in drain
+          runbook_url: https://github.com/Greenhat-Security/GreenGateway/blob/main/docs/deployment/operational-alerts.md#lifecycle-stalls
+
+      # Audit loss and flush failures are not suppressed during startup/drain.
+      - alert: GreenGatewayAuditLoss
+        expr: |
+          sum by (job, instance, deployment_mode) (increase(audit_events_dropped_total{job="greengateway"}[5m])) > 0
+          and on (job, instance) (up{job="greengateway"} == 1)
+        for: 2m
+        labels: {severity: critical, owner: gateway-operations}
+        annotations:
+          summary: Gateway audit events were dropped
+          runbook_url: https://github.com/Greenhat-Security/GreenGateway/blob/main/docs/deployment/operational-alerts.md#audit-delivery
+
+      - alert: GreenGatewayAuditBacklog
+        expr: |
+          max by (job, instance, deployment_mode) (
+            (greengateway_audit_queue_depth{job="greengateway"} / greengateway_audit_queue_capacity{job="greengateway"} > 0.8)
+            or (greengateway_audit_queue_oldest_age_seconds{job="greengateway"} > 30)
+          )
+          and on (job, instance) (greengateway_gateway_ready{job="greengateway"} == 1)
+          and on (job, instance) (up{job="greengateway"} == 1)
+        for: 5m
+        labels: {severity: warning, owner: gateway-operations}
+        annotations:
+          summary: Gateway audit delivery backlog is sustained
+          runbook_url: https://github.com/Greenhat-Security/GreenGateway/blob/main/docs/deployment/operational-alerts.md#audit-delivery
+
+      - alert: GreenGatewayAuditFlushFailures
+        expr: |
+          sum by (job, instance, deployment_mode) (increase(greengateway_audit_flush_total{job="greengateway",outcome="failure"}[5m])) > 0
+          and on (job, instance) (up{job="greengateway"} == 1)
+        for: 2m
+        labels: {severity: warning, owner: gateway-operations}
+        annotations:
+          summary: Gateway audit sink flushes are failing
+          runbook_url: https://github.com/Greenhat-Security/GreenGateway/blob/main/docs/deployment/operational-alerts.md#audit-delivery
+
+      - alert: GreenGatewayDatabasePoolSaturated
+        expr: |
+          max by (job, instance, deployment_mode) (greengateway_database_pool_waiting{job="greengateway",deployment_mode="cluster"} > 0)
+          and on (job, instance) (greengateway_database_pool_available{job="greengateway",deployment_mode="cluster"} == 0)
+          and on (job, instance) (greengateway_gateway_ready{job="greengateway"} == 1)
+          and on (job, instance) (up{job="greengateway",deployment_mode="cluster"} == 1)
+        for: 5m
+        labels: {severity: warning, owner: gateway-operations}
+        annotations:
+          summary: Gateway database callers are waiting with no free pool connections
+          runbook_url: https://github.com/Greenhat-Security/GreenGateway/blob/main/docs/deployment/operational-alerts.md#database-capacity
+
+      - alert: GreenGatewayDatabasePoolTimeouts
+        expr: |
+          sum by (job, instance, deployment_mode) (increase(greengateway_database_pool_timeouts_total{job="greengateway",deployment_mode="cluster"}[5m])) > 0
+          and on (job, instance) (greengateway_gateway_ready{job="greengateway"} == 1)
+          and on (job, instance) (up{job="greengateway",deployment_mode="cluster"} == 1)
+        for: 2m
+        labels: {severity: warning, owner: gateway-operations}
+        annotations:
+          summary: Gateway database pool acquisitions are timing out
+          runbook_url: https://github.com/Greenhat-Security/GreenGateway/blob/main/docs/deployment/operational-alerts.md#database-capacity
+
+      - alert: GreenGatewaySchemaIncompatible
+        expr: |
+          max by (job, instance, deployment_mode) (greengateway_schema_compatible{job="greengateway",deployment_mode="cluster"} == 0)
+          and on (job, instance) (up{job="greengateway",deployment_mode="cluster"} == 1)
+        for: 1m
+        labels: {severity: critical, owner: gateway-operations}
+        annotations:
+          summary: Gateway observed an incompatible database schema
+          runbook_url: https://github.com/Greenhat-Security/GreenGateway/blob/main/docs/deployment/operational-alerts.md#cluster-authority
+
+      - alert: GreenGatewayClusterHeartbeatStale
+        expr: |
+          max by (job, instance, deployment_mode) (greengateway_cluster_heartbeat_age_seconds{job="greengateway",deployment_mode="cluster"} >= 30)
+          and on (job, instance) (greengateway_gateway_ready{job="greengateway"} == 1)
+          and on (job, instance) (up{job="greengateway",deployment_mode="cluster"} == 1)
+        for: 1m
+        labels: {severity: warning, owner: gateway-operations}
+        annotations:
+          summary: Gateway membership heartbeat has reached the example stale window
+          runbook_url: https://github.com/Greenhat-Security/GreenGateway/blob/main/docs/deployment/operational-alerts.md#cluster-authority
+
+      - alert: GreenGatewaySecurityRevisionLag
+        expr: |
+          max by (job, instance, deployment_mode) (greengateway_security_revision_lag{job="greengateway",deployment_mode="cluster"} > 0)
+          and on (job, instance) (greengateway_gateway_ready{job="greengateway"} == 1)
+          and on (job, instance) (up{job="greengateway",deployment_mode="cluster"} == 1)
+        for: 5m
+        labels: {severity: warning, owner: gateway-operations}
+        annotations:
+          summary: Gateway security revision lag is sustained
+          runbook_url: https://github.com/Greenhat-Security/GreenGateway/blob/main/docs/deployment/operational-alerts.md#cluster-authority
+
+      - alert: GreenGatewayClusterConfigMismatch
+        expr: |
+          max by (job, instance, deployment_mode) (greengateway_cluster_config_mismatch{job="greengateway",deployment_mode="cluster"} == 1)
+          and on (job, instance) (up{job="greengateway",deployment_mode="cluster"} == 1)
+        for: 5m
+        labels: {severity: warning, owner: gateway-operations}
+        annotations:
+          summary: Gateway configuration fingerprint has not converged
+          runbook_url: https://github.com/Greenhat-Security/GreenGateway/blob/main/docs/deployment/operational-alerts.md#cluster-authority
+
+      - alert: GreenGatewayClusterMetricsMissing
+        expr: |
+          max by (job, instance, deployment_mode) (up{job="greengateway",deployment_mode="cluster"} == 1)
+          unless on (job, instance) (
+            greengateway_database_pool_size{job="greengateway",deployment_mode="cluster"}
+            and on (job, instance) greengateway_database_pool_available{job="greengateway",deployment_mode="cluster"}
+            and on (job, instance) greengateway_database_pool_waiting{job="greengateway",deployment_mode="cluster"}
+          )
+        for: 2m
+        labels: {severity: critical, owner: gateway-operations}
+        annotations:
+          summary: Cluster gateway scrape is missing database pool gauges
+          runbook_url: https://github.com/Greenhat-Security/GreenGateway/blob/main/docs/deployment/operational-alerts.md#metrics-availability

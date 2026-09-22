@@ -105,6 +105,16 @@ class ToolContractTests(unittest.TestCase):
         self.replace("build-tools.json", '"cargo_deny": "0.20.2"', '"cargo_deny": "latest"')
         self.rejects("exact version")
 
+    def test_promtool_requires_exact_version_and_reviewed_checksum(self):
+        original = (self.root / "build-tools.json").read_text()
+        for key, value, message in [("promtool", "latest", "exact version"),
+                                    ("promtool_linux_amd64_sha256", "missing", "reviewed checksum")]:
+            with self.subTest(key=key):
+                data = json.loads(original)
+                data[key] = value
+                (self.root / "build-tools.json").write_text(json.dumps(data))
+                self.rejects(message)
+
     def test_raw_npm_install_or_exec_cannot_bypass_review(self):
         for command in ["npm ci", "npm install", "npm exec playwright", "npm rebuild"]:
             with self.subTest(command=command):
