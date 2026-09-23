@@ -62,6 +62,8 @@ def check_contract(ci):
         "EVENT_NAME": "${{ github.event_name }}",
         "EVENT_HEAD_SHA": "${{ github.sha }}",
         "EVENT_BASE_SHA": "${{ github.event.pull_request.base.sha }}",
+        "EVENT_BEFORE_SHA": "${{ github.event.before }}",
+        "EVENT_REF_TYPE": "${{ github.ref_type }}",
     }, "event input must be passed through environment variables")
     compare = next(step for step in steps if step.get("id") == "benchmark")
     require(compare.get("run") == COMPARE, "complete base/head comparison is mandatory")
@@ -172,10 +174,13 @@ class ImmutableRevisionResolution(unittest.TestCase):
         return subprocess.check_output(["git", *args], cwd=self.repo, text=True,
                                        stderr=subprocess.PIPE).strip()
 
-    def resolve(self, event="pull_request", base=None, head=None):
+    def resolve(self, event="pull_request", base=None, head=None,
+                before=None, ref_type="branch"):
         env = dict(os.environ, EVENT_NAME=event,
                    EVENT_BASE_SHA=base if base is not None else self.commits[0],
                    EVENT_HEAD_SHA=head if head is not None else self.commits[-1],
+                   EVENT_BEFORE_SHA=before if before is not None else self.commits[0],
+                   EVENT_REF_TYPE=ref_type,
                    GITHUB_OUTPUT=str(self.repo / "outputs"))
         return subprocess.run(["bash", "-c", self.resolver], cwd=self.repo, env=env,
                               capture_output=True, text=True, timeout=10)
@@ -210,13 +215,30 @@ class ImmutableRevisionResolution(unittest.TestCase):
         self.assertEqual(self.evidence()["base_sha"], self.commits[0])
         self.assertNotEqual(self.evidence()["base_sha"], self.commits[-2])
 
-    def test_branch_and_release_tag_pushes_use_first_parent(self):
+    def test_multi_commit_branch_push_uses_previous_branch_tip(self):
+        result = self.resolve(event="push")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.evidence()["base_sha"], self.commits[0])
+        self.assertNotEqual(self.evidence()["base_sha"], self.commits[-2])
+        self.assertEqual(self.evidence()["head_kind"], "push_branch")
+
+    def test_release_tag_push_uses_first_parent(self):
         self.git("tag", "v0.0.0-fixture")
         self.git("checkout", "--quiet", "v0.0.0-fixture")
-        result = self.resolve(event="push", base="")
+        result = self.resolve(event="push", base="", ref_type="tag", before="")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(self.evidence()["base_sha"], self.commits[-2])
-        self.assertEqual(self.evidence()["head_kind"], "push_commit")
+        self.assertEqual(self.evidence()["head_kind"], "push_tag")
+
+    def test_branch_push_with_invalid_before_or_ref_type_fails_closed(self):
+        for arguments in [
+            {"before": "0" * 40}, {"before": self.commits[0][:12]},
+            {"ref_type": "unknown"},
+            {"before": self.commits[-1], "head": self.commits[0]},
+        ]:
+            with self.subTest(arguments=arguments):
+                self.assertNotEqual(self.resolve(event="push", **arguments).returncode, 0)
+                self.assertFalse((self.repo / "outputs").exists())
 
     def test_mismatched_checkout_and_unknown_events_fail_closed(self):
         for arguments in [{"head": self.commits[0]}, {"event": "pull_request_target"},

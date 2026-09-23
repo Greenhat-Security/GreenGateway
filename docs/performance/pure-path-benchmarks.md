@@ -207,9 +207,11 @@ that accepts arbitrary head hashes or automatically rewrites the budget.
 
 For pull requests, checkout uses the exact `github.sha` merge commit and compares
 it with the event's `pull_request.base.sha`. This measures the proposed merged
-tree against its pinned target branch state. For main and release-tag pushes,
-the comparison uses the checked-out event commit and its first parent. A root
-commit without a parent fails; a missing base is never replaced with the head.
+tree against its pinned target branch state. For main pushes, the comparison
+uses the push event's immutable `before` SHA, covering every commit in a
+multi-commit push. Release-tag pushes compare the event commit with its first
+parent. A root commit without a parent fails; a missing base is never replaced
+with the head.
 Complete Git history is fetched, and the resolver verifies that the checkout
 matches the event commit before running the comparison.
 

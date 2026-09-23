@@ -46,6 +46,8 @@ jobs:
           EVENT_NAME: ${{ github.event_name }}
           EVENT_HEAD_SHA: ${{ github.sha }}
           EVENT_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          EVENT_BEFORE_SHA: ${{ github.event.before }}
+          EVENT_REF_TYPE: ${{ github.ref_type }}
         run: |
           set -euo pipefail
           python - <<'PY'
@@ -76,10 +78,23 @@ jobs:
               base = commit(os.environ["EVENT_BASE_SHA"])
               head_kind = "pull_request_merge"
           elif event == "push":
-              base = commit(subprocess.check_output(
-                  ["git", "rev-parse", "--verify", head + "^"], text=True
-              ).strip())
-              head_kind = "push_commit"
+              ref_type = os.environ["EVENT_REF_TYPE"]
+              if ref_type == "branch":
+                  base = commit(os.environ["EVENT_BEFORE_SHA"])
+                  if base == head:
+                      raise ValueError("branch push has no new commit")
+                  subprocess.run(
+                      ["git", "merge-base", "--is-ancestor", base, head],
+                      check=True,
+                  )
+                  head_kind = "push_branch"
+              elif ref_type == "tag":
+                  base = commit(subprocess.check_output(
+                      ["git", "rev-parse", "--verify", head + "^"], text=True
+                  ).strip())
+                  head_kind = "push_tag"
+              else:
+                  raise ValueError("unsupported push ref type")
           else:
               raise ValueError("unsupported microbenchmark event")
           output = Path("target/microbench")
