@@ -23,7 +23,7 @@ import sys
 import time
 
 SCHEMA_VERSION = 1
-INITIAL_BASE = "167cc5ecf816197f34e1cbb7455c1c21854aa6c8"
+INITIAL_BASE = "c0b098a08df1091fc129ae54348f022d529cfb02"
 INITIAL_HARNESS_SHA256 = "0e005f7903991f9f4eb7b22cf2b56871c9a0d0a554f3d4ecf4d9a85598881f73"
 HARNESS_PATH = "scripts/benchmarks/pure_paths.rs"
 BUDGET_PATH = "microbench-budget.json"

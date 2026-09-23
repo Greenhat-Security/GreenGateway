@@ -146,7 +146,7 @@ protections. The job does not write baselines or grant itself repository write
 access.
 
 Initial adoption has one explicit exception: the exact reviewed commit
-`167cc5ecf816197f34e1cbb7455c1c21854aa6c8` predates the budget file and may use
+`c0b098a08df1091fc129ae54348f022d529cfb02` predates the budget file and may use
 the head's proposed bootstrap policy only after strict validation: it must
 approve exactly the reviewed initial harness digest and permit zero allocation growth. An
 arbitrary base without a budget fails. After this change lands, subsequent
