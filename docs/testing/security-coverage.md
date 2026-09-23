@@ -5,6 +5,13 @@ CI measures real branch coverage with `cargo-llvm-cov` 0.9.0 and the pinned
 instrumentation; production builds continue using the Dockerfile toolchain.
 The existing Linux, PostgreSQL and protocol acceptance gates remain mandatory.
 
+[Targeted security mutations](security-mutations.md) provide a separate check
+that selected pure predicates have behavior assertions strong enough to detect
+reviewed source changes. The bounded mutation campaign runs on a trusted
+schedule or manual dispatch. It does not change these coverage floors or any
+existing pull-request or image-promotion requirement; its reviewed scope and
+individual outcomes must not be presented as a whole-gateway mutation score.
+
 The gate checks each file in `.github/security-coverage.json` separately:
 JWT handling, authentication and RBAC middleware, CSRF, response headers,
 validation, role evaluation, admin authorization and egress. Their inline test

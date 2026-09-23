@@ -1,0 +1,107 @@
+{
+  "schema_version": 1,
+  "harness_version": "1.0.0",
+  "targets": [
+    {
+      "id": "path-prefix",
+      "path": "gateway/src/path_match.rs",
+      "function": "path_match::path_prefix_matches",
+      "start_marker": "pub fn path_prefix_matches(",
+      "end_marker": "\n}\n",
+      "source_sha256": "0b99b0be8d4b8a3a03f30129f7eef6d0501189aa78c7bb19ffdf5782e7cf7a76",
+      "tests": [
+        "path_match::tests::prefix_matches_at_segment_boundary_only",
+        "path_match::tests::non_absolute_prefixes_do_not_match",
+        "path_match::tests::non_probe_exempt_entries_keep_subtree_semantics",
+        "path_match::tests::slash_ended_prefixes_keep_their_subtree_boundary"
+      ],
+      "mutations": [
+        {
+          "id": "drop-segment-boundary",
+          "old": ".is_some_and(|remaining| remaining.starts_with('/'))",
+          "new": ".is_some()"
+        },
+        {
+          "id": "reject-slash-subtree",
+          "old": "return path.starts_with(path_prefix);",
+          "new": "return false;"
+        }
+      ]
+    },
+    {
+      "id": "unsafe-path",
+      "path": "gateway/src/path_match.rs",
+      "function": "path_match::is_unsafe_request_path",
+      "start_marker": "pub fn is_unsafe_request_path(",
+      "end_marker": "\n}\n",
+      "source_sha256": "f7040db0b73e9add28ac4c58d91f58124f762ed6b2627289dc8eea7b1683c602",
+      "tests": [
+        "path_match::tests::empty_interior_segments_are_unsafe_but_ordinary_paths_are_not",
+        "path_match::tests::unsafe_paths_include_encoding_dot_segments_and_backslashes"
+      ],
+      "mutations": [
+        {
+          "id": "allow-backslash",
+          "old": "|| path.contains('\\\\')",
+          "new": "|| false"
+        },
+        {
+          "id": "allow-empty-segment",
+          "old": "|| path.contains(\"//\")",
+          "new": "|| false"
+        }
+      ]
+    },
+    {
+      "id": "egress-host",
+      "path": "gateway/src/egress.rs",
+      "function": "egress::host_glob_matches",
+      "start_marker": "fn host_glob_matches(",
+      "end_marker": "\n}\n",
+      "source_sha256": "5c6ed2395981367dd4ed5104da48981f8e7615a7e865b3f3f5d8bb602195c988",
+      "tests": [
+        "egress::tests::host_glob_matching_supports_exact_and_leading_wildcard_patterns"
+      ],
+      "mutations": [
+        {
+          "id": "drop-label-boundary",
+          "old": "&& host.as_bytes()[host.len() - suffix.len() - 1] == b'.'",
+          "new": "&& true"
+        },
+        {
+          "id": "skip-host-case-fold",
+          "old": "let host = host.to_ascii_lowercase();",
+          "new": "let host = host.to_owned();"
+        }
+      ]
+    },
+    {
+      "id": "kernel-host",
+      "path": "gateway/src/policy_eval/mod.rs",
+      "function": "policy_eval::route_host_matches",
+      "start_marker": "fn route_host_matches(",
+      "end_marker": "\n}\n",
+      "source_sha256": "63d415fd4f53befd311cdf51d45984dbd2cce5eadca89780dedd1eb89b87a34b",
+      "tests": [
+        "policy_eval::tests::a_route_host_alone_makes_the_host_binding_mandatory",
+        "policy_eval::tests::a_permissive_default_does_not_authorize_an_unrouted_virtual_upstream",
+        "policy_eval::tests::an_ipv6_request_host_is_evaluated_rather_than_refused_as_malformed",
+        "policy_eval::tests::an_unbound_permission_route_cannot_authorize_a_selected_virtual_host",
+        "policy_eval::tests::a_host_qualified_permission_route_requires_a_present_matching_host"
+      ],
+      "mutations": [
+        {
+          "id": "ignore-required-binding",
+          "old": "return !binding_required;",
+          "new": "return true;"
+        },
+        {
+          "id": "accept-absent-host",
+          "old": "request_host.is_some_and(|request_host| {",
+          "new": "request_host.is_none_or(|request_host| {"
+        }
+      ]
+    }
+  ],
+  "exceptions": []
+}

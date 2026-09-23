@@ -88,6 +88,21 @@ mod tests {
     }
 
     #[test]
+    fn slash_ended_prefixes_keep_their_subtree_boundary() {
+        for path in ["/admin/", "/admin/assets", "/admin/assets/index.js"] {
+            assert!(path_prefix_matches(path, "/admin/"), "{path}");
+        }
+        for path in ["/admin", "/administrator/", "/admin-panel/assets"] {
+            assert!(!path_prefix_matches(path, "/admin/"), "{path}");
+        }
+
+        for path in ["/", "/admin", "/admin/assets"] {
+            assert!(path_prefix_matches(path, "/"), "{path}");
+        }
+        assert!(!path_prefix_matches("admin/assets", "/"));
+    }
+
+    #[test]
     fn existing_probe_paths_keep_exact_lookalike_behavior() {
         for path in ["/health", "/version", "/metrics"] {
             assert!(path_prefix_matches(path, path));
