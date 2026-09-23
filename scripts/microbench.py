@@ -345,9 +345,18 @@ def _production_prefix(source):
     depths = _depths(masked)
     markers = [m for m in re.finditer(r"#\s*\[\s*cfg\s*\(\s*test\s*\)\s*\]", masked)
                if depths[m.start()] == 0]
-    if len(markers) != 1:
-        raise ValueError("expected exactly one top-level test-module boundary")
-    marker = markers[0]
+    if len(markers) == 2:
+        # The path helper also has a separate property-test module. Strip it
+        # from the projection only when its complete declaration is known.
+        property_module = masked[markers[0].end():markers[1].start()]
+        if not re.fullmatch(
+            r"\s*#\[\s*path\s*=\s*\]\s*mod\s+property_tests\s*;\s*",
+            property_module,
+        ):
+            raise ValueError("unexpected test module before the trailing tests module")
+    elif len(markers) != 1:
+        raise ValueError("expected one or two top-level test-module boundaries")
+    marker = markers[-1]
     if not re.match(r"\s*mod\s+tests\s*\{", masked[marker.end():]):
         raise ValueError("test boundary is not the trailing tests module")
     opening = masked.index("{", marker.end())
@@ -355,7 +364,7 @@ def _production_prefix(source):
                     if masked[i] == "}" and depths[i] == 1), None)
     if closing is None or masked[closing + 1:].strip():
         raise ValueError("production items follow the tests module")
-    return source[:marker.start()]
+    return source[:markers[0].start()]
 
 
 def _top_function(source, name):

@@ -32,6 +32,15 @@ class SourceProjectionTests(unittest.TestCase):
         self.assertIn("fn path_segments_match", projected)
         self.assertNotIn("async fn", projected)
         self.assertNotIn("fn resolve_and_check", projected)
+        self.assertNotIn("mod property_tests", projected)
+
+    def test_unexpected_test_module_cannot_be_silently_stripped(self):
+        data = sources()
+        data["gateway/src/path_match.rs"] = data["gateway/src/path_match.rs"].replace(
+            "mod property_tests;", "mod replacement_tests;"
+        )
+        with self.assertRaises(ValueError):
+            bench.project_sources(data)
 
     def test_deleted_selected_function_is_an_error(self):
         data = sources()
