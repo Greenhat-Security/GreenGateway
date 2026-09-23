@@ -1,6 +1,6 @@
 # Pure-path microbenchmark budgets
 
-Part of #437. The standalone microbenchmark controller compares allocation
+Part of #437. The required `microbench` CI job compares deterministic allocation
 counts for a small set of pure production predicates. Wall-clock timings remain
 informational. The existing nightly, HA, failover, load and release workflows
 remain in place; these microbenchmarks do not establish a production SLO.
@@ -136,6 +136,45 @@ and a deliberately introduced allocation regression fails. Its overall success
 means that both expectations held; the intentionally rejected comparison must
 remain visible in the saved evidence. It does not modify production source.
 
+## Initial local measurement record
+
+On 2026-09-22, three independent comparisons of base
+`167cc5ecf816197f34e1cbb7455c1c21854aa6c8` with benchmark implementation
+`d7d68937f365accaac91702d4b0af5e3015b8f00` passed. Both sides had identical
+production-source and projection hashes. Each comparison rebuilt both binaries
+with Rust 1.98.1, edition 2021, `opt-level=3`, one codegen unit and no debug info.
+Python was 3.13.15. The host was Linux 6.18.44 x86-64 on an Intel Xeon Platinum
+8272CL, with nine visible logical CPUs, an eight-CPU cgroup quota and a 20 GiB
+memory limit. A separate full-workspace Cargo build was running concurrently.
+This was an uncontrolled development host, not a qualified timing runner.
+
+Every target had identical allocation counts in all 54 samples across the
+three comparisons and both revisions. Counts below are per sample of 1,000
+dataset iterations. Timing ranges span the six base/head sample-set medians;
+the last column is the largest within-set `(max - min) / median`, not a
+confidence interval.
+
+| Target | Allocation calls | Requested bytes | Median timing range (ms) | Largest within-set spread |
+| --- | ---: | ---: | ---: | ---: |
+| `request_path` | 0 | 0 | 2.607–3.300 | 272.9% |
+| `path_prefix` | 0 | 0 | 0.066–0.126 | 185.4% |
+| `rule_path` | 87,000 | 5,286,000 | 7.406–11.239 | 71.3% |
+| `egress_host` | 31,000 | 1,118,000 | 0.973–1.887 | 322.5% |
+
+The full comparison commands completed in 6.311, 6.081 and 6.299 seconds,
+including controller startup. The independent self-test completed in 9.866
+seconds: its neutral rebuild passed and its deliberate allocation regression
+failed all four target budgets. That fixture adds one 64-byte allocation per
+decision, producing 32,000 extra calls for `request_path` and 16,000 for each
+other target per sample.
+
+The associated validation record retains `repeat-1`, `repeat-2`, `repeat-3`,
+`self-test` and `measurement-commands.json`, including raw samples and exact
+commands. The stable allocator counts support the initial zero-growth budget
+for this fixture. The large timing spread on unchanged source supports leaving
+time informational; these measurements establish neither a blocking timing
+threshold nor the total hosted CI job duration.
+
 ## Base ownership and reviewed updates
 
 `microbench-budget.json` versions the benchmark schema and regression budget.
@@ -164,9 +203,34 @@ The first PR is checked against its old base policy, and the second against the
 new policy; intervening PRs retain a valid current harness. Do not add a fallback
 that accepts arbitrary head hashes or automatically rewrites the budget.
 
-## CI integration follow-up
+## CI comparison and evidence
 
-The next PR slice wires this measured controller into pull-request and push checks,
-with immutable event revisions, required evidence uploads and image-promotion
-dependencies. Hosted execution remains unverified until that integration runs
-on GitHub Actions.
+For pull requests, checkout uses the exact `github.sha` merge commit and compares
+it with the event's `pull_request.base.sha`. This measures the proposed merged
+tree against its pinned target branch state. For main pushes, the comparison
+uses the push event's immutable `before` SHA, covering every commit in a
+multi-commit push. Release-tag pushes compare the event commit with its first
+parent. A root commit without a parent fails; a missing base is never replaced
+with the head.
+Complete Git history is fetched, and the resolver verifies that the checkout
+matches the event commit before running the comparison.
+
+The job runs for every existing CI pull-request and push trigger, without path
+filters, skipped targets or optional failure status. It has read-only contents
+permission, no persisted checkout credentials and no secrets, so fork pull
+requests use the ordinary unprivileged `pull_request` event. Failure evidence is
+uploaded with `always()` and missing artifacts are an error. Image promotion
+depends on `microbench` succeeding alongside all pre-existing validation jobs.
+
+Local workflow fixtures exercise real Git revision resolution and reject
+credential persistence, a mutable or shallow checkout, changed event scopes,
+skipped comparisons, permissive failure handling, incomplete evidence uploads
+and removal of the promotion dependency. These fixtures do not substitute for
+a hosted PR run. Hosted execution and runner timing qualification remain pending
+until maintainers run this change through GitHub Actions.
+
+Keep timing informational until repeated runs on the intended controlled runner
+show a usable signal-to-noise margin and a reviewed regression fixture proves
+the proposed threshold. Follow the broader comparison rules in
+[the proxy baseline](proxy-baseline.md); production load qualification remains
+tracked by #389.
