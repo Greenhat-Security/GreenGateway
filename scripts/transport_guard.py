@@ -79,12 +79,85 @@ def enumeration(metadata):
         raise ValueError("no production Cargo target")
     return {"files": files, "roots":roots}, build_inputs
 
+def validate_standalone_path(file):
+    if not isinstance(file,str) or not re.fullmatch(r"scripts/benchmarks/(?:[A-Za-z0-9_-]+/)*[A-Za-z0-9_-]+\.rs",file):
+        raise ValueError("standalone benchmark must name one exact scripts/benchmarks Rust file")
+
+
+def standalone_hash(file):
+    validate_standalone_path(file)
+    source=ROOT/file
+    try:
+        resolved=source.resolve(strict=True)
+        resolved.relative_to(ROOT.resolve())
+    except (OSError,ValueError) as error:
+        raise ValueError("standalone benchmark is missing or escapes the repository: " + file) from error
+    if resolved != ROOT.resolve()/file or not resolved.is_file():
+        raise ValueError("standalone benchmark must be a regular file without symbolic links: " + file)
+    return hashlib.sha256(resolved.read_bytes().replace(b"\r\n",b"\n")).hexdigest()
+
+
+def validate_standalone_entries(entries, reviewed=True):
+    if not isinstance(entries,list):
+        raise ValueError("standalone_benchmarks must be an exact list")
+    seen=set()
+    for entry in entries:
+        if not isinstance(entry,dict) or set(entry)!={"file","sha256","owner","purpose"}:
+            raise ValueError("standalone benchmark requires exact review fields")
+        validate_standalone_path(entry["file"])
+        if not isinstance(entry["sha256"],str) or not re.fullmatch(r"[a-f0-9]{64}",entry["sha256"]):
+            raise ValueError("standalone benchmark requires an exact SHA256")
+        if any(not isinstance(entry[field],str) or (reviewed and len(entry[field].strip())<12)
+               for field in ("owner","purpose")):
+            raise ValueError("standalone benchmark owner and purpose required")
+        if entry["file"] in seen:
+            raise ValueError("duplicate standalone benchmark")
+        seen.add(entry["file"])
+
+
+def standalone_roots(manifest, entries):
+    """Parse reviewed standalone files as additional nonproduction roots.
+
+    Enumeration and every Cargo root remain intact. The Rust Tree still rejects
+    production modules reached through these roots and all other unowned files.
+    """
+    validate_standalone_entries(entries,reviewed=False)
+    cargo_files={root["file"] for root in manifest["roots"]}
+    for entry in entries:
+        file=entry["file"]
+        if file not in manifest["files"]:
+            raise ValueError("standalone benchmark is not an enumerated Rust source: " + file)
+        if file in cargo_files:
+            raise ValueError("standalone benchmark conflicts with a Cargo target root: " + file)
+        if standalone_hash(file)!=entry["sha256"]:
+            raise ValueError("standalone benchmark source changed; explicit inventory and review required: " + file)
+    roots=list(manifest["roots"])
+    for entry in entries:
+        roots.append({"file":entry["file"],"name":"standalone_benchmark["+entry["file"]+"]",
+                      "test":True,"kind":["standalone-benchmark"]})
+    return {"files":list(manifest["files"]),"roots":roots}
+
+
+def inventory_standalone(reviewed, paths):
+    """Only explicit registrations/refreshes replace reviewed hashes."""
+    requested=list(paths)
+    if len(set(requested))!=len(requested):
+        raise ValueError("duplicate standalone benchmark inventory request")
+    entries={entry["file"]:dict(entry) for entry in reviewed}
+    for file in requested:
+        entries[file]={"file":file,"sha256":standalone_hash(file),"owner":"","purpose":""}
+    return [entries[file] for file in sorted(entries)]
+
+
 def validate_policy(policy):
-    if set(policy) != {"schema", "owner", "purpose", "graph", "build_inputs", "scopes"} or policy["schema"] != 1:
+    if (not isinstance(policy,dict)
+            or set(policy)!={"schema","owner","purpose","graph","build_inputs","standalone_benchmarks","scopes"}
+            or type(policy["schema"]) is not int or policy["schema"]!=2):
         raise ValueError("invalid transport policy schema")
     for field in ("owner", "purpose"):
         if not isinstance(policy[field],str) or len(policy[field].strip()) < 12:
             raise ValueError(f"substantive {field} required")
+    validate_standalone_entries(policy["standalone_benchmarks"])
     seen = set()
     for s in policy["scopes"]:
         if set(s) != {"file","scope","sha256","reasons","owner","purpose"}:
@@ -114,9 +187,11 @@ def compare_scopes(actual, reviewed):
     if changed:
         raise ValueError("transport syntax review required:\n" + "\n".join(changed))
 
-def check(inventory=False):
+def check(inventory=False, standalone_benchmarks=()):
     decision = {"status":"failed","stage":"enumeration"}
     try:
+        if standalone_benchmarks and not inventory:
+            raise ValueError("standalone registrations are accepted only by inventory")
         locked = tomllib.loads((ROOT/"Cargo.lock").read_text(encoding="utf-8"))
         for p in locked["package"]:
             if p.get("source") not in (None,REGISTRY):
@@ -124,14 +199,18 @@ def check(inventory=False):
         metadata = json.loads(run("cargo","metadata","--locked","--all-features","--format-version","1"))
         current_graph = graph(metadata,locked)
         manifest, build_inputs = enumeration(metadata)
-        policy = None if inventory else read(POLICY)
-        if policy is not None:
-            validate_policy(policy)
+        policy = read(POLICY)
+        validate_policy(policy)
+        if not inventory:
             decision["stage"]="dependency-review"
             if policy["graph"] != current_graph:
                 raise ValueError("dependency/feature/target exposure changed; review before compiling the syntax tool")
             if policy["build_inputs"] != build_inputs:
                 raise ValueError("build-script inputs changed; generated code review required")
+        decision["stage"]="standalone-review"
+        registrations=(inventory_standalone(policy["standalone_benchmarks"],standalone_benchmarks)
+                       if inventory else policy["standalone_benchmarks"])
+        manifest=standalone_roots(manifest,registrations)
         write(OUTPUT/"enumeration.json",manifest)
         decision["stage"]="syntax"
         facts=json.loads(run("cargo","run","--locked","--example","transport_guard","--",str(ROOT),str(OUTPUT/"enumeration.json")))
@@ -141,12 +220,12 @@ def check(inventory=False):
         missing=sorted(set(manifest["files"])-set(facts["files"]))
         if missing:
             raise ValueError("Rust files not owned by a Cargo target/module graph: " + ", ".join(missing))
-        candidate={"schema":1,"owner":"GreenGateway maintainers", "purpose":"Review production transport authority and unexpanded syntax inputs.","graph":current_graph,"build_inputs":build_inputs,"scopes":facts["scopes"]}
+        candidate={"schema":2,"owner":"GreenGateway maintainers", "purpose":"Review production transport authority and unexpanded syntax inputs.","graph":current_graph,"build_inputs":build_inputs,"standalone_benchmarks":registrations,"scopes":facts["scopes"]}
         write(OUTPUT/"candidate.json",candidate)
-        if policy is not None:
+        if not inventory:
             decision["stage"]="scope-review"
             compare_scopes(facts["scopes"],policy["scopes"])
-        decision.update(status="inventory" if inventory else "passed",stage="complete",files=len(facts["files"]),scopes=len(facts["scopes"]),packages=len(current_graph["packages"]))
+        decision.update(status="inventory" if inventory else "passed",stage="complete",files=len(facts["files"]),scopes=len(facts["scopes"]),packages=len(current_graph["packages"]),standalone_benchmarks=len(registrations))
         print(json.dumps(decision))
     except Exception as error:
         decision["error"]=str(error)
@@ -157,9 +236,13 @@ def check(inventory=False):
 def main():
     parser=argparse.ArgumentParser(description=__doc__)
     parser.add_argument("command",choices=["check","inventory"])
+    parser.add_argument("--standalone-benchmark",action="append",default=[],metavar="FILE",
+                        help="inventory only: register or refresh one exact standalone benchmark for review")
     args=parser.parse_args()
+    if args.standalone_benchmark and args.command!="inventory":
+        parser.error("--standalone-benchmark is accepted only with inventory")
     try:
-        check(args.command=="inventory")
+        check(args.command=="inventory",args.standalone_benchmark)
     except (ValueError,KeyError,OSError,subprocess.CalledProcessError) as error:
         print(f"transport guard: {error}",file=sys.stderr)
         if isinstance(error,subprocess.CalledProcessError):

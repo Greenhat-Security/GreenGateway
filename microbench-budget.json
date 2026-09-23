@@ -1,0 +1,28 @@
+{
+  "schema_version": 1,
+  "harness_sha256": [
+    "0e005f7903991f9f4eb7b22cf2b56871c9a0d0a554f3d4ecf4d9a85598881f73"
+  ],
+  "targets": [
+    {
+      "id": "request_path",
+      "max_allocation_growth": 0,
+      "max_allocated_bytes_growth": 0
+    },
+    {
+      "id": "path_prefix",
+      "max_allocation_growth": 0,
+      "max_allocated_bytes_growth": 0
+    },
+    {
+      "id": "rule_path",
+      "max_allocation_growth": 0,
+      "max_allocated_bytes_growth": 0
+    },
+    {
+      "id": "egress_host",
+      "max_allocation_growth": 0,
+      "max_allocated_bytes_growth": 0
+    }
+  ]
+}

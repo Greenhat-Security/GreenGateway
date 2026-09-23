@@ -1,5 +1,5 @@
 {
-  "schema": 1,
+  "schema": 2,
   "owner": "GreenGateway maintainers",
   "purpose": "Review production transport authority and unexpanded syntax inputs.",
   "graph": {
@@ -6020,6 +6020,14 @@
     {
       "file": "gateway/build.rs",
       "sha256": "ac4ed880307df58884ed466c31a2b186e54dfd36b08b6ca068a561145a08f09f"
+    }
+  ],
+  "standalone_benchmarks": [
+    {
+      "file": "scripts/benchmarks/pure_paths.rs",
+      "sha256": "0e005f7903991f9f4eb7b22cf2b56871c9a0d0a554f3d4ecf4d9a85598881f73",
+      "owner": "GreenGateway maintainers: backend performance and transport ownership reviewers",
+      "purpose": "Review this exact standalone, dependency-free benchmark harness as nonproduction measurement code. Parse it as an explicit root while retaining all Cargo production roots, mixed-ownership checks, and fail-closed rejection of unregistered Rust files."
     }
   ],
   "scopes": [
