@@ -3127,6 +3127,12 @@ paths:
                 rbac::RbacState::new(policy, Vec::new(), false, audit.clone()),
                 rbac::rbac_middleware,
             ))
+            // This fixture has no proxy routes. Production completes routing
+            // classification before RBAC; supply that same known-contextless
+            // fact rather than testing an impossible unclassified request.
+            .layer(axum::Extension(
+                crate::upstream_route::ProxyRouteClassificationCompleted,
+            ))
             .layer(from_fn_with_state(
                 auth::AuthState {
                     admin_sessions: None,

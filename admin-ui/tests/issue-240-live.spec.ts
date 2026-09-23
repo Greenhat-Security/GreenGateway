@@ -538,14 +538,30 @@ test.describe.serial('Issue #240 live admin acceptance', () => {
 });
 
 async function saveBearerToken(page: Page, token: string) {
+  const rejectedAdminRequests: string[] = [];
+  page.on('response', (response) => {
+    const path = new URL(response.url()).pathname;
+    if (response.status() === 401 && path.startsWith('/v1/admin/')) {
+      rejectedAdminRequests.push(
+        `${response.request().method()} ${path}: 401, bearer=${Boolean(response.request().headers().authorization)}`,
+      );
+    }
+  });
   await page.goto('/admin/');
   await page.getByLabel('Token', { exact: true }).fill(token);
   await page.getByRole('button', { name: 'Save' }).click();
-  await expect(
-    page.getByRole('status').filter({
-      hasText: 'Token active in this tab until reload or session expiry.',
-    }),
-  ).toBeVisible();
+  try {
+    await expect(
+      page.getByRole('status').filter({
+        hasText: 'Token active in this tab until reload or session expiry.',
+      }),
+    ).toBeVisible();
+  } catch (error) {
+    throw new Error(
+      `Bearer activation failed. Admin 401 responses: ${rejectedAdminRequests.join('; ') || 'none'}`,
+      { cause: error },
+    );
+  }
 }
 
 async function assertThemeChanges(page: Page) {

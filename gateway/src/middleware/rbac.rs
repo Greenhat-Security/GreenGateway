@@ -7,6 +7,8 @@ use std::{
     time::Duration,
 };
 
+#[cfg(test)]
+use crate::rbac::{DefaultAction, EnforcementMode};
 use arc_swap::ArcSwap;
 #[cfg(feature = "postgres")]
 use async_trait::async_trait;
@@ -16,7 +18,9 @@ use axum::{
     response::{IntoResponse, Response},
     Json,
 };
-use http::{Method, StatusCode};
+#[cfg(test)]
+use http::Method;
+use http::StatusCode;
 use notify::{RecursiveMode, Watcher};
 use serde::Serialize;
 use serde_json::{json, Value};
@@ -28,11 +32,10 @@ use crate::{
     auth::{self, actor_from_principal, protected_resource},
     client_ip::{canonical_client_ip, request_id, ClientIpPolicy},
     config::Config,
-    path_match::{exempt_path_matches, is_unsafe_request_path, path_prefix_matches},
+    path_match::{exempt_path_matches, is_unsafe_request_path},
     rbac::{
-        policy::ToolPolicyEntry, rule::principal_identity_matches, DefaultAction, EgressPolicy,
-        EnforcementMode, Policy, PolicyEngine, RouteRule, RuleAction, RuleDecision,
-        RuleDispatchContext, RuleDispatchKind, RuleMatcher,
+        policy::ToolPolicyEntry, rule::principal_identity_matches, EgressPolicy, Policy,
+        PolicyEngine, RouteRule, RuleAction, RuleDispatchContext, RuleDispatchKind, RuleMatcher,
     },
     upstream_route::{
         self, ProxyRouteAuthorizationContext, ProxyRouteClassificationCompleted,
@@ -290,7 +293,9 @@ pub(crate) struct RbacPolicyState {
     engine: PolicyEngine,
     rule_matcher: RuleMatcher,
     rule_ids: Vec<String>,
+    #[cfg(test)]
     default_action: DefaultAction,
+    #[cfg(test)]
     enforcement_mode: EnforcementMode,
     routes: Vec<RouteRule>,
     /// The security revision this compiled snapshot is keyed by. `0` for
@@ -310,15 +315,7 @@ pub(crate) struct RbacPolicyState {
     /// disagree with the snapshot it belongs to, and compiling once per install
     /// keeps three parses and a digest off the request path.
     ///
-    /// Nothing consults it for a decision yet; #422's adapter is the cutover.
-    ///
-    /// `expect` rather than `allow` deliberately: when the adapter reads this,
-    /// the expectation goes unfulfilled and CI says so, instead of an `allow`
-    /// quietly outliving the reason for it.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "read by #422's adapter; tests consult it now")
-    )]
+    /// The HTTP adapter uses this instance for every admitted decision.
     compiled: crate::policy_eval::CompiledPolicy,
 }
 
@@ -725,7 +722,9 @@ fn tool_policy_principal_matches(
 
 impl RbacPolicyState {
     fn from_policy(policy: Policy) -> Self {
+        #[cfg(test)]
         let default_action = policy.default_action.clone();
+        #[cfg(test)]
         let enforcement_mode = policy.enforcement_mode;
         let routes = policy.routes.clone();
         let rule_ids = policy
@@ -744,7 +743,9 @@ impl RbacPolicyState {
             engine: PolicyEngine::new(policy),
             rule_matcher,
             rule_ids,
+            #[cfg(test)]
             default_action,
+            #[cfg(test)]
             enforcement_mode,
             routes,
             security_revision: 0,
@@ -768,7 +769,9 @@ impl RbacPolicyState {
         policy: Policy,
         security_revision: i64,
     ) -> Result<Self, crate::policy_eval::CompileError> {
+        #[cfg(test)]
         let default_action = policy.default_action.clone();
+        #[cfg(test)]
         let enforcement_mode = policy.enforcement_mode;
         let routes = policy.routes.clone();
         let rule_ids = policy
@@ -787,7 +790,9 @@ impl RbacPolicyState {
             engine: PolicyEngine::new(policy),
             rule_matcher,
             rule_ids,
+            #[cfg(test)]
             default_action,
+            #[cfg(test)]
             enforcement_mode,
             routes,
             security_revision,
@@ -797,10 +802,6 @@ impl RbacPolicyState {
 
     /// The pure kernel's view of this snapshot: the same policy, compiled once at
     /// install, pinned to the revision this snapshot serves under.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "read by #422's adapter; tests consult it now")
-    )]
     pub(crate) fn compiled(&self) -> &crate::policy_eval::CompiledPolicy {
         &self.compiled
     }
@@ -1176,24 +1177,6 @@ pub async fn rbac_middleware(State(state): State<RbacState>, req: Request, next:
     let principal = req.extensions().get::<auth::Principal>().cloned();
     let policy_path = state.policy_path_for_request(path);
     let request_host = upstream_route::request_host_without_port(req.uri(), req.headers());
-    let required_upstream_host = proxy_context.as_ref().map(|context| context.host.as_str());
-    let dispatch_context = if req
-        .extensions()
-        .get::<ProxyRouteClassificationCompleted>()
-        .is_none()
-    {
-        RuleDispatchContext::unknown()
-    } else if let Some(context) = req.extensions().get::<ProxyRouteObservationContext>() {
-        RuleDispatchContext::classified_with_route_id(
-            context.route_id.as_deref(),
-            context.route_host.as_deref(),
-            context.route_path_prefix.as_deref(),
-            Some(context.upstream_origin.as_str()),
-        )
-    } else {
-        RuleDispatchContext::contextless()
-    };
-
     // Cluster mode's strict revision check (issue #241): this request may
     // consult the local compiled snapshot only if it is keyed by the
     // authority's current security revision. A failed check is `503` with
@@ -1257,352 +1240,227 @@ pub async fn rbac_middleware(State(state): State<RbacState>, req: Request, next:
     {
         context.security_revision = served_security_revision;
     }
-    // Direct firewall rules run before route-to-permission rules. A direct deny
-    // remains global, but host-qualified upstreams require an explicit host-bound
-    // route permission. Direct allow cannot authorize them, while first-match
-    // shadow telemetry is retained before route evaluation. MCP aliases evaluate
-    // their raw and canonical policy identities together so a deny or shadow on
-    // either identity cannot be suppressed by an allow on the other.
-    let first_direct_rule = matching_direct_rule(
-        &policy.rule_matcher,
-        req.method().as_str(),
-        path,
-        policy_path,
-        principal.as_ref(),
-        dispatch_context,
-        false,
-    );
-    let direct_rule_decision = if required_upstream_host.is_some() {
-        matching_direct_rule(
-            &policy.rule_matcher,
-            req.method().as_str(),
-            path,
-            policy_path,
-            principal.as_ref(),
-            dispatch_context,
-            true,
-        )
+    // Normalize only facts already established by admission. In particular, no
+    // Host is Absent, not Missing, and all policy references below come from the
+    // same snapshot the revision gate pinned for this request.
+    let compiled = policy.compiled();
+    let observation = req.extensions().get::<ProxyRouteObservationContext>();
+    let classified = req
+        .extensions()
+        .get::<ProxyRouteClassificationCompleted>()
+        .is_some();
+    let dispatch = observation.map(|facts| crate::policy_eval::DispatchFacts {
+        route_id: facts.route_id.clone(),
+        route_host: facts.route_host.clone(),
+        route_path_prefix: facts.route_path_prefix.clone(),
+        upstream_origin: facts.upstream_origin.clone(),
+    });
+    let target = if !classified {
+        crate::policy_eval::HttpTarget::Missing
+    } else if policy_path != path {
+        crate::policy_eval::HttpTarget::McpAlias {
+            canonical_path: policy_path.to_owned(),
+        }
+    } else if observation.is_some() {
+        crate::policy_eval::HttpTarget::ProxyDispatch
     } else {
-        first_direct_rule.clone()
+        crate::policy_eval::HttpTarget::Contextless
     };
-    if required_upstream_host.is_some() {
-        if let Some(rule_decision) = first_direct_rule.as_ref() {
-            if rule_decision.action == RuleAction::Shadow {
-                let matched_rule_id = policy.rule_id(rule_decision.rule_index);
-                emit_rule_would_deny(&state, &context, principal.as_ref(), &matched_rule_id);
-            }
-        }
-    }
-    if let Some(rule_decision) = direct_rule_decision {
-        let matched_rule_id = policy.rule_id(rule_decision.rule_index);
-        return match rule_decision.action {
-            RuleAction::Allow => {
-                emit_rule_allowed(&state, &context, principal.as_ref(), &matched_rule_id);
-                let decision = decision_for_direct_rule(
-                    PolicyDecisionOutcome::Allowed,
-                    "matched_rule",
-                    matched_rule_id,
-                );
-                drop(policy);
-                let response = run_pinned(
-                    pinned_connections.clone(),
-                    admitted_bundle.clone(),
-                    next,
-                    req,
+    let input = crate::policy_eval::PolicyEvaluationContext {
+        version: crate::policy_eval::CONTEXT_VERSION,
+        snapshot: compiled.snapshot(),
+        method: Some(req.method().clone()),
+        path: Some(path.to_owned()),
+        principal: principal.as_ref().map_or(
+            crate::policy_eval::PrincipalFact::Anonymous,
+            |principal| {
+                crate::policy_eval::PrincipalFact::Authenticated(
+                    crate::policy_eval::PrincipalIdentity::from_principal(principal),
                 )
-                .await;
-                with_policy_decision(response, decision)
-            }
-            RuleAction::Deny => {
-                emit_rule_denied(&state, &context, principal.as_ref(), &matched_rule_id);
-                with_policy_decision(
-                    forbidden(),
-                    decision_for_direct_rule(
-                        PolicyDecisionOutcome::Denied,
-                        "matched_rule",
-                        matched_rule_id,
-                    ),
-                )
-            }
-            RuleAction::Shadow => {
-                emit_rule_would_deny(&state, &context, principal.as_ref(), &matched_rule_id);
-                let decision = decision_for_direct_rule(
-                    PolicyDecisionOutcome::WouldDeny,
-                    "matched_rule",
-                    matched_rule_id,
-                );
-                drop(policy);
-                let response = run_pinned(
-                    pinned_connections.clone(),
-                    admitted_bundle.clone(),
-                    next,
-                    req,
-                )
-                .await;
-                with_policy_decision(response, decision)
-            }
-        };
-    }
-
-    let matching_policy_route = matching_route_for_request(
-        &policy.routes,
-        req.method(),
-        path,
-        policy_path,
-        required_upstream_host.or(request_host.as_deref()),
-        required_upstream_host.is_some(),
-    );
-
-    if let Some(rule) = matching_policy_route {
-        if principal.as_ref().is_some_and(|principal| {
-            policy
-                .engine
-                .principal_has_permission(principal, &rule.permission)
-        }) {
-            emit_allowed(&state, &context, principal.as_ref(), Some(rule), None);
-            let decision = decision_for_rule(PolicyDecisionOutcome::Allowed, "matched_rule", rule);
-            drop(policy);
-            let response = run_pinned(
-                pinned_connections.clone(),
-                admitted_bundle.clone(),
-                next,
-                req,
-            )
-            .await;
-            return with_policy_decision(response, decision);
-        }
-
-        let reason = if principal.is_some() {
-            "missing_permission"
-        } else {
-            "missing_principal"
-        };
-        return match effective_enforcement_mode(&policy, rule) {
-            EnforcementMode::Enforce => {
-                emit_denied(&state, &context, principal.as_ref(), reason, Some(rule));
-                with_policy_decision(
-                    forbidden(),
-                    decision_for_rule(PolicyDecisionOutcome::Denied, reason, rule),
-                )
-            }
-            EnforcementMode::Shadow => {
-                emit_would_deny(&state, &context, principal.as_ref(), reason, Some(rule));
-                let decision = decision_for_rule(PolicyDecisionOutcome::WouldDeny, reason, rule);
-                drop(policy);
-                let response = run_pinned(
-                    pinned_connections.clone(),
-                    admitted_bundle.clone(),
-                    next,
-                    req,
-                )
-                .await;
-                with_policy_decision(response, decision)
-            }
-        };
-    }
-
-    if required_upstream_host.is_some() {
-        emit_host_policy_required(
-            &state,
-            &context,
-            principal.as_ref(),
-            proxy_context
-                .as_ref()
-                .expect("host binding requires proxy dispatch context"),
-        );
-        return with_policy_decision(
-            forbidden(),
-            PolicyDecision {
-                outcome: PolicyDecisionOutcome::Denied,
-                reason: "host_policy_required",
-                permission: None,
-                path_prefix: None,
-                matched_rule_id: None,
             },
-        );
-    }
-
-    let default_action = policy.default_action.clone();
-    let enforcement_mode = policy.enforcement_mode;
-    drop(policy);
-
-    match default_action {
-        DefaultAction::Allow => {
-            let decision = PolicyDecision {
-                outcome: PolicyDecisionOutcome::Allowed,
-                reason: "default_allow",
-                permission: None,
-                path_prefix: None,
-                matched_rule_id: None,
-            };
-            emit_allowed(
+        ),
+        target,
+        request_host: request_host.map_or(
+            crate::policy_eval::HostFact::Absent,
+            crate::policy_eval::HostFact::Present,
+        ),
+        dispatch,
+    };
+    // The classifier derives these two contexts together. Never accept a
+    // missing or different host-binding authority as a contextless allow.
+    let evaluation = if observation.and_then(|facts| facts.authorization_context()) != proxy_context
+    {
+        Err(crate::policy_eval::EvaluationError::InconsistentContext)
+    } else {
+        compiled.evaluate(&input)
+    };
+    let evaluation = match evaluation {
+        Ok(result)
+            if result.is_complete()
+                && result.logical() != crate::policy_eval::LogicalDecision::Indeterminate =>
+        {
+            result
+        }
+        Ok(result) => {
+            return evaluation_failed(
                 &state,
                 &context,
                 principal.as_ref(),
+                "policy_evaluation_incomplete",
+                result.limitation(),
                 None,
-                Some("default_allow"),
             );
-            let response = run_pinned(
-                pinned_connections.clone(),
-                admitted_bundle.clone(),
-                next,
-                req,
-            )
-            .await;
-            with_policy_decision(response, decision)
         }
-        DefaultAction::Deny => match enforcement_mode {
-            EnforcementMode::Enforce => {
-                emit_denied(&state, &context, principal.as_ref(), "default_deny", None);
-                with_policy_decision(
-                    forbidden(),
-                    PolicyDecision {
-                        outcome: PolicyDecisionOutcome::Denied,
-                        reason: "default_deny",
-                        permission: None,
-                        path_prefix: None,
-                        matched_rule_id: None,
-                    },
-                )
-            }
-            EnforcementMode::Shadow => {
-                emit_would_deny(&state, &context, principal.as_ref(), "default_deny", None);
-                let response = run_pinned(
-                    pinned_connections.clone(),
-                    admitted_bundle.clone(),
-                    next,
-                    req,
-                )
-                .await;
-                with_policy_decision(
-                    response,
-                    PolicyDecision {
-                        outcome: PolicyDecisionOutcome::WouldDeny,
-                        reason: "default_deny",
-                        permission: None,
-                        path_prefix: None,
-                        matched_rule_id: None,
-                    },
-                )
-            }
-        },
+        Err(error) => {
+            return evaluation_failed(
+                &state,
+                &context,
+                principal.as_ref(),
+                "policy_evaluation_error",
+                None,
+                Some(error),
+            );
+        }
+    };
+    let decision = match apply_http_evaluation(
+        &state,
+        &policy,
+        &context,
+        principal.as_ref(),
+        proxy_context.as_ref(),
+        &evaluation,
+    ) {
+        Ok(decision) => decision,
+        Err(error) => {
+            return evaluation_failed(
+                &state,
+                &context,
+                principal.as_ref(),
+                "policy_evaluation_error",
+                None,
+                Some(error),
+            )
+        }
+    };
+    drop(policy);
+    if evaluation.effect() == crate::policy_eval::PolicyEffect::Block {
+        return with_policy_decision(forbidden(), decision);
     }
+    let response = run_pinned(pinned_connections, admitted_bundle, next, req).await;
+    with_policy_decision(response, decision)
 }
 
-fn effective_enforcement_mode(policy: &RbacPolicyState, rule: &RouteRule) -> EnforcementMode {
-    rule.enforcement_mode.unwrap_or(policy.enforcement_mode)
-}
-
-fn matching_direct_rule(
-    matcher: &RuleMatcher,
-    method: &str,
-    path: &str,
-    policy_path: &str,
+/// Translate a complete verdict without re-evaluating any policy predicate.
+/// Resolve all ordinals before emitting anything, preserving the direct-shadow
+/// observation followed by the host-bound route's actual verdict.
+fn apply_http_evaluation(
+    state: &RbacState,
+    policy: &RbacPolicyState,
+    context: &AuditContext,
     principal: Option<&auth::Principal>,
-    dispatch_context: RuleDispatchContext<'_>,
-    denies_only: bool,
-) -> Option<RuleDecision> {
-    if policy_path != path {
-        return matcher.evaluate_equivalent_paths_with_dispatch(
-            method,
-            &[policy_path, path],
-            principal,
-            dispatch_context,
-            denies_only,
-        );
-    }
+    proxy_context: Option<&ProxyRouteAuthorizationContext>,
+    evaluation: &crate::policy_eval::Evaluation,
+) -> Result<PolicyDecision, crate::policy_eval::EvaluationError> {
+    use crate::policy_eval::{EvaluationError, PolicyEffect, Reason, RuleReference};
 
-    if denies_only {
-        matcher.evaluate_denies_with_dispatch(method, path, principal, dispatch_context)
+    let observed = match evaluation.observation() {
+        Some(RuleReference::Direct(index)) => Some(
+            policy
+                .rule_ids
+                .get(index)
+                .ok_or(EvaluationError::InternalInvariant)?,
+        ),
+        Some(RuleReference::Route(_)) => return Err(EvaluationError::InternalInvariant),
+        None => None,
+    };
+    let direct = match evaluation.matched() {
+        Some(RuleReference::Direct(index)) => Some(
+            policy
+                .rule_ids
+                .get(index)
+                .ok_or(EvaluationError::InternalInvariant)?,
+        ),
+        _ => None,
+    };
+    let route = match evaluation.matched() {
+        Some(RuleReference::Route(index)) => Some(
+            policy
+                .routes
+                .get(index)
+                .ok_or(EvaluationError::InternalInvariant)?,
+        ),
+        _ => None,
+    };
+    let host_denial = if evaluation.reason() == Reason::HostPolicyRequired {
+        Some(proxy_context.ok_or(EvaluationError::InternalInvariant)?)
     } else {
-        matcher.evaluate_with_dispatch(method, path, principal, dispatch_context)
+        None
+    };
+    let outcome = match evaluation.effect() {
+        PolicyEffect::Allow => PolicyDecisionOutcome::Allowed,
+        PolicyEffect::Block => PolicyDecisionOutcome::Denied,
+        PolicyEffect::Observe => PolicyDecisionOutcome::WouldDeny,
+    };
+    let reason = evaluation.reason().as_str();
+    if let Some(id) = observed {
+        emit_rule_would_deny(state, context, principal, id);
     }
-}
-
-#[cfg(test)]
-fn matching_route<'a>(
-    routes: &'a [RouteRule],
-    method: &Method,
-    path: &str,
-) -> Option<&'a RouteRule> {
-    matching_route_with_host(routes, method, path, None, false)
-}
-
-fn matching_route_with_host<'a>(
-    routes: &'a [RouteRule],
-    method: &Method,
-    path: &str,
-    request_host: Option<&str>,
-    host_binding_required: bool,
-) -> Option<&'a RouteRule> {
-    routes.iter().find(|rule| {
-        path_prefix_matches(path, &rule.path_prefix)
-            && method_matches(&rule.methods, method)
-            && route_host_matches(rule, request_host, host_binding_required)
-    })
-}
-
-fn matching_route_for_request<'a>(
-    routes: &'a [RouteRule],
-    method: &Method,
-    path: &str,
-    policy_path: &str,
-    request_host: Option<&str>,
-    host_binding_required: bool,
-) -> Option<&'a RouteRule> {
-    if policy_path != path {
-        matching_exact_route(routes, method, path, request_host, host_binding_required).or_else(
-            || {
-                matching_route_with_host(
-                    routes,
-                    method,
-                    policy_path,
-                    request_host,
-                    host_binding_required,
-                )
-            },
-        )
+    if let Some(id) = direct {
+        match evaluation.effect() {
+            PolicyEffect::Allow => emit_rule_allowed(state, context, principal, id),
+            PolicyEffect::Block => emit_rule_denied(state, context, principal, id),
+            PolicyEffect::Observe => emit_rule_would_deny(state, context, principal, id),
+        }
+        return Ok(decision_for_direct_rule(outcome, reason, id.clone()));
+    }
+    if let Some(proxy_context) = host_denial {
+        emit_host_policy_required(state, context, principal, proxy_context);
     } else {
-        matching_route_with_host(routes, method, path, request_host, host_binding_required)
+        match evaluation.effect() {
+            PolicyEffect::Allow => emit_allowed(state, context, principal, route, Some(reason)),
+            PolicyEffect::Block => emit_denied(state, context, principal, reason, route),
+            PolicyEffect::Observe => emit_would_deny(state, context, principal, reason, route),
+        }
     }
-}
-
-fn matching_exact_route<'a>(
-    routes: &'a [RouteRule],
-    method: &Method,
-    path: &str,
-    request_host: Option<&str>,
-    host_binding_required: bool,
-) -> Option<&'a RouteRule> {
-    routes.iter().find(|rule| {
-        rule.path_prefix == path
-            && method_matches(&rule.methods, method)
-            && route_host_matches(rule, request_host, host_binding_required)
+    Ok(match route {
+        Some(route) => decision_for_rule(outcome, reason, route),
+        None => PolicyDecision {
+            outcome,
+            reason,
+            permission: None,
+            path_prefix: None,
+            matched_rule_id: None,
+        },
     })
 }
 
-fn route_host_matches(
-    rule: &RouteRule,
-    request_host: Option<&str>,
-    host_binding_required: bool,
-) -> bool {
-    if rule.hosts.is_empty() {
-        return !host_binding_required;
-    }
-
-    request_host.is_some_and(|request_host| {
-        rule.hosts
-            .iter()
-            .any(|host| host.eq_ignore_ascii_case(request_host))
-    })
-}
-
-fn method_matches(methods: &[String], method: &Method) -> bool {
-    methods.is_empty()
-        || methods.iter().any(|configured| {
-            let configured = configured.trim();
-            configured == "*" || configured.eq_ignore_ascii_case(method.as_str())
-        })
+/// Incomplete input and evaluator errors block even in shadow mode. Diagnostics
+/// contain bounded enums, never the context, policy, credentials or trace.
+fn evaluation_failed(
+    state: &RbacState,
+    context: &AuditContext,
+    principal: Option<&auth::Principal>,
+    reason: &'static str,
+    limitation: Option<crate::policy_eval::Limitation>,
+    error: Option<crate::policy_eval::EvaluationError>,
+) -> Response {
+    tracing::warn!(
+        reason,
+        ?limitation,
+        ?error,
+        "HTTP policy evaluation refused"
+    );
+    emit_denied(state, context, principal, reason, None);
+    with_policy_decision(
+        forbidden(),
+        PolicyDecision {
+            outcome: PolicyDecisionOutcome::Denied,
+            reason,
+            permission: None,
+            path_prefix: None,
+            matched_rule_id: None,
+        },
+    )
 }
 
 fn audit_context(req: &Request, client_ip_policy: &ClientIpPolicy) -> AuditContext {
@@ -1901,3 +1759,7 @@ fn with_policy_decision(mut response: Response, decision: PolicyDecision) -> Res
 #[cfg(test)]
 #[path = "rbac_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "rbac_legacy_tests.rs"]
+pub(crate) mod legacy;

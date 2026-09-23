@@ -16,6 +16,7 @@ use http::Request;
 use serde_json::{json, Value};
 use tower::ServiceExt;
 
+use super::legacy::matching_route;
 use super::*;
 use crate::{
     audit::{sink::tests::CaptureSink, AuditSink},
@@ -2671,13 +2672,15 @@ fn proxy_request(method: Method, uri: &str, host: &str) -> Request<Body> {
         .map_or(host, |(hostname, _)| hostname)
         .to_ascii_lowercase();
     let mut request = request_with_host(method, uri, host);
+    let observation = ProxyRouteObservationContext::new(
+        Some(normalized_host),
+        Some("/data".to_owned()),
+        "https://upstream.example.test".to_owned(),
+    );
     request
         .extensions_mut()
-        .insert(ProxyRouteAuthorizationContext::new(
-            normalized_host,
-            Some("/data".to_owned()),
-            "https://upstream.example.test".to_owned(),
-        ));
+        .insert(observation.authorization_context().unwrap());
+    request.extensions_mut().insert(observation);
     request
 }
 
@@ -3025,4 +3028,103 @@ async fn evaluating_a_policy_emits_no_audit_events() {
             .map(|event| event.event_type.clone())
             .collect::<Vec<_>>()
     );
+}
+
+#[tokio::test]
+async fn kernel_adapter_blocks_missing_routing_facts_even_under_shadow_allow() {
+    let mut policy = test_policy(DefaultAction::Allow, &[], &[]);
+    policy.enforcement_mode = EnforcementMode::Shadow;
+    let (state, capture) = test_state(policy, &[]);
+    // No classifier: this cannot occur in the production stack. It must never
+    // turn into a contextless/default allow if the middleware order regresses.
+    let router = Router::new()
+        .fallback(any(unreachable_downstream))
+        .layer(from_fn_with_state(state, rbac_middleware));
+    let response = router.oneshot(request(Method::GET, "/data")).await.unwrap();
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    assert_eq!(
+        response
+            .extensions()
+            .get::<PolicyDecision>()
+            .unwrap()
+            .reason,
+        "policy_evaluation_incomplete"
+    );
+    let event = captured_event(&capture, AUTHZ_DENIED).await;
+    assert_eq!(event.payload["reason"], "policy_evaluation_incomplete");
+}
+
+#[tokio::test]
+async fn kernel_adapter_errors_block_without_downstream_effects_or_sensitive_diagnostics() {
+    for inconsistent_dispatch in [false, true] {
+        let (state, capture) = test_state(test_policy(DefaultAction::Allow, &[], &[]), &[]);
+        let router = Router::new()
+            .fallback(any(unreachable_downstream))
+            .layer(from_fn_with_state(state, rbac_middleware));
+        let mut req = request(Method::GET, "/data");
+        req.extensions_mut()
+            .insert(ProxyRouteClassificationCompleted);
+        if inconsistent_dispatch {
+            // A host-binding context with no matching classifier observation
+            // must not be discarded and authorized by the permissive default.
+            req.extensions_mut()
+                .insert(ProxyRouteAuthorizationContext::new(
+                    "synthetic-secret-host.example".to_owned(),
+                    None,
+                    "https://synthetic-secret-origin.example".to_owned(),
+                ));
+        } else {
+            // Principal shape is bounded at authentication in production. An
+            // impossible input reaching this adapter still fails closed.
+            let mut principal = test_principal(&["reader"]);
+            principal.roles = vec!["synthetic-sensitive-role".repeat(30)];
+            req.extensions_mut().insert(principal);
+        }
+        let response = router.oneshot(req).await.unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        assert_eq!(
+            response
+                .extensions()
+                .get::<PolicyDecision>()
+                .unwrap()
+                .reason,
+            "policy_evaluation_error"
+        );
+        assert_eq!(body_string(response).await, "{\"error\":\"forbidden\"}");
+        let event = captured_event(&capture, AUTHZ_DENIED).await;
+        assert_eq!(event.payload["reason"], "policy_evaluation_error");
+        assert!(!event.payload.to_string().contains("synthetic-sensitive"));
+        assert!(!event.payload.to_string().contains("synthetic-secret"));
+    }
+}
+
+#[tokio::test]
+async fn kernel_adapter_preserves_absent_host_as_a_known_fact() {
+    let (state, capture) = test_state(
+        test_policy(
+            DefaultAction::Allow,
+            &[],
+            &[host_route(&["GET"], &["api.example.test"], "/data", "read")],
+        ),
+        &[],
+    );
+    let response = test_router(state, None)
+        .oneshot(request(Method::GET, "/data"))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response
+            .extensions()
+            .get::<PolicyDecision>()
+            .unwrap()
+            .reason,
+        "default_allow"
+    );
+    let event = captured_event(&capture, AUTHZ_ALLOWED).await;
+    assert_eq!(event.payload["reason"], "default_allow");
+}
+
+async fn unreachable_downstream() -> &'static str {
+    panic!("rejected admission reached downstream effects")
 }

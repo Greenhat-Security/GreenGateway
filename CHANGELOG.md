@@ -9,6 +9,8 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 
 ### Production readiness fixes
 
+- Route live HTTP/RBAC authorization through the compiled policy evaluator pinned to the admitted snapshot (part of #422). Preserve direct-rule, host-bound route, MCP HTTP alias, shadow and audit behavior; block incomplete or inconsistent evaluation inputs before downstream work. Tool admission, rate selection and egress retain their existing authorities.
+
 - Bound gRPC response cleanup independently of downstream polling, own listener connection tasks through shutdown, and bound WebSocket writes while allowing both directions to progress.
 - Acquire tool-scoped concurrency before global capacity; classify MCP application errors as failures while preserving their protocol response; count HTTP passive-health success only after a complete body.
 - Return effective admin capabilities from the server, audit endpoint permission denials, and display alternative role constraints correctly. Proxied documents now carry an enforced CSP sandbox: active upstream web applications must use their own origin. See the deployment guide for this compatibility change.

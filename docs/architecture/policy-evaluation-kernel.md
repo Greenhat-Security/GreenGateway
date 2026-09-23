@@ -1,8 +1,10 @@
 # Pure policy evaluation foundation
 
-Issue #421 introduces `gateway/src/policy_eval/`. **It has no production caller.**
-Live HTTP/RBAC middleware, MCP/tool admission, rate selection and egress remain
-authoritative. Issue #422 owns adapter cutover after differential parity.
+Issue #421 introduces `gateway/src/policy_eval/`. **The HTTP/RBAC adapter now
+uses it for live decisions**, including routes, host qualification, dispatch
+constraints and raw/canonical MCP HTTP identities (#422, PR 1). Tool admission,
+rate selection and egress retain their existing authorities. This does not
+complete #422 or add Policy Studio simulation/replay endpoints.
 
 It now covers contextless HTTP direct rules and permission routes, host-qualified
 routes and dispatch-scoped direct rules, MCP alias identities, and rate-lane
@@ -174,8 +176,10 @@ tests, plus the RBAC suite. CI gates on two distinct Clippy invocations --
 whether `cfg(test)` and the `postgres` feature are on, so run both rather than a
 superset of them. The structural transport and dependency gates must pass too.
 
-**The differential tests drive the real `rbac_middleware` and compare against it,
-never a second hand-written evaluator.** That is the method, not a detail: it
+**The differential matrices run against both the frozen pre-cutover middleware
+and the live `rbac_middleware`.** The original implementation is retained only
+in `rbac_legacy_tests.rs`, compiled under `cfg(test)`, so comparing the adapter
+to the kernel cannot make the kernel its own oracle. That is the method, not a detail: it
 caught a semantic the kernel had wrong -- a selected virtual upstream with no
 host-bound route is refused outright, and neither the policy default nor shadow
 enforcement softens it -- where a second evaluator would have encoded the same
@@ -204,7 +208,27 @@ execution closures, and exercise shadow/default combinations and identity
 constraints. Additional tests assert input binding, missing/invalid facts,
 redacted bounded traces, thread determinism and no audit emission.
 
-Nothing here marks any #422 cutover complete. The remaining #421 PR 2 lane is
+The HTTP/route adapter is the first #422 cutover. The remaining #421 PR 2 lane is
 static egress; it needs its trusted-fact boundary
 established before any of it is pure, since its acceptance criterion is that a
 denied request makes zero DNS calls.
+
+## Live HTTP adapter (#422, PR 1)
+
+Admission, exemptions and the cluster revision gate remain outside the evaluator.
+The adapter uses the compiled instance on the admitted policy bundle (or the
+standalone snapshot), captures existing classifier and principal facts, and
+translates the result into existing response extensions and audit events.
+Rule and route ordinals resolve against that same snapshot. A selected-host
+shadow observation is emitted before the final route verdict, as before.
+
+An absent Host is a known `Absent` fact. Missing classification is incomplete;
+inconsistent observation/authorization contexts and evaluator failures block,
+even in shadow mode, with `policy_evaluation_incomplete` or
+`policy_evaluation_error` as the audit/decision reason. Warning diagnostics carry
+only bounded limitation/error enums. No credentials, DNS, transport or downstream
+handler are invoked on these failures. Production admission already rejects the
+shape violations documented in the parity matrix before this stage.
+
+Rollback is a code rollback; policy schemas, persistence and revisions are
+unchanged. The legacy implementation is not a runtime fallback.

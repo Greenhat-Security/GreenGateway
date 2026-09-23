@@ -2,7 +2,7 @@
 
 Contract evidence for [#421](https://github.com/Greenhat-Security/GreenGateway/issues/421). It names, per lane, the legacy decision entry point, the kernel entry point that reproduces it, how inputs are normalized, what happens with no match, and what authority the result is bound to.
 
-**The legacy entry points are still authoritative.** Nothing in `gateway/src/policy_eval/` decides a live request. [#422](https://github.com/Greenhat-Security/GreenGateway/issues/422) owns the cutover, lane by lane, and each lane's legacy implementation is removed only after its differential tests prove parity. Until then the kernel's correctness claim is exactly what its tests assert and no more.
+**HTTP/RBAC now uses the shared evaluator (#422, PR 1).** The table names the pre-cutover entry points and the kernel replacements. The old HTTP middleware and matching helpers remain only in `rbac_legacy_tests.rs` as a frozen test oracle; they are absent from serving builds. Tool admission, rate selection, static egress and analysis consumers have not been migrated.
 
 ## Lanes
 
@@ -68,7 +68,7 @@ The issuer bound is worth a sentence. A principal's issuer is configuration — 
 
 ## Evidence
 
-The differential tests drive the **real `rbac_middleware`** and compare against it, never a second hand-written evaluator. That is not stylistic. It caught a semantic the kernel had wrong — a selected virtual upstream with no host-bound route is refused outright — where a hand-written oracle would have encoded the same wrong assumption twice and passed. In the same change a hand-written assertion elsewhere in the suite *was* wrong about the same behaviour.
+The differential matrices drive both the **frozen original middleware** and the **live `rbac_middleware` adapter** against the kernel. The oracle is the original implementation, never a newly hand-written evaluator or the new adapter alone. That is not stylistic. It caught a semantic the kernel had wrong — a selected virtual upstream with no host-bound route is refused outright — where a hand-written oracle would have encoded the same wrong assumption twice and passed. In the same change a hand-written assertion elsewhere in the suite *was* wrong about the same behaviour.
 
 Two corollaries, both learned the hard way:
 

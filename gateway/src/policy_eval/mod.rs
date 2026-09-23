@@ -1,5 +1,5 @@
-//! Pure policy foundation for issue #421. Production adapters stay in
-//! middleware until #422 proves each cutover.
+//! Pure policy foundation for issue #421, used by the live HTTP/RBAC adapter.
+//! Remaining tool, rate and egress cutovers are tracked in #422.
 //!
 //! PR 1 supported contextless HTTP direct rules, ordinary permission routes and
 //! defaults. The routing lane added host-qualified routes and dispatch-scoped
@@ -73,12 +73,6 @@
 //! No runtime handle, store, audit sink, provider, resolver, or callback enters
 //! this API. Principal inputs contain only policy facts, never credentials.
 
-// No production caller until #422's adapter consumes this, at which point the
-// allow comes off and each item that is still unused is annotated individually
-// with the reason -- a module-level allow is why an unused addition can arrive
-// unnoticed, so it should not outlive the cutover.
-#![allow(dead_code)]
-
 mod input;
 #[cfg(test)]
 mod property_tests;
@@ -118,6 +112,13 @@ use crate::{
 pub(crate) const CONTEXT_VERSION: u16 = 3;
 pub(crate) const HTTP_SEMANTICS_VERSION: &str = "gg-http-alias-v1";
 pub(crate) const HTTP_DOMAIN: &str = "http_alias_v1";
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "offline compilation and trace reuse remain outside the live HTTP adapter"
+    )
+)]
 pub(crate) const MAX_TRACE_BYTES: usize = 2048;
 /// Frame kind for the in-memory install path's digest. Outside ADR-0004's
 /// reserved `source`/`semantic` namespace on purpose; see [`PolicyDigest`].
@@ -129,6 +130,10 @@ pub(crate) enum PolicyAuthority {
     /// A source digest, not an invented persistent standalone revision.
     Standalone,
     /// The watermark supplied by the existing cluster admission mechanism.
+    #[cfg_attr(
+        all(not(test), not(feature = "postgres")),
+        expect(dead_code, reason = "cluster authority requires the postgres feature")
+    )]
     PostgreSql { security_revision: i64 },
 }
 
@@ -148,6 +153,13 @@ pub(crate) enum PolicyAuthority {
 #[serde(rename_all = "snake_case")]
 pub(crate) enum PolicyDigest {
     /// Over the exact accepted source-document bytes.
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "offline compilation and trace reuse remain outside the live HTTP adapter"
+        )
+    )]
     Source([u8; 32]),
     /// Over a deterministic encoding of the already-validated policy, for an
     /// install path that never held the source bytes.
@@ -192,6 +204,13 @@ impl fmt::Debug for CompiledPolicy {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "offline compilation and trace reuse remain outside the live HTTP adapter"
+    )
+)]
 pub(crate) enum CompileError {
     InputTooLarge,
     InvalidJson,
@@ -202,6 +221,13 @@ pub(crate) enum CompileError {
 }
 
 impl CompiledPolicy {
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "offline compilation and trace reuse remain outside the live HTTP adapter"
+        )
+    )]
     pub(crate) fn compile(source: &[u8], authority: PolicyAuthority) -> Result<Self, CompileError> {
         validate_authority(authority)?;
         let value = input::parse(source)?;
@@ -353,6 +379,13 @@ impl CompiledPolicy {
     /// let an unconstrained override match, and simulation and replay would report
     /// a lane governing traffic that live never rate-limits. Changing that is a
     /// deliberate decision for the cutover, in both paths at once.
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "rate selection cutover is a separate slice of issue #422"
+        )
+    )]
     pub(crate) fn select_rate_lane(
         &self,
         context: &PolicyEvaluationContext,
@@ -709,6 +742,13 @@ impl PrincipalIdentity {
 
 #[derive(Clone)]
 pub(crate) enum PrincipalFact {
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "live admission always supplies this fact; analysis may not"
+        )
+    )]
     Missing,
     Anonymous,
     Authenticated(PrincipalIdentity),
@@ -741,6 +781,13 @@ pub(crate) enum HttpTarget {
 /// no match and an unanswerable question.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum HostFact {
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "live admission always supplies this fact; analysis may not"
+        )
+    )]
     Missing,
     Absent,
     Present(String),
@@ -812,6 +859,13 @@ pub(crate) enum EvaluationError {
     InconsistentContext,
     InternalInvariant,
     TraceEncoding,
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "offline compilation and trace reuse remain outside the live HTTP adapter"
+        )
+    )]
     TraceTooLarge,
 }
 
@@ -1146,6 +1200,13 @@ impl Evaluation {
     /// Fixed-schema JSON trace: only bounded enums, ordinals, digests and numeric
     /// revisions. No authored IDs, permissions, paths or identity values escape.
     /// This deterministic encoding is not the future policy semantic/JCS digest.
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "offline compilation and trace reuse remain outside the live HTTP adapter"
+        )
+    )]
     pub(crate) fn canonical_trace_bytes(&self) -> Result<Vec<u8>, EvaluationError> {
         let bytes = serde_json::to_vec(self).map_err(|_| EvaluationError::TraceEncoding)?;
         if bytes.len() > MAX_TRACE_BYTES {
@@ -1154,6 +1215,13 @@ impl Evaluation {
         Ok(bytes)
     }
 
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "offline compilation and trace reuse remain outside the live HTTP adapter"
+        )
+    )]
     pub(crate) fn reusable_for(&self, context: &PolicyEvaluationContext) -> bool {
         self.complete
             && context.validate(self.binding.snapshot).is_ok()
@@ -1304,6 +1372,13 @@ fn framed_digest(kind: &str, media_type: &str, version: &str, payload: &[u8]) ->
 /// the value would say so. Validating the context before producing the value
 /// protects the production of it, not its later use.
 #[derive(Clone, Copy, Debug, PartialEq, Serialize)]
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "rate selection cutover is a separate slice of issue #422"
+    )
+)]
 pub(crate) struct RateLaneSelection {
     binding: InputBinding,
     outcome: RateLaneOutcome,
@@ -1311,6 +1386,13 @@ pub(crate) struct RateLaneSelection {
 
 #[derive(Clone, Copy, Debug, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "rate selection cutover is a separate slice of issue #422"
+    )
+)]
 pub(crate) enum RateLaneOutcome {
     /// No configured override governs this request: either none matched, or the
     /// caller is anonymous and the live path never consults an override for one.
@@ -1328,11 +1410,25 @@ pub(crate) enum RateLaneOutcome {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Serialize)]
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "rate selection cutover is a separate slice of issue #422"
+    )
+)]
 pub(crate) struct RateLimit {
     requests_per_second: f64,
     burst: u32,
 }
 
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "rate selection cutover is a separate slice of issue #422"
+    )
+)]
 impl RateLaneSelection {
     pub(crate) fn outcome(&self) -> RateLaneOutcome {
         self.outcome
@@ -1374,6 +1470,13 @@ impl RateLaneSelection {
     }
 }
 
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "rate selection cutover is a separate slice of issue #422"
+    )
+)]
 impl RateLimit {
     pub(crate) fn requests_per_second(&self) -> f64 {
         self.requests_per_second
