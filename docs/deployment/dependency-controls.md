@@ -181,6 +181,17 @@ stage installs no packages and copies no libraries from the builder. Shells,
 apt, curl, Perl and mount utilities are absent. See the upstream
 [Distroless runtime contents](https://github.com/GoogleContainerTools/distroless/blob/main/cc/README.md).
 
+The current base digest predates Debian's [DLA-4792-1 timezone-data update](https://lists.debian.org/debian-lts-announce/2026/09/msg00027.html).
+Until Distroless publishes the fixed package, the builder extracts the official
+`tzdata_2026c-0+deb12u1_all.deb` data archive, verified by Docker's `ADD --checksum`
+against SHA-256 `c6bdac9aa03e89a112c8d900cb60321889cfec535e0397b74383bd10c8b3cb44`.
+Package name, version and architecture are checked before extraction. Only the
+package data and matching `status.d`/checksum metadata enter the runtime; package
+maintainer scripts are not executed. The final-image check verifies both the
+installed-version metadata and the actual timezone database version, and the
+existing scan still permits no exceptions. Remove this overlay only after a
+reviewed base digest provides the fixed data and passes those checks.
+
 The deployed UID/GID remains **10001:10001**, the working directory remains `/`,
 and the home is `/nonexistent`. Existing volume and secret ownership rules are
 unchanged. Writable application state still requires explicit volumes; the CI
