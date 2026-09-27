@@ -354,6 +354,7 @@ fn harness_with_added_headers(
     let mut settings = default_grpc_settings();
     configure(&mut settings);
     let header_policy = RouteRequestHeaderPolicy {
+        cookie_session: None,
         add_request_headers: added_headers
             .iter()
             .map(|(name, value)| {

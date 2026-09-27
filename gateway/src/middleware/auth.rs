@@ -212,6 +212,7 @@ pub async fn auth_middleware(
         .await;
     };
 
+    let is_admin_session = admin_session.is_some();
     let validator = admin_session
         .map(|(sessions, _)| sessions as Arc<dyn SessionValidator>)
         .or_else(|| state.validator.as_ref().map(Arc::clone));
@@ -270,6 +271,16 @@ pub async fn auth_middleware(
     {
         Ok(principal) => {
             emit_success(&state, &audit, &credential, &principal);
+            if !is_admin_session {
+                if let Some(session) = ValidatedCookieSession::capture(
+                    req.headers(),
+                    &state.cookie_name,
+                    &credential,
+                    &principal,
+                ) {
+                    req.extensions_mut().insert(session);
+                }
+            }
             req.extensions_mut().insert(principal.clone());
             state.principal_directory.observe(&principal);
             let mut response = next.run(req).await;
@@ -297,6 +308,112 @@ pub async fn auth_middleware(
             .await
         }
     }
+}
+
+/// An upstream may receive only the cookie this middleware actually validated.
+/// Keep the value out of Principal, logs and Debug output. The private fields
+/// prevent proxy code from constructing this authority from request headers.
+#[derive(Clone)]
+pub(crate) struct ValidatedCookieSession {
+    cookie_name: String,
+    cookie_header: http::HeaderValue,
+}
+
+impl std::fmt::Debug for ValidatedCookieSession {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("ValidatedCookieSession([REDACTED])")
+    }
+}
+
+impl ValidatedCookieSession {
+    fn capture(
+        headers: &HeaderMap,
+        cookie_name: &str,
+        credential: &SessionCredential,
+        principal: &Principal,
+    ) -> Option<Self> {
+        let SessionCredential::Cookie(validated_value) = credential else {
+            return None;
+        };
+        if principal.auth_method != crate::auth::AuthMethod::Cookie
+            || headers.contains_key(http::header::AUTHORIZATION)
+            || !safe_cookie_token(cookie_name)
+            || !safe_cookie_value(validated_value)
+        {
+            return None;
+        }
+        let alias = |name: &str| {
+            name.strip_prefix("__Secure-")
+                .or_else(|| name.strip_prefix("__Host-"))
+                .unwrap_or(name)
+                .to_owned()
+        };
+        let expected_alias = alias(cookie_name);
+        let mut matches = 0;
+        for header in headers.get_all(http::header::COOKIE) {
+            for cookie in header.to_str().ok()?.split(';') {
+                let Some((name, value)) = cookie.trim().split_once('=') else {
+                    continue;
+                };
+                let name = name.trim();
+                if alias(name) == expected_alias {
+                    if name != cookie_name || value != validated_value {
+                        return None;
+                    }
+                    matches += 1;
+                }
+            }
+        }
+        if matches != 1 {
+            return None;
+        }
+        let mut cookie_header =
+            http::HeaderValue::from_str(&format!("{cookie_name}={validated_value}")).ok()?;
+        cookie_header.set_sensitive(true);
+        Some(Self {
+            cookie_name: cookie_name.to_owned(),
+            cookie_header,
+        })
+    }
+
+    pub(crate) fn cookie_name(&self) -> &str {
+        &self.cookie_name
+    }
+
+    pub(crate) fn cookie_header(&self) -> &http::HeaderValue {
+        &self.cookie_header
+    }
+}
+
+pub(crate) fn safe_cookie_value(value: &str) -> bool {
+    !value.is_empty()
+        && value.bytes().all(
+            |byte| matches!(byte, 0x21 | 0x23..=0x2b | 0x2d..=0x3a | 0x3c..=0x5b | 0x5d..=0x7e),
+        )
+}
+
+pub(crate) fn safe_cookie_token(value: &str) -> bool {
+    !value.is_empty()
+        && value.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric()
+                || matches!(
+                    byte,
+                    b'!' | b'#'
+                        | b'$'
+                        | b'%'
+                        | b'&'
+                        | b'\''
+                        | b'*'
+                        | b'+'
+                        | b'-'
+                        | b'.'
+                        | b'^'
+                        | b'_'
+                        | b'`'
+                        | b'|'
+                        | b'~'
+                )
+        })
 }
 
 fn audit_context(req: &Request, path: String, client_ip_policy: &ClientIpPolicy) -> AuditContext {

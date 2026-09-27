@@ -469,6 +469,7 @@ fn websocket_config(
 
     let route = config::UpstreamRouteConfig {
         id: Some("ws-route".to_owned()),
+        forward_cookie_session: false,
         connection_id: None,
         path_prefix: Some("/socket".to_owned()),
         host: None,

@@ -622,6 +622,12 @@ fn insert_route(input: &mut BTreeMap<String, String>, prefix: &str, route: &Upst
         route.host.clone().unwrap_or_default(),
     );
     input.insert(format!("{prefix}.upstream_url"), route.upstream_url.clone());
+    // Preserve the pre-delegation projection when the capability is disabled,
+    // so an ordinary route can participate in a mixed-version rolling upgrade.
+    // Enabled delegation changes authority and must fence older replicas out.
+    if route.forward_cookie_session {
+        input.insert(format!("{prefix}.forward_cookie_session"), "true".into());
+    }
     for (endpoint_index, endpoint) in route.upstreams.iter().enumerate() {
         let endpoint_prefix = format!("{prefix}.endpoint[{endpoint_index}]");
         input.insert(format!("{endpoint_prefix}.id"), endpoint.id.clone());
@@ -1153,6 +1159,42 @@ mod tests {
         assert_ne!(
             static_config_fingerprint(&base),
             static_config_fingerprint(&changed)
+        );
+    }
+
+    #[test]
+    fn fingerprint_covers_cookie_session_delegation_authority() {
+        let mut base = config_from(&[]);
+        base.upstream_routes = vec![serde_json::from_value(serde_json::json!({
+            "id": "session-api", "path_prefix": "/api/project",
+            "upstream_url": "https://api.example.test"
+        }))
+        .unwrap()];
+        let mut projection = BTreeMap::new();
+        insert_route(&mut projection, "route[0]", &base.upstream_routes[0]);
+        // Compatibility fixture for the route projection at 7747783a: default
+        // routes must retain their existing fingerprint during an upgrade.
+        assert_eq!(
+            serde_json::to_value(&projection).unwrap(),
+            serde_json::json!({
+                "route[0].id": "session-api",
+                "route[0].connection_id": "",
+                "route[0].path_prefix": "/api/project",
+                "route[0].host": "",
+                "route[0].upstream_url": "https://api.example.test",
+                "route[0].tls_ca_bundle_path": "",
+                "route[0].add_request_header_names": "",
+                "route[0].strip_request_headers": "",
+                "route[0].timeout_ms": "",
+                "route[0].response_idle_timeout_ms": "",
+                "route[0].connect_timeout_ms": ""
+            })
+        );
+        let mut delegated = base.clone();
+        delegated.upstream_routes[0].forward_cookie_session = true;
+        assert_ne!(
+            static_config_fingerprint(&base),
+            static_config_fingerprint(&delegated)
         );
     }
 
