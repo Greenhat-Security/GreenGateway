@@ -23,6 +23,7 @@ use crate::{
 
 mod admission;
 mod circuit;
+mod cookie_session;
 mod forward;
 pub(crate) mod grpc;
 mod health;
@@ -178,6 +179,7 @@ impl upstream_route::RouteMatch for ProxyRoute {
 struct RouteRequestHeaderPolicy {
     add_request_headers: Vec<(HeaderName, HeaderValue)>,
     strip_request_headers: Vec<HeaderName>,
+    cookie_session: Option<cookie_session::CookieSessionPolicy>,
 }
 
 #[derive(Clone)]
@@ -464,7 +466,7 @@ impl ProxyState {
                         })
                     })
                     .transpose()?;
-                let request_header_policy = route_request_header_policy(route);
+                let request_header_policy = route_request_header_policy(route, config);
                 if let Some(target) = connection_target.as_ref() {
                     validate_connection_header_policy(&request_header_policy, target)?;
                 }
@@ -890,7 +892,10 @@ fn route_endpoints(
         .collect()
 }
 
-fn route_request_header_policy(route: &config::UpstreamRouteConfig) -> RouteRequestHeaderPolicy {
+fn route_request_header_policy(
+    route: &config::UpstreamRouteConfig,
+    config: &config::Config,
+) -> RouteRequestHeaderPolicy {
     let mut add_request_headers = route
         .add_request_headers
         .iter()
@@ -918,6 +923,13 @@ fn route_request_header_policy(route: &config::UpstreamRouteConfig) -> RouteRequ
     RouteRequestHeaderPolicy {
         add_request_headers,
         strip_request_headers,
+        cookie_session: route
+            .forward_cookie_session
+            .then(|| cookie_session::CookieSessionPolicy {
+                session_cookie_name: config.auth_cookie_name.clone(),
+                csrf_cookie_name: config.csrf_cookie_name.clone(),
+                csrf_header_name: config.csrf_header_name.clone(),
+            }),
     }
 }
 
@@ -1048,6 +1060,7 @@ mod tests {
         let additional_header = HeaderName::from_static("cf-access-client-id");
         let credential_headers = [credential_header.clone(), additional_header.clone()];
         let safe = RouteRequestHeaderPolicy {
+            cookie_session: None,
             add_request_headers: vec![(
                 HeaderName::from_static("x-route-label"),
                 HeaderValue::from_static("billing"),
@@ -1058,6 +1071,7 @@ mod tests {
             .expect("unrelated route transforms should remain valid");
 
         let adding_credential = RouteRequestHeaderPolicy {
+            cookie_session: None,
             add_request_headers: vec![(
                 credential_header.clone(),
                 HeaderValue::from_static("forbidden"),
@@ -1070,6 +1084,7 @@ mod tests {
         ));
 
         let stripping_credential = RouteRequestHeaderPolicy {
+            cookie_session: None,
             add_request_headers: Vec::new(),
             strip_request_headers: vec![credential_header.clone()],
         };
@@ -1083,6 +1098,7 @@ mod tests {
 
         // An additional header is Connection-owned in exactly the same way.
         let adding_additional = RouteRequestHeaderPolicy {
+            cookie_session: None,
             add_request_headers: vec![(
                 additional_header.clone(),
                 HeaderValue::from_static("forbidden"),
@@ -1094,6 +1110,7 @@ mod tests {
             Err(egress::EgressError::InvalidPolicy(_))
         ));
         let stripping_additional = RouteRequestHeaderPolicy {
+            cookie_session: None,
             add_request_headers: Vec::new(),
             strip_request_headers: vec![additional_header],
         };
@@ -1244,6 +1261,7 @@ mod tests {
     #[test]
     fn generated_legacy_route_id_depends_on_logical_matcher_not_endpoint() {
         let mut route = config::UpstreamRouteConfig {
+            forward_cookie_session: false,
             id: None,
             connection_id: None,
             path_prefix: Some("/api".to_owned()),
@@ -1501,6 +1519,7 @@ mod tests {
                 .expect("default client should build"),
         );
         let route = config::UpstreamRouteConfig {
+            forward_cookie_session: false,
             id: None,
             connection_id: None,
             path_prefix: Some("/api".to_owned()),
@@ -1549,6 +1568,7 @@ mod tests {
         let first_identity_path = write_test_client_identity("first");
         let second_identity_path = write_test_client_identity("second");
         let route = config::UpstreamRouteConfig {
+            forward_cookie_session: false,
             id: Some("payments".to_owned()),
             connection_id: None,
             path_prefix: Some("/payments".to_owned()),

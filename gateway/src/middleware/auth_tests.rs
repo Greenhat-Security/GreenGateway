@@ -167,6 +167,97 @@ fn test_principal() -> Principal {
     }
 }
 
+#[test]
+fn session_delegation_captures_only_one_exact_cookie_and_redacts_it() {
+    let mut principal = test_principal();
+    principal.auth_method = AuthMethod::Cookie;
+    let headers = HeaderMap::from_iter([(
+        http::header::COOKIE,
+        http::HeaderValue::from_static(
+            "unrelated=discard; __Secure-session=fixture%2Fvalue; csrf_token=csrf",
+        ),
+    )]);
+    let session = ValidatedCookieSession::capture(
+        &headers,
+        "__Secure-session",
+        &SessionCredential::Cookie("fixture%2Fvalue".to_owned()),
+        &principal,
+    )
+    .unwrap();
+    assert_eq!(session.cookie_header(), "__Secure-session=fixture%2Fvalue");
+    assert!(session.cookie_header().is_sensitive());
+    assert_eq!(format!("{session:?}"), "ValidatedCookieSession([REDACTED])");
+}
+
+#[test]
+fn session_delegation_refuses_ambiguous_unvalidated_or_mixed_credentials() {
+    let mut principal = test_principal();
+    principal.auth_method = AuthMethod::Cookie;
+    for cookie in [
+        "session=fixture; session=fixture",
+        "session=fixture; __Secure-session=fixture",
+        "session=fixture; __Host-session=other",
+        "session=other",
+        "other=fixture",
+    ] {
+        let headers = HeaderMap::from_iter([(
+            http::header::COOKIE,
+            http::HeaderValue::from_str(cookie).unwrap(),
+        )]);
+        assert!(ValidatedCookieSession::capture(
+            &headers,
+            "session",
+            &SessionCredential::Cookie("fixture".into()),
+            &principal
+        )
+        .is_none());
+    }
+    let mut headers = HeaderMap::from_iter([(
+        http::header::COOKIE,
+        http::HeaderValue::from_static("session=fixture"),
+    )]);
+    headers.append(
+        http::header::COOKIE,
+        http::HeaderValue::from_static("session=fixture"),
+    );
+    assert!(ValidatedCookieSession::capture(
+        &headers,
+        "session",
+        &SessionCredential::Cookie("fixture".into()),
+        &principal
+    )
+    .is_none());
+    headers.remove(http::header::COOKIE);
+    headers.insert(
+        http::header::COOKIE,
+        http::HeaderValue::from_static("session=fixture"),
+    );
+    headers.insert(AUTHORIZATION, http::HeaderValue::from_static("malformed"));
+    assert!(ValidatedCookieSession::capture(
+        &headers,
+        "session",
+        &SessionCredential::Cookie("fixture".into()),
+        &principal
+    )
+    .is_none());
+    headers.remove(AUTHORIZATION);
+    assert!(ValidatedCookieSession::capture(
+        &headers,
+        "session",
+        &SessionCredential::Bearer("fixture".into()),
+        &principal
+    )
+    .is_none());
+    principal.auth_method = AuthMethod::ServiceToken;
+    assert!(ValidatedCookieSession::capture(
+        &headers,
+        "session",
+        &SessionCredential::Cookie("fixture".into()),
+        &principal
+    )
+    .is_none());
+}
+
 #[tokio::test]
 async fn exempt_path_returns_ok_without_credential_and_emits_no_auth_event() {
     let (state, capture) = test_state(None);

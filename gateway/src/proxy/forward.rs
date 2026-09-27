@@ -223,6 +223,33 @@ async fn forward_to_upstream(
     source_ip: &str,
 ) -> Response {
     let (parts, body) = request.into_parts();
+    let delegated_cookie = match upstream.request_header_policy.cookie_session.as_ref() {
+        None => None,
+        Some(policy) => match super::cookie_session::delegated_cookie(&parts, policy) {
+            Ok(cookie) => {
+                emit_cookie_session_decision(
+                    proxy,
+                    &parts,
+                    source_ip,
+                    &upstream.pool.id,
+                    "accepted",
+                    "validated_session",
+                );
+                Some(cookie)
+            }
+            Err(reason) => {
+                emit_cookie_session_decision(
+                    proxy,
+                    &parts,
+                    source_ip,
+                    &upstream.pool.id,
+                    "rejected",
+                    reason,
+                );
+                return cookie_session_rejected(reason);
+            }
+        },
+    };
     // The WebSocket data plane hooks in here, after the whole middleware chain
     // -- authentication, rate limiting, RBAC, direct policy, route
     // classification, CSRF -- has already run and after the route has been
@@ -662,7 +689,7 @@ async fn forward_to_upstream(
             || proxy_target_url(&endpoint.upstream_origin, &parts.uri),
             |target| target.url().to_owned(),
         );
-        let headers = connection_headers.as_ref().map_or_else(
+        let mut headers = connection_headers.as_ref().map_or_else(
             || {
                 attempt_headers(
                     &parts.headers,
@@ -673,6 +700,9 @@ async fn forward_to_upstream(
             },
             |(headers, _credential)| headers.clone(),
         );
+        if let Some(cookie) = delegated_cookie.as_ref() {
+            super::cookie_session::inject(&mut headers, cookie);
+        }
         let egress_client = prepared_connection_transport
             .as_ref()
             .map_or(&endpoint.egress_client, |prepared| prepared.client());
@@ -854,6 +884,19 @@ async fn forward_to_upstream(
         };
 
         let upstream_status = upstream_response.status;
+        if delegated_cookie.is_some()
+            && matches!(upstream_status.as_u16(), 301 | 302 | 303 | 307 | 308)
+        {
+            emit_cookie_session_decision(
+                proxy,
+                &parts,
+                source_ip,
+                &upstream.pool.id,
+                "rejected",
+                "upstream_redirect_rejected",
+            );
+            return cookie_session_rejected("upstream_redirect_rejected");
+        }
         let authentication_kind = connection_target
             .as_ref()
             .map(ConnectionHttpTarget::authentication_kind);
@@ -1226,6 +1269,42 @@ pub(super) fn attempt_headers(
     set_upstream_client_ip(&mut headers, source_ip);
     apply_route_request_header_policy(&mut headers, policy);
     headers
+}
+
+fn emit_cookie_session_decision(
+    proxy: &ProxyState,
+    parts: &http::request::Parts,
+    source_ip: &str,
+    route_id: &str,
+    outcome: &'static str,
+    reason: &'static str,
+) {
+    let request_id = parts
+        .headers
+        .get(REQUEST_ID_HEADER)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("unknown");
+    let actor = parts
+        .extensions
+        .get::<auth::Principal>()
+        .map(auth::actor_from_principal);
+    proxy.audit.emit(audit::AuditEvent::new(
+        "upstream.cookie_session_delegation",
+        request_id,
+        source_ip,
+        actor,
+        json!({"route_id": route_id, "outcome": outcome, "reason": reason}),
+    ));
+}
+
+pub(super) fn cookie_session_rejected(reason: &'static str) -> Response {
+    let status = match reason {
+        "validated_cookie_session_required" => StatusCode::UNAUTHORIZED,
+        "session_delegation_method_rejected" => StatusCode::METHOD_NOT_ALLOWED,
+        "upstream_redirect_rejected" => StatusCode::BAD_GATEWAY,
+        _ => StatusCode::FORBIDDEN,
+    };
+    (status, Json(json!({"error": reason}))).into_response()
 }
 
 async fn reserve_retry(
@@ -2378,6 +2457,59 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn cookie_session_delegation_rejects_before_body_or_origin_io_and_audits_without_secrets()
+    {
+        let address: SocketAddr = "127.0.0.1:9".parse().unwrap();
+        let (mut proxy, sink) = retry_proxy([address, address], None, Duration::from_secs(1));
+        let ProxyRoutes::RoutingTable { routes } = &mut proxy.routes else {
+            panic!("route fixture");
+        };
+        routes[0].request_header_policy.cookie_session =
+            Some(super::super::cookie_session::CookieSessionPolicy {
+                session_cookie_name: "session".into(),
+                csrf_cookie_name: "csrf_token".into(),
+                csrf_header_name: "x-csrf-token".into(),
+            });
+        let body = Body::from_stream(stream::pending::<Result<bytes::Bytes, std::io::Error>>());
+        let request = Request::builder()
+            .method(Method::POST)
+            .uri("/api/project")
+            .header(
+                header::COOKIE,
+                "session=private-cookie-canary; csrf_token=private-csrf-canary",
+            )
+            .header("x-request-id", "session-denial")
+            .body(body)
+            .unwrap();
+        let response = tokio::time::timeout(
+            Duration::from_millis(250),
+            proxy.forward_request(request, "203.0.113.7"),
+        )
+        .await
+        .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        let event = tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if let Some(event) = sink
+                    .events()
+                    .into_iter()
+                    .find(|event| event.event_type == "upstream.cookie_session_delegation")
+                {
+                    break event;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(event.payload["outcome"], "rejected");
+        assert_eq!(event.payload["reason"], "validated_cookie_session_required");
+        let encoded = serde_json::to_string(&event).unwrap();
+        assert!(!encoded.contains("private-cookie-canary"));
+        assert!(!encoded.contains("private-csrf-canary"));
+    }
+
     #[test]
     fn connection_attempt_headers_strip_caller_credentials_before_route_transforms() {
         let mut inbound = HeaderMap::new();
@@ -2401,6 +2533,7 @@ mod tests {
             HeaderValue::from_static("caller-request-id"),
         );
         let policy = RouteRequestHeaderPolicy {
+            cookie_session: None,
             add_request_headers: vec![(
                 HeaderName::from_static("x-route-label"),
                 HeaderValue::from_static("billing"),

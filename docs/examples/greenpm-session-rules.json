@@ -1,0 +1,528 @@
+{
+  "rules": [
+    {
+      "id": "greenpm-1",
+      "methods": [
+        "GET",
+        "POST"
+      ],
+      "path": "/api/exponential/tasks",
+      "dispatch": {
+        "kind": "route",
+        "route_id": "greenpm-legacy"
+      },
+      "principal": {
+        "issuers": [
+          "provider:greenhat-session"
+        ],
+        "auth_methods": [
+          "session_cookie"
+        ]
+      },
+      "action": "allow"
+    },
+    {
+      "id": "greenpm-2",
+      "methods": [
+        "GET",
+        "PATCH",
+        "DELETE"
+      ],
+      "path": "/api/exponential/tasks/{task_id}",
+      "dispatch": {
+        "kind": "route",
+        "route_id": "greenpm-legacy"
+      },
+      "principal": {
+        "issuers": [
+          "provider:greenhat-session"
+        ],
+        "auth_methods": [
+          "session_cookie"
+        ]
+      },
+      "action": "allow"
+    },
+    {
+      "id": "greenpm-3",
+      "methods": [
+        "GET",
+        "POST"
+      ],
+      "path": "/api/exponential/tasks/{task_id}/comments",
+      "dispatch": {
+        "kind": "route",
+        "route_id": "greenpm-legacy"
+      },
+      "principal": {
+        "issuers": [
+          "provider:greenhat-session"
+        ],
+        "auth_methods": [
+          "session_cookie"
+        ]
+      },
+      "action": "allow"
+    },
+    {
+      "id": "greenpm-4",
+      "methods": [
+        "DELETE"
+      ],
+      "path": "/api/exponential/tasks/{task_id}/comments/{comment_id}",
+      "dispatch": {
+        "kind": "route",
+        "route_id": "greenpm-legacy"
+      },
+      "principal": {
+        "issuers": [
+          "provider:greenhat-session"
+        ],
+        "auth_methods": [
+          "session_cookie"
+        ]
+      },
+      "action": "allow"
+    },
+    {
+      "id": "greenpm-5",
+      "methods": [
+        "GET",
+        "POST"
+      ],
+      "path": "/api/exponential/sprints",
+      "dispatch": {
+        "kind": "route",
+        "route_id": "greenpm-legacy"
+      },
+      "principal": {
+        "issuers": [
+          "provider:greenhat-session"
+        ],
+        "auth_methods": [
+          "session_cookie"
+        ]
+      },
+      "action": "allow"
+    },
+    {
+      "id": "greenpm-6",
+      "methods": [
+        "GET",
+        "PATCH",
+        "DELETE"
+      ],
+      "path": "/api/exponential/sprints/{sprint_id}",
+      "dispatch": {
+        "kind": "route",
+        "route_id": "greenpm-legacy"
+      },
+      "principal": {
+        "issuers": [
+          "provider:greenhat-session"
+        ],
+        "auth_methods": [
+          "session_cookie"
+        ]
+      },
+      "action": "allow"
+    },
+    {
+      "id": "greenpm-7",
+      "methods": [
+        "GET",
+        "POST"
+      ],
+      "path": "/api/exponential/projects",
+      "dispatch": {
+        "kind": "route",
+        "route_id": "greenpm-legacy"
+      },
+      "principal": {
+        "issuers": [
+          "provider:greenhat-session"
+        ],
+        "auth_methods": [
+          "session_cookie"
+        ]
+      },
+      "action": "allow"
+    },
+    {
+      "id": "greenpm-8",
+      "methods": [
+        "GET"
+      ],
+      "path": "/api/exponential/projects/{project_id}",
+      "dispatch": {
+        "kind": "route",
+        "route_id": "greenpm-legacy"
+      },
+      "principal": {
+        "issuers": [
+          "provider:greenhat-session"
+        ],
+        "auth_methods": [
+          "session_cookie"
+        ]
+      },
+      "action": "allow"
+    },
+    {
+      "id": "greenpm-9",
+      "methods": [
+        "GET"
+      ],
+      "path": "/api/exponential/projects/{project_id}/tasks",
+      "dispatch": {
+        "kind": "route",
+        "route_id": "greenpm-legacy"
+      },
+      "principal": {
+        "issuers": [
+          "provider:greenhat-session"
+        ],
+        "auth_methods": [
+          "session_cookie"
+        ]
+      },
+      "action": "allow"
+    },
+    {
+      "id": "greenpm-10",
+      "methods": [
+        "GET",
+        "POST"
+      ],
+      "path": "/api/exponential/projects/{project_id}/members",
+      "dispatch": {
+        "kind": "route",
+        "route_id": "greenpm-legacy"
+      },
+      "principal": {
+        "issuers": [
+          "provider:greenhat-session"
+        ],
+        "auth_methods": [
+          "session_cookie"
+        ]
+      },
+      "action": "allow"
+    },
+    {
+      "id": "greenpm-11",
+      "methods": [
+        "GET"
+      ],
+      "path": "/api/exponential/projects/{project_id}/permissions",
+      "dispatch": {
+        "kind": "route",
+        "route_id": "greenpm-legacy"
+      },
+      "principal": {
+        "issuers": [
+          "provider:greenhat-session"
+        ],
+        "auth_methods": [
+          "session_cookie"
+        ]
+      },
+      "action": "allow"
+    },
+    {
+      "id": "greenpm-12",
+      "methods": [
+        "GET",
+        "POST"
+      ],
+      "path": "/api/exponential/teams",
+      "dispatch": {
+        "kind": "route",
+        "route_id": "greenpm-legacy"
+      },
+      "principal": {
+        "issuers": [
+          "provider:greenhat-session"
+        ],
+        "auth_methods": [
+          "session_cookie"
+        ]
+      },
+      "action": "allow"
+    },
+    {
+      "id": "greenpm-13",
+      "methods": [
+        "GET"
+      ],
+      "path": "/api/exponential/teams/{team_id}",
+      "dispatch": {
+        "kind": "route",
+        "route_id": "greenpm-legacy"
+      },
+      "principal": {
+        "issuers": [
+          "provider:greenhat-session"
+        ],
+        "auth_methods": [
+          "session_cookie"
+        ]
+      },
+      "action": "allow"
+    },
+    {
+      "id": "greenpm-14",
+      "methods": [
+        "GET",
+        "POST"
+      ],
+      "path": "/api/exponential/teams/{team_id}/members",
+      "dispatch": {
+        "kind": "route",
+        "route_id": "greenpm-legacy"
+      },
+      "principal": {
+        "issuers": [
+          "provider:greenhat-session"
+        ],
+        "auth_methods": [
+          "session_cookie"
+        ]
+      },
+      "action": "allow"
+    },
+    {
+      "id": "greenpm-15",
+      "methods": [
+        "GET"
+      ],
+      "path": "/api/exponential/teams/{team_id}/permissions",
+      "dispatch": {
+        "kind": "route",
+        "route_id": "greenpm-legacy"
+      },
+      "principal": {
+        "issuers": [
+          "provider:greenhat-session"
+        ],
+        "auth_methods": [
+          "session_cookie"
+        ]
+      },
+      "action": "allow"
+    },
+    {
+      "id": "greenpm-16",
+      "methods": [
+        "GET",
+        "POST",
+        "DELETE"
+      ],
+      "path": "/api/exponential/labels",
+      "dispatch": {
+        "kind": "route",
+        "route_id": "greenpm-legacy"
+      },
+      "principal": {
+        "issuers": [
+          "provider:greenhat-session"
+        ],
+        "auth_methods": [
+          "session_cookie"
+        ]
+      },
+      "action": "allow"
+    },
+    {
+      "id": "greenpm-17",
+      "methods": [
+        "GET",
+        "POST"
+      ],
+      "path": "/api/exponential/views",
+      "dispatch": {
+        "kind": "route",
+        "route_id": "greenpm-legacy"
+      },
+      "principal": {
+        "issuers": [
+          "provider:greenhat-session"
+        ],
+        "auth_methods": [
+          "session_cookie"
+        ]
+      },
+      "action": "allow"
+    },
+    {
+      "id": "greenpm-18",
+      "methods": [
+        "DELETE"
+      ],
+      "path": "/api/exponential/views/{view_id}",
+      "dispatch": {
+        "kind": "route",
+        "route_id": "greenpm-legacy"
+      },
+      "principal": {
+        "issuers": [
+          "provider:greenhat-session"
+        ],
+        "auth_methods": [
+          "session_cookie"
+        ]
+      },
+      "action": "allow"
+    },
+    {
+      "id": "greenpm-19",
+      "methods": [
+        "GET"
+      ],
+      "path": "/api/exponential/projects/{project_id}/assignees",
+      "dispatch": {
+        "kind": "route",
+        "route_id": "greenpm-legacy"
+      },
+      "principal": {
+        "issuers": [
+          "provider:greenhat-session"
+        ],
+        "auth_methods": [
+          "session_cookie"
+        ]
+      },
+      "action": "allow"
+    },
+    {
+      "id": "greenpm-20",
+      "methods": [
+        "GET"
+      ],
+      "path": "/api/me/module-access",
+      "dispatch": {
+        "kind": "route",
+        "route_id": "greenpm-module-access"
+      },
+      "principal": {
+        "issuers": [
+          "provider:greenhat-session"
+        ],
+        "auth_methods": [
+          "session_cookie"
+        ]
+      },
+      "action": "allow"
+    },
+    {
+      "id": "greenpm-21",
+      "methods": [
+        "PATCH",
+        "DELETE"
+      ],
+      "path": "/api/greenpm-owned/teams/{team_id}",
+      "dispatch": {
+        "kind": "route",
+        "route_id": "greenpm-owned"
+      },
+      "principal": {
+        "issuers": [
+          "provider:greenhat-session"
+        ],
+        "auth_methods": [
+          "session_cookie"
+        ]
+      },
+      "action": "allow"
+    },
+    {
+      "id": "greenpm-22",
+      "methods": [
+        "PATCH",
+        "DELETE"
+      ],
+      "path": "/api/greenpm-owned/projects/{project_id}",
+      "dispatch": {
+        "kind": "route",
+        "route_id": "greenpm-owned"
+      },
+      "principal": {
+        "issuers": [
+          "provider:greenhat-session"
+        ],
+        "auth_methods": [
+          "session_cookie"
+        ]
+      },
+      "action": "allow"
+    },
+    {
+      "id": "greenpm-23",
+      "methods": [
+        "PATCH",
+        "DELETE"
+      ],
+      "path": "/api/greenpm-owned/projects/{project_id}/members",
+      "dispatch": {
+        "kind": "route",
+        "route_id": "greenpm-owned"
+      },
+      "principal": {
+        "issuers": [
+          "provider:greenhat-session"
+        ],
+        "auth_methods": [
+          "session_cookie"
+        ]
+      },
+      "action": "allow"
+    },
+    {
+      "id": "greenpm-24",
+      "methods": [
+        "GET"
+      ],
+      "path": "/api/greenpm-owned/search",
+      "dispatch": {
+        "kind": "route",
+        "route_id": "greenpm-owned"
+      },
+      "principal": {
+        "issuers": [
+          "provider:greenhat-session"
+        ],
+        "auth_methods": [
+          "session_cookie"
+        ]
+      },
+      "action": "allow"
+    },
+    {
+      "id": "greenpm-legacy-deny-other-operations",
+      "path": "/api/exponential/**",
+      "dispatch": {
+        "kind": "route",
+        "route_id": "greenpm-legacy"
+      },
+      "action": "deny"
+    },
+    {
+      "id": "greenpm-module-access-deny-other-operations",
+      "path": "/api/me/module-access/**",
+      "dispatch": {
+        "kind": "route",
+        "route_id": "greenpm-module-access"
+      },
+      "action": "deny"
+    },
+    {
+      "id": "greenpm-owned-deny-other-operations",
+      "path": "/api/greenpm-owned/**",
+      "dispatch": {
+        "kind": "route",
+        "route_id": "greenpm-owned"
+      },
+      "action": "deny"
+    }
+  ]
+}

@@ -800,6 +800,10 @@ pub struct McpUpstreamServerConfig {
 pub struct UpstreamRouteConfig {
     #[serde(default)]
     pub id: Option<String>,
+    /// Delegate only the cookie session validated by this gateway to one trusted HTTP upstream.
+    /// This never forwards an arbitrary Cookie header or a bearer credential.
+    #[serde(default)]
+    pub forward_cookie_session: bool,
     #[serde(default)]
     pub connection_id: Option<String>,
     #[serde(default)]
@@ -2714,6 +2718,58 @@ impl Config {
             parse_optional_upstream_url(UPSTREAM_URL, get_var(UPSTREAM_URL), &mut problems);
         let upstream_routes =
             parse_upstream_routes(UPSTREAM_ROUTES, get_var(UPSTREAM_ROUTES), &mut problems);
+        for (index, route) in upstream_routes.iter().enumerate() {
+            if !route.forward_cookie_session {
+                continue;
+            }
+            let route_name = format!("{UPSTREAM_ROUTES}[{index}].forward_cookie_session");
+            if !auth_enabled || auth_mode != AuthMode::Required || !csrf_enabled {
+                problems.push(format!(
+                    "{route_name} requires {AUTH_ENABLED}=true, {AUTH_MODE}=required and {CSRF_ENABLED}=true"
+                ));
+            }
+            let auth_cookie_base = auth_cookie_name
+                .strip_prefix("__Secure-")
+                .or_else(|| auth_cookie_name.strip_prefix("__Host-"))
+                .unwrap_or(&auth_cookie_name);
+            let csrf_cookie_base = csrf_cookie_name
+                .strip_prefix("__Secure-")
+                .or_else(|| csrf_cookie_name.strip_prefix("__Host-"))
+                .unwrap_or(&csrf_cookie_name);
+            if auth_cookie_base == csrf_cookie_base {
+                problems.push(format!(
+                    "{route_name} requires distinct {AUTH_COOKIE_NAME} and {CSRF_COOKIE_NAME}"
+                ));
+            }
+            if cookie_session_identity_header(&csrf_header_name) {
+                problems.push(format!(
+                    "{route_name} requires {CSRF_HEADER_NAME} not to name a credential or identity header"
+                ));
+            }
+            if route.add_request_headers.contains_key(&csrf_header_name)
+                || route.strip_request_headers.contains(&csrf_header_name)
+            {
+                problems.push(format!(
+                    "{route_name} must not add or strip the configured {CSRF_HEADER_NAME}"
+                ));
+            }
+            if let Some(prefix) = route.path_prefix.as_deref() {
+                if auth_exempt_paths.iter().any(|exempt| {
+                    crate::path_match::exempt_path_matches(prefix, exempt)
+                        || crate::path_match::path_prefix_matches(exempt, prefix)
+                }) {
+                    problems.push(format!("{route_name} must not overlap {AUTH_EXEMPT_PATHS}"));
+                }
+                // CSRF exemptions match exact paths; an exempt descendant is enough
+                // to leave a delegated mutation without the gateway's outer check.
+                if csrf_exempt_paths
+                    .iter()
+                    .any(|exempt| crate::path_match::path_prefix_matches(exempt, prefix))
+                {
+                    problems.push(format!("{route_name} must not overlap {CSRF_EXEMPT_PATHS}"));
+                }
+            }
+        }
         let mcp_upstream_servers = parse_mcp_upstream_servers(
             MCP_UPSTREAM_SERVERS,
             get_var(MCP_UPSTREAM_SERVERS),
@@ -5292,12 +5348,16 @@ fn validate_upstream_routes(
         }
 
         let upstream_url = if has_legacy_url {
-            validate_upstream_url(
-                &format!("{route_name}.upstream_url"),
-                &route.upstream_url,
-                problems,
-            )
-            .unwrap_or_else(|| route.upstream_url.trim().to_owned())
+            let url_name = format!("{route_name}.upstream_url");
+            // Delegation names an exact origin. The legacy proxy discards a
+            // configured base path, so accepting one here would misstate the
+            // destination entrusted with a user's session.
+            let validated_url = if route.forward_cookie_session {
+                validate_pool_endpoint_url(&url_name, &route.upstream_url, problems)
+            } else {
+                validate_upstream_url(&url_name, &route.upstream_url, problems)
+            };
+            validated_url.unwrap_or_else(|| route.upstream_url.trim().to_owned())
         } else {
             String::new()
         };
@@ -5366,6 +5426,45 @@ fn validate_upstream_routes(
             &add_request_headers,
             problems,
         );
+        if route.forward_cookie_session {
+            let setting = format!("{route_name}.forward_cookie_session");
+            if id.is_none() || path_prefix.as_deref().is_none_or(|prefix| prefix == "/") {
+                problems.push(format!(
+                    "{setting} requires an explicit id and a non-root path_prefix"
+                ));
+            }
+            if has_connection
+                || has_pool
+                || !url::Url::parse(&upstream_url).is_ok_and(|url| url.scheme() == "https")
+            {
+                problems.push(format!(
+                    "{setting} requires a single HTTPS upstream_url without connection_id or upstreams"
+                ));
+            }
+            if route.request_body.mode != UpstreamRequestBodyMode::Buffered
+                || route.sse.is_some()
+                || route.websocket.is_some()
+                || route.grpc.is_some()
+            {
+                problems.push(format!(
+                    "{setting} requires buffered HTTP without sse, websocket or grpc"
+                ));
+            }
+            if route.health_check.is_some() || route.retry.is_some() {
+                problems.push(format!(
+                    "{setting} must not configure health_check or retry"
+                ));
+            }
+            if add_request_headers
+                .keys()
+                .chain(strip_request_headers.iter())
+                .any(|name| name == "x-csrf-token" || cookie_session_identity_header(name))
+            {
+                problems.push(format!(
+                    "{setting} must not add or strip credential, identity or CSRF headers"
+                ));
+            }
+        }
         let tls_ca_bundle_path = normalize_route_tls_material_path(
             &format!("{route_name}.tls_ca_bundle_path"),
             route.tls_ca_bundle_path,
@@ -5844,6 +5943,7 @@ fn validate_upstream_routes(
 
         validated.push(UpstreamRouteConfig {
             id,
+            forward_cookie_session: route.forward_cookie_session,
             connection_id,
             path_prefix,
             host,
@@ -5869,6 +5969,36 @@ fn validate_upstream_routes(
     }
 
     validated
+}
+
+pub(crate) fn cookie_session_identity_header(name: &str) -> bool {
+    matches!(
+        name,
+        "authorization"
+            | "cookie"
+            | "x-email"
+            | "x-remote-user"
+            | "x-tenant-id"
+            | "x-session-id"
+            | "x-groups"
+            | "x-group"
+            | "x-scope"
+            | "x-scopes"
+            | "remote-user"
+            | "cf-access-jwt-assertion"
+    ) || [
+        "x-user",
+        "x-auth",
+        "x-org",
+        "x-role",
+        "x-permission",
+        "x-forwarded-",
+        "x-actor-",
+        "x-greenhat-",
+        "x-greenpm-",
+    ]
+    .iter()
+    .any(|prefix| name.starts_with(prefix))
 }
 
 fn normalize_stable_id(name: &str, value: &str, problems: &mut Vec<String>) -> Option<String> {

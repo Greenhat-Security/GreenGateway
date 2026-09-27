@@ -3570,6 +3570,7 @@ fn upstream_routes_parse_json_array_and_normalize_matchers() {
         vec![
             UpstreamRouteConfig {
                 id: None,
+                forward_cookie_session: false,
                 connection_id: None,
                 path_prefix: Some("/api".to_owned()),
                 host: Some("api.example.test".to_owned()),
@@ -3597,6 +3598,7 @@ fn upstream_routes_parse_json_array_and_normalize_matchers() {
             },
             UpstreamRouteConfig {
                 id: None,
+                forward_cookie_session: false,
                 connection_id: None,
                 path_prefix: Some("/assets".to_owned()),
                 host: None,
@@ -3648,6 +3650,316 @@ fn connection_bound_upstream_route_parses_without_a_legacy_destination() {
         route.add_request_headers.get("x-route-label"),
         Some(&"billing".to_owned())
     );
+}
+
+fn cookie_session_route_document() -> serde_json::Value {
+    serde_json::json!({
+        "id": "pm-session",
+        "path_prefix": "/api/exponential",
+        "upstream_url": "https://pm-backend.example.test",
+        "forward_cookie_session": true
+    })
+}
+
+fn cookie_session_route_config(
+    route: serde_json::Value,
+    overrides: &[(&str, &str)],
+) -> Result<Config, ConfigError> {
+    let routes = serde_json::to_string(&vec![route]).expect("test route should serialize");
+    Config::from_env_vars(|name| {
+        if name == "UPSTREAM_ROUTES" {
+            Ok(routes.clone())
+        } else if let Some((_, value)) = overrides.iter().find(|(key, _)| *key == name) {
+            Ok((*value).to_owned())
+        } else {
+            Err(VarError::NotPresent)
+        }
+    })
+}
+
+#[test]
+fn forward_cookie_session_is_explicit_and_preserved_by_normalization() {
+    let mut route = cookie_session_route_document();
+    route["id"] = serde_json::json!(" pm-session ");
+    route["path_prefix"] = serde_json::json!(" /api/exponential ");
+    route["upstream_url"] = serde_json::json!(" https://pm-backend.example.test/ ");
+    route["add_request_headers"] = serde_json::json!({
+        "X-Route-Label": "pm",
+        "X-PM-Origin-Key": "fixture-origin-header"
+    });
+    let config = cookie_session_route_config(route.clone(), &[])
+        .expect("a bounded HTTPS cookie-session route should parse");
+    assert!(config.upstream_routes[0].forward_cookie_session);
+    assert_eq!(config.upstream_routes[0].id.as_deref(), Some("pm-session"));
+    assert_eq!(
+        config.upstream_routes[0]
+            .add_request_headers
+            .get("x-route-label"),
+        Some(&"pm".to_owned())
+    );
+    assert_eq!(
+        config.upstream_routes[0]
+            .add_request_headers
+            .get("x-pm-origin-key"),
+        Some(&"fixture-origin-header".to_owned())
+    );
+    assert_eq!(
+        config.upstream_routes[0].path_prefix.as_deref(),
+        Some("/api/exponential")
+    );
+
+    route
+        .as_object_mut()
+        .expect("object")
+        .remove("forward_cookie_session");
+    let config = cookie_session_route_config(route.clone(), &[])
+        .expect("omitting the opt-in should preserve existing route behavior");
+    assert!(!config.upstream_routes[0].forward_cookie_session);
+    route["forward_cookie_session"] = serde_json::json!(false);
+    let config = cookie_session_route_config(route, &[("AUTH_ENABLED", "false")])
+        .expect("disabled delegation must not impose its authentication requirements");
+    assert!(!config.upstream_routes[0].forward_cookie_session);
+}
+
+#[test]
+fn forward_cookie_session_rejects_unbounded_destinations_and_transport_modes() {
+    let cases = [
+        (
+            "id",
+            serde_json::Value::Null,
+            "requires an explicit id and a non-root path_prefix",
+        ),
+        (
+            "path_prefix",
+            serde_json::Value::Null,
+            "requires an explicit id and a non-root path_prefix",
+        ),
+        (
+            "path_prefix",
+            serde_json::json!("/"),
+            "requires an explicit id and a non-root path_prefix",
+        ),
+        (
+            "upstream_url",
+            serde_json::json!("http://pm-backend.example.test"),
+            "requires a single HTTPS upstream_url",
+        ),
+        (
+            "connection_id",
+            serde_json::json!("pm-backend"),
+            "requires a single HTTPS upstream_url",
+        ),
+        (
+            "upstreams",
+            serde_json::json!([{"id":"pm", "url":"https://pm-backend.example.test"}]),
+            "requires a single HTTPS upstream_url",
+        ),
+        (
+            "request_body",
+            serde_json::json!({"mode":"stream"}),
+            "requires buffered HTTP",
+        ),
+        ("sse", serde_json::json!({}), "requires buffered HTTP"),
+        ("websocket", serde_json::json!({}), "requires buffered HTTP"),
+        ("grpc", serde_json::json!({}), "requires buffered HTTP"),
+        (
+            "health_check",
+            serde_json::json!({}),
+            "must not configure health_check or retry",
+        ),
+        (
+            "retry",
+            serde_json::json!({}),
+            "must not configure health_check or retry",
+        ),
+    ];
+    for (field, value, expected) in cases {
+        let mut route = cookie_session_route_document();
+        route[field] = value;
+        if matches!(field, "connection_id" | "upstreams") {
+            route
+                .as_object_mut()
+                .expect("object")
+                .remove("upstream_url");
+        }
+        let error = cookie_session_route_config(route, &[])
+            .expect_err("delegation must have one bounded HTTP destination");
+        assert!(error.to_string().contains(expected), "{field}: {error}");
+    }
+}
+
+#[test]
+fn forward_cookie_session_requires_an_unambiguous_origin_root() {
+    for (url, expected) in [
+        (
+            "https://api.example.test/base",
+            "must be an origin URL without a base path",
+        ),
+        (
+            "https://api.example.test?q",
+            "must not contain userinfo, query, or fragment components",
+        ),
+        (
+            "https://api.example.test#f",
+            "must not contain URL userinfo or a fragment",
+        ),
+        (
+            "https://fixture-user@api.example.test",
+            "must not contain URL userinfo or a fragment",
+        ),
+    ] {
+        let mut route = cookie_session_route_document();
+        route["upstream_url"] = serde_json::json!(url);
+        let error = cookie_session_route_config(route, &[])
+            .expect_err("delegation must not silently discard URL components");
+        assert!(error.to_string().contains(expected), "{error}");
+        assert!(!error.to_string().contains("fixture-user"));
+    }
+}
+
+#[test]
+fn forward_cookie_session_rejects_credential_and_identity_header_transforms() {
+    for header in [
+        "Cookie",
+        "AUTHORIZATION",
+        "X-CSRF-Token",
+        "X-User-Id",
+        "X-Auth-Roles",
+        "X-Forwarded-User",
+        "X-Org-Id",
+        "X-Session-Id",
+        "X-Tenant-Id",
+        "X-Actor-Id",
+        "X-Greenhat-User",
+        "X-Greenpm-User",
+        "Remote-User",
+        "CF-Access-JWT-Assertion",
+    ] {
+        for field in ["add_request_headers", "strip_request_headers"] {
+            let mut route = cookie_session_route_document();
+            route[field] = if field == "add_request_headers" {
+                serde_json::json!({header: "test-value"})
+            } else {
+                serde_json::json!([header])
+            };
+            let error = cookie_session_route_config(route, &[])
+                .expect_err("route transforms must not replace delegated authority");
+            assert!(
+                error
+                    .to_string()
+                    .contains("must not add or strip credential, identity or CSRF headers"),
+                "{field} {header}: {error}"
+            );
+        }
+    }
+}
+
+#[test]
+fn forward_cookie_session_requires_enforced_authentication_and_csrf() {
+    for (setting, value) in [
+        ("AUTH_ENABLED", "false"),
+        ("AUTH_MODE", "observe"),
+        ("CSRF_ENABLED", "false"),
+    ] {
+        let error =
+            cookie_session_route_config(cookie_session_route_document(), &[(setting, value)])
+                .expect_err("delegation must require outer authentication and CSRF enforcement");
+        assert!(
+            error
+                .to_string()
+                .contains("requires AUTH_ENABLED=true, AUTH_MODE=required and CSRF_ENABLED=true"),
+            "{setting}: {error}"
+        );
+    }
+}
+
+#[test]
+fn forward_cookie_session_rejects_exemptions_inside_its_route() {
+    for (setting, value) in [
+        ("AUTH_EXEMPT_PATHS", "/api"),
+        ("AUTH_EXEMPT_PATHS", "/api/exponential"),
+        ("AUTH_EXEMPT_PATHS", "/api/exponential/tasks"),
+        ("CSRF_EXEMPT_PATHS", "/api/exponential"),
+        ("CSRF_EXEMPT_PATHS", "/api/exponential/tasks"),
+    ] {
+        let error =
+            cookie_session_route_config(cookie_session_route_document(), &[(setting, value)])
+                .expect_err("no delegated path may bypass an outer security check");
+        assert!(
+            error
+                .to_string()
+                .contains(&format!("must not overlap {setting}")),
+            "{setting} {value}: {error}"
+        );
+    }
+
+    for (setting, value) in [
+        ("AUTH_EXEMPT_PATHS", "/api/exponential-other"),
+        ("AUTH_EXEMPT_PATHS", "/health"),
+        ("CSRF_EXEMPT_PATHS", "/api/exponential-other"),
+        // CSRF exemptions are exact paths, so this does not exempt the route.
+        ("CSRF_EXEMPT_PATHS", "/api"),
+    ] {
+        cookie_session_route_config(cookie_session_route_document(), &[(setting, value)])
+            .expect("non-overlapping exemptions must not disable valid delegation");
+    }
+}
+
+#[test]
+fn forward_cookie_session_protects_custom_csrf_names_and_cookie_aliases() {
+    for field in ["add_request_headers", "strip_request_headers"] {
+        let mut route = cookie_session_route_document();
+        route[field] = if field == "add_request_headers" {
+            serde_json::json!({"X-PM-CSRF": "test-value"})
+        } else {
+            serde_json::json!(["X-PM-CSRF"])
+        };
+        let error = cookie_session_route_config(route, &[("CSRF_HEADER_NAME", "x-pm-csrf")])
+            .expect_err("the configured CSRF header must remain caller-bound");
+        assert!(error
+            .to_string()
+            .contains("must not add or strip the configured CSRF_HEADER_NAME"));
+    }
+    for name in ["Cookie", "Authorization", "X-User-Id"] {
+        let error = cookie_session_route_config(
+            cookie_session_route_document(),
+            &[("CSRF_HEADER_NAME", name)],
+        )
+        .expect_err("CSRF must not reuse a credential or identity header");
+        assert!(error
+            .to_string()
+            .contains("requires CSRF_HEADER_NAME not to name a credential or identity header"));
+    }
+    for (session_name, csrf_name) in [
+        ("session", "session"),
+        ("session", "__Secure-session"),
+        ("session", "__Host-session"),
+        ("__Secure-session", "session"),
+        ("__Host-session", "session"),
+        ("__Secure-session", "__Host-session"),
+        ("__Host-session", "__Secure-session"),
+    ] {
+        let error = cookie_session_route_config(
+            cookie_session_route_document(),
+            &[
+                ("AUTH_COOKIE_NAME", session_name),
+                ("CSRF_COOKIE_NAME", csrf_name),
+            ],
+        )
+        .expect_err("session cookie aliases must not double as CSRF cookies");
+        assert!(error
+            .to_string()
+            .contains("requires distinct AUTH_COOKIE_NAME and CSRF_COOKIE_NAME"));
+    }
+    cookie_session_route_config(
+        cookie_session_route_document(),
+        &[
+            ("AUTH_COOKIE_NAME", "product.session"),
+            ("CSRF_COOKIE_NAME", "product.csrf"),
+            ("CSRF_HEADER_NAME", "x-pm-csrf"),
+        ],
+    )
+    .expect("distinct custom cookie and header names should remain supported");
 }
 
 /// The gRPC listener must not share a socket with either existing one.

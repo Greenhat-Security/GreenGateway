@@ -10346,7 +10346,7 @@
         "unexpanded-macro"
       ],
       "scope": "gateway::proxy::forward::forward_to_upstream#1",
-      "sha256": "51cc9458e6879f60e6580bfa7fe709ee0a9a606ffacd566618929aa9dc018e16",
+      "sha256": "048dacb8cc214c88a1fdda8b5da12f5f69ae726bc64dfc3549aebbc70fb20fbe",
       "owner": "GreenGateway maintainers",
       "purpose": "Existing macro/attribute inputs for this exact application item; changed expansion inputs require explicit review."
     },
