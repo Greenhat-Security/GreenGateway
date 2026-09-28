@@ -928,6 +928,10 @@ fn route_request_header_policy(
             .then(|| cookie_session::CookieSessionPolicy {
                 session_cookie_name: config.auth_cookie_name.clone(),
                 csrf_cookie_name: config.csrf_cookie_name.clone(),
+                upstream_csrf_cookie_name: route
+                    .upstream_csrf_cookie_name
+                    .clone()
+                    .unwrap_or_else(|| config.csrf_cookie_name.clone()),
                 csrf_header_name: config.csrf_header_name.clone(),
             }),
     }
@@ -1262,6 +1266,7 @@ mod tests {
     fn generated_legacy_route_id_depends_on_logical_matcher_not_endpoint() {
         let mut route = config::UpstreamRouteConfig {
             forward_cookie_session: false,
+            upstream_csrf_cookie_name: None,
             id: None,
             connection_id: None,
             path_prefix: Some("/api".to_owned()),
@@ -1520,6 +1525,7 @@ mod tests {
         );
         let route = config::UpstreamRouteConfig {
             forward_cookie_session: false,
+            upstream_csrf_cookie_name: None,
             id: None,
             connection_id: None,
             path_prefix: Some("/api".to_owned()),
@@ -1569,6 +1575,7 @@ mod tests {
         let second_identity_path = write_test_client_identity("second");
         let route = config::UpstreamRouteConfig {
             forward_cookie_session: false,
+            upstream_csrf_cookie_name: None,
             id: Some("payments".to_owned()),
             connection_id: None,
             path_prefix: Some("/payments".to_owned()),

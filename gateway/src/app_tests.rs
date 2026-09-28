@@ -1310,6 +1310,7 @@ fn route(
     config::UpstreamRouteConfig {
         id: None,
         forward_cookie_session: false,
+        upstream_csrf_cookie_name: None,
         connection_id: None,
         path_prefix: path_prefix.map(str::to_owned),
         host: host.map(str::to_owned),

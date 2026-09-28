@@ -206,6 +206,7 @@ fn grpc_config(upstream: SocketAddr, grpc_listener: bool) -> config::Config {
     let route = config::UpstreamRouteConfig {
         id: Some("grpc-route".to_owned()),
         forward_cookie_session: false,
+        upstream_csrf_cookie_name: None,
         connection_id: None,
         path_prefix: Some("/".to_owned()),
         host: None,

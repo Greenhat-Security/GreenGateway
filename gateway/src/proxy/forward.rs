@@ -2469,6 +2469,7 @@ mod tests {
             Some(super::super::cookie_session::CookieSessionPolicy {
                 session_cookie_name: "session".into(),
                 csrf_cookie_name: "csrf_token".into(),
+                upstream_csrf_cookie_name: "csrf_token".into(),
                 csrf_header_name: "x-csrf-token".into(),
             });
         let body = Body::from_stream(stream::pending::<Result<bytes::Bytes, std::io::Error>>());

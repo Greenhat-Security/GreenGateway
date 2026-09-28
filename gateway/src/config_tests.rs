@@ -3571,6 +3571,7 @@ fn upstream_routes_parse_json_array_and_normalize_matchers() {
             UpstreamRouteConfig {
                 id: None,
                 forward_cookie_session: false,
+                upstream_csrf_cookie_name: None,
                 connection_id: None,
                 path_prefix: Some("/api".to_owned()),
                 host: Some("api.example.test".to_owned()),
@@ -3599,6 +3600,7 @@ fn upstream_routes_parse_json_array_and_normalize_matchers() {
             UpstreamRouteConfig {
                 id: None,
                 forward_cookie_session: false,
+                upstream_csrf_cookie_name: None,
                 connection_id: None,
                 path_prefix: Some("/assets".to_owned()),
                 host: None,
@@ -6055,4 +6057,34 @@ fn config_debug_renders_no_dsn_material() {
             "Config Debug must not carry DSN material ({fragment}): {rendered}"
         );
     }
+}
+
+#[test]
+fn upstream_csrf_cookie_translation_is_opt_in_and_rejects_identity_names() {
+    let mut route = cookie_session_route_document();
+    route["upstream_csrf_cookie_name"] = serde_json::json!("gh_api_csrf");
+    let config = cookie_session_route_config(route.clone(), &[]).unwrap();
+    assert_eq!(
+        config.upstream_routes[0]
+            .upstream_csrf_cookie_name
+            .as_deref(),
+        Some("gh_api_csrf")
+    );
+    for name in [
+        "",
+        "bad name",
+        "bad;name",
+        "session",
+        "__Secure-session",
+        "__Host-session",
+    ] {
+        route["upstream_csrf_cookie_name"] = serde_json::json!(name);
+        assert!(
+            cookie_session_route_config(route.clone(), &[]).is_err(),
+            "{name}"
+        );
+    }
+    route["upstream_csrf_cookie_name"] = serde_json::json!("gh_api_csrf");
+    route["forward_cookie_session"] = serde_json::json!(false);
+    assert!(cookie_session_route_config(route, &[]).is_err());
 }
