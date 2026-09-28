@@ -532,6 +532,26 @@
       "action": "deny"
     },
     {
+      "id": "greenpm-task-move",
+      "methods": [
+        "PATCH"
+      ],
+      "path": "/api/greenpm-owned/tasks/{task_id}/move",
+      "dispatch": {
+        "kind": "route",
+        "route_id": "greenpm-owned"
+      },
+      "principal": {
+        "issuers": [
+          "provider:greenhat-session"
+        ],
+        "auth_methods": [
+          "session_cookie"
+        ]
+      },
+      "action": "allow"
+    },
+    {
       "id": "greenpm-owned-deny-other-operations",
       "path": "/api/greenpm-owned/**",
       "dispatch": {

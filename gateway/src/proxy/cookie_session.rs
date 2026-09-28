@@ -312,6 +312,7 @@ mod tests {
         other_provider.issuer = Some("provider:other".into());
         for (method, path) in [
             ("PATCH", "/api/greenpm-owned/tasks/fixture-task/assignee"),
+            ("PATCH", "/api/greenpm-owned/tasks/fixture-task/move"),
             ("GET", "/api/greenpm-owned/my-tasks"),
         ] {
             assert!(allows(method, path, Some(&principal), owned));
@@ -334,6 +335,9 @@ mod tests {
         }
         for (method, path) in [
             ("GET", "/api/greenpm-owned/tasks/fixture-task/assignee"),
+            ("GET", "/api/greenpm-owned/tasks/fixture-task/move"),
+            ("DELETE", "/api/greenpm-owned/tasks/fixture-task/move"),
+            ("PATCH", "/api/greenpm-owned/tasks/fixture-task/move/extra"),
             ("DELETE", "/api/greenpm-owned/tasks/fixture-task/assignee"),
             ("POST", "/api/greenpm-owned/my-tasks"),
             ("PATCH", "/api/greenpm-owned/tasks/fixture-task"),

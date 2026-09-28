@@ -50,3 +50,5 @@ The legacy matrix was inspected at Tools API commit `99e0b7441a3e71e2eef37ed9c6f
 ## Release checks
 
 Before enabling the route, test two different valid users; revoked/missing sessions; introspection outage; no module grant; cross-project/tenant denial; missing/mismatched/duplicate CSRF; mixed bearer/cookie requests; cookie aliases; spoofed actor headers; exact unsupported methods/paths; origin-secret rejection; and a redirecting upstream. Check audit attribution without credential values. Test rollback with the existing route table/policy preserved. Configure previews as isolated fixtures with separate origins and machine credentials, never production cookies or databases. Preview bearer traffic must not use `forward_cookie_session`.
+
+Task ordering uses the exact `greenpm-task-move` PATCH rule for `/api/greenpm-owned/tasks/{task_id}/move` (issue #530). Add it before the owned deny rule only after review. The API independently verifies the session and project edit permission, checks the destination belongs to that project/status, and persists integer ordering atomically. No direct database or legacy fallback is introduced.
