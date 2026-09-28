@@ -1851,6 +1851,7 @@ fn from_config_auto_seeds_all_route_upstream_hosts_into_allowlist() {
         crate::config::UpstreamRouteConfig {
             id: None,
             forward_cookie_session: false,
+            upstream_csrf_cookie_name: None,
             connection_id: None,
             path_prefix: Some("/api".to_owned()),
             host: None,
@@ -1876,6 +1877,7 @@ fn from_config_auto_seeds_all_route_upstream_hosts_into_allowlist() {
         crate::config::UpstreamRouteConfig {
             id: None,
             forward_cookie_session: false,
+            upstream_csrf_cookie_name: None,
             connection_id: None,
             path_prefix: Some("/assets".to_owned()),
             host: None,
@@ -1901,6 +1903,7 @@ fn from_config_auto_seeds_all_route_upstream_hosts_into_allowlist() {
         crate::config::UpstreamRouteConfig {
             id: Some("payments".to_owned()),
             forward_cookie_session: false,
+            upstream_csrf_cookie_name: None,
             connection_id: None,
             path_prefix: Some("/payments".to_owned()),
             host: None,

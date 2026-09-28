@@ -804,6 +804,9 @@ pub struct UpstreamRouteConfig {
     /// This never forwards an arbitrary Cookie header or a bearer credential.
     #[serde(default)]
     pub forward_cookie_session: bool,
+    /// Destination name for the already-validated canonical CSRF cookie.
+    #[serde(default)]
+    pub upstream_csrf_cookie_name: Option<String>,
     #[serde(default)]
     pub connection_id: Option<String>,
     #[serde(default)]
@@ -2719,6 +2722,22 @@ impl Config {
         let upstream_routes =
             parse_upstream_routes(UPSTREAM_ROUTES, get_var(UPSTREAM_ROUTES), &mut problems);
         for (index, route) in upstream_routes.iter().enumerate() {
+            if let Some(name) = &route.upstream_csrf_cookie_name {
+                let name_base = name
+                    .strip_prefix("__Secure-")
+                    .or_else(|| name.strip_prefix("__Host-"))
+                    .unwrap_or(name);
+                let auth_base = auth_cookie_name
+                    .strip_prefix("__Secure-")
+                    .or_else(|| auth_cookie_name.strip_prefix("__Host-"))
+                    .unwrap_or(&auth_cookie_name);
+                if !route.forward_cookie_session
+                    || !crate::middleware::auth::safe_cookie_token(name)
+                    || name_base == auth_base
+                {
+                    problems.push(format!("{UPSTREAM_ROUTES}[{index}].upstream_csrf_cookie_name requires cookie-session delegation and a safe non-identity cookie name"));
+                }
+            }
             if !route.forward_cookie_session {
                 continue;
             }
@@ -5944,6 +5963,7 @@ fn validate_upstream_routes(
         validated.push(UpstreamRouteConfig {
             id,
             forward_cookie_session: route.forward_cookie_session,
+            upstream_csrf_cookie_name: route.upstream_csrf_cookie_name,
             connection_id,
             path_prefix,
             host,

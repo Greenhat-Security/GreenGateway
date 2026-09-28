@@ -13,6 +13,7 @@ use crate::{
 pub(super) struct CookieSessionPolicy {
     pub session_cookie_name: String,
     pub csrf_cookie_name: String,
+    pub upstream_csrf_cookie_name: String,
     pub csrf_header_name: String,
 }
 
@@ -46,7 +47,19 @@ pub(super) fn delegated_cookie(
     ) {
         return Err("session_delegation_method_rejected");
     }
-    if policy.csrf_cookie_name == policy.session_cookie_name
+    let upstream_base = policy
+        .upstream_csrf_cookie_name
+        .strip_prefix("__Secure-")
+        .or_else(|| policy.upstream_csrf_cookie_name.strip_prefix("__Host-"))
+        .unwrap_or(&policy.upstream_csrf_cookie_name);
+    let session_base = policy
+        .session_cookie_name
+        .strip_prefix("__Secure-")
+        .or_else(|| policy.session_cookie_name.strip_prefix("__Host-"))
+        .unwrap_or(&policy.session_cookie_name);
+    if upstream_base == session_base
+        || !safe_cookie_token(&policy.upstream_csrf_cookie_name)
+        || policy.csrf_cookie_name == policy.session_cookie_name
         || !safe_cookie_token(&policy.csrf_cookie_name)
     {
         return Err("session_delegation_configuration_invalid");
@@ -79,7 +92,7 @@ pub(super) fn delegated_cookie(
                 .cookie_header()
                 .to_str()
                 .map_err(|_| "validated_cookie_session_required")?,
-            policy.csrf_cookie_name
+            policy.upstream_csrf_cookie_name
         ))
         .map_err(|_| "session_delegation_csrf_invalid")?,
         None => session.cookie_header().clone(),
@@ -391,10 +404,19 @@ mod tests {
     }
 
     async fn forward(request: Request<Body>) -> Response {
+        forward_with_csrf_name(request, "csrf_token").await
+    }
+
+    async fn legacy_forward(request: Request<Body>) -> Response {
+        forward_with_csrf_name(request, "gh_api_csrf").await
+    }
+
+    async fn forward_with_csrf_name(request: Request<Body>, upstream_name: &str) -> Response {
         let (parts, _) = request.into_parts();
         let policy = CookieSessionPolicy {
             session_cookie_name: "session".into(),
             csrf_cookie_name: "csrf_token".into(),
+            upstream_csrf_cookie_name: upstream_name.into(),
             csrf_header_name: "x-csrf-token".into(),
         };
         match delegated_cookie(&parts, &policy) {
@@ -436,6 +458,7 @@ mod tests {
         };
         Router::new()
             .route("/api/project", any(forward))
+            .route("/api/legacy", any(legacy_forward))
             .layer(from_fn_with_state(state, auth_middleware))
     }
 
@@ -588,5 +611,66 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    }
+    #[tokio::test]
+    async fn upstream_csrf_translation_validates_canonical_pair_and_never_trusts_legacy_cookie() {
+        for method in [Method::PATCH, Method::POST, Method::DELETE] {
+            let request = Request::builder()
+                .method(method)
+                .uri("/api/legacy")
+                .header(
+                    header::COOKIE,
+                    "session=alice; csrf_token=canonical-fixture; gh_api_csrf=untrusted-fixture",
+                )
+                .header("x-csrf-token", "canonical-fixture")
+                .body(Body::empty())
+                .unwrap();
+            let response = router().oneshot(request).await.unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            assert_eq!(
+                to_bytes(response.into_body(), 4096).await.unwrap(),
+                "session=alice; gh_api_csrf=canonical-fixture"
+            );
+        }
+        for (cookies, token) in [
+            (
+                "session=alice; gh_api_csrf=legacy-fixture",
+                "legacy-fixture",
+            ),
+            (
+                "session=alice; csrf_token=canonical-fixture; gh_api_csrf=legacy-fixture",
+                "legacy-fixture",
+            ),
+            ("session=alice; csrf_token=one; csrf_token=two", "one"),
+        ] {
+            let response = router()
+                .oneshot(
+                    Request::builder()
+                        .method(Method::POST)
+                        .uri("/api/legacy")
+                        .header(header::COOKIE, cookies)
+                        .header("x-csrf-token", token)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        }
+        let response = router()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/legacy")
+                    .header(header::COOKIE, "session=alice")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            to_bytes(response.into_body(), 4096).await.unwrap(),
+            "session=alice"
+        );
     }
 }
