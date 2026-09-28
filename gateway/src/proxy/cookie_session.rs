@@ -274,6 +274,82 @@ mod tests {
             .is_none());
     }
 
+    #[test]
+    fn greenpm_assignment_and_personal_feed_require_exact_operation_and_session_route() {
+        let fragment: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../docs/examples/greenpm-session-rules.json"
+        ))
+        .unwrap();
+        let policy = crate::rbac::Policy::validate_json_value(serde_json::json!({
+            "schema_version": "0.1.0", "id": "greenpm-example", "default_action": "deny",
+            "rules": fragment["rules"], "roles": {}, "routes": []
+        }))
+        .unwrap();
+        let matcher = crate::rbac::RuleMatcher::new(&policy.rules);
+        let principal = Principal {
+            user_id: "fixture-user".into(),
+            issuer: Some("provider:greenhat-session".into()),
+            email: None,
+            org_id: None,
+            roles: vec![],
+            session_id: "fixture-session-id".into(),
+            auth_method: AuthMethod::Cookie,
+        };
+        let owned = crate::rbac::RuleDispatchContext::classified_with_route_id(
+            Some("greenpm-owned"),
+            None,
+            Some("/api/greenpm-owned"),
+            None,
+        );
+        let allows = |method, path, actor, dispatch| {
+            matcher
+                .evaluate_with_dispatch(method, path, actor, dispatch)
+                .is_some_and(|decision| decision.action == crate::rbac::RuleAction::Allow)
+        };
+        let mut bearer = principal.clone();
+        bearer.auth_method = AuthMethod::Bearer;
+        let mut other_provider = principal.clone();
+        other_provider.issuer = Some("provider:other".into());
+        for (method, path) in [
+            ("PATCH", "/api/greenpm-owned/tasks/fixture-task/assignee"),
+            ("GET", "/api/greenpm-owned/my-tasks"),
+        ] {
+            assert!(allows(method, path, Some(&principal), owned));
+            assert!(!allows(method, path, None, owned));
+            assert!(!allows(
+                method,
+                path,
+                Some(&principal),
+                crate::rbac::RuleDispatchContext::contextless()
+            ));
+            let wrong_route = crate::rbac::RuleDispatchContext::classified_with_route_id(
+                Some("greenpm-legacy"),
+                None,
+                Some("/api/exponential"),
+                None,
+            );
+            assert!(!allows(method, path, Some(&principal), wrong_route));
+            assert!(!allows(method, path, Some(&bearer), owned));
+            assert!(!allows(method, path, Some(&other_provider), owned));
+        }
+        for (method, path) in [
+            ("GET", "/api/greenpm-owned/tasks/fixture-task/assignee"),
+            ("DELETE", "/api/greenpm-owned/tasks/fixture-task/assignee"),
+            ("POST", "/api/greenpm-owned/my-tasks"),
+            ("PATCH", "/api/greenpm-owned/tasks/fixture-task"),
+            (
+                "PATCH",
+                "/api/greenpm-owned/tasks/fixture-task/assignee/extra",
+            ),
+            ("GET", "/api/greenpm-owned/my-tasks/other-user"),
+        ] {
+            assert!(
+                !allows(method, path, Some(&principal), owned),
+                "{method} {path}"
+            );
+        }
+    }
+
     #[async_trait::async_trait]
     impl SessionValidator for Validator {
         async fn validate_session(

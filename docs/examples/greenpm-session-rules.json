@@ -498,6 +498,22 @@
       "action": "allow"
     },
     {
+      "id": "greenpm-task-assignment",
+      "methods": ["PATCH"],
+      "path": "/api/greenpm-owned/tasks/{task_id}/assignee",
+      "dispatch": {"kind": "route", "route_id": "greenpm-owned"},
+      "principal": {"issuers": ["provider:greenhat-session"], "auth_methods": ["session_cookie"]},
+      "action": "allow"
+    },
+    {
+      "id": "greenpm-personal-tasks",
+      "methods": ["GET"],
+      "path": "/api/greenpm-owned/my-tasks",
+      "dispatch": {"kind": "route", "route_id": "greenpm-owned"},
+      "principal": {"issuers": ["provider:greenhat-session"], "auth_methods": ["session_cookie"]},
+      "action": "allow"
+    },
+    {
       "id": "greenpm-legacy-deny-other-operations",
       "path": "/api/exponential/**",
       "dispatch": {
