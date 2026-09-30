@@ -51,7 +51,7 @@ notify = "8.2.0"
 # edge, not a crate, and lets `caller_assertion.rs` check that a configured
 # ES256 public point is actually on P-256 rather than merely the right length,
 # without hand-rolling 256-bit modular arithmetic.
-num-bigint = { version = "0.4.8", default-features = false }
+num-bigint = { version = "0.5.1", default-features = false }
 percent-encoding = "2.3.2"
 pulldown-cmark = { version = "0.13.0", default-features = false }
 proptest = "1.9.0"
