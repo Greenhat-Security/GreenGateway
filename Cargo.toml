@@ -40,7 +40,7 @@ hyper = { version = "1.10.1", default-features = false, features = ["client", "s
 # NOT requested: that is the feature that would make every listener serve h2c.
 hyper-util = { version = "0.1.20", default-features = false, features = ["tokio", "service"] }
 ipnet = "2.11.0"
-jsonschema = { version = "0.46.9", default-features = false }
+jsonschema = { version = "0.56.0", default-features = false }
 jsonwebtoken = { version = "11.0.0", features = ["aws_lc_rs"] }
 metrics = "0.24.6"
 metrics-exporter-prometheus = { version = "0.18.3", default-features = false }
