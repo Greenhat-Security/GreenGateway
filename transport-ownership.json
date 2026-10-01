@@ -6097,9 +6097,9 @@
         "network-or-process-reference"
       ],
       "scope": "gateway::app_state::AppState#1",
-      "sha256": "bfc12724d8bf2db559896c90b65b9926d1aad97f72ced5e3c30dd4c7a57b1592",
+      "sha256": "58e0481c4556759cd91b2dfbb0cc505b2e049975a54195abf5242e7745e2a5ec",
       "owner": "GreenGateway maintainers",
-      "purpose": "Application state retains existing transport handles; the optional admin-session capability field adds only serialized login, completion and logout metadata, with no new transport construction authority."
+      "purpose": "Reviewed standalone reliability changes: process-local readiness state, fixed-label metrics and exact audit loss accounting. No new outbound transport authority; SQLite probes use configured local paths and observation filtering preserves security findings."
     },
     {
       "file": "gateway/src/main.rs",
@@ -6270,6 +6270,26 @@
       "sha256": "5d9f812e6d6973f484fcf6f9205e773ecbb4503112229f85e702d7904367395b",
       "owner": "GreenGateway maintainers",
       "purpose": "Reviewed exact import/reexport or alias for this module; constructor bodies require separate scope review."
+    },
+    {
+      "file": "gateway/src/probes.rs",
+      "reasons": [
+        "unexpanded-macro"
+      ],
+      "scope": "gateway::probes::impl  StandaloneStorageReadiness::check_paths#1",
+      "sha256": "734658c66836a7bd47a7744b9aa5e4feb8bc8adcec429a22272dfe6b206a0b53",
+      "owner": "GreenGateway maintainers",
+      "purpose": "Reviewed standalone reliability changes: process-local readiness state, fixed-label metrics and exact audit loss accounting. No new outbound transport authority; SQLite probes use configured local paths and observation filtering preserves security findings."
+    },
+    {
+      "file": "gateway/src/probes.rs",
+      "reasons": [
+        "unexpanded-macro"
+      ],
+      "scope": "gateway::probes::impl  StandaloneStorageReadiness::publish_gauges#1",
+      "sha256": "1beaf10465fe404ae059dfaf70954af7b686d1e73b4e475d05aa856c7bc425e1",
+      "owner": "GreenGateway maintainers",
+      "purpose": "Reviewed standalone reliability changes: process-local readiness state, fixed-label metrics and exact audit loss accounting. No new outbound transport authority; SQLite probes use configured local paths and observation filtering preserves security findings."
     },
     {
       "file": "gateway/src/probes.rs",
@@ -6726,10 +6746,10 @@
       "reasons": [
         "capability-import-or-glob"
       ],
-      "scope": "gateway::audit::sqlite_sink::use std :: { error :: Error , fmt , io , path :: PathBuf , sync :: { mpsc :: { self , RecvTimeoutError , Sender } , Arc , Mutex , MutexGuard , } , thread :: { self , JoinHandle } , time :: { Duration as StdDuration , Instant } , }#1",
-      "sha256": "081e3745abce6a112cf43da84eb032e0292da6f09eb9b10077c335c4800a34fc",
+      "scope": "gateway::audit::sqlite_sink::use std :: { error :: Error , fmt , io , path :: PathBuf , sync :: { atomic :: { AtomicU64 , Ordering } , mpsc :: { self , RecvTimeoutError , Sender } , Arc , Mutex , MutexGuard , } , thread :: { self , JoinHandle } , time :: { Duration as StdDuration , Instant } , }#1",
+      "sha256": "5cd8f63b92577ca040547302fed2fe25656a39bd315276473945c2e3e6f2b3ea",
       "owner": "GreenGateway maintainers",
-      "purpose": "Reviewed exact import/reexport or alias for this module; constructor bodies require separate scope review."
+      "purpose": "Reviewed standalone reliability changes: process-local readiness state, fixed-label metrics and exact audit loss accounting. No new outbound transport authority; SQLite probes use configured local paths and observation filtering preserves security findings."
     },
     {
       "file": "gateway/src/audit/sqlite_sink.rs",
@@ -6746,10 +6766,20 @@
       "reasons": [
         "unexpanded-macro"
       ],
-      "scope": "gateway::audit::sqlite_sink::impl  SqliteSinkShared::flush_buffer#1",
-      "sha256": "a2a1ab8d32ae07f11c787e36856b026316355ae3ad8ad2722dc47f5bd0629186",
+      "scope": "gateway::audit::sqlite_sink::impl  SqliteSink::new_with_intervals#1",
+      "sha256": "95e004c950cb13f28e1f43971486c611901ce4c0d6bc521d92d622143fbafed5",
       "owner": "GreenGateway maintainers",
-      "purpose": "Audit/storage operations and instrumentation with existing shared backend authority."
+      "purpose": "Reviewed standalone reliability changes: process-local readiness state, fixed-label metrics and exact audit loss accounting. No new outbound transport authority; SQLite probes use configured local paths and observation filtering preserves security findings."
+    },
+    {
+      "file": "gateway/src/audit/sqlite_sink.rs",
+      "reasons": [
+        "unexpanded-macro"
+      ],
+      "scope": "gateway::audit::sqlite_sink::impl  SqliteSinkShared::flush_buffer#1",
+      "sha256": "beda9dab8b35db4b541f7e51db66463672a67416fc08af78c6ddc05ef1839bce",
+      "owner": "GreenGateway maintainers",
+      "purpose": "Reviewed standalone reliability changes: process-local readiness state, fixed-label metrics and exact audit loss accounting. No new outbound transport authority; SQLite probes use configured local paths and observation filtering preserves security findings."
     },
     {
       "file": "gateway/src/audit/sqlite_sink.rs",
@@ -9831,6 +9861,16 @@
     {
       "file": "gateway/src/middleware/observation.rs",
       "reasons": [
+        "unexpanded-macro"
+      ],
+      "scope": "gateway::middleware::observation::observation_middleware#1",
+      "sha256": "ad337288cc63eb750f3680ffe7d08ae592e967b4c337c77c15ad0b2a21c4aa55",
+      "owner": "GreenGateway maintainers",
+      "purpose": "Reviewed standalone reliability changes: process-local readiness state, fixed-label metrics and exact audit loss accounting. No new outbound transport authority; SQLite probes use configured local paths and observation filtering preserves security findings."
+    },
+    {
+      "file": "gateway/src/middleware/observation.rs",
+      "reasons": [
         "unexpanded-attribute"
       ],
       "scope": "gateway::middleware::observation::impl  SchemaConformanceState::from_config_cluster#1",
@@ -9998,6 +10038,16 @@
       "sha256": "16897e5a293289e00a20698c95c9bcaf98e1315489262272851b013ee568f9bc",
       "owner": "GreenGateway maintainers",
       "purpose": "Narrow cfg_attr(not(test), expect(dead_code)) for the existing offline analysis or rate-selection contract pending its separate adapter. Replaces the policy evaluator module-wide allowance; no transport or process capability is introduced."
+    },
+    {
+      "file": "gateway/src/policy_eval/mod.rs",
+      "reasons": [
+        "unexpanded-attribute"
+      ],
+      "scope": "gateway::policy_eval::tools::attributes#1",
+      "sha256": "a97782e307cca2c63218bbb7beb6f2201e8f53d757c50109077b984a8314d83b",
+      "owner": "policy evaluation tool lane (#421)",
+      "purpose": "The tools module contains pure policy evaluation only; its non-test dead-code allowance remains scoped to this offline lane until the tool adapters in #422 consume it. No transport or runtime authority is introduced."
     },
     {
       "file": "gateway/src/policy_eval/mod.rs",
@@ -10228,16 +10278,6 @@
       "sha256": "677e297768ed4be46122c1eb78bf8f7e1fd7e77467de8220aab874003916fc0a",
       "owner": "GreenGateway maintainers",
       "purpose": "Narrow cfg_attr(not(test), expect(dead_code)) for the existing offline analysis or rate-selection contract pending its separate adapter. Replaces the policy evaluator module-wide allowance; no transport or process capability is introduced."
-    },
-    {
-      "file": "gateway/src/policy_eval/mod.rs",
-      "reasons": [
-        "unexpanded-attribute"
-      ],
-      "scope": "gateway::policy_eval::tools::attributes#1",
-      "sha256": "a97782e307cca2c63218bbb7beb6f2201e8f53d757c50109077b984a8314d83b",
-      "owner": "policy evaluation tool lane (#421)",
-      "purpose": "The tools module contains pure policy evaluation only; its non-test dead-code allowance remains scoped to this offline lane until the tool adapters in #422 consume it. No transport or runtime authority is introduced."
     },
     {
       "file": "gateway/src/proxy/admission.rs",

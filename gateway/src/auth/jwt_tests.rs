@@ -1519,6 +1519,7 @@ fn test_config(jwks_url: Option<&str>) -> Config {
         audit_log_file: None,
         audit_sqlite_path: None,
         audit_sqlite_retention_days: None,
+        audit_successful_probes_metrics_only: false,
         shutdown_drain_delay_ms: crate::config::DEFAULT_SHUTDOWN_DRAIN_DELAY_MS,
         shutdown_timeout_ms: crate::config::DEFAULT_SHUTDOWN_TIMEOUT_MS,
         audit_drain_timeout_ms: crate::config::DEFAULT_AUDIT_DRAIN_TIMEOUT_MS,

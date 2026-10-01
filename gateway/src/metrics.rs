@@ -1,4 +1,14 @@
 pub const LOCK_POISON_RECOVERIES_TOTAL: &str = "lock_poison_recoveries_total";
+/// Committed background write checks, with fixed store and outcome labels.
+pub const SQLITE_STORAGE_CHECKS_TOTAL: &str = "greengateway_sqlite_storage_checks_total";
+/// Last security-store check succeeded and is no more than 45 seconds old.
+pub const SQLITE_STORAGE_HEALTHY: &str = "greengateway_sqlite_storage_healthy";
+pub const SQLITE_STORAGE_CHECK_AGE_SECONDS: &str = "greengateway_sqlite_storage_check_age_seconds";
+/// Last SQLite audit flush succeeded. A later success recovers this gauge;
+/// dropped-event counters retain the history of loss.
+pub const AUDIT_SQLITE_HEALTHY: &str = "greengateway_audit_sqlite_healthy";
+pub const SUCCESSFUL_OPERATIONAL_OBSERVATIONS_SUPPRESSED_TOTAL: &str =
+    "greengateway_successful_operational_observations_suppressed_total";
 pub const INBOUND_TLS_HANDSHAKES_TOTAL: &str = "inbound_tls_handshakes_total";
 pub const INBOUND_TLS_HANDSHAKES_IN_FLIGHT: &str = "inbound_tls_handshakes_in_flight";
 /// Inbound certificate material reloads, per listener.

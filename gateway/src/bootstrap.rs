@@ -1999,6 +1999,7 @@ pub(super) fn gateway_app_with_process_started_at_and_overrides(
             .map(|runtime| runtime as Arc<dyn cluster_status::SecurityStatus>);
     #[cfg(not(feature = "postgres"))]
     let cluster_security_status: Option<Arc<dyn cluster_status::SecurityStatus>> = None;
+    let standalone_storage_readiness = StandaloneStorageReadiness::start(&config, &lifecycle);
     let cluster_admin_state = ClusterAdminState {
         rbac_state: rbac_state.clone(),
         // Having an authority to read *is* cluster mode here: both seeds
@@ -2010,6 +2011,7 @@ pub(super) fn gateway_app_with_process_started_at_and_overrides(
         lifecycle: lifecycle.clone(),
         cluster_readiness: cluster_readiness.clone(),
         readiness_probe: readiness_probe.clone(),
+        standalone_storage_readiness: standalone_storage_readiness.clone(),
         proxy: proxy_state.clone(),
         security: cluster_security_status,
         audit: audit_log.clone(),
@@ -2135,6 +2137,7 @@ pub(super) fn gateway_app_with_process_started_at_and_overrides(
         lifecycle,
         cluster_readiness,
         readiness_probe,
+        standalone_storage_readiness,
         audit_log: audit_log.clone(),
         #[cfg(feature = "postgres")]
         database_pool: build_overrides

@@ -250,6 +250,7 @@ const ADMIN_TLS_KEY_FILE: &str = "ADMIN_TLS_KEY_FILE";
 const AUDIT_LOG_FILE: &str = "AUDIT_LOG_FILE";
 const AUDIT_SQLITE_PATH: &str = "AUDIT_SQLITE_PATH";
 const AUDIT_SQLITE_RETENTION_DAYS: &str = "AUDIT_SQLITE_RETENTION_DAYS";
+const AUDIT_SUCCESSFUL_PROBES_METRICS_ONLY: &str = "AUDIT_SUCCESSFUL_PROBES_METRICS_ONLY";
 const AUDIT_DRAIN_TIMEOUT_MS: &str = "AUDIT_DRAIN_TIMEOUT_MS";
 const AUTH_COOKIE_NAME: &str = "AUTH_COOKIE_NAME";
 const AUTH_ENABLED: &str = "AUTH_ENABLED";
@@ -433,6 +434,7 @@ pub struct Config {
     pub audit_log_file: Option<String>,
     pub audit_sqlite_path: Option<String>,
     pub audit_sqlite_retention_days: Option<u32>,
+    pub audit_successful_probes_metrics_only: bool,
     pub shutdown_drain_delay_ms: u64,
     pub shutdown_timeout_ms: u64,
     pub audit_drain_timeout_ms: u64,
@@ -1854,6 +1856,13 @@ impl Config {
             parse_optional_string(AUDIT_LOG_FILE, get_var(AUDIT_LOG_FILE), &mut problems);
         let audit_sqlite_path =
             parse_optional_string(AUDIT_SQLITE_PATH, get_var(AUDIT_SQLITE_PATH), &mut problems);
+        let audit_successful_probes_metrics_only = parse_var(
+            AUDIT_SUCCESSFUL_PROBES_METRICS_ONLY,
+            get_var(AUDIT_SUCCESSFUL_PROBES_METRICS_ONLY),
+            false,
+            "boolean",
+            &mut problems,
+        );
         let audit_sqlite_retention_days = normalize_audit_retention_days(
             AUDIT_SQLITE_RETENTION_DAYS,
             "SQLite",
@@ -3239,6 +3248,7 @@ impl Config {
                 audit_log_file,
                 audit_sqlite_path,
                 audit_sqlite_retention_days,
+                audit_successful_probes_metrics_only,
                 shutdown_drain_delay_ms,
                 shutdown_timeout_ms,
                 audit_drain_timeout_ms,
