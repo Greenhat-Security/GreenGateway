@@ -233,7 +233,10 @@ if behavior == "failure_nonzero":
 
     def test_cpu_limit_kills_real_child(self):
         self.worker("cpu")
-        self.budgets.update(cpu_seconds=1, wall_seconds=4)
+        # Busy CI runners can take several wall seconds to deliver one CPU
+        # second. Keep this test bounded while letting the CPU limit win;
+        # the separate test above checks the short wall timeout.
+        self.budgets.update(cpu_seconds=1, wall_seconds=30)
         with self.assertRaisesRegex(corpus.Failure, "cpu_or_resource_limit"):
             self.run_worker()
 
