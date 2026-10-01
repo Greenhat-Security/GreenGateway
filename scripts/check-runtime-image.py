@@ -54,12 +54,16 @@ def runtime_check(image, output):
                 require(not ({'bin/sh', 'bin/bash', 'usr/bin/curl', 'usr/bin/perl',
                              'usr/bin/apt', 'usr/bin/mount', 'bin/mount'} & paths.keys()))
                 require('var/lib/dpkg/status.d/libc6' in paths)
+                require('var/lib/dpkg/status.d/libgcc-s1' in paths)
+                require(not any(name.startswith('var/lib/dpkg/status.d/libssl')
+                                or '/libssl.so' in name or '/libcrypto.so' in name
+                                for name in paths))
                 require(paths['etc/ssl/certs/ca-certificates.crt'].size > 10000)
                 # Check package contents as well as scanner-visible metadata;
                 # replacing only the version label must never pass this gate.
                 tzdata_status = filesystem.extractfile(paths['var/lib/dpkg/status.d/tzdata']).read().decode()
                 tzdata_source = filesystem.extractfile(paths['usr/share/zoneinfo/tzdata.zi']).read().decode()
-                require('Version: 2026c-0+deb12u1\n' in tzdata_status)
+                require('Version: 2026c-0+deb13u1\n' in tzdata_status)
                 require(tzdata_source.startswith('# version 2026c\n'))
                 passwd = filesystem.extractfile(paths['etc/passwd']).read().decode()
                 require('greengateway:x:10001:10001::/nonexistent:' in passwd)

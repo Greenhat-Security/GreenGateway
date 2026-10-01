@@ -393,6 +393,43 @@ pub(super) fn duration_millis(duration: Duration) -> u64 {
 }
 
 #[cfg(test)]
+pub(super) async fn audit_extension_probe_middleware(
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    if req.extensions().get::<audit::AuditLog>().is_none() {
+        return http::StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    }
+
+    next.run(req).await
+}
+
+#[cfg(test)]
+pub(super) async fn principal_probe(
+    principal: Option<Extension<auth::Principal>>,
+) -> axum::response::Response {
+    match principal {
+        Some(Extension(principal)) => Json(json!({
+            "user_id": principal.user_id,
+            "roles": principal.roles,
+            "auth_method": test_auth_method_label(&principal.auth_method),
+        }))
+        .into_response(),
+        None => http::StatusCode::NO_CONTENT.into_response(),
+    }
+}
+
+#[cfg(test)]
+pub(super) fn test_auth_method_label(auth_method: &auth::AuthMethod) -> &'static str {
+    match auth_method {
+        auth::AuthMethod::Cookie => "session_cookie",
+        auth::AuthMethod::Bearer => "bearer_token",
+        auth::AuthMethod::ServiceToken => "service_token",
+        auth::AuthMethod::ClientCertificate => "client_certificate",
+    }
+}
+
+#[cfg(test)]
 mod storage_readiness_tests {
     use super::*;
 
@@ -483,42 +520,5 @@ mod storage_readiness_tests {
             !db.0.exists(),
             "a missing security store must never be recreated by the probe"
         );
-    }
-}
-
-#[cfg(test)]
-pub(super) async fn audit_extension_probe_middleware(
-    req: axum::extract::Request,
-    next: axum::middleware::Next,
-) -> axum::response::Response {
-    if req.extensions().get::<audit::AuditLog>().is_none() {
-        return http::StatusCode::INTERNAL_SERVER_ERROR.into_response();
-    }
-
-    next.run(req).await
-}
-
-#[cfg(test)]
-pub(super) async fn principal_probe(
-    principal: Option<Extension<auth::Principal>>,
-) -> axum::response::Response {
-    match principal {
-        Some(Extension(principal)) => Json(json!({
-            "user_id": principal.user_id,
-            "roles": principal.roles,
-            "auth_method": test_auth_method_label(&principal.auth_method),
-        }))
-        .into_response(),
-        None => http::StatusCode::NO_CONTENT.into_response(),
-    }
-}
-
-#[cfg(test)]
-pub(super) fn test_auth_method_label(auth_method: &auth::AuthMethod) -> &'static str {
-    match auth_method {
-        auth::AuthMethod::Cookie => "session_cookie",
-        auth::AuthMethod::Bearer => "bearer_token",
-        auth::AuthMethod::ServiceToken => "service_token",
-        auth::AuthMethod::ClientCertificate => "client_certificate",
     }
 }
