@@ -1,6 +1,150 @@
 //! probes boundary extracted from the application composition root.
 use super::*;
 
+const SQLITE_READINESS_INTERVAL: Duration = Duration::from_secs(15);
+const SQLITE_READINESS_MAX_AGE: Duration = Duration::from_secs(45);
+const SQLITE_READINESS_BUSY_TIMEOUT: Duration = Duration::from_millis(500);
+
+/// Background-only committed writes to security stores. HTTP probes only read
+/// this cache, so probe frequency cannot create SQLite writes or grow its WAL.
+pub(super) struct StandaloneStorageReadiness {
+    result: Mutex<(bool, Instant)>,
+}
+
+impl StandaloneStorageReadiness {
+    pub(super) fn start(
+        config: &config::Config,
+        lifecycle: &GatewayLifecycle,
+    ) -> Option<Arc<Self>> {
+        if config.state_backend != config::StateBackend::Sqlite {
+            return None;
+        }
+        let mut paths: Vec<(&'static str, PathBuf)> = [
+            ("service_tokens", config.service_token_sqlite_path.as_ref()),
+            ("connections", config.connections_sqlite_path.as_ref()),
+        ]
+        .into_iter()
+        .filter_map(|(kind, path)| path.map(|path| (kind, PathBuf::from(path))))
+        .collect();
+        if let Some(path) = policy_history_sqlite_path(config) {
+            paths.push(("policy_history", path));
+        }
+        if paths.is_empty() {
+            return None;
+        }
+        let state = Arc::new(Self {
+            result: Mutex::new((Self::check_paths(&paths), Instant::now())),
+        });
+        let background = Arc::clone(&state);
+        let cancellation = lifecycle.background_cancellation();
+        lifecycle.register_background_task(tokio::spawn(async move {
+            let mut interval = tokio::time::interval_at(
+                tokio::time::Instant::now() + SQLITE_READINESS_INTERVAL,
+                SQLITE_READINESS_INTERVAL,
+            );
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                tokio::select! {
+                    biased;
+                    _ = cancellation.cancelled() => break,
+                    _ = interval.tick() => background.check(paths.clone()).await,
+                }
+            }
+        }));
+        Some(state)
+    }
+
+    async fn check(&self, paths: Vec<(&'static str, PathBuf)>) {
+        let healthy = tokio::task::spawn_blocking(move || Self::check_paths(&paths))
+            .await
+            .unwrap_or(false);
+        let mut result = self
+            .result
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        *result = (healthy, Instant::now());
+    }
+
+    fn check_paths(paths: &[(&'static str, PathBuf)]) -> bool {
+        let mut healthy = true;
+        for (kind, path) in paths {
+            let result = check_sqlite_storage(path);
+            ::metrics::counter!(
+                metrics::SQLITE_STORAGE_CHECKS_TOTAL,
+                "store" => *kind,
+                "outcome" => if result.is_ok() { "success" } else { "failure" },
+            )
+            .increment(1);
+            if let Err(error) = result {
+                healthy = false;
+                tracing::warn!(store = kind, error = %error, "SQLite security storage is unavailable");
+            }
+        }
+        healthy
+    }
+
+    pub(super) fn blocked_reason(&self) -> Option<&'static str> {
+        let result = self
+            .result
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        (!result.0 || result.1.elapsed() > SQLITE_READINESS_MAX_AGE)
+            .then_some("storage_unavailable")
+    }
+
+    fn publish_gauges(&self) {
+        let result = self
+            .result
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        ::metrics::gauge!(metrics::SQLITE_STORAGE_HEALTHY).set(
+            if result.0 && result.1.elapsed() <= SQLITE_READINESS_MAX_AGE {
+                1.0
+            } else {
+                0.0
+            },
+        );
+        ::metrics::gauge!(metrics::SQLITE_STORAGE_CHECK_AGE_SECONDS)
+            .set(result.1.elapsed().as_secs_f64());
+    }
+}
+
+fn check_sqlite_storage(path: &FsPath) -> rusqlite::Result<()> {
+    // Never CREATE a missing store: an empty replacement is not recovery.
+    let mut connection =
+        rusqlite::Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE)?;
+    connection.busy_timeout(SQLITE_READINESS_BUSY_TIMEOUT)?;
+    commit_storage_canary(&mut connection)
+}
+
+fn commit_storage_canary(connection: &mut rusqlite::Connection) -> rusqlite::Result<()> {
+    let transaction =
+        connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+    transaction.execute_batch(
+        "CREATE TABLE IF NOT EXISTS gateway_storage_canary (
+            singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
+            value INTEGER NOT NULL CHECK(value IN (0, 1))
+         );
+         INSERT INTO gateway_storage_canary(singleton, value) VALUES(1, 0)
+         ON CONFLICT(singleton) DO UPDATE SET value = 1 - value;",
+    )?;
+    let expected: i64 = transaction.query_row(
+        "SELECT value FROM gateway_storage_canary WHERE singleton = 1",
+        [],
+        |row| row.get(0),
+    )?;
+    transaction.commit()?;
+    let committed: i64 = connection.query_row(
+        "SELECT value FROM gateway_storage_canary WHERE singleton = 1",
+        [],
+        |row| row.get(0),
+    )?;
+    if committed != expected {
+        return Err(rusqlite::Error::InvalidQuery);
+    }
+    Ok(())
+}
+
 pub(super) async fn health(State(state): State<AppState>) -> Json<HealthResponse> {
     record_request("/health");
     let upstream = match state.proxy.as_ref() {
@@ -16,18 +160,18 @@ pub(super) async fn health(State(state): State<AppState>) -> Json<HealthResponse
 
 pub(super) async fn livez() -> impl IntoResponse {
     record_request("/livez");
-    (
+    operational_response((
         StatusCode::OK,
         Json(ProbeResponse {
             status: "alive",
             reason: None,
         }),
-    )
+    ))
 }
 
 pub(super) async fn startupz(State(state): State<AppState>) -> Response {
     record_request("/startupz");
-    if state.lifecycle.startup_complete() {
+    let response = if state.lifecycle.startup_complete() {
         (
             StatusCode::OK,
             Json(ProbeResponse {
@@ -45,7 +189,8 @@ pub(super) async fn startupz(State(state): State<AppState>) -> Response {
             }),
         )
             .into_response()
-    }
+    };
+    operational_response(response)
 }
 
 /// Why this replica refuses readiness, or `None` when it does not.
@@ -58,6 +203,7 @@ pub(super) async fn readiness_blocked_reason(
     lifecycle: &GatewayLifecycle,
     cluster_readiness: Option<&Arc<ha::ClusterReadiness>>,
     readiness_probe: Option<&Arc<ha_status::ReadinessProbe>>,
+    standalone_storage_readiness: Option<&Arc<StandaloneStorageReadiness>>,
     proxy: Option<&ProxyState>,
 ) -> Option<&'static str> {
     if !lifecycle.accepting_work() {
@@ -85,6 +231,9 @@ pub(super) async fn readiness_blocked_reason(
             return Some(reason);
         }
     }
+    if let Some(reason) = standalone_storage_readiness.and_then(|probe| probe.blocked_reason()) {
+        return Some(reason);
+    }
     if proxy.is_some_and(|proxy| !proxy.required_pools_ready()) {
         return Some("required_upstream_unavailable");
     }
@@ -97,10 +246,11 @@ pub(super) async fn readyz(State(state): State<AppState>) -> Response {
         &state.lifecycle,
         state.cluster_readiness.as_ref(),
         state.readiness_probe.as_ref(),
+        state.standalone_storage_readiness.as_ref(),
         state.proxy.as_ref(),
     )
     .await;
-    match reason {
+    let response = match reason {
         Some(reason) => (
             StatusCode::SERVICE_UNAVAILABLE,
             Json(ProbeResponse {
@@ -117,7 +267,8 @@ pub(super) async fn readyz(State(state): State<AppState>) -> Response {
             }),
         )
             .into_response(),
-    }
+    };
+    operational_response(response)
 }
 
 pub(super) async fn version(State(state): State<AppState>) -> Json<VersionResponse> {
@@ -132,13 +283,21 @@ pub(super) async fn version(State(state): State<AppState>) -> Json<VersionRespon
 pub(super) async fn metrics_endpoint(State(state): State<AppState>) -> impl IntoResponse {
     record_request("/metrics");
     publish_scrape_gauges(&state);
-    (
+    operational_response((
         [(
             header::CONTENT_TYPE,
             "text/plain; version=0.0.4; charset=utf-8",
         )],
         state.metrics_handle.render(),
-    )
+    ))
+}
+
+fn operational_response(response: impl IntoResponse) -> Response {
+    let mut response = response.into_response();
+    response
+        .extensions_mut()
+        .insert(middleware::observation::BuiltinOperationalEndpoint);
+    response
 }
 
 /// Sample the process state that has no periodic owner, just before
@@ -162,6 +321,9 @@ pub(super) fn publish_scrape_gauges(state: &AppState) {
     // no transition at all, and "never became ready" is the condition
     // most worth alerting on.
     state.lifecycle.publish_phase_gauges();
+    if let Some(probe) = state.standalone_storage_readiness.as_ref() {
+        probe.publish_gauges();
+    }
     #[cfg(feature = "postgres")]
     if let Some(pool) = state.database_pool.as_ref() {
         storage::postgres::publish_pool_gauges(pool);
@@ -264,5 +426,99 @@ pub(super) fn test_auth_method_label(auth_method: &auth::AuthMethod) -> &'static
         auth::AuthMethod::Bearer => "bearer_token",
         auth::AuthMethod::ServiceToken => "service_token",
         auth::AuthMethod::ClientCertificate => "client_certificate",
+    }
+}
+
+#[cfg(test)]
+mod storage_readiness_tests {
+    use super::*;
+
+    struct TestDatabase(PathBuf);
+
+    impl TestDatabase {
+        fn new() -> Self {
+            let path = std::env::temp_dir().join(format!(
+                "gateway-storage-check-{}.sqlite",
+                uuid::Uuid::new_v4()
+            ));
+            rusqlite::Connection::open(&path).expect("create test database");
+            Self(path)
+        }
+    }
+
+    impl Drop for TestDatabase {
+        fn drop(&mut self) {
+            for suffix in ["", "-wal", "-shm"] {
+                let _ = fs::remove_file(format!("{}{suffix}", self.0.display()));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn lock_failure_recovers_without_http_probes_writing() {
+        let db = TestDatabase::new();
+        let state = StandaloneStorageReadiness {
+            result: Mutex::new((false, Instant::now())),
+        };
+        state.check(vec![("service_tokens", db.0.clone())]).await;
+        assert_eq!(state.blocked_reason(), None);
+        let connection = rusqlite::Connection::open(&db.0).expect("open test database");
+        let before: i64 = connection
+            .query_row("SELECT value FROM gateway_storage_canary", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        connection.execute_batch("BEGIN IMMEDIATE").unwrap();
+        for _ in 0..1000 {
+            assert_eq!(state.blocked_reason(), None);
+            state.publish_gauges();
+        }
+        let after: i64 = connection
+            .query_row("SELECT value FROM gateway_storage_canary", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(
+            before, after,
+            "HTTP probe reads must not perform canary writes"
+        );
+        state.check(vec![("service_tokens", db.0.clone())]).await;
+        assert_eq!(state.blocked_reason(), Some("storage_unavailable"));
+        connection.execute_batch("ROLLBACK").unwrap();
+        state.check(vec![("service_tokens", db.0.clone())]).await;
+        assert_eq!(state.blocked_reason(), None);
+    }
+
+    #[test]
+    fn read_only_and_full_databases_fail_real_committed_write_check() {
+        let mut readonly = rusqlite::Connection::open_in_memory().unwrap();
+        readonly.execute_batch("PRAGMA query_only = ON").unwrap();
+        assert!(commit_storage_canary(&mut readonly).is_err());
+        let mut full = rusqlite::Connection::open_in_memory().unwrap();
+        full.execute_batch("PRAGMA max_page_count = 1").unwrap();
+        let error = commit_storage_canary(&mut full).unwrap_err();
+        assert_eq!(
+            error.sqlite_error_code(),
+            Some(rusqlite::ErrorCode::DiskFull)
+        );
+    }
+
+    #[tokio::test]
+    async fn stale_check_and_missing_store_refuse_readiness() {
+        let state = StandaloneStorageReadiness {
+            result: Mutex::new((
+                true,
+                Instant::now() - SQLITE_READINESS_MAX_AGE - Duration::from_secs(1),
+            )),
+        };
+        assert_eq!(state.blocked_reason(), Some("storage_unavailable"));
+        let db = TestDatabase::new();
+        fs::remove_file(&db.0).unwrap();
+        state.check(vec![("service_tokens", db.0.clone())]).await;
+        assert_eq!(state.blocked_reason(), Some("storage_unavailable"));
+        assert!(
+            !db.0.exists(),
+            "a missing security store must never be recreated by the probe"
+        );
     }
 }

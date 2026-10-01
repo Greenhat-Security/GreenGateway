@@ -24,7 +24,9 @@ The deployment probes are exact, gateway-owned `GET`/`HEAD` routes on the data l
 
 - `/livez` returns `200` while the process is running, including while it is draining.
 - `/startupz` returns `503` until listener startup completes, then remains `200` for the lifetime of the process.
-- `/readyz` returns `200` only while the process accepts work and every upstream pool configured with `required_for_readiness:true` has at least `minimum_healthy` eligible endpoints. It returns `503` while starting, while draining, or when a required pool lacks capacity. Pools not marked as required do not affect readiness.
+- `/readyz` returns `200` only while the process accepts work, configured security storage is healthy, and every upstream pool configured with `required_for_readiness:true` has at least `minimum_healthy` eligible endpoints. It returns `503` while starting, while draining, when security storage is unavailable, or when a required pool lacks capacity. Pools not marked as required do not affect readiness.
+
+In standalone SQLite mode, configured service-token, Connection, and policy-history databases receive a background committed write check every 15 seconds. The check updates one reserved `gateway_storage_canary` row, reads it back after commit, and never creates a missing database. Lock contention waits at most 500 ms per store. HTTP probes only read the cached result; a failed check or a result older than 45 seconds returns `503` with `storage_unavailable`. Recovery needs no incoming traffic. This proves a small write can commit now; it cannot reserve disk space for future writes. Monitor filesystem capacity alongside readiness. Audit-only failures do not refuse traffic, but must alert on audit health and loss metrics.
 - `/health` remains a backward-compatible `200` aggregate response. Detailed per-pool and per-endpoint state remains available only from the protected admin status endpoint.
 
 Probe bodies contain only aggregate state and stable reason categories; they do not expose upstream URLs, endpoint topology, credentials, or internal errors. The default authentication, RBAC, and CSRF exemptions include all four probe routes. Setting an exempt-path variable explicitly replaces that default, so operators using explicit lists should retain the probes needed by their orchestrator.
@@ -398,6 +400,16 @@ Optional SQLite audit event retention window, in days.
 Default: empty, which disables SQLite pruning.
 
 Format and validation: must parse as a `u32` day count when set. `0` is accepted and means the same as leaving the variable empty: pruning disabled. A literal zero-day window would place the prune cutoff at the current instant and delete the entire audit history on every prune tick, so GreenGateway reads `0` as the "no retention limit" the value is normally written to mean and logs a warning at startup. Set a positive day count to prune. This value is only applied when `AUDIT_SQLITE_PATH` is also set; if the path is unset, the parsed retention value is accepted but has no effect. Retention pruning uses the indexed epoch column and runs at most once per minute, independently of the more frequent audit flush cadence. Rows with malformed external timestamps retain a `NULL` epoch and are not deleted automatically.
+
+Deleting retained rows makes SQLite pages reusable; it does not shrink the file or impose a byte limit. Compact only with a verified backup and enough free space, and never replace a database while its writer is running.
+
+### AUDIT_SUCCESSFUL_PROBES_METRICS_ONLY
+
+Default: `false`.
+
+When `true`, successful GET/HEAD responses from the built-in `/livez`, `/startupz`, `/readyz`, and `/metrics` handlers skip `http.request_observed`. Their request metrics remain and `greengateway_successful_operational_observations_suppressed_total` counts suppressed observations. The handler marks its own response, so a business route with a similar name is never excluded. Failed probes, rejected authentication, policy denials and shadow denials, schema mismatches, and upstream traffic remain audited. Authentication and authorization decision events remain unchanged. `/health` and `/version` remain audited. The setting applies to all observation sinks, including stdout and discovery, rather than merely hiding query results.
+
+SQLite audit batches that fail to commit count their events under `audit_events_dropped_total{reason="sqlite"}` and in the admin audit loss total. `greengateway_audit_sqlite_healthy` is `0` after a failed flush and returns to `1` after a later successful flush. Recovery never clears the cumulative loss count, and shutdown still reports historical flush errors.
 
 ### SHUTDOWN_DRAIN_DELAY_MS
 

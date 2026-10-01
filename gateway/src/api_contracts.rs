@@ -1325,6 +1325,7 @@ impl ClusterAdminState {
             &self.lifecycle,
             self.cluster_readiness.as_ref(),
             self.readiness_probe.as_ref(),
+            self.standalone_storage_readiness.as_ref(),
             self.proxy.as_ref(),
         )
         .await;

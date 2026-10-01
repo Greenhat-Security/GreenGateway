@@ -75,6 +75,7 @@ pub struct ObservationState {
     pub client_ip_policy: ClientIpPolicy,
     payload_capture: Option<PayloadCaptureConfig>,
     conformance: Option<SchemaConformanceState>,
+    successful_probes_metrics_only: bool,
 }
 
 impl ObservationState {
@@ -84,6 +85,7 @@ impl ObservationState {
             client_ip_policy: ClientIpPolicy::from_config(config),
             payload_capture: PayloadCaptureConfig::from_config(config),
             conformance: None,
+            successful_probes_metrics_only: config.audit_successful_probes_metrics_only,
         }
     }
 
@@ -417,6 +419,23 @@ pub async fn observation_middleware(
         )
     });
 
+    // Only a response produced by a built-in operational handler can qualify.
+    // Do not let an exempt path prefix or a proxied lookalike suppress evidence.
+    let operational_endpoint = response.extensions().get::<BuiltinOperationalEndpoint>();
+    if state.successful_probes_metrics_only
+        && operational_endpoint.is_some()
+        && matches!(method.as_str(), "GET" | "HEAD")
+        && status == 200
+        && auth_outcome.is_none_or(|outcome| outcome.reason.is_none())
+        && policy_decision.is_none_or(|decision| decision.outcome == PolicyDecisionOutcome::Allowed)
+        && upstream_outcome.is_none()
+        && schema_mismatch != Some(true)
+    {
+        ::metrics::counter!(crate::metrics::SUCCESSFUL_OPERATIONAL_OBSERVATIONS_SUPPRESSED_TOTAL)
+            .increment(1);
+        return response;
+    }
+
     state.audit.emit(AuditEvent::new(
         HTTP_REQUEST_OBSERVED,
         &request_id,
@@ -441,6 +460,10 @@ pub async fn observation_middleware(
 
     response
 }
+
+/// Inserted by gateway-owned handlers, never inferred from caller input.
+#[derive(Clone, Copy)]
+pub(crate) struct BuiltinOperationalEndpoint;
 
 struct ObservationPayloadInput<'a> {
     method: &'a str,
@@ -1707,6 +1730,90 @@ mod tests {
         assert_eq!(event.payload["auth_outcome"], json!("not_evaluated"));
         assert_eq!(event.payload["policy_decision"], json!("not_evaluated"));
         assert!(event.actor.is_none());
+    }
+
+    #[tokio::test]
+    async fn only_successful_builtin_operational_responses_are_metrics_only() {
+        for (enabled, builtin, method, status, expected_events) in [
+            (true, true, Method::GET, StatusCode::OK, 0),
+            (true, true, Method::HEAD, StatusCode::OK, 0),
+            (false, true, Method::GET, StatusCode::OK, 1),
+            (true, false, Method::GET, StatusCode::OK, 1),
+            (true, true, Method::POST, StatusCode::OK, 1),
+            (true, true, Method::GET, StatusCode::SERVICE_UNAVAILABLE, 1),
+            (true, true, Method::GET, StatusCode::UNAUTHORIZED, 1),
+        ] {
+            let (mut state, capture) = test_observation_state();
+            state.successful_probes_metrics_only = enabled;
+            let audit = state.audit.clone();
+            let app = Router::new()
+                .route(
+                    "/readyz",
+                    axum::routing::any(move || async move {
+                        let mut response = status.into_response();
+                        if builtin {
+                            response.extensions_mut().insert(BuiltinOperationalEndpoint);
+                        }
+                        response
+                    }),
+                )
+                .layer(axum::middleware::from_fn_with_state(
+                    state,
+                    observation_middleware,
+                ));
+            assert_eq!(
+                app.oneshot(request(method, "/readyz", "probe-fixture"))
+                    .await
+                    .unwrap()
+                    .status(),
+                status
+            );
+            audit
+                .close_and_drain(Duration::from_secs(2))
+                .await
+                .expect("flush test observations");
+            assert_eq!(capture.events().len(), expected_events);
+        }
+    }
+
+    #[tokio::test]
+    async fn successful_probe_keeps_security_findings() {
+        for policy in [
+            PolicyDecisionOutcome::Denied,
+            PolicyDecisionOutcome::WouldDeny,
+        ] {
+            let (mut state, capture) = test_observation_state();
+            state.successful_probes_metrics_only = true;
+            let audit = state.audit.clone();
+            let app = Router::new()
+                .route(
+                    "/readyz",
+                    axum::routing::get(move || async move {
+                        let mut response = StatusCode::OK.into_response();
+                        response.extensions_mut().insert(BuiltinOperationalEndpoint);
+                        response.extensions_mut().insert(PolicyDecision {
+                            outcome: policy,
+                            reason: "fixture",
+                            permission: None,
+                            path_prefix: None,
+                            matched_rule_id: None,
+                        });
+                        response
+                    }),
+                )
+                .layer(axum::middleware::from_fn_with_state(
+                    state,
+                    observation_middleware,
+                ));
+            app.oneshot(request(Method::GET, "/readyz", "policy-probe-fixture"))
+                .await
+                .unwrap();
+            audit
+                .close_and_drain(Duration::from_secs(2))
+                .await
+                .expect("flush test observations");
+            assert_eq!(capture.events().len(), 1);
+        }
     }
 
     #[tokio::test]
@@ -3157,6 +3264,7 @@ paths:
                     client_ip_policy: ClientIpPolicy::default(),
                     payload_capture: None,
                     conformance: None,
+                    successful_probes_metrics_only: false,
                 },
                 observation_middleware,
             ))
@@ -3170,6 +3278,7 @@ paths:
                 client_ip_policy: ClientIpPolicy::default(),
                 payload_capture: None,
                 conformance: None,
+                successful_probes_metrics_only: false,
             },
             capture,
         )
@@ -3185,6 +3294,7 @@ paths:
                 client_ip_policy: ClientIpPolicy::default(),
                 payload_capture: None,
                 conformance: Some(conformance),
+                successful_probes_metrics_only: false,
             },
             capture,
         )

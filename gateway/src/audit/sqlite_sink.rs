@@ -3,6 +3,7 @@ use std::{
     fmt, io,
     path::PathBuf,
     sync::{
+        atomic::{AtomicU64, Ordering},
         mpsc::{self, RecvTimeoutError, Sender},
         Arc, Mutex, MutexGuard,
     },
@@ -170,12 +171,14 @@ impl SqliteSink {
             source,
         })?;
 
+        ::metrics::gauge!(crate::metrics::AUDIT_SQLITE_HEALTHY).set(1.0);
         let shared = Arc::new(SqliteSinkShared {
             path: config.path,
             retention_days: config.retention_days,
             connection: Mutex::new(connection),
             buffer: Mutex::new(Vec::with_capacity(SQLITE_BATCH_SIZE)),
             flush_failure: Mutex::new(None),
+            dropped: AtomicU64::new(0),
             #[cfg(test)]
             mid_flush_hook: Mutex::new(None),
         });
@@ -237,6 +240,13 @@ impl SqliteSink {
 }
 
 impl AuditSink for SqliteSink {
+    fn backlog(&self) -> crate::audit::sink::SinkBacklog {
+        crate::audit::sink::SinkBacklog {
+            dropped: self.shared.dropped.load(Ordering::Acquire),
+            ..Default::default()
+        }
+    }
+
     fn name(&self) -> &'static str {
         "sqlite"
     }
@@ -270,6 +280,7 @@ struct SqliteSinkShared {
     connection: Mutex<Connection>,
     buffer: Mutex<Vec<AuditEvent>>,
     flush_failure: Mutex<Option<String>>,
+    dropped: AtomicU64,
     // Fires once, between the drain and the INSERT, so a test can drive a
     // second flush into exactly the window the commit-ordering bug lived in
     // instead of waiting for the scheduler to reproduce it.
@@ -309,7 +320,16 @@ impl SqliteSinkShared {
         drop(connection);
 
         crate::audit::record_flush_outcome(result.is_ok());
+        ::metrics::gauge!(crate::metrics::AUDIT_SQLITE_HEALTHY).set(if result.is_ok() {
+            1.0
+        } else {
+            0.0
+        });
         if let Err(err) = result {
+            self.dropped
+                .fetch_add(events.len() as u64, Ordering::AcqRel);
+            ::metrics::counter!(crate::audit::AUDIT_EVENTS_DROPPED_TOTAL, "reason" => "sqlite")
+                .increment(events.len() as u64);
             let mut failure = self
                 .flush_failure
                 .lock()
@@ -701,6 +721,65 @@ mod tests {
 
         let _reopened = sqlite_sink(&db.path, None);
         assert_eq!(row_count(&db.path), 10);
+    }
+
+    #[test]
+    fn failed_batch_is_counted_exactly_and_later_flush_recovers_health() {
+        let db = TempDb::new("loss-recovery");
+        let sink = SqliteSink::new_with_intervals(
+            SqliteSinkConfig {
+                path: db.path.clone(),
+                retention_days: None,
+            },
+            StdDuration::from_secs(3600),
+            StdDuration::from_secs(3600),
+        )
+        .unwrap();
+        let recorder = crate::audit::sink::tests::CountingRecorder::default();
+        sink.shared
+            .connection_guard()
+            .execute_batch("PRAGMA query_only = ON")
+            .unwrap();
+        ::metrics::with_local_recorder(&recorder, || {
+            for index in 0..7 {
+                sink.emit(&test_event(
+                    &format!("audit.refused.{index}"),
+                    json!({"status": 200}),
+                ));
+            }
+            sink.flush_for_test();
+        });
+        assert_eq!(row_count(&db.path), 0);
+        assert_eq!(sink.backlog().dropped, 7);
+        assert_eq!(
+            recorder.count(
+                crate::audit::AUDIT_EVENTS_DROPPED_TOTAL,
+                &[("reason", "sqlite")]
+            ),
+            7
+        );
+        assert_eq!(
+            recorder.gauge_value(crate::metrics::AUDIT_SQLITE_HEALTHY, &[]),
+            Some(0.0)
+        );
+        sink.shared
+            .connection_guard()
+            .execute_batch("PRAGMA query_only = OFF")
+            .unwrap();
+        ::metrics::with_local_recorder(&recorder, || {
+            sink.emit(&test_event("audit.recovered", json!({"status": 200})));
+            sink.flush_for_test();
+        });
+        assert_eq!(row_count(&db.path), 1);
+        assert_eq!(
+            sink.backlog().dropped,
+            7,
+            "recovery must not erase counted historical loss"
+        );
+        assert_eq!(
+            recorder.gauge_value(crate::metrics::AUDIT_SQLITE_HEALTHY, &[]),
+            Some(1.0)
+        );
     }
 
     #[test]

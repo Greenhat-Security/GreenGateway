@@ -151,6 +151,7 @@ pub(super) struct AppState {
     /// lease, and its security watermark. None in standalone mode,
     /// which has no shared authority and so none of these states.
     pub(super) readiness_probe: Option<Arc<ha_status::ReadinessProbe>>,
+    pub(super) standalone_storage_readiness: Option<Arc<StandaloneStorageReadiness>>,
     /// The audit writer, so a scrape can sample its queue (issue #241,
     /// PR 14). The queue has no periodic owner -- the writer is a
     /// blocking consumer -- so publishing from the writer would sample
@@ -385,6 +386,7 @@ pub(super) struct ClusterAdminState {
     pub(super) cluster_readiness: Option<Arc<ha::ClusterReadiness>>,
     pub(super) readiness_probe: Option<Arc<ha_status::ReadinessProbe>>,
     pub(super) proxy: Option<ProxyState>,
+    pub(super) standalone_storage_readiness: Option<Arc<StandaloneStorageReadiness>>,
     /// The cluster security runtime, absent in standalone mode.
     pub(super) security: Option<Arc<dyn cluster_status::SecurityStatus>>,
     pub(super) audit: audit::AuditLog,

@@ -174,23 +174,22 @@ output prevents promotion. See [operator verification and offline evidence](../R
 
 ## Minimal production runtime
 
-The gateway uses the digest-pinned `gcr.io/distroless/cc-debian12:nonroot`
-runtime. It retains Debian glibc compatibility with the Rust builder, CA roots,
-DNS/NSS and timezone data, and Debian package metadata for scanning. The final
-stage installs no packages and copies no libraries from the builder. Shells,
-apt, curl, Perl and mount utilities are absent. See the upstream
-[Distroless runtime contents](https://github.com/GoogleContainerTools/distroless/blob/main/cc/README.md).
+The gateway uses the digest-pinned `gcr.io/distroless/base-nossl-debian13:nonroot`
+runtime. Debian 13 glibc supports the older Rust builder ABI; the actual loader
+and running-image tests enforce compatibility. The base retains CA roots,
+DNS/NSS, fixed tzdata 2026c and Debian package metadata for scanning. Shells,
+apt, curl, Perl, mount utilities and OpenSSL are absent. Gateway uses Rustls,
+and Linux linkage requires only glibc and libgcc.
 
-The current base digest predates Debian's [DLA-4792-1 timezone-data update](https://lists.debian.org/debian-lts-announce/2026/09/msg00027.html).
-Until Distroless publishes the fixed package, the builder extracts the official
-`tzdata_2026c-0+deb12u1_all.deb` data archive, verified by Docker's `ADD --checksum`
-against SHA-256 `c6bdac9aa03e89a112c8d900cb60321889cfec535e0397b74383bd10c8b3cb44`.
-Package name, version and architecture are checked before extraction. Only the
-package data and matching `status.d`/checksum metadata enter the runtime; package
-maintainer scripts are not executed. The final-image check verifies both the
-installed-version metadata and the actual timezone database version, and the
-existing scan still permits no exceptions. Remove this overlay only after a
-reviewed base digest provides the fixed data and passes those checks.
+The builder extracts the official Debian 13 `libgcc-s1` and `gcc-14-base`
+14.2.0-19 data archives, each pinned by Docker `ADD --checksum`. Package names,
+versions and architecture are checked before extraction. Complete package data
+and matching `status.d`/checksum metadata enter the runtime; maintainer scripts
+are not executed and no builder libraries are copied. The image check requires
+libgcc inventory, rejects OpenSSL libraries and metadata, and verifies both the
+tzdata package metadata and the actual timezone database version. The old
+Debian 12 timezone overlay is removed because the new base supplies fixed data.
+The scan still permits no exceptions.
 
 The deployed UID/GID remains **10001:10001**, the working directory remains `/`,
 and the home is `/nonexistent`. Existing volume and secret ownership rules are
