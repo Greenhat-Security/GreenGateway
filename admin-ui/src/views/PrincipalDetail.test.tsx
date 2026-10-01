@@ -40,7 +40,8 @@ describe('PrincipalDetail', () => {
     expect(
       await screen.findByRole('heading', { level: 2, name: 'alice' }),
     ).toBeTruthy();
-    expect(screen.getByText('Bearer').className).toContain('badge');
+    // The page heading comes from the URL before principal data arrives.
+    expect((await screen.findByText('Bearer')).className).toContain('badge');
     expect(screen.getAllByText('https://idp.example').length).toBeGreaterThan(0);
     expect(screen.getByText('alice@example.test')).toBeTruthy();
     expect(screen.getByText('org-a')).toBeTruthy();
