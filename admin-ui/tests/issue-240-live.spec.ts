@@ -547,7 +547,19 @@ async function saveBearerToken(page: Page, token: string) {
       );
     }
   });
-  await page.goto('/admin/');
+  const [initialCapabilities] = await Promise.all([
+    page.waitForResponse((response) =>
+      new URL(response.url()).pathname === '/v1/admin/capabilities'),
+    page.goto('/admin/'),
+  ]);
+  await initialCapabilities.finished();
+  if (initialCapabilities.status() === 401) {
+    // The initial anonymous rejection clears credential inputs. Let the UI
+    // process it before typing; this must not race the credential submission.
+    await expect(page.getByRole('status').filter({
+      hasText: 'Session ended. Sign in again.',
+    })).toBeVisible();
+  }
   await page.getByLabel('Token', { exact: true }).fill(token);
   await page.getByRole('button', { name: 'Save' }).click();
   try {
