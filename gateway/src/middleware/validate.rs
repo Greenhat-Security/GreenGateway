@@ -18,7 +18,10 @@ use serde::Serialize;
 use crate::{
     config::Config,
     request_bounds::{MAX_REQUEST_HOST_BYTES, MAX_REQUEST_METHOD_BYTES},
-    upstream_route::{host_header, HostHeader},
+    upstream_route::{
+        greenpm_research_operation, host_header, GreenPmResearchOperation, HostHeader,
+        ProxyRouteObservationContext, GREENPM_EVIDENCE_REQUEST_BYTES,
+    },
 };
 
 #[derive(Serialize)]
@@ -136,9 +139,10 @@ pub async fn validate_request(State(config): State<Config>, req: Request, next: 
 
     // This early guard rejects declared oversize bodies before downstream
     // handlers apply their streaming byte limits.
+    let body_limit = request_body_limit(&config, &req);
     if let Some(content_length) = content_length(req.headers()) {
-        if content_length > config.max_body_size {
-            return payload_too_large(config.max_body_size);
+        if content_length > body_limit {
+            return payload_too_large(body_limit);
         }
     }
 
@@ -151,6 +155,26 @@ pub async fn validate_request(State(config): State<Config>, req: Request, next: 
     }
 
     next.run(req).await
+}
+
+fn request_body_limit(config: &Config, req: &Request) -> usize {
+    let Some(route) = req.extensions().get::<ProxyRouteObservationContext>() else {
+        return config.max_body_size;
+    };
+    let Some(route_id) = route.route_id.as_deref() else {
+        return config.max_body_size;
+    };
+    let enabled = config.upstream_routes.iter().any(|configured| {
+        configured.id.as_deref() == Some(route_id) && configured.body_limit_profile.is_some()
+    });
+    if enabled
+        && greenpm_research_operation(route_id, req.method(), req.uri())
+            == Some(GreenPmResearchOperation::Upload)
+    {
+        GREENPM_EVIDENCE_REQUEST_BYTES
+    } else {
+        config.max_body_size
+    }
 }
 
 fn is_empty_admin_logout(req: &Request, config: &Config) -> bool {

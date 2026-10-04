@@ -10295,9 +10295,9 @@
         "unexpanded-macro"
       ],
       "scope": "gateway::proxy::admission::impl  PoolAdmission::permit#1",
-      "sha256": "e66c39a53b016ef6fd13754d88ae5feb0d818bc80b121452fb0db8fec379fc84",
+      "sha256": "3f3f37c74693e2a0b42f6179150601630c275958095cb2282901fddc900c13df",
       "owner": "GreenGateway maintainers",
-      "purpose": "Existing macro/attribute inputs for this exact application item; changed expansion inputs require explicit review."
+      "purpose": "Reviewed exact GreenPM research byte budgets, bounded single-export buffering, retained admission lifetime and replica agreement; no additional transport authority."
     },
     {
       "file": "gateway/src/proxy/admission.rs",
@@ -10386,9 +10386,9 @@
         "unexpanded-macro"
       ],
       "scope": "gateway::proxy::forward::forward_to_upstream#1",
-      "sha256": "048dacb8cc214c88a1fdda8b5da12f5f69ae726bc64dfc3549aebbc70fb20fbe",
+      "sha256": "b5130d2a45182a6d96511b92f4100f0c2b2feae883c3d8ccd0d555f01f808d91",
       "owner": "GreenGateway maintainers",
-      "purpose": "Existing macro/attribute inputs for this exact application item; changed expansion inputs require explicit review."
+      "purpose": "Reviewed exact GreenPM research byte budgets, bounded single-export buffering, retained admission lifetime and replica agreement; no additional transport authority."
     },
     {
       "file": "gateway/src/proxy/forward.rs",

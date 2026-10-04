@@ -1,0 +1,146 @@
+{
+  "rules": [
+    {
+      "id": "greenpm-research-project-catalog",
+      "methods": [
+        "GET"
+      ],
+      "path": "/api/greenpm-owned/research/projects",
+      "dispatch": {
+        "kind": "route",
+        "route_id": "greenpm-owned"
+      },
+      "principal": {
+        "auth_methods": [
+          "session_cookie"
+        ],
+        "issuers": [
+          "provider:greenhat-session"
+        ]
+      },
+      "action": "allow"
+    },
+    {
+      "id": "greenpm-project-research",
+      "methods": [
+        "GET",
+        "PATCH"
+      ],
+      "path": "/api/greenpm-owned/projects/{project_id}/research",
+      "dispatch": {
+        "kind": "route",
+        "route_id": "greenpm-owned"
+      },
+      "principal": {
+        "auth_methods": [
+          "session_cookie"
+        ],
+        "issuers": [
+          "provider:greenhat-session"
+        ]
+      },
+      "action": "allow"
+    },
+    {
+      "id": "greenpm-task-research",
+      "methods": [
+        "GET",
+        "PATCH"
+      ],
+      "path": "/api/greenpm-owned/tasks/{task_id}/research",
+      "dispatch": {
+        "kind": "route",
+        "route_id": "greenpm-owned"
+      },
+      "principal": {
+        "auth_methods": [
+          "session_cookie"
+        ],
+        "issuers": [
+          "provider:greenhat-session"
+        ]
+      },
+      "action": "allow"
+    },
+    {
+      "id": "greenpm-task-research-review",
+      "methods": [
+        "POST"
+      ],
+      "path": "/api/greenpm-owned/tasks/{task_id}/research/review",
+      "dispatch": {
+        "kind": "route",
+        "route_id": "greenpm-owned"
+      },
+      "principal": {
+        "auth_methods": [
+          "session_cookie"
+        ],
+        "issuers": [
+          "provider:greenhat-session"
+        ]
+      },
+      "action": "allow"
+    },
+    {
+      "id": "greenpm-task-research-evidence-upload",
+      "methods": [
+        "POST"
+      ],
+      "path": "/api/greenpm-owned/tasks/{task_id}/research/evidence",
+      "dispatch": {
+        "kind": "route",
+        "route_id": "greenpm-owned"
+      },
+      "principal": {
+        "auth_methods": [
+          "session_cookie"
+        ],
+        "issuers": [
+          "provider:greenhat-session"
+        ]
+      },
+      "action": "allow"
+    },
+    {
+      "id": "greenpm-task-research-evidence-download",
+      "methods": [
+        "GET"
+      ],
+      "path": "/api/greenpm-owned/tasks/{task_id}/research/evidence/{evidence_id}",
+      "dispatch": {
+        "kind": "route",
+        "route_id": "greenpm-owned"
+      },
+      "principal": {
+        "auth_methods": [
+          "session_cookie"
+        ],
+        "issuers": [
+          "provider:greenhat-session"
+        ]
+      },
+      "action": "allow"
+    },
+    {
+      "id": "greenpm-project-research-export",
+      "methods": [
+        "GET"
+      ],
+      "path": "/api/greenpm-owned/projects/{project_id}/research/export",
+      "dispatch": {
+        "kind": "route",
+        "route_id": "greenpm-owned"
+      },
+      "principal": {
+        "auth_methods": [
+          "session_cookie"
+        ],
+        "issuers": [
+          "provider:greenhat-session"
+        ]
+      },
+      "action": "allow"
+    }
+  ]
+}

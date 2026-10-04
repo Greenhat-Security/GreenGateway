@@ -17,6 +17,7 @@ pub(super) struct PoolAdmission {
 pub(super) struct PoolAdmissionPermit {
     pool_id: Arc<str>,
     _in_flight: OwnedSemaphorePermit,
+    _resource: Option<OwnedSemaphorePermit>,
 }
 
 struct QueuedGauge {
@@ -90,6 +91,7 @@ impl PoolAdmission {
         PoolAdmissionPermit {
             pool_id: Arc::clone(&self.pool_id),
             _in_flight: permit,
+            _resource: None,
         }
     }
 
@@ -100,6 +102,15 @@ impl PoolAdmission {
             "reason" => reason
         )
         .increment(1);
+    }
+}
+
+impl PoolAdmissionPermit {
+    /// Retain an additional bounded resource through the same response-pump
+    /// completion, cancellation, shutdown and timeout lifetime as admission.
+    pub(super) fn retaining(mut self, resource: Option<OwnedSemaphorePermit>) -> Self {
+        self._resource = resource;
+        self
     }
 }
 

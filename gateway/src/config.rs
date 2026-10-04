@@ -806,6 +806,9 @@ pub struct UpstreamRouteConfig {
     /// This never forwards an arbitrary Cookie header or a bearer credential.
     #[serde(default)]
     pub forward_cookie_session: bool,
+    /// Reviewed, operation-specific bounds; never a general route-wide override.
+    #[serde(default)]
+    pub body_limit_profile: Option<UpstreamBodyLimitProfile>,
     /// Destination name for the already-validated canonical CSRF cookie.
     #[serde(default)]
     pub upstream_csrf_cookie_name: Option<String>,
@@ -851,6 +854,12 @@ pub struct UpstreamRouteConfig {
     pub tls_ca_bundle_path: Option<PathBuf>,
     #[serde(default)]
     pub openapi_spec_path: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UpstreamBodyLimitProfile {
+    GreenpmResearchV1,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -5455,6 +5464,16 @@ fn validate_upstream_routes(
             &add_request_headers,
             problems,
         );
+        if route.body_limit_profile.is_some()
+            && (id.as_deref() != Some("greenpm-owned")
+                || path_prefix.as_deref() != Some("/api/greenpm-owned")
+                || upstream_url.trim_end_matches('/') != "https://greenpm-api.fly.dev"
+                || !route.forward_cookie_session)
+        {
+            problems.push(format!(
+                "{route_name}.body_limit_profile requires the greenpm-owned cookie-session route at /api/greenpm-owned to https://greenpm-api.fly.dev"
+            ));
+        }
         if route.forward_cookie_session {
             let setting = format!("{route_name}.forward_cookie_session");
             if id.is_none() || path_prefix.as_deref().is_none_or(|prefix| prefix == "/") {
@@ -5973,6 +5992,7 @@ fn validate_upstream_routes(
         validated.push(UpstreamRouteConfig {
             id,
             forward_cookie_session: route.forward_cookie_session,
+            body_limit_profile: route.body_limit_profile,
             upstream_csrf_cookie_name: route.upstream_csrf_cookie_name,
             connection_id,
             path_prefix,

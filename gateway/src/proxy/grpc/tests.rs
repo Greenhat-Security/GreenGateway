@@ -414,6 +414,7 @@ fn harness_with_added_headers(
         proxy: ProxyState {
             routes: ProxyRoutes::RoutingTable {
                 routes: vec![ProxyRoute {
+                    research_transport: None,
                     route_id: "grpc".to_owned(),
                     path_prefix: Some("/".to_owned()),
                     host: None,

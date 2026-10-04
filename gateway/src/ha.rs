@@ -628,6 +628,14 @@ fn insert_route(input: &mut BTreeMap<String, String>, prefix: &str, route: &Upst
     if route.forward_cookie_session {
         input.insert(format!("{prefix}.forward_cookie_session"), "true".into());
     }
+    // Disabled profiles preserve the prior projection for rolling upgrades.
+    // Enabled byte budgets and buffering behavior must agree across replicas.
+    if let Some(profile) = route.body_limit_profile {
+        let name = match profile {
+            crate::config::UpstreamBodyLimitProfile::GreenpmResearchV1 => "greenpm_research_v1",
+        };
+        input.insert(format!("{prefix}.body_limit_profile"), name.into());
+    }
     for (endpoint_index, endpoint) in route.upstreams.iter().enumerate() {
         let endpoint_prefix = format!("{prefix}.endpoint[{endpoint_index}]");
         input.insert(format!("{endpoint_prefix}.id"), endpoint.id.clone());
@@ -1160,6 +1168,29 @@ mod tests {
             static_config_fingerprint(&base),
             static_config_fingerprint(&changed)
         );
+    }
+
+    #[test]
+    fn greenpm_research_profile_participates_in_replica_agreement() {
+        let route = r#"[{"id":"greenpm-owned","path_prefix":"/api/greenpm-owned","upstream_url":"https://greenpm-api.fly.dev","forward_cookie_session":true}]"#;
+        let base = config_from(&[("UPSTREAM_ROUTES", route)]);
+        let mut enabled = base.clone();
+        enabled.upstream_routes[0].body_limit_profile =
+            Some(crate::config::UpstreamBodyLimitProfile::GreenpmResearchV1);
+        assert_ne!(
+            static_config_fingerprint(&base),
+            static_config_fingerprint(&enabled)
+        );
+        let mut before = BTreeMap::new();
+        insert_route(&mut before, "route", &base.upstream_routes[0]);
+        assert!(!before.contains_key("route.body_limit_profile"));
+        let mut after = BTreeMap::new();
+        insert_route(&mut after, "route", &enabled.upstream_routes[0]);
+        assert_eq!(
+            after.remove("route.body_limit_profile").as_deref(),
+            Some("greenpm_research_v1")
+        );
+        assert_eq!(before, after, "disabled projection remains unchanged");
     }
 
     #[test]

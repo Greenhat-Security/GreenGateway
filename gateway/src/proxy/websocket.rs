@@ -1825,6 +1825,7 @@ mod tests {
             ("x-user-header", "kept"),
         ]);
         let upstream = MatchedUpstream {
+            research_transport: None,
             connection_id: None,
             request_header_policy: RouteRequestHeaderPolicy::default(),
             pool: test_pool(),
@@ -1908,6 +1909,7 @@ mod tests {
     fn an_upgrade_without_a_negotiated_subprotocol_or_origin_sends_neither() {
         let parts = handshake_parts(&[("origin", "https://app.example")]);
         let upstream = MatchedUpstream {
+            research_transport: None,
             connection_id: None,
             request_header_policy: RouteRequestHeaderPolicy::default(),
             pool: test_pool(),

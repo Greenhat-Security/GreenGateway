@@ -2,9 +2,52 @@
 
 use std::net::Ipv6Addr;
 
-use http::{header, HeaderMap, Uri};
+use http::{header, HeaderMap, Method, Uri};
 
 use crate::{path_match::path_prefix_matches, request_bounds::MAX_REQUEST_HOST_BYTES};
+
+/// Fixed bounds for the opt-in GreenPM research transport profile. These are
+/// not grants: authentication, route policy and CSRF still run before forwarding.
+pub(crate) const GREENPM_EVIDENCE_REQUEST_BYTES: usize = 1_572_864;
+pub(crate) const GREENPM_RESEARCH_EXPORT_BYTES: usize = 23_068_672;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum GreenPmResearchOperation {
+    Upload,
+    Export,
+}
+
+pub(crate) fn greenpm_research_operation(
+    route_id: &str,
+    method: &Method,
+    uri: &Uri,
+) -> Option<GreenPmResearchOperation> {
+    // Compare the raw path. Encoded separators, escaped UUIDs, dot segments,
+    // suffixes, query switches and method aliases cannot widen either budget.
+    if route_id != "greenpm-owned" || uri.query().is_some() {
+        return None;
+    }
+    let parts = uri.path().split('/').collect::<Vec<_>>();
+    let ["", "api", "greenpm-owned", resource, id, "research", action] = parts.as_slice() else {
+        return None;
+    };
+    if id.len() != 36
+        || !id.bytes().enumerate().all(|(index, byte)| {
+            if matches!(index, 8 | 13 | 18 | 23) {
+                byte == b'-'
+            } else {
+                byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)
+            }
+        })
+    {
+        return None;
+    }
+    match (*resource, *action, method) {
+        ("tasks", "evidence", &Method::POST) => Some(GreenPmResearchOperation::Upload),
+        ("projects", "export", &Method::GET) => Some(GreenPmResearchOperation::Export),
+        _ => None,
+    }
+}
 
 pub(crate) const STABLE_ROUTE_ID_MAX_LEN: usize = 64;
 
@@ -564,5 +607,88 @@ mod tests {
 
         // Origin-form: no authority, so the Host field alone decides.
         assert_eq!(classify(&HeaderMap::new()), HostHeader::Absent);
+    }
+}
+
+#[cfg(test)]
+mod greenpm_research_tests {
+    use super::{greenpm_research_operation, GreenPmResearchOperation};
+    use http::{Method, Uri};
+
+    #[test]
+    fn greenpm_research_bounds_require_exact_route_method_and_canonical_path() {
+        let id = "11111111-2222-4333-8444-aaaaaaaaaaaa";
+        let upload = format!("/api/greenpm-owned/tasks/{id}/research/evidence");
+        let export = format!("/api/greenpm-owned/projects/{id}/research/export");
+        for (method, path, operation) in [
+            (Method::POST, &upload, GreenPmResearchOperation::Upload),
+            (Method::GET, &export, GreenPmResearchOperation::Export),
+        ] {
+            assert_eq!(
+                greenpm_research_operation("greenpm-owned", &method, &path.parse::<Uri>().unwrap()),
+                Some(operation)
+            );
+            assert_eq!(
+                greenpm_research_operation("other", &method, &path.parse::<Uri>().unwrap()),
+                None
+            );
+            for altered in [
+                format!("{path}/"),
+                format!("{path}/extra"),
+                format!("{path}?download=1"),
+                format!("{path}?"),
+                path.replace("/research/", "//research/"),
+                path.replace("/research/", "/../research/"),
+                path.replace("/research/", "/%2e%2e/research/"),
+                path.replace(id, &id.to_uppercase()),
+                path.replace(id, "not-a-uuid"),
+                path.replace("/tasks/", "/%74asks/")
+                    .replace("/projects/", "/%70rojects/"),
+                path.replace("/research/", "%2Fresearch/"),
+                path.replace("/research/", "%5Cresearch/"),
+            ] {
+                assert_eq!(
+                    greenpm_research_operation(
+                        "greenpm-owned",
+                        &method,
+                        &altered.parse::<Uri>().unwrap()
+                    ),
+                    None,
+                    "{altered}"
+                );
+            }
+            for other in [
+                Method::HEAD,
+                Method::PUT,
+                Method::PATCH,
+                Method::DELETE,
+                Method::OPTIONS,
+            ] {
+                assert_eq!(
+                    greenpm_research_operation(
+                        "greenpm-owned",
+                        &other,
+                        &path.parse::<Uri>().unwrap()
+                    ),
+                    None
+                );
+            }
+        }
+        assert_eq!(
+            greenpm_research_operation(
+                "greenpm-owned",
+                &Method::GET,
+                &upload.parse::<Uri>().unwrap()
+            ),
+            None
+        );
+        assert_eq!(
+            greenpm_research_operation(
+                "greenpm-owned",
+                &Method::POST,
+                &export.parse::<Uri>().unwrap()
+            ),
+            None
+        );
     }
 }

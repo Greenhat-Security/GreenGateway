@@ -1311,6 +1311,7 @@ fn route(
     config::UpstreamRouteConfig {
         id: None,
         forward_cookie_session: false,
+        body_limit_profile: None,
         upstream_csrf_cookie_name: None,
         connection_id: None,
         path_prefix: path_prefix.map(str::to_owned),
