@@ -3571,6 +3571,7 @@ fn upstream_routes_parse_json_array_and_normalize_matchers() {
             UpstreamRouteConfig {
                 id: None,
                 forward_cookie_session: false,
+                body_limit_profile: None,
                 upstream_csrf_cookie_name: None,
                 connection_id: None,
                 path_prefix: Some("/api".to_owned()),
@@ -3600,6 +3601,7 @@ fn upstream_routes_parse_json_array_and_normalize_matchers() {
             UpstreamRouteConfig {
                 id: None,
                 forward_cookie_session: false,
+                body_limit_profile: None,
                 upstream_csrf_cookie_name: None,
                 connection_id: None,
                 path_prefix: Some("/assets".to_owned()),
@@ -6087,4 +6089,68 @@ fn upstream_csrf_cookie_translation_is_opt_in_and_rejects_identity_names() {
     route["upstream_csrf_cookie_name"] = serde_json::json!("gh_api_csrf");
     route["forward_cookie_session"] = serde_json::json!(false);
     assert!(cookie_session_route_config(route, &[]).is_err());
+}
+
+#[test]
+fn greenpm_research_profile_is_opt_in_and_pinned_to_the_owned_origin() {
+    let route = serde_json::json!({
+        "id":"greenpm-owned", "path_prefix":"/api/greenpm-owned",
+        "upstream_url":"https://greenpm-api.fly.dev", "forward_cookie_session":true,
+        "body_limit_profile":"greenpm_research_v1"
+    });
+    let config = cookie_session_route_config(route.clone(), &[]).unwrap();
+    assert_eq!(
+        config.upstream_routes[0].body_limit_profile,
+        Some(UpstreamBodyLimitProfile::GreenpmResearchV1)
+    );
+    assert_eq!(config.max_body_size, 1_048_576);
+    assert_eq!(config.egress_max_request_body_bytes, 1_048_576);
+    assert_eq!(config.egress_max_response_bytes, 5_242_880);
+    for (field, value) in [
+        ("id", serde_json::json!("unrelated")),
+        (
+            "path_prefix",
+            serde_json::json!("/api/greenpm-owned/research"),
+        ),
+        (
+            "upstream_url",
+            serde_json::json!("https://other.example.test"),
+        ),
+        (
+            "upstream_url",
+            serde_json::json!("https://greenpm-api.fly.dev:444"),
+        ),
+        (
+            "upstream_url",
+            serde_json::json!("https://greenpm-api.fly.dev/other"),
+        ),
+        (
+            "upstream_url",
+            serde_json::json!("http://greenpm-api.fly.dev"),
+        ),
+        ("forward_cookie_session", serde_json::json!(false)),
+        ("request_body", serde_json::json!({"mode":"stream"})),
+        ("sse", serde_json::json!({})),
+        ("body_limit_profile", serde_json::json!("unbounded")),
+    ] {
+        let mut invalid = route.clone();
+        invalid[field] = value;
+        assert!(
+            cookie_session_route_config(invalid, &[]).is_err(),
+            "{field}"
+        );
+    }
+    for setting in ["AUTH_ENABLED", "CSRF_ENABLED"] {
+        assert!(cookie_session_route_config(route.clone(), &[(setting, "false")]).is_err());
+    }
+    let mut ordinary = route;
+    ordinary
+        .as_object_mut()
+        .unwrap()
+        .remove("body_limit_profile");
+    assert!(cookie_session_route_config(ordinary, &[])
+        .unwrap()
+        .upstream_routes[0]
+        .body_limit_profile
+        .is_none());
 }

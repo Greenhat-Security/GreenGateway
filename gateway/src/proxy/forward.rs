@@ -23,7 +23,7 @@ use super::{retry, MatchedUpstream, ProxyState, RequestBodyMode, RouteRequestHea
 use crate::{
     audit, auth,
     connections::http::{ConnectionHttpError, ConnectionHttpTarget},
-    egress, middleware,
+    egress, middleware, upstream_route,
 };
 
 pub(super) const REQUEST_ID_HEADER: &str = "x-request-id";
@@ -266,7 +266,48 @@ async fn forward_to_upstream(
             .await;
         }
     }
+    let research_operation = upstream.research_transport.as_ref().and_then(|_| {
+        upstream_route::greenpm_research_operation(&upstream.pool.id, &parts.method, &parts.uri)
+    });
+    let research_client =
+        upstream
+            .research_transport
+            .as_ref()
+            .and_then(|transport| match research_operation {
+                Some(upstream_route::GreenPmResearchOperation::Upload) => Some(&transport.upload),
+                Some(upstream_route::GreenPmResearchOperation::Export) => Some(&transport.export),
+                None => None,
+            });
+    let max_request_body_bytes = research_client.map_or(proxy.max_request_body_bytes, |client| {
+        client.max_request_body_bytes()
+    });
     let request_id = parts.headers.get(REQUEST_ID_HEADER).cloned();
+    let export_buffer_permit = if research_operation
+        == Some(upstream_route::GreenPmResearchOperation::Export)
+    {
+        let Some(transport) = upstream.research_transport.as_ref() else {
+            return admission_unavailable_response(&upstream.pool.id, request_id);
+        };
+        match Arc::clone(&transport.export_buffers).try_acquire_owned() {
+            Ok(permit) => Some(permit),
+            Err(_) => {
+                proxy.audit.emit(audit::AuditEvent::new(
+                    "upstream.research_export_admission",
+                    request_id.as_ref().and_then(|value| value.to_str().ok()).unwrap_or("unknown"),
+                    source_ip,
+                    parts.extensions.get::<auth::Principal>().map(auth::actor_from_principal),
+                    json!({"route_id": upstream.pool.id.as_ref(), "outcome": "rejected", "reason": "buffer_busy"}),
+                ));
+                let mut response = admission_unavailable_response(&upstream.pool.id, request_id);
+                response
+                    .headers_mut()
+                    .insert(header::RETRY_AFTER, HeaderValue::from_static("5"));
+                return response;
+            }
+        }
+    } else {
+        None
+    };
     let Some(response_stream_registration) = proxy.lifecycle.try_register_response_stream() else {
         tracing::info!(
             pool_id = upstream.pool.id.as_ref(),
@@ -285,11 +326,11 @@ async fn forward_to_upstream(
         Ok(length) => length,
         Err(()) => return invalid_request_body(),
     };
-    if known_length.is_some_and(|size| size > proxy.max_request_body_bytes as u64) {
+    if known_length.is_some_and(|size| size > max_request_body_bytes as u64) {
         if let Some(payload_capture) = payload_capture.as_ref() {
             payload_capture.mark_body_capture_incomplete();
         }
-        return crate::payload_too_large(proxy.max_request_body_bytes);
+        return crate::payload_too_large(max_request_body_bytes);
     }
     if proxy.lifecycle.draining() {
         tracing::info!(
@@ -313,7 +354,7 @@ async fn forward_to_upstream(
         result = upstream.pool.admission.acquire() => result,
     };
     let admission_permit = match admission_result {
-        Ok(permit) => permit,
+        Ok(permit) => permit.retaining(export_buffer_permit),
         Err(error) => {
             let reason = match error {
                 super::admission::PoolAdmissionError::QueueFull => "queue_full",
@@ -351,7 +392,7 @@ async fn forward_to_upstream(
                 }
                 buffered = tokio::time::timeout_at(
                     body_read_deadline,
-                    read_buffered_request_body(body, proxy.max_request_body_bytes),
+                    read_buffered_request_body(body, max_request_body_bytes),
                 ) => buffered,
             };
             match buffered {
@@ -376,15 +417,15 @@ async fn forward_to_upstream(
                         BufferedRequestBodyError::TooLarge => {
                             tracing::warn!(
                                 error_category = "request_body_too_large",
-                                max = proxy.max_request_body_bytes,
+                                max = max_request_body_bytes,
                                 "proxied request body exceeded the configured limit"
                             );
-                            return crate::payload_too_large(proxy.max_request_body_bytes);
+                            return crate::payload_too_large(max_request_body_bytes);
                         }
                         BufferedRequestBodyError::ReadFailed => {
                             tracing::warn!(
                                 error_category = "request_body_read_failed",
-                                max = proxy.max_request_body_bytes,
+                                max = max_request_body_bytes,
                                 "failed to read proxied request body"
                             );
                             return invalid_request_body();
@@ -703,12 +744,13 @@ async fn forward_to_upstream(
         if let Some(cookie) = delegated_cookie.as_ref() {
             super::cookie_session::inject(&mut headers, cookie);
         }
-        let egress_client = prepared_connection_transport
-            .as_ref()
-            .map_or(&endpoint.egress_client, |prepared| prepared.client());
+        let egress_client = prepared_connection_transport.as_ref().map_or(
+            research_client.unwrap_or(&endpoint.egress_client),
+            |prepared| prepared.client(),
+        );
         let attempt_started = Instant::now();
         let send = async {
-            if let Some(sse) = upstream.sse {
+            let result = if let Some(sse) = upstream.sse {
                 let max_response_bytes = sse
                     .max_response_bytes
                     .unwrap_or_else(|| Some(egress_client.max_response_bytes()));
@@ -761,6 +803,12 @@ async fn forward_to_upstream(
                             .await
                     }
                 }
+            };
+            let response = result?;
+            if research_operation == Some(upstream_route::GreenPmResearchOperation::Export) {
+                buffer_research_export(response).await
+            } else {
+                Ok(response)
             }
         };
         let sent = tokio::select! {
@@ -2178,6 +2226,47 @@ fn is_hop_by_hop_header(name: &HeaderName) -> bool {
     )
 }
 
+/// Finish the bounded archive before sending any successful headers or bytes.
+/// An oversized or failed chunked export therefore returns a normal 502 instead
+/// of an apparently successful, partially downloaded ZIP. The caller wraps this
+/// read in the existing total deadline and shutdown cancellation.
+async fn buffer_research_export(
+    mut response: egress::EgressStreamResponse,
+) -> Result<egress::EgressStreamResponse, egress::EgressError> {
+    const CHUNK_BYTES: usize = 64 * 1024;
+    let mut chunks = Vec::new();
+    let mut pending = Vec::with_capacity(CHUNK_BYTES);
+    let mut size = 0usize;
+    while let Some(chunk) = response.body.next().await {
+        let chunk = chunk?;
+        size = size.saturating_add(chunk.len());
+        if size > upstream_route::GREENPM_RESEARCH_EXPORT_BYTES {
+            return Err(egress::EgressError::ResponseTooLarge {
+                size,
+                max: upstream_route::GREENPM_RESEARCH_EXPORT_BYTES,
+            });
+        }
+        // Coalesce tiny upstream frames as well as splitting large ones. At
+        // most 352 independent allocations retain the archive; an emitted
+        // chunk never keeps the rest alive after cancellation releases admission.
+        let mut remaining = chunk.as_ref();
+        while !remaining.is_empty() {
+            let count = remaining.len().min(CHUNK_BYTES - pending.len());
+            pending.extend_from_slice(&remaining[..count]);
+            remaining = &remaining[count..];
+            if pending.len() == CHUNK_BYTES {
+                let complete = std::mem::replace(&mut pending, Vec::with_capacity(CHUNK_BYTES));
+                chunks.push(Ok(bytes::Bytes::from(complete)));
+            }
+        }
+    }
+    if !pending.is_empty() {
+        chunks.push(Ok(bytes::Bytes::from(pending)));
+    }
+    response.body = Box::pin(stream::iter(chunks));
+    Ok(response)
+}
+
 fn proxy_error_response(error: &egress::EgressError) -> Response {
     let (status, code) = match error {
         egress::EgressError::RequestBodyTooLarge { .. } => {
@@ -2385,6 +2474,366 @@ mod tests {
         },
         proxy::{health, ProxyEndpoint, ProxyRoute, ProxyRoutes, RequestBodyMode, UpstreamPool},
     };
+
+    fn greenpm_research_proxy(address: SocketAddr, enabled: bool) -> ProxyState {
+        let (mut proxy, _) = retry_proxy([address, address], None, Duration::from_secs(10));
+        proxy.max_request_body_bytes = 1_048_576;
+        let ProxyRoutes::RoutingTable { routes } = &mut proxy.routes else {
+            panic!("route");
+        };
+        let route = &mut routes[0];
+        route.route_id = "greenpm-owned".into();
+        route.path_prefix = Some("/api/greenpm-owned".into());
+        Arc::get_mut(&mut route.pool).unwrap().id = Arc::from("greenpm-owned");
+        if enabled {
+            // Production validation pins HTTPS + cookie delegation. This isolated
+            // transport fixture substitutes a loopback origin after that gate.
+            let route_config = serde_json::from_value(serde_json::json!({
+                "id":"greenpm-owned", "path_prefix":"/api/greenpm-owned",
+                "upstream_url":"https://greenpm-api.fly.dev", "forward_cookie_session":true,
+                "body_limit_profile":"greenpm_research_v1"
+            }))
+            .unwrap();
+            let egress_config = egress::EgressConfig {
+                allowed_hosts: HashSet::from(["127.0.0.1".into()]),
+                deny_private_ips: false,
+                timeout: Duration::from_secs(10),
+                ..egress::EgressConfig::default()
+            };
+            route.research_transport = super::super::ResearchTransport::from_route(
+                &route_config,
+                &egress_config,
+                &route.pool.endpoints[0].egress_client,
+            )
+            .unwrap();
+        }
+        proxy
+    }
+
+    #[tokio::test]
+    async fn greenpm_research_profile_never_bypasses_cookie_delegation() {
+        let mut proxy = greenpm_research_proxy("127.0.0.1:9".parse().unwrap(), true);
+        let ProxyRoutes::RoutingTable { routes } = &mut proxy.routes else {
+            panic!("route");
+        };
+        routes[0].request_header_policy.cookie_session =
+            Some(super::super::cookie_session::CookieSessionPolicy {
+                session_cookie_name: "session".into(),
+                csrf_cookie_name: "csrf_token".into(),
+                upstream_csrf_cookie_name: "csrf_token".into(),
+                csrf_header_name: "x-csrf-token".into(),
+            });
+        let request = Request::builder()
+            .method(Method::POST)
+            .uri("/api/greenpm-owned/tasks/11111111-2222-4333-8444-aaaaaaaaaaaa/research/evidence")
+            .header(CONTENT_TYPE, "application/json")
+            .header("x-user-id", "forged-user")
+            .header("x-org-id", "forged-org")
+            .body(Body::from_stream(stream::pending::<
+                Result<bytes::Bytes, io::Error>,
+            >()))
+            .unwrap();
+        let response = tokio::time::timeout(
+            Duration::from_millis(250),
+            proxy.forward_request(request, "203.0.113.7"),
+        )
+        .await
+        .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn greenpm_research_upload_counts_actual_bytes_with_and_without_content_length() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let received = Arc::new(AtomicUsize::new(0));
+        let observed = Arc::clone(&received);
+        let app = axum::Router::new().fallback(move |request: Request<Body>| {
+            let observed = Arc::clone(&observed);
+            async move {
+                let body = axum::body::to_bytes(request.into_body(), 2_000_000)
+                    .await
+                    .unwrap();
+                observed.store(body.len(), Ordering::SeqCst);
+                StatusCode::OK
+            }
+        });
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let path =
+            "/api/greenpm-owned/tasks/11111111-2222-4333-8444-aaaaaaaaaaaa/research/evidence";
+        for declared in [true, false] {
+            for (enabled, length, expected) in [
+                (true, 1_572_864, StatusCode::OK),
+                (true, 1_572_865, StatusCode::PAYLOAD_TOO_LARGE),
+                (false, 1_048_577, StatusCode::PAYLOAD_TOO_LARGE),
+                (false, 1_048_576, StatusCode::OK),
+            ] {
+                received.store(0, Ordering::SeqCst);
+                let proxy = greenpm_research_proxy(address, enabled);
+                let mut request = Request::builder()
+                    .method(Method::POST)
+                    .uri(path)
+                    .header(CONTENT_TYPE, "application/json");
+                if declared {
+                    request = request.header(CONTENT_LENGTH, length);
+                }
+                let body = Body::from_stream(stream::iter([Ok::<_, io::Error>(
+                    bytes::Bytes::from(vec![b' '; length]),
+                )]));
+                let response = proxy
+                    .forward_request(request.body(body).unwrap(), "203.0.113.7")
+                    .await;
+                assert_eq!(
+                    response.status(),
+                    expected,
+                    "enabled={enabled}, declared={declared}, length={length}"
+                );
+                if expected == StatusCode::OK {
+                    axum::body::to_bytes(response.into_body(), 1024)
+                        .await
+                        .unwrap();
+                    assert_eq!(received.load(Ordering::SeqCst), length);
+                } else {
+                    assert_eq!(
+                        received.load(Ordering::SeqCst),
+                        0,
+                        "reject before origin I/O"
+                    );
+                }
+            }
+        }
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn greenpm_research_export_is_bounded_before_success_and_defaults_stay_unchanged() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let size = Arc::new(AtomicUsize::new(0));
+        let source_size = Arc::clone(&size);
+        let app = axum::Router::new().fallback(move || {
+            let size = source_size.load(Ordering::SeqCst);
+            async move {
+                // Unknown length: exercise the actual counter, not a header.
+                let chunks = (0..size).step_by(65_536).map(move |start| {
+                    Ok::<_, io::Error>(bytes::Bytes::from(vec![b'z'; (size - start).min(65_536)]))
+                });
+                (
+                    [
+                        (CONTENT_TYPE, "application/zip"),
+                        (
+                            header::CONTENT_DISPOSITION,
+                            "attachment; filename=research.zip",
+                        ),
+                        (
+                            header::CONTENT_SECURITY_POLICY,
+                            "default-src 'none'; sandbox",
+                        ),
+                        (
+                            HeaderName::from_static("x-content-sha256"),
+                            "synthetic-hash",
+                        ),
+                    ],
+                    Body::from_stream(stream::iter(chunks)),
+                )
+            }
+        });
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let path =
+            "/api/greenpm-owned/projects/11111111-2222-4333-8444-aaaaaaaaaaaa/research/export";
+        for (enabled, length, success) in [
+            (true, 6_291_456, true),
+            (true, 23_068_672, true),
+            (true, 23_068_673, false),
+            (false, 6_291_456, false),
+        ] {
+            size.store(length, Ordering::SeqCst);
+            let proxy = greenpm_research_proxy(address, enabled);
+            let response = proxy
+                .forward_request(
+                    Request::builder()
+                        .method(Method::GET)
+                        .uri(path)
+                        .body(Body::empty())
+                        .unwrap(),
+                    "203.0.113.7",
+                )
+                .await;
+            if success {
+                assert_eq!(response.status(), StatusCode::OK);
+                assert_eq!(
+                    response.headers()[header::CONTENT_DISPOSITION],
+                    "attachment; filename=research.zip"
+                );
+                assert_eq!(
+                    response.headers()[header::CONTENT_SECURITY_POLICY],
+                    "default-src 'none'; sandbox"
+                );
+                assert_eq!(response.headers()["x-content-sha256"], "synthetic-hash");
+                assert_eq!(
+                    axum::body::to_bytes(response.into_body(), 24_000_000)
+                        .await
+                        .unwrap()
+                        .len(),
+                    length
+                );
+            } else if enabled {
+                assert_eq!(
+                    response.status(),
+                    StatusCode::BAD_GATEWAY,
+                    "no successful partial archive"
+                );
+                assert!(!response.headers().contains_key(header::CONTENT_DISPOSITION));
+            } else {
+                assert!(
+                    response.status() == StatusCode::BAD_GATEWAY
+                        || axum::body::to_bytes(response.into_body(), 24_000_000)
+                            .await
+                            .is_err(),
+                    "ordinary response cap is still 5 MiB"
+                );
+            }
+        }
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn greenpm_research_export_buffer_admission_survives_handoff_and_releases() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let received = Arc::new(AtomicUsize::new(0));
+        let archive_size = Arc::new(AtomicUsize::new(6_291_456));
+        let count = Arc::clone(&received);
+        let current_size = Arc::clone(&archive_size);
+        let app = axum::Router::new().fallback(move |request: Request<Body>| {
+            count.fetch_add(1, Ordering::SeqCst);
+            let size = if request.uri().path().ends_with("/export") {
+                current_size.load(Ordering::SeqCst)
+            } else {
+                16
+            };
+            async move { Body::from(vec![b'z'; size]) }
+        });
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let proxy = greenpm_research_proxy(address, true);
+        let ProxyRoutes::RoutingTable { routes } = &proxy.routes else {
+            panic!("route");
+        };
+        let budget = Arc::clone(
+            &routes[0]
+                .research_transport
+                .as_ref()
+                .unwrap()
+                .export_buffers,
+        );
+        let path =
+            "/api/greenpm-owned/projects/11111111-2222-4333-8444-aaaaaaaaaaaa/research/export";
+        let request = |path: &str| {
+            Request::builder()
+                .method(Method::GET)
+                .uri(path)
+                .body(Body::empty())
+                .unwrap()
+        };
+        let held = proxy.forward_request(request(path), "203.0.113.7").await;
+        assert_eq!(held.status(), StatusCode::OK);
+        assert_eq!(
+            budget.available_permits(),
+            0,
+            "retain after complete upstream read"
+        );
+        let rejected = proxy.forward_request(request(path), "203.0.113.7").await;
+        assert_eq!(rejected.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(rejected.headers()[header::RETRY_AFTER], "5");
+        assert_eq!(
+            received.load(Ordering::SeqCst),
+            1,
+            "busy export never contacts origin"
+        );
+        let ordinary = proxy
+            .forward_request(
+                request("/api/greenpm-owned/research/projects"),
+                "203.0.113.7",
+            )
+            .await;
+        assert_eq!(
+            ordinary.status(),
+            StatusCode::OK,
+            "ordinary reads do not share export budget"
+        );
+        axum::body::to_bytes(ordinary.into_body(), 1024)
+            .await
+            .unwrap();
+        assert_eq!(budget.available_permits(), 0);
+        drop(held);
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while budget.available_permits() == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        let consumed = proxy.forward_request(request(path), "203.0.113.7").await;
+        assert_eq!(
+            axum::body::to_bytes(consumed.into_body(), 24_000_000)
+                .await
+                .unwrap()
+                .len(),
+            6_291_456
+        );
+        assert_eq!(
+            budget.available_permits(),
+            1,
+            "EOF releases the buffer budget"
+        );
+        archive_size.store(23_068_673, Ordering::SeqCst);
+        let too_large = proxy.forward_request(request(path), "203.0.113.7").await;
+        assert_eq!(too_large.status(), StatusCode::BAD_GATEWAY);
+        assert_eq!(
+            budget.available_permits(),
+            1,
+            "read failure releases the buffer budget"
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn greenpm_research_export_coalesces_tiny_origin_frames() {
+        let response = egress::EgressStreamResponse {
+            status: StatusCode::OK,
+            headers: HeaderMap::new(),
+            body: Box::pin(stream::iter(
+                (0..131_073).map(|_| Ok(bytes::Bytes::from_static(b"x"))),
+            )),
+        };
+        let buffered = buffer_research_export(response).await.unwrap();
+        let chunks = buffered.body.collect::<Vec<_>>().await;
+        assert_eq!(
+            chunks.len(),
+            3,
+            "tiny frames cannot amplify retained chunk metadata"
+        );
+        assert_eq!(
+            chunks
+                .into_iter()
+                .map(|chunk| chunk.unwrap().len())
+                .collect::<Vec<_>>(),
+            [65_536, 65_536, 1]
+        );
+    }
+
+    #[tokio::test]
+    async fn greenpm_research_export_refuses_upstream_body_errors() {
+        let response = egress::EgressStreamResponse {
+            status: StatusCode::OK,
+            headers: HeaderMap::new(),
+            body: Box::pin(stream::iter([
+                Ok(bytes::Bytes::from_static(b"incomplete zip")),
+                Err(egress::EgressError::ResponseTooLarge { size: 2, max: 1 }),
+            ])),
+        };
+        assert!(buffer_research_export(response).await.is_err());
+    }
 
     const TEST_ATTEMPT_KEY_HEADER: &str = "x-test-attempt-key";
 
@@ -5181,6 +5630,7 @@ mod tests {
             ProxyState {
                 routes: ProxyRoutes::RoutingTable {
                     routes: vec![ProxyRoute {
+                        research_transport: None,
                         route_id: "payments".to_owned(),
                         path_prefix: Some("/".to_owned()),
                         host: None,

@@ -790,3 +790,128 @@ async fn ignores_content_type_for_get_requests() {
 
     assert_eq!(response.status(), StatusCode::OK);
 }
+
+#[tokio::test]
+async fn greenpm_research_upload_preflight_preserves_json_and_default_bounds() {
+    let upload = "/api/greenpm-owned/tasks/11111111-2222-4333-8444-aaaaaaaaaaaa/research/evidence";
+    let mut config = test_config(1_048_576, vec!["application/json"]);
+    config.upstream_routes = vec![serde_json::from_value(serde_json::json!({
+        "id":"greenpm-owned", "path_prefix":"/api/greenpm-owned",
+        "upstream_url":"https://greenpm-api.fly.dev", "forward_cookie_session":true,
+        "body_limit_profile":"greenpm_research_v1"
+    }))
+    .unwrap()];
+    for (classified, enabled, method, path, mime, length, expected) in [
+        (
+            true,
+            true,
+            "POST",
+            upload,
+            "application/json",
+            1_572_864,
+            StatusCode::OK,
+        ),
+        (
+            true,
+            true,
+            "POST",
+            upload,
+            "application/json",
+            1_572_865,
+            StatusCode::PAYLOAD_TOO_LARGE,
+        ),
+        (
+            false,
+            true,
+            "POST",
+            upload,
+            "application/json",
+            1_048_577,
+            StatusCode::PAYLOAD_TOO_LARGE,
+        ),
+        (
+            true,
+            false,
+            "POST",
+            upload,
+            "application/json",
+            1_048_577,
+            StatusCode::PAYLOAD_TOO_LARGE,
+        ),
+        (
+            true,
+            true,
+            "PATCH",
+            upload,
+            "application/json",
+            1_048_577,
+            StatusCode::PAYLOAD_TOO_LARGE,
+        ),
+        (
+            true,
+            true,
+            "POST",
+            "/api/greenpm-owned/tasks",
+            "application/json",
+            1_048_577,
+            StatusCode::PAYLOAD_TOO_LARGE,
+        ),
+        (
+            true,
+            true,
+            "POST",
+            upload,
+            "application/octet-stream",
+            1_100_000,
+            StatusCode::UNSUPPORTED_MEDIA_TYPE,
+        ),
+        (
+            true,
+            true,
+            "POST",
+            upload,
+            "multipart/form-data",
+            1_100_000,
+            StatusCode::UNSUPPORTED_MEDIA_TYPE,
+        ),
+        (
+            true,
+            false,
+            "POST",
+            upload,
+            "application/json",
+            1_048_576,
+            StatusCode::OK,
+        ),
+    ] {
+        let mut current = config.clone();
+        if !enabled {
+            current.upstream_routes[0].body_limit_profile = None;
+        }
+        let app = Router::new()
+            .fallback(|| async { StatusCode::OK })
+            .layer(from_fn_with_state(current, validate_request));
+        let mut request = Request::builder()
+            .method(method)
+            .uri(path)
+            .header(CONTENT_TYPE, mime)
+            .header(CONTENT_LENGTH, length)
+            .body(Body::empty())
+            .unwrap();
+        if classified {
+            request
+                .extensions_mut()
+                .insert(ProxyRouteObservationContext::new_with_route_id(
+                    "greenpm-owned".into(),
+                    None,
+                    Some("/api/greenpm-owned".into()),
+                    "https://greenpm-api.fly.dev".into(),
+                ));
+        }
+        assert_eq!(
+            app.oneshot(request).await.unwrap().status(),
+            expected,
+            "classified={classified}, profile={enabled}, method={method}, length={length}"
+        );
+    }
+}

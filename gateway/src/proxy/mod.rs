@@ -159,6 +159,7 @@ struct ProxyRoute {
     connection_id: Option<String>,
     request_header_policy: RouteRequestHeaderPolicy,
     pool: Arc<UpstreamPool>,
+    research_transport: Option<ResearchTransport>,
     request_body_mode: RequestBodyMode,
     sse: Option<SseResponseConfig>,
     websocket: Option<Arc<websocket::RouteWebSocketRuntime>>,
@@ -187,10 +188,43 @@ struct MatchedUpstream {
     connection_id: Option<String>,
     request_header_policy: RouteRequestHeaderPolicy,
     pool: Arc<UpstreamPool>,
+    research_transport: Option<ResearchTransport>,
     request_body_mode: RequestBodyMode,
     sse: Option<SseResponseConfig>,
     websocket: Option<Arc<websocket::RouteWebSocketRuntime>>,
     grpc: Option<Arc<grpc::RouteGrpcRuntime>>,
+}
+
+/// Dedicated clients share the existing resolver/cache and all timeout/TLS/SSRF
+/// settings. Only a fixed operation classifier may select their byte bounds.
+#[derive(Clone)]
+struct ResearchTransport {
+    upload: Arc<egress::EgressClient>,
+    export: Arc<egress::EgressClient>,
+    export_buffers: Arc<tokio::sync::Semaphore>,
+}
+
+impl ResearchTransport {
+    fn from_route(
+        route: &config::UpstreamRouteConfig,
+        default_config: &egress::EgressConfig,
+        default_client: &egress::EgressClient,
+    ) -> Result<Option<Self>, egress::EgressError> {
+        if route.body_limit_profile.is_none() {
+            return Ok(None);
+        }
+        let mut upload_config = default_config.clone();
+        RouteEgressClientKey::from_route(route, route.tls_ca_bundle_path.clone(), None)
+            .apply_to_config(&mut upload_config)?;
+        let mut export_config = upload_config.clone();
+        upload_config.max_request_body_bytes = upstream_route::GREENPM_EVIDENCE_REQUEST_BYTES;
+        export_config.max_response_bytes = upstream_route::GREENPM_RESEARCH_EXPORT_BYTES;
+        Ok(Some(Self {
+            upload: Arc::new(default_client.reconfigured(upload_config)?),
+            export: Arc::new(default_client.reconfigured(export_config)?),
+            export_buffers: Arc::new(tokio::sync::Semaphore::new(1)),
+        }))
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -544,6 +578,11 @@ impl ProxyState {
                     connection_id: route.connection_id.clone(),
                     request_header_policy,
                     pool,
+                    research_transport: ResearchTransport::from_route(
+                        route,
+                        default_egress_config,
+                        &egress_client,
+                    )?,
                     request_body_mode: route.request_body.mode.into(),
                     sse: route.sse.as_ref().map(Into::into),
                     websocket: websocket_runtime,
@@ -630,6 +669,7 @@ impl ProxyState {
                 connection_id: None,
                 request_header_policy: RouteRequestHeaderPolicy::default(),
                 pool: Arc::clone(pool),
+                research_transport: None,
                 request_body_mode: RequestBodyMode::Buffered,
                 sse: None,
                 websocket: None,
@@ -640,6 +680,7 @@ impl ProxyState {
                     connection_id: route.connection_id.clone(),
                     request_header_policy: route.request_header_policy.clone(),
                     pool: Arc::clone(&route.pool),
+                    research_transport: route.research_transport.clone(),
                     request_body_mode: route.request_body_mode,
                     sse: route.sse,
                     websocket: route.websocket.clone(),
@@ -1263,9 +1304,35 @@ mod tests {
     }
 
     #[test]
+    fn greenpm_research_clients_preserve_configured_global_limits() {
+        let route = serde_json::from_value(serde_json::json!({
+            "id":"greenpm-owned", "path_prefix":"/api/greenpm-owned",
+            "upstream_url":"https://greenpm-api.fly.dev", "forward_cookie_session":true,
+            "body_limit_profile":"greenpm_research_v1"
+        }))
+        .unwrap();
+        let config = egress::EgressConfig {
+            max_request_body_bytes: 16_777_216,
+            max_response_bytes: 8_388_608,
+            ..egress::EgressConfig::default()
+        };
+        let ordinary = egress::EgressClient::new(config.clone()).unwrap();
+        let specialized = ResearchTransport::from_route(&route, &config, &ordinary)
+            .unwrap()
+            .unwrap();
+        assert_eq!(ordinary.max_request_body_bytes(), 16_777_216);
+        assert_eq!(ordinary.max_response_bytes(), 8_388_608);
+        assert_eq!(specialized.upload.max_request_body_bytes(), 1_572_864);
+        assert_eq!(specialized.upload.max_response_bytes(), 8_388_608);
+        assert_eq!(specialized.export.max_request_body_bytes(), 16_777_216);
+        assert_eq!(specialized.export.max_response_bytes(), 23_068_672);
+    }
+
+    #[test]
     fn generated_legacy_route_id_depends_on_logical_matcher_not_endpoint() {
         let mut route = config::UpstreamRouteConfig {
             forward_cookie_session: false,
+            body_limit_profile: None,
             upstream_csrf_cookie_name: None,
             id: None,
             connection_id: None,
@@ -1434,6 +1501,7 @@ mod tests {
             None,
         ));
         let connection_route = ProxyRoute {
+            research_transport: None,
             route_id: "connection-route".to_owned(),
             path_prefix: Some("/secure".to_owned()),
             host: None,
@@ -1525,6 +1593,7 @@ mod tests {
         );
         let route = config::UpstreamRouteConfig {
             forward_cookie_session: false,
+            body_limit_profile: None,
             upstream_csrf_cookie_name: None,
             id: None,
             connection_id: None,
@@ -1575,6 +1644,7 @@ mod tests {
         let second_identity_path = write_test_client_identity("second");
         let route = config::UpstreamRouteConfig {
             forward_cookie_session: false,
+            body_limit_profile: None,
             upstream_csrf_cookie_name: None,
             id: Some("payments".to_owned()),
             connection_id: None,
