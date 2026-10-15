@@ -11790,6 +11790,86 @@ fn redacted_partial_mtls_draft_round_trips_each_hidden_binding_independently() {
     assert!(!private_key_only.requires_secrets_write_to_replace(&private_key_candidate));
 }
 
+#[test]
+fn replacement_keeps_an_omitted_caller_assertion_and_removes_it_only_on_null() {
+    // The admin UI does not edit the block, so a routine edit omits it. Reading
+    // that as removal would put a Connection that cannot yet attest its caller
+    // back into service without the assertion.
+    let current: connections::model::ConnectionWrite = serde_json::from_value(json!({
+        "display_name": "Attested API",
+        "enabled": true,
+        "kind": "http_api",
+        "endpoint": {
+            "base_url": "https://billing.example.test",
+            "base_path": "/"
+        },
+        "authentication": {"type": "none"},
+        "caller_assertion": {
+            "signing_key_id": "assertion-signing-key",
+            "kid": "gw-test-1",
+            "algorithm": "es256",
+            "issuer": "https://gateway.example.test",
+            "audience": "https://billing.example.test",
+            "token_type": "at+jwt",
+            "header_name": "x-caller-assertion",
+            "lifetime_seconds": 60
+        },
+        "tls": {}
+    }))
+    .expect("attested Connection should deserialize");
+    let current = current
+        .validated()
+        .expect("attested Connection should validate");
+    let mut routine_edit = json!({
+        "display_name": "Attested API renamed",
+        "enabled": false,
+        "kind": "http_api",
+        "endpoint": {
+            "base_url": "https://billing.example.test",
+            "base_path": "/"
+        },
+        "authentication": {"type": "none"},
+        "tls": {}
+    });
+
+    let kept = parse_connection_write_body(&Bytes::from(routine_edit.to_string()), &current)
+        .expect("an edit that omits the assertion should keep it");
+    assert_eq!(kept.caller_assertion, current.caller_assertion);
+    assert_eq!(kept.display_name, "Attested API renamed");
+    assert!(!kept.enabled);
+    assert_eq!(
+        connections::admin::changed_connection_fields(Some(&current), Some(&kept)),
+        vec!["display_name", "enabled"]
+    );
+
+    routine_edit["caller_assertion"] = Value::Null;
+    let removed = parse_connection_write_body(&Bytes::from(routine_edit.to_string()), &current)
+        .expect("an explicit null should remove the assertion");
+    assert!(removed.caller_assertion.is_none());
+    assert!(
+        connections::admin::changed_connection_fields(Some(&current), Some(&removed))
+            .contains(&"caller_assertion")
+    );
+
+    // With no current block there is nothing to keep.
+    let mut unattested = current.clone();
+    unattested.caller_assertion = None;
+    let plain_edit = json!({
+        "display_name": "Plain API",
+        "enabled": true,
+        "kind": "http_api",
+        "endpoint": {
+            "base_url": "https://billing.example.test",
+            "base_path": "/"
+        },
+        "authentication": {"type": "none"},
+        "tls": {}
+    });
+    let plain = parse_connection_write_body(&Bytes::from(plain_edit.to_string()), &unattested)
+        .expect("an edit of an unattested Connection should parse");
+    assert!(plain.caller_assertion.is_none());
+}
+
 #[tokio::test]
 async fn managed_openapi_preview_and_register_enforce_permissions_and_revisions() {
     let connection_db = TempDb::new("connection-openapi-admin-guards");

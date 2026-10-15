@@ -598,7 +598,13 @@
         "endpoint": {
           "$ref": "#/$defs/Endpoint"
         },
-        "caller_assertion": { "$ref": "#/$defs/CallerAssertion" },
+        "caller_assertion": {
+          "oneOf": [
+            { "$ref": "#/$defs/CallerAssertion" },
+            { "type": "null" }
+          ],
+          "description": "Omitted keeps the current block, because a safe read cannot be sent back and the admin UI does not edit it; null removes it."
+        },
         "authentication": {
           "$ref": "#/$defs/MutationAuthentication"
         },
