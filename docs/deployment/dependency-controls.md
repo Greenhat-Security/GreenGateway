@@ -39,10 +39,10 @@ names and dependency claims that do not match the current tree. In particular:
   is not a CVE.
 - [GHSA-h395-gr6q-cpjc](https://github.com/Keats/jsonwebtoken/security/advisories/GHSA-h395-gr6q-cpjc)
   affected the runtime `jsonwebtoken` dependency. Its minimum version is now
-  11.0.0, well past the first patched release (10.3.0), and Cargo.lock selects
-  11.0.0. JWT validation uses the AWS-LC backend already present in the TLS
-  stack. Publish and verify a new image before updating deployment digests; a
-  previous image retains its original dependencies.
+  11.0.0, well past the first patched release (10.3.0), and Cargo.lock now
+  selects 11.1.0. JWT validation uses the AWS-LC backend already present in
+  the TLS stack. Publish and verify a new image before updating deployment
+  digests; a previous image retains its original dependencies.
 - The npm gates and the nightly fixture/HTTP buffering fixes are included in
   the preceding production-readiness change. The five release benchmarks passed
   locally without increasing budgets; production load validation is separate.
@@ -62,13 +62,16 @@ and the Dockerfile must agree with it. `scripts/build_tools.py check` rejects
 missing declarations, version drift, unpinned installs and implicit npx downloads.
 CI uses the shared `.github/actions/build-tools` action before any build.
 
-The production/default compiler is Rust 1.98.0, matching the reviewed
+The production/default compiler is Rust 1.99.0, matching the reviewed
 Docker image update.
 The required `production-compiler` job checks all targets with that compiler;
-ordinary CI uses the previously passing Rust 1.98.1. Coverage remains on
-nightly-2026-09-01 with cargo-llvm-cov 0.9.0 and unchanged floors. Its dated
-compiler is deliberate, not an invitation to follow nightly updates.
-Node 26.8.2 and bundled npm 11.19.1 match the current pinned Node image.
+ordinary CI uses the previously passing Rust 1.98.1. As with the 1.98.0 image
+update, the CI compiler does not follow the production image: moving it changes
+the enforced lint set and the microbenchmark compiler, so it is reviewed
+separately. Coverage remains on nightly-2026-09-01 with cargo-llvm-cov 0.9.0
+and unchanged floors. Its dated compiler is deliberate, not an invitation to
+follow nightly updates.
+Node 26.10.0 and bundled npm 11.19.1 match the current pinned Node image.
 Gateway builds verify the actual Node/npm executable versions before installing
 UI dependencies, and Docker additionally checks its actual Rust version.
 Cargo builds use the existing lockfile without resolution updates.

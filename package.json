@@ -20,8 +20,8 @@
   "devDependencies": {
     "@cloudflare/workers-types": "^5.20260915.1",
     "typescript": "^7.0.2",
-    "vitest": "^5.0.1",
-    "wrangler": "4.145.0"
+    "vitest": "^5.0.3",
+    "wrangler": "4.149.0"
   },
   "cloudflare": {
     "bindings": {
@@ -46,12 +46,12 @@
     }
   },
   "engines": {
-    "node": "26.8.2",
+    "node": "26.10.0",
     "npm": "11.19.1"
   },
   "allowScripts": {
-    "https://registry.npmjs.org/esbuild/-/esbuild-0.28.1.tgz": false,
+    "https://registry.npmjs.org/esbuild/-/esbuild-0.28.2.tgz": false,
     "https://registry.npmjs.org/fsevents/-/fsevents-2.3.3.tgz": false,
-    "https://registry.npmjs.org/workerd/-/workerd-1.20260930.2.tgz": false
+    "https://registry.npmjs.org/workerd/-/workerd-1.20261006.1.tgz": false
   }
 }

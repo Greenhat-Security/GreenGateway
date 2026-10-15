@@ -118,7 +118,7 @@ jobs:
         run: python scripts/microbench.py run --base "$BASE_SHA" --head "$HEAD_SHA" --output target/microbench
       - name: Preserve base, head and comparison evidence
         if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: microbench-${{ github.sha }}
           path: target/microbench/
@@ -153,7 +153,7 @@ jobs:
         run: python scripts/security_corpus.py --mode regression --report target/security-corpus/report.json
       - name: Preserve redacted corpus decision
         if: ${{ always() }}
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: security-corpus
           path: target/security-corpus/report.json
@@ -188,14 +188,14 @@ jobs:
         run: python scripts/check-security-coverage.py target/security-coverage.json
       - name: Preserve coverage evidence
         if: ${{ always() && steps.coverage.outcome == 'success' }}
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: security-coverage
           path: target/security-coverage.json
           if-no-files-found: error
       - name: Preserve available coverage failure diagnostics
         if: ${{ always() && steps.coverage.outcome != 'success' }}
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: security-coverage-diagnostics
           path: target/security-coverage.json
@@ -246,7 +246,7 @@ jobs:
         run: python scripts/alert_rules.py check
       - name: Preserve alert validation evidence
         if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: operational-alerts
           path: target/alert-rules/
@@ -275,7 +275,7 @@ jobs:
         run: python scripts/cargo_policy.py check
       - name: Retain policy decisions and exact exception evidence
         if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: cargo-policy-${{ matrix.os }}
           path: target/cargo-policy/
@@ -304,7 +304,7 @@ jobs:
           python -m unittest discover -s scripts -p test_transport_guard.py -v
       - name: Upload transport ownership decision
         if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: transport-ownership
           path: target/transport-guard/
@@ -499,7 +499,7 @@ jobs:
 
       - name: Retain live admin UI evidence
         if: ${{ always() && steps.live-ui.outcome == 'success' }}
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: admin-ui-live-evidence
           path: admin-ui/playwright-report/live-summary.json
@@ -519,7 +519,7 @@ jobs:
 
       - name: Retain required screenshot evidence
         if: ${{ always() && steps.screenshots.outcome == 'success' }}
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: admin-ui-screenshot-evidence
           path: |
@@ -531,7 +531,7 @@ jobs:
 
       - name: Retain available admin UI diagnostics
         if: ${{ always() }}
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: admin-ui-test-diagnostics
           path: |
@@ -733,7 +733,7 @@ jobs:
 
       - name: Retain stream evidence
         if: ${{ always() && steps.dev-smoke.outcome == 'success' }}
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: dev-stream-evidence
           path: artifacts/proxy-load/ci-stream-summary.json
@@ -757,7 +757,7 @@ jobs:
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
 
       - name: Install cargo-audit
-        uses: taiki-e/install-action@fa23953489c080190314742a9b907f8e97c6767c # v2
+        uses: taiki-e/install-action@f7e5d7c961414b23f5b25b2da9294395d08513ad # v2
         with:
           tool: cargo-audit@0.22.2
           checksum: true
@@ -1050,7 +1050,7 @@ jobs:
       - name: Set up verified Buildx and pinned BuildKit
         uses: ./.github/actions/buildx
       - name: Build without publishing
-        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: .
           file: ./Dockerfile
@@ -1061,7 +1061,7 @@ jobs:
         run: python scripts/check-runtime-image.py --image greengateway:preview --scan-preview
       - name: Preserve preview runtime and scan evidence
         if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: preview-runtime
           path: target/runtime-check/
@@ -1117,7 +1117,7 @@ jobs:
           python scripts/check-runtime-image.py --image "$image" --output target/image-scan/runtime
       - name: Preserve raw findings and gate decision
         if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: image-scan-${{ github.sha }}
           path: target/image-scan/
@@ -1151,7 +1151,7 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
       - name: Download this run's SBOM and bundles
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: image-evidence-${{ github.sha }}
           path: target/image-evidence/
@@ -1163,7 +1163,7 @@ jobs:
         run: python scripts/image_evidence.py verify
       - name: Preserve verifier results
         if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: image-verification-${{ github.sha }}
           path: target/image-verification/

@@ -1,8 +1,8 @@
 # syntax=docker/dockerfile:1@sha256:ecfaec9ed6d810b56388c508f4121597bfbba70d41a6dfeee4d8cad5f295fc32
 
-FROM node:26.8.2-bookworm-slim@sha256:cd9f682fa2885cd1056e830424764158570061c59736a1da836bc3d73df095ae AS node
+FROM node:26.10.0-bookworm-slim@sha256:662933cf47f013bc8e4beb31a6116448427a82057ba7c42c97e4c5ba766504c2 AS node
 
-FROM rust:1.98.0-slim-bookworm@sha256:1469a27c125cb5a3aebfa4f4e4665d935b02fb72cc093b2c974b3d740e43f157 AS builder
+FROM rust:1.99.0-slim-bookworm@sha256:2c3a22f0a5533ea2dd5a16627bc841228151faa2d4de2644ac9987e4a2f1f2fa AS builder
 
 COPY --from=node /usr/local/bin/node /usr/local/bin/node
 COPY --from=node /usr/local/lib/node_modules /usr/local/lib/node_modules
@@ -16,7 +16,7 @@ COPY .node-version .npm-version build-tools.json npm-script-policy.json ./
 COPY scripts/npm-script-policy.mjs scripts/npm-script-policy.mjs
 RUN test "$(node --version)" = "v$(cat .node-version)" \
     && test "$(npm --version)" = "$(cat .npm-version)" \
-    && rustc --version | grep -E '^rustc 1\.98\.0 '
+    && rustc --version | grep -E '^rustc 1\.99\.0 '
 COPY gateway/Cargo.toml gateway/Cargo.toml
 
 RUN mkdir -p gateway/src \
