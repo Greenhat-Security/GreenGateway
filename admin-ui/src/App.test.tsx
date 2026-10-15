@@ -13,16 +13,29 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import { AdminShell } from './App';
 import { adminFetchJson } from './lib/api';
-import { ADMIN_TOKEN_STORAGE_KEY, getMemoryToken, clearMemoryToken, setMemoryToken } from './lib/auth';
+import { getAdminIdentityVersion } from './lib/adminSession';
+import { ADMIN_TOKEN_STORAGE_KEY, getMemoryToken, clearMemoryToken, isBearerSelected, setMemoryToken } from './lib/auth';
+
+const ADMIN_SESSION = {
+  storage: 'standalone_memory',
+  completion_mode: 'cookie',
+  login_url: '/v1/admin/auth/login',
+  completion_url: '/v1/admin/auth/callback',
+  logout_url: '/v1/admin/auth/logout',
+  max_age_seconds: 3600,
+};
 
 afterEach(() => {
   cleanup();
   clearMemoryToken();
+  vi.restoreAllMocks();
   vi.unstubAllGlobals();
   window.localStorage.removeItem('greengateway_admin_theme');
   window.sessionStorage.removeItem(ADMIN_TOKEN_STORAGE_KEY);
   window.history.replaceState(null, '', '/');
   document.cookie = 'csrf_token=; Max-Age=0; Path=/';
+  document.cookie = 'ops_csrf=; Max-Age=0; Path=/';
+  document.querySelectorAll('meta[data-auth-test]').forEach((meta) => meta.remove());
   delete document.documentElement.dataset.theme;
 });
 
@@ -246,6 +259,218 @@ describe('AdminShell', () => {
 
     const link = await screen.findByRole('link', { name: 'Log in with SSO' });
     expect(link.getAttribute('href')).toBe('/v1/admin/auth/login');
+  });
+
+  it('completes an offered cookie session without reading, storing or rendering a token', async () => {
+    document.cookie = 'csrf_token=browser-csrf; Path=/';
+    const canary = `test-${crypto.randomUUID()}`;
+    const read = vi.spyOn(Storage.prototype, 'getItem');
+    const write = vi.spyOn(Storage.prototype, 'setItem');
+    const fetch = sessionFetchMock({
+      '/version': offeredVersion,
+      // Even a token-shaped field in a cookie completion is never read.
+      '/v1/admin/auth/callback': () => jsonResponse({ authenticated: true, expires_in: 3600, access_token: canary }),
+    });
+    vi.stubGlobal('fetch', fetch);
+    window.history.replaceState(null, '', '/admin/#/auth/complete?code=authorization-code&state=browser-bound-state');
+    const identity = getAdminIdentityVersion();
+
+    render(<StrictMode><MemoryRouter><AdminShell /></MemoryRouter></StrictMode>);
+
+    await screen.findByText('Signed in with SSO. The session cookie lasts until logout or session expiry.');
+    const completions = fetch.mock.calls.filter(([url]) => url === '/v1/admin/auth/callback');
+    expect(completions).toHaveLength(1);
+    expect(completions[0][1]).toMatchObject({
+      method: 'POST',
+      credentials: 'same-origin',
+      cache: 'no-store',
+      redirect: 'error',
+      body: JSON.stringify({ code: 'authorization-code', state: 'browser-bound-state', mode: 'cookie' }),
+    });
+    const headers = new Headers(completions[0][1]?.headers);
+    expect(headers.get('x-csrf-token')).toBe('browser-csrf');
+    expect(headers.has('authorization')).toBe(false);
+    expect(getMemoryToken()).toBeNull();
+    expect(isBearerSelected()).toBe(false);
+    expect(getAdminIdentityVersion()).toBeGreaterThan(identity);
+    expect(document.documentElement.outerHTML.includes(canary)).toBe(false);
+    expect(read.mock.calls.every(([key]) => key === 'greengateway_admin_theme')).toBe(true);
+    expect(write.mock.calls.every(([key]) => key === 'greengateway_admin_theme')).toBe(true);
+    expect(window.sessionStorage.length).toBe(0);
+    expect(screen.queryByLabelText('Token', { exact: true })).toBeNull();
+    expect(screen.getByRole('link', { name: 'Log in with SSO' }).getAttribute('href')).toBe('/v1/admin/auth/login');
+  });
+
+  it('logs out of the cookie session through the shared client with the CSRF header', async () => {
+    document.cookie = 'csrf_token=browser-csrf; Path=/';
+    let logoutStatus = 403;
+    const fetch = sessionFetchMock({
+      '/version': offeredVersion,
+      '/v1/admin/auth/logout': () => logoutStatus === 204
+        ? new Response(null, { status: 204 })
+        : jsonResponse({ error: 'invalid_origin_or_csrf' }, logoutStatus),
+    });
+    vi.stubGlobal('fetch', fetch);
+    render(<MemoryRouter><AdminShell /></MemoryRouter>);
+    const logout = await screen.findByRole('button', { name: 'Log out' });
+    const identity = getAdminIdentityVersion();
+
+    fireEvent.click(logout);
+    await screen.findByText('Log out did not complete. The session may still be active; try again.');
+    expect(getAdminIdentityVersion()).toBe(identity);
+
+    logoutStatus = 204;
+    fireEvent.click(screen.getByRole('button', { name: 'Log out' }));
+    await screen.findByText('Logged out. Sign in again to continue.');
+    expect(getAdminIdentityVersion()).toBeGreaterThan(identity);
+    const logouts = fetch.mock.calls.filter(([url]) => url === '/v1/admin/auth/logout');
+    expect(logouts).toHaveLength(2);
+    for (const [, init] of logouts) {
+      expect(init).toMatchObject({ method: 'POST', credentials: 'same-origin', cache: 'no-store', redirect: 'error' });
+      const headers = new Headers(init?.headers);
+      expect(headers.get('x-csrf-token')).toBe('browser-csrf');
+      expect(headers.has('authorization')).toBe(false);
+    }
+  });
+
+  it('clears credentials, grants and drafts when switching between cookie and bearer modes', async () => {
+    const fetch = sessionFetchMock({
+      '/version': offeredVersion,
+      '/v1/admin/capabilities': (init) => init?.credentials === 'omit' && !new Headers(init.headers).has('Authorization')
+        ? jsonResponse({ error: 'unauthenticated' }, 401)
+        : jsonResponse({ permissions: ['admin:traffic:read'] }),
+      '/v1/admin/traffic/endpoints': () => jsonResponse({ endpoints: [], next_cursor: null }),
+    });
+    vi.stubGlobal('fetch', fetch);
+    render(<MemoryRouter><AdminShell /></MemoryRouter>);
+    const search = await screen.findByLabelText('Endpoint');
+    fireEvent.change(search, { target: { value: 'unsaved-draft' } });
+    const toggle = screen.getByRole('button', { name: 'Use bearer token' });
+    toggle.focus();
+    const capabilityRequests = () => fetch.mock.calls.filter(([url]) => url === '/v1/admin/capabilities');
+    const before = capabilityRequests().length;
+
+    await act(async () => { fireEvent.click(toggle); });
+
+    expect(isBearerSelected()).toBe(true);
+    expect(getMemoryToken()).toBeNull();
+    expect(screen.queryByLabelText('Endpoint')).toBeNull();
+    expect(screen.queryByRole('button', { name: 'Log out' })).toBeNull();
+    expect(screen.queryByRole('link', { name: 'Log in with SSO' })).toBeNull();
+    expect(document.activeElement?.textContent).toBe('Use SSO session');
+    await screen.findByText('Sign in with traffic read permission to view gateway observations.');
+    const bearerRequest = capabilityRequests()[before][1];
+    expect(bearerRequest?.credentials).toBe('omit');
+    expect(new Headers(bearerRequest?.headers).has('Authorization')).toBe(false);
+
+    const input = screen.getByLabelText('Token', { exact: true }) as HTMLInputElement;
+    fireEvent.change(input, { target: { value: `test-${crypto.randomUUID()}` } });
+    fireEvent.click(screen.getByRole('button', { name: 'Save' }));
+    expect(getMemoryToken()).not.toBeNull();
+    fireEvent.change(input, { target: { value: 'another-draft' } });
+    const identity = getAdminIdentityVersion();
+
+    await act(async () => { fireEvent.click(screen.getByRole('button', { name: 'Use SSO session' })); });
+
+    expect(getMemoryToken()).toBeNull();
+    expect(isBearerSelected()).toBe(false);
+    expect(getAdminIdentityVersion()).toBeGreaterThan(identity);
+    expect(screen.queryByLabelText('Token', { exact: true })).toBeNull();
+    expect((await screen.findByLabelText('Endpoint') as HTMLInputElement).value).toBe('');
+    expect(capabilityRequests().at(-1)?.[1]?.credentials).toBe('same-origin');
+  });
+
+  it('keeps an explicit bearer selection when its token is cleared or saved empty', async () => {
+    vi.stubGlobal('fetch', sessionFetchMock({ '/version': offeredVersion }));
+    render(<MemoryRouter><AdminShell /></MemoryRouter>);
+    fireEvent.click(await screen.findByRole('button', { name: 'Use bearer token' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Clear' }));
+    expect(isBearerSelected()).toBe(true);
+    fireEvent.click(screen.getByRole('button', { name: 'Save' }));
+    expect(isBearerSelected()).toBe(true);
+    expect(screen.getByRole('button', { name: 'Use SSO session' })).toBeTruthy();
+  });
+
+  it('discovers sessions on a split management listener with a custom prefix and CSRF names', async () => {
+    for (const [name, content] of [
+      ['greengateway-admin-api-base', '/v1/ops'],
+      ['greengateway-csrf-cookie-name', 'ops_csrf'],
+      ['greengateway-csrf-header-name', 'x-ops-csrf'],
+    ]) {
+      const meta = document.createElement('meta');
+      meta.name = name; meta.content = content; meta.dataset.authTest = '';
+      document.head.append(meta);
+    }
+    document.cookie = 'ops_csrf=ops-csrf; Path=/';
+    const fetch = sessionFetchMock({
+      // The data listener owns /version; the management origin answers 404.
+      '/version': () => jsonResponse({ error: 'not found' }, 404),
+      '/v1/ops/auth/config': () => jsonResponse({
+        bearer_completion: true,
+        admin_session: {
+          ...ADMIN_SESSION,
+          login_url: '/v1/ops/auth/login',
+          completion_url: '/v1/ops/auth/callback',
+          logout_url: '/v1/ops/auth/logout',
+        },
+      }),
+      '/v1/ops/auth/callback': () => jsonResponse({ authenticated: true, expires_in: 60 }),
+    });
+    vi.stubGlobal('fetch', fetch);
+    window.history.replaceState(null, '', '/admin/#/auth/complete?code=code&state=state');
+
+    render(<MemoryRouter><AdminShell /></MemoryRouter>);
+
+    await screen.findByText('Signed in with SSO. The session cookie lasts until logout or session expiry.');
+    expect((await screen.findByRole('link', { name: 'Log in with SSO' })).getAttribute('href')).toBe('/v1/ops/auth/login');
+    const discovery = fetch.mock.calls.find(([url]) => url === '/v1/ops/auth/config');
+    expect(discovery?.[1]).toMatchObject({ credentials: 'omit', cache: 'no-store', redirect: 'error' });
+    const completion = fetch.mock.calls.find(([url]) => url === '/v1/ops/auth/callback');
+    expect(completion?.[1]?.body).toBe(JSON.stringify({ code: 'code', state: 'state', mode: 'cookie' }));
+    expect(new Headers(completion?.[1]?.headers).get('x-ops-csrf')).toBe('ops-csrf');
+    expect(getMemoryToken()).toBeNull();
+  });
+
+  it('keeps the existing bearer completion and panel when no admin session is advertised', async () => {
+    const fetch = sessionFetchMock({
+      '/version': () => jsonResponse({ version: '0.5.0', admin_login_configured: true }),
+      '/v1/admin/auth/callback': () => jsonResponse({ access_token: 'oidc-exchanged-token' }),
+    });
+    vi.stubGlobal('fetch', fetch);
+    window.history.replaceState(null, '', '/admin/#/auth/complete?code=code&state=state');
+
+    render(<MemoryRouter><AdminShell /></MemoryRouter>);
+
+    await screen.findByText('Signed in with SSO in this tab until reload or session expiry.');
+    expect(getMemoryToken()).toBe('oidc-exchanged-token');
+    const completion = fetch.mock.calls.find(([url]) => url === '/v1/admin/auth/callback');
+    expect(completion?.[1]?.body).toBe(JSON.stringify({ code: 'code', state: 'state' }));
+    expect(fetch.mock.calls.some(([url]) => String(url).endsWith('/auth/config'))).toBe(false);
+    expect(screen.getByRole('heading', { level: 2, name: 'Bearer token' })).toBeTruthy();
+    expect(screen.getByRole('link', { name: 'Log in with SSO' })).toBeTruthy();
+    expect(screen.queryByRole('button', { name: 'Log out' })).toBeNull();
+    expect(screen.queryByRole('button', { name: 'Use bearer token' })).toBeNull();
+  });
+
+  it.each([
+    ['a mismatched logout route', () => jsonResponse({ version: '0.5.0', admin_login_configured: true, admin_session: { ...ADMIN_SESSION, logout_url: '/v1/other/auth/logout' } })],
+    ['a non-cookie completion mode', () => jsonResponse({ version: '0.5.0', admin_login_configured: true, admin_session: { ...ADMIN_SESSION, completion_mode: 'bearer' } })],
+    ['unavailable discovery', () => jsonResponse({ error: 'unavailable' }, 503)],
+  ])('fails closed without completing SSO for %s', async (_case, version) => {
+    const fetch = sessionFetchMock({
+      '/version': version,
+      '/v1/admin/auth/config': () => jsonResponse({ error: 'unavailable' }, 503),
+      '/v1/admin/auth/callback': () => jsonResponse({ access_token: 'unexpected-token' }),
+    });
+    vi.stubGlobal('fetch', fetch);
+    window.history.replaceState(null, '', '/admin/#/auth/complete?code=code&state=state');
+
+    render(<MemoryRouter><AdminShell /></MemoryRouter>);
+
+    await screen.findByText('SSO sign-in did not complete. Start sign-in again.');
+    expect(fetch.mock.calls.some(([url]) => url === '/v1/admin/auth/callback')).toBe(false);
+    expect(getMemoryToken()).toBeNull();
+    expect(screen.queryByRole('button', { name: 'Log out' })).toBeNull();
   });
 
   it('registers the traffic inventory route and navigation entry', async () => {
@@ -887,5 +1112,34 @@ function versionFetchMock(adminLoginConfigured: boolean) {
     }
 
     return Promise.reject(new Error(`unexpected fetch: ${url.pathname}`));
+  });
+}
+
+function sessionFetchMock(
+  responses: Record<string, (init?: RequestInit) => Response | Promise<Response>>,
+) {
+  return vi.fn((input: string, init?: RequestInit) => {
+    const url = new URL(input, 'http://localhost');
+    const respond = responses[url.pathname];
+    return respond
+      ? Promise.resolve(respond(init))
+      : Promise.reject(new Error(`unexpected fetch: ${url.pathname}`));
+  });
+}
+
+function offeredVersion() {
+  return jsonResponse({
+    version: '0.5.0',
+    admin_login_configured: true,
+    admin_session: ADMIN_SESSION,
+  });
+}
+
+function jsonResponse(body: unknown, status = 200) {
+  return new Response(JSON.stringify(body), {
+    status,
+    headers: {
+      'Content-Type': 'application/json',
+    },
   });
 }

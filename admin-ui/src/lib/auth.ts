@@ -28,6 +28,16 @@ export function clearMemoryToken() {
   adminIdentityChanged();
 }
 
+/** Explicit bearer mode never uses an ambient session cookie, even before a token is pasted. */
+export function selectBearerMode() {
+  removeLegacyAdminToken();
+  token = null;
+  bearerSelected = true;
+  adminIdentityChanged();
+}
+
+export function isBearerSelected(): boolean { return bearerSelected; }
+
 /** A rejected bearer must never silently fall back to an ambient cookie. */
 export function adminRequestCredentials(): RequestCredentials {
   return bearerSelected ? 'omit' : 'same-origin';
