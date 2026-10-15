@@ -3,9 +3,9 @@
   "projects": {
     ".": {
       "node_modules/esbuild": {
-        "version": "0.28.1",
-        "resolved": "https://registry.npmjs.org/esbuild/-/esbuild-0.28.1.tgz",
-        "integrity": "sha512-HrJrvZv5ayxBzPfwphOoNzkzOIIlifzk0KJrGK2c8R4+LKpMtpYLQeUdjnwjWv/LZlkH2laZk+4w78pi99D4Vw==",
+        "version": "0.28.2",
+        "resolved": "https://registry.npmjs.org/esbuild/-/esbuild-0.28.2.tgz",
+        "integrity": "sha512-HKVLS8dvII+xoKW9kmqxbRKrnWEXfJJr/FZhhJmiqIB0e053QNYFqOBouTMO/k5sID4MvCiUCvv8b9M4h32wIA==",
         "allow": false,
         "scripts": {
           "postinstall": "node install.js"
@@ -36,15 +36,15 @@
         "reason": "Optional Darwin watcher; published tarball has no install lifecycle hook or binding.gyp despite lock metadata."
       },
       "node_modules/workerd": {
-        "version": "1.20260930.2",
-        "resolved": "https://registry.npmjs.org/workerd/-/workerd-1.20260930.2.tgz",
-        "integrity": "sha512-k1lQzEiGyCDqaRsR5+o9PBT5wVU5omtas6hXx3spbEHHMFo8a7tkAixVCMsWFeiT7xhrmg21Hd6a9jLNrkcUMg==",
+        "version": "1.20261006.1",
+        "resolved": "https://registry.npmjs.org/workerd/-/workerd-1.20261006.1.tgz",
+        "integrity": "sha512-8MadBuffZ5NdpLwZjUmsqT5QlaKXq4gjgT6wzcKeynZTICNXyePhc+5QVoKiK7+MMhFTLNrRO2KXLlpk8Q6BkA==",
         "allow": false,
         "scripts": {
           "postinstall": "node install.js"
         },
         "source_sha256": {
-          "package/install.js": "667898fd966bad269f8884d912e06a02df2965f3f6a5b40f23ea4ff3ec95ee46"
+          "package/install.js": "ba1ebba846c67b5dd20f4bbfd7b1249ed5fe5ec54c7199352cef36cca7b19d76"
         },
         "reason": "Native binary is supplied by the locked platform optional dependency; installer fallback downloads and binary rewrites are unnecessary for supported builds."
       }
