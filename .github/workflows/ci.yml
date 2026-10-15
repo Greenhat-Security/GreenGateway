@@ -352,6 +352,13 @@ jobs:
     name: test
     runs-on: ubuntu-latest
     timeout-minutes: 20
+    # Clippy denies warnings in non-test code, and in test code only without
+    # the `postgres` feature. Deny compiler warnings in this default-feature
+    # test build too, so a discarded `must_use` result in a database-backed
+    # test fails here instead of passing as a log line. Job-level so the Rust
+    # cache keys on it.
+    env:
+      RUSTFLAGS: -D warnings
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
