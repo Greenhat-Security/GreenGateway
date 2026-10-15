@@ -383,6 +383,49 @@ describe('connections API client', () => {
     }
   });
 
+  it('accepts a test refused because the caller assertion is not enforced', async () => {
+    // The gateway refuses every test on a Connection carrying a caller
+    // assertion until request-path injection ships; the operator must see that
+    // reason rather than a contract error.
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(() =>
+        Promise.resolve(
+          jsonResponse(
+            200,
+            {
+              ok: false,
+              state: 'unavailable',
+              tested_at: '2026-07-29T12:00:00Z',
+              latency_ms: 0,
+              stages: [
+                {
+                  name: 'authenticated',
+                  outcome: 'failure',
+                  reason: 'caller_assertion_not_enforced',
+                },
+              ],
+            },
+            { ETag: '"connection:v1"' },
+          ),
+        ),
+      ),
+    );
+
+    const tested = await testConnection('connection-1', '"connection:v1"');
+
+    expect(tested.value).toMatchObject({
+      ok: false,
+      stages: [
+        {
+          name: 'authenticated',
+          outcome: 'failure',
+          reason: 'caller_assertion_not_enforced',
+        },
+      ],
+    });
+  });
+
   it('requires unambiguous identities and versions after mutations', async () => {
     const detail = {
       ...connectionDetail(),

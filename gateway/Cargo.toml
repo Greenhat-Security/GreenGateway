@@ -66,6 +66,10 @@ zeroize.workspace = true
 syn = { version = "3.0.5", features = ["full", "visit"] }
 quote = "1.0.46"
 proc-macro2 = "1.0.106"
+# Runtime RSA key generation for the RS256 caller-assertion round trip. The
+# binary already links this crate through jsonwebtoken; the edge only makes it
+# nameable from tests.
+aws-lc-rs.workspace = true
 proptest.workspace = true
 rcgen.workspace = true
 rustix.workspace = true

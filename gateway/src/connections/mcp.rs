@@ -20,7 +20,7 @@ use crate::tools::{
 
 use super::{
     control_plane::{CatalogMutationGuard, CatalogRefreshGuard, ConnectionControlPlane},
-    http::ConnectionHttpRuntime,
+    http::{ConnectionHttpError, ConnectionHttpRuntime},
     model::{ConnectionId, ConnectionKind, DiscoveryConfig},
     status::{ConnectionOperationalState, ConnectionStatusReason, SafeConnectionStatus},
     store::{
@@ -72,6 +72,9 @@ pub enum McpCatalogRefreshError {
     ConnectionDisabled,
     ConnectionKindMismatch,
     DiscoveryNotConfigured,
+    /// The Connection asks for a signed caller assertion, which this gateway
+    /// does not yet inject; discovery is refused before any session opens.
+    CallerAssertionNotEnforced,
     PreconditionFailed,
     /// A discovered tool's registry name is already published by another
     /// lane at the authority.
@@ -104,6 +107,7 @@ impl McpCatalogRefreshError {
             Self::ConnectionDisabled => "connection_disabled",
             Self::ConnectionKindMismatch => "connection_kind_mismatch",
             Self::DiscoveryNotConfigured => "discovery_not_configured",
+            Self::CallerAssertionNotEnforced => "caller_assertion_not_enforced",
             Self::PreconditionFailed => "connection_changed",
             Self::ToolNameConflict => "tool_name_conflict",
             Self::RefreshInProgress => "refresh_in_progress",
@@ -501,11 +505,24 @@ impl McpConnectionCatalogService {
         }
         let target_error = self.http.mcp_target(connection_id.as_str()).err();
         if let Some(error) = target_error {
-            return Err(match error.safe_reason() {
-                "connection_disabled" => McpCatalogRefreshError::ConnectionDisabled,
-                "connection_kind_mismatch" => McpCatalogRefreshError::ConnectionKindMismatch,
-                "invalid_connection_id" => McpCatalogRefreshError::InvalidConnectionId,
-                "connection_not_found" => McpCatalogRefreshError::ConnectionNotFound,
+            // Matched by variant rather than by reason string, so a renamed
+            // reason cannot quietly turn into `discovery_not_configured`.
+            return Err(match error {
+                ConnectionHttpError::ConnectionDisabled => {
+                    McpCatalogRefreshError::ConnectionDisabled
+                }
+                ConnectionHttpError::WrongConnectionKind => {
+                    McpCatalogRefreshError::ConnectionKindMismatch
+                }
+                ConnectionHttpError::InvalidConnectionId => {
+                    McpCatalogRefreshError::InvalidConnectionId
+                }
+                ConnectionHttpError::ConnectionNotFound => {
+                    McpCatalogRefreshError::ConnectionNotFound
+                }
+                ConnectionHttpError::CallerAssertionNotEnforced => {
+                    McpCatalogRefreshError::CallerAssertionNotEnforced
+                }
                 _ => McpCatalogRefreshError::DiscoveryNotConfigured,
             });
         }
@@ -982,6 +999,9 @@ fn refresh_transport_error(error: &McpUpstreamCallError) -> McpCatalogRefreshErr
         McpUpstreamCallError::Connection {
             reason: "connection_changed",
         } => McpCatalogRefreshError::PreconditionFailed,
+        McpUpstreamCallError::Connection {
+            reason: "caller_assertion_not_enforced",
+        } => McpCatalogRefreshError::CallerAssertionNotEnforced,
         McpUpstreamCallError::Connection { reason }
             if matches!(
                 *reason,
@@ -1159,6 +1179,88 @@ mod tests {
         assert!(
             runtime.state.load().is_empty(),
             "deleted or converted Connections must not accumulate in runtime state"
+        );
+    }
+
+    #[tokio::test]
+    async fn refresh_refuses_an_unenforced_caller_assertion_before_any_session() {
+        // Nothing listens on the endpoint: only the refusal can produce the
+        // error asserted below, and it must come before a session is opened.
+        let database = TemporaryDatabase::new();
+        let mut config = Config::test_defaults();
+        config.connections_sqlite_path = Some(database.0.display().to_string());
+        config.egress_allowed_hosts = vec![Ipv4Addr::LOCALHOST.to_string()];
+        config.egress_deny_private_ips = false;
+        let control_plane =
+            ConnectionControlPlane::from_config(&config).expect("control plane should build");
+        let snapshot = control_plane.runtime_snapshot();
+        let candidate: ConnectionWrite = serde_json::from_value(json!({
+            "display_name": "Attested MCP",
+            "enabled": true,
+            "kind": "mcp_streamable_http",
+            "endpoint": {
+                "base_url": "http://127.0.0.1:9",
+                "base_path": "/mcp"
+            },
+            "authentication": { "type": "none" },
+            "caller_assertion": {
+                "signing_key_id": "assertion-signing-key",
+                "kid": "gw-test-1",
+                "algorithm": "es256",
+                "issuer": "https://gateway.example.test",
+                "audience": "https://mcp.example.test",
+                "token_type": "at+jwt",
+                "header_name": "x-caller-assertion",
+                "lifetime_seconds": 60
+            },
+            "tls": {},
+            "discovery": {
+                "type": "managed_mcp",
+                "use_connection_authentication": false
+            }
+        }))
+        .expect("attested MCP Connection should deserialize");
+        let record = control_plane
+            .create_managed(snapshot.collection_etag(), candidate, "test-admin")
+            .await
+            .expect("attested MCP Connection should create");
+        let egress_client = Arc::new(
+            EgressClient::new(EgressConfig::from_config(&config))
+                .expect("managed MCP egress client should build"),
+        );
+        let http = ConnectionHttpRuntime::new(
+            control_plane.clone(),
+            EgressConfig::from_config(&config),
+            egress_client,
+        );
+        let registry = ToolRegistry::disabled();
+        let service = McpConnectionCatalogService::load(control_plane.clone(), http, registry)
+            .expect("managed MCP catalog service should load");
+
+        let refused = service
+            .refresh(record.id.as_str(), record.etag().as_str(), "test-admin")
+            .await
+            .err();
+
+        assert_eq!(
+            refused,
+            Some(McpCatalogRefreshError::CallerAssertionNotEnforced)
+        );
+        assert_eq!(
+            refused.map(McpCatalogRefreshError::safe_reason),
+            Some("caller_assertion_not_enforced")
+        );
+    }
+
+    #[test]
+    fn a_refused_discovery_session_keeps_the_caller_assertion_reason() {
+        // A session call carries the refusal as its safe reason string; tie
+        // that string to the typed error so neither can drift alone.
+        assert_eq!(
+            refresh_transport_error(&McpUpstreamCallError::Connection {
+                reason: ConnectionHttpError::CallerAssertionNotEnforced.safe_reason(),
+            }),
+            McpCatalogRefreshError::CallerAssertionNotEnforced
         );
     }
 

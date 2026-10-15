@@ -1818,8 +1818,20 @@ pub(super) fn parse_connection_write_body(
     let mut candidate = serde_json::from_slice::<Value>(body)
         .map_err(|_| Box::new(bad_request("invalid connection JSON")))?;
     retain_hidden_connection_bindings(&mut candidate, current)?;
-    let candidate = serde_json::from_value::<connections::model::ConnectionWrite>(candidate)
+    // The admin UI does not edit `caller_assertion`, and the safe read shows
+    // only whether its signing key is bound, so a routine edit (a display
+    // name, the enabled flag, a secret rotation) cannot send the block back.
+    // Reading that omission as removal would quietly lift the refusal of a
+    // Connection that cannot yet attest its caller and serve its calls
+    // unattested. An omitted block is therefore kept, and removing it takes
+    // an explicit `"caller_assertion": null`. The body is known to be an
+    // object here, so a missing key and an explicit `null` are distinct.
+    let caller_assertion_omitted = candidate.get("caller_assertion").is_none();
+    let mut candidate = serde_json::from_value::<connections::model::ConnectionWrite>(candidate)
         .map_err(|_| Box::new(bad_request("invalid connection JSON")))?;
+    if caller_assertion_omitted {
+        candidate.caller_assertion = current.caller_assertion.clone();
+    }
     validate_connection_write(candidate)
 }
 

@@ -288,6 +288,7 @@ export type ConnectionTestReason =
   | 'tls_invalid'
   | 'tls_unavailable'
   | 'authentication_not_supported'
+  | 'caller_assertion_not_enforced'
   | 'credential_invalid'
   | 'credential_unavailable'
   | 'oauth_token_egress_denied'
@@ -1225,6 +1226,7 @@ function isConnectionTestReason(
     value === 'tls_invalid' ||
     value === 'tls_unavailable' ||
     value === 'authentication_not_supported' ||
+    value === 'caller_assertion_not_enforced' ||
     value === 'credential_invalid' ||
     value === 'credential_unavailable' ||
     value === 'oauth_token_egress_denied' ||

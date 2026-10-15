@@ -171,6 +171,11 @@ pub enum ConnectionHttpError {
     ConnectionDisabled,
     WrongConnectionKind,
     UnsupportedAuthentication,
+    /// The Connection carries a `caller_assertion` block, and this gateway
+    /// does not yet inject the assertion on the request path. Sending the
+    /// call anyway would hand the upstream a request it cannot attribute
+    /// while the operator believes every call is attested.
+    CallerAssertionNotEnforced,
     TlsInvalid,
     TlsUnavailable,
     InvalidTargetPath,
@@ -255,10 +260,7 @@ impl ConnectionHttpRuntime {
         let connection_id = ConnectionId::parse(connection_id.to_owned())
             .map_err(|_| ConnectionHttpError::InvalidConnectionId)?;
         let snapshot = self.effective_snapshot();
-        let record = snapshot
-            .managed()
-            .get(&connection_id)
-            .ok_or(ConnectionHttpError::ConnectionNotFound)?;
+        let record = managed_record(&snapshot, &connection_id)?;
         validate_http_connection(record)?;
         let url = connection_target_url(record, path_and_query)?;
         let client = self.client_for(record)?;
@@ -283,10 +285,7 @@ impl ConnectionHttpRuntime {
         let connection_id = ConnectionId::parse(connection_id.to_owned())
             .map_err(|_| ConnectionHttpError::InvalidConnectionId)?;
         let snapshot = self.effective_snapshot();
-        let record = snapshot
-            .managed()
-            .get(&connection_id)
-            .ok_or(ConnectionHttpError::ConnectionNotFound)?;
+        let record = managed_record(&snapshot, &connection_id)?;
         let use_connection_authentication = validate_mcp_connection(record)?;
         let url = connection_target_url(record, "/")?;
         let client = self.client_for(record)?;
@@ -317,10 +316,7 @@ impl ConnectionHttpRuntime {
         let connection_id = ConnectionId::parse(connection_id.to_owned())
             .map_err(|_| ConnectionHttpError::InvalidConnectionId)?;
         let snapshot = self.control_plane.runtime_snapshot();
-        let record = snapshot
-            .managed()
-            .get(&connection_id)
-            .ok_or(ConnectionHttpError::ConnectionNotFound)?;
+        let record = managed_record(&snapshot, &connection_id)?;
         let (path, use_connection_authentication) = validate_openapi_connection(record)?;
         let url = connection_target_url(record, path)?;
         let client = self.client_for(record)?;
@@ -356,10 +352,7 @@ impl ConnectionHttpRuntime {
         let connection_id = ConnectionId::parse(connection_id.to_owned())
             .map_err(|_| ConnectionHttpError::InvalidConnectionId)?;
         let snapshot = self.control_plane.runtime_snapshot();
-        let record = snapshot
-            .managed()
-            .get(&connection_id)
-            .ok_or(ConnectionHttpError::ConnectionNotFound)?;
+        let record = managed_record(&snapshot, &connection_id)?;
         let connection_etag = record.etag();
         if connection_etag.as_str() != expected_connection_etag {
             return Ok(None);
@@ -426,10 +419,7 @@ impl ConnectionHttpRuntime {
         let connection_id = ConnectionId::parse(connection_id.to_owned())
             .map_err(|_| ConnectionHttpError::InvalidConnectionId)?;
         let snapshot = self.control_plane.runtime_snapshot();
-        let record = snapshot
-            .managed()
-            .get(&connection_id)
-            .ok_or(ConnectionHttpError::ConnectionNotFound)?;
+        let record = managed_record(&snapshot, &connection_id)?;
         let connection_etag = record.etag();
         if connection_etag.as_str() != expected_connection_etag {
             return Ok(None);
@@ -1060,6 +1050,7 @@ impl ConnectionHttpError {
             Self::ConnectionDisabled => "connection_disabled",
             Self::WrongConnectionKind => "connection_kind_mismatch",
             Self::UnsupportedAuthentication => "authentication_not_supported",
+            Self::CallerAssertionNotEnforced => "caller_assertion_not_enforced",
             Self::TlsInvalid => "tls_invalid",
             Self::TlsUnavailable => "tls_unavailable",
             Self::InvalidTargetPath => "invalid_target_path",
@@ -1149,6 +1140,44 @@ fn connection_tls_secret_error(error: SecretResolveError) -> ConnectionHttpError
         | SecretResolveErrorKind::UnsafeSource
         | SecretResolveErrorKind::ProviderFailure => ConnectionHttpError::TlsUnavailable,
     }
+}
+
+/// Looks up the managed record a target is built from, and refuses one this
+/// gateway cannot honour.
+///
+/// Every target constructor goes through here, and a [`ConnectionHttpTarget`]
+/// is the only way any lane -- tool calls, the proxy, managed MCP sessions and
+/// discovery, OpenAPI discovery, enum sources and Connection tests -- reaches
+/// an egress client, a TLS identity or a credential. A refusal here therefore
+/// lands before DNS, before any secret is read, before OAuth minting and before
+/// a byte leaves the gateway, and no lane can route around it.
+fn managed_record<'a>(
+    snapshot: &'a super::control_plane::ConnectionRuntimeSnapshot,
+    connection_id: &ConnectionId,
+) -> Result<&'a StoredConnection, ConnectionHttpError> {
+    let record = snapshot
+        .managed()
+        .get(connection_id)
+        .ok_or(ConnectionHttpError::ConnectionNotFound)?;
+    refuse_unenforced_caller_assertion(record)?;
+    Ok(record)
+}
+
+/// Refuses a Connection that asks for a signed caller assertion.
+///
+/// The model and the admin API accept and persist `caller_assertion`, but the
+/// request path does not yet mint or inject it. Serving such a Connection would
+/// be a silent fail-open: the operator configured "every call names its caller"
+/// and the upstream would receive anonymous calls instead, including calls that
+/// arrived with no principal at all. Until injection ships, the configured
+/// intent is honoured the only way it can be -- by not sending the call.
+fn refuse_unenforced_caller_assertion(
+    record: &StoredConnection,
+) -> Result<(), ConnectionHttpError> {
+    if record.write.caller_assertion.is_some() {
+        return Err(ConnectionHttpError::CallerAssertionNotEnforced);
+    }
+    Ok(())
 }
 
 fn validate_http_connection(record: &StoredConnection) -> Result<(), ConnectionHttpError> {
@@ -1331,8 +1360,9 @@ mod tests {
         config::Config,
         connections::{
             model::{
-                AdditionalHeader, ConnectionEndpoint, ConnectionTimeouts, ConnectionWrite,
-                OAuthClientAuthMethod, TlsProfile,
+                AdditionalHeader, CallerAssertionAlgorithm, CallerAssertionSettings,
+                ConnectionEndpoint, ConnectionTimeouts, ConnectionWrite, OAuthClientAuthMethod,
+                TlsProfile,
             },
             secret::{OperatorSecretAliasConfig, OperatorSecretAliasSource, SecretRootConfig},
             status::{ConnectionOperationalState, ConnectionRevisions, ConnectionStatusReason},
@@ -2212,6 +2242,158 @@ mod tests {
             .expect("unchanged connection should return an MCP test target");
         assert_eq!(test.url(), "https://billing.example.test/mcp");
         assert_eq!(test.authentication_kind(), "none");
+    }
+
+    /// A caller assertion as an operator would configure one. Its signing key
+    /// alias is deliberately left unconfigured: the refusal has to land before
+    /// anything would try to read it.
+    fn unenforced_caller_assertion() -> CallerAssertionSettings {
+        CallerAssertionSettings {
+            signing_key_id: "assertion-signing-key".to_owned(),
+            kid: "gw-test-1".to_owned(),
+            algorithm: CallerAssertionAlgorithm::Es256,
+            issuer: "https://gateway.example.test".to_owned(),
+            audience: "https://billing.example.test".to_owned(),
+            token_type: "at+jwt".to_owned(),
+            header_name: "x-caller-assertion".to_owned(),
+            lifetime_seconds: 60,
+            claims: Vec::new(),
+            bind_request: false,
+            bind_approval: false,
+        }
+    }
+
+    #[tokio::test]
+    async fn every_http_target_refuses_an_unenforced_caller_assertion_before_preparation() {
+        // Nothing injects the assertion yet, so serving this Connection would
+        // send the upstream calls it cannot attribute while the operator
+        // believes every call names its caller.
+        let mut write = record("/v1").write;
+        write.caller_assertion = Some(unenforced_caller_assertion());
+        write.discovery = Some(DiscoveryConfig::ManagedOpenapi {
+            path: Some("/openapi.json".to_owned()),
+            use_connection_authentication: false,
+        });
+        write.test_profile = Some(ConnectionTestProfile {
+            method: "GET".to_owned(),
+            path: "/ready".to_owned(),
+            expected_statuses: vec![200],
+        });
+        let temporary = TemporaryManagedRuntime::from_write("caller-assertion-http", write).await;
+        let connection_id = temporary.connection_id.as_str();
+        let stored = temporary.stored_connection();
+        let etag = stored.etag().to_string();
+        let refused = Some(ConnectionHttpError::CallerAssertionNotEnforced);
+
+        // Tool calls, enum sources and the proxy.
+        assert_eq!(
+            temporary.runtime.target(connection_id, "/charges").err(),
+            refused
+        );
+        // Tool and route binding validation.
+        assert_eq!(
+            temporary.runtime.validate_binding(connection_id).err(),
+            refused
+        );
+        // OpenAPI discovery.
+        assert_eq!(
+            temporary
+                .runtime
+                .openapi_discovery_target(connection_id)
+                .err(),
+            refused
+        );
+        // Connection tests, which otherwise probe even a disabled Connection.
+        assert_eq!(
+            temporary.runtime.test_target(connection_id, &etag).err(),
+            refused
+        );
+        // No egress client was prepared for a target that was never built.
+        assert_eq!(temporary.cached_client_count(), 0);
+
+        let execution = ConnectionTestService::new(temporary.runtime.clone())
+            .execute(&stored, &etag)
+            .await;
+        assert!(!execution.result.ok);
+        assert_eq!(
+            execution.result.stages,
+            vec![ConnectionTestStage::failure(
+                ConnectionTestStageName::Authenticated,
+                ConnectionTestReason::CallerAssertionNotEnforced,
+            )]
+        );
+        assert_eq!(
+            execution.status_reason,
+            ConnectionStatusReason::RequestFailed
+        );
+        assert_eq!(temporary.cached_client_count(), 0);
+
+        // The assertion is the only reason: the same Connection without one
+        // builds a target again.
+        let mut without_assertion = stored.write.clone();
+        without_assertion.caller_assertion = None;
+        temporary
+            .runtime
+            .control_plane
+            .replace_managed(&stored.id, &stored.etag(), without_assertion, "test-admin")
+            .await
+            .expect("the Connection without an assertion should save");
+        assert!(temporary.runtime.target(connection_id, "/charges").is_ok());
+    }
+
+    #[tokio::test]
+    async fn every_mcp_target_refuses_an_unenforced_caller_assertion_before_preparation() {
+        // Even a session that would not use the Connection's own credential is
+        // refused: the assertion is about the caller, not the credential.
+        let mut write = record("/mcp").write;
+        write.kind = ConnectionKind::McpStreamableHttp;
+        write.discovery = Some(DiscoveryConfig::ManagedMcp {
+            use_connection_authentication: false,
+        });
+        write.caller_assertion = Some(unenforced_caller_assertion());
+        let temporary = TemporaryManagedRuntime::from_write("caller-assertion-mcp", write).await;
+        let connection_id = temporary.connection_id.as_str();
+        let stored = temporary.stored_connection();
+        let etag = stored.etag().to_string();
+        let refused = Some(ConnectionHttpError::CallerAssertionNotEnforced);
+
+        // MCP tool calls and catalog discovery.
+        assert_eq!(temporary.runtime.mcp_target(connection_id).err(), refused);
+        // MCP Connection tests.
+        assert_eq!(
+            temporary
+                .runtime
+                .mcp_test_target(connection_id, &etag)
+                .err(),
+            refused
+        );
+        assert_eq!(temporary.cached_client_count(), 0);
+
+        let execution = ConnectionTestService::new(temporary.runtime.clone())
+            .execute(&stored, &etag)
+            .await;
+        assert!(!execution.result.ok);
+        assert_eq!(
+            execution.result.stages,
+            vec![ConnectionTestStage::failure(
+                ConnectionTestStageName::Authenticated,
+                ConnectionTestReason::CallerAssertionNotEnforced,
+            )]
+        );
+        assert_eq!(
+            execution.status_reason,
+            ConnectionStatusReason::RequestFailed
+        );
+        assert_eq!(temporary.cached_client_count(), 0);
+    }
+
+    #[test]
+    fn the_caller_assertion_refusal_has_a_distinct_safe_reason() {
+        let error = ConnectionHttpError::CallerAssertionNotEnforced;
+        assert_eq!(error.safe_reason(), "caller_assertion_not_enforced");
+        // It is a configuration refusal, not a secret-provider failure, so it
+        // must not raise a secret-resolution alarm for a key nobody read.
+        assert!(!error.is_secret_resolution_failure());
     }
 
     #[tokio::test]

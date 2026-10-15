@@ -419,7 +419,10 @@ pub(super) fn connection_refresh_error_response(
         | connections::mcp::McpCatalogRefreshError::RefreshInProgress
         | connections::mcp::McpCatalogRefreshError::ConnectionDisabled
         | connections::mcp::McpCatalogRefreshError::ConnectionKindMismatch
-        | connections::mcp::McpCatalogRefreshError::DiscoveryNotConfigured => StatusCode::CONFLICT,
+        | connections::mcp::McpCatalogRefreshError::DiscoveryNotConfigured
+        | connections::mcp::McpCatalogRefreshError::CallerAssertionNotEnforced => {
+            StatusCode::CONFLICT
+        }
         connections::mcp::McpCatalogRefreshError::StoreUnavailable
         | connections::mcp::McpCatalogRefreshError::StorageUnavailable => {
             StatusCode::SERVICE_UNAVAILABLE
@@ -463,6 +466,7 @@ pub(super) fn openapi_catalog_error_response(
         | OpenApiCatalogError::ConnectionDisabled
         | OpenApiCatalogError::ConnectionKindMismatch
         | OpenApiCatalogError::DiscoveryNotConfigured
+        | OpenApiCatalogError::CallerAssertionNotEnforced
         | OpenApiCatalogError::ToolConflict => StatusCode::CONFLICT,
         OpenApiCatalogError::SpecTooLarge => StatusCode::PAYLOAD_TOO_LARGE,
         OpenApiCatalogError::InvalidSpec

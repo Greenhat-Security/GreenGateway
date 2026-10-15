@@ -1125,6 +1125,11 @@ fn protocol_probe_connection_error(
             ConnectionTestReason::AuthenticationNotSupported,
             ConnectionStatusReason::SecretUnavailable,
         ),
+        ConnectionHttpError::CallerAssertionNotEnforced => (
+            ConnectionTestStageName::Authenticated,
+            ConnectionTestReason::CallerAssertionNotEnforced,
+            ConnectionStatusReason::RequestFailed,
+        ),
         ConnectionHttpError::TlsInvalid => (
             ConnectionTestStageName::SecretAvailable,
             ConnectionTestReason::TlsInvalid,
@@ -1265,6 +1270,11 @@ fn protocol_probe_connection_reason(
             ConnectionTestStageName::SecretAvailable,
             ConnectionTestReason::AuthenticationNotSupported,
             ConnectionStatusReason::SecretUnavailable,
+        ),
+        "caller_assertion_not_enforced" => (
+            ConnectionTestStageName::Authenticated,
+            ConnectionTestReason::CallerAssertionNotEnforced,
+            ConnectionStatusReason::RequestFailed,
         ),
         "tls_invalid" => (
             ConnectionTestStageName::SecretAvailable,
@@ -3196,6 +3206,31 @@ mod tests {
                 (mcp.stage(), mcp.status_reason())
             );
             assert_eq!(mcp.safe_reason(), expected_reason);
+        }
+    }
+
+    #[test]
+    fn http_and_mcp_report_an_unenforced_caller_assertion_identically() {
+        // The refusal reaches a managed MCP probe either as the typed target
+        // error or, from a session call, as its safe reason string. Both must
+        // say the same thing an HTTP Connection test says.
+        let error = ConnectionHttpError::CallerAssertionNotEnforced;
+        let (http_stage, http_state, http_status_reason) = connection_failure_classification(error);
+        for mcp in [
+            protocol_probe_connection_error(error, ConnectionTestStageName::ProtocolValid),
+            protocol_probe_connection_reason(
+                error.safe_reason(),
+                ConnectionTestStageName::ProtocolValid,
+            ),
+        ] {
+            assert_eq!(
+                (mcp.stage(), mcp.operational_state(), mcp.status_reason()),
+                (http_stage, http_state, http_status_reason)
+            );
+            assert_eq!(
+                mcp.safe_reason(),
+                ConnectionTestReason::CallerAssertionNotEnforced
+            );
         }
     }
 

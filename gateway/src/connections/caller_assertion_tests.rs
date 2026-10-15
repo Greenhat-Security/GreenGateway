@@ -5,11 +5,13 @@
 //! attests its caller must never quietly fall back to acting anonymously, must never attest a value
 //! a caller could have chosen, and must never emit a token an upstream will reject.
 //!
-//! Keys are generated per test with `rcgen` rather than committed. No private key material belongs
-//! in this tree.
+//! Keys are generated per test rather than committed: P-256 keys with `rcgen`, RSA keys with
+//! aws-lc-rs. No private key material belongs in this tree.
 
-use jsonwebtoken::{decode, DecodingKey, Validation};
+use aws_lc_rs::encoding::AsDer;
+use jsonwebtoken::{decode, jwk::Jwk, DecodingKey, Validation};
 use serde_json::Value;
+use tokio_rustls::rustls::pki_types::PrivatePkcs8KeyDer;
 
 use super::*;
 
@@ -36,6 +38,47 @@ fn es256_key(pair: &rcgen::KeyPair) -> AssertionSigningKey {
 fn es256_public_point(pair: &rcgen::KeyPair) -> Vec<u8> {
     let der = rcgen::PublicKeyData::subject_public_key_info(pair);
     der[der.len() - 65..].to_vec()
+}
+
+/// A freshly generated RSA-2048 key: its PKCS#8 PEM, and the modulus and exponent a JWKS publishes.
+struct Rs256Pair {
+    pem: String,
+    modulus: Vec<u8>,
+    exponent: Vec<u8>,
+}
+
+/// `rcgen` is built on ring here, and ring cannot generate RSA keys, so the key comes from aws-lc-rs
+/// -- already linked as `jsonwebtoken`'s backend -- and `rcgen` only wraps its DER as PEM.
+fn rs256_pair() -> Rs256Pair {
+    let generated = aws_lc_rs::rsa::KeyPair::generate(aws_lc_rs::rsa::KeySize::Rsa2048)
+        .expect("RSA-2048 key generates");
+    let pkcs8 = generated
+        .as_der()
+        .expect("generated RSA key encodes as PKCS#8")
+        .as_ref()
+        .to_vec();
+    let pem = rcgen::KeyPair::from_pkcs8_der_and_sign_algo(
+        &PrivatePkcs8KeyDer::from(pkcs8),
+        &rcgen::PKCS_RSA_SHA256,
+    )
+    .expect("generated RSA key loads")
+    .serialize_pem();
+    let public = aws_lc_rs::rsa::PublicKeyComponents::<Vec<u8>>::from(
+        aws_lc_rs::signature::KeyPair::public_key(&generated),
+    );
+    Rs256Pair {
+        pem,
+        modulus: public.n,
+        exponent: public.e,
+    }
+}
+
+/// The public JWK this gateway would publish for `pair`, parsed by a standard JWK reader.
+fn published_rs256_jwk(pair: &Rs256Pair) -> Jwk {
+    let jwk = rs256_public_jwk("gw-rsa-1", &pair.modulus, &pair.exponent).expect("valid JWK");
+    // No private component ever reaches the published document.
+    assert!(jwk.get("d").is_none());
+    serde_json::from_value(jwk).expect("the published JWK is a standard JWK")
 }
 
 fn config() -> CallerAssertionConfig<'static> {
@@ -338,6 +381,66 @@ fn an_es256_assertion_verifies_against_the_published_key() {
     let public = DecodingKey::from_ec_pem(pair.public_key_pem().as_bytes()).expect("public key");
     let decoded = decode::<Value>(&token, &public, &validation).expect("verifies");
     assert_eq!(decoded.claims["sub"], "https://idp.example#user-1");
+}
+
+#[test]
+fn an_rs256_assertion_verifies_against_the_published_jwk() {
+    // Cloudflare Access publishes RS256, so an upstream that already verifies it must be able to
+    // verify this the same way: a standard verifier, holding only the JWK this gateway publishes.
+    let pair = rs256_pair();
+    let key = AssertionSigningKey::from_pkcs8_pem(
+        "gw-rsa-1",
+        AssertionAlgorithm::Rs256,
+        pair.pem.as_bytes(),
+    )
+    .expect("generated RSA key loads");
+    let token = sign_caller_assertion(
+        &key,
+        &config(),
+        Some(&caller()),
+        REQUEST_ID,
+        1_757_000_000,
+        None,
+        None,
+    )
+    .expect("signs");
+
+    let (header, _) = decode_unverified(&token);
+    assert_eq!(header["alg"], "RS256");
+    assert_eq!(header["typ"], "at+jwt");
+    assert_eq!(header["kid"], "gw-rsa-1");
+
+    let mut validation = Validation::new(Algorithm::RS256);
+    validation.set_issuer(&[ISSUER]);
+    validation.set_audience(&[AUDIENCE]);
+    // The fixture timestamp is fixed, so this checks the signature and the bound claims rather than
+    // the wall clock.
+    validation.validate_exp = false;
+    let public = DecodingKey::from_jwk(&published_rs256_jwk(&pair)).expect("public key");
+    let decoded = decode::<Value>(&token, &public, &validation).expect("verifies");
+    assert_eq!(decoded.claims["sub"], "https://idp.example#user-1");
+    assert_eq!(decoded.claims["caller_sub"], "user-1");
+    assert_eq!(decoded.claims["jti"], REQUEST_ID);
+
+    // The signature is what makes it verify: the published key of any other pair refuses it.
+    let other = DecodingKey::from_jwk(&published_rs256_jwk(&rs256_pair())).expect("public key");
+    assert!(decode::<Value>(&token, &other, &validation).is_err());
+
+    // And an RSA key is not an ES256 key, the reverse of the mismatch refused below.
+    assert_eq!(
+        AssertionSigningKey::from_pkcs8_pem(
+            "gw-rsa-1",
+            AssertionAlgorithm::Es256,
+            pair.pem.as_bytes()
+        )
+        .map(|_| ())
+        .unwrap_err(),
+        CallerAssertionError::KeyUnusable
+    );
+    // The loaded key still never prints its material.
+    let rendered = format!("{key:?}");
+    assert!(rendered.contains("gw-rsa-1"));
+    assert!(!rendered.contains("BEGIN"));
 }
 
 #[test]

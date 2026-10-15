@@ -8,7 +8,7 @@
     "CallerAssertion": {
       "type": "object",
       "additionalProperties": false,
-      "description": "Attest the calling principal to the upstream alongside the primary credential rather than instead of it: the credential says which system is calling, the assertion says on whose behalf, so an upstream the operator controls can apply its own per-user checks. The gateway signs a short-lived JWT naming the validated principal and sends it in the named header; the upstream verifies it against the gateway's published JWKS. Omit to send only the credential.",
+      "description": "Accepted but not yet enforced: until request-path injection ships, the gateway refuses every call, test and discovery on a Connection carrying this block, with the failure reason caller_assertion_not_enforced. Once enforced, the block will attest the calling principal to the upstream alongside the primary credential rather than instead of it: the credential says which system is calling, the assertion says on whose behalf, so an upstream the operator controls can apply its own per-user checks. The gateway will sign a short-lived JWT naming the validated principal and send it in the named header, and the upstream will verify it against the gateway's published JWKS. Omit the block to send only the credential.",
       "required": [
         "signing_key_id",
         "kid",
@@ -26,17 +26,17 @@
         "issuer": { "type": "string", "minLength": 1, "maxLength": 512 },
         "audience": { "type": "string", "minLength": 1, "maxLength": 512 },
         "token_type": { "type": "string", "minLength": 1, "maxLength": 128, "description": "JOSE typ. Naming the intended use stops a token minted for one upstream being replayed at another that trusts the same keys." },
-        "header_name": { "type": "string", "minLength": 1, "maxLength": 64, "description": "Header carrying the assertion. Must be a non-reserved HTTP header name and must differ from the header the primary credential uses; normalized to lowercase." },
+        "header_name": { "type": "string", "minLength": 1, "maxLength": 64, "description": "Header carrying the assertion. Must be a non-reserved HTTP header name and must differ, case-insensitively, from the header the primary credential uses and from every additional header name; normalized to lowercase." },
         "lifetime_seconds": { "type": "integer", "minimum": 1, "maximum": 300, "description": "An assertion is a bearer credential for as long as it is valid, so this is a replay window rather than a convenience setting." },
         "claims": { "type": "array", "maxItems": 2, "uniqueItems": true, "items": { "enum": ["email", "roles"] }, "description": "Principal fields to attest beyond sub, which is always present. A closed set rather than free-form templating, so a configuration mistake cannot attest something a caller supplied." },
         "bind_request": { "type": "boolean", "description": "Include the method, path and a SHA-256 of the body actually sent, so an assertion cannot be lifted onto different arguments. The digest covers the transmitted bytes, not a canonical form, so an upstream verifies it with its standard library." },
-        "bind_approval": { "type": "boolean", "description": "Require, and include, the approval that authorised a mutation." }
+        "bind_approval": { "type": "boolean", "const": false, "description": "Reserved: would require, and include, the approval that authorised a mutation. No approval subsystem exists yet, so only false is accepted." }
       }
     },
     "SafeCallerAssertion": {
       "type": "object",
       "additionalProperties": false,
-      "description": "Attest the calling principal to the upstream alongside the primary credential rather than instead of it: the credential says which system is calling, the assertion says on whose behalf, so an upstream the operator controls can apply its own per-user checks. The gateway signs a short-lived JWT naming the validated principal and sends it in the named header; the upstream verifies it against the gateway's published JWKS. Omit to send only the credential.",
+      "description": "Accepted but not yet enforced: until request-path injection ships, the gateway refuses every call, test and discovery on a Connection carrying this block, with the failure reason caller_assertion_not_enforced. Once enforced, the block will attest the calling principal to the upstream alongside the primary credential rather than instead of it: the credential says which system is calling, the assertion says on whose behalf, so an upstream the operator controls can apply its own per-user checks. The gateway will sign a short-lived JWT naming the validated principal and send it in the named header, and the upstream will verify it against the gateway's published JWKS. Omit the block to send only the credential.",
       "required": [
         "signing_key_configured",
         "kid",
@@ -58,7 +58,7 @@
         "lifetime_seconds": { "type": "integer", "minimum": 1, "maximum": 300, "description": "An assertion is a bearer credential for as long as it is valid, so this is a replay window rather than a convenience setting." },
         "claims": { "type": "array", "maxItems": 2, "uniqueItems": true, "items": { "enum": ["email", "roles"] }, "description": "Principal fields to attest beyond sub, which is always present. A closed set rather than free-form templating, so a configuration mistake cannot attest something a caller supplied." },
         "bind_request": { "type": "boolean", "description": "Include the method, path and a SHA-256 of the body actually sent, so an assertion cannot be lifted onto different arguments. The digest covers the transmitted bytes, not a canonical form, so an upstream verifies it with its standard library." },
-        "bind_approval": { "type": "boolean", "description": "Require, and include, the approval that authorised a mutation." }
+        "bind_approval": { "type": "boolean", "description": "Reserved: would require, and include, the approval that authorised a mutation. New writes accept only false; a Connection persisted earlier may still report true, and is refused at runtime like every Connection carrying an assertion." }
       }
     },
     "StableId": {
@@ -598,7 +598,13 @@
         "endpoint": {
           "$ref": "#/$defs/Endpoint"
         },
-        "caller_assertion": { "$ref": "#/$defs/CallerAssertion" },
+        "caller_assertion": {
+          "oneOf": [
+            { "$ref": "#/$defs/CallerAssertion" },
+            { "type": "null" }
+          ],
+          "description": "Omitted keeps the current block, because a safe read cannot be sent back and the admin UI does not edit it; null removes it."
+        },
         "authentication": {
           "$ref": "#/$defs/MutationAuthentication"
         },

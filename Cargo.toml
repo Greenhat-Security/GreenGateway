@@ -9,6 +9,13 @@ license-file = "LICENSE"
 [workspace.dependencies]
 arc-swap = "1.7.1"
 async-trait = "0.1.89"
+# Test-only (see `gateway/Cargo.toml`): `caller_assertion_tests.rs` generates
+# an RSA key at test runtime for the RS256 round trip, because no private key
+# belongs in this tree and neither `rcgen` (built on ring here) nor
+# `jsonwebtoken` can generate one. Already in the graph transitively:
+# jsonwebtoken's `aws_lc_rs` feature depends on it, and this is the same 1.x it
+# resolves. Naming it directly adds a dependency edge, not a crate.
+aws-lc-rs = "1.18.1"
 axum = { version = "0.8.9", features = ["ws"] }
 base64 = "0.23.1"
 # The PostgreSQL foundation of issue #241 PR 3 uses the protocol crate plus a

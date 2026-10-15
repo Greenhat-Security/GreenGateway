@@ -98,6 +98,9 @@ pub enum EnumSourceFailureReason {
     ToolDisabled,
     EgressDenied,
     CredentialUnavailable,
+    /// The source's Connection asks for a signed caller assertion, which this
+    /// gateway does not yet inject, so the fetch is refused before any I/O.
+    CallerAssertionNotEnforced,
     UpstreamStatus(u16),
     ResponseTooLarge,
     NotJson,
@@ -116,6 +119,7 @@ impl EnumSourceFailureReason {
             Self::ToolDisabled => "tool_disabled".to_owned(),
             Self::EgressDenied => "egress_denied".to_owned(),
             Self::CredentialUnavailable => "credential_unavailable".to_owned(),
+            Self::CallerAssertionNotEnforced => "caller_assertion_not_enforced".to_owned(),
             Self::UpstreamStatus(status) => format!("upstream_status:{status}"),
             Self::ResponseTooLarge => "response_too_large".to_owned(),
             Self::NotJson => "not_json".to_owned(),
@@ -1648,7 +1652,11 @@ fn suspicious_source_token(token: &str) -> bool {
 }
 
 fn connection_failure(error: ConnectionHttpError) -> EnumSourceFailureReason {
-    if error.is_secret_resolution_failure()
+    if error == ConnectionHttpError::CallerAssertionNotEnforced {
+        // Kept distinct so an operator sees why the source never refreshes,
+        // rather than an egress denial nothing in the egress policy explains.
+        EnumSourceFailureReason::CallerAssertionNotEnforced
+    } else if error.is_secret_resolution_failure()
         || matches!(
             error,
             ConnectionHttpError::OAuthTokenUnavailable
@@ -2075,6 +2083,80 @@ mod tests {
         assert!(enum_row_matches_provenance(
             &volatile, 2, &digest, 3, 4, None, true,
         ));
+    }
+
+    #[tokio::test]
+    async fn a_source_on_a_connection_with_an_unenforced_caller_assertion_is_refused() {
+        let temporary = TemporaryEnumStore::new();
+        let mut config = Config::test_defaults();
+        config.connections_sqlite_path = Some(temporary.database.display().to_string());
+        let control_plane =
+            ConnectionControlPlane::from_config(&config).expect("control plane should build");
+        let initial = control_plane.runtime_snapshot();
+        let created = control_plane
+            .create_managed(
+                initial.collection_etag(),
+                serde_json::from_value(json!({
+                    "display_name": "Metadata API",
+                    "enabled": true,
+                    "kind": "http_api",
+                    "endpoint": {
+                        "base_url": "https://metadata.example.test",
+                        "base_path": "/v1"
+                    },
+                    "authentication": {"type": "none"},
+                    "caller_assertion": {
+                        "signing_key_id": "assertion-signing-key",
+                        "kid": "gw-test-1",
+                        "algorithm": "es256",
+                        "issuer": "https://gateway.example.test",
+                        "audience": "https://metadata.example.test",
+                        "token_type": "at+jwt",
+                        "header_name": "X-Caller-Assertion",
+                        "lifetime_seconds": 60
+                    }
+                }))
+                .expect("fixture Connection should deserialize"),
+                "test-admin",
+            )
+            .await
+            .expect("fixture Connection should create");
+        // The default egress policy denies every host, so a regression that
+        // reached egress would fail as `egress_denied`, never as the refusal.
+        let egress_config = EgressConfig::default();
+        let egress_client =
+            Arc::new(EgressClient::new(egress_config.clone()).expect("egress client should build"));
+        let http = ConnectionHttpRuntime::new(control_plane.clone(), egress_config, egress_client);
+        let audit = AuditLog::new(Arc::new(CaptureSink::new()) as Arc<dyn AuditSink>);
+        let runtime = EnumSourceRuntime::new(control_plane, http, audit, Vec::new());
+        let source = enum_plan(1);
+        let authorizer = CountingAuthorizer::default();
+
+        let refused = runtime
+            .fetch_json(
+                &created.id,
+                &source.id,
+                &source.request,
+                &source.limits,
+                &authorizer,
+            )
+            .await
+            .err();
+
+        assert_eq!(
+            refused,
+            Some(EnumSourceFailureReason::CallerAssertionNotEnforced)
+        );
+        assert_eq!(
+            refused
+                .as_ref()
+                .map(EnumSourceFailureReason::safe_reason)
+                .as_deref(),
+            Some("caller_assertion_not_enforced")
+        );
+        // Policy still decides first; the refusal follows it and precedes
+        // every DNS, TLS, OAuth and secret-provider step.
+        assert_eq!(authorizer.calls.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]
