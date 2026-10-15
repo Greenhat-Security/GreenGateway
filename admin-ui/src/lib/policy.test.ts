@@ -1,8 +1,11 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
+import { AdminApiError } from './api';
 import {
   createPolicyRule,
   fetchPolicy,
+  fetchPolicyRuleHits,
+  fetchPolicyRuleShadowReview,
   deletePolicyRule,
   patchPolicyRule,
   reorderPolicyRules,
@@ -54,6 +57,68 @@ describe('policy writes', () => {
       expect(observed[0].get('x-csrf-token')).toBe('token-123');
     },
   );
+});
+
+describe('policy evidence', () => {
+  const unavailableBody = {
+    error: 'policy rule hit counts require an audit query store',
+    reason: 'audit_evidence_unavailable',
+  };
+
+  it('returns counted hits, including a counted zero, as available evidence', async () => {
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(() =>
+        Promise.resolve(
+          jsonResponse(200, {
+            rules: [
+              { rule_id: 'busy', hits: 3 },
+              { rule_id: 'quiet', hits: 0 },
+            ],
+          }),
+        ),
+      ),
+    );
+
+    expect(await fetchPolicyRuleHits()).toEqual({
+      status: 'available',
+      value: { busy: 3, quiet: 0 },
+    });
+  });
+
+  it.each([
+    ['hit counts', fetchPolicyRuleHits],
+    ['shadow review', fetchPolicyRuleShadowReview],
+  ])(
+    'reports %s without an audit store as unavailable, not empty',
+    async (_name, fetchEvidence) => {
+      vi.stubGlobal(
+        'fetch',
+        vi.fn(() => Promise.resolve(jsonResponse(503, unavailableBody))),
+      );
+
+      expect(await fetchEvidence()).toEqual({
+        status: 'unavailable',
+        message: unavailableBody.error,
+      });
+    },
+  );
+
+  it.each([
+    ['a 503 without the evidence reason', 503, { error: 'policy control plane unavailable' }],
+    ['a 500', 500, { error: 'policy rule hit count query failed' }],
+    ['a 403', 403, { error: 'forbidden', reason: 'audit_evidence_unavailable' }],
+  ])('rejects %s instead of reporting an evidence state', async (_name, status, body) => {
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(() => Promise.resolve(jsonResponse(status, body))),
+    );
+
+    await expect(fetchPolicyRuleHits()).rejects.toBeInstanceOf(AdminApiError);
+    await expect(fetchPolicyRuleShadowReview()).rejects.toBeInstanceOf(
+      AdminApiError,
+    );
+  });
 });
 
 function jsonResponse(status: number, body: unknown): Response {

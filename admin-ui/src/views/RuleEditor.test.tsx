@@ -388,6 +388,77 @@ describe('RuleEditor', () => {
     expect(screen.getByText('/api/users/123')).toBeTruthy();
   });
 
+  it('presents a truncated preview count as a lower bound', async () => {
+    const fetchMock = policyBackedFetch(policyFixture(), 'W/"policy-1"', {
+      preview: {
+        ...previewResponseFixture(3, '/api/users/123'),
+        scanned_event_count: 900,
+        scan_truncated: true,
+        complete: false,
+      },
+    });
+    vi.stubGlobal('fetch', fetchMock);
+
+    renderRuleEditor();
+
+    await screen.findByLabelText('Path pattern');
+    vi.useFakeTimers();
+    fireEvent.change(screen.getByLabelText('Path pattern'), {
+      target: { value: '/api/users/{id}' },
+    });
+    await advanceTimersByTime(RULE_PREVIEW_DEBOUNCE_MS);
+    vi.useRealTimers();
+
+    expect(await screen.findByText('Scan truncated')).toBeTruthy();
+    expect(
+      screen.getByText((_, node) =>
+        Boolean(
+          node instanceof HTMLElement &&
+            node.classList.contains('body-copy') &&
+            node.textContent ===
+              'This rule would have matched at least 3 requests in the last 24 hours; only the newest 900 events in that window were scanned.',
+        ),
+      ),
+    ).toBeTruthy();
+  });
+
+  it('presents a complete preview count without a truncation notice', async () => {
+    const fetchMock = policyBackedFetch(policyFixture(), 'W/"policy-1"', {
+      preview: {
+        ...previewResponseFixture(0, '/api/users/123'),
+        samples: [],
+        scan_truncated: false,
+        complete: true,
+      },
+    });
+    vi.stubGlobal('fetch', fetchMock);
+
+    renderRuleEditor();
+
+    await screen.findByLabelText('Path pattern');
+    vi.useFakeTimers();
+    fireEvent.change(screen.getByLabelText('Path pattern'), {
+      target: { value: '/api/users/{id}' },
+    });
+    await advanceTimersByTime(RULE_PREVIEW_DEBOUNCE_MS);
+    vi.useRealTimers();
+
+    expect(
+      await screen.findByText('No matched request samples returned.'),
+    ).toBeTruthy();
+    expect(screen.queryByText('Scan truncated')).toBeNull();
+    expect(
+      screen.getByText((_, node) =>
+        Boolean(
+          node instanceof HTMLElement &&
+            node.classList.contains('body-copy') &&
+            node.textContent ===
+              'This rule would have matched 0 requests in the last 24 hours.',
+        ),
+      ),
+    ).toBeTruthy();
+  });
+
   it('keeps the newest preview when an older preview resolves last', async () => {
     const previewCalls: Deferred<Response>[] = [];
     const fetchMock = policyBackedFetch(policyFixture(), 'W/"policy-1"', {

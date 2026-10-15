@@ -3,11 +3,15 @@ import { Link } from 'react-router-dom';
 
 import { AdminApiError } from '../lib/api';
 import {
+  PolicyDocument,
+  PolicyRule,
   PolicyRulePatch,
   PolicyRuleShadowReviewSummary,
   fetchPolicy,
   fetchPolicyRuleShadowReview,
+  isPolicyRuleEnabled,
   patchPolicyRule,
+  policyRuleId,
 } from '../lib/policy';
 import { MethodList, formatPrincipal, ruleTarget } from './RuleTable';
 import { RuleWorkspaceNav } from './RuleWorkspaceNav';
@@ -27,15 +31,30 @@ type ShadowReviewError = {
 const POLICY_CHANGED_MESSAGE =
   'Policy changed since this page loaded; refresh and retry.';
 
+type ShadowReviewItem = {
+  ruleId: string;
+  rule: PolicyRule;
+  // Null when audit evidence is unavailable: nothing is known about what the
+  // rule would have denied, which is not the same as "nothing".
+  summary: PolicyRuleShadowReviewSummary | null;
+};
+
+type ShadowReviewEvidence =
+  | { status: 'complete' }
+  | { status: 'truncated' }
+  | { status: 'unavailable'; message: string };
+
 export function ShadowReviewView() {
-  const [summaries, setSummaries] = useState<PolicyRuleShadowReviewSummary[]>([]);
+  const [items, setItems] = useState<ShadowReviewItem[]>([]);
   const [isLoading, setIsLoading] = useState(true);
   const [loadError, setLoadError] = useState<ShadowReviewError | null>(null);
   const [mutationError, setMutationError] = useState<ShadowReviewError | null>(null);
   const [mutationNotice, setMutationNotice] = useState<string | null>(null);
   const [canWritePolicy, setCanWritePolicy] = useState(false);
   const [mutatingRuleId, setMutatingRuleId] = useState<string | null>(null);
-  const [scanTruncated, setScanTruncated] = useState(false);
+  const [evidence, setEvidence] = useState<ShadowReviewEvidence>({
+    status: 'complete',
+  });
   const [confirmingPromoteId, setConfirmingPromoteId] = useState<string | null>(
     null,
   );
@@ -49,7 +68,7 @@ export function ShadowReviewView() {
       setMutationError(null);
       setMutationNotice(null);
       setCanWritePolicy(false);
-      setScanTruncated(false);
+      setEvidence({ status: 'complete' });
 
       try {
         const [policyResult, review] = await Promise.all([
@@ -61,16 +80,31 @@ export function ShadowReviewView() {
         }
 
         setCanWritePolicy(policyResult.canWrite);
-        setSummaries(review.rules);
-        setScanTruncated(review.scan_truncated);
+        if (review.status === 'available') {
+          setItems(
+            review.value.rules.map((summary) => ({
+              ruleId: summary.rule_id,
+              rule: summary.rule,
+              summary,
+            })),
+          );
+          setEvidence(
+            review.value.scan_truncated
+              ? { status: 'truncated' }
+              : { status: 'complete' },
+          );
+        } else {
+          setItems(enabledShadowRules(policyResult.policy));
+          setEvidence({ status: 'unavailable', message: review.message });
+        }
       } catch (error) {
         if (!isCurrent) {
           return;
         }
 
         setCanWritePolicy(false);
-        setSummaries([]);
-        setScanTruncated(false);
+        setItems([]);
+        setEvidence({ status: 'complete' });
         setLoadError(toShadowReviewError(error));
       } finally {
         if (isCurrent) {
@@ -87,12 +121,12 @@ export function ShadowReviewView() {
   }, []);
 
   const resultCount = useMemo(() => {
-    return `${summaries.length} ${summaries.length === 1 ? 'rule' : 'rules'}`;
-  }, [summaries.length]);
+    return `${items.length} ${items.length === 1 ? 'rule' : 'rules'}`;
+  }, [items.length]);
   const showWritePermissionNotice =
     !isLoading &&
     !loadError &&
-    summaries.length > 0 &&
+    items.length > 0 &&
     !canWritePolicy &&
     mutationError?.kind !== 'forbidden';
 
@@ -132,9 +166,7 @@ export function ShadowReviewView() {
 
       await patchPolicyRule(ruleId, policyResult.etag, patch);
       setCanWritePolicy(policyResult.canWrite);
-      setSummaries((current) =>
-        current.filter((summary) => summary.rule_id !== ruleId),
-      );
+      setItems((current) => current.filter((item) => item.ruleId !== ruleId));
       setMutationNotice(successMessage);
       return true;
     } catch (error) {
@@ -173,9 +205,22 @@ export function ShadowReviewView() {
             <p>{mutationNotice}</p>
           </div>
         ) : null}
-        {scanTruncated ? (
+        {evidence.status === 'truncated' ? (
           <div className="error-panel alert warning" role="status">
-            <p>Audit scan limit reached; counts and samples show the newest scanned events.</p>
+            <p>
+              Audit scan limit reached; counts, principals, and samples cover only the
+              newest scanned events, so each count is a lower bound.
+            </p>
+          </div>
+        ) : null}
+        {evidence.status === 'unavailable' ? (
+          <div className="error-panel alert warning" role="status">
+            <h3>Shadow evidence unavailable</h3>
+            <p>{evidence.message}</p>
+            <p>
+              Would-deny counts, affected principals, and samples were not read. A
+              rule without evidence has not been shown to be safe to promote.
+            </p>
           </div>
         ) : null}
 
@@ -185,26 +230,27 @@ export function ShadowReviewView() {
           </div>
         ) : null}
 
-        {!isLoading && summaries.length === 0 && !loadError ? (
+        {!isLoading && items.length === 0 && !loadError ? (
           <div className="empty-state">No rules are currently in shadow mode.</div>
         ) : null}
 
-        {summaries.length > 0 ? (
+        {items.length > 0 ? (
           <ol className="policy-history-list shadow-review-list" aria-label="Shadow review queue">
-            {summaries.map((summary) => (
+            {items.map((item) => (
               <ShadowReviewEntry
                 canWritePolicy={canWritePolicy}
                 confirmingPromoteId={confirmingPromoteId}
-                isMutating={mutatingRuleId === summary.rule_id}
+                evidence={evidence}
+                isMutating={mutatingRuleId === item.ruleId}
                 isMutationBusy={mutatingRuleId !== null}
-                key={summary.rule_id}
-                summary={summary}
+                item={item}
+                key={item.ruleId}
                 onConfirmingPromoteChange={setConfirmingPromoteId}
                 onDisable={() => {
-                  void disableRule(summary.rule_id);
+                  void disableRule(item.ruleId);
                 }}
                 onPromote={() => {
-                  void promoteRule(summary.rule_id);
+                  void promoteRule(item.ruleId);
                 }}
               />
             ))}
@@ -216,7 +262,8 @@ export function ShadowReviewView() {
 }
 
 function ShadowReviewEntry({
-  summary,
+  item,
+  evidence,
   canWritePolicy,
   confirmingPromoteId,
   isMutating,
@@ -225,7 +272,8 @@ function ShadowReviewEntry({
   onPromote,
   onDisable,
 }: {
-  summary: PolicyRuleShadowReviewSummary;
+  item: ShadowReviewItem;
+  evidence: ShadowReviewEvidence;
   canWritePolicy: boolean;
   confirmingPromoteId: string | null;
   isMutating: boolean;
@@ -234,6 +282,8 @@ function ShadowReviewEntry({
   onPromote: () => void;
   onDisable: () => void;
 }) {
+  const { summary } = item;
+
   return (
     <li className="policy-history-entry shadow-review-entry">
       <div className="policy-history-marker" aria-hidden="true" />
@@ -241,10 +291,10 @@ function ShadowReviewEntry({
         <div className="policy-history-entry-heading shadow-review-entry-heading">
           <div>
             <span className="badge warning">Shadow</span>
-            <h3>{summary.rule_id}</h3>
+            <h3>{item.ruleId}</h3>
           </div>
           <span className="badge neutral">
-            {formatWouldDenyCount(summary.would_deny_count)}
+            {formatWouldDenyEvidence(summary, evidence)}
           </span>
         </div>
 
@@ -252,10 +302,10 @@ function ShadowReviewEntry({
           <div>
             <dt>Methods</dt>
             <dd>
-              {summary.rule.tool_name ? (
+              {item.rule.tool_name ? (
                 <span className="badge neutral">MCP tool</span>
               ) : (
-                <MethodList methods={summary.rule.methods ?? []} />
+                <MethodList methods={item.rule.methods ?? []} />
               )}
             </dd>
           </div>
@@ -263,19 +313,21 @@ function ShadowReviewEntry({
             <dt>Target</dt>
             <dd>
               <code className="endpoint-template rule-path">
-                {ruleTarget(summary.rule)}
+                {ruleTarget(item.rule)}
               </code>
             </dd>
           </div>
           <div>
             <dt>Principal</dt>
-            <dd>{formatPrincipal(summary.rule.principal)}</dd>
+            <dd>{formatPrincipal(item.rule.principal)}</dd>
           </div>
         </dl>
 
         <div className="shadow-review-section">
           <h4>Affected principals</h4>
-          {summary.affected_principals.length > 0 ? (
+          {summary === null ? (
+            <p className="shadow-review-muted">Evidence unavailable.</p>
+          ) : summary.affected_principals.length > 0 ? (
             <div className="shadow-review-chip-list" aria-label="Affected principals">
               {summary.affected_principals.map((principal) => (
                 <span
@@ -298,7 +350,9 @@ function ShadowReviewEntry({
 
         <div className="shadow-review-section">
           <h4>Sample requests</h4>
-          {summary.samples.length > 0 ? (
+          {summary === null ? (
+            <p className="shadow-review-muted">Evidence unavailable.</p>
+          ) : summary.samples.length > 0 ? (
             <ul className="shadow-review-sample-list">
               {summary.samples.map((sample) => (
                 <li className="shadow-review-sample" key={sample.event_id}>
@@ -317,7 +371,7 @@ function ShadowReviewEntry({
 
         <div className="policy-history-actions shadow-review-actions">
           <ShadowRulePromoteControl
-            ruleId={summary.rule_id}
+            ruleId={item.ruleId}
             canWritePolicy={canWritePolicy}
             confirmingPromoteId={confirmingPromoteId}
             isMutating={isMutating}
@@ -328,7 +382,7 @@ function ShadowReviewEntry({
           <button
             type="button"
             className="secondary-button"
-            aria-label={`Disable ${summary.rule_id}`}
+            aria-label={`Disable ${item.ruleId}`}
             title={canWritePolicy ? undefined : 'Requires admin:policy:write'}
             disabled={!canWritePolicy || isMutationBusy}
             onClick={onDisable}
@@ -458,8 +512,33 @@ function ShadowReviewMutationError({ error }: { error: ShadowReviewError }) {
   );
 }
 
+// Unread evidence, a truncated scan, and a complete count must read
+// differently: only the last can say a rule would have denied nothing.
+function formatWouldDenyEvidence(
+  summary: PolicyRuleShadowReviewSummary | null,
+  evidence: ShadowReviewEvidence,
+): string {
+  if (summary === null || evidence.status === 'unavailable') {
+    return 'Evidence unavailable';
+  }
+
+  const count = formatWouldDenyCount(summary.would_deny_count);
+  return evidence.status === 'truncated' ? `${count} (scan truncated)` : count;
+}
+
 function formatWouldDenyCount(value: number): string {
   return `${value.toLocaleString()} would-deny ${value === 1 ? 'event' : 'events'}`;
+}
+
+// The selection the gateway's review makes -- enabled shadow rules, keyed by
+// the id live audit attribution uses -- for listing them when no evidence
+// about them could be read.
+function enabledShadowRules(policy: PolicyDocument): ShadowReviewItem[] {
+  return policy.rules.flatMap((rule, index) =>
+    isPolicyRuleEnabled(rule) && rule.action === 'shadow'
+      ? [{ ruleId: policyRuleId(rule, index), rule, summary: null }]
+      : [],
+  );
 }
 
 function formatUtcTimestamp(value: string): string {

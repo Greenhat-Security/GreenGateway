@@ -587,7 +587,7 @@ pub(super) async fn policy_rule_preview_endpoint(
         return admin_permission_denied_response(ADMIN_AUDIT_READ_PERMISSION.to_owned());
     }
     let Some(query_store) = state.event_store.as_ref() else {
-        return service_unavailable("policy rule preview requires an audit query store");
+        return policy_evidence_unavailable("policy rule preview requires an audit query store");
     };
 
     let body = match read_request_body(body, state.max_body_size).await {
@@ -624,16 +624,19 @@ pub(super) async fn policy_rule_hits_endpoint(
         Ok(rbac_state) => rbac_state,
         Err(error) => return policy_admin_authz_error_response(error),
     };
+    // Without an audit store there are no counts to report, not counts of
+    // zero: answering every rule with `hits: 0` would present unread evidence
+    // as "never matched".
+    let Some(query_store) = state.query_store.as_ref() else {
+        return policy_evidence_unavailable("policy rule hit counts require an audit query store");
+    };
     let policy = rbac_state.current_policy();
-    let counts = match state.query_store.as_ref() {
-        Some(query_store) => match query_store.rule_hit_counts().await {
-            Ok(counts) => counts,
-            Err(err) => {
-                tracing::error!(error = %err, "failed to query policy rule hit counts");
-                return internal_server_error("policy rule hit count query failed");
-            }
-        },
-        None => HashMap::new(),
+    let counts = match query_store.rule_hit_counts().await {
+        Ok(counts) => counts,
+        Err(err) => {
+            tracing::error!(error = %err, "failed to query policy rule hit counts");
+            return internal_server_error("policy rule hit count query failed");
+        }
     };
 
     Json(PolicyRuleHitsResponse {
@@ -672,6 +675,12 @@ pub(super) async fn policy_rule_shadow_review_endpoint(
     if !rbac_state.principal_has_permission(principal, ADMIN_AUDIT_READ_PERMISSION) {
         return admin_permission_denied_response(ADMIN_AUDIT_READ_PERMISSION.to_owned());
     }
+    // An empty summary per shadow rule would read as "this rule would deny
+    // nothing" and invite promoting it to enforced deny on evidence that was
+    // never read.
+    let Some(query_store) = state.query_store.as_ref() else {
+        return policy_evidence_unavailable("policy shadow review requires an audit query store");
+    };
     let policy = rbac_state.current_policy();
     let shadow_rules = policy
         .rules
@@ -690,18 +699,15 @@ pub(super) async fn policy_rule_shadow_review_endpoint(
         .map(|(rule_id, _)| rule_id.clone())
         .collect::<Vec<_>>();
 
-    let review = match state.query_store.as_ref() {
-        Some(query_store) => match query_store
-            .shadow_rule_would_deny_summaries(&rule_ids)
-            .await
-        {
-            Ok(review) => review,
-            Err(err) => {
-                tracing::error!(error = %err, "failed to query shadow rule review summaries");
-                return internal_server_error("shadow rule review query failed");
-            }
-        },
-        None => audit::query::ShadowRuleWouldDenySummarySet::default(),
+    let review = match query_store
+        .shadow_rule_would_deny_summaries(&rule_ids)
+        .await
+    {
+        Ok(review) => review,
+        Err(err) => {
+            tracing::error!(error = %err, "failed to query shadow rule review summaries");
+            return internal_server_error("shadow rule review query failed");
+        }
     };
 
     Json(PolicyRuleShadowReviewResponse {
@@ -867,13 +873,27 @@ pub(super) async fn preview_rule(
     query_store: &dyn storage::AuditEventStore,
     request: PolicyRulePreviewRequest,
 ) -> Result<PolicyRulePreviewResponse, storage::RepositoryError> {
+    preview_rule_with_scan_limit(query_store, request, MAX_RULE_PREVIEW_SCAN_ROWS).await
+}
+
+/// Scan at most `max_scan_rows` observations, newest first, however wide the
+/// requested window is. A window holding more rows than that answers with
+/// `scan_truncated` and `complete: false`, so a count over the newest rows is
+/// never presented as a count over the whole window.
+pub(super) async fn preview_rule_with_scan_limit(
+    query_store: &dyn storage::AuditEventStore,
+    request: PolicyRulePreviewRequest,
+    max_scan_rows: usize,
+) -> Result<PolicyRulePreviewResponse, storage::RepositoryError> {
     let matcher = rbac::RuleMatcher::new(std::slice::from_ref(&request.rule));
     let sample_limit = request
         .sample_limit
         .unwrap_or(DEFAULT_RULE_PREVIEW_SAMPLE_LIMIT)
         .min(MAX_RULE_PREVIEW_SAMPLE_LIMIT);
+    let max_scan_rows = u64::try_from(max_scan_rows).unwrap_or(u64::MAX);
     let mut match_count = 0_u64;
     let mut scanned_event_count = 0_u64;
+    let mut scan_truncated = false;
     let mut samples = Vec::with_capacity(sample_limit);
 
     let mut filters = audit::query::RequestObservationFilters {
@@ -884,12 +904,19 @@ pub(super) async fn preview_rule(
         path_prefix: prefix_preview_path_filter(&request.rule.path),
         before_id: None,
     };
-    loop {
+    'scan: loop {
         let observations = query_store.query_request_observations(&filters).await?;
         if observations.is_empty() {
             break;
         }
         for observation in observations {
+            // Reaching one more row after the ceiling is what proves the
+            // window held more than was scanned; a scan that ends exactly at
+            // the ceiling with nothing left is complete.
+            if scanned_event_count >= max_scan_rows {
+                scan_truncated = true;
+                break 'scan;
+            }
             filters.before_id = Some(observation.id);
             scanned_event_count = scanned_event_count.saturating_add(1);
             let principal = observation
@@ -940,6 +967,8 @@ pub(super) async fn preview_rule(
     Ok(PolicyRulePreviewResponse {
         match_count,
         scanned_event_count,
+        scan_truncated,
+        complete: !scan_truncated,
         sample_strategy: "newest_matches",
         samples,
     })
