@@ -2306,6 +2306,106 @@ mod tests {
         assert_eq!(events[0].payload["invocation_source"], json!("internal"));
     }
 
+    /// Inside a pinned request the rendered-HTTP rule is judged by the policy
+    /// the gate pinned at admission, as tool admission is; a revision
+    /// installed afterwards is invisible to it and visible outside the pin.
+    /// Reading the live lane here would admit the tool under one snapshot and
+    /// judge its rendered request under another.
+    #[cfg(feature = "postgres")]
+    #[tokio::test]
+    async fn tool_http_operation_reads_the_pinned_policy_not_the_live_lane() {
+        let pinned_policy = Policy::validate_json_value(json!({
+            "schema_version": "0.1.0",
+            "tools": {
+                "echo": {
+                    "timeout_ms": 5000,
+                    "max_concurrent": 2
+                }
+            },
+            "rules": [{
+                "id": "allow-echo-http-pinned",
+                "methods": ["POST"],
+                "path": "/v1/echo",
+                "action": "allow"
+            }]
+        }))
+        .expect("pinned tool policy should parse");
+        let live_policy = Policy::validate_json_value(json!({
+            "schema_version": "0.1.0",
+            "tools": {
+                "echo": {
+                    "enabled": false,
+                    "timeout_ms": 5000,
+                    "max_concurrent": 2
+                }
+            },
+            "rules": [{
+                "id": "deny-echo-http-live",
+                "methods": ["POST"],
+                "path": "/v1/echo",
+                "action": "deny"
+            }]
+        }))
+        .expect("live tool policy should parse");
+        let capture = CaptureSink::new();
+        let audit = AuditLog::new(Arc::new(capture.clone()) as Arc<dyn AuditSink>);
+        let rbac_state = crate::middleware::rbac::RbacState::new(
+            pinned_policy.clone(),
+            Vec::new(),
+            false,
+            audit.clone(),
+        );
+        let runtime_config = ToolRuntimeConfig::from_policy(&pinned_policy)
+            .expect("pinned tool policy should configure runtime");
+        let runtime =
+            ToolRuntime::new_with_rbac_state(runtime_config, audit, Some(rbac_state.clone()));
+        let context = context_with_roles(&["admin"]);
+        let pinned = rbac_state.policy_handle().load_full();
+
+        // A reconcile installs the next revision after the request's admission.
+        rbac_state
+            .install_revision_snapshot(live_policy, 1)
+            .await
+            .expect("the live lane installs revision 1");
+
+        let (visible_inside, allowed_inside) =
+            crate::middleware::rbac::with_pinned_policy(pinned, async {
+                (
+                    runtime.tool_visible_to_context("echo", &context),
+                    runtime.authorize_http_operation("echo", "POST", "/v1/echo", &context),
+                )
+            })
+            .await;
+        assert!(visible_inside, "tool admission reads the pinned snapshot");
+        assert!(
+            allowed_inside,
+            "a pinned request never sees a rule installed after its admission"
+        );
+        let events = audit_events(&capture, 1).await;
+        assert_eq!(events.len(), 1, "{events:#?}");
+        assert_eq!(events[0].event_type, AUTHZ_ALLOWED);
+        assert_eq!(
+            events[0].payload["matched_rule_id"],
+            json!("allow-echo-http-pinned")
+        );
+
+        assert!(
+            !runtime.tool_visible_to_context("echo", &context),
+            "outside the pin the live lane is read"
+        );
+        assert!(
+            !runtime.authorize_http_operation("echo", "POST", "/v1/echo", &context),
+            "outside the pin the live lane is read"
+        );
+        let events = audit_events(&capture, 2).await;
+        assert_eq!(events.len(), 2, "{events:#?}");
+        assert_eq!(events[1].event_type, AUTHZ_DENIED);
+        assert_eq!(
+            events[1].payload["matched_rule_id"],
+            json!("deny-echo-http-live")
+        );
+    }
+
     #[tokio::test]
     async fn admin_playground_http_rule_audit_never_contains_rendered_arguments() {
         let canary = "submitted-path-canary";

@@ -9831,7 +9831,7 @@
         "network-or-process-reference"
       ],
       "scope": "gateway::mcp::impl ServerHandler McpServer::list_tools#1",
-      "sha256": "2d1421dedd6253bf16961d2d46081ab9f313893e1f2c52746085a3a57dc5ea11",
+      "sha256": "d0b5b8ca18cd1751b1babd0d17141c1cc027a82d628a704784b7275661fedab4",
       "owner": "GreenGateway maintainers",
       "purpose": "Existing application transport references or syntax in this exact item; new or changed authority requires explicit review."
     },
@@ -9841,7 +9841,7 @@
         "network-or-process-reference"
       ],
       "scope": "gateway::mcp::impl ServerHandler McpServer::call_tool#1",
-      "sha256": "76b4f9c3689e2c8addabd34d7e47b4a69efdaa1a8cff009c23ad181b6e13f0b2",
+      "sha256": "71fd94bf771c17a351d596a253e5b70ca18f62853d03d0e23b3d597919c8d9a3",
       "owner": "GreenGateway maintainers",
       "purpose": "Existing application transport references or syntax in this exact item; new or changed authority requires explicit review."
     },
@@ -9851,7 +9851,7 @@
         "network-or-process-reference"
       ],
       "scope": "gateway::mcp::impl ServerHandler McpServer::enqueue_task#1",
-      "sha256": "341da16e35c3efca7179cbaaf3d3f5395802876fec34f453f72fed94ff65587e",
+      "sha256": "b61ea72d45b3e384f5d05991dafb893953f951dd29d19d0a86c565b4b4bff361",
       "owner": "GreenGateway maintainers",
       "purpose": "Existing application transport references or syntax in this exact item; new or changed authority requires explicit review."
     },
@@ -9864,6 +9864,16 @@
       "sha256": "e8feef2aea6cb6ab591915a3f45c076e87f77fd9ddb697c12823cc058035acba",
       "owner": "GreenGateway maintainers",
       "purpose": "Existing application transport references or syntax in this exact item; new or changed authority requires explicit review."
+    },
+    {
+      "file": "gateway/src/mcp.rs",
+      "reasons": [
+        "network-or-process-reference"
+      ],
+      "scope": "gateway::mcp::impl  McpServer::enqueue_task_work#1",
+      "sha256": "e0a25ea9441efef99e4bc2cde0294c5f6f061be950f02b796c3456fe274039cb",
+      "owner": "GreenGateway maintainers",
+      "purpose": "Body of McpServer::enqueue_task, moved so task rejection runs boxed under the request's re-entered security pins; it names rmcp's CreateTaskResult and adds no transport authority."
     },
     {
       "file": "gateway/src/mcp.rs",
@@ -10042,7 +10052,7 @@
         "unexpanded-macro"
       ],
       "scope": "gateway::middleware::rbac::macro tokio :: task_local#1",
-      "sha256": "323b989820aa2112f4606d911c8b8c37d69db4ba65f04926c9dd890e4c75e335",
+      "sha256": "e05ad9aae7f25f6d39f856836553b732d22bd33629e0cc08233615233127a807",
       "owner": "GreenGateway maintainers",
       "purpose": "Existing macro/attribute inputs for this exact application item; changed expansion inputs require explicit review."
     },
