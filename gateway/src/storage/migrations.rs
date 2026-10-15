@@ -231,6 +231,13 @@ static MANIFEST: LazyLock<Vec<Migration>> = LazyLock::new(|| {
         )
         .finalize()
         .with_pinned_checksum("24a309c77f0adb640ec1d4e417fb2dd4f666914e02aad069440d293a2a41e3ab"),
+        Migration::new(
+            16,
+            "connection_change_evidence",
+            include_str!("migrations/0016_connection_change_evidence.sql"),
+        )
+        .finalize()
+        .with_pinned_checksum("dfa271439d8833474d2ce622e818ca52aca5710fab996a26218af0794a74bab4"),
     ]
 });
 
@@ -265,15 +272,18 @@ impl SchemaCompatibility {
 
 // No adjacent release pair has been qualified. Do not widen these bounds or
 // add an extension without the pinned SQL and two-binary gate in issue #426.
+// Moving the point from 15 to 16 (Connection change evidence, #425) is not
+// an overlap: a schema-15 binary refuses schema 16 and this binary refuses
+// schema 15, so that upgrade is a coordinated drain/migrate/restart.
 const BINARY_SCHEMA_COMPATIBILITY: SchemaCompatibility = SchemaCompatibility {
-    read: (15, 15),
-    write: (15, 15),
+    read: (16, 16),
+    write: (16, 16),
     approved_extensions: &[],
 };
 
 /// The intersection of the explicit read/write contracts, advertised to the
 /// roster. This is a summary, not proof of ledger integrity or permission to
-/// contract the schema. The shipped contract still accepts only schema 15.
+/// contract the schema. The shipped contract still accepts only schema 16.
 pub(crate) fn schema_version_range() -> (i32, i32) {
     BINARY_SCHEMA_COMPATIBILITY.serving_range()
 }
@@ -1053,14 +1063,25 @@ mod tests {
     fn the_shipped_contract_has_no_unproved_overlap() {
         assert_eq!(
             MANIFEST.len(),
-            15,
+            16,
             "review the compatibility contract when adding SQL"
         );
-        assert_eq!(schema_version_range(), (15, 15));
+        assert_eq!(BINARY_SCHEMA_COMPATIBILITY.read, (16, 16));
+        assert_eq!(BINARY_SCHEMA_COMPATIBILITY.write, (16, 16));
+        assert_eq!(schema_version_range(), (16, 16));
         assert!(BINARY_SCHEMA_COMPATIBILITY.approved_extensions.is_empty());
         assert_eq!(
             validate_runtime_ledger(&ledger_for(&MANIFEST, MANIFEST.len(), "")),
             Ok(SchemaStatus::Current)
+        );
+        // The previous release's schema is not served: moving the point is
+        // a coordinated upgrade, never an overlap window.
+        assert_eq!(
+            validate_runtime_ledger(&ledger_for(&MANIFEST, MANIFEST.len() - 1, "")),
+            Ok(SchemaStatus::NeedsUpgrade {
+                applied: 15,
+                missing: 1
+            })
         );
     }
 
@@ -1518,7 +1539,7 @@ mod tests {
         let authority = PostgresReadinessAuthority::new(foundation.pool().clone());
         assert_eq!(
             authority.observe().await,
-            AuthorityObservation::Writable { schema_version: 15 }
+            AuthorityObservation::Writable { schema_version: 16 }
         );
         let client = foundation.pool().get().await.expect("fixture client");
         client
@@ -1530,7 +1551,7 @@ mod tests {
             .expect("change fixture checksum without changing extent");
         assert_eq!(
             authority.observe().await,
-            AuthorityObservation::IncompatibleSchema { schema_version: 15 }
+            AuthorityObservation::IncompatibleSchema { schema_version: 16 }
         );
         client
             .execute(
@@ -1541,7 +1562,7 @@ mod tests {
             .expect("restore fixture checksum");
         assert_eq!(
             authority.observe().await,
-            AuthorityObservation::Writable { schema_version: 15 }
+            AuthorityObservation::Writable { schema_version: 16 }
         );
         client
             .execute(
@@ -1552,7 +1573,7 @@ mod tests {
             .expect("remove a fixture history row");
         assert_eq!(
             authority.observe().await,
-            AuthorityObservation::IncompatibleSchema { schema_version: 15 }
+            AuthorityObservation::IncompatibleSchema { schema_version: 16 }
         );
         drop(client);
         clean_database(foundation.pool()).await;
@@ -1611,7 +1632,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn migrations_twelve_through_fifteen_preserve_existing_connection_state() {
+    async fn migrations_twelve_through_sixteen_preserve_existing_connection_state() {
         let Some(dsn) = real_dsn() else {
             eprintln!("skipping: no test database locator; CI runs this test");
             return;
@@ -1625,7 +1646,14 @@ mod tests {
         bootstrap_ledger(&client)
             .await
             .expect("migration ledger should bootstrap");
-        for migration in &MANIFEST[..MANIFEST.len() - 2] {
+        // Stop at the v11 shape by version, not by distance from the end of
+        // the manifest, so appending a migration cannot quietly move the
+        // starting point past the additional-header migration under test.
+        let through_v11 = MANIFEST
+            .iter()
+            .take_while(|migration| migration.version <= 11)
+            .count();
+        for migration in &MANIFEST[..through_v11] {
             apply_one(&client, migration, &test_settings())
                 .await
                 .expect("pre-additional-header migrations should apply");
@@ -1660,8 +1688,13 @@ mod tests {
 
         let applied = apply_missing(foundation.pool(), &test_settings())
             .await
-            .expect("additional-header and overlay migrations should apply");
-        assert_eq!(applied, MigrateOutput::Applied { applied: 2 });
+            .expect("additional-header and later migrations should apply");
+        assert_eq!(
+            applied,
+            MigrateOutput::Applied {
+                applied: MANIFEST.len() - through_v11
+            }
+        );
 
         let client = foundation
             .pool()
@@ -1786,7 +1819,9 @@ mod tests {
         drop(store);
 
         // Reconstruct the exact v12 shape while retaining populated v12
-        // rows, then let migrations 13 through 15 run.
+        // rows, then let migrations 13 through 16 run. Each later
+        // migration's DDL is undone explicitly, so appending one fails
+        // here until its reconstruction is added.
         foundation
             .pool()
             .get()
@@ -1799,6 +1834,7 @@ mod tests {
                      DROP COLUMN overlay_revision; \
                  ALTER TABLE greengateway.connection_mcp_catalog_entries \
                      DROP COLUMN annotations_json, DROP COLUMN title; \
+                 DROP TABLE greengateway.connection_change_evidence; \
                  DELETE FROM {LEDGER_TABLE} WHERE version >= 13;"
             ))
             .await
@@ -1807,8 +1843,8 @@ mod tests {
         assert_eq!(
             apply_missing(foundation.pool(), &test_settings())
                 .await
-                .expect("migrations 13 through 15 should apply"),
-            MigrateOutput::Applied { applied: 3 }
+                .expect("migrations 13 through 16 should apply"),
+            MigrateOutput::Applied { applied: 4 }
         );
         let reopened = crate::connections::pg_store::PostgresConnectionStore::new(
             foundation.pool().clone(),
@@ -1839,6 +1875,21 @@ mod tests {
             .await
             .expect("new overlay table should read")
             .is_empty());
+        // Migration 16 is additive and records no history it did not see:
+        // a Connection that predates it has no fabricated change evidence.
+        let evidence: i64 = foundation
+            .pool()
+            .get()
+            .await
+            .expect("evidence verification checkout")
+            .query_one(
+                "SELECT COUNT(*) FROM greengateway.connection_change_evidence",
+                &[],
+            )
+            .await
+            .expect("the evidence table should resolve after migration 16")
+            .get(0);
+        assert_eq!(evidence, 0);
     }
 
     #[tokio::test]

@@ -608,13 +608,20 @@ impl PostgresConnectionStore {
     /// Delete a connection under its etag compare-and-swap. A connection
     /// still referenced by dependency rows is refused; deletes cascade to
     /// versions, bindings, catalogs, and status rows in the same commit
-    /// as the state/outbox bumps.
+    /// as the state/outbox bumps and the deletion's durable evidence
+    /// (`connection_change_evidence`, migration 16), which does not
+    /// cascade. A refused or failed delete writes no evidence, and a
+    /// delete whose evidence cannot be written does not commit.
     pub async fn delete(
         &self,
         id: &ConnectionId,
         expected: &ConnectionEtag,
-        _actor_user_id: &str,
+        actor_user_id: &str,
     ) -> Result<(), ConnectionStoreError> {
+        validate_evidence_actor(actor_user_id)?;
+        // One logical operation, minted once per call: every evidence row
+        // this transaction writes carries it, and nothing regenerates it.
+        let operation_id = uuid::Uuid::new_v4();
         let client = self
             .pool
             .get()
@@ -644,12 +651,32 @@ impl PostgresConnectionStore {
             // The outbox row precedes the cascade delete: version 0 marks a
             // deletion (specification versions start at 1). The version
             // rows cascade with the record, as they do in the standalone
-            // store; the deletion is attributed by the admin audit event
-            // the handler records with its actor, which is why the actor
-            // is not written here. Any tool names the record's catalogs
+            // store, so they cannot attribute the deletion; its evidence
+            // row -- actor, action, event and operation identity, prior
+            // version, and the shared revision the outbox row took -- has
+            // no foreign key and outlives the record. Both commit with the
+            // delete or not at all. Any tool names the record's catalogs
             // held are released in the same transaction.
-            bump_connection_state(&client, RESOURCE_CONNECTION, id, Some(current.revisions.connection), 0)
-                .await?;
+            let security_revision = bump_connection_state(
+                &client,
+                RESOURCE_CONNECTION,
+                id,
+                Some(current.revisions.connection),
+                0,
+            )
+            .await?;
+            record_change_evidence(
+                &client,
+                &ChangeEvidence {
+                    operation_id,
+                    action: EVIDENCE_ACTION_DELETE,
+                    id,
+                    prior_version: current.revisions.connection,
+                    security_revision,
+                    actor_user_id,
+                },
+            )
+            .await?;
             postgres_tool_names::release_tool_names(&client, id.as_str())
                 .await
                 .map_err(|error| pg_error(OPERATION_DELETE, error))?;
@@ -4761,14 +4788,15 @@ const RESOURCE_CONNECTION_CATALOG: &str = "connection_catalog";
 /// mark and append the outbox row, all inside the caller's transaction:
 /// a connection mutation cannot succeed without its durable record.
 /// `resource_type` says which counter `from_version`/`to_version` carry;
-/// see the two constants above.
+/// see the two constants above. Returns the shared revision this
+/// transaction took, which is also the outbox row's `revision`.
 async fn bump_connection_state(
     client: &deadpool_postgres::Object,
     resource_type: &str,
     id: &ConnectionId,
     from_version: Option<u64>,
     to_version: u64,
-) -> Result<(), ConnectionStoreError> {
+) -> Result<i64, ConnectionStoreError> {
     let from = match from_version {
         Some(version) => u64_to_i64(id, version)?,
         None => 0,
@@ -4822,6 +4850,83 @@ async fn bump_connection_state(
         )
         .await
         .map_err(|error| pg_error(OPERATION_CREATE, error))?;
+    Ok(security_revision)
+}
+
+/// The closed action vocabulary of `connection_change_evidence`
+/// (migration 16). Values are the proposed authority-event operation
+/// codes (`docs/schemas/authority_event.v1.schema.json`), so a later
+/// projection needs no translation table; the migration's CHECK refuses
+/// anything else.
+const EVIDENCE_ACTION_DELETE: &str = "connection.delete";
+
+/// The longest actor migration 16 accepts. It is exactly the principal
+/// subject bound authentication enforces, so evidence never refuses a
+/// principal a validator produced; the assertion keeps the immutable SQL
+/// bound and the Rust bound from drifting apart silently.
+const EVIDENCE_ACTOR_MAX_BYTES: usize = 4096;
+const _: () =
+    assert!(EVIDENCE_ACTOR_MAX_BYTES == crate::auth::principal::MAX_PRINCIPAL_SUBJECT_BYTES);
+
+const OPERATION_CHANGE_EVIDENCE: &str = "change_evidence_append";
+
+/// An unattributable change has no evidence to record, so it is refused
+/// before any transaction opens rather than committed anonymously. An
+/// authenticated principal always satisfies this; the CHECK in migration
+/// 16 is the backstop.
+fn validate_evidence_actor(actor_user_id: &str) -> Result<(), ConnectionStoreError> {
+    if actor_user_id.is_empty() || actor_user_id.len() > EVIDENCE_ACTOR_MAX_BYTES {
+        return Err(ConnectionStoreError::Validation {
+            problems: vec![format!(
+                "the change actor must be between 1 and {EVIDENCE_ACTOR_MAX_BYTES} bytes"
+            )],
+        });
+    }
+    Ok(())
+}
+
+/// One committed change's evidence: identifiers, revisions and the actor,
+/// never specification, endpoint, binding or secret material.
+struct ChangeEvidence<'a> {
+    operation_id: uuid::Uuid,
+    action: &'static str,
+    id: &'a ConnectionId,
+    prior_version: u64,
+    security_revision: i64,
+    actor_user_id: &'a str,
+}
+
+/// Append one evidence row inside the caller's transaction. The row's
+/// `event_id` is minted here, once; `committed_at` is the database
+/// clock's. Any failure is returned for the caller to roll back, so the
+/// change it describes never commits without it.
+async fn record_change_evidence(
+    client: &deadpool_postgres::Object,
+    evidence: &ChangeEvidence<'_>,
+) -> Result<(), ConnectionStoreError> {
+    let event_id = uuid::Uuid::new_v4().to_string();
+    let operation_id = evidence.operation_id.to_string();
+    let prior_version = u64_to_i64(evidence.id, evidence.prior_version)?;
+    client
+        .execute(
+            r#"
+            INSERT INTO greengateway.connection_change_evidence (
+                event_id, operation_id, actor_user_id, action, connection_id,
+                prior_version, security_revision
+            ) VALUES ($1::text::uuid, $2::text::uuid, $3, $4, $5::text::uuid, $6, $7)
+            "#,
+            &[
+                &event_id,
+                &operation_id,
+                &evidence.actor_user_id,
+                &evidence.action,
+                &evidence.id.as_str(),
+                &prior_version,
+                &evidence.security_revision,
+            ],
+        )
+        .await
+        .map_err(|error| pg_error(OPERATION_CHANGE_EVIDENCE, error))?;
     Ok(())
 }
 
