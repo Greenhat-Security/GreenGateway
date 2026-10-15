@@ -62,13 +62,16 @@ and the Dockerfile must agree with it. `scripts/build_tools.py check` rejects
 missing declarations, version drift, unpinned installs and implicit npx downloads.
 CI uses the shared `.github/actions/build-tools` action before any build.
 
-The production/default compiler is Rust 1.98.0, matching the reviewed
+The production/default compiler is Rust 1.99.0, matching the reviewed
 Docker image update.
 The required `production-compiler` job checks all targets with that compiler;
-ordinary CI uses the previously passing Rust 1.98.1. Coverage remains on
-nightly-2026-09-01 with cargo-llvm-cov 0.9.0 and unchanged floors. Its dated
-compiler is deliberate, not an invitation to follow nightly updates.
-Node 26.8.2 and bundled npm 11.19.1 match the current pinned Node image.
+ordinary CI uses the previously passing Rust 1.98.1. As with the 1.98.0 image
+update, the CI compiler does not follow the production image: moving it changes
+the enforced lint set and the microbenchmark compiler, so it is reviewed
+separately. Coverage remains on nightly-2026-09-01 with cargo-llvm-cov 0.9.0
+and unchanged floors. Its dated compiler is deliberate, not an invitation to
+follow nightly updates.
+Node 26.10.0 and bundled npm 11.19.1 match the current pinned Node image.
 Gateway builds verify the actual Node/npm executable versions before installing
 UI dependencies, and Docker additionally checks its actual Rust version.
 Cargo builds use the existing lockfile without resolution updates.
