@@ -216,12 +216,20 @@ pub const DATABASE_POOL_TIMEOUTS_TOTAL: &str = "greengateway_database_pool_timeo
 /// pool queueing or as database work instead of a sum of the two.
 /// `operation_class` is one of
 /// [`crate::storage::postgres::CheckoutClass`]'s seven fixed names;
-/// `error_class` is `none` or the kind the checkout failure was classified
-/// as, so `timeout` here is the same event
-/// [`DATABASE_POOL_TIMEOUTS_TOTAL`] counts. Checkouts made anywhere else
-/// -- the audit sink, the discovery projector, the tools and connection
-/// control planes, pending logins, membership, the readiness probe --
-/// are not in this series; the pool gauges above still see them.
+/// `error_class` is `none`, the kind the checkout failure was classified
+/// as, or [`crate::storage::postgres::CHECKOUT_ERROR_CLASS_CANCELLED`]
+/// for a wait its caller abandoned. `timeout` here is the same event
+/// [`DATABASE_POOL_TIMEOUTS_TOTAL`] counts; `cancelled` is not a pool
+/// timeout and is not counted there. `cancelled` is how the longest
+/// request-path waits end under saturation: the security gates read the
+/// revision inside a 250 ms deadline and the tool runtime acquires leases
+/// inside its queue timeout, both far shorter than the pool's own wait,
+/// and either one drops a checkout still waiting. So read `cancelled`
+/// beside `none` -- `none` alone is censored at those deadlines.
+/// Checkouts made anywhere else -- the audit sink, the discovery
+/// projector, the tools and connection control planes, pending logins,
+/// membership, the readiness probe -- are not in this series; the pool
+/// gauges above still see them.
 #[cfg(feature = "postgres")]
 pub const DATABASE_POOL_ACQUIRE_SECONDS: &str = "greengateway_database_pool_acquire_seconds";
 
@@ -239,7 +247,9 @@ pub const DATABASE_POOL_ACQUIRE_SECONDS: &str = "greengateway_database_pool_acqu
 /// wait is in [`DATABASE_POOL_ACQUIRE_SECONDS`] and a checkout that never
 /// produced a connection records nothing here. The membership store, the
 /// connectivity check and the readiness probe predate that split and
-/// still time their checkout with their statement.
+/// still time their checkout with their statement. An operation is
+/// recorded when it finishes, so one its caller's deadline cut off
+/// mid-statement records nothing here.
 #[cfg(feature = "postgres")]
 pub const DATABASE_OPERATION_SECONDS: &str = "greengateway_database_operation_seconds";
 

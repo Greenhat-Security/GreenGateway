@@ -8505,9 +8505,10 @@ fn ha_label_vocabularies() -> Vec<(&'static str, &'static str, Vec<&'static str>
                 .collect(),
         ),
         // The acquisition histogram's two labels are both runtime
-        // values -- the class a store names and the kind a failed
-        // checkout was classified as -- so both are declared (issue
-        // #439). Neither list depends on anything a request carries.
+        // values -- the class a store names, and the kind a failed
+        // checkout was classified as or `cancelled` for one its caller
+        // abandoned -- so both are declared (issue #439). Neither list
+        // depends on anything a request carries.
         (
             metrics::DATABASE_POOL_ACQUIRE_SECONDS,
             "operation_class",
@@ -8519,13 +8520,7 @@ fn ha_label_vocabularies() -> Vec<(&'static str, &'static str, Vec<&'static str>
         (
             metrics::DATABASE_POOL_ACQUIRE_SECONDS,
             "error_class",
-            storage::RepositoryErrorKind::KNOWN
-                .iter()
-                .map(|kind| kind.metric_label())
-                .chain(std::iter::once(
-                    storage::postgres::OPERATION_ERROR_CLASS_NONE,
-                ))
-                .collect(),
+            storage::postgres::pool_acquire_error_classes(),
         ),
     ]);
     rules
@@ -8579,7 +8574,8 @@ fn looks_like_a_uuid(value: &str) -> bool {
 }
 
 /// Record one pool checkout per class and outcome through the real
-/// emitter: the success sentinel, then every classified kind.
+/// emitters: the success sentinel, every classified kind, and a wait the
+/// caller abandoned.
 #[cfg(feature = "postgres")]
 fn record_every_pool_acquisition() {
     for class in storage::postgres::CheckoutClass::KNOWN {
@@ -8587,6 +8583,7 @@ fn record_every_pool_acquisition() {
         for kind in storage::RepositoryErrorKind::KNOWN {
             storage::postgres::observe_pool_acquire(class, Duration::from_millis(50), Some(kind));
         }
+        storage::postgres::observe_cancelled_pool_acquire(class, Duration::from_millis(250));
     }
 }
 
@@ -8856,12 +8853,13 @@ fn the_ha_metric_registry_never_labels_by_a_caller_influenced_value() {
 ///
 /// The registry audit above proves each label value comes *from* a
 /// declared vocabulary; this proves the family cannot grow past it. The
-/// synthetic run records every class under every outcome -- the whole
-/// space -- with the hostile request in flight, and the space is then
-/// recorded a second time: a label minted from anything a caller sent,
-/// or from anything that varies between checkouts, would be one series
-/// too many. The class list is held small on purpose, because it is the
-/// multiplier.
+/// synthetic run records every class under every outcome -- success,
+/// each classified kind and `cancelled`, the whole space -- with the
+/// hostile request in flight, and the space is then recorded a second
+/// time: a label minted from anything a caller sent, or from anything
+/// that varies between checkouts, would be one series too many. Today
+/// that is seven classes by eight outcomes. The class list is held small
+/// on purpose, because it is the multiplier.
 #[cfg(feature = "postgres")]
 #[test]
 fn the_pool_acquisition_series_are_bounded_by_two_fixed_vocabularies() {
@@ -8881,13 +8879,11 @@ fn the_pool_acquisition_series_are_bounded_by_two_fixed_vocabularies() {
         .iter()
         .map(|class| class.metric_label())
         .collect();
-    let outcomes: Vec<&str> = storage::RepositoryErrorKind::KNOWN
-        .iter()
-        .map(|kind| kind.metric_label())
-        .chain(std::iter::once(
-            storage::postgres::OPERATION_ERROR_CLASS_NONE,
-        ))
-        .collect();
+    let outcomes = storage::postgres::pool_acquire_error_classes();
+    assert!(
+        outcomes.contains(&storage::postgres::CHECKOUT_ERROR_CLASS_CANCELLED),
+        "an abandoned checkout is an outcome of the family, not a missing sample"
+    );
     assert!(
         classes.len() <= 8,
         "the operation-class list multiplies every outcome; keep it a short fixed list: \
@@ -8922,7 +8918,7 @@ fn the_pool_acquisition_series_are_bounded_by_two_fixed_vocabularies() {
         );
         assert!(
             outcomes.contains(&labels["error_class"].as_str()),
-            "error_class must be a classified kind or none: {line}"
+            "error_class must be a classified kind, none or cancelled: {line}"
         );
         series.insert((
             labels["operation_class"].clone(),

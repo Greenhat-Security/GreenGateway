@@ -11285,8 +11285,8 @@
       "reasons": [
         "unexpanded-macro"
       ],
-      "scope": "gateway::storage::postgres::observe_pool_acquire#1",
-      "sha256": "21f05f64973cff3933adff859caaa38b1658abb0fb8d6610c1ebc89442018d55",
+      "scope": "gateway::storage::postgres::record_pool_acquire#1",
+      "sha256": "14c8e07f57545084cdf03133da0ec309b8ae4ac8601a40c9c6e12a3cbde31327",
       "owner": "GreenGateway maintainers",
       "purpose": "Operator-configured PostgreSQL foundation: verified connector, bounded shared pool and connection lifecycle."
     },
@@ -11296,7 +11296,7 @@
         "network-or-process-reference"
       ],
       "scope": "gateway::storage::postgres::checkout#1",
-      "sha256": "5fec6336bfaf581afe83d7e10b23ab83de60c605e8cf5737b7caaae9ddb3f121",
+      "sha256": "c90395cbb4c0a4cf28ec7300bc7f9e519e3bdb51165ff09714482fdd6723d908",
       "owner": "GreenGateway maintainers",
       "purpose": "Operator-configured PostgreSQL foundation: verified connector, bounded shared pool and connection lifecycle."
     },
@@ -11306,7 +11306,7 @@
         "network-or-process-reference"
       ],
       "scope": "gateway::storage::postgres::timed_checkout#1",
-      "sha256": "1e61d9b5ee7641e1b9fdcefa82f5f4be9a820b1b840c8182a872b8d9f452d2d9",
+      "sha256": "749e0374f3ac14bcb99a0e4cb4822d91acd901e8bca3ed2c2677a55a76d28767",
       "owner": "GreenGateway maintainers",
       "purpose": "Operator-configured PostgreSQL foundation: verified connector, bounded shared pool and connection lifecycle."
     },

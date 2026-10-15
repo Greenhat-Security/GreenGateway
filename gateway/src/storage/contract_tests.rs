@@ -1604,6 +1604,27 @@ pub(crate) mod postgres_audit_tests {
         (Arc::new(PostgresPolicyStore::new(pool.clone())), pool)
     }
 
+    /// A pool of exactly one connection on `database` whose checkouts give
+    /// up after `acquire_timeout_ms`. Holding that one connection is a
+    /// saturated pool on demand, which is the regime the acquisition
+    /// series exists to show.
+    async fn one_connection_foundation(
+        database: &TestDatabase,
+        acquire_timeout_ms: u64,
+    ) -> PostgresFoundation {
+        let test_dsn_file = write_dsn_file(&database.dsn);
+        let mut config = crate::config::Config::test_defaults();
+        config.state_backend = crate::config::StateBackend::Postgres;
+        config.deployment_id = Some("deploy-acquire-contract".to_owned());
+        config.database.url_file = Some(test_dsn_file.path.clone());
+        config.database.tls_mode = crate::config::DatabaseTlsMode::LoopbackDev;
+        config.database.pool_max = 1;
+        config.database.acquire_timeout_ms = acquire_timeout_ms;
+        PostgresFoundation::establish(&config)
+            .await
+            .expect("a one-connection pool should establish")
+    }
+
     /// An authority read times its pool checkout and its statement in two
     /// separate series, against a real pool (issue #439).
     ///
@@ -1615,9 +1636,17 @@ pub(crate) mod postgres_audit_tests {
     /// this operation is the database's time and nothing else. The refusal
     /// itself is what it always was: the read fails with `Timeout`, which
     /// the gate answers `503`.
+    ///
+    /// A read whose caller gives up first is the request-path case: the
+    /// gates bound the revision read with `RECONCILE_DEADLINE`, well inside
+    /// the pool's default wait, and drop the checkout when it passes. That
+    /// wait still lands in the acquisition series, as `cancelled`, for as
+    /// long as the caller waited -- and is not a pool timeout, because the
+    /// pool never gave up.
     #[tokio::test]
     async fn an_authority_read_times_its_checkout_apart_from_its_statement() {
-        use crate::storage::postgres::CheckoutClass;
+        use crate::security_cluster::RECONCILE_DEADLINE;
+        use crate::storage::postgres::{CheckoutClass, CHECKOUT_ERROR_CLASS_CANCELLED};
         use crate::storage::{RepositoryErrorKind, SecurityRevisionSource};
 
         let Some(admin_dsn) = locator() else {
@@ -1629,9 +1658,9 @@ pub(crate) mod postgres_audit_tests {
         let recorder = crate::audit::sink::tests::CountingRecorder::default();
         // The recorder is a thread-local and a pool's connections are
         // driven by the runtime that opened them, so the whole exercise --
-        // both pools included -- runs on one thread with a runtime of its
+        // every pool included -- runs on one thread with a runtime of its
         // own.
-        let (served, saturated) = std::thread::scope(|scope| {
+        let (served, saturated, abandoned) = std::thread::scope(|scope| {
             scope
                 .spawn(|| {
                     let runtime = tokio::runtime::Builder::new_current_thread()
@@ -1643,17 +1672,7 @@ pub(crate) mod postgres_audit_tests {
                             let (store, _pool) = migrated_policy_store(&database).await;
                             let served = store.revision_source().current().await;
 
-                            let test_dsn_file = write_dsn_file(&database.dsn);
-                            let mut config = crate::config::Config::test_defaults();
-                            config.state_backend = crate::config::StateBackend::Postgres;
-                            config.deployment_id = Some("deploy-policy-contract".to_owned());
-                            config.database.url_file = Some(test_dsn_file.path.clone());
-                            config.database.tls_mode = crate::config::DatabaseTlsMode::LoopbackDev;
-                            config.database.pool_max = 1;
-                            config.database.acquire_timeout_ms = 50;
-                            let one_connection = PostgresFoundation::establish(&config)
-                                .await
-                                .expect("a one-connection pool should establish");
+                            let one_connection = one_connection_foundation(&database, 50).await;
                             let held = one_connection
                                 .pool()
                                 .get()
@@ -1664,7 +1683,22 @@ pub(crate) mod postgres_audit_tests {
                                     .current()
                                     .await;
                             drop(held);
-                            (served, saturated)
+
+                            // The pool would wait far longer than the gate does.
+                            let patient = one_connection_foundation(&database, 5_000).await;
+                            let held = patient
+                                .pool()
+                                .get()
+                                .await
+                                .expect("the pool's only connection");
+                            let abandoned = tokio::time::timeout(
+                                RECONCILE_DEADLINE,
+                                SecurityRevisionSource::new(patient.pool().clone()).current(),
+                            )
+                            .await
+                            .is_err();
+                            drop(held);
+                            (served, saturated, abandoned)
                         })
                     })
                 })
@@ -1678,6 +1712,10 @@ pub(crate) mod postgres_audit_tests {
                 .expect_err("a saturated pool must refuse, not answer")
                 .kind(),
             RepositoryErrorKind::Timeout
+        );
+        assert!(
+            abandoned,
+            "the caller's deadline, not the pool's, ended the second wait"
         );
         let checkouts = |error_class: &str| {
             recorder.histogram_values(
@@ -1713,10 +1751,212 @@ pub(crate) mod postgres_audit_tests {
             statements(timeout).is_empty(),
             "a checkout that never produced a connection ran no statement to time"
         );
+        let given_up = checkouts(CHECKOUT_ERROR_CLASS_CANCELLED);
+        assert_eq!(given_up.len(), 1, "the abandoned read's checkout");
+        assert!(
+            given_up[0] >= RECONCILE_DEADLINE.as_secs_f64() * 0.8,
+            "the sample is how long the caller waited, not zero: {given_up:?}"
+        );
+        assert_eq!(
+            statements("none").len(),
+            1,
+            "the abandoned read ran no statement either"
+        );
         assert_eq!(
             recorder.count(crate::metrics::DATABASE_POOL_TIMEOUTS_TOTAL, &[]),
             1,
-            "the refused checkout is still counted as a pool timeout"
+            "the refused checkout is still counted as a pool timeout, and the abandoned one is not"
+        );
+    }
+
+    /// The other per-request authority calls, once each over `pool`: the
+    /// service-token verification, the JWT revocation lookup, the shared
+    /// rate-limit decision and the global lease acquire.
+    async fn request_path_calls(
+        pool: &deadpool_postgres::Pool,
+        limit: SharedLimit,
+    ) -> (
+        Result<TokenVerification, RepositoryError>,
+        Result<bool, crate::auth::AuthError>,
+        Result<SharedDecision, RepositoryError>,
+        Result<LeaseAttempt, RepositoryError>,
+    ) {
+        let deployment = "deploy-acquire-contract";
+        let tokens = PostgresServiceTokenStore::new(pool.clone());
+        let revocations =
+            PostgresJwtRevocationStore::new(pool.clone(), deployment, "https://issuer-a.example");
+        let limits = PostgresRateLimitStore::new(pool.clone(), deployment, limits_keyring(), 1_000);
+        let leases = PostgresExecutionLeaseStore::new(
+            pool.clone(),
+            deployment,
+            uuid::Uuid::new_v4(),
+            Duration::from_secs(5),
+        );
+        (
+            tokens.verify("ggw_unknown").await,
+            revocations.is_revoked("jti-unknown").await,
+            limits
+                .decide(SharedLane::Read, "ip:203.0.113.7", limit)
+                .await,
+            leases.try_acquire("global", 1, "req-1").await,
+        )
+    }
+
+    /// Every other per-request authority call checks out under the class
+    /// its call site names, and starts its statement clock only once it
+    /// holds the connection (issue #439).
+    ///
+    /// The registry audit in `app_tests.rs` drives the emitter directly,
+    /// so it proves the label space and nothing about who records into
+    /// it. This is the other half, against a real pool. Served, each call
+    /// lands one acquisition sample under its class and one statement
+    /// sample under its operation. On a saturated pool each still refuses
+    /// -- the denylist as a dependency failure, the rest as `Timeout` --
+    /// with its wait under its class as `timeout` and nothing in the
+    /// statement series, which is what timing the statement after the
+    /// checkout means.
+    #[tokio::test]
+    async fn each_request_path_authority_call_checks_out_under_its_own_class() {
+        use crate::storage::postgres::CheckoutClass;
+        use crate::storage::RepositoryErrorKind;
+
+        let Some(admin_dsn) = locator() else {
+            eprintln!("skipping: no test database locator; CI runs this test");
+            return;
+        };
+        let _guard = DATABASE.lock().await;
+        let database = create_test_database(&admin_dsn).await;
+        let recorder = crate::audit::sink::tests::CountingRecorder::default();
+        let limit = SharedLimit {
+            requests_per_second: 1.0,
+            burst: 3,
+        };
+        // One thread with a runtime of its own, for the reason the
+        // revision-read test above gives.
+        let (served, refused) = std::thread::scope(|scope| {
+            scope
+                .spawn(|| {
+                    let runtime = tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()
+                        .expect("a runtime for the recording thread");
+                    ::metrics::with_local_recorder(&recorder, || {
+                        runtime.block_on(async {
+                            let pool = migrated_limits_pool(&database).await;
+                            let served = request_path_calls(&pool, limit).await;
+
+                            let one_connection = one_connection_foundation(&database, 50).await;
+                            let held = one_connection
+                                .pool()
+                                .get()
+                                .await
+                                .expect("the pool's only connection");
+                            let refused = request_path_calls(one_connection.pool(), limit).await;
+                            drop(held);
+                            (served, refused)
+                        })
+                    })
+                })
+                .join()
+                .expect("the recording thread")
+        });
+
+        let (verified, revocation, decided, leased) = served;
+        assert!(verified.is_ok(), "a free pool serves the verification");
+        assert!(
+            revocation.is_ok(),
+            "a free pool serves the revocation lookup"
+        );
+        assert!(
+            decided.is_ok(),
+            "a free pool serves the rate-limit decision"
+        );
+        assert!(leased.is_ok(), "a free pool serves the lease acquire");
+        let (verified, revocation, decided, leased) = refused;
+        assert_eq!(
+            verified.err().map(|error| error.kind()),
+            Some(RepositoryErrorKind::Timeout),
+            "a verification without a connection refuses"
+        );
+        assert!(
+            matches!(revocation, Err(crate::auth::AuthError::Upstream(_))),
+            "a revocation lookup without a connection is a dependency failure, never `not revoked`"
+        );
+        assert_eq!(
+            decided.err().map(|error| error.kind()),
+            Some(RepositoryErrorKind::Timeout),
+            "a rate-limit decision without a connection refuses"
+        );
+        assert_eq!(
+            leased.err().map(|error| error.kind()),
+            Some(RepositoryErrorKind::Timeout),
+            "a lease acquire without a connection refuses"
+        );
+
+        let checkouts = |class: CheckoutClass, error_class: &str| {
+            recorder.histogram_values(
+                crate::metrics::DATABASE_POOL_ACQUIRE_SECONDS,
+                &[
+                    ("operation_class", class.metric_label()),
+                    ("error_class", error_class),
+                ],
+            )
+        };
+        let statements = |operation: &str, error_class: &str| {
+            recorder.histogram_values(
+                crate::metrics::DATABASE_OPERATION_SECONDS,
+                &[("operation", operation), ("error_class", error_class)],
+            )
+        };
+        let timeout = RepositoryErrorKind::Timeout.metric_label();
+        // The verification and the revocation lookup share a class.
+        for (class, calls) in [
+            (CheckoutClass::CredentialCheck, 2),
+            (CheckoutClass::RateLimit, 1),
+            (CheckoutClass::ExecutionLease, 1),
+        ] {
+            assert_eq!(
+                checkouts(class, "none").len(),
+                calls,
+                "the served checkouts under {class:?}"
+            );
+            assert_eq!(
+                checkouts(class, timeout).len(),
+                calls,
+                "the refused checkouts under {class:?}"
+            );
+        }
+        for class in [
+            CheckoutClass::RevisionCheck,
+            CheckoutClass::SecurityStateRead,
+            CheckoutClass::ControlPlaneWrite,
+            CheckoutClass::Maintenance,
+        ] {
+            assert!(
+                checkouts(class, "none").is_empty() && checkouts(class, timeout).is_empty(),
+                "none of these calls checks out as {class:?}"
+            );
+        }
+        for operation in [
+            "service_token_verify",
+            "jwt_revocation_lookup",
+            "rate_limit_decide",
+            "execution_lease_acquire",
+        ] {
+            assert_eq!(
+                statements(operation, "none").len(),
+                1,
+                "the served {operation} statement"
+            );
+            assert!(
+                statements(operation, timeout).is_empty(),
+                "a refused {operation} ran no statement to time"
+            );
+        }
+        assert_eq!(
+            recorder.count(crate::metrics::DATABASE_POOL_TIMEOUTS_TOTAL, &[]),
+            4,
+            "each refused checkout is still counted as a pool timeout"
         );
     }
 
