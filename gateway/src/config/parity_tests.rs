@@ -9,19 +9,25 @@
 //! same reason. A fixture that has to change records a behaviour change; that
 //! belongs to a pull request that says so, not to one that moves code.
 
+use std::collections::BTreeSet;
+
 use super::diagnostic::{ConfigDiagnostic, ConfigDiagnosticCode};
 use super::*;
+
+/// What a fixture environment holds for `name`: exactly the listed value, or
+/// unset when the fixture does not list it.
+fn fixture_value(fixture: &[(&str, &str)], name: &str) -> Result<String, VarError> {
+    fixture
+        .iter()
+        .find(|(variable, _)| *variable == name)
+        .map(|(_, value)| (*value).to_owned())
+        .ok_or(VarError::NotPresent)
+}
 
 /// Parses a fixture environment: each listed variable has exactly the listed
 /// value, and every other variable is unset.
 fn parse_fixture(fixture: &[(&str, &str)]) -> Result<Config, ConfigError> {
-    Config::from_env_vars(|name| {
-        fixture
-            .iter()
-            .find(|(variable, _)| *variable == name)
-            .map(|(_, value)| (*value).to_owned())
-            .ok_or(VarError::NotPresent)
-    })
+    Config::from_env_vars(|name| fixture_value(fixture, name))
 }
 
 fn accepted(fixture: &[(&str, &str)]) -> Config {
@@ -1017,6 +1023,43 @@ fn egress_settings_normalize_hosts_and_refuse_ambiguous_values() {
     }
 }
 
+/// A refused environment can skip a read that only a valid value reaches, so
+/// the inventory tests' recordings -- every variable unset, and every
+/// variable set to a probe most settings refuse -- are repeated here for
+/// configurations the parser accepts. Each one requests every inventoried
+/// variable and nothing else.
+#[test]
+fn accepted_configurations_request_every_inventoried_variable_and_nothing_else() {
+    let cluster = postgres_fixture();
+    let standalone_session = [
+        ("AUTH_PROVIDERS", admin_login_provider_document()),
+        ("ADMIN_LOGIN_PROVIDER", "primary"),
+        ("ADMIN_PREFIX", "/operations"),
+        ("ADMIN_SESSION_MODE", "standalone_memory"),
+    ];
+    let split_listeners = [
+        ("LISTEN_ADDR", "0.0.0.0:8080"),
+        ("ADMIN_LISTEN_ADDR", "127.0.0.1:9091"),
+        ("GRPC_LISTEN_ADDR", "0.0.0.0:50051"),
+        ("ADMIN_TLS_CERT_FILE", "/run/tls/admin.crt"),
+        ("ADMIN_TLS_KEY_FILE", "/run/tls/admin.key"),
+    ];
+
+    let inventoried: BTreeSet<&str> = inventory::CONFIG_INPUTS.iter().copied().collect();
+    for fixture in [&cluster[..], &standalone_session[..], &split_listeners[..]] {
+        let mut requested = BTreeSet::new();
+        let parsed = Config::from_env_vars(|name| {
+            requested.insert(name.to_owned());
+            fixture_value(fixture, name)
+        });
+        if let Err(error) = parsed {
+            panic!("the fixture should be accepted: {fixture:?}\n{error}");
+        }
+        let requested: BTreeSet<&str> = requested.iter().map(String::as_str).collect();
+        assert_eq!(requested, inventoried, "{fixture:?}");
+    }
+}
+
 #[test]
 fn diagnostics_follow_the_problems_one_for_one_and_describe_the_input() {
     let error = refused(&[
@@ -1176,45 +1219,79 @@ fn no_diagnostic_carries_a_value_even_when_every_input_holds_a_canary() {
 
 #[test]
 fn no_diagnostic_carries_a_secret_or_locator_from_a_structured_input() {
-    for fixture in [
+    // Each fixture is paired with the start of the problem it exists to
+    // provoke, so it is evidence about that rule rather than about whichever
+    // refusal it happens to reach.
+    for (fixture, refusal) in [
         // A client secret beside a provider type the report quotes back.
-        &[(
-            "AUTH_PROVIDERS",
-            r#"[{"name":"corp","type":"zqcanary","client_secret":"zqcanary"}]"#,
-        )][..],
+        (
+            &[(
+                "AUTH_PROVIDERS",
+                r#"[{"name":"corp","type":"zqcanary","client_secret":"zqcanary"}]"#,
+            )][..],
+            "AUTH_PROVIDERS[0].type must be 'jwt' or 'cookie_session'",
+        ),
         // An environment locator inside an alias the parser refuses.
-        &[(
-            "CONNECTION_SECRET_ALIASES",
-            r#"[{"id":"billing","label":"Billing","source":{"type":"environment","key":"zqcanary"},"unexpected":true}]"#,
-        )][..],
+        (
+            &[(
+                "CONNECTION_SECRET_ALIASES",
+                r#"[{"id":"billing","label":"Billing","source":{"type":"environment","key":"zqcanary"},"unexpected":true}]"#,
+            )][..],
+            "CONNECTION_SECRET_ALIASES must be a JSON array of operator alias objects",
+        ),
         // Key-file and root locators for a keyring standalone mode refuses.
-        &[
-            ("CONNECTION_SECRETS_ROOT", "/run/secrets/zqcanary"),
-            (
-                "RATE_LIMIT_KEYRING",
-                r#"[{"id":"rl-primary","file":"zqcanary","role":"primary"}]"#,
-            ),
-        ][..],
-        &[
-            ("CONNECTION_SECRETS_ROOT", "/run/secrets/zqcanary"),
-            (
-                "CONNECTION_LOCAL_SECRET_KEYRING",
-                r#"[{"id":"primary","file":"zqcanary","role":"primary"}]"#,
-            ),
-        ][..],
+        (
+            &[
+                ("CONNECTION_SECRETS_ROOT", "/run/secrets/zqcanary"),
+                (
+                    "RATE_LIMIT_KEYRING",
+                    r#"[{"id":"rl-primary","file":"zqcanary","role":"primary"}]"#,
+                ),
+            ][..],
+            "RATE_LIMIT_KEYRING is set while STATE_BACKEND is sqlite",
+        ),
+        (
+            &[
+                ("CONNECTION_SECRETS_ROOT", "/run/secrets/zqcanary"),
+                (
+                    "CONNECTION_LOCAL_SECRET_KEYRING",
+                    r#"[{"id":"primary","file":"zqcanary","role":"primary"}]"#,
+                ),
+            ][..],
+            "CONNECTION_LOCAL_SECRET_KEYRING: local secret keyring requires CONNECTIONS_SQLITE_PATH",
+        ),
         // The database connection string's locator, in the wrong mode.
-        &[("DATABASE_URL_FILE", "/run/secrets/zqcanary")][..],
+        (
+            &[("DATABASE_URL_FILE", "/run/secrets/zqcanary")][..],
+            "DATABASE_URL_FILE is set while STATE_BACKEND is sqlite",
+        ),
         // A private key's locator without its certificate.
-        &[("TLS_KEY_FILE", "/run/tls/zqcanary.key")][..],
+        (
+            &[("TLS_KEY_FILE", "/run/tls/zqcanary.key")][..],
+            "TLS_KEY_FILE is set without TLS_CERT_FILE",
+        ),
         // A provider document that does not parse.
-        &[("CONNECTION_VAULT_PROVIDER", r#"{"profiles":["zqcanary""#)][..],
+        (
+            &[("CONNECTION_VAULT_PROVIDER", r#"{"profiles":["zqcanary""#)][..],
+            "CONNECTION_VAULT_PROVIDER must be a JSON object with profiles and aliases arrays",
+        ),
         // A static header value on a route the parser refuses.
-        &[(
-            "UPSTREAM_ROUTES",
-            r#"[{"upstream_url":"https://api.example.test","add_request_headers":{"x-route-label":"zqcanary"}}]"#,
-        )][..],
+        (
+            &[(
+                "UPSTREAM_ROUTES",
+                r#"[{"upstream_url":"https://api.example.test","add_request_headers":{"x-route-label":"zqcanary"}}]"#,
+            )][..],
+            "UPSTREAM_ROUTES[0] must set at least one of path_prefix or host",
+        ),
     ] {
         let error = refused(fixture);
+        assert!(
+            error
+                .problems
+                .iter()
+                .any(|problem| problem.starts_with(refusal)),
+            "{fixture:?} was not refused with {refusal:?}:\n{error}"
+        );
         assert_diagnostics_are_value_free(&error);
     }
 
