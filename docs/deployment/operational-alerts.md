@@ -235,6 +235,18 @@ neither is permission to bypass verification. A prior approved binary is an
 option only within the documented schema/security rollback boundary. This is a
 release-system signal, not an invented gateway runtime metric.
 
+### Security incident
+
+The security on-call leads when the trigger is a suspected compromise rather
+than a failing signal: a leaked JWT or service token, an exposed upstream
+credential, or a replica that is no longer trusted. Follow the
+[security incident runbook](incident-rehearsal.md) to withdraw the identities,
+rotate the affected Connection's secret reference, verify that every replica
+compiled the resulting revision, collect sanitized evidence, and replace a
+suspect replica with a verified image against the same database. A withdrawal
+does not recall work or bytes already admitted; a hard stop is a controlled
+drain plus upstream credential or network revocation, as that runbook states.
+
 ## Remaining operational proof
 
 The pack does not yet cover every security-signal category in #440:
@@ -246,10 +258,13 @@ The pack does not yet cover every security-signal category in #440:
 | Authentication/JWKS dependency availability | No dedicated bounded availability counter for the complete dependency path. Define an appropriate signal separately; do not infer identity-provider health from unrelated errors or expose issuer URLs in labels. |
 | Rate-limit denials | `greengateway_rate_limit_shared_decisions_total` exists in cluster mode, with bounded `lane` labels and `outcome` values `allowed`, `denied`, `unavailable`. It covers shared-authority decisions, not every local rejection or standalone traffic. Informational denial-trend thresholds require a workload baseline and are deferred; `unavailable` is an authority failure, distinct from a deliberate denial. |
 
-The next portion of #440 is a disposable incident rehearsal: inject representative
-failures, confirm the expected signal and recovery, and retain sanitized evidence
-of the injection, observation and cleanup. That rehearsal remains separate from
-the target-platform production exercise in [issue #389](https://github.com/Greenhat-Security/GreenGateway/issues/389),
+The disposable incident rehearsal for #440 is described in
+[the security incident runbook](incident-rehearsal.md#what-the-release-gate-rehearses):
+the `ha_security_two_replica` release-gate leg withdraws identities, rotates a
+Connection's secret reference, checks revision convergence and the audit
+evidence for secret material, and replaces a replica, on every pull request.
+That rehearsal remains separate from the target-platform production exercise in
+[issue #389](https://github.com/Greenhat-Security/GreenGateway/issues/389),
 which must prove real alert delivery to the assigned responder and measure
 detection, notification, acknowledgement and recovery times. Neither passing
 `promtool` fixtures nor a disposable local rehearsal completes those operational
