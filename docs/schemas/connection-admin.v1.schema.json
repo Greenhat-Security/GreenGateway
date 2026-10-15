@@ -8,7 +8,7 @@
     "CallerAssertion": {
       "type": "object",
       "additionalProperties": false,
-      "description": "Accepted but not yet enforced: until request-path injection ships, the gateway refuses every call, test and discovery on a Connection carrying this block, with the failure reason caller_assertion_not_enforced. Once enforced, the block will attest the calling principal to the upstream alongside the primary credential rather than instead of it: the credential says which system is calling, the assertion says on whose behalf, so an upstream the operator controls can apply its own per-user checks. The gateway will sign a short-lived JWT naming the validated principal and send it in the named header, and the upstream will verify it against the gateway's published JWKS. Omit the block to send only the credential.",
+      "description": "Accepted and stored but not yet enforced: once request-path injection ships, this block will attest the calling principal to the upstream, and until then the gateway refuses every call, test and discovery on a Connection carrying it, with the failure reason caller_assertion_not_enforced. When enforced, the assertion will travel alongside the primary credential rather than instead of it: the credential says which system is calling, the assertion says on whose behalf, so an upstream the operator controls can apply its own per-user checks. The gateway will sign a short-lived JWT naming the validated principal and send it in the named header, and the upstream will verify it against the gateway's published JWKS. Omit the block to send only the credential.",
       "required": [
         "signing_key_id",
         "kid",
@@ -21,7 +21,7 @@
       ],
       "properties": {
         "signing_key_id": { "type": "string", "minLength": 1, "maxLength": 128, "description": "Secret alias holding the PKCS#8 private key." },
-        "kid": { "type": "string", "minLength": 1, "maxLength": 128, "description": "JOSE kid, published in the JWKS, so an upstream can select the right key and keys can rotate without a flag day." },
+        "kid": { "type": "string", "minLength": 1, "maxLength": 128, "description": "JOSE kid, to be published in the gateway's JWKS once assertions are enforced, so an upstream can select the right key and keys can rotate without a flag day." },
         "algorithm": { "enum": ["es256", "rs256"], "description": "Signature algorithm. Both are offered because verifier libraries and platform documentation differ on which is convenient." },
         "issuer": { "type": "string", "minLength": 1, "maxLength": 512 },
         "audience": { "type": "string", "minLength": 1, "maxLength": 512 },
@@ -36,7 +36,7 @@
     "SafeCallerAssertion": {
       "type": "object",
       "additionalProperties": false,
-      "description": "Accepted but not yet enforced: until request-path injection ships, the gateway refuses every call, test and discovery on a Connection carrying this block, with the failure reason caller_assertion_not_enforced. Once enforced, the block will attest the calling principal to the upstream alongside the primary credential rather than instead of it: the credential says which system is calling, the assertion says on whose behalf, so an upstream the operator controls can apply its own per-user checks. The gateway will sign a short-lived JWT naming the validated principal and send it in the named header, and the upstream will verify it against the gateway's published JWKS. Omit the block to send only the credential.",
+      "description": "Accepted and stored but not yet enforced: once request-path injection ships, this block will attest the calling principal to the upstream, and until then the gateway refuses every call, test and discovery on a Connection carrying it, with the failure reason caller_assertion_not_enforced. When enforced, the assertion will travel alongside the primary credential rather than instead of it: the credential says which system is calling, the assertion says on whose behalf, so an upstream the operator controls can apply its own per-user checks. The gateway will sign a short-lived JWT naming the validated principal and send it in the named header, and the upstream will verify it against the gateway's published JWKS. Omit the block to send only the credential.",
       "required": [
         "signing_key_configured",
         "kid",
@@ -49,7 +49,7 @@
       ],
       "properties": {
         "signing_key_configured": { "type": "boolean", "description": "Whether a signing key is bound. The alias itself is never returned." },
-        "kid": { "type": "string", "minLength": 1, "maxLength": 128, "description": "JOSE kid, published in the JWKS, so an upstream can select the right key and keys can rotate without a flag day." },
+        "kid": { "type": "string", "minLength": 1, "maxLength": 128, "description": "JOSE kid, to be published in the gateway's JWKS once assertions are enforced, so an upstream can select the right key and keys can rotate without a flag day." },
         "algorithm": { "enum": ["es256", "rs256"], "description": "Signature algorithm. Both are offered because verifier libraries and platform documentation differ on which is convenient." },
         "issuer": { "type": "string", "minLength": 1, "maxLength": 512 },
         "audience": { "type": "string", "minLength": 1, "maxLength": 512 },
@@ -603,7 +603,7 @@
             { "$ref": "#/$defs/CallerAssertion" },
             { "type": "null" }
           ],
-          "description": "Omitted keeps the current block, because a safe read cannot be sent back and the admin UI does not edit it; null removes it."
+          "description": "Omitted keeps the current block; null removes it. A safe read cannot be sent back, so the admin UI, which shows the block read only, always omits it."
         },
         "authentication": {
           "$ref": "#/$defs/MutationAuthentication"
