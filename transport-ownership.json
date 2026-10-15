@@ -9774,7 +9774,7 @@
         "network-or-process-reference"
       ],
       "scope": "gateway::mcp::impl ServerHandler McpServer::call_tool#1",
-      "sha256": "56bd65ba20dbde9a45f908fdf908dea5f9529bad8fe1ef841e8cdcea60730b09",
+      "sha256": "71fd94bf771c17a351d596a253e5b70ca18f62853d03d0e23b3d597919c8d9a3",
       "owner": "GreenGateway maintainers",
       "purpose": "Existing application transport references or syntax in this exact item; new or changed authority requires explicit review."
     },
@@ -9784,7 +9784,7 @@
         "network-or-process-reference"
       ],
       "scope": "gateway::mcp::impl ServerHandler McpServer::enqueue_task#1",
-      "sha256": "510d65cba7858e5e46e64c87bc87ac7cbb986de97da1c173a58706ce9ca1cce0",
+      "sha256": "b61ea72d45b3e384f5d05991dafb893953f951dd29d19d0a86c565b4b4bff361",
       "owner": "GreenGateway maintainers",
       "purpose": "Existing application transport references or syntax in this exact item; new or changed authority requires explicit review."
     },
@@ -9797,6 +9797,16 @@
       "sha256": "e8feef2aea6cb6ab591915a3f45c076e87f77fd9ddb697c12823cc058035acba",
       "owner": "GreenGateway maintainers",
       "purpose": "Existing application transport references or syntax in this exact item; new or changed authority requires explicit review."
+    },
+    {
+      "file": "gateway/src/mcp.rs",
+      "reasons": [
+        "network-or-process-reference"
+      ],
+      "scope": "gateway::mcp::impl  McpServer::enqueue_task_work#1",
+      "sha256": "e0a25ea9441efef99e4bc2cde0294c5f6f061be950f02b796c3456fe274039cb",
+      "owner": "GreenGateway maintainers",
+      "purpose": "Body of McpServer::enqueue_task, moved so task rejection runs boxed under the request's re-entered security pins; it names rmcp's CreateTaskResult and adds no transport authority."
     },
     {
       "file": "gateway/src/mcp.rs",

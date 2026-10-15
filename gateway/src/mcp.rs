@@ -1,4 +1,4 @@
-use std::{sync::Arc, time::Instant};
+use std::{future::Future, pin::Pin, sync::Arc, time::Instant};
 
 use axum::{
     body::Body,
@@ -160,7 +160,6 @@ impl ServerHandler for McpServer {
         request: CallToolRequestParams,
         context: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, ErrorData> {
-        let tool_name = request.name.to_string();
         let lookup_started = Instant::now();
         let invocation_context = invocation_context_from_request(&context, &self.client_ip_policy);
         // As in `list_tools`: the lookup, the invocation and the rendered
@@ -170,7 +169,56 @@ impl ServerHandler for McpServer {
             .extensions
             .get::<Parts>()
             .map(|parts| &parts.extensions);
-        crate::middleware::rbac::with_request_pins(request_extensions, async move {
+        crate::middleware::rbac::with_request_pins(
+            request_extensions,
+            self.call_tool_work(request, lookup_started, invocation_context),
+        )
+        .await
+    }
+
+    async fn enqueue_task(
+        &self,
+        request: CallToolRequestParams,
+        context: RequestContext<RoleServer>,
+    ) -> Result<CreateTaskResult, ErrorData> {
+        let lookup_started = Instant::now();
+        let invocation_context = invocation_context_from_request(&context, &self.client_ip_policy);
+        // As in `list_tools`: the rejected call is still admitted, audited and
+        // observed under the revision the HTTP request was admitted at.
+        let request_extensions = context
+            .extensions
+            .get::<Parts>()
+            .map(|parts| &parts.extensions);
+        crate::middleware::rbac::with_request_pins(
+            request_extensions,
+            self.enqueue_task_work(request, lookup_started, invocation_context),
+        )
+        .await
+    }
+
+    fn get_tool(&self, _name: &str) -> Option<Tool> {
+        // rmcp uses this hook only for taskSupport prevalidation. GreenGateway
+        // intentionally owns SEP-1319 task rejection so rejected task calls feed
+        // the same audit/inventory path as ordinary tool calls.
+        None
+    }
+}
+
+/// The work of `call_tool` and `enqueue_task`, which run it under the
+/// request's pins. Each is built in a stack frame of its own and boxed: the
+/// tool executor's future is large, and every layer that pins it would
+/// otherwise hold, and in unoptimized builds copy across the stack, a whole
+/// instance of it.
+impl McpServer {
+    fn call_tool_work(
+        &self,
+        request: CallToolRequestParams,
+        lookup_started: Instant,
+        invocation_context: ToolInvocationContext,
+    ) -> Pin<Box<dyn Future<Output = Result<CallToolResult, ErrorData>> + Send + '_>> {
+        Box::pin(async move {
+            let tool_name = request.name.to_string();
+
             if self.registry.get(&tool_name).is_none() {
                 if let Some(executor) = self.executor.as_ref() {
                     executor.record_unknown_tool_call(
@@ -219,24 +267,17 @@ impl ServerHandler for McpServer {
                 Err(error) => Err(runtime_error_to_mcp_error(error, composite_error_context)),
             }
         })
-        .await
     }
 
-    async fn enqueue_task(
+    fn enqueue_task_work(
         &self,
         request: CallToolRequestParams,
-        context: RequestContext<RoleServer>,
-    ) -> Result<CreateTaskResult, ErrorData> {
-        let tool_name = request.name.to_string();
-        let lookup_started = Instant::now();
-        let invocation_context = invocation_context_from_request(&context, &self.client_ip_policy);
-        // As in `list_tools`: the rejected call is still admitted, audited and
-        // observed under the revision the HTTP request was admitted at.
-        let request_extensions = context
-            .extensions
-            .get::<Parts>()
-            .map(|parts| &parts.extensions);
-        crate::middleware::rbac::with_request_pins(request_extensions, async move {
+        lookup_started: Instant,
+        invocation_context: ToolInvocationContext,
+    ) -> Pin<Box<dyn Future<Output = Result<CreateTaskResult, ErrorData>> + Send + '_>> {
+        Box::pin(async move {
+            let tool_name = request.name.to_string();
+
             if self.registry.get(&tool_name).is_none() {
                 if let Some(executor) = self.executor.as_ref() {
                     executor.record_unknown_tool_call(
@@ -259,7 +300,7 @@ impl ServerHandler for McpServer {
                 .reject_task_tool_call(invocation_context, &tool_name)
                 .await
             {
-                Ok(()) => Err::<CreateTaskResult, _>(task_unsupported_error(tool_name)),
+                Ok(()) => Err(task_unsupported_error(tool_name)),
                 Err(ToolRuntimeError::WorkFailed {
                     tool_name,
                     reason: Some(reason),
@@ -270,14 +311,6 @@ impl ServerHandler for McpServer {
                 Err(error) => Err(runtime_error_to_mcp_error(error, None)),
             }
         })
-        .await
-    }
-
-    fn get_tool(&self, _name: &str) -> Option<Tool> {
-        // rmcp uses this hook only for taskSupport prevalidation. GreenGateway
-        // intentionally owns SEP-1319 task rejection so rejected task calls feed
-        // the same audit/inventory path as ordinary tool calls.
-        None
     }
 }
 
