@@ -1,5 +1,6 @@
 """Offline contracts for the trusted, bounded mutation workflow."""
 
+import ast
 import unittest
 from pathlib import Path
 
@@ -12,6 +13,14 @@ UPLOAD = "actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9"
 CONTROLLER = "python scripts/security_mutations.py --report target/security-mutations/report.json"
 REGISTRY_CHECK = "python scripts/security_mutations.py --validate-registry"
 WORKFLOW_CONTRACTS = "python scripts/test_security_mutations_workflows.py"
+REGISTRY_UNIT_TESTS = "python scripts/test_security_mutations.py ManifestTests TestListTests"
+FULL_SUITE = "cargo test --workspace --locked"
+TEST_LIST = "target/security-mutations/test-list.txt"
+TEST_LIST_CHECK = (
+    "mkdir -p target/security-mutations\n"
+    + FULL_SUITE + " -- --list --format terse > " + TEST_LIST + "\n"
+    + "python scripts/security_mutations.py --check-test-list " + TEST_LIST + "\n"
+)
 
 
 class WorkflowTests(unittest.TestCase):
@@ -120,32 +129,89 @@ class WorkflowTests(unittest.TestCase):
         self.assertNotIn("security-mutations", self.ci["jobs"]["promote-image"]["needs"])
         self.assertIn("security-coverage", self.ci["jobs"]["promote-image"]["needs"])
 
-    def test_registry_drift_check_runs_in_an_existing_required_job(self):
+    def assert_unconditional_required_job(self, name):
         self.assertIn("pull_request", self.ci["on"])
         # Reusing a required job keeps the required-check and promotion lists unchanged.
-        self.assertIn("supply-chain", self.ci["jobs"]["promote-image"]["needs"])
-        job = self.ci["jobs"]["supply-chain"]
-        for optional in ("if", "needs", "continue-on-error", "strategy"):
+        self.assertIn(name, self.ci["jobs"]["promote-image"]["needs"])
+        job = self.ci["jobs"][name]
+        # Job defaults or env would reach every step, including the checks below.
+        for optional in ("if", "needs", "continue-on-error", "strategy", "defaults", "env"):
             self.assertNotIn(optional, job)
         steps = job["steps"]
-        checks = [step for step in steps if step.get("run") in (WORKFLOW_CONTRACTS, REGISTRY_CHECK)]
-        self.assertEqual([step["run"] for step in checks], [WORKFLOW_CONTRACTS, REGISTRY_CHECK])
+        checkout = steps[0]
+        self.assertEqual(checkout["uses"], CHECKOUT)
+        self.assertEqual(sum(step.get("uses") == CHECKOUT for step in steps), 1)
+        # Checking another ref or repository would pass review for code that is not under review.
+        for override in ("ref", "repository", "path"):
+            self.assertNotIn(override, checkout.get("with", {}))
+        self.assertNotIn("if", checkout)
+        return steps
+
+    def test_no_workflow_default_or_environment_reaches_the_registry_checks(self):
+        # A default shell or working directory could neuter or redirect a
+        # `run` step whose text still matches; inherited env could redirect it.
+        self.assertNotIn("defaults", self.ci)
+        self.assertEqual(self.ci["env"], {"CARGO_TERM_COLOR": "always"})
+
+    def test_registry_drift_check_runs_in_an_existing_required_job(self):
+        steps = self.assert_unconditional_required_job("supply-chain")
+        checks = [step for step in steps if step.get("run") in (REGISTRY_UNIT_TESTS, WORKFLOW_CONTRACTS, REGISTRY_CHECK)]
+        self.assertEqual([step["run"] for step in checks], [REGISTRY_UNIT_TESTS, WORKFLOW_CONTRACTS, REGISTRY_CHECK])
         setup = [index for index, step in enumerate(steps) if step.get("uses") == "./.github/actions/build-tools"]
         parser = [index for index, step in enumerate(steps) if step.get("run") == "python -m pip install PyYAML==6.0.3"]
         self.assertEqual(len(setup), 1)
         self.assertEqual(len(parser), 1)
         for step in checks:
             with self.subTest(step=step["name"]):
-                self.assertNotIn("if", step)
-                self.assertNotIn("continue-on-error", step)
+                # Exact keys pin the runner's default shell and working directory
+                # and rule out step env, conditions and continue-on-error.
+                self.assertEqual(set(step), {"name", "run"})
                 self.assertLess(max(setup[0], parser[0]), steps.index(step))
+
+    def test_registry_tests_must_exist_in_the_required_test_job(self):
+        steps = self.assert_unconditional_required_job("test")
+        suites = [index for index, step in enumerate(steps) if step.get("run") == FULL_SUITE]
+        checks = [index for index, step in enumerate(steps) if "--check-test-list" in step.get("run", "")]
+        setup = [index for index, step in enumerate(steps) if step.get("uses") == "./.github/actions/build-tools"]
+        self.assertEqual((len(suites), len(checks), len(setup)), (1, 1, 1))
+        check = steps[checks[0]]
+        # Exact keys rule out step env, working-directory, conditions and
+        # continue-on-error. `shell: bash` runs `bash -eo pipefail`, so a failed
+        # listing stops the step before a partial file can be checked.
+        self.assertEqual(set(check), {"name", "shell", "run"})
+        self.assertEqual(check["shell"], "bash")
+        self.assertEqual(check["run"], TEST_LIST_CHECK)
+        # The listing repeats the full suite's exact invocation, so it names
+        # the binaries that step built and ran rather than a narrower set.
+        self.assertIn("\n" + steps[suites[0]]["run"] + " -- --list --format terse > " + TEST_LIST + "\n", check["run"])
+        self.assertLess(setup[0], suites[0])
+        self.assertLess(suites[0], checks[0])
+
+    def test_pull_request_controller_tests_need_no_compiler_or_child_process(self):
+        tree = ast.parse((ROOT / "scripts/test_security_mutations.py").read_text())
+        classes = {node.name: node for node in tree.body if isinstance(node, ast.ClassDef)}
+        selected = REGISTRY_UNIT_TESTS.split()[2:]
+        self.assertEqual(selected, ["ManifestTests", "TestListTests"])
+        for name in selected:
+            with self.subTest(test_class=name):
+                calls = [node for node in ast.walk(classes[name])
+                         if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)]
+                # Calibration compiles Rust, the campaign compiles the gateway and
+                # run_process starts real children: all stay in the scheduled job.
+                self.assertFalse({call.func.attr for call in calls} & {"calibrate", "campaign", "run_process"})
+                entries = [call for call in calls if call.func.attr == "main"]
+                self.assertTrue(entries)
+                for call in entries:
+                    # A controller entry without a registry mode is the campaign.
+                    self.assertIsInstance(call.args[0], ast.List)
+                    self.assertIn(getattr(call.args[0].elts[0], "value", None), ("--validate-registry", "--check-test-list"))
 
     def test_pull_request_ci_never_builds_or_measures_mutants(self):
         commands = [step["run"] for job in self.ci["jobs"].values() for step in job.get("steps", [])
                     if "security_mutations" in step.get("run", "")]
-        # The controller tests calibrate with rustc and the campaign compiles
-        # every mutant; both stay in the scheduled security-mutations.yml.
-        self.assertEqual(commands, [WORKFLOW_CONTRACTS, REGISTRY_CHECK])
+        # The remaining controller tests calibrate with rustc and the campaign
+        # compiles every mutant; both stay in the scheduled security-mutations.yml.
+        self.assertEqual(commands, [REGISTRY_UNIT_TESTS, WORKFLOW_CONTRACTS, REGISTRY_CHECK, TEST_LIST_CHECK])
 
 
 if __name__ == "__main__":

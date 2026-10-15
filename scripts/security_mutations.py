@@ -6,6 +6,9 @@ build. Only the disposable archive is changed. JSON evidence never contains
 compiler output, panic text, source snippets or environment values.
 `--validate-registry` is the pull-request drift check: it applies the same
 registry validation to the checkout without building, testing or mutating.
+`--check-test-list` adds the test-name half of discovery to that check: every
+selected test must occur exactly once in a terse libtest listing of the test
+binaries pull-request CI already built.
 """
 from __future__ import annotations
 
@@ -32,6 +35,7 @@ MAX_REPORT = 262144
 MAX_BUILD_OUTPUT = 8388608
 MAX_TEST_OUTPUT = 65536
 MAX_ARCHIVE = 268435456
+MAX_TEST_LIST = 8388608
 ID = re.compile(r"[a-z][a-z0-9_-]{0,63}\Z")
 TEST = re.compile(r"[A-Za-z_][A-Za-z0-9_:]{0,255}\Z")
 SHA = re.compile(r"[0-9a-f]{64}\Z")
@@ -465,8 +469,7 @@ def repository_manifest(root: Path, manifest: Path) -> str:
     return manifest_path.relative_to(root).as_posix()
 
 
-def validate_registry(args: argparse.Namespace, report: dict) -> None:
-    """Fail on registry drift that would stop the campaign; never builds or runs tests."""
+def checkout_registry(args: argparse.Namespace, report: dict) -> dict:
     root = args.root.resolve()
     manifest_file = regular_file(root, repository_manifest(root, args.manifest), MAX_MANIFEST)
     manifest, mutants = load_manifest(root, manifest_file)
@@ -474,8 +477,65 @@ def validate_registry(args: argparse.Namespace, report: dict) -> None:
     report["registry_sha256"] = sha256(manifest_file.read_bytes())
     report["targets"] = [{key: target[key] for key in ("id", "path", "function", "source_sha256", "tests")} for target in manifest["targets"]]
     report["registered_mutants"] = len(mutants)
-    # Nothing was measured: counts stay zero, and test discovery remains a campaign step.
+    return manifest
+
+
+def validate_registry(args: argparse.Namespace, report: dict) -> None:
+    """Fail on registry drift that would stop the campaign; never builds or runs tests."""
+    checkout_registry(args, report)
+    # Nothing was measured: counts stay zero, and running the tests remains a campaign step.
     report.update(status="passed", reason="registry_valid", phase="complete")
+
+
+def read_test_list(path: Path) -> bytes:
+    if path.is_symlink() or not path.is_file():
+        raise HarnessError("invalid_test_list_file")
+    with path.open("rb") as handle:
+        listing = handle.read(MAX_TEST_LIST + 1)
+    if len(listing) > MAX_TEST_LIST:
+        raise HarnessError("test_list_limit")
+    return listing
+
+
+def listed_tests(listing: bytes) -> dict[str, list[str]]:
+    """Map each name in `--list --format terse` output to the kinds listed for it."""
+    try:
+        text = listing.decode()
+    except UnicodeError:
+        raise HarnessError("invalid_test_list") from None
+    entries: dict[str, list[str]] = {}
+    for line in text.split("\n"):
+        if not line:
+            continue
+        name, separator, kind = line.rpartition(": ")
+        # A summary, warning or test output line is not a listed test: refuse to guess.
+        if not separator or not name or kind not in ("test", "benchmark"):
+            raise HarnessError("invalid_test_list")
+        entries.setdefault(name, []).append(kind)
+    if not entries:
+        raise HarnessError("empty_test_list")
+    return entries
+
+
+def check_test_list(args: argparse.Namespace, report: dict) -> None:
+    """Fail unless every selected test is listed exactly once; never builds or runs tests."""
+    manifest = checkout_registry(args, report)
+    report["source_state"] = "checkout_registry_and_test_list"
+    listing = read_test_list(args.check_test_list)
+    report["test_list_sha256"] = sha256(listing)
+    entries = listed_tests(listing)
+    report["listed_tests"] = sum(len(kinds) for kinds in entries.values())
+    selected = sorted({test for target in manifest["targets"] for test in target["tests"]})
+    report["selected_tests"] = selected
+    # Exact names only, as the campaign's `--exact` discovery would see them. Only
+    # registry names cross the report boundary, never other listing content.
+    report["unlisted_tests"] = [test for test in selected if test not in entries]
+    report["ambiguous_tests"] = [test for test in selected if test in entries and entries[test] != ["test"]]
+    if report["unlisted_tests"]:
+        raise HarnessError("registry_test_not_listed")
+    if report["ambiguous_tests"]:
+        raise HarnessError("registry_test_ambiguous")
+    report.update(status="passed", reason="registry_tests_listed", phase="complete")
 
 
 def campaign(args: argparse.Namespace, report: dict) -> None:
@@ -650,14 +710,16 @@ def main(argv: list[str] | None = None) -> int:
     modes = parser.add_mutually_exclusive_group()
     modes.add_argument("--calibrate", action="store_true")
     modes.add_argument("--validate-registry", action="store_true")
+    modes.add_argument("--check-test-list", type=Path, metavar="LISTING")
     args = parser.parse_args(argv)
+    label = "security mutation " + ("registry check" if args.validate_registry or args.check_test_list is not None else "campaign")
     args.manifest = args.manifest or args.root / "security-mutations.json"
     args.target_dir = args.target_dir or args.root / "target/security-mutations/build"
     try:
         args.report = validate_report_path(args.report, args.root)
     except HarnessError:
         # Writing to the rejected destination would itself violate isolation.
-        print("security mutation campaign: failed (unsafe_report_path)", file=sys.stderr)
+        print(label + ": failed (unsafe_report_path)", file=sys.stderr)
         return 1
     report: dict = {"schema_version": 1, "harness_version": VERSION, "status": "failed", "reason": "incomplete_campaign",
                     "phase": "initializing", "results": [], "counts": counts([]), "limits": {
@@ -678,6 +740,8 @@ def main(argv: list[str] | None = None) -> int:
             report.update(toolchain=pins, calibration=calibrate(env), status="passed", reason="calibration_passed", phase="complete")
         elif args.validate_registry:
             validate_registry(args, report)
+        elif args.check_test_list is not None:
+            check_test_list(args, report)
         else:
             campaign(args, report)
     except HarnessError as error:
@@ -694,7 +758,10 @@ def main(argv: list[str] | None = None) -> int:
         except OSError:
             print("security mutation report could not be written", file=sys.stderr)
             return 1
-    print("security mutation campaign: " + report["status"] + " (" + report["reason"] + ")")
+    print(label + ": " + report["status"] + " (" + report["reason"] + ")")
+    for key in ("unlisted_tests", "ambiguous_tests"):
+        for test in report.get(key, []):
+            print("  " + key.removesuffix("_tests") + ": " + test)
     return 0 if report["status"] == "passed" else 1
 
 
