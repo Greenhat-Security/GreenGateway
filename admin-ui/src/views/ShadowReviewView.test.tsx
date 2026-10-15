@@ -234,6 +234,107 @@ describe('ShadowReviewView', () => {
 
     expect(await screen.findByText('quiet-shadow')).toBeTruthy();
     expect(screen.getByText('0 would-deny events')).toBeTruthy();
+    expect(screen.getByText('No affected principals recorded.')).toBeTruthy();
+    expect(screen.queryByText('Evidence unavailable')).toBeNull();
+    expect(screen.queryByText(/scan truncated/)).toBeNull();
+  });
+
+  it('marks counts from a truncated audit scan as lower bounds', async () => {
+    vi.stubGlobal(
+      'fetch',
+      shadowReviewFetchMock({
+        policy: policyDocument(),
+        review: shadowReviewResponse({
+          scanned_event_count: 100_000,
+          scan_truncated: true,
+          rules: [
+            shadowSummary({ rule_id: 'busy-shadow', would_deny_count: 2 }),
+            shadowSummary({
+              rule_id: 'quiet-shadow',
+              would_deny_count: 0,
+              affected_principals: [],
+              samples: [],
+            }),
+          ],
+        }),
+      }).fetch,
+    );
+
+    renderShadowReviewView();
+
+    expect(
+      await screen.findByText('2 would-deny events (scan truncated)'),
+    ).toBeTruthy();
+    expect(screen.getByText('0 would-deny events (scan truncated)')).toBeTruthy();
+    expect(screen.queryByText('0 would-deny events')).toBeNull();
+    expect(
+      screen.getByText(
+        'Audit scan limit reached; counts, principals, and samples cover only the newest scanned events, so each count is a lower bound.',
+      ),
+    ).toBeTruthy();
+  });
+
+  it('lists enabled shadow rules with unavailable evidence instead of zero counts', async () => {
+    const fetcher = shadowReviewFetchMock({
+      policy: policyDocument({
+        rules: [
+          rule({ id: 'shadow-reports', action: 'shadow', path: '/reports/**' }),
+          rule({ id: 'deny-exports', action: 'deny', path: '/exports/**' }),
+          rule({
+            id: 'shadow-disabled',
+            action: 'shadow',
+            enabled: false,
+            path: '/disabled/**',
+          }),
+          rule({ id: null, action: 'shadow', path: '/unnamed/**' }),
+        ],
+      }),
+      review: shadowReviewResponse(),
+      reviewStatus: 503,
+      reviewBody: {
+        error: 'policy shadow review requires an audit query store',
+        reason: 'audit_evidence_unavailable',
+      },
+    });
+    vi.stubGlobal('fetch', fetcher.fetch);
+
+    renderShadowReviewView();
+
+    expect(await screen.findByText('Shadow evidence unavailable')).toBeTruthy();
+    expect(
+      screen.getByText('policy shadow review requires an audit query store'),
+    ).toBeTruthy();
+    expect(screen.getByText('shadow-reports')).toBeTruthy();
+    expect(screen.getByText('3')).toBeTruthy();
+    expect(screen.queryByText('deny-exports')).toBeNull();
+    expect(screen.queryByText('shadow-disabled')).toBeNull();
+    expect(screen.getByText('2 rules')).toBeTruthy();
+    expect(screen.getAllByText('Evidence unavailable')).toHaveLength(2);
+    expect(screen.getAllByText('Evidence unavailable.')).toHaveLength(4);
+    expect(screen.queryByText(/would-deny event/)).toBeNull();
+    expect(screen.queryByText('No affected principals recorded.')).toBeNull();
+    expect(screen.queryByText('Request failed')).toBeNull();
+  });
+
+  it('still reports a shadow review failure that is not an evidence state', async () => {
+    vi.stubGlobal(
+      'fetch',
+      shadowReviewFetchMock({
+        policy: policyDocument({
+          rules: [rule({ id: 'shadow-reports', action: 'shadow' })],
+        }),
+        review: shadowReviewResponse(),
+        reviewStatus: 500,
+        reviewBody: { error: 'shadow rule review query failed' },
+      }).fetch,
+    );
+
+    renderShadowReviewView();
+
+    expect(await screen.findByText('Request failed')).toBeTruthy();
+    expect(screen.getByText('shadow rule review query failed')).toBeTruthy();
+    expect(screen.queryByText('Shadow evidence unavailable')).toBeNull();
+    expect(screen.queryByText('shadow-reports')).toBeNull();
   });
 });
 
@@ -258,11 +359,15 @@ function shadowReviewFetchMock({
   canWrite = true,
   policy,
   review,
+  reviewStatus = 200,
+  reviewBody,
   policyEtags = ['"etag-initial"'],
 }: {
   canWrite?: boolean;
   policy: PolicyDocument;
   review: ShadowReviewResponseFixture;
+  reviewStatus?: number;
+  reviewBody?: unknown;
   policyEtags?: string[];
 }) {
   let policyRequestCount = 0;
@@ -280,7 +385,7 @@ function shadowReviewFetchMock({
     }
 
     if (url.pathname === '/v1/admin/policy/rules/shadow-review') {
-      return Promise.resolve(jsonResponse(200, review));
+      return Promise.resolve(jsonResponse(reviewStatus, reviewBody ?? review));
     }
 
     if (

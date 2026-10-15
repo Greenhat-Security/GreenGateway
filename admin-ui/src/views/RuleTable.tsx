@@ -5,6 +5,7 @@ import { AdminApiError } from '../lib/api';
 import {
   PolicyDefaultAction,
   PolicyDocument,
+  PolicyEvidence,
   PolicyRule,
   deletePolicyRule,
   fetchPolicy,
@@ -37,7 +38,9 @@ type RuleRow = {
 export function RuleTable() {
   const [policy, setPolicy] = useState<PolicyDocument | null>(null);
   const [etag, setEtag] = useState<string | null>(null);
-  const [hits, setHits] = useState<Record<string, number>>({});
+  const [hits, setHits] = useState<PolicyEvidence<Record<string, number>> | null>(
+    null,
+  );
   const [isLoading, setIsLoading] = useState(true);
   const [loadError, setLoadError] = useState<PolicyLoadError | null>(null);
   const [mutationError, setMutationError] = useState<PolicyLoadError | null>(
@@ -80,7 +83,7 @@ export function RuleTable() {
 
         setPolicy(null);
         setEtag(null);
-        setHits({});
+        setHits(null);
         setCanWritePolicy(false);
         setLoadError(toPolicyLoadError(error));
       } finally {
@@ -278,6 +281,9 @@ export function RuleTable() {
         </p>
 
         {loadError ? <PolicyErrorMessage error={loadError} /> : null}
+        {hits?.status === 'unavailable' && rows.length > 0 ? (
+          <RuleHitEvidenceUnavailableNotice message={hits.message} />
+        ) : null}
         {showWritePermissionNotice ? <PolicyWritePermissionNotice /> : null}
         {mutationError ? <PolicyMutationErrorMessage error={mutationError} /> : null}
 
@@ -385,7 +391,7 @@ export function RuleTable() {
                     </td>
                     <td className="rule-evidence-cell" data-label="Evidence">
                       <span className="numeric-cell">
-                        {formatRuleHits(hits[row.id] ?? 0)}
+                        {formatRuleHitEvidence(hits, row.id)}
                       </span>
                     </td>
                     <td data-label="Operations">
@@ -812,12 +818,38 @@ function formatAuthMethod(value: string): string {
   }
 }
 
-function formatRuleHits(value: number): string {
+// Unread evidence, a rule the counts did not cover, and a counted zero are
+// three different answers; only the last says the audit store holds no match.
+function formatRuleHitEvidence(
+  hits: PolicyEvidence<Record<string, number>> | null,
+  ruleId: string,
+): string {
+  if (hits === null || hits.status === 'unavailable') {
+    return 'Evidence unavailable';
+  }
+
+  const value = Object.hasOwn(hits.value, ruleId) ? hits.value[ruleId] : undefined;
+  if (typeof value !== 'number') {
+    return 'Not reported';
+  }
   if (value === 0) {
-    return 'never matched';
+    return 'No recorded hits';
   }
 
   return `${value.toLocaleString()} ${value === 1 ? 'hit' : 'hits'}`;
+}
+
+function RuleHitEvidenceUnavailableNotice({ message }: { message: string }) {
+  return (
+    <div className="error-panel alert warning" role="status">
+      <h3>Hit evidence unavailable</h3>
+      <p>{message}</p>
+      <p>
+        No audit evidence was read, so this table cannot show whether any rule
+        has matched traffic. A missing count is not a zero.
+      </p>
+    </div>
+  );
 }
 
 function actionBadgeClass(action: PolicyRule['action'] | PolicyDefaultAction): string {

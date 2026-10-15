@@ -123,6 +123,7 @@ pub(super) const DEFAULT_PRINCIPAL_DETAIL_AUDIT_EVENT_LIMIT: usize = 500;
 pub(super) const DEFAULT_PRINCIPAL_ANOMALY_HISTORY_LIMIT: usize = 20;
 pub(super) const DEFAULT_RULE_PREVIEW_SAMPLE_LIMIT: usize = 20;
 pub(super) const MAX_RULE_PREVIEW_SAMPLE_LIMIT: usize = 100;
+pub(super) const MAX_RULE_PREVIEW_SCAN_ROWS: usize = 100_000;
 
 #[derive(rust_embed::RustEmbed)]
 #[folder = "../admin-ui/dist/"]

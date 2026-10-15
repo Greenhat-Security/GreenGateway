@@ -1,5 +1,10 @@
-import { adminFetchJson, adminFetchJsonResponse } from './api';
+import { AdminApiError, adminFetchJson, adminFetchJsonResponse } from './api';
 import { adminApiUrl } from './config';
+
+// The gateway's stable reason when a policy evidence endpoint has no audit
+// store to read. It answers 503 instead of zeros, so the UI can say the
+// evidence is missing rather than imply a rule never matched.
+export const POLICY_EVIDENCE_UNAVAILABLE_REASON = 'audit_evidence_unavailable';
 
 export type PolicyDefaultAction = 'allow' | 'deny';
 export type PolicyRuleAction = 'allow' | 'deny' | 'shadow';
@@ -92,6 +97,10 @@ export type PolicyRulePreviewRequest = {
 export type PolicyRulePreviewResponse = {
   match_count: number;
   scanned_event_count: number;
+  // True when the window held more observations than one preview scans;
+  // match_count then covers only the newest scanned_event_count of them.
+  scan_truncated: boolean;
+  complete: boolean;
   sample_strategy: string;
   samples: PolicyRulePreviewSample[];
 };
@@ -129,6 +138,12 @@ export type PolicyRuleShadowReviewResponse = {
   scan_truncated: boolean;
   rules: PolicyRuleShadowReviewSummary[];
 };
+
+// Evidence read from the audit store, or an explicit statement that there was
+// none to read. Never collapse `unavailable` into an empty or zero `value`.
+export type PolicyEvidence<T> =
+  | { status: 'available'; value: T }
+  | { status: 'unavailable'; message: string };
 
 type PolicyRuleHitsResponse =
   | {
@@ -236,24 +251,66 @@ export async function reorderPolicyRules(
   );
 }
 
-export async function fetchPolicyRuleHits(): Promise<Record<string, number>> {
-  const response = await adminFetchJson<PolicyRuleHitsResponse>(
-    adminApiUrl('/policy/rules/hits'),
-  );
-
-  if (isPolicyRuleHitsListResponse(response)) {
-    return Object.fromEntries(
-      response.rules.map((rule) => [rule.rule_id, rule.hits]),
+export async function fetchPolicyRuleHits(): Promise<
+  PolicyEvidence<Record<string, number>>
+> {
+  let response: PolicyRuleHitsResponse;
+  try {
+    response = await adminFetchJson<PolicyRuleHitsResponse>(
+      adminApiUrl('/policy/rules/hits'),
     );
+  } catch (error) {
+    return unavailablePolicyEvidence(error);
   }
 
-  return response;
+  if (isPolicyRuleHitsListResponse(response)) {
+    return {
+      status: 'available',
+      value: Object.fromEntries(
+        response.rules.map((rule) => [rule.rule_id, rule.hits]),
+      ),
+    };
+  }
+
+  return { status: 'available', value: response };
 }
 
-export async function fetchPolicyRuleShadowReview(): Promise<PolicyRuleShadowReviewResponse> {
-  return adminFetchJson<PolicyRuleShadowReviewResponse>(
-    adminApiUrl('/policy/rules/shadow-review'),
+export async function fetchPolicyRuleShadowReview(): Promise<
+  PolicyEvidence<PolicyRuleShadowReviewResponse>
+> {
+  try {
+    return {
+      status: 'available',
+      value: await adminFetchJson<PolicyRuleShadowReviewResponse>(
+        adminApiUrl('/policy/rules/shadow-review'),
+      ),
+    };
+  } catch (error) {
+    return unavailablePolicyEvidence(error);
+  }
+}
+
+export function isPolicyEvidenceUnavailableError(
+  error: unknown,
+): error is AdminApiError {
+  return (
+    error instanceof AdminApiError &&
+    error.status === 503 &&
+    error.code === POLICY_EVIDENCE_UNAVAILABLE_REASON
   );
+}
+
+// Only the gateway's explicit "no audit store" answer becomes unavailable
+// evidence. Every other failure, including other 503s, still rejects so the
+// caller reports it as an error instead of an evidence state.
+function unavailablePolicyEvidence(error: unknown): {
+  status: 'unavailable';
+  message: string;
+} {
+  if (isPolicyEvidenceUnavailableError(error)) {
+    return { status: 'unavailable', message: error.message };
+  }
+  throw error;
 }
 
 export function policyRuleId(rule: PolicyRule, index: number): string {

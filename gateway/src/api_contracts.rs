@@ -352,6 +352,12 @@ pub(super) struct PolicyRulePreviewRequest {
 pub(super) struct PolicyRulePreviewResponse {
     pub(super) match_count: u64,
     pub(super) scanned_event_count: u64,
+    /// The window held more observations than the scan ceiling allowed, so
+    /// `match_count` covers only the newest `scanned_event_count` of them.
+    pub(super) scan_truncated: bool,
+    /// Every observation in the window was scanned. Never true for a
+    /// truncated scan: a partial count is not evidence of the whole window.
+    pub(super) complete: bool,
     pub(super) sample_strategy: &'static str,
     pub(super) samples: Vec<PolicyRulePreviewSample>,
 }
