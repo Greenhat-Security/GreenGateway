@@ -40,7 +40,11 @@ hyper = { version = "1.10.1", default-features = false, features = ["client", "s
 # NOT requested: that is the feature that would make every listener serve h2c.
 hyper-util = { version = "0.1.20", default-features = false, features = ["tokio", "service"] }
 ipnet = "2.11.0"
-jsonschema = { version = "0.46.9", default-features = false }
+# jsonschema 0.52 made IDN support an optional `idna` feature (on by default).
+# With default features off, `idn-email` and `idn-hostname` would silently turn
+# into unknown formats, which the crate accepts. Request `idna` explicitly so
+# those formats keep the checks they had when idna was a mandatory dependency.
+jsonschema = { version = "0.56.0", default-features = false, features = ["idna"] }
 jsonwebtoken = { version = "11.0.0", features = ["aws_lc_rs"] }
 metrics = "0.24.6"
 metrics-exporter-prometheus = { version = "0.18.3", default-features = false }

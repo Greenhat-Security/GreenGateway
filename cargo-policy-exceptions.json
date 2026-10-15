@@ -15,7 +15,7 @@
         "0.22.1": [
           "axum@0.8.9",
           "hyper-util@0.1.20",
-          "jsonwebtoken@11.0.0",
+          "jsonwebtoken@11.1.0",
           "metrics-exporter-prometheus@0.18.3",
           "pem@3.0.6",
           "postgres-protocol@0.6.12",
@@ -188,15 +188,16 @@
       "remediation": "Re-evaluate when the listed parent dependencies update; remove the exception once their version requirements converge.",
       "parents": {
         "0.2.17": [
-          "jsonwebtoken@11.0.0",
+          "jsonwebtoken@11.1.0",
           "rand_core@0.6.4",
           "ring@0.17.14"
         ],
         "0.3.4": [
           "ahash@0.8.12",
-          "jsonschema@0.46.10",
+          "jsonschema-value@0.56.0",
+          "jsonschema@0.56.0",
           "rand_core@0.9.5",
-          "referencing@0.46.10"
+          "referencing@0.56.0"
         ],
         "0.4.3": [
           "crypto-common@0.2.2",
@@ -218,17 +219,17 @@
       ],
       "owner": "GreenGateway maintainers",
       "expires": "2026-12-01",
-      "reason": "SQLite hashlink, metrics/schema references and indexmap require distinct table APIs.",
+      "reason": "metrics-util 0.20 and the SQLite VFS (rsqlite-vfs) still use hashbrown 0.16 while SQLite hashlink, indexmap and jsonschema's referencing use 0.17.",
       "remediation": "Re-evaluate when the listed parent dependencies update; remove the exception once their version requirements converge.",
       "parents": {
         "0.16.1": [
           "metrics-util@0.20.4",
-          "referencing@0.46.10",
           "rsqlite-vfs@0.1.1"
         ],
         "0.17.1": [
           "hashlink@0.12.2",
-          "indexmap@2.14.2"
+          "indexmap@2.14.2",
+          "referencing@0.56.0"
         ]
       }
     },
@@ -262,11 +263,11 @@
       ],
       "owner": "GreenGateway maintainers",
       "expires": "2026-12-01",
-      "reason": "rcgen 0.14.10 moved to pem 4 while jsonwebtoken 11.0.0 still parses PEM with pem 3.",
+      "reason": "rcgen 0.14.10 moved to pem 4 while jsonwebtoken 11.1.0 still parses PEM with pem 3.",
       "remediation": "Re-evaluate when the listed parent dependencies update; remove the exception once their version requirements converge.",
       "parents": {
         "3.0.6": [
-          "jsonwebtoken@11.0.0"
+          "jsonwebtoken@11.1.0"
         ],
         "4.0.0": [
           "rcgen@0.14.10"
@@ -371,7 +372,7 @@
       "name": "syn",
       "versions": [
         "2.0.119",
-        "3.0.5"
+        "3.0.6"
       ],
       "owner": "GreenGateway maintainers",
       "expires": "2026-12-01",
@@ -388,6 +389,7 @@
           "jni-sys-macros@0.4.1",
           "rmcp-macros@2.2.0",
           "rust-embed-impl@8.12.0",
+          "strum_macros@0.28.0",
           "synstructure@0.13.2",
           "tls_codec_derive@0.4.2",
           "tracing-attributes@0.1.31",
@@ -398,7 +400,7 @@
           "zerofrom-derive@0.1.7",
           "zeroize_derive@1.5.0"
         ],
-        "3.0.5": [
+        "3.0.6": [
           "async-trait@0.1.92",
           "displaydoc@0.2.7",
           "futures-macro@0.3.34",
@@ -542,7 +544,7 @@
           "mio@1.2.3",
           "nu-ansi-term@0.50.3",
           "quinn-udp@0.5.15",
-          "rustix@1.1.4",
+          "rustix@1.1.5",
           "rustls-platform-verifier@0.7.0",
           "schannel@0.1.29",
           "socket2@0.6.5",
