@@ -451,8 +451,6 @@ impl RbacState {
         self
     }
 
-    /// The policy snapshot this request is judged by: the one the gate
-    /// pinned at admission (cluster mode), else the live lane.
     /// The compiled kernel of the snapshot a request would be judged by right
     /// now, for the differential tests.
     ///
@@ -466,6 +464,8 @@ impl RbacState {
         self.effective_policy()
     }
 
+    /// The policy snapshot this request is judged by: the one the gate
+    /// pinned at admission (cluster mode), else the live lane.
     fn effective_policy(&self) -> Arc<RbacPolicyState> {
         #[cfg(feature = "postgres")]
         if let Ok(pinned) = PINNED_POLICY.try_with(Arc::clone) {
@@ -648,22 +648,27 @@ impl RbacState {
         })
     }
 
+    /// The rendered-HTTP firewall rule for a tool's upstream request, judged by
+    /// the same snapshot as [`RbacState::evaluate_tool_authorization`]. An
+    /// invocation admitted under the pinned policy must not have its rendered
+    /// request judged by a revision a reconcile installed while it was in
+    /// flight: that is one decision built from two snapshots (#422).
     pub(crate) fn evaluate_tool_http_rule(
         &self,
         method: &str,
         path: &str,
         principal: Option<&auth::Principal>,
     ) -> Option<MatchedRuleDecision> {
-        self.policy
-            .load()
+        self.effective_policy()
             .evaluate_tool_http_rule(method, path, principal)
     }
 
     /// Previews whether the requesting principal may invoke a policy-backed
     /// tool without emitting audit events or beginning tool execution.
     ///
-    /// The live policy is loaded exactly once so the tool entry and any direct
-    /// tool-name rule are evaluated from the same immutable snapshot.
+    /// The request's policy snapshot is loaded exactly once so the tool entry
+    /// and any direct tool-name rule are evaluated from the same immutable
+    /// snapshot.
     pub(crate) fn tool_policy_eligibility(
         &self,
         tool_name: &str,

@@ -108,11 +108,16 @@ rendered HTTP method/path facts do not pass through inbound request admission.
 The runtime Actor projection accepts three auth modes and currently drops a
 client-certificate identity, whereas inventory retains it. The differential
 fixture pins both outcomes. Adapters must preserve or explicitly change that
-behavior with both authorities tested. `evaluate_tool_http_rule` currently loads
-the current policy instead of `effective_policy()`; this pure extraction accepts
-an explicit snapshot and does not change that live pinning behavior.
+behavior with both authorities tested. Every live tool-lane read, including the
+rendered HTTP rule, goes through `effective_policy()`. In cluster mode,
+invocation, visibility, inventory eligibility, composite enablement and
+`evaluate_tool_http_rule` are all judged by the snapshot the revision gate
+pinned at admission, never by a revision installed while the request was in
+flight. `tool_http_operation_reads_the_pinned_policy_not_the_live_lane` holds
+the rendered HTTP rule and tool visibility to the pinned snapshot together.
 
 Registry existence and listing metadata, composite grant validity, enum-source
 refresh, non-RBAC permissive fallback, transport and mutable execution state are
 outside this contract. The named operation and `not_evaluated` trace fields make
-those limits explicit. Static egress remains outstanding under #421.
+those limits explicit. Static egress has no kernel entry point yet; it is owned
+by #422 PR 3b.
