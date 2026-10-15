@@ -5,6 +5,7 @@ import {
   type ConnectionDetail,
   type ConnectionKind,
   type ConnectionWrite,
+  type SafeCallerAssertion,
   type TlsProfile
 } from '../../lib/connections';
 import {
@@ -51,6 +52,8 @@ export type ConnectionFormState = {
   resource: string;
   authenticationBinding: BindingDraft;
   additionalHeaders: AdditionalHeaderDraft[];
+  // Shown read only and never written; see `writeFromForm`.
+  callerAssertion: SafeCallerAssertion | null;
   caBundleBinding: BindingDraft;
   clientCertificateBinding: BindingDraft;
   clientPrivateKeyBinding: BindingDraft;
@@ -131,6 +134,7 @@ export const DEFAULT_FORM: ConnectionFormState = {
   resource: '',
   authenticationBinding: emptyBinding(),
   additionalHeaders: [],
+  callerAssertion: null,
   caBundleBinding: emptyBinding(),
   clientCertificateBinding: emptyBinding(),
   clientPrivateKeyBinding: emptyBinding(),
@@ -230,6 +234,7 @@ export function formFromDetail(detail: ConnectionDetail): ConnectionFormState {
         binding: bindingFromMarker(header.secret_configured),
       }),
     ),
+    callerAssertion: configuration.caller_assertion ?? null,
     caBundleBinding: bindingFromMarker(
       configuration.tls.ca_bundle_configured,
     ),
@@ -313,6 +318,12 @@ export function writeFromForm(form: ConnectionFormState): ConnectionWrite {
         }
         : undefined;
 
+  // `form.callerAssertion` is deliberately not written. The replace contract
+  // keeps an omitted block, and the safe read hides its signing key alias, so
+  // leaving the key out is the only way this UI can keep the block exactly as
+  // stored. Anything it sent instead, `null` included, could only remove the
+  // block and put a Connection that cannot yet attest its caller back into
+  // service.
   return {
     display_name: form.displayName.trim(),
     ...(description ? { description } : {}),
@@ -450,6 +461,23 @@ export function validateForm(
   ) {
     errors['authentication.header_name'] = 'Enter the API key header name.';
   }
+  // A save keeps the stored caller assertion, and the gateway revalidates it
+  // against the headers being saved, so these would be refused anyway; saying
+  // so here names the field to change instead of a form-wide error.
+  const callerAssertionHeaderName =
+    form.callerAssertion?.header_name.toLowerCase() ?? null;
+  if (
+    callerAssertionHeaderName !== null &&
+    form.authenticationType === 'header_api_key' &&
+    form.headerName.trim().toLowerCase() === callerAssertionHeaderName
+  ) {
+    errors['authentication.header_name'] =
+      'The API key header cannot use the caller assertion header name.';
+  }
+  if (form.callerAssertion?.bind_approval === true) {
+    errors.form =
+      'This connection was saved with a caller assertion that asks for approval binding, which the gateway no longer accepts. Remove the caller assertion through the admin API before saving this connection.';
+  }
   if (form.additionalHeaders.length > MAX_ADDITIONAL_HEADERS) {
     errors.form = `Configure no more than ${MAX_ADDITIONAL_HEADERS} additional headers.`;
   }
@@ -469,6 +497,9 @@ export function validateForm(
       ) {
         errors[nameField] =
           'An additional header cannot use the primary credential header name.';
+      } else if (normalized === callerAssertionHeaderName) {
+        errors[nameField] =
+          'An additional header cannot use the caller assertion header name.';
       } else if (additionalHeaderNames.has(normalized)) {
         errors[nameField] =
           'Additional header names must be unique, ignoring case.';

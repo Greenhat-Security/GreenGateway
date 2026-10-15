@@ -15,6 +15,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import type {
   ConnectionDetail,
   ConnectionListPage,
+  SafeCallerAssertion,
   SafeConnectionAdditionalHeader,
 } from '../lib/connections';
 import type {
@@ -359,6 +360,144 @@ describe('ConnectionEditor', () => {
       client_private_key_configured: true,
     });
     expect(JSON.stringify(body)).not.toContain('secret_id');
+  });
+
+  it('shows a stored caller assertion read only and saves without it', async () => {
+    const stored: SafeCallerAssertion = {
+      signing_key_configured: true,
+      kid: 'gw-2026-09',
+      algorithm: 'es256',
+      issuer: 'https://gateway.example.test',
+      audience: 'https://billing.example.test/api',
+      token_type: 'at+jwt',
+      header_name: 'x-caller-assertion',
+      lifetime_seconds: 60,
+      claims: ['email'],
+      bind_request: true,
+      bind_approval: false,
+    };
+    const puts: RequestInit[] = [];
+    vi.stubGlobal(
+      'fetch',
+      vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
+        const url = requestUrl(input);
+        if (
+          url.pathname === '/v1/admin/connections/billing' &&
+          !init?.method
+        ) {
+          return Promise.resolve(
+            jsonResponse(200, managedDetail({ callerAssertion: stored }), {
+              ETag: '"record-7"',
+            }),
+          );
+        }
+        if (
+          url.pathname === '/v1/admin/connections/billing' &&
+          init?.method === 'PUT'
+        ) {
+          puts.push(init);
+          // The gateway keeps an omitted block, so it comes back unchanged.
+          return Promise.resolve(
+            jsonResponse(
+              200,
+              managedDetail({
+                displayName: 'Billing API renamed',
+                callerAssertion: stored,
+              }),
+              { ETag: '"record-8"' },
+            ),
+          );
+        }
+        return Promise.reject(new Error(`unexpected request: ${url.pathname}`));
+      }),
+    );
+
+    renderEditor('/connections/billing/edit');
+    const name = await screen.findByLabelText('Display name');
+    const section = screen
+      .getByRole('heading', { name: 'Caller assertion' })
+      .closest('section');
+    expect(section).toBeTruthy();
+    expect(section?.textContent).toContain('Accepted, not yet enforced.');
+    expect(section?.textContent).toContain('caller_assertion_not_enforced');
+    expect(section?.textContent).toContain('gw-2026-09');
+    expect(section?.textContent).toContain('x-caller-assertion');
+    expect(section?.textContent).toContain('sub, email');
+    // Read only: nothing in the section can change the block.
+    expect(
+      section?.querySelectorAll('input, select, textarea, button'),
+    ).toHaveLength(0);
+
+    fireEvent.change(name, { target: { value: 'Billing API renamed' } });
+    fireEvent.click(screen.getByRole('button', { name: 'Save connection' }));
+
+    expect(await screen.findByText('Connection detail route')).toBeTruthy();
+    expect(puts).toHaveLength(1);
+    expect(headerValue(puts[0]?.headers, 'If-Match')).toBe('"record-7"');
+    const body = JSON.parse(String(puts[0]?.body)) as Record<string, unknown>;
+    expect(body.display_name).toBe('Billing API renamed');
+    // Omitted, never `null`: an omitted block is kept, `null` removes it.
+    expect(Object.hasOwn(body, 'caller_assertion')).toBe(false);
+    expect(String(puts[0]?.body)).not.toContain('caller_assertion');
+  });
+
+  it('flags a header that reuses the caller assertion header before writing', async () => {
+    const fetchMock = vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
+      const url = requestUrl(input);
+      if (
+        url.pathname === '/v1/admin/connection-secrets' &&
+        !init?.method
+      ) {
+        return Promise.resolve(
+          jsonResponse(200, secretList(), {
+            ETag: '"secret-entity"',
+            'X-GreenGateway-Connection-Secrets-ETag': '"secret-collection"',
+          }),
+        );
+      }
+      if (
+        url.pathname === '/v1/admin/connections/billing' &&
+        !init?.method
+      ) {
+        return Promise.resolve(
+          jsonResponse(
+            200,
+            managedDetail({
+              canBindSecret: true,
+              callerAssertion: {
+                signing_key_configured: true,
+                kid: 'gw-2026-09',
+                algorithm: 'es256',
+                issuer: 'https://gateway.example.test',
+                audience: 'https://billing.example.test/api',
+                token_type: 'at+jwt',
+                header_name: 'x-caller-assertion',
+                lifetime_seconds: 60,
+                bind_request: false,
+                bind_approval: false,
+              },
+            }),
+            { ETag: '"record-7"' },
+          ),
+        );
+      }
+      return Promise.reject(new Error(`unexpected request: ${url.pathname}`));
+    });
+    vi.stubGlobal('fetch', fetchMock);
+
+    renderEditor('/connections/billing/edit');
+    const headerName = await screen.findByLabelText('Header name');
+    fireEvent.change(headerName, { target: { value: 'X-Caller-Assertion' } });
+    fireEvent.click(screen.getByRole('button', { name: 'Save connection' }));
+
+    expect(
+      await screen.findByText(
+        'The API key header cannot use the caller assertion header name.',
+      ),
+    ).toBeTruthy();
+    expect(
+      fetchMock.mock.calls.some(([, init]) => init?.method === 'PUT'),
+    ).toBe(false);
   });
 
   it('creates an ordered, four-row-bounded additional header list from header secret aliases', async () => {
@@ -2241,6 +2380,7 @@ function managedDetail({
   displayName = 'Billing API',
   discoveryUsesAuthentication,
   additionalHeaders = [],
+  callerAssertion,
 }: {
   canBindSecret?: boolean;
   canManageSecrets?: boolean;
@@ -2248,6 +2388,7 @@ function managedDetail({
   displayName?: string;
   discoveryUsesAuthentication?: boolean;
   additionalHeaders?: SafeConnectionAdditionalHeader[];
+  callerAssertion?: SafeCallerAssertion;
 } = {}): ConnectionDetail {
   return {
     id: 'billing',
@@ -2281,6 +2422,9 @@ function managedDetail({
               secret_configured: true,
             }
           : { type: 'none' },
+      ...(callerAssertion === undefined
+        ? {}
+        : { caller_assertion: callerAssertion }),
       ...(additionalHeaders.length > 0
         ? { additional_headers: additionalHeaders }
         : {}),
