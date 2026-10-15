@@ -12628,6 +12628,28 @@ async fn mcp_refresh_errors_expose_bounded_upstream_diagnostics() {
 }
 
 #[tokio::test]
+async fn caller_assertion_refusals_are_conflicts_with_their_own_reason() {
+    // A Connection that cannot yet attest its caller is a state the operator
+    // must change, like a disabled one, not an upstream failure to retry.
+    let response = connection_refresh_error_response(
+        connections::mcp::McpCatalogRefreshError::CallerAssertionNotEnforced,
+    );
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+    let body = json_body(response).await;
+    assert_eq!(body["reason"], json!("caller_assertion_not_enforced"));
+
+    for operation in ["preview", "register", "refresh"] {
+        let response = openapi_catalog_error_response(
+            connections::openapi::OpenApiCatalogError::CallerAssertionNotEnforced,
+            operation,
+        );
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        let body = json_body(response).await;
+        assert_eq!(body["reason"], json!("caller_assertion_not_enforced"));
+    }
+}
+
+#[tokio::test]
 async fn connection_refresh_requires_permission_empty_body_and_exact_etag() {
     let connection_db = TempDb::new("connection-refresh-guards");
     let policy = TempPolicyFile::new(&connection_policy_document_string());

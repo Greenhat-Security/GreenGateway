@@ -3190,10 +3190,18 @@ mod tests {
         let _ = fs::remove_dir_all(&root);
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "current_thread")]
     async fn unenforced_caller_assertion_is_refused_before_secret_or_upstream_io() {
         // A proxied call on a Connection configured to attest its caller would
-        // otherwise leave carrying only the service credential.
+        // otherwise leave carrying only the service credential. The proxy's
+        // only record of why is its fail-closed log line, so capture it.
+        let logs = CapturedLogs::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .without_time()
+            .with_writer(logs.clone())
+            .finish();
+        let _guard = crate::tracing_test_guard(subscriber);
         let root = std::env::temp_dir().join(format!(
             "greengateway-proxy-caller-assertion-{}",
             uuid::Uuid::new_v4()
@@ -3306,6 +3314,14 @@ mod tests {
             .await
             .expect("refusal body should read");
         assert_eq!(body.as_ref(), br#"{"error":"bad_gateway"}"#);
+        drop(_guard);
+        // Any other target error would produce the same status and outcome;
+        // only the category names the refusal.
+        let output = logs.contents();
+        assert!(
+            output.contains("caller_assertion_not_enforced"),
+            "the fail-closed log line should name the refusal"
+        );
 
         let events = sink.events();
         assert!(events.iter().all(|event| {
@@ -3314,6 +3330,7 @@ mod tests {
         let rendered = serde_json::to_string(&events).expect("audits should serialize");
         for secret in ["primary-secret-canary", "signing-key-canary"] {
             assert!(!rendered.contains(secret), "audit leaked {secret}");
+            assert!(!output.contains(secret), "log leaked {secret}");
         }
 
         let _ = fs::remove_dir_all(&root);
