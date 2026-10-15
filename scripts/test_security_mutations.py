@@ -57,12 +57,31 @@ class ManifestTests(unittest.TestCase):
             self.load()
         self.assertEqual(category, raised.exception.category)
 
+    def validate(self, *arguments):
+        report = self.root / "target/report.json"
+        # A compiler, test or git process would make this more than a registry check.
+        with mock.patch.object(mutations.subprocess, "Popen", side_effect=AssertionError("process started")) as popen, mock.patch("builtins.print"):
+            code = mutations.main(["--validate-registry", "--report", str(report), *arguments])
+        popen.assert_not_called()
+        return code, json.loads(report.read_text())
+
+    def validate_fixture(self):
+        self.path.write_text(json.dumps(self.manifest))
+        return self.validate("--root", str(self.root), "--manifest", str(self.path))
+
     def test_current_registry_is_nonempty_and_resolves(self):
         root = Path(__file__).resolve().parents[1]
         manifest, mutants = mutations.load_manifest(root, root / "security-mutations.json")
         self.assertGreater(len(mutants), 0)
         self.assertEqual(len({mutant["id"] for mutant in mutants}), len(mutants))
         self.assertEqual(len(manifest["targets"]), 4)
+
+    def test_current_registry_passes_the_pull_request_drift_check(self):
+        root = Path(__file__).resolve().parents[1]
+        code, report = self.validate()
+        self.assertEqual((0, "passed", "registry_valid"), (code, report["status"], report["reason"]))
+        self.assertEqual(mutations.sha256((root / "security-mutations.json").read_bytes()), report["registry_sha256"])
+        self.assertEqual(len(mutations.load_manifest(root, root / "security-mutations.json")[1]), report["registered_mutants"])
 
     def test_valid_manifest_and_identity_bind_source_and_change(self):
         _, mutants = self.load()
@@ -174,6 +193,71 @@ class ManifestTests(unittest.TestCase):
         self.assert_rejected("stale_exception")
         self.manifest["exceptions"] = [self.exception(), self.exception()]
         self.assert_rejected("invalid_exceptions")
+
+    def test_registry_check_reports_identity_but_never_a_score(self):
+        code, report = self.validate_fixture()
+        self.assertEqual((0, "passed", "registry_valid"), (code, report["status"], report["reason"]))
+        self.assertEqual("checkout_registry_only", report["source_state"])
+        self.assertEqual(mutations.sha256(self.path.read_bytes()), report["registry_sha256"])
+        self.assertEqual([{"id": "predicate", "path": "source.rs", "function": "allowed",
+                           "source_sha256": mutations.sha256(SOURCE), "tests": [TEST_NAME]}], report["targets"])
+        self.assertEqual(1, report["registered_mutants"])
+        self.assertEqual([], report["results"])
+        self.assertEqual(mutations.counts([]), report["counts"])
+        self.assertNotIn("baseline", report)
+
+    def test_registry_check_fails_closed_on_target_source_drift(self):
+        for label, source, category in (("edited", SOURCE.replace(b"4", b"5"), "function_hash_drift"),
+                                        ("renamed", SOURCE.replace(b"allowed", b"renamed"), "function_scope_drift"),
+                                        ("duplicated", SOURCE + SOURCE, "function_scope_drift"),
+                                        ("crlf", SOURCE.replace(b"\n", b"\r\n"), "function_scope_drift")):
+            with self.subTest(label=label):
+                (self.root / "source.rs").write_bytes(source)
+                code, report = self.validate_fixture()
+                self.assertEqual((1, "failed", category), (code, report["status"], report["reason"]))
+                self.assertNotIn("targets", report)
+        (self.root / "source.rs").unlink()
+        code, report = self.validate_fixture()
+        self.assertEqual((1, "invalid_file"), (code, report["reason"]))
+
+    def test_registry_check_fails_closed_on_unreconciled_registry(self):
+        def unknown_version(manifest):
+            manifest["harness_version"] = "0.0.0"
+
+        def duplicated_test(manifest):
+            manifest["targets"][0]["tests"] = [TEST_NAME, TEST_NAME]
+
+        def invalid_test_name(manifest):
+            manifest["targets"][0]["tests"] = ["security::rejects boundary"]
+
+        def missing_anchor(manifest):
+            manifest["targets"][0]["mutations"][0]["old"] = "value <= 4"
+
+        def stale_exception(manifest):
+            manifest["exceptions"] = [self.exception()]
+            manifest["exceptions"][0]["mutation_sha256"] = "0" * 64
+
+        for change, category in ((unknown_version, "unsupported_version"), (duplicated_test, "duplicate_test"),
+                                 (invalid_test_name, "invalid_test_name"), (missing_anchor, "invalid_replacement"),
+                                 (stale_exception, "stale_exception")):
+            with self.subTest(change=change.__name__):
+                self.manifest = manifest_fixture()
+                change(self.manifest)
+                code, report = self.validate_fixture()
+                self.assertEqual((1, "failed", category), (code, report["status"], report["reason"]))
+
+    def test_registry_check_requires_a_registry_inside_the_repository(self):
+        with tempfile.TemporaryDirectory() as directory:
+            self.path = Path(directory) / "manifest.json"
+            code, report = self.validate_fixture()
+        self.assertEqual((1, "manifest_outside_repository"), (code, report["reason"]))
+
+    def test_registry_check_cannot_be_combined_with_calibration(self):
+        report = self.root / "target/report.json"
+        with mock.patch("sys.stderr", new_callable=io.StringIO), self.assertRaises(SystemExit) as raised:
+            mutations.main(["--validate-registry", "--calibrate", "--report", str(report)])
+        self.assertEqual(2, raised.exception.code)
+        self.assertFalse(report.exists())
 
 
 class ResultTests(unittest.TestCase):
