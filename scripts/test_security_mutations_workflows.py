@@ -10,6 +10,8 @@ ROOT = Path(__file__).resolve().parents[1]
 CHECKOUT = "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1"
 UPLOAD = "actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a"
 CONTROLLER = "python scripts/security_mutations.py --report target/security-mutations/report.json"
+REGISTRY_CHECK = "python scripts/security_mutations.py --validate-registry"
+WORKFLOW_CONTRACTS = "python scripts/test_security_mutations_workflows.py"
 
 
 class WorkflowTests(unittest.TestCase):
@@ -20,6 +22,7 @@ class WorkflowTests(unittest.TestCase):
             (ROOT / ".github/workflows/security-mutations.yml").read_text(),
             Loader=yaml.BaseLoader,
         )
+        self.ci = yaml.load((ROOT / ".github/workflows/ci.yml").read_text(), Loader=yaml.BaseLoader)
         self.assertEqual(set(self.workflow["jobs"]), {"security-mutations"})
         self.job = self.workflow["jobs"]["security-mutations"]
         self.steps = self.job["steps"]
@@ -82,13 +85,14 @@ class WorkflowTests(unittest.TestCase):
             [
                 "python -m pip install PyYAML==6.0.3",
                 "python scripts/test_security_mutations.py",
-                "python scripts/test_security_mutations_workflows.py",
+                WORKFLOW_CONTRACTS,
                 CONTROLLER,
             ],
         )
-        # Calibration and single-mutant reproductions cannot replace the
-        # complete reviewed campaign in the scheduled assurance job.
+        # Calibration, registry-only checks and single-mutant reproductions
+        # cannot replace the complete reviewed campaign in the scheduled job.
         self.assertNotIn("--calibrate", CONTROLLER)
+        self.assertNotIn("--validate-registry", CONTROLLER)
         self.assertNotIn("--mutant", CONTROLLER)
 
     def test_failed_or_skipped_measurements_cannot_be_ignored(self):
@@ -112,10 +116,36 @@ class WorkflowTests(unittest.TestCase):
         })
 
     def test_scheduled_measurement_is_separate_from_required_pr_jobs(self):
-        ci = yaml.load((ROOT / ".github/workflows/ci.yml").read_text(), Loader=yaml.BaseLoader)
-        self.assertNotIn("security-mutations", ci["jobs"])
-        self.assertNotIn("security-mutations", ci["jobs"]["promote-image"]["needs"])
-        self.assertIn("security-coverage", ci["jobs"]["promote-image"]["needs"])
+        self.assertNotIn("security-mutations", self.ci["jobs"])
+        self.assertNotIn("security-mutations", self.ci["jobs"]["promote-image"]["needs"])
+        self.assertIn("security-coverage", self.ci["jobs"]["promote-image"]["needs"])
+
+    def test_registry_drift_check_runs_in_an_existing_required_job(self):
+        self.assertIn("pull_request", self.ci["on"])
+        # Reusing a required job keeps the required-check and promotion lists unchanged.
+        self.assertIn("supply-chain", self.ci["jobs"]["promote-image"]["needs"])
+        job = self.ci["jobs"]["supply-chain"]
+        for optional in ("if", "needs", "continue-on-error", "strategy"):
+            self.assertNotIn(optional, job)
+        steps = job["steps"]
+        checks = [step for step in steps if step.get("run") in (WORKFLOW_CONTRACTS, REGISTRY_CHECK)]
+        self.assertEqual([step["run"] for step in checks], [WORKFLOW_CONTRACTS, REGISTRY_CHECK])
+        setup = [index for index, step in enumerate(steps) if step.get("uses") == "./.github/actions/build-tools"]
+        parser = [index for index, step in enumerate(steps) if step.get("run") == "python -m pip install PyYAML==6.0.3"]
+        self.assertEqual(len(setup), 1)
+        self.assertEqual(len(parser), 1)
+        for step in checks:
+            with self.subTest(step=step["name"]):
+                self.assertNotIn("if", step)
+                self.assertNotIn("continue-on-error", step)
+                self.assertLess(max(setup[0], parser[0]), steps.index(step))
+
+    def test_pull_request_ci_never_builds_or_measures_mutants(self):
+        commands = [step["run"] for job in self.ci["jobs"].values() for step in job.get("steps", [])
+                    if "security_mutations" in step.get("run", "")]
+        # The controller tests calibrate with rustc and the campaign compiles
+        # every mutant; both stay in the scheduled security-mutations.yml.
+        self.assertEqual(commands, [WORKFLOW_CONTRACTS, REGISTRY_CHECK])
 
 
 if __name__ == "__main__":

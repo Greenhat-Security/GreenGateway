@@ -4,6 +4,8 @@
 The production campaign builds a clean HEAD archive with the ordinary Cargo/UI
 build. Only the disposable archive is changed. JSON evidence never contains
 compiler output, panic text, source snippets or environment values.
+`--validate-registry` is the pull-request drift check: it applies the same
+registry validation to the checkout without building, testing or mutating.
 """
 from __future__ import annotations
 
@@ -456,6 +458,26 @@ def pin_environment(root: Path, call: Any) -> tuple[dict, dict[str, str]]:
     return {key: pins[key] for key in required}, env
 
 
+def repository_manifest(root: Path, manifest: Path) -> str:
+    manifest_path = manifest.resolve()
+    if not manifest_path.is_relative_to(root):
+        raise HarnessError("manifest_outside_repository")
+    return manifest_path.relative_to(root).as_posix()
+
+
+def validate_registry(args: argparse.Namespace, report: dict) -> None:
+    """Fail on registry drift that would stop the campaign; never builds or runs tests."""
+    root = args.root.resolve()
+    manifest_file = regular_file(root, repository_manifest(root, args.manifest), MAX_MANIFEST)
+    manifest, mutants = load_manifest(root, manifest_file)
+    report["source_state"] = "checkout_registry_only"
+    report["registry_sha256"] = sha256(manifest_file.read_bytes())
+    report["targets"] = [{key: target[key] for key in ("id", "path", "function", "source_sha256", "tests")} for target in manifest["targets"]]
+    report["registered_mutants"] = len(mutants)
+    # Nothing was measured: counts stay zero, and test discovery remains a campaign step.
+    report.update(status="passed", reason="registry_valid", phase="complete")
+
+
 def campaign(args: argparse.Namespace, report: dict) -> None:
     root = args.root.resolve()
     deadline = time.monotonic() + args.campaign_seconds
@@ -482,10 +504,7 @@ def campaign(args: argparse.Namespace, report: dict) -> None:
         raise HarnessError("invalid_source_revision")
     report["base_commit"] = commit
     report["source_state"] = "tracked_clean_head_archive"
-    manifest_path = args.manifest.resolve()
-    if not manifest_path.is_relative_to(root):
-        raise HarnessError("manifest_outside_repository")
-    relative_manifest = manifest_path.relative_to(root).as_posix()
+    relative_manifest = repository_manifest(root, args.manifest)
     tracked = call(["git", "ls-files", "--error-unmatch", "--", relative_manifest], root, env)
     require_process(tracked)
     regular_file(root, relative_manifest, MAX_MANIFEST)
@@ -628,7 +647,9 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--test-seconds", type=int, default=30)
     parser.add_argument("--test-cpu-seconds", type=int, default=20)
     parser.add_argument("--memory-mib", type=int, default=2048)
-    parser.add_argument("--calibrate", action="store_true")
+    modes = parser.add_mutually_exclusive_group()
+    modes.add_argument("--calibrate", action="store_true")
+    modes.add_argument("--validate-registry", action="store_true")
     args = parser.parse_args(argv)
     args.manifest = args.manifest or args.root / "security-mutations.json"
     args.target_dir = args.target_dir or args.root / "target/security-mutations/build"
@@ -655,6 +676,8 @@ def main(argv: list[str] | None = None) -> int:
                 return run_process(command, cwd, env, wall_seconds=30, cpu_seconds=20, memory_mib=2048)
             pins, env = pin_environment(root, call)
             report.update(toolchain=pins, calibration=calibrate(env), status="passed", reason="calibration_passed", phase="complete")
+        elif args.validate_registry:
+            validate_registry(args, report)
         else:
             campaign(args, report)
     except HarnessError as error:

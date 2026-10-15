@@ -20,7 +20,8 @@ function SHA-256, exact test names and exact replacement text. Missing or moved
 functions, changed source, ambiguous anchors and absent tests fail the campaign
 until a reviewer reconciles the registry with the authoritative code. Selection
 does not silently fall back to a substring match or another similarly named
-function.
+function. Pull requests check the registry side of that reconciliation before
+merge; see [Pull-request registry check](#pull-request-registry-check).
 
 | Target | Security decision | Reviewed changes |
 |---|---|---|
@@ -57,6 +58,7 @@ export RUSTUP_TOOLCHAIN="$(python -c "import json;print(json.load(open('build-to
 export CARGO_BUILD_JOBS=1
 python scripts/test_security_mutations.py
 python scripts/test_security_mutations_workflows.py
+python scripts/security_mutations.py --validate-registry
 python scripts/security_mutations.py --report target/security-mutations/report.json
 ```
 
@@ -200,7 +202,9 @@ The checked-in registry is the reviewed baseline, with no exceptions initially.
 Maintainers responsible for the selected path, egress and evaluator decisions
 own recurring failures. The contributor changing a selected function must
 reconcile its source hash, selected tests and measured outcomes in that same
-review. A scheduled failure is not resolved merely by rerunning until green.
+review. The [pull-request registry check](#pull-request-registry-check)
+enforces the registry part of that rule before merge. A scheduled failure is
+not resolved merely by rerunning until green.
 
 For a new survivor, reproduce its exact identity against the reported commit
 and inspect the security behavior being changed. Add an assertion that
@@ -224,6 +228,57 @@ the exploit, production payloads, credentials or raw diagnostics in a public
 issue or CI artifact. Reduce the reproduction to synthetic, non-sensitive
 inputs and involve the owning maintainers before public disclosure.
 
+## Pull-request registry check
+
+Every pull request, `main` push and version tag runs
+`python scripts/security_mutations.py --validate-registry` in the required
+`supply-chain` CI job, after `scripts/test_security_mutations_workflows.py`
+confirms that this step and the scheduled campaign's trust boundary are still
+in place. Reusing that job leaves the required-check and image-promotion lists
+unchanged.
+
+The check runs the campaign's registry loader against the checked-out tree:
+schema and harness version, safe regular-file paths, a start marker that occurs
+once at the beginning of a line, the function scope it opens, the function
+SHA-256, each mutation's `old` text occurring exactly once in that function,
+selected test names' syntax, count and uniqueness, and each exception's binding
+to a current mutation identity. A pass reports `reason: registry_valid` with
+`source_state: checkout_registry_only`. Nothing is compiled, discovered,
+tested or mutated, so its counts stay zero and it is not a mutation score. Like
+the campaign, it runs only on Linux, and `--validate-registry` cannot be
+combined with `--calibrate`. The controller tests stay in the scheduled job
+because they include a real Rust calibration build.
+
+The reconciliation rule for pull requests: a change that edits, moves or
+renames a registered function or its file, or edits the registry, must leave
+this check passing in the same pull request. Update the target's `path`,
+`function`, `start_marker` and `source_sha256` as needed, and revise any
+mutation whose `old` text no longer occurs exactly once. A new digest is a
+review statement rather than a formality: confirm that each mutation still
+expresses its reviewed security change and that each selected test still
+asserts that behavior. Measured outcomes still come from a complete campaign,
+as described above.
+
+The digest covers the committed bytes from the start of the `start_marker` line
+through the first following `\n}\n`, inclusive. To recompute one, for example:
+
+```sh
+python - <<'PY'
+import hashlib, pathlib
+source = pathlib.Path("gateway/src/path_match.rs").read_bytes()
+start = source.index(b"pub fn path_prefix_matches(")
+print(hashlib.sha256(source[start:source.index(b"\n}\n", start) + 3]).hexdigest())
+PY
+```
+
+Then rerun `--validate-registry`, which applies the exact rules. A working tree
+with CRLF line endings, such as a Windows checkout with `core.autocrlf=true`,
+fails with `function_scope_drift`; hash the committed LF bytes instead.
+
+This check cannot detect a renamed or deleted selected test, a new survivor, an
+unviable mutant or a timeout. Those need the compiled test binary and remain
+campaign results. The required `test` job still runs every selected test.
+
 ## Trusted scheduled execution
 
 `.github/workflows/security-mutations.yml` runs nightly at 04:41 UTC and accepts
@@ -234,8 +289,9 @@ disabled. The workflow grants only `contents: read`, uses immutable action
 references, installs the pinned build tools, tests controller failure handling
 and workflow trust boundaries, then runs the complete registry.
 
-There is no mutation job on pull requests yet. The existing
-[security coverage gate](security-coverage.md), normal tests and image-promotion
-dependencies remain unchanged. A future small PR gate requires a separately
-reviewed target scope and measured end-to-end runtime; the scheduled baseline
-does not authorize a slow or partial mutation job on every pull request.
+Pull requests run only the registry check above; no mutant is built or measured
+on a pull request. The existing [security coverage gate](security-coverage.md),
+normal tests and image-promotion dependencies remain unchanged. A future small
+PR mutation gate requires a separately reviewed target scope and measured
+end-to-end runtime; the scheduled baseline does not authorize a slow or partial
+mutation job on every pull request.
