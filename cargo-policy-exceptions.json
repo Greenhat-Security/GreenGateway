@@ -194,10 +194,10 @@
         ],
         "0.3.4": [
           "ahash@0.8.12",
-          "jsonschema-value@0.56.0",
-          "jsonschema@0.56.0",
+          "jsonschema-value@0.58.6",
+          "jsonschema@0.58.6",
           "rand_core@0.9.5",
-          "referencing@0.56.0"
+          "referencing@0.58.6"
         ],
         "0.4.3": [
           "crypto-common@0.2.2",
@@ -229,7 +229,7 @@
         "0.17.1": [
           "hashlink@0.12.2",
           "indexmap@2.14.2",
-          "referencing@0.56.0"
+          "referencing@0.58.6"
         ]
       }
     },
@@ -376,7 +376,7 @@
       ],
       "owner": "GreenGateway maintainers",
       "expires": "2026-12-01",
-      "reason": "serde_derive 1.0.229, the gateway transport guard example and the other current proc-macro crates require syn 3 while the remaining derive crates still use syn 2.",
+      "reason": "serde_derive 1.0.229, the gateway transport guard example and the other current proc-macro crates require syn 3 while the remaining derive crates still use syn 2. jsonschema-macros-core is locked but never built: jsonschema's arbitrary-precision feature names it only through a weak optional-dependency feature.",
       "remediation": "Re-evaluate when the listed parent dependencies update; remove the exception once their version requirements converge.",
       "parents": {
         "2.0.119": [
@@ -387,6 +387,7 @@
           "der_derive@0.7.3",
           "jni-macros@0.22.4",
           "jni-sys-macros@0.4.1",
+          "jsonschema-macros-core@0.58.6",
           "rmcp-macros@2.2.0",
           "rust-embed-impl@8.12.0",
           "strum_macros@0.28.0",

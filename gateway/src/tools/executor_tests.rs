@@ -3071,6 +3071,129 @@ async fn numeric_keywords_judge_arguments_beyond_f64_exactly_and_audit_rejection
 }
 
 #[tokio::test]
+async fn arguments_too_wide_to_compare_exactly_are_refused_and_audited_before_validation() {
+    let mut tool = echo_tool();
+    tool["input_json_schema"] = json!({
+        "type": "object",
+        "properties": {
+            "value": {"minimum": 0},
+            "values": {"type": "array", "items": {"exclusiveMaximum": 100.5}}
+        },
+        "additionalProperties": false
+    });
+    let refused = [
+        // Eight bytes that kept the validator busy for seconds when measured.
+        r#"{"value": 1e-99999}"#.to_owned(),
+        // One integer literal a digit wider than the whole budget.
+        format!(r#"{{"value": 1{}}}"#, "7".repeat(1_024)),
+        // Seven numbers that each fit, but not together.
+        format!(r#"{{"values": [{}]}}"#, ["1e400"; 7].join(", ")),
+    ];
+    for arguments in refused {
+        let (executor, capture) = executor_for_tools(
+            socket_addr(1),
+            [tool.clone()],
+            runtime_config([("echo", enabled_tool(500, 1))], 2, 1, 100),
+        );
+        let error = executor
+            .execute(
+                "echo",
+                serde_json::from_str(&arguments).expect("test arguments should parse"),
+                invocation_context(),
+                CancellationToken::new(),
+            )
+            .await
+            .expect_err("arguments too wide to compare exactly should be refused");
+        let ToolRuntimeError::WorkFailed {
+            reason: Some(reason),
+            details: Some(details),
+            ..
+        } = error
+        else {
+            panic!("arguments too wide to compare exactly must be invalid params");
+        };
+        assert_eq!(reason, TOOL_INVALID_PARAMS_REASON);
+        assert_eq!(
+            details["problems"],
+            json!([{
+                "path": "",
+                "keyword": "number_width",
+                "message": "numeric arguments are too wide to compare exactly"
+            }])
+        );
+
+        let events = audit_events(&capture, 3).await;
+        let failure = events
+            .iter()
+            .find(|event| event.event_type == audit::event::TOOL_INVOKE_FAILURE)
+            .expect("the refusal should be audited");
+        assert_eq!(failure.payload["failure_reason"], "invalid_params");
+        assert_eq!(
+            failure.payload["problems"],
+            json!([{
+                "path": "",
+                "keyword": "number_width",
+                "message": "numeric arguments are too wide to compare exactly"
+            }])
+        );
+    }
+
+    // The budget still admits six numbers of 401 digits, or one of 1,024.
+    for arguments in [
+        format!(r#"{{"values": [{}]}}"#, ["-1e400"; 6].join(", ")),
+        format!(r#"{{"value": 1{}}}"#, "7".repeat(1_023)),
+    ] {
+        let (addr, server) = one_request_server(StatusCode::OK, b"ok").await;
+        let (executor, _capture) = executor_for_tools(
+            addr,
+            [tool.clone()],
+            runtime_config([("echo", enabled_tool(500, 1))], 2, 1, 100),
+        );
+        let args: Value = serde_json::from_str(&arguments).expect("test arguments should parse");
+        let result = executor
+            .execute(
+                "echo",
+                args.clone(),
+                invocation_context(),
+                CancellationToken::new(),
+            )
+            .await
+            .expect("arguments inside the budget should validate");
+        assert_eq!(http_response(result).status, StatusCode::OK);
+        let request = server.await.expect("server task should join");
+        assert_eq!(
+            serde_json::from_slice::<Value>(&request.body).expect("request body should be JSON"),
+            args
+        );
+    }
+}
+
+#[tokio::test]
+async fn served_schema_too_wide_to_compare_exactly_fails_closed_before_compiling() {
+    let (executor, _capture) = executor_for_tools(
+        socket_addr(1),
+        [echo_tool()],
+        runtime_config([("echo", enabled_tool(500, 1))], 2, 1, 100),
+    );
+    // Loading holds registry schemas to the budget; a served schema can still
+    // gain enum values from a dynamic source afterwards.
+    let mut served = (*tool_definition(echo_tool(), "echo")).clone();
+    served.input_schema = serde_json::from_str(
+        r#"{"type": "object", "properties": {"message": {"enum": ["hello", 1e-99999]}}}"#,
+    )
+    .expect("served schema should parse");
+
+    match executor.validator_for(&served) {
+        Err(ToolExecutorError::SchemaCompile { message, .. }) => assert_eq!(
+            message,
+            "input schema contains numbers too wide to compare exactly"
+        ),
+        Err(other) => panic!("expected a schema compile failure, got {other}"),
+        Ok(_) => panic!("a served schema too wide to compare exactly must not compile"),
+    }
+}
+
+#[tokio::test]
 async fn idn_formats_still_reject_invalid_internationalized_arguments() {
     // Without jsonschema's `idna` feature these are unknown formats, which
     // accept anything. Draft 7 asserts `format`; 2020-12 only annotates it.
