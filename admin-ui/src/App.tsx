@@ -13,6 +13,7 @@ import {
 import {
   assertAdminRequestOrigin,
   clearMemoryToken,
+  getCredentialSelection,
   getMemoryToken,
   isBearerSelected,
   selectBearerMode,
@@ -101,6 +102,7 @@ export function AdminShell() {
   const [authCompletionStatus, setAuthCompletionStatus] = useState<string | null>(
     null,
   );
+  const [loadAuthDiscovery] = useState(() => sharedAdminAuthDiscovery());
   const pageTitle = pageTitleForPath(location.pathname);
 
   useEffect(() => {
@@ -109,13 +111,13 @@ export function AdminShell() {
   }, [theme]);
 
   useEffect(() => {
-    void completeAuthFromFragment().then((result) => {
+    void completeAuthFromFragment(loadAuthDiscovery).then((result) => {
       if (result) {
         setAuthCompletionStatus(result.status);
         setAuthRefreshKey((current) => current + 1);
       }
     });
-  }, []);
+  }, [loadAuthDiscovery]);
 
   function toggleTheme() {
     setTheme((current) => (current === 'dark' ? 'light' : 'dark'));
@@ -214,6 +216,7 @@ export function AdminShell() {
               <Dashboard
                 authRefreshKey={authRefreshKey}
                 authCompletionStatus={authCompletionStatus}
+                loadAuthDiscovery={loadAuthDiscovery}
               />
             }
           />
@@ -250,9 +253,11 @@ export function AdminShell() {
 function Dashboard({
   authRefreshKey,
   authCompletionStatus,
+  loadAuthDiscovery,
 }: {
   authRefreshKey: number;
   authCompletionStatus: string | null;
+  loadAuthDiscovery: () => Promise<AdminAuthDiscovery>;
 }) {
   return (
     <main className="content-grid page-content">
@@ -260,6 +265,7 @@ function Dashboard({
       <TokenPanel
         authRefreshKey={authRefreshKey}
         authCompletionStatus={authCompletionStatus}
+        loadAuthDiscovery={loadAuthDiscovery}
       />
 
       <section className="panel" aria-labelledby="views-heading">
@@ -337,18 +343,25 @@ function Dashboard({
 function TokenPanel({
   authRefreshKey,
   authCompletionStatus,
+  loadAuthDiscovery,
 }: {
   authRefreshKey: number;
   authCompletionStatus: string | null;
+  loadAuthDiscovery: () => Promise<AdminAuthDiscovery>;
 }) {
   const inputRef = useRef<HTMLInputElement>(null);
   const [hasToken, setHasToken] = useState(() => getMemoryToken() !== null);
   const [bearerSelected, setBearerSelected] = useState(() => isBearerSelected());
   const [visible, setVisible] = useState(false);
   const [status, setStatus] = useState<string | null>(null);
-  const [ssoConfigured, setSsoConfigured] = useState(false);
-  const [session, setSession] = useState<AdminSessionOffer | null>(null);
+  const [discovery, setDiscovery] = useState<AdminAuthDiscovery | null>(null);
+  const [discoveryAttempt, setDiscoveryAttempt] = useState(0);
   const [loggingOut, setLoggingOut] = useState(false);
+  const session = discovery?.session ?? null;
+  const ssoConfigured = discovery?.loginConfigured ?? false;
+  // Without an answer, a session cookie may still authenticate this tab, so
+  // the panel must not present it as signed out.
+  const discoveryUnavailable = discovery !== null && !discovery.available;
   // An offered cookie session is the default; bearer mode is entered only by
   // an explicit switch or by saving a token.
   const cookieMode = session !== null && !bearerSelected;
@@ -366,10 +379,9 @@ function TokenPanel({
     let cancelled = false;
 
     async function loadAuthOptions() {
-      const discovery = await discoverAdminAuth();
+      const result = await loadAuthDiscovery();
       if (!cancelled) {
-        setSsoConfigured(discovery.loginConfigured);
-        setSession(discovery.session);
+        setDiscovery(result);
       }
     }
 
@@ -378,7 +390,7 @@ function TokenPanel({
     return () => {
       cancelled = true;
     };
-  }, []);
+  }, [loadAuthDiscovery, discoveryAttempt]);
 
   useEffect(() => {
     if (authRefreshKey === 0) {
@@ -432,14 +444,15 @@ function TokenPanel({
   }
 
   async function logOut() {
-    if (session === null) {
-      return;
-    }
     setLoggingOut(true);
     try {
       // The shared client adds the configured CSRF header and, on success,
-      // clears memory credentials and changes the admin identity.
-      await adminFetchJson<unknown>(session.logoutUrl, { method: 'POST', cache: 'no-store' });
+      // clears memory credentials and changes the admin identity. Without a
+      // discovery answer, this UI's own prefix is the only route it accepts.
+      await adminFetchJson<unknown>(session?.logoutUrl ?? adminApiUrl('/auth/logout'), {
+        method: 'POST',
+        cache: 'no-store',
+      });
       setStatus('Logged out. Sign in again to continue.');
     } catch {
       setStatus('Log out did not complete. The session may still be active; try again.');
@@ -447,6 +460,22 @@ function TokenPanel({
       setLoggingOut(false);
     }
   }
+
+  function retryDiscovery() {
+    setStatus(null);
+    setDiscoveryAttempt((attempt) => attempt + 1);
+  }
+
+  const logOutButton = (
+    <button
+      type="button"
+      className="secondary-button"
+      disabled={loggingOut}
+      onClick={() => { void logOut(); }}
+    >
+      {loggingOut ? 'Logging out' : 'Log out'}
+    </button>
+  );
 
   return (
     <section className="panel token-panel" aria-labelledby="token-heading">
@@ -473,23 +502,22 @@ function TokenPanel({
               Log in with SSO
             </a>
           ) : null}
-          {cookieMode ? (
-            <button
-              type="button"
-              className="secondary-button"
-              disabled={loggingOut}
-              onClick={() => { void logOut(); }}
-            >
-              {loggingOut ? 'Logging out' : 'Log out'}
-            </button>
-          ) : null}
+          {cookieMode ? logOutButton : null}
           <button
             type="button"
             className="secondary-button"
+            disabled={loggingOut}
             onClick={switchCredentialMode}
           >
             {cookieMode ? 'Use bearer token' : 'Use SSO session'}
           </button>
+        </div>
+      ) : discoveryUnavailable ? (
+        <div className="sso-login-row">
+          <button type="button" className="secondary-button" onClick={retryDiscovery}>
+            Retry sign-in options
+          </button>
+          {bearerSelected ? null : logOutButton}
         </div>
       ) : ssoConfigured ? (
         <div className="sso-login-row">
@@ -540,7 +568,9 @@ function TokenPanel({
               ? 'Admin requests use the SSO session cookie when signed in.'
               : hasToken
                 ? 'A token is active in this tab until reload.'
-                : 'No bearer token is active in this tab.')}
+                : discoveryUnavailable && !bearerSelected
+                  ? 'Sign-in options are unavailable. An SSO session may still be active; retry or log out.'
+                  : 'No bearer token is active in this tab.')}
         </span>
       </div>
     </section>
@@ -551,7 +581,9 @@ type AuthCompletionResult = {
   status: string;
 };
 
-async function completeAuthFromFragment(): Promise<AuthCompletionResult | null> {
+async function completeAuthFromFragment(
+  loadAuthDiscovery: () => Promise<AdminAuthDiscovery>,
+): Promise<AuthCompletionResult | null> {
   if (typeof window === 'undefined') {
     return null;
   }
@@ -572,10 +604,11 @@ async function completeAuthFromFragment(): Promise<AuthCompletionResult | null> 
       return { status: 'SSO sign-in did not complete. Start sign-in again.' };
     }
     const identity = getAdminIdentityVersion();
+    const selection = getCredentialSelection();
     try {
       // An unconfirmed server contract must not silently fall back to
       // returning a bearer token to this page.
-      const discovery = await discoverAdminAuth();
+      const discovery = await loadAuthDiscovery();
       if (!discovery.available) {
         throw new Error('SSO completion failed');
       }
@@ -598,19 +631,10 @@ async function completeAuthFromFragment(): Promise<AuthCompletionResult | null> 
       if (!response.ok) {
         throw new Error('SSO completion failed');
       }
-      const body: unknown = await response.json();
       if (session) {
-        // The server sets an HttpOnly cookie. This body carries no credential,
-        // and no token field is read from it.
-        if (!isCookieCompletionResponse(body)) {
-          throw new Error('SSO completion failed');
-        }
-        if (identity !== getAdminIdentityVersion()) {
-          return { status: 'SSO completion discarded because the session changed. Start sign-in again.' };
-        }
-        adminIdentityChanged();
-        return { status: 'Signed in with SSO. The session cookie lasts until logout or session expiry.' };
+        return await applyCookieCompletion(response, session, selection);
       }
+      const body: unknown = await response.json();
       if (
         !body || typeof body !== 'object' || !('access_token' in body) ||
         typeof body.access_token !== 'string' || !body.access_token.trim()
@@ -645,6 +669,68 @@ function clearLocationHash() {
   );
 }
 
+/**
+ * The response set the HttpOnly session cookie before this body is read. A
+ * 401 for a request sent before that cookie existed changes only the identity
+ * version, so it does not discard the completion. Choosing other credentials
+ * while it was pending does, and an unexpected body is not trusted either:
+ * both end the issued session rather than leave one the UI did not apply.
+ */
+async function applyCookieCompletion(
+  response: Response,
+  session: AdminSessionOffer,
+  selection: number,
+): Promise<AuthCompletionResult> {
+  let body: unknown = null;
+  try {
+    body = await response.json();
+  } catch {
+    // An unreadable success may still have set the cookie.
+  }
+  // This body carries no credential, and no token field is read from it.
+  const completed = isCookieCompletionResponse(body);
+  if (completed && selection === getCredentialSelection()) {
+    adminIdentityChanged();
+    return { status: 'Signed in with SSO. The session cookie lasts until logout or session expiry.' };
+  }
+  const revoked = await revokeAdminSession(session.logoutUrl);
+  if (!isBearerSelected()) {
+    // Cookie-mode requests could have used the issued session meanwhile.
+    adminIdentityChanged();
+  }
+  if (!revoked) {
+    return {
+      status: 'The SSO session could not be ended and may still be active. Log out from SSO session mode to end it.',
+    };
+  }
+  return completed
+    ? { status: 'SSO completion discarded because the session changed. Start sign-in again.' }
+    : { status: 'SSO sign-in did not complete. Start sign-in again.' };
+}
+
+/**
+ * Ends the gateway session this browser holds whatever the tab's credential
+ * mode: same-origin cookies and the CSRF header, never an Authorization
+ * header, and no change to the tab's memory credentials.
+ */
+async function revokeAdminSession(logoutUrl: string): Promise<boolean> {
+  try {
+    assertAdminRequestOrigin(logoutUrl);
+    const headers = new Headers({ Accept: 'application/json' });
+    addCsrfHeader(headers, 'POST');
+    const response = await fetch(logoutUrl, {
+      method: 'POST',
+      credentials: 'same-origin',
+      cache: 'no-store',
+      redirect: 'error',
+      headers,
+    });
+    return response.ok;
+  } catch {
+    return false;
+  }
+}
+
 type AdminSessionOffer = Readonly<{
   loginUrl: string;
   completionUrl: string;
@@ -664,6 +750,28 @@ const ADMIN_AUTH_UNAVAILABLE: AdminAuthDiscovery = {
 };
 
 /**
+ * One answer drives both the SSO completion and the panel, so they cannot
+ * disagree about the credential mode. Only a confirmed answer is reused; the
+ * next caller asks again after an unavailable one.
+ */
+function sharedAdminAuthDiscovery(): () => Promise<AdminAuthDiscovery> {
+  let current: Promise<AdminAuthDiscovery> | null = null;
+  return () => {
+    if (current !== null) {
+      return current;
+    }
+    const request = discoverAdminAuth();
+    current = request;
+    void request.then((result) => {
+      if (!result.available && current === request) {
+        current = null;
+      }
+    });
+    return request;
+  };
+}
+
+/**
  * `/version` answers on a unified listener. A split management listener only
  * serves the prefix-aware `auth/config` route, which exists only while admin
  * sessions are enabled. Discovery bypasses the shared admin client, so it
@@ -671,7 +779,7 @@ const ADMIN_AUTH_UNAVAILABLE: AdminAuthDiscovery = {
  */
 async function discoverAdminAuth(): Promise<AdminAuthDiscovery> {
   try {
-    const response = await fetch('/version');
+    const response = await fetch('/version', { cache: 'no-store' });
     if (response.ok) {
       const body: unknown = await response.json();
       if (isVersionResponse(body)) {
@@ -688,6 +796,9 @@ async function discoverAdminAuth(): Promise<AdminAuthDiscovery> {
       cache: 'no-store',
       redirect: 'error',
     });
+    // With sessions enabled the route is exempt from authentication and RBAC,
+    // so only a gateway without sessions (or a proxy that does not forward
+    // the route) answers these.
     if (response.status === 401 || response.status === 403 || response.status === 404) {
       return { available: true, loginConfigured: false, session: null };
     }

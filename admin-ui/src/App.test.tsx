@@ -13,7 +13,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import { AdminShell } from './App';
 import { adminFetchJson } from './lib/api';
-import { getAdminIdentityVersion } from './lib/adminSession';
+import { getAdminIdentityVersion, isAdminUnauthenticated } from './lib/adminSession';
 import { ADMIN_TOKEN_STORAGE_KEY, getMemoryToken, clearMemoryToken, isBearerSelected, setMemoryToken } from './lib/auth';
 
 const ADMIN_SESSION = {
@@ -244,7 +244,7 @@ describe('AdminShell', () => {
       </MemoryRouter>,
     );
 
-    await waitFor(() => expect(fetch).toHaveBeenCalledWith('/version'));
+    await waitFor(() => expect(fetch).toHaveBeenCalledWith('/version', { cache: 'no-store' }));
     expect(screen.queryByRole('link', { name: 'Log in with SSO' })).toBeNull();
   });
 
@@ -299,6 +299,114 @@ describe('AdminShell', () => {
     expect(window.sessionStorage.length).toBe(0);
     expect(screen.queryByLabelText('Token', { exact: true })).toBeNull();
     expect(screen.getByRole('link', { name: 'Log in with SSO' }).getAttribute('href')).toBe('/v1/admin/auth/login');
+    // The completion and the panel share one discovery answer.
+    expect(fetch.mock.calls.filter(([url]) => url === '/version')).toHaveLength(1);
+  });
+
+  it.each([false, true])('signs in when admin requests are rejected before the session cookie exists (StrictMode %s)', async (strict) => {
+    const server = cookieSessionServer();
+    vi.stubGlobal('fetch', server.fetch);
+    window.history.replaceState(null, '', '/admin/#/auth/complete?code=code&state=state');
+    const shell = <MemoryRouter><AdminShell /></MemoryRouter>;
+
+    render(strict ? <StrictMode>{shell}</StrictMode> : shell);
+    // The dashboard asks for permissions before the completion answers, and
+    // the gateway rejects that cookie-less request.
+    await waitFor(() => expect(isAdminUnauthenticated()).toBe(true));
+    await waitFor(() => expect(server.completions()).toHaveLength(1));
+    const identity = getAdminIdentityVersion();
+    await act(async () => { server.complete(); });
+
+    await screen.findByText('Signed in with SSO. The session cookie lasts until logout or session expiry.');
+    expect(getAdminIdentityVersion()).toBeGreaterThan(identity);
+    expect(isAdminUnauthenticated()).toBe(false);
+    expect(await screen.findByLabelText('Endpoint')).toBeTruthy();
+    expect(server.active()).toBe(true);
+    expect(server.logouts()).toHaveLength(0);
+    expect(getMemoryToken()).toBeNull();
+  });
+
+  it('ends a cookie session issued after the operator switched to a bearer token', async () => {
+    document.cookie = 'csrf_token=browser-csrf; Path=/';
+    const server = cookieSessionServer();
+    vi.stubGlobal('fetch', server.fetch);
+    window.history.replaceState(null, '', '/admin/#/auth/complete?code=code&state=state');
+    render(<MemoryRouter><AdminShell /></MemoryRouter>);
+    await waitFor(() => expect(server.completions()).toHaveLength(1));
+    const toggle = await screen.findByRole('button', { name: 'Use bearer token' });
+
+    await act(async () => { fireEvent.click(toggle); });
+    const token = `test-${crypto.randomUUID()}`;
+    fireEvent.change(screen.getByLabelText('Token', { exact: true }), { target: { value: token } });
+    fireEvent.click(screen.getByRole('button', { name: 'Save' }));
+    await act(async () => { server.complete(); });
+
+    await screen.findByText('SSO completion discarded because the session changed. Start sign-in again.');
+    expect(server.active()).toBe(false);
+    const logouts = server.logouts();
+    expect(logouts).toHaveLength(1);
+    // Revocation sends the session cookie even though bearer mode omits it,
+    // and leaves the bearer selection alone.
+    expect(logouts[0]).toMatchObject({ method: 'POST', credentials: 'same-origin', cache: 'no-store', redirect: 'error' });
+    expect(new Headers(logouts[0]?.headers).get('x-csrf-token')).toBe('browser-csrf');
+    expect(new Headers(logouts[0]?.headers).has('authorization')).toBe(false);
+    expect(getMemoryToken()).toBe(token);
+    expect(isBearerSelected()).toBe(true);
+
+    await act(async () => { fireEvent.click(screen.getByRole('button', { name: 'Use SSO session' })); });
+    await screen.findByText('Sign in with traffic read permission to view gateway observations.');
+    expect(screen.queryByLabelText('Endpoint')).toBeNull();
+    expect(server.cookieGrants()).toBe(0);
+  });
+
+  it.each([
+    {
+      outcome: 'a discarded session it could not end', body: { authenticated: true, expires_in: 3600 },
+      switchToBearer: true, logoutStatus: 503,
+      message: 'The SSO session could not be ended and may still be active. Log out from SSO session mode to end it.',
+    },
+    {
+      outcome: 'an unexpected success body', body: { authenticated: false },
+      switchToBearer: false, logoutStatus: 204,
+      message: 'SSO sign-in did not complete. Start sign-in again.',
+    },
+  ])('reports $outcome instead of claiming the completion was discarded', async ({ body, switchToBearer, logoutStatus, message }) => {
+    const server = cookieSessionServer({ body, logoutStatus });
+    vi.stubGlobal('fetch', server.fetch);
+    window.history.replaceState(null, '', '/admin/#/auth/complete?code=code&state=state');
+    render(<MemoryRouter><AdminShell /></MemoryRouter>);
+    await waitFor(() => expect(server.completions()).toHaveLength(1));
+    const toggle = await screen.findByRole('button', { name: 'Use bearer token' });
+    if (switchToBearer) {
+      await act(async () => { fireEvent.click(toggle); });
+    }
+    await act(async () => { server.complete(); });
+
+    await screen.findByText(message);
+    expect(server.logouts()).toHaveLength(1);
+    expect(server.active()).toBe(logoutStatus !== 204);
+    expect(getMemoryToken()).toBeNull();
+  });
+
+  it('offers retry and log out when session discovery is unavailable', async () => {
+    let offered = false;
+    const fetch = sessionFetchMock({
+      '/version': () => offered ? offeredVersion() : jsonResponse({ error: 'unavailable' }, 503),
+      '/v1/admin/auth/config': () => jsonResponse({ error: 'unavailable' }, 503),
+    });
+    vi.stubGlobal('fetch', fetch);
+    render(<MemoryRouter><AdminShell /></MemoryRouter>);
+
+    const retry = await screen.findByRole('button', { name: 'Retry sign-in options' });
+    expect(screen.getByRole('button', { name: 'Log out' })).toBeTruthy();
+    expect(screen.getByText('Sign-in options are unavailable. An SSO session may still be active; retry or log out.')).toBeTruthy();
+
+    offered = true;
+    fireEvent.click(retry);
+
+    expect(await screen.findByRole('heading', { level: 2, name: 'SSO session' })).toBeTruthy();
+    expect(screen.queryByRole('button', { name: 'Retry sign-in options' })).toBeNull();
+    expect(screen.getByRole('button', { name: 'Log out' })).toBeTruthy();
   });
 
   it('logs out of the cookie session through the shared client with the CSRF header', async () => {
@@ -470,7 +578,9 @@ describe('AdminShell', () => {
     await screen.findByText('SSO sign-in did not complete. Start sign-in again.');
     expect(fetch.mock.calls.some(([url]) => url === '/v1/admin/auth/callback')).toBe(false);
     expect(getMemoryToken()).toBeNull();
-    expect(screen.queryByRole('button', { name: 'Log out' })).toBeNull();
+    // A session cookie may still exist, so the panel keeps Log out reachable.
+    expect(await screen.findByRole('button', { name: 'Retry sign-in options' })).toBeTruthy();
+    expect(screen.getByRole('button', { name: 'Log out' })).toBeTruthy();
   });
 
   it('registers the traffic inventory route and navigation entry', async () => {
@@ -1125,6 +1235,58 @@ function sessionFetchMock(
       ? Promise.resolve(respond(init))
       : Promise.reject(new Error(`unexpected fetch: ${url.pathname}`));
   });
+}
+
+/**
+ * A gateway that issues the HttpOnly session only when the held completion is
+ * released, and rejects cookie-mode admin requests until then.
+ */
+function cookieSessionServer({
+  body = { authenticated: true, expires_in: 3600 } as unknown,
+  logoutStatus = 204,
+} = {}) {
+  let active = false;
+  let cookieGrants = 0;
+  let release!: () => void;
+  const completion = new Promise<Response>((resolve) => {
+    release = () => {
+      active = true;
+      resolve(jsonResponse(body));
+    };
+  });
+  const fetch = sessionFetchMock({
+    '/version': offeredVersion,
+    '/v1/admin/capabilities': (init) => {
+      if (new Headers(init?.headers).has('Authorization')) {
+        return jsonResponse({ permissions: ['admin:traffic:read'] });
+      }
+      if (active && init?.credentials === 'same-origin') {
+        cookieGrants += 1;
+        return jsonResponse({ permissions: ['admin:traffic:read'] });
+      }
+      return jsonResponse({ error: 'unauthenticated' }, 401);
+    },
+    '/v1/admin/traffic/endpoints': () => jsonResponse({ endpoints: [], next_cursor: null }),
+    '/v1/admin/auth/callback': () => completion,
+    '/v1/admin/auth/logout': (init) => {
+      if (logoutStatus !== 204) {
+        return jsonResponse({ error: 'unavailable' }, logoutStatus);
+      }
+      if (init?.credentials === 'same-origin') active = false;
+      return new Response(null, { status: 204 });
+    },
+  });
+  const calls = (path: string) => fetch.mock.calls
+    .filter(([url]) => url === path)
+    .map(([, init]) => init);
+  return {
+    fetch,
+    complete: () => release(),
+    active: () => active,
+    cookieGrants: () => cookieGrants,
+    completions: () => calls('/v1/admin/auth/callback'),
+    logouts: () => calls('/v1/admin/auth/logout'),
+  };
 }
 
 function offeredVersion() {

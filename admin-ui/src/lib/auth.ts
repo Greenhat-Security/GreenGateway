@@ -4,6 +4,9 @@ import { adminIdentityChanged, adminSessionEnded, subscribeAdminSession } from '
 export const ADMIN_TOKEN_STORAGE_KEY = 'greengateway_admin_token';
 let token: string | null = null;
 let bearerSelected = false;
+// Changes only when this tab chooses credentials, never when the server
+// rejects them, so a pending sign-in can tell the two apart.
+let credentialSelection = 0;
 
 export function removeLegacyAdminToken() {
   if (typeof window === 'undefined') return;
@@ -18,6 +21,7 @@ export function setMemoryToken(value: string) {
   removeLegacyAdminToken();
   token = value.trim() || null;
   bearerSelected = token !== null;
+  credentialSelection += 1;
   adminIdentityChanged();
 }
 
@@ -25,6 +29,7 @@ export function clearMemoryToken() {
   removeLegacyAdminToken();
   token = null;
   bearerSelected = false;
+  credentialSelection += 1;
   adminIdentityChanged();
 }
 
@@ -33,10 +38,13 @@ export function selectBearerMode() {
   removeLegacyAdminToken();
   token = null;
   bearerSelected = true;
+  credentialSelection += 1;
   adminIdentityChanged();
 }
 
 export function isBearerSelected(): boolean { return bearerSelected; }
+
+export function getCredentialSelection(): number { return credentialSelection; }
 
 /** A rejected bearer must never silently fall back to an ambient cookie. */
 export function adminRequestCredentials(): RequestCredentials {
