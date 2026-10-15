@@ -111,37 +111,48 @@ impl ServerHandler for McpServer {
         context: RequestContext<RoleServer>,
     ) -> Result<ListToolsResult, ErrorData> {
         let invocation_context = invocation_context_from_request(&context, &self.client_ip_policy);
-        let tools = self
-            .registry
-            .list()
-            .into_iter()
-            .filter(|definition| {
-                // Fail closed: without an executor there is no runtime to evaluate
-                // `enabled`, allowed_roles/issuers/auth_methods or tool deny rules
-                // against, so advertising the registry would publish tool names,
-                // descriptions and input schemas the policy conceals.
-                self.executor.as_ref().is_some_and(|executor| {
-                    executor.can_list_tool(&definition.name, &invocation_context)
+        // rmcp serves this request from a task it spawned, which the snapshots
+        // the revision gate pinned for the HTTP request do not reach. Re-enter
+        // them so the registry and every visibility check read the admitted
+        // revision rather than the live lanes.
+        let request_extensions = context
+            .extensions
+            .get::<Parts>()
+            .map(|parts| &parts.extensions);
+        crate::middleware::rbac::with_request_pins(request_extensions, async {
+            let tools = self
+                .registry
+                .list()
+                .into_iter()
+                .filter(|definition| {
+                    // Fail closed: without an executor there is no runtime to evaluate
+                    // `enabled`, allowed_roles/issuers/auth_methods or tool deny rules
+                    // against, so advertising the registry would publish tool names,
+                    // descriptions and input schemas the policy conceals.
+                    self.executor.as_ref().is_some_and(|executor| {
+                        executor.can_list_tool(&definition.name, &invocation_context)
+                    })
                 })
-            })
-            .map(|definition| {
-                let executor = self
-                    .executor
-                    .as_ref()
-                    .expect("the visibility filter retained a tool only with an executor");
-                let served = executor
-                    .served_definition(definition.as_ref())
-                    .map_err(|_| {
-                        ErrorData::internal_error(
-                            "tool input schema could not be prepared",
-                            Some(json!({ "tool_name": definition.name })),
-                        )
-                    })?;
-                mcp_tool_from_definition(served.definition.as_ref())
-            })
-            .collect::<Result<Vec<_>, _>>()?;
+                .map(|definition| {
+                    let executor = self
+                        .executor
+                        .as_ref()
+                        .expect("the visibility filter retained a tool only with an executor");
+                    let served = executor
+                        .served_definition(definition.as_ref())
+                        .map_err(|_| {
+                            ErrorData::internal_error(
+                                "tool input schema could not be prepared",
+                                Some(json!({ "tool_name": definition.name })),
+                            )
+                        })?;
+                    mcp_tool_from_definition(served.definition.as_ref())
+                })
+                .collect::<Result<Vec<_>, _>>()?;
 
-        Ok(ListToolsResult::with_all_items(tools))
+            Ok::<_, ErrorData>(ListToolsResult::with_all_items(tools))
+        })
+        .await
     }
 
     async fn call_tool(
@@ -152,52 +163,63 @@ impl ServerHandler for McpServer {
         let tool_name = request.name.to_string();
         let lookup_started = Instant::now();
         let invocation_context = invocation_context_from_request(&context, &self.client_ip_policy);
+        // As in `list_tools`: the lookup, the invocation and the rendered
+        // request are judged by the revision the HTTP request was admitted
+        // at, never by one a reconcile installed while it was in flight.
+        let request_extensions = context
+            .extensions
+            .get::<Parts>()
+            .map(|parts| &parts.extensions);
+        crate::middleware::rbac::with_request_pins(request_extensions, async move {
+            if self.registry.get(&tool_name).is_none() {
+                if let Some(executor) = self.executor.as_ref() {
+                    executor.record_unknown_tool_call(
+                        &invocation_context,
+                        &tool_name,
+                        lookup_started.elapsed(),
+                    );
+                }
+                return Err(unknown_tool_error(&tool_name));
+            }
 
-        if self.registry.get(&tool_name).is_none() {
-            if let Some(executor) = self.executor.as_ref() {
-                executor.record_unknown_tool_call(
-                    &invocation_context,
+            let Some(executor) = self.executor.as_ref() else {
+                return Err(ErrorData::internal_error(
+                    "tool executor is not configured",
+                    Some(json!({ "tool_name": tool_name })),
+                ));
+            };
+
+            let arguments = Value::Object(request.arguments.unwrap_or_default());
+            let composite_error_context =
+                executor
+                    .is_composite(&tool_name)
+                    .then(|| CompositeRuntimeErrorContext {
+                        request_id: invocation_context.request_id.clone(),
+                    });
+
+            match executor
+                .execute(
                     &tool_name,
-                    lookup_started.elapsed(),
-                );
+                    arguments,
+                    invocation_context,
+                    CancellationToken::new(),
+                )
+                .await
+            {
+                Ok(ToolExecutionResult::Http(result)) => {
+                    Ok(call_tool_result_from_http_execution(result))
+                }
+                Ok(ToolExecutionResult::McpCallToolResult(result)) => Ok(result),
+                Ok(ToolExecutionResult::Composite(result)) => {
+                    Ok(CallToolResult::structured(json!({
+                        "status": http::StatusCode::OK.as_u16(),
+                        "body": result.body,
+                    })))
+                }
+                Err(error) => Err(runtime_error_to_mcp_error(error, composite_error_context)),
             }
-            return Err(unknown_tool_error(&tool_name));
-        }
-
-        let Some(executor) = self.executor.as_ref() else {
-            return Err(ErrorData::internal_error(
-                "tool executor is not configured",
-                Some(json!({ "tool_name": tool_name })),
-            ));
-        };
-
-        let arguments = Value::Object(request.arguments.unwrap_or_default());
-        let composite_error_context =
-            executor
-                .is_composite(&tool_name)
-                .then(|| CompositeRuntimeErrorContext {
-                    request_id: invocation_context.request_id.clone(),
-                });
-
-        match executor
-            .execute(
-                &tool_name,
-                arguments,
-                invocation_context,
-                CancellationToken::new(),
-            )
-            .await
-        {
-            Ok(ToolExecutionResult::Http(result)) => {
-                Ok(call_tool_result_from_http_execution(result))
-            }
-            Ok(ToolExecutionResult::McpCallToolResult(result)) => Ok(result),
-            Ok(ToolExecutionResult::Composite(result)) => Ok(CallToolResult::structured(json!({
-                "status": http::StatusCode::OK.as_u16(),
-                "body": result.body,
-            }))),
-            Err(error) => Err(runtime_error_to_mcp_error(error, composite_error_context)),
-        }
+        })
+        .await
     }
 
     async fn enqueue_task(
@@ -208,37 +230,47 @@ impl ServerHandler for McpServer {
         let tool_name = request.name.to_string();
         let lookup_started = Instant::now();
         let invocation_context = invocation_context_from_request(&context, &self.client_ip_policy);
-
-        if self.registry.get(&tool_name).is_none() {
-            if let Some(executor) = self.executor.as_ref() {
-                executor.record_unknown_tool_call(
-                    &invocation_context,
-                    &tool_name,
-                    lookup_started.elapsed(),
-                );
+        // As in `list_tools`: the rejected call is still admitted, audited and
+        // observed under the revision the HTTP request was admitted at.
+        let request_extensions = context
+            .extensions
+            .get::<Parts>()
+            .map(|parts| &parts.extensions);
+        crate::middleware::rbac::with_request_pins(request_extensions, async move {
+            if self.registry.get(&tool_name).is_none() {
+                if let Some(executor) = self.executor.as_ref() {
+                    executor.record_unknown_tool_call(
+                        &invocation_context,
+                        &tool_name,
+                        lookup_started.elapsed(),
+                    );
+                }
+                return Err(unknown_tool_error(&tool_name));
             }
-            return Err(unknown_tool_error(&tool_name));
-        }
 
-        let Some(executor) = self.executor.as_ref() else {
-            return Err(ErrorData::internal_error(
-                "tool executor is not configured",
-                Some(json!({ "tool_name": tool_name })),
-            ));
-        };
+            let Some(executor) = self.executor.as_ref() else {
+                return Err(ErrorData::internal_error(
+                    "tool executor is not configured",
+                    Some(json!({ "tool_name": tool_name })),
+                ));
+            };
 
-        match executor
-            .reject_task_tool_call(invocation_context, &tool_name)
-            .await
-        {
-            Ok(()) => Err(task_unsupported_error(tool_name)),
-            Err(ToolRuntimeError::WorkFailed {
-                tool_name,
-                reason: Some(reason),
-                ..
-            }) if reason == TOOL_TASK_UNSUPPORTED_REASON => Err(task_unsupported_error(tool_name)),
-            Err(error) => Err(runtime_error_to_mcp_error(error, None)),
-        }
+            match executor
+                .reject_task_tool_call(invocation_context, &tool_name)
+                .await
+            {
+                Ok(()) => Err::<CreateTaskResult, _>(task_unsupported_error(tool_name)),
+                Err(ToolRuntimeError::WorkFailed {
+                    tool_name,
+                    reason: Some(reason),
+                    ..
+                }) if reason == TOOL_TASK_UNSUPPORTED_REASON => {
+                    Err(task_unsupported_error(tool_name))
+                }
+                Err(error) => Err(runtime_error_to_mcp_error(error, None)),
+            }
+        })
+        .await
     }
 
     fn get_tool(&self, _name: &str) -> Option<Tool> {
@@ -1371,6 +1403,280 @@ mod tests {
         assert_eq!(body["error"]["data"]["tool_name"], json!("missing_tool"));
     }
 
+    /// rmcp serves `/mcp` from tasks it spawns, which the revision gate's
+    /// task-local pins do not reach. Driven through `rbac_middleware`, a
+    /// `tools/list` and a `tools/call` must still be judged by the bundle the
+    /// gate admitted them under: the registry lookup, the invocation and the
+    /// rendered HTTP rule. The gate below has a reconcile install the next
+    /// revision on the live lanes right after each admission, so any of those
+    /// reads falling back to the live lane would find no such tool, or a
+    /// policy that denies both the tool and its rendered request.
+    #[cfg(feature = "postgres")]
+    #[tokio::test]
+    async fn mcp_requests_are_judged_by_the_admitted_revision_not_one_installed_in_flight() {
+        let admitted_policy = crate::rbac::Policy::validate_json_value(json!({
+            "schema_version": "0.1.0",
+            "default_action": "allow",
+            "tools": {
+                "pinned_probe": {
+                    "timeout_ms": 5000,
+                    "max_concurrent": 2
+                }
+            },
+            "rules": [
+                {
+                    "id": "allow-probe-tool-admitted",
+                    "tool_name": "pinned_probe",
+                    "action": "allow"
+                },
+                {
+                    "id": "allow-probe-http-admitted",
+                    "methods": ["GET"],
+                    "path": "/pinned_probe",
+                    "action": "allow"
+                }
+            ]
+        }))
+        .expect("admitted policy should parse");
+        let live_policy = crate::rbac::Policy::validate_json_value(json!({
+            "schema_version": "0.1.0",
+            "default_action": "allow",
+            "tools": {
+                "pinned_probe": {
+                    "timeout_ms": 5000,
+                    "max_concurrent": 2
+                }
+            },
+            "rules": [
+                {
+                    "id": "deny-probe-tool-live",
+                    "tool_name": "pinned_probe",
+                    "action": "deny"
+                },
+                {
+                    "id": "deny-probe-http-live",
+                    "methods": ["GET"],
+                    "path": "/pinned_probe",
+                    "action": "deny"
+                }
+            ]
+        }))
+        .expect("live policy should parse");
+        let capture = crate::audit::sink::tests::CaptureSink::new();
+        let audit = audit::AuditLog::new(Arc::new(capture.clone()) as Arc<dyn AuditSink>);
+        let rbac_state = crate::middleware::rbac::RbacState::new(
+            admitted_policy.clone(),
+            Vec::new(),
+            false,
+            audit.clone(),
+        );
+        rbac_state
+            .install_revision_snapshot(admitted_policy.clone(), 1)
+            .await
+            .expect("the admitted revision installs");
+        let registry = ToolRegistry::disabled();
+        registry
+            .merge_definitions(vec![legacy_tool_definition("pinned_probe")])
+            .expect("the admitted tool registers");
+        let admitted = Arc::new(crate::security_cluster::SecurityBundle {
+            revision: 1,
+            policy: rbac_state.policy_handle().load_full(),
+            tools: registry.state_handle().load_full(),
+            connections: Arc::new(
+                crate::connections::control_plane::ConnectionRuntimeSnapshot::empty_for_test(),
+            ),
+        });
+        let runtime = ToolRuntime::new_with_rbac_state(
+            ToolRuntimeConfig::from_policy(&admitted_policy)
+                .expect("admitted policy should configure the runtime"),
+            audit.clone(),
+            Some(rbac_state.clone()),
+        );
+        // No egress host is allowed, so a call admitted all the way through
+        // fails at egress, after both policy decisions, without leaving the
+        // process.
+        let egress_client = Arc::new(
+            egress::EgressClient::new(egress::EgressConfig::default())
+                .expect("test egress client should build"),
+        );
+        let executor = ToolExecutor::new(
+            registry.clone(),
+            runtime,
+            egress_client,
+            audit.clone(),
+            "https://upstream.invalid",
+        )
+        .expect("MCP executor should build");
+        let state = McpState::new(
+            registry.clone(),
+            Some(executor),
+            client_ip::ClientIpPolicy::default(),
+        );
+        let gate = ReconcileAfterAdmissionGate {
+            admitted,
+            rbac_state: rbac_state.clone(),
+            next_policy: live_policy,
+            live_tools: registry.state_handle(),
+            next_tools: ToolRegistry::disabled().state_handle().load_full(),
+        };
+        let router = axum::Router::new()
+            .route("/mcp", axum::routing::post(serve_mcp))
+            .with_state(state.clone())
+            .layer(axum::middleware::from_fn_with_state(
+                rbac_state.clone().with_revision_gate(Arc::new(gate)),
+                crate::middleware::rbac::rbac_middleware,
+            ))
+            .layer(axum::middleware::from_fn(admit_mcp_caller));
+
+        let listed = mcp_json_rpc_body(
+            router
+                .clone()
+                .oneshot(mcp_json_rpc_request(40, "tools/list", None))
+                .await
+                .expect("the gated MCP route should respond"),
+        )
+        .await;
+        assert_eq!(
+            listed_tool_names(&listed),
+            vec!["pinned_probe".to_owned()],
+            "the admitted registry and policy list the tool: {listed}"
+        );
+
+        let called = mcp_json_rpc_body(
+            router
+                .clone()
+                .oneshot(mcp_json_rpc_request(
+                    41,
+                    "tools/call",
+                    Some(json!({ "name": "pinned_probe", "arguments": {} })),
+                ))
+                .await
+                .expect("the gated MCP route should respond"),
+        )
+        .await;
+        // Not unknown (the live registry), not rejected (the live tool rule)
+        // and not denied (the live rendered-HTTP rule): the call got as far as
+        // egress, which is only reachable past both policy decisions.
+        assert_eq!(
+            called["error"]["code"],
+            json!(ErrorCode::INTERNAL_ERROR.0),
+            "{called}"
+        );
+        assert_eq!(
+            called["error"]["data"]["reason"],
+            json!("host_not_allowed"),
+            "{called}"
+        );
+
+        audit
+            .close_and_drain(Duration::from_secs(5))
+            .await
+            .expect("audit should drain");
+        let matched = capture
+            .events()
+            .iter()
+            .filter_map(|event| {
+                event.payload["matched_rule_id"]
+                    .as_str()
+                    .map(|rule_id| (event.event_type.clone(), rule_id.to_owned()))
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            matched,
+            vec![
+                (
+                    "authz.allowed".to_owned(),
+                    "allow-probe-tool-admitted".to_owned()
+                ),
+                (
+                    "authz.allowed".to_owned(),
+                    "allow-probe-http-admitted".to_owned()
+                ),
+            ],
+            "the invocation and the rendered request are audited under the admitted revision"
+        );
+
+        // The reconcile really did move the live lanes: read without the
+        // pins, the policy is the next revision and the tool is gone.
+        assert_eq!(rbac_state.snapshot_security_revision(), 2);
+        let unpinned = mcp_json_rpc(&state, 42, "tools/list", None).await;
+        assert!(
+            listed_tool_names(&unpinned).is_empty(),
+            "without the pins the live lanes are read: {unpinned}"
+        );
+    }
+
+    /// Admits every request under `admitted`, then has a reconcile install
+    /// the next revision on the live lanes before the request is served: the
+    /// policy the tool runtime reads and the registry the executor reads.
+    #[cfg(feature = "postgres")]
+    struct ReconcileAfterAdmissionGate {
+        admitted: Arc<crate::security_cluster::SecurityBundle>,
+        rbac_state: crate::middleware::rbac::RbacState,
+        next_policy: crate::rbac::Policy,
+        live_tools: Arc<arc_swap::ArcSwap<crate::tools::definitions::ToolRegistryState>>,
+        next_tools: Arc<crate::tools::definitions::ToolRegistryState>,
+    }
+
+    #[cfg(feature = "postgres")]
+    #[async_trait::async_trait]
+    impl crate::middleware::rbac::SecurityRevisionGate for ReconcileAfterAdmissionGate {
+        async fn ensure_current_revision(
+            &self,
+        ) -> Result<i64, crate::middleware::rbac::SecurityRevisionCheckError> {
+            Ok(self.admitted.revision)
+        }
+
+        async fn admit(
+            &self,
+        ) -> Result<
+            crate::middleware::rbac::Admission,
+            crate::middleware::rbac::SecurityRevisionCheckError,
+        > {
+            let admission = crate::middleware::rbac::Admission {
+                revision: self.admitted.revision,
+                bundle: Some(Arc::clone(&self.admitted)),
+            };
+            self.rbac_state
+                .install_revision_snapshot(self.next_policy.clone(), self.admitted.revision + 1)
+                .await
+                .expect("the next revision installs");
+            self.live_tools.store(Arc::clone(&self.next_tools));
+            Ok(admission)
+        }
+    }
+
+    /// `mcp_endpoint` without the body limit, over a bare `McpState`.
+    #[cfg(feature = "postgres")]
+    async fn serve_mcp(State(state): State<McpState>, request: AxumRequest<Body>) -> Response {
+        match state.service.oneshot(request).await {
+            Ok(response) => response.map(Body::new).into_response(),
+            Err(error) => match error {},
+        }
+    }
+
+    /// What production establishes before `rbac_middleware` runs: an
+    /// authenticated caller and a completed routing classification.
+    #[cfg(feature = "postgres")]
+    async fn admit_mcp_caller(
+        mut request: AxumRequest<Body>,
+        next: axum::middleware::Next,
+    ) -> Response {
+        request.extensions_mut().insert(auth::Principal {
+            user_id: "user-123".to_owned(),
+            issuer: None,
+            email: Some("user@example.test".to_owned()),
+            org_id: None,
+            roles: vec!["operator".to_owned()],
+            session_id: "session-123".to_owned(),
+            auth_method: auth::AuthMethod::Bearer,
+        });
+        request
+            .extensions_mut()
+            .insert(crate::upstream_route::ProxyRouteClassificationCompleted);
+        next.run(request).await
+    }
+
     /// Builds the MCP surface the way startup does when TOOLS_FILE is present but
     /// still empty, and hands back the shared registry so a test can hot-reload
     /// definitions into it afterwards.
@@ -1560,6 +1866,17 @@ mod tests {
     }
 
     async fn mcp_json_rpc(state: &McpState, id: u64, method: &str, params: Option<Value>) -> Value {
+        let response = state
+            .service
+            .clone()
+            .oneshot(mcp_json_rpc_request(id, method, params))
+            .await
+            .expect("MCP service should respond")
+            .map(Body::new);
+        mcp_json_rpc_body(response).await
+    }
+
+    fn mcp_json_rpc_request(id: u64, method: &str, params: Option<Value>) -> AxumRequest<Body> {
         let mut payload = json!({
             "jsonrpc": "2.0",
             "id": id,
@@ -1569,7 +1886,7 @@ mod tests {
             payload["params"] = params;
         }
 
-        let request = AxumRequest::builder()
+        AxumRequest::builder()
             .method(http::Method::POST)
             .uri("/mcp")
             .header(header::HOST, "localhost")
@@ -1577,15 +1894,10 @@ mod tests {
             .header(header::ACCEPT, "application/json, text/event-stream")
             .header("MCP-Protocol-Version", "2025-11-25")
             .body(Body::from(payload.to_string()))
-            .expect("MCP request should build");
+            .expect("MCP request should build")
+    }
 
-        let response = state
-            .service
-            .clone()
-            .oneshot(request)
-            .await
-            .expect("MCP service should respond")
-            .map(Body::new);
+    async fn mcp_json_rpc_body(response: Response) -> Value {
         let status = response.status();
         let body = axum::body::to_bytes(response.into_body(), usize::MAX)
             .await

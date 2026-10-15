@@ -108,13 +108,34 @@ rendered HTTP method/path facts do not pass through inbound request admission.
 The runtime Actor projection accepts three auth modes and currently drops a
 client-certificate identity, whereas inventory retains it. The differential
 fixture pins both outcomes. Adapters must preserve or explicitly change that
-behavior with both authorities tested. Every live tool-lane read, including the
-rendered HTTP rule, goes through `effective_policy()`. In cluster mode,
-invocation, visibility, inventory eligibility, composite enablement and
-`evaluate_tool_http_rule` are all judged by the snapshot the revision gate
-pinned at admission, never by a revision installed while the request was in
-flight. `tool_http_operation_reads_the_pinned_policy_not_the_live_lane` holds
-the rendered HTTP rule and tool visibility to the pinned snapshot together.
+behavior with both authorities tested. Every live tool-lane policy read,
+including the rendered HTTP rule, goes through `effective_policy()`, and
+registry and Connection lookups go through their own pinned accessors. In
+cluster mode `rbac_middleware` pins the bundle the revision gate admitted
+(policy, tools, Connections) as task-locals of the request's task, and hands
+the same pins to the request as a `RequestPins` extension. Task-locals do not
+cross `tokio::spawn`. Reads made in the request's own task, such as the admin
+playground and inventory endpoints, see the pins directly. MCP `tools/list`,
+`tools/call` and task rejection run in tasks rmcp spawns, so `McpServer`
+re-enters the pins from the extension with `with_request_pins` before its
+first registry or policy read. Either way invocation, visibility, inventory
+eligibility, composite enablement and `evaluate_tool_http_rule` are judged by
+the admitted snapshot, never by a revision installed while the request was in
+flight. A handler that moves tool-lane work onto a task of its own must
+re-enter the pins the same way, or it reads the live lanes.
+`tool_http_operation_reads_the_pinned_policy_not_the_live_lane` holds the
+rendered HTTP rule and tool visibility to the pinned snapshot together.
+`mcp_requests_are_judged_by_the_admitted_revision_not_one_installed_in_flight`
+drives `tools/list` and `tools/call` through `rbac_middleware` while a
+reconcile installs the next policy and registry, and checks the listing, the
+invocation and the rendered HTTP decision all come from the admitted revision.
+
+Because both reads are pinned, the admin playground's second rendered-HTTP
+check, made after its execution precondition, reads the same snapshot as the
+first in cluster mode. It repeats that decision and its audit event. It is not
+protection against a revision installed while the precondition ran; that
+revision judges the next admitted request. Standalone mode pins nothing, so
+there the recheck still reads the live lane.
 
 Registry existence and listing metadata, composite grant validity, enum-source
 refresh, non-RBAC permissive fallback, transport and mutable execution state are
