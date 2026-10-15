@@ -955,20 +955,38 @@ function PreviewResult({
   response: PolicyRulePreviewResponse;
   windowHours: number;
 }) {
+  // A truncated scan counted only the newest events, so its match count is a
+  // lower bound for the window, never the window's count.
+  const truncated =
+    response.scan_truncated === true || response.complete === false;
+
   return (
     <div className="rule-preview-result">
       <div className="rule-preview-stat">
         <span className="stat-label">Matched requests</span>
         <span className="stat-value">{formatCount(response.match_count)}</span>
         <span className="body-copy">
-          This rule would have matched {formatCount(response.match_count)}{' '}
-          requests in the last {formatWindowHours(windowHours)}.
+          {truncated ? (
+            <>
+              This rule would have matched at least{' '}
+              {formatCount(response.match_count)} requests in the last{' '}
+              {formatWindowHours(windowHours)}; only the newest{' '}
+              {formatCount(response.scanned_event_count)} events in that window
+              were scanned.
+            </>
+          ) : (
+            <>
+              This rule would have matched {formatCount(response.match_count)}{' '}
+              requests in the last {formatWindowHours(windowHours)}.
+            </>
+          )}
         </span>
       </div>
       <div className="rule-preview-meta">
         <span className="badge neutral">
           {formatCount(response.scanned_event_count)} scanned
         </span>
+        {truncated ? <span className="badge warning">Scan truncated</span> : null}
         <span className="badge neutral">{response.sample_strategy}</span>
       </div>
       {response.samples.length === 0 ? (

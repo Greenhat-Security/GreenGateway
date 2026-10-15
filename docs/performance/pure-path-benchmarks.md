@@ -95,8 +95,8 @@ completion. Compiler processes have a 30-second limit, benchmark processes a
 projection is not forcibly interrupted, so 120 seconds is not a hard kill
 deadline for the entire controller. CI imposes a separate ten-minute job
 timeout, including checkout, pinned tool setup, fixture tests and artifact
-upload. Total hosted job duration still needs verification on an actual GitHub
-runner.
+upload. The [hosted CI record](#hosted-ci-record) shows GitHub-hosted jobs
+finishing well inside both limits.
 
 ## Reproduce a comparison
 
@@ -172,8 +172,36 @@ The associated validation record retains `repeat-1`, `repeat-2`, `repeat-3`,
 `self-test` and `measurement-commands.json`, including raw samples and exact
 commands. The stable allocator counts support the initial zero-growth budget
 for this fixture. The large timing spread on unchanged source supports leaving
-time informational; these measurements establish neither a blocking timing
-threshold nor the total hosted CI job duration.
+time informational; these local measurements do not establish a blocking timing
+threshold, and they do not describe the hosted CI job recorded below.
+
+## Hosted CI record
+
+Every main-push CI run from the #523 merge (run 35839228763, 2026-09-23)
+through run 37222074807 (2026-10-04) included a passing `microbench` job on a
+GitHub-hosted `ubuntu-latest` runner. Those nine jobs took 26 to 45 seconds
+from job start to completion, excluding queue time.
+
+The latest successful main-push run, 37222074807, compared push commit
+`0c264de0f75911c804f854d7a285f983e372c127` with the event's `before` SHA
+`9a48f0e2731920a4ee49cad4896d5f88dce75382`. Its `microbench` job took 29
+seconds on the `ubuntu-24.04` image version 20260927.320.1, with Rust 1.98.1
+and Python 3.13.15. Pinned tool setup took 10 seconds and the fixture step,
+which ran 52 tests, 7 seconds. By its log timestamps, the comparison step
+reported `passed` with no errors 1.8 seconds after it started, and the evidence
+upload succeeded.
+
+Pull-request mode has also run on a hosted runner. In run 37221295106, the
+`microbench` job for #538 compared the checked-out merge commit
+`5b753edaf10e3d9568f4c5bf95ed035a9af97c31` with `pull_request.base.sha`
+`9a48f0e2731920a4ee49cad4896d5f88dce75382` and passed in 27 seconds.
+
+These are durations on shared hosted runners, not a timing qualification. The
+evidence artifacts have 30-day retention, so this record keeps run and commit
+identifiers rather than relying on the artifacts. The scheduled
+`nightly-performance` workflow remains separate and does not run these
+microbenchmarks; its run 38537287732 on 2026-10-14 passed the `ha-performance`
+job on commit `0c264de0f75911c804f854d7a285f983e372c127`.
 
 ## Base ownership and reviewed updates
 
@@ -226,8 +254,9 @@ Local workflow fixtures exercise real Git revision resolution and reject
 credential persistence, a mutable or shallow checkout, changed event scopes,
 skipped comparisons, permissive failure handling, incomplete evidence uploads
 and removal of the promotion dependency. These fixtures do not substitute for
-a hosted PR run. Hosted execution and runner timing qualification remain pending
-until maintainers run this change through GitHub Actions.
+hosted runs; the [hosted CI record](#hosted-ci-record) identifies passing
+pull-request and main-push executions. Hosted execution does not qualify runner
+timing.
 
 Keep timing informational until repeated runs on the intended controlled runner
 show a usable signal-to-noise margin and a reviewed regression fixture proves

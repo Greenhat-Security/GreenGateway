@@ -11790,6 +11790,86 @@ fn redacted_partial_mtls_draft_round_trips_each_hidden_binding_independently() {
     assert!(!private_key_only.requires_secrets_write_to_replace(&private_key_candidate));
 }
 
+#[test]
+fn replacement_keeps_an_omitted_caller_assertion_and_removes_it_only_on_null() {
+    // The admin UI does not edit the block, so a routine edit omits it. Reading
+    // that as removal would put a Connection that cannot yet attest its caller
+    // back into service without the assertion.
+    let current: connections::model::ConnectionWrite = serde_json::from_value(json!({
+        "display_name": "Attested API",
+        "enabled": true,
+        "kind": "http_api",
+        "endpoint": {
+            "base_url": "https://billing.example.test",
+            "base_path": "/"
+        },
+        "authentication": {"type": "none"},
+        "caller_assertion": {
+            "signing_key_id": "assertion-signing-key",
+            "kid": "gw-test-1",
+            "algorithm": "es256",
+            "issuer": "https://gateway.example.test",
+            "audience": "https://billing.example.test",
+            "token_type": "at+jwt",
+            "header_name": "x-caller-assertion",
+            "lifetime_seconds": 60
+        },
+        "tls": {}
+    }))
+    .expect("attested Connection should deserialize");
+    let current = current
+        .validated()
+        .expect("attested Connection should validate");
+    let mut routine_edit = json!({
+        "display_name": "Attested API renamed",
+        "enabled": false,
+        "kind": "http_api",
+        "endpoint": {
+            "base_url": "https://billing.example.test",
+            "base_path": "/"
+        },
+        "authentication": {"type": "none"},
+        "tls": {}
+    });
+
+    let kept = parse_connection_write_body(&Bytes::from(routine_edit.to_string()), &current)
+        .expect("an edit that omits the assertion should keep it");
+    assert_eq!(kept.caller_assertion, current.caller_assertion);
+    assert_eq!(kept.display_name, "Attested API renamed");
+    assert!(!kept.enabled);
+    assert_eq!(
+        connections::admin::changed_connection_fields(Some(&current), Some(&kept)),
+        vec!["display_name", "enabled"]
+    );
+
+    routine_edit["caller_assertion"] = Value::Null;
+    let removed = parse_connection_write_body(&Bytes::from(routine_edit.to_string()), &current)
+        .expect("an explicit null should remove the assertion");
+    assert!(removed.caller_assertion.is_none());
+    assert!(
+        connections::admin::changed_connection_fields(Some(&current), Some(&removed))
+            .contains(&"caller_assertion")
+    );
+
+    // With no current block there is nothing to keep.
+    let mut unattested = current.clone();
+    unattested.caller_assertion = None;
+    let plain_edit = json!({
+        "display_name": "Plain API",
+        "enabled": true,
+        "kind": "http_api",
+        "endpoint": {
+            "base_url": "https://billing.example.test",
+            "base_path": "/"
+        },
+        "authentication": {"type": "none"},
+        "tls": {}
+    });
+    let plain = parse_connection_write_body(&Bytes::from(plain_edit.to_string()), &unattested)
+        .expect("an edit of an unattested Connection should parse");
+    assert!(plain.caller_assertion.is_none());
+}
+
 #[tokio::test]
 async fn managed_openapi_preview_and_register_enforce_permissions_and_revisions() {
     let connection_db = TempDb::new("connection-openapi-admin-guards");
@@ -12544,6 +12624,28 @@ async fn mcp_refresh_errors_expose_bounded_upstream_diagnostics() {
             !body.to_string().contains("bounded upstream error"),
             "upstream messages must not cross the safe response boundary"
         );
+    }
+}
+
+#[tokio::test]
+async fn caller_assertion_refusals_are_conflicts_with_their_own_reason() {
+    // A Connection that cannot yet attest its caller is a state the operator
+    // must change, like a disabled one, not an upstream failure to retry.
+    let response = connection_refresh_error_response(
+        connections::mcp::McpCatalogRefreshError::CallerAssertionNotEnforced,
+    );
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+    let body = json_body(response).await;
+    assert_eq!(body["reason"], json!("caller_assertion_not_enforced"));
+
+    for operation in ["preview", "register", "refresh"] {
+        let response = openapi_catalog_error_response(
+            connections::openapi::OpenApiCatalogError::CallerAssertionNotEnforced,
+            operation,
+        );
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        let body = json_body(response).await;
+        assert_eq!(body["reason"], json!("caller_assertion_not_enforced"));
     }
 }
 
@@ -17830,6 +17932,8 @@ async fn policy_rule_preview_returns_matches_samples_and_does_not_mutate_policy(
     let body = json_body(response).await;
     assert_eq!(body["match_count"], json!(2));
     assert_eq!(body["scanned_event_count"], json!(3));
+    assert_eq!(body["scan_truncated"], json!(false));
+    assert_eq!(body["complete"], json!(true));
     assert_eq!(body["sample_strategy"], json!("newest_matches"));
     assert_eq!(body["samples"][0]["event_id"], json!("match-new"));
     assert_eq!(body["samples"][0]["method"], json!("GET"));
@@ -17983,8 +18087,58 @@ async fn policy_rule_preview_requires_audit_store() {
     assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
     assert_eq!(
         json_body(response).await,
-        json!({ "error": "policy rule preview requires an audit query store" })
+        json!({
+            "error": "policy rule preview requires an audit query store",
+            "reason": "audit_evidence_unavailable"
+        })
     );
+}
+
+#[tokio::test]
+async fn policy_rule_preview_scan_ceiling_reports_a_truncated_incomplete_count() {
+    let db = TempDb::new("rule-preview-scan-ceiling");
+    create_audit_schema(&db.path);
+    seed_rule_preview_events(&db.path);
+    let store = storage::SqliteAuditEventStore::open(&db.path).expect("query store should open");
+    let request = || {
+        parse_rule_preview_body(&Bytes::from(
+            json!({
+                "rule": {
+                    "methods": ["GET"],
+                    "path": "/api/items/{id}",
+                    "principal": { "roles": ["reader"] },
+                    "action": "deny"
+                },
+                "from": "2024-06-01T12:00:00Z",
+                "to": "2024-06-01T12:00:05Z"
+            })
+            .to_string(),
+        ))
+        .expect("preview request should parse")
+    };
+
+    // Three observations fall inside the window, newest first: match-new,
+    // wrong-role, match-old. A two-row ceiling reads only the first two, so
+    // the one match it saw is not the window's count.
+    let truncated = preview_rule_with_scan_limit(&store, request(), 2)
+        .await
+        .expect("truncated preview should complete");
+    assert_eq!(truncated.scanned_event_count, 2);
+    assert_eq!(truncated.match_count, 1);
+    assert!(truncated.scan_truncated);
+    assert!(!truncated.complete);
+    assert_eq!(truncated.samples.len(), 1);
+    assert_eq!(truncated.samples[0].event_id, "match-new");
+
+    // A ceiling the window exactly fills is not a truncation: every row was
+    // read and nothing was left behind.
+    let exact = preview_rule_with_scan_limit(&store, request(), 3)
+        .await
+        .expect("exact-ceiling preview should complete");
+    assert_eq!(exact.scanned_event_count, 3);
+    assert_eq!(exact.match_count, 2);
+    assert!(!exact.scan_truncated);
+    assert!(exact.complete);
 }
 
 #[tokio::test]
@@ -18092,9 +18246,39 @@ async fn policy_rule_hits_count_real_rbac_observation_events() {
 }
 
 #[tokio::test]
-async fn policy_rule_hits_return_zero_counts_when_sqlite_is_unset() {
+async fn policy_rule_hits_report_evidence_unavailable_when_sqlite_is_unset() {
     let policy = TempPolicyFile::new(&direct_rule_policy_document());
     let router = policy_admin_router(Some(&policy), test_audit_log());
+
+    let response = router
+        .oneshot(policy_admin_request(
+            Method::GET,
+            POLICY_RULE_HITS_ADMIN_ROUTE,
+            Some(test_principal(&["admin"])),
+            None,
+            None,
+        ))
+        .await
+        .expect("policy rule hits should complete");
+
+    // No per-rule zeros: an unread audit store is not evidence that a rule
+    // never matched.
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(
+        json_body(response).await,
+        json!({
+            "error": "policy rule hit counts require an audit query store",
+            "reason": "audit_evidence_unavailable"
+        })
+    );
+}
+
+#[tokio::test]
+async fn policy_rule_hits_return_real_zero_counts_from_an_empty_audit_store() {
+    let db = TempDb::new("rule-hits-empty-store");
+    create_audit_schema(&db.path);
+    let policy = TempPolicyFile::new(&direct_rule_policy_document());
+    let router = policy_admin_router_with_sqlite(Some(&policy), test_audit_log(), Some(&db.path));
 
     let response = router
         .oneshot(policy_admin_request(
@@ -18215,6 +18399,9 @@ async fn policy_rule_shadow_review_returns_enabled_shadow_rules_with_would_deny_
         json!("analyst-2")
     );
 
+    // A real zero: the store was read in full and holds no would-deny events
+    // for this rule.
+    assert_eq!(body["scan_truncated"], json!(false));
     let exports =
         shadow_review_rule(&body, "shadow-exports").expect("shadow exports rule should be present");
     assert_eq!(exports["would_deny_count"], json!(0));
@@ -18246,7 +18433,7 @@ async fn policy_rule_shadow_review_requires_audit_read_permission() {
 }
 
 #[tokio::test]
-async fn policy_rule_shadow_review_returns_zero_counts_when_sqlite_is_unset() {
+async fn policy_rule_shadow_review_reports_evidence_unavailable_when_sqlite_is_unset() {
     let policy = TempPolicyFile::new(&shadow_review_policy_document());
     let router = policy_admin_router(Some(&policy), test_audit_log());
 
@@ -18261,22 +18448,36 @@ async fn policy_rule_shadow_review_returns_zero_counts_when_sqlite_is_unset() {
         .await
         .expect("policy shadow review should complete");
 
-    assert_eq!(response.status(), StatusCode::OK);
-    let body = json_body(response).await;
+    // No zero would-deny summaries: they would read as "safe to promote".
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
     assert_eq!(
-        shadow_review_rule_ids(&body),
-        vec!["shadow-reports".to_owned(), "shadow-exports".to_owned()]
+        json_body(response).await,
+        json!({
+            "error": "policy shadow review requires an audit query store",
+            "reason": "audit_evidence_unavailable"
+        })
     );
-    assert_eq!(
-        shadow_review_rule(&body, "shadow-reports")
-            .and_then(|rule| rule["would_deny_count"].as_u64()),
-        Some(0)
-    );
-    assert_eq!(
-        shadow_review_rule(&body, "shadow-exports")
-            .and_then(|rule| rule["would_deny_count"].as_u64()),
-        Some(0)
-    );
+}
+
+#[tokio::test]
+async fn policy_rule_shadow_review_checks_audit_read_before_evidence_availability() {
+    let policy = TempPolicyFile::new(&shadow_review_policy_document());
+    let capture = audit::sink::tests::CaptureSink::new();
+    let log = audit::AuditLog::new(Arc::new(capture.clone()));
+    let router = policy_admin_router(Some(&policy), log.clone());
+
+    let response = router
+        .oneshot(policy_admin_request(
+            Method::GET,
+            POLICY_RULE_SHADOW_REVIEW_ADMIN_ROUTE,
+            Some(test_principal(&["policy-reader"])),
+            None,
+            None,
+        ))
+        .await
+        .expect("policy shadow review should complete");
+
+    assert_admin_denial(&response, &log, &capture, ADMIN_AUDIT_READ_PERMISSION).await;
 }
 
 #[tokio::test]
@@ -18319,6 +18520,8 @@ async fn policy_rule_preview_moderate_scale_completes_under_two_seconds() {
 
     assert_eq!(response.match_count, 5_000);
     assert_eq!(response.samples.len(), 5);
+    assert!(!response.scan_truncated);
+    assert!(response.complete);
     assert!(
         elapsed < Duration::from_secs(2),
         "50k-row preview took {elapsed:?}"
@@ -33169,9 +33372,40 @@ mod cluster_discovery_tests {
                 let body = json_body(response).await;
                 assert_eq!(body["match_count"], 2);
                 assert_eq!(body["scanned_event_count"], 2);
+                assert_eq!(body["scan_truncated"], false);
+                assert_eq!(body["complete"], true);
                 assert_eq!(body["samples"][0]["event_id"], "wiring-000002");
                 assert_eq!(body["samples"].as_array().expect("samples").len(), 1);
             }
+        }
+        // Hit counts and shadow review still read only the SQLite query
+        // surface, which cluster mode never has: they must say so rather
+        // than answer zeros the shared store was never asked for.
+        for route in [
+            POLICY_RULE_HITS_ADMIN_ROUTE,
+            POLICY_RULE_SHADOW_REVIEW_ADMIN_ROUTE,
+        ] {
+            let response = router
+                .clone()
+                .oneshot(policy_admin_request(
+                    Method::GET,
+                    route,
+                    Some(test_principal(&["policy-audit-reader"])),
+                    None,
+                    None,
+                ))
+                .await
+                .expect("evidence request");
+            assert_eq!(
+                response.status(),
+                StatusCode::SERVICE_UNAVAILABLE,
+                "{route}"
+            );
+            assert_eq!(
+                json_body(response).await["reason"],
+                "audit_evidence_unavailable",
+                "{route}"
+            );
         }
         let denied = router
             .oneshot(audit_query_request(

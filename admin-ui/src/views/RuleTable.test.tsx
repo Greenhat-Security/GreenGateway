@@ -118,7 +118,9 @@ describe('RuleTable', () => {
     expect(screen.getAllByText('any principal')).toHaveLength(2);
     expect(screen.getByText('/billing/{id}')).toBeTruthy();
     expect(screen.getByText('12 hits')).toBeTruthy();
-    expect(screen.getByText('never matched')).toBeTruthy();
+    expect(screen.getByText('No recorded hits')).toBeTruthy();
+    expect(screen.queryByText('Evidence unavailable')).toBeNull();
+    expect(screen.queryByText('Hit evidence unavailable')).toBeNull();
     expect(screen.queryByText('First match wins')).toBeNull();
     expect(screen.queryByText('Last matched unavailable')).toBeNull();
     expect(screen.getByRole('switch', { name: 'Disable rule allow-billing' })).toBeTruthy();
@@ -129,6 +131,87 @@ describe('RuleTable', () => {
     expect(screen.getByText('Allow').className).toContain('success');
     expect(screen.getByText('Shadow').className).toContain('warning');
     expect(screen.getByText('Deny').className).toContain('danger');
+  });
+
+  it('shows unavailable hit evidence as unavailable rather than as zero hits', async () => {
+    const fetcher = policyFetchMock({
+      policy: policyDocument({
+        rules: [
+          rule({ id: 'allow-billing', path: '/billing/**', action: 'allow' }),
+          rule({ id: 'deny-public', path: '/public/**', action: 'deny' }),
+        ],
+      }),
+      hitsStatus: 503,
+      hitsBody: {
+        error: 'policy rule hit counts require an audit query store',
+        reason: 'audit_evidence_unavailable',
+      },
+    });
+    vi.stubGlobal('fetch', fetcher.fetch);
+
+    renderRuleTable();
+
+    const row = await screen.findByTestId('rule-row-allow-billing');
+    expect(within(row).getByText('Evidence unavailable')).toBeTruthy();
+    expect(
+      within(screen.getByTestId('rule-row-deny-public')).getByText(
+        'Evidence unavailable',
+      ),
+    ).toBeTruthy();
+    expect(
+      screen.getByText('Hit evidence unavailable').closest('[role="status"]'),
+    ).toBeTruthy();
+    expect(
+      screen.getByText('policy rule hit counts require an audit query store'),
+    ).toBeTruthy();
+    expect(screen.queryByText('No recorded hits')).toBeNull();
+    expect(screen.queryByText('Request failed')).toBeNull();
+    expect(
+      (screen.getByRole('switch', { name: 'Disable rule allow-billing' }) as HTMLButtonElement)
+        .disabled,
+    ).toBe(false);
+  });
+
+  it('distinguishes a rule missing from the hit counts from a counted zero', async () => {
+    const fetcher = policyFetchMock({
+      policy: policyDocument({
+        rules: [
+          rule({ id: 'counted-zero', path: '/zero', action: 'allow' }),
+          rule({ id: 'added-later', path: '/later', action: 'deny' }),
+        ],
+      }),
+      hits: { 'counted-zero': 0 },
+    });
+    vi.stubGlobal('fetch', fetcher.fetch);
+
+    renderRuleTable();
+
+    expect(
+      within(await screen.findByTestId('rule-row-counted-zero')).getByText(
+        'No recorded hits',
+      ),
+    ).toBeTruthy();
+    expect(
+      within(screen.getByTestId('rule-row-added-later')).getByText('Not reported'),
+    ).toBeTruthy();
+  });
+
+  it('still fails the load for a hit-count error that is not an evidence state', async () => {
+    const fetcher = policyFetchMock({
+      policy: policyDocument({
+        rules: [rule({ id: 'allow-billing', path: '/billing/**', action: 'allow' })],
+      }),
+      hitsStatus: 503,
+      hitsBody: { error: 'policy control plane unavailable' },
+    });
+    vi.stubGlobal('fetch', fetcher.fetch);
+
+    renderRuleTable();
+
+    expect(await screen.findByText('Request failed')).toBeTruthy();
+    expect(screen.getByText('policy control plane unavailable')).toBeTruthy();
+    expect(screen.queryByText('Evidence unavailable')).toBeNull();
+    expect(screen.queryByTestId('rule-row-allow-billing')).toBeNull();
   });
 
   it('disables write controls after a policy write permission denial', async () => {
@@ -387,11 +470,15 @@ function policyFetchMock({
   canWrite = true,
   policy,
   hits = {},
+  hitsStatus = 200,
+  hitsBody,
   patchStatus = 200,
 }: {
   canWrite?: boolean;
   policy: PolicyDocument;
   hits?: Record<string, number>;
+  hitsStatus?: number;
+  hitsBody?: unknown;
   patchStatus?: number;
 }) {
   let currentPolicy = policy;
@@ -407,12 +494,15 @@ function policyFetchMock({
 
     if (url.pathname === '/v1/admin/policy/rules/hits') {
       return Promise.resolve(
-        jsonResponse(200, {
-          rules: Object.entries(hits).map(([rule_id, ruleHits]) => ({
-            rule_id,
-            hits: ruleHits,
-          })),
-        }),
+        jsonResponse(
+          hitsStatus,
+          hitsBody ?? {
+            rules: Object.entries(hits).map(([rule_id, ruleHits]) => ({
+              rule_id,
+              hits: ruleHits,
+            })),
+          },
+        ),
       );
     }
 

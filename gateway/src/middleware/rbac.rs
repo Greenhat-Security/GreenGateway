@@ -131,9 +131,11 @@ pub struct Admission {
 #[cfg(feature = "postgres")]
 tokio::task_local! {
     /// The policy snapshot pinned for the request being served, set when
-    /// the gate admits it. Every policy read inside the request -- the
-    /// middleware's own, and the tool runtime's authorization -- goes
-    /// through it, so one admitted request is judged by one policy.
+    /// the gate admits it. Every policy read made in the request's task --
+    /// the middleware's own, and the tool runtime's authorization -- goes
+    /// through it, so one admitted request is judged by one policy. A task
+    /// the request spawns does not inherit it: work served from such a task
+    /// re-enters it with [`with_request_pins`].
     static PINNED_POLICY: Arc<RbacPolicyState>;
 }
 
@@ -144,6 +146,80 @@ pub(crate) async fn with_pinned_policy<F: std::future::Future>(
     future: F,
 ) -> F::Output {
     PINNED_POLICY.scope(policy, future).await
+}
+
+/// The snapshots the revision gate pinned for one admitted request: the
+/// Connection snapshot it dispatches under and the bundle of lanes it is
+/// judged by. The pins are task-locals, which a spawned task does not
+/// inherit, so [`rbac_middleware`] also hands them to the request as an
+/// extension for [`with_request_pins`] to re-enter.
+#[cfg(feature = "postgres")]
+#[derive(Clone)]
+pub(crate) struct RequestPins {
+    connections: Option<Arc<crate::connections::control_plane::ConnectionRuntimeSnapshot>>,
+    bundle: Option<Arc<crate::security_cluster::SecurityBundle>>,
+}
+
+#[cfg(feature = "postgres")]
+impl RequestPins {
+    /// Run `future` with these snapshots pinned.
+    async fn scope<F: std::future::Future>(self, future: F) -> F::Output {
+        let Self {
+            connections,
+            bundle,
+        } = self;
+        let run = async move {
+            match connections {
+                Some(snapshot) => {
+                    crate::connections::http::with_pinned_connections(snapshot, future).await
+                }
+                None => future.await,
+            }
+        };
+        match bundle {
+            Some(bundle) => {
+                let policy = Arc::clone(&bundle.policy);
+                let tools = Arc::clone(&bundle.tools);
+                with_pinned_policy(
+                    policy,
+                    crate::tools::definitions::with_pinned_tools(tools, run),
+                )
+                .await
+            }
+            None => run.await,
+        }
+    }
+}
+
+/// Run `future` under the snapshots pinned for the request these extensions
+/// belong to, for work the request's handler serves from a task it did not
+/// run in itself.
+///
+/// rmcp's Streamable HTTP service is such a handler: it serves every `/mcp`
+/// JSON-RPC request from a task it spawns. There the pins
+/// [`rbac_middleware`] set are gone, every lane read falls back to the live
+/// lane, and a reconcile landing between two of one tool call's checks would
+/// have them judged by two revisions (#422). Re-entering the pins here puts
+/// those reads back on the admitted snapshots. Without pins (standalone mode,
+/// an exempt path, no extensions) `future` reads the live lanes, as the
+/// request's own task would.
+#[cfg(feature = "postgres")]
+pub(crate) async fn with_request_pins<F: std::future::Future>(
+    extensions: Option<&http::Extensions>,
+    future: F,
+) -> F::Output {
+    match extensions.and_then(|extensions| extensions.get::<RequestPins>()) {
+        Some(pins) => pins.clone().scope(future).await,
+        None => future.await,
+    }
+}
+
+#[cfg(not(feature = "postgres"))]
+pub(crate) async fn with_request_pins<F: std::future::Future>(
+    _extensions: Option<&http::Extensions>,
+    future: F,
+) -> F::Output {
+    future.await
 }
 
 #[derive(Clone)]
@@ -428,12 +504,6 @@ impl RbacState {
         self
     }
 
-    /// Attach cluster mode's strict revision gate. The snapshot installed
-    /// at construction is keyed by revision 0 and therefore not servable
-    /// until the gate has reconciled it; production wiring calls
-    /// [`RbacState::install_revision_snapshot`] with the authority's
-    /// current revision before the listener serves, and the gate keeps it
-    /// current afterwards.
     /// Cluster mode: the control plane whose snapshot an admitted request
     /// pins for its dispatch.
     #[cfg(feature = "postgres")]
@@ -445,14 +515,18 @@ impl RbacState {
         self
     }
 
+    /// Attach cluster mode's strict revision gate. The snapshot installed
+    /// at construction is keyed by revision 0 and therefore not servable
+    /// until the gate has reconciled it; production wiring calls
+    /// [`RbacState::install_revision_snapshot`] with the authority's
+    /// current revision before the listener serves, and the gate keeps it
+    /// current afterwards.
     #[cfg(feature = "postgres")]
     pub(crate) fn with_revision_gate(mut self, gate: Arc<dyn SecurityRevisionGate>) -> Self {
         self.revision_gate = Some(gate);
         self
     }
 
-    /// The policy snapshot this request is judged by: the one the gate
-    /// pinned at admission (cluster mode), else the live lane.
     /// The compiled kernel of the snapshot a request would be judged by right
     /// now, for the differential tests.
     ///
@@ -466,6 +540,8 @@ impl RbacState {
         self.effective_policy()
     }
 
+    /// The policy snapshot this request is judged by: the one the gate
+    /// pinned at admission (cluster mode), else the live lane.
     fn effective_policy(&self) -> Arc<RbacPolicyState> {
         #[cfg(feature = "postgres")]
         if let Ok(pinned) = PINNED_POLICY.try_with(Arc::clone) {
@@ -598,8 +674,9 @@ impl RbacState {
     }
 
     /// Returns requested delegated roles that the principal cannot activate.
-    /// Wildcard principals may delegate any role. The policy is read once so
-    /// the wildcard and per-role decisions use the same live snapshot.
+    /// Wildcard principals may delegate any role. The request's policy
+    /// snapshot is read once so the wildcard and per-role decisions use the
+    /// same snapshot.
     pub fn disallowed_delegated_roles(
         &self,
         principal: &auth::Principal,
@@ -648,22 +725,27 @@ impl RbacState {
         })
     }
 
+    /// The rendered-HTTP firewall rule for a tool's upstream request, judged by
+    /// the same snapshot as [`RbacState::evaluate_tool_authorization`]. An
+    /// invocation admitted under the pinned policy must not have its rendered
+    /// request judged by a revision a reconcile installed while it was in
+    /// flight: that is one decision built from two snapshots (#422).
     pub(crate) fn evaluate_tool_http_rule(
         &self,
         method: &str,
         path: &str,
         principal: Option<&auth::Principal>,
     ) -> Option<MatchedRuleDecision> {
-        self.policy
-            .load()
+        self.effective_policy()
             .evaluate_tool_http_rule(method, path, principal)
     }
 
     /// Previews whether the requesting principal may invoke a policy-backed
     /// tool without emitting audit events or beginning tool execution.
     ///
-    /// The live policy is loaded exactly once so the tool entry and any direct
-    /// tool-name rule are evaluated from the same immutable snapshot.
+    /// The request's policy snapshot is loaded exactly once so the tool entry
+    /// and any direct tool-name rule are evaluated from the same immutable
+    /// snapshot.
     pub(crate) fn tool_policy_eligibility(
         &self,
         tool_name: &str,
@@ -1074,36 +1156,26 @@ fn spawn_sighup_reload_task(
     None
 }
 
-/// `next.run(req)` with the request's Connection snapshot pinned (cluster
-/// mode) or without one (standalone, or an exempt path that skipped the
-/// gate).
+/// `next.run(req)` with the request's Connection snapshot and bundle pinned
+/// (cluster mode) or without them (standalone, or an exempt path that
+/// skipped the gate). The pins also travel with the request as a
+/// [`RequestPins`] extension, so a handler that serves it from a task of its
+/// own can re-enter them.
 #[cfg(feature = "postgres")]
 async fn run_pinned(
     pinned: Option<Arc<crate::connections::control_plane::ConnectionRuntimeSnapshot>>,
     bundle: Option<Arc<crate::security_cluster::SecurityBundle>>,
     next: Next,
-    req: Request,
+    mut req: Request,
 ) -> Response {
-    let run = async move {
-        match pinned {
-            Some(snapshot) => {
-                crate::connections::http::with_pinned_connections(snapshot, next.run(req)).await
-            }
-            None => next.run(req).await,
-        }
+    let pins = RequestPins {
+        connections: pinned,
+        bundle,
     };
-    match bundle {
-        Some(bundle) => {
-            let policy = Arc::clone(&bundle.policy);
-            let tools = Arc::clone(&bundle.tools);
-            with_pinned_policy(
-                policy,
-                crate::tools::definitions::with_pinned_tools(tools, run),
-            )
-            .await
-        }
-        None => run.await,
+    if pins.connections.is_some() || pins.bundle.is_some() {
+        req.extensions_mut().insert(pins.clone());
     }
+    pins.scope(next.run(req)).await
 }
 
 #[cfg(not(feature = "postgres"))]

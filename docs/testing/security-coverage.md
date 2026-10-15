@@ -8,9 +8,11 @@ The existing Linux, PostgreSQL and protocol acceptance gates remain mandatory.
 [Targeted security mutations](security-mutations.md) provide a separate check
 that selected pure predicates have behavior assertions strong enough to detect
 reviewed source changes. The bounded mutation campaign runs on a trusted
-schedule or manual dispatch. It does not change these coverage floors or any
-existing pull-request or image-promotion requirement; its reviewed scope and
-individual outcomes must not be presented as a whole-gateway mutation score.
+schedule or manual dispatch; pull requests only check, inside the existing
+`supply-chain` job, that its registry still matches the source. Neither changes
+these coverage floors or the set of pull-request or image-promotion jobs; the
+reviewed scope and individual outcomes must not be presented as a
+whole-gateway mutation score.
 
 The gate checks each file in `.github/security-coverage.json` separately:
 JWT handling, authentication and RBAC middleware, CSRF, response headers,

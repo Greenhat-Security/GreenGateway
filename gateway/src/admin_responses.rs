@@ -93,6 +93,24 @@ pub(super) fn policy_history_not_configured() -> Response {
         .into_response()
 }
 
+/// A policy evidence endpoint (rule preview, hit counts, shadow review) has
+/// no audit store to read.
+///
+/// A `503` with a stable `reason` rather than a successful empty result: a
+/// zero hit count or an empty shadow summary reads exactly like "this rule
+/// never matched", and an operator could delete or promote a rule on
+/// evidence that was never read.
+pub(super) fn policy_evidence_unavailable(error: &str) -> Response {
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        Json(json!({
+            "error": error,
+            "reason": "audit_evidence_unavailable",
+        })),
+    )
+        .into_response()
+}
+
 pub(super) fn token_rbac_not_configured() -> Response {
     (
         StatusCode::NOT_FOUND,
@@ -419,7 +437,10 @@ pub(super) fn connection_refresh_error_response(
         | connections::mcp::McpCatalogRefreshError::RefreshInProgress
         | connections::mcp::McpCatalogRefreshError::ConnectionDisabled
         | connections::mcp::McpCatalogRefreshError::ConnectionKindMismatch
-        | connections::mcp::McpCatalogRefreshError::DiscoveryNotConfigured => StatusCode::CONFLICT,
+        | connections::mcp::McpCatalogRefreshError::DiscoveryNotConfigured
+        | connections::mcp::McpCatalogRefreshError::CallerAssertionNotEnforced => {
+            StatusCode::CONFLICT
+        }
         connections::mcp::McpCatalogRefreshError::StoreUnavailable
         | connections::mcp::McpCatalogRefreshError::StorageUnavailable => {
             StatusCode::SERVICE_UNAVAILABLE
@@ -463,6 +484,7 @@ pub(super) fn openapi_catalog_error_response(
         | OpenApiCatalogError::ConnectionDisabled
         | OpenApiCatalogError::ConnectionKindMismatch
         | OpenApiCatalogError::DiscoveryNotConfigured
+        | OpenApiCatalogError::CallerAssertionNotEnforced
         | OpenApiCatalogError::ToolConflict => StatusCode::CONFLICT,
         OpenApiCatalogError::SpecTooLarge => StatusCode::PAYLOAD_TOO_LARGE,
         OpenApiCatalogError::InvalidSpec
