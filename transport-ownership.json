@@ -11283,6 +11283,36 @@
     {
       "file": "gateway/src/storage/postgres.rs",
       "reasons": [
+        "unexpanded-macro"
+      ],
+      "scope": "gateway::storage::postgres::observe_pool_acquire#1",
+      "sha256": "21f05f64973cff3933adff859caaa38b1658abb0fb8d6610c1ebc89442018d55",
+      "owner": "GreenGateway maintainers",
+      "purpose": "Operator-configured PostgreSQL foundation: verified connector, bounded shared pool and connection lifecycle."
+    },
+    {
+      "file": "gateway/src/storage/postgres.rs",
+      "reasons": [
+        "network-or-process-reference"
+      ],
+      "scope": "gateway::storage::postgres::checkout#1",
+      "sha256": "5fec6336bfaf581afe83d7e10b23ab83de60c605e8cf5737b7caaae9ddb3f121",
+      "owner": "GreenGateway maintainers",
+      "purpose": "Operator-configured PostgreSQL foundation: verified connector, bounded shared pool and connection lifecycle."
+    },
+    {
+      "file": "gateway/src/storage/postgres.rs",
+      "reasons": [
+        "network-or-process-reference"
+      ],
+      "scope": "gateway::storage::postgres::timed_checkout#1",
+      "sha256": "1e61d9b5ee7641e1b9fdcefa82f5f4be9a820b1b840c8182a872b8d9f452d2d9",
+      "owner": "GreenGateway maintainers",
+      "purpose": "Operator-configured PostgreSQL foundation: verified connector, bounded shared pool and connection lifecycle."
+    },
+    {
+      "file": "gateway/src/storage/postgres.rs",
+      "reasons": [
         "network-or-process-reference"
       ],
       "scope": "gateway::storage::postgres::publish_pool_gauges#1",
@@ -12568,7 +12598,7 @@
         "network-or-process-reference"
       ],
       "scope": "gateway::storage::postgres_service_tokens::exported_tokens#1",
-      "sha256": "6c808ef885f5268982756c3d784e896e880d7dbcbcaeef39765579d363dd2676",
+      "sha256": "9de7fea7707d8a80d4fe7a898159763064ec36d3c8f122f72bfde53365bfa5f4",
       "owner": "GreenGateway maintainers",
       "purpose": "PostgreSQL repository operations through the shared infrastructure pool; no caller-selected HTTP authority."
     },
@@ -12588,7 +12618,7 @@
         "network-or-process-reference"
       ],
       "scope": "gateway::storage::postgres_session::impl  DedicatedSession::acquire#1",
-      "sha256": "ac8280968bb5705ec4e47f44f36266b1f5eab38516fa987c253e6cd36335436c",
+      "sha256": "a110799eb2422962f76f6347fecdbc803254b4178f17625e5e3a8e69ff91e0ae",
       "owner": "GreenGateway maintainers",
       "purpose": "PostgreSQL repository operations through the shared infrastructure pool; no caller-selected HTTP authority."
     },

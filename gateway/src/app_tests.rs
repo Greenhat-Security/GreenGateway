@@ -8376,7 +8376,7 @@ const CANARIES: [(&str, &str); 8] = [
 /// The only label *names* an HA metric may carry. The exporter adds
 /// `quantile` to summaries itself, so it is allowed here without being
 /// something the gateway chose.
-const ALLOWED_HA_LABEL_NAMES: [&str; 9] = [
+const ALLOWED_HA_LABEL_NAMES: [&str; 10] = [
     "job",
     "outcome",
     "task",
@@ -8384,6 +8384,7 @@ const ALLOWED_HA_LABEL_NAMES: [&str; 9] = [
     "reason",
     "scope",
     "operation",
+    "operation_class",
     "error_class",
     "quantile",
 ];
@@ -8413,6 +8414,7 @@ fn expected_ha_metric_names() -> Vec<&'static str> {
         metrics::DATABASE_POOL_AVAILABLE,
         metrics::DATABASE_POOL_WAITING,
         metrics::DATABASE_POOL_TIMEOUTS_TOTAL,
+        metrics::DATABASE_POOL_ACQUIRE_SECONDS,
         metrics::DATABASE_OPERATION_SECONDS,
         metrics::SECURITY_REVISION_COMPILED,
         metrics::SECURITY_REVISION_CURRENT,
@@ -8502,6 +8504,29 @@ fn ha_label_vocabularies() -> Vec<(&'static str, &'static str, Vec<&'static str>
                 ))
                 .collect(),
         ),
+        // The acquisition histogram's two labels are both runtime
+        // values -- the class a store names and the kind a failed
+        // checkout was classified as -- so both are declared (issue
+        // #439). Neither list depends on anything a request carries.
+        (
+            metrics::DATABASE_POOL_ACQUIRE_SECONDS,
+            "operation_class",
+            storage::postgres::CheckoutClass::KNOWN
+                .iter()
+                .map(|class| class.metric_label())
+                .collect(),
+        ),
+        (
+            metrics::DATABASE_POOL_ACQUIRE_SECONDS,
+            "error_class",
+            storage::RepositoryErrorKind::KNOWN
+                .iter()
+                .map(|kind| kind.metric_label())
+                .chain(std::iter::once(
+                    storage::postgres::OPERATION_ERROR_CLASS_NONE,
+                ))
+                .collect(),
+        ),
     ]);
     rules
 }
@@ -8551,6 +8576,18 @@ fn looks_like_a_uuid(value: &str) -> bool {
         && [8, 4, 4, 4, 12].iter().zip(&groups).all(|(width, group)| {
             group.len() == *width && group.bytes().all(|byte| byte.is_ascii_hexdigit())
         })
+}
+
+/// Record one pool checkout per class and outcome through the real
+/// emitter: the success sentinel, then every classified kind.
+#[cfg(feature = "postgres")]
+fn record_every_pool_acquisition() {
+    for class in storage::postgres::CheckoutClass::KNOWN {
+        storage::postgres::observe_pool_acquire(class, Duration::from_micros(400), None);
+        for kind in storage::RepositoryErrorKind::KNOWN {
+            storage::postgres::observe_pool_acquire(class, Duration::from_millis(50), Some(kind));
+        }
+    }
 }
 
 /// Drive every HA metric this PR adds, with every canary in the
@@ -8652,6 +8689,11 @@ async fn synthetic_ha_run() {
                 Some(kind),
             );
         }
+        // Every checkout class under every outcome a checkout can be
+        // classified as (issue #439): the acquisition family's whole
+        // label space, so the bound below is checked against all of it
+        // rather than against whichever classes a test happened to touch.
+        record_every_pool_acquisition();
 
         security_cluster::record_revision_gauges(41, 44);
         for reason in [
@@ -8807,6 +8849,91 @@ fn the_ha_metric_registry_never_labels_by_a_caller_influenced_value() {
             }
         }
     }
+}
+
+/// The pool-acquisition histogram's series are the product of two fixed
+/// lists and nothing more (issue #439).
+///
+/// The registry audit above proves each label value comes *from* a
+/// declared vocabulary; this proves the family cannot grow past it. The
+/// synthetic run records every class under every outcome -- the whole
+/// space -- with the hostile request in flight, and the space is then
+/// recorded a second time: a label minted from anything a caller sent,
+/// or from anything that varies between checkouts, would be one series
+/// too many. The class list is held small on purpose, because it is the
+/// multiplier.
+#[cfg(feature = "postgres")]
+#[test]
+fn the_pool_acquisition_series_are_bounded_by_two_fixed_vocabularies() {
+    let recorder = PrometheusBuilder::new().build_recorder();
+    let handle = recorder.handle();
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("test runtime should build");
+    ::metrics::with_local_recorder(&recorder, || {
+        runtime.block_on(synthetic_ha_run());
+        record_every_pool_acquisition();
+    });
+    let rendered = handle.render();
+
+    let classes: Vec<&str> = storage::postgres::CheckoutClass::KNOWN
+        .iter()
+        .map(|class| class.metric_label())
+        .collect();
+    let outcomes: Vec<&str> = storage::RepositoryErrorKind::KNOWN
+        .iter()
+        .map(|kind| kind.metric_label())
+        .chain(std::iter::once(
+            storage::postgres::OPERATION_ERROR_CLASS_NONE,
+        ))
+        .collect();
+    assert!(
+        classes.len() <= 8,
+        "the operation-class list multiplies every outcome; keep it a short fixed list: \
+         {classes:?}"
+    );
+
+    let mut series = std::collections::BTreeSet::new();
+    for line in rendered.lines().filter(|line| !line.starts_with('#')) {
+        // The summary's quantile lines and its `_sum` and `_count`
+        // lines all belong to the family.
+        if !rendered_metric_name(line).starts_with(metrics::DATABASE_POOL_ACQUIRE_SECONDS) {
+            continue;
+        }
+        for (what, canary) in CANARIES {
+            assert!(
+                !line.contains(canary),
+                "{what} must never reach the acquisition series: {line}"
+            );
+        }
+        let labels: std::collections::BTreeMap<String, String> = rendered_labels(line)
+            .into_iter()
+            .filter(|(label, _)| label != "quantile")
+            .collect();
+        assert_eq!(
+            labels.keys().map(String::as_str).collect::<Vec<_>>(),
+            ["error_class", "operation_class"],
+            "the acquisition series carries exactly its two declared labels: {line}"
+        );
+        assert!(
+            classes.contains(&labels["operation_class"].as_str()),
+            "operation_class must be a fixed class: {line}"
+        );
+        assert!(
+            outcomes.contains(&labels["error_class"].as_str()),
+            "error_class must be a classified kind or none: {line}"
+        );
+        series.insert((
+            labels["operation_class"].clone(),
+            labels["error_class"].clone(),
+        ));
+    }
+    assert_eq!(
+        series.len(),
+        classes.len() * outcomes.len(),
+        "every class under every outcome, and not one series more:\n{rendered}"
+    );
 }
 
 #[tokio::test]

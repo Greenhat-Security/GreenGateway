@@ -1604,6 +1604,122 @@ pub(crate) mod postgres_audit_tests {
         (Arc::new(PostgresPolicyStore::new(pool.clone())), pool)
     }
 
+    /// An authority read times its pool checkout and its statement in two
+    /// separate series, against a real pool (issue #439).
+    ///
+    /// A served revision read lands one sample in each. A read that cannot
+    /// get a connection lands its wait in the acquisition series as
+    /// `timeout` -- counted as a pool timeout, like every checkout timeout
+    /// -- and nothing in the statement series, because no statement ran:
+    /// `greengateway_database_operation_seconds{error_class="timeout"}` on
+    /// this operation is the database's time and nothing else. The refusal
+    /// itself is what it always was: the read fails with `Timeout`, which
+    /// the gate answers `503`.
+    #[tokio::test]
+    async fn an_authority_read_times_its_checkout_apart_from_its_statement() {
+        use crate::storage::postgres::CheckoutClass;
+        use crate::storage::{RepositoryErrorKind, SecurityRevisionSource};
+
+        let Some(admin_dsn) = locator() else {
+            eprintln!("skipping: no test database locator; CI runs this test");
+            return;
+        };
+        let _guard = DATABASE.lock().await;
+        let database = create_test_database(&admin_dsn).await;
+        let recorder = crate::audit::sink::tests::CountingRecorder::default();
+        // The recorder is a thread-local and a pool's connections are
+        // driven by the runtime that opened them, so the whole exercise --
+        // both pools included -- runs on one thread with a runtime of its
+        // own.
+        let (served, saturated) = std::thread::scope(|scope| {
+            scope
+                .spawn(|| {
+                    let runtime = tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()
+                        .expect("a runtime for the recording thread");
+                    ::metrics::with_local_recorder(&recorder, || {
+                        runtime.block_on(async {
+                            let (store, _pool) = migrated_policy_store(&database).await;
+                            let served = store.revision_source().current().await;
+
+                            let test_dsn_file = write_dsn_file(&database.dsn);
+                            let mut config = crate::config::Config::test_defaults();
+                            config.state_backend = crate::config::StateBackend::Postgres;
+                            config.deployment_id = Some("deploy-policy-contract".to_owned());
+                            config.database.url_file = Some(test_dsn_file.path.clone());
+                            config.database.tls_mode = crate::config::DatabaseTlsMode::LoopbackDev;
+                            config.database.pool_max = 1;
+                            config.database.acquire_timeout_ms = 50;
+                            let one_connection = PostgresFoundation::establish(&config)
+                                .await
+                                .expect("a one-connection pool should establish");
+                            let held = one_connection
+                                .pool()
+                                .get()
+                                .await
+                                .expect("the pool's only connection");
+                            let saturated =
+                                SecurityRevisionSource::new(one_connection.pool().clone())
+                                    .current()
+                                    .await;
+                            drop(held);
+                            (served, saturated)
+                        })
+                    })
+                })
+                .join()
+                .expect("the recording thread")
+        });
+
+        assert!(served.is_ok(), "a free pool serves the revision read");
+        assert_eq!(
+            saturated
+                .expect_err("a saturated pool must refuse, not answer")
+                .kind(),
+            RepositoryErrorKind::Timeout
+        );
+        let checkouts = |error_class: &str| {
+            recorder.histogram_values(
+                crate::metrics::DATABASE_POOL_ACQUIRE_SECONDS,
+                &[
+                    (
+                        "operation_class",
+                        CheckoutClass::RevisionCheck.metric_label(),
+                    ),
+                    ("error_class", error_class),
+                ],
+            )
+        };
+        let statements = |error_class: &str| {
+            recorder.histogram_values(
+                crate::metrics::DATABASE_OPERATION_SECONDS,
+                &[
+                    ("operation", "policy_revision_read"),
+                    ("error_class", error_class),
+                ],
+            )
+        };
+        let timeout = RepositoryErrorKind::Timeout.metric_label();
+        assert_eq!(checkouts("none").len(), 1, "the served read's checkout");
+        assert_eq!(statements("none").len(), 1, "the served read's statement");
+        let waited = checkouts(timeout);
+        assert_eq!(waited.len(), 1, "the refused read's checkout");
+        assert!(
+            waited[0] >= 0.04,
+            "the sample is the wait the checkout gave up after, not zero: {waited:?}"
+        );
+        assert!(
+            statements(timeout).is_empty(),
+            "a checkout that never produced a connection ran no statement to time"
+        );
+        assert_eq!(
+            recorder.count(crate::metrics::DATABASE_POOL_TIMEOUTS_TOTAL, &[]),
+            1,
+            "the refused checkout is still counted as a pool timeout"
+        );
+    }
+
     // ------------------------------------------------------------------
     // Shared service-token store (issue #241, PR 9)
     // ------------------------------------------------------------------

@@ -1058,6 +1058,129 @@ where
     result
 }
 
+/// What a pool checkout is for: the fixed `operation_class` label of
+/// [`crate::metrics::DATABASE_POOL_ACQUIRE_SECONDS`] (issue #439).
+///
+/// A class rather than an operation, and a short closed list on purpose.
+/// The question the acquisition series answers is "which kind of
+/// authority work is waiting for a connection", and that is a handful of
+/// kinds; the per-operation detail already lives in
+/// [`crate::metrics::DATABASE_OPERATION_SECONDS`]. The caller names the
+/// class at the call site, so nothing about the request -- a principal,
+/// a token, a route, a key -- can reach the label.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum CheckoutClass {
+    /// The security-revision counter read: every protected request, every
+    /// admin request, every service-token validation, and the background
+    /// reconcile poller's tick.
+    RevisionCheck,
+    /// Service-token verification and the JWT revocation lookup.
+    CredentialCheck,
+    /// A shared rate-limit decision, and the bounded eviction a new key
+    /// past the bucket bound triggers.
+    RateLimit,
+    /// Execution-lease acquire, renew, release and fence checks: tool
+    /// invocations, and the singleton leader terms that share the store.
+    ExecutionLease,
+    /// Reads of authoritative security state that are not made on every
+    /// request: the activation revisions and active documents
+    /// reconciliation reads (inline on a request only when its replica is
+    /// behind), and the admin reads of policy, history and tokens.
+    SecurityStateRead,
+    /// Committed control-plane mutations: policy commits, service-token
+    /// create, revoke and rotate, and JWT revocations.
+    ControlPlaneWrite,
+    /// Singleton maintenance sessions, cleanup sweeps and operator
+    /// commands.
+    Maintenance,
+}
+
+impl CheckoutClass {
+    /// Every class, so the registry label audit can hold the rendered
+    /// series to this list rather than to whatever happened to be emitted.
+    /// Test-only: the call sites name their own class, and nothing in the
+    /// running process needs to enumerate them.
+    #[cfg(test)]
+    pub(crate) const KNOWN: [Self; 7] = [
+        Self::RevisionCheck,
+        Self::CredentialCheck,
+        Self::RateLimit,
+        Self::ExecutionLease,
+        Self::SecurityStateRead,
+        Self::ControlPlaneWrite,
+        Self::Maintenance,
+    ];
+
+    pub(crate) fn metric_label(self) -> &'static str {
+        match self {
+            Self::RevisionCheck => "revision_check",
+            Self::CredentialCheck => "credential_check",
+            Self::RateLimit => "rate_limit",
+            Self::ExecutionLease => "execution_lease",
+            Self::SecurityStateRead => "security_state_read",
+            Self::ControlPlaneWrite => "control_plane_write",
+            Self::Maintenance => "maintenance",
+        }
+    }
+}
+
+/// Record how long one pool checkout waited and how it ended (issue #439).
+///
+/// The one emission point for
+/// [`crate::metrics::DATABASE_POOL_ACQUIRE_SECONDS`]. `error_class` is the
+/// same vocabulary [`observe_operation`] uses -- `none`, or the kind
+/// [`classify_pool_error`] assigned -- so a checkout that timed out reads
+/// `timeout` here exactly as it does everywhere else.
+pub(crate) fn observe_pool_acquire(
+    class: CheckoutClass,
+    elapsed: std::time::Duration,
+    error_class: Option<RepositoryErrorKind>,
+) {
+    ::metrics::histogram!(
+        crate::metrics::DATABASE_POOL_ACQUIRE_SECONDS,
+        "operation_class" => class.metric_label(),
+        "error_class" => error_class
+            .map_or(OPERATION_ERROR_CLASS_NONE, RepositoryErrorKind::metric_label)
+    )
+    .record(elapsed.as_secs_f64());
+}
+
+/// Check a connection out of `pool` for `class` of authority work: the
+/// shared checkout boundary of the per-request authority stores
+/// (issue #439).
+///
+/// It is `pool.get()` and [`classify_pool_error`] exactly as the stores
+/// called them before, so a checkout that fails is classified, logged and
+/// counted the same way and still refuses the caller -- a store that
+/// cannot get a connection has not decided anything, and nothing here
+/// turns that into an answer. What it adds is the wait, timed on its own:
+/// a store times its statements with [`timed_operation`] *after* this
+/// returns, so the pool's queue and the database's work are two series
+/// rather than one sum an operator has to guess the split of.
+pub(crate) async fn checkout(
+    pool: &Pool,
+    class: CheckoutClass,
+) -> Result<deadpool_postgres::Object, RepositoryError> {
+    timed_checkout(class, pool.get()).await
+}
+
+/// [`checkout`]'s body over any checkout future, so the timing and the
+/// classification can be exercised without a database: the test that
+/// pins them hands it a future that has already failed.
+async fn timed_checkout<T, F>(class: CheckoutClass, acquire: F) -> Result<T, RepositoryError>
+where
+    F: std::future::Future<Output = Result<T, deadpool_postgres::PoolError>>,
+{
+    let started = std::time::Instant::now();
+    let result = acquire.await.map_err(classify_pool_error);
+    observe_pool_acquire(
+        class,
+        started.elapsed(),
+        result.as_ref().err().map(RepositoryError::kind),
+    );
+    result
+}
+
 /// Publish the pool's shape as gauges (issue #241, PR 14), sampled when
 /// `/metrics` is scraped.
 ///
@@ -1258,6 +1381,116 @@ mod tests {
             std::collections::BTreeSet::from_iter(vocabulary.iter().copied()).len(),
             "the success sentinel must not collide with a classified kind"
         );
+    }
+
+    /// A checkout is timed under its class and its classified outcome,
+    /// and the classification is exactly the one `classify_pool_error`
+    /// has always made (issue #439): a wait that timed out is `timeout`
+    /// and is still counted as a pool timeout, a closed pool is
+    /// `unavailable`, and both still reach the caller as errors.
+    ///
+    /// The checkout futures here have already resolved, which is the
+    /// point: the timing and the classification are the helper's, and
+    /// neither needs a database to be pinned.
+    #[test]
+    fn a_checkout_is_timed_by_class_and_keeps_its_classification() {
+        use deadpool_postgres::{PoolError, TimeoutType};
+
+        let recorder = crate::audit::sink::tests::CountingRecorder::default();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("test runtime should build");
+        let (acquired, timed_out, closed) = ::metrics::with_local_recorder(&recorder, || {
+            runtime.block_on(async {
+                let acquired = timed_checkout(CheckoutClass::RevisionCheck, async {
+                    Ok::<_, PoolError>(())
+                })
+                .await;
+                let timed_out = timed_checkout(CheckoutClass::CredentialCheck, async {
+                    Err::<(), _>(PoolError::Timeout(TimeoutType::Wait))
+                })
+                .await;
+                let closed = timed_checkout(CheckoutClass::RateLimit, async {
+                    Err::<(), _>(PoolError::Closed)
+                })
+                .await;
+                (acquired, timed_out, closed)
+            })
+        });
+        assert!(acquired.is_ok());
+        assert_eq!(
+            timed_out
+                .expect_err("a timed-out checkout must refuse")
+                .kind(),
+            RepositoryErrorKind::Timeout
+        );
+        assert_eq!(
+            closed.expect_err("a closed pool must refuse").kind(),
+            RepositoryErrorKind::Unavailable
+        );
+
+        for (class, error_class) in [
+            (CheckoutClass::RevisionCheck, OPERATION_ERROR_CLASS_NONE),
+            (
+                CheckoutClass::CredentialCheck,
+                RepositoryErrorKind::Timeout.metric_label(),
+            ),
+            (
+                CheckoutClass::RateLimit,
+                RepositoryErrorKind::Unavailable.metric_label(),
+            ),
+        ] {
+            assert_eq!(
+                recorder
+                    .histogram_values(
+                        crate::metrics::DATABASE_POOL_ACQUIRE_SECONDS,
+                        &[
+                            ("operation_class", class.metric_label()),
+                            ("error_class", error_class),
+                        ],
+                    )
+                    .len(),
+                1,
+                "one acquisition sample for {class:?} under {error_class}"
+            );
+        }
+        assert_eq!(
+            recorder.count(crate::metrics::DATABASE_POOL_TIMEOUTS_TOTAL, &[]),
+            1,
+            "the timed-out checkout is still counted where every checkout timeout is"
+        );
+    }
+
+    /// The operation classes are a short fixed list of bare label words,
+    /// distinct from each other and from the success sentinel the
+    /// `error_class` label uses.
+    #[test]
+    fn the_checkout_classes_are_a_short_fixed_vocabulary() {
+        let labels: Vec<&str> = CheckoutClass::KNOWN
+            .iter()
+            .map(|class| class.metric_label())
+            .collect();
+        assert_eq!(
+            labels.len(),
+            7,
+            "a new class is a reviewed vocabulary change"
+        );
+        assert_eq!(
+            labels.len(),
+            std::collections::BTreeSet::from_iter(labels.iter().copied()).len(),
+            "two classes must never share a label, which would merge their series"
+        );
+        for label in &labels {
+            assert!(
+                !label.is_empty()
+                    && label.len() <= 32
+                    && label
+                        .bytes()
+                        .all(|byte| byte.is_ascii_lowercase() || byte == b'_'),
+                "an operation class must be a short bare lowercase word: {label:?}"
+            );
+            assert_ne!(*label, OPERATION_ERROR_CLASS_NONE);
+        }
     }
 
     fn tls_settings(tls_mode: DatabaseTlsMode) -> DatabaseSettings {
