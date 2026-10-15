@@ -2920,6 +2920,246 @@ fn validation_failure_audit_paths_preserve_schema_properties_and_hide_dynamic_ke
 }
 
 #[tokio::test]
+async fn numeric_keywords_judge_arguments_beyond_f64_exactly_and_audit_rejections() {
+    // 10^400 written out in full: past u64 and f64, with no exponent to shorten it.
+    let wide_integer = format!("1{}", "0".repeat(400));
+    let cases = [
+        (r#"{"minimum": 0}"#, "1e400".to_owned(), None),
+        (r#"{"minimum": 0}"#, "-1e400".to_owned(), Some("minimum")),
+        (r#"{"minimum": 0}"#, wide_integer.clone(), None),
+        (
+            r#"{"minimum": 0}"#,
+            format!("-{wide_integer}"),
+            Some("minimum"),
+        ),
+        (r#"{"maximum": 100}"#, "1e400".to_owned(), Some("maximum")),
+        (r#"{"maximum": 100}"#, "-1e400".to_owned(), None),
+        (r#"{"maximum": 100}"#, wide_integer.clone(), Some("maximum")),
+        (r#"{"exclusiveMinimum": 0}"#, "1e400".to_owned(), None),
+        (
+            r#"{"exclusiveMinimum": 0}"#,
+            "-1e400".to_owned(),
+            Some("exclusiveMinimum"),
+        ),
+        (
+            r#"{"exclusiveMaximum": 100}"#,
+            "1e400".to_owned(),
+            Some("exclusiveMaximum"),
+        ),
+        (r#"{"exclusiveMaximum": 100}"#, "-1e400".to_owned(), None),
+        (r#"{"multipleOf": 2}"#, "1e400".to_owned(), None),
+        (r#"{"multipleOf": 2}"#, "-1e400".to_owned(), None),
+        (r#"{"multipleOf": 0.5}"#, "1e400".to_owned(), None),
+        (
+            r#"{"multipleOf": 3}"#,
+            "1e400".to_owned(),
+            Some("multipleOf"),
+        ),
+        (
+            r#"{"multipleOf": 3}"#,
+            wide_integer.clone(),
+            Some("multipleOf"),
+        ),
+        (r#"{"enum": [1, 2]}"#, "1e400".to_owned(), Some("enum")),
+        (r#"{"enum": [1, 2]}"#, wide_integer.clone(), Some("enum")),
+        (r#"{"enum": [1e400]}"#, wide_integer.clone(), None),
+        (r#"{"const": 1}"#, "1e400".to_owned(), Some("const")),
+        (r#"{"const": 1}"#, "-1e400".to_owned(), Some("const")),
+        (r#"{"const": 1e400}"#, wide_integer.clone(), None),
+        (r#"{"type": "integer"}"#, "1e400".to_owned(), None),
+        (r#"{"type": "integer"}"#, "-1e400".to_owned(), None),
+        (r#"{"type": "integer"}"#, "1.5e400".to_owned(), None),
+        (r#"{"type": "integer"}"#, wide_integer.clone(), None),
+        (r#"{"type": "integer"}"#, "1e-400".to_owned(), Some("type")),
+        // Exact where comparing as f64 would round the two sides together.
+        (
+            r#"{"maximum": 18446744073709551615}"#,
+            "18446744073709551616".to_owned(),
+            Some("maximum"),
+        ),
+        (
+            r#"{"enum": [18446744073709551616]}"#,
+            "18446744073709551617".to_owned(),
+            Some("enum"),
+        ),
+        (
+            r#"{"maximum": 0.3}"#,
+            "0.30000000000000001".to_owned(),
+            Some("maximum"),
+        ),
+        // Limits beyond f64 in the schema itself.
+        (r#"{"maximum": 1e400}"#, "5".to_owned(), None),
+        (r#"{"minimum": 1e400}"#, "5".to_owned(), Some("minimum")),
+    ];
+
+    for (keyword_schema, argument, rejected_by) in cases {
+        let mut tool = echo_tool();
+        tool["input_json_schema"] = serde_json::from_str(&format!(
+            r#"{{"type": "object", "required": ["value"], "properties": {{"value": {keyword_schema}}}, "additionalProperties": false}}"#
+        ))
+        .expect("numeric keyword schema should parse");
+        let args: Value = serde_json::from_str(&format!(r#"{{"value": {argument}}}"#))
+            .expect("numeric argument should parse");
+        let shown = &argument[..argument.len().min(24)];
+
+        let Some(keyword) = rejected_by else {
+            let (addr, server) = one_request_server(StatusCode::OK, b"ok").await;
+            let (executor, _capture) = executor_for_tools(
+                addr,
+                [tool],
+                runtime_config([("echo", enabled_tool(500, 1))], 2, 1, 100),
+            );
+            let result = executor
+                .execute(
+                    "echo",
+                    args.clone(),
+                    invocation_context(),
+                    CancellationToken::new(),
+                )
+                .await
+                .unwrap_or_else(|error| {
+                    panic!("{keyword_schema} should accept {shown}: {error:?}")
+                });
+            assert_eq!(http_response(result).status, StatusCode::OK);
+            let request = server.await.expect("server task should join");
+            assert_eq!(
+                serde_json::from_slice::<Value>(&request.body)
+                    .expect("request body should be JSON"),
+                args,
+                "{keyword_schema} must forward {shown} exactly"
+            );
+            continue;
+        };
+
+        let (executor, capture) = executor_for_tools(
+            socket_addr(1),
+            [tool],
+            runtime_config([("echo", enabled_tool(500, 1))], 2, 1, 100),
+        );
+        let error = executor
+            .execute("echo", args, invocation_context(), CancellationToken::new())
+            .await
+            .expect_err("an out-of-range numeric argument should be rejected");
+        let ToolRuntimeError::WorkFailed {
+            reason: Some(reason),
+            details: Some(details),
+            ..
+        } = error
+        else {
+            panic!("{keyword_schema} must reject {shown} as invalid params");
+        };
+        assert_eq!(reason, TOOL_INVALID_PARAMS_REASON);
+        let problems = details["problems"]
+            .as_array()
+            .expect("caller problems should be present");
+        assert_eq!(problems.len(), 1, "{keyword_schema} with {shown}");
+        assert_eq!(problems[0]["path"], "/value");
+        assert_eq!(
+            problems[0]["keyword"], keyword,
+            "{keyword_schema} with {shown}"
+        );
+
+        let events = audit_events(&capture, 3).await;
+        let failure = events
+            .iter()
+            .find(|event| event.event_type == audit::event::TOOL_INVOKE_FAILURE)
+            .expect("the rejection should be audited");
+        assert_eq!(failure.payload["failure_reason"], "invalid_params");
+        assert_eq!(failure.payload["problems"][0]["path"], "/value");
+        assert_eq!(failure.payload["problems"][0]["keyword"], keyword);
+    }
+}
+
+#[tokio::test]
+async fn idn_formats_still_reject_invalid_internationalized_arguments() {
+    // Without jsonschema's `idna` feature these are unknown formats, which
+    // accept anything. Draft 7 asserts `format`; 2020-12 only annotates it.
+    let mut tool = echo_tool();
+    tool["input_json_schema"] = json!({
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "type": "object",
+        "properties": {
+            "email": {"type": "string", "format": "idn-email"},
+            "host": {"type": "string", "format": "idn-hostname"}
+        },
+        "additionalProperties": false
+    });
+
+    let (executor, capture) = executor_for_tools(
+        socket_addr(1),
+        [tool.clone()],
+        runtime_config([("echo", enabled_tool(500, 1))], 2, 1, 100),
+    );
+    let error = executor
+        .execute(
+            "echo",
+            // A label may not start with a hyphen, nor hold "--" in its third
+            // and fourth positions unless it is an A-label.
+            json!({"email": "用户@-例子.广告", "host": "ab--cd.example"}),
+            invocation_context(),
+            CancellationToken::new(),
+        )
+        .await
+        .expect_err("invalid internationalized arguments should be rejected");
+    let ToolRuntimeError::WorkFailed {
+        reason: Some(reason),
+        details: Some(details),
+        ..
+    } = error
+    else {
+        panic!("invalid internationalized arguments must be invalid params");
+    };
+    assert_eq!(reason, TOOL_INVALID_PARAMS_REASON);
+    let mut problems = details["problems"]
+        .as_array()
+        .expect("caller problems should be present")
+        .iter()
+        .map(|problem| {
+            (
+                problem["path"].as_str().unwrap_or_default().to_owned(),
+                problem["keyword"].as_str().unwrap_or_default().to_owned(),
+            )
+        })
+        .collect::<Vec<_>>();
+    problems.sort();
+    assert_eq!(
+        problems,
+        vec![
+            ("/email".to_owned(), "format".to_owned()),
+            ("/host".to_owned(), "format".to_owned()),
+        ]
+    );
+    let events = audit_events(&capture, 3).await;
+    assert!(events.iter().any(|event| {
+        event.event_type == audit::event::TOOL_INVOKE_FAILURE
+            && event.payload["failure_reason"] == "invalid_params"
+    }));
+
+    let (addr, server) = one_request_server(StatusCode::OK, b"ok").await;
+    let (executor, _capture) = executor_for_tools(
+        addr,
+        [tool],
+        runtime_config([("echo", enabled_tool(500, 1))], 2, 1, 100),
+    );
+    let args = json!({"email": "用户@例子.广告", "host": "例子.测试"});
+    let result = executor
+        .execute(
+            "echo",
+            args.clone(),
+            invocation_context(),
+            CancellationToken::new(),
+        )
+        .await
+        .expect("valid internationalized arguments should pass");
+    assert_eq!(http_response(result).status, StatusCode::OK);
+    let request = server.await.expect("server task should join");
+    assert_eq!(
+        serde_json::from_slice::<Value>(&request.body).expect("request body should be JSON"),
+        args
+    );
+}
+
+#[tokio::test]
 async fn schema_validation_rejects_unexpected_args_by_default_before_network() {
     let (addr, server) = one_request_server(StatusCode::OK, b"should-not-run").await;
     let (executor, _capture) = executor_for_tools(
