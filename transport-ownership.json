@@ -1147,6 +1147,7 @@
         "dependencies": [
           "arc-swap@1.9.2|registry+https://github.com/rust-lang/crates.io-index",
           "async-trait@0.1.92|registry+https://github.com/rust-lang/crates.io-index",
+          "aws-lc-rs@1.18.1|registry+https://github.com/rust-lang/crates.io-index",
           "axum@0.8.9|registry+https://github.com/rust-lang/crates.io-index",
           "base64@0.23.1|registry+https://github.com/rust-lang/crates.io-index",
           "bytes@1.12.1|registry+https://github.com/rust-lang/crates.io-index",
@@ -5527,6 +5528,17 @@
             "features": [
               "zeroize"
             ],
+            "source": "registry+https://github.com/rust-lang/crates.io-index"
+          },
+          {
+            "name": "aws-lc-rs",
+            "rename": null,
+            "kind": "dev",
+            "target": null,
+            "req": "^1.18.1",
+            "optional": false,
+            "uses_default_features": true,
+            "features": [],
             "source": "registry+https://github.com/rust-lang/crates.io-index"
           },
           {
