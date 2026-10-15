@@ -41,8 +41,13 @@ use crate::{
             ConnectionAuthentication, ConnectionEndpoint, ConnectionId, ConnectionKind,
             ConnectionWrite, OAuthClientAuthMethod, TlsProfile,
         },
-        secret::{OperatorSecretAliasConfig, OperatorSecretAliasSource, SecretRootConfig},
+        secret::{
+            OperatorSecretAliasConfig, OperatorSecretAliasSource, ResolvedSecret,
+            SecretAliasMetadata, SecretProviderKind, SecretPurpose, SecretResolveError,
+            SecretResolveErrorKind, SecretResolver, SecretRootConfig,
+        },
         store::{StoredEnumSourceValue, StoredOpenApiCatalog, StoredOpenApiCatalogEntry},
+        vault_secret::VaultProviderConfig,
     },
     discovery::{
         aggregator::{EndpointAggregatorSink, EndpointAggregatorSinkConfig},
@@ -2162,13 +2167,18 @@ async fn connection_tool_with_unenforced_caller_assertion_is_refused_before_any_
     const API_KEY_CANARY: &str = "assertion-test-api-key-canary";
     const SIGNING_KEY_CANARY: &str = "assertion-test-signing-key-canary";
     let (addr, ca_pem, server) = one_request_tls_server().await;
-    let connection = TemporaryStaticAuthRuntime::header_api_key_with_caller_assertion(
+    let (connection, secrets) = TemporaryStaticAuthRuntime::header_api_key_with_caller_assertion(
         addr,
         &ca_pem,
         API_KEY_CANARY.as_bytes(),
         SIGNING_KEY_CANARY.as_bytes(),
     )
     .await;
+    assert_eq!(
+        secrets.resolutions(),
+        0,
+        "setting up the Connection must not read its secrets"
+    );
     let capture = CaptureSink::new();
     let audit = AuditLog::new(Arc::new(capture.clone()) as Arc<dyn AuditSink>);
     let runtime = ToolRuntime::new(
@@ -2237,46 +2247,30 @@ async fn connection_tool_with_unenforced_caller_assertion_is_refused_before_any_
         assert!(!rendered.contains(canary), "the audit leaked {canary}");
     }
 
-    // While both secrets resolve, a missing secret-resolution event proves
-    // nothing. Remove them: a provider read before the refusal would now fail
-    // as `credential_unavailable` and raise that event, so the same refusal
-    // with no such event shows the provider is never consulted.
-    fs::remove_file(&connection.secret_path).expect("the API key file should disappear");
-    fs::remove_file(connection.root.join("assertion-signing-key"))
-        .expect("the signing key file should disappear");
-    let error = executor
-        .execute(
-            "get_charge",
-            json!({ "charge_id": "ch_unattested_unreadable" }),
-            invocation_context(),
-            CancellationToken::new(),
-        )
-        .await
-        .expect_err("the refusal must not depend on the secrets resolving");
-    let ToolRuntimeError::WorkFailed { reason, .. } = error else {
-        panic!("the refusal should surface as a work failure");
-    };
-    assert_eq!(reason.as_deref(), Some("caller_assertion_not_enforced"));
-    wait_until(Duration::from_secs(1), || {
-        capture
-            .events()
-            .iter()
-            .filter(|event| event.event_type == audit::event::TOOL_INVOKE_FAILURE)
-            .count()
-            >= 2
-    })
-    .await;
-    let events = capture.events();
-    assert!(events
-        .iter()
-        .filter(|event| event.event_type == audit::event::TOOL_INVOKE_FAILURE)
-        .all(|event| event.payload["failure_reason"] == json!("caller_assertion_not_enforced")));
+    // Both secrets sit behind a provider that counts every resolution, so
+    // "never consulted" is a count of zero rather than the absence of an
+    // event that a successful read would not raise either.
+    assert_eq!(
+        secrets.resolutions(),
+        0,
+        "no secret provider may be consulted for a refused Connection"
+    );
     assert!(
         events
             .iter()
             .all(|event| event.event_type != audit::event::CONNECTION_SECRET_RESOLUTION_FAILED),
-        "no secret provider may be consulted for a refused Connection"
+        "a refused Connection must not report a secret-resolution failure"
     );
+    // The count is real: the resolver the runtime uses routes this alias to
+    // the counting provider.
+    let resolved = connection
+        .control_plane
+        .secret_resolver()
+        .resolve("billing-api-key", SecretPurpose::HeaderApiKey)
+        .await
+        .expect("the counting provider should serve the API key");
+    assert_eq!(resolved.expose(), API_KEY_CANARY.as_bytes());
+    assert_eq!(secrets.resolutions(), 1);
     assert!(
         tokio::time::timeout(Duration::from_millis(100), server)
             .await
@@ -2290,7 +2284,7 @@ async fn composite_leaf_on_unenforced_caller_assertion_is_refused_before_member_
     // A composite reports its own `composite_failed`; the leaf's reason has to
     // survive into the caller's details so the operator can see why.
     let (addr, ca_pem, server) = scripted_tls_server(Vec::new()).await;
-    let connection = TemporaryStaticAuthRuntime::header_api_key_with_caller_assertion(
+    let (connection, secrets) = TemporaryStaticAuthRuntime::header_api_key_with_caller_assertion(
         addr,
         &ca_pem,
         b"composite-key",
@@ -2348,6 +2342,11 @@ async fn composite_leaf_on_unenforced_caller_assertion_is_refused_before_member_
         .find(|event| event.event_type == audit::event::TOOL_INVOKE_FAILURE)
         .expect("the composite refusal should be audited");
     assert_eq!(failure.payload["failure_reason"], json!("composite_failed"));
+    assert_eq!(
+        secrets.resolutions(),
+        0,
+        "a refused composite leaf must not consult a secret provider"
+    );
     assert!(
         server
             .await
@@ -5888,23 +5887,31 @@ impl TemporaryStaticAuthRuntime {
     }
 
     /// A header-API-key Connection that also asks for a signed caller
-    /// assertion, with `signing_key` stored behind the assertion's alias so a
-    /// test can prove nothing ever read it.
+    /// assertion. Its API key and the assertion's signing key are served by
+    /// the returned counting provider rather than by files, so a test can
+    /// prove that neither was ever read.
     async fn header_api_key_with_caller_assertion(
         addr: SocketAddr,
         ca_pem: &str,
         secret: &[u8],
         signing_key: &[u8],
-    ) -> Self {
-        Self::header_api_key_with(addr, ca_pem, secret, &[], Some(signing_key)).await
+    ) -> (Self, Arc<CountingSecretProvider>) {
+        let secrets = Arc::new(CountingSecretProvider::new(vec![
+            ("billing-api-key", secret.to_vec()),
+            ("assertion-signing-key", signing_key.to_vec()),
+        ]));
+        let connection = Self::header_api_key_with(addr, ca_pem, secret, &[], Some(&secrets)).await;
+        (connection, secrets)
     }
 
+    /// With `counted_assertion`, the Connection also carries a caller
+    /// assertion, and its secrets resolve only through that provider.
     async fn header_api_key_with(
         addr: SocketAddr,
         ca_pem: &str,
         secret: &[u8],
         additional: &[(&str, &str, &[u8])],
-        assertion_signing_key: Option<&[u8]>,
+        counted_assertion: Option<&Arc<CountingSecretProvider>>,
     ) -> Self {
         let root = std::env::temp_dir().join(format!(
             "greengateway-tool-static-auth-{}",
@@ -5926,13 +5933,18 @@ impl TemporaryStaticAuthRuntime {
                 .expect("temporary CA permissions should set");
         }
 
-        let mut aliases = vec![OperatorSecretAliasConfig {
-            id: "billing-api-key".to_owned(),
-            label: "Billing API key".to_owned(),
-            source: OperatorSecretAliasSource::File {
-                key: "api-key".to_owned(),
-            },
-        }];
+        // A counted Connection resolves its API key through the provider, so
+        // the file written above is not registered as an alias for it.
+        let mut aliases = Vec::new();
+        if counted_assertion.is_none() {
+            aliases.push(OperatorSecretAliasConfig {
+                id: "billing-api-key".to_owned(),
+                label: "Billing API key".to_owned(),
+                source: OperatorSecretAliasSource::File {
+                    key: "api-key".to_owned(),
+                },
+            });
+        }
         for (_, alias_id, value) in additional {
             let path = root.join(alias_id);
             fs::write(&path, value).expect("temporary additional secret should write");
@@ -5950,47 +5962,35 @@ impl TemporaryStaticAuthRuntime {
                 },
             });
         }
-        let caller_assertion = match assertion_signing_key {
-            Some(signing_key) => {
-                let path = root.join("assertion-signing-key");
-                fs::write(&path, signing_key).expect("temporary signing key should write");
-                #[cfg(unix)]
-                {
-                    use std::os::unix::fs::PermissionsExt;
-                    fs::set_permissions(&path, fs::Permissions::from_mode(0o600))
-                        .expect("temporary signing key permissions should set");
-                }
-                aliases.push(OperatorSecretAliasConfig {
-                    id: "assertion-signing-key".to_owned(),
-                    label: "Caller assertion signing key".to_owned(),
-                    source: OperatorSecretAliasSource::File {
-                        key: "assertion-signing-key".to_owned(),
-                    },
-                });
-                Some(CallerAssertionSettings {
-                    signing_key_id: "assertion-signing-key".to_owned(),
-                    kid: "gw-test-1".to_owned(),
-                    algorithm: CallerAssertionAlgorithm::Es256,
-                    issuer: "https://gateway.example.test".to_owned(),
-                    audience: "https://billing.example.test".to_owned(),
-                    token_type: "at+jwt".to_owned(),
-                    header_name: "x-caller-assertion".to_owned(),
-                    lifetime_seconds: 60,
-                    claims: Vec::new(),
-                    bind_request: false,
-                    bind_approval: false,
-                })
-            }
-            None => None,
-        };
+        let caller_assertion = counted_assertion.map(|_| CallerAssertionSettings {
+            signing_key_id: "assertion-signing-key".to_owned(),
+            kid: "gw-test-1".to_owned(),
+            algorithm: CallerAssertionAlgorithm::Es256,
+            issuer: "https://gateway.example.test".to_owned(),
+            audience: "https://billing.example.test".to_owned(),
+            token_type: "at+jwt".to_owned(),
+            header_name: "x-caller-assertion".to_owned(),
+            lifetime_seconds: 60,
+            claims: Vec::new(),
+            bind_request: false,
+            bind_approval: false,
+        });
 
         let mut config = Config::test_defaults();
         config.connections_sqlite_path =
             Some(root.join("connections.sqlite").display().to_string());
         config.connection_secrets_root = Some(SecretRootConfig::new(root.clone()));
         config.connection_secret_aliases = aliases;
+        if let Some(secrets) = counted_assertion {
+            config.connection_vault_provider = secrets.alias_declarations();
+        }
         let control_plane =
             ConnectionControlPlane::from_config(&config).expect("control plane should build");
+        if let Some(secrets) = counted_assertion {
+            control_plane.install_network_secret_providers(vec![
+                Arc::clone(secrets) as Arc<dyn SecretResolver>
+            ]);
+        }
         let initial = control_plane.runtime_snapshot();
         let created = control_plane
             .create_managed(
@@ -6147,6 +6147,106 @@ impl TemporaryStaticAuthRuntime {
             runtime,
             egress_client,
         }
+    }
+}
+
+/// Serves fixed secret values and counts every resolution.
+///
+/// Installed as the network provider for the aliases it declares, which is
+/// the seam the control plane offers for substituting a provider in tests. A
+/// test can then show that a refusal never consulted a provider at all,
+/// rather than only that no resolution-failure event appeared.
+struct CountingSecretProvider {
+    values: Vec<(&'static str, Vec<u8>)>,
+    resolutions: AtomicUsize,
+}
+
+impl CountingSecretProvider {
+    fn new(values: Vec<(&'static str, Vec<u8>)>) -> Self {
+        Self {
+            values,
+            resolutions: AtomicUsize::new(0),
+        }
+    }
+
+    fn resolutions(&self) -> usize {
+        self.resolutions.load(Ordering::SeqCst)
+    }
+
+    /// Declares this provider's aliases as Vault aliases, so the control
+    /// plane defers them to an installed network provider. The profile is
+    /// never contacted: nothing activates the real providers in these tests.
+    fn alias_declarations(&self) -> VaultProviderConfig {
+        let aliases = self
+            .values
+            .iter()
+            .map(|(id, _)| {
+                json!({
+                    "id": id,
+                    "label": format!("Counted {id}"),
+                    "profile": "counted",
+                    "mount": "secret",
+                    "path": "gateway/counted",
+                    "key": id,
+                })
+            })
+            .collect::<Vec<_>>();
+        serde_json::from_value(json!({
+            "profiles": [{
+                "id": "counted",
+                "address": "https://vault.example.test:8200",
+                "auth": {
+                    "type": "workload_jwt",
+                    "mount": "kubernetes",
+                    "role": "gateway",
+                    "token_root": "/var/run/secrets/tokens",
+                    "token_file": "vault-token"
+                }
+            }],
+            "aliases": aliases,
+        }))
+        .expect("counted alias declarations should deserialize")
+    }
+}
+
+#[async_trait::async_trait]
+impl SecretResolver for CountingSecretProvider {
+    async fn resolve(
+        &self,
+        alias_id: &str,
+        purpose: SecretPurpose,
+    ) -> Result<ResolvedSecret, SecretResolveError> {
+        self.resolutions.fetch_add(1, Ordering::SeqCst);
+        let value = self
+            .values
+            .iter()
+            .find(|(id, _)| *id == alias_id)
+            .map(|(_, value)| value.clone())
+            .ok_or_else(|| {
+                SecretResolveError::new(alias_id, SecretResolveErrorKind::UnknownAlias)
+            })?;
+        ResolvedSecret::new(purpose, value)
+            .map_err(|_| SecretResolveError::new(alias_id, SecretResolveErrorKind::InvalidMaterial))
+    }
+
+    fn contains_alias(&self, alias_id: &str) -> bool {
+        self.values.iter().any(|(id, _)| *id == alias_id)
+    }
+
+    fn aliases(&self) -> Vec<SecretAliasMetadata> {
+        self.values
+            .iter()
+            .map(|(id, _)| SecretAliasMetadata {
+                id: (*id).to_owned(),
+                label: format!("Counted {id}"),
+                provider: SecretProviderKind::VaultKvV2,
+                configured: true,
+                purpose: None,
+                pinned: false,
+                version: None,
+                rotated_at: None,
+            })
+            .collect()
     }
 }
 
