@@ -237,6 +237,8 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 
 ### Fixed
 
+- Saving an MCP Connection in the admin UI no longer deletes its stored test profile. The editor hides the test-profile section for MCP Connections and dropped any profile the Connection had been saved with through the admin API. The profile is inert on an MCP Connection, but dropping it changed the stored record on an unrelated save, and on a credentialed Connection the changed test target made that save require secrets permission. Switching a Connection's kind to MCP in the editor still clears the profile.
+
 - Container release tags now depend on successful checks for the exact commit. CI builds a unique candidate, waits for all validation and secret-scanning jobs, and promotes its immutable digest without rebuilding. Pull-request builds cannot publish, and runs superseded before the final ref check leave their candidates unpromoted.
 
 - Policy screens now use server-computed write permission instead of decoding JWT roles in the browser. Repeated saves of a new rule update its returned ID, and the default-deny banner accurately describes forwarding under global shadow enforcement.

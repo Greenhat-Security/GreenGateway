@@ -357,7 +357,13 @@ export function writeFromForm(form: ConnectionFormState): ConnectionWrite {
       }
       : {}),
     ...(discovery ? { discovery } : {}),
-    ...(form.kind === 'http_api' && form.testProfileEnabled
+    // Not gated on the kind. Switching to MCP already clears
+    // `testProfileEnabled`, so this only keeps a profile an MCP Connection was
+    // loaded with. It is inert there and its section is hidden, but dropping it
+    // on an unrelated save deleted a stored field, and on a credentialed
+    // Connection the changed test target made that save need secrets
+    // permission.
+    ...(form.testProfileEnabled
       ? {
         test_profile: {
           method: form.testMethod,

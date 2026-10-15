@@ -105,6 +105,28 @@ describe('connection editor load and save', () => {
     expect(write.display_name).toBe('Plain API');
   });
 
+  it('keeps a test profile an MCP connection was loaded with', async () => {
+    const stored = storedConnection();
+    const mcp = {
+      ...stored,
+      kind: 'mcp_streamable_http',
+      configuration: {
+        ...stored.configuration,
+        discovery: {
+          type: 'managed_mcp',
+          use_connection_authentication: true,
+        },
+      },
+    };
+
+    const write = writeFromForm(formFromDetail(await loadThroughClient(mcp)));
+
+    expect(write.kind).toBe('mcp_streamable_http');
+    expect(write.test_profile).toStrictEqual(
+      stored.configuration.test_profile,
+    );
+  });
+
   it('refuses a header name the caller assertion already uses', async () => {
     const form = formFromDetail(await loadThroughClient(storedConnection()));
 
