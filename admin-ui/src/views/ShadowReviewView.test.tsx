@@ -18,7 +18,6 @@ describe('ShadowReviewView', () => {
     vi.stubGlobal(
       'fetch',
       shadowReviewFetchMock({
-        policy: policyDocument(),
         review: shadowReviewResponse({
           rules: [
             shadowSummary({
@@ -77,10 +76,9 @@ describe('ShadowReviewView', () => {
     expect(screen.getByText('Jul 4, 2026, 4:10 PM UTC')).toBeTruthy();
   });
 
-  it('requires confirming before promoting a shadow rule, with a freshly fetched current policy ETag', async () => {
+  it('requires confirming before promoting a shadow rule, sent with the reviewed policy ETag', async () => {
     const fetcher = shadowReviewFetchMock({
-      policy: policyDocument(),
-      policyEtags: ['"etag-stale"', '"etag-current"'],
+      policyEtags: ['"etag-reviewed"'],
       review: shadowReviewResponse({
         rules: [shadowSummary({ rule_id: 'shadow-reports' })],
       }),
@@ -89,11 +87,12 @@ describe('ShadowReviewView', () => {
 
     renderShadowReviewView();
 
-    fireEvent.click(
-      await screen.findByRole('button', {
-        name: 'Promote shadow-reports to deny',
-      }),
-    );
+    const promoteButton = (await screen.findByRole('button', {
+      name: 'Promote shadow-reports to deny',
+    })) as HTMLButtonElement;
+    expect(promoteButton.disabled).toBe(false);
+    expect(promoteButton.getAttribute('aria-describedby')).toBeNull();
+    fireEvent.click(promoteButton);
 
     expect(fetcher.patchRuleIds).toEqual([]);
     const confirmButton = await screen.findByRole('button', {
@@ -103,15 +102,18 @@ describe('ShadowReviewView', () => {
     fireEvent.click(confirmButton);
 
     await waitFor(() => {
-      expect(fetcher.patchHeaders).toEqual(['"etag-current"']);
+      expect(fetcher.patchHeaders).toEqual(['"etag-reviewed"']);
     });
     expect(fetcher.patchBodies).toEqual([{ action: 'deny' }]);
     expect(fetcher.patchRuleIds).toEqual(['shadow-reports']);
+    expect(await screen.findByText('Rule promoted to deny.')).toBeTruthy();
+    // The change is tied to the policy the operator reviewed, not to one
+    // fetched just before sending it.
+    expect(fetcher.policyRequestCount()).toBe(1);
   });
 
   it('cancels a pending promote confirmation without patching the rule', async () => {
     const fetcher = shadowReviewFetchMock({
-      policy: policyDocument(),
       review: shadowReviewResponse({
         rules: [shadowSummary({ rule_id: 'shadow-reports' })],
       }),
@@ -136,10 +138,9 @@ describe('ShadowReviewView', () => {
     expect(fetcher.patchRuleIds).toEqual([]);
   });
 
-  it('demotes a shadow rule by disabling it with a freshly fetched current policy ETag', async () => {
+  it('demotes a shadow rule by disabling it with the reviewed policy ETag', async () => {
     const fetcher = shadowReviewFetchMock({
-      policy: policyDocument(),
-      policyEtags: ['"etag-stale"', '"etag-current"'],
+      policyEtags: ['"etag-reviewed"'],
       review: shadowReviewResponse({
         rules: [shadowSummary({ rule_id: 'shadow-reports' })],
       }),
@@ -155,31 +156,168 @@ describe('ShadowReviewView', () => {
     );
 
     await waitFor(() => {
-      expect(fetcher.patchHeaders).toEqual(['"etag-current"']);
+      expect(fetcher.patchHeaders).toEqual(['"etag-reviewed"']);
     });
     expect(fetcher.patchBodies).toEqual([{ enabled: false }]);
     expect(fetcher.patchRuleIds).toEqual(['shadow-reports']);
+    expect(fetcher.policyRequestCount()).toBe(1);
+  });
+
+  it('sends the next change with the ETag the previous change returned', async () => {
+    const fetcher = shadowReviewFetchMock({
+      policyEtags: ['"etag-reviewed"'],
+      review: shadowReviewResponse({
+        rules: [
+          shadowSummary({ rule_id: 'shadow-reports' }),
+          shadowSummary({ rule_id: 'shadow-exports' }),
+        ],
+      }),
+    });
+    vi.stubGlobal('fetch', fetcher.fetch);
+
+    renderShadowReviewView();
+
+    fireEvent.click(
+      await screen.findByRole('button', { name: 'Disable shadow-reports' }),
+    );
+    expect(await screen.findByText('Shadow rule disabled.')).toBeTruthy();
+    expect(screen.queryByText('shadow-reports')).toBeNull();
+
+    fireEvent.click(screen.getByRole('button', { name: 'Disable shadow-exports' }));
+
+    await waitFor(() => {
+      expect(fetcher.patchHeaders).toEqual([
+        '"etag-reviewed"',
+        '"etag-after-patch-1"',
+      ]);
+    });
+    expect(fetcher.patchRuleIds).toEqual(['shadow-reports', 'shadow-exports']);
+    expect(fetcher.policyRequestCount()).toBe(1);
+  });
+
+  it('refuses a position-keyed promote with 412 after a concurrent change instead of patching another rule', async () => {
+    const reviewedRule = rule({ id: null, action: 'shadow', path: '/reports/**' });
+    const fetcher = shadowReviewFetchMock({
+      policyEtags: ['"etag-reviewed"'],
+      review: shadowReviewResponse({
+        rules: [shadowSummary({ rule_id: '0', rule: reviewedRule })],
+      }),
+    });
+    vi.stubGlobal('fetch', fetcher.fetch);
+
+    renderShadowReviewView();
+
+    fireEvent.click(
+      await screen.findByRole('button', { name: 'Promote 0 to deny' }),
+    );
+    // Another writer reorders the rules, so position 0 is now another rule.
+    fetcher.setServerEtag('"etag-after-concurrent-reorder"');
+    fireEvent.click(
+      await screen.findByRole('button', { name: 'Confirm promote 0 to deny' }),
+    );
+
+    expect(await screen.findByText('Policy changed')).toBeTruthy();
+    expect(
+      screen.getByText('Policy changed since this page loaded; refresh and retry.'),
+    ).toBeTruthy();
+    expect(fetcher.patchHeaders).toEqual(['"etag-reviewed"']);
+    expect(fetcher.appliedPatchRuleIds).toEqual([]);
+    expect(screen.getByText('0')).toBeTruthy();
+    expect(
+      (
+        screen.getByRole('button', {
+          name: 'Confirm promote 0 to deny',
+          description:
+            'Promote and Disable are unavailable because the policy changed after this review was read. Refresh to review the current rules.',
+        }) as HTMLButtonElement
+      ).disabled,
+    ).toBe(true);
+    expect(
+      (screen.getByRole('button', { name: 'Disable 0' }) as HTMLButtonElement).disabled,
+    ).toBe(true);
+  });
+
+  it('blocks changes when the review and the policy were read from different versions', async () => {
+    const fetcher = shadowReviewFetchMock({
+      // A write landed between the two reads: position 0 holds another rule
+      // in the policy whose ETag a change would be sent with.
+      policy: policyDocument({
+        rules: [rule({ id: null, action: 'shadow', path: '/exports/**' })],
+      }),
+      review: shadowReviewResponse({
+        rules: [
+          shadowSummary({
+            rule_id: '0',
+            rule: rule({ id: null, action: 'shadow', path: '/reports/**' }),
+          }),
+        ],
+      }),
+    });
+    vi.stubGlobal('fetch', fetcher.fetch);
+
+    renderShadowReviewView();
+
+    expect(await screen.findByText('Policy changed during review')).toBeTruthy();
+    const description =
+      'Promote and Disable are unavailable because the policy changed after this review was read. Refresh to review the current rules.';
+    const promoteButton = screen.getByRole('button', {
+      name: 'Promote 0 to deny',
+      description,
+    }) as HTMLButtonElement;
+    const disableButton = screen.getByRole('button', {
+      name: 'Disable 0',
+      description,
+    }) as HTMLButtonElement;
+    expect(promoteButton.disabled).toBe(true);
+    expect(disableButton.disabled).toBe(true);
+    fireEvent.click(disableButton);
+    expect(fetcher.patchRuleIds).toEqual([]);
+  });
+
+  it('blocks changes when the policy read returned no ETag', async () => {
+    const fetcher = shadowReviewFetchMock({
+      policyEtags: [],
+      review: shadowReviewResponse({
+        rules: [shadowSummary({ rule_id: 'shadow-reports' })],
+      }),
+    });
+    vi.stubGlobal('fetch', fetcher.fetch);
+
+    renderShadowReviewView();
+
+    const promoteButton = (await screen.findByRole('button', {
+      name: 'Promote shadow-reports to deny',
+      description:
+        'Promote and Disable are unavailable because the policy ETag was not returned, so a change could not be tied to the reviewed policy. Refresh and retry.',
+    })) as HTMLButtonElement;
+    expect(promoteButton.disabled).toBe(true);
+    expect(
+      (screen.getByRole('button', { name: 'Disable shadow-reports' }) as HTMLButtonElement)
+        .disabled,
+    ).toBe(true);
+    expect(fetcher.patchRuleIds).toEqual([]);
   });
 
   it('disables promote and demote controls for read-only principals', async () => {
+    const summary = shadowSummary({ rule_id: 'read-only-shadow' });
     vi.stubGlobal(
       'fetch',
       shadowReviewFetchMock({
-      canWrite: false,
+        canWrite: false,
         policy: policyDocument({
           roles: {
             reader: { permissions: ['admin:policy:read'] },
           },
+          rules: [summary.rule],
         }),
-        review: shadowReviewResponse({
-          rules: [shadowSummary({ rule_id: 'read-only-shadow' })],
-        }),
+        review: shadowReviewResponse({ rules: [summary] }),
       }).fetch,
     );
 
     renderShadowReviewView({ token: jwtWithRoles(['reader']) });
 
     expect(await screen.findByText('Policy write permission required')).toBeTruthy();
+    expect(screen.queryByText('Policy changed during review')).toBeNull();
     expect(
       (
         screen.getByRole('button', {
@@ -200,7 +338,6 @@ describe('ShadowReviewView', () => {
     vi.stubGlobal(
       'fetch',
       shadowReviewFetchMock({
-        policy: policyDocument(),
         review: shadowReviewResponse({ rules: [] }),
       }).fetch,
     );
@@ -216,7 +353,6 @@ describe('ShadowReviewView', () => {
     vi.stubGlobal(
       'fetch',
       shadowReviewFetchMock({
-        policy: policyDocument(),
         review: shadowReviewResponse({
           rules: [
             shadowSummary({
@@ -243,7 +379,6 @@ describe('ShadowReviewView', () => {
     vi.stubGlobal(
       'fetch',
       shadowReviewFetchMock({
-        policy: policyDocument(),
         review: shadowReviewResponse({
           scanned_event_count: 100_000,
           scan_truncated: true,
@@ -316,6 +451,52 @@ describe('ShadowReviewView', () => {
     expect(screen.queryByText('Request failed')).toBeNull();
   });
 
+  it('disables Promote and Disable while shadow evidence is unavailable, and says why', async () => {
+    const fetcher = shadowReviewFetchMock({
+      policy: policyDocument({
+        rules: [
+          rule({ id: 'shadow-reports', action: 'shadow', path: '/reports/**' }),
+          rule({ id: null, action: 'shadow', path: '/unnamed/**' }),
+        ],
+      }),
+      review: shadowReviewResponse(),
+      reviewStatus: 503,
+      reviewBody: {
+        error: 'policy shadow review requires an audit query store',
+        reason: 'audit_evidence_unavailable',
+      },
+    });
+    vi.stubGlobal('fetch', fetcher.fetch);
+
+    renderShadowReviewView();
+
+    expect(await screen.findByText('Shadow evidence unavailable')).toBeTruthy();
+    const explanation =
+      'Promote and Disable are unavailable while shadow evidence is unavailable: nothing shows which requests changing this rule would affect.';
+    expect(screen.getAllByText(explanation)).toHaveLength(2);
+    for (const ruleId of ['shadow-reports', '1']) {
+      const promoteButton = screen.getByRole('button', {
+        name: `Promote ${ruleId} to deny`,
+        description: explanation,
+      }) as HTMLButtonElement;
+      const disableButton = screen.getByRole('button', {
+        name: `Disable ${ruleId}`,
+        description: explanation,
+      }) as HTMLButtonElement;
+      expect(promoteButton.disabled).toBe(true);
+      expect(promoteButton.title).toBe(explanation);
+      expect(disableButton.disabled).toBe(true);
+      fireEvent.click(promoteButton);
+      fireEvent.click(disableButton);
+    }
+
+    expect(
+      screen.queryByRole('button', { name: /^Confirm promote/ }),
+    ).toBeNull();
+    expect(fetcher.patchRuleIds).toEqual([]);
+    expect(screen.queryByText('Policy write permission required')).toBeNull();
+  });
+
   it('still reports a shadow review failure that is not an evidence state', async () => {
     vi.stubGlobal(
       'fetch',
@@ -355,6 +536,10 @@ function renderShadowReviewView({
   );
 }
 
+// The policy defaults to the one the review describes: the rules the review
+// lists, in order. Pass `policy` to model a review read from another version.
+// PATCH checks If-Match against the server's current ETag the way the gateway
+// does, answering 412 on any mismatch.
 function shadowReviewFetchMock({
   canWrite = true,
   policy,
@@ -364,16 +549,21 @@ function shadowReviewFetchMock({
   policyEtags = ['"etag-initial"'],
 }: {
   canWrite?: boolean;
-  policy: PolicyDocument;
+  policy?: PolicyDocument;
   review: ShadowReviewResponseFixture;
   reviewStatus?: number;
   reviewBody?: unknown;
   policyEtags?: string[];
 }) {
+  const servedPolicy =
+    policy ?? policyDocument({ rules: review.rules.map((summary) => summary.rule) });
   let policyRequestCount = 0;
+  let serverEtag: string | null = policyEtags[0] ?? null;
+  let patchCount = 0;
   const patchBodies: PolicyRulePatch[] = [];
   const patchHeaders: Array<string | null> = [];
   const patchRuleIds: string[] = [];
+  const appliedPatchRuleIds: string[] = [];
   const fetch = vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
     const url = new URL(String(input), 'http://localhost');
 
@@ -381,7 +571,8 @@ function shadowReviewFetchMock({
       const etag =
         policyEtags[Math.min(policyRequestCount, policyEtags.length - 1)] ?? null;
       policyRequestCount += 1;
-      return Promise.resolve(jsonResponse(200, policy, { ...(etag ? { ETag: etag } : {}), 'x-greengateway-policy-write': String(canWrite) }));
+      serverEtag = etag;
+      return Promise.resolve(jsonResponse(200, servedPolicy, { ...(etag ? { ETag: etag } : {}), 'x-greengateway-policy-write': String(canWrite) }));
     }
 
     if (url.pathname === '/v1/admin/policy/rules/shadow-review') {
@@ -394,19 +585,41 @@ function shadowReviewFetchMock({
     ) {
       const ruleId = decodeURIComponent(url.pathname.split('/').at(-1) ?? '');
       const patch = JSON.parse(String(init.body)) as PolicyRulePatch;
+      const ifMatch = requestHeader(init.headers, 'If-Match');
       patchRuleIds.push(ruleId);
       patchBodies.push(patch);
-      patchHeaders.push(requestHeader(init.headers, 'If-Match'));
+      patchHeaders.push(ifMatch);
+      if (ifMatch === null || ifMatch !== serverEtag) {
+        return Promise.resolve(
+          jsonResponse(412, {
+            error: 'If-Match does not match the current policy ETag',
+          }),
+        );
+      }
+      patchCount += 1;
+      serverEtag = `"etag-after-patch-${patchCount}"`;
+      appliedPatchRuleIds.push(ruleId);
       const rule = review.rules.find((item) => item.rule_id === ruleId)?.rule;
       return Promise.resolve(
-        jsonResponse(200, { ...rule, ...patch }, { ETag: '"etag-after-patch"' }),
+        jsonResponse(200, { ...rule, ...patch }, { ETag: serverEtag }),
       );
     }
 
     return Promise.reject(new Error(`unexpected fetch: ${url.pathname}`));
   });
 
-  return { fetch, patchBodies, patchHeaders, patchRuleIds };
+  return {
+    fetch,
+    patchBodies,
+    patchHeaders,
+    patchRuleIds,
+    appliedPatchRuleIds,
+    policyRequestCount: () => policyRequestCount,
+    // Models another writer committing a change after the page loaded.
+    setServerEtag: (etag: string) => {
+      serverEtag = etag;
+    },
+  };
 }
 
 type ShadowReviewResponseFixture = {

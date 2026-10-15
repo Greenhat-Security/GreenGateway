@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from 'react';
+import { useEffect, useId, useMemo, useState } from 'react';
 import { Link } from 'react-router-dom';
 
 import { AdminApiError } from '../lib/api';
@@ -6,6 +6,7 @@ import {
   PolicyDocument,
   PolicyRule,
   PolicyRulePatch,
+  PolicyRuleShadowReviewResponse,
   PolicyRuleShadowReviewSummary,
   fetchPolicy,
   fetchPolicyRuleShadowReview,
@@ -30,6 +31,12 @@ type ShadowReviewError = {
 
 const POLICY_CHANGED_MESSAGE =
   'Policy changed since this page loaded; refresh and retry.';
+const EVIDENCE_REQUIRED_ACTION_MESSAGE =
+  'Promote and Disable are unavailable while shadow evidence is unavailable: nothing shows which requests changing this rule would affect.';
+const POLICY_CHANGED_ACTION_MESSAGE =
+  'Promote and Disable are unavailable because the policy changed after this review was read. Refresh to review the current rules.';
+const MISSING_ETAG_ACTION_MESSAGE =
+  'Promote and Disable are unavailable because the policy ETag was not returned, so a change could not be tied to the reviewed policy. Refresh and retry.';
 
 type ShadowReviewItem = {
   ruleId: string;
@@ -55,6 +62,14 @@ export function ShadowReviewView() {
   const [evidence, setEvidence] = useState<ShadowReviewEvidence>({
     status: 'complete',
   });
+  // The ETag of the policy the listed rules were read from. Every change is
+  // sent with it, never with a freshly fetched one: the gateway compares
+  // If-Match against the whole policy, so a write made since the operator
+  // reviewed a rule answers 412 instead of changing whatever rule holds that
+  // id now. Rules without an explicit id are addressed by position, which
+  // any other write can move.
+  const [policyEtag, setPolicyEtag] = useState<string | null>(null);
+  const [policyChanged, setPolicyChanged] = useState(false);
   const [confirmingPromoteId, setConfirmingPromoteId] = useState<string | null>(
     null,
   );
@@ -69,6 +84,8 @@ export function ShadowReviewView() {
       setMutationNotice(null);
       setCanWritePolicy(false);
       setEvidence({ status: 'complete' });
+      setPolicyEtag(null);
+      setPolicyChanged(false);
 
       try {
         const [policyResult, review] = await Promise.all([
@@ -80,6 +97,7 @@ export function ShadowReviewView() {
         }
 
         setCanWritePolicy(policyResult.canWrite);
+        setPolicyEtag(policyResult.etag);
         if (review.status === 'available') {
           setItems(
             review.value.rules.map((summary) => ({
@@ -93,6 +111,9 @@ export function ShadowReviewView() {
               ? { status: 'truncated' }
               : { status: 'complete' },
           );
+          setPolicyChanged(
+            !reviewDescribesPolicy(review.value, policyResult.policy),
+          );
         } else {
           setItems(enabledShadowRules(policyResult.policy));
           setEvidence({ status: 'unavailable', message: review.message });
@@ -105,6 +126,8 @@ export function ShadowReviewView() {
         setCanWritePolicy(false);
         setItems([]);
         setEvidence({ status: 'complete' });
+        setPolicyEtag(null);
+        setPolicyChanged(false);
         setLoadError(toShadowReviewError(error));
       } finally {
         if (isCurrent) {
@@ -129,6 +152,11 @@ export function ShadowReviewView() {
     items.length > 0 &&
     !canWritePolicy &&
     mutationError?.kind !== 'forbidden';
+  const actionBlockReason = shadowActionBlockReason({
+    evidence,
+    policyEtag,
+    policyChanged,
+  });
 
   async function promoteRule(ruleId: string) {
     const succeeded = await mutateRule(
@@ -150,7 +178,13 @@ export function ShadowReviewView() {
     patch: PolicyRulePatch,
     successMessage: string,
   ): Promise<boolean> {
-    if (!canWritePolicy || mutatingRuleId !== null) {
+    const reviewedEtag = policyEtag;
+    if (
+      !canWritePolicy ||
+      mutatingRuleId !== null ||
+      actionBlockReason !== null ||
+      reviewedEtag === null
+    ) {
       return false;
     }
 
@@ -159,13 +193,10 @@ export function ShadowReviewView() {
     setMutationNotice(null);
 
     try {
-      const policyResult = await fetchPolicy();
-      if (!policyResult.etag) {
-        throw new Error('Current policy ETag was not returned; refresh and retry.');
-      }
-
-      await patchPolicyRule(ruleId, policyResult.etag, patch);
-      setCanWritePolicy(policyResult.canWrite);
+      const response = await patchPolicyRule(ruleId, reviewedEtag, patch);
+      // A patch changes one rule in place and moves none, so the returned
+      // ETag describes exactly the rules still listed here.
+      setPolicyEtag(response.etag);
       setItems((current) => current.filter((item) => item.ruleId !== ruleId));
       setMutationNotice(successMessage);
       return true;
@@ -173,6 +204,9 @@ export function ShadowReviewView() {
       const reviewError = toShadowReviewError(error);
       if (reviewError.kind === 'forbidden') {
         setCanWritePolicy(false);
+      }
+      if (reviewError.kind === 'policy-changed') {
+        setPolicyChanged(true);
       }
       setMutationError(reviewError);
       return false;
@@ -200,6 +234,15 @@ export function ShadowReviewView() {
         {loadError ? <ShadowReviewErrorMessage error={loadError} /> : null}
         {showWritePermissionNotice ? <PolicyWritePermissionNotice /> : null}
         {mutationError ? <ShadowReviewMutationError error={mutationError} /> : null}
+        {policyChanged && mutationError?.kind !== 'policy-changed' ? (
+          <div className="error-panel alert warning" role="alert">
+            <h3>Policy changed during review</h3>
+            <p>
+              The shadow review and the policy were read from different versions.
+              Refresh to review the current rules before promoting or disabling one.
+            </p>
+          </div>
+        ) : null}
         {mutationNotice ? (
           <div className="error-panel alert success" role="status">
             <p>{mutationNotice}</p>
@@ -238,6 +281,7 @@ export function ShadowReviewView() {
           <ol className="policy-history-list shadow-review-list" aria-label="Shadow review queue">
             {items.map((item) => (
               <ShadowReviewEntry
+                actionBlockReason={actionBlockReason}
                 canWritePolicy={canWritePolicy}
                 confirmingPromoteId={confirmingPromoteId}
                 evidence={evidence}
@@ -264,6 +308,7 @@ export function ShadowReviewView() {
 function ShadowReviewEntry({
   item,
   evidence,
+  actionBlockReason,
   canWritePolicy,
   confirmingPromoteId,
   isMutating,
@@ -274,6 +319,7 @@ function ShadowReviewEntry({
 }: {
   item: ShadowReviewItem;
   evidence: ShadowReviewEvidence;
+  actionBlockReason: string | null;
   canWritePolicy: boolean;
   confirmingPromoteId: string | null;
   isMutating: boolean;
@@ -283,6 +329,14 @@ function ShadowReviewEntry({
   onDisable: () => void;
 }) {
   const { summary } = item;
+  const actionNoteId = useId();
+  const actionControl: ShadowActionControl = {
+    disabled: !canWritePolicy || isMutationBusy || actionBlockReason !== null,
+    title: !canWritePolicy
+      ? 'Requires admin:policy:write'
+      : (actionBlockReason ?? undefined),
+    describedBy: actionBlockReason === null ? undefined : actionNoteId,
+  };
 
   return (
     <li className="policy-history-entry shadow-review-entry">
@@ -369,13 +423,17 @@ function ShadowReviewEntry({
           )}
         </div>
 
+        {actionBlockReason !== null ? (
+          <p className="shadow-review-muted" id={actionNoteId}>
+            {actionBlockReason}
+          </p>
+        ) : null}
         <div className="policy-history-actions shadow-review-actions">
           <ShadowRulePromoteControl
             ruleId={item.ruleId}
-            canWritePolicy={canWritePolicy}
+            control={actionControl}
             confirmingPromoteId={confirmingPromoteId}
             isMutating={isMutating}
-            isMutationBusy={isMutationBusy}
             onConfirmingPromoteChange={onConfirmingPromoteChange}
             onPromote={onPromote}
           />
@@ -383,8 +441,9 @@ function ShadowReviewEntry({
             type="button"
             className="secondary-button"
             aria-label={`Disable ${item.ruleId}`}
-            title={canWritePolicy ? undefined : 'Requires admin:policy:write'}
-            disabled={!canWritePolicy || isMutationBusy}
+            aria-describedby={actionControl.describedBy}
+            title={actionControl.title}
+            disabled={actionControl.disabled}
             onClick={onDisable}
           >
             {isMutating ? 'Disabling' : 'Disable'}
@@ -395,20 +454,27 @@ function ShadowReviewEntry({
   );
 }
 
+// Promote and Disable share one availability: both change what happens to
+// the requests this rule matches, so both need the same evidence and the same
+// policy version behind them.
+type ShadowActionControl = {
+  disabled: boolean;
+  title: string | undefined;
+  describedBy: string | undefined;
+};
+
 function ShadowRulePromoteControl({
   ruleId,
-  canWritePolicy,
+  control,
   confirmingPromoteId,
   isMutating,
-  isMutationBusy,
   onConfirmingPromoteChange,
   onPromote,
 }: {
   ruleId: string;
-  canWritePolicy: boolean;
+  control: ShadowActionControl;
   confirmingPromoteId: string | null;
   isMutating: boolean;
-  isMutationBusy: boolean;
   onConfirmingPromoteChange: (ruleId: string | null) => void;
   onPromote: () => void;
 }) {
@@ -419,7 +485,9 @@ function ShadowRulePromoteControl({
           type="button"
           className="primary-button row-action-button"
           aria-label={`Confirm promote ${ruleId} to deny`}
-          disabled={!canWritePolicy || isMutationBusy}
+          aria-describedby={control.describedBy}
+          title={control.title}
+          disabled={control.disabled}
           onClick={onPromote}
         >
           {isMutating ? 'Promoting' : 'Confirm'}
@@ -440,8 +508,9 @@ function ShadowRulePromoteControl({
       type="button"
       className="primary-button"
       aria-label={`Promote ${ruleId} to deny`}
-      title={canWritePolicy ? undefined : 'Requires admin:policy:write'}
-      disabled={!canWritePolicy || isMutationBusy}
+      aria-describedby={control.describedBy}
+      title={control.title}
+      disabled={control.disabled}
       onClick={() => onConfirmingPromoteChange(ruleId)}
     >
       Promote
@@ -530,6 +599,30 @@ function formatWouldDenyCount(value: number): string {
   return `${value.toLocaleString()} would-deny ${value === 1 ? 'event' : 'events'}`;
 }
 
+// Why Promote and Disable cannot run, or null when they may. Unread evidence
+// is no basis for changing a rule, and a change must be checked against the
+// policy version the operator reviewed.
+function shadowActionBlockReason({
+  evidence,
+  policyEtag,
+  policyChanged,
+}: {
+  evidence: ShadowReviewEvidence;
+  policyEtag: string | null;
+  policyChanged: boolean;
+}): string | null {
+  if (evidence.status === 'unavailable') {
+    return EVIDENCE_REQUIRED_ACTION_MESSAGE;
+  }
+  if (policyChanged) {
+    return POLICY_CHANGED_ACTION_MESSAGE;
+  }
+  if (policyEtag === null) {
+    return MISSING_ETAG_ACTION_MESSAGE;
+  }
+  return null;
+}
+
 // The selection the gateway's review makes -- enabled shadow rules, keyed by
 // the id live audit attribution uses -- for listing them when no evidence
 // about them could be read.
@@ -539,6 +632,47 @@ function enabledShadowRules(policy: PolicyDocument): ShadowReviewItem[] {
       ? [{ ruleId: policyRuleId(rule, index), rule, summary: null }]
       : [],
   );
+}
+
+// The review and the policy (with its ETag) are separate reads, so a write
+// landing between them leaves the listed rules describing a different policy
+// than the ETag a change would be sent with. Only when the review lists
+// exactly the policy's enabled shadow rules, under the same ids, does that
+// ETag stand for the rules on screen.
+function reviewDescribesPolicy(
+  review: PolicyRuleShadowReviewResponse,
+  policy: PolicyDocument,
+): boolean {
+  const policyShadowRules = enabledShadowRules(policy);
+  return (
+    policyShadowRules.length === review.rules.length &&
+    policyShadowRules.every((item, index) => {
+      const summary = review.rules[index];
+      return (
+        summary !== undefined &&
+        summary.rule_id === item.ruleId &&
+        canonicalJson(summary.rule) === canonicalJson(item.rule)
+      );
+    })
+  );
+}
+
+function canonicalJson(value: unknown): string {
+  return JSON.stringify(sortedJsonValue(value));
+}
+
+function sortedJsonValue(value: unknown): unknown {
+  if (Array.isArray(value)) {
+    return value.map(sortedJsonValue);
+  }
+  if (value !== null && typeof value === 'object') {
+    return Object.fromEntries(
+      Object.entries(value as Record<string, unknown>)
+        .sort(([left], [right]) => (left < right ? -1 : left > right ? 1 : 0))
+        .map(([key, item]) => [key, sortedJsonValue(item)]),
+    );
+  }
+  return value;
 }
 
 function formatUtcTimestamp(value: string): string {
