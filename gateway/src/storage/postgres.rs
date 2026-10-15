@@ -1604,14 +1604,18 @@ mod tests {
             .enable_time()
             .build()
             .expect("test runtime should build");
+        // The deadline is armed inside the runtime, as a caller's is.
         let abandoned = ::metrics::with_local_recorder(&recorder, || {
-            runtime.block_on(tokio::time::timeout(
-                Duration::from_millis(20),
-                timed_checkout(
-                    CheckoutClass::ExecutionLease,
-                    std::future::pending::<Result<(), deadpool_postgres::PoolError>>(),
-                ),
-            ))
+            runtime.block_on(async {
+                tokio::time::timeout(
+                    Duration::from_millis(20),
+                    timed_checkout(
+                        CheckoutClass::ExecutionLease,
+                        std::future::pending::<Result<(), deadpool_postgres::PoolError>>(),
+                    ),
+                )
+                .await
+            })
         });
         assert!(
             abandoned.is_err(),
