@@ -518,8 +518,7 @@ impl OpenApiConnectionCatalogService {
                     .managed()
                     .get(&catalog.connection_id)
                     .is_some_and(|record| {
-                        record.write.enabled
-                            && supports_managed_openapi_catalog(record)
+                        serves_managed_openapi_catalog(record)
                             && catalog.observed_etag == record.etag()
                     })
             })
@@ -694,8 +693,7 @@ impl OpenApiConnectionCatalogService {
                     .managed()
                     .get(&catalog.connection_id)
                     .is_some_and(|record| {
-                        record.write.enabled
-                            && supports_managed_openapi_catalog(record)
+                        serves_managed_openapi_catalog(record)
                             && catalog.observed_etag == record.etag()
                     })
             })
@@ -724,9 +722,7 @@ impl OpenApiConnectionCatalogService {
                 .get(&catalog.connection_id)
                 .cloned();
             let Some(current_record) = current_record.filter(|record| {
-                record.write.enabled
-                    && supports_managed_openapi_catalog(record)
-                    && catalog.observed_etag == record.etag()
+                serves_managed_openapi_catalog(record) && catalog.observed_etag == record.etag()
             }) else {
                 self.discard_runtime_catalog(&catalog.connection_id);
                 continue;
@@ -810,7 +806,7 @@ impl OpenApiConnectionCatalogService {
     }
 
     pub fn reconcile_connection(&self, record: &StoredConnection) {
-        if !record.write.enabled || !supports_managed_openapi_catalog(record) {
+        if !serves_managed_openapi_catalog(record) {
             self.discard_runtime_catalog(&record.id);
         }
     }
@@ -2782,6 +2778,19 @@ fn supports_managed_openapi_catalog(record: &StoredConnection) -> bool {
         )
 }
 
+/// Whether a Connection's stored OpenAPI catalog may be live in the registry.
+///
+/// A catalog on a Connection that carries a `caller_assertion` is withdrawn
+/// like one on a disabled Connection. Every call on it is refused until the
+/// request path injects the assertion, and the binding validation each
+/// registry change runs refuses its tools, so leaving them installed would
+/// fail every later change to any lane, and a restart.
+fn serves_managed_openapi_catalog(record: &StoredConnection) -> bool {
+    record.write.enabled
+        && record.write.caller_assertion.is_none()
+        && supports_managed_openapi_catalog(record)
+}
+
 fn catalog_change_counts(
     prior: Option<&StoredOpenApiCatalog>,
     candidate: &[StoredOpenApiCatalogEntry],
@@ -3640,6 +3649,208 @@ paths:
                 )),
             "reconciliation installs the durable authoritative catalog"
         );
+    }
+
+    /// A caller assertion as an operator would configure one. Nothing reads its
+    /// signing key alias: every lane refuses the Connection first.
+    fn caller_assertion_json() -> Value {
+        json!({
+            "signing_key_id": "assertion-signing-key",
+            "kid": "gw-test-1",
+            "algorithm": "es256",
+            "issuer": "https://gateway.example.test",
+            "audience": "https://billing.example.test",
+            "token_type": "at+jwt",
+            "header_name": "x-caller-assertion",
+            "lifetime_seconds": 60
+        })
+    }
+
+    const CALLER_ASSERTION_TEST_SPEC: &str = r#"
+openapi: 3.0.3
+info:
+  title: Billing
+  version: 1.0.0
+paths:
+  /invoices/{invoice_id}:
+    get:
+      operationId: get_invoice
+      summary: Read one invoice
+      parameters:
+        - in: path
+          name: invoice_id
+          required: true
+          schema:
+            type: string
+"#;
+
+    #[tokio::test]
+    async fn an_unenforced_caller_assertion_refuses_preview_register_and_refresh() {
+        let database = TemporaryDatabase::new();
+        let mut config = Config::test_defaults();
+        config.connections_sqlite_path = Some(database.0.display().to_string());
+        let control_plane =
+            ConnectionControlPlane::from_config(&config).expect("control plane should build");
+        let snapshot = control_plane.runtime_snapshot();
+        let candidate: ConnectionWrite = serde_json::from_value(json!({
+            "display_name": "Attested Billing OpenAPI",
+            "enabled": true,
+            "kind": "http_api",
+            "endpoint": {
+                "base_url": "https://billing.example.test",
+                "base_path": "/v1"
+            },
+            "authentication": {"type": "none"},
+            "caller_assertion": caller_assertion_json(),
+            "tls": {},
+            "discovery": {
+                "type": "managed_openapi",
+                "path": "/openapi.json",
+                "use_connection_authentication": false
+            }
+        }))
+        .expect("attested OpenAPI Connection should deserialize");
+        let record = control_plane
+            .create_managed(snapshot.collection_etag(), candidate, "test-admin")
+            .await
+            .expect("attested OpenAPI Connection should create");
+        // The default egress policy denies every host, so a regression that
+        // reached the spec fetch would fail as `egress_denied` instead.
+        let egress_config = EgressConfig::from_config(&config);
+        let egress_client =
+            Arc::new(EgressClient::new(egress_config.clone()).expect("egress should build"));
+        let http = ConnectionHttpRuntime::new(control_plane.clone(), egress_config, egress_client);
+        let registry = ToolRegistry::disabled();
+        let service =
+            OpenApiConnectionCatalogService::load(control_plane.clone(), http, registry.clone())
+                .expect("managed OpenAPI service should load");
+        let refused = Some(OpenApiCatalogError::CallerAssertionNotEnforced);
+        let spec = CALLER_ASSERTION_TEST_SPEC;
+
+        assert_eq!(
+            service.preview(record.id.as_str(), spec).await.err(),
+            refused
+        );
+        assert_eq!(
+            service
+                .register(
+                    record.id.as_str(),
+                    record.etag().as_str(),
+                    0,
+                    0,
+                    &spec_digest(spec),
+                    spec,
+                    &["get_invoice".to_owned()],
+                    &[],
+                    "test-admin",
+                )
+                .await
+                .err(),
+            refused
+        );
+        assert_eq!(
+            service
+                .refresh(record.id.as_str(), record.etag().as_str(), "test-admin")
+                .await
+                .err(),
+            refused
+        );
+        assert!(registry.get("get_invoice").is_none());
+        assert_eq!(service.runtime().current_revision(&record.id), None);
+        assert_eq!(
+            OpenApiCatalogError::CallerAssertionNotEnforced.safe_reason(),
+            "caller_assertion_not_enforced"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_live_catalog_is_withdrawn_when_its_connection_gains_a_caller_assertion() {
+        let database = TemporaryDatabase::new();
+        let mut config = Config::test_defaults();
+        config.connections_sqlite_path = Some(database.0.display().to_string());
+        let control_plane =
+            ConnectionControlPlane::from_config(&config).expect("control plane should build");
+        let snapshot = control_plane.runtime_snapshot();
+        let candidate: ConnectionWrite = serde_json::from_value(json!({
+            "display_name": "Managed Billing OpenAPI",
+            "enabled": true,
+            "kind": "http_api",
+            "endpoint": {
+                "base_url": "https://billing.example.test",
+                "base_path": "/v1"
+            },
+            "authentication": {"type": "none"},
+            "tls": {},
+            "discovery": {
+                "type": "managed_openapi",
+                "use_connection_authentication": false
+            }
+        }))
+        .expect("managed OpenAPI Connection should deserialize");
+        let record = control_plane
+            .create_managed(snapshot.collection_etag(), candidate, "test-admin")
+            .await
+            .expect("managed OpenAPI Connection should create");
+        let egress_config = EgressConfig::from_config(&config);
+        let egress_client =
+            Arc::new(EgressClient::new(egress_config.clone()).expect("egress should build"));
+        let http = ConnectionHttpRuntime::new(control_plane.clone(), egress_config, egress_client);
+        let registry = ToolRegistry::disabled();
+        let service = OpenApiConnectionCatalogService::load(
+            control_plane.clone(),
+            http.clone(),
+            registry.clone(),
+        )
+        .expect("managed OpenAPI service should load");
+        let spec = CALLER_ASSERTION_TEST_SPEC;
+        let preview = service
+            .preview(record.id.as_str(), spec)
+            .await
+            .expect("bounded managed spec should preview");
+        let selected_tool_names = preview
+            .binding
+            .definitions
+            .iter()
+            .map(|definition| definition.name.clone())
+            .collect::<Vec<_>>();
+        service
+            .register(
+                record.id.as_str(),
+                record.etag().as_str(),
+                preview.spec_revision,
+                preview.catalog_revision,
+                &preview.spec_digest,
+                spec,
+                &selected_tool_names,
+                &preview.binding.security_selections,
+                "test-admin",
+            )
+            .await
+            .expect("exact preview should publish");
+        assert!(registry.get("get_invoice").is_some());
+
+        let mut attested = record.write.clone();
+        attested.caller_assertion = Some(
+            serde_json::from_value(caller_assertion_json())
+                .expect("caller assertion should deserialize"),
+        );
+        let updated = control_plane
+            .replace_managed(&record.id, &record.etag(), attested, "test-admin")
+            .await
+            .expect("adding a caller assertion should save");
+        service.reconcile_connection(&updated);
+
+        // Its tools would be refused on every call; left installed, they would
+        // also fail the binding validation every later registry change runs,
+        // for every lane, which the gateway's own validator shows here.
+        assert!(registry.get("get_invoice").is_none());
+        assert_eq!(service.runtime().current_revision(&record.id), None);
+        let validator_http = http.clone();
+        registry
+            .set_definition_validator(Arc::new(move |definitions| {
+                crate::bootstrap::validate_connection_bound_tools(&validator_http, definitions)
+            }))
+            .expect("the remaining lanes should still validate");
     }
 
     #[tokio::test]
