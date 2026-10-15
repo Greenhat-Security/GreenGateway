@@ -35,10 +35,12 @@
 //!   `storage/postgres.rs::build_pool` builds the deployment's, down to
 //!   the `ROLLBACK` recycling statement that is most of what a checkout
 //!   costs. The product has isolated this wait since issue #439's first
-//!   PR -- the authority stores record every checkout in
-//!   `greengateway_database_pool_acquire_seconds` -- but that series is
-//!   the checkout under whatever load a replica is carrying, and this
-//!   tier is the warm, uncontended checkout the budget names.
+//!   PR -- the authority stores record each checkout's wait in
+//!   `greengateway_database_pool_acquire_seconds`, whether the pool
+//!   served it, refused it, or its caller's deadline gave up on it first
+//!   (`error_class="cancelled"`) -- but that series is the checkout under
+//!   whatever load a replica is carrying, and this tier is the warm,
+//!   uncontended checkout the budget names.
 //! * `stall_experiment` — `audit_enqueue` is budgeted at "0 ms on the
 //!   request path", which is a claim about where work happens rather than
 //!   a latency. Since issue #11 every serving replica writes its audit
@@ -67,12 +69,19 @@
 //! product series is an exporter summary per replica over a short rolling
 //! window, recorded under whatever else that replica is doing; this tier
 //! is a fixed number of samples on one warm connection with nearest-rank
-//! quantiles, compared night over night. Swapping one for the other
-//! changes what each budget is measured against, which is a decision for
-//! the capacity scenarios that will scrape the product series under load
-//! (issue #439's second PR), not a side effect of the change that added
-//! the series. Recorded here rather than in a commit message because the
-//! `method` field is where a reader will ask the question.
+//! quantiles, compared night over night. The two do not even time the
+//! same exchange: this tier prepares each copied statement once and then
+//! executes it, so a sample is one execute round trip, while the stores
+//! send the same SQL text unprepared, which tokio-postgres prepares and
+//! then executes on every call -- two round trips, both inside the
+//! product's operation time. A product sample is also recorded only when
+//! its call finishes, so one a request deadline cut off is absent.
+//! Swapping one for the other changes what each budget is measured
+//! against, which is a decision for the capacity scenarios that will
+//! scrape the product series under load (issue #439's second PR), not a
+//! side effect of the change that added the series. Recorded here rather
+//! than in a commit message because the `method` field is where a reader
+//! will ask the question.
 //!
 //! ## What the artifact is for
 //!
