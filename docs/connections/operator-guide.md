@@ -363,11 +363,38 @@ Connection carrying a `caller_assertion` block is refused for every tool call,
 proxied request, managed MCP session, OpenAPI or MCP discovery, enum or label
 source fetch, and stored test, before any DNS lookup, secret read, OAuth mint,
 or upstream request, rather than sent without the assertion the operator asked
-for. Tool and proxy-route bindings to it are rejected the same way bindings to
-a disabled Connection are. Every refusal carries the fixed reason
-`caller_assertion_not_enforced`: the tool audit `failure_reason`, the
-Connection test stage reason, the catalog error `reason`, and the proxy's
-`error_category` log field. Remove the block to use the Connection meanwhile.
+for.
+
+The refusal reason is the fixed string `caller_assertion_not_enforced`. Where
+it appears depends on the lane:
+
+- Tool call: the `failure_reason` of `tool.invoke_failure` and the `reason` of
+  `tool.upstream_request`. For a composite tool, `failure_reason` is
+  `composite_failed`; the failing step's `caller_assertion_not_enforced` is in
+  the error details returned to the caller, not in the audit event.
+- Stored Connection test: the `authenticated` stage reason.
+- OpenAPI preview, registration and refresh, and MCP catalog refresh: the
+  `reason` of a `409 Conflict` response.
+- Enum source refresh: the `reason` of `connection.enum_source_refresh_failed`.
+  Label sources compile during OpenAPI preview and registration, which are
+  refused first.
+- Proxied request: the caller receives `502` with `{"error":"bad_gateway"}`.
+  The reason appears only as `error_category` on the gateway's warning log
+  line, not in a structured audit event. Every other Connection failure on a
+  proxy route behaves the same way.
+
+Bindings to such a Connection fail the way bindings to a disabled Connection
+do. A `TOOLS_FILE` tool or a proxy route bound to it fails startup or the whole
+reload that contains it, not only that binding. A managed OpenAPI catalog on it
+is withdrawn from the tool list and kept in storage; refresh it after removing
+the block to publish it again. Managed MCP tools stay listed, and every call to
+one is refused.
+
+The admin UI does not edit the block. A replacement (`PUT`) that omits
+`caller_assertion` keeps the current block, so a routine edit in the UI cannot
+remove it by accident and put the Connection back into service unattested. To
+use the Connection before enforcement ships, remove the block deliberately:
+send `"caller_assertion": null` in a `PUT` through the admin API.
 
 New and replacement writes also reject `bind_approval: true`, because no
 approval subsystem exists for a mutation to be bound to, and an assertion

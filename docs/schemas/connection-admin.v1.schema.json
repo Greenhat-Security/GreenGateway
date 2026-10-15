@@ -8,7 +8,7 @@
     "CallerAssertion": {
       "type": "object",
       "additionalProperties": false,
-      "description": "Attest the calling principal to the upstream alongside the primary credential rather than instead of it: the credential says which system is calling, the assertion says on whose behalf, so an upstream the operator controls can apply its own per-user checks. The gateway signs a short-lived JWT naming the validated principal and sends it in the named header; the upstream verifies it against the gateway's published JWKS. Omit to send only the credential. Accepted but not yet enforced: until request-path injection ships, the gateway refuses every call, test and discovery on a Connection carrying this block, with the failure reason caller_assertion_not_enforced.",
+      "description": "Accepted but not yet enforced: until request-path injection ships, the gateway refuses every call, test and discovery on a Connection carrying this block, with the failure reason caller_assertion_not_enforced. Once enforced, the block will attest the calling principal to the upstream alongside the primary credential rather than instead of it: the credential says which system is calling, the assertion says on whose behalf, so an upstream the operator controls can apply its own per-user checks. The gateway will sign a short-lived JWT naming the validated principal and send it in the named header, and the upstream will verify it against the gateway's published JWKS. Omit the block to send only the credential.",
       "required": [
         "signing_key_id",
         "kid",
@@ -36,7 +36,7 @@
     "SafeCallerAssertion": {
       "type": "object",
       "additionalProperties": false,
-      "description": "Attest the calling principal to the upstream alongside the primary credential rather than instead of it: the credential says which system is calling, the assertion says on whose behalf, so an upstream the operator controls can apply its own per-user checks. The gateway signs a short-lived JWT naming the validated principal and sends it in the named header; the upstream verifies it against the gateway's published JWKS. Omit to send only the credential. Accepted but not yet enforced: until request-path injection ships, the gateway refuses every call, test and discovery on a Connection carrying this block, with the failure reason caller_assertion_not_enforced.",
+      "description": "Accepted but not yet enforced: until request-path injection ships, the gateway refuses every call, test and discovery on a Connection carrying this block, with the failure reason caller_assertion_not_enforced. Once enforced, the block will attest the calling principal to the upstream alongside the primary credential rather than instead of it: the credential says which system is calling, the assertion says on whose behalf, so an upstream the operator controls can apply its own per-user checks. The gateway will sign a short-lived JWT naming the validated principal and send it in the named header, and the upstream will verify it against the gateway's published JWKS. Omit the block to send only the credential.",
       "required": [
         "signing_key_configured",
         "kid",
