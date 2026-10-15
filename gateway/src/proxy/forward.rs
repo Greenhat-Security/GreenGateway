@@ -1925,6 +1925,7 @@ fn connection_failure_response(
         | ConnectionHttpError::ConnectionNotFound
         | ConnectionHttpError::WrongConnectionKind
         | ConnectionHttpError::UnsupportedAuthentication
+        | ConnectionHttpError::CallerAssertionNotEnforced
         | ConnectionHttpError::TlsInvalid
         | ConnectionHttpError::InvalidTargetPath
         | ConnectionHttpError::CredentialHeaderConflict
@@ -3187,6 +3188,148 @@ mod tests {
         }
 
         let _ = fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn unenforced_caller_assertion_is_refused_before_secret_or_upstream_io() {
+        // A proxied call on a Connection configured to attest its caller would
+        // otherwise leave carrying only the service credential.
+        let root = std::env::temp_dir().join(format!(
+            "greengateway-proxy-caller-assertion-{}",
+            uuid::Uuid::new_v4()
+        ));
+        fs::create_dir(&root).expect("assertion test secret root should create");
+        for (file, value) in [
+            ("primary", b"primary-secret-canary".as_slice()),
+            ("assertion-signing-key", b"signing-key-canary".as_slice()),
+        ] {
+            fs::write(root.join(file), value).expect("assertion test secret should write");
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+
+            fs::set_permissions(&root, fs::Permissions::from_mode(0o700))
+                .expect("assertion test secret root permissions should set");
+            for file in ["primary", "assertion-signing-key"] {
+                fs::set_permissions(root.join(file), fs::Permissions::from_mode(0o600))
+                    .expect("assertion test secret permissions should set");
+            }
+        }
+
+        let mut connection_config = config::Config::test_defaults();
+        connection_config.connections_sqlite_path =
+            Some(root.join("connections.sqlite").display().to_string());
+        connection_config.connection_secrets_root = Some(SecretRootConfig::new(root.clone()));
+        connection_config.connection_secret_aliases = [
+            ("primary", "Primary"),
+            ("assertion-signing-key", "Assertion signing key"),
+        ]
+        .into_iter()
+        .map(|(id, label)| OperatorSecretAliasConfig {
+            id: id.to_owned(),
+            label: label.to_owned(),
+            source: OperatorSecretAliasSource::File { key: id.to_owned() },
+        })
+        .collect();
+        let control_plane = ConnectionControlPlane::from_config(&connection_config)
+            .expect("assertion test control plane should build");
+        let write: ConnectionWrite = serde_json::from_value(json!({
+            "display_name": "Attested API",
+            "enabled": true,
+            "kind": "http_api",
+            "endpoint": {
+                "base_url": "https://billing.example.test",
+                "base_path": "/"
+            },
+            "authentication": {
+                "type": "header_api_key",
+                "header_name": "x-api-key",
+                "secret_id": "primary"
+            },
+            "caller_assertion": {
+                "signing_key_id": "assertion-signing-key",
+                "kid": "gw-test-1",
+                "algorithm": "es256",
+                "issuer": "https://gateway.example.test",
+                "audience": "https://billing.example.test",
+                "token_type": "at+jwt",
+                "header_name": "X-Caller-Assertion",
+                "lifetime_seconds": 60
+            }
+        }))
+        .expect("assertion test Connection should deserialize");
+        let initial = control_plane.runtime_snapshot();
+        let created = control_plane
+            .create_managed(initial.collection_etag(), write, "test-admin")
+            .await
+            .expect("assertion test Connection should create");
+        let connection_id = created.id.to_string();
+        let egress_config = egress::EgressConfig {
+            allowed_hosts: HashSet::from(["billing.example.test".to_owned()]),
+            ..egress::EgressConfig::default()
+        };
+        let egress_client = Arc::new(
+            egress::EgressClient::new(egress_config.clone())
+                .expect("assertion test egress client should build"),
+        );
+        let runtime = ConnectionHttpRuntime::new(control_plane, egress_config, egress_client);
+
+        // No server listens on either endpoint, so only the refusal can
+        // produce the fixed response asserted below.
+        let nowhere_a = SocketAddr::from(([127, 0, 0, 1], 9));
+        let nowhere_b = SocketAddr::from(([127, 0, 0, 1], 10));
+        let (mut proxy, sink) =
+            retry_proxy([nowhere_a, nowhere_b], None, Duration::from_millis(100));
+        let ProxyRoutes::RoutingTable { routes } = &mut proxy.routes else {
+            panic!("assertion test proxy should use a routing table");
+        };
+        routes[0].connection_id = Some(connection_id);
+        proxy.connection_http = Some(runtime);
+
+        let request = Request::builder()
+            .method(Method::GET)
+            .uri("/charges")
+            .header(REQUEST_ID_HEADER, "assertion-request")
+            .body(Body::empty())
+            .expect("assertion request should build");
+        let response = proxy.forward_request(request, "203.0.113.8").await;
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        let outcome = response
+            .extensions()
+            .get::<middleware::decision::UpstreamOutcome>()
+            .expect("the refusal should record a fixed upstream outcome");
+        assert_eq!(outcome.status, None);
+        assert_eq!(outcome.endpoint_id, None);
+        assert!(outcome.attempts.is_empty());
+        let body = axum::body::to_bytes(response.into_body(), 1024)
+            .await
+            .expect("refusal body should read");
+        assert_eq!(body.as_ref(), br#"{"error":"bad_gateway"}"#);
+
+        let events = sink.events();
+        assert!(events.iter().all(|event| {
+            event.event_type != audit::event::CONNECTION_SECRET_RESOLUTION_FAILED
+        }));
+        let rendered = serde_json::to_string(&events).expect("audits should serialize");
+        for secret in ["primary-secret-canary", "signing-key-canary"] {
+            assert!(!rendered.contains(secret), "audit leaked {secret}");
+        }
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn an_unenforced_caller_assertion_uses_a_safe_gateway_status() {
+        let refused = connection_failure_response(
+            ConnectionHttpError::CallerAssertionNotEnforced,
+            "payments",
+            None,
+            Vec::new(),
+            Duration::ZERO,
+        );
+        // A configuration refusal that will not clear by retrying.
+        assert_eq!(refused.status(), StatusCode::BAD_GATEWAY);
     }
 
     #[test]

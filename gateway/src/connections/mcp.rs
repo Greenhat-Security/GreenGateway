@@ -72,6 +72,9 @@ pub enum McpCatalogRefreshError {
     ConnectionDisabled,
     ConnectionKindMismatch,
     DiscoveryNotConfigured,
+    /// The Connection asks for a signed caller assertion, which this gateway
+    /// does not yet inject; discovery is refused before any session opens.
+    CallerAssertionNotEnforced,
     PreconditionFailed,
     /// A discovered tool's registry name is already published by another
     /// lane at the authority.
@@ -104,6 +107,7 @@ impl McpCatalogRefreshError {
             Self::ConnectionDisabled => "connection_disabled",
             Self::ConnectionKindMismatch => "connection_kind_mismatch",
             Self::DiscoveryNotConfigured => "discovery_not_configured",
+            Self::CallerAssertionNotEnforced => "caller_assertion_not_enforced",
             Self::PreconditionFailed => "connection_changed",
             Self::ToolNameConflict => "tool_name_conflict",
             Self::RefreshInProgress => "refresh_in_progress",
@@ -506,6 +510,9 @@ impl McpConnectionCatalogService {
                 "connection_kind_mismatch" => McpCatalogRefreshError::ConnectionKindMismatch,
                 "invalid_connection_id" => McpCatalogRefreshError::InvalidConnectionId,
                 "connection_not_found" => McpCatalogRefreshError::ConnectionNotFound,
+                "caller_assertion_not_enforced" => {
+                    McpCatalogRefreshError::CallerAssertionNotEnforced
+                }
                 _ => McpCatalogRefreshError::DiscoveryNotConfigured,
             });
         }
@@ -982,6 +989,9 @@ fn refresh_transport_error(error: &McpUpstreamCallError) -> McpCatalogRefreshErr
         McpUpstreamCallError::Connection {
             reason: "connection_changed",
         } => McpCatalogRefreshError::PreconditionFailed,
+        McpUpstreamCallError::Connection {
+            reason: "caller_assertion_not_enforced",
+        } => McpCatalogRefreshError::CallerAssertionNotEnforced,
         McpUpstreamCallError::Connection { reason }
             if matches!(
                 *reason,

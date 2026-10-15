@@ -248,6 +248,9 @@ pub enum OpenApiCatalogError {
     InvalidSpec,
     InvalidSelection,
     AuthenticationMismatch,
+    /// The Connection asks for a signed caller assertion, which this gateway
+    /// does not yet inject; nothing is fetched or published for it.
+    CallerAssertionNotEnforced,
     ToolConflict,
     EgressDenied,
     SecretUnavailable,
@@ -274,6 +277,7 @@ impl OpenApiCatalogError {
             Self::InvalidSpec => "invalid_spec",
             Self::InvalidSelection => "invalid_selection",
             Self::AuthenticationMismatch => "authentication_mismatch",
+            Self::CallerAssertionNotEnforced => "caller_assertion_not_enforced",
             Self::ToolConflict => "tool_name_conflict",
             Self::EgressDenied => "egress_denied",
             Self::SecretUnavailable => "secret_unavailable",
@@ -2856,6 +2860,9 @@ fn connection_http_error(error: ConnectionHttpError) -> OpenApiCatalogError {
         ConnectionHttpError::UnsupportedAuthentication
         | ConnectionHttpError::CredentialHeaderConflict => {
             OpenApiCatalogError::AuthenticationMismatch
+        }
+        ConnectionHttpError::CallerAssertionNotEnforced => {
+            OpenApiCatalogError::CallerAssertionNotEnforced
         }
         ConnectionHttpError::TransportUnavailable => OpenApiCatalogError::RequestFailed,
     }

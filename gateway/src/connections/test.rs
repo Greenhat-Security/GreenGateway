@@ -85,6 +85,9 @@ pub enum ConnectionTestReason {
     TlsInvalid,
     TlsUnavailable,
     AuthenticationNotSupported,
+    /// The Connection asks for a signed caller assertion, which this gateway
+    /// does not yet inject, so the test is refused before any request.
+    CallerAssertionNotEnforced,
     CredentialInvalid,
     CredentialUnavailable,
     OauthTokenEgressDenied,
@@ -866,6 +869,13 @@ pub(crate) fn connection_failure_classification(
             ConnectionOperationalState::Degraded,
             ConnectionStatusReason::InvalidResponse,
         ),
+        // Nothing was sent: the gateway cannot yet attest the caller this
+        // Connection says every request must name.
+        ConnectionHttpError::CallerAssertionNotEnforced => (
+            ConnectionTestStageName::Authenticated,
+            ConnectionOperationalState::Unavailable,
+            ConnectionStatusReason::RequestFailed,
+        ),
         ConnectionHttpError::InvalidTargetPath => (
             ConnectionTestStageName::ProtocolValid,
             ConnectionOperationalState::Unavailable,
@@ -921,6 +931,9 @@ fn test_reason_from_connection(error: ConnectionHttpError) -> ConnectionTestReas
         ConnectionHttpError::WrongConnectionKind => ConnectionTestReason::ConnectionKindMismatch,
         ConnectionHttpError::UnsupportedAuthentication => {
             ConnectionTestReason::AuthenticationNotSupported
+        }
+        ConnectionHttpError::CallerAssertionNotEnforced => {
+            ConnectionTestReason::CallerAssertionNotEnforced
         }
         ConnectionHttpError::TlsInvalid => ConnectionTestReason::TlsInvalid,
         ConnectionHttpError::TlsUnavailable => ConnectionTestReason::TlsUnavailable,
@@ -1176,12 +1189,30 @@ mod tests {
                 ConnectionOperationalState::Unavailable,
                 ConnectionStatusReason::SecretUnavailable,
             ),
+            (
+                ConnectionHttpError::CallerAssertionNotEnforced,
+                ConnectionTestStageName::Authenticated,
+                ConnectionOperationalState::Unavailable,
+                ConnectionStatusReason::RequestFailed,
+            ),
         ] {
             assert_eq!(
                 connection_failure_classification(error),
                 (expected_stage, expected_state, expected_status_reason)
             );
         }
+    }
+
+    #[test]
+    fn an_unenforced_caller_assertion_is_reported_by_its_own_reason() {
+        // An operator who configured an assertion must see why the test did
+        // not run, not a generic authentication or secret failure.
+        let reason = test_reason_from_connection(ConnectionHttpError::CallerAssertionNotEnforced);
+        assert_eq!(reason, ConnectionTestReason::CallerAssertionNotEnforced);
+        assert_eq!(
+            serde_json::to_value(reason).expect("reason should serialize"),
+            serde_json::json!("caller_assertion_not_enforced")
+        );
     }
 
     #[test]

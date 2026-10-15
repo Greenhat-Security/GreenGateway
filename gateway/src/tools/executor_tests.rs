@@ -37,8 +37,9 @@ use crate::{
         control_plane::ConnectionControlPlane,
         http::ConnectionHttpRuntime,
         model::{
-            AdditionalHeader, ConnectionAuthentication, ConnectionEndpoint, ConnectionId,
-            ConnectionKind, ConnectionWrite, OAuthClientAuthMethod, TlsProfile,
+            AdditionalHeader, CallerAssertionAlgorithm, CallerAssertionSettings,
+            ConnectionAuthentication, ConnectionEndpoint, ConnectionId, ConnectionKind,
+            ConnectionWrite, OAuthClientAuthMethod, TlsProfile,
         },
         secret::{OperatorSecretAliasConfig, OperatorSecretAliasSource, SecretRootConfig},
         store::{StoredEnumSourceValue, StoredOpenApiCatalog, StoredOpenApiCatalogEntry},
@@ -2150,6 +2151,102 @@ async fn connection_tool_checks_egress_before_reading_the_secret_provider() {
             .await
             .is_err(),
         "egress denial must happen before the TLS upstream receives a request"
+    );
+}
+
+#[tokio::test]
+async fn connection_tool_with_unenforced_caller_assertion_is_refused_before_any_io() {
+    // The Connection is otherwise fully usable: the upstream is reachable and
+    // allowlisted and both secrets resolve. Only the assertion it asks for,
+    // which nothing injects yet, may stop the call.
+    const API_KEY_CANARY: &str = "assertion-test-api-key-canary";
+    const SIGNING_KEY_CANARY: &str = "assertion-test-signing-key-canary";
+    let (addr, ca_pem, server) = one_request_tls_server().await;
+    let connection = TemporaryStaticAuthRuntime::header_api_key_with_caller_assertion(
+        addr,
+        &ca_pem,
+        API_KEY_CANARY.as_bytes(),
+        SIGNING_KEY_CANARY.as_bytes(),
+    )
+    .await;
+    let capture = CaptureSink::new();
+    let audit = AuditLog::new(Arc::new(capture.clone()) as Arc<dyn AuditSink>);
+    let runtime = ToolRuntime::new(
+        runtime_config([("get_charge", enabled_tool(500, 1))], 2, 1, 100),
+        audit.clone(),
+    );
+    let executor = executor_for_connection_tool(
+        connection_charge_tool(&connection.connection_id),
+        &connection,
+        runtime,
+        audit,
+    );
+
+    let error = executor
+        .execute(
+            "get_charge",
+            json!({ "charge_id": "ch_unattested" }),
+            invocation_context(),
+            CancellationToken::new(),
+        )
+        .await
+        .expect_err("a Connection that cannot attest its caller must not be called");
+    let ToolRuntimeError::WorkFailed {
+        message, reason, ..
+    } = error
+    else {
+        panic!("the refusal should surface as a work failure");
+    };
+    assert_eq!(reason.as_deref(), Some("caller_assertion_not_enforced"));
+    for canary in [API_KEY_CANARY, SIGNING_KEY_CANARY] {
+        assert!(
+            !message.contains(canary),
+            "the caller error leaked {canary}"
+        );
+    }
+
+    wait_until(Duration::from_secs(1), || {
+        capture
+            .events()
+            .iter()
+            .any(|event| event.event_type == audit::event::TOOL_INVOKE_FAILURE)
+    })
+    .await;
+    let events = capture.events();
+    let failure = events
+        .iter()
+        .find(|event| event.event_type == audit::event::TOOL_INVOKE_FAILURE)
+        .expect("the refusal should be audited");
+    assert_eq!(failure.payload["reason"], json!("work_error"));
+    assert_eq!(
+        failure.payload["failure_reason"],
+        json!("caller_assertion_not_enforced")
+    );
+    let upstream = events
+        .iter()
+        .find(|event| event.event_type == audit::event::TOOL_UPSTREAM_REQUEST)
+        .expect("the refused upstream request should be audited");
+    assert_eq!(upstream.payload["outcome"], json!("failure"));
+    assert_eq!(
+        upstream.payload["reason"],
+        json!("caller_assertion_not_enforced")
+    );
+    assert_eq!(upstream.payload["upstream_status"], Value::Null);
+    assert!(
+        events
+            .iter()
+            .all(|event| event.event_type != audit::event::CONNECTION_SECRET_RESOLUTION_FAILED),
+        "no secret provider may be consulted for a refused Connection"
+    );
+    let rendered = serde_json::to_string(&events).expect("events should serialize");
+    for canary in [API_KEY_CANARY, SIGNING_KEY_CANARY] {
+        assert!(!rendered.contains(canary), "the audit leaked {canary}");
+    }
+    assert!(
+        tokio::time::timeout(Duration::from_millis(100), server)
+            .await
+            .is_err(),
+        "the refusal must happen before the upstream receives a request"
     );
 }
 
@@ -5680,6 +5777,28 @@ impl TemporaryStaticAuthRuntime {
         secret: &[u8],
         additional: &[(&str, &str, &[u8])],
     ) -> Self {
+        Self::header_api_key_with(addr, ca_pem, secret, additional, None).await
+    }
+
+    /// A header-API-key Connection that also asks for a signed caller
+    /// assertion, with `signing_key` stored behind the assertion's alias so a
+    /// test can prove nothing ever read it.
+    async fn header_api_key_with_caller_assertion(
+        addr: SocketAddr,
+        ca_pem: &str,
+        secret: &[u8],
+        signing_key: &[u8],
+    ) -> Self {
+        Self::header_api_key_with(addr, ca_pem, secret, &[], Some(signing_key)).await
+    }
+
+    async fn header_api_key_with(
+        addr: SocketAddr,
+        ca_pem: &str,
+        secret: &[u8],
+        additional: &[(&str, &str, &[u8])],
+        assertion_signing_key: Option<&[u8]>,
+    ) -> Self {
         let root = std::env::temp_dir().join(format!(
             "greengateway-tool-static-auth-{}",
             uuid::Uuid::new_v4()
@@ -5724,6 +5843,39 @@ impl TemporaryStaticAuthRuntime {
                 },
             });
         }
+        let caller_assertion = match assertion_signing_key {
+            Some(signing_key) => {
+                let path = root.join("assertion-signing-key");
+                fs::write(&path, signing_key).expect("temporary signing key should write");
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    fs::set_permissions(&path, fs::Permissions::from_mode(0o600))
+                        .expect("temporary signing key permissions should set");
+                }
+                aliases.push(OperatorSecretAliasConfig {
+                    id: "assertion-signing-key".to_owned(),
+                    label: "Caller assertion signing key".to_owned(),
+                    source: OperatorSecretAliasSource::File {
+                        key: "assertion-signing-key".to_owned(),
+                    },
+                });
+                Some(CallerAssertionSettings {
+                    signing_key_id: "assertion-signing-key".to_owned(),
+                    kid: "gw-test-1".to_owned(),
+                    algorithm: CallerAssertionAlgorithm::Es256,
+                    issuer: "https://gateway.example.test".to_owned(),
+                    audience: "https://billing.example.test".to_owned(),
+                    token_type: "at+jwt".to_owned(),
+                    header_name: "x-caller-assertion".to_owned(),
+                    lifetime_seconds: 60,
+                    claims: Vec::new(),
+                    bind_request: false,
+                    bind_approval: false,
+                })
+            }
+            None => None,
+        };
 
         let mut config = Config::test_defaults();
         config.connections_sqlite_path =
@@ -5749,7 +5901,7 @@ impl TemporaryStaticAuthRuntime {
                         header_name: "x-api-key".to_owned(),
                         secret_id: Some("billing-api-key".to_owned()),
                     },
-                    caller_assertion: None,
+                    caller_assertion,
                     additional_headers: additional
                         .iter()
                         .map(|(header_name, alias_id, _)| AdditionalHeader {

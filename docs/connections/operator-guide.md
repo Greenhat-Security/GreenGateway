@@ -355,6 +355,24 @@ issuer/token-endpoint discovery are also unsupported. Do not emulate them with
 custom request headers or a tool argument; retain the legacy integration or
 place a purpose-built token broker behind an independently secured Connection.
 
+### Signed caller assertions
+
+`caller_assertion` is accepted and stored but **not yet enforced**: GreenGateway
+does not mint or inject the assertion on the request path. Until that ships, a
+Connection carrying a `caller_assertion` block is refused for every tool call,
+proxied request, managed MCP session, OpenAPI or MCP discovery, enum or label
+source fetch, and stored test, before any DNS lookup, secret read, OAuth mint,
+or upstream request, rather than sent without the assertion the operator asked
+for. Tool and proxy-route bindings to it are rejected the same way bindings to
+a disabled Connection are. Every refusal carries the fixed reason
+`caller_assertion_not_enforced`: the tool audit `failure_reason`, the
+Connection test stage reason, the catalog error `reason`, and the proxy's
+`error_category` log field. Remove the block to use the Connection meanwhile.
+
+New and replacement writes also reject `bind_approval: true`, because no
+approval subsystem exists for a mutation to be bound to, and an assertion
+`header_name` that matches any additional header name regardless of case.
+
 ## TLS, Custom CAs, and Mutual TLS
 
 TLS trust is independent from HTTP authentication:

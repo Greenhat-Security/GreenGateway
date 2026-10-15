@@ -349,9 +349,13 @@ impl ConnectionWrite {
 
     /// Validate a document already persisted under the v0 write contract.
     ///
-    /// Early v0 releases accepted `OPTIONS` test profiles. Keep that one
-    /// historical value readable across upgrades, while [`Self::validated`]
-    /// remains the only validator for new and replacement writes.
+    /// Early v0 releases accepted `OPTIONS` test profiles, and a
+    /// `caller_assertion` that asked for `bind_approval` or reused an
+    /// additional header's name. Keep those historical values readable across
+    /// upgrades, while [`Self::validated`] remains the only validator for new
+    /// and replacement writes. Reading one is not serving it: every Connection
+    /// carrying a `caller_assertion` is refused at runtime until the request
+    /// path injects the assertion.
     pub(crate) fn validated_persisted_v0(self) -> Result<Self, Vec<ConnectionValidationError>> {
         self.validated_with_legacy_options(true)
     }
@@ -392,6 +396,8 @@ impl ConnectionWrite {
         validate_caller_assertion(
             self.caller_assertion.as_mut(),
             &self.authentication,
+            &self.additional_headers,
+            allow_legacy_options,
             &mut errors,
         );
         validate_additional_headers(
@@ -541,9 +547,14 @@ pub fn is_valid_connection_id(value: &str) -> bool {
 /// ceiling is a replay window, not a convenience setting.
 pub const MAX_CALLER_ASSERTION_LIFETIME_SECONDS: u32 = 300;
 
+/// `allow_legacy` is set only when reading a document persisted before the
+/// additional-header and approval-binding rules below existed; see
+/// [`ConnectionWrite::validated_persisted_v0`].
 fn validate_caller_assertion(
     settings: Option<&mut CallerAssertionSettings>,
     authentication: &ConnectionAuthentication,
+    additional_headers: &[AdditionalHeader],
+    allow_legacy: bool,
     errors: &mut Vec<ConnectionValidationError>,
 ) {
     let Some(settings) = settings else {
@@ -595,6 +606,35 @@ fn validate_caller_assertion(
                 ));
             }
         }
+        // Additional headers ride on the same request, so a shared name would
+        // leave one value silently replacing the other depending on injection
+        // order. Compared case-insensitively because additional header names
+        // are only normalized after this runs.
+        if !allow_legacy
+            && additional_headers.iter().any(|header| {
+                header
+                    .header_name
+                    .eq_ignore_ascii_case(&settings.header_name)
+            })
+        {
+            errors.push(ConnectionValidationError::new(
+                "caller_assertion.header_name",
+                "duplicate_header_name",
+                "must differ from every additional header name",
+            ));
+        }
+    }
+
+    // There is no approval subsystem for a mutation to carry the id of, so an
+    // approval binding could only ever be unsatisfiable or quietly ignored.
+    // Refusing it now keeps a Connection from claiming a guarantee that nothing
+    // can provide.
+    if settings.bind_approval && !allow_legacy {
+        errors.push(ConnectionValidationError::new(
+            "caller_assertion.bind_approval",
+            "unsupported_binding",
+            "approval binding is not supported yet and must be false",
+        ));
     }
 
     if settings.lifetime_seconds == 0
@@ -1414,6 +1454,80 @@ newline"
     fn a_claim_may_be_listed_once() {
         let errors = assertion_errors(json!({ "claims": ["email", "email"] }));
         assert!(errors.iter().any(|error| error.code == "duplicate_claim"));
+    }
+
+    #[test]
+    fn the_assertion_header_may_not_reuse_an_additional_header_name() {
+        // Both ride on the same request, so one would silently replace the
+        // other. The case differs on purpose: header names are case-insensitive
+        // and additional headers are only normalized after this check runs.
+        let mut document = with_caller_assertion(json!({ "header_name": "x-caller-assertion" }));
+        document["additional_headers"] = json!([{
+            "header_name": "X-Caller-Assertion",
+            "secret_id": "billing-proxy-token"
+        }]);
+        let candidate: ConnectionWrite =
+            serde_json::from_value(document).expect("candidate should deserialize");
+        let errors = candidate
+            .clone()
+            .validated()
+            .expect_err("a shared header name should be rejected");
+        assert!(errors.iter().any(|error| {
+            error.field == "caller_assertion.header_name" && error.code == "duplicate_header_name"
+        }));
+
+        // A document persisted before the rule existed stays readable; the
+        // runtime refuses every Connection carrying an assertion regardless.
+        candidate
+            .validated_persisted_v0()
+            .expect("an already-persisted collision must remain readable");
+    }
+
+    #[test]
+    fn an_additional_header_with_a_different_name_is_accepted_beside_the_assertion() {
+        let mut document = with_caller_assertion(json!({}));
+        document["additional_headers"] = json!([{
+            "header_name": "cf-access-client-id",
+            "secret_id": "billing-proxy-token"
+        }]);
+        serde_json::from_value::<ConnectionWrite>(document)
+            .expect("should deserialize")
+            .validated()
+            .expect("distinct header names should validate");
+    }
+
+    #[test]
+    fn approval_binding_is_refused_until_an_approval_subsystem_exists() {
+        // Nothing can supply the approval id this would require, so accepting
+        // it would persist a guarantee the gateway cannot keep.
+        let document = with_caller_assertion(json!({ "bind_approval": true }));
+        assert!(
+            connection_schema_validator().validate(&document).is_err(),
+            "the published schema should refuse an approval binding"
+        );
+        let candidate: ConnectionWrite =
+            serde_json::from_value(document).expect("candidate should deserialize");
+        let errors = candidate
+            .clone()
+            .validated()
+            .expect_err("an approval binding should be rejected");
+        assert!(errors.iter().any(|error| {
+            error.field == "caller_assertion.bind_approval" && error.code == "unsupported_binding"
+        }));
+
+        candidate
+            .validated_persisted_v0()
+            .expect("an already-persisted approval binding must remain readable");
+
+        // Explicitly false is the only accepted value.
+        let document = with_caller_assertion(json!({ "bind_approval": false }));
+        connection_schema_validator()
+            .validate(&document)
+            .expect("the published schema should accept bind_approval false");
+        serde_json::from_value::<ConnectionWrite>(document)
+            .expect("should deserialize")
+            .validated()
+            .expect("bind_approval false should validate");
     }
 
     #[test]
