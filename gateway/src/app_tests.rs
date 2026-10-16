@@ -31373,7 +31373,8 @@ mod cluster_policy_tests {
         // authority's revision like the production startup path does.
         rbac_state
             .install_revision_snapshot(active.policy.clone(), active.security_revision)
-            .await;
+            .await
+            .expect("the authority's revision should install");
 
         // GET serves the authoritative document and its verified ETag.
         let etag = etag_of(
@@ -31629,7 +31630,8 @@ mod cluster_policy_tests {
         );
         rbac_state
             .install_revision_snapshot(active.policy.clone(), active.security_revision)
-            .await;
+            .await
+            .expect("the authority's revision should install");
         let runtime = ClusterSecurityRuntime::new(
             store.revision_source(),
             PolicyResource::new(store.clone(), rbac_state.clone()),
@@ -31696,7 +31698,8 @@ mod cluster_policy_tests {
         // replica booted against.
         rbac_state
             .install_revision_snapshot(active.policy.clone(), active.security_revision)
-            .await;
+            .await
+            .expect("the authority's revision should install");
 
         // Sanity: the granted admin principal is authorized while the
         // snapshot is current.
@@ -31791,7 +31794,8 @@ mod cluster_policy_tests {
         );
         rbac_state
             .install_revision_snapshot(active.policy.clone(), active.security_revision)
-            .await;
+            .await
+            .expect("the authority's revision should install");
         let runtime = ClusterSecurityRuntime::new(
             store.revision_source(),
             PolicyResource::new(store.clone(), rbac_state.clone()),
@@ -32202,7 +32206,8 @@ mod cluster_tools_tests {
                 active_policy.policy.clone(),
                 active_policy.security_revision,
             )
-            .await;
+            .await
+            .expect("the authority's revision should install");
         let registry =
             ToolRegistry::from_definitions_with_audit(Vec::new(), Some(test_audit_log()));
         let boot_tools = tools_store
@@ -32457,7 +32462,8 @@ mod cluster_tools_tests {
                 active_policy.policy.clone(),
                 active_policy.security_revision,
             )
-            .await;
+            .await
+            .expect("the authority's revision should install");
         let runtime = ClusterSecurityRuntime::new(
             policy_store.revision_source(),
             PolicyResource::new(policy_store.clone(), rbac_state.clone()),
@@ -32544,7 +32550,8 @@ mod cluster_tools_tests {
                 active_policy.policy.clone(),
                 active_policy.security_revision,
             )
-            .await;
+            .await
+            .expect("the authority's revision should install");
         let runtime = ClusterSecurityRuntime::new(
             policy_store.revision_source(),
             PolicyResource::new(policy_store.clone(), rbac_state.clone()),
@@ -32767,7 +32774,8 @@ mod cluster_tools_tests {
                 active_policy.policy.clone(),
                 active_policy.security_revision,
             )
-            .await;
+            .await
+            .expect("the authority's revision should install");
         let runtime = ClusterSecurityRuntime::new(
             policy_store.revision_source(),
             PolicyResource::new(policy_store.clone(), rbac_state.clone()),
@@ -32897,7 +32905,8 @@ mod cluster_tools_tests {
                 active_policy.policy.clone(),
                 active_policy.security_revision,
             )
-            .await;
+            .await
+            .expect("the authority's revision should install");
         let registry =
             ToolRegistry::from_definitions_with_audit(Vec::new(), Some(test_audit_log()));
         let boot_tools = tools_store
@@ -33627,7 +33636,8 @@ mod cluster_discovery_tests {
         // handler's snapshot is unkeyed.
         rbac_state
             .install_revision_snapshot(active.policy.clone(), active.security_revision)
-            .await;
+            .await
+            .expect("the authority's revision should install");
 
         let engine = discovery::cluster_suggestions::ClusterRuleSuggestionEngine::new(
             Arc::new(PostgresDiscoveryReadStore::new(pool.clone())),

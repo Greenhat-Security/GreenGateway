@@ -28,7 +28,7 @@ rustup toolchain install "$RUSTUP_TOOLCHAIN" --component rustfmt --component cli
 
 cargo fmt --check
 cargo clippy --workspace --locked -- -D warnings
-cargo test --workspace --locked
+RUSTFLAGS="-D warnings" cargo test --workspace --locked
 python scripts/transport_guard.py check
 python scripts/cargo_policy.py install   # `check` execs the pinned cargo-deny directly
 python scripts/cargo_policy.py check
