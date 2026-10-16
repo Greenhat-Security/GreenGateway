@@ -20,8 +20,9 @@ function SHA-256, exact test names and exact replacement text. Missing or moved
 functions, changed source, ambiguous anchors and absent tests fail the campaign
 until a reviewer reconciles the registry with the authoritative code. Selection
 does not silently fall back to a substring match or another similarly named
-function. Pull requests check the registry side of that reconciliation before
-merge; see [Pull-request registry check](#pull-request-registry-check).
+function. Pull requests check the registry side of that reconciliation, and
+that every selected test still exists, before merge; see
+[Pull-request registry check](#pull-request-registry-check).
 
 | Target | Security decision | Reviewed changes |
 |---|---|---|
@@ -59,6 +60,9 @@ export CARGO_BUILD_JOBS=1
 python scripts/test_security_mutations.py
 python scripts/test_security_mutations_workflows.py
 python scripts/security_mutations.py --validate-registry
+mkdir -p target/security-mutations
+cargo test --workspace --locked -- --list --format terse > target/security-mutations/test-list.txt
+python scripts/security_mutations.py --check-test-list target/security-mutations/test-list.txt
 python scripts/security_mutations.py --report target/security-mutations/report.json
 ```
 
@@ -230,24 +234,46 @@ inputs and involve the owning maintainers before public disclosure.
 
 ## Pull-request registry check
 
-Every pull request, `main` push and version tag runs
-`python scripts/security_mutations.py --validate-registry` in the required
-`supply-chain` CI job, after `scripts/test_security_mutations_workflows.py`
-confirms that this step and the scheduled campaign's trust boundary are still
-in place. Reusing that job leaves the required-check and image-promotion lists
-unchanged.
+Every pull request, `main` push and version tag runs two registry checks, each
+in an existing required CI job. Reusing those jobs leaves the required-check
+and image-promotion lists unchanged.
 
-The check runs the campaign's registry loader against the checked-out tree:
-schema and harness version, safe regular-file paths, a start marker that occurs
-once at the beginning of a line, the function scope it opens, the function
-SHA-256, each mutation's `old` text occurring exactly once in that function,
-selected test names' syntax, count and uniqueness, and each exception's binding
-to a current mutation identity. A pass reports `reason: registry_valid` with
+The `supply-chain` job runs the controller's `ManifestTests` and
+`TestListTests`, which need neither a compiler nor a child process, then
+`scripts/test_security_mutations_workflows.py`, which confirms that these
+steps and the scheduled campaign's trust boundary are still in place, and then
+`python scripts/security_mutations.py --validate-registry`. The remaining
+controller tests stay in the scheduled job because they include a real Rust
+calibration build and real process-limit checks.
+
+`--validate-registry` runs the campaign's registry loader against the
+checked-out tree: schema and harness version, safe regular-file paths, a start
+marker that occurs once at the beginning of a line, the function scope it
+opens, the function SHA-256, each mutation's `old` text occurring exactly once
+in that function, selected test names' syntax, count and uniqueness, and each
+exception's binding to a current mutation identity. A pass prints
+`security mutation registry check: passed (registry_valid)` and reports
 `source_state: checkout_registry_only`. Nothing is compiled, discovered,
-tested or mutated, so its counts stay zero and it is not a mutation score. Like
-the campaign, it runs only on Linux, and `--validate-registry` cannot be
-combined with `--calibrate`. The controller tests stay in the scheduled job
-because they include a real Rust calibration build.
+tested or mutated, so its counts stay zero and it is not a mutation score.
+
+The `test` job, after `cargo test --workspace --locked` has built and run the
+suite, repeats that exact invocation with `-- --list --format terse` to list
+the same test binaries without rebuilding them, and passes the listing to
+`python scripts/security_mutations.py --check-test-list`. That mode applies the
+same registry validation, then requires every selected test to be listed
+exactly once, as a test, under its exact name. A renamed or deleted test fails
+with `registry_test_not_listed`; one listed more than once, for example by two
+test binaries, or only as a benchmark fails with `registry_test_ambiguous`.
+Both print the affected registry names and record them in the report as
+`unlisted_tests` and `ambiguous_tests`. A listing line that is not terse
+libtest output fails with `invalid_test_list`, and an empty listing with
+`empty_test_list`; the check never falls back to a prefix or substring match.
+A pass reports `reason: registry_tests_listed` with
+`source_state: checkout_registry_and_test_list`, the listing's SHA-256 and
+the number of listed entries, again with zero counts.
+
+Like the campaign, both modes run only on Linux. They cannot be combined with
+each other or with `--calibrate`.
 
 The reconciliation rule for pull requests: a change that edits, moves or
 renames a registered function or its file, or edits the registry, must leave
@@ -275,9 +301,12 @@ Then rerun `--validate-registry`, which applies the exact rules. A working tree
 with CRLF line endings, such as a Windows checkout with `core.autocrlf=true`,
 fails with `function_scope_drift`; hash the committed LF bytes instead.
 
-This check cannot detect a renamed or deleted selected test, a new survivor, an
-unviable mutant or a timeout. Those need the compiled test binary and remain
-campaign results. The required `test` job still runs every selected test.
+A selected test that is renamed or deleted must be updated in the registry in
+the same pull request, with the same review of what the replacement asserts.
+Neither check can detect a new survivor, an unviable mutant, a timeout or a
+selected test marked `#[ignore]`. Those need mutated builds or a baseline run
+and remain campaign results. The required `test` job still runs every
+non-ignored selected test.
 
 ## Trusted scheduled execution
 
@@ -289,9 +318,10 @@ disabled. The workflow grants only `contents: read`, uses immutable action
 references, installs the pinned build tools, tests controller failure handling
 and workflow trust boundaries, then runs the complete registry.
 
-Pull requests run only the registry check above; no mutant is built or measured
-on a pull request. The existing [security coverage gate](security-coverage.md),
-normal tests and image-promotion dependencies remain unchanged. A future small
+Pull requests run only the registry checks above; no mutant is built or
+measured on a pull request. The existing
+[security coverage gate](security-coverage.md), normal tests and
+image-promotion dependencies remain unchanged. A future small
 PR mutation gate requires a separately reviewed target scope and measured
 end-to-end runtime; the scheduled baseline does not authorize a slow or partial
 mutation job on every pull request.
