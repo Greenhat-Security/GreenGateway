@@ -53,7 +53,9 @@ def check_contract(ci):
         "ref": "${{ github.sha }}", "fetch-depth": "0", "persist-credentials": "false",
     }, "checkout must use the event commit and preserve complete history")
     tools = next(step for step in steps if step.get("uses") == "./.github/actions/build-tools")
-    require(tools.get("with") == {"rust": "ci", "node": "false"}, "pinned Rust profile")
+    # The HTTP policy target builds the gateway test binary, whose build script
+    # builds the admin UI with the pinned Node.
+    require(tools.get("with") == {"rust": "ci", "node": "true"}, "pinned Rust and Node profile")
     pins = json.loads((ROOT / "build-tools.json").read_text(encoding="utf-8"))
     require(any(step.get("run") == f"python -m pip install PyYAML=={pins['pyyaml']}"
                 for step in steps), "pinned fixture parser")
