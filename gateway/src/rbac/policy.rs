@@ -17,7 +17,10 @@ use super::rule::{
     principal_identity_matches, valid_auth_method_name, PrincipalMatcher, Rule, RuleDispatchKind,
     AUTH_METHOD_BEARER_TOKEN, AUTH_METHOD_SESSION_COOKIE,
 };
-use crate::{auth::principal::canonical_issuer, auth::Principal, config::Config};
+use crate::{
+    auth::principal::canonical_issuer, auth::Principal, config::Config,
+    request_bounds::MAX_TOOL_NAME_BYTES,
+};
 
 pub(crate) const KNOWN_TOP_LEVEL_KEYS: &[&str] = &[
     "schema_version",
@@ -444,6 +447,14 @@ fn validate_rules(rules: &[Rule]) -> Result<(), PolicyError> {
                 )));
             }
 
+            // The bound the tool lane evaluates names under, so no rule can name
+            // a tool the evaluator cannot be asked about.
+            if tool_name.len() > MAX_TOOL_NAME_BYTES {
+                return Err(PolicyError::Invalid(format!(
+                    "rules[{rule_index}].tool_name must not exceed {MAX_TOOL_NAME_BYTES} bytes"
+                )));
+            }
+
             if !rule.methods.is_empty() {
                 return Err(PolicyError::Invalid(format!(
                     "rules[{rule_index}].methods must be empty when tool_name is set"
@@ -555,6 +566,13 @@ fn validate_rule_dispatch_origin(
 
 fn validate_tools(tools: &HashMap<String, ToolPolicyEntry>) -> Result<(), PolicyError> {
     for (tool_name, entry) in tools {
+        // Checked first, and reported without the name: an entry the tool lane
+        // could never be asked about must not load, nor echo a payload back.
+        if tool_name.len() > MAX_TOOL_NAME_BYTES {
+            return Err(PolicyError::Invalid(format!(
+                "tools entry names must not exceed {MAX_TOOL_NAME_BYTES} bytes"
+            )));
+        }
         if entry.timeout_ms == 0 {
             return Err(PolicyError::Invalid(format!(
                 "tools.{tool_name}.timeout_ms must be positive"

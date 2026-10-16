@@ -8,7 +8,7 @@ use std::{
 };
 
 #[cfg(test)]
-use crate::rbac::{DefaultAction, EnforcementMode};
+use crate::rbac::{DefaultAction, EnforcementMode, RuleDispatchContext, RuleMatcher};
 use arc_swap::ArcSwap;
 #[cfg(feature = "postgres")]
 use async_trait::async_trait;
@@ -18,9 +18,7 @@ use axum::{
     response::{IntoResponse, Response},
     Json,
 };
-#[cfg(test)]
-use http::Method;
-use http::StatusCode;
+use http::{Method, StatusCode};
 use notify::{RecursiveMode, Watcher};
 use serde::Serialize;
 use serde_json::{json, Value};
@@ -33,10 +31,19 @@ use crate::{
     client_ip::{canonical_client_ip, request_id, ClientIpPolicy},
     config::Config,
     path_match::{exempt_path_matches, is_unsafe_request_path},
-    rbac::{
-        policy::ToolPolicyEntry, rule::principal_identity_matches, EgressPolicy, Policy,
-        PolicyEngine, RouteRule, RuleAction, RuleDispatchContext, RuleDispatchKind, RuleMatcher,
+    policy_eval::{
+        tools::{
+            ToolEvaluation, ToolEvaluationContext, ToolLimitation, ToolOperation, ToolReason,
+            TOOL_CONTEXT_VERSION,
+        },
+        EvaluationError, LogicalDecision, PolicyEffect, PrincipalFact, PrincipalIdentity,
+        RuleReference,
     },
+    rbac::{
+        policy::ToolPolicyEntry, EgressPolicy, Policy, PolicyEngine, RouteRule, RuleAction,
+        RuleDispatchKind,
+    },
+    request_bounds::MAX_TOOL_NAME_BYTES,
     upstream_route::{
         self, ProxyRouteAuthorizationContext, ProxyRouteClassificationCompleted,
         ProxyRouteObservationContext,
@@ -128,19 +135,26 @@ pub struct Admission {
     pub bundle: Option<Arc<crate::security_cluster::SecurityBundle>>,
 }
 
-#[cfg(feature = "postgres")]
 tokio::task_local! {
-    /// The policy snapshot pinned for the request being served, set when
-    /// the gate admits it. Every policy read made in the request's task --
-    /// the middleware's own, and the tool runtime's authorization -- goes
-    /// through it, so one admitted request is judged by one policy. A task
-    /// the request spawns does not inherit it: work served from such a task
-    /// re-enters it with [`with_request_pins`].
+    /// The policy snapshot pinned for the request being served. Cluster mode
+    /// sets it when the revision gate admits a request with a published
+    /// bundle; [`RbacState::with_request_policy_snapshot`] sets it for a check
+    /// whose reads must agree with one another in either mode.
+    ///
+    /// It covers the reads made through [`RbacState::effective_policy`] in the
+    /// pinning task: the tool lane (invocation, visibility, inventory
+    /// eligibility, composite enablement, the rendered HTTP rule) and delegated
+    /// role checks. It does not cover everything. The middleware judges the
+    /// request by `bundle.policy` directly, before the pin is installed around
+    /// the rest of the request. The management lane
+    /// ([`RbacState::principal_has_permission`]) and the admin read-modify-write
+    /// baselines ([`RbacState::current_policy`]) read the live lane on purpose.
+    /// A task the request spawns does not inherit the pin: work served from
+    /// such a task re-enters it with [`with_request_pins`].
     static PINNED_POLICY: Arc<RbacPolicyState>;
 }
 
 /// Run `future` with `policy` pinned as the request's policy snapshot.
-#[cfg(feature = "postgres")]
 pub(crate) async fn with_pinned_policy<F: std::future::Future>(
     policy: Arc<RbacPolicyState>,
     future: F,
@@ -367,6 +381,10 @@ pub(crate) fn validate_policy_proxy_dispatch_config(
 
 pub(crate) struct RbacPolicyState {
     engine: PolicyEngine,
+    /// The pre-cutover direct-rule matcher, kept only for the frozen
+    /// differential oracles in `legacy`. Every serving decision reads
+    /// `compiled`.
+    #[cfg(test)]
     rule_matcher: RuleMatcher,
     rule_ids: Vec<String>,
     #[cfg(test)]
@@ -391,7 +409,7 @@ pub(crate) struct RbacPolicyState {
     /// disagree with the snapshot it belongs to, and compiling once per install
     /// keeps three parses and a digest off the request path.
     ///
-    /// The HTTP adapter uses this instance for every admitted decision.
+    /// The HTTP and tool-lane adapters use this instance for every decision.
     compiled: crate::policy_eval::CompiledPolicy,
 }
 
@@ -401,26 +419,103 @@ pub(crate) struct MatchedRuleDecision {
     pub matched_rule_id: String,
 }
 
-pub(crate) struct ToolAuthorizationSnapshot<'a> {
-    pub tool: Option<ToolPolicySnapshot<'a>>,
-    pub rule_decision: Option<MatchedRuleDecision>,
+/// A tool invocation decided by the shared evaluator over one policy snapshot,
+/// with the snapshot data the runtime needs to act on it.
+pub(crate) struct ToolInvocationAuthorization<'a> {
+    /// Every tool entry the snapshot names, so the runtime can prune the
+    /// limiters of tools the policy no longer carries.
     pub tools: &'a HashMap<String, ToolPolicyEntry>,
+    pub verdict: ToolInvocationVerdict<'a>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct ToolPolicySnapshot<'a> {
-    pub enabled: bool,
-    pub allowed_roles: &'a [String],
-    pub issuers: &'a [String],
-    pub auth_methods: &'a [String],
-    pub timeout_ms: u64,
-    pub max_concurrent: u32,
+/// The evaluator's invocation answer, translated for the runtime. Each variant
+/// keeps the runtime's existing error and audit vocabulary.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum ToolInvocationVerdict<'a> {
+    /// The policy entry exists, is enabled and admits the caller's identity,
+    /// and `tool` is that entry, read from the instance that judged it. The
+    /// outcome is then `rule_decision`: the first matching tool-name rule,
+    /// whose action is the evaluator's effect -- allow, deny, or a shadow
+    /// observation -- for the runtime to audit and enforce. No rule allows.
+    Entry {
+        tool: &'a ToolPolicyEntry,
+        rule_decision: Option<MatchedRuleDecision>,
+    },
+    UnknownTool,
+    Disabled,
+    RoleNotAllowed {
+        allowed_roles: &'a [String],
+    },
+    /// No decision: blocked, whatever the policy's enforcement mode.
+    Refused(ToolPolicyRefusal),
+}
+
+/// Why the tool lane refused to answer rather than decide.
+///
+/// Every variant blocks, in shadow mode too, as an incomplete or refused HTTP
+/// evaluation does (#422). None is reachable from a served call. Policy
+/// validation refuses a policy tool name over [`MAX_TOOL_NAME_BYTES`], so no
+/// policy can name a tool the evaluator cannot be asked about, and every
+/// registry source bounds tool names far below it. Tool rendering refuses a
+/// method or path the evaluator would refuse, and an authenticated principal
+/// has passed the same shape check the evaluator applies. The reason is a
+/// stable code; diagnostics are bounded enums, never a name, path or identity.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ToolPolicyRefusal {
+    /// A tool name over [`MAX_TOOL_NAME_BYTES`], refused before evaluation.
+    NameOutOfBounds,
+    /// The evaluator lacked a fact it needed.
+    Incomplete(Option<ToolLimitation>),
+    /// The evaluator refused the question, or its answer could not be
+    /// attributed to the snapshot it came from.
+    Error(EvaluationError),
+}
+
+impl ToolPolicyRefusal {
+    pub(crate) fn reason(self) -> &'static str {
+        match self {
+            Self::NameOutOfBounds => "tool_name_out_of_bounds",
+            Self::Incomplete(_) => "policy_evaluation_incomplete",
+            Self::Error(_) => "policy_evaluation_error",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub(crate) struct ToolPolicyEligibility {
     pub eligible: bool,
     pub reason: &'static str,
+}
+
+/// One policy snapshot's inventory eligibility answers, for a caller that
+/// previews many tools and must not straddle a policy install between them.
+pub(crate) struct ToolEligibilitySnapshot(Arc<RbacPolicyState>);
+
+impl ToolEligibilitySnapshot {
+    /// Whether `principal` may invoke `tool_name` under this snapshot, without
+    /// emitting audit events or beginning execution. A shadow rule leaves a tool
+    /// eligible; a refusal is ineligible with the refusal's reason.
+    pub(crate) fn eligibility(
+        &self,
+        tool_name: &str,
+        principal: &auth::Principal,
+    ) -> ToolPolicyEligibility {
+        match self.0.evaluate_tool(
+            ToolOperation::PolicyEligibility,
+            tool_name,
+            principal_fact(Some(principal)),
+            None,
+        ) {
+            Ok(evaluation) => ToolPolicyEligibility {
+                eligible: evaluation.effect() == PolicyEffect::Allow,
+                reason: evaluation.reason().as_str(),
+            },
+            Err(refusal) => ToolPolicyEligibility {
+                eligible: false,
+                reason: refusal.reason(),
+            },
+        }
+    }
 }
 
 #[derive(Serialize)]
@@ -540,14 +635,28 @@ impl RbacState {
         self.effective_policy()
     }
 
-    /// The policy snapshot this request is judged by: the one the gate
-    /// pinned at admission (cluster mode), else the live lane.
+    /// The policy snapshot this request is judged by: the one pinned for it
+    /// (by the gate at admission in cluster mode, or by
+    /// [`RbacState::with_request_policy_snapshot`]), else the live lane.
     fn effective_policy(&self) -> Arc<RbacPolicyState> {
-        #[cfg(feature = "postgres")]
         if let Ok(pinned) = PINNED_POLICY.try_with(Arc::clone) {
             return pinned;
         }
         self.policy.load_full()
+    }
+
+    /// Run `future` with the request's policy snapshot pinned, so every
+    /// [`RbacState::effective_policy`] read inside it -- the tool lane and
+    /// [`RbacState::request_snapshot_grants_permission`] -- answers from one
+    /// snapshot. In cluster mode that is the snapshot already pinned at
+    /// admission; in standalone mode it is the live lane, read once here. A
+    /// check made of several such reads cannot then straddle a policy install
+    /// and be answered by two snapshots (#422).
+    pub(crate) async fn with_request_policy_snapshot<F: std::future::Future>(
+        &self,
+        future: F,
+    ) -> F::Output {
+        with_pinned_policy(self.effective_policy(), future).await
     }
 
     /// The live policy lane, for the security runtime to capture bundles
@@ -673,6 +782,20 @@ impl RbacState {
             .principal_has_permission(principal, permission)
     }
 
+    /// [`RbacState::principal_has_permission`] judged by the request's policy
+    /// snapshot rather than the live lane, for a check that must agree with
+    /// the tool-lane decisions made beside it. The management lane itself keeps
+    /// reading live.
+    pub(crate) fn request_snapshot_grants_permission(
+        &self,
+        principal: &auth::Principal,
+        permission: &str,
+    ) -> bool {
+        self.effective_policy()
+            .engine
+            .principal_has_permission(principal, permission)
+    }
+
     /// Returns requested delegated roles that the principal cannot activate.
     /// Wildcard principals may delegate any role. The request's policy
     /// snapshot is read once so the wildcard and per-role decisions use the
@@ -708,98 +831,135 @@ impl RbacState {
         }
     }
 
+    /// Decide one tool invocation with the shared evaluator, over the request's
+    /// policy snapshot, and hand the verdict to `evaluate` along with that
+    /// snapshot's tool entries.
+    ///
+    /// `principal` is the identity the caller projects, which for the tool
+    /// runtime is its Actor projection, not necessarily the inbound principal.
     pub(crate) fn evaluate_tool_authorization<R>(
         &self,
         tool_name: &str,
         principal: Option<&auth::Principal>,
-        evaluate: impl FnOnce(ToolAuthorizationSnapshot<'_>) -> R,
+        evaluate: impl FnOnce(ToolInvocationAuthorization<'_>) -> R,
     ) -> R {
         let policy = self.effective_policy();
-        let tool = policy.tool_policy(tool_name);
-        let rule_decision = policy.evaluate_tool_rule(tool_name, principal);
-
-        evaluate(ToolAuthorizationSnapshot {
-            tool,
-            rule_decision,
-            tools: &policy.engine.policy().tools,
+        let verdict = policy.tool_invocation_verdict(tool_name, principal);
+        evaluate(ToolInvocationAuthorization {
+            tools: policy.compiled.tool_entries(),
+            verdict,
         })
     }
 
-    /// The rendered-HTTP firewall rule for a tool's upstream request, judged by
-    /// the same snapshot as [`RbacState::evaluate_tool_authorization`]. An
-    /// invocation admitted under the pinned policy must not have its rendered
-    /// request judged by a revision a reconcile installed while it was in
-    /// flight: that is one decision built from two snapshots (#422).
+    /// Whether a tool is listed to `principal`, decided by the shared evaluator.
+    /// A shadow rule does not hide a tool. A refusal hides it.
+    pub(crate) fn tool_visible(&self, tool_name: &str, principal: Option<&auth::Principal>) -> bool {
+        self.effective_policy()
+            .evaluate_tool(
+                ToolOperation::Visibility,
+                tool_name,
+                principal_fact(principal),
+                None,
+            )
+            .is_ok_and(|evaluation| evaluation.effect() == PolicyEffect::Allow)
+    }
+
+    /// Whether a leaf run under an already-admitted composite grant is enabled.
+    /// Only the policy entry's enable bit decides: the grant has already
+    /// answered for identity, tool rules and admission, so no identity is
+    /// supplied. A refusal is not enabled.
+    pub(crate) fn composite_leaf_enabled(&self, tool_name: &str) -> bool {
+        self.effective_policy()
+            .evaluate_tool(
+                ToolOperation::CompositeLeaf,
+                tool_name,
+                PrincipalFact::Missing,
+                None,
+            )
+            .is_ok_and(|evaluation| evaluation.effect() == PolicyEffect::Allow)
+    }
+
+    /// The rendered-HTTP firewall rule for a tool's upstream request, decided
+    /// by the shared evaluator over the same snapshot as
+    /// [`RbacState::evaluate_tool_authorization`]. An invocation admitted under
+    /// the pinned policy must not have its rendered request judged by a
+    /// revision a reconcile installed while it was in flight: that is one
+    /// decision built from two snapshots (#422).
+    ///
+    /// Direct rules only, under unknown dispatch: no route or default applies,
+    /// so `Ok(None)` (no rule matched) allows. The tool name binds the
+    /// question but does not decide it.
     pub(crate) fn evaluate_tool_http_rule(
         &self,
+        tool_name: &str,
         method: &str,
         path: &str,
         principal: Option<&auth::Principal>,
-    ) -> Option<MatchedRuleDecision> {
-        self.effective_policy()
-            .evaluate_tool_http_rule(method, path, principal)
+    ) -> Result<Option<MatchedRuleDecision>, ToolPolicyRefusal> {
+        // Rendering passes an `http::Method`'s own text, so this cannot fail
+        // for a served call; an unparsable method is refused, not guessed.
+        let method = Method::from_bytes(method.as_bytes())
+            .map_err(|_| refused(ToolOperation::RenderedHttp, inconsistent()))?;
+        let policy = self.effective_policy();
+        let evaluation = policy.evaluate_tool(
+            ToolOperation::RenderedHttp,
+            tool_name,
+            principal_fact(principal),
+            Some((method, path.to_owned())),
+        )?;
+        policy
+            .matched_tool_rule(&evaluation)
+            .map_err(|refusal| refused(ToolOperation::RenderedHttp, refusal))
     }
 
     /// Previews whether the requesting principal may invoke a policy-backed
-    /// tool without emitting audit events or beginning tool execution.
-    ///
-    /// The request's policy snapshot is loaded exactly once so the tool entry
-    /// and any direct tool-name rule are evaluated from the same immutable
-    /// snapshot.
+    /// tool without emitting audit events or beginning tool execution. One
+    /// question against a freshly read snapshot; a caller previewing several
+    /// tools takes [`RbacState::tool_eligibility_snapshot`] once instead, as
+    /// inventory does.
+    #[cfg(test)]
     pub(crate) fn tool_policy_eligibility(
         &self,
         tool_name: &str,
         principal: &auth::Principal,
     ) -> ToolPolicyEligibility {
-        let policy = self.effective_policy();
-        let Some(tool) = policy.tool_policy(tool_name) else {
-            return ToolPolicyEligibility {
-                eligible: false,
-                reason: "not_in_policy",
-            };
-        };
+        self.tool_eligibility_snapshot()
+            .eligibility(tool_name, principal)
+    }
 
-        if !tool.enabled {
-            return ToolPolicyEligibility {
-                eligible: false,
-                reason: "policy_disabled",
-            };
-        }
-
-        if !tool_policy_principal_matches(tool, principal) {
-            return ToolPolicyEligibility {
-                eligible: false,
-                reason: "principal_not_eligible",
-            };
-        }
-
-        if policy
-            .evaluate_tool_rule(tool_name, Some(principal))
-            .is_some_and(|decision| decision.action == RuleAction::Deny)
-        {
-            return ToolPolicyEligibility {
-                eligible: false,
-                reason: "policy_denied",
-            };
-        }
-
-        ToolPolicyEligibility {
-            eligible: true,
-            reason: "eligible",
-        }
+    /// The request's policy snapshot, read once, for previewing the
+    /// eligibility of many tools from the same snapshot.
+    pub(crate) fn tool_eligibility_snapshot(&self) -> ToolEligibilitySnapshot {
+        ToolEligibilitySnapshot(self.effective_policy())
     }
 }
 
-fn tool_policy_principal_matches(
-    tool: ToolPolicySnapshot<'_>,
-    principal: &auth::Principal,
-) -> bool {
-    principal_identity_matches(tool.issuers, tool.auth_methods, principal)
-        && (tool.allowed_roles.is_empty()
-            || tool
-                .allowed_roles
-                .iter()
-                .any(|allowed_role| principal.roles.iter().any(|role| role == allowed_role)))
+/// The policy fact for an identity a tool-lane consumer projects. No identity
+/// is an anonymous caller, never a missing fact: every tool-lane consumer
+/// knows whether it has one.
+fn principal_fact(principal: Option<&auth::Principal>) -> PrincipalFact {
+    principal.map_or(PrincipalFact::Anonymous, |principal| {
+        PrincipalFact::Authenticated(PrincipalIdentity::from_principal(principal))
+    })
+}
+
+fn inconsistent() -> ToolPolicyRefusal {
+    ToolPolicyRefusal::Error(EvaluationError::InconsistentContext)
+}
+
+fn internal_invariant() -> ToolPolicyRefusal {
+    ToolPolicyRefusal::Error(EvaluationError::InternalInvariant)
+}
+
+/// Record a tool-lane refusal with bounded diagnostics, and hand it back.
+fn refused(operation: ToolOperation, refusal: ToolPolicyRefusal) -> ToolPolicyRefusal {
+    tracing::warn!(
+        ?operation,
+        reason = refusal.reason(),
+        ?refusal,
+        "tool policy evaluation refused"
+    );
+    refusal
 }
 
 impl RbacPolicyState {
@@ -815,6 +975,7 @@ impl RbacPolicyState {
             .enumerate()
             .map(|(rule_index, rule)| rule.id.clone().unwrap_or_else(|| rule_index.to_string()))
             .collect();
+        #[cfg(test)]
         let rule_matcher = RuleMatcher::new(&policy.rules);
         let compiled = crate::policy_eval::CompiledPolicy::from_validated_policy(
             policy.clone(),
@@ -823,6 +984,7 @@ impl RbacPolicyState {
 
         Self {
             engine: PolicyEngine::new(policy),
+            #[cfg(test)]
             rule_matcher,
             rule_ids,
             #[cfg(test)]
@@ -862,6 +1024,7 @@ impl RbacPolicyState {
             .enumerate()
             .map(|(rule_index, rule)| rule.id.clone().unwrap_or_else(|| rule_index.to_string()))
             .collect();
+        #[cfg(test)]
         let rule_matcher = RuleMatcher::new(&policy.rules);
         let compiled = crate::policy_eval::CompiledPolicy::from_validated_policy(
             policy.clone(),
@@ -870,6 +1033,7 @@ impl RbacPolicyState {
 
         Ok(Self {
             engine: PolicyEngine::new(policy),
+            #[cfg(test)]
             rule_matcher,
             rule_ids,
             #[cfg(test)]
@@ -888,53 +1052,117 @@ impl RbacPolicyState {
         &self.compiled
     }
 
-    fn rule_id(&self, rule_index: usize) -> String {
-        self.rule_ids
-            .get(rule_index)
-            .cloned()
-            .unwrap_or_else(|| rule_index.to_string())
+    /// Ask the shared evaluator one tool-lane question of this snapshot.
+    ///
+    /// A tool name longer than any policy may carry is refused before the
+    /// evaluator is asked, so its own size refusal is never what decides a
+    /// served call. An incomplete answer and an evaluator error are refusals,
+    /// never a default; each is logged here, once, with bounded diagnostics.
+    fn evaluate_tool(
+        &self,
+        operation: ToolOperation,
+        tool_name: &str,
+        principal: PrincipalFact,
+        rendered: Option<(Method, String)>,
+    ) -> Result<ToolEvaluation, ToolPolicyRefusal> {
+        if tool_name.len() > MAX_TOOL_NAME_BYTES {
+            return Err(refused(operation, ToolPolicyRefusal::NameOutOfBounds));
+        }
+        let (method, path) = rendered.unzip();
+        let context = ToolEvaluationContext {
+            version: TOOL_CONTEXT_VERSION,
+            snapshot: self.compiled.snapshot(),
+            operation,
+            tool_name: Some(tool_name.to_owned()),
+            principal,
+            method,
+            path,
+        };
+        match self.compiled.evaluate_tool(&context) {
+            Ok(evaluation)
+                if evaluation.is_complete()
+                    && evaluation.logical() != LogicalDecision::Indeterminate =>
+            {
+                Ok(evaluation)
+            }
+            Ok(evaluation) => Err(refused(
+                operation,
+                ToolPolicyRefusal::Incomplete(evaluation.limitation()),
+            )),
+            Err(error) => Err(refused(operation, ToolPolicyRefusal::Error(error))),
+        }
     }
 
-    fn tool_policy(&self, tool_name: &str) -> Option<ToolPolicySnapshot<'_>> {
-        self.engine
-            .policy()
-            .tools
-            .get(tool_name)
-            .map(|entry| ToolPolicySnapshot {
-                enabled: entry.enabled,
-                allowed_roles: entry.allowed_roles.as_slice(),
-                issuers: entry.issuers.as_slice(),
-                auth_methods: entry.auth_methods.as_slice(),
-                timeout_ms: entry.timeout_ms,
-                max_concurrent: entry.max_concurrent,
-            })
+    /// The rule a tool invocation or rendered request matched, attributed by
+    /// this snapshot's rule ids exactly as the HTTP adapter attributes one.
+    /// The action follows the effect: allow, deny, or a shadow observation.
+    fn matched_tool_rule(
+        &self,
+        evaluation: &ToolEvaluation,
+    ) -> Result<Option<MatchedRuleDecision>, ToolPolicyRefusal> {
+        if evaluation.reason() != ToolReason::MatchedRule {
+            return Ok(None);
+        }
+        let matched_rule_id = match evaluation.matched() {
+            Some(RuleReference::Direct(index)) => self.rule_ids.get(index).cloned(),
+            _ => None,
+        }
+        .ok_or_else(internal_invariant)?;
+        let action = match evaluation.effect() {
+            PolicyEffect::Allow => RuleAction::Allow,
+            PolicyEffect::Block => RuleAction::Deny,
+            PolicyEffect::Observe => RuleAction::Shadow,
+        };
+        Ok(Some(MatchedRuleDecision {
+            action,
+            matched_rule_id,
+        }))
     }
 
-    fn evaluate_tool_rule(
+    fn tool_invocation_verdict(
         &self,
         tool_name: &str,
         principal: Option<&auth::Principal>,
-    ) -> Option<MatchedRuleDecision> {
-        self.rule_matcher
-            .evaluate_tool(tool_name, principal)
-            .map(|decision| MatchedRuleDecision {
-                action: decision.action,
-                matched_rule_id: self.rule_id(decision.rule_index),
-            })
-    }
-
-    fn evaluate_tool_http_rule(
-        &self,
-        method: &str,
-        path: &str,
-        principal: Option<&auth::Principal>,
-    ) -> Option<MatchedRuleDecision> {
-        self.rule_matcher
-            .evaluate_with_dispatch(method, path, principal, RuleDispatchContext::unknown())
-            .map(|decision| MatchedRuleDecision {
-                action: decision.action,
-                matched_rule_id: self.rule_id(decision.rule_index),
-            })
+    ) -> ToolInvocationVerdict<'_> {
+        let evaluation = match self.evaluate_tool(
+            ToolOperation::Invocation,
+            tool_name,
+            principal_fact(principal),
+            None,
+        ) {
+            Ok(evaluation) => evaluation,
+            Err(refusal) => return ToolInvocationVerdict::Refused(refusal),
+        };
+        let rule_decision = match self.matched_tool_rule(&evaluation) {
+            Ok(rule_decision) => rule_decision,
+            Err(refusal) => {
+                return ToolInvocationVerdict::Refused(refused(ToolOperation::Invocation, refusal))
+            }
+        };
+        let entry = self.compiled.tool_entries().get(tool_name);
+        match (evaluation.reason(), entry, rule_decision) {
+            (ToolReason::UnknownTool, None, None) => ToolInvocationVerdict::UnknownTool,
+            (ToolReason::Disabled, Some(_), None) => ToolInvocationVerdict::Disabled,
+            (ToolReason::RoleNotAllowed, Some(entry), None) => {
+                ToolInvocationVerdict::RoleNotAllowed {
+                    allowed_roles: &entry.allowed_roles,
+                }
+            }
+            (ToolReason::Allowed, Some(tool), None) => ToolInvocationVerdict::Entry {
+                tool,
+                rule_decision: None,
+            },
+            (ToolReason::MatchedRule, Some(tool), Some(rule_decision)) => {
+                ToolInvocationVerdict::Entry {
+                    tool,
+                    rule_decision: Some(rule_decision),
+                }
+            }
+            _ => ToolInvocationVerdict::Refused(refused(
+                ToolOperation::Invocation,
+                internal_invariant(),
+            )),
+        }
     }
 }
 

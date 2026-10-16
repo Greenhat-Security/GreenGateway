@@ -4069,6 +4069,78 @@ async fn single_dot_path_placeholder_arg_is_rejected_before_network() {
 }
 
 #[tokio::test]
+async fn a_rendered_path_tool_policy_would_refuse_is_refused_at_rendering_before_network() {
+    // A rendered request never passes inbound request admission, so rendering
+    // holds its path to the predicate its HTTP rule is evaluated under (#422):
+    // an empty segment, or a path past the evaluator's bound, is refused here
+    // with its own error, before the rule is asked and before any network.
+    let definition = tool_definition(tenant_config_tool(), "get_tenant_config");
+    let prefix_len = "/v1/tenants/tenant-a/config/".len();
+    for args in [
+        json!({ "tenant_id": "", "config_name": "default" }),
+        json!({
+            "tenant_id": "tenant-a",
+            "config_name": "c".repeat(crate::request_bounds::MAX_REQUEST_PATH_BYTES - prefix_len + 1)
+        }),
+    ] {
+        let server = gated_server().await;
+        let (executor, _capture) = executor_for_tools(
+            server.addr,
+            [tenant_config_tool()],
+            runtime_config([("get_tenant_config", enabled_tool(500, 1))], 2, 1, 100),
+        );
+        match executor.build_request(&definition, &args) {
+            Err(ToolExecutorError::UrlBuild { message, .. }) => {
+                assert_eq!(message, "rendered path is outside the bounds tool policy evaluates");
+            }
+            other => panic!("expected the rendering bound, got {other:?}"),
+        }
+        let error = executor
+            .execute(
+                "get_tenant_config",
+                args,
+                invocation_context(),
+                CancellationToken::new(),
+            )
+            .await
+            .expect_err("an out-of-bounds rendered path must fail before upstream");
+        let message = work_failed_message(error);
+        assert!(
+            message.contains("rendered path is outside the bounds tool policy evaluates"),
+            "unexpected error: {message}"
+        );
+        assert_no_upstream_requests(&server).await;
+        server.stop.cancel();
+        server.handle.abort();
+    }
+
+    // At the bound itself the path renders, and the evaluator accepts it.
+    let server = gated_server().await;
+    let (executor, _capture) = executor_for_tools(
+        server.addr,
+        [tenant_config_tool()],
+        runtime_config([("get_tenant_config", enabled_tool(500, 1))], 2, 1, 100),
+    );
+    let args = json!({
+        "tenant_id": "tenant-a",
+        "config_name": "c".repeat(crate::request_bounds::MAX_REQUEST_PATH_BYTES - prefix_len)
+    });
+    let request = executor
+        .build_request(&definition, &args)
+        .expect("a path at the bound renders");
+    assert_eq!(
+        request.path.len(),
+        crate::request_bounds::MAX_REQUEST_PATH_BYTES
+    );
+    assert_eq!(
+        crate::policy_eval::tools::validate_rendered_http_path(&request.path),
+        Ok(())
+    );
+    server.stop.cancel();
+    server.handle.abort();
+}
+
+#[tokio::test]
 async fn non_dot_segment_path_placeholder_args_with_dots_are_accepted_and_encoded() {
     for (value, expected_target) in [
         ("v1.2.3", "/v1/widgets/v1%2E2%2E3?include_details=true"),

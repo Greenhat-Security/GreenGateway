@@ -2909,6 +2909,20 @@ impl ToolExecutor {
                 message: err.to_string(),
             }
         })?;
+        // A rendered request never passes through inbound request admission,
+        // so its method and path are held here to the bounds its HTTP rule is
+        // evaluated under (`request_bounds`, #422). Refusing them at rendering
+        // gives the limit its own error, before the rule is asked.
+        if method.as_str().len() > crate::request_bounds::MAX_REQUEST_METHOD_BYTES {
+            return Err(ToolExecutorError::InvalidMethod {
+                tool_name: tool.name.clone(),
+                method: tool.upstream.method.clone(),
+                message: format!(
+                    "method exceeds {} bytes",
+                    crate::request_bounds::MAX_REQUEST_METHOD_BYTES
+                ),
+            });
+        }
         let path = render_path_template(tool, args)?;
         let connection_target = matches!(tool.target, Some(ToolTarget::Http { .. }));
         let upstream_origin = if connection_target {
@@ -2990,6 +3004,16 @@ impl ToolExecutor {
             },
             None => None,
         };
+
+        // The exact bytes the rendered HTTP rule is evaluated over, checked by
+        // the evaluator's own predicate: bounded, absolute, no empty or dot
+        // segment, and only well-formed escapes.
+        if crate::policy_eval::tools::validate_rendered_http_path(url.path()).is_err() {
+            return Err(ToolExecutorError::UrlBuild {
+                tool_name: tool.name.clone(),
+                message: "rendered path is outside the bounds tool policy evaluates".to_owned(),
+            });
+        }
 
         Ok(ToolUpstreamRequest {
             method,

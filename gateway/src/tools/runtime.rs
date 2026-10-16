@@ -23,9 +23,7 @@ use crate::{
         DEFAULT_TOOL_RUNTIME_QUEUE_DEPTH, DEFAULT_TOOL_RUNTIME_QUEUE_TIMEOUT_MS,
     },
     connections::model::ConnectionId,
-    middleware::rbac::{
-        MatchedRuleDecision, RbacState, ToolAuthorizationSnapshot, ToolPolicySnapshot,
-    },
+    middleware::rbac::{MatchedRuleDecision, RbacState, ToolInvocationVerdict},
     rbac::{
         policy, rule::principal_identity_matches, Policy, Rule, RuleAction, RuleDispatchContext,
         RuleMatcher,
@@ -341,7 +339,10 @@ struct HttpRuleAudit<'a> {
     tool_name: &'a str,
     method: &'a str,
     path: &'a str,
-    matched_rule_id: &'a str,
+    /// `matched_rule` for a rule decision, else the refusal's stable reason.
+    reason: &'a str,
+    /// None only for a refusal, which no rule decided.
+    matched_rule_id: Option<&'a str>,
 }
 
 struct ExecutionPermits {
@@ -890,53 +891,7 @@ impl ToolRuntime {
         context: &ToolInvocationContext,
         cancel: &CancellationToken,
     ) -> Result<AdmittedInvocation, ToolRuntimeError> {
-        let authorization = match self.authorize_tool_call(tool_name, context) {
-            Ok(authorization) => authorization,
-            Err(error) => {
-                self.emit_rejected_error(context, tool_name, &error);
-                return Err(error);
-            }
-        };
-        let state = authorization.state;
-
-        let principal = principal_from_tool_context(context);
-        if let Some(rule_decision) = authorization.rule_decision {
-            let matched_rule_id = rule_decision.matched_rule_id;
-            match rule_decision.action {
-                RuleAction::Allow => {
-                    self.emit_tool_rule_event(
-                        AUTHZ_ALLOWED,
-                        context,
-                        tool_name,
-                        principal.as_ref(),
-                        &matched_rule_id,
-                    );
-                }
-                RuleAction::Shadow => {
-                    self.emit_tool_rule_event(
-                        AUTHZ_WOULD_DENY,
-                        context,
-                        tool_name,
-                        principal.as_ref(),
-                        &matched_rule_id,
-                    );
-                }
-                RuleAction::Deny => {
-                    self.emit_tool_rule_event(
-                        AUTHZ_DENIED,
-                        context,
-                        tool_name,
-                        principal.as_ref(),
-                        &matched_rule_id,
-                    );
-                    self.emit_rejected(context, tool_name, "matched_rule");
-                    return Err(ToolRuntimeError::Rejected {
-                        tool_name: tool_name.to_owned(),
-                        reason: "matched_rule".to_owned(),
-                    });
-                }
-            }
-        }
+        let state = self.admit_invocation(tool_name, context)?;
 
         let queue_permit = match Arc::clone(&self.inner.queue).try_acquire_owned() {
             Ok(permit) => permit,
@@ -1000,6 +955,73 @@ impl ToolRuntime {
         })
     }
 
+    /// The policy half of admission: authorize the call, audit the tool rule
+    /// that decided it, and refuse it if that rule denies. Capacity is
+    /// acquired afterwards, by the caller.
+    fn admit_invocation(
+        &self,
+        tool_name: &str,
+        context: &ToolInvocationContext,
+    ) -> Result<ToolExecutionState, ToolRuntimeError> {
+        let authorization = match self.authorize_tool_call(tool_name, context) {
+            Ok(authorization) => authorization,
+            Err(error) => {
+                self.emit_rejected_error(context, tool_name, &error);
+                return Err(error);
+            }
+        };
+        self.enforce_tool_rule(tool_name, context, authorization)
+    }
+
+    fn enforce_tool_rule(
+        &self,
+        tool_name: &str,
+        context: &ToolInvocationContext,
+        authorization: AuthorizedToolInvocation,
+    ) -> Result<ToolExecutionState, ToolRuntimeError> {
+        let state = authorization.state;
+
+        let principal = principal_from_tool_context(context);
+        if let Some(rule_decision) = authorization.rule_decision {
+            let matched_rule_id = rule_decision.matched_rule_id;
+            match rule_decision.action {
+                RuleAction::Allow => {
+                    self.emit_tool_rule_event(
+                        AUTHZ_ALLOWED,
+                        context,
+                        tool_name,
+                        principal.as_ref(),
+                        &matched_rule_id,
+                    );
+                }
+                RuleAction::Shadow => {
+                    self.emit_tool_rule_event(
+                        AUTHZ_WOULD_DENY,
+                        context,
+                        tool_name,
+                        principal.as_ref(),
+                        &matched_rule_id,
+                    );
+                }
+                RuleAction::Deny => {
+                    self.emit_tool_rule_event(
+                        AUTHZ_DENIED,
+                        context,
+                        tool_name,
+                        principal.as_ref(),
+                        &matched_rule_id,
+                    );
+                    self.emit_rejected(context, tool_name, "matched_rule");
+                    return Err(ToolRuntimeError::Rejected {
+                        tool_name: tool_name.to_owned(),
+                        reason: "matched_rule".to_owned(),
+                    });
+                }
+            }
+        }
+        Ok(state)
+    }
+
     fn authorize_tool_call(
         &self,
         tool_name: &str,
@@ -1007,19 +1029,49 @@ impl ToolRuntime {
     ) -> Result<AuthorizedToolInvocation, ToolRuntimeError> {
         let principal = principal_from_tool_context(context);
         if let Some(rbac_state) = &self.inner.rbac_state {
+            // The shared evaluator decides (#422 PR 2); this only translates its
+            // verdict into the runtime's existing errors and limits.
             return rbac_state.evaluate_tool_authorization(
                 tool_name,
                 principal.as_ref(),
                 |authorization| {
                     self.prune_idle_limiters(authorization.tools.keys());
-                    let config = authorize_tool_snapshot(tool_name, context, &authorization)?;
+                    let (tool, rule_decision) = match authorization.verdict {
+                        ToolInvocationVerdict::Entry {
+                            tool,
+                            rule_decision,
+                        } => (tool, rule_decision),
+                        ToolInvocationVerdict::UnknownTool => {
+                            return Err(ToolRuntimeError::UnknownTool {
+                                tool_name: tool_name.to_owned(),
+                            })
+                        }
+                        ToolInvocationVerdict::Disabled => {
+                            return Err(ToolRuntimeError::Disabled {
+                                tool_name: tool_name.to_owned(),
+                            })
+                        }
+                        ToolInvocationVerdict::RoleNotAllowed { allowed_roles } => {
+                            return Err(ToolRuntimeError::RoleDenied {
+                                tool_name: tool_name.to_owned(),
+                                allowed_roles: allowed_roles.to_vec(),
+                            })
+                        }
+                        ToolInvocationVerdict::Refused(refusal) => {
+                            return Err(ToolRuntimeError::Rejected {
+                                tool_name: tool_name.to_owned(),
+                                reason: refusal.reason().to_owned(),
+                            })
+                        }
+                    };
+                    let config = tool_config_from_policy(tool);
                     let limiter = self.limiter_for_tool(tool_name, config.max_concurrent);
                     Ok(AuthorizedToolInvocation {
                         state: ToolExecutionState {
                             config,
                             limiter: Some(limiter),
                         },
-                        rule_decision: authorization.rule_decision,
+                        rule_decision,
                     })
                 },
             );
@@ -1068,7 +1120,26 @@ impl ToolRuntime {
     ) -> bool {
         let principal = principal_from_tool_context(context);
         let decision = if let Some(rbac_state) = &self.inner.rbac_state {
-            rbac_state.evaluate_tool_http_rule(method, path, principal.as_ref())
+            match rbac_state.evaluate_tool_http_rule(tool_name, method, path, principal.as_ref()) {
+                Ok(decision) => decision,
+                Err(refusal) => {
+                    // No answer is a block, audited like a denying rule but
+                    // with the refusal's stable reason and no rule attributed.
+                    self.emit_http_rule_event(
+                        AUTHZ_DENIED,
+                        context,
+                        principal.as_ref(),
+                        HttpRuleAudit {
+                            tool_name,
+                            method,
+                            path,
+                            reason: refusal.reason(),
+                            matched_rule_id: None,
+                        },
+                    );
+                    return false;
+                }
+            }
         } else {
             self.inner
                 .rule_matcher
@@ -1101,7 +1172,8 @@ impl ToolRuntime {
                 tool_name,
                 method,
                 path,
-                matched_rule_id: &decision.matched_rule_id,
+                reason: "matched_rule",
+                matched_rule_id: Some(&decision.matched_rule_id),
             },
         );
 
@@ -1114,9 +1186,7 @@ impl ToolRuntime {
     /// are evaluated separately for every actual leaf request.
     pub(crate) fn composite_leaf_enabled(&self, tool_name: &str) -> bool {
         if let Some(rbac_state) = &self.inner.rbac_state {
-            return rbac_state.evaluate_tool_authorization(tool_name, None, |authorization| {
-                authorization.tool.is_some_and(|tool| tool.enabled)
-            });
+            return rbac_state.composite_leaf_enabled(tool_name);
         }
 
         self.lookup_tool(tool_name)
@@ -1138,11 +1208,7 @@ impl ToolRuntime {
     ) -> bool {
         if let Some(rbac_state) = &self.inner.rbac_state {
             let principal = principal_from_tool_context(context);
-            return rbac_state.evaluate_tool_authorization(
-                tool_name,
-                principal.as_ref(),
-                |authorization| tool_visible_for_snapshot(context, &authorization),
-            );
+            return rbac_state.tool_visible(tool_name, principal.as_ref());
         }
 
         let Ok(state) = self.lookup_tool(tool_name) else {
@@ -1395,7 +1461,7 @@ impl ToolRuntime {
                 "tool_name": observation.tool_name,
                 "path": path,
                 "method": observation.method,
-                "reason": "matched_rule",
+                "reason": observation.reason,
                 "matched_rule_id": observation.matched_rule_id,
                 "invocation_source": context.source.as_str(),
             }),
@@ -1482,16 +1548,20 @@ impl SourceAuthorizer for ToolRuntime {
         let audit_path = audit_path_template
             .split_once('?')
             .map_or(audit_path_template, |(path, _)| path);
+        // One read of the live policy for both checks below, so the enable bit
+        // and the deny rules come from the same snapshot even when an install
+        // lands while the precheck runs (#422). Live, as before: the refresher
+        // runs outside any request, and nothing is pinned there.
+        let policy = self.inner.rbac_state.as_ref().map(RbacState::current_policy);
         if let Some(tool_name) = tool {
-            let enabled = if let Some(rbac_state) = &self.inner.rbac_state {
-                rbac_state
-                    .current_policy()
+            let enabled = match &policy {
+                Some(policy) => policy
                     .tools
                     .get(tool_name)
-                    .is_some_and(|entry| entry.enabled)
-            } else {
-                self.lookup_tool(tool_name)
-                    .is_ok_and(|state| state.config.enabled)
+                    .is_some_and(|entry| entry.enabled),
+                None => self
+                    .lookup_tool(tool_name)
+                    .is_ok_and(|state| state.config.enabled),
             };
             if !enabled {
                 self.emit_enum_source_denial(
@@ -1510,8 +1580,7 @@ impl SourceAuthorizer for ToolRuntime {
         // explicit deny can block this contextless internal GET; allow and
         // shadow rules cannot grant additional authority. Match the rendered
         // path identity, excluding the deterministic query string.
-        let matched_rule_id = if let Some(rbac_state) = &self.inner.rbac_state {
-            let policy = rbac_state.current_policy();
+        let matched_rule_id = if let Some(policy) = &policy {
             RuleMatcher::new(&policy.rules)
                 .evaluate_denies_with_dispatch(
                     "GET",
@@ -1596,59 +1665,6 @@ fn tool_config_from_policy(entry: &policy::ToolPolicyEntry) -> ToolRuntimeToolCo
         timeout: Duration::from_millis(entry.timeout_ms),
         max_concurrent: entry.max_concurrent as usize,
     }
-}
-
-fn tool_config_from_policy_snapshot(tool: ToolPolicySnapshot<'_>) -> ToolRuntimeToolConfig {
-    ToolRuntimeToolConfig {
-        enabled: tool.enabled,
-        allowed_roles: tool.allowed_roles.to_vec(),
-        issuers: tool.issuers.to_vec(),
-        auth_methods: tool.auth_methods.to_vec(),
-        timeout: Duration::from_millis(tool.timeout_ms),
-        max_concurrent: tool.max_concurrent as usize,
-    }
-}
-
-fn authorize_tool_snapshot(
-    tool_name: &str,
-    context: &ToolInvocationContext,
-    authorization: &ToolAuthorizationSnapshot<'_>,
-) -> Result<ToolRuntimeToolConfig, ToolRuntimeError> {
-    let Some(tool) = authorization.tool else {
-        return Err(ToolRuntimeError::UnknownTool {
-            tool_name: tool_name.to_owned(),
-        });
-    };
-
-    if !tool.enabled {
-        return Err(ToolRuntimeError::Disabled {
-            tool_name: tool_name.to_owned(),
-        });
-    }
-
-    if !tool_principal_matches(tool.allowed_roles, tool.issuers, tool.auth_methods, context) {
-        return Err(ToolRuntimeError::RoleDenied {
-            tool_name: tool_name.to_owned(),
-            allowed_roles: tool.allowed_roles.to_vec(),
-        });
-    }
-
-    Ok(tool_config_from_policy_snapshot(tool))
-}
-
-fn tool_visible_for_snapshot(
-    context: &ToolInvocationContext,
-    authorization: &ToolAuthorizationSnapshot<'_>,
-) -> bool {
-    authorization.tool.is_some_and(|tool| {
-        tool.enabled
-            && tool_principal_matches(tool.allowed_roles, tool.issuers, tool.auth_methods, context)
-    }) && tool_rule_allows_visibility(
-        authorization
-            .rule_decision
-            .as_ref()
-            .map(|decision| &decision.action),
-    )
 }
 
 fn tool_rule_allows_visibility(rule_action: Option<&RuleAction>) -> bool {
@@ -1736,6 +1752,10 @@ fn bounded_audit_text(value: &str, max_chars: usize) -> String {
         })
         .collect()
 }
+
+#[cfg(test)]
+#[path = "runtime_legacy_tests.rs"]
+pub(crate) mod legacy;
 
 #[cfg(test)]
 mod tests {
