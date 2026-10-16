@@ -3207,9 +3207,12 @@ mod tests {
             uuid::Uuid::new_v4()
         ));
         fs::create_dir(&root).expect("assertion test secret root should create");
+        // A real key: it is loaded when the Connection is saved, and the
+        // refusal must still come before anything would sign with it.
+        let signing_key = crate::connections::test_support::generated_es256_pem();
         for (file, value) in [
             ("primary", b"primary-secret-canary".as_slice()),
-            ("assertion-signing-key", b"signing-key-canary".as_slice()),
+            ("assertion-signing-key", signing_key.as_bytes()),
         ] {
             fs::write(root.join(file), value).expect("assertion test secret should write");
         }
@@ -3328,7 +3331,11 @@ mod tests {
             event.event_type != audit::event::CONNECTION_SECRET_RESOLUTION_FAILED
         }));
         let rendered = serde_json::to_string(&events).expect("audits should serialize");
-        for secret in ["primary-secret-canary", "signing-key-canary"] {
+        let mut secrets = vec!["primary-secret-canary"];
+        secrets.extend(crate::connections::test_support::pem_body_lines(
+            &signing_key,
+        ));
+        for secret in secrets {
             assert!(!rendered.contains(secret), "audit leaked {secret}");
             assert!(!output.contains(secret), "log leaked {secret}");
         }

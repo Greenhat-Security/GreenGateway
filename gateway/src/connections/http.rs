@@ -2245,11 +2245,12 @@ mod tests {
     }
 
     /// A caller assertion as an operator would configure one. Its signing key
-    /// alias is deliberately left unconfigured: the refusal has to land before
-    /// anything would try to read it.
+    /// is loaded when the Connection is saved; every target must still refuse
+    /// before anything would sign with it.
     fn unenforced_caller_assertion() -> CallerAssertionSettings {
         CallerAssertionSettings {
-            signing_key_id: "assertion-signing-key".to_owned(),
+            signing_key_id: crate::connections::test_support::ASSERTION_SIGNING_KEY_ALIAS
+                .to_owned(),
             kid: "gw-test-1".to_owned(),
             algorithm: CallerAssertionAlgorithm::Es256,
             issuer: "https://gateway.example.test".to_owned(),
@@ -2260,7 +2261,20 @@ mod tests {
             claims: Vec::new(),
             bind_request: false,
             bind_approval: false,
+            published_keys: Vec::new(),
         }
+    }
+
+    /// A managed runtime whose single Connection is `write`, with a generated
+    /// caller-assertion signing key behind the alias it binds.
+    async fn attested_runtime(name: &str, write: ConnectionWrite) -> TemporaryManagedRuntime {
+        let root = temporary_managed_root(name);
+        fs::create_dir(&root).expect("temporary managed root should create");
+        let alias = crate::connections::test_support::write_assertion_signing_key(
+            &root,
+            &crate::connections::test_support::generated_es256_pem(),
+        );
+        TemporaryManagedRuntime::build_with_root(name, root, write, vec![alias], None).await
     }
 
     #[tokio::test]
@@ -2279,7 +2293,7 @@ mod tests {
             path: "/ready".to_owned(),
             expected_statuses: vec![200],
         });
-        let temporary = TemporaryManagedRuntime::from_write("caller-assertion-http", write).await;
+        let temporary = attested_runtime("caller-assertion-http", write).await;
         let connection_id = temporary.connection_id.as_str();
         let stored = temporary.stored_connection();
         let etag = stored.etag().to_string();
@@ -2351,7 +2365,7 @@ mod tests {
             use_connection_authentication: false,
         });
         write.caller_assertion = Some(unenforced_caller_assertion());
-        let temporary = TemporaryManagedRuntime::from_write("caller-assertion-mcp", write).await;
+        let temporary = attested_runtime("caller-assertion-mcp", write).await;
         let connection_id = temporary.connection_id.as_str();
         let stored = temporary.stored_connection();
         let etag = stored.etag().to_string();

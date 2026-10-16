@@ -171,6 +171,10 @@ pub(super) fn unified_router(
             auth::protected_resource::WELL_KNOWN_SUFFIX_ROUTE,
             get(oauth_protected_resource_metadata_endpoint),
         )
+        .route(
+            connections::caller_assertion::JWKS_PATH,
+            get(caller_assertion_jwks_endpoint),
+        )
         .route(routes.admin.ui_prefix.as_str(), get(admin_ui_index))
         .route(routes.admin.ui_slash_route.as_str(), get(admin_ui_index))
         .route(routes.admin.ui_asset_route.as_str(), get(admin_ui_asset));
@@ -203,6 +207,10 @@ pub(super) fn data_router(app_state: AppState) -> Router {
         .route(
             auth::protected_resource::WELL_KNOWN_SUFFIX_ROUTE,
             get(oauth_protected_resource_metadata_endpoint),
+        )
+        .route(
+            connections::caller_assertion::JWKS_PATH,
+            get(caller_assertion_jwks_endpoint),
         );
     let router = add_mcp_routes(router, &app_state.routes);
 

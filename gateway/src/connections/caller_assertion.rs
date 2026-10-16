@@ -43,16 +43,55 @@
 //! Hashing what was transmitted has none of that. Both sides see the same bytes, verification is a
 //! few lines in any language, and it is what AWS SigV4, Stripe and GitHub webhook signatures do.
 //!
+//! ## Publishing the keys
+//!
+//! An upstream verifies against the JWKS at [`JWKS_PATH`]: the public half of every key an enabled
+//! Connection signs with, plus the keys it lists as `published_keys` -- the next key, published
+//! before it signs anything, and the previous one, kept until every assertion it signed has
+//! expired. The public half is derived from the private key rather than configured beside it, so
+//! the two cannot disagree, and the document is built from an explicit list of public members, so
+//! no private parameter can reach it whatever the key carried.
+//!
 //! This module signs and refuses. It does not decide who may call an operation or whether a mutation
 //! was approved; policy and the approval store run before anything here is asked for a token.
 
-use std::fmt;
+use std::{
+    collections::{btree_map::Entry, BTreeMap},
+    fmt,
+};
 
 use base64::Engine as _;
-use jsonwebtoken::{Algorithm, EncodingKey, Header};
+use jsonwebtoken::{
+    jwk::{AlgorithmParameters, EllipticCurve, Jwk},
+    Algorithm, EncodingKey, Header,
+};
 use serde::Serialize;
 use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
+use tokio_rustls::rustls::pki_types::pem::SectionKind;
+use zeroize::Zeroizing;
+
+use super::model::CallerAssertionAlgorithm;
+
+/// Where this gateway publishes the public half of every caller-assertion key.
+///
+/// Deliberately not the conventional `/.well-known/jwks.json`. The gateway claims this exact path on
+/// every listener and never proxies it, and an upstream behind the gateway may publish a JWKS of
+/// its own under the conventional name; claiming that one would quietly hand the upstream's
+/// verifiers this gateway's keys instead of its own.
+pub const JWKS_PATH: &str = "/.well-known/caller-assertion-jwks.json";
+
+/// How long a verifier may reuse the published key set before fetching it again.
+///
+/// This is the delay the rotation procedure is built on: a key must be published for at least this
+/// long before it signs anything, so every verifier holds it by the time it is used.
+pub const JWKS_MAX_AGE_SECONDS: u64 = 300;
+
+/// `Cache-Control` for the published key set: shareable, and fresh for [`JWKS_MAX_AGE_SECONDS`].
+pub const JWKS_CACHE_CONTROL: &str = "public, max-age=300";
+
+/// Smallest RSA modulus this gateway will sign with, in bytes: 2048 bits.
+const MIN_RSA_MODULUS_BYTES: usize = 256;
 
 /// Longest assertion this will emit. Beyond this a header is likely to be refused by an upstream or
 /// an intermediary before anyone reads it, so it is a failure to sign rather than a surprise later.
@@ -86,6 +125,23 @@ impl AssertionAlgorithm {
         match self {
             Self::Es256 => "ES256",
             Self::Rs256 => "RS256",
+        }
+    }
+
+    /// The other supported algorithm, for telling an operator which one a key actually is.
+    fn other(self) -> Self {
+        match self {
+            Self::Es256 => Self::Rs256,
+            Self::Rs256 => Self::Es256,
+        }
+    }
+}
+
+impl From<CallerAssertionAlgorithm> for AssertionAlgorithm {
+    fn from(algorithm: CallerAssertionAlgorithm) -> Self {
+        match algorithm {
+            CallerAssertionAlgorithm::Es256 => Self::Es256,
+            CallerAssertionAlgorithm::Rs256 => Self::Rs256,
         }
     }
 }
@@ -171,6 +227,8 @@ pub struct AssertionSigningKey {
     key_id: String,
     algorithm: AssertionAlgorithm,
     encoding: EncodingKey,
+    /// Derived from `encoding` when the key loads, never configured beside it.
+    public_jwk: Value,
 }
 
 impl fmt::Debug for AssertionSigningKey {
@@ -190,6 +248,13 @@ impl AssertionSigningKey {
     /// The key id is validated here rather than per request: it has to match a `kid` in the JWKS the
     /// upstream holds, and a mismatch fails every call, so it is worth catching at configuration
     /// time.
+    ///
+    /// The material must be exactly one `PRIVATE KEY` block. A PKCS#1 or SEC1 key, a public key, a
+    /// certificate, or a second block beside the key is refused rather than guessed at: the parser
+    /// underneath would otherwise accept an RSA public key or certificate here and fail only when
+    /// asked to sign. The public JWK is derived before the key is returned, and that derivation is
+    /// what refuses a key of the right family but the wrong shape -- an EC key on another curve, or
+    /// an RSA key under 2048 bits -- so a key that loads is a key that can sign and be published.
     pub fn from_pkcs8_pem(
         key_id: &str,
         algorithm: AssertionAlgorithm,
@@ -198,15 +263,20 @@ impl AssertionSigningKey {
         if !is_printable_claim(key_id, 128) {
             return Err(CallerAssertionError::InvalidClaim("key_id"));
         }
+        if !is_single_pkcs8_private_key(pem) {
+            return Err(CallerAssertionError::KeyUnusable);
+        }
         let encoding = match algorithm {
             AssertionAlgorithm::Es256 => EncodingKey::from_ec_pem(pem),
             AssertionAlgorithm::Rs256 => EncodingKey::from_rsa_pem(pem),
         }
         .map_err(|_| CallerAssertionError::KeyUnusable)?;
+        let public_jwk = derive_public_jwk(key_id, algorithm, &encoding)?;
         Ok(Self {
             key_id: key_id.to_owned(),
             algorithm,
             encoding,
+            public_jwk,
         })
     }
 
@@ -216,6 +286,217 @@ impl AssertionSigningKey {
 
     pub fn algorithm(&self) -> AssertionAlgorithm {
         self.algorithm
+    }
+
+    /// The JWK published for this key: public members only, `kid` included.
+    pub fn public_jwk(&self) -> &Value {
+        &self.public_jwk
+    }
+}
+
+/// Whether `material` is exactly one PEM `PRIVATE KEY` (PKCS#8) block and nothing else PEM-shaped.
+///
+/// Every decoded block is held in a zeroizing buffer, so the private key bytes this sees are wiped
+/// when it returns.
+fn is_single_pkcs8_private_key(material: &[u8]) -> bool {
+    let mut reader = material;
+    let mut private_keys = 0usize;
+    loop {
+        match tokio_rustls::rustls::pki_types::pem::from_buf(&mut reader) {
+            Ok(Some((kind, der))) => {
+                let _der = Zeroizing::new(der);
+                if kind != SectionKind::PrivateKey {
+                    return false;
+                }
+                private_keys += 1;
+                if private_keys > 1 {
+                    return false;
+                }
+            }
+            Ok(None) => return private_keys == 1,
+            Err(_) => return false,
+        }
+    }
+}
+
+/// The public JWK for a loaded private key, built through the same explicit member list as
+/// [`es256_public_jwk`] and [`rs256_public_jwk`], so it carries no private parameter whatever the
+/// key held.
+fn derive_public_jwk(
+    key_id: &str,
+    algorithm: AssertionAlgorithm,
+    encoding: &EncodingKey,
+) -> Result<Value, CallerAssertionError> {
+    let derived = Jwk::from_encoding_key(encoding, algorithm.jsonwebtoken())
+        .map_err(|_| CallerAssertionError::KeyUnusable)?;
+    let decoder = base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    match (algorithm, &derived.algorithm) {
+        (AssertionAlgorithm::Es256, AlgorithmParameters::EllipticCurve(parameters))
+            if parameters.curve == EllipticCurve::P256 =>
+        {
+            let x = decoder
+                .decode(&parameters.x)
+                .map_err(|_| CallerAssertionError::KeyUnusable)?;
+            let y = decoder
+                .decode(&parameters.y)
+                .map_err(|_| CallerAssertionError::KeyUnusable)?;
+            if x.len() != 32 || y.len() != 32 {
+                return Err(CallerAssertionError::KeyUnusable);
+            }
+            let mut point = Vec::with_capacity(65);
+            point.push(0x04);
+            point.extend_from_slice(&x);
+            point.extend_from_slice(&y);
+            es256_public_jwk(key_id, &point)
+        }
+        (AssertionAlgorithm::Rs256, AlgorithmParameters::RSA(parameters)) => {
+            let modulus = decoder
+                .decode(&parameters.n)
+                .map_err(|_| CallerAssertionError::KeyUnusable)?;
+            let exponent = decoder
+                .decode(&parameters.e)
+                .map_err(|_| CallerAssertionError::KeyUnusable)?;
+            if modulus.len() < MIN_RSA_MODULUS_BYTES {
+                return Err(CallerAssertionError::KeyUnusable);
+            }
+            rs256_public_jwk(key_id, &modulus, &exponent)
+        }
+        _ => Err(CallerAssertionError::KeyUnusable),
+    }
+}
+
+/// Why a configured signing key was refused, in terms an operator can act on.
+///
+/// Carries no key material and no parser detail: the code names what is wrong with the
+/// configuration, never what the secret contains.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SigningKeyRejection {
+    /// The material is not exactly one PKCS#8 `PRIVATE KEY` PEM block.
+    NotPkcs8,
+    /// The key is a usable key for the other supported algorithm, so the configured `algorithm`
+    /// is wrong.
+    AlgorithmMismatch,
+    /// The key cannot sign with the configured algorithm: an EC key on another curve, an RSA key
+    /// under 2048 bits, or malformed key material.
+    Unusable,
+}
+
+impl SigningKeyRejection {
+    /// A stable, non-revealing validation code.
+    pub fn code(self) -> &'static str {
+        match self {
+            Self::NotPkcs8 => "invalid_signing_key",
+            Self::AlgorithmMismatch => "algorithm_mismatch",
+            Self::Unusable => "unusable_signing_key",
+        }
+    }
+}
+
+/// Loads `material` as the key published under `kid` for `algorithm`, or says why it cannot be.
+///
+/// This is the one place a configured key is turned into something this gateway signs with or
+/// publishes, so load-time validation and the published JWKS can never disagree about which keys
+/// are usable.
+pub fn load_signing_key(
+    kid: &str,
+    algorithm: AssertionAlgorithm,
+    material: &[u8],
+) -> Result<AssertionSigningKey, SigningKeyRejection> {
+    if !is_single_pkcs8_private_key(material) {
+        return Err(SigningKeyRejection::NotPkcs8);
+    }
+    AssertionSigningKey::from_pkcs8_pem(kid, algorithm, material).map_err(|_| {
+        if AssertionSigningKey::from_pkcs8_pem(kid, algorithm.other(), material).is_ok() {
+            SigningKeyRejection::AlgorithmMismatch
+        } else {
+            SigningKeyRejection::Unusable
+        }
+    })
+}
+
+/// The JWK Set published at [`JWKS_PATH`]: the exact response body and its entity tag.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct JwksDocument {
+    body: String,
+    etag: String,
+    key_count: usize,
+}
+
+/// A built key set, and every `kid` that had to be left out of it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct JwksBuild {
+    pub document: JwksDocument,
+    /// Key IDs that named two different keys. Neither is published: a verifier selecting by `kid`
+    /// could take either one, so publishing both would make verification depend on which it chose.
+    pub withheld_kids: Vec<String>,
+}
+
+impl JwksDocument {
+    /// Builds the set from each key's public JWK, in any order.
+    ///
+    /// Two Connections that share one key publish it once. The keys are ordered by `kid` so the
+    /// body, and therefore the entity tag, depend only on which keys are published.
+    pub fn from_public_jwks(keys: impl IntoIterator<Item = Value>) -> JwksBuild {
+        let mut by_kid: BTreeMap<String, Option<Value>> = BTreeMap::new();
+        for jwk in keys {
+            let Some(kid) = jwk.get("kid").and_then(Value::as_str).map(str::to_owned) else {
+                continue;
+            };
+            match by_kid.entry(kid) {
+                Entry::Vacant(entry) => {
+                    entry.insert(Some(jwk));
+                }
+                Entry::Occupied(mut entry) => {
+                    if entry.get().as_ref() != Some(&jwk) {
+                        entry.insert(None);
+                    }
+                }
+            }
+        }
+        let mut published = Vec::with_capacity(by_kid.len());
+        let mut withheld_kids = Vec::new();
+        for (kid, jwk) in by_kid {
+            match jwk {
+                Some(jwk) => published.push(jwk),
+                None => withheld_kids.push(kid),
+            }
+        }
+        let key_count = published.len();
+        let body = serde_json::json!({ "keys": published }).to_string();
+        let etag = format!(
+            "\"caller-assertion-jwks:sha256:{}\"",
+            body_digest(body.as_bytes())
+        );
+        JwksBuild {
+            document: Self {
+                body,
+                etag,
+                key_count,
+            },
+            withheld_kids,
+        }
+    }
+
+    pub fn body(&self) -> &str {
+        &self.body
+    }
+
+    /// A strong entity tag over the body, quotes included.
+    pub fn etag(&self) -> &str {
+        &self.etag
+    }
+
+    pub fn key_count(&self) -> usize {
+        self.key_count
+    }
+
+    /// Whether an `If-None-Match` value names this document, so a verifier revalidating its cached
+    /// copy can be answered `304 Not Modified`. Compared weakly, as RFC 9110 requires for this
+    /// header.
+    pub fn matches_if_none_match(&self, header: &str) -> bool {
+        header.split(',').map(str::trim).any(|candidate| {
+            candidate == "*" || candidate.strip_prefix("W/").unwrap_or(candidate) == self.etag
+        })
     }
 }
 

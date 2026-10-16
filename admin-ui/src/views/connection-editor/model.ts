@@ -1000,6 +1000,8 @@ export function secretMaxLength(
       return 1024 * 1024;
     case 'tls_private_key':
       return 256 * 1024;
+    case 'assertion_signing_key':
+      return 16 * 1024;
     default:
       return 8 * 1024;
   }

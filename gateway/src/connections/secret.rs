@@ -25,6 +25,10 @@ use super::model::{MAX_CREDENTIALS, MAX_DISPLAY_NAME_CHARS, MAX_SECRET_ID_BYTES}
 pub const MAX_HTTP_CREDENTIAL_BYTES: usize = 8 * 1024;
 pub const MAX_TLS_PRIVATE_KEY_BYTES: usize = 256 * 1024;
 pub const MAX_TLS_CERTIFICATE_BYTES: usize = 1024 * 1024;
+/// A PKCS#8 PEM private key for RSA-8192, the largest this gateway signs with,
+/// is under 7 KiB. The cap leaves room for a comment line while refusing
+/// anything that is plainly not one key -- a bundle, a keystore, a log file.
+pub const MAX_ASSERTION_SIGNING_KEY_BYTES: usize = 16 * 1024;
 pub const MAX_OPERATOR_SECRET_ALIASES: usize = MAX_CREDENTIALS;
 pub const MAX_OPERATOR_SECRET_ALIAS_CONFIG_BYTES: usize = 256 * 1024;
 pub const MAX_CONCURRENT_SECRET_RESOLUTIONS: usize = 16;
@@ -874,6 +878,10 @@ pub enum SecretPurpose {
     TlsPrivateKey,
     TlsCertificate,
     TlsCaBundle,
+    /// The PKCS#8 private key a caller assertion is signed with. It is only
+    /// ever handed to the signer and to the public-key derivation behind the
+    /// published JWKS: no lane injects it, and it is never a header value.
+    AssertionSigningKey,
 }
 
 impl SecretPurpose {
@@ -884,6 +892,7 @@ impl SecretPurpose {
             }
             Self::TlsPrivateKey => MAX_TLS_PRIVATE_KEY_BYTES,
             Self::TlsCertificate | Self::TlsCaBundle => MAX_TLS_CERTIFICATE_BYTES,
+            Self::AssertionSigningKey => MAX_ASSERTION_SIGNING_KEY_BYTES,
         }
     }
 
@@ -892,9 +901,21 @@ impl SecretPurpose {
     ///
     /// The OAuth client secret is deliberately excluded: it is URL-encoded and
     /// then base64-encoded into a Basic credential, so bytes that no header may
-    /// carry survive that transformation harmlessly.
+    /// carry survive that transformation harmlessly. The assertion signing key
+    /// is excluded because it never leaves the gateway at all; only signatures
+    /// made with it do.
     pub(crate) const fn is_http_header_value(self) -> bool {
         matches!(self, Self::HeaderApiKey | Self::StaticBearer)
+    }
+
+    /// Whether the encrypted local store can hold material for this purpose.
+    ///
+    /// Its table constrains the purpose column to the purposes it was created
+    /// with, so a signing key is provisioned through an operator alias or a
+    /// network provider instead, and a local create for one is refused before
+    /// anything is written.
+    pub(crate) const fn is_locally_storable(self) -> bool {
+        !matches!(self, Self::AssertionSigningKey)
     }
 }
 
@@ -1256,6 +1277,49 @@ mod tests {
         // TLS material is PEM and legitimately full of newlines.
         ResolvedSecret::new(SecretPurpose::TlsPrivateKey, b"-----BEGIN\nkey\n".to_vec())
             .expect("PEM material must not be header-checked");
+    }
+
+    #[test]
+    fn an_assertion_signing_key_is_bounded_pem_and_never_a_header_value() {
+        // PEM is full of newlines. That is accepted for the signing key, and the
+        // same bytes are refused for every purpose a lane sends as a header, so
+        // the key cannot be bound as a credential by accident either.
+        let pem_shaped = b"-----BEGIN KEY-----\nnot-real-key-material\n-----END KEY-----\n";
+        ResolvedSecret::new(SecretPurpose::AssertionSigningKey, pem_shaped.to_vec())
+            .expect("PEM material must not be header-checked");
+        assert!(!SecretPurpose::AssertionSigningKey.is_http_header_value());
+        for purpose in [SecretPurpose::HeaderApiKey, SecretPurpose::StaticBearer] {
+            assert_eq!(
+                ResolvedSecret::new(purpose, pem_shaped.to_vec())
+                    .expect_err("PEM is never a header value"),
+                SecretValueError::NotHeaderSafe
+            );
+        }
+
+        assert_eq!(
+            ResolvedSecret::new(
+                SecretPurpose::AssertionSigningKey,
+                vec![b'k'; MAX_ASSERTION_SIGNING_KEY_BYTES + 1]
+            )
+            .expect_err("an oversized key must be rejected"),
+            SecretValueError::TooLarge {
+                maximum: MAX_ASSERTION_SIGNING_KEY_BYTES
+            }
+        );
+        ResolvedSecret::new(
+            SecretPurpose::AssertionSigningKey,
+            vec![b'k'; MAX_ASSERTION_SIGNING_KEY_BYTES],
+        )
+        .expect("a key at the cap is accepted");
+
+        // The local store's purpose column predates this purpose.
+        assert!(!SecretPurpose::AssertionSigningKey.is_locally_storable());
+        assert!(SecretPurpose::TlsPrivateKey.is_locally_storable());
+        assert_eq!(
+            serde_json::to_value(SecretPurpose::AssertionSigningKey)
+                .expect("purpose should serialize"),
+            serde_json::json!("assertion_signing_key")
+        );
     }
 
     #[test]

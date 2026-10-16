@@ -31,4 +31,6 @@ pub mod secret;
 pub mod status;
 pub mod store;
 pub mod test;
+#[cfg(test)]
+pub(crate) mod test_support;
 pub mod vault_secret;

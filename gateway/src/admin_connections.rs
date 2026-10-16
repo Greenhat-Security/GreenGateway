@@ -2408,6 +2408,20 @@ pub(super) fn connection_mutation_error_response(
             }),
         )
             .into_response(),
+        // The field and a fixed code (`algorithm_mismatch`, `invalid_signing_key`,
+        // `unusable_signing_key`, `duplicate_kid`): enough to fix the
+        // configuration, and nothing about the key material.
+        connections::control_plane::ConnectionMutationError::CallerAssertionKeyRejected {
+            field,
+            code,
+        } => (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(ConnectionValidationResponse {
+                error: "connection validation failed",
+                problems: vec![ConnectionValidationProblem { field, code }],
+            }),
+        )
+            .into_response(),
         connections::control_plane::ConnectionMutationError::BindingUnavailable => {
             service_unavailable("connection binding validation is unavailable")
         }

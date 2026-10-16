@@ -3,7 +3,7 @@ use std::{
     error::Error,
     fmt,
     sync::{Arc, Mutex, MutexGuard, OnceLock},
-    time::Instant,
+    time::{Duration, Instant},
 };
 
 use arc_swap::ArcSwap;
@@ -15,6 +15,10 @@ use tokio::sync::{
 
 use crate::config::Config;
 
+use super::caller_assertion::{
+    load_signing_key, JwksDocument, SigningKeyRejection, JWKS_MAX_AGE_SECONDS,
+};
+use super::model::{CallerAssertionAlgorithm, CallerAssertionKeyRef};
 use super::{
     aws_secret::{
         provider_generation as aws_provider_generation, AwsProviderConfig, AwsProviderConfigError,
@@ -57,6 +61,16 @@ use super::{
         VaultKvV2SecretProvider, VaultProviderConfig, VaultProviderConfigError, VaultTransport,
     },
 };
+
+/// How long a built caller-assertion JWKS is served before its keys are read
+/// again: the time a verifier may cache it, so a change of key material behind
+/// an alias reaches verifiers within two cache lifetimes at most.
+const JWKS_REFRESH_INTERVAL: Duration = Duration::from_secs(JWKS_MAX_AGE_SECONDS);
+
+/// How long a failed JWKS build is remembered before a fetch tries again. The
+/// endpoint is unauthenticated, so without this a provider that is down would
+/// be asked once per fetch.
+const JWKS_RETRY_INTERVAL: Duration = Duration::from_secs(30);
 
 /// Dependency rows waiting to be written, keyed by the consumer kind whose
 /// whole set they replace. One entry per kind: a later derivation for the
@@ -103,7 +117,34 @@ pub struct ConnectionControlPlane {
     azure_config: AzureProviderConfig,
     aws_config: AwsProviderConfig,
     kubernetes_config: KubernetesProviderConfig,
+    /// The last caller-assertion JWKS built, shared by every clone. Its lock
+    /// also serializes builds, so concurrent fetches after a change share one.
+    caller_assertion_jwks: Arc<AsyncMutex<Option<CachedJwks>>>,
 }
+
+/// A caller-assertion key an enabled managed Connection publishes, as
+/// configured. The JWKS cache is keyed on the whole list, so any change to
+/// which keys are published rebuilds it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct PublishedKeyBinding {
+    connection_id: ConnectionId,
+    field: &'static str,
+    signing_key_id: String,
+    kid: String,
+    algorithm: CallerAssertionAlgorithm,
+}
+
+struct CachedJwks {
+    bindings: Vec<PublishedKeyBinding>,
+    built_at: Instant,
+    /// `None` records a failed build, so it is not retried on every fetch.
+    document: Option<Arc<JwksDocument>>,
+}
+
+/// The caller-assertion JWKS could not be built. Why is logged, with the
+/// Connection and field responsible; nothing about it reaches the response.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CallerAssertionJwksUnavailable;
 
 #[derive(Clone)]
 pub struct ConnectionRuntimeSnapshot {
@@ -599,10 +640,7 @@ impl ConnectionControlPlane {
                 // them: the connection id is a UUID, the admin API that could
                 // identify it is not running yet, and the causes range from an
                 // unset environment variable to material a header cannot carry.
-                let (fields, reason) = match error {
-                    BindingActivationError::Invalid { fields } => (fields, "invalid material"),
-                    BindingActivationError::Unavailable => (Vec::new(), "source unavailable"),
-                };
+                let (fields, reason) = error.diagnostic();
                 tracing::error!(
                     connection_id = %record.id,
                     display_name = ?record.write.display_name,
@@ -680,6 +718,7 @@ impl ConnectionControlPlane {
             azure_config: config.connection_azure_provider.clone(),
             aws_config: config.connection_aws_provider.clone(),
             kubernetes_config: config.connection_kubernetes_provider.clone(),
+            caller_assertion_jwks: Arc::new(AsyncMutex::new(None)),
         })
     }
 
@@ -1169,6 +1208,7 @@ impl ConnectionControlPlane {
             });
         }
         self.ensure_activatable(&candidate)?;
+        self.ensure_assertion_kids_unambiguous(None, &candidate, &current)?;
         // The local check above is authoritative in standalone mode. In
         // cluster mode the store re-derives the collection ETag from the
         // authority's records under its own lock and refuses the create if
@@ -1211,6 +1251,7 @@ impl ConnectionControlPlane {
     ) -> Result<StoredConnection, ConnectionMutationError> {
         let _guard = self.mutation_guard().await;
         self.ensure_activatable(&candidate)?;
+        self.ensure_assertion_kids_unambiguous(Some(id), &candidate, &self.runtime.load_full())?;
         let replaced = self
             .managed_store()?
             .replace(id, expected, candidate, actor)
@@ -1302,10 +1343,7 @@ impl ConnectionControlPlane {
                 .secret_resolver
                 .validate_enabled_candidate(&record.write)
             {
-                let (fields, reason) = match error {
-                    BindingActivationError::Invalid { fields } => (fields, "invalid material"),
-                    BindingActivationError::Unavailable => (Vec::new(), "source unavailable"),
-                };
+                let (fields, reason) = error.diagnostic();
                 tracing::error!(
                     connection_id = %record.id,
                     fields = ?fields,
@@ -1474,6 +1512,23 @@ impl ConnectionControlPlane {
             }
         }
 
+        if let Some(assertion) = candidate.caller_assertion.as_ref() {
+            for key in assertion
+                .keys()
+                .filter(|key| resolver.is_deferred_alias(key.signing_key_id))
+            {
+                let material = resolve_deferred(
+                    &resolver,
+                    key.field,
+                    key.signing_key_id,
+                    SecretPurpose::AssertionSigningKey,
+                )
+                .await?;
+                load_assertion_key(key, material.expose())
+                    .map_err(binding_activation_to_mutation_error)?;
+            }
+        }
+
         if let Some(alias) = candidate
             .tls
             .ca_bundle_alias
@@ -1541,15 +1596,141 @@ impl ConnectionControlPlane {
         &self,
         candidate: &ConnectionWrite,
     ) -> Result<(), ConnectionMutationError> {
-        match self.secret_resolver.validate_enabled_candidate(candidate) {
-            Ok(()) => Ok(()),
-            Err(BindingActivationError::Invalid { fields }) => {
-                Err(ConnectionMutationError::UnresolvableBindings { fields })
+        self.secret_resolver
+            .validate_enabled_candidate(candidate)
+            .map_err(binding_activation_to_mutation_error)
+    }
+
+    /// Refuses a candidate that would publish a `kid` another enabled
+    /// Connection already publishes for a different key.
+    ///
+    /// The JWKS is one set for the whole gateway, and a verifier selects a key
+    /// from it by `kid` alone. Two Connections may share a key -- the same
+    /// alias, algorithm and `kid` -- and it is published once; a `kid` naming
+    /// two different keys would leave a verifier picking one of them. Runs
+    /// under the mutation lock against the snapshot the candidate replaces, so
+    /// two concurrent writes cannot both pass it.
+    fn ensure_assertion_kids_unambiguous(
+        &self,
+        id: Option<&ConnectionId>,
+        candidate: &ConnectionWrite,
+        current: &ConnectionRuntimeSnapshot,
+    ) -> Result<(), ConnectionMutationError> {
+        if !candidate.enabled {
+            return Ok(());
+        }
+        let Some(assertion) = candidate.caller_assertion.as_ref() else {
+            return Ok(());
+        };
+        for (other_id, record) in current.managed() {
+            if Some(other_id) == id || !record.write.enabled {
+                continue;
             }
-            Err(BindingActivationError::Unavailable) => {
-                Err(ConnectionMutationError::BindingUnavailable)
+            let Some(other) = record.write.caller_assertion.as_ref() else {
+                continue;
+            };
+            for key in assertion.keys() {
+                if other
+                    .keys()
+                    .any(|published| assertion_keys_conflict(&key, &published))
+                {
+                    return Err(ConnectionMutationError::CallerAssertionKeyRejected {
+                        field: key.kid_field,
+                        code: "duplicate_kid",
+                    });
+                }
             }
         }
+        Ok(())
+    }
+
+    /// The JWKS published at
+    /// [`JWKS_PATH`](super::caller_assertion::JWKS_PATH): the public half of
+    /// every key an enabled managed Connection's caller assertion signs with or
+    /// publishes.
+    ///
+    /// Each key is read through the same secret resolution, and loaded by the
+    /// same loader, that admitted its Connection, so the published set and
+    /// load-time validation cannot disagree about which keys are usable. The
+    /// endpoint serving this is unauthenticated by design, so a fetch reads
+    /// the cache unless the configured keys changed, the set is older than
+    /// [`JWKS_REFRESH_INTERVAL`], or a failed build is older than
+    /// [`JWKS_RETRY_INTERVAL`].
+    ///
+    /// Fails closed. If any key cannot be resolved or loaded, nothing is
+    /// published: a partial set would tell every verifier that refetches it to
+    /// drop a key that may still be signing, while a verifier that cannot
+    /// refetch keeps the set it already holds.
+    pub async fn caller_assertion_jwks(
+        &self,
+    ) -> Result<Arc<JwksDocument>, CallerAssertionJwksUnavailable> {
+        let bindings = published_key_bindings(&self.runtime.load_full());
+        let mut cache = self.caller_assertion_jwks.lock().await;
+        if let Some(cached) = cache.as_ref().filter(|cached| cached.bindings == bindings) {
+            let age = cached.built_at.elapsed();
+            match &cached.document {
+                Some(document) if age < JWKS_REFRESH_INTERVAL => return Ok(Arc::clone(document)),
+                None if age < JWKS_RETRY_INTERVAL => return Err(CallerAssertionJwksUnavailable),
+                Some(_) | None => {}
+            }
+        }
+        let document = self
+            .build_caller_assertion_jwks(&bindings)
+            .await
+            .map(Arc::new);
+        *cache = Some(CachedJwks {
+            bindings,
+            built_at: Instant::now(),
+            document: document.clone(),
+        });
+        document.ok_or(CallerAssertionJwksUnavailable)
+    }
+
+    async fn build_caller_assertion_jwks(
+        &self,
+        bindings: &[PublishedKeyBinding],
+    ) -> Option<JwksDocument> {
+        let mut public_jwks = Vec::with_capacity(bindings.len());
+        for binding in bindings {
+            let material = match self
+                .secret_resolver
+                .resolve(&binding.signing_key_id, SecretPurpose::AssertionSigningKey)
+                .await
+            {
+                Ok(material) => material,
+                Err(error) => {
+                    tracing::warn!(
+                        connection_id = %binding.connection_id,
+                        field = binding.field,
+                        kid = %binding.kid,
+                        reason = ?error.kind(),
+                        "a caller-assertion key could not be resolved; the JWKS is unavailable"
+                    );
+                    return None;
+                }
+            };
+            match load_signing_key(&binding.kid, binding.algorithm.into(), material.expose()) {
+                Ok(key) => public_jwks.push(key.public_jwk().clone()),
+                Err(rejection) => {
+                    tracing::warn!(
+                        connection_id = %binding.connection_id,
+                        field = binding.field,
+                        kid = %binding.kid,
+                        reason = rejection.code(),
+                        "a caller-assertion key is no longer usable; the JWKS is unavailable"
+                    );
+                    return None;
+                }
+            }
+        }
+        let build = JwksDocument::from_public_jwks(public_jwks);
+        for kid in &build.withheld_kids {
+            tracing::error!(
+                kid = %kid,
+                "enabled Connections publish different caller-assertion keys under one kid; neither is published"
+            );
+        }
+        Some(build.document)
     }
 
     /// Serialize this mutation against every other control-plane and
@@ -1630,8 +1811,20 @@ fn update_digest_field(digest: &mut Sha256, value: &str) {
 #[derive(Debug)]
 pub enum ConnectionMutationError {
     Unavailable(ManagedConnectionMutationUnavailable),
-    CollectionConflict { current: String },
-    UnresolvableBindings { fields: Vec<&'static str> },
+    CollectionConflict {
+        current: String,
+    },
+    UnresolvableBindings {
+        fields: Vec<&'static str>,
+    },
+    /// A caller-assertion key the candidate binds cannot be used as configured:
+    /// `code` says why (`algorithm_mismatch`, `invalid_signing_key`,
+    /// `unusable_signing_key`, `duplicate_kid`) without saying anything about
+    /// the material.
+    CallerAssertionKeyRejected {
+        field: &'static str,
+        code: &'static str,
+    },
     BindingUnavailable,
     Busy,
     DeadlineExceeded,
@@ -1650,6 +1843,10 @@ impl fmt::Display for ConnectionMutationError {
                 formatter,
                 "enabled connection has unresolvable bindings in {} field(s)",
                 fields.len()
+            ),
+            Self::CallerAssertionKeyRejected { field, code } => write!(
+                formatter,
+                "enabled connection has an unusable caller-assertion key in {field}: {code}"
             ),
             Self::BindingUnavailable => {
                 formatter.write_str("enabled connection binding validation is unavailable")
@@ -1670,6 +1867,7 @@ impl Error for ConnectionMutationError {
             Self::Store(error) => Some(error),
             Self::CollectionConflict { .. }
             | Self::UnresolvableBindings { .. }
+            | Self::CallerAssertionKeyRejected { .. }
             | Self::BindingUnavailable
             | Self::Busy
             | Self::DeadlineExceeded => None,
@@ -1705,8 +1903,28 @@ struct ConnectionSecretResolver {
 
 #[derive(Debug)]
 enum BindingActivationError {
-    Invalid { fields: Vec<&'static str> },
+    Invalid {
+        fields: Vec<&'static str>,
+    },
     Unavailable,
+    /// A caller-assertion key resolved but cannot sign, or be published, for
+    /// its configured algorithm.
+    SigningKey {
+        field: &'static str,
+        rejection: SigningKeyRejection,
+    },
+}
+
+impl BindingActivationError {
+    /// The fields and safe reason a startup or reconcile refusal reports.
+    /// Never the material, and never the alias it came from.
+    fn diagnostic(&self) -> (Vec<&'static str>, &'static str) {
+        match self {
+            Self::Invalid { fields } => (fields.clone(), "invalid material"),
+            Self::Unavailable => (Vec::new(), "source unavailable"),
+            Self::SigningKey { field, rejection } => (vec![*field], rejection.code()),
+        }
+    }
 }
 
 impl fmt::Debug for ConnectionSecretResolver {
@@ -1815,6 +2033,23 @@ impl ConnectionSecretResolver {
             }
         }
 
+        // Every key a caller assertion publishes is loaded now, for its own
+        // algorithm: a key of the wrong algorithm or shape would otherwise be
+        // accepted here and then fail every call and every JWKS fetch.
+        if let Some(assertion) = candidate.caller_assertion.as_ref() {
+            for key in assertion
+                .keys()
+                .filter(|key| !self.is_deferred_alias(key.signing_key_id))
+            {
+                let material = self.resolve_required(
+                    key.field,
+                    key.signing_key_id,
+                    SecretPurpose::AssertionSigningKey,
+                )?;
+                load_assertion_key(key, material.expose())?;
+            }
+        }
+
         let ca_bundle = candidate
             .tls
             .ca_bundle_alias
@@ -1902,6 +2137,19 @@ impl ConnectionSecretResolver {
         }) {
             return Err(BindingActivationError::Invalid {
                 fields: vec!["additional_headers.secret_id"],
+            });
+        }
+
+        // A published `kid` names one key, and verifiers cache keys by it, so
+        // the material behind a caller-assertion key is never replaced in
+        // place: the next key is published under its own alias and `kid`.
+        if let Some(key) = candidate.caller_assertion.as_ref().and_then(|assertion| {
+            assertion
+                .keys()
+                .find(|key| key.signing_key_id == rotated_id)
+        }) {
+            return Err(BindingActivationError::Invalid {
+                fields: vec![key.field],
             });
         }
 
@@ -2034,7 +2282,60 @@ fn binding_activation_to_mutation_error(error: BindingActivationError) -> Connec
             ConnectionMutationError::UnresolvableBindings { fields }
         }
         BindingActivationError::Unavailable => ConnectionMutationError::BindingUnavailable,
+        BindingActivationError::SigningKey { field, rejection } => {
+            ConnectionMutationError::CallerAssertionKeyRejected {
+                field,
+                code: rejection.code(),
+            }
+        }
     }
+}
+
+/// Loads resolved material as the caller-assertion key `key` configures,
+/// which is what checks it against the configured algorithm.
+fn load_assertion_key(
+    key: CallerAssertionKeyRef<'_>,
+    material: &[u8],
+) -> Result<(), BindingActivationError> {
+    load_signing_key(key.kid, key.algorithm.into(), material)
+        .map(|_| ())
+        .map_err(|rejection| BindingActivationError::SigningKey {
+            field: key.field,
+            rejection,
+        })
+}
+
+/// Whether two published keys share a `kid` without being the same key.
+fn assertion_keys_conflict(
+    left: &CallerAssertionKeyRef<'_>,
+    right: &CallerAssertionKeyRef<'_>,
+) -> bool {
+    left.kid == right.kid
+        && (left.signing_key_id != right.signing_key_id || left.algorithm != right.algorithm)
+}
+
+/// Every key the enabled managed Connections of `snapshot` publish, in
+/// Connection order and then configured order.
+fn published_key_bindings(snapshot: &ConnectionRuntimeSnapshot) -> Vec<PublishedKeyBinding> {
+    let mut bindings = Vec::new();
+    for (connection_id, record) in snapshot.managed() {
+        if !record.write.enabled {
+            continue;
+        }
+        let Some(assertion) = record.write.caller_assertion.as_ref() else {
+            continue;
+        };
+        for key in assertion.keys() {
+            bindings.push(PublishedKeyBinding {
+                connection_id: connection_id.clone(),
+                field: key.field,
+                signing_key_id: key.signing_key_id.to_owned(),
+                kid: key.kid.to_owned(),
+                algorithm: key.algorithm,
+            });
+        }
+    }
+    bindings
 }
 
 /// Resolves one deferred binding, mapping the outcome onto the mutation-error
@@ -2198,7 +2499,8 @@ impl LocalSecretManager for CoordinatedLocalSecretManager {
             self.secret_resolver
                 .validate_enabled_candidate_with_rotated_secret(&record.write, id, &replacement)
                 .map_err(|error| match error {
-                    BindingActivationError::Invalid { .. } => LocalSecretError::InvalidSecret,
+                    BindingActivationError::Invalid { .. }
+                    | BindingActivationError::SigningKey { .. } => LocalSecretError::InvalidSecret,
                     BindingActivationError::Unavailable => LocalSecretError::StorageFailure,
                 })?;
         }
@@ -4270,6 +4572,392 @@ mod tests {
                 .expect("count should load"),
             1
         );
+    }
+
+    /// A configuration whose operator aliases name caller-assertion key files
+    /// written into the temporary root, as an operator would mount them.
+    fn with_assertion_keys(
+        temporary: &TemporaryLocalControlPlane,
+        keys: &[(&str, &str)],
+    ) -> Config {
+        let mut config = temporary.config();
+        for (alias, pem) in keys {
+            write_assertion_key(temporary, alias, pem);
+            config.connection_secret_aliases.push(
+                crate::connections::secret::OperatorSecretAliasConfig {
+                    id: (*alias).to_owned(),
+                    label: format!("Assertion key {alias}"),
+                    source: crate::connections::secret::OperatorSecretAliasSource::File {
+                        key: (*alias).to_owned(),
+                    },
+                },
+            );
+        }
+        config
+    }
+
+    fn write_assertion_key(temporary: &TemporaryLocalControlPlane, alias: &str, pem: &str) {
+        let path = temporary.root.join(alias);
+        fs::write(&path, pem).expect("assertion key should write");
+        set_file_permissions(&path, 0o600);
+    }
+
+    /// Generated per test: no private key material belongs in this tree.
+    fn es256_pem() -> String {
+        rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256)
+            .expect("P-256 key generates")
+            .serialize_pem()
+    }
+
+    fn attested_candidate(
+        signing_key_id: &str,
+        kid: &str,
+        algorithm: &str,
+        published_keys: serde_json::Value,
+    ) -> ConnectionWrite {
+        serde_json::from_value(serde_json::json!({
+            "display_name": "Attested API",
+            "enabled": true,
+            "kind": "http_api",
+            "endpoint": {
+                "base_url": "https://billing.example.test",
+                "base_path": "/v1"
+            },
+            "authentication": { "type": "none" },
+            "caller_assertion": {
+                "signing_key_id": signing_key_id,
+                "kid": kid,
+                "algorithm": algorithm,
+                "issuer": "https://gateway.example.test",
+                "audience": "https://billing.example.test",
+                "token_type": "at+jwt",
+                "header_name": "x-caller-assertion",
+                "lifetime_seconds": 60,
+                "published_keys": published_keys
+            }
+        }))
+        .expect("attested candidate should deserialize")
+    }
+
+    fn published_kids(document: &JwksDocument) -> Vec<String> {
+        let body: serde_json::Value =
+            serde_json::from_str(document.body()).expect("the JWKS is JSON");
+        body["keys"]
+            .as_array()
+            .expect("the JWKS has a key array")
+            .iter()
+            .map(|key| key["kid"].as_str().expect("every key has a kid").to_owned())
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn an_assertion_key_of_the_wrong_algorithm_is_refused_at_create_with_a_safe_code() {
+        let temporary = TemporaryLocalControlPlane::new("assertion-mismatch");
+        let signing = es256_pem();
+        let next = es256_pem();
+        let control_plane = ConnectionControlPlane::from_config(&with_assertion_keys(
+            &temporary,
+            &[("assertion-key", &signing), ("assertion-key-next", &next)],
+        ))
+        .expect("control plane should build");
+        let before = control_plane.runtime_snapshot();
+
+        // A P-256 key configured as RS256 is the operator's mistake, and the
+        // diagnostic names it as one, against the field, and nothing else.
+        let Err(error) = control_plane
+            .create_managed(
+                before.collection_etag(),
+                attested_candidate("assertion-key", "gw-1", "rs256", serde_json::json!([])),
+                "test-admin",
+            )
+            .await
+        else {
+            panic!("an ES256 key configured as RS256 must be refused");
+        };
+        assert!(
+            matches!(
+                error,
+                ConnectionMutationError::CallerAssertionKeyRejected {
+                    field: "caller_assertion.signing_key_id",
+                    code: "algorithm_mismatch",
+                }
+            ),
+            "{error:?}"
+        );
+        let rendered = format!("{error} {error:?}");
+        for line in signing.lines().filter(|line| !line.starts_with("-----")) {
+            assert!(!rendered.contains(line), "the refusal leaked key material");
+        }
+
+        // A published-only key is held to the same rule as the signing key.
+        let Err(error) = control_plane
+            .create_managed(
+                before.collection_etag(),
+                attested_candidate(
+                    "assertion-key",
+                    "gw-1",
+                    "es256",
+                    serde_json::json!([
+                        { "signing_key_id": "assertion-key-next", "kid": "gw-2", "algorithm": "rs256" }
+                    ]),
+                ),
+                "test-admin",
+            )
+            .await
+        else {
+            panic!("a published key of the wrong algorithm must be refused");
+        };
+        assert!(
+            matches!(
+                error,
+                ConnectionMutationError::CallerAssertionKeyRejected {
+                    field: "caller_assertion.published_keys.signing_key_id",
+                    code: "algorithm_mismatch",
+                }
+            ),
+            "{error:?}"
+        );
+        assert!(control_plane.runtime_snapshot().managed().is_empty());
+
+        // The same keys under their own algorithm are accepted.
+        control_plane
+            .create_managed(
+                before.collection_etag(),
+                attested_candidate(
+                    "assertion-key",
+                    "gw-1",
+                    "es256",
+                    serde_json::json!([
+                        { "signing_key_id": "assertion-key-next", "kid": "gw-2", "algorithm": "es256" }
+                    ]),
+                ),
+                "test-admin",
+            )
+            .await
+            .expect("keys matching their algorithm should be accepted");
+    }
+
+    #[tokio::test]
+    async fn a_persisted_assertion_key_that_no_longer_loads_fails_restart_closed() {
+        let temporary = TemporaryLocalControlPlane::new("assertion-restart");
+        let config = with_assertion_keys(&temporary, &[("assertion-key", &es256_pem())]);
+        let control_plane =
+            ConnectionControlPlane::from_config(&config).expect("control plane should build");
+        let before = control_plane.runtime_snapshot();
+        control_plane
+            .create_managed(
+                before.collection_etag(),
+                attested_candidate("assertion-key", "gw-1", "es256", serde_json::json!([])),
+                "test-admin",
+            )
+            .await
+            .expect("attested Connection should create");
+        drop(control_plane);
+
+        // Something that is not a key now sits behind the alias.
+        write_assertion_key(&temporary, "assertion-key", "not a key");
+        let Err(ConnectionControlPlaneError::UnresolvableBindings { fields, reason, .. }) =
+            ConnectionControlPlane::from_config(&config)
+        else {
+            panic!("an unusable assertion key must stop the gateway starting");
+        };
+        assert_eq!(fields, vec!["caller_assertion.signing_key_id"]);
+        assert_eq!(reason, "invalid_signing_key");
+    }
+
+    #[tokio::test]
+    async fn the_jwks_publishes_every_enabled_connection_s_keys_and_follows_changes() {
+        let temporary = TemporaryLocalControlPlane::new("assertion-jwks");
+        let config = with_assertion_keys(
+            &temporary,
+            &[
+                ("key-a", &es256_pem()),
+                ("key-a-next", &es256_pem()),
+                ("key-b", &es256_pem()),
+            ],
+        );
+        let control_plane =
+            ConnectionControlPlane::from_config(&config).expect("control plane should build");
+        let empty = control_plane
+            .caller_assertion_jwks()
+            .await
+            .expect("an empty set is still a set");
+        assert_eq!(empty.body(), r#"{"keys":[]}"#);
+
+        let snapshot = control_plane.runtime_snapshot();
+        let attested = control_plane
+            .create_managed(
+                snapshot.collection_etag(),
+                attested_candidate(
+                    "key-a",
+                    "gw-a",
+                    "es256",
+                    serde_json::json!([
+                        { "signing_key_id": "key-a-next", "kid": "gw-a-next", "algorithm": "es256" }
+                    ]),
+                ),
+                "test-admin",
+            )
+            .await
+            .expect("attested Connection should create");
+        let snapshot = control_plane.runtime_snapshot();
+        let mut disabled = attested_candidate("key-b", "gw-b", "es256", serde_json::json!([]));
+        disabled.enabled = false;
+        control_plane
+            .create_managed(snapshot.collection_etag(), disabled, "test-admin")
+            .await
+            .expect("disabled attested Connection should create");
+
+        // The signing key and the next key of the enabled Connection, and
+        // nothing of the disabled one.
+        let published = control_plane
+            .caller_assertion_jwks()
+            .await
+            .expect("keys should publish");
+        assert_eq!(published_kids(&published), vec!["gw-a", "gw-a-next"]);
+        assert!(!published.body().contains("\"d\""));
+        // Served from the cache while nothing changed.
+        let again = control_plane
+            .caller_assertion_jwks()
+            .await
+            .expect("keys should publish");
+        assert!(Arc::ptr_eq(&published, &again));
+
+        // Disabling the Connection withdraws its keys at the next fetch.
+        let mut withdrawn = attested.write.clone();
+        withdrawn.enabled = false;
+        control_plane
+            .replace_managed(&attested.id, &attested.etag(), withdrawn, "test-admin")
+            .await
+            .expect("disabling should save");
+        let after = control_plane
+            .caller_assertion_jwks()
+            .await
+            .expect("an empty set is still a set");
+        assert_eq!(after.key_count(), 0);
+        assert_ne!(after.etag(), published.etag());
+    }
+
+    #[tokio::test]
+    async fn the_jwks_fails_closed_when_a_published_key_cannot_be_read() {
+        let temporary = TemporaryLocalControlPlane::new("assertion-jwks-unavailable");
+        let signing = es256_pem();
+        let config = with_assertion_keys(&temporary, &[("key-a", &signing)]);
+        let control_plane =
+            ConnectionControlPlane::from_config(&config).expect("control plane should build");
+        let snapshot = control_plane.runtime_snapshot();
+        control_plane
+            .create_managed(
+                snapshot.collection_etag(),
+                attested_candidate("key-a", "gw-a", "es256", serde_json::json!([])),
+                "test-admin",
+            )
+            .await
+            .expect("attested Connection should create");
+
+        // A partial set would tell verifiers to drop a key that may still sign.
+        fs::remove_file(temporary.root.join("key-a")).expect("the key file should disappear");
+        assert_eq!(
+            control_plane.caller_assertion_jwks().await.err(),
+            Some(CallerAssertionJwksUnavailable)
+        );
+        // The failure is remembered for the retry interval, so an
+        // unauthenticated fetch cannot make the gateway ask its secret
+        // provider again and again.
+        write_assertion_key(&temporary, "key-a", &signing);
+        assert_eq!(
+            control_plane.caller_assertion_jwks().await.err(),
+            Some(CallerAssertionJwksUnavailable)
+        );
+    }
+
+    #[tokio::test]
+    async fn a_kid_another_connection_publishes_for_a_different_key_is_refused() {
+        let temporary = TemporaryLocalControlPlane::new("assertion-kid");
+        let config = with_assertion_keys(
+            &temporary,
+            &[
+                ("key-a", &es256_pem()),
+                ("key-b", &es256_pem()),
+                ("key-c", &es256_pem()),
+            ],
+        );
+        let control_plane =
+            ConnectionControlPlane::from_config(&config).expect("control plane should build");
+        let snapshot = control_plane.runtime_snapshot();
+        control_plane
+            .create_managed(
+                snapshot.collection_etag(),
+                attested_candidate("key-a", "gw-shared", "es256", serde_json::json!([])),
+                "test-admin",
+            )
+            .await
+            .expect("the first Connection should create");
+
+        let snapshot = control_plane.runtime_snapshot();
+        let Err(error) = control_plane
+            .create_managed(
+                snapshot.collection_etag(),
+                attested_candidate("key-b", "gw-shared", "es256", serde_json::json!([])),
+                "test-admin",
+            )
+            .await
+        else {
+            panic!("a kid naming a second key must be refused");
+        };
+        assert!(
+            matches!(
+                error,
+                ConnectionMutationError::CallerAssertionKeyRejected {
+                    field: "caller_assertion.kid",
+                    code: "duplicate_kid",
+                }
+            ),
+            "{error:?}"
+        );
+        let Err(error) = control_plane
+            .create_managed(
+                snapshot.collection_etag(),
+                attested_candidate(
+                    "key-c",
+                    "gw-c",
+                    "es256",
+                    serde_json::json!([
+                        { "signing_key_id": "key-b", "kid": "gw-shared", "algorithm": "es256" }
+                    ]),
+                ),
+                "test-admin",
+            )
+            .await
+        else {
+            panic!("a published kid naming a second key must be refused");
+        };
+        assert!(
+            matches!(
+                error,
+                ConnectionMutationError::CallerAssertionKeyRejected {
+                    field: "caller_assertion.published_keys.kid",
+                    code: "duplicate_kid",
+                }
+            ),
+            "{error:?}"
+        );
+
+        // Sharing the key itself is the common deployment, and it is published
+        // once.
+        control_plane
+            .create_managed(
+                snapshot.collection_etag(),
+                attested_candidate("key-a", "gw-shared", "es256", serde_json::json!([])),
+                "test-admin",
+            )
+            .await
+            .expect("a second Connection may share the same key");
+        let published = control_plane
+            .caller_assertion_jwks()
+            .await
+            .expect("the shared key should publish");
+        assert_eq!(published_kids(&published), vec!["gw-shared"]);
     }
 
     #[cfg(unix)]

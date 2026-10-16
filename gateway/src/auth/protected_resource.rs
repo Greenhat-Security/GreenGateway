@@ -123,11 +123,17 @@ fn public_url_with_appended_path(public_url: &str, path: &str) -> String {
     url.to_string()
 }
 
+/// The gateway's public metadata paths: the protected-resource metadata, and
+/// the JWKS upstreams verify caller assertions against. Both are public by
+/// design -- a verifier holds no gateway credential -- so authentication and
+/// RBAC let them through without a credential, and they are gateway-owned, so
+/// a proxy route can never answer them instead.
 pub(crate) fn is_well_known_path(path: &str) -> bool {
     path == WELL_KNOWN_PATH
         || path
             .strip_prefix(WELL_KNOWN_PATH)
             .is_some_and(|suffix| suffix.starts_with('/'))
+        || path == crate::connections::caller_assertion::JWKS_PATH
 }
 
 #[cfg(test)]

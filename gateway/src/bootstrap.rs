@@ -2144,7 +2144,7 @@ pub(super) fn gateway_app_with_process_started_at_and_overrides(
             .pg_limits
             .as_ref()
             .map(|seed| seed.pool.clone()),
-        _connections: connection_control_plane,
+        connections: connection_control_plane,
     };
     let audit_admin_state = AuditAdminState {
         query_store: audit_event_store,

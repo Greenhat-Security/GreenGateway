@@ -497,8 +497,11 @@ impl LocalSecretProvider {
         secret: ResolvedSecret,
     ) -> Result<SecretAliasMetadata, LocalSecretError> {
         validate_label(label)?;
-        let now = utc_timestamp()?;
         let purpose = secret.purpose();
+        if !purpose.is_locally_storable() {
+            return Err(LocalSecretError::InvalidSecret);
+        }
+        let now = utc_timestamp()?;
         let mut connection = self.connection_guard();
         let transaction = connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
@@ -1177,6 +1180,9 @@ fn purpose_as_str(purpose: SecretPurpose) -> &'static str {
         SecretPurpose::TlsPrivateKey => "tls_private_key",
         SecretPurpose::TlsCertificate => "tls_certificate",
         SecretPurpose::TlsCaBundle => "tls_ca_bundle",
+        // Never written: the table's purpose constraint predates it, and
+        // `create` refuses it first. Named here only so the match stays total.
+        SecretPurpose::AssertionSigningKey => "assertion_signing_key",
     }
 }
 
@@ -1479,6 +1485,27 @@ mod tests {
             environment.load_keyring(&environment.primary_config()),
             Err(LocalSecretKeyringConfigError::KeyFileUnsafe { index: 0 })
         ));
+    }
+
+    #[test]
+    fn an_assertion_signing_key_is_refused_before_anything_is_written() {
+        // The table's purpose constraint predates the signing-key purpose, so a
+        // create for one must fail as invalid material, not as a storage error
+        // half way through a transaction.
+        let environment = TestEnvironment::new("assertion-signing-key");
+        environment.write_key(PRIMARY_FILE, 11);
+        let (_store, provider) = environment
+            .provider(&environment.primary_config())
+            .expect("provider should open");
+
+        assert!(matches!(
+            provider.create(
+                "Assertion signing key",
+                secret(SecretPurpose::AssertionSigningKey, CANARY),
+            ),
+            Err(LocalSecretError::InvalidSecret)
+        ));
+        assert!(provider.metadata().is_empty());
     }
 
     #[tokio::test]

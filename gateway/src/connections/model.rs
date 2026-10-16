@@ -236,6 +236,70 @@ pub struct CallerAssertionSettings {
     /// Require, and include, the approval that authorised a mutation.
     #[serde(default)]
     pub bind_approval: bool,
+    /// Keys published in the JWKS beside the signing key that never sign:
+    /// the next key, published before the switch so every verifier already
+    /// holds it, and the previous one, kept until every assertion it signed
+    /// has expired. This is what lets a key rotate without a flag day.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub published_keys: Vec<CallerAssertionPublishedKey>,
+}
+
+/// A key published in the JWKS that this Connection does not sign with.
+///
+/// It is still a private key behind a secret alias, not a pasted public key:
+/// the gateway derives the public half itself, exactly as it does for the
+/// signing key, so the key that is published is always the key that would
+/// sign once it is promoted.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct CallerAssertionPublishedKey {
+    pub signing_key_id: String,
+    pub kid: String,
+    pub algorithm: CallerAssertionAlgorithm,
+}
+
+/// Most keys one Connection may publish beside its signing key. A rotation
+/// needs two at most -- the next key and the previous one -- so this leaves
+/// room for an overlapping rotation without letting the JWKS grow unbounded.
+pub const MAX_CALLER_ASSERTION_PUBLISHED_KEYS: usize = 4;
+
+/// The field a signing key binding is reported under.
+pub const CALLER_ASSERTION_SIGNING_KEY_FIELD: &str = "caller_assertion.signing_key_id";
+/// The field a published-only key binding is reported under.
+pub const CALLER_ASSERTION_PUBLISHED_KEY_FIELD: &str =
+    "caller_assertion.published_keys.signing_key_id";
+
+/// One key a caller assertion publishes, with the fields it is configured in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CallerAssertionKeyRef<'a> {
+    /// Where the key's alias is configured, for a binding diagnostic.
+    pub field: &'static str,
+    /// Where the key's `kid` is configured, for a `kid` diagnostic.
+    pub kid_field: &'static str,
+    pub signing_key_id: &'a str,
+    pub kid: &'a str,
+    pub algorithm: CallerAssertionAlgorithm,
+}
+
+impl CallerAssertionSettings {
+    /// Every key this assertion publishes: the signing key first, then each
+    /// published-only key in configured order.
+    pub fn keys(&self) -> impl Iterator<Item = CallerAssertionKeyRef<'_>> {
+        std::iter::once(CallerAssertionKeyRef {
+            field: CALLER_ASSERTION_SIGNING_KEY_FIELD,
+            kid_field: "caller_assertion.kid",
+            signing_key_id: &self.signing_key_id,
+            kid: &self.kid,
+            algorithm: self.algorithm,
+        })
+        .chain(self.published_keys.iter().map(|key| CallerAssertionKeyRef {
+            field: CALLER_ASSERTION_PUBLISHED_KEY_FIELD,
+            kid_field: "caller_assertion.published_keys.kid",
+            signing_key_id: &key.signing_key_id,
+            kid: &key.kid,
+            algorithm: key.algorithm,
+        }))
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
@@ -433,10 +497,15 @@ impl ConnectionWrite {
         }
     }
 
+    /// Whether this Connection binds secret material of any kind. A caller
+    /// assertion counts: its keys are private keys behind secret aliases, and
+    /// binding one makes the gateway read it, sign with it and publish its
+    /// public half.
     pub fn configures_credential_authority(&self) -> bool {
         !matches!(self.authentication, ConnectionAuthentication::None)
             || !self.additional_headers.is_empty()
             || !self.tls.is_empty()
+            || self.caller_assertion.is_some()
     }
 
     /// Whether any request on this Connection carries a secret-backed
@@ -454,6 +523,9 @@ impl ConnectionWrite {
         self.authentication != candidate.authentication
             || self.additional_headers != candidate.additional_headers
             || self.tls != candidate.tls
+            // Any change to what the gateway attests with its keys, or to which
+            // keys it signs with and publishes, is credential authority.
+            || self.caller_assertion != candidate.caller_assertion
             || ((self.configures_credential_authority()
                 || candidate.configures_credential_authority())
                 && (self.endpoint != candidate.endpoint
@@ -515,6 +587,13 @@ impl ConnectionWrite {
             .any(|secret_id| !binding_is_configured(secret_id))
         {
             unresolved.push("additional_headers.secret_id");
+        }
+        if let Some(assertion) = &self.caller_assertion {
+            for key in assertion.keys() {
+                if !binding_is_configured(key.signing_key_id) && !unresolved.contains(&key.field) {
+                    unresolved.push(key.field);
+                }
+            }
         }
         for (field, binding) in [
             ("tls.ca_bundle_alias", self.tls.ca_bundle_alias.as_deref()),
@@ -658,6 +737,65 @@ fn validate_caller_assertion(
             break;
         }
         seen.push(*claim);
+    }
+
+    validate_published_assertion_keys(settings, errors);
+}
+
+/// The keys a caller assertion publishes beside its signing key.
+///
+/// Every published `kid` must name one key, so a verifier selecting by `kid`
+/// cannot pick the wrong one, and every alias may appear once, so one key is
+/// never published under two names.
+fn validate_published_assertion_keys(
+    settings: &CallerAssertionSettings,
+    errors: &mut Vec<ConnectionValidationError>,
+) {
+    if settings.published_keys.len() > MAX_CALLER_ASSERTION_PUBLISHED_KEYS {
+        errors.push(ConnectionValidationError::new(
+            "caller_assertion.published_keys",
+            "too_many_keys",
+            format!("must list at most {MAX_CALLER_ASSERTION_PUBLISHED_KEYS} keys"),
+        ));
+    }
+    for key in &settings.published_keys {
+        validate_secret_id(
+            CALLER_ASSERTION_PUBLISHED_KEY_FIELD,
+            &key.signing_key_id,
+            errors,
+        );
+        if key.kid.is_empty() || key.kid.len() > 128 || key.kid.chars().any(char::is_control) {
+            errors.push(ConnectionValidationError::new(
+                "caller_assertion.published_keys.kid",
+                "invalid_value",
+                "must be 1 to 128 bytes and contain no control characters",
+            ));
+        }
+    }
+
+    let mut kids = Vec::with_capacity(settings.published_keys.len() + 1);
+    let mut aliases = Vec::with_capacity(settings.published_keys.len() + 1);
+    for key in settings.keys() {
+        if kids.contains(&key.kid) {
+            errors.push(ConnectionValidationError::new(
+                key.kid_field,
+                "duplicate_kid",
+                "every published key needs its own kid, distinct from the signing key's",
+            ));
+            break;
+        }
+        kids.push(key.kid);
+    }
+    for key in settings.keys() {
+        if aliases.contains(&key.signing_key_id) {
+            errors.push(ConnectionValidationError::new(
+                CALLER_ASSERTION_PUBLISHED_KEY_FIELD,
+                "duplicate_signing_key",
+                "each key may be published once",
+            ));
+            break;
+        }
+        aliases.push(key.signing_key_id);
     }
 }
 
@@ -1536,6 +1674,181 @@ newline"
         // setting that silently does nothing.
         let document = with_caller_assertion(json!({ "bind_requests": true }));
         assert!(connection_schema_validator().validate(&document).is_err());
+    }
+
+    fn with_published_keys(published_keys: Value) -> Value {
+        with_caller_assertion(json!({ "published_keys": published_keys }))
+    }
+
+    #[test]
+    fn published_keys_match_schema_and_list_after_the_signing_key() {
+        // The rotation model: the next key is published beside the signing key
+        // before it signs, and the previous one stays until it has expired.
+        let document = with_published_keys(json!([
+            { "signing_key_id": "assertion-key-next", "kid": "gw-2026-10", "algorithm": "rs256" },
+            { "signing_key_id": "assertion-key-previous", "kid": "gw-2026-08", "algorithm": "es256" }
+        ]));
+        connection_schema_validator()
+            .validate(&document)
+            .expect("published schema should accept published keys");
+        let validated = serde_json::from_value::<ConnectionWrite>(document)
+            .expect("should deserialize")
+            .validated()
+            .expect("should validate");
+        let assertion = validated.caller_assertion.expect("assertion retained");
+        let keys = assertion.keys().collect::<Vec<_>>();
+        assert_eq!(
+            keys.iter()
+                .map(|key| (key.field, key.signing_key_id, key.kid, key.algorithm))
+                .collect::<Vec<_>>(),
+            vec![
+                (
+                    CALLER_ASSERTION_SIGNING_KEY_FIELD,
+                    "assertion-signing-key",
+                    "gw-2026-09",
+                    CallerAssertionAlgorithm::Es256
+                ),
+                (
+                    CALLER_ASSERTION_PUBLISHED_KEY_FIELD,
+                    "assertion-key-next",
+                    "gw-2026-10",
+                    CallerAssertionAlgorithm::Rs256
+                ),
+                (
+                    CALLER_ASSERTION_PUBLISHED_KEY_FIELD,
+                    "assertion-key-previous",
+                    "gw-2026-08",
+                    CallerAssertionAlgorithm::Es256
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn every_published_kid_and_alias_names_one_key() {
+        // A kid shared with the signing key would leave a verifier choosing
+        // between two keys; an alias listed twice publishes one key twice.
+        let errors = assertion_errors(json!({ "published_keys": [
+            { "signing_key_id": "assertion-key-next", "kid": "gw-2026-09", "algorithm": "es256" }
+        ] }));
+        assert!(errors.iter().any(|error| {
+            error.field == "caller_assertion.published_keys.kid" && error.code == "duplicate_kid"
+        }));
+
+        let errors = assertion_errors(json!({ "published_keys": [
+            { "signing_key_id": "assertion-signing-key", "kid": "gw-2026-10", "algorithm": "es256" }
+        ] }));
+        assert!(errors.iter().any(|error| {
+            error.field == CALLER_ASSERTION_PUBLISHED_KEY_FIELD
+                && error.code == "duplicate_signing_key"
+        }));
+
+        let errors = assertion_errors(json!({ "published_keys": [
+            { "signing_key_id": "assertion-key-next", "kid": "", "algorithm": "es256" }
+        ] }));
+        assert!(errors
+            .iter()
+            .any(|error| error.field == "caller_assertion.published_keys.kid"));
+
+        let errors = assertion_errors(json!({ "published_keys": [
+            { "signing_key_id": "env:NOT_AN_ALIAS", "kid": "gw-2026-10", "algorithm": "es256" }
+        ] }));
+        assert!(errors.iter().any(|error| {
+            error.field == CALLER_ASSERTION_PUBLISHED_KEY_FIELD && error.code == "invalid_secret_id"
+        }));
+    }
+
+    #[test]
+    fn published_keys_are_bounded() {
+        let keys = (0..=MAX_CALLER_ASSERTION_PUBLISHED_KEYS)
+            .map(|index| {
+                json!({
+                    "signing_key_id": format!("assertion-key-{index}"),
+                    "kid": format!("gw-{index}"),
+                    "algorithm": "es256"
+                })
+            })
+            .collect::<Vec<_>>();
+        let document = with_published_keys(Value::Array(keys));
+        assert!(
+            connection_schema_validator().validate(&document).is_err(),
+            "the published schema should bound published keys"
+        );
+        let errors = serde_json::from_value::<ConnectionWrite>(document)
+            .expect("should deserialize")
+            .validated()
+            .expect_err("too many published keys should be rejected");
+        assert!(errors.iter().any(|error| error.code == "too_many_keys"));
+    }
+
+    #[test]
+    fn every_assertion_key_alias_must_be_configured_before_enabling() {
+        let mut document = with_published_keys(json!([
+            { "signing_key_id": "assertion-key-next", "kid": "gw-2026-10", "algorithm": "es256" }
+        ]));
+        document["enabled"] = json!(true);
+        let candidate = serde_json::from_value::<ConnectionWrite>(document)
+            .expect("should deserialize")
+            .validated()
+            .expect("should validate");
+        let configured = [
+            "billing-client-secret",
+            "billing-ca",
+            "billing-client-cert",
+            "billing-client-key",
+        ];
+        assert_eq!(
+            candidate.unresolved_enabled_binding_fields(|id| configured.contains(&id)),
+            vec![
+                CALLER_ASSERTION_SIGNING_KEY_FIELD,
+                CALLER_ASSERTION_PUBLISHED_KEY_FIELD
+            ]
+        );
+        assert!(candidate
+            .unresolved_enabled_binding_fields(|id| configured.contains(&id)
+                || id == "assertion-signing-key"
+                || id == "assertion-key-next")
+            .is_empty());
+    }
+
+    #[test]
+    fn a_caller_assertion_is_credential_authority() {
+        // Its keys are private keys behind secret aliases: binding one, or
+        // changing what it attests, needs the same authority as a credential.
+        let mut plain = serde_json::from_value::<ConnectionWrite>(example())
+            .expect("should deserialize")
+            .validated()
+            .expect("should validate");
+        plain.authentication = ConnectionAuthentication::None;
+        plain.tls = TlsProfile::default();
+        plain.discovery = None;
+        assert!(!plain.configures_credential_authority());
+
+        let attested = serde_json::from_value::<ConnectionWrite>(with_caller_assertion(json!({})))
+            .expect("should deserialize")
+            .validated()
+            .expect("should validate");
+        let mut attested_plain = plain.clone();
+        attested_plain.caller_assertion = attested.caller_assertion.clone();
+        assert!(attested_plain.configures_credential_authority());
+        assert!(attested_plain.requires_secrets_write_to_create());
+        assert!(attested_plain.requires_secrets_write_to_delete());
+        assert!(plain.requires_secrets_write_to_replace(&attested_plain));
+        assert!(attested_plain.requires_secrets_write_to_replace(&plain));
+
+        let mut rotated = attested_plain.clone();
+        if let Some(assertion) = rotated.caller_assertion.as_mut() {
+            assertion.published_keys.push(CallerAssertionPublishedKey {
+                signing_key_id: "assertion-key-next".to_owned(),
+                kid: "gw-2026-10".to_owned(),
+                algorithm: CallerAssertionAlgorithm::Es256,
+            });
+        }
+        assert!(attested_plain.requires_secrets_write_to_replace(&rotated));
+
+        let mut renamed = attested_plain.clone();
+        renamed.display_name = "Renamed".to_owned();
+        assert!(!attested_plain.requires_secrets_write_to_replace(&renamed));
     }
 
     #[test]
