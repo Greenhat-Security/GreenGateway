@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import { Link } from 'react-router-dom';
 
 import { AdminApiError } from '../lib/api';
@@ -10,6 +10,7 @@ import {
   deletePolicyRule,
   fetchPolicy,
   fetchPolicyRuleHits,
+  hasExplicitPolicyRuleId,
   isPolicyRuleEnabled,
   patchPolicyRule,
   policyRuleId,
@@ -23,11 +24,15 @@ type PolicyLoadError = {
     | 'unauthorized'
     | 'forbidden'
     | 'unavailable'
+    | 'policy-changed'
     | 'bad-request'
     | 'network'
     | 'generic';
   message: string;
 };
+
+const POLICY_CHANGED_MESSAGE =
+  'Policy changed since this page loaded; refresh and retry.';
 
 type RuleRow = {
   rule: PolicyRule;
@@ -35,12 +40,28 @@ type RuleRow = {
   index: number;
 };
 
+// A rule without an explicit id is counted under its array position, so its
+// count describes its row only while the rows sit where they did when the
+// counts were read: `moved` after a delete or reorder here, until counts are
+// read again; `diverged` after a 412, when the server's rule order is no
+// longer known here at all.
+type RuleHitPositions = 'current' | 'moved' | 'diverged';
+
+type RuleHits = {
+  evidence: PolicyEvidence<Record<string, number>>;
+  positions: RuleHitPositions;
+};
+
 export function RuleTable() {
   const [policy, setPolicy] = useState<PolicyDocument | null>(null);
   const [etag, setEtag] = useState<string | null>(null);
-  const [hits, setHits] = useState<PolicyEvidence<Record<string, number>> | null>(
-    null,
-  );
+  const [hits, setHits] = useState<RuleHits | null>(null);
+  const [hitsRefreshError, setHitsRefreshError] = useState<string | null>(null);
+  // Hit counts are re-read after every rule change. A read that resolves
+  // after a newer one started is dropped.
+  const hitsReadRef = useRef(0);
+  const mutationsInFlightRef = useRef(0);
+  const policyDivergedRef = useRef(false);
   const [isLoading, setIsLoading] = useState(true);
   const [loadError, setLoadError] = useState<PolicyLoadError | null>(null);
   const [mutationError, setMutationError] = useState<PolicyLoadError | null>(
@@ -62,6 +83,7 @@ export function RuleTable() {
       setLoadError(null);
       setMutationError(null);
       setCanWritePolicy(false);
+      setHitsRefreshError(null);
 
       try {
         const [policyResult, hitCounts] = await Promise.all([
@@ -75,7 +97,7 @@ export function RuleTable() {
         setCanWritePolicy(policyResult.canWrite);
         setPolicy(policyResult.policy);
         setEtag(policyResult.etag);
-        setHits(hitCounts);
+        setHits({ evidence: hitCounts, positions: 'current' });
       } catch (error) {
         if (!isCurrent) {
           return;
@@ -121,20 +143,14 @@ export function RuleTable() {
     }
 
     const nextEnabled = !isPolicyRuleEnabled(row.rule);
-    setMutatingRuleId(row.id);
-    setMutationError(null);
-
-    try {
+    await runRuleMutation(row.id, async () => {
       const response = await patchPolicyRule(row.id, currentEtag, {
         enabled: nextEnabled,
       });
       setEtag(response.etag);
       updateRule(row.id, response.value);
-    } catch (error) {
-      handleMutationError(error);
-    } finally {
-      setMutatingRuleId(null);
-    }
+      return { movedRows: false };
+    });
   }
 
   async function deleteRule(row: RuleRow) {
@@ -143,19 +159,13 @@ export function RuleTable() {
       return;
     }
 
-    setMutatingRuleId(row.id);
-    setMutationError(null);
-
-    try {
+    await runRuleMutation(row.id, async () => {
       const response = await deletePolicyRule(row.id, currentEtag);
       setEtag(response.etag);
       removeRule(row.id);
       setConfirmingDeleteId(null);
-    } catch (error) {
-      handleMutationError(error);
-    } finally {
-      setMutatingRuleId(null);
-    }
+      return { movedRows: true };
+    });
   }
 
   async function dropRule(targetId: string) {
@@ -194,10 +204,7 @@ export function RuleTable() {
       return;
     }
 
-    setMutatingRuleId(movingRuleId);
-    setMutationError(null);
-
-    try {
+    await runRuleMutation(movingRuleId, async () => {
       const response = await reorderPolicyRules(nextOrder, currentEtag);
       setEtag(response.etag);
       setPolicy((current) =>
@@ -208,16 +215,82 @@ export function RuleTable() {
             }
           : current,
       );
+      // A pending delete confirmation names a rule id, and a position id
+      // now names a different rule.
+      setConfirmingDeleteId(null);
       const nextPriority = response.value.order.indexOf(movingRuleId) + 1;
       setOrderAnnouncement(
         nextPriority > 0
           ? `Moved ${movingRuleId} to priority ${nextPriority}.`
           : `Moved ${movingRuleId}.`,
       );
+      return { movedRows: true };
+    });
+  }
+
+  // Every rule change runs through here so hit counts follow it: counts are
+  // read again once the change settles, and a change that moved rows hides
+  // position-keyed counts until that read lands. A 412 means the server's
+  // rule order is no longer the one shown here, so position-keyed counts
+  // stay hidden until the page is reloaded.
+  async function runRuleMutation(
+    ruleId: string,
+    mutate: () => Promise<{ movedRows: boolean }>,
+  ) {
+    mutationsInFlightRef.current += 1;
+    setMutatingRuleId(ruleId);
+    setMutationError(null);
+
+    try {
+      const { movedRows } = await mutate();
+      if (movedRows) {
+        markHitPositions('moved');
+      }
     } catch (error) {
+      if (isPolicyPreconditionFailure(error)) {
+        policyDivergedRef.current = true;
+        markHitPositions('diverged');
+      }
       handleMutationError(error);
     } finally {
+      mutationsInFlightRef.current -= 1;
       setMutatingRuleId(null);
+    }
+
+    await rereadRuleHits();
+  }
+
+  function markHitPositions(positions: 'moved' | 'diverged') {
+    setHits((current) =>
+      current && current.positions !== 'diverged'
+        ? { ...current, positions }
+        : current,
+    );
+  }
+
+  async function rereadRuleHits() {
+    hitsReadRef.current += 1;
+    const read = hitsReadRef.current;
+    // Counts that land while a change is in flight may already describe the
+    // rule order that change produces, which this table does not show yet;
+    // that change's own read replaces them.
+    const isCurrentRead = () =>
+      read === hitsReadRef.current && mutationsInFlightRef.current === 0;
+    try {
+      const evidence = await fetchPolicyRuleHits();
+      if (!isCurrentRead()) {
+        return;
+      }
+      setHits({
+        evidence,
+        positions: policyDivergedRef.current ? 'diverged' : 'current',
+      });
+      setHitsRefreshError(null);
+    } catch (error) {
+      if (!isCurrentRead()) {
+        return;
+      }
+      setHitsRefreshError(toPolicyLoadError(error).message);
     }
   }
 
@@ -281,8 +354,11 @@ export function RuleTable() {
         </p>
 
         {loadError ? <PolicyErrorMessage error={loadError} /> : null}
-        {hits?.status === 'unavailable' && rows.length > 0 ? (
-          <RuleHitEvidenceUnavailableNotice message={hits.message} />
+        {hits?.evidence.status === 'unavailable' && rows.length > 0 ? (
+          <RuleHitEvidenceUnavailableNotice message={hits.evidence.message} />
+        ) : null}
+        {hitsRefreshError !== null && rows.length > 0 ? (
+          <RuleHitRefreshFailedNotice message={hitsRefreshError} />
         ) : null}
         {showWritePermissionNotice ? <PolicyWritePermissionNotice /> : null}
         {mutationError ? <PolicyMutationErrorMessage error={mutationError} /> : null}
@@ -391,7 +467,7 @@ export function RuleTable() {
                     </td>
                     <td className="rule-evidence-cell" data-label="Evidence">
                       <span className="numeric-cell">
-                        {formatRuleHitEvidence(hits, row.id)}
+                        {formatRuleHitEvidence(hits, row)}
                       </span>
                     </td>
                     <td data-label="Operations">
@@ -718,6 +794,15 @@ function PolicyMutationErrorMessage({ error }: { error: PolicyLoadError }) {
     );
   }
 
+  if (error.kind === 'policy-changed') {
+    return (
+      <div className="error-panel alert warning" role="alert">
+        <h3>Policy changed</h3>
+        <p>{error.message}</p>
+      </div>
+    );
+  }
+
   return (
     <div
       className={`error-panel alert ${error.kind === 'bad-request' ? 'warning' : 'error'}`}
@@ -820,15 +905,18 @@ function formatAuthMethod(value: string): string {
 
 // Unread evidence, a rule the counts did not cover, and a counted zero are
 // three different answers; only the last says the audit store holds no match.
-function formatRuleHitEvidence(
-  hits: PolicyEvidence<Record<string, number>> | null,
-  ruleId: string,
-): string {
-  if (hits === null || hits.status === 'unavailable') {
+// A position-keyed count read before rows moved is not shown at all: it
+// belongs to whichever rule used to hold that position.
+function formatRuleHitEvidence(hits: RuleHits | null, row: RuleRow): string {
+  if (hits === null || hits.evidence.status === 'unavailable') {
     return 'Evidence unavailable';
   }
+  if (!hasExplicitPolicyRuleId(row.rule) && hits.positions !== 'current') {
+    return hits.positions === 'diverged' ? 'Reload to recount' : 'Recount pending';
+  }
 
-  const value = Object.hasOwn(hits.value, ruleId) ? hits.value[ruleId] : undefined;
+  const counts = hits.evidence.value;
+  const value = Object.hasOwn(counts, row.id) ? counts[row.id] : undefined;
   if (typeof value !== 'number') {
     return 'Not reported';
   }
@@ -850,6 +938,24 @@ function RuleHitEvidenceUnavailableNotice({ message }: { message: string }) {
       </p>
     </div>
   );
+}
+
+function RuleHitRefreshFailedNotice({ message }: { message: string }) {
+  return (
+    <div className="error-panel alert warning" role="status">
+      <h3>Hit counts not re-read</h3>
+      <p>{message}</p>
+      <p>
+        Counts were not read again after the last rule change. Rules without an
+        explicit id are counted by position, so their counts stay hidden until
+        the counts are read for the current order.
+      </p>
+    </div>
+  );
+}
+
+function isPolicyPreconditionFailure(error: unknown): boolean {
+  return error instanceof AdminApiError && error.status === 412;
 }
 
 function actionBadgeClass(action: PolicyRule['action'] | PolicyDefaultAction): string {
@@ -884,6 +990,9 @@ function toPolicyLoadError(error: unknown): PolicyLoadError {
     }
     if (error.status === 404) {
       return { kind: 'unavailable', message: error.message };
+    }
+    if (error.status === 412) {
+      return { kind: 'policy-changed', message: POLICY_CHANGED_MESSAGE };
     }
     if (error.status === 400) {
       return { kind: 'bad-request', message: error.message };

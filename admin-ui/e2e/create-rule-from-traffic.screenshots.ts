@@ -89,6 +89,8 @@ test('captures traffic inventory create-rule prefill journey', async ({
       body: JSON.stringify({
         match_count: 14,
         scanned_event_count: 80,
+        scan_truncated: false,
+        complete: true,
         sample_strategy: 'newest_matches',
         samples: [
           {

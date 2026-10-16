@@ -419,6 +419,192 @@ describe('RuleTable', () => {
     expect(fetcher.reorderHeaders[0]).toBe('"etag-initial"');
   });
 
+  it('re-reads hit counts after a delete and never shows a deleted rule count on the row that moved up', async () => {
+    const reread = createDeferred<Response>();
+    const fetcher = policyFetchMock({
+      policy: policyDocument({
+        rules: [
+          rule({ id: null, path: '/deleted', action: 'deny' }),
+          rule({ id: null, path: '/moved-up', action: 'allow' }),
+          rule({ id: 'named-rule', path: '/named', action: 'allow' }),
+        ],
+      }),
+      hits: { '0': 50, '1': 7, 'named-rule': 3 },
+      hitsRereads: [() => reread.promise],
+    });
+    vi.stubGlobal('fetch', fetcher.fetch);
+
+    renderRuleTable();
+
+    expect(
+      within(await screen.findByTestId('rule-row-0')).getByText('50 hits'),
+    ).toBeTruthy();
+    fireEvent.click(screen.getByRole('button', { name: 'Delete rule 0' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Confirm delete rule 0' }));
+
+    await waitFor(() => {
+      expect(fetcher.deleteRuleIds).toEqual(['0']);
+    });
+    await waitFor(() => {
+      expect(fetcher.hitsRequestCount()).toBe(2);
+    });
+    // Position 0 now holds the rule that moved up; the count read for the
+    // deleted rule must not appear beside it.
+    const movedRow = screen.getByTestId('rule-row-0');
+    expect(within(movedRow).getByText('/moved-up')).toBeTruthy();
+    expect(within(movedRow).getByText('Recount pending')).toBeTruthy();
+    expect(screen.queryByText('50 hits')).toBeNull();
+    expect(screen.queryByText('7 hits')).toBeNull();
+    expect(
+      within(screen.getByTestId('rule-row-named-rule')).getByText('3 hits'),
+    ).toBeTruthy();
+
+    reread.resolve(jsonResponse(200, hitsResponseBody({ '0': 7, 'named-rule': 4 })));
+
+    expect(
+      await within(screen.getByTestId('rule-row-0')).findByText('7 hits'),
+    ).toBeTruthy();
+    expect(
+      within(screen.getByTestId('rule-row-named-rule')).getByText('4 hits'),
+    ).toBeTruthy();
+    expect(screen.queryByText('Recount pending')).toBeNull();
+  });
+
+  it('re-reads hit counts after a reorder and hides position-keyed counts until it lands', async () => {
+    const reread = createDeferred<Response>();
+    const fetcher = policyFetchMock({
+      policy: policyDocument({
+        rules: [
+          rule({ id: null, path: '/first', action: 'allow' }),
+          rule({ id: null, path: '/second', action: 'deny' }),
+        ],
+      }),
+      hits: { '0': 50, '1': 7 },
+      hitsRereads: [() => reread.promise],
+    });
+    vi.stubGlobal('fetch', fetcher.fetch);
+
+    renderRuleTable();
+
+    expect(
+      within(await screen.findByTestId('rule-row-0')).getByText('50 hits'),
+    ).toBeTruthy();
+    fireEvent.click(screen.getByRole('button', { name: 'Move rule 0 down' }));
+
+    await waitFor(() => {
+      expect(fetcher.reorderBodies).toEqual([['1', '0']]);
+    });
+    await waitFor(() => {
+      expect(fetcher.hitsRequestCount()).toBe(2);
+    });
+    expect(within(screen.getByTestId('rule-row-0')).getByText('/second')).toBeTruthy();
+    expect(screen.getAllByText('Recount pending')).toHaveLength(2);
+    expect(screen.queryByText('50 hits')).toBeNull();
+    expect(screen.queryByText('7 hits')).toBeNull();
+
+    reread.resolve(jsonResponse(200, hitsResponseBody({ '0': 9, '1': 4 })));
+
+    expect(
+      await within(screen.getByTestId('rule-row-0')).findByText('9 hits'),
+    ).toBeTruthy();
+    expect(within(screen.getByTestId('rule-row-1')).getByText('4 hits')).toBeTruthy();
+  });
+
+  it('re-reads hit counts after a toggle without hiding counts that did not move', async () => {
+    const reread = createDeferred<Response>();
+    const fetcher = policyFetchMock({
+      policy: policyDocument({
+        rules: [rule({ id: null, path: '/toggled', action: 'deny' })],
+      }),
+      hits: { '0': 5 },
+      hitsRereads: [() => reread.promise],
+    });
+    vi.stubGlobal('fetch', fetcher.fetch);
+
+    renderRuleTable();
+
+    fireEvent.click(await screen.findByRole('switch', { name: 'Disable rule 0' }));
+
+    await waitFor(() => {
+      expect(fetcher.hitsRequestCount()).toBe(2);
+    });
+    expect(within(screen.getByTestId('rule-row-0')).getByText('5 hits')).toBeTruthy();
+
+    reread.resolve(jsonResponse(200, hitsResponseBody({ '0': 6 })));
+
+    expect(
+      await within(screen.getByTestId('rule-row-0')).findByText('6 hits'),
+    ).toBeTruthy();
+  });
+
+  it('keeps position-keyed counts hidden after a failed re-read and says so', async () => {
+    const fetcher = policyFetchMock({
+      policy: policyDocument({
+        rules: [
+          rule({ id: null, path: '/deleted', action: 'deny' }),
+          rule({ id: null, path: '/moved-up', action: 'allow' }),
+        ],
+      }),
+      hits: { '0': 50, '1': 7 },
+      hitsRereads: [
+        () =>
+          Promise.resolve(
+            jsonResponse(500, { error: 'policy rule hit count query failed' }),
+          ),
+      ],
+    });
+    vi.stubGlobal('fetch', fetcher.fetch);
+
+    renderRuleTable();
+
+    fireEvent.click(await screen.findByRole('button', { name: 'Delete rule 0' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Confirm delete rule 0' }));
+
+    expect(await screen.findByText('Hit counts not re-read')).toBeTruthy();
+    expect(screen.getByText('policy rule hit count query failed')).toBeTruthy();
+    expect(
+      within(screen.getByTestId('rule-row-0')).getByText('Recount pending'),
+    ).toBeTruthy();
+    expect(screen.queryByText('50 hits')).toBeNull();
+  });
+
+  it('hides position-keyed counts for good after a 412 shows the policy moved on', async () => {
+    const fetcher = policyFetchMock({
+      policy: policyDocument({
+        rules: [
+          rule({ id: null, path: '/unnamed', action: 'deny' }),
+          rule({ id: 'named-rule', path: '/named', action: 'allow' }),
+        ],
+      }),
+      hits: { '0': 50, 'named-rule': 3 },
+      patchStatus: 412,
+    });
+    vi.stubGlobal('fetch', fetcher.fetch);
+
+    renderRuleTable();
+
+    fireEvent.click(await screen.findByRole('switch', { name: 'Disable rule 0' }));
+
+    expect(await screen.findByText('Policy changed')).toBeTruthy();
+    expect(
+      screen.getByText('Policy changed since this page loaded; refresh and retry.'),
+    ).toBeTruthy();
+    await waitFor(() => {
+      expect(fetcher.hitsRequestCount()).toBe(2);
+    });
+    // Even freshly read counts describe the server's newer rule order, not
+    // the rows shown here.
+    await waitFor(() => {
+      expect(
+        within(screen.getByTestId('rule-row-0')).getByText('Reload to recount'),
+      ).toBeTruthy();
+    });
+    expect(screen.queryByText('50 hits')).toBeNull();
+    expect(
+      within(screen.getByTestId('rule-row-named-rule')).getByText('3 hits'),
+    ).toBeTruthy();
+  });
+
   it('marks rule cells with responsive data labels', async () => {
     const fetcher = policyFetchMock({
       policy: policyDocument({
@@ -472,6 +658,7 @@ function policyFetchMock({
   hits = {},
   hitsStatus = 200,
   hitsBody,
+  hitsRereads = [],
   patchStatus = 200,
 }: {
   canWrite?: boolean;
@@ -479,12 +666,17 @@ function policyFetchMock({
   hits?: Record<string, number>;
   hitsStatus?: number;
   hitsBody?: unknown;
+  // Answers for the hit-count reads after the first, in order; once used up,
+  // later reads repeat the first answer.
+  hitsRereads?: Array<() => Promise<Response>>;
   patchStatus?: number;
 }) {
   let currentPolicy = policy;
   let currentEtag = '"etag-initial"';
+  let hitsRequestCount = 0;
   const reorderBodies: string[][] = [];
   const reorderHeaders: Array<string | null> = [];
+  const deleteRuleIds: string[] = [];
   const fetch = vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
     const url = new URL(String(input), 'http://localhost');
 
@@ -493,15 +685,15 @@ function policyFetchMock({
     }
 
     if (url.pathname === '/v1/admin/policy/rules/hits') {
+      hitsRequestCount += 1;
+      const reread = hitsRequestCount > 1 ? hitsRereads[hitsRequestCount - 2] : undefined;
+      if (reread) {
+        return reread();
+      }
       return Promise.resolve(
         jsonResponse(
           hitsStatus,
-          hitsBody ?? {
-            rules: Object.entries(hits).map(([rule_id, ruleHits]) => ({
-              rule_id,
-              hits: ruleHits,
-            })),
-          },
+          hitsBody ?? hitsResponseBody(hits),
         ),
       );
     }
@@ -515,13 +707,33 @@ function policyFetchMock({
       }
       const ruleId = decodeURIComponent(url.pathname.split('/').at(-1) ?? '');
       const patch = JSON.parse(String(init.body)) as Partial<PolicyRule>;
-      const updatedRule = currentPolicy.rules.find((item) => item.id === ruleId);
+      const updatedRule = currentPolicy.rules.find(
+        (item, index) => (item.id ?? String(index)) === ruleId,
+      );
       if (!updatedRule) {
         return Promise.resolve(jsonResponse(404, { error: 'missing' }));
       }
       Object.assign(updatedRule, patch);
       currentEtag = '"etag-patch"';
       return Promise.resolve(jsonResponse(200, updatedRule, { ETag: currentEtag, 'x-greengateway-policy-write': String(canWrite) }));
+    }
+
+    if (
+      url.pathname.startsWith('/v1/admin/policy/rules/') &&
+      init?.method === 'DELETE'
+    ) {
+      const ruleId = decodeURIComponent(url.pathname.split('/').at(-1) ?? '');
+      deleteRuleIds.push(ruleId);
+      currentPolicy = {
+        ...currentPolicy,
+        rules: currentPolicy.rules.filter(
+          (item, index) => (item.id ?? String(index)) !== ruleId,
+        ),
+      };
+      currentEtag = '"etag-delete"';
+      return Promise.resolve(
+        jsonResponse(200, { deleted_rule_id: ruleId }, { ETag: currentEtag }),
+      );
     }
 
     if (url.pathname === '/v1/admin/policy/rules/order' && init?.method === 'PUT') {
@@ -541,7 +753,39 @@ function policyFetchMock({
     return Promise.reject(new Error(`unexpected fetch: ${url.pathname}`));
   });
 
-  return { fetch, reorderBodies, reorderHeaders };
+  return {
+    fetch,
+    reorderBodies,
+    reorderHeaders,
+    deleteRuleIds,
+    hitsRequestCount: () => hitsRequestCount,
+  };
+}
+
+function hitsResponseBody(hits: Record<string, number>) {
+  return {
+    rules: Object.entries(hits).map(([rule_id, ruleHits]) => ({
+      rule_id,
+      hits: ruleHits,
+    })),
+  };
+}
+
+type Deferred<T> = {
+  promise: Promise<T>;
+  resolve: (value: T) => void;
+};
+
+function createDeferred<T>(): Deferred<T> {
+  let resolve: ((value: T) => void) | undefined;
+  const promise = new Promise<T>((innerResolve) => {
+    resolve = innerResolve;
+  });
+  if (!resolve) {
+    throw new Error('Failed to create deferred promise');
+  }
+
+  return { promise, resolve };
 }
 
 function requestHeader(headers: HeadersInit | undefined, name: string): string | null {
