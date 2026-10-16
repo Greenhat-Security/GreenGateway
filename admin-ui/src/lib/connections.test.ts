@@ -253,6 +253,83 @@ describe('connections API client', () => {
     }
   });
 
+  it('projects a caller assertion exactly as stored and drops anything else', async () => {
+    const canary = 'UNEXPECTED_CALLER_ASSERTION_SECRET_CANARY';
+    const withClaims = callerAssertion();
+    const { claims: _claims, ...withoutClaims } = withClaims;
+    for (const stored of [withClaims, withoutClaims]) {
+      const detail = connectionDetail();
+      vi.stubGlobal(
+        'fetch',
+        vi.fn(() =>
+          Promise.resolve(
+            jsonResponse(200, {
+              ...detail,
+              configuration: {
+                ...detail.configuration,
+                caller_assertion: {
+                  ...stored,
+                  signing_key_id: canary,
+                  private_key_value: canary,
+                },
+              },
+            }),
+          ),
+        ),
+      );
+
+      const { value } = await getConnection('connection/one');
+
+      // The same bytes the gateway serialized, minus fields the safe read
+      // contract does not define.
+      expect(JSON.stringify(value.configuration?.caller_assertion)).toBe(
+        JSON.stringify(stored),
+      );
+      expect(JSON.stringify(value)).not.toContain(canary);
+    }
+  });
+
+  it('rejects malformed caller assertion projections', async () => {
+    const invalid: Array<Record<string, unknown>> = [
+      { signing_key_configured: 'yes' },
+      { kid: '' },
+      { algorithm: 'hs256' },
+      { issuer: 7 },
+      { audience: null },
+      { token_type: '' },
+      { header_name: '' },
+      { lifetime_seconds: 0 },
+      { lifetime_seconds: 1.5 },
+      { claims: ['sub'] },
+      { claims: ['email', 'email'] },
+      { claims: 'email' },
+      { bind_request: 'false' },
+      { bind_approval: undefined },
+    ];
+
+    for (const override of invalid) {
+      const detail = connectionDetail();
+      vi.stubGlobal(
+        'fetch',
+        vi.fn(() =>
+          Promise.resolve(
+            jsonResponse(200, {
+              ...detail,
+              configuration: {
+                ...detail.configuration,
+                caller_assertion: { ...callerAssertion(), ...override },
+              },
+            }),
+          ),
+        ),
+      );
+      await expect(getConnection('connection/one')).rejects.toMatchObject({
+        name: ConnectionContractError.name,
+        requiresReload: false,
+      });
+    }
+  });
+
   it('projects delete, test, and refresh responses onto safe DTOs', async () => {
     const canary = 'UNEXPECTED_CONNECTION_OPERATION_SECRET_CANARY';
     vi.stubGlobal(
@@ -809,6 +886,24 @@ function connectionStatus() {
   return {
     state: 'configured',
     reason: 'not_tested',
+  };
+}
+
+// In the gateway's serialization order, so a projection can be compared byte
+// for byte.
+function callerAssertion() {
+  return {
+    signing_key_configured: true,
+    kid: 'gw-test-1',
+    algorithm: 'rs256',
+    issuer: 'https://gateway.example.test',
+    audience: 'https://billing.example.test',
+    token_type: 'at+jwt',
+    header_name: 'x-caller-assertion',
+    lifetime_seconds: 60,
+    claims: ['roles'],
+    bind_request: false,
+    bind_approval: false,
   };
 }
 

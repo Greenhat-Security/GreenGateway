@@ -12772,6 +12772,324 @@ async fn caller_assertion_refusals_are_conflicts_with_their_own_reason() {
     }
 }
 
+/// A caller assertion as an operator would send one. Nothing reads its
+/// signing key alias: every lane refuses the Connection first.
+fn admin_caller_assertion_json() -> Value {
+    json!({
+        "signing_key_id": "assertion-signing-key",
+        "kid": "gw-test-1",
+        "algorithm": "es256",
+        "issuer": "https://gateway.example.test",
+        "audience": "https://openapi.example.test",
+        "token_type": "at+jwt",
+        "header_name": "x-caller-assertion",
+        "lifetime_seconds": 60,
+        "claims": ["email"],
+        "bind_request": true
+    })
+}
+
+/// Create `body` with a caller assertion through the admin API, returning
+/// the new Connection's ID and ETag.
+async fn create_attested_connection(router: &Router, mut body: Value) -> (String, String) {
+    body["caller_assertion"] = admin_caller_assertion_json();
+    let list = router
+        .clone()
+        .oneshot(connection_admin_request(
+            Method::GET,
+            CONNECTIONS_ADMIN_ROUTE,
+            Some(test_principal(&["connections-reader"])),
+            None,
+            None,
+            false,
+        ))
+        .await
+        .expect("connection list should complete");
+    let collection_etag = list
+        .headers()
+        .get(CONNECTION_COLLECTION_ETAG_HEADER)
+        .and_then(|value| value.to_str().ok())
+        .expect("connection list should include collection ETag")
+        .to_owned();
+    let created = router
+        .clone()
+        .oneshot(connection_admin_request(
+            Method::POST,
+            CONNECTIONS_ADMIN_ROUTE,
+            Some(test_principal(&["connections-editor"])),
+            Some(body.to_string()),
+            Some(&collection_etag),
+            true,
+        ))
+        .await
+        .expect("attested connection create should complete");
+    assert_eq!(created.status(), StatusCode::CREATED);
+    let etag = created
+        .headers()
+        .get(header::ETAG)
+        .and_then(|value| value.to_str().ok())
+        .expect("created connection should include ETag")
+        .to_owned();
+    let id = json_body(created).await["id"]
+        .as_str()
+        .expect("created connection should include ID")
+        .to_owned();
+    (id, etag)
+}
+
+#[tokio::test]
+async fn attested_connection_catalog_operations_are_conflicts_over_http() {
+    // The refusal reaches an admin client as a 409 naming the reason, and the
+    // register and refresh failures are audited with it, through the real
+    // handlers rather than only the error mappers.
+    let connection_db = TempDb::new("connection-caller-assertion-catalogs");
+    let policy = TempPolicyFile::new(&connection_policy_document_string());
+    let capture = audit::sink::tests::CaptureSink::new();
+    let audit_log = audit::AuditLog::new(Arc::new(capture.clone()) as Arc<dyn audit::AuditSink>);
+    let router = connection_admin_router(&connection_db, &policy, audit_log);
+
+    let openapi_body: Value =
+        serde_json::from_str(&managed_openapi_connection_body("Attested OpenAPI"))
+            .expect("managed OpenAPI body should parse");
+    let (openapi_id, openapi_etag) = create_attested_connection(&router, openapi_body).await;
+    let spec = widget_openapi_spec();
+
+    let preview = router
+        .clone()
+        .oneshot(connection_admin_request(
+            Method::POST,
+            &format!("{CONNECTIONS_ADMIN_ROUTE}/{openapi_id}/openapi/preview"),
+            Some(test_principal(&["openapi-tools-reader"])),
+            Some(json!({ "spec": spec }).to_string()),
+            None,
+            true,
+        ))
+        .await
+        .expect("attested preview should complete");
+    assert_eq!(preview.status(), StatusCode::CONFLICT);
+    assert_eq!(
+        json_body(preview).await["reason"],
+        json!("caller_assertion_not_enforced")
+    );
+
+    // A correct digest and a non-empty selection, so only the refusal can
+    // stop the registration.
+    let register = router
+        .clone()
+        .oneshot(connection_admin_request(
+            Method::POST,
+            &format!("{CONNECTIONS_ADMIN_ROUTE}/{openapi_id}/openapi/register"),
+            Some(test_principal(&["openapi-tools-writer"])),
+            Some(
+                json!({
+                    "spec": spec,
+                    "spec_digest": hex::encode(Sha256::digest(spec.as_bytes())),
+                    "expected_spec_revision": 0,
+                    "expected_catalog_revision": 0,
+                    "selected_tool_names": ["getWidget"],
+                    "security_confirmations": [],
+                })
+                .to_string(),
+            ),
+            Some(&openapi_etag),
+            true,
+        ))
+        .await
+        .expect("attested register should complete");
+    assert_eq!(register.status(), StatusCode::CONFLICT);
+    assert_eq!(
+        json_body(register).await["reason"],
+        json!("caller_assertion_not_enforced")
+    );
+
+    let openapi_refresh = router
+        .clone()
+        .oneshot(connection_admin_request(
+            Method::POST,
+            &format!("{CONNECTIONS_ADMIN_ROUTE}/{openapi_id}/refresh"),
+            Some(test_principal(&["connections-refresher"])),
+            None,
+            Some(&openapi_etag),
+            true,
+        ))
+        .await
+        .expect("attested OpenAPI refresh should complete");
+    assert_eq!(openapi_refresh.status(), StatusCode::CONFLICT);
+    assert_eq!(
+        json_body(openapi_refresh).await["reason"],
+        json!("caller_assertion_not_enforced")
+    );
+
+    let (mcp_id, mcp_etag) = create_attested_connection(
+        &router,
+        json!({
+            "display_name": "Attested MCP",
+            "enabled": true,
+            "kind": "mcp_streamable_http",
+            "endpoint": {
+                "base_url": "https://mcp.example.test",
+                "base_path": "/mcp"
+            },
+            "authentication": { "type": "none" },
+            "discovery": {
+                "type": "managed_mcp",
+                "use_connection_authentication": false
+            }
+        }),
+    )
+    .await;
+    let mcp_refresh = router
+        .clone()
+        .oneshot(connection_admin_request(
+            Method::POST,
+            &format!("{CONNECTIONS_ADMIN_ROUTE}/{mcp_id}/refresh"),
+            Some(test_principal(&["connections-refresher"])),
+            None,
+            Some(&mcp_etag),
+            true,
+        ))
+        .await
+        .expect("attested MCP refresh should complete");
+    assert_eq!(mcp_refresh.status(), StatusCode::CONFLICT);
+    assert_eq!(
+        json_body(mcp_refresh).await["reason"],
+        json!("caller_assertion_not_enforced")
+    );
+
+    let refused = |event: &audit::AuditEvent, id: &str| {
+        event.payload["connection_id"] == json!(id)
+            && event.payload["outcome"] == json!("failure")
+            && event.payload["reason"] == json!("caller_assertion_not_enforced")
+    };
+    assert_eventually(Duration::from_secs(1), || {
+        let events = capture.events();
+        events.iter().any(|event| {
+            event.event_type == audit::event::TOOL_REGISTRY_CHANGED
+                && event.payload["action"] == json!("managed_openapi_catalog_registration_rejected")
+                && refused(event, openapi_id.as_str())
+        }) && [&openapi_id, &mcp_id].into_iter().all(|id| {
+            events.iter().any(|event| {
+                event.event_type == audit::event::CONNECTION_REFRESHED
+                    && refused(event, id.as_str())
+            })
+        })
+    });
+}
+
+#[tokio::test]
+async fn a_routine_admin_ui_save_keeps_the_caller_assertion_byte_for_byte() {
+    // The admin UI shows the block read only and never sends it. Its save is
+    // the safe read written back without `caller_assertion`; the gateway has
+    // to come back with the same block, byte for byte.
+    let connection_db = TempDb::new("connection-caller-assertion-ui-save");
+    let policy = TempPolicyFile::new(&connection_policy_document_string());
+    let router = connection_admin_router(&connection_db, &policy, test_audit_log());
+    let connection_body: Value =
+        serde_json::from_str(&managed_openapi_connection_body("Attested API"))
+            .expect("managed OpenAPI body should parse");
+    let (id, etag) = create_attested_connection(&router, connection_body).await;
+    let uri = format!("{CONNECTIONS_ADMIN_ROUTE}/{id}");
+
+    let read = router
+        .clone()
+        .oneshot(connection_admin_request(
+            Method::GET,
+            &uri,
+            Some(test_principal(&["connections-reader"])),
+            None,
+            None,
+            false,
+        ))
+        .await
+        .expect("attested connection read should complete");
+    assert_eq!(read.status(), StatusCode::OK);
+    let read = json_body(read).await;
+    let stored = read["configuration"]["caller_assertion"].clone();
+    assert_eq!(stored["signing_key_configured"], json!(true));
+    assert_eq!(stored["kid"], json!("gw-test-1"));
+    assert!(
+        !read.to_string().contains("assertion-signing-key"),
+        "the safe read must not name the signing key alias"
+    );
+
+    // Exactly what the editor's `writeFromForm` sends for this Connection
+    // after a rename.
+    let mut ui_save = json!({
+        "display_name": "Attested API renamed",
+        "enabled": read["enabled"],
+        "kind": read["kind"],
+        "endpoint": read["configuration"]["endpoint"],
+        "authentication": read["configuration"]["authentication"],
+        "tls": {},
+        "discovery": read["configuration"]["discovery"],
+    });
+    assert!(ui_save.get("caller_assertion").is_none());
+    let saved = router
+        .clone()
+        .oneshot(connection_admin_request(
+            Method::PUT,
+            &uri,
+            Some(test_principal(&["connections-editor"])),
+            Some(ui_save.to_string()),
+            Some(&etag),
+            true,
+        ))
+        .await
+        .expect("admin UI save should complete");
+    assert_eq!(saved.status(), StatusCode::OK);
+    let saved_etag = saved
+        .headers()
+        .get(header::ETAG)
+        .and_then(|value| value.to_str().ok())
+        .expect("saved connection should include ETag")
+        .to_owned();
+    let saved = json_body(saved).await;
+    assert_eq!(saved["display_name"], json!("Attested API renamed"));
+    assert_eq!(
+        serde_json::to_string(&saved["configuration"]["caller_assertion"])
+            .expect("saved block should serialize"),
+        serde_json::to_string(&stored).expect("stored block should serialize"),
+    );
+
+    let reread = router
+        .clone()
+        .oneshot(connection_admin_request(
+            Method::GET,
+            &uri,
+            Some(test_principal(&["connections-reader"])),
+            None,
+            None,
+            false,
+        ))
+        .await
+        .expect("attested connection reread should complete");
+    let reread = json_body(reread).await;
+    assert_eq!(
+        serde_json::to_string(&reread["configuration"]["caller_assertion"])
+            .expect("reread block should serialize"),
+        serde_json::to_string(&stored).expect("stored block should serialize"),
+    );
+
+    // The same body with an explicit `null` is the deliberate removal the
+    // admin UI never sends.
+    ui_save["caller_assertion"] = Value::Null;
+    let removed = router
+        .oneshot(connection_admin_request(
+            Method::PUT,
+            &uri,
+            Some(test_principal(&["connections-editor"])),
+            Some(ui_save.to_string()),
+            Some(&saved_etag),
+            true,
+        ))
+        .await
+        .expect("explicit removal should complete");
+    assert_eq!(removed.status(), StatusCode::OK);
+    assert!(json_body(removed).await["configuration"]
+        .get("caller_assertion")
+        .is_none());
+}
+
 #[tokio::test]
 async fn connection_refresh_requires_permission_empty_body_and_exact_etag() {
     let connection_db = TempDb::new("connection-refresh-guards");
