@@ -1,9 +1,167 @@
-//! Frozen pre-cutover middleware from 167cc5e, only for differential tests.
-//! Never compiled into the serving binary; do not update its decision semantics.
+//! Frozen pre-cutover middleware from 167cc5e, and the frozen pre-cutover tool
+//! lane from 05c295a, only for differential tests. Never compiled into the
+//! serving binary; do not update their decision semantics.
 
 use super::*;
-use crate::{path_match::path_prefix_matches, rbac::RuleDecision};
+use crate::{
+    path_match::path_prefix_matches,
+    rbac::{rule::principal_identity_matches, RuleDecision},
+};
 use http::Method;
+
+impl RbacPolicyState {
+    fn rule_id(&self, rule_index: usize) -> String {
+        self.rule_ids
+            .get(rule_index)
+            .cloned()
+            .unwrap_or_else(|| rule_index.to_string())
+    }
+}
+
+/// The tool lane's pre-cutover snapshot view, as the runtime consumed it.
+pub(crate) struct ToolAuthorizationSnapshot<'a> {
+    pub tool: Option<ToolPolicySnapshot<'a>>,
+    pub rule_decision: Option<MatchedRuleDecision>,
+    pub tools: &'a HashMap<String, ToolPolicyEntry>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ToolPolicySnapshot<'a> {
+    pub enabled: bool,
+    pub allowed_roles: &'a [String],
+    pub issuers: &'a [String],
+    pub auth_methods: &'a [String],
+    pub timeout_ms: u64,
+    pub max_concurrent: u32,
+}
+
+impl RbacState {
+    pub(crate) fn legacy_evaluate_tool_authorization<R>(
+        &self,
+        tool_name: &str,
+        principal: Option<&auth::Principal>,
+        evaluate: impl FnOnce(ToolAuthorizationSnapshot<'_>) -> R,
+    ) -> R {
+        let policy = self.effective_policy();
+        let tool = policy.tool_policy(tool_name);
+        let rule_decision = policy.evaluate_tool_rule(tool_name, principal);
+
+        evaluate(ToolAuthorizationSnapshot {
+            tool,
+            rule_decision,
+            tools: &policy.engine.policy().tools,
+        })
+    }
+
+    pub(crate) fn legacy_evaluate_tool_http_rule(
+        &self,
+        method: &str,
+        path: &str,
+        principal: Option<&auth::Principal>,
+    ) -> Option<MatchedRuleDecision> {
+        self.effective_policy()
+            .evaluate_tool_http_rule(method, path, principal)
+    }
+
+    pub(crate) fn legacy_tool_policy_eligibility(
+        &self,
+        tool_name: &str,
+        principal: &auth::Principal,
+    ) -> ToolPolicyEligibility {
+        let policy = self.effective_policy();
+        let Some(tool) = policy.tool_policy(tool_name) else {
+            return ToolPolicyEligibility {
+                eligible: false,
+                reason: "not_in_policy",
+            };
+        };
+
+        if !tool.enabled {
+            return ToolPolicyEligibility {
+                eligible: false,
+                reason: "policy_disabled",
+            };
+        }
+
+        if !tool_policy_principal_matches(tool, principal) {
+            return ToolPolicyEligibility {
+                eligible: false,
+                reason: "principal_not_eligible",
+            };
+        }
+
+        if policy
+            .evaluate_tool_rule(tool_name, Some(principal))
+            .is_some_and(|decision| decision.action == RuleAction::Deny)
+        {
+            return ToolPolicyEligibility {
+                eligible: false,
+                reason: "policy_denied",
+            };
+        }
+
+        ToolPolicyEligibility {
+            eligible: true,
+            reason: "eligible",
+        }
+    }
+}
+
+fn tool_policy_principal_matches(
+    tool: ToolPolicySnapshot<'_>,
+    principal: &auth::Principal,
+) -> bool {
+    principal_identity_matches(tool.issuers, tool.auth_methods, principal)
+        && (tool.allowed_roles.is_empty()
+            || tool
+                .allowed_roles
+                .iter()
+                .any(|allowed_role| principal.roles.iter().any(|role| role == allowed_role)))
+}
+
+impl RbacPolicyState {
+    fn tool_policy(&self, tool_name: &str) -> Option<ToolPolicySnapshot<'_>> {
+        self.engine
+            .policy()
+            .tools
+            .get(tool_name)
+            .map(|entry| ToolPolicySnapshot {
+                enabled: entry.enabled,
+                allowed_roles: entry.allowed_roles.as_slice(),
+                issuers: entry.issuers.as_slice(),
+                auth_methods: entry.auth_methods.as_slice(),
+                timeout_ms: entry.timeout_ms,
+                max_concurrent: entry.max_concurrent,
+            })
+    }
+
+    fn evaluate_tool_rule(
+        &self,
+        tool_name: &str,
+        principal: Option<&auth::Principal>,
+    ) -> Option<MatchedRuleDecision> {
+        self.rule_matcher
+            .evaluate_tool(tool_name, principal)
+            .map(|decision| MatchedRuleDecision {
+                action: decision.action,
+                matched_rule_id: self.rule_id(decision.rule_index),
+            })
+    }
+
+    fn evaluate_tool_http_rule(
+        &self,
+        method: &str,
+        path: &str,
+        principal: Option<&auth::Principal>,
+    ) -> Option<MatchedRuleDecision> {
+        self.rule_matcher
+            .evaluate_with_dispatch(method, path, principal, RuleDispatchContext::unknown())
+            .map(|decision| MatchedRuleDecision {
+                action: decision.action,
+                matched_rule_id: self.rule_id(decision.rule_index),
+            })
+    }
+}
 
 pub(crate) async fn rbac_middleware(
     State(state): State<RbacState>,

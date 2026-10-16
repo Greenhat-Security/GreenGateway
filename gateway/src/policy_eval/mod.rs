@@ -1,5 +1,6 @@
-//! Pure policy foundation for issue #421, used by the live HTTP/RBAC adapter.
-//! Remaining tool, rate and egress cutovers are tracked in #422.
+//! Pure policy foundation for issue #421, used by the live HTTP/RBAC adapter
+//! and the live tool-lane adapters. Remaining rate and egress cutovers are
+//! tracked in #422.
 //!
 //! PR 1 supported contextless HTTP direct rules, ordinary permission routes and
 //! defaults. The routing lane added host-qualified routes and dispatch-scoped
@@ -78,11 +79,6 @@ mod input;
 mod property_tests;
 #[cfg(test)]
 mod tests;
-// This lane remains offline even after #422 switches the HTTP adapter.
-#[cfg_attr(
-    not(test),
-    allow(dead_code, reason = "tool policy adapters are a later #422 cutover")
-)]
 pub(crate) mod tools;
 
 use std::fmt;
@@ -742,13 +738,9 @@ impl PrincipalIdentity {
 
 #[derive(Clone)]
 pub(crate) enum PrincipalFact {
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "live admission always supplies this fact; analysis may not"
-        )
-    )]
+    /// Never captured. Live HTTP admission always supplies the fact; the tool
+    /// lane's composite enablement supplies this, because a leaf run under an
+    /// admitted composite grant is judged by its enable bit alone.
     Missing,
     Anonymous,
     Authenticated(PrincipalIdentity),

@@ -19,7 +19,7 @@ use crate::{
             StoredOpenApiCatalogEntry, StoredOpenApiInventoryCatalog,
         },
     },
-    middleware::rbac::RbacState,
+    middleware::rbac::{RbacState, ToolEligibilitySnapshot},
 };
 
 use super::definitions::{
@@ -580,6 +580,9 @@ impl CapabilityInventory {
         let snapshot = self.control_plane.runtime_snapshot();
         let (mcp_catalogs, openapi_catalogs, statuses) =
             self.load_managed_inventory(&snapshot).await?;
+        // Every capability below is judged by this one policy snapshot, so a
+        // listing cannot straddle a policy install between two of its tools.
+        let eligibility = rbac_state.tool_eligibility_snapshot();
         let connections = connection_contexts(&snapshot, &statuses);
         let registry = self
             .registry
@@ -615,7 +618,7 @@ impl CapabilityInventory {
             let connection = connections
                 .get(&connection_id)
                 .map(|context| context.reference.clone());
-            let policy = tool_policy(rbac_state, principal, &definition.name);
+            let policy = tool_policy(&eligibility, principal, &definition.name);
             let execution_revision = durable_execution_revision(&durable);
             let dynamic_enums = self.dynamic_enum_details(&definition)?;
             let capability = tool_capability(
@@ -644,7 +647,7 @@ impl CapabilityInventory {
             }
             let (source, connection, state) =
                 local_tool_context(&definition, &snapshot, &connections)?;
-            let policy = tool_policy(rbac_state, principal, &definition.name);
+            let policy = tool_policy(&eligibility, principal, &definition.name);
             let execution_revision = local_execution_revision(&definition, &snapshot, &connections);
             let dynamic_enums = self.dynamic_enum_details(definition.as_ref())?;
             let capability = tool_capability(
@@ -1412,12 +1415,14 @@ fn transform_shape_summary(shape: &ParameterShape) -> CapabilityTransformShapeSu
     }
 }
 
+/// Inventory eligibility, decided by the shared evaluator over one policy
+/// snapshot for the whole listing.
 fn tool_policy(
-    rbac_state: &RbacState,
+    eligibility: &ToolEligibilitySnapshot,
     principal: &Principal,
     tool_name: &str,
 ) -> CapabilityPolicyEligibility {
-    let eligibility = rbac_state.tool_policy_eligibility(tool_name, principal);
+    let eligibility = eligibility.eligibility(tool_name, principal);
     CapabilityPolicyEligibility {
         eligible: eligibility.eligible,
         reason: eligibility.reason,

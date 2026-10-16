@@ -154,18 +154,41 @@ pub(super) async fn tool_playground_execute_endpoint(
             let principal = precondition_principal.clone();
             let expected_etag = expected_etag.clone();
             Box::pin(async move {
+                // The management lane reads live, so a revocation installed
+                // since the endpoint's own check still refuses here. It can
+                // only refuse: what grants is judged below.
                 if !rbac_state.principal_has_permission(&principal, ADMIN_TOOLS_EXECUTE_PERMISSION)
                 {
                     return Err(tools::executor::ToolExecutionPreconditionError::Failed);
                 }
-                match inventory
-                    .execution_etag_for_definition(&rbac_state, &principal, &current_definition)
+                // The execute permission and the tool-policy eligibility behind
+                // the etag are judged together, by one policy snapshot: the
+                // request's (#422). Without the pin the two could come from two
+                // installs and grant what neither snapshot grants alone.
+                rbac_state
+                    .with_request_policy_snapshot(async {
+                        if !rbac_state.request_snapshot_grants_permission(
+                            &principal,
+                            ADMIN_TOOLS_EXECUTE_PERMISSION,
+                        ) {
+                            return Err(tools::executor::ToolExecutionPreconditionError::Failed);
+                        }
+                        match inventory
+                            .execution_etag_for_definition(
+                                &rbac_state,
+                                &principal,
+                                &current_definition,
+                            )
+                            .await
+                        {
+                            Ok(Some(current_etag)) if current_etag == expected_etag => Ok(()),
+                            Ok(_) => Err(tools::executor::ToolExecutionPreconditionError::Failed),
+                            Err(_) => {
+                                Err(tools::executor::ToolExecutionPreconditionError::Unavailable)
+                            }
+                        }
+                    })
                     .await
-                {
-                    Ok(Some(current_etag)) if current_etag == expected_etag => Ok(()),
-                    Ok(_) => Err(tools::executor::ToolExecutionPreconditionError::Failed),
-                    Err(_) => Err(tools::executor::ToolExecutionPreconditionError::Unavailable),
-                }
             })
         });
     let context = tools::runtime::ToolInvocationContext {
