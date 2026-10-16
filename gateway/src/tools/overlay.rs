@@ -65,9 +65,9 @@ use super::{
         MAX_COMPOSITE_STEPS,
     },
     definitions::{
-        dynamic_enum_schema, dynamic_enum_schema_mut, BodyMappingMode, EnumBinding,
-        HttpToolMapping, QueryParamMapping, ToolAnnotations, ToolDefinition, ToolSource,
-        ToolTarget, ToolVisibility,
+        dynamic_enum_schema, dynamic_enum_schema_mut, exact_comparison_budget_problem,
+        numbers_exceed_exact_comparison_budget, BodyMappingMode, EnumBinding, HttpToolMapping,
+        QueryParamMapping, ToolAnnotations, ToolDefinition, ToolSource, ToolTarget, ToolVisibility,
     },
     openapi::{OpenApiToolBinding, OpenApiToolGeneration, OpenApiToolSecuritySelection},
     selector::{
@@ -1072,7 +1072,15 @@ fn document_problems(overlay: &OverlayDocument) -> Vec<OverlayProblem> {
                 &mut limit_reported,
                 &mut problems,
             );
-            if let Err(error) = jsonschema::validator_for(fragment) {
+            if numbers_exceed_exact_comparison_budget(fragment) {
+                problems.push(OverlayProblem {
+                    path: fragment_path,
+                    message: format!(
+                        "agent schema fragment {}",
+                        exact_comparison_budget_problem()
+                    ),
+                });
+            } else if let Err(error) = jsonschema::validator_for(fragment) {
                 problems.push(OverlayProblem {
                     path: fragment_path,
                     message: format!("agent schema fragment is not valid JSON Schema: {error}"),
@@ -1150,7 +1158,15 @@ fn shape_document_problems(path: &str, shape: &Shape, problems: &mut Vec<Overlay
                 message: "agent schema fragments must not contain format; this gateway does not assert formats (use pattern)".to_owned(),
             });
         }
-        if let Err(error) = jsonschema::validator_for(fragment) {
+        if numbers_exceed_exact_comparison_budget(fragment) {
+            problems.push(OverlayProblem {
+                path: fragment_path,
+                message: format!(
+                    "agent schema fragment {}",
+                    exact_comparison_budget_problem()
+                ),
+            });
+        } else if let Err(error) = jsonschema::validator_for(fragment) {
             problems.push(OverlayProblem {
                 path: fragment_path,
                 message: format!("agent schema fragment is not valid JSON Schema: {error}"),
@@ -2654,6 +2670,16 @@ fn compile_tool_transform(
             Value::Array(rewritten_required.into_iter().map(Value::String).collect()),
         );
     }
+    if numbers_exceed_exact_comparison_budget(&input_schema) {
+        problems.push(OverlayProblem {
+            path: tool_path,
+            message: format!(
+                "transformed agent input schema {}",
+                exact_comparison_budget_problem()
+            ),
+        });
+        return None;
+    }
     if let Err(error) = jsonschema::validator_for(&input_schema) {
         problems.push(OverlayProblem {
             path: tool_path,
@@ -3575,6 +3601,16 @@ fn compile_composites(
             ),
             ("additionalProperties".to_owned(), Value::Bool(false)),
         ]));
+        if numbers_exceed_exact_comparison_budget(&input_schema) {
+            problems.push(OverlayProblem {
+                path: format!("{composite_path}/input"),
+                message: format!(
+                    "compiled composite input {}",
+                    exact_comparison_budget_problem()
+                ),
+            });
+            continue;
+        }
         if let Err(error) = jsonschema::validator_for(&input_schema) {
             problems.push(OverlayProblem {
                 path: format!("{composite_path}/input"),

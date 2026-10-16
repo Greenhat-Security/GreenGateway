@@ -39,6 +39,22 @@ const MAX_INPUT_SCHEMA_PRECHECK_NODES: usize = 4_096;
 /// carries managed OpenAPI and MCP catalogs whose only size bound is an entry
 /// count, so a ceiling sized for one local file would reject ordinary catalogs.
 const MAX_REGISTRY_INPUT_SCHEMA_PRECHECK_NODES: usize = 1_048_576;
+/// Exact-comparison budget for the numbers in one schema or argument object,
+/// stated as the width in decimal digits of the single widest number it buys.
+///
+/// jsonschema is built with `arbitrary-precision`, so a number that `u64` and
+/// `f64` cannot hold exactly is compared as a big integer or fraction, and the
+/// work grows with the square of the digits it spans: its mantissa digits plus
+/// the magnitude of its exponent. A short exponent buys a very wide number;
+/// measured against jsonschema 0.58.6, validating the eight-byte argument
+/// `1e-99999` against `{"minimum": 0}` ran for more than five seconds. Each
+/// number wider than `MAX_UNMETERED_NUMBER_DIGITS` is charged its span
+/// squared, and a document may spend what one number this wide costs: `1e400`
+/// spans 401 digits and fits six times.
+const MAX_EXACT_NUMBER_DIGITS: u64 = 1_024;
+/// Numbers no wider than `u64::MAX` (20 digits) cost a bounded amount to
+/// compare however they are written, so they are not charged.
+const MAX_UNMETERED_NUMBER_DIGITS: u64 = 20;
 const TOOLS_FILE_SCHEMA_JSON: &str = include_str!("../../../docs/schemas/tools.v0.schema.json");
 const MCP_PROXY_METHOD: &str = "MCP_PROXY";
 pub const COMPOSITE_METHOD: &str = "COMPOSITE";
@@ -2107,7 +2123,13 @@ fn parameter_shape_problems(path: &str, shape: &ParameterShape, problems: &mut V
                 agent.name
             ));
         }
-        if let Err(error) = jsonschema::validator_for(&agent.schema) {
+        if numbers_exceed_exact_comparison_budget(&agent.schema) {
+            problems.push(format!(
+                "{path}.agent property '{}' {}",
+                agent.name,
+                exact_comparison_budget_problem()
+            ));
+        } else if let Err(error) = jsonschema::validator_for(&agent.schema) {
             problems.push(format!(
                 "{path}.agent property '{}' is not a valid JSON Schema: {error}",
                 agent.name
@@ -2669,6 +2691,10 @@ fn input_schema_precheck_problem(
         }
     }
 
+    if numbers_exceed_exact_comparison_budget(schema) {
+        return Some(exact_comparison_budget_problem());
+    }
+
     for reference in local_references {
         if let Some(problem) = local_reference_chain_problem(schema, &anchors, reference, budget) {
             return Some(problem);
@@ -2676,6 +2702,67 @@ fn input_schema_precheck_problem(
     }
 
     None
+}
+
+/// The problem reported for a schema whose numbers exceed the exact
+/// comparison budget.
+///
+/// With exact comparison, jsonschema parses a schema's numeric limits when it
+/// compiles, at a cost that grows with the square of their digits, so every
+/// compile of a schema that did not ship with the gateway checks
+/// [`numbers_exceed_exact_comparison_budget`] first and reports this instead.
+pub(crate) fn exact_comparison_budget_problem() -> String {
+    format!(
+        "contains numbers that would cost more to compare exactly than one {MAX_EXACT_NUMBER_DIGITS}-digit number"
+    )
+}
+
+/// Whether comparing every number in `value` exactly would cost more than one
+/// `MAX_EXACT_NUMBER_DIGITS`-digit number. Tool arguments and served schemas
+/// reach this without a depth bound, so it walks with an explicit stack.
+pub(crate) fn numbers_exceed_exact_comparison_budget(value: &Value) -> bool {
+    let budget = MAX_EXACT_NUMBER_DIGITS * MAX_EXACT_NUMBER_DIGITS;
+    let mut spent = 0_u64;
+    let mut stack = vec![value];
+    while let Some(value) = stack.pop() {
+        match value {
+            Value::Number(number) => {
+                let digits = number_digit_span(number.as_str());
+                if digits > MAX_UNMETERED_NUMBER_DIGITS {
+                    spent = spent.saturating_add(digits.saturating_mul(digits));
+                    if spent > budget {
+                        return true;
+                    }
+                }
+            }
+            Value::Array(values) => stack.extend(values),
+            Value::Object(object) => stack.extend(object.values()),
+            Value::Null | Value::Bool(_) | Value::String(_) => {}
+        }
+    }
+    false
+}
+
+/// Decimal digits a JSON number literal spans: every mantissa digit plus the
+/// magnitude of its exponent, so `1e400` spans 401 and `-0.05` spans 3.
+fn number_digit_span(literal: &str) -> u64 {
+    let (mantissa, exponent) = literal.split_once(['e', 'E']).unwrap_or((literal, ""));
+    let mantissa_digits = mantissa
+        .bytes()
+        .filter(|byte| byte.is_ascii_digit())
+        .count();
+    let exponent_magnitude =
+        exponent
+            .bytes()
+            .filter(|byte| byte.is_ascii_digit())
+            .fold(0_u64, |magnitude, digit| {
+                magnitude
+                    .saturating_mul(10)
+                    .saturating_add(u64::from(digit - b'0'))
+            });
+    u64::try_from(mantissa_digits)
+        .unwrap_or(u64::MAX)
+        .saturating_add(exponent_magnitude)
 }
 
 /// Two-level node budget for the input-schema precheck.
@@ -3303,6 +3390,86 @@ mod tests {
             "tools": [tool]
         }))
         .expect("literal data containing repeated $anchor keys should not count as schema anchors");
+    }
+
+    #[test]
+    fn input_schema_numbers_too_wide_to_compare_exactly_are_rejected_before_jsonschema_compile() {
+        for limit in [
+            r#"{"type": "number", "minimum": 1e-99999}"#.to_owned(),
+            format!(r#"{{"enum": [{}]}}"#, ["1e400"; 7].join(", ")),
+        ] {
+            let mut tool = echo_tool("wide_schema", "POST", "/v1/echo");
+            tool["input_json_schema"]["properties"]["count"] =
+                serde_json::from_str(&limit).expect("test schema fragment should parse");
+
+            let error = ToolRegistry::from_json_value(json!({
+                "schema_version": "0.1.0",
+                "tools": [tool]
+            }))
+            .expect_err("schema numbers too wide to compare exactly should reject");
+
+            let message = error.to_string();
+            assert!(
+                message.contains(
+                    "tool 'wide_schema' input_json_schema contains numbers that would cost more to compare exactly than one 1024-digit number"
+                ),
+                "unexpected error for {limit}: {message}"
+            );
+        }
+    }
+
+    #[test]
+    fn input_schema_numbers_beyond_f64_within_the_exact_comparison_budget_load() {
+        let mut tool = echo_tool("beyond_f64_schema", "POST", "/v1/echo");
+        tool["input_json_schema"]["properties"]["count"] = serde_json::from_str(
+            r#"{"type": "integer", "maximum": 1e400, "multipleOf": 18446744073709551616}"#,
+        )
+        .expect("test schema fragment should parse");
+
+        ToolRegistry::from_json_value(json!({
+            "schema_version": "0.1.0",
+            "tools": [tool]
+        }))
+        .expect("numbers beyond f64 inside the exact comparison budget should load");
+    }
+
+    #[test]
+    fn exact_comparison_budget_charges_wide_numbers_by_their_squared_span() {
+        assert_eq!(number_digit_span("1e400"), 401);
+        assert_eq!(number_digit_span("-1.5E-400"), 402);
+        assert_eq!(number_digit_span("-0.05"), 3);
+        assert_eq!(number_digit_span("18446744073709551615"), 20);
+        assert_eq!(number_digit_span("1e99999999999999999999999"), u64::MAX);
+
+        let parse =
+            |text: &str| serde_json::from_str::<Value>(text).expect("test JSON should parse");
+        // One number may be exactly as wide as the budget, and no wider.
+        assert!(!numbers_exceed_exact_comparison_budget(&parse(&format!(
+            "[1{}]",
+            "7".repeat(1_023)
+        ))));
+        assert!(numbers_exceed_exact_comparison_budget(&parse(&format!(
+            "[1{}]",
+            "7".repeat(1_024)
+        ))));
+        // The budget is shared: six 401-digit numbers fit and a seventh, even
+        // nested elsewhere in the document, does not.
+        let six = ["1e400"; 6].join(", ");
+        assert!(!numbers_exceed_exact_comparison_budget(&parse(&format!(
+            "[{six}]"
+        ))));
+        assert!(numbers_exceed_exact_comparison_budget(&parse(&format!(
+            r#"{{"values": [{six}], "nested": {{"value": -1e400}}}}"#
+        ))));
+        // A few bytes of exponent are as wide as the value they write.
+        assert!(numbers_exceed_exact_comparison_budget(&parse("1e-99999")));
+        // Numbers no wider than u64::MAX are never charged, however many.
+        assert!(!numbers_exceed_exact_comparison_budget(&parse(&format!(
+            "[{}]",
+            std::iter::repeat_n("18446744073709551615", 10_000)
+                .collect::<Vec<_>>()
+                .join(", ")
+        ))));
     }
 
     #[test]
