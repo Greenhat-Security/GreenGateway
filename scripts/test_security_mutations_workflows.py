@@ -129,14 +129,19 @@ class WorkflowTests(unittest.TestCase):
         self.assertNotIn("security-mutations", self.ci["jobs"]["promote-image"]["needs"])
         self.assertIn("security-coverage", self.ci["jobs"]["promote-image"]["needs"])
 
-    def assert_unconditional_required_job(self, name):
+    def assert_unconditional_required_job(self, name, env=None):
         self.assertIn("pull_request", self.ci["on"])
         # Reusing a required job keeps the required-check and promotion lists unchanged.
         self.assertIn(name, self.ci["jobs"]["promote-image"]["needs"])
         job = self.ci["jobs"][name]
         # Job defaults or env would reach every step, including the checks below.
-        for optional in ("if", "needs", "continue-on-error", "strategy", "defaults", "env"):
+        for optional in ("if", "needs", "continue-on-error", "strategy", "defaults"):
             self.assertNotIn(optional, job)
+        # A job that needs env pins it exactly, so nothing else can be added.
+        if env is None:
+            self.assertNotIn("env", job)
+        else:
+            self.assertEqual(job.get("env"), env)
         steps = job["steps"]
         checkout = steps[0]
         self.assertEqual(checkout["uses"], CHECKOUT)
@@ -169,7 +174,12 @@ class WorkflowTests(unittest.TestCase):
                 self.assertLess(max(setup[0], parser[0]), steps.index(step))
 
     def test_registry_tests_must_exist_in_the_required_test_job(self):
-        steps = self.assert_unconditional_required_job("test")
+        # The test build denies compiler warnings (RUSTFLAGS, #557). The listing
+        # step reuses the Test step's exact command under the same flags, so it
+        # lists the binary that just ran instead of rebuilding it.
+        steps = self.assert_unconditional_required_job(
+            "test", env={"RUSTFLAGS": "-D warnings"}
+        )
         suites = [index for index, step in enumerate(steps) if step.get("run") == FULL_SUITE]
         checks = [index for index, step in enumerate(steps) if "--check-test-list" in step.get("run", "")]
         setup = [index for index, step in enumerate(steps) if step.get("uses") == "./.github/actions/build-tools"]
