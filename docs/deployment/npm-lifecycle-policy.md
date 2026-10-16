@@ -103,7 +103,11 @@ Wrangler 4.149.0 (Miniflare `5.20261006.1-alpha`) depends on Sharp `0.35.5`
 itself, so no override is needed. Both lockfiles select source-map-js `1.2.2`,
 past [GHSA-68fv-2mgg-jv7q](https://github.com/advisories/GHSA-68fv-2mgg-jv7q),
 and both npm projects use Vitest `5.0.3` or later, past the fix for
-[GHSA-82fw-gwwq-j7x9](https://github.com/advisories/GHSA-82fw-gwwq-j7x9).
+[GHSA-82fw-gwwq-j7x9](https://github.com/advisories/GHSA-82fw-gwwq-j7x9),
+and Vite `8.3.4` or later, past the dev-server fixes for
+[GHSA-rq7h-c2jc-7f22](https://github.com/advisories/GHSA-rq7h-c2jc-7f22),
+[GHSA-vfpm-58rq-9qcg](https://github.com/advisories/GHSA-vfpm-58rq-9qcg) and
+[GHSA-9jrq-w75r-8gcw](https://github.com/advisories/GHSA-9jrq-w75r-8gcw).
 These updates do not require dependency install hooks.
 
 1. Use the pinned tools and produce a proposed lockfile without running hooks:

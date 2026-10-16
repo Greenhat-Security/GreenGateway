@@ -202,6 +202,33 @@ export type ConnectionTestProfile = {
   expected_statuses: number[];
 };
 
+export type CallerAssertionAlgorithm = 'es256' | 'rs256';
+
+export type CallerAssertionClaim = 'email' | 'roles';
+
+/**
+ * A Connection's caller assertion as the safe read returns it: every field
+ * except the signing key alias, which is reduced to `signing_key_configured`.
+ *
+ * The gateway accepts and stores the block but does not enforce it yet, and
+ * refuses every call, test and discovery on a Connection that carries one.
+ * This UI only displays it. See `ConnectionWrite.caller_assertion` for why a
+ * save never sends it.
+ */
+export type SafeCallerAssertion = {
+  signing_key_configured: boolean;
+  kid: string;
+  algorithm: CallerAssertionAlgorithm;
+  issuer: string;
+  audience: string;
+  token_type: string;
+  header_name: string;
+  lifetime_seconds: number;
+  claims?: CallerAssertionClaim[];
+  bind_request: boolean;
+  bind_approval: boolean;
+};
+
 export type ConnectionWrite = {
   display_name: string;
   description?: string;
@@ -210,6 +237,15 @@ export type ConnectionWrite = {
   endpoint: ConnectionEndpoint;
   authentication: ConnectionAuthentication;
   additional_headers?: ConnectionAdditionalHeader[];
+  /**
+   * Never sent. A replacement that omits `caller_assertion` keeps the stored
+   * block, and `null` removes it. The safe read hides the block's signing key
+   * alias, so this UI cannot send the block back, and anything it could send
+   * would at best remove the block: that lifts the refusal and puts a
+   * Connection that cannot yet attest its caller back into service. The type
+   * rules the key out so no save can include it.
+   */
+  caller_assertion?: never;
   tls: TlsProfile;
   timeouts?: ConnectionTimeouts;
   discovery?: DiscoveryConfig;
@@ -220,6 +256,7 @@ export type SafeConnectionConfiguration = {
   description?: string;
   endpoint: ConnectionEndpoint;
   authentication: SafeConnectionAuthentication;
+  caller_assertion?: SafeCallerAssertion;
   additional_headers?: SafeConnectionAdditionalHeader[];
   tls: SafeTlsConfiguration;
   timeouts?: ConnectionTimeouts;
@@ -872,6 +909,15 @@ function projectSafeConnectionConfiguration(
     authentication: projectSafeConnectionAuthentication(
       source.authentication,
     ),
+    // Projected so the editor and detail page can show it. Dropping it here
+    // left an operator with no sign that the Connection is refused, or why.
+    ...(source.caller_assertion === undefined
+      ? {}
+      : {
+          caller_assertion: projectSafeCallerAssertion(
+            source.caller_assertion,
+          ),
+        }),
     ...(source.additional_headers === undefined
       ? {}
       : {
@@ -894,6 +940,62 @@ function projectSafeConnectionConfiguration(
           ),
         }),
   };
+}
+
+function projectSafeCallerAssertion(value: unknown): SafeCallerAssertion {
+  const source = responseObject(value, 'safe caller assertion');
+  if (
+    typeof source.signing_key_configured !== 'boolean' ||
+    !isNonEmptyString(source.kid) ||
+    !isCallerAssertionAlgorithm(source.algorithm) ||
+    !isNonEmptyString(source.issuer) ||
+    !isNonEmptyString(source.audience) ||
+    !isNonEmptyString(source.token_type) ||
+    !isNonEmptyString(source.header_name) ||
+    !isNonNegativeInteger(source.lifetime_seconds) ||
+    source.lifetime_seconds === 0 ||
+    (source.claims !== undefined &&
+      !isCallerAssertionClaimList(source.claims)) ||
+    typeof source.bind_request !== 'boolean' ||
+    typeof source.bind_approval !== 'boolean'
+  ) {
+    throw invalidConnectionResponse('safe caller assertion');
+  }
+  // Fields in the gateway's serialization order, and `claims` only when the
+  // gateway sent it, so the projection is the block exactly as stored.
+  return {
+    signing_key_configured: source.signing_key_configured,
+    kid: source.kid,
+    algorithm: source.algorithm,
+    issuer: source.issuer,
+    audience: source.audience,
+    token_type: source.token_type,
+    header_name: source.header_name,
+    lifetime_seconds: source.lifetime_seconds,
+    ...(source.claims === undefined ? {} : { claims: [...source.claims] }),
+    bind_request: source.bind_request,
+    bind_approval: source.bind_approval,
+  };
+}
+
+function isCallerAssertionAlgorithm(
+  value: unknown,
+): value is CallerAssertionAlgorithm {
+  return value === 'es256' || value === 'rs256';
+}
+
+function isCallerAssertionClaimList(
+  value: unknown,
+): value is CallerAssertionClaim[] {
+  return (
+    Array.isArray(value) &&
+    value.every((claim) => claim === 'email' || claim === 'roles') &&
+    new Set(value).size === value.length
+  );
+}
+
+function isNonEmptyString(value: unknown): value is string {
+  return typeof value === 'string' && value.length > 0;
 }
 
 function projectSafeConnectionAdditionalHeaders(

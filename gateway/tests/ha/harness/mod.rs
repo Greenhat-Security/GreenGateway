@@ -918,6 +918,28 @@ impl Cluster {
     pub fn temporary_paths(&self) -> (PathBuf, PathBuf) {
         (self.secrets.path().to_owned(), self.files.path().to_owned())
     }
+
+    /// Mount operator secret material under the deployment's
+    /// `CONNECTION_SECRETS_ROOT`, the way an operator provisions a file
+    /// alias: one owner-only file, named by the `key` a
+    /// `CONNECTION_SECRET_ALIASES` entry declares.
+    ///
+    /// The replicas are already running when a suite calls this, and that
+    /// is the point. A file alias is read on every resolution, so material
+    /// mounted after boot is what the next write or reconcile resolves; the
+    /// alias *list* is the static half and is fixed at startup.
+    pub fn provision_connection_secret(&self, key: &str, material: &[u8]) {
+        self.secrets.write_private(key, material);
+    }
+
+    /// Remove material [`Self::provision_connection_secret`] mounted: the
+    /// retirement half of a rotation. Anything still bound to the alias
+    /// stops resolving, which is what a suite calling this is relying on.
+    pub fn retire_connection_secret(&self, key: &str) {
+        std::fs::remove_file(self.secrets.path().join(key)).unwrap_or_else(|error| {
+            panic!("the harness secret file {key} should be removable: {error}")
+        });
+    }
 }
 
 impl Drop for Cluster {

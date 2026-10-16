@@ -221,6 +221,10 @@ jobs:
       - run: python -m unittest discover -s scripts -p 'test_npm_script_policy.py' -v
       - run: python3 scripts/check-supply-chain.py
       - run: python3 scripts/test_security_gates.py
+      - name: Test the security mutation registry checks
+        # Only the controller tests that need no compiler or child process.
+        # Calibration and process-limit tests stay in security-mutations.yml.
+        run: python scripts/test_security_mutations.py ManifestTests TestListTests
       - name: Verify security mutation workflow contracts
         run: python scripts/test_security_mutations_workflows.py
       - name: Check the security mutation registry for drift
@@ -358,6 +362,13 @@ jobs:
     name: test
     runs-on: ubuntu-latest
     timeout-minutes: 20
+    # Clippy denies warnings in non-test code, and in test code only without
+    # the `postgres` feature. Deny compiler warnings in this default-feature
+    # test build too, so a discarded `must_use` result in a database-backed
+    # test fails here instead of passing as a log line. Job-level so the Rust
+    # cache keys on it.
+    env:
+      RUSTFLAGS: -D warnings
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -372,6 +383,16 @@ jobs:
 
       - name: Test
         run: cargo test --workspace --locked
+
+      - name: Check security mutation registry tests still exist
+        # Lists the test binaries the Test step just built and ran; nothing is
+        # rebuilt, run or mutated. A selected test that was renamed, deleted or
+        # duplicated fails here rather than in the scheduled campaign.
+        shell: bash
+        run: |
+          mkdir -p target/security-mutations
+          cargo test --workspace --locked -- --list --format terse > target/security-mutations/test-list.txt
+          python scripts/security_mutations.py --check-test-list target/security-mutations/test-list.txt
 
   # PostgreSQL foundation (issue #241, PR 3): the gateway suite against a real
   # PostgreSQL 16 service container, in both feature states.

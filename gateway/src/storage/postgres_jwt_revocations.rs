@@ -46,7 +46,11 @@ use sha2::{Digest, Sha256};
 
 use crate::auth::{AuthError, RevocationStore};
 
-use super::{log_classified, postgres::classify_pool_error, RepositoryError, RepositoryErrorKind};
+use super::{
+    log_classified,
+    postgres::{checkout, timed_operation, CheckoutClass},
+    RepositoryError, RepositoryErrorKind,
+};
 
 const OPERATION_LOOKUP: &str = "jwt_revocation_lookup";
 const OPERATION_REVOKE: &str = "jwt_revocation_revoke";
@@ -148,7 +152,7 @@ impl PostgresJwtRevocationStore {
             .map(|value| canonical_rfc3339(value, OPERATION_REVOKE, "expires_at"))
             .transpose()?;
         let digest = self.jti_digest(jti);
-        let client = self.pool.get().await.map_err(classify_pool_error)?;
+        let client = checkout(&self.pool, CheckoutClass::ControlPlaneWrite).await?;
         if let Some(expires_at) = expires_at.as_deref() {
             // An expiry the validator can no longer accept a token at (by
             // the database clock, past the retention window) could only
@@ -295,7 +299,7 @@ impl PostgresJwtRevocationStore {
     /// and bounded; the singleton scheduling of this work arrives with the
     /// membership PR. Returns how many rows were deleted.
     pub async fn cleanup_expired(&self, limit: usize) -> Result<u64, RepositoryError> {
-        let client = self.pool.get().await.map_err(classify_pool_error)?;
+        let client = checkout(&self.pool, CheckoutClass::Maintenance).await?;
         self.cleanup_expired_with(&client, limit).await
     }
 
@@ -331,27 +335,28 @@ impl PostgresJwtRevocationStore {
 impl RevocationStore for PostgresJwtRevocationStore {
     async fn is_revoked(&self, jti: &str) -> Result<bool, AuthError> {
         let digest = self.jti_digest(jti);
-        let client = self
-            .pool
-            .get()
+        let client = checkout(&self.pool, CheckoutClass::CredentialCheck)
             .await
-            .map_err(classify_pool_error)
             .map_err(dependency_failure)?;
-        let row = client
-            .query_one(
-                r#"
-                SELECT EXISTS (
-                    SELECT 1 FROM greengateway.jwt_revocations
-                    WHERE issuer = $1 AND jti_hash = $2
-                      AND (expires_at IS NULL OR expires_at > now() - make_interval(secs => $3))
+        timed_operation(OPERATION_LOOKUP, async {
+            let row = client
+                .query_one(
+                    r#"
+                    SELECT EXISTS (
+                        SELECT 1 FROM greengateway.jwt_revocations
+                        WHERE issuer = $1 AND jti_hash = $2
+                          AND (expires_at IS NULL OR expires_at > now() - make_interval(secs => $3))
+                    )
+                    "#,
+                    &[&self.issuer.as_ref(), &digest, &self.retention_leeway_secs],
                 )
-                "#,
-                &[&self.issuer.as_ref(), &digest, &self.retention_leeway_secs],
-            )
-            .await
-            .map_err(|error| dependency_failure(classify_query(error, OPERATION_LOOKUP)))?;
-        row.try_get::<_, bool>(0)
-            .map_err(|_| dependency_failure(invalid_data(OPERATION_LOOKUP)))
+                .await
+                .map_err(|error| classify_query(error, OPERATION_LOOKUP))?;
+            row.try_get::<_, bool>(0)
+                .map_err(|_| invalid_data(OPERATION_LOOKUP))
+        })
+        .await
+        .map_err(dependency_failure)
     }
 }
 

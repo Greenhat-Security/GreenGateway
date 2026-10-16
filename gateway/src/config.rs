@@ -59,6 +59,11 @@ use crate::{
     upstream_route,
 };
 
+mod diagnostic;
+mod inventory;
+#[cfg(test)]
+mod parity_tests;
+
 const DEFAULT_LISTEN_ADDR: &str = "0.0.0.0:8080";
 static DEFAULT_LISTEN_SOCKET_ADDR: LazyLock<SocketAddr> = LazyLock::new(|| {
     DEFAULT_LISTEN_ADDR
@@ -230,6 +235,7 @@ pub const MAX_GRPC_MAX_CONCURRENT_STREAMS: u32 = 10_000;
 pub const DEFAULT_GRPC_MAX_METADATA_BYTES: u32 = 16_384;
 pub const MIN_GRPC_MAX_METADATA_BYTES: u32 = 1_024;
 pub const MAX_GRPC_MAX_METADATA_BYTES: u32 = 1_048_576;
+const LISTEN_ADDR: &str = "LISTEN_ADDR";
 const ADMIN_LISTEN_ADDR: &str = "ADMIN_LISTEN_ADDR";
 const GRPC_LISTEN_ADDR: &str = "GRPC_LISTEN_ADDR";
 const GRPC_MAX_CONCURRENT_STREAMS: &str = "GRPC_MAX_CONCURRENT_STREAMS";
@@ -1514,6 +1520,10 @@ impl FromStr for AuthMode {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ConfigError {
     problems: Vec<String>,
+    /// The same problems as value-free diagnostics, one per problem and in
+    /// the same order (issue #433). The problems stay the operator-facing
+    /// report; see `diagnostic` for why both exist.
+    diagnostics: Vec<diagnostic::ConfigDiagnostic>,
 }
 
 impl Config {
@@ -1533,8 +1543,17 @@ impl Config {
     pub(crate) fn from_env_vars(
         mut get_var: impl FnMut(&str) -> Result<String, VarError>,
     ) -> Result<Self, ConfigError> {
+        // How each lookup came back -- unset, empty, not Unicode, or set,
+        // never the value -- is remembered so a refusal can also be reported
+        // as value-free diagnostics. Every lookup still reaches the caller's
+        // reader exactly as before, in the same order.
+        let mut lookups = diagnostic::Lookups::default();
+        let mut get_var = |name: &str| {
+            let value = get_var(name);
+            lookups.record(name, &value);
+            value
+        };
         let mut problems = Vec::new();
-        const LISTEN_ADDR: &str = "LISTEN_ADDR";
 
         let listener_problem_count = problems.len();
         let listen_addr = parse_var(
@@ -3350,7 +3369,11 @@ impl Config {
                 database,
             })
         } else {
-            Err(ConfigError { problems })
+            let diagnostics = diagnostic::diagnose(&problems, &lookups);
+            Err(ConfigError {
+                problems,
+                diagnostics,
+            })
         }
     }
 
@@ -3703,6 +3726,14 @@ impl ConfigError {
     #[cfg_attr(not(feature = "postgres"), allow(dead_code))]
     pub(crate) fn problems(&self) -> &[String] {
         &self.problems
+    }
+
+    /// The problems as value-free diagnostics: one per problem, in the same
+    /// order, naming the inventoried variable each problem is about and how
+    /// it was set, and never quoting a value.
+    #[allow(dead_code)] // Read by the parity tests until the #433 compiler reads it.
+    pub(crate) fn diagnostics(&self) -> &[diagnostic::ConfigDiagnostic] {
+        &self.diagnostics
     }
 }
 

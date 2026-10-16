@@ -14,6 +14,12 @@
 //! on database time; nothing sleeps for a guessed duration and nothing
 //! moves a clock.
 //!
+//! The last section asks the same question of an incident (issue #440): a
+//! responder's withdrawals and a Connection's rotated secret reference must
+//! bind both replicas, leave audit evidence that carries none of what it is
+//! about, and still bind a replacement replica that never saw them made.
+//! `docs/deployment/incident-rehearsal.md` is the runbook it rehearses.
+//!
 //! Skips silently without `GATEWAY_TEST_POSTGRES_URL_FILE`, like every
 //! other PostgreSQL-backed suite in this repository.
 
@@ -21,7 +27,7 @@
 
 mod harness;
 
-use std::time::Duration;
+use std::{collections::BTreeSet, time::Duration};
 
 use serde_json::{json, Value};
 
@@ -2301,4 +2307,864 @@ async fn wait_for_lease_fence_above(
         );
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
+}
+
+// ---------------------------------------------------------------------
+// Security incident rehearsal (issue #440, PR 3)
+// ---------------------------------------------------------------------
+
+const CONNECTION_SECRETS_ROUTE: &str = "/v1/admin/connection-secrets";
+const CLUSTER_ROUTE: &str = "/v1/admin/cluster";
+const CLUSTER_REPLICAS_ROUTE: &str = "/v1/admin/cluster/replicas";
+
+/// The operator alias the rehearsal's Connection is bound through before
+/// the incident, and the one the rotation rebinds it to. An opaque ID is
+/// all the admin API ever shows of a reference; the file keys behind these
+/// two are generated per run, because a locator is something no surface may
+/// repeat and a fixed one could not be told apart from a coincidence.
+const PRE_INCIDENT_ALIAS: &str = "rehearsal-bearer-before";
+const POST_INCIDENT_ALIAS: &str = "rehearsal-bearer-after";
+
+/// How long an audit record the writing replica has already emitted may
+/// take to be observable: the file sink is written by the audit writer
+/// thread just after the response, and the PostgreSQL sink a flush interval
+/// after that.
+const AUDIT_RECORD_BUDGET: Duration = Duration::from_secs(30);
+
+/// A value that exists only to be withdrawn, rotated away, or searched for.
+///
+/// Generated per run and prefixed `FAKE-`, for the reason `secret_leak.rs`
+/// gives: a checked-in constant that looked like a credential would be a
+/// finding of its own in a repository whose scanner reads history.
+fn rehearsal_canary(label: &str) -> String {
+    format!("FAKE-rehearsal-{label}-{}", uuid::Uuid::new_v4().simple())
+}
+
+/// `CONNECTION_SECRET_ALIASES` for the rehearsal: two file aliases under
+/// the harness's secrets root. The list is static configuration, so both
+/// aliases exist from boot; the material behind them is not, and the
+/// rehearsal mounts and retires it while the replicas run.
+fn rehearsal_secret_aliases(pre_incident_key: &str, post_incident_key: &str) -> String {
+    json!([
+        {
+            "id": PRE_INCIDENT_ALIAS,
+            "label": "Rehearsal bearer before the incident",
+            "source": { "type": "file", "key": pre_incident_key },
+        },
+        {
+            "id": POST_INCIDENT_ALIAS,
+            "label": "Rehearsal bearer after the incident",
+            "source": { "type": "file", "key": post_incident_key },
+        },
+    ])
+    .to_string()
+}
+
+/// A credentialed Connection bound through `alias`.
+///
+/// Enabled, so neither a write nor a replica's reconcile can take the
+/// reference on trust: an enabled binding is resolved for its purpose
+/// before it is persisted, and again by every replica before that replica
+/// publishes it. HTTPS, because a credentialed Connection must be. Nothing
+/// routes to it and nothing tests it, so the endpoint is never dialled --
+/// and the egress allowlist names only loopback, so a dial would be refused
+/// rather than leave the runner.
+fn rehearsal_connection(alias: &str) -> Value {
+    json!({
+        "display_name": "incident rehearsal",
+        "kind": "http_api",
+        "endpoint": { "base_url": "https://upstream.rehearsal.test", "base_path": "/" },
+        "authentication": { "type": "static_bearer", "secret_id": alias },
+        "enabled": true,
+    })
+}
+
+/// The authority's security-revision head: the counter every replica's
+/// gate compares its compiled watermark with on every protected request.
+async fn authority_revision(cluster: &Cluster) -> i64 {
+    cluster
+        .database
+        .count("SELECT last_revision FROM greengateway.security_revision_state WHERE singleton")
+        .await
+}
+
+/// Poll until `replica`'s own cluster status says it has compiled at least
+/// `revision` and observes nothing newer, and answer that status.
+///
+/// The status read is a protected request, so its gate has reconciled
+/// before it answers; the poll is for a replica that has just joined and is
+/// still warming its pool.
+async fn wait_until_compiled(
+    cluster: &Cluster,
+    replica: &str,
+    admin: &str,
+    revision: i64,
+) -> Value {
+    let deadline = std::time::Instant::now() + CONVERGENCE_BUDGET;
+    loop {
+        let (status, _, body) =
+            send_settled(|| cluster.get(replica, CLUSTER_ROUTE).bearer(admin)).await;
+        assert_eq!(
+            status, 200,
+            "replica {replica}'s cluster status should read: {body}"
+        );
+        let compiled = body["local"]["compiled_security_revision"].as_i64();
+        if compiled.is_some_and(|compiled| compiled >= revision)
+            && body["local"]["revision_lag"] == 0
+        {
+            return body;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "replica {replica} never compiled security revision {revision} within \
+             {CONVERGENCE_BUDGET:?}: {body}"
+        );
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+}
+
+/// Poll until the roster `replica` publishes holds exactly `members` live,
+/// undrained rows, every one of them at `revision` or later, and answer
+/// those rows.
+///
+/// The deployment's view rather than one replica's account of itself: each
+/// member writes its compiled watermark with its heartbeat, so a member
+/// that had not converged would show here even if nobody asked it.
+async fn wait_until_roster_compiled(
+    cluster: &Cluster,
+    replica: &str,
+    admin: &str,
+    revision: i64,
+    members: usize,
+) -> Vec<Value> {
+    let deadline = std::time::Instant::now() + CONVERGENCE_BUDGET;
+    loop {
+        let (status, _, body) =
+            send_settled(|| cluster.get(replica, CLUSTER_REPLICAS_ROUTE).bearer(admin)).await;
+        assert_eq!(status, 200, "the roster should read on {replica}: {body}");
+        let live: Vec<Value> = body["replicas"]
+            .as_array()
+            .unwrap_or_else(|| panic!("the roster should list its replicas: {body}"))
+            .iter()
+            .filter(|member| member["live"] == true && member["draining_at"].is_null())
+            .cloned()
+            .collect();
+        let converged = live.iter().all(|member| {
+            member["compiled_security_revision"]
+                .as_i64()
+                .is_some_and(|compiled| compiled >= revision)
+        });
+        if live.len() == members && converged {
+            return live;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the roster never showed {members} live member(s) at security revision {revision} \
+             or later within {CONVERGENCE_BUDGET:?}: {body}"
+        );
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+}
+
+/// How many Connections `replica` reports bound through each rehearsal
+/// alias, as `(pre-incident, post-incident)`.
+///
+/// Read from the alias metadata the admin API publishes, which is the only
+/// place a reference is visible at all: a Connection's own view reports a
+/// bound secret as a boolean and never names it.
+async fn alias_dependents(cluster: &Cluster, replica: &str, admin: &str) -> (u64, u64) {
+    let (status, _, body) =
+        send_settled(|| cluster.get(replica, CONNECTION_SECRETS_ROUTE).bearer(admin)).await;
+    assert_eq!(
+        status, 200,
+        "the alias metadata should read on {replica}: {body}"
+    );
+    let dependents = |alias: &str| {
+        body["secrets"]
+            .as_array()
+            .and_then(|secrets| secrets.iter().find(|secret| secret["id"] == alias))
+            .and_then(|secret| secret["dependency_count"].as_u64())
+            .unwrap_or_else(|| panic!("replica {replica} does not publish alias {alias}: {body}"))
+    };
+    (
+        dependents(PRE_INCIDENT_ALIAS),
+        dependents(POST_INCIDENT_ALIAS),
+    )
+}
+
+/// Poll until `sql` -- a count over `greengateway.audit_events` -- finds
+/// the record `description` names, and fail unless it found exactly one.
+async fn wait_for_audit_record(cluster: &Cluster, description: &str, sql: &str) {
+    let deadline = std::time::Instant::now() + AUDIT_RECORD_BUDGET;
+    loop {
+        let found = cluster.database.count(sql).await;
+        if found > 0 {
+            assert_eq!(
+                found, 1,
+                "{description} should be recorded once in the audit of record, not {found} times"
+            );
+            return;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "{description} never reached the shared audit table within {AUDIT_RECORD_BUDGET:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+}
+
+/// Poll until `replica`'s own audit file holds at least `expected`
+/// `auth.failure` records: the refusals it made are evidence too, and the
+/// one place a refusal is recorded by the replica that made it.
+async fn wait_for_refusals_audited(cluster: &Cluster, replica: &str, expected: usize) {
+    let deadline = std::time::Instant::now() + AUDIT_RECORD_BUDGET;
+    loop {
+        let refusals = cluster
+            .replica(replica)
+            .audit_events()
+            .iter()
+            .filter(|event| event["event_type"] == "auth.failure")
+            .count();
+        if refusals >= expected {
+            return;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "replica {replica} audited {refusals} refusal(s), not the {expected} it made, within \
+             {AUDIT_RECORD_BUDGET:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+}
+
+/// Every row of `table`, one JSON object per line, in `order`.
+///
+/// `row_to_json` rather than a column list, so a column added later is in
+/// the haystack the day it exists rather than the day someone remembers it.
+async fn table_rows(cluster: &Cluster, table: &str, order: &str) -> String {
+    cluster
+        .database
+        .query_one(&format!(
+            "SELECT coalesce(string_agg(row_to_json(t)::text, E'\\n' ORDER BY t.{order}), '') \
+             FROM {table} t"
+        ))
+        .await
+        .get::<_, String>(0)
+}
+
+/// Fail if `needle` appears in any of `sources`, naming the source and
+/// quoting the line it was found on, so the failure says where to look.
+fn assert_absent(sources: &[(String, String)], description: &str, needle: &str) {
+    assert!(
+        !needle.is_empty(),
+        "the {description} is empty, so its absence would prove nothing"
+    );
+    for (source, text) in sources {
+        if let Some(offset) = text.find(needle) {
+            let start = text[..offset].rfind('\n').map_or(0, |index| index + 1);
+            let end = text[offset..]
+                .find('\n')
+                .map_or(text.len(), |index| offset + index);
+            panic!(
+                "the {description} appeared in {source}:\n  {}",
+                &text[start..end]
+            );
+        }
+    }
+}
+
+/// A disposable security-incident rehearsal, end to end (issue #440).
+///
+/// The responder inherits a deployment in which a session JWT and a service
+/// token are presumed compromised and a Connection's upstream credential is
+/// presumed exposed. The rehearsal withdraws both identities, rebinds the
+/// Connection to replacement material and retires the old material, and
+/// then holds the deployment to four claims:
+///
+/// 1. every withdrawal binds both replicas on the very next request, and
+///    nothing else is withdrawn with it;
+/// 2. the authority's revision moved exactly once per decision, in order,
+///    and every replica -- by its own account and by the roster's --
+///    compiled it;
+/// 3. the decisions are in the audit evidence, and no credential, no secret
+///    material and no locator is;
+/// 4. a replica replaced by a fresh process of the known-good binary,
+///    against the same database, enforces every decision without writing
+///    any security state of its own.
+///
+/// What it deliberately does not rehearse -- recalling work already
+/// admitted, verifying an image digest, delivering an alert -- and why, is
+/// in `docs/deployment/incident-rehearsal.md`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_security_incident_rehearsal_holds_through_a_replica_replacement() {
+    let pre_incident_key = format!("rehearsal-material-{}", uuid::Uuid::new_v4().simple());
+    let post_incident_key = format!("rehearsal-material-{}", uuid::Uuid::new_v4().simple());
+    let Some(mut cluster) = start_secure_cluster(ClusterOptions {
+        shared_env: vec![(
+            "CONNECTION_SECRET_ALIASES".to_owned(),
+            rehearsal_secret_aliases(&pre_incident_key, &post_incident_key),
+        )],
+        ..ClusterOptions::default()
+    })
+    .await
+    else {
+        return skipped();
+    };
+    let responder = admin_token(&cluster.oidc, "responder@ha.test");
+
+    // ---- before the incident -------------------------------------------
+    //
+    // What the responder inherits, every piece of it working on both
+    // replicas, so that each refusal later is the incident's doing and not
+    // a credential that never worked.
+    let pre_incident_material = rehearsal_canary("pre-incident-material");
+    cluster.provision_connection_secret(&pre_incident_key, pre_incident_material.as_bytes());
+    let (status, headers, body) =
+        send_settled(|| cluster.get("a", CONNECTIONS_ROUTE).bearer(&responder)).await;
+    assert_eq!(status, 200, "the connection list should read: {body}");
+    let collection = headers
+        .get(CONNECTION_COLLECTION_ETAG_HEADER)
+        .and_then(|value| value.to_str().ok())
+        .expect("the connection list should publish its collection ETag")
+        .to_owned();
+    let (status, headers, body) = send_settled(|| {
+        cluster
+            .post("a", CONNECTIONS_ROUTE)
+            .bearer(&responder)
+            .if_match(&collection)
+            .json(&rehearsal_connection(PRE_INCIDENT_ALIAS))
+    })
+    .await;
+    assert_eq!(
+        status, 201,
+        "creating the bound Connection should succeed: {body}"
+    );
+    let connection_id = body["id"]
+        .as_str()
+        .unwrap_or_else(|| panic!("a created connection should carry an id: {body}"))
+        .to_owned();
+    let connection_route = format!("{CONNECTIONS_ROUTE}/{connection_id}");
+    let pre_rotation_etag = etag(&headers, "the connection creation");
+    let pre_rotation_credential = body["revisions"]["credential"]
+        .as_u64()
+        .unwrap_or_else(|| panic!("a created connection should carry its revisions: {body}"));
+    wait_until_etag(
+        &cluster,
+        "b",
+        &connection_route,
+        &responder,
+        &pre_rotation_etag,
+        CONVERGENCE_BUDGET,
+    )
+    .await;
+
+    let (token_id, service_token) = create_service_token(&cluster, "a", &responder).await;
+    let jti = rehearsal_canary("jti");
+    let session = cluster.oidc.mint_role_token(
+        oidc::PRIMARY_KID,
+        "compromised@ha.test",
+        &jti,
+        &[ADMIN_ROLE],
+        3_600,
+    );
+    for replica in ["a", "b"] {
+        assert!(
+            authenticates(&cluster, replica, &session).await,
+            "the session JWT should authenticate on {replica} before the incident"
+        );
+        assert!(
+            authenticates(&cluster, replica, &service_token).await,
+            "the service token should authenticate on {replica} before the incident"
+        );
+    }
+    let incident_start = authority_revision(&cluster).await;
+
+    // ---- 1. withdraw the identities ------------------------------------
+    //
+    // The JWT by the operator's break-glass command, the only write path
+    // the shared denylist has, run against this deployment and no other;
+    // the service token through the admin API, on the replica that did not
+    // create it.
+    let output = cluster.run_command(&["revoke-jwt", &cluster.oidc.issuer, &jti]);
+    let revoke_jwt_output = format!(
+        "--- stdout ---\n{}\n--- stderr ---\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        output.status.success(),
+        "revoke-jwt should succeed\n{revoke_jwt_output}"
+    );
+    let jwt_revocation_revision = String::from_utf8_lossy(&output.stdout)
+        .split_whitespace()
+        .find_map(|word| {
+            word.strip_prefix("security_revision=")
+                .and_then(|value| value.parse::<i64>().ok())
+        })
+        .unwrap_or_else(|| {
+            panic!("revoke-jwt should name the revision it committed\n{revoke_jwt_output}")
+        });
+
+    let (status, _, body) = send_settled(|| {
+        cluster
+            .delete("b", &format!("{TOKENS_ROUTE}/{token_id}"))
+            .bearer(&responder)
+    })
+    .await;
+    assert_eq!(
+        status, 200,
+        "withdrawing the service token on B should succeed: {body}"
+    );
+
+    // Refused on the very next request, on both replicas. Not a poll, for
+    // the reason the service-token row above gives: the shared revision is
+    // what makes this immediate, and a loop would hide a replica serving a
+    // withdrawn credential from its cache for a while. The responder's own
+    // session survives on both, because a containment that withdrew
+    // everything would be an outage rather than a containment.
+    for replica in ["a", "b"] {
+        assert!(
+            !authenticates(&cluster, replica, &session).await,
+            "the withdrawn JWT must be refused by {replica} on its next request"
+        );
+        assert!(
+            !authenticates(&cluster, replica, &service_token).await,
+            "the withdrawn service token must be refused by {replica} on its next request"
+        );
+        assert!(
+            authenticates(&cluster, replica, &responder).await,
+            "the responder's own session must survive a targeted withdrawal on {replica}"
+        );
+    }
+
+    // ---- 2. rotate the Connection's secret reference --------------------
+    //
+    // Cluster mode has no writable secret store (the encrypted local
+    // provider is standalone-only), so a rotation is the operator's
+    // sequence: mount the replacement material behind the second alias,
+    // rebind the Connection to it with a conditional write, and retire the
+    // old material. The rebind is made on B, which never wrote the
+    // Connection, under the ETag both replicas serve.
+    let post_incident_material = rehearsal_canary("post-incident-material");
+    cluster.provision_connection_secret(&post_incident_key, post_incident_material.as_bytes());
+    let (status, headers, body) = send_settled(|| {
+        cluster
+            .put("b", &connection_route)
+            .bearer(&responder)
+            .if_match(&pre_rotation_etag)
+            .json(&rehearsal_connection(POST_INCIDENT_ALIAS))
+    })
+    .await;
+    assert_eq!(
+        status, 200,
+        "rebinding the Connection on B should commit: {body}"
+    );
+    let rotated_etag = etag(&headers, "the connection rebind");
+    let rotated_credential = body["revisions"]["credential"]
+        .as_u64()
+        .unwrap_or_else(|| panic!("a replaced connection should carry its revisions: {body}"));
+    assert!(
+        rotated_credential > pre_rotation_credential,
+        "a rebind must advance the credential revision ({pre_rotation_credential} -> \
+         {rotated_credential}), or a client cached under the old one would survive it"
+    );
+    assert_ne!(
+        rotated_etag, pre_rotation_etag,
+        "a rebind must change the Connection's ETag"
+    );
+
+    // Retire the old material. In production that is revoking it at its
+    // issuer and then unmounting it; here it is the unmount, which is what
+    // gives the replacement below something to prove: a replica booted
+    // after this line becomes ready only if nothing it enforces still
+    // resolves the retired material.
+    cluster.retire_connection_secret(&pre_incident_key);
+
+    wait_until_etag(
+        &cluster,
+        "a",
+        &connection_route,
+        &responder,
+        &rotated_etag,
+        CONVERGENCE_BUDGET,
+    )
+    .await;
+    for replica in ["a", "b"] {
+        assert_eq!(
+            alias_dependents(&cluster, replica, &responder).await,
+            (0, 1),
+            "replica {replica} should bind the Connection through the post-incident alias only"
+        );
+    }
+    let bindings: Vec<String> = cluster
+        .database
+        .query_all(&format!(
+            "SELECT secret_id FROM greengateway.connection_credential_bindings \
+             WHERE connection_id = '{connection_id}'"
+        ))
+        .await
+        .iter()
+        .map(|row| row.get::<_, String>(0))
+        .collect();
+    assert_eq!(
+        bindings,
+        vec![POST_INCIDENT_ALIAS.to_owned()],
+        "the authority's derived binding rows should name the post-incident alias alone"
+    );
+
+    // ---- 3. the authority revision converges ----------------------------
+    //
+    // Three decisions, three revisions, in the order they were made, each
+    // naming what it decided -- the JWT by its digest, never by its `jti`.
+    let incident_head = authority_revision(&cluster).await;
+    let decisions: Vec<(i64, String, Option<String>)> = cluster
+        .database
+        .query_all(&format!(
+            "SELECT revision, resource_type, resource_id FROM greengateway.security_outbox \
+             WHERE revision > {incident_start} ORDER BY revision"
+        ))
+        .await
+        .iter()
+        .map(|row| (row.get(0), row.get(1), row.get(2)))
+        .collect();
+    let decision_types: Vec<&str> = decisions
+        .iter()
+        .map(|(_, resource_type, _)| resource_type.as_str())
+        .collect();
+    assert_eq!(
+        decision_types,
+        ["jwt_revocation", "service_token", "connection"],
+        "each incident decision should advance the shared revision exactly once, in order"
+    );
+    assert_eq!(
+        decisions[0].0, jwt_revocation_revision,
+        "revoke-jwt should report the revision its withdrawal committed at"
+    );
+    let revocation_digest = decisions[0].2.clone().unwrap_or_default();
+    assert!(
+        revocation_digest.len() == 64
+            && revocation_digest
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit()),
+        "the outbox should name the JWT withdrawal by its digest"
+    );
+    assert_eq!(
+        decisions[1].2.as_deref(),
+        Some(token_id.as_str()),
+        "the outbox should name the withdrawn service token"
+    );
+    assert_eq!(
+        decisions[2].2.as_deref(),
+        Some(connection_id.as_str()),
+        "the outbox should name the rebound Connection"
+    );
+    assert_eq!(
+        decisions[2].0, incident_head,
+        "the authority's head should be the incident's last decision"
+    );
+    for replica in ["a", "b"] {
+        wait_until_compiled(&cluster, replica, &responder, incident_head).await;
+    }
+    wait_until_roster_compiled(&cluster, "a", &responder, incident_head, 2).await;
+
+    // ---- 4. the audit evidence -------------------------------------------
+    //
+    // The decisions made through the admin API are in the audit of record,
+    // each naming its subject; the JWT's, made by a one-shot command with
+    // no audit sink, is the denylist row and the outbox row above, both
+    // attributed; the refusals that followed are in each refusing replica's
+    // own audit. What none of it may carry is swept for at the end, once
+    // the replacement's boot has been added to it.
+    wait_for_audit_record(
+        &cluster,
+        "the service-token withdrawal",
+        &format!(
+            "SELECT count(*)::bigint FROM greengateway.audit_events \
+             WHERE event_type = 'service_token.changed' \
+               AND payload_json->>'action' = 'token_revoked' \
+               AND payload_json->>'token_id' = '{token_id}'"
+        ),
+    )
+    .await;
+    wait_for_audit_record(
+        &cluster,
+        "the Connection's credential rebind",
+        &format!(
+            "SELECT count(*)::bigint FROM greengateway.audit_events \
+             WHERE event_type = 'connection.credential_changed' \
+               AND payload_json->>'action' = 'updated' \
+               AND payload_json->>'connection_id' = '{connection_id}' \
+               AND payload_json->'changed_fields' ? 'authentication'"
+        ),
+    )
+    .await;
+    let denylist: Vec<(String, i64)> = cluster
+        .database
+        .query_all("SELECT actor_user_id, security_revision FROM greengateway.jwt_revocations")
+        .await
+        .iter()
+        .map(|row| (row.get(0), row.get(1)))
+        .collect();
+    assert_eq!(
+        denylist,
+        vec![("operator:revoke-jwt".to_owned(), jwt_revocation_revision)],
+        "the denylist should hold one attributed withdrawal at the revision it committed"
+    );
+    for replica in ["a", "b"] {
+        // Two withdrawn credentials, each refused here at least once.
+        wait_for_refusals_audited(&cluster, replica, 2).await;
+    }
+
+    // ---- 5. replace a replica with the known-good binary ----------------
+    //
+    // B leaves the way a supervisor takes a suspect replica out: a
+    // controlled drain, which the harness fails the test over if it does
+    // not finish inside its budget. Its replacement is a new process of the
+    // binary A runs -- the known-good build -- against the same database,
+    // with the same static configuration and a new identity.
+    let (_, _, before_replacement) =
+        send_settled(|| cluster.get("b", CLUSTER_ROUTE).bearer(&responder)).await;
+    let replaced_instance = before_replacement["local"]["instance_id"]
+        .as_str()
+        .unwrap_or_else(|| panic!("replica b should name its instance: {before_replacement}"))
+        .to_owned();
+    cluster.stop("b");
+    let drain_records: Vec<String> = cluster
+        .replica("b")
+        .audit_events()
+        .iter()
+        .filter_map(|event| event["event_type"].as_str().map(str::to_owned))
+        .collect();
+    for expected in ["gateway.shutdown_started", "gateway.shutdown_completed"] {
+        assert!(
+            drain_records
+                .iter()
+                .any(|event_type| event_type == expected),
+            "replica b should have written {expected} on its controlled drain; its audit file \
+             holds {drain_records:?}"
+        );
+    }
+
+    let replacement = cluster.add_replica().await;
+    cluster
+        .replica_mut(&replacement)
+        .wait_until_ready(harness::READY_BUDGET)
+        .await;
+    let survivor = wait_until_compiled(&cluster, "a", &responder, incident_head).await;
+    let joined = wait_until_compiled(&cluster, &replacement, &responder, incident_head).await;
+    let survivor_instance = survivor["local"]["instance_id"]
+        .as_str()
+        .unwrap_or_default();
+    let replacement_instance = joined["local"]["instance_id"].as_str().unwrap_or_default();
+    assert!(
+        !replacement_instance.is_empty()
+            && replacement_instance != replaced_instance
+            && replacement_instance != survivor_instance,
+        "the replacement should join as a new member, not reuse an identity: {joined}"
+    );
+    let roster =
+        wait_until_roster_compiled(&cluster, &replacement, &responder, incident_head, 2).await;
+    assert!(
+        roster
+            .iter()
+            .any(|member| member["instance_id"] == replacement_instance),
+        "the roster should list the replacement among its live members: {roster:?}"
+    );
+    let binary_versions: BTreeSet<String> = roster
+        .iter()
+        .map(|member| member["binary_version"].to_string())
+        .collect();
+    let fingerprints: BTreeSet<String> = roster
+        .iter()
+        .map(|member| member["fingerprint"].to_string())
+        .collect();
+    assert_eq!(
+        binary_versions.len(),
+        1,
+        "the replacement should run the survivor's binary version: {roster:?}"
+    );
+    assert_eq!(
+        fingerprints.len(),
+        1,
+        "the replacement should agree with the survivor's static configuration: {roster:?}"
+    );
+
+    // Every decision holds on the replica that never saw one made, and
+    // still holds on the one that did.
+    for replica in ["a", replacement.as_str()] {
+        assert!(
+            !authenticates(&cluster, replica, &session).await,
+            "the withdrawn JWT must stay refused on {replica} after the replacement"
+        );
+        assert!(
+            !authenticates(&cluster, replica, &service_token).await,
+            "the withdrawn service token must stay refused on {replica} after the replacement"
+        );
+        assert!(
+            authenticates(&cluster, replica, &responder).await,
+            "the responder's session should authenticate on {replica} after the replacement"
+        );
+    }
+    wait_until_etag(
+        &cluster,
+        &replacement,
+        &connection_route,
+        &responder,
+        &rotated_etag,
+        CONVERGENCE_BUDGET,
+    )
+    .await;
+    assert_eq!(
+        alias_dependents(&cluster, &replacement, &responder).await,
+        (0, 1),
+        "the replacement should bind the Connection through the post-incident alias only"
+    );
+
+    // And the replacement decided nothing. The head is the one the incident
+    // left and the withdrawals are still recorded as withdrawals: a
+    // recovery that moved the head, or needed a write of its own to come
+    // up, is a recovery that could have rewound one.
+    assert_eq!(
+        authority_revision(&cluster).await,
+        incident_head,
+        "replacing a replica must not write security state"
+    );
+    let withdrawn_tokens = cluster
+        .database
+        .count(&format!(
+            "SELECT count(*)::bigint FROM greengateway.service_tokens \
+             WHERE id = '{token_id}' AND revoked_at IS NOT NULL"
+        ))
+        .await;
+    assert_eq!(
+        withdrawn_tokens, 1,
+        "the service token should still be recorded as withdrawn"
+    );
+    assert_eq!(
+        cluster
+            .database
+            .count("SELECT count(*)::bigint FROM greengateway.jwt_revocations")
+            .await,
+        1,
+        "the JWT withdrawal should still be on the denylist"
+    );
+
+    // ---- 6. none of it is in the evidence --------------------------------
+    //
+    // Every surface a responder would copy into a ticket or hand to an
+    // auditor: each replica's audit file and process output (the drained
+    // replica's shutdown and the replacement's boot included), the
+    // break-glass command's output, and every row of every table the
+    // incident wrote.
+    let mut evidence: Vec<(String, String)> = Vec::new();
+    for replica in &cluster.replicas {
+        evidence.push((
+            format!("replica {}'s audit log file", replica.name),
+            std::fs::read_to_string(replica.audit_path()).unwrap_or_default(),
+        ));
+        evidence.push((
+            format!("replica {}'s stdout and stderr", replica.name),
+            replica.captured_output(),
+        ));
+    }
+    evidence.push((
+        "the revoke-jwt command's output".to_owned(),
+        revoke_jwt_output,
+    ));
+    for (table, order) in [
+        ("greengateway.audit_events", "id"),
+        ("greengateway.security_outbox", "revision"),
+        ("greengateway.jwt_revocations", "revoked_at"),
+        ("greengateway.service_tokens", "id"),
+        ("greengateway.connection_credential_bindings", "purpose"),
+    ] {
+        evidence.push((
+            format!("the {table} rows"),
+            table_rows(&cluster, table, order).await,
+        ));
+    }
+    // A positive control, so the absences below cannot pass by the evidence
+    // never having been about this incident at all.
+    assert!(
+        evidence.iter().any(|(_, text)| text.contains(&token_id))
+            && evidence
+                .iter()
+                .any(|(_, text)| text.contains(&connection_id)),
+        "the collected evidence should name the withdrawn token and the rebound Connection"
+    );
+    let needles = [
+        ("withdrawn session JWT", session.as_str()),
+        ("withdrawn session's jti", jti.as_str()),
+        (
+            "withdrawn service token's plaintext",
+            service_token.as_str(),
+        ),
+        ("responder's own JWT", responder.as_str()),
+        (
+            "pre-incident Connection material",
+            pre_incident_material.as_str(),
+        ),
+        (
+            "post-incident Connection material",
+            post_incident_material.as_str(),
+        ),
+        (
+            "pre-incident material's file key",
+            pre_incident_key.as_str(),
+        ),
+        (
+            "post-incident material's file key",
+            post_incident_key.as_str(),
+        ),
+    ];
+    for (description, needle) in needles {
+        assert_absent(&evidence, description, needle);
+    }
+    // And the shape no needle can anticipate: the compact-JWS prefix every
+    // token this deployment accepts begins with.
+    assert_absent(&evidence, "compact JWS", "eyJ");
+
+    // ---- the rehearsal's own record ---------------------------------------
+    //
+    // Counts, revisions and the harness's replica letters only: no
+    // identifier, address, principal or credential, and swept like every
+    // other surface before it is printed. `cargo test` captures it; a
+    // local rehearsal run with `--nocapture` keeps it as the drill's
+    // secret-free record.
+    let summary = json!({
+        "rehearsal": "security_incident",
+        "security_revision": {
+            "before_incident": incident_start,
+            "after_incident": incident_head,
+            "after_replacement": incident_head,
+        },
+        "decisions": decision_types,
+        "withdrawals_refused_on": ["a", "b", replacement],
+        "connection_rotation": {
+            "credential_revision": [pre_rotation_credential, rotated_credential],
+            "pre_incident_alias_dependents": 0,
+            "post_incident_alias_dependents": 1,
+            "pre_incident_material_retired": true,
+        },
+        "audit_evidence": {
+            "service_token_withdrawals": 1,
+            "connection_credential_changes": 1,
+            "surfaces_swept": evidence.len(),
+            "secret_material_found": 0,
+        },
+        "replacement": {
+            "drained": "b",
+            "joined": replacement,
+            "new_member_identity": true,
+            "binary_versions": binary_versions.len(),
+            "fingerprints": fingerprints.len(),
+        },
+    })
+    .to_string();
+    let record = [("the rehearsal summary".to_owned(), summary.clone())];
+    for (description, needle) in needles {
+        assert_absent(&record, description, needle);
+    }
+    assert_absent(&record, "compact JWS", "eyJ");
+    println!("security incident rehearsal: {summary}");
 }

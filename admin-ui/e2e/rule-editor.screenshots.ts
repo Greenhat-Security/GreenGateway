@@ -77,6 +77,8 @@ test('captures rule editor empty, filled, and preview states', async ({
       body: JSON.stringify({
         match_count: 37,
         scanned_event_count: 91,
+        scan_truncated: false,
+        complete: true,
         sample_strategy: 'newest_matches',
         samples: [
           {

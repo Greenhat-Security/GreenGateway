@@ -7,7 +7,9 @@ import {
   fetchPolicyRuleHits,
   fetchPolicyRuleShadowReview,
   deletePolicyRule,
+  hasExplicitPolicyRuleId,
   patchPolicyRule,
+  policyRuleId,
   reorderPolicyRules,
 } from './policy';
 
@@ -118,6 +120,26 @@ describe('policy evidence', () => {
     await expect(fetchPolicyRuleShadowReview()).rejects.toBeInstanceOf(
       AdminApiError,
     );
+  });
+});
+
+describe('policy rule ids', () => {
+  it('addresses a rule without an explicit id by its position', () => {
+    const positional = { id: null, action: 'deny' } as const;
+    const omitted = { action: 'deny' } as const;
+    const named = { id: 'named-rule', action: 'deny' } as const;
+    const emptyNamed = { id: '', action: 'deny' } as const;
+
+    expect(policyRuleId(positional, 2)).toBe('2');
+    expect(policyRuleId(omitted, 3)).toBe('3');
+    expect(policyRuleId(named, 4)).toBe('named-rule');
+    expect(hasExplicitPolicyRuleId(positional)).toBe(false);
+    expect(hasExplicitPolicyRuleId(omitted)).toBe(false);
+    expect(hasExplicitPolicyRuleId(named)).toBe(true);
+    // The gateway keeps an empty id as the rule's id, so it does not move
+    // with the rule's position.
+    expect(policyRuleId(emptyNamed, 5)).toBe('');
+    expect(hasExplicitPolicyRuleId(emptyNamed)).toBe(true);
   });
 });
 

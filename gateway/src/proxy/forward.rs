@@ -3316,11 +3316,23 @@ mod tests {
         assert_eq!(body.as_ref(), br#"{"error":"bad_gateway"}"#);
         drop(_guard);
         // Any other target error would produce the same status and outcome;
-        // only the category names the refusal.
+        // only the category on the fail-closed line names the refusal. Match
+        // that field on that line, so the reason appearing anywhere else in
+        // the output, or a different category, cannot pass.
         let output = logs.contents();
+        let failed_closed = output
+            .lines()
+            .filter(|line| line.contains("connection-bound proxied request failed closed"))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            failed_closed.len(),
+            1,
+            "the refusal should log exactly one fail-closed line:\n{output}"
+        );
         assert!(
-            output.contains("caller_assertion_not_enforced"),
-            "the fail-closed log line should name the refusal"
+            failed_closed[0].contains(r#"error_category="caller_assertion_not_enforced""#),
+            "the fail-closed line should name the refusal: {}",
+            failed_closed[0]
         );
 
         let events = sink.events();

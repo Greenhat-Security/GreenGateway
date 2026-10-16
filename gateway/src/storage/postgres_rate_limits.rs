@@ -41,7 +41,11 @@ use sha2::Sha256;
 
 use crate::connections::local_secret::LocalSecretKeyring;
 
-use super::{log_classified, postgres::classify_pool_error, RepositoryError, RepositoryErrorKind};
+use super::{
+    log_classified,
+    postgres::{checkout, timed_operation, CheckoutClass},
+    RepositoryError, RepositoryErrorKind,
+};
 
 const OPERATION_DECIDE: &str = "rate_limit_decide";
 const OPERATION_EVICT: &str = "rate_limit_evict";
@@ -158,57 +162,61 @@ impl PostgresRateLimitStore {
         let digest = self.key_digest(lane, key)?;
         let emission = limit.emission_interval_secs();
         let tolerance = limit.tolerance_secs();
-        let client = self.pool.get().await.map_err(classify_pool_error)?;
-        let row = client
-            .query_one(
-                "WITH upsert AS (
-                     INSERT INTO greengateway.rate_limit_buckets AS b
-                         (deployment_id, lane, key_digest, tat, allowed, updated_at)
-                     VALUES ($1, $2, $3,
-                         now() + CASE WHEN $5::double precision >= 0
-                                      THEN make_interval(secs => $4::double precision)
-                                      ELSE interval '0' END,
-                         $5::double precision >= 0,
-                         now())
-                     ON CONFLICT (deployment_id, lane, key_digest) DO UPDATE SET
-                         allowed = (GREATEST(b.tat, now()) - now())
-                             <= make_interval(secs => $5::double precision),
-                         tat = CASE WHEN (GREATEST(b.tat, now()) - now())
-                                         <= make_interval(secs => $5::double precision)
-                                    THEN GREATEST(b.tat, now())
-                                         + make_interval(secs => $4::double precision)
-                                    ELSE b.tat END,
-                         updated_at = now()
-                     RETURNING b.allowed AS allowed, (b.xmax = 0) AS inserted
-                 ),
-                 counted AS (
-                     INSERT INTO greengateway.rate_limit_cardinality AS c (deployment_id, live)
-                     SELECT $1, 1 FROM upsert WHERE upsert.inserted
-                     ON CONFLICT (deployment_id) DO UPDATE SET live = c.live + 1
-                     RETURNING c.live AS live
-                 )
-                 SELECT upsert.allowed, upsert.inserted,
-                        (SELECT live FROM counted) AS live
-                 FROM upsert",
-                &[
-                    &self.deployment_id,
-                    &lane.as_str(),
-                    &digest,
-                    &emission,
-                    &tolerance,
-                ],
-            )
-            .await
-            .map_err(|error| classify_query(error, OPERATION_DECIDE))?;
-        let allowed: bool = row
-            .try_get("allowed")
-            .map_err(|_| invalid_data(OPERATION_DECIDE))?;
-        let inserted: bool = row
-            .try_get("inserted")
-            .map_err(|_| invalid_data(OPERATION_DECIDE))?;
-        let live: Option<i64> = row
-            .try_get("live")
-            .map_err(|_| invalid_data(OPERATION_DECIDE))?;
+        let client = checkout(&self.pool, CheckoutClass::RateLimit).await?;
+        let (allowed, inserted, live) = timed_operation(OPERATION_DECIDE, async {
+            let row = client
+                .query_one(
+                    "WITH upsert AS (
+                         INSERT INTO greengateway.rate_limit_buckets AS b
+                             (deployment_id, lane, key_digest, tat, allowed, updated_at)
+                         VALUES ($1, $2, $3,
+                             now() + CASE WHEN $5::double precision >= 0
+                                          THEN make_interval(secs => $4::double precision)
+                                          ELSE interval '0' END,
+                             $5::double precision >= 0,
+                             now())
+                         ON CONFLICT (deployment_id, lane, key_digest) DO UPDATE SET
+                             allowed = (GREATEST(b.tat, now()) - now())
+                                 <= make_interval(secs => $5::double precision),
+                             tat = CASE WHEN (GREATEST(b.tat, now()) - now())
+                                             <= make_interval(secs => $5::double precision)
+                                        THEN GREATEST(b.tat, now())
+                                             + make_interval(secs => $4::double precision)
+                                        ELSE b.tat END,
+                             updated_at = now()
+                         RETURNING b.allowed AS allowed, (b.xmax = 0) AS inserted
+                     ),
+                     counted AS (
+                         INSERT INTO greengateway.rate_limit_cardinality AS c (deployment_id, live)
+                         SELECT $1, 1 FROM upsert WHERE upsert.inserted
+                         ON CONFLICT (deployment_id) DO UPDATE SET live = c.live + 1
+                         RETURNING c.live AS live
+                     )
+                     SELECT upsert.allowed, upsert.inserted,
+                            (SELECT live FROM counted) AS live
+                     FROM upsert",
+                    &[
+                        &self.deployment_id,
+                        &lane.as_str(),
+                        &digest,
+                        &emission,
+                        &tolerance,
+                    ],
+                )
+                .await
+                .map_err(|error| classify_query(error, OPERATION_DECIDE))?;
+            let allowed: bool = row
+                .try_get("allowed")
+                .map_err(|_| invalid_data(OPERATION_DECIDE))?;
+            let inserted: bool = row
+                .try_get("inserted")
+                .map_err(|_| invalid_data(OPERATION_DECIDE))?;
+            let live: Option<i64> = row
+                .try_get("live")
+                .map_err(|_| invalid_data(OPERATION_DECIDE))?;
+            Ok((allowed, inserted, live))
+        })
+        .await?;
         if inserted {
             if let Some(live) = live {
                 if live > self.max_buckets {
@@ -227,33 +235,36 @@ impl PostgresRateLimitStore {
     /// bring the count down with them, in one statement.
     async fn evict_oldest(&self, excess: i64) -> Result<(), RepositoryError> {
         let batch = excess.clamp(1, EVICTION_BATCH);
-        let client = self.pool.get().await.map_err(classify_pool_error)?;
-        client
-            .execute(
-                "WITH gone AS (
-                     DELETE FROM greengateway.rate_limit_buckets
-                     WHERE ctid = ANY(ARRAY(
-                         SELECT ctid FROM greengateway.rate_limit_buckets
-                         WHERE deployment_id = $1
-                         ORDER BY updated_at ASC
-                         LIMIT $2))
-                     RETURNING 1
-                 )
-                 UPDATE greengateway.rate_limit_cardinality
-                 SET live = GREATEST(live - (SELECT count(*) FROM gone), 0)
-                 WHERE deployment_id = $1",
-                &[&self.deployment_id, &batch],
-            )
-            .await
-            .map_err(|error| classify_query(error, OPERATION_EVICT))?;
-        Ok(())
+        let client = checkout(&self.pool, CheckoutClass::RateLimit).await?;
+        timed_operation(OPERATION_EVICT, async {
+            client
+                .execute(
+                    "WITH gone AS (
+                         DELETE FROM greengateway.rate_limit_buckets
+                         WHERE ctid = ANY(ARRAY(
+                             SELECT ctid FROM greengateway.rate_limit_buckets
+                             WHERE deployment_id = $1
+                             ORDER BY updated_at ASC
+                             LIMIT $2))
+                         RETURNING 1
+                     )
+                     UPDATE greengateway.rate_limit_cardinality
+                     SET live = GREATEST(live - (SELECT count(*) FROM gone), 0)
+                     WHERE deployment_id = $1",
+                    &[&self.deployment_id, &batch],
+                )
+                .await
+                .map_err(|error| classify_query(error, OPERATION_EVICT))?;
+            Ok(())
+        })
+        .await
     }
 
     /// Reclaim up to `limit` buckets idle for at least `idle_secs` by the
     /// database clock, keeping the count exact. For the maintenance
     /// singleton; returns how many were removed.
     pub async fn cleanup_idle(&self, idle_secs: f64, limit: u32) -> Result<u64, RepositoryError> {
-        let client = self.pool.get().await.map_err(classify_pool_error)?;
+        let client = checkout(&self.pool, CheckoutClass::Maintenance).await?;
         self.cleanup_idle_with(&client, idle_secs, limit).await
     }
 
@@ -300,7 +311,7 @@ impl PostgresRateLimitStore {
     /// The exact number of live buckets for this deployment, from the
     /// counter (never a table scan).
     pub async fn live_buckets(&self) -> Result<i64, RepositoryError> {
-        let client = self.pool.get().await.map_err(classify_pool_error)?;
+        let client = checkout(&self.pool, CheckoutClass::Maintenance).await?;
         let row = client
             .query_opt(
                 "SELECT live FROM greengateway.rate_limit_cardinality WHERE deployment_id = $1",
