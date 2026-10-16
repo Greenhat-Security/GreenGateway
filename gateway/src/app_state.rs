@@ -164,7 +164,9 @@ pub(super) struct AppState {
     /// history, so it has to be read when somebody asks.
     #[cfg(feature = "postgres")]
     pub(super) database_pool: Option<deadpool_postgres::Pool>,
-    pub(super) _connections: connections::control_plane::ConnectionControlPlane,
+    /// The Connection control plane, which also owns the caller-assertion
+    /// JWKS the data listener publishes.
+    pub(super) connections: connections::control_plane::ConnectionControlPlane,
 }
 
 #[derive(Clone)]

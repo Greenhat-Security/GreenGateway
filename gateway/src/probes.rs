@@ -342,6 +342,53 @@ pub(super) async fn oauth_protected_resource_metadata_endpoint(
     Json(metadata.document()).into_response()
 }
 
+/// The JWKS upstreams verify caller assertions against.
+///
+/// Public by design, like the protected-resource metadata: a verifier holds no
+/// gateway credential, and the document carries public keys only. It is
+/// cacheable for the lifetime the rotation procedure waits out, and carries a
+/// strong entity tag so a verifier revalidates with `If-None-Match` instead of
+/// downloading the set again. When the set cannot be built the gateway says so
+/// with `503` and `no-store`, rather than publishing part of it.
+pub(super) async fn caller_assertion_jwks_endpoint(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Response {
+    let Ok(document) = state.connections.caller_assertion_jwks().await else {
+        let mut response = service_unavailable("caller assertion keys are unavailable");
+        response
+            .headers_mut()
+            .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+        return response;
+    };
+    let Ok(etag) = HeaderValue::from_str(document.etag()) else {
+        return internal_server_error("caller assertion keys are unavailable");
+    };
+    let revalidated = headers
+        .get(header::IF_NONE_MATCH)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| document.matches_if_none_match(value));
+    let mut response = if revalidated {
+        StatusCode::NOT_MODIFIED.into_response()
+    } else {
+        (
+            [(
+                header::CONTENT_TYPE,
+                HeaderValue::from_static("application/json"),
+            )],
+            document.body().to_owned(),
+        )
+            .into_response()
+    };
+    let response_headers = response.headers_mut();
+    response_headers.insert(header::ETAG, etag);
+    response_headers.insert(
+        header::CACHE_CONTROL,
+        HeaderValue::from_static(connections::caller_assertion::JWKS_CACHE_CONTROL),
+    );
+    response
+}
+
 pub(super) async fn proxy_fallback(
     State(state): State<AppState>,
     request: Request<Body>,

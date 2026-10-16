@@ -2090,6 +2090,8 @@ mod tests {
         let temporary = TemporaryEnumStore::new();
         let mut config = Config::test_defaults();
         config.connections_sqlite_path = Some(temporary.database.display().to_string());
+        let signing_key = crate::connections::test_support::AssertionSigningKeyRoot::new();
+        signing_key.configure(&mut config);
         let control_plane =
             ConnectionControlPlane::from_config(&config).expect("control plane should build");
         let initial = control_plane.runtime_snapshot();

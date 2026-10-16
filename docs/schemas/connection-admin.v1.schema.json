@@ -8,7 +8,7 @@
     "CallerAssertion": {
       "type": "object",
       "additionalProperties": false,
-      "description": "Accepted but not yet enforced: until request-path injection ships, the gateway refuses every call, test and discovery on a Connection carrying this block, with the failure reason caller_assertion_not_enforced. Once enforced, the block will attest the calling principal to the upstream alongside the primary credential rather than instead of it: the credential says which system is calling, the assertion says on whose behalf, so an upstream the operator controls can apply its own per-user checks. The gateway will sign a short-lived JWT naming the validated principal and send it in the named header, and the upstream will verify it against the gateway's published JWKS. Omit the block to send only the credential.",
+      "description": "Accepted but not yet enforced: until request-path injection ships, the gateway refuses every call, test and discovery on a Connection carrying this block, with the failure reason caller_assertion_not_enforced. Its keys are already live: an enabled Connection's signing key and published keys are resolved and checked against their algorithm when the Connection is saved or loaded, and their public halves are published at /.well-known/caller-assertion-jwks.json. Once enforced, the block will attest the calling principal to the upstream alongside the primary credential rather than instead of it: the credential says which system is calling, the assertion says on whose behalf, so an upstream the operator controls can apply its own per-user checks. The gateway will sign a short-lived JWT naming the validated principal and send it in the named header, and the upstream will verify it against that JWKS. Omit the block to send only the credential.",
       "required": [
         "signing_key_id",
         "kid",
@@ -20,8 +20,8 @@
         "lifetime_seconds"
       ],
       "properties": {
-        "signing_key_id": { "type": "string", "minLength": 1, "maxLength": 128, "description": "Secret alias holding the PKCS#8 private key." },
-        "kid": { "type": "string", "minLength": 1, "maxLength": 128, "description": "JOSE kid, published in the JWKS, so an upstream can select the right key and keys can rotate without a flag day." },
+        "signing_key_id": { "type": "string", "minLength": 1, "maxLength": 128, "description": "Secret alias holding the private key as exactly one PKCS#8 PEM block (BEGIN PRIVATE KEY): a P-256 key for es256, an RSA key of at least 2048 bits for rs256. Resolved with the assertion_signing_key purpose; a key of the other algorithm is refused as algorithm_mismatch." },
+        "kid": { "type": "string", "minLength": 1, "maxLength": 128, "description": "JOSE kid, published in the JWKS, so an upstream can select the right key and keys can rotate without a flag day. Name one key only: never put new key material behind a kid that is already published." },
         "algorithm": { "enum": ["es256", "rs256"], "description": "Signature algorithm. Both are offered because verifier libraries and platform documentation differ on which is convenient." },
         "issuer": { "type": "string", "minLength": 1, "maxLength": 512 },
         "audience": { "type": "string", "minLength": 1, "maxLength": 512 },
@@ -30,13 +30,29 @@
         "lifetime_seconds": { "type": "integer", "minimum": 1, "maximum": 300, "description": "An assertion is a bearer credential for as long as it is valid, so this is a replay window rather than a convenience setting." },
         "claims": { "type": "array", "maxItems": 2, "uniqueItems": true, "items": { "enum": ["email", "roles"] }, "description": "Principal fields to attest beyond sub, which is always present. A closed set rather than free-form templating, so a configuration mistake cannot attest something a caller supplied." },
         "bind_request": { "type": "boolean", "description": "Include the method, path and a SHA-256 of the body actually sent, so an assertion cannot be lifted onto different arguments. The digest covers the transmitted bytes, not a canonical form, so an upstream verifies it with its standard library." },
-        "bind_approval": { "type": "boolean", "const": false, "description": "Reserved: would require, and include, the approval that authorised a mutation. No approval subsystem exists yet, so only false is accepted." }
+        "bind_approval": { "type": "boolean", "const": false, "description": "Reserved: would require, and include, the approval that authorised a mutation. No approval subsystem exists yet, so only false is accepted." },
+        "published_keys": {
+          "type": "array",
+          "maxItems": 4,
+          "description": "Keys published in the JWKS beside the signing key that never sign: the next key, published before the switch so every verifier already holds it, and the previous one, kept until every assertion it signed has expired. Each kid and each alias may appear once across the signing key and this list.",
+          "items": { "$ref": "#/$defs/CallerAssertionPublishedKey" }
+        }
+      }
+    },
+    "CallerAssertionPublishedKey": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["signing_key_id", "kid", "algorithm"],
+      "properties": {
+        "signing_key_id": { "type": "string", "minLength": 1, "maxLength": 128, "description": "Secret alias holding the private key, in the same form as the signing key. The gateway derives and publishes its public half; nothing is ever signed with it while it is listed here." },
+        "kid": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "algorithm": { "enum": ["es256", "rs256"] }
       }
     },
     "SafeCallerAssertion": {
       "type": "object",
       "additionalProperties": false,
-      "description": "Accepted but not yet enforced: until request-path injection ships, the gateway refuses every call, test and discovery on a Connection carrying this block, with the failure reason caller_assertion_not_enforced. Once enforced, the block will attest the calling principal to the upstream alongside the primary credential rather than instead of it: the credential says which system is calling, the assertion says on whose behalf, so an upstream the operator controls can apply its own per-user checks. The gateway will sign a short-lived JWT naming the validated principal and send it in the named header, and the upstream will verify it against the gateway's published JWKS. Omit the block to send only the credential.",
+      "description": "Accepted but not yet enforced: until request-path injection ships, the gateway refuses every call, test and discovery on a Connection carrying this block, with the failure reason caller_assertion_not_enforced. Its keys are already live: an enabled Connection's signing key and published keys are resolved and checked against their algorithm when the Connection is saved or loaded, and their public halves are published at /.well-known/caller-assertion-jwks.json. Once enforced, the block will attest the calling principal to the upstream alongside the primary credential rather than instead of it: the credential says which system is calling, the assertion says on whose behalf, so an upstream the operator controls can apply its own per-user checks. The gateway will sign a short-lived JWT naming the validated principal and send it in the named header, and the upstream will verify it against that JWKS. Omit the block to send only the credential.",
       "required": [
         "signing_key_configured",
         "kid",
@@ -49,7 +65,7 @@
       ],
       "properties": {
         "signing_key_configured": { "type": "boolean", "description": "Whether a signing key is bound. The alias itself is never returned." },
-        "kid": { "type": "string", "minLength": 1, "maxLength": 128, "description": "JOSE kid, published in the JWKS, so an upstream can select the right key and keys can rotate without a flag day." },
+        "kid": { "type": "string", "minLength": 1, "maxLength": 128, "description": "JOSE kid, published in the JWKS, so an upstream can select the right key and keys can rotate without a flag day. Name one key only: never put new key material behind a kid that is already published." },
         "algorithm": { "enum": ["es256", "rs256"], "description": "Signature algorithm. Both are offered because verifier libraries and platform documentation differ on which is convenient." },
         "issuer": { "type": "string", "minLength": 1, "maxLength": 512 },
         "audience": { "type": "string", "minLength": 1, "maxLength": 512 },
@@ -58,7 +74,22 @@
         "lifetime_seconds": { "type": "integer", "minimum": 1, "maximum": 300, "description": "An assertion is a bearer credential for as long as it is valid, so this is a replay window rather than a convenience setting." },
         "claims": { "type": "array", "maxItems": 2, "uniqueItems": true, "items": { "enum": ["email", "roles"] }, "description": "Principal fields to attest beyond sub, which is always present. A closed set rather than free-form templating, so a configuration mistake cannot attest something a caller supplied." },
         "bind_request": { "type": "boolean", "description": "Include the method, path and a SHA-256 of the body actually sent, so an assertion cannot be lifted onto different arguments. The digest covers the transmitted bytes, not a canonical form, so an upstream verifies it with its standard library." },
-        "bind_approval": { "type": "boolean", "description": "Reserved: would require, and include, the approval that authorised a mutation. New writes accept only false; a Connection persisted earlier may still report true, and is refused at runtime like every Connection carrying an assertion." }
+        "bind_approval": { "type": "boolean", "description": "Reserved: would require, and include, the approval that authorised a mutation. New writes accept only false; a Connection persisted earlier may still report true, and is refused at runtime like every Connection carrying an assertion." },
+        "published_keys": {
+          "type": "array",
+          "maxItems": 4,
+          "description": "Keys published in the JWKS beside the signing key that never sign.",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["signing_key_configured", "kid", "algorithm"],
+            "properties": {
+              "signing_key_configured": { "type": "boolean", "description": "Whether the key is bound. The alias itself is never returned." },
+              "kid": { "type": "string", "minLength": 1, "maxLength": 128 },
+              "algorithm": { "enum": ["es256", "rs256"] }
+            }
+          }
+        }
       }
     },
     "StableId": {
@@ -1199,6 +1230,19 @@
       }
     },
     "SecretPurpose": {
+      "description": "What a secret alias may be resolved as. assertion_signing_key is the PKCS#8 private key a caller assertion signs with and whose public half the gateway publishes; it is never sent as a header value, and the encrypted local store cannot hold it, so it comes from an operator alias or an external secret provider.",
+      "enum": [
+        "header_api_key",
+        "static_bearer",
+        "oauth_client_secret",
+        "tls_private_key",
+        "tls_certificate",
+        "tls_ca_bundle",
+        "assertion_signing_key"
+      ]
+    },
+    "LocalSecretPurpose": {
+      "description": "The purposes the encrypted local store can hold.",
       "enum": [
         "header_api_key",
         "static_bearer",
@@ -1271,7 +1315,7 @@
         "compatible_purposes": {
           "type": "array",
           "minItems": 1,
-          "maxItems": 6,
+          "maxItems": 7,
           "uniqueItems": true,
           "items": {
             "$ref": "#/$defs/SecretPurpose"
@@ -1357,7 +1401,7 @@
           "maxLength": 128
         },
         "purpose": {
-          "$ref": "#/$defs/SecretPurpose"
+          "$ref": "#/$defs/LocalSecretPurpose"
         },
         "value": {
           "type": "string",
@@ -1376,7 +1420,7 @@
       ],
       "properties": {
         "purpose": {
-          "$ref": "#/$defs/SecretPurpose"
+          "$ref": "#/$defs/LocalSecretPurpose"
         },
         "value": {
           "type": "string",

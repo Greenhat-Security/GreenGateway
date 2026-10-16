@@ -2157,16 +2157,21 @@ async fn connection_tool_checks_egress_before_reading_the_secret_provider() {
 #[tokio::test]
 async fn connection_tool_with_unenforced_caller_assertion_is_refused_before_any_io() {
     // The Connection is otherwise fully usable: the upstream is reachable and
-    // allowlisted and both secrets resolve. Only the assertion it asks for,
+    // allowlisted and both secrets resolve -- the signing key is a real key,
+    // loaded when the Connection was saved. Only the assertion it asks for,
     // which nothing injects yet, may stop the call.
     const API_KEY_CANARY: &str = "assertion-test-api-key-canary";
-    const SIGNING_KEY_CANARY: &str = "assertion-test-signing-key-canary";
+    let signing_key = crate::connections::test_support::generated_es256_pem();
+    let mut canaries = vec![API_KEY_CANARY];
+    canaries.extend(crate::connections::test_support::pem_body_lines(
+        &signing_key,
+    ));
     let (addr, ca_pem, server) = one_request_tls_server().await;
     let connection = TemporaryStaticAuthRuntime::header_api_key_with_caller_assertion(
         addr,
         &ca_pem,
         API_KEY_CANARY.as_bytes(),
-        SIGNING_KEY_CANARY.as_bytes(),
+        signing_key.as_bytes(),
     )
     .await;
     let capture = CaptureSink::new();
@@ -2198,7 +2203,7 @@ async fn connection_tool_with_unenforced_caller_assertion_is_refused_before_any_
         panic!("the refusal should surface as a work failure");
     };
     assert_eq!(reason.as_deref(), Some("caller_assertion_not_enforced"));
-    for canary in [API_KEY_CANARY, SIGNING_KEY_CANARY] {
+    for canary in &canaries {
         assert!(
             !message.contains(canary),
             "the caller error leaked {canary}"
@@ -2233,7 +2238,7 @@ async fn connection_tool_with_unenforced_caller_assertion_is_refused_before_any_
     );
     assert_eq!(upstream.payload["upstream_status"], Value::Null);
     let rendered = serde_json::to_string(&events).expect("events should serialize");
-    for canary in [API_KEY_CANARY, SIGNING_KEY_CANARY] {
+    for canary in &canaries {
         assert!(!rendered.contains(canary), "the audit leaked {canary}");
     }
 
@@ -2294,7 +2299,7 @@ async fn composite_leaf_on_unenforced_caller_assertion_is_refused_before_member_
         addr,
         &ca_pem,
         b"composite-key",
-        b"composite-signing-key",
+        crate::connections::test_support::generated_es256_pem().as_bytes(),
     )
     .await;
     let definitions = composite_note_definitions(&connection.connection_id);
@@ -5888,8 +5893,8 @@ impl TemporaryStaticAuthRuntime {
     }
 
     /// A header-API-key Connection that also asks for a signed caller
-    /// assertion, with `signing_key` stored behind the assertion's alias so a
-    /// test can prove nothing ever read it.
+    /// assertion, with `signing_key` stored behind the assertion's alias. It
+    /// must be a real PKCS#8 key: the Connection only saves once its key loads.
     async fn header_api_key_with_caller_assertion(
         addr: SocketAddr,
         ca_pem: &str,
@@ -5979,6 +5984,7 @@ impl TemporaryStaticAuthRuntime {
                     claims: Vec::new(),
                     bind_request: false,
                     bind_approval: false,
+                    published_keys: Vec::new(),
                 })
             }
             None => None,

@@ -1191,6 +1191,10 @@ mod tests {
         config.connections_sqlite_path = Some(database.0.display().to_string());
         config.egress_allowed_hosts = vec![Ipv4Addr::LOCALHOST.to_string()];
         config.egress_deny_private_ips = false;
+        // The key is loaded when the Connection is saved; the call is still
+        // refused before anything would sign with it.
+        let signing_key = crate::connections::test_support::AssertionSigningKeyRoot::new();
+        signing_key.configure(&mut config);
         let control_plane =
             ConnectionControlPlane::from_config(&config).expect("control plane should build");
         let snapshot = control_plane.runtime_snapshot();

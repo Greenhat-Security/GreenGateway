@@ -136,6 +136,7 @@ impl SafeSecretAliasView {
                     SecretPurpose::TlsPrivateKey,
                     SecretPurpose::TlsCertificate,
                     SecretPurpose::TlsCaBundle,
+                    SecretPurpose::AssertionSigningKey,
                 ]
             },
             |purpose| vec![purpose],
@@ -318,6 +319,18 @@ pub struct SafeCallerAssertion {
     pub claims: Vec<CallerAssertionClaim>,
     pub bind_request: bool,
     pub bind_approval: bool,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub published_keys: Vec<SafePublishedAssertionKey>,
+}
+
+/// A published-only assertion key as the admin API shows it: its `kid` and
+/// algorithm, which the JWKS publishes anyway, and whether its alias is bound.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct SafePublishedAssertionKey {
+    pub signing_key_configured: bool,
+    pub kid: String,
+    pub algorithm: CallerAssertionAlgorithm,
 }
 
 impl SafeConnectionConfiguration {
@@ -341,6 +354,15 @@ impl SafeConnectionConfiguration {
                     claims: assertion.claims.clone(),
                     bind_request: assertion.bind_request,
                     bind_approval: assertion.bind_approval,
+                    published_keys: assertion
+                        .published_keys
+                        .iter()
+                        .map(|key| SafePublishedAssertionKey {
+                            signing_key_configured: !key.signing_key_id.is_empty(),
+                            kid: key.kid.clone(),
+                            algorithm: key.algorithm,
+                        })
+                        .collect(),
                 }
             }),
             additional_headers: write

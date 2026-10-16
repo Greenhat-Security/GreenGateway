@@ -1971,6 +1971,7 @@ const fn purpose_code(purpose: SecretPurpose) -> u8 {
         SecretPurpose::TlsPrivateKey => 4,
         SecretPurpose::TlsCertificate => 5,
         SecretPurpose::TlsCaBundle => 6,
+        SecretPurpose::AssertionSigningKey => 7,
     }
 }
 

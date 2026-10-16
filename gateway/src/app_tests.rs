@@ -13735,7 +13735,7 @@ async fn connection_secret_admin_crud_is_safe_permissioned_and_preconditioned() 
     assert_eq!(operator["actions"]["can_delete"], json!(false));
     assert_eq!(
         operator["compatible_purposes"].as_array().map(Vec::len),
-        Some(6)
+        Some(7)
     );
     let operator_etag = operator["etag"]
         .as_str()
@@ -31064,6 +31064,8 @@ mod issue_257_acceptance_grpc;
 mod issue_360_composite_acceptance;
 #[path = "tests/issue_373_oauth_bootstrap.rs"]
 mod issue_373_oauth_bootstrap;
+#[path = "tests/issue_463_caller_assertion_jwks.rs"]
+mod issue_463_caller_assertion_jwks;
 
 // ------------------------------------------------------------------
 // Cluster-mode policy control plane (issue #241, PR 7): endpoint

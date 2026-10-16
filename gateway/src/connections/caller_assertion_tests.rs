@@ -635,3 +635,393 @@ fn a_key_that_does_not_match_its_algorithm_is_refused_at_load() {
         CallerAssertionError::KeyUnusable
     );
 }
+
+/// Every member a published JWK may carry, by key type. Anything else -- `d`, `p`, `q`, `dp`, `dq`,
+/// `qi`, `oth`, `k` -- would be private material or an unreviewed extension.
+const EC_PUBLIC_MEMBERS: [&str; 7] = ["alg", "crv", "kid", "kty", "use", "x", "y"];
+const RSA_PUBLIC_MEMBERS: [&str; 6] = ["alg", "e", "kid", "kty", "n", "use"];
+const PRIVATE_MEMBERS: [&str; 8] = ["d", "p", "q", "dp", "dq", "qi", "oth", "k"];
+
+fn assert_only_public_members(jwk: &Value) {
+    let mut members = jwk
+        .as_object()
+        .expect("a JWK is an object")
+        .keys()
+        .map(String::as_str)
+        .collect::<Vec<_>>();
+    members.sort_unstable();
+    let allowed: &[&str] = match jwk["kty"].as_str() {
+        Some("EC") => &EC_PUBLIC_MEMBERS,
+        Some("RSA") => &RSA_PUBLIC_MEMBERS,
+        other => panic!("unexpected key type {other:?}"),
+    };
+    assert_eq!(
+        members, allowed,
+        "the published JWK carries exactly the public members"
+    );
+    for private in PRIVATE_MEMBERS {
+        assert!(
+            jwk.get(private).is_none(),
+            "the published JWK carries {private}"
+        );
+    }
+}
+
+/// The base64 body of a PEM document, line by line: each is a fragment of private key material.
+fn pem_body_lines(pem: &str) -> Vec<&str> {
+    pem.lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty() && !line.starts_with("-----"))
+        .collect()
+}
+
+fn loaded(kid: &str, algorithm: AssertionAlgorithm, pem: &str) -> AssertionSigningKey {
+    load_signing_key(kid, algorithm, pem.as_bytes()).expect("generated key loads")
+}
+
+fn sign_as(key: &AssertionSigningKey, subject: &str) -> String {
+    let caller = CallerIdentity {
+        issuer: CALLER_ISSUER,
+        subject,
+        email: None,
+        roles: &[],
+    };
+    sign_caller_assertion(
+        key,
+        &config(),
+        Some(&caller),
+        REQUEST_ID,
+        1_757_000_000,
+        None,
+        None,
+    )
+    .expect("signs")
+}
+
+/// A verifier holding only the published set, as an upstream does: it selects the key by the
+/// token's `kid`, takes the algorithm from the published key rather than from the token, and checks
+/// the signature, issuer and audience.
+fn verify_against_published_set(token: &str, jwks: &str) -> Option<Value> {
+    let set: jsonwebtoken::jwk::JwkSet =
+        serde_json::from_str(jwks).expect("the published set is a standard JWK Set");
+    let kid = jsonwebtoken::decode_header(token).ok()?.kid?;
+    let jwk = set.find(&kid)?;
+    let algorithm = match jwk.common.key_algorithm.as_ref()? {
+        jsonwebtoken::jwk::KeyAlgorithm::ES256 => Algorithm::ES256,
+        jsonwebtoken::jwk::KeyAlgorithm::RS256 => Algorithm::RS256,
+        _ => return None,
+    };
+    let key = DecodingKey::from_jwk(jwk).ok()?;
+    let mut validation = Validation::new(algorithm);
+    validation.set_issuer(&[ISSUER]);
+    validation.set_audience(&[AUDIENCE]);
+    // The fixture timestamp is fixed, so this checks the signature and the bound claims rather than
+    // the wall clock.
+    validation.validate_exp = false;
+    decode::<Value>(token, &key, &validation)
+        .ok()
+        .map(|data| data.claims)
+}
+
+fn published(keys: &[&AssertionSigningKey]) -> JwksBuild {
+    JwksDocument::from_public_jwks(keys.iter().map(|key| key.public_jwk().clone()))
+}
+
+#[test]
+fn a_resolved_es256_key_publishes_a_jwk_that_verifies_what_it_signs() {
+    let pem = es256_pair().serialize_pem();
+    let key = loaded("gw-es-1", AssertionAlgorithm::Es256, &pem);
+    assert_only_public_members(key.public_jwk());
+    assert_eq!(key.public_jwk()["kid"], "gw-es-1");
+    assert_eq!(key.public_jwk()["alg"], "ES256");
+
+    let build = published(&[&key]);
+    assert!(build.withheld_kids.is_empty());
+    let claims = verify_against_published_set(&sign_as(&key, "user-1"), build.document.body())
+        .expect("the published JWK verifies the resolved key's signature");
+    assert_eq!(claims["sub"], "https://idp.example#user-1");
+
+    // A token from any other key is refused by the same set.
+    let stranger = loaded(
+        "gw-es-1",
+        AssertionAlgorithm::Es256,
+        &es256_pair().serialize_pem(),
+    );
+    assert!(
+        verify_against_published_set(&sign_as(&stranger, "user-1"), build.document.body())
+            .is_none()
+    );
+}
+
+#[test]
+fn a_resolved_rs256_key_publishes_a_jwk_that_verifies_what_it_signs() {
+    let pair = rs256_pair();
+    let key = loaded("gw-rsa-1", AssertionAlgorithm::Rs256, &pair.pem);
+    assert_only_public_members(key.public_jwk());
+    // Derived from the private key, it is exactly the JWK the public components would produce.
+    assert_eq!(
+        key.public_jwk(),
+        &rs256_public_jwk("gw-rsa-1", &pair.modulus, &pair.exponent).expect("valid JWK")
+    );
+
+    let build = published(&[&key]);
+    let claims = verify_against_published_set(&sign_as(&key, "user-2"), build.document.body())
+        .expect("the published JWK verifies the resolved key's signature");
+    assert_eq!(claims["caller_sub"], "user-2");
+
+    let stranger = loaded("gw-rsa-1", AssertionAlgorithm::Rs256, &rs256_pair().pem);
+    assert!(
+        verify_against_published_set(&sign_as(&stranger, "user-2"), build.document.body())
+            .is_none()
+    );
+}
+
+#[test]
+fn an_upstream_holding_both_published_keys_accepts_assertions_signed_by_either() {
+    // The rotation model: the next key is published before it signs, and the previous one stays
+    // published until everything it signed has expired. An upstream that fetched the set at any
+    // point in between holds both, so it never rejects a valid assertion mid-rotation.
+    let previous = loaded(
+        "gw-2026-09",
+        AssertionAlgorithm::Es256,
+        &es256_pair().serialize_pem(),
+    );
+    let next = loaded("gw-2026-10", AssertionAlgorithm::Rs256, &rs256_pair().pem);
+    let both = published(&[&previous, &next]);
+    assert_eq!(both.document.key_count(), 2);
+
+    for (key, subject) in [
+        (&previous, "before-the-switch"),
+        (&next, "after-the-switch"),
+    ] {
+        let claims = verify_against_published_set(&sign_as(key, subject), both.document.body())
+            .expect("either published key verifies");
+        assert_eq!(claims["caller_sub"], subject);
+    }
+
+    // Once the previous key is retired from the set, what it signed no longer verifies, and what
+    // the next key signs still does.
+    let retired = published(&[&next]);
+    assert!(verify_against_published_set(
+        &sign_as(&previous, "before-the-switch"),
+        retired.document.body()
+    )
+    .is_none());
+    assert!(verify_against_published_set(
+        &sign_as(&next, "after-the-switch"),
+        retired.document.body()
+    )
+    .is_some());
+    // And the two sets are distinguishable by a cache validator.
+    assert_ne!(both.document.etag(), retired.document.etag());
+}
+
+#[test]
+fn no_private_parameter_ever_reaches_the_published_set() {
+    let ec_pem = es256_pair().serialize_pem();
+    let rsa = rs256_pair();
+    let ec = loaded("gw-es-1", AssertionAlgorithm::Es256, &ec_pem);
+    let rs = loaded("gw-rsa-1", AssertionAlgorithm::Rs256, &rsa.pem);
+    let build = published(&[&ec, &rs]);
+
+    let document: Value =
+        serde_json::from_str(build.document.body()).expect("the published set is JSON");
+    assert_eq!(
+        document.as_object().map(|members| members.len()),
+        Some(1),
+        "the set carries nothing beside its keys"
+    );
+    let keys = document["keys"].as_array().expect("a key array");
+    assert_eq!(keys.len(), 2);
+    for jwk in keys {
+        assert_only_public_members(jwk);
+    }
+
+    // No fragment of either private key appears in the body, the entity tag, or the debug output
+    // of anything that held it.
+    let rendered = [
+        build.document.body().to_owned(),
+        build.document.etag().to_owned(),
+        format!("{build:?}"),
+        format!("{ec:?}"),
+        format!("{rs:?}"),
+    ]
+    .join("\n");
+    for line in pem_body_lines(&ec_pem)
+        .into_iter()
+        .chain(pem_body_lines(&rsa.pem))
+    {
+        assert!(!rendered.contains(line), "private key material leaked");
+    }
+    assert!(!rendered.contains("PRIVATE KEY"));
+}
+
+#[test]
+fn an_algorithm_mismatch_is_reported_as_one() {
+    // The operator chose the wrong `algorithm` for a perfectly good key; saying so is the whole
+    // diagnostic.
+    let ec_pem = es256_pair().serialize_pem();
+    let rsa = rs256_pair();
+    assert_eq!(
+        load_signing_key("gw-1", AssertionAlgorithm::Rs256, ec_pem.as_bytes()).map(|_| ()),
+        Err(SigningKeyRejection::AlgorithmMismatch)
+    );
+    assert_eq!(
+        load_signing_key("gw-1", AssertionAlgorithm::Es256, rsa.pem.as_bytes()).map(|_| ()),
+        Err(SigningKeyRejection::AlgorithmMismatch)
+    );
+    assert_eq!(
+        SigningKeyRejection::AlgorithmMismatch.code(),
+        "algorithm_mismatch"
+    );
+
+    // A key of the right family on the wrong curve is not a mismatch with the other algorithm: it
+    // cannot sign as either.
+    let p384 = rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P384_SHA384)
+        .expect("P-384 key generates")
+        .serialize_pem();
+    assert_eq!(
+        load_signing_key("gw-1", AssertionAlgorithm::Es256, p384.as_bytes()).map(|_| ()),
+        Err(SigningKeyRejection::Unusable)
+    );
+    assert_eq!(SigningKeyRejection::Unusable.code(), "unusable_signing_key");
+}
+
+#[test]
+fn material_that_is_not_exactly_one_pkcs8_private_key_is_refused() {
+    let pair = es256_pair();
+    let pem = pair.serialize_pem();
+    let certificate = rcgen::CertificateParams::default()
+        .self_signed(&pair)
+        .expect("test certificate builds")
+        .pem();
+    let refused = [
+        // The public half alone, which the underlying parser would otherwise take as an RSA key.
+        pair.public_key_pem(),
+        certificate.clone(),
+        // A PKCS#1 or SEC1 label is not PKCS#8, whatever it wraps.
+        pem.replace("PRIVATE KEY", "RSA PRIVATE KEY"),
+        pem.replace("PRIVATE KEY", "EC PRIVATE KEY"),
+        // Two keys, or a key with a certificate: which one would sign is not this gateway's guess.
+        format!("{pem}{}", es256_pair().serialize_pem()),
+        format!("{pem}{certificate}"),
+        "not a key".to_owned(),
+        String::new(),
+    ];
+    for material in refused {
+        assert_eq!(
+            load_signing_key("gw-1", AssertionAlgorithm::Es256, material.as_bytes()).map(|_| ()),
+            Err(SigningKeyRejection::NotPkcs8)
+        );
+    }
+    assert_eq!(SigningKeyRejection::NotPkcs8.code(), "invalid_signing_key");
+
+    // Commentary around the one block is not a second block.
+    let annotated = format!("assertion key for the billing upstream\n{pem}");
+    assert!(load_signing_key("gw-1", AssertionAlgorithm::Es256, annotated.as_bytes()).is_ok());
+}
+
+#[test]
+fn a_key_shared_by_two_connections_is_published_once() {
+    // One gateway key serving many upstreams is the common deployment, and it is one key.
+    let pem = es256_pair().serialize_pem();
+    let first = loaded("gw-shared", AssertionAlgorithm::Es256, &pem);
+    let second = loaded("gw-shared", AssertionAlgorithm::Es256, &pem);
+    let build = published(&[&first, &second]);
+    assert!(build.withheld_kids.is_empty());
+    assert_eq!(build.document.key_count(), 1);
+}
+
+#[test]
+fn a_kid_that_names_two_different_keys_is_withheld() {
+    // A verifier selecting by `kid` could take either key, so neither is published under it.
+    let first = loaded(
+        "gw-clash",
+        AssertionAlgorithm::Es256,
+        &es256_pair().serialize_pem(),
+    );
+    let second = loaded(
+        "gw-clash",
+        AssertionAlgorithm::Es256,
+        &es256_pair().serialize_pem(),
+    );
+    let unrelated = loaded(
+        "gw-other",
+        AssertionAlgorithm::Es256,
+        &es256_pair().serialize_pem(),
+    );
+    let build = published(&[&first, &second, &unrelated]);
+    assert_eq!(build.withheld_kids, vec!["gw-clash".to_owned()]);
+    assert_eq!(build.document.key_count(), 1);
+    assert!(build.document.body().contains("gw-other"));
+    assert!(!build.document.body().contains("gw-clash"));
+}
+
+#[test]
+fn the_entity_tag_depends_only_on_which_keys_are_published() {
+    let first = loaded(
+        "gw-a",
+        AssertionAlgorithm::Es256,
+        &es256_pair().serialize_pem(),
+    );
+    let second = loaded(
+        "gw-b",
+        AssertionAlgorithm::Es256,
+        &es256_pair().serialize_pem(),
+    );
+    let forward = published(&[&first, &second]);
+    let reverse = published(&[&second, &first]);
+    assert_eq!(forward.document, reverse.document);
+    assert!(forward
+        .document
+        .etag()
+        .starts_with("\"caller-assertion-jwks:sha256:"));
+    assert!(forward.document.etag().ends_with('"'));
+
+    let empty = JwksDocument::from_public_jwks(Vec::new());
+    assert_eq!(empty.document.body(), r#"{"keys":[]}"#);
+    assert_eq!(empty.document.key_count(), 0);
+    assert_ne!(empty.document.etag(), forward.document.etag());
+}
+
+#[test]
+fn a_cached_copy_revalidates_against_the_entity_tag() {
+    let key = loaded(
+        "gw-a",
+        AssertionAlgorithm::Es256,
+        &es256_pair().serialize_pem(),
+    );
+    let document = published(&[&key]).document;
+    let etag = document.etag().to_owned();
+    assert!(document.matches_if_none_match(&etag));
+    assert!(document.matches_if_none_match(&format!("W/{etag}")));
+    assert!(document.matches_if_none_match(&format!("\"stale\", {etag}")));
+    assert!(document.matches_if_none_match("*"));
+    assert!(!document.matches_if_none_match("\"stale\""));
+    assert!(!document.matches_if_none_match(""));
+}
+
+#[test]
+fn the_published_set_is_cacheable_for_its_advertised_lifetime() {
+    // The header is a literal so it can be a static header value; it must not drift from the
+    // lifetime the rotation procedure waits out.
+    assert_eq!(
+        JWKS_CACHE_CONTROL,
+        format!("public, max-age={JWKS_MAX_AGE_SECONDS}")
+    );
+    assert!(JWKS_PATH.starts_with("/.well-known/"));
+}
+
+#[test]
+fn the_configured_algorithm_maps_onto_the_signing_algorithm() {
+    use super::super::model::CallerAssertionAlgorithm;
+
+    assert_eq!(
+        AssertionAlgorithm::from(CallerAssertionAlgorithm::Es256),
+        AssertionAlgorithm::Es256
+    );
+    assert_eq!(
+        AssertionAlgorithm::from(CallerAssertionAlgorithm::Rs256),
+        AssertionAlgorithm::Rs256
+    );
+}
