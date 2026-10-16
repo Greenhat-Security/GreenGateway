@@ -51,7 +51,7 @@ The pool opens connections lazily. `DATABASE_POOL_MAX` is a ceiling, not a start
 
 ## Sizing the pool itself
 
-A replica's pool needs to cover its concurrent database work, which is one connection per in-flight request that is touching the authority, plus the background tasks: the membership heartbeat, and on the leader the maintenance pass and the discovery projector.
+A replica's pool needs to cover its concurrent database work, which is one connection per in-flight request that is touching the authority, plus the background tasks: the membership heartbeat, and on the leader the maintenance pass and the discovery projector. [Authority cost](../performance/authority-cost.md) counts the checkouts, statements and round trips each request path makes, and which background work shares the pool.
 
 Start at the default `DATABASE_POOL_MAX=10` and change it on evidence:
 
@@ -81,7 +81,7 @@ Raising `DATABASE_STATEMENT_TIMEOUT_MS` above the default is almost always the w
 
 ## What to look at when it is 3am
 
-`/metrics` samples `greengateway_database_pool_size`, `greengateway_database_pool_available` and `greengateway_database_pool_waiting` from this replica's pool. Zero available connections with waiting callers is pressure; `greengateway_database_pool_timeouts_total` records checkout timeouts that a later snapshot could miss. See [operational alerts](operational-alerts.md#database-capacity) for checked rules and first-response guidance. Correlate them with the database and logs:
+`/metrics` samples `greengateway_database_pool_size`, `greengateway_database_pool_available` and `greengateway_database_pool_waiting` from this replica's pool. Zero available connections with waiting callers is pressure; `greengateway_database_pool_timeouts_total` records checkout timeouts that a later snapshot could miss. `greengateway_database_pool_acquire_seconds` times each authority-store checkout by operation class, apart from the statements that follow it in `greengateway_database_operation_seconds`, so a slow request can be read as queueing for a connection or as a slow database. A wait the request gave up on before the pool answered is recorded as `error_class="cancelled"`, and under saturation that is where the longest request-path waits go; [authority cost](../performance/authority-cost.md#reading-the-series) shows how to read the outcomes and the two series together. See [operational alerts](operational-alerts.md#database-capacity) for checked rules and first-response guidance. Correlate them with the database and logs:
 
 **How many connections each replica is holding, right now:**
 

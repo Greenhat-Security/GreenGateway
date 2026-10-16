@@ -53,7 +53,7 @@ use super::{
     policy_history::{
         ActivePolicy, PolicyCommitError, PolicyCommitRequest, PolicyControlPlane, PolicyHistory,
     },
-    postgres::classify_pool_error,
+    postgres::{checkout, timed_operation, CheckoutClass},
     postgres_documents::{self, DocumentResource},
     RepositoryError, RepositoryErrorKind,
 };
@@ -145,18 +145,21 @@ impl SecurityRevisionSource {
     }
 
     pub async fn current(&self) -> Result<i64, RepositoryError> {
-        let client = self.pool.get().await.map_err(classify_pool_error)?;
-        let row = client
-            .query_opt(
-                "SELECT last_revision FROM greengateway.security_revision_state WHERE singleton",
-                &[],
-            )
-            .await
-            .map_err(|error| classify_query(error, OPERATION_REVISION))?;
-        // The counter row is seeded by migration 4 and never deleted; its
-        // absence means the schema is not what this build expects.
-        row.map(|row| row.get::<_, i64>(0))
-            .ok_or_else(|| invalid_data(OPERATION_REVISION))
+        let client = checkout(&self.pool, CheckoutClass::RevisionCheck).await?;
+        timed_operation(OPERATION_REVISION, async {
+            let row = client
+                .query_opt(
+                    "SELECT last_revision FROM greengateway.security_revision_state WHERE singleton",
+                    &[],
+                )
+                .await
+                .map_err(|error| classify_query(error, OPERATION_REVISION))?;
+            // The counter row is seeded by migration 4 and never deleted;
+            // its absence means the schema is not what this build expects.
+            row.map(|row| row.get::<_, i64>(0))
+                .ok_or_else(|| invalid_data(OPERATION_REVISION))
+        })
+        .await
     }
 }
 
@@ -188,7 +191,7 @@ impl PostgresPolicyStore {
         after_revision: i64,
         limit: usize,
     ) -> Result<Vec<SecurityOutboxEntry>, RepositoryError> {
-        let client = self.pool.get().await.map_err(classify_pool_error)?;
+        let client = checkout(&self.pool, CheckoutClass::SecurityStateRead).await?;
         let rows = client
             .query(
                 r#"
@@ -217,47 +220,47 @@ impl PostgresPolicyStore {
 #[async_trait]
 impl PolicyControlPlane for PostgresPolicyStore {
     async fn active(&self) -> Result<Option<ActivePolicy>, RepositoryError> {
-        let client = self.pool.get().await.map_err(classify_pool_error)?;
-        let row = postgres_documents::read_active(&client, POLICY_DOCUMENT_RESOURCE)
-            .await?
-            .map(
-                |(version, stored_etag, security_revision, _created_at, document_json)| {
-                    (version, stored_etag, security_revision, document_json)
-                },
-            );
-        let Some((version, stored_etag, security_revision, document_json)) = row else {
-            return Ok(None);
-        };
-        let policy = policy_from_json(&document_json, OPERATION_ACTIVE)?;
-        let etag = crate::policy_etag(&policy).map_err(|_| invalid_data(OPERATION_ACTIVE))?;
-        if etag != stored_etag {
-            // The pointer names an ETag the document does not hash to.
-            // Either the row was edited out-of-band or the deployment's
-            // data is corrupt; either way the document is unverifiable and
-            // must never be served. Fail closed.
-            tracing::error!(
-                "the active policy document does not match its recorded ETag; \
-                 refusing to serve an unverifiable document"
-            );
-            return Err(invalid_data(OPERATION_ACTIVE));
-        }
-        Ok(Some(ActivePolicy {
-            policy,
-            version,
-            etag,
-            security_revision,
-        }))
+        let client = checkout(&self.pool, CheckoutClass::SecurityStateRead).await?;
+        timed_operation(OPERATION_ACTIVE, async {
+            let row = postgres_documents::read_active(&client, POLICY_DOCUMENT_RESOURCE)
+                .await?
+                .map(
+                    |(version, stored_etag, security_revision, _created_at, document_json)| {
+                        (version, stored_etag, security_revision, document_json)
+                    },
+                );
+            let Some((version, stored_etag, security_revision, document_json)) = row else {
+                return Ok(None);
+            };
+            let policy = policy_from_json(&document_json, OPERATION_ACTIVE)?;
+            let etag = crate::policy_etag(&policy).map_err(|_| invalid_data(OPERATION_ACTIVE))?;
+            if etag != stored_etag {
+                // The pointer names an ETag the document does not hash to.
+                // Either the row was edited out-of-band or the deployment's
+                // data is corrupt; either way the document is unverifiable
+                // and must never be served. Fail closed.
+                tracing::error!(
+                    "the active policy document does not match its recorded ETag; \
+                     refusing to serve an unverifiable document"
+                );
+                return Err(invalid_data(OPERATION_ACTIVE));
+            }
+            Ok(Some(ActivePolicy {
+                policy,
+                version,
+                etag,
+                security_revision,
+            }))
+        })
+        .await
     }
 
     async fn commit(
         &self,
         request: PolicyCommitRequest<'_>,
     ) -> Result<ActivePolicy, PolicyCommitError> {
-        let client = self
-            .pool
-            .get()
+        let client = checkout(&self.pool, CheckoutClass::ControlPlaneWrite)
             .await
-            .map_err(classify_pool_error)
             .map_err(store_error)?;
         postgres_documents::begin(&client, OPERATION_COMMIT)
             .await
@@ -467,7 +470,7 @@ impl PolicyHistory for PostgresPolicyStore {
                 }
             },
         };
-        let client = self.pool.get().await.map_err(classify_pool_error)?;
+        let client = checkout(&self.pool, CheckoutClass::SecurityStateRead).await?;
         let rows = match cursor {
             Some(cursor) => {
                 client
@@ -509,7 +512,7 @@ impl PolicyHistory for PostgresPolicyStore {
     }
 
     async fn get_version(&self, version: i64) -> Result<Option<PolicyVersion>, RepositoryError> {
-        let client = self.pool.get().await.map_err(classify_pool_error)?;
+        let client = checkout(&self.pool, CheckoutClass::SecurityStateRead).await?;
         let row = client
             .query_opt(
                 r#"
