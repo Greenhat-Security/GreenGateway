@@ -2123,7 +2123,13 @@ fn parameter_shape_problems(path: &str, shape: &ParameterShape, problems: &mut V
                 agent.name
             ));
         }
-        if let Err(error) = jsonschema::validator_for(&agent.schema) {
+        if numbers_exceed_exact_comparison_budget(&agent.schema) {
+            problems.push(format!(
+                "{path}.agent property '{}' {}",
+                agent.name,
+                exact_comparison_budget_problem()
+            ));
+        } else if let Err(error) = jsonschema::validator_for(&agent.schema) {
             problems.push(format!(
                 "{path}.agent property '{}' is not a valid JSON Schema: {error}",
                 agent.name
@@ -2686,9 +2692,7 @@ fn input_schema_precheck_problem(
     }
 
     if numbers_exceed_exact_comparison_budget(schema) {
-        return Some(format!(
-            "contains numbers that would cost more to compare exactly than one {MAX_EXACT_NUMBER_DIGITS}-digit number"
-        ));
+        return Some(exact_comparison_budget_problem());
     }
 
     for reference in local_references {
@@ -2698,6 +2702,19 @@ fn input_schema_precheck_problem(
     }
 
     None
+}
+
+/// The problem reported for a schema whose numbers exceed the exact
+/// comparison budget.
+///
+/// With exact comparison, jsonschema parses a schema's numeric limits when it
+/// compiles, at a cost that grows with the square of their digits, so every
+/// compile of a schema that did not ship with the gateway checks
+/// [`numbers_exceed_exact_comparison_budget`] first and reports this instead.
+pub(crate) fn exact_comparison_budget_problem() -> String {
+    format!(
+        "contains numbers that would cost more to compare exactly than one {MAX_EXACT_NUMBER_DIGITS}-digit number"
+    )
 }
 
 /// Whether comparing every number in `value` exactly would cost more than one
