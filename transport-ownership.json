@@ -8263,7 +8263,17 @@
         "network-or-process-reference"
       ],
       "scope": "gateway::connections::pg_store::bump_connection_state#1",
-      "sha256": "38943aec0f8a3659b3ba6f67521be76760fdd4e87adb7561694a2b092e5c7fac",
+      "sha256": "e9b7c6e38491a5ae36f26c7ec0784f01369619563e42281411e1a3605187db61",
+      "owner": "GreenGateway maintainers",
+      "purpose": "PostgreSQL repository operations through the shared infrastructure pool; no caller-selected HTTP authority."
+    },
+    {
+      "file": "gateway/src/connections/pg_store.rs",
+      "reasons": [
+        "network-or-process-reference"
+      ],
+      "scope": "gateway::connections::pg_store::record_change_evidence#1",
+      "sha256": "7b435547b32d65efca0e29ad4614803d7afcc17adabbc5e2f0ffade8992286b0",
       "owner": "GreenGateway maintainers",
       "purpose": "PostgreSQL repository operations through the shared infrastructure pool; no caller-selected HTTP authority."
     },

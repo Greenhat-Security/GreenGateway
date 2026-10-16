@@ -2532,6 +2532,21 @@ async fn delete_flushes_queued_dependency_guards_before_it_is_judged() {
         .delete_managed(&record.id, &record.etag(), "op-3")
         .await
         .expect("an unreferenced Connection deletes");
+
+    // The actor the control plane is handed reaches the authority: the
+    // refused attempt left no evidence and the committed one names op-3.
+    let actors: Vec<String> = client
+        .query(
+            "SELECT actor_user_id FROM greengateway.connection_change_evidence \
+             WHERE connection_id = $1::text::uuid",
+            &[&record.id.as_str()],
+        )
+        .await
+        .expect("evidence")
+        .iter()
+        .map(|row| row.get(0))
+        .collect();
+    assert_eq!(actors, ["op-3"]);
 }
 
 /// The authority itself refuses a tool name another lane holds, so two
@@ -3378,5 +3393,505 @@ async fn global_history_pruning_preserves_every_connections_current_status() {
             last_refresh_at: Some(quiet_refresh_at),
         },
         "durable activity timestamps must survive global history pruning"
+    );
+}
+
+// ==== Connection change evidence (issue #425, PR 2; migration 16) ====
+
+/// One `connection_change_evidence` row, every column, read as text where
+/// the column is a UUID or timestamp so no extra type support is needed.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct EvidenceRow {
+    event_id: String,
+    operation_id: String,
+    actor_user_id: String,
+    action: String,
+    connection_id: String,
+    prior_version: i64,
+    security_revision: i64,
+    committed_at: String,
+}
+
+/// The whole evidence table in commit order.
+async fn evidence_rows(pool: &deadpool_postgres::Pool) -> Vec<EvidenceRow> {
+    pool.get()
+        .await
+        .expect("evidence checkout")
+        .query(
+            r#"
+            SELECT event_id::text, operation_id::text, actor_user_id, action,
+                   connection_id::text, prior_version, security_revision,
+                   committed_at::text
+            FROM greengateway.connection_change_evidence
+            ORDER BY security_revision, event_id
+            "#,
+            &[],
+        )
+        .await
+        .expect("evidence rows should read")
+        .iter()
+        .map(|row| EvidenceRow {
+            event_id: row.get(0),
+            operation_id: row.get(1),
+            actor_user_id: row.get(2),
+            action: row.get(3),
+            connection_id: row.get(4),
+            prior_version: row.get(5),
+            security_revision: row.get(6),
+            committed_at: row.get(7),
+        })
+        .collect()
+}
+
+async fn security_revision(pool: &deadpool_postgres::Pool) -> i64 {
+    count(
+        pool,
+        "SELECT last_revision FROM greengateway.security_revision_state WHERE singleton",
+    )
+    .await
+}
+
+async fn deletion_tombstones(pool: &deadpool_postgres::Pool, id: &ConnectionId) -> i64 {
+    count(
+        pool,
+        &format!(
+            "SELECT COUNT(*) FROM greengateway.security_outbox \
+             WHERE resource_type = 'connection' AND to_version = 0 AND resource_id = '{}'",
+            id.as_str()
+        ),
+    )
+    .await
+}
+
+/// The deletion is attributable after the record and its cascading
+/// history are gone, and after the process that wrote it is gone: the
+/// evidence row names the actor, the action, the prior version and the
+/// exact shared revision of the unchanged outbox tombstone, under the
+/// database clock, and carries identifiers only. A client whose delete
+/// response was lost reconciles from that row; its blind retry is a
+/// `NotFound` that writes nothing.
+#[tokio::test]
+async fn deletion_evidence_survives_cascade_and_restart_and_reconciles_a_lost_response() {
+    let Some(admin_dsn) = locator() else {
+        eprintln!("skipping: no test database locator; CI runs this test");
+        return;
+    };
+    let database = create_test_database(&admin_dsn).await;
+    let (store, pool) = migrated_store(&database.dsn, 64).await;
+
+    let columns: Vec<String> = pool
+        .get()
+        .await
+        .expect("column checkout")
+        .query(
+            "SELECT column_name::text FROM information_schema.columns \
+             WHERE table_schema = 'greengateway' AND table_name = 'connection_change_evidence' \
+             ORDER BY ordinal_position",
+            &[],
+        )
+        .await
+        .expect("evidence columns should read")
+        .iter()
+        .map(|row| row.get(0))
+        .collect();
+    assert_eq!(
+        columns,
+        [
+            "event_id",
+            "operation_id",
+            "actor_user_id",
+            "action",
+            "connection_id",
+            "prior_version",
+            "security_revision",
+            "committed_at"
+        ],
+        "evidence holds identifiers, revisions and the actor; a new column needs review"
+    );
+
+    let created = store
+        .create(http_candidate("Evidence API"), "creating-admin", None)
+        .await
+        .expect("create should commit");
+    let replaced = store
+        .replace(
+            &created.id,
+            &created.etag(),
+            http_candidate("Evidence API v2"),
+            "editing-admin",
+        )
+        .await
+        .expect("replace should commit");
+    assert_eq!(replaced.revisions.connection, 2);
+    assert!(
+        evidence_rows(&pool).await.is_empty(),
+        "create and replace record no deletion evidence"
+    );
+
+    store
+        .delete(&created.id, &replaced.etag(), "deleting-admin")
+        .await
+        .expect("delete should commit");
+
+    // Everything that could have attributed the deletion cascaded away...
+    assert_eq!(store.get(&created.id).await.expect("get"), None);
+    assert_eq!(
+        count(
+            &pool,
+            &format!(
+                "SELECT COUNT(*) FROM greengateway.connection_documents \
+                 WHERE connection_id = '{}'::uuid",
+                created.id.as_str()
+            )
+        )
+        .await,
+        0,
+        "the version history cascaded with the record"
+    );
+    // ...the outbox tombstone is exactly what it was before evidence...
+    let tombstone = pool
+        .get()
+        .await
+        .expect("tombstone checkout")
+        .query_one(
+            "SELECT revision, from_version, to_version FROM greengateway.security_outbox \
+             WHERE resource_type = 'connection' AND resource_id = $1 AND to_version = 0",
+            &[&created.id.as_str()],
+        )
+        .await
+        .expect("exactly one deletion tombstone");
+    let tombstone_revision: i64 = tombstone.get(0);
+    assert_eq!(
+        (tombstone.get::<_, i64>(1), tombstone.get::<_, i64>(2)),
+        (2, 0),
+        "the tombstone keeps its prior version and the 0 deletion sentinel"
+    );
+    // ...and the evidence names who did it, bound to that tombstone.
+    let evidence = evidence_rows(&pool).await;
+    assert_eq!(evidence.len(), 1, "{evidence:?}");
+    let row = &evidence[0];
+    assert_eq!(row.action, "connection.delete");
+    assert_eq!(row.actor_user_id, "deleting-admin");
+    assert_eq!(row.connection_id, created.id.as_str());
+    assert_eq!(row.prior_version, 2);
+    assert_eq!(row.security_revision, tombstone_revision);
+    assert_eq!(security_revision(&pool).await, tombstone_revision);
+    assert_ne!(row.event_id, row.operation_id);
+    assert_eq!(
+        count(
+            &pool,
+            "SELECT COUNT(*) FROM greengateway.connection_change_evidence \
+             WHERE committed_at <= now() AND committed_at > now() - interval '1 hour'",
+        )
+        .await,
+        1,
+        "committed_at is the database clock's"
+    );
+    let stored = pool
+        .get()
+        .await
+        .expect("evidence text checkout")
+        .query_one(
+            "SELECT row_to_json(e)::text FROM greengateway.connection_change_evidence e",
+            &[],
+        )
+        .await
+        .expect("evidence row should encode")
+        .get::<_, String>(0);
+    for material in [
+        "billing-token",
+        "billing.example.test",
+        "/openapi.json",
+        "Evidence API",
+    ] {
+        assert!(
+            !stored.contains(material),
+            "evidence must not carry specification or secret material ({material}): {stored}"
+        );
+    }
+
+    // A restart is a new process over the same authority.
+    drop(store);
+    drop(pool);
+    let (restarted, restarted_pool) = migrated_store(&database.dsn, 64).await;
+    restarted
+        .validate_persisted_state()
+        .await
+        .expect("evidence for a deleted Connection does not disturb boot validation");
+    assert_eq!(
+        evidence_rows(&restarted_pool).await,
+        evidence,
+        "the evidence survives restart unchanged"
+    );
+
+    // The response was lost and the client retries with its ETag: the
+    // committed delete is not repeated, and the original evidence is the
+    // reconciliation answer.
+    let retried = restarted
+        .delete(&created.id, &replaced.etag(), "deleting-admin")
+        .await
+        .expect_err("a committed delete is not repeated");
+    assert!(
+        matches!(retried, ConnectionStoreError::NotFound { .. }),
+        "{retried}"
+    );
+    assert_eq!(evidence_rows(&restarted_pool).await, evidence);
+    assert_eq!(deletion_tombstones(&restarted_pool, &created.id).await, 1);
+    assert_eq!(security_revision(&restarted_pool).await, tombstone_revision);
+}
+
+/// Only a committed deletion is evidence. A stale ETag, a dependency
+/// guard, a missing record and an unattributable actor are each refused
+/// with nothing written and no revision consumed; the actor bound is the
+/// principal subject bound, so a maximal subject still deletes.
+#[tokio::test]
+async fn refused_deletes_write_no_evidence() {
+    let Some(admin_dsn) = locator() else {
+        eprintln!("skipping: no test database locator; CI runs this test");
+        return;
+    };
+    let database = create_test_database(&admin_dsn).await;
+    let (store, pool) = migrated_store(&database.dsn, 64).await;
+    let created = store
+        .create(http_candidate("Guarded API"), "op-1", None)
+        .await
+        .expect("create should commit");
+    let revision_before = security_revision(&pool).await;
+
+    let stale = store
+        .delete(
+            &created.id,
+            &fabricated_stale_etag(&created.id),
+            "stale-admin",
+        )
+        .await
+        .expect_err("a stale ETag must not delete");
+    assert!(
+        matches!(stale, ConnectionStoreError::Conflict { .. }),
+        "{stale}"
+    );
+
+    pool.get()
+        .await
+        .expect("dependency checkout")
+        .execute(
+            "INSERT INTO greengateway.connection_dependencies \
+                 (connection_id, consumer_kind, consumer_id, created_at) \
+                 VALUES ($1::text::uuid, 'proxy_route', 'route-a', '2026-01-01T00:00:00Z')",
+            &[&created.id.as_str()],
+        )
+        .await
+        .expect("dependency insert");
+    let blocked = store
+        .delete(&created.id, &created.etag(), "blocked-admin")
+        .await
+        .expect_err("a referenced Connection must not delete");
+    assert!(
+        matches!(blocked, ConnectionStoreError::DependencyConflict { .. }),
+        "{blocked}"
+    );
+
+    let absent = ConnectionId::new_managed();
+    let missing = store
+        .delete(&absent, &fabricated_stale_etag(&absent), "absent-admin")
+        .await
+        .expect_err("an absent Connection must not delete");
+    assert!(
+        matches!(missing, ConnectionStoreError::NotFound { .. }),
+        "{missing}"
+    );
+
+    for actor in [String::new(), "a".repeat(EVIDENCE_ACTOR_MAX_BYTES + 1)] {
+        let unattributable = store
+            .delete(&created.id, &created.etag(), &actor)
+            .await
+            .expect_err("an unattributable delete must not commit");
+        assert!(
+            matches!(unattributable, ConnectionStoreError::Validation { .. }),
+            "{unattributable}"
+        );
+    }
+
+    assert!(evidence_rows(&pool).await.is_empty());
+    assert_eq!(
+        security_revision(&pool).await,
+        revision_before,
+        "no refused delete consumed a revision"
+    );
+    assert_eq!(deletion_tombstones(&pool, &created.id).await, 0);
+    assert!(store.get(&created.id).await.expect("get").is_some());
+
+    pool.get()
+        .await
+        .expect("dependency cleanup checkout")
+        .execute("DELETE FROM greengateway.connection_dependencies", &[])
+        .await
+        .expect("dependency cleanup");
+    let maximal_actor = "m".repeat(EVIDENCE_ACTOR_MAX_BYTES);
+    store
+        .delete(&created.id, &created.etag(), &maximal_actor)
+        .await
+        .expect("a maximal principal subject still deletes");
+    let evidence = evidence_rows(&pool).await;
+    assert_eq!(evidence.len(), 1);
+    assert_eq!(evidence[0].actor_user_id, maximal_actor);
+    assert_eq!(evidence[0].security_revision, revision_before + 1);
+}
+
+/// Two replicas delete one Connection with the same ETag: the authority
+/// serializes them, exactly one commits, and exactly one evidence row and
+/// one tombstone exist, naming the winner.
+#[tokio::test]
+async fn concurrent_deletes_produce_one_winner_and_one_evidence_row() {
+    let Some(admin_dsn) = locator() else {
+        eprintln!("skipping: no test database locator; CI runs this test");
+        return;
+    };
+    let database = create_test_database(&admin_dsn).await;
+    let (store, pool) = migrated_store(&database.dsn, 64).await;
+    let created = store
+        .create(http_candidate("Race Delete"), "op-1", None)
+        .await
+        .expect("create should commit");
+    let etag = created.etag();
+
+    let store_a = PostgresConnectionStore::new(pool.clone(), 64).expect("store a");
+    let store_b = PostgresConnectionStore::new(pool.clone(), 64).expect("store b");
+    let (a, b) = tokio::join!(
+        store_a.delete(&created.id, &etag, "replica-a"),
+        store_b.delete(&created.id, &etag, "replica-b")
+    );
+    let (winner, loser) = match (a, b) {
+        (Ok(()), Err(loser)) => ("replica-a", loser),
+        (Err(loser), Ok(())) => ("replica-b", loser),
+        outcome => panic!("exactly one racing deleter commits: {outcome:?}"),
+    };
+    assert!(
+        matches!(
+            loser,
+            ConnectionStoreError::NotFound { .. } | ConnectionStoreError::Conflict { .. }
+        ),
+        "{loser}"
+    );
+    let evidence = evidence_rows(&pool).await;
+    assert_eq!(evidence.len(), 1, "{evidence:?}");
+    assert_eq!(evidence[0].actor_user_id, winner);
+    assert_eq!(deletion_tombstones(&pool, &created.id).await, 1);
+    assert_eq!(
+        evidence[0].security_revision,
+        security_revision(&pool).await
+    );
+}
+
+/// The evidence is required, not best effort: when its insert fails the
+/// delete reports failure and nothing of it commits -- record, history,
+/// bindings, tombstone, revisions -- and the aborted attempt consumes no
+/// revision. The same ETag deletes once evidence can be written again.
+#[tokio::test]
+async fn a_failed_evidence_insert_rolls_back_the_whole_delete() {
+    let Some(admin_dsn) = locator() else {
+        eprintln!("skipping: no test database locator; CI runs this test");
+        return;
+    };
+    let database = create_test_database(&admin_dsn).await;
+    let (store, pool) = migrated_store(&database.dsn, 64).await;
+    let created = store
+        .create(http_candidate("Faulted API"), "op-1", None)
+        .await
+        .expect("create should commit");
+    let revision_before = security_revision(&pool).await;
+    let state_before = store.state_revision().await.expect("state revision");
+    let outbox_before = count(&pool, "SELECT COUNT(*) FROM greengateway.security_outbox").await;
+
+    pool.get()
+        .await
+        .expect("failure trigger checkout")
+        .batch_execute(
+            r#"
+                CREATE FUNCTION greengateway.fail_connection_change_evidence()
+                RETURNS trigger LANGUAGE plpgsql AS $$
+                BEGIN
+                    RAISE EXCEPTION 'injected evidence failure';
+                END;
+                $$;
+                CREATE TRIGGER fail_connection_change_evidence
+                BEFORE INSERT ON greengateway.connection_change_evidence
+                FOR EACH ROW EXECUTE FUNCTION greengateway.fail_connection_change_evidence();
+                "#,
+        )
+        .await
+        .expect("failure trigger should install");
+    let failed = store
+        .delete(&created.id, &created.etag(), "faulted-admin")
+        .await
+        .expect_err("a delete whose evidence cannot commit must fail");
+    assert!(
+        matches!(failed, ConnectionStoreError::Postgres { .. }),
+        "{failed}"
+    );
+    pool.get()
+        .await
+        .expect("failure trigger cleanup checkout")
+        .batch_execute(
+            r#"
+                DROP TRIGGER fail_connection_change_evidence
+                    ON greengateway.connection_change_evidence;
+                DROP FUNCTION greengateway.fail_connection_change_evidence();
+                "#,
+        )
+        .await
+        .expect("failure trigger should drop");
+
+    assert_eq!(
+        store.get(&created.id).await.expect("get"),
+        Some(created.clone()),
+        "the record is untouched"
+    );
+    assert_eq!(
+        count(
+            &pool,
+            &format!(
+                "SELECT COUNT(*) FROM greengateway.connection_documents \
+                 WHERE connection_id = '{}'::uuid",
+                created.id.as_str()
+            )
+        )
+        .await,
+        1,
+        "the version history did not cascade"
+    );
+    assert_eq!(
+        count(
+            &pool,
+            "SELECT COUNT(*) FROM greengateway.connection_credential_bindings"
+        )
+        .await,
+        1,
+        "the binding did not cascade"
+    );
+    assert_eq!(
+        count(&pool, "SELECT COUNT(*) FROM greengateway.security_outbox").await,
+        outbox_before,
+        "the tombstone rolled back with the evidence"
+    );
+    assert_eq!(deletion_tombstones(&pool, &created.id).await, 0);
+    assert_eq!(security_revision(&pool).await, revision_before);
+    assert_eq!(
+        store.state_revision().await.expect("state revision"),
+        state_before
+    );
+    assert!(evidence_rows(&pool).await.is_empty());
+
+    store
+        .delete(&created.id, &created.etag(), "recovered-admin")
+        .await
+        .expect("the unchanged ETag deletes once evidence can commit");
+    let evidence = evidence_rows(&pool).await;
+    assert_eq!(evidence.len(), 1, "{evidence:?}");
+    assert_eq!(evidence[0].actor_user_id, "recovered-admin");
+    assert_eq!(
+        evidence[0].security_revision,
+        revision_before + 1,
+        "the aborted attempt consumed no revision"
     );
 }

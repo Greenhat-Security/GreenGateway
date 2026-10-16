@@ -76,6 +76,9 @@ const AUTHORITATIVE_TABLES: &[&str] = &[
     "discovery_rule_suggestions",
     "discovery_detector_state",
     "discovery_template_groups",
+    // 0016: Connection change evidence. The import never writes it, but a
+    // row records an authority change, so its presence means history.
+    "connection_change_evidence",
 ];
 
 /// The authoritative singleton counters and the column that carries them.
