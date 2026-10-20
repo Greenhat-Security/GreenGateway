@@ -10159,9 +10159,9 @@
         "unexpanded-macro"
       ],
       "scope": "gateway::middleware::rbac::macro tokio :: task_local#1",
-      "sha256": "e05ad9aae7f25f6d39f856836553b732d22bd33629e0cc08233615233127a807",
+      "sha256": "52c9064f3d4f13e9d546f3bb9eff8f858efcfa91967cc085736d4131712a0c06",
       "owner": "GreenGateway maintainers",
-      "purpose": "Existing macro/attribute inputs for this exact application item; changed expansion inputs require explicit review."
+      "purpose": "Issue #422 tool-lane cutover: the PINNED_POLICY task-local (static PINNED_POLICY: Arc<RbacPolicyState>) is now unconditional instead of postgres-only, so with_request_policy_snapshot and the tool runtime can pin one in-process policy snapshot for a check or an invocation in standalone mode too; doc rewritten. It changes which policy snapshot reads observe, not transport: no I/O and no network, provider, resolver or process authority."
     },
     {
       "file": "gateway/src/middleware/rbac.rs",
@@ -10169,9 +10169,9 @@
         "unexpanded-attribute"
       ],
       "scope": "gateway::middleware::rbac::RbacPolicyState#1",
-      "sha256": "cc27e072e1e1a7e9d948e3b74d1fe3b2fb57e49df3faac353c1a1970645b28e4",
+      "sha256": "9ce1a716af4f359a8ce1b47c9b5a51f8d3e84a7f62d0d45d15dc1b0fa0166c77",
       "owner": "GreenGateway maintainers",
-      "purpose": "Issue #422 HTTP adapter: evaluate the admitted immutable policy snapshot and translate its result into existing audit and response behavior. Existing cfg/cfg_attr inputs only; no new transport, provider, resolver or process authority."
+      "purpose": "Issue #422 tool-lane cutover: the pre-cutover direct-rule matcher field (rule_matcher) is now #[cfg(test)] and kept only for the frozen differential oracles, so serving snapshots carry only the compiled policy that every HTTP and tool-lane decision reads. cfg gating and a doc comment only; no field, client, socket, TLS, DNS or header authority is added."
     },
     {
       "file": "gateway/src/middleware/rbac.rs",
@@ -10224,14 +10224,24 @@
       "purpose": "Narrow cfg_attr(not(test), expect(dead_code)) for the existing offline analysis or rate-selection contract pending its separate adapter. Replaces the policy evaluator module-wide allowance; no transport or process capability is introduced."
     },
     {
-      "file": "gateway/src/policy_eval/mod.rs",
+      "file": "gateway/src/policy_eval/tools.rs",
       "reasons": [
         "unexpanded-attribute"
       ],
-      "scope": "gateway::policy_eval::tools::attributes#1",
-      "sha256": "a97782e307cca2c63218bbb7beb6f2201e8f53d757c50109077b984a8314d83b",
-      "owner": "policy evaluation tool lane (#421)",
-      "purpose": "The tools module contains pure policy evaluation only; its non-test dead-code allowance remains scoped to this offline lane until the tool adapters in #422 consume it. No transport or runtime authority is introduced."
+      "scope": "gateway::policy_eval::tools::impl  ToolEvaluation::canonical_trace_bytes#1",
+      "sha256": "a9dc78540c3206445f2ec78d1efb5d4994f5c0cdcaa752f1b5c89c6126b3b814",
+      "owner": "policy evaluation tool lane (#422)",
+      "purpose": "Narrow cfg_attr(not(test), expect(dead_code)), needed because the tools module-wide dead-code allowance was removed when the live tool lane began deciding through this module (#422). The function serializes a trace into a bounded in-memory buffer with serde_json; offline trace reuse stays dead in production. Dead-code gating only; no I/O and no transport or process capability."
+    },
+    {
+      "file": "gateway/src/policy_eval/tools.rs",
+      "reasons": [
+        "unexpanded-attribute"
+      ],
+      "scope": "gateway::policy_eval::tools::impl  ToolEvaluation::reusable_for#1",
+      "sha256": "336f4a1559a4b70512448604da7114846055ed691a0791a3acfb2f883deec629",
+      "owner": "policy evaluation tool lane (#422)",
+      "purpose": "Narrow cfg_attr(not(test), expect(dead_code)), needed because the tools module-wide dead-code allowance was removed when the live tool lane began deciding through this module (#422). The function compares an evaluation binding with a context digest and does no I/O; offline trace reuse stays dead in production. Dead-code gating only; no transport or process capability."
     },
     {
       "file": "gateway/src/policy_eval/mod.rs",
@@ -10290,16 +10300,6 @@
       ],
       "scope": "gateway::policy_eval::impl  CompiledPolicy::select_rate_lane#1",
       "sha256": "5f645b34d2d8cbf1865fe89ed6317350b86252e0ed43f38adad4576cab2069bb",
-      "owner": "GreenGateway maintainers",
-      "purpose": "Narrow cfg_attr(not(test), expect(dead_code)) for the existing offline analysis or rate-selection contract pending its separate adapter. Replaces the policy evaluator module-wide allowance; no transport or process capability is introduced."
-    },
-    {
-      "file": "gateway/src/policy_eval/mod.rs",
-      "reasons": [
-        "unexpanded-attribute"
-      ],
-      "scope": "gateway::policy_eval::PrincipalFact#1",
-      "sha256": "826a2c272778c7d29674de8d2bdcfb212c54add9eba84d987a94770486d8bf1d",
       "owner": "GreenGateway maintainers",
       "purpose": "Narrow cfg_attr(not(test), expect(dead_code)) for the existing offline analysis or rate-selection contract pending its separate adapter. Replaces the policy evaluator module-wide allowance; no transport or process capability is introduced."
     },

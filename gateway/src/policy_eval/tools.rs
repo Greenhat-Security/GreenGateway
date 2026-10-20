@@ -1,7 +1,10 @@
 //! Policy-backed tool decisions. These operations deliberately do not compose
 //! into a promise that a tool can execute. Registry visibility, composite grants,
 //! admission, leases, HTTP rendering and transport remain adapter responsibilities.
-//! No production caller until the tool cutover in #422.
+//!
+//! The live tool lane decides through this module (#422 PR 2): the adapters in
+//! `middleware::rbac` build each context from the request's pinned policy
+//! snapshot and translate the result for `tools::runtime` and inventory.
 
 use super::{
     framed_digest, validate_path, CompiledPolicy, EvaluationError, LogicalDecision, PolicyEffect,
@@ -9,19 +12,19 @@ use super::{
 };
 use crate::{
     auth::Principal,
-    rbac::{matcher::RuleDispatchContext, rule::principal_identity_matches, RuleAction},
-    request_bounds::MAX_REQUEST_METHOD_BYTES,
+    rbac::{
+        matcher::RuleDispatchContext, policy::ToolPolicyEntry, rule::principal_identity_matches,
+        RuleAction,
+    },
+    request_bounds::{MAX_REQUEST_METHOD_BYTES, MAX_TOOL_NAME_BYTES},
 };
 use http::Method;
 use serde::Serialize;
-use std::fmt;
+use std::{collections::HashMap, fmt};
 
 pub(crate) const TOOL_CONTEXT_VERSION: u16 = 1;
 const TOOL_SEMANTICS_VERSION: &str = "gg-tool-policy-v1";
 const TOOL_DOMAIN: &str = "tool_policy_v1";
-// An offline work bound, not a new policy-name grammar. Before live cutover,
-// #422 must reconcile this with tool-name admission (currently unbounded).
-pub(crate) const MAX_TOOL_NAME_BYTES: usize = 4096;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -152,7 +155,11 @@ impl ToolEvaluationContext {
 /// executor authorizes those exact bytes after segment encoding, so this lane
 /// accepts valid escapes while retaining the same structural path guards.
 /// Inbound request paths continue to use `validate_path`, which rejects `%`.
-fn validate_rendered_http_path(path: &str) -> Result<(), EvaluationError> {
+///
+/// Tool rendering refuses a path this refuses before it asks for the rendered
+/// HTTP rule, with this same predicate, so a rendered request the gateway
+/// would send is never refused here as malformed or oversized.
+pub(crate) fn validate_rendered_http_path(path: &str) -> Result<(), EvaluationError> {
     if path.len() > super::MAX_REQUEST_PATH_BYTES {
         return Err(EvaluationError::ContextTooLarge);
     }
@@ -298,6 +305,13 @@ impl ToolEvaluation {
         self.limitation
     }
 
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "offline trace reuse remains outside the live tool adapters"
+        )
+    )]
     pub(crate) fn canonical_trace_bytes(&self) -> Result<Vec<u8>, EvaluationError> {
         let bytes = serde_json::to_vec(self).map_err(|_| EvaluationError::TraceEncoding)?;
         if bytes.len() > MAX_TRACE_BYTES {
@@ -306,6 +320,13 @@ impl ToolEvaluation {
         Ok(bytes)
     }
 
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "offline trace reuse remains outside the live tool adapters"
+        )
+    )]
     pub(crate) fn reusable_for(&self, context: &ToolEvaluationContext) -> bool {
         self.complete
             && context.validate(self.binding.snapshot).is_ok()
@@ -332,6 +353,13 @@ impl ToolEvaluation {
 }
 
 impl CompiledPolicy {
+    /// The tool entries this instance decides by. An adapter reads an admitted
+    /// entry's limits here, from the instance that admitted it, rather than from
+    /// a second copy of the policy that agrees with it only by construction.
+    pub(crate) fn tool_entries(&self) -> &HashMap<String, ToolPolicyEntry> {
+        &self.engine.policy().tools
+    }
+
     pub(crate) fn evaluate_tool(
         &self,
         context: &ToolEvaluationContext,

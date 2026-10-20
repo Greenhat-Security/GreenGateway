@@ -11,6 +11,9 @@
 //!
 //! Principal bounds live beside `Principal` in `auth::principal`, and `Host`
 //! parsing beside its consumers in `upstream_route`, on the same principle.
+//! The tool lane's facts follow the same rule from different admission points:
+//! a tool name is bounded where policy is validated, and a rendered request
+//! where the tool executor renders it.
 
 /// Longest HTTP method token admitted. The registered methods are at most
 /// seven bytes; the bound leaves room for extension methods without letting a
@@ -34,3 +37,18 @@ pub(crate) const MAX_REQUEST_HOST_BYTES: usize = 4096;
 /// upstream URLs (from which the origin derives) are refused above it by
 /// configuration validation.
 pub(crate) const MAX_DISPATCH_FACT_BYTES: usize = 4096;
+
+/// Longest tool name the tool lane evaluates. Policy validation refuses a
+/// longer `tools` entry name or rule `tool_name`, so no policy can name a tool
+/// the kernel cannot be asked about, and the tool-lane adapter refuses a longer
+/// name before evaluation, which blocks the call as an unknown name would.
+/// Discovered MCP and OpenAPI tool names are bounded far below it (128
+/// characters). A `TOOLS_FILE` definition's name is bounded only by that file's
+/// size cap, so a call to a local tool can carry a longer name; it is refused
+/// with `tool_name_out_of_bounds`, and no policy entry could have named it.
+///
+/// A rendered tool request's method and path are held to
+/// [`MAX_REQUEST_METHOD_BYTES`] and [`MAX_REQUEST_PATH_BYTES`] at rendering,
+/// before its HTTP rule is evaluated: they never pass through inbound request
+/// admission.
+pub(crate) const MAX_TOOL_NAME_BYTES: usize = 4096;

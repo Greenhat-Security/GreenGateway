@@ -131,6 +131,127 @@ fn tool_policy_eligibility_treats_allow_and_shadow_rules_as_eligible() {
     }
 }
 
+/// The admin playground's precondition judges the execute permission and the
+/// tool eligibility behind its etag together, inside
+/// [`RbacState::with_request_policy_snapshot`] (#422). A revocation installed
+/// inside that scope must not reach either answer, or the two could come from
+/// two installs and grant what neither grants alone. The management lane
+/// ([`RbacState::principal_has_permission`]) reads live on purpose, so it sees
+/// the revocation and can refuse.
+#[tokio::test]
+async fn a_pinned_request_snapshot_answers_permission_and_eligibility_while_the_management_lane_reads_live(
+) {
+    const EXECUTE: &str = "admin:tools:execute";
+    let principal = test_principal(&["operator"]);
+    let mut granting = test_policy(DefaultAction::Deny, &[("operator", &[EXECUTE])], &[]);
+    granting.tools.insert(
+        "reports.export".to_owned(),
+        tool_policy_entry(true, &["operator"], &[], &[]),
+    );
+    let mut revoking = test_policy(DefaultAction::Deny, &[("operator", &[])], &[]);
+    revoking.tools.insert(
+        "reports.export".to_owned(),
+        tool_policy_entry(false, &["operator"], &[], &[]),
+    );
+    let (state, _capture) = test_state(granting, &[]);
+    let eligible = ToolPolicyEligibility {
+        eligible: true,
+        reason: "eligible",
+    };
+
+    let inside = state
+        .with_request_policy_snapshot(async {
+            state.replace_policy(revoking);
+            (
+                state.request_snapshot_grants_permission(&principal, EXECUTE),
+                state
+                    .tool_eligibility_snapshot()
+                    .eligibility("reports.export", &principal),
+                state.tool_policy_eligibility("reports.export", &principal),
+                state.principal_has_permission(&principal, EXECUTE),
+            )
+        })
+        .await;
+    assert_eq!(
+        inside,
+        (true, eligible, eligible, false),
+        "the pinned snapshot answers the precondition; the management lane is live"
+    );
+
+    assert!(!state.request_snapshot_grants_permission(&principal, EXECUTE));
+    assert_eq!(
+        state.tool_policy_eligibility("reports.export", &principal),
+        ToolPolicyEligibility {
+            eligible: false,
+            reason: "policy_disabled",
+        }
+    );
+}
+
+/// Inventory takes one eligibility snapshot per listing, so a listing cannot
+/// straddle an install between two of its tools: a snapshot taken before an
+/// install answers every tool from the policy it was taken from.
+#[test]
+fn a_tool_eligibility_snapshot_taken_before_an_install_answers_every_tool_from_it() {
+    let principal = test_principal(&["operator"]);
+    let mut before = test_policy(DefaultAction::Deny, &[], &[]);
+    for name in ["kept", "disabled_later", "denied_before"] {
+        before.tools.insert(
+            name.to_owned(),
+            tool_policy_entry(true, &["operator"], &[], &[]),
+        );
+    }
+    before.rules.push(Rule {
+        id: Some("deny-denied-before".to_owned()),
+        enabled: true,
+        methods: Vec::new(),
+        path: String::new(),
+        tool_name: Some("denied_before".to_owned()),
+        dispatch: None,
+        principal: PrincipalMatcher::default(),
+        action: RuleAction::Deny,
+    });
+    let mut after = test_policy(DefaultAction::Deny, &[], &[]);
+    for (name, enabled) in [
+        ("kept", true),
+        ("disabled_later", false),
+        ("denied_before", true),
+        ("added_later", true),
+    ] {
+        after.tools.insert(
+            name.to_owned(),
+            tool_policy_entry(enabled, &["operator"], &[], &[]),
+        );
+    }
+    let (state, _capture) = test_state(before, &[]);
+
+    let snapshot = state.tool_eligibility_snapshot();
+    state.replace_policy(after);
+
+    let answer = |eligibility: ToolPolicyEligibility| (eligibility.eligible, eligibility.reason);
+    let names = ["kept", "disabled_later", "denied_before", "added_later"];
+    assert_eq!(
+        names.map(|name| answer(snapshot.eligibility(name, &principal))),
+        [
+            (true, "eligible"),
+            (true, "eligible"),
+            (false, "policy_denied"),
+            (false, "not_in_policy"),
+        ],
+        "the snapshot answers every tool from the policy it was taken from"
+    );
+    assert_eq!(
+        names.map(|name| answer(state.tool_policy_eligibility(name, &principal))),
+        [
+            (true, "eligible"),
+            (false, "policy_disabled"),
+            (true, "eligible"),
+            (true, "eligible"),
+        ],
+        "a fresh read answers from the installed policy"
+    );
+}
+
 #[tokio::test]
 async fn exempt_path_returns_ok_without_authz_event() {
     let (state, capture) = test_state(
