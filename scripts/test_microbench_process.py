@@ -610,14 +610,18 @@ class KernelStageExecutionTests(unittest.TestCase):
                   "cargo": sys.executable, "ui_source": HEAD,
                   "ui_build_inputs": list(bench.UI_BUILD_INPUTS), "context": kernel_context()}
         real_bounded = bench._bounded
+        self.kernel_calls = []
 
         def bounded(_command, working, label, _seconds, deadline, env=None, cwd=None, max_bytes=None):
             side = working.name.removesuffix("-kernel")
+            self.kernel_calls.append((side, label))
             seconds = 2
             if failures.get(f"{side}:{label}") == "crash":
                 code = "print('deliberate process failure'); raise SystemExit(23)"
             elif failures.get(f"{side}:{label}") == "timeout":
                 code, seconds = "import time; time.sleep(30)", 0.08
+            elif label == "clean":
+                code = "pass"
             elif label == "build":
                 artifact = {"reason": "compiler-artifact", "executable": str(executable),
                             "target": {"name": "gateway", "kind": ["bin"]}, "profile": {"test": True}}
@@ -657,6 +661,18 @@ class KernelStageExecutionTests(unittest.TestCase):
         stored = json.loads((output / "summary.json").read_text(encoding="utf-8"))
         self.assertEqual(stored, report)
         return report, output
+
+    def test_each_revision_cleans_the_gateway_and_measures_its_own_binary_copy(self):
+        # A shared target directory once let the head build reuse the base
+        # binary: Cargo judged the second tree fresh and listed zero tests.
+        with tempfile.TemporaryDirectory() as directory:
+            report, _ = self.run_stage(directory, results={"base": None, "head": kernel_result()})
+            self.assertEqual(report["status"], "passed", report["errors"])
+            for side in ("base", "head"):
+                labels = [label for owner, label in self.kernel_calls if owner == side]
+                self.assertEqual(labels[:2], ["clean", "build"], labels)
+                copy = Path(directory) / "work" / "binaries" / side / "gateway-test"
+                self.assertEqual(copy.read_bytes(), b"fixture executable")
 
     def test_pending_head_measurement_over_a_base_without_the_harness_passes(self):
         with tempfile.TemporaryDirectory() as directory:

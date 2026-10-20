@@ -989,10 +989,21 @@ def _build_kernel(root, revision, label, output, compiler, kernel, digest, work,
     target_dir = Path(work) / "cargo-target"
     target_dir.mkdir(parents=True, exist_ok=True)
     environment = _cargo_environment(compiler, kernel["context"]["rust_ci"], target_dir)
+    # The revisions share one target directory so dependencies build once, but
+    # Cargo names a workspace member's artifacts without its source path: left
+    # alone, the second tree is judged fresh and reuses the first revision's
+    # gateway binary. Cleaning the gateway package makes each revision compile
+    # its own source.
+    _bounded([kernel["cargo"], "clean", "-p", "gateway", "--locked"], directory, "clean",
+             KERNEL_PROCESS_SECONDS, deadline, environment, cwd=tree)
     command = [kernel["cargo"], *CARGO_ARGUMENTS]
     messages, build_seconds = _bounded(command, directory, "build", BUILD_SECONDS, deadline,
                                        environment, cwd=tree, max_bytes=MAX_BUILD_LOG_BYTES)
-    binary = _test_executable(messages, target_dir)
+    built = _test_executable(messages, target_dir)
+    # The next revision's clean removes this artifact, so measure a private copy.
+    binary = Path(work) / "binaries" / label / built.name
+    binary.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(built, binary)
     # Exact matching avoids libtest's successful zero-test behaviour.
     listing, _ = _bounded([str(binary), KERNEL_TEST, "--exact", "--ignored", "--list"], directory,
                           "list", KERNEL_PROCESS_SECONDS, deadline, environment)
