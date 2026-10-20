@@ -337,5 +337,264 @@ class SavedEvidenceTests(unittest.TestCase):
             bench.compare_saved_results(envelope(), envelope(), policy)
 
 
+def kernel_budget():
+    value = budget()
+    value["schema_version"] = 2
+    value["kernel_harness_sha256"] = ["f" * 64]
+    value["targets"].append({"id": "http_policy", "max_allocation_growth": 0,
+                             "max_allocated_bytes_growth": 0})
+    return value
+
+
+# Captured from the gateway test binary (unoptimized test profile) on the
+# harness this change adds: 17 decisions per pass, 100 passes per sample.
+def kernel_result(regression=False):
+    calls, size_sum = (43400, 1547800) if regression else (41700, 1439000)
+    return {
+        "schema_version": 1, "harness": "gateway-test-binary", "regression_fixture": regression,
+        "warmup": 10, "iterations": 100, "samples": 9,
+        "targets": [{
+            "id": "http_policy", "input_cases": 17, "input_bytes": 1459,
+            "operations_per_iteration": 17, "expected_checksum": 1700,
+            "allocation_samples": [
+                {"allocations": calls, "allocated_bytes": size_sum, "checksum": 1700}
+                for _ in range(9)
+            ],
+            "timing_samples_ns": [40000000 + i * 100000 for i in range(9)],
+        }],
+    }
+
+
+def kernel_envelope(regression=False, revision="b" * 40):
+    return {
+        "schema_version": 1,
+        "context": {
+            "rust_ci": "1.98.1", "rustc_vv": "rustc 1.98.1\nrelease: 1.98.1\n",
+            "cargo_vv": "cargo 1.98.1\nrelease: 1.98.1\n",
+            "cargo_arguments": list(bench.CARGO_ARGUMENTS),
+            "cargo_env": dict(bench.CARGO_PROFILE_ENV), "node": "26.10.0", "npm": "11.19.1",
+            "machine": {"platform": "test-linux", "machine": "x86_64",
+                        "logical_cpus": 2, "python": "3.13.15"},
+            "warmup": 10, "iterations": 100, "samples": 9,
+        },
+        "revision": revision, "harness_sha256": "f" * 64, "regression_fixture": regression,
+        "result": kernel_result(regression),
+    }
+
+
+def kernel_limit():
+    return {"id": "http_policy", "max_allocation_growth": 0, "max_allocated_bytes_growth": 0}
+
+
+class BudgetSchemaTests(unittest.TestCase):
+    def test_both_budget_schemas_are_accepted_and_only_schema_two_budgets_the_kernel(self):
+        self.assertFalse(bench.budgets_kernel(bench.validate_budget(budget())))
+        self.assertTrue(bench.budgets_kernel(bench.validate_budget(kernel_budget())))
+        repository = json.loads((ROOT / "microbench-budget.json").read_text(encoding="utf-8"))
+        bench.validate_budget(repository)
+
+    def test_kernel_budget_must_be_complete_ordered_approved_and_zero(self):
+        changes = {
+            "no kernel digests": lambda value: value.pop("kernel_harness_sha256"),
+            "empty kernel digests": lambda value: value.update(kernel_harness_sha256=[]),
+            "three kernel digests": lambda value: value.update(
+                kernel_harness_sha256=["1" * 64, "2" * 64, "3" * 64]),
+            "duplicate kernel digest": lambda value: value.update(
+                kernel_harness_sha256=["1" * 64, "1" * 64]),
+            "uppercase kernel digest": lambda value: value.update(kernel_harness_sha256=["F" * 64]),
+            "kernel target missing": lambda value: value["targets"].pop(),
+            "kernel target first": lambda value: value["targets"].insert(0, value["targets"].pop()),
+            "kernel growth": lambda value: value["targets"][-1].update(max_allocation_growth=1),
+            "kernel byte growth": lambda value: value["targets"][-1].update(
+                max_allocated_bytes_growth=True),
+            "unknown key": lambda value: value.update(skipped_targets=["http_policy"]),
+            "future schema": lambda value: value.update(schema_version=3),
+            "boolean schema": lambda value: value.update(schema_version=True),
+        }
+        for name, change in changes.items():
+            with self.subTest(change=name):
+                value = kernel_budget()
+                change(value)
+                with self.assertRaises(ValueError):
+                    bench.validate_budget(value)
+        schema_one_with_kernel = kernel_budget()
+        schema_one_with_kernel["schema_version"] = 1
+        with self.assertRaises(ValueError):
+            bench.validate_budget(schema_one_with_kernel)
+        del schema_one_with_kernel["kernel_harness_sha256"]
+        with self.assertRaises(ValueError):
+            bench.validate_budget(schema_one_with_kernel)
+
+    def test_pure_comparison_ignores_the_kernel_entry_of_a_schema_two_budget(self):
+        report = bench.compare_results(result(), result(), kernel_budget())
+        self.assertEqual(report["status"], "passed")
+        self.assertEqual([target["id"] for target in report["targets"]], list(bench.TARGET_IDS))
+
+    def test_adoption_state_follows_the_base_budget_and_cannot_retire_enforcement(self):
+        self.assertEqual(bench.kernel_policy(budget(), budget()), "pending")
+        self.assertEqual(bench.kernel_policy(budget(), kernel_budget()), "proposed")
+        self.assertEqual(bench.kernel_policy(kernel_budget(), kernel_budget()), "enforced")
+        with self.assertRaisesRegex(ValueError, "retire"):
+            bench.kernel_policy(kernel_budget(), budget())
+
+
+class KernelResultTests(unittest.TestCase):
+    def assert_invalid(self, value, regression=False):
+        with self.assertRaises((ValueError, RuntimeError)):
+            bench.validate_kernel_result(value, regression)
+
+    def test_measured_report_and_requested_fixture_pass(self):
+        bench.validate_kernel_result(kernel_result())
+        bench.validate_kernel_result(kernel_result(True), regression=True)
+
+    def test_fixture_marker_must_match_the_requested_run(self):
+        self.assert_invalid(kernel_result(True))
+        self.assert_invalid(kernel_result(), regression=True)
+        value = kernel_result()
+        value["regression_fixture"] = 0
+        self.assert_invalid(value)
+
+    def test_protocol_dataset_and_harness_drift_reject(self):
+        for field, invalid in (("schema_version", 2), ("warmup", 100), ("iterations", 1000),
+                               ("samples", 8), ("harness", "standalone")):
+            with self.subTest(field=field):
+                value = kernel_result()
+                value[field] = invalid
+                self.assert_invalid(value)
+        for field in ("input_cases", "input_bytes", "operations_per_iteration", "expected_checksum"):
+            with self.subTest(field=field):
+                value = kernel_result()
+                value["targets"][0][field] -= 1
+                self.assert_invalid(value)
+
+    def test_wrong_skipped_extra_or_unstable_targets_reject(self):
+        value = kernel_result()
+        value["targets"][0]["id"] = "rule_path"
+        self.assert_invalid(value)
+        value = kernel_result()
+        value["targets"] = []
+        self.assert_invalid(value)
+        value = kernel_result()
+        value["targets"].append(copy.deepcopy(value["targets"][0]))
+        self.assert_invalid(value)
+        value = kernel_result()
+        value["targets"][0]["allocation_samples"][4]["allocations"] += 1
+        self.assert_invalid(value)
+        value = kernel_result()
+        value["targets"][0]["allocation_samples"][0]["checksum"] -= 17
+        self.assert_invalid(value)
+        value = kernel_result()
+        value["targets"][0]["timing_samples_ns"][0] = 0
+        self.assert_invalid(value)
+        value = kernel_result()
+        value["targets"][0]["skipped"] = False
+        self.assert_invalid(value)
+
+
+class KernelComparisonTests(unittest.TestCase):
+    def test_neutral_and_improved_counts_pass_and_timing_stays_informational(self):
+        head = kernel_envelope()
+        for sample in head["result"]["targets"][0]["allocation_samples"]:
+            sample["allocations"] -= 100
+            sample["allocated_bytes"] -= 100
+        head["result"]["targets"][0]["timing_samples_ns"] = [10**10] * 9
+        for after in (kernel_envelope(), head):
+            report = bench.compare_kernel_results(kernel_envelope(), after, kernel_limit())
+            self.assertEqual(report["status"], "passed")
+            self.assertEqual(report["id"], "http_policy")
+
+    def test_allocation_and_byte_growth_independently_fail(self):
+        for field in ("allocations", "allocated_bytes"):
+            with self.subTest(field=field):
+                head = kernel_envelope()
+                for sample in head["result"]["targets"][0]["allocation_samples"]:
+                    sample[field] += 1
+                report = bench.compare_kernel_results(kernel_envelope(), head, kernel_limit())
+                self.assertEqual(report["status"], "failed")
+
+    def test_deliberate_fixture_is_detected_and_never_normal_evidence(self):
+        report = bench.compare_kernel_results(kernel_envelope(), kernel_envelope(True),
+                                              kernel_limit(), regression_head=True)
+        self.assertEqual(report["status"], "failed")
+        self.assertEqual(report["growth"], {"allocations": 1700, "allocated_bytes": 108800})
+        for before, after in ((kernel_envelope(True), kernel_envelope()),
+                              (kernel_envelope(), kernel_envelope(True))):
+            with self.assertRaises(ValueError):
+                bench.compare_kernel_results(before, after, kernel_limit())
+
+    def test_incompatible_build_tools_profile_or_runner_reject(self):
+        changes = {
+            "compiler": lambda context: context.update(rust_ci="1.99.0"),
+            "cargo build": lambda context: context.update(cargo_vv="cargo 1.98.1\nrelease: 1.98.1\nhost: other\n"),
+            "profile": lambda context: context["cargo_env"].update(CARGO_PROFILE_DEV_DEBUG="2"),
+            "arguments": lambda context: context["cargo_arguments"].append("--release"),
+            "ui tools": lambda context: context.update(node="26.11.0"),
+            "runner": lambda context: context["machine"].update(logical_cpus=4),
+        }
+        for name, change in changes.items():
+            with self.subTest(change=name):
+                head = kernel_envelope()
+                change(head["context"])
+                with self.assertRaises(ValueError):
+                    bench.compare_kernel_results(kernel_envelope(), head, kernel_limit())
+
+    def test_unpinned_cargo_and_bare_results_reject(self):
+        head = kernel_envelope()
+        head["context"]["cargo_vv"] = "cargo 1.97.0\nrelease: 1.97.0\n"
+        with self.assertRaises(ValueError):
+            bench.validate_kernel_envelope(head)
+        with self.assertRaises((ValueError, KeyError)):
+            bench.compare_kernel_results(kernel_result(), kernel_result(), kernel_limit())
+        for key in ("context", "revision", "harness_sha256", "regression_fixture"):
+            head = kernel_envelope()
+            del head[key]
+            with self.subTest(key=key), self.assertRaises(ValueError):
+                bench.compare_kernel_results(kernel_envelope(), head, kernel_limit())
+
+    def test_budget_entry_must_name_the_kernel_target(self):
+        limit = kernel_limit()
+        limit["id"] = "rule_path"
+        with self.assertRaises(ValueError):
+            bench.compare_kernel_results(kernel_envelope(), kernel_envelope(), limit)
+
+
+DECLARATION = (
+    '#[cfg(test)]\n#[path = "../tests/support/policy_benchmark.rs"]\nmod policy_benchmark;\n'
+)
+
+
+class KernelWiringTests(unittest.TestCase):
+    def main_source(self):
+        return (ROOT / "gateway/src/main.rs").read_text(encoding="utf-8")
+
+    def test_repository_wiring_is_the_reviewed_test_only_declaration(self):
+        self.assertIn(DECLARATION, self.main_source())
+        self.assertTrue(bench.kernel_wiring(self.main_source()))
+
+    def test_revision_without_the_declaration_is_absent(self):
+        source = self.main_source().replace(DECLARATION, "")
+        self.assertFalse(bench.kernel_wiring(source))
+        commented = self.main_source().replace(
+            DECLARATION, "".join("// " + line + "\n" for line in DECLARATION.splitlines()))
+        self.assertFalse(bench.kernel_wiring(commented))
+
+    def test_redirected_disabled_or_duplicated_wiring_is_rejected(self):
+        replacements = {
+            "other file": DECLARATION.replace("policy_benchmark.rs", "decoy.rs"),
+            "production module": DECLARATION.replace("#[cfg(test)]\n", ""),
+            "disabled": "#[cfg(any())]\n" + DECLARATION,
+            "redirected": '#[cfg_attr(test, path = "decoy.rs")]\n' + DECLARATION,
+            "duplicated": DECLARATION + "#[cfg(not(test))]\nmod policy_benchmark {}\n",
+            "nested": "mod nested {\n" + DECLARATION + "}\n",
+            "inline module": "#[cfg(test)]\nmod policy_benchmark {}\n",
+            "renamed reference": "#[cfg(test)]\nuse crate::decoy as policy_benchmark;\n",
+        }
+        for name, replacement in replacements.items():
+            with self.subTest(change=name):
+                source = self.main_source().replace(DECLARATION, replacement)
+                with self.assertRaises(ValueError):
+                    bench.kernel_wiring(source)
+
+
 if __name__ == '__main__':
     unittest.main()
