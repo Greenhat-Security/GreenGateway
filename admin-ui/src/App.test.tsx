@@ -686,13 +686,13 @@ describe('AdminShell', () => {
 
     expect((screen.getByRole('button', { name: 'Logging out' }) as HTMLButtonElement).disabled).toBe(true);
     for (const name of controls) {
-      expect((screen.getByRole('button', { name, exact: true }) as HTMLButtonElement).disabled).toBe(true);
+      expect((screen.getByRole('button', { name }) as HTMLButtonElement).disabled).toBe(true);
     }
     await act(async () => { finish(); });
 
     await screen.findByText('Logged out. Sign in again to continue.');
     for (const name of controls) {
-      expect((screen.getByRole('button', { name, exact: true }) as HTMLButtonElement).disabled).toBe(false);
+      expect((screen.getByRole('button', { name }) as HTMLButtonElement).disabled).toBe(false);
     }
   });
 
