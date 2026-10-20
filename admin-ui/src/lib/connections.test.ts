@@ -257,7 +257,20 @@ describe('connections API client', () => {
     const canary = 'UNEXPECTED_CALLER_ASSERTION_SECRET_CANARY';
     const withClaims = callerAssertion();
     const { claims: _claims, ...withoutClaims } = withClaims;
-    for (const stored of [withClaims, withoutClaims]) {
+    // A rotation in progress, on a Connection whose keys the gateway leaves
+    // out of its JWKS.
+    const rotating = {
+      ...withClaims,
+      published_keys: [
+        { signing_key_configured: true, kid: 'gw-test-2', algorithm: 'es256' },
+        { signing_key_configured: false, kid: 'gw-test-0', algorithm: 'rs256' },
+      ],
+      key_problem: {
+        field: 'caller_assertion.signing_key_id',
+        code: 'invalid_signing_key',
+      },
+    };
+    for (const stored of [withClaims, withoutClaims, rotating]) {
       const detail = connectionDetail();
       vi.stubGlobal(
         'fetch',
@@ -305,6 +318,21 @@ describe('connections API client', () => {
       { claims: 'email' },
       { bind_request: 'false' },
       { bind_approval: undefined },
+      { published_keys: 'gw-test-2' },
+      { published_keys: [{ signing_key_configured: true, kid: '', algorithm: 'es256' }] },
+      { published_keys: [{ signing_key_configured: 'yes', kid: 'gw-test-2', algorithm: 'es256' }] },
+      { published_keys: [{ signing_key_configured: true, kid: 'gw-test-2', algorithm: 'hs256' }] },
+      {
+        published_keys: Array.from({ length: 5 }, (_, index) => ({
+          signing_key_configured: true,
+          kid: `gw-test-${index + 2}`,
+          algorithm: 'es256',
+        })),
+      },
+      { key_problem: 'invalid_signing_key' },
+      { key_problem: { field: 'caller_assertion.issuer', code: 'invalid_signing_key' } },
+      { key_problem: { field: 'caller_assertion.kid', code: 'key_material_leaked' } },
+      { key_problem: { field: 'caller_assertion.kid' } },
     ];
 
     for (const override of invalid) {

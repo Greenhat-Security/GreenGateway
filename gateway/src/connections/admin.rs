@@ -4,6 +4,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use super::{
+    caller_assertion::CallerAssertionKeyProblem,
     control_plane::ConnectionRuntimeSnapshot,
     model::{
         CallerAssertionAlgorithm, CallerAssertionClaim, ConnectionAuthentication,
@@ -136,6 +137,7 @@ impl SafeSecretAliasView {
                     SecretPurpose::TlsPrivateKey,
                     SecretPurpose::TlsCertificate,
                     SecretPurpose::TlsCaBundle,
+                    SecretPurpose::AssertionSigningKey,
                 ]
             },
             |purpose| vec![purpose],
@@ -318,10 +320,30 @@ pub struct SafeCallerAssertion {
     pub claims: Vec<CallerAssertionClaim>,
     pub bind_request: bool,
     pub bind_approval: bool,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub published_keys: Vec<SafePublishedAssertionKey>,
+    /// Present when this replica leaves the block's keys out of the published
+    /// JWKS: the field configuring the key that cannot be used and a fixed
+    /// code, never the alias or anything about the material. The Connection
+    /// is refused at runtime either way while assertions are not enforced.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub key_problem: Option<CallerAssertionKeyProblem>,
+}
+
+/// A published-only assertion key as the admin API shows it: its `kid` and
+/// algorithm, which the JWKS publishes anyway, and whether its alias is bound.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct SafePublishedAssertionKey {
+    pub signing_key_configured: bool,
+    pub kid: String,
+    pub algorithm: CallerAssertionAlgorithm,
 }
 
 impl SafeConnectionConfiguration {
-    fn from_write(write: &ConnectionWrite) -> Self {
+    fn from_write(
+        write: &ConnectionWrite,
+        caller_assertion_key_problem: Option<CallerAssertionKeyProblem>,
+    ) -> Self {
         Self {
             description: write.description.clone(),
             endpoint: write.endpoint.clone(),
@@ -341,6 +363,16 @@ impl SafeConnectionConfiguration {
                     claims: assertion.claims.clone(),
                     bind_request: assertion.bind_request,
                     bind_approval: assertion.bind_approval,
+                    published_keys: assertion
+                        .published_keys
+                        .iter()
+                        .map(|key| SafePublishedAssertionKey {
+                            signing_key_configured: !key.signing_key_id.is_empty(),
+                            kid: key.kid.clone(),
+                            algorithm: key.algorithm,
+                        })
+                        .collect(),
+                    key_problem: caller_assertion_key_problem,
                 }
             }),
             additional_headers: write
@@ -628,11 +660,15 @@ pub fn managed_detail_view(
     dependencies: Vec<ConnectionDependency>,
     permissions: ConnectionPermissions,
     secret_management_available: bool,
+    caller_assertion_key_problem: Option<CallerAssertionKeyProblem>,
 ) -> ConnectionDetailView {
     let dependency_count = dependencies.len();
     ConnectionDetailView {
         summary: record.safe_summary(status),
-        configuration: Some(SafeConnectionConfiguration::from_write(&record.write)),
+        configuration: Some(SafeConnectionConfiguration::from_write(
+            &record.write,
+            caller_assertion_key_problem,
+        )),
         dependencies,
         actions: ConnectionActions::managed(
             permissions,
@@ -785,8 +821,9 @@ mod tests {
     #[test]
     fn safe_configuration_never_serializes_secret_ids() {
         let write = credentialed_write();
-        let serialized = serde_json::to_string(&SafeConnectionConfiguration::from_write(&write))
-            .expect("safe configuration should serialize");
+        let serialized =
+            serde_json::to_string(&SafeConnectionConfiguration::from_write(&write, None))
+                .expect("safe configuration should serialize");
         assert!(!serialized.contains("billing-secret-id-canary"));
         assert!(!serialized.contains("billing-ca-id-canary"));
         assert!(!serialized.contains("proxy-client-id-canary"));

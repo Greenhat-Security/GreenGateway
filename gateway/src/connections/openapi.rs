@@ -3651,8 +3651,9 @@ paths:
         );
     }
 
-    /// A caller assertion as an operator would configure one. Nothing reads its
-    /// signing key alias: every lane refuses the Connection first.
+    /// A caller assertion as an operator would configure one. Its signing key is
+    /// loaded when the Connection is saved, and nothing signs with it: every
+    /// lane refuses the Connection first.
     fn caller_assertion_json() -> Value {
         json!({
             "signing_key_id": "assertion-signing-key",
@@ -3689,6 +3690,8 @@ paths:
         let database = TemporaryDatabase::new();
         let mut config = Config::test_defaults();
         config.connections_sqlite_path = Some(database.0.display().to_string());
+        let signing_key = crate::connections::test_support::AssertionSigningKeyRoot::new();
+        signing_key.configure(&mut config);
         let control_plane =
             ConnectionControlPlane::from_config(&config).expect("control plane should build");
         let snapshot = control_plane.runtime_snapshot();
@@ -3768,6 +3771,8 @@ paths:
         let database = TemporaryDatabase::new();
         let mut config = Config::test_defaults();
         config.connections_sqlite_path = Some(database.0.display().to_string());
+        let signing_key = crate::connections::test_support::AssertionSigningKeyRoot::new();
+        signing_key.configure(&mut config);
         let control_plane =
             ConnectionControlPlane::from_config(&config).expect("control plane should build");
         let snapshot = control_plane.runtime_snapshot();

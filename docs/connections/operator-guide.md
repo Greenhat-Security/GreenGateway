@@ -363,7 +363,8 @@ Connection carrying a `caller_assertion` block is refused for every tool call,
 proxied request, managed MCP session, OpenAPI or MCP discovery, enum or label
 source fetch, and stored test, before any DNS lookup, secret read, OAuth mint,
 or upstream request, rather than sent without the assertion the operator asked
-for.
+for. Its keys are already live, though: a save checks them, and their public
+halves are published (see [The published JWKS](#the-published-jwks)).
 
 The refusal reason is the fixed string `caller_assertion_not_enforced`. Where
 it appears depends on the lane:
@@ -396,7 +397,7 @@ the block to publish it again. Managed MCP tools stay listed, and every call to
 one is refused.
 
 The admin UI shows the block read only, on the Connection detail page and in
-the editor: every field except the signing key alias, which appears only as
+the editor: every field except the key aliases, which appear only as
 configured or not, with a note that the block is accepted but not yet enforced
 and that the Connection is refused. The UI has no controls for the block and
 never sends it. A replacement (`PUT`) that omits `caller_assertion` keeps the
@@ -411,6 +412,190 @@ deliberately: send `"caller_assertion": null` in a `PUT` through the admin API.
 New and replacement writes also reject `bind_approval: true`, because no
 approval subsystem exists for a mutation to be bound to, and an assertion
 `header_name` that matches any additional header name regardless of case.
+
+A caller assertion binds private keys, so it is credential authority: creating
+a Connection that carries one, deleting it, and any change to the block,
+including removing it with `null`, needs `admin:connections:secrets:write` as
+well as `admin:connections:write`. So does changing the endpoint or test
+target of a Connection that carries one, as for any Connection with credential
+bindings. A routine save that keeps the block exactly as stored, such as a
+rename, does not.
+
+#### Signing keys
+
+The block's keys are live even though nothing signs with them yet. The
+`signing_key_id` and the `signing_key_id` of each entry in `published_keys`
+name a secret alias that must hold exactly one PKCS#8 PEM private key block
+(`-----BEGIN PRIVATE KEY-----`, at most 16 KiB): a P-256 key for `es256`, or an
+RSA key of at least 2048 bits for `rs256`. A PKCS#1 (`BEGIN RSA PRIVATE KEY`)
+or SEC1 (`BEGIN EC PRIVATE KEY`) key, an encrypted key, a public key, a
+certificate, and any second PEM block beside the key are refused. Commentary
+outside the block is allowed. `openssl genpkey` writes the accepted form:
+
+```sh
+openssl genpkey -algorithm EC -pkeyopt ec_paramgen_curve:P-256 -out assertion-es256.pem
+openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:3072 -out assertion-rs256.pem
+```
+
+Keep a key behind an operator alias or an external secret provider. The
+encrypted local store cannot hold one: its schema predates the
+`assertion_signing_key` purpose, and a local create for that purpose is
+refused before anything is written.
+
+Saving an enabled Connection checks every key it configures. Operator aliases
+are read and loaded on the save itself; an alias behind a network provider is
+read and loaded by the admin API before the save, the same pass that resolves
+every other deferred binding. A key that cannot be used refuses the save with
+`422` and a problem naming the field and one of these codes:
+
+| Code | Meaning |
+| --- | --- |
+| `unresolvable_binding` | The alias is not configured, is unknown to its source, is refused by it, or holds material that is not valid for a signing key. |
+| `invalid_signing_key` | The material is not exactly one PKCS#8 `PRIVATE KEY` block. |
+| `algorithm_mismatch` | The material is a usable key for the other algorithm, so `algorithm` is wrong. |
+| `unusable_signing_key` | The key cannot sign with the configured algorithm: an EC key on another curve, an RSA key under 2048 bits, or malformed key material. |
+| `duplicate_kid` | Another enabled Connection on this replica publishes a different key under the same `kid`. Two Connections may share one key: the same alias, `kid` and algorithm. |
+
+A source that cannot be read at that moment answers `503` instead, and the save
+can be retried. None of these responses, logs or admin views carries the alias,
+the material or anything derived from it.
+
+#### The published JWKS
+
+The public half of every key an enabled Connection signs with or publishes is
+served as one JWK Set at `GET /.well-known/caller-assertion-jwks.json`. The
+path is deliberately not `/.well-known/jwks.json`, which an upstream behind the
+gateway may publish for itself.
+
+- It is public. A verifier holds no gateway credential, so the path is always
+  exempt from authentication and RBAC, whatever `AUTH_EXEMPT_PATHS` and
+  `RBAC_EXEMPT_PATHS` say, and it is gateway-owned: a proxy route never answers
+  it, even one at `/`. It is served on the data listener, which is the only
+  listener when the admin surface shares it, and not on a separate admin
+  listener. It is served whether or not any Connection attests its caller
+  (`{"keys":[]}` when none does), and there is no setting that turns it off.
+  It exposes each published `kid`, its algorithm and how many keys there are.
+- It carries public members only: `kty`, `crv`, `x` and `y` for an ES256 key,
+  `kty`, `n` and `e` for an RS256 key, plus `kid`, `alg` and `use: "sig"`. The
+  public half is derived from the private key rather than configured beside it,
+  and is re-encoded from that fixed member list, so no private parameter can
+  reach the document.
+- It is one set for the whole gateway. A key two Connections share is
+  published once. Any principal who can bind a caller assertion can therefore
+  add a key every verifier of this set will trust, so a verifier must pin the
+  `iss` and `aud` it expects, and each upstream should be given its own
+  `audience`.
+- A response carries `Cache-Control: public, max-age=300` and a strong `ETag`;
+  a request with a matching `If-None-Match` is answered `304 Not Modified`.
+- The gateway reads the keys again when the set of configured keys changes (a
+  save or reconcile that adds, removes or disables one) and otherwise every
+  300 seconds, so a change of material behind an alias reaches a verifier that
+  honours `max-age` within about 600 seconds. A set that left a Connection out
+  is read again every 30 seconds, and a save of a Connection rebuilds that
+  replica's set at the next fetch, so a repaired key comes back promptly.
+  However often the set is fetched, the gateway reads each alias at most once
+  per build, and a fetch that arrives while the set is being rebuilt for the
+  same keys is answered from the previous build rather than held on the secret
+  provider.
+- After a refresh fails to read a key, the gateway does not keep publishing
+  what that key held before: the material behind an alias that is not pinned to
+  a version may have changed, and the gateway never uses what such an alias
+  held as a fallback once it can no longer read it. That Connection is left out
+  of the set until a refresh reads the key again. Verifiers should keep their
+  last good copy when a fetch fails.
+- A fetch that has no set built from the current configuration waits up to 10
+  seconds for a build in progress, then gets `503` with
+  `Cache-Control: no-store`, so a verifier keeps the set it already holds.
+
+A Connection publishes all of its keys or none of them. Its keys are left out
+when one of its aliases is not configured, cannot be read, or does not hold a
+usable key for its algorithm, and when it publishes a `kid` that another
+enabled Connection publishes for a different key; the save check above
+prevents that, but two replicas can each admit one side of it concurrently,
+and a document stored before the check was never held to it, so both
+Connections are left out. Every other Connection's keys are still published.
+
+When a Connection's keys are left out, the gateway logs a warning,
+`an enabled Connection's caller-assertion keys cannot all be used; its keys are
+left out of the published JWKS and the Connection stays refused`, with
+`connection_id`, `field` and `code`, when it first finds the problem and
+whenever the problem changes. The Connection's admin detail reports the same
+pair as `configuration.caller_assertion.key_problem`, and the admin UI shows it
+as "Keys not published". The codes are those in the table above, plus
+`binding_unavailable` when the key's source could not be read. Startup and a
+cluster reconcile read the keys behind operator aliases; a key behind a network
+provider is only checked there for being configured, and is first read when
+the set is built.
+
+#### Stored Connections whose keys cannot be used
+
+A stored Connection whose keys cannot be used never stops the gateway starting
+and never fails a cluster reconcile. Its keys are left out of the JWKS, the
+problem is logged and shown as above, and the Connection stays refused on every
+lane with `caller_assertion_not_enforced`, exactly as before. Startup and
+reconcile still refuse a stored Connection whose other bindings this replica
+cannot resolve, as they always have.
+
+A save is held to the stricter rule. A save that keeps such a Connection
+enabled checks its keys again and is refused until they are usable, including
+an admin UI save of another field, because the UI keeps the stored block. To
+clear the problem, do one of these:
+
+- Put a usable key behind the alias and save the Connection again. The set
+  includes its keys from the next fetch.
+- Disable the Connection. A disabled Connection publishes nothing, and saving
+  it needs no key.
+- Remove the block with `"caller_assertion": null`, which needs
+  `admin:connections:secrets:write`.
+
+#### Upgrade note: caller assertions stored by earlier releases
+
+Earlier releases stored a `caller_assertion` block without reading its signing
+key, so an enabled Connection may carry an alias that is not configured, a
+placeholder, or a key in a format this release refuses. After upgrading:
+
+- The gateway starts, and a cluster reconcile succeeds, as before. Each such
+  Connection publishes no keys, reports `key_problem`, logs the warning above,
+  and stays refused with `caller_assertion_not_enforced`.
+- Its next save is stricter. A save that keeps it enabled, including an admin
+  UI save of another field, loads its keys and is refused with `422` and the
+  field and code until they are usable.
+- Creating, deleting, or changing a Connection's `caller_assertion`, including
+  removing it, now needs `admin:connections:secrets:write`.
+
+Before or after upgrading, put a real PKCS#8 key behind each enabled attested
+Connection's aliases, disable the Connection, or remove its block.
+`GET /v1{ADMIN_PREFIX}/connections/{id}` reports
+`configuration.caller_assertion.key_problem` for every Connection that still
+needs attention, and the admin UI shows it on the Connection's page.
+
+#### Rotating a signing key
+
+The JWKS lets a key rotate without a flag day, provided every verifier holds a
+key before anything is signed with it, and still holds it until everything it
+signed has expired:
+
+1. Put the next key behind a new alias. Add it to `published_keys` with a new
+   `kid` and its algorithm, and save.
+2. Wait at least 300 seconds, the JWKS `max-age`, so every verifier that
+   honours it has fetched the next key before it signs anything. Wait longer if
+   a verifier caches the set for longer.
+3. In one `PUT`, make the next key the signing key (`signing_key_id`, `kid` and
+   `algorithm`) and move the previous signing key into `published_keys`.
+4. Keep the previous key published for at least `lifetime_seconds` plus the
+   verifiers' cache time, 300 seconds for one that honours `max-age`, so every
+   assertion it signed has expired before a verifier drops it. Then remove it
+   from `published_keys` and save.
+5. Never change the material behind an alias or `kid` that is published. A
+   verifier caches keys by `kid` and would reject what the new material signs
+   until its cache expires. To retire a compromised key, remove it from the
+   block, which withdraws it at the next fetch, and publish a new key under a
+   new `kid`.
+
+The gateway does not enforce these waits yet. Nothing signs until request-path
+injection ships, so today the steps only shape what the JWKS publishes; follow
+them now so a rotation started before enforcement is already safe when it
+arrives.
 
 ## TLS, Custom CAs, and Mutual TLS
 

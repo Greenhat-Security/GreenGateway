@@ -2162,23 +2162,27 @@ async fn connection_tool_checks_egress_before_reading_the_secret_provider() {
 #[tokio::test]
 async fn connection_tool_with_unenforced_caller_assertion_is_refused_before_any_io() {
     // The Connection is otherwise fully usable: the upstream is reachable and
-    // allowlisted and both secrets resolve. Only the assertion it asks for,
+    // allowlisted and both secrets resolve -- the signing key is a real key,
+    // loaded when the Connection was saved. Only the assertion it asks for,
     // which nothing injects yet, may stop the call.
     const API_KEY_CANARY: &str = "assertion-test-api-key-canary";
-    const SIGNING_KEY_CANARY: &str = "assertion-test-signing-key-canary";
+    let signing_key = crate::connections::test_support::generated_es256_pem();
+    let mut canaries = vec![API_KEY_CANARY];
+    canaries.extend(crate::connections::test_support::pem_body_lines(
+        &signing_key,
+    ));
     let (addr, ca_pem, server) = one_request_tls_server().await;
     let (connection, secrets) = TemporaryStaticAuthRuntime::header_api_key_with_caller_assertion(
         addr,
         &ca_pem,
         API_KEY_CANARY.as_bytes(),
-        SIGNING_KEY_CANARY.as_bytes(),
+        signing_key.as_bytes(),
     )
     .await;
-    assert_eq!(
-        secrets.resolutions(),
-        0,
-        "setting up the Connection must not read its secrets"
-    );
+    // Saving read each secret exactly once: the API key, and the signing key
+    // it loaded. Everything after this is measured against that count.
+    let saved = secrets.resolutions();
+    assert_eq!(saved, 2, "saving the Connection reads each secret once");
     let capture = CaptureSink::new();
     let audit = AuditLog::new(Arc::new(capture.clone()) as Arc<dyn AuditSink>);
     let runtime = ToolRuntime::new(
@@ -2208,7 +2212,7 @@ async fn connection_tool_with_unenforced_caller_assertion_is_refused_before_any_
         panic!("the refusal should surface as a work failure");
     };
     assert_eq!(reason.as_deref(), Some("caller_assertion_not_enforced"));
-    for canary in [API_KEY_CANARY, SIGNING_KEY_CANARY] {
+    for canary in &canaries {
         assert!(
             !message.contains(canary),
             "the caller error leaked {canary}"
@@ -2243,16 +2247,16 @@ async fn connection_tool_with_unenforced_caller_assertion_is_refused_before_any_
     );
     assert_eq!(upstream.payload["upstream_status"], Value::Null);
     let rendered = serde_json::to_string(&events).expect("events should serialize");
-    for canary in [API_KEY_CANARY, SIGNING_KEY_CANARY] {
+    for canary in &canaries {
         assert!(!rendered.contains(canary), "the audit leaked {canary}");
     }
 
     // Both secrets sit behind a provider that counts every resolution, so
-    // "never consulted" is a count of zero rather than the absence of an
-    // event that a successful read would not raise either.
+    // "never consulted" is no read beyond the save's rather than the absence
+    // of an event that a successful read would not raise either.
     assert_eq!(
         secrets.resolutions(),
-        0,
+        saved,
         "no secret provider may be consulted for a refused Connection"
     );
     assert!(
@@ -2270,7 +2274,7 @@ async fn connection_tool_with_unenforced_caller_assertion_is_refused_before_any_
         .await
         .expect("the counting provider should serve the API key");
     assert_eq!(resolved.expose(), API_KEY_CANARY.as_bytes());
-    assert_eq!(secrets.resolutions(), 1);
+    assert_eq!(secrets.resolutions(), saved + 1);
     assert!(
         tokio::time::timeout(Duration::from_millis(100), server)
             .await
@@ -2288,9 +2292,11 @@ async fn composite_leaf_on_unenforced_caller_assertion_is_refused_before_member_
         addr,
         &ca_pem,
         b"composite-key",
-        b"composite-signing-key",
+        crate::connections::test_support::generated_es256_pem().as_bytes(),
     )
     .await;
+    let saved = secrets.resolutions();
+    assert_eq!(saved, 2, "saving the Connection reads each secret once");
     let definitions = composite_note_definitions(&connection.connection_id);
     let (executor, capture) = executor_for_composite_definitions(
         definitions,
@@ -2344,7 +2350,7 @@ async fn composite_leaf_on_unenforced_caller_assertion_is_refused_before_member_
     assert_eq!(failure.payload["failure_reason"], json!("composite_failed"));
     assert_eq!(
         secrets.resolutions(),
-        0,
+        saved,
         "a refused composite leaf must not consult a secret provider"
     );
     assert!(
@@ -6495,7 +6501,9 @@ impl TemporaryStaticAuthRuntime {
     /// A header-API-key Connection that also asks for a signed caller
     /// assertion. Its API key and the assertion's signing key are served by
     /// the returned counting provider rather than by files, so a test can
-    /// prove that neither was ever read.
+    /// count every read. The signing key must be a real PKCS#8 key: the
+    /// Connection is saved the way the admin API saves it, which resolves
+    /// both secrets once and loads the key.
     async fn header_api_key_with_caller_assertion(
         addr: SocketAddr,
         ca_pem: &str,
@@ -6580,6 +6588,7 @@ impl TemporaryStaticAuthRuntime {
             claims: Vec::new(),
             bind_request: false,
             bind_approval: false,
+            published_keys: Vec::new(),
         });
 
         let mut config = Config::test_defaults();
@@ -6597,38 +6606,45 @@ impl TemporaryStaticAuthRuntime {
                 Arc::clone(secrets) as Arc<dyn SecretResolver>
             ]);
         }
+        let write = ConnectionWrite {
+            display_name: "Billing API".to_owned(),
+            description: None,
+            enabled: true,
+            kind: ConnectionKind::HttpApi,
+            endpoint: ConnectionEndpoint {
+                base_url: format!("https://127.0.0.1:{}", addr.port()),
+                base_path: "/v1".to_owned(),
+            },
+            authentication: ConnectionAuthentication::HeaderApiKey {
+                header_name: "x-api-key".to_owned(),
+                secret_id: Some("billing-api-key".to_owned()),
+            },
+            caller_assertion,
+            additional_headers: additional
+                .iter()
+                .map(|(header_name, alias_id, _)| AdditionalHeader {
+                    header_name: (*header_name).to_owned(),
+                    secret_id: Some((*alias_id).to_owned()),
+                })
+                .collect(),
+            tls: TlsProfile::default(),
+            timeouts: None,
+            discovery: None,
+            test_profile: None,
+        };
+        // The admin API resolves every binding a network provider owns before
+        // it saves, which for a counted Connection is both secrets, and loads
+        // the signing key for its algorithm. Saving through the same pass is
+        // what proves the generated key is a usable one.
+        if counted_assertion.is_some() {
+            control_plane
+                .ensure_deferred_bindings_resolvable(&write)
+                .await
+                .expect("the counted secrets should resolve, and the signing key load");
+        }
         let initial = control_plane.runtime_snapshot();
         let created = control_plane
-            .create_managed(
-                initial.collection_etag(),
-                ConnectionWrite {
-                    display_name: "Billing API".to_owned(),
-                    description: None,
-                    enabled: true,
-                    kind: ConnectionKind::HttpApi,
-                    endpoint: ConnectionEndpoint {
-                        base_url: format!("https://127.0.0.1:{}", addr.port()),
-                        base_path: "/v1".to_owned(),
-                    },
-                    authentication: ConnectionAuthentication::HeaderApiKey {
-                        header_name: "x-api-key".to_owned(),
-                        secret_id: Some("billing-api-key".to_owned()),
-                    },
-                    caller_assertion,
-                    additional_headers: additional
-                        .iter()
-                        .map(|(header_name, alias_id, _)| AdditionalHeader {
-                            header_name: (*header_name).to_owned(),
-                            secret_id: Some((*alias_id).to_owned()),
-                        })
-                        .collect(),
-                    tls: TlsProfile::default(),
-                    timeouts: None,
-                    discovery: None,
-                    test_profile: None,
-                },
-                "test-admin",
-            )
+            .create_managed(initial.collection_etag(), write, "test-admin")
             .await
             .expect("test Connection should create");
         let mut egress_config = EgressConfig {
