@@ -2,7 +2,7 @@
 
 Issue #430 covers dependency installation in both npm projects, Cargo's embedded
 UI build, Docker and CI. Node and npm versions come from `build-tools.json`;
-the capability fixture must run on that exact npm (currently 11.19.1).
+the capability fixture must run on that exact npm (currently 11.20.0).
 
 ## Reviewed inventory
 
@@ -16,7 +16,7 @@ integrity and read without extracting or executing their contents.
 | Package | Projects | Published lifecycle behavior | Decision |
 | --- | --- | --- | --- |
 | esbuild 0.28.2 | root | `postinstall: node install.js`; selects a platform binary, may rewrite its launcher, validates the version, and can invoke npm or fetch a fallback binary | Deny; use the locked platform optional dependency |
-| workerd 1.20261006.1 | root | `postinstall: node install.js`; selects and validates the native binary, optimizes its launcher, and can fetch a fallback binary | Deny; use the locked platform optional dependency |
+| workerd 1.20261012.1 | root | `postinstall: node install.js`; selects and validates the native binary, optimizes its launcher, and can fetch a fallback binary | Deny; use the locked platform optional dependency |
 | fsevents 2.3.3 | root, admin-ui | Lockfile flags install scripts, but the published archive has no install hook or `binding.gyp`; explicit build/prepublish scripts compile the Darwin addon | Deny conservatively; optional Darwin-only watcher |
 
 Esbuild is locked only by the root package since Vite 8 replaced it with
@@ -99,8 +99,9 @@ itself, so the override was removed; a future Miniflare that regresses Sharp
 would need a new, version-limited override. Wrangler 4.148.0 and earlier pin a
 Miniflare whose Sharp is older than `0.35.5`, the fix for its bundled librsvg
 advisory [GHSA-wq5f-xc86-pv6w](https://github.com/advisories/GHSA-wq5f-xc86-pv6w);
-Wrangler 4.149.0 (Miniflare `5.20261006.1-alpha`) depends on Sharp `0.35.5`
-itself, so no override is needed. Both lockfiles select source-map-js `1.2.2`,
+Wrangler 4.149.0 (Miniflare `5.20261006.1-alpha`) and the current 4.151.0
+(Miniflare `5.20261012.0-beta`) depend on Sharp `0.35.5` themselves, so no
+override is needed. Both lockfiles select source-map-js `1.2.2`,
 past [GHSA-68fv-2mgg-jv7q](https://github.com/advisories/GHSA-68fv-2mgg-jv7q),
 and both npm projects use Vitest `5.0.3` or later, past the fix for
 [GHSA-82fw-gwwq-j7x9](https://github.com/advisories/GHSA-82fw-gwwq-j7x9),
