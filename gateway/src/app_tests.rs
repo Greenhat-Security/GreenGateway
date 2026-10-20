@@ -12772,8 +12772,9 @@ async fn caller_assertion_refusals_are_conflicts_with_their_own_reason() {
     }
 }
 
-/// A caller assertion as an operator would send one. Nothing reads its
-/// signing key alias: every lane refuses the Connection first.
+/// A caller assertion as an operator would send one. Saving it loads the key
+/// behind its alias, which [`attested_connection_admin_router`] provides;
+/// nothing signs with it, because every lane refuses the Connection first.
 fn admin_caller_assertion_json() -> Value {
     json!({
         "signing_key_id": "assertion-signing-key",
@@ -12790,7 +12791,8 @@ fn admin_caller_assertion_json() -> Value {
 }
 
 /// Create `body` with a caller assertion through the admin API, returning
-/// the new Connection's ID and ETag.
+/// the new Connection's ID and ETag. Binding a caller assertion binds secret
+/// material, so the creator holds secrets-write as well.
 async fn create_attested_connection(router: &Router, mut body: Value) -> (String, String) {
     body["caller_assertion"] = admin_caller_assertion_json();
     let list = router
@@ -12816,7 +12818,7 @@ async fn create_attested_connection(router: &Router, mut body: Value) -> (String
         .oneshot(connection_admin_request(
             Method::POST,
             CONNECTIONS_ADMIN_ROUTE,
-            Some(test_principal(&["connections-editor"])),
+            Some(test_principal(&["connections-secrets-editor"])),
             Some(body.to_string()),
             Some(&collection_etag),
             true,
@@ -12846,7 +12848,7 @@ async fn attested_connection_catalog_operations_are_conflicts_over_http() {
     let policy = TempPolicyFile::new(&connection_policy_document_string());
     let capture = audit::sink::tests::CaptureSink::new();
     let audit_log = audit::AuditLog::new(Arc::new(capture.clone()) as Arc<dyn audit::AuditSink>);
-    let router = connection_admin_router(&connection_db, &policy, audit_log);
+    let router = attested_connection_admin_router(&connection_db, &policy, audit_log);
 
     let openapi_body: Value =
         serde_json::from_str(&managed_openapi_connection_body("Attested OpenAPI"))
@@ -12983,7 +12985,7 @@ async fn a_routine_admin_ui_save_keeps_the_caller_assertion_byte_for_byte() {
     // to come back with the same block, byte for byte.
     let connection_db = TempDb::new("connection-caller-assertion-ui-save");
     let policy = TempPolicyFile::new(&connection_policy_document_string());
-    let router = connection_admin_router(&connection_db, &policy, test_audit_log());
+    let router = attested_connection_admin_router(&connection_db, &policy, test_audit_log());
     let connection_body: Value =
         serde_json::from_str(&managed_openapi_connection_body("Attested API"))
             .expect("managed OpenAPI body should parse");
@@ -13071,13 +13073,28 @@ async fn a_routine_admin_ui_save_keeps_the_caller_assertion_byte_for_byte() {
     );
 
     // The same body with an explicit `null` is the deliberate removal the
-    // admin UI never sends.
+    // admin UI never sends. It withdraws the Connection's keys from the JWKS
+    // and lifts its refusal, so like any change to the block it needs
+    // secrets-write: the editor that could rename the Connection cannot.
     ui_save["caller_assertion"] = Value::Null;
-    let removed = router
+    let refused = router
+        .clone()
         .oneshot(connection_admin_request(
             Method::PUT,
             &uri,
             Some(test_principal(&["connections-editor"])),
+            Some(ui_save.to_string()),
+            Some(&saved_etag),
+            true,
+        ))
+        .await
+        .expect("explicit removal without secrets-write should complete");
+    assert_eq!(refused.status(), StatusCode::FORBIDDEN);
+    let removed = router
+        .oneshot(connection_admin_request(
+            Method::PUT,
+            &uri,
+            Some(test_principal(&["connections-secrets-editor"])),
             Some(ui_save.to_string()),
             Some(&saved_etag),
             true,
@@ -26636,6 +26653,50 @@ fn connection_admin_router_with_prefix(
     audit_log: audit::AuditLog,
     admin_prefix: &str,
 ) -> Router {
+    let config = connection_admin_config(connection_db, policy, admin_prefix);
+    let recorder = PrometheusBuilder::new().build_recorder();
+
+    app(
+        config,
+        recorder.handle(),
+        audit_log,
+        test_audit_event_sender(),
+    )
+    .expect("connection admin app should build")
+}
+
+/// The connection admin router, with an operator alias holding a generated
+/// caller-assertion signing key under the alias [`admin_caller_assertion_json`]
+/// binds. Saving an enabled Connection loads its key, so an attested
+/// Connection only saves where a real key sits behind the alias.
+fn attested_connection_admin_router(
+    connection_db: &TempDb,
+    policy: &TempPolicyFile,
+    audit_log: audit::AuditLog,
+) -> Router {
+    let mut config = connection_admin_config(connection_db, policy, config::DEFAULT_ADMIN_PREFIX);
+    config
+        .connection_secret_aliases
+        .push(connections::test_support::write_assertion_signing_key(
+            &connection_db.path.with_extension("secrets"),
+            &connections::test_support::generated_es256_pem(),
+        ));
+    let recorder = PrometheusBuilder::new().build_recorder();
+
+    app(
+        config,
+        recorder.handle(),
+        audit_log,
+        test_audit_event_sender(),
+    )
+    .expect("attested connection admin app should build")
+}
+
+fn connection_admin_config(
+    connection_db: &TempDb,
+    policy: &TempPolicyFile,
+    admin_prefix: &str,
+) -> config::Config {
     let secret_root = connection_db.path.with_extension("secrets");
     fs::create_dir_all(&secret_root).expect("connection test secret root should create");
     let secret_file = secret_root.join("credential-token");
@@ -26680,15 +26741,7 @@ fn connection_admin_router_with_prefix(
     config
         .rbac_exempt_paths
         .push(admin_routes.connection_secrets_route);
-    let recorder = PrometheusBuilder::new().build_recorder();
-
-    app(
-        config,
-        recorder.handle(),
-        audit_log,
-        test_audit_event_sender(),
-    )
-    .expect("connection admin app should build")
+    config
 }
 
 fn connection_admin_request(

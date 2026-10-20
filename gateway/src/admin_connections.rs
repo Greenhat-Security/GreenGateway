@@ -659,6 +659,7 @@ pub(super) async fn connection_get_endpoint(
                 dependencies,
                 permissions,
                 state.control_plane.is_local_secret_manager_configured(),
+                state.control_plane.caller_assertion_key_problem(&record),
             )),
         )
             .into_response();
@@ -795,6 +796,7 @@ pub(super) async fn connection_create_endpoint(
                 Vec::new(),
                 permissions,
                 state.control_plane.is_local_secret_manager_configured(),
+                state.control_plane.caller_assertion_key_problem(&created),
             )),
         )
             .into_response(),
@@ -944,6 +946,7 @@ pub(super) async fn connection_put_endpoint(
                 dependencies,
                 permissions,
                 state.control_plane.is_local_secret_manager_configured(),
+                state.control_plane.caller_assertion_key_problem(&updated),
             )),
         )
             .into_response(),

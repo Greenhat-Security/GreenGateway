@@ -2,9 +2,10 @@
 //!
 //! An upstream verifying caller assertions holds no gateway credential: it fetches the published
 //! set anonymously, caches it, and verifies tokens against the keys in it. These tests drive that
-//! from the outside -- Connections saved before the gateway starts, so loading them is what
-//! resolves their keys -- and check what the set publishes, what it withholds, and that nothing
-//! about the private keys reaches a response or an audit event. Keys are generated per test.
+//! from the outside -- Connections saved before the gateway starts, so the set is built from what
+//! a restarted gateway loaded -- and check what the set publishes, what it leaves out, and that
+//! nothing about the private keys reaches a response or an audit event. Keys are generated per
+//! test.
 
 use super::*;
 use crate::connections::{
@@ -168,7 +169,7 @@ async fn upstreams_fetch_the_published_keys_without_a_credential_and_verify_what
         keys.alias("key-disabled", &disabled_pem),
     ];
 
-    // Saved before the gateway starts, as after a restart: loading them resolves their keys. The
+    // Saved before the gateway starts, as after a restart, so the set reads their keys anew. The
     // enabled Connection signs with an ES256 key and already publishes the RS256 key it will
     // rotate to; the disabled one publishes nothing.
     {
@@ -326,6 +327,62 @@ async fn upstreams_fetch_the_published_keys_without_a_credential_and_verify_what
             "the audit trail leaked key material"
         );
     }
+}
+
+#[tokio::test]
+async fn a_stored_connection_whose_key_cannot_be_used_does_not_stop_the_gateway() {
+    // The upgrade case: #556 stored caller assertions whatever their alias held. The gateway has to
+    // start, keep publishing every other Connection's keys, and leave only the broken one out.
+    let keys = KeyRoot::new();
+    let healthy_pem = generated_es256_pem();
+    let mut config = test_config(Vec::new());
+    config.connections_sqlite_path =
+        Some(keys.root.join("connections.sqlite").display().to_string());
+    config.connection_secrets_root = Some(SecretRootConfig::new(keys.root.clone()));
+    config.connection_secret_aliases = vec![
+        keys.alias("key-healthy", &healthy_pem),
+        keys.alias("key-broken", &generated_es256_pem()),
+    ];
+    {
+        let control_plane =
+            ConnectionControlPlane::from_config(&config).expect("control plane should build");
+        for (alias, kid) in [("key-healthy", "gw-healthy"), ("key-broken", "gw-broken")] {
+            let snapshot = control_plane.runtime_snapshot();
+            let write: ConnectionWrite =
+                serde_json::from_value(attested(alias, kid, "es256", json!([])))
+                    .expect("attested Connection should deserialize");
+            control_plane
+                .create_managed(snapshot.collection_etag(), write, "test-admin")
+                .await
+                .expect("attested Connection should create");
+        }
+    }
+    // The key behind one alias stops being a key before the gateway starts again.
+    fs::write(keys.root.join("key-broken"), "not a key").expect("the broken key should write");
+
+    let router = app(
+        config,
+        PrometheusBuilder::new().build_recorder().handle(),
+        test_audit_log(),
+        test_audit_event_sender(),
+    )
+    .expect("an unusable caller-assertion key must not stop the gateway starting");
+    let response = router
+        .oneshot(jwks_request())
+        .await
+        .expect("JWKS request should complete");
+    assert_eq!(response.status(), StatusCode::OK);
+    let document: Value =
+        serde_json::from_str(&body_string(response).await).expect("the JWKS is JSON");
+    assert_eq!(
+        document["keys"]
+            .as_array()
+            .expect("the JWKS has a key array")
+            .iter()
+            .map(|key| key["kid"].as_str().unwrap_or_default())
+            .collect::<Vec<_>>(),
+        vec!["gw-healthy"]
+    );
 }
 
 #[tokio::test]

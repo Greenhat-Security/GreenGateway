@@ -348,8 +348,10 @@ pub(super) async fn oauth_protected_resource_metadata_endpoint(
 /// gateway credential, and the document carries public keys only. It is
 /// cacheable for the lifetime the rotation procedure waits out, and carries a
 /// strong entity tag so a verifier revalidates with `If-None-Match` instead of
-/// downloading the set again. When the set cannot be built the gateway says so
-/// with `503` and `no-store`, rather than publishing part of it.
+/// downloading the set again. A Connection whose keys cannot be used is left
+/// out of the set rather than withholding everyone's keys. Only when no set
+/// built from the current configuration can be served in time does the
+/// gateway answer `503` with `no-store`, so a verifier keeps what it holds.
 pub(super) async fn caller_assertion_jwks_endpoint(
     State(state): State<AppState>,
     headers: HeaderMap,

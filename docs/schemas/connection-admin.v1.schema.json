@@ -89,6 +89,33 @@
               "algorithm": { "enum": ["es256", "rs256"] }
             }
           }
+        },
+        "key_problem": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["field", "code"],
+          "description": "Present only when this replica leaves the block's keys out of the published JWKS, from its last check of exactly these keys: at startup, at a cluster reconcile, or in the last JWKS build. A Connection publishes all of its keys or none. field names where the key that cannot be used is configured and code says why; neither carries the alias or anything about the material. The Connection is refused at runtime either way while caller assertions are not enforced. A save that keeps the block enabled checks its keys again and is refused while one still cannot be used.",
+          "properties": {
+            "field": {
+              "enum": [
+                "caller_assertion.signing_key_id",
+                "caller_assertion.published_keys.signing_key_id",
+                "caller_assertion.kid",
+                "caller_assertion.published_keys.kid"
+              ]
+            },
+            "code": {
+              "enum": [
+                "unresolvable_binding",
+                "binding_unavailable",
+                "invalid_signing_key",
+                "algorithm_mismatch",
+                "unusable_signing_key",
+                "duplicate_kid"
+              ],
+              "description": "unresolvable_binding: the alias is not configured, unknown to its source, refused by it, or holds material that is not a key. binding_unavailable: the source could not be read, and the key returns once it can. invalid_signing_key: not exactly one PKCS#8 PEM block. algorithm_mismatch: a usable key of the other algorithm. unusable_signing_key: not a P-256 key for es256 or an RSA key of at least 2048 bits for rs256. duplicate_kid: another enabled Connection publishes a different key under this kid."
+            }
+          }
         }
       }
     },

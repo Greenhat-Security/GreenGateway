@@ -294,11 +294,28 @@ impl AssertionSigningKey {
     }
 }
 
+/// The opening marker of every PEM block, whatever its label.
+const PEM_BEGIN_MARKER: &[u8] = b"-----BEGIN";
+
 /// Whether `material` is exactly one PEM `PRIVATE KEY` (PKCS#8) block and nothing else PEM-shaped.
 ///
-/// Every decoded block is held in a zeroizing buffer, so the private key bytes this sees are wiped
-/// when it returns.
+/// The parser underneath skips any block whose label it does not know -- an `ENCRYPTED PRIVATE
+/// KEY`, an `OPENSSH PRIVATE KEY`, an `RSA PUBLIC KEY` -- so counting the blocks it returns would
+/// let one of those sit beside the key unnoticed. Every opening marker is counted in the raw
+/// material first, and there must be exactly one.
+///
+/// Each block this decodes is dropped into a zeroizing buffer, so that copy of the key is wiped
+/// when it returns. That is the only copy this function controls: the parser's own line and
+/// base64 buffers, and the second parse `jsonwebtoken` makes when the key is loaded, are not
+/// zeroized.
 fn is_single_pkcs8_private_key(material: &[u8]) -> bool {
+    let begin_markers = material
+        .windows(PEM_BEGIN_MARKER.len())
+        .filter(|window| *window == PEM_BEGIN_MARKER)
+        .count();
+    if begin_markers != 1 {
+        return false;
+    }
     let mut reader = material;
     let mut private_keys = 0usize;
     loop {
@@ -390,6 +407,26 @@ impl SigningKeyRejection {
             Self::Unusable => "unusable_signing_key",
         }
     }
+}
+
+/// The key's alias is not configured, is unknown to its source, is refused by it, or holds material
+/// that is not valid for a signing key.
+pub const KEY_PROBLEM_UNRESOLVABLE: &str = "unresolvable_binding";
+/// The key's secret source could not be read: missing, busy, unsafe, or failing.
+pub const KEY_PROBLEM_UNAVAILABLE: &str = "binding_unavailable";
+/// Another enabled Connection publishes a different key under the same `kid`.
+pub const KEY_PROBLEM_DUPLICATE_KID: &str = "duplicate_kid";
+
+/// Why one Connection's caller-assertion keys are left out of the published JWKS.
+///
+/// `field` is where the key that cannot be used is configured, and `code` is one of the
+/// [`SigningKeyRejection`] codes, [`KEY_PROBLEM_UNRESOLVABLE`], [`KEY_PROBLEM_UNAVAILABLE`] or
+/// [`KEY_PROBLEM_DUPLICATE_KID`]. Neither says anything about the alias or the material, so this is
+/// safe to log and to show to an operator.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct CallerAssertionKeyProblem {
+    pub field: &'static str,
+    pub code: &'static str,
 }
 
 /// Loads `material` as the key published under `kid` for `algorithm`, or says why it cannot be.

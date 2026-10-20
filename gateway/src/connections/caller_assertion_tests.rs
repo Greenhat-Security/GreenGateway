@@ -887,6 +887,11 @@ fn an_algorithm_mismatch_is_reported_as_one() {
     assert_eq!(SigningKeyRejection::Unusable.code(), "unusable_signing_key");
 }
 
+/// A well-formed PEM block under `label`, carrying bytes that are not a key.
+fn foreign_block(label: &str) -> String {
+    format!("-----BEGIN {label}-----\nAAAAAAAAAAAAAAAA\n-----END {label}-----\n")
+}
+
 #[test]
 fn material_that_is_not_exactly_one_pkcs8_private_key_is_refused() {
     let pair = es256_pair();
@@ -905,6 +910,11 @@ fn material_that_is_not_exactly_one_pkcs8_private_key_is_refused() {
         // Two keys, or a key with a certificate: which one would sign is not this gateway's guess.
         format!("{pem}{}", es256_pair().serialize_pem()),
         format!("{pem}{certificate}"),
+        // Blocks the PEM parser does not recognise, which it skips rather than reports, so only
+        // counting every opening marker sees them beside the key.
+        format!("{pem}{}", foreign_block("ENCRYPTED PRIVATE KEY")),
+        format!("{}{pem}", foreign_block("OPENSSH PRIVATE KEY")),
+        format!("{pem}{}", foreign_block("RSA PUBLIC KEY")),
         "not a key".to_owned(),
         String::new(),
     ];
