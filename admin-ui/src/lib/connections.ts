@@ -207,6 +207,41 @@ export type CallerAssertionAlgorithm = 'es256' | 'rs256';
 export type CallerAssertionClaim = 'email' | 'roles';
 
 /**
+ * A key the JWKS publishes beside the signing key that never signs: the
+ * next key in a rotation, or the previous one. Its alias is reduced to
+ * `signing_key_configured`, like the signing key's.
+ */
+export type SafePublishedAssertionKey = {
+  signing_key_configured: boolean;
+  kid: string;
+  algorithm: CallerAssertionAlgorithm;
+};
+
+export type CallerAssertionKeyProblemField =
+  | 'caller_assertion.signing_key_id'
+  | 'caller_assertion.published_keys.signing_key_id'
+  | 'caller_assertion.kid'
+  | 'caller_assertion.published_keys.kid';
+
+export type CallerAssertionKeyProblemCode =
+  | 'unresolvable_binding'
+  | 'binding_unavailable'
+  | 'invalid_signing_key'
+  | 'algorithm_mismatch'
+  | 'unusable_signing_key'
+  | 'duplicate_kid';
+
+/**
+ * Why the gateway leaves a Connection's keys out of its published JWKS: the
+ * field configuring the key that cannot be used and a fixed code. Never the
+ * alias or anything about the key material.
+ */
+export type CallerAssertionKeyProblem = {
+  field: CallerAssertionKeyProblemField;
+  code: CallerAssertionKeyProblemCode;
+};
+
+/**
  * A Connection's caller assertion as the safe read returns it: every field
  * except the signing key alias, which is reduced to `signing_key_configured`.
  *
@@ -227,6 +262,9 @@ export type SafeCallerAssertion = {
   claims?: CallerAssertionClaim[];
   bind_request: boolean;
   bind_approval: boolean;
+  published_keys?: SafePublishedAssertionKey[];
+  /** Present only when the gateway leaves this block's keys out of its JWKS. */
+  key_problem?: CallerAssertionKeyProblem;
 };
 
 export type ConnectionWrite = {
@@ -957,12 +995,17 @@ function projectSafeCallerAssertion(value: unknown): SafeCallerAssertion {
     (source.claims !== undefined &&
       !isCallerAssertionClaimList(source.claims)) ||
     typeof source.bind_request !== 'boolean' ||
-    typeof source.bind_approval !== 'boolean'
+    typeof source.bind_approval !== 'boolean' ||
+    (source.published_keys !== undefined &&
+      !isSafePublishedAssertionKeyList(source.published_keys)) ||
+    (source.key_problem !== undefined &&
+      !isCallerAssertionKeyProblem(source.key_problem))
   ) {
     throw invalidConnectionResponse('safe caller assertion');
   }
-  // Fields in the gateway's serialization order, and `claims` only when the
-  // gateway sent it, so the projection is the block exactly as stored.
+  // Fields in the gateway's serialization order, and the optional ones only
+  // when the gateway sent them, so the projection is the block exactly as
+  // stored.
   return {
     signing_key_configured: source.signing_key_configured,
     kid: source.kid,
@@ -975,7 +1018,67 @@ function projectSafeCallerAssertion(value: unknown): SafeCallerAssertion {
     ...(source.claims === undefined ? {} : { claims: [...source.claims] }),
     bind_request: source.bind_request,
     bind_approval: source.bind_approval,
+    ...(source.published_keys === undefined
+      ? {}
+      : {
+          published_keys: source.published_keys.map((key) => ({
+            signing_key_configured: key.signing_key_configured,
+            kid: key.kid,
+            algorithm: key.algorithm,
+          })),
+        }),
+    ...(source.key_problem === undefined
+      ? {}
+      : {
+          key_problem: {
+            field: source.key_problem.field,
+            code: source.key_problem.code,
+          },
+        }),
   };
+}
+
+// The gateway publishes at most this many keys beside a signing key.
+const MAX_PUBLISHED_ASSERTION_KEYS = 4;
+
+function isSafePublishedAssertionKeyList(
+  value: unknown,
+): value is SafePublishedAssertionKey[] {
+  return (
+    Array.isArray(value) &&
+    value.length <= MAX_PUBLISHED_ASSERTION_KEYS &&
+    value.every(
+      (key) =>
+        typeof key === 'object' &&
+        key !== null &&
+        !Array.isArray(key) &&
+        typeof (key as Record<string, unknown>).signing_key_configured ===
+          'boolean' &&
+        isNonEmptyString((key as Record<string, unknown>).kid) &&
+        isCallerAssertionAlgorithm((key as Record<string, unknown>).algorithm),
+    )
+  );
+}
+
+function isCallerAssertionKeyProblem(
+  value: unknown,
+): value is CallerAssertionKeyProblem {
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) {
+    return false;
+  }
+  const { field, code } = value as Record<string, unknown>;
+  return (
+    (field === 'caller_assertion.signing_key_id' ||
+      field === 'caller_assertion.published_keys.signing_key_id' ||
+      field === 'caller_assertion.kid' ||
+      field === 'caller_assertion.published_keys.kid') &&
+    (code === 'unresolvable_binding' ||
+      code === 'binding_unavailable' ||
+      code === 'invalid_signing_key' ||
+      code === 'algorithm_mismatch' ||
+      code === 'unusable_signing_key' ||
+      code === 'duplicate_kid')
+  );
 }
 
 function isCallerAssertionAlgorithm(
