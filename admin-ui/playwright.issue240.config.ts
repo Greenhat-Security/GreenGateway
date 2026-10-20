@@ -11,6 +11,13 @@ const liveServer = path.join(
   'issue-240-live-server.mjs',
 );
 const fixtureCommand = `"${process.execPath}" "${liveServer}"`;
+// A real HTTPS gateway with admin sessions and a disposable OIDC provider.
+const adminSessionServer = path.join(
+  adminUiRoot,
+  'tests',
+  'fixtures',
+  'admin-session-live-server.mjs',
+);
 const viteEnvironment = stringEnvironment({
   ...process.env,
   GREENGATEWAY_BACKEND_URL: 'http://127.0.0.1:43202',
@@ -18,7 +25,7 @@ const viteEnvironment = stringEnvironment({
 
 export default defineConfig({
   testDir: 'tests',
-  testMatch: 'issue-240-live.spec.ts',
+  testMatch: ['issue-240-live.spec.ts', 'admin-session-live.spec.ts'],
   fullyParallel: false,
   workers: 1,
   timeout: 90_000,
@@ -36,6 +43,18 @@ export default defineConfig({
       command: fixtureCommand,
       cwd: adminUiRoot,
       url: 'http://127.0.0.1:43202/readyz',
+      reuseExistingServer: false,
+      timeout: 300_000,
+      stdout: 'pipe',
+      stderr: 'pipe',
+    },
+    {
+      name: 'admin-session-real-gateway',
+      command: `"${process.execPath}" "${adminSessionServer}"`,
+      cwd: adminUiRoot,
+      url: 'https://127.0.0.1:43212/readyz',
+      // The fixture's certificate is generated for this run.
+      ignoreHTTPSErrors: true,
       reuseExistingServer: false,
       timeout: 300_000,
       stdout: 'pipe',
