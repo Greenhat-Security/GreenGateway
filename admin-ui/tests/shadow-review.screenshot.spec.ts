@@ -4,6 +4,32 @@ import path from 'node:path';
 
 const screenshotDir = path.join(process.cwd(), '.screenshots');
 
+// The policy and the shadow review describe the same rules, as they do when
+// no write lands between the two reads; otherwise the queue blocks Promote
+// and Disable.
+const shadowRules = [
+  {
+    id: 'shadow-report-deletes',
+    enabled: true,
+    methods: ['DELETE'],
+    path: '/reports/**',
+    principal: {
+      roles: ['analyst'],
+    },
+    action: 'shadow',
+  },
+  {
+    id: 'shadow-admin-posts',
+    enabled: true,
+    methods: ['POST', 'PATCH'],
+    path: '/admin/**',
+    principal: {
+      roles: ['support'],
+    },
+    action: 'shadow',
+  },
+];
+
 test.beforeEach(async () => {
   await mkdir(screenshotDir, { recursive: true });
 });
@@ -28,7 +54,7 @@ test('captures the shadow review queue', async ({ page }) => {
           },
         },
         routes: [],
-        rules: [],
+        rules: shadowRules,
       }),
     });
   });
@@ -43,16 +69,7 @@ test('captures the shadow review queue', async ({ page }) => {
         rules: [
           {
             rule_id: 'shadow-report-deletes',
-            rule: {
-              id: 'shadow-report-deletes',
-              enabled: true,
-              methods: ['DELETE'],
-              path: '/reports/**',
-              principal: {
-                roles: ['analyst'],
-              },
-              action: 'shadow',
-            },
+            rule: shadowRules[0],
             would_deny_count: 28,
             affected_principals: [
               { user_id: 'analyst-ada', roles: ['analyst'] },
@@ -74,16 +91,7 @@ test('captures the shadow review queue', async ({ page }) => {
           },
           {
             rule_id: 'shadow-admin-posts',
-            rule: {
-              id: 'shadow-admin-posts',
-              enabled: true,
-              methods: ['POST', 'PATCH'],
-              path: '/admin/**',
-              principal: {
-                roles: ['support'],
-              },
-              action: 'shadow',
-            },
+            rule: shadowRules[1],
             would_deny_count: 7,
             affected_principals: [
               { user_id: 'support-jules', roles: ['support'] },
@@ -116,6 +124,10 @@ test('captures the shadow review queue', async ({ page }) => {
   await expect(page.getByText('28 would-deny events')).toBeVisible();
   await expect(page.getByText('shadow-admin-posts')).toBeVisible();
   await expect(page.getByText('7 would-deny events')).toBeVisible();
+  await expect(
+    page.getByRole('button', { name: 'Promote shadow-report-deletes to deny' }),
+  ).toBeEnabled();
+  await expect(page.getByText('Policy changed during review')).toHaveCount(0);
 
   const screenshot = await page.screenshot({
     path: path.join(screenshotDir, 'shadow-review-queue.png'),

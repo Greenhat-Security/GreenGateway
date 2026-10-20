@@ -1,7 +1,7 @@
 {
   "version": 1,
   "issue": 425,
-  "reviewed_revision": "4314d63373539700dffb303bc4e2d385ceb53295",
+  "reviewed_revision": "05c295a52763ba09701ef38bb030e30e5bc7e4d7",
   "storage_modes": [
     "postgres",
     "standalone"
@@ -406,7 +406,7 @@
         "missing_metadata",
         "missing_delivery"
       ],
-      "follow_up": "PR2: preserve safe per-operation evidence independently of cascading Connection history; record credential changes by Connection identity/revision only, never binding IDs or locators.",
+      "follow_up": "PR2: extend migration 16's connection_change_evidence (a closed action set) to create/replace in these same transactions, independently of cascading Connection history; record credential changes by Connection identity/revision only, never binding IDs or locators.",
       "sources": [
         {
           "path": "gateway/src/connections/pg_store.rs",
@@ -509,34 +509,62 @@
           "anchor": "async fn connection_delete_endpoint("
         }
       ],
-      "boundary": "delete checks ETag and dependencies, appends outbox tombstone to_version=0, releases names, deletes parent and commits.",
-      "record": "Outbox tombstone remains; connection_versions and bindings cascade. Existing durable deletion record already names resource and prior revision.",
-      "actor": "delete accepts _actor_user_id but does not persist it; attribution exists only in post-commit audit emission.",
-      "identity": "Shared revision, Connection ID, previous version and deletion sentinel; no operation ID.",
+      "boundary": "PostgresConnectionStore::delete refuses an empty or oversized actor before opening a transaction, then locks shared Connection state and the record, checks ETag and dependencies, appends the outbox tombstone to_version=0 and one connection_change_evidence row carrying the same shared revision, releases names, deletes the parent and commits once. An evidence insert failure rolls the whole delete back.",
+      "record": "Outbox tombstone unchanged; connection_documents and bindings cascade. connection_change_evidence (migration 16) has no foreign key, so it survives the cascade; it holds identifiers, revisions and the actor only. Stale ETag, dependency, missing record and lost race write no row.",
+      "actor": "actor_user_id (the authenticated principal subject, 1 to 4096 bytes, the principal bound) committed with the delete and retained after it. Issuer, auth mode and a keyed safe actor reference are still absent.",
+      "identity": "Generated event_id and operation_id UUIDs, Connection ID, prior version, shared security revision equal to the tombstone's revision, database-clock committed_at. operation_id is minted per store call, not bound to a client idempotency key; a lost response is reconciled by the Connection's evidence row, and a blind retry is NotFound.",
       "delivery": "post_commit_telemetry",
       "disposition": [
         "missing_metadata",
         "missing_delivery"
       ],
-      "follow_up": "PR2 first narrow storage slice: retain deletion actor/action/event identity in existing transaction without changing outbox tombstone semantics; test evidence survives parent cascade and rolls back on failed CAS.",
+      "follow_up": "PR2 follow-up: carry issuer/auth mode and a caller-bound operation identity to the store. PR3: dispatch these rows with a persisted cursor and own their retention so undelivered evidence is never erased. Keyed safe-reference derivation precedes any authority_event.v1 projection.",
       "sources": [
         {
+          "path": "gateway/src/storage/migrations/0016_connection_change_evidence.sql",
+          "anchor": "CREATE TABLE greengateway.connection_change_evidence ("
+        },
+        {
           "path": "gateway/src/connections/pg_store.rs",
-          "anchor": "_actor_user_id: &str"
+          "anchor": "validate_evidence_actor(actor_user_id)?;"
         },
         {
           "path": "gateway/src/connections/pg_store.rs",
           "anchor": "version 0 marks a"
+        },
+        {
+          "path": "gateway/src/connections/pg_store.rs",
+          "anchor": "async fn record_change_evidence("
         }
       ],
       "tests": [
         {
           "path": "gateway/src/connections/pg_store_tests.rs",
-          "anchor": "async fn records_create_replace_delete_with_cas_and_shared_state_bumps("
+          "anchor": "async fn deletion_evidence_survives_cascade_and_restart_and_reconciles_a_lost_response("
+        },
+        {
+          "path": "gateway/src/connections/pg_store_tests.rs",
+          "anchor": "async fn refused_deletes_write_no_evidence("
+        },
+        {
+          "path": "gateway/src/connections/pg_store_tests.rs",
+          "anchor": "async fn concurrent_deletes_produce_one_winner_and_one_evidence_row("
+        },
+        {
+          "path": "gateway/src/connections/pg_store_tests.rs",
+          "anchor": "async fn a_failed_evidence_insert_rolls_back_the_whole_delete("
+        },
+        {
+          "path": "gateway/src/connections/pg_store_tests.rs",
+          "anchor": "async fn delete_flushes_queued_dependency_guards_before_it_is_judged("
+        },
+        {
+          "path": "gateway/src/storage/migrations.rs",
+          "anchor": "async fn migrations_twelve_through_sixteen_preserve_existing_connection_state("
         }
       ],
       "required_durability_supported": false,
-      "test_claim": "Existing behavior regression anchors only; these tests do not certify the proposed authority-event contract or delivery."
+      "test_claim": "PostgreSQL-gated regression anchors for the transactional deletion evidence. They do not certify the proposed authority-event contract, delivery or retention."
     },
     {
       "id": "connection_delete_standalone",

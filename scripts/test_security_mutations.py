@@ -60,9 +60,11 @@ class ManifestTests(unittest.TestCase):
     def validate(self, *arguments):
         report = self.root / "target/report.json"
         # A compiler, test or git process would make this more than a registry check.
-        with mock.patch.object(mutations.subprocess, "Popen", side_effect=AssertionError("process started")) as popen, mock.patch("builtins.print"):
+        with mock.patch.object(mutations.subprocess, "Popen", side_effect=AssertionError("process started")) as popen, \
+                mock.patch("sys.stdout", new_callable=io.StringIO) as stdout:
             code = mutations.main(["--validate-registry", "--report", str(report), *arguments])
         popen.assert_not_called()
+        self.printed = stdout.getvalue()
         return code, json.loads(report.read_text())
 
     def validate_fixture(self):
@@ -205,6 +207,8 @@ class ManifestTests(unittest.TestCase):
         self.assertEqual([], report["results"])
         self.assertEqual(mutations.counts([]), report["counts"])
         self.assertNotIn("baseline", report)
+        # A registry check must never read as a campaign result in a CI log.
+        self.assertEqual("security mutation registry check: passed (registry_valid)\n", self.printed)
 
     def test_registry_check_fails_closed_on_target_source_drift(self):
         for label, source, category in (("edited", SOURCE.replace(b"4", b"5"), "function_hash_drift"),
@@ -216,6 +220,7 @@ class ManifestTests(unittest.TestCase):
                 code, report = self.validate_fixture()
                 self.assertEqual((1, "failed", category), (code, report["status"], report["reason"]))
                 self.assertNotIn("targets", report)
+                self.assertEqual(f"security mutation registry check: failed ({category})\n", self.printed)
         (self.root / "source.rs").unlink()
         code, report = self.validate_fixture()
         self.assertEqual((1, "invalid_file"), (code, report["reason"]))
@@ -257,6 +262,134 @@ class ManifestTests(unittest.TestCase):
         with mock.patch("sys.stderr", new_callable=io.StringIO), self.assertRaises(SystemExit) as raised:
             mutations.main(["--validate-registry", "--calibrate", "--report", str(report)])
         self.assertEqual(2, raised.exception.code)
+        self.assertFalse(report.exists())
+
+
+def listing(*names, kind="test"):
+    return "".join(f"{name}: {kind}\n" for name in names).encode()
+
+
+class TestListTests(unittest.TestCase):
+    """`--check-test-list` reads a listing file; it never starts a compiler, test or git process."""
+
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary.cleanup)
+        self.root = Path(self.temporary.name)
+        (self.root / "source.rs").write_bytes(SOURCE)
+        self.manifest = self.root / "manifest.json"
+        self.manifest.write_text(json.dumps(manifest_fixture()))
+        self.listing = self.root / "target/test-list.txt"
+        self.listing.parent.mkdir()
+
+    def check(self, listed=None):
+        if listed is not None:
+            self.listing.write_bytes(listed)
+        report = self.root / "target/report.json"
+        with mock.patch.object(mutations.subprocess, "Popen", side_effect=AssertionError("process started")) as popen, \
+                mock.patch("sys.stdout", new_callable=io.StringIO) as stdout:
+            code = mutations.main(["--check-test-list", str(self.listing), "--root", str(self.root),
+                                   "--manifest", str(self.manifest), "--report", str(report)])
+        popen.assert_not_called()
+        self.printed = stdout.getvalue()
+        return code, json.loads(report.read_text())
+
+    def test_each_selected_test_listed_exactly_once_passes(self):
+        listed = listing("security::accepts_boundary", TEST_NAME, "other::tests::unrelated")
+        code, report = self.check(listed)
+        self.assertEqual((0, "passed", "registry_tests_listed"), (code, report["status"], report["reason"]))
+        self.assertEqual("checkout_registry_and_test_list", report["source_state"])
+        self.assertEqual(mutations.sha256(self.manifest.read_bytes()), report["registry_sha256"])
+        self.assertEqual(mutations.sha256(listed), report["test_list_sha256"])
+        self.assertEqual(3, report["listed_tests"])
+        self.assertEqual([TEST_NAME], report["selected_tests"])
+        self.assertEqual(([], []), (report["unlisted_tests"], report["ambiguous_tests"]))
+        # Listing a test is not running it: there is no baseline and no score.
+        self.assertEqual([], report["results"])
+        self.assertEqual(mutations.counts([]), report["counts"])
+        self.assertNotIn("baseline", report)
+        self.assertEqual("security mutation registry check: passed (registry_tests_listed)\n", self.printed)
+
+    def test_renamed_or_deleted_selected_test_fails_and_is_named(self):
+        # Only the exact name counts, as with the campaign's `--exact` discovery.
+        for label, listed in (("renamed", listing("security::rejects_the_boundary")),
+                              ("deleted", listing("other::tests::unrelated")),
+                              ("extended", listing(TEST_NAME + "_extended")),
+                              ("nested", listing("outer::" + TEST_NAME)),
+                              ("truncated", listing("security::rejects"))):
+            with self.subTest(label=label):
+                code, report = self.check(listed)
+                self.assertEqual((1, "failed", "registry_test_not_listed"), (code, report["status"], report["reason"]))
+                self.assertEqual(([TEST_NAME], []), (report["unlisted_tests"], report["ambiguous_tests"]))
+                self.assertEqual("security mutation registry check: failed (registry_test_not_listed)\n"
+                                 f"  unlisted: {TEST_NAME}\n", self.printed)
+
+    def test_selected_test_listed_twice_or_as_benchmark_is_ambiguous(self):
+        for label, listed in (("two binaries", listing(TEST_NAME, "other::tests::unrelated", TEST_NAME)),
+                              ("benchmark", listing(TEST_NAME, kind="benchmark")),
+                              ("test and benchmark", listing(TEST_NAME) + listing(TEST_NAME, kind="benchmark"))):
+            with self.subTest(label=label):
+                code, report = self.check(listed)
+                self.assertEqual((1, "failed", "registry_test_ambiguous"), (code, report["status"], report["reason"]))
+                self.assertEqual(([], [TEST_NAME]), (report["unlisted_tests"], report["ambiguous_tests"]))
+                self.assertEqual("security mutation registry check: failed (registry_test_ambiguous)\n"
+                                 f"  ambiguous: {TEST_NAME}\n", self.printed)
+
+    def test_every_unlisted_and_ambiguous_test_is_reported(self):
+        manifest = manifest_fixture()
+        manifest["targets"][0]["tests"] = ["security::z_last", TEST_NAME, "security::a_first"]
+        self.manifest.write_text(json.dumps(manifest))
+        code, report = self.check(listing(TEST_NAME, TEST_NAME))
+        self.assertEqual((1, "registry_test_not_listed"), (code, report["reason"]))
+        self.assertEqual(["security::a_first", "security::z_last"], report["unlisted_tests"])
+        self.assertEqual([TEST_NAME], report["ambiguous_tests"])
+
+    def test_anything_but_a_terse_libtest_listing_fails_closed(self):
+        for label, listed, category in (
+                ("pretty summary", listing(TEST_NAME) + b"\n1 test, 0 benchmarks\n", "invalid_test_list"),
+                ("test result line", listing(TEST_NAME) + f"test {TEST_NAME} ... ok\n".encode(), "invalid_test_list"),
+                ("unknown kind", f"{TEST_NAME}: doctest\n".encode(), "invalid_test_list"),
+                ("crlf", listing(TEST_NAME).replace(b"\n", b"\r\n"), "invalid_test_list"),
+                ("unnamed", b": test\n" + listing(TEST_NAME), "invalid_test_list"),
+                ("non-utf8", listing(TEST_NAME) + b"\xff: test\n", "invalid_test_list"),
+                ("empty", b"", "empty_test_list"),
+                ("blank lines", b"\n\n", "empty_test_list")):
+            with self.subTest(label=label):
+                code, report = self.check(listed)
+                self.assertEqual((1, "failed", category), (code, report["status"], report["reason"]))
+                self.assertNotIn("unlisted_tests", report)
+
+    def reason(self, listed=None):
+        code, report = self.check(listed)
+        return code, report["reason"]
+
+    def test_missing_linked_special_or_oversized_listing_fails(self):
+        self.assertEqual((1, "invalid_test_list_file"), self.reason())
+        real = self.root / "target/real.txt"
+        real.write_bytes(listing(TEST_NAME))
+        self.listing.symlink_to(real)
+        self.assertEqual((1, "invalid_test_list_file"), self.reason())
+        self.listing.unlink()
+        # A FIFO is rejected without being opened, so this cannot block.
+        os.mkfifo(self.listing)
+        self.assertEqual((1, "invalid_test_list_file"), self.reason())
+        self.listing.unlink()
+        with mock.patch.object(mutations, "MAX_TEST_LIST", len(listing(TEST_NAME)) - 1):
+            self.assertEqual((1, "test_list_limit"), self.reason(listing(TEST_NAME)))
+
+    def test_registry_drift_fails_before_the_listing_is_read(self):
+        (self.root / "source.rs").write_bytes(SOURCE.replace(b"4", b"5"))
+        code, report = self.check(listing(TEST_NAME))
+        self.assertEqual((1, "function_hash_drift"), (code, report["reason"]))
+        self.assertNotIn("test_list_sha256", report)
+
+    def test_listing_check_is_its_own_mode(self):
+        report = self.root / "target/report.json"
+        for other in ("--validate-registry", "--calibrate"):
+            with self.subTest(other=other):
+                with mock.patch("sys.stderr", new_callable=io.StringIO), self.assertRaises(SystemExit) as raised:
+                    mutations.main(["--check-test-list", str(self.listing), other, "--report", str(report)])
+                self.assertEqual(2, raised.exception.code)
         self.assertFalse(report.exists())
 
 

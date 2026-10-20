@@ -1163,7 +1163,7 @@
           "hyper-util@0.1.20|registry+https://github.com/rust-lang/crates.io-index",
           "hyper@1.11.1|registry+https://github.com/rust-lang/crates.io-index",
           "ipnet@2.12.2|registry+https://github.com/rust-lang/crates.io-index",
-          "jsonschema@0.56.0|registry+https://github.com/rust-lang/crates.io-index",
+          "jsonschema@0.58.6|registry+https://github.com/rust-lang/crates.io-index",
           "jsonwebtoken@11.1.0|registry+https://github.com/rust-lang/crates.io-index",
           "metrics-exporter-prometheus@0.18.3|registry+https://github.com/rust-lang/crates.io-index",
           "metrics@0.24.6|registry+https://github.com/rust-lang/crates.io-index",
@@ -1789,17 +1789,49 @@
         ]
       },
       {
-        "package": "jsonschema-regex@0.56.0|registry+https://github.com/rust-lang/crates.io-index",
-        "checksum": "cb862addfa7782108933abcf842fe25334523a9df5b89ea4d9620e3dd7b42181",
+        "package": "jsonschema-macros-core@0.58.6|registry+https://github.com/rust-lang/crates.io-index",
+        "checksum": "bf3ebe067f2c25a981a7d1b2f696fc213e10dbf80ba5fe997f7dc2e4fe261f26",
+        "features": [
+          "arbitrary-precision"
+        ],
+        "dependencies": [
+          "fancy-regex@0.19.2|registry+https://github.com/rust-lang/crates.io-index",
+          "indexmap@2.14.2|registry+https://github.com/rust-lang/crates.io-index",
+          "jsonschema-regex@0.58.6|registry+https://github.com/rust-lang/crates.io-index",
+          "percent-encoding@2.3.2|registry+https://github.com/rust-lang/crates.io-index",
+          "proc-macro-crate@3.5.0|registry+https://github.com/rust-lang/crates.io-index",
+          "proc-macro2@1.0.107|registry+https://github.com/rust-lang/crates.io-index",
+          "quote@1.0.47|registry+https://github.com/rust-lang/crates.io-index",
+          "referencing@0.58.6|registry+https://github.com/rust-lang/crates.io-index",
+          "regex@1.13.1|registry+https://github.com/rust-lang/crates.io-index",
+          "serde_json@1.0.151|registry+https://github.com/rust-lang/crates.io-index",
+          "syn@2.0.119|registry+https://github.com/rust-lang/crates.io-index"
+        ]
+      },
+      {
+        "package": "jsonschema-macros@0.58.6|registry+https://github.com/rust-lang/crates.io-index",
+        "checksum": "5553b59276ad81f2f49c80cd381a6d6d873e74139cdeb2bef0f9eb28a2ded2b6",
+        "features": [
+          "arbitrary-precision"
+        ],
+        "dependencies": [
+          "jsonschema-macros-core@0.58.6|registry+https://github.com/rust-lang/crates.io-index",
+          "proc-macro2@1.0.107|registry+https://github.com/rust-lang/crates.io-index"
+        ]
+      },
+      {
+        "package": "jsonschema-regex@0.58.6|registry+https://github.com/rust-lang/crates.io-index",
+        "checksum": "a968fffd387b2ab005bf00c1851f5d26e90df05b6f7ad609ed0d620033cca5e7",
         "features": [],
         "dependencies": [
           "regex-syntax@0.8.11|registry+https://github.com/rust-lang/crates.io-index"
         ]
       },
       {
-        "package": "jsonschema-value@0.56.0|registry+https://github.com/rust-lang/crates.io-index",
-        "checksum": "a05cd404c5ff6e2731dbbf7e290a27417750acfb59e329560a1d0af384c93fb0",
+        "package": "jsonschema-value@0.58.6|registry+https://github.com/rust-lang/crates.io-index",
+        "checksum": "39b7670345e5ce87371339d13705dbb9276b7e3e934bbe1efa2c6734a1f65a96",
         "features": [
+          "arbitrary-precision",
           "default",
           "serde_json"
         ],
@@ -1808,6 +1840,7 @@
           "bytecount@0.6.9|registry+https://github.com/rust-lang/crates.io-index",
           "fraction@0.17.0|registry+https://github.com/rust-lang/crates.io-index",
           "getrandom@0.3.4|registry+https://github.com/rust-lang/crates.io-index",
+          "num-bigint@0.4.8|registry+https://github.com/rust-lang/crates.io-index",
           "num-cmp@0.1.0|registry+https://github.com/rust-lang/crates.io-index",
           "num-traits@0.2.19|registry+https://github.com/rust-lang/crates.io-index",
           "serde_json@1.0.151|registry+https://github.com/rust-lang/crates.io-index",
@@ -1815,9 +1848,10 @@
         ]
       },
       {
-        "package": "jsonschema@0.56.0|registry+https://github.com/rust-lang/crates.io-index",
-        "checksum": "b6a806f80c1f5560431009ce5ec29b59d38f950e0cd7db5f1b8925e6d8104e21",
+        "package": "jsonschema@0.58.6|registry+https://github.com/rust-lang/crates.io-index",
+        "checksum": "f622c574a29fb3034a0a90645afee194dfedc75fc124228801b6e77041075bd1",
         "features": [
+          "arbitrary-precision",
           "idna"
         ],
         "dependencies": [
@@ -1830,12 +1864,14 @@
           "getrandom@0.3.4|registry+https://github.com/rust-lang/crates.io-index",
           "idna@1.1.0|registry+https://github.com/rust-lang/crates.io-index",
           "itoa@1.0.18|registry+https://github.com/rust-lang/crates.io-index",
-          "jsonschema-regex@0.56.0|registry+https://github.com/rust-lang/crates.io-index",
-          "jsonschema-value@0.56.0|registry+https://github.com/rust-lang/crates.io-index",
+          "jsonschema-macros@0.58.6|registry+https://github.com/rust-lang/crates.io-index",
+          "jsonschema-regex@0.58.6|registry+https://github.com/rust-lang/crates.io-index",
+          "jsonschema-value@0.58.6|registry+https://github.com/rust-lang/crates.io-index",
+          "num-bigint@0.4.8|registry+https://github.com/rust-lang/crates.io-index",
           "num-cmp@0.1.0|registry+https://github.com/rust-lang/crates.io-index",
           "num-traits@0.2.19|registry+https://github.com/rust-lang/crates.io-index",
           "percent-encoding@2.3.2|registry+https://github.com/rust-lang/crates.io-index",
-          "referencing@0.56.0|registry+https://github.com/rust-lang/crates.io-index",
+          "referencing@0.58.6|registry+https://github.com/rust-lang/crates.io-index",
           "regex@1.13.1|registry+https://github.com/rust-lang/crates.io-index",
           "serde@1.0.229|registry+https://github.com/rust-lang/crates.io-index",
           "serde_json@1.0.151|registry+https://github.com/rust-lang/crates.io-index",
@@ -2542,6 +2578,14 @@
         ]
       },
       {
+        "package": "proc-macro-crate@3.5.0|registry+https://github.com/rust-lang/crates.io-index",
+        "checksum": "e67ba7e9b2b56446f1d419b1d807906278ffa1a658a8a5d8a39dcb1f5a78614f",
+        "features": [],
+        "dependencies": [
+          "toml_edit@0.25.17+spec-1.1.0|registry+https://github.com/rust-lang/crates.io-index"
+        ]
+      },
+      {
         "package": "proc-macro2@1.0.107|registry+https://github.com/rust-lang/crates.io-index",
         "checksum": "985e7ec9bb745e6ce6535b544d84d6cd6f7ad8bd711c398938ae983b91a766d9",
         "features": [
@@ -2857,8 +2901,8 @@
         ]
       },
       {
-        "package": "referencing@0.56.0|registry+https://github.com/rust-lang/crates.io-index",
-        "checksum": "a3b4a92fac7e28c27de3ad26df2ecb9e652f227b258e845af034052e5b22c96c",
+        "package": "referencing@0.58.6|registry+https://github.com/rust-lang/crates.io-index",
+        "checksum": "558f3855529c0a7e78a48e409fa653456e55f1b167eab4109c16a255b7727e3f",
         "features": [
           "default"
         ],
@@ -4104,6 +4148,43 @@
         ]
       },
       {
+        "package": "toml_datetime@1.1.2+spec-1.1.0|registry+https://github.com/rust-lang/crates.io-index",
+        "checksum": "2b86d767906c6c42421dcba507eb9d203e779497710a47782a224bb871653053",
+        "features": [
+          "alloc",
+          "default",
+          "std"
+        ],
+        "dependencies": [
+          "serde_core@1.0.229|registry+https://github.com/rust-lang/crates.io-index"
+        ]
+      },
+      {
+        "package": "toml_edit@0.25.17+spec-1.1.0|registry+https://github.com/rust-lang/crates.io-index",
+        "checksum": "e3641d5bbb5349a79e1020a242d251efbc546ad8048d133958323ce9c40a9c9c",
+        "features": [
+          "parse"
+        ],
+        "dependencies": [
+          "indexmap@2.14.2|registry+https://github.com/rust-lang/crates.io-index",
+          "toml_datetime@1.1.2+spec-1.1.0|registry+https://github.com/rust-lang/crates.io-index",
+          "toml_parser@1.1.5+spec-1.1.0|registry+https://github.com/rust-lang/crates.io-index",
+          "winnow@1.0.4|registry+https://github.com/rust-lang/crates.io-index"
+        ]
+      },
+      {
+        "package": "toml_parser@1.1.5+spec-1.1.0|registry+https://github.com/rust-lang/crates.io-index",
+        "checksum": "baa693a8032d7e1cada7d0041e96126df243179ff061456783ac7f12bda4744c",
+        "features": [
+          "alloc",
+          "default",
+          "std"
+        ],
+        "dependencies": [
+          "winnow@1.0.4|registry+https://github.com/rust-lang/crates.io-index"
+        ]
+      },
+      {
         "package": "tower-http@0.6.11|registry+https://github.com/rust-lang/crates.io-index",
         "checksum": "4cfcf7e2740e6fc6d4d688b4ef00650406bb94adf4731e43c096c3a19fe40840",
         "features": [
@@ -5005,6 +5086,21 @@
         "dependencies": []
       },
       {
+        "package": "winnow@1.0.4|registry+https://github.com/rust-lang/crates.io-index",
+        "checksum": "23b97319f7b8343df12cc98938e5c3eb436064524c8d2b4e30a1d3a36eecdf81",
+        "features": [
+          "alloc",
+          "ascii",
+          "binary",
+          "default",
+          "parser",
+          "std"
+        ],
+        "dependencies": [
+          "memchr@2.8.3|registry+https://github.com/rust-lang/crates.io-index"
+        ]
+      },
+      {
         "package": "winx@0.36.4|registry+https://github.com/rust-lang/crates.io-index",
         "checksum": "3f3fd376f71958b862e7afb20cfe5a22830e1963462f3a17f49d82a6c1d1f42d",
         "features": [],
@@ -5240,6 +5336,20 @@
             "source": "registry+https://github.com/rust-lang/crates.io-index"
           },
           {
+            "name": "jsonschema",
+            "rename": null,
+            "kind": null,
+            "target": null,
+            "req": "^0.58.6",
+            "optional": false,
+            "uses_default_features": false,
+            "features": [
+              "arbitrary-precision",
+              "idna"
+            ],
+            "source": "registry+https://github.com/rust-lang/crates.io-index"
+          },
+          {
             "name": "serde_json",
             "rename": null,
             "kind": null,
@@ -5374,19 +5484,6 @@
             "features": [
               "full",
               "visit"
-            ],
-            "source": "registry+https://github.com/rust-lang/crates.io-index"
-          },
-          {
-            "name": "jsonschema",
-            "rename": null,
-            "kind": null,
-            "target": null,
-            "req": "^0.56.0",
-            "optional": false,
-            "uses_default_features": false,
-            "features": [
-              "idna"
             ],
             "source": "registry+https://github.com/rust-lang/crates.io-index"
           },
@@ -8166,7 +8263,17 @@
         "network-or-process-reference"
       ],
       "scope": "gateway::connections::pg_store::bump_connection_state#1",
-      "sha256": "38943aec0f8a3659b3ba6f67521be76760fdd4e87adb7561694a2b092e5c7fac",
+      "sha256": "e9b7c6e38491a5ae36f26c7ec0784f01369619563e42281411e1a3605187db61",
+      "owner": "GreenGateway maintainers",
+      "purpose": "PostgreSQL repository operations through the shared infrastructure pool; no caller-selected HTTP authority."
+    },
+    {
+      "file": "gateway/src/connections/pg_store.rs",
+      "reasons": [
+        "network-or-process-reference"
+      ],
+      "scope": "gateway::connections::pg_store::record_change_evidence#1",
+      "sha256": "7b435547b32d65efca0e29ad4614803d7afcc17adabbc5e2f0ffade8992286b0",
       "owner": "GreenGateway maintainers",
       "purpose": "PostgreSQL repository operations through the shared infrastructure pool; no caller-selected HTTP authority."
     },
@@ -11305,6 +11412,36 @@
     {
       "file": "gateway/src/storage/postgres.rs",
       "reasons": [
+        "unexpanded-macro"
+      ],
+      "scope": "gateway::storage::postgres::record_pool_acquire#1",
+      "sha256": "14c8e07f57545084cdf03133da0ec309b8ae4ac8601a40c9c6e12a3cbde31327",
+      "owner": "GreenGateway maintainers",
+      "purpose": "Operator-configured PostgreSQL foundation: verified connector, bounded shared pool and connection lifecycle."
+    },
+    {
+      "file": "gateway/src/storage/postgres.rs",
+      "reasons": [
+        "network-or-process-reference"
+      ],
+      "scope": "gateway::storage::postgres::checkout#1",
+      "sha256": "c90395cbb4c0a4cf28ec7300bc7f9e519e3bdb51165ff09714482fdd6723d908",
+      "owner": "GreenGateway maintainers",
+      "purpose": "Operator-configured PostgreSQL foundation: verified connector, bounded shared pool and connection lifecycle."
+    },
+    {
+      "file": "gateway/src/storage/postgres.rs",
+      "reasons": [
+        "network-or-process-reference"
+      ],
+      "scope": "gateway::storage::postgres::timed_checkout#1",
+      "sha256": "749e0374f3ac14bcb99a0e4cb4822d91acd901e8bca3ed2c2677a55a76d28767",
+      "owner": "GreenGateway maintainers",
+      "purpose": "Operator-configured PostgreSQL foundation: verified connector, bounded shared pool and connection lifecycle."
+    },
+    {
+      "file": "gateway/src/storage/postgres.rs",
+      "reasons": [
         "network-or-process-reference"
       ],
       "scope": "gateway::storage::postgres::publish_pool_gauges#1",
@@ -12590,7 +12727,7 @@
         "network-or-process-reference"
       ],
       "scope": "gateway::storage::postgres_service_tokens::exported_tokens#1",
-      "sha256": "6c808ef885f5268982756c3d784e896e880d7dbcbcaeef39765579d363dd2676",
+      "sha256": "9de7fea7707d8a80d4fe7a898159763064ec36d3c8f122f72bfde53365bfa5f4",
       "owner": "GreenGateway maintainers",
       "purpose": "PostgreSQL repository operations through the shared infrastructure pool; no caller-selected HTTP authority."
     },
@@ -12610,7 +12747,7 @@
         "network-or-process-reference"
       ],
       "scope": "gateway::storage::postgres_session::impl  DedicatedSession::acquire#1",
-      "sha256": "ac8280968bb5705ec4e47f44f36266b1f5eab38516fa987c253e6cd36335436c",
+      "sha256": "a110799eb2422962f76f6347fecdbc803254b4178f17625e5e3a8e69ff91e0ae",
       "owner": "GreenGateway maintainers",
       "purpose": "PostgreSQL repository operations through the shared infrastructure pool; no caller-selected HTTP authority."
     },

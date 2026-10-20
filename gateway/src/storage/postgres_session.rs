@@ -63,7 +63,11 @@
 
 use sha2::{Digest, Sha256};
 
-use super::{log_classified, postgres::classify_pool_error, RepositoryError, RepositoryErrorKind};
+use super::{
+    log_classified,
+    postgres::{checkout, CheckoutClass},
+    RepositoryError, RepositoryErrorKind,
+};
 
 const OPERATION_LOCK: &str = "dedicated_session_lock";
 const OPERATION_PROBE: &str = "dedicated_session_probe";
@@ -105,7 +109,7 @@ impl DedicatedSession {
         pool: &deadpool_postgres::Pool,
         key: i64,
     ) -> Result<Self, RepositoryError> {
-        let client = pool.get().await.map_err(classify_pool_error)?;
+        let client = checkout(pool, CheckoutClass::Maintenance).await?;
         // From here to the end of this function the connection has exactly
         // one owner, and that owner detaches it on every path out but the
         // two that are provably clean.

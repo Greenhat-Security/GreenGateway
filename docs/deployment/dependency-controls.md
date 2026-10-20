@@ -86,6 +86,22 @@ duplicate versions and parent chains are recorded in the Cargo policy with
 maintainer ownership and a 2026-12-01 expiry. Remove the old transport group
 when Axum converges; no license or advisory allowances are added.
 
+jsonschema 0.58.6 is built without default features (so no HTTP or file
+reference resolution) and with exactly `arbitrary-precision` and `idna`. Keep
+both. `arbitrary-precision` matches the workspace's `serde_json`
+`arbitrary_precision`: without it jsonschema's numeric code assumes every number
+fits a `u64`, `i64` or `f64` and panics on one that does not, which 0.58.6 still
+does for `type: integer`. Without `idna`, `idn-email` and `idn-hostname` silently
+become unknown formats that accept anything. Exact comparison costs grow with
+the square of a number's width, so the tool registry and executor bound the
+numbers in input schemas and tool arguments before the validator sees them.
+The feature reaches jsonschema-macros only through a weak optional-dependency
+feature, so Cargo.lock and `cargo metadata` resolve jsonschema-macros,
+jsonschema-macros-core, proc-macro-crate, toml_edit, toml_parser,
+toml_datetime and winnow although none of them is built
+(`cargo tree -p gateway --target all -i jsonschema-macros` prints nothing). The
+transport inventory and the syn 2 duplicate exception record them as resolved.
+
 Buildx is selected explicitly and its BuildKit daemon image is digest-pinned,
 including CI Compose builds. Action pins and the exact cargo-audit version
 remain separate declarations; cargo-audit installation retains checksum

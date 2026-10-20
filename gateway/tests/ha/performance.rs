@@ -34,8 +34,13 @@
 //!   `deadpool_postgres` pool built exactly as
 //!   `storage/postgres.rs::build_pool` builds the deployment's, down to
 //!   the `ROLLBACK` recycling statement that is most of what a checkout
-//!   costs. No product series isolates this: the stores time the checkout
-//!   together with the statement that follows it.
+//!   costs. The product has isolated this wait since issue #439's first
+//!   PR -- the authority stores record each checkout's wait in
+//!   `greengateway_database_pool_acquire_seconds`, whether the pool
+//!   served it, refused it, or its caller's deadline gave up on it first
+//!   (`error_class="cancelled"`) -- but that series is the checkout under
+//!   whatever load a replica is carrying, and this tier is the warm,
+//!   uncontended checkout the budget names.
 //! * `stall_experiment` — `audit_enqueue` is budgeted at "0 ms on the
 //!   request path", which is a claim about where work happens rather than
 //!   a latency. Since issue #11 every serving replica writes its audit
@@ -49,15 +54,34 @@
 //!
 //! `greengateway_database_operation_seconds` looks like exactly the right
 //! series — the gateway timing its own store operations, labelled by a
-//! fixed `operation` vocabulary — and it would be, except that only
-//! `storage/postgres_membership.rs` calls `storage::postgres::timed_operation`
-//! today. Every other `OPERATION_*` constant is an error-classification
-//! label with no timing behind it, so the histogram carries the membership
-//! and maintenance operations and none of the nine budgeted ones. Adopting
-//! the series in each store is a production change, and it is the change
-//! that would let this file delete its `authority_statement` tier
-//! altogether. Recorded here rather than in a commit message because the
-//! `method` field is where a reader will ask the question.
+//! fixed `operation` vocabulary — and when this file was written only
+//! `storage/postgres_membership.rs` called `storage::postgres::timed_operation`,
+//! so the histogram carried none of the budgeted operations. Issue #439's
+//! first PR adopted it in the five stores this file copies statements
+//! from: `policy_revision_read`, `service_token_verify`,
+//! `jwt_revocation_lookup`, `rate_limit_decide` and
+//! `execution_lease_acquire` are now timed in the product, from the moment
+//! the connection is held, with the checkout before it in
+//! `greengateway_database_pool_acquire_seconds`
+//! (`docs/performance/authority-cost.md` maps each budget to its series).
+//!
+//! The `authority_statement` tier stays anyway, and on purpose. The
+//! product series is an exporter summary per replica over a short rolling
+//! window, recorded under whatever else that replica is doing; this tier
+//! is a fixed number of samples on one warm connection with nearest-rank
+//! quantiles, compared night over night. The two do not even time the
+//! same exchange: this tier prepares each copied statement once and then
+//! executes it, so a sample is one execute round trip, while the stores
+//! send the same SQL text unprepared, which tokio-postgres prepares and
+//! then executes on every call -- two round trips, both inside the
+//! product's operation time. A product sample is also recorded only when
+//! its call finishes, so one a request deadline cut off is absent.
+//! Swapping one for the other changes what each budget is measured
+//! against, which is a decision for the capacity scenarios that will
+//! scrape the product series under load (issue #439's second PR), not a
+//! side effect of the change that added the series. Recorded here rather
+//! than in a commit message because the `method` field is where a reader
+//! will ask the question.
 //!
 //! ## What the artifact is for
 //!

@@ -1666,6 +1666,44 @@ fn composite_agent_fragments_reject_nested_format_assertions() {
 }
 
 #[test]
+fn agent_fragments_over_the_exact_comparison_budget_fail_before_compiling() {
+    // `1e-99999` is eight bytes, but with exact comparison jsonschema would
+    // parse it into a 100,000-digit fraction while compiling the fragment.
+    // Each fragment must be refused by the budget before any compile runs.
+    let wide: Value = serde_json::from_str(r#"{"type": "number", "minimum": 1e-99999}"#)
+        .expect("test fragment should parse");
+
+    let error = validate(&json!({
+        "schema_version": "0.1.0",
+        "shapes": {
+            "wide": {
+                "agent": {"value": wide.clone()},
+                "wire": {"/value": {"from": "value"}}
+            }
+        }
+    }))
+    .expect_err("a shape agent fragment over the budget must fail");
+    assert!(
+        error.problems.iter().any(|problem| {
+            problem.path.ends_with("/agent/value")
+                && problem.message.contains("cost more to compare exactly")
+        }),
+        "{error}"
+    );
+
+    let mut document = composite_overlay();
+    document["composites"]["create_note_for_records"]["input"]["properties"]["title"] = wide;
+    let error = validate(&document).expect_err("a composite fragment over the budget must fail");
+    assert!(
+        error
+            .problems
+            .iter()
+            .any(|problem| problem.message.contains("cost more to compare exactly")),
+        "{error}"
+    );
+}
+
+#[test]
 fn composite_agent_fragments_refuse_legacy_schema_dialects() {
     let mut document = composite_overlay();
     document["composites"]["create_note_for_records"]["input"]["properties"]["title"] = json!({

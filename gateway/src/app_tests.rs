@@ -8376,7 +8376,7 @@ const CANARIES: [(&str, &str); 8] = [
 /// The only label *names* an HA metric may carry. The exporter adds
 /// `quantile` to summaries itself, so it is allowed here without being
 /// something the gateway chose.
-const ALLOWED_HA_LABEL_NAMES: [&str; 9] = [
+const ALLOWED_HA_LABEL_NAMES: [&str; 10] = [
     "job",
     "outcome",
     "task",
@@ -8384,6 +8384,7 @@ const ALLOWED_HA_LABEL_NAMES: [&str; 9] = [
     "reason",
     "scope",
     "operation",
+    "operation_class",
     "error_class",
     "quantile",
 ];
@@ -8413,6 +8414,7 @@ fn expected_ha_metric_names() -> Vec<&'static str> {
         metrics::DATABASE_POOL_AVAILABLE,
         metrics::DATABASE_POOL_WAITING,
         metrics::DATABASE_POOL_TIMEOUTS_TOTAL,
+        metrics::DATABASE_POOL_ACQUIRE_SECONDS,
         metrics::DATABASE_OPERATION_SECONDS,
         metrics::SECURITY_REVISION_COMPILED,
         metrics::SECURITY_REVISION_CURRENT,
@@ -8502,6 +8504,24 @@ fn ha_label_vocabularies() -> Vec<(&'static str, &'static str, Vec<&'static str>
                 ))
                 .collect(),
         ),
+        // The acquisition histogram's two labels are both runtime
+        // values -- the class a store names, and the kind a failed
+        // checkout was classified as or `cancelled` for one its caller
+        // abandoned -- so both are declared (issue #439). Neither list
+        // depends on anything a request carries.
+        (
+            metrics::DATABASE_POOL_ACQUIRE_SECONDS,
+            "operation_class",
+            storage::postgres::CheckoutClass::KNOWN
+                .iter()
+                .map(|class| class.metric_label())
+                .collect(),
+        ),
+        (
+            metrics::DATABASE_POOL_ACQUIRE_SECONDS,
+            "error_class",
+            storage::postgres::pool_acquire_error_classes(),
+        ),
     ]);
     rules
 }
@@ -8551,6 +8571,20 @@ fn looks_like_a_uuid(value: &str) -> bool {
         && [8, 4, 4, 4, 12].iter().zip(&groups).all(|(width, group)| {
             group.len() == *width && group.bytes().all(|byte| byte.is_ascii_hexdigit())
         })
+}
+
+/// Record one pool checkout per class and outcome through the real
+/// emitters: the success sentinel, every classified kind, and a wait the
+/// caller abandoned.
+#[cfg(feature = "postgres")]
+fn record_every_pool_acquisition() {
+    for class in storage::postgres::CheckoutClass::KNOWN {
+        storage::postgres::observe_pool_acquire(class, Duration::from_micros(400), None);
+        for kind in storage::RepositoryErrorKind::KNOWN {
+            storage::postgres::observe_pool_acquire(class, Duration::from_millis(50), Some(kind));
+        }
+        storage::postgres::observe_cancelled_pool_acquire(class, Duration::from_millis(250));
+    }
 }
 
 /// Drive every HA metric this PR adds, with every canary in the
@@ -8652,6 +8686,11 @@ async fn synthetic_ha_run() {
                 Some(kind),
             );
         }
+        // Every checkout class under every outcome a checkout can be
+        // classified as (issue #439): the acquisition family's whole
+        // label space, so the bound below is checked against all of it
+        // rather than against whichever classes a test happened to touch.
+        record_every_pool_acquisition();
 
         security_cluster::record_revision_gauges(41, 44);
         for reason in [
@@ -8807,6 +8846,90 @@ fn the_ha_metric_registry_never_labels_by_a_caller_influenced_value() {
             }
         }
     }
+}
+
+/// The pool-acquisition histogram's series are the product of two fixed
+/// lists and nothing more (issue #439).
+///
+/// The registry audit above proves each label value comes *from* a
+/// declared vocabulary; this proves the family cannot grow past it. The
+/// synthetic run records every class under every outcome -- success,
+/// each classified kind and `cancelled`, the whole space -- with the
+/// hostile request in flight, and the space is then recorded a second
+/// time: a label minted from anything a caller sent, or from anything
+/// that varies between checkouts, would be one series too many. Today
+/// that is seven classes by eight outcomes. The class list is held small
+/// on purpose, because it is the multiplier.
+#[cfg(feature = "postgres")]
+#[test]
+fn the_pool_acquisition_series_are_bounded_by_two_fixed_vocabularies() {
+    let recorder = PrometheusBuilder::new().build_recorder();
+    let handle = recorder.handle();
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("test runtime should build");
+    ::metrics::with_local_recorder(&recorder, || {
+        runtime.block_on(synthetic_ha_run());
+        record_every_pool_acquisition();
+    });
+    let rendered = handle.render();
+
+    let classes: Vec<&str> = storage::postgres::CheckoutClass::KNOWN
+        .iter()
+        .map(|class| class.metric_label())
+        .collect();
+    let outcomes = storage::postgres::pool_acquire_error_classes();
+    assert!(
+        outcomes.contains(&storage::postgres::CHECKOUT_ERROR_CLASS_CANCELLED),
+        "an abandoned checkout is an outcome of the family, not a missing sample"
+    );
+    assert!(
+        classes.len() <= 8,
+        "the operation-class list multiplies every outcome; keep it a short fixed list: \
+         {classes:?}"
+    );
+
+    let mut series = std::collections::BTreeSet::new();
+    for line in rendered.lines().filter(|line| !line.starts_with('#')) {
+        // The summary's quantile lines and its `_sum` and `_count`
+        // lines all belong to the family.
+        if !rendered_metric_name(line).starts_with(metrics::DATABASE_POOL_ACQUIRE_SECONDS) {
+            continue;
+        }
+        for (what, canary) in CANARIES {
+            assert!(
+                !line.contains(canary),
+                "{what} must never reach the acquisition series: {line}"
+            );
+        }
+        let labels: std::collections::BTreeMap<String, String> = rendered_labels(line)
+            .into_iter()
+            .filter(|(label, _)| label != "quantile")
+            .collect();
+        assert_eq!(
+            labels.keys().map(String::as_str).collect::<Vec<_>>(),
+            ["error_class", "operation_class"],
+            "the acquisition series carries exactly its two declared labels: {line}"
+        );
+        assert!(
+            classes.contains(&labels["operation_class"].as_str()),
+            "operation_class must be a fixed class: {line}"
+        );
+        assert!(
+            outcomes.contains(&labels["error_class"].as_str()),
+            "error_class must be a classified kind, none or cancelled: {line}"
+        );
+        series.insert((
+            labels["operation_class"].clone(),
+            labels["error_class"].clone(),
+        ));
+    }
+    assert_eq!(
+        series.len(),
+        classes.len() * outcomes.len(),
+        "every class under every outcome, and not one series more:\n{rendered}"
+    );
 }
 
 #[tokio::test]
@@ -12647,6 +12770,324 @@ async fn caller_assertion_refusals_are_conflicts_with_their_own_reason() {
         let body = json_body(response).await;
         assert_eq!(body["reason"], json!("caller_assertion_not_enforced"));
     }
+}
+
+/// A caller assertion as an operator would send one. Nothing reads its
+/// signing key alias: every lane refuses the Connection first.
+fn admin_caller_assertion_json() -> Value {
+    json!({
+        "signing_key_id": "assertion-signing-key",
+        "kid": "gw-test-1",
+        "algorithm": "es256",
+        "issuer": "https://gateway.example.test",
+        "audience": "https://openapi.example.test",
+        "token_type": "at+jwt",
+        "header_name": "x-caller-assertion",
+        "lifetime_seconds": 60,
+        "claims": ["email"],
+        "bind_request": true
+    })
+}
+
+/// Create `body` with a caller assertion through the admin API, returning
+/// the new Connection's ID and ETag.
+async fn create_attested_connection(router: &Router, mut body: Value) -> (String, String) {
+    body["caller_assertion"] = admin_caller_assertion_json();
+    let list = router
+        .clone()
+        .oneshot(connection_admin_request(
+            Method::GET,
+            CONNECTIONS_ADMIN_ROUTE,
+            Some(test_principal(&["connections-reader"])),
+            None,
+            None,
+            false,
+        ))
+        .await
+        .expect("connection list should complete");
+    let collection_etag = list
+        .headers()
+        .get(CONNECTION_COLLECTION_ETAG_HEADER)
+        .and_then(|value| value.to_str().ok())
+        .expect("connection list should include collection ETag")
+        .to_owned();
+    let created = router
+        .clone()
+        .oneshot(connection_admin_request(
+            Method::POST,
+            CONNECTIONS_ADMIN_ROUTE,
+            Some(test_principal(&["connections-editor"])),
+            Some(body.to_string()),
+            Some(&collection_etag),
+            true,
+        ))
+        .await
+        .expect("attested connection create should complete");
+    assert_eq!(created.status(), StatusCode::CREATED);
+    let etag = created
+        .headers()
+        .get(header::ETAG)
+        .and_then(|value| value.to_str().ok())
+        .expect("created connection should include ETag")
+        .to_owned();
+    let id = json_body(created).await["id"]
+        .as_str()
+        .expect("created connection should include ID")
+        .to_owned();
+    (id, etag)
+}
+
+#[tokio::test]
+async fn attested_connection_catalog_operations_are_conflicts_over_http() {
+    // The refusal reaches an admin client as a 409 naming the reason, and the
+    // register and refresh failures are audited with it, through the real
+    // handlers rather than only the error mappers.
+    let connection_db = TempDb::new("connection-caller-assertion-catalogs");
+    let policy = TempPolicyFile::new(&connection_policy_document_string());
+    let capture = audit::sink::tests::CaptureSink::new();
+    let audit_log = audit::AuditLog::new(Arc::new(capture.clone()) as Arc<dyn audit::AuditSink>);
+    let router = connection_admin_router(&connection_db, &policy, audit_log);
+
+    let openapi_body: Value =
+        serde_json::from_str(&managed_openapi_connection_body("Attested OpenAPI"))
+            .expect("managed OpenAPI body should parse");
+    let (openapi_id, openapi_etag) = create_attested_connection(&router, openapi_body).await;
+    let spec = widget_openapi_spec();
+
+    let preview = router
+        .clone()
+        .oneshot(connection_admin_request(
+            Method::POST,
+            &format!("{CONNECTIONS_ADMIN_ROUTE}/{openapi_id}/openapi/preview"),
+            Some(test_principal(&["openapi-tools-reader"])),
+            Some(json!({ "spec": spec }).to_string()),
+            None,
+            true,
+        ))
+        .await
+        .expect("attested preview should complete");
+    assert_eq!(preview.status(), StatusCode::CONFLICT);
+    assert_eq!(
+        json_body(preview).await["reason"],
+        json!("caller_assertion_not_enforced")
+    );
+
+    // A correct digest and a non-empty selection, so only the refusal can
+    // stop the registration.
+    let register = router
+        .clone()
+        .oneshot(connection_admin_request(
+            Method::POST,
+            &format!("{CONNECTIONS_ADMIN_ROUTE}/{openapi_id}/openapi/register"),
+            Some(test_principal(&["openapi-tools-writer"])),
+            Some(
+                json!({
+                    "spec": spec,
+                    "spec_digest": hex::encode(Sha256::digest(spec.as_bytes())),
+                    "expected_spec_revision": 0,
+                    "expected_catalog_revision": 0,
+                    "selected_tool_names": ["getWidget"],
+                    "security_confirmations": [],
+                })
+                .to_string(),
+            ),
+            Some(&openapi_etag),
+            true,
+        ))
+        .await
+        .expect("attested register should complete");
+    assert_eq!(register.status(), StatusCode::CONFLICT);
+    assert_eq!(
+        json_body(register).await["reason"],
+        json!("caller_assertion_not_enforced")
+    );
+
+    let openapi_refresh = router
+        .clone()
+        .oneshot(connection_admin_request(
+            Method::POST,
+            &format!("{CONNECTIONS_ADMIN_ROUTE}/{openapi_id}/refresh"),
+            Some(test_principal(&["connections-refresher"])),
+            None,
+            Some(&openapi_etag),
+            true,
+        ))
+        .await
+        .expect("attested OpenAPI refresh should complete");
+    assert_eq!(openapi_refresh.status(), StatusCode::CONFLICT);
+    assert_eq!(
+        json_body(openapi_refresh).await["reason"],
+        json!("caller_assertion_not_enforced")
+    );
+
+    let (mcp_id, mcp_etag) = create_attested_connection(
+        &router,
+        json!({
+            "display_name": "Attested MCP",
+            "enabled": true,
+            "kind": "mcp_streamable_http",
+            "endpoint": {
+                "base_url": "https://mcp.example.test",
+                "base_path": "/mcp"
+            },
+            "authentication": { "type": "none" },
+            "discovery": {
+                "type": "managed_mcp",
+                "use_connection_authentication": false
+            }
+        }),
+    )
+    .await;
+    let mcp_refresh = router
+        .clone()
+        .oneshot(connection_admin_request(
+            Method::POST,
+            &format!("{CONNECTIONS_ADMIN_ROUTE}/{mcp_id}/refresh"),
+            Some(test_principal(&["connections-refresher"])),
+            None,
+            Some(&mcp_etag),
+            true,
+        ))
+        .await
+        .expect("attested MCP refresh should complete");
+    assert_eq!(mcp_refresh.status(), StatusCode::CONFLICT);
+    assert_eq!(
+        json_body(mcp_refresh).await["reason"],
+        json!("caller_assertion_not_enforced")
+    );
+
+    let refused = |event: &audit::AuditEvent, id: &str| {
+        event.payload["connection_id"] == json!(id)
+            && event.payload["outcome"] == json!("failure")
+            && event.payload["reason"] == json!("caller_assertion_not_enforced")
+    };
+    assert_eventually(Duration::from_secs(1), || {
+        let events = capture.events();
+        events.iter().any(|event| {
+            event.event_type == audit::event::TOOL_REGISTRY_CHANGED
+                && event.payload["action"] == json!("managed_openapi_catalog_registration_rejected")
+                && refused(event, openapi_id.as_str())
+        }) && [&openapi_id, &mcp_id].into_iter().all(|id| {
+            events.iter().any(|event| {
+                event.event_type == audit::event::CONNECTION_REFRESHED
+                    && refused(event, id.as_str())
+            })
+        })
+    });
+}
+
+#[tokio::test]
+async fn a_routine_admin_ui_save_keeps_the_caller_assertion_byte_for_byte() {
+    // The admin UI shows the block read only and never sends it. Its save is
+    // the safe read written back without `caller_assertion`; the gateway has
+    // to come back with the same block, byte for byte.
+    let connection_db = TempDb::new("connection-caller-assertion-ui-save");
+    let policy = TempPolicyFile::new(&connection_policy_document_string());
+    let router = connection_admin_router(&connection_db, &policy, test_audit_log());
+    let connection_body: Value =
+        serde_json::from_str(&managed_openapi_connection_body("Attested API"))
+            .expect("managed OpenAPI body should parse");
+    let (id, etag) = create_attested_connection(&router, connection_body).await;
+    let uri = format!("{CONNECTIONS_ADMIN_ROUTE}/{id}");
+
+    let read = router
+        .clone()
+        .oneshot(connection_admin_request(
+            Method::GET,
+            &uri,
+            Some(test_principal(&["connections-reader"])),
+            None,
+            None,
+            false,
+        ))
+        .await
+        .expect("attested connection read should complete");
+    assert_eq!(read.status(), StatusCode::OK);
+    let read = json_body(read).await;
+    let stored = read["configuration"]["caller_assertion"].clone();
+    assert_eq!(stored["signing_key_configured"], json!(true));
+    assert_eq!(stored["kid"], json!("gw-test-1"));
+    assert!(
+        !read.to_string().contains("assertion-signing-key"),
+        "the safe read must not name the signing key alias"
+    );
+
+    // Exactly what the editor's `writeFromForm` sends for this Connection
+    // after a rename.
+    let mut ui_save = json!({
+        "display_name": "Attested API renamed",
+        "enabled": read["enabled"],
+        "kind": read["kind"],
+        "endpoint": read["configuration"]["endpoint"],
+        "authentication": read["configuration"]["authentication"],
+        "tls": {},
+        "discovery": read["configuration"]["discovery"],
+    });
+    assert!(ui_save.get("caller_assertion").is_none());
+    let saved = router
+        .clone()
+        .oneshot(connection_admin_request(
+            Method::PUT,
+            &uri,
+            Some(test_principal(&["connections-editor"])),
+            Some(ui_save.to_string()),
+            Some(&etag),
+            true,
+        ))
+        .await
+        .expect("admin UI save should complete");
+    assert_eq!(saved.status(), StatusCode::OK);
+    let saved_etag = saved
+        .headers()
+        .get(header::ETAG)
+        .and_then(|value| value.to_str().ok())
+        .expect("saved connection should include ETag")
+        .to_owned();
+    let saved = json_body(saved).await;
+    assert_eq!(saved["display_name"], json!("Attested API renamed"));
+    assert_eq!(
+        serde_json::to_string(&saved["configuration"]["caller_assertion"])
+            .expect("saved block should serialize"),
+        serde_json::to_string(&stored).expect("stored block should serialize"),
+    );
+
+    let reread = router
+        .clone()
+        .oneshot(connection_admin_request(
+            Method::GET,
+            &uri,
+            Some(test_principal(&["connections-reader"])),
+            None,
+            None,
+            false,
+        ))
+        .await
+        .expect("attested connection reread should complete");
+    let reread = json_body(reread).await;
+    assert_eq!(
+        serde_json::to_string(&reread["configuration"]["caller_assertion"])
+            .expect("reread block should serialize"),
+        serde_json::to_string(&stored).expect("stored block should serialize"),
+    );
+
+    // The same body with an explicit `null` is the deliberate removal the
+    // admin UI never sends.
+    ui_save["caller_assertion"] = Value::Null;
+    let removed = router
+        .oneshot(connection_admin_request(
+            Method::PUT,
+            &uri,
+            Some(test_principal(&["connections-editor"])),
+            Some(ui_save.to_string()),
+            Some(&saved_etag),
+            true,
+        ))
+        .await
+        .expect("explicit removal should complete");
+    assert_eq!(removed.status(), StatusCode::OK);
+    assert!(json_body(removed).await["configuration"]
+        .get("caller_assertion")
+        .is_none());
 }
 
 #[tokio::test]
@@ -31373,7 +31814,8 @@ mod cluster_policy_tests {
         // authority's revision like the production startup path does.
         rbac_state
             .install_revision_snapshot(active.policy.clone(), active.security_revision)
-            .await;
+            .await
+            .expect("the authority's revision should install");
 
         // GET serves the authoritative document and its verified ETag.
         let etag = etag_of(
@@ -31629,7 +32071,8 @@ mod cluster_policy_tests {
         );
         rbac_state
             .install_revision_snapshot(active.policy.clone(), active.security_revision)
-            .await;
+            .await
+            .expect("the authority's revision should install");
         let runtime = ClusterSecurityRuntime::new(
             store.revision_source(),
             PolicyResource::new(store.clone(), rbac_state.clone()),
@@ -31696,7 +32139,8 @@ mod cluster_policy_tests {
         // replica booted against.
         rbac_state
             .install_revision_snapshot(active.policy.clone(), active.security_revision)
-            .await;
+            .await
+            .expect("the authority's revision should install");
 
         // Sanity: the granted admin principal is authorized while the
         // snapshot is current.
@@ -31791,7 +32235,8 @@ mod cluster_policy_tests {
         );
         rbac_state
             .install_revision_snapshot(active.policy.clone(), active.security_revision)
-            .await;
+            .await
+            .expect("the authority's revision should install");
         let runtime = ClusterSecurityRuntime::new(
             store.revision_source(),
             PolicyResource::new(store.clone(), rbac_state.clone()),
@@ -32202,7 +32647,8 @@ mod cluster_tools_tests {
                 active_policy.policy.clone(),
                 active_policy.security_revision,
             )
-            .await;
+            .await
+            .expect("the authority's revision should install");
         let registry =
             ToolRegistry::from_definitions_with_audit(Vec::new(), Some(test_audit_log()));
         let boot_tools = tools_store
@@ -32457,7 +32903,8 @@ mod cluster_tools_tests {
                 active_policy.policy.clone(),
                 active_policy.security_revision,
             )
-            .await;
+            .await
+            .expect("the authority's revision should install");
         let runtime = ClusterSecurityRuntime::new(
             policy_store.revision_source(),
             PolicyResource::new(policy_store.clone(), rbac_state.clone()),
@@ -32544,7 +32991,8 @@ mod cluster_tools_tests {
                 active_policy.policy.clone(),
                 active_policy.security_revision,
             )
-            .await;
+            .await
+            .expect("the authority's revision should install");
         let runtime = ClusterSecurityRuntime::new(
             policy_store.revision_source(),
             PolicyResource::new(policy_store.clone(), rbac_state.clone()),
@@ -32767,7 +33215,8 @@ mod cluster_tools_tests {
                 active_policy.policy.clone(),
                 active_policy.security_revision,
             )
-            .await;
+            .await
+            .expect("the authority's revision should install");
         let runtime = ClusterSecurityRuntime::new(
             policy_store.revision_source(),
             PolicyResource::new(policy_store.clone(), rbac_state.clone()),
@@ -32897,7 +33346,8 @@ mod cluster_tools_tests {
                 active_policy.policy.clone(),
                 active_policy.security_revision,
             )
-            .await;
+            .await
+            .expect("the authority's revision should install");
         let registry =
             ToolRegistry::from_definitions_with_audit(Vec::new(), Some(test_audit_log()));
         let boot_tools = tools_store
@@ -33627,7 +34077,8 @@ mod cluster_discovery_tests {
         // handler's snapshot is unkeyed.
         rbac_state
             .install_revision_snapshot(active.policy.clone(), active.security_revision)
-            .await;
+            .await
+            .expect("the authority's revision should install");
 
         let engine = discovery::cluster_suggestions::ClusterRuleSuggestionEngine::new(
             Arc::new(PostgresDiscoveryReadStore::new(pool.clone())),

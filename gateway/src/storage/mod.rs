@@ -162,8 +162,8 @@ impl RepositoryErrorKind {
     /// and `"invalid data"` with a space in it is not that.
     /// `every_error_kind_has_a_bare_label_and_a_stored_name` keeps the two
     /// in step.
-    // The only emitter is the cluster-mode store histogram; a
-    // `--no-default-features` build has no store to time.
+    // The only emitters are the cluster-mode store and pool-acquisition
+    // histograms; a `--no-default-features` build has no store to time.
     #[cfg_attr(not(feature = "postgres"), allow(dead_code))]
     pub fn metric_label(self) -> &'static str {
         match self {
