@@ -1,4 +1,8 @@
-import type { SafeCallerAssertion } from '../lib/connections';
+import type {
+  CallerAssertionKeyProblem,
+  CallerAssertionKeyProblemCode,
+  SafeCallerAssertion,
+} from '../lib/connections';
 
 /**
  * A Connection's caller assertion, read only. Shared by the detail page and
@@ -23,7 +27,8 @@ export function CallerAssertionSummary({
           The admin UI shows this block read only, and saving the connection
           here keeps it unchanged. To use the connection before enforcement
           ships, remove the block through the admin API by sending{' '}
-          <code>&quot;caller_assertion&quot;: null</code>.
+          <code>&quot;caller_assertion&quot;: null</code>, which needs the
+          secrets-write permission.
         </p>
         {assertion.bind_approval ? (
           <p>
@@ -33,6 +38,9 @@ export function CallerAssertionSummary({
           </p>
         ) : null}
       </div>
+      {assertion.key_problem ? (
+        <KeyProblemAlert problem={assertion.key_problem} />
+      ) : null}
       <dl className="traffic-metadata-grid">
         <Row
           label="Signing key"
@@ -68,8 +76,49 @@ export function CallerAssertionSummary({
             assertion.bind_approval ? 'Requested, not supported' : 'Not bound'
           }
         />
+        {(assertion.published_keys ?? []).map((key) => (
+          <Row
+            key={key.kid}
+            label="Also published"
+            value={`${key.kid} (${key.algorithm.toUpperCase()}, ${
+              key.signing_key_configured ? 'configured' : 'not configured'
+            })`}
+          />
+        ))}
       </dl>
     </>
+  );
+}
+
+const KEY_PROBLEM_REASONS: Record<CallerAssertionKeyProblemCode, string> = {
+  unresolvable_binding:
+    'its secret alias is not configured, or does not hold a key',
+  binding_unavailable:
+    'its secret source could not be read; the key returns once it can be',
+  invalid_signing_key:
+    'its secret is not exactly one PKCS#8 private key (BEGIN PRIVATE KEY)',
+  algorithm_mismatch: 'its key is for the other algorithm',
+  unusable_signing_key:
+    'its key is not a P-256 key for ES256 or an RSA key of at least 2048 bits for RS256',
+  duplicate_kid:
+    'another enabled connection publishes a different key under the same key ID',
+};
+
+function KeyProblemAlert({ problem }: { problem: CallerAssertionKeyProblem }) {
+  return (
+    <div className="alert error" role="alert">
+      <p>
+        <strong>Keys not published.</strong> GreenGateway leaves this
+        connection&apos;s keys out of its published key set because the key
+        configured in <code>{problem.field}</code> cannot be used:{' '}
+        {KEY_PROBLEM_REASONS[problem.code]} (<code>{problem.code}</code>).
+      </p>
+      <p>
+        Every other connection&apos;s keys are still published. A save that
+        keeps this connection enabled checks its keys again and is refused
+        until the key is fixed; disabling the connection needs no key.
+      </p>
+    </div>
   );
 }
 

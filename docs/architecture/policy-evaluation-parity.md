@@ -2,7 +2,7 @@
 
 Contract evidence for [#421](https://github.com/Greenhat-Security/GreenGateway/issues/421). It names, per lane, the legacy decision entry point, the kernel entry point that reproduces it, how inputs are normalized, what happens with no match, and what authority the result is bound to.
 
-**HTTP/RBAC now uses the shared evaluator (#422, PR 1).** The table names the pre-cutover entry points and the kernel replacements. The old HTTP middleware and matching helpers remain only in `rbac_legacy_tests.rs` as a frozen test oracle; they are absent from serving builds. Tool admission, rate selection, static egress and analysis consumers have not been migrated.
+**HTTP/RBAC (#422 PR 1) and the tool lane (#422 PR 2) now use the shared evaluator.** The table names the pre-cutover entry points and the kernel replacements. The old HTTP middleware remains only in `rbac_legacy_tests.rs`, and the tool lane as it stood at 05c295a only in `tools/runtime_legacy_tests.rs` over `rbac_legacy_tests.rs`; both are frozen test oracles, absent from serving builds. Two tool-lane paths still match rules with `RuleMatcher` directly and are not migrated: the enum-source precheck and the runtime's non-RBAC fallback (both in the table). Rate selection, static egress and the analysis consumers have not been migrated.
 
 ## Lanes
 
@@ -16,11 +16,13 @@ Contract evidence for [#421](https://github.com/Greenhat-Security/GreenGateway/i
 | Selected virtual upstream | `required_upstream_host` branch, `host_policy_required` | `Reason::HostPolicyRequired` | Derived from `route_host`, never carried twice | **Refused outright** — the policy default does not apply and shadow does not soften it | same |
 | MCP alias identities | `evaluate_equivalent_paths_with_dispatch` + exact-then-prefix route search | `match_direct` / `match_route` with `canonical_path: Some(..)` | Request path plus the canonical policy identity, carried in `HttpTarget::McpAlias` | Action-major precedence across both identities; route matched exactly on the request path, then by prefix on the canonical one | same |
 | Rate lane selection | `policy_rate_limit_request` guard + `RateLimitState::matching_limiter` | `CompiledPolicy::select_rate_lane` | Method, path pattern, principal; **anonymous reaches no override**, reproducing the live early return | `RateLaneOutcome::NoOverride` | `InputBinding` on the selection itself |
-| Tool invocation | `ToolRuntime::execute_with_context` → `authorize_tool_call`, `prepare_invocation` | `evaluate_tool`, `Invocation` | Runtime Actor-projected identity; exact tool name | Enabled matching entry allows without a tool rule; absent entry denies | Policy `ResourceSnapshot` + tool context digest |
-| Tool visibility | `ToolRuntime::tool_visible_to_context` | `evaluate_tool`, `Visibility` | Same runtime identity; registry listing remains outside | Enabled matching entry visible; absent entry hidden | same, operation-bound |
-| Inventory eligibility | `RbacState::tool_policy_eligibility` via inventory | `evaluate_tool`, `PolicyEligibility` | Authenticated Principal directly | Exact existing eligible/reason pair | same, operation-bound |
-| Composite leaf enablement | `ToolRuntime::composite_leaf_enabled` | `evaluate_tool`, `CompositeLeaf` | Exact policy name; ignores identity/tool rules under an existing grant | Absent entry denies | same, operation-bound |
-| Rendered tool HTTP rules | `ToolRuntime::authorize_http_operation` | `evaluate_tool`, `RenderedHttp` | Exact separated rendered path/method; runtime identity; **unknown dispatch** | Allow; no route/default fallback | same, operation-bound |
+| Tool invocation | `ToolRuntime::authorize_tool_call` → `RbacState::evaluate_tool_authorization` over `ToolAuthorizationSnapshot` (`RuleMatcher::evaluate_tool`), frozen as `legacy_admit` | `RbacPolicyState::tool_invocation_verdict` → `evaluate_tool`, `Invocation` | Runtime Actor-projected identity; exact tool name, refused over 4096 bytes before evaluation | Enabled matching entry allows without a tool rule; absent entry denies (`unknown_tool`) | Policy `ResourceSnapshot` + tool context digest; the whole invocation pinned to one snapshot (below) |
+| Tool visibility | `ToolRuntime::tool_visible_to_context` → `tool_visible_for_snapshot`, frozen as `legacy_tool_visible_to_context` | `RbacState::tool_visible` → `evaluate_tool`, `Visibility` | Same runtime identity; registry listing remains outside | Enabled matching entry visible; absent entry hidden; a shadow rule does not hide | same, operation-bound |
+| Inventory eligibility | `RbacState::tool_policy_eligibility` via inventory, frozen as `legacy_tool_policy_eligibility` | `ToolEligibilitySnapshot::eligibility` → `evaluate_tool`, `PolicyEligibility`, one snapshot per listing | Authenticated Principal directly | Exact existing eligible/reason pair | same, operation-bound |
+| Composite leaf enablement | `ToolRuntime::composite_leaf_enabled` → enable bit of `evaluate_tool_authorization`, frozen as `legacy_composite_leaf_enabled` | `RbacState::composite_leaf_enabled` → `evaluate_tool`, `CompositeLeaf`, `PrincipalFact::Missing` | Exact policy name; ignores identity/tool rules under an existing grant | Absent entry denies | same, operation-bound |
+| Rendered tool HTTP rules | `ToolRuntime::authorize_http_operation` → `RuleMatcher::evaluate_with_dispatch`, unknown dispatch, frozen as `legacy_authorize_http_operation` | `RbacState::evaluate_tool_http_rule` → `evaluate_tool`, `RenderedHttp` | Exact separated rendered path/method, checked at rendering by `validate_rendered_http_path`; runtime identity; **unknown dispatch** | Allow; no route/default fallback | same, operation-bound |
+| Enum-source precheck | `SourceAuthorizer::authorize` for `ToolRuntime`: enable bit, then `RuleMatcher::evaluate_denies_with_dispatch`, contextless `GET` | **not migrated**; both checks read one live `current_policy()` | Rendered path without its query; no principal | Allow unless the tool is disabled or a deny matches | the live policy, read once |
+| Non-RBAC tool fallback | `ToolRuntime` built without an `RbacState`: `ToolRuntimeConfig` entries and its own `RuleMatcher` | **not migrated** | Runtime identity; exact tool name | `default_policy` for unlisted tools | the runtime's configuration |
 | Static egress | `egress.rs` | **not implemented** | — | — | — |
 
 ## Trace reasons and limitation codes
@@ -85,60 +87,26 @@ A result bound to one digest is not reusable under the other, and a context pinn
 
 ## Tool lane evidence and cutover limits
 
-`policy_eval::tools::tests` compares all five operations against the installed
-policy and unchanged live consumers. The admission matrix varies global mode,
-default, first-rule action, identity constraints, anonymous/authenticated callers,
-and absent/disabled entries. It checks invocation errors, work execution,
-visibility, inventory reason codes and composite enablement. Audit comparisons
-check event type and original rule attribution, including source ordinals after
-disabled and unrelated rules. Rendered HTTP fixtures distinguish unknown from
-contextless dispatch and prove that no-match allows even with a deny default,
-a permission route and no tool entry. Shadow stays visible/eligible but produces
-Observe for invocation/rendered HTTP.
+**Oracle.** The frozen pre-cutover tool lane from 05c295a: `tools/runtime_legacy_tests.rs` (`legacy_admit`, `legacy_tool_visible_to_context`, `legacy_composite_leaf_enabled`, `legacy_authorize_http_operation`) over `middleware/rbac_legacy_tests.rs` (`legacy_evaluate_tool_authorization`, `legacy_evaluate_tool_http_rule`, `legacy_tool_policy_eligibility`). It is the original implementation, never a hand-written evaluator, and it is absent from serving builds.
 
-Tool context version 1 and semantics `gg-tool-policy-v1` are independent of the
-HTTP context version. Every result binds the operation and all supplied policy
-facts. Missing facts fail closed; malformed facts return errors. Inventory has
-no anonymous live contract, so an anonymous inventory context is inconsistent.
-Composite enablement can complete with a missing identity because it does not
-use identity. The new API is bounded, but a live adapter still needs parity at
-its rejection boundaries: policy tool names have no equivalent 4 KiB bound, and
-rendered HTTP method/path facts do not pass through inbound request admission.
+**Differential fixtures** (`policy_eval::tools::tests`). `generated_policies_are_decided_alike_by_the_frozen_consumers_and_the_live_runtime` is a proptest with a fixed seed (`422_002`, 128 cases) over generated tool entries, tool and path rules, enforcement mode and default. `the_frozen_consumers_and_the_live_runtime_agree_across_the_named_matrix` adds the cases the corpus reaches only by chance: a rule before and after the deciding one, disabled rules in between (so source ordinals and ids must be attributed exactly), every first-tool action under both modes and defaults, and each identity constraint alone. Both ask the frozen consumers and the live runtime every question over seven identities (anonymous, bearer, cookie, service token, client certificate, another issuer, 256 roles) and four names, and compare admission errors and admitted limits, whether work ran, a full served `execute_with_context` on a third runtime, visibility, composite enablement, inventory eligibility, rendered-HTTP decisions over three methods and four paths, and the audit each side emitted, field by field. `live_adapters_translate_the_kernel_answer_for_invocation_visibility_inventory_and_composite` and `rendered_http_matches_live_direct_rules_unknown_dispatch_and_audit_attribution` check each adapter's translation of the installed kernel's answer; they are not parity evidence, because the live consumers are now the kernel.
 
-The runtime Actor projection accepts three auth modes and currently drops a
-client-certificate identity, whereas inventory retains it. The differential
-fixture pins both outcomes. Adapters must preserve or explicitly change that
-behavior with both authorities tested. Every live tool-lane policy read,
-including the rendered HTTP rule, goes through `effective_policy()`, and
-registry and Connection lookups go through their own pinned accessors. In
-cluster mode `rbac_middleware` pins the bundle the revision gate admitted
-(policy, tools, Connections) as task-locals of the request's task, and hands
-the same pins to the request as a `RequestPins` extension. Task-locals do not
-cross `tokio::spawn`. Reads made in the request's own task, such as the admin
-playground and inventory endpoints, see the pins directly. MCP `tools/list`,
-`tools/call` and task rejection run in tasks rmcp spawns, so `McpServer`
-re-enters the pins from the extension with `with_request_pins` before its
-first registry or policy read. Either way invocation, visibility, inventory
-eligibility, composite enablement and `evaluate_tool_http_rule` are judged by
-the admitted snapshot, never by a revision installed while the request was in
-flight. A handler that moves tool-lane work onto a task of its own must
-re-enter the pins the same way, or it reads the live lanes.
-`tool_http_operation_reads_the_pinned_policy_not_the_live_lane` holds the
-rendered HTTP rule and tool visibility to the pinned snapshot together.
-`mcp_requests_are_judged_by_the_admitted_revision_not_one_installed_in_flight`
-drives `tools/list` and `tools/call` through `rbac_middleware` while a
-reconcile installs the next policy and registry, and checks the listing, the
-invocation and the rendered HTTP decision all come from the admitted revision.
+The runtime Actor projection accepts three auth modes and drops a client-certificate identity, whereas inventory retains it. The fixtures pin both outcomes on both sides.
 
-Because both reads are pinned, the admin playground's second rendered-HTTP
-check, made after its execution precondition, reads the same snapshot as the
-first in cluster mode. It repeats that decision and its audit event. It is not
-protection against a revision installed while the precondition ran; that
-revision judges the next admitted request. Standalone mode pins nothing, so
-there the recheck still reads the live lane.
+**Refusals.** Where the evaluator refuses to answer, the adapter blocks, in shadow mode too: `tool_name_out_of_bounds` (a name over `MAX_TOOL_NAME_BYTES`, refused before the evaluator is asked), `policy_evaluation_incomplete` and `policy_evaluation_error`. A refused invocation is `tool.invoke.rejected` and a refused rendered request `authz.denied`, each with the refusal as `reason` and `matched_rule_id: null`; an inventory preview is ineligible with that reason, and visibility and composite enablement answer no. MCP answers them as a `policy_denied` error carrying the reason, the playground as `403 policy_denied`, and executor observations as `403` with the refusal's reason. They are the only answers that differ from the frozen consumers, always toward a block: an over-long name (old: unknown tool), a principal the evaluator refuses for shape, and rendered facts it refuses. `refusals_block_with_stable_reasons_where_the_frozen_consumers_answered` pins each. The adapter also admits only on the evaluator's own allow effect: an `Allowed` invocation or a no-rule rendered answer with any other effect is refused as `policy_evaluation_error`, so a later kernel change fails closed.
 
-Registry existence and listing metadata, composite grant validity, enum-source
-refresh, non-RBAC permissive fallback, transport and mutable execution state are
-outside this contract. The named operation and `not_evaluated` trace fields make
-those limits explicit. Static egress has no kernel entry point yet; it is owned
-by #422 PR 3b.
+**Bounds.** Policy validation refuses a `tools` key or a rule `tool_name` over 4096 bytes (`request_bounds::MAX_TOOL_NAME_BYTES`), without echoing it, so no policy names a tool the evaluator cannot be asked about. A stored or published policy carrying a longer name no longer loads, which fails closed. Discovered MCP and OpenAPI tool names are bounded at 128 characters; a `TOOLS_FILE` name only by that file's size cap, so a call to such a local tool is the one served path to `tool_name_out_of_bounds`. Rendering holds a rendered request to the evaluator's own bounds before its rule is asked: a method over 64 bytes, and any path `validate_rendered_http_path` refuses (over 8 KiB, relative, an empty or dot segment, a malformed escape), fail as configuration errors. That refuses some requests the gateway used to send, such as an empty path argument. `the_tool_lane_bounds_are_exactly_the_bounds_policy_validation_and_the_adapter_enforce` pins both sides of each bound.
+
+Tool context version 1 and semantics `gg-tool-policy-v1` are independent of the HTTP context version. Every result binds the operation and all supplied policy facts. Missing facts fail closed; malformed facts return errors. Inventory has no anonymous live contract, so an anonymous inventory context is inconsistent. Composite enablement can complete with a missing identity because it does not use identity. Trace reuse (`canonical_trace_bytes`, `reusable_for`) stays offline, and the live adapters still compute each answer's context binding.
+
+### Which snapshot judges a tool decision
+
+Every live tool-lane policy read goes through `effective_policy()`, and registry and Connection lookups go through their own pinned accessors.
+
+- **Each invocation is pinned, in both modes.** The tool runtime runs every invocation (`execute_with_context`, and `execute_result_with_context_and_outcome`, which the executor, MCP calls, MCP task rejection and the admin playground all reach) inside `RbacState::with_request_policy_snapshot`. Admission, the queue wait, the playground's execution precondition, the rendered-HTTP rule and composite leaf enablement are then judged by one snapshot. In cluster mode it is the bundle the revision gate admitted the request under; in standalone mode it is the live lane, read once when the invocation starts. A revision installed while the call is queued or running judges the next invocation, never part of this one, so admission from one snapshot cannot pair with another's rules and allow what neither allows. `a_revision_installed_after_admission_never_judges_the_rest_of_the_invocation` installs a revision from inside the work, between admission and the rendered request; `a_revision_installed_while_an_invocation_is_queued_never_judges_its_rendered_request` installs one while the call waits for a permit.
+- **Cluster mode also pins the request.** `rbac_middleware` pins the admitted bundle (policy, tools, Connections) as task-locals of the request's task and hands the same pins to the request as a `RequestPins` extension. Task-locals do not cross `tokio::spawn`. MCP `tools/list`, `tools/call` and task rejection run in tasks rmcp spawns, so `McpServer` re-enters the pins with `with_request_pins` before its first registry or policy read. `mcp_requests_are_judged_by_the_admitted_revision_not_one_installed_in_flight` and `tool_http_operation_reads_the_pinned_policy_not_the_live_lane` hold that.
+- **The admin playground adds refuse-only live checks.** Its precondition judges the execute permission and the eligibility behind its etag inside `with_request_policy_snapshot` (`request_snapshot_grants_permission`, `ToolEligibilitySnapshot`), which inside the runtime is the invocation's snapshot. It also re-reads the management lane live (`principal_has_permission`), and its last rendered-HTTP check, after the precondition, reads the live lane (`authorize_http_operation_live`). Both live reads follow a pinned decision that already allowed the call, so each can only refuse: a revocation or a deny published while the call was queued or its precondition ran still stops it. `a_pinned_request_snapshot_answers_permission_and_eligibility_while_the_management_lane_reads_live`, `the_live_rendered_http_check_refuses_inside_a_pinned_invocation` and `pinned_playground_invocation_still_refuses_a_deny_published_during_its_precondition` hold this. Composite leaves and MCP proxy tools have no such final live check; they are judged by the pinned snapshot.
+- **Inventory reads one snapshot per listing.** `CapabilityInventory` takes one `ToolEligibilitySnapshot` per build, so a listing cannot straddle an install between two tools. `a_tool_eligibility_snapshot_taken_before_an_install_answers_every_tool_from_it` holds it.
+- **Not pinned.** In standalone mode MCP `tools/list` asks each tool's visibility separately of the live lane, so one listing can straddle an install. Each tool's answer still comes from one snapshot, and a listing grants nothing: every call is judged afresh. The enum-source precheck reads the live policy once for both its enable bit and its deny rules (`the_enum_source_precheck_judges_enablement_and_denies_by_one_snapshot`); the refresher runs outside any request, and an admin overlay install resolves its sources against the live policy its read-modify-write builds on.
+
+Registry existence and listing metadata, composite grant validity, enum-source refresh, the non-RBAC permissive fallback, transport and mutable execution state are outside this contract. The named operation and `not_evaluated` trace fields make those limits explicit. Static egress has no kernel entry point yet; it is owned by #422 PR 3b.

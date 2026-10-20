@@ -2162,23 +2162,27 @@ async fn connection_tool_checks_egress_before_reading_the_secret_provider() {
 #[tokio::test]
 async fn connection_tool_with_unenforced_caller_assertion_is_refused_before_any_io() {
     // The Connection is otherwise fully usable: the upstream is reachable and
-    // allowlisted and both secrets resolve. Only the assertion it asks for,
+    // allowlisted and both secrets resolve -- the signing key is a real key,
+    // loaded when the Connection was saved. Only the assertion it asks for,
     // which nothing injects yet, may stop the call.
     const API_KEY_CANARY: &str = "assertion-test-api-key-canary";
-    const SIGNING_KEY_CANARY: &str = "assertion-test-signing-key-canary";
+    let signing_key = crate::connections::test_support::generated_es256_pem();
+    let mut canaries = vec![API_KEY_CANARY];
+    canaries.extend(crate::connections::test_support::pem_body_lines(
+        &signing_key,
+    ));
     let (addr, ca_pem, server) = one_request_tls_server().await;
     let (connection, secrets) = TemporaryStaticAuthRuntime::header_api_key_with_caller_assertion(
         addr,
         &ca_pem,
         API_KEY_CANARY.as_bytes(),
-        SIGNING_KEY_CANARY.as_bytes(),
+        signing_key.as_bytes(),
     )
     .await;
-    assert_eq!(
-        secrets.resolutions(),
-        0,
-        "setting up the Connection must not read its secrets"
-    );
+    // Saving read each secret exactly once: the API key, and the signing key
+    // it loaded. Everything after this is measured against that count.
+    let saved = secrets.resolutions();
+    assert_eq!(saved, 2, "saving the Connection reads each secret once");
     let capture = CaptureSink::new();
     let audit = AuditLog::new(Arc::new(capture.clone()) as Arc<dyn AuditSink>);
     let runtime = ToolRuntime::new(
@@ -2208,7 +2212,7 @@ async fn connection_tool_with_unenforced_caller_assertion_is_refused_before_any_
         panic!("the refusal should surface as a work failure");
     };
     assert_eq!(reason.as_deref(), Some("caller_assertion_not_enforced"));
-    for canary in [API_KEY_CANARY, SIGNING_KEY_CANARY] {
+    for canary in &canaries {
         assert!(
             !message.contains(canary),
             "the caller error leaked {canary}"
@@ -2243,16 +2247,16 @@ async fn connection_tool_with_unenforced_caller_assertion_is_refused_before_any_
     );
     assert_eq!(upstream.payload["upstream_status"], Value::Null);
     let rendered = serde_json::to_string(&events).expect("events should serialize");
-    for canary in [API_KEY_CANARY, SIGNING_KEY_CANARY] {
+    for canary in &canaries {
         assert!(!rendered.contains(canary), "the audit leaked {canary}");
     }
 
     // Both secrets sit behind a provider that counts every resolution, so
-    // "never consulted" is a count of zero rather than the absence of an
-    // event that a successful read would not raise either.
+    // "never consulted" is no read beyond the save's rather than the absence
+    // of an event that a successful read would not raise either.
     assert_eq!(
         secrets.resolutions(),
-        0,
+        saved,
         "no secret provider may be consulted for a refused Connection"
     );
     assert!(
@@ -2270,7 +2274,7 @@ async fn connection_tool_with_unenforced_caller_assertion_is_refused_before_any_
         .await
         .expect("the counting provider should serve the API key");
     assert_eq!(resolved.expose(), API_KEY_CANARY.as_bytes());
-    assert_eq!(secrets.resolutions(), 1);
+    assert_eq!(secrets.resolutions(), saved + 1);
     assert!(
         tokio::time::timeout(Duration::from_millis(100), server)
             .await
@@ -2288,9 +2292,11 @@ async fn composite_leaf_on_unenforced_caller_assertion_is_refused_before_member_
         addr,
         &ca_pem,
         b"composite-key",
-        b"composite-signing-key",
+        crate::connections::test_support::generated_es256_pem().as_bytes(),
     )
     .await;
+    let saved = secrets.resolutions();
+    assert_eq!(saved, 2, "saving the Connection reads each secret once");
     let definitions = composite_note_definitions(&connection.connection_id);
     let (executor, capture) = executor_for_composite_definitions(
         definitions,
@@ -2344,7 +2350,7 @@ async fn composite_leaf_on_unenforced_caller_assertion_is_refused_before_member_
     assert_eq!(failure.payload["failure_reason"], json!("composite_failed"));
     assert_eq!(
         secrets.resolutions(),
-        0,
+        saved,
         "a refused composite leaf must not consult a secret provider"
     );
     assert!(
@@ -2692,6 +2698,174 @@ async fn live_http_deny_published_during_precondition_fails_before_secret_or_ups
             .is_err(),
         "the newly denied invocation must not send upstream bytes"
     );
+}
+
+/// The served playground path, through the runtime: the whole invocation is
+/// pinned to the snapshot it was admitted under (#422), so inside the
+/// precondition the rendered request is still allowed by that snapshot after
+/// a deny publishes. The last rendered-HTTP check reads the live lane and can
+/// only refuse, so that deny still stops the call before any secret or
+/// upstream I/O.
+#[tokio::test]
+async fn pinned_playground_invocation_still_refuses_a_deny_published_during_its_precondition() {
+    const ARGUMENT_CANARY: &str = "pinned-policy-race-argument-canary";
+    const SECRET_CANARY: &str = "pinned-policy-race-secret-canary";
+
+    let (addr, ca_pem, server) = one_request_tls_server().await;
+    let connection =
+        TemporaryStaticAuthRuntime::header_api_key(addr, &ca_pem, SECRET_CANARY.as_bytes()).await;
+    let capture = CaptureSink::new();
+    let audit = AuditLog::new(Arc::new(capture.clone()) as Arc<dyn AuditSink>);
+    let initial_policy = Policy::validate_json_value(json!({
+        "schema_version": "0.1.0",
+        "tools": {
+            "get_charge": {
+                "timeout_ms": 500,
+                "max_concurrent": 1
+            }
+        }
+    }))
+    .expect("initial live policy should validate");
+    let rbac_state =
+        crate::middleware::rbac::RbacState::new(initial_policy, Vec::new(), false, audit.clone());
+    let runtime = ToolRuntime::new_with_rbac_state(
+        runtime_config([("get_charge", enabled_tool(500, 1))], 2, 1, 100),
+        audit.clone(),
+        Some(rbac_state.clone()),
+    );
+    let pinned_probe = runtime.clone();
+    let executor = executor_for_connection_tool(
+        connection_charge_tool(&connection.connection_id),
+        &connection,
+        runtime,
+        audit,
+    );
+    let policy_path = connection.root.join("live-policy-pinned.json");
+    let rbac_state_for_precondition = rbac_state.clone();
+    let secret_path = connection.secret_path.clone();
+    let precondition = ToolExecutionPrecondition::new_async(move |_| {
+        let policy_path = policy_path.clone();
+        let rbac_state = rbac_state_for_precondition.clone();
+        let secret_path = secret_path.clone();
+        let pinned_probe = pinned_probe.clone();
+        Box::pin(async move {
+            let deny_policy = json!({
+                "schema_version": "0.1.0",
+                "tools": {
+                    "get_charge": {
+                        "timeout_ms": 500,
+                        "max_concurrent": 1
+                    }
+                },
+                "rules": [{
+                    "id": "deny-charge-during-pinned-precondition",
+                    "methods": ["GET"],
+                    "path": "/charges/{charge_id}",
+                    "action": "deny"
+                }]
+            });
+            fs::write(
+                &policy_path,
+                serde_json::to_vec(&deny_policy).expect("deny policy should serialize"),
+            )
+            .expect("deny policy should write");
+            crate::middleware::rbac::reload_policy_from_file(&rbac_state, &policy_path)
+                .await
+                .expect("deny policy should publish during the final precondition");
+            let mut context = invocation_context();
+            context.source = ToolInvocationSource::AdminPlayground;
+            assert!(
+                pinned_probe.authorize_http_operation(
+                    "get_charge",
+                    "GET",
+                    &format!("/charges/{ARGUMENT_CANARY}"),
+                    &context,
+                ),
+                "inside the invocation the admitted snapshot, with no rule, still answers"
+            );
+            fs::remove_file(&secret_path)
+                .expect("secret canary should disappear after the policy reload");
+            Ok(())
+        })
+    });
+    let mut context = invocation_context();
+    context.source = ToolInvocationSource::AdminPlayground;
+
+    let error = executor
+        .execute_with_precondition(
+            "get_charge",
+            json!({ "charge_id": ARGUMENT_CANARY }),
+            context,
+            CancellationToken::new(),
+            precondition,
+        )
+        .await
+        .expect_err("the deny published during the precondition must fail closed");
+
+    assert!(matches!(
+        error,
+        ToolRuntimeError::Rejected { ref tool_name, ref reason }
+            if tool_name == "get_charge" && reason == "matched_rule"
+    ));
+    let events = audit_events(&capture, 1).await;
+    let denied = events
+        .iter()
+        .filter(|event| event.event_type == "authz.denied")
+        .collect::<Vec<_>>();
+    assert_eq!(denied.len(), 1, "{events:#?}");
+    assert_eq!(
+        denied[0].payload["matched_rule_id"],
+        json!("deny-charge-during-pinned-precondition")
+    );
+    assert_eq!(
+        denied[0].payload["invocation_source"],
+        json!("admin_playground")
+    );
+    assert!(events.iter().all(|event| {
+        event.event_type != audit::event::CONNECTION_SECRET_RESOLUTION_FAILED
+            && event.event_type != audit::event::TOOL_UPSTREAM_REQUEST
+    }));
+    let rendered_events =
+        serde_json::to_string(&events).expect("policy-race audit events should serialize");
+    assert!(!rendered_events.contains(ARGUMENT_CANARY));
+    assert!(!rendered_events.contains(SECRET_CANARY));
+    assert!(
+        tokio::time::timeout(Duration::from_millis(100), server)
+            .await
+            .is_err(),
+        "the denied invocation must not send upstream bytes"
+    );
+}
+
+/// A tool-lane refusal is a policy block, observed as one: 403 with the
+/// refusal's own stable reason, as a denying rule is, never the 503 of an
+/// unexplained runtime rejection.
+#[test]
+fn tool_policy_refusals_are_observed_as_policy_blocks() {
+    for reason in crate::middleware::rbac::ToolPolicyRefusal::REASONS {
+        let outcome = runtime_admission_failure_observation_outcome(
+            7,
+            &ToolRuntimeError::Rejected {
+                tool_name: "reports.export".to_owned(),
+                reason: reason.to_owned(),
+            },
+            false,
+        )
+        .expect("a refusal is observed");
+        assert_eq!(outcome.status, StatusCode::FORBIDDEN.as_u16(), "{reason}");
+        assert_eq!(outcome.reason, Some(reason));
+    }
+    let other = runtime_admission_failure_observation_outcome(
+        7,
+        &ToolRuntimeError::Rejected {
+            tool_name: "reports.export".to_owned(),
+            reason: "something_else".to_owned(),
+        },
+        false,
+    )
+    .expect("a rejection is observed");
+    assert_eq!(other.status, StatusCode::SERVICE_UNAVAILABLE.as_u16());
+    assert_eq!(other.reason, Some(TOOL_RUNTIME_REJECTED_REASON));
 }
 
 #[tokio::test]
@@ -4428,6 +4602,81 @@ async fn single_dot_path_placeholder_arg_is_rejected_before_network() {
         "widget_id",
     )
     .await;
+}
+
+#[tokio::test]
+async fn a_rendered_path_tool_policy_would_refuse_is_refused_at_rendering_before_network() {
+    // A rendered request never passes inbound request admission, so rendering
+    // holds its path to the predicate its HTTP rule is evaluated under (#422):
+    // an empty segment, or a path past the evaluator's bound, is refused here
+    // with its own error, before the rule is asked and before any network.
+    let definition = tool_definition(tenant_config_tool(), "get_tenant_config");
+    let prefix_len = "/v1/tenants/tenant-a/config/".len();
+    for args in [
+        json!({ "tenant_id": "", "config_name": "default" }),
+        json!({
+            "tenant_id": "tenant-a",
+            "config_name": "c".repeat(crate::request_bounds::MAX_REQUEST_PATH_BYTES - prefix_len + 1)
+        }),
+    ] {
+        let server = gated_server().await;
+        let (executor, _capture) = executor_for_tools(
+            server.addr,
+            [tenant_config_tool()],
+            runtime_config([("get_tenant_config", enabled_tool(500, 1))], 2, 1, 100),
+        );
+        match executor.build_request(&definition, &args) {
+            Err(ToolExecutorError::UrlBuild { message, .. }) => {
+                assert_eq!(
+                    message,
+                    "rendered path is outside the bounds tool policy evaluates"
+                );
+            }
+            other => panic!("expected the rendering bound, got {other:?}"),
+        }
+        let error = executor
+            .execute(
+                "get_tenant_config",
+                args,
+                invocation_context(),
+                CancellationToken::new(),
+            )
+            .await
+            .expect_err("an out-of-bounds rendered path must fail before upstream");
+        let message = work_failed_message(error);
+        assert!(
+            message.contains("rendered path is outside the bounds tool policy evaluates"),
+            "unexpected error: {message}"
+        );
+        assert_no_upstream_requests(&server).await;
+        server.stop.cancel();
+        server.handle.abort();
+    }
+
+    // At the bound itself the path renders, and the evaluator accepts it.
+    let server = gated_server().await;
+    let (executor, _capture) = executor_for_tools(
+        server.addr,
+        [tenant_config_tool()],
+        runtime_config([("get_tenant_config", enabled_tool(500, 1))], 2, 1, 100),
+    );
+    let args = json!({
+        "tenant_id": "tenant-a",
+        "config_name": "c".repeat(crate::request_bounds::MAX_REQUEST_PATH_BYTES - prefix_len)
+    });
+    let request = executor
+        .build_request(&definition, &args)
+        .expect("a path at the bound renders");
+    assert_eq!(
+        request.path.len(),
+        crate::request_bounds::MAX_REQUEST_PATH_BYTES
+    );
+    assert_eq!(
+        crate::policy_eval::tools::validate_rendered_http_path(&request.path),
+        Ok(())
+    );
+    server.stop.cancel();
+    server.handle.abort();
 }
 
 #[tokio::test]
@@ -6252,7 +6501,9 @@ impl TemporaryStaticAuthRuntime {
     /// A header-API-key Connection that also asks for a signed caller
     /// assertion. Its API key and the assertion's signing key are served by
     /// the returned counting provider rather than by files, so a test can
-    /// prove that neither was ever read.
+    /// count every read. The signing key must be a real PKCS#8 key: the
+    /// Connection is saved the way the admin API saves it, which resolves
+    /// both secrets once and loads the key.
     async fn header_api_key_with_caller_assertion(
         addr: SocketAddr,
         ca_pem: &str,
@@ -6337,6 +6588,7 @@ impl TemporaryStaticAuthRuntime {
             claims: Vec::new(),
             bind_request: false,
             bind_approval: false,
+            published_keys: Vec::new(),
         });
 
         let mut config = Config::test_defaults();
@@ -6354,38 +6606,45 @@ impl TemporaryStaticAuthRuntime {
                 Arc::clone(secrets) as Arc<dyn SecretResolver>
             ]);
         }
+        let write = ConnectionWrite {
+            display_name: "Billing API".to_owned(),
+            description: None,
+            enabled: true,
+            kind: ConnectionKind::HttpApi,
+            endpoint: ConnectionEndpoint {
+                base_url: format!("https://127.0.0.1:{}", addr.port()),
+                base_path: "/v1".to_owned(),
+            },
+            authentication: ConnectionAuthentication::HeaderApiKey {
+                header_name: "x-api-key".to_owned(),
+                secret_id: Some("billing-api-key".to_owned()),
+            },
+            caller_assertion,
+            additional_headers: additional
+                .iter()
+                .map(|(header_name, alias_id, _)| AdditionalHeader {
+                    header_name: (*header_name).to_owned(),
+                    secret_id: Some((*alias_id).to_owned()),
+                })
+                .collect(),
+            tls: TlsProfile::default(),
+            timeouts: None,
+            discovery: None,
+            test_profile: None,
+        };
+        // The admin API resolves every binding a network provider owns before
+        // it saves, which for a counted Connection is both secrets, and loads
+        // the signing key for its algorithm. Saving through the same pass is
+        // what proves the generated key is a usable one.
+        if counted_assertion.is_some() {
+            control_plane
+                .ensure_deferred_bindings_resolvable(&write)
+                .await
+                .expect("the counted secrets should resolve, and the signing key load");
+        }
         let initial = control_plane.runtime_snapshot();
         let created = control_plane
-            .create_managed(
-                initial.collection_etag(),
-                ConnectionWrite {
-                    display_name: "Billing API".to_owned(),
-                    description: None,
-                    enabled: true,
-                    kind: ConnectionKind::HttpApi,
-                    endpoint: ConnectionEndpoint {
-                        base_url: format!("https://127.0.0.1:{}", addr.port()),
-                        base_path: "/v1".to_owned(),
-                    },
-                    authentication: ConnectionAuthentication::HeaderApiKey {
-                        header_name: "x-api-key".to_owned(),
-                        secret_id: Some("billing-api-key".to_owned()),
-                    },
-                    caller_assertion,
-                    additional_headers: additional
-                        .iter()
-                        .map(|(header_name, alias_id, _)| AdditionalHeader {
-                            header_name: (*header_name).to_owned(),
-                            secret_id: Some((*alias_id).to_owned()),
-                        })
-                        .collect(),
-                    tls: TlsProfile::default(),
-                    timeouts: None,
-                    discovery: None,
-                    test_profile: None,
-                },
-                "test-admin",
-            )
+            .create_managed(initial.collection_etag(), write, "test-admin")
             .await
             .expect("test Connection should create");
         let mut egress_config = EgressConfig {

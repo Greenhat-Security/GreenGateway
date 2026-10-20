@@ -240,6 +240,13 @@ function storedConnection() {
         claims: ['email', 'roles'],
         bind_request: true,
         bind_approval: false,
+        published_keys: [
+          { signing_key_configured: true, kid: 'gw-2026-10', algorithm: 'rs256' },
+        ],
+        key_problem: {
+          field: 'caller_assertion.published_keys.signing_key_id',
+          code: 'binding_unavailable',
+        },
       },
       additional_headers: [
         {

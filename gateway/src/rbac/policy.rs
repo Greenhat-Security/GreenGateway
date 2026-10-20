@@ -17,7 +17,10 @@ use super::rule::{
     principal_identity_matches, valid_auth_method_name, PrincipalMatcher, Rule, RuleDispatchKind,
     AUTH_METHOD_BEARER_TOKEN, AUTH_METHOD_SESSION_COOKIE,
 };
-use crate::{auth::principal::canonical_issuer, auth::Principal, config::Config};
+use crate::{
+    auth::principal::canonical_issuer, auth::Principal, config::Config,
+    request_bounds::MAX_TOOL_NAME_BYTES,
+};
 
 pub(crate) const KNOWN_TOP_LEVEL_KEYS: &[&str] = &[
     "schema_version",
@@ -444,6 +447,14 @@ fn validate_rules(rules: &[Rule]) -> Result<(), PolicyError> {
                 )));
             }
 
+            // The bound the tool lane evaluates names under, so no rule can name
+            // a tool the evaluator cannot be asked about.
+            if tool_name.len() > MAX_TOOL_NAME_BYTES {
+                return Err(PolicyError::Invalid(format!(
+                    "rules[{rule_index}].tool_name must not exceed {MAX_TOOL_NAME_BYTES} bytes"
+                )));
+            }
+
             if !rule.methods.is_empty() {
                 return Err(PolicyError::Invalid(format!(
                     "rules[{rule_index}].methods must be empty when tool_name is set"
@@ -555,6 +566,13 @@ fn validate_rule_dispatch_origin(
 
 fn validate_tools(tools: &HashMap<String, ToolPolicyEntry>) -> Result<(), PolicyError> {
     for (tool_name, entry) in tools {
+        // Checked first, and reported without the name: an entry the tool lane
+        // could never be asked about must not load, nor echo a payload back.
+        if tool_name.len() > MAX_TOOL_NAME_BYTES {
+            return Err(PolicyError::Invalid(format!(
+                "tools entry names must not exceed {MAX_TOOL_NAME_BYTES} bytes"
+            )));
+        }
         if entry.timeout_ms == 0 {
             return Err(PolicyError::Invalid(format!(
                 "tools.{tool_name}.timeout_ms must be positive"
@@ -2118,6 +2136,35 @@ mod tests {
             error.to_string().contains("unknown auth method 'api_key'"),
             "unexpected error: {error}"
         );
+    }
+
+    /// The published schema bounds tool names where policy validation does.
+    /// JSON Schema counts characters and the gateway bytes, so for an ASCII
+    /// name the bound is the same byte on both sides; a multibyte name can pass
+    /// the schema and still be refused by the gateway, never the reverse.
+    #[test]
+    fn the_published_schema_bounds_tool_names_where_policy_validation_does() {
+        let validator = policy_schema_validator();
+        let at_bound = "t".repeat(crate::request_bounds::MAX_TOOL_NAME_BYTES);
+        let past_bound = format!("{at_bound}t");
+        for (name, accepted) in [(at_bound, true), (past_bound, false)] {
+            let mut tools = serde_json::Map::new();
+            tools.insert(name.clone(), json!({}));
+            for document in [
+                json!({ "schema_version": "0.1.0", "tools": tools }),
+                json!({
+                    "schema_version": "0.1.0",
+                    "rules": [{ "tool_name": name, "action": "deny" }]
+                }),
+            ] {
+                assert_eq!(validator.is_valid(&document), accepted, "schema");
+                assert_eq!(
+                    Policy::validate_json_value(document).is_ok(),
+                    accepted,
+                    "policy validation"
+                );
+            }
+        }
     }
 
     /// Every `auth_methods` enum in the published schema lists exactly the

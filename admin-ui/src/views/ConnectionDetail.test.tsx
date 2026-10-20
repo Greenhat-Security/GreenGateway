@@ -353,6 +353,67 @@ describe('ConnectionDetail', () => {
     expect(document.body.textContent).not.toContain(
       'SIGNING_KEY_ALIAS_CANARY',
     );
+    // Nothing says the keys are unpublished when the gateway did not.
+    expect(screen.queryByText('Keys not published.')).toBeNull();
+  });
+
+  it('says why a caller assertion\'s keys are left out of the published key set', async () => {
+    vi.stubGlobal(
+      'fetch',
+      vi.fn().mockResolvedValue(
+        jsonResponse(
+          200,
+          connectionDetail({
+            configuration: {
+              endpoint: {
+                base_url: 'https://api.example',
+                base_path: '/',
+              },
+              authentication: { type: 'none' },
+              caller_assertion: {
+                signing_key_configured: true,
+                kid: 'gw-2026-09',
+                algorithm: 'es256',
+                issuer: 'https://gateway.example.test',
+                audience: 'https://api.example',
+                token_type: 'at+jwt',
+                header_name: 'x-caller-assertion',
+                lifetime_seconds: 60,
+                bind_request: false,
+                bind_approval: false,
+                published_keys: [
+                  {
+                    signing_key_configured: true,
+                    kid: 'gw-2026-10',
+                    algorithm: 'rs256',
+                  },
+                ],
+                key_problem: {
+                  field: 'caller_assertion.signing_key_id',
+                  code: 'algorithm_mismatch',
+                },
+              },
+              tls: {
+                ca_bundle_configured: false,
+                client_certificate_configured: false,
+                client_private_key_configured: false,
+              },
+            },
+          }),
+          { ETag: '"connection-v1"' },
+        ),
+      ),
+    );
+
+    renderDetail();
+
+    const alert = (await screen.findByText('Keys not published.')).closest(
+      '[role="alert"]',
+    );
+    expect(alert?.textContent).toContain('caller_assertion.signing_key_id');
+    expect(alert?.textContent).toContain('algorithm_mismatch');
+    expect(alert?.textContent).toContain('other algorithm');
+    expect(specValue('Also published')).toBe('gw-2026-10 (RS256, configured)');
   });
 
   it('stops on an ETag conflict and reloads before allowing another operation', async () => {

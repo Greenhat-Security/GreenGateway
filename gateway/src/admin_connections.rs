@@ -659,6 +659,7 @@ pub(super) async fn connection_get_endpoint(
                 dependencies,
                 permissions,
                 state.control_plane.is_local_secret_manager_configured(),
+                state.control_plane.caller_assertion_key_problem(&record),
             )),
         )
             .into_response();
@@ -795,6 +796,7 @@ pub(super) async fn connection_create_endpoint(
                 Vec::new(),
                 permissions,
                 state.control_plane.is_local_secret_manager_configured(),
+                state.control_plane.caller_assertion_key_problem(&created),
             )),
         )
             .into_response(),
@@ -944,6 +946,7 @@ pub(super) async fn connection_put_endpoint(
                 dependencies,
                 permissions,
                 state.control_plane.is_local_secret_manager_configured(),
+                state.control_plane.caller_assertion_key_problem(&updated),
             )),
         )
             .into_response(),
@@ -2405,6 +2408,20 @@ pub(super) fn connection_mutation_error_response(
                         code: "unresolvable_binding",
                     })
                     .collect(),
+            }),
+        )
+            .into_response(),
+        // The field and a fixed code (`algorithm_mismatch`, `invalid_signing_key`,
+        // `unusable_signing_key`, `duplicate_kid`): enough to fix the
+        // configuration, and nothing about the key material.
+        connections::control_plane::ConnectionMutationError::CallerAssertionKeyRejected {
+            field,
+            code,
+        } => (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(ConnectionValidationResponse {
+                error: "connection validation failed",
+                problems: vec![ConnectionValidationProblem { field, code }],
             }),
         )
             .into_response(),

@@ -121,6 +121,61 @@ describe('connection secrets API client', () => {
     expect(result.value.actions.can_create).toBe(true);
   });
 
+  it('accepts an operator alias that may also hold a caller-assertion signing key', async () => {
+    // The gateway lists `assertion_signing_key` among an operator alias's
+    // compatible purposes. Rejecting it would discard the whole inventory and
+    // disable every secret bind in this UI.
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(() =>
+        Promise.resolve(
+          jsonResponse(
+            200,
+            {
+              secrets: [
+                secretMetadata({
+                  id: 'assertion-signing-key',
+                  etag: '"connection-secret:assertion-signing-key:v0"',
+                  label: 'Caller assertion signing key',
+                  provider: 'operator_file',
+                  compatible_purposes: [
+                    'header_api_key',
+                    'static_bearer',
+                    'oauth_client_secret',
+                    'tls_private_key',
+                    'tls_certificate',
+                    'tls_ca_bundle',
+                    'assertion_signing_key',
+                  ],
+                  version: undefined,
+                  actions: { can_rotate: false, can_delete: false },
+                }),
+                secretMetadata(),
+              ],
+              actions: { can_create: true },
+              providers: {
+                operator_aliases: true,
+                local_encrypted: true,
+              },
+            },
+            {
+              ETag: '"connection-secrets:representation:v1"',
+              'x-greengateway-connection-secrets-etag':
+                '"connection-secrets:mutation:v1"',
+            },
+          ),
+        ),
+      ),
+    );
+
+    const result = await listConnectionSecrets();
+
+    expect(result.value.secrets).toHaveLength(2);
+    expect(result.value.secrets[0].compatible_purposes).toContain(
+      'assertion_signing_key',
+    );
+  });
+
   it('uses exact collection/item ETags and never expects plaintext in responses', async () => {
     const calls: Array<{
       path: string;
