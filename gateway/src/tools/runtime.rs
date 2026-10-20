@@ -1552,7 +1552,11 @@ impl SourceAuthorizer for ToolRuntime {
         // and the deny rules come from the same snapshot even when an install
         // lands while the precheck runs (#422). Live, as before: the refresher
         // runs outside any request, and nothing is pinned there.
-        let policy = self.inner.rbac_state.as_ref().map(RbacState::current_policy);
+        let policy = self
+            .inner
+            .rbac_state
+            .as_ref()
+            .map(RbacState::current_policy);
         if let Some(tool_name) = tool {
             let enabled = match &policy {
                 Some(policy) => policy

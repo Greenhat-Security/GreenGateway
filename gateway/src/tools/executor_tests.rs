@@ -4091,7 +4091,10 @@ async fn a_rendered_path_tool_policy_would_refuse_is_refused_at_rendering_before
         );
         match executor.build_request(&definition, &args) {
             Err(ToolExecutorError::UrlBuild { message, .. }) => {
-                assert_eq!(message, "rendered path is outside the bounds tool policy evaluates");
+                assert_eq!(
+                    message,
+                    "rendered path is outside the bounds tool policy evaluates"
+                );
             }
             other => panic!("expected the rendering bound, got {other:?}"),
         }

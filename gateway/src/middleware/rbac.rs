@@ -853,7 +853,11 @@ impl RbacState {
 
     /// Whether a tool is listed to `principal`, decided by the shared evaluator.
     /// A shadow rule does not hide a tool. A refusal hides it.
-    pub(crate) fn tool_visible(&self, tool_name: &str, principal: Option<&auth::Principal>) -> bool {
+    pub(crate) fn tool_visible(
+        &self,
+        tool_name: &str,
+        principal: Option<&auth::Principal>,
+    ) -> bool {
         self.effective_policy()
             .evaluate_tool(
                 ToolOperation::Visibility,

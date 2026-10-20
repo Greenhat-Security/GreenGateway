@@ -702,7 +702,11 @@ fn differential_identities() -> Vec<Option<Principal>> {
     ]
 }
 
-fn differential_context(index: usize, name: &str, identity: Option<&Principal>) -> ToolInvocationContext {
+fn differential_context(
+    index: usize,
+    name: &str,
+    identity: Option<&Principal>,
+) -> ToolInvocationContext {
     ToolInvocationContext {
         request_id: format!("differential-{index}-{name}"),
         source_ip: "203.0.113.7".into(),
@@ -786,10 +790,19 @@ async fn assert_old_and_new_agree(policy: &Policy) {
             }
         }
     }
-    audit_old.close_and_drain(Duration::from_secs(5)).await.unwrap();
-    audit_new.close_and_drain(Duration::from_secs(5)).await.unwrap();
+    audit_old
+        .close_and_drain(Duration::from_secs(5))
+        .await
+        .unwrap();
+    audit_new
+        .close_and_drain(Duration::from_secs(5))
+        .await
+        .unwrap();
     let old = audit_records(&capture_old);
-    assert!(!old.is_empty(), "the corpus must exercise audited decisions");
+    assert!(
+        !old.is_empty(),
+        "the corpus must exercise audited decisions"
+    );
     assert_eq!(old, audit_records(&capture_new));
 }
 
@@ -938,17 +951,20 @@ async fn the_frozen_consumers_and_the_live_runtime_agree_across_the_named_matrix
     for global in [false, true] {
         for default_allow in [false, true] {
             for action in [None, Some(0u8), Some(1), Some(2)] {
-                for (roles, issuers, auth_methods) in
-                    [(0, 0, 0), (1, 0, 0), (0, 1, 0), (0, 0, 1), (1, 1, 1), (0, 0, 4)]
-                {
+                for (roles, issuers, auth_methods) in [
+                    (0, 0, 0),
+                    (1, 0, 0),
+                    (0, 1, 0),
+                    (0, 0, 1),
+                    (1, 1, 1),
+                    (0, 0, 4),
+                ] {
                     let entries = [
                         (0, true, roles, issuers, auth_methods, 250, 2),
                         (1, false, 0, 0, 0, 250, 1),
                     ];
-                    let mut rules = vec![
-                        (0, 0, 0, false, 0, true, 0),
-                        (1, 2, 0, true, 0, false, 1),
-                    ];
+                    let mut rules =
+                        vec![(0, 0, 0, false, 0, true, 0), (1, 2, 0, true, 0, false, 1)];
                     if let Some(action) = action {
                         rules.extend([
                             (0, 0, action, true, 1, true, 0),
@@ -981,16 +997,16 @@ async fn the_tool_lane_bounds_are_exactly_the_bounds_policy_validation_and_the_a
     past_bound_entry.insert(past_bound.clone(), json!({}));
     for (field, invalid) in [
         ("tools", Value::Object(past_bound_entry)),
-        (
-            "rules",
-            json!([{"tool_name":past_bound,"action":"deny"}]),
-        ),
+        ("rules", json!([{"tool_name":past_bound,"action":"deny"}])),
     ] {
         let mut value = value.clone();
         value[field] = invalid;
         let error = Policy::validate_json_value(value).unwrap_err().to_string();
         assert!(error.contains("must not exceed 4096 bytes"), "{error}");
-        assert!(!error.contains(&past_bound), "the refusal must not echo the name");
+        assert!(
+            !error.contains(&past_bound),
+            "the refusal must not echo the name"
+        );
     }
 
     let (state, runtime, audit, capture) = live(&policy);
@@ -1076,7 +1092,9 @@ async fn refusals_block_with_stable_reasons_where_the_frozen_consumers_answered(
     assert!(!runtime_old.legacy_composite_leaf_enabled(&over_long));
     assert!(!runtime_new.composite_leaf_enabled(&over_long));
     assert_eq!(
-        state_old.legacy_tool_policy_eligibility(&over_long, &principal()).reason,
+        state_old
+            .legacy_tool_policy_eligibility(&over_long, &principal())
+            .reason,
         "not_in_policy"
     );
     assert_eq!(
@@ -1100,9 +1118,11 @@ async fn refusals_block_with_stable_reasons_where_the_frozen_consumers_answered(
     ));
     assert!(runtime_old.legacy_tool_visible_to_context("reports.export", &identified));
     assert!(!runtime_new.tool_visible_to_context("reports.export", &identified));
-    assert!(state_old
-        .legacy_tool_policy_eligibility("reports.export", &empty_subject)
-        .eligible);
+    assert!(
+        state_old
+            .legacy_tool_policy_eligibility("reports.export", &empty_subject)
+            .eligible
+    );
     assert_eq!(
         state_new.tool_policy_eligibility("reports.export", &empty_subject),
         ToolPolicyEligibility {
@@ -1110,8 +1130,18 @@ async fn refusals_block_with_stable_reasons_where_the_frozen_consumers_answered(
             reason: "policy_evaluation_error",
         }
     );
-    assert!(runtime_old.legacy_authorize_http_operation("reports.export", "GET", "/reports", &identified));
-    assert!(!runtime_new.authorize_http_operation("reports.export", "GET", "/reports", &identified));
+    assert!(runtime_old.legacy_authorize_http_operation(
+        "reports.export",
+        "GET",
+        "/reports",
+        &identified
+    ));
+    assert!(!runtime_new.authorize_http_operation(
+        "reports.export",
+        "GET",
+        "/reports",
+        &identified
+    ));
 
     // Rendered facts the evaluator refuses: an empty segment, a relative
     // path, a malformed escape, a method that is not a token.
@@ -1121,12 +1151,23 @@ async fn refusals_block_with_stable_reasons_where_the_frozen_consumers_answered(
         ("GET", "/reports/%zz"),
         ("NOT A TOKEN", "/reports/42"),
     ] {
-        assert!(runtime_old.legacy_authorize_http_operation("reports.export", method, path, &anonymous));
+        assert!(runtime_old.legacy_authorize_http_operation(
+            "reports.export",
+            method,
+            path,
+            &anonymous
+        ));
         assert!(!runtime_new.authorize_http_operation("reports.export", method, path, &anonymous));
     }
 
-    audit_old.close_and_drain(Duration::from_secs(5)).await.unwrap();
-    audit_new.close_and_drain(Duration::from_secs(5)).await.unwrap();
+    audit_old
+        .close_and_drain(Duration::from_secs(5))
+        .await
+        .unwrap();
+    audit_new
+        .close_and_drain(Duration::from_secs(5))
+        .await
+        .unwrap();
     // Old: the rule attributed allow for every rendered request it answered.
     let old = audit_records(&capture_old);
     assert!(old
@@ -1145,7 +1186,13 @@ async fn refusals_block_with_stable_reasons_where_the_frozen_consumers_answered(
             )
         })
         .collect();
-    let rejected = |reason: &str| (crate::audit::event::TOOL_INVOKE_REJECTED.to_owned(), reason.to_owned(), Value::Null);
+    let rejected = |reason: &str| {
+        (
+            crate::audit::event::TOOL_INVOKE_REJECTED.to_owned(),
+            reason.to_owned(),
+            Value::Null,
+        )
+    };
     let denied = |reason: &str| ("authz.denied".to_owned(), reason.to_owned(), Value::Null);
     assert_eq!(
         reasons,
