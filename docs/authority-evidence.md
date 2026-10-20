@@ -1,13 +1,16 @@
 # Durable authority-change evidence inventory and contract
 
-Part of [#425](https://github.com/Greenhat-Security/GreenGateway/issues/425), PR 1.
-Reviewed source: `4314d63373539700dffb303bc4e2d385ceb53295`.
+Part of [#425](https://github.com/Greenhat-Security/GreenGateway/issues/425), PR 1
+and the first PR 2 slice (PostgreSQL Connection deletion evidence).
+Reviewed source: `05c295a52763ba09701ef38bb030e30e5bc7e4d7`.
 
 This inventory identifies existing atomic records and the work needed for required
-authority-change evidence. It does **not** implement or enable required-durability
-mode, a new database table, a dispatcher, or a standalone revision ledger. No row
-is qualified for that future mode by this change. Current application behavior
-and storage selection are unchanged.
+authority-change evidence. PR 1 added the inventory and the proposed event
+contract. The first PR 2 slice adds one durable evidence table, migration 16's
+`greengateway.connection_change_evidence`, written by PostgreSQL Connection
+deletes. Neither implements or enables required-durability mode, a dispatcher,
+or a standalone revision ledger, and no row is qualified for that future mode.
+Storage selection and standalone behavior are unchanged.
 
 Run the executable inventory and proposed event-contract tests with the pinned
 Node version from `build-tools.json`:
@@ -41,7 +44,7 @@ or unconfigured individual stores.
 | Policy publish, rollback, rule edits and suggestion acceptance | Immutable document/history, actor subject, action/diff, active pointer, shared revision and outbox; suggestion acceptance composes its own state in the same transaction | Stable operation/event identity, scoped actor context, durable delivery |
 | Tools publication | Shared document transaction plus name reservations | Same metadata/delivery extension as policy |
 | Connection and credential binding changes | Record, bindings, immutable version, shared revision and outbox | Actor/history must survive Connection deletion; safe per-operation metadata and delivery |
-| Connection deletion | Outbox tombstone with prior version and shared revision | Deletion actor is currently ignored by the store; version history cascades |
+| Connection deletion | Outbox tombstone with prior version and shared revision, plus a non-cascading `connection_change_evidence` row (actor, action, event/operation UUIDs, prior version, the tombstone's shared revision, database-clock time) in the same transaction | Issuer/auth mode, caller-bound operation identity, safe-reference projection, durable delivery and retention |
 | Managed MCP/OpenAPI catalog and overlay publication | Catalog/overlay CAS, entries, dependencies, reservations, revision and outbox | Current actor rows are replaced or cascaded; retain per-change evidence |
 | Service-token issue/rotate/revoke | Token change, row/shared revisions and outbox; repeated revoke is a no-op | Creation retains original creator, but rotate/revoke store APIs receive no mutation actor; preserve action and operation identity |
 | JWT revocation | Scoped JTI digest, actor row, shared revision and outbox | Extension/reactivation overwrites actor; expiry cleanup removes row. CLI actor is system provenance, not a named human |
@@ -92,10 +95,11 @@ before asserting required durability for them.
 ## Proposed authority event v1
 
 [The closed JSON schema](schemas/authority_event.v1.schema.json) and the checker
-define a **proposed** safe projection. Current `security_outbox` rows and
-`audit_event.v0` events do not already satisfy this schema. Runtime producer,
-identity derivation, persistence and dispatcher integration belong to later
-slices.
+define a **proposed** safe projection. Current `security_outbox` rows,
+`connection_change_evidence` rows and `audit_event.v0` events do not already
+satisfy this schema: the evidence rows hold the internal actor ID, not a keyed
+safe reference, and no `authority_id`. Runtime producer, identity derivation and
+dispatcher integration belong to later slices.
 
 Revision transitions are operation-specific. Resource creation (`connection.create`,
 `secret.create`, `service_token.issue`) has no prior revision; replacement,
@@ -192,12 +196,17 @@ become a call inside the authority transaction.
 
 ## Next reviewable slices and validation gates
 
-1. **PostgreSQL Connection deletion evidence.** Extend its existing transaction
-   with non-cascading actor/action/event/operation metadata, using an immutable
-   additive migration and current coordinated-upgrade rules. Preserve outbox
-   resource identity and tombstone. Verified-TLS database tests must cover actor
-   survival after delete/restart, stale ETag, dependency rejection, two writers,
-   forced evidence-insert failure, rollback and ambiguous-result reconciliation.
+1. **PostgreSQL Connection deletion evidence (landed).** The delete transaction
+   now writes non-cascading actor/action/event/operation metadata to migration
+   16's `connection_change_evidence`, beside the unchanged outbox tombstone and
+   carrying its shared revision. Migration 16 moves the serving contract from
+   exactly schema 15 to exactly schema 16, a coordinated drain/migrate/restart.
+   PostgreSQL-gated store tests cover actor survival after delete and restart,
+   stale ETag, dependency rejection, a missing record, two writers, a forced
+   evidence-insert failure and its rollback, and reconciling a lost response
+   from the evidence row; CI runs them against its disposable loopback database,
+   not verified TLS. Still open for this row: issuer/auth mode and a
+   caller-bound operation identity at the store boundary.
 2. **Service-token and JWT metadata.** Carry mutation actor/action through
    `ServiceTokenStore` and both adapters; retain rotate/revoke history and JWT
    extension/cleanup provenance. Exercise repeat revoke, rotate/revoke races,

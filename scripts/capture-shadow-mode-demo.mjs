@@ -270,6 +270,8 @@ async function installMockRoutes(page) {
     await json(route, {
       match_count: 31,
       scanned_event_count: 416,
+      scan_truncated: false,
+      complete: true,
       sample_strategy: 'newest_matches',
       samples: [
         previewSample({

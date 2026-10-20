@@ -206,6 +206,33 @@ pub const DATABASE_POOL_WAITING: &str = "greengateway_database_pool_waiting";
 #[cfg(feature = "postgres")]
 pub const DATABASE_POOL_TIMEOUTS_TOTAL: &str = "greengateway_database_pool_timeouts_total";
 
+/// How long an authority store waited to check a connection out of the
+/// pool, by operation class and classified outcome (issue #439).
+///
+/// Recorded at [`crate::storage::postgres::checkout`], the checkout
+/// boundary the per-request authority stores share, and kept apart from
+/// [`DATABASE_OPERATION_SECONDS`]: those stores start their operation's
+/// clock once the connection is held, so a slow request can be read as
+/// pool queueing or as database work instead of a sum of the two.
+/// `operation_class` is one of
+/// [`crate::storage::postgres::CheckoutClass`]'s seven fixed names;
+/// `error_class` is `none`, the kind the checkout failure was classified
+/// as, or [`crate::storage::postgres::CHECKOUT_ERROR_CLASS_CANCELLED`]
+/// for a wait its caller abandoned. `timeout` here is the same event
+/// [`DATABASE_POOL_TIMEOUTS_TOTAL`] counts; `cancelled` is not a pool
+/// timeout and is not counted there. `cancelled` is how the longest
+/// request-path waits end under saturation: the security gates read the
+/// revision inside a 250 ms deadline and the tool runtime acquires leases
+/// inside its queue timeout, both far shorter than the pool's own wait,
+/// and either one drops a checkout still waiting. So read `cancelled`
+/// beside `none` -- `none` alone is censored at those deadlines.
+/// Checkouts made anywhere else -- the audit sink, the discovery
+/// projector, the tools and connection control planes, pending logins,
+/// membership, the readiness probe -- are not in this series; the pool
+/// gauges above still see them.
+#[cfg(feature = "postgres")]
+pub const DATABASE_POOL_ACQUIRE_SECONDS: &str = "greengateway_database_pool_acquire_seconds";
+
 /// Store operation latency by operation and classified outcome.
 ///
 /// `operation` is one of the stores' `OPERATION_*` constants -- a fixed,
@@ -213,6 +240,16 @@ pub const DATABASE_POOL_TIMEOUTS_TOTAL: &str = "greengateway_database_pool_timeo
 /// statement text, the parameters, or the rows. `error_class` is
 /// `none` on success and a [`crate::storage::RepositoryErrorKind`] name
 /// otherwise; SQLSTATEs and driver messages stay in the log.
+///
+/// Where the time starts depends on the store. The per-request authority
+/// stores check out through [`crate::storage::postgres::checkout`] and
+/// start an operation's clock once the connection is held, so their pool
+/// wait is in [`DATABASE_POOL_ACQUIRE_SECONDS`] and a checkout that never
+/// produced a connection records nothing here. The membership store, the
+/// connectivity check and the readiness probe predate that split and
+/// still time their checkout with their statement. An operation is
+/// recorded when it finishes, so one its caller's deadline cut off
+/// mid-statement records nothing here.
 #[cfg(feature = "postgres")]
 pub const DATABASE_OPERATION_SECONDS: &str = "greengateway_database_operation_seconds";
 

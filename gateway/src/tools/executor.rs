@@ -42,7 +42,8 @@ use crate::{
             MAX_COMPOSITE_JSON_DEPTH, MAX_COMPOSITE_RESULT_PROPERTIES, MAX_COMPOSITE_STEPS,
         },
         definitions::{
-            BodyMappingMode, McpProxyMapping, ToolDefinition, ToolRegistry, ToolSource, ToolTarget,
+            numbers_exceed_exact_comparison_budget, BodyMappingMode, McpProxyMapping,
+            ToolDefinition, ToolRegistry, ToolSource, ToolTarget,
         },
         enum_source::{EnumSourceRuntime, EnumSourceState},
         mcp_upstream::{self, McpUpstreamRuntimeConfig},
@@ -2875,6 +2876,14 @@ impl ToolExecutor {
             return Ok(validator);
         }
 
+        // Registry definitions were held to this budget when they loaded, but a
+        // served schema can also carry enum values an upstream source supplied.
+        if numbers_exceed_exact_comparison_budget(&effective_schema) {
+            return Err(ToolExecutorError::SchemaCompile {
+                tool_name: tool.name.clone(),
+                message: "input schema contains numbers too wide to compare exactly".to_owned(),
+            });
+        }
         let validator = Arc::new(jsonschema::validator_for(&effective_schema).map_err(|err| {
             ToolExecutorError::SchemaCompile {
                 tool_name: tool.name.clone(),
@@ -3278,10 +3287,11 @@ fn schema_with_strict_object_defaults(schema: &Value, is_root: bool, depth: usiz
 
     match schema {
         Value::Object(schema) if schema_has_strict_injection_skip_keyword(schema) => {
-            // Sibling additionalProperties changes jsonschema 0.46.9 behavior for
-            // composition, reference, and pattern-based schemas. Leave that schema
-            // level and its branches unchanged rather than pretending strictness is
-            // safely enforceable there.
+            // An injected additionalProperties judges keys against only the
+            // properties and patternProperties beside it, so next to composition,
+            // reference, or pattern keywords it would change what the author's
+            // schema accepts. Leave that schema level and its branches unchanged
+            // rather than pretending strictness is safely enforceable there.
             Value::Object(schema.clone())
         }
         Value::Object(schema) => {
@@ -3360,6 +3370,21 @@ fn validate_args(
     validator: &jsonschema::Validator,
     args: &Value,
 ) -> Result<(), ToolExecutorError> {
+    // The validator compares numbers exactly, at a cost that grows with the
+    // square of their width. Refuse arguments over the budget before it runs.
+    if numbers_exceed_exact_comparison_budget(args) {
+        return Err(ToolExecutorError::InputValidation {
+            tool_name: tool.name.clone(),
+            problems: vec![ValidationProblem {
+                path: String::new(),
+                audit_path: String::new(),
+                keyword: "number_width".to_owned(),
+                allowed: None,
+                message: "numeric arguments are too wide to compare exactly".to_owned(),
+            }],
+        });
+    }
+
     let problems: Vec<_> = validator
         .iter_errors(args)
         .take(MAX_VALIDATION_PROBLEMS)
@@ -3498,6 +3523,7 @@ fn audit_validation_problem(problem: &ValidationProblem) -> ToolAuditValidationP
         "type" => "value has the wrong JSON type",
         "enum" => "value is not one of the allowed values",
         "max_iterations" => "composite iteration count exceeds the configured maximum",
+        "number_width" => "numeric arguments are too wide to compare exactly",
         _ => "value does not satisfy the schema constraint",
     };
     ToolAuditValidationProblem {

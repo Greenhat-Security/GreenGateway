@@ -5,7 +5,8 @@ import {
 } from 'react';
 
 import {
-  type ConnectionKind
+  type ConnectionKind,
+  type SafeCallerAssertion
 } from '../../lib/connections';
 import {
   createConnectionSecret,
@@ -15,6 +16,7 @@ import {
   type ConnectionSecretMetadata,
   type ConnectionSecretPurpose
 } from '../../lib/secrets';
+import { CallerAssertionSummary } from '../CallerAssertionSummary';
 
 import {
   AdditionalHeaderDraft,
@@ -477,6 +479,33 @@ export function AdditionalHeadersSection({
       <p className="capability-description">
         {headers.length} of {MAX_ADDITIONAL_HEADERS} configured.
       </p>
+    </section>
+  );
+}
+
+/**
+ * The stored caller assertion, read only. The editor has no controls for it,
+ * and a save leaves it exactly as stored.
+ */
+export function CallerAssertionSection({
+  assertion,
+}: {
+  assertion: SafeCallerAssertion | null;
+}) {
+  if (assertion === null) {
+    return null;
+  }
+
+  return (
+    <section
+      className="connection-form-section"
+      aria-labelledby="connection-caller-assertion-heading"
+    >
+      <div className="section-heading">
+        <p className="eyebrow">Caller attestation</p>
+        <h3 id="connection-caller-assertion-heading">Caller assertion</h3>
+      </div>
+      <CallerAssertionSummary assertion={assertion} />
     </section>
   );
 }

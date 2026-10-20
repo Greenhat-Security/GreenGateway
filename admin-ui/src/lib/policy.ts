@@ -317,6 +317,13 @@ export function policyRuleId(rule: PolicyRule, index: number): string {
   return rule.id ?? String(index);
 }
 
+// A rule without an explicit id is addressed, and attributed in audit
+// history, by its array position, so that id names a different rule as
+// soon as a delete or reorder moves it.
+export function hasExplicitPolicyRuleId(rule: PolicyRule): boolean {
+  return rule.id !== undefined && rule.id !== null;
+}
+
 export function isPolicyRuleEnabled(rule: PolicyRule): boolean {
   return rule.enabled !== false;
 }

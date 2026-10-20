@@ -1,7 +1,8 @@
 {
   "schema_version": 1,
   "harness_sha256": [
-    "0e005f7903991f9f4eb7b22cf2b56871c9a0d0a554f3d4ecf4d9a85598881f73"
+    "0e005f7903991f9f4eb7b22cf2b56871c9a0d0a554f3d4ecf4d9a85598881f73",
+    "f0c6abba555cb81e8cc419f39473895eeefb3ad558537f95659dfcdfcf22285e"
   ],
   "targets": [
     {

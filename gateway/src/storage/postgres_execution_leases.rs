@@ -31,7 +31,11 @@ use async_trait::async_trait;
 
 use crate::tools::lease::{ExecutionLease, ExecutionLeaseStore, LeaseAttempt};
 
-use super::{log_classified, postgres::classify_pool_error, RepositoryError, RepositoryErrorKind};
+use super::{
+    log_classified,
+    postgres::{checkout, timed_operation, CheckoutClass},
+    RepositoryError, RepositoryErrorKind,
+};
 
 const OPERATION_ACQUIRE: &str = "execution_lease_acquire";
 const OPERATION_RENEW: &str = "execution_lease_renew";
@@ -91,7 +95,7 @@ impl PostgresExecutionLeaseStore {
     /// removed.
     #[allow(dead_code)] // the singleton runs `reap_expired_with` on its session; this is the store-level surface, pinned by the contract tests
     pub async fn reap_expired(&self, grace: Duration, limit: u32) -> Result<u64, RepositoryError> {
-        let client = self.pool.get().await.map_err(classify_pool_error)?;
+        let client = checkout(&self.pool, CheckoutClass::Maintenance).await?;
         self.reap_expired_with(&client, grace, limit).await
     }
 
@@ -147,127 +151,139 @@ impl ExecutionLeaseStore for PostgresExecutionLeaseStore {
             bounded => bounded,
         };
         let holder = self.holder.to_string();
-        let client = self.pool.get().await.map_err(classify_pool_error)?;
-        let row = client
-            .query_opt(
-                "INSERT INTO greengateway.execution_leases AS l
-                     (deployment_id, scope, slot, fence, holder_instance, invocation,
-                      acquired_at, renewed_at, expires_at)
-                 SELECT $1, $2, s.slot, nextval('greengateway.execution_lease_fence'),
-                        $4::text::uuid, $5, now(), now(), now() + make_interval(secs => $6::double precision)
-                 FROM generate_series(0, $3::integer - 1) AS s(slot)
-                 WHERE NOT EXISTS (
-                     SELECT 1 FROM greengateway.execution_leases e
-                     WHERE e.deployment_id = $1 AND e.scope = $2 AND e.slot = s.slot
-                       AND e.expires_at > now())
-                 ORDER BY s.slot
-                 LIMIT 1
-                 ON CONFLICT (deployment_id, scope, slot) DO UPDATE SET
-                     fence = EXCLUDED.fence,
-                     holder_instance = EXCLUDED.holder_instance,
-                     invocation = EXCLUDED.invocation,
-                     acquired_at = now(),
-                     renewed_at = now(),
-                     expires_at = EXCLUDED.expires_at
-                 WHERE l.expires_at <= now()
-                 RETURNING l.slot, l.fence",
-                &[
-                    &self.deployment_id,
-                    &scope,
-                    &capacity,
-                    &holder,
-                    &invocation,
-                    &self.ttl_secs(),
-                ],
-            )
-            .await
-            .map_err(|error| classify_query(error, OPERATION_ACQUIRE))?;
-        match row {
-            Some(row) => {
-                let slot: i32 = row
-                    .try_get("slot")
-                    .map_err(|_| invalid_data(OPERATION_ACQUIRE))?;
-                let fence: i64 = row
-                    .try_get("fence")
-                    .map_err(|_| invalid_data(OPERATION_ACQUIRE))?;
-                Ok(LeaseAttempt::Acquired(ExecutionLease {
-                    scope: scope.to_owned(),
-                    slot,
-                    fence,
-                }))
+        let client = checkout(&self.pool, CheckoutClass::ExecutionLease).await?;
+        timed_operation(OPERATION_ACQUIRE, async {
+            let row = client
+                .query_opt(
+                    "INSERT INTO greengateway.execution_leases AS l
+                         (deployment_id, scope, slot, fence, holder_instance, invocation,
+                          acquired_at, renewed_at, expires_at)
+                     SELECT $1, $2, s.slot, nextval('greengateway.execution_lease_fence'),
+                            $4::text::uuid, $5, now(), now(), now() + make_interval(secs => $6::double precision)
+                     FROM generate_series(0, $3::integer - 1) AS s(slot)
+                     WHERE NOT EXISTS (
+                         SELECT 1 FROM greengateway.execution_leases e
+                         WHERE e.deployment_id = $1 AND e.scope = $2 AND e.slot = s.slot
+                           AND e.expires_at > now())
+                     ORDER BY s.slot
+                     LIMIT 1
+                     ON CONFLICT (deployment_id, scope, slot) DO UPDATE SET
+                         fence = EXCLUDED.fence,
+                         holder_instance = EXCLUDED.holder_instance,
+                         invocation = EXCLUDED.invocation,
+                         acquired_at = now(),
+                         renewed_at = now(),
+                         expires_at = EXCLUDED.expires_at
+                     WHERE l.expires_at <= now()
+                     RETURNING l.slot, l.fence",
+                    &[
+                        &self.deployment_id,
+                        &scope,
+                        &capacity,
+                        &holder,
+                        &invocation,
+                        &self.ttl_secs(),
+                    ],
+                )
+                .await
+                .map_err(|error| classify_query(error, OPERATION_ACQUIRE))?;
+            match row {
+                Some(row) => {
+                    let slot: i32 = row
+                        .try_get("slot")
+                        .map_err(|_| invalid_data(OPERATION_ACQUIRE))?;
+                    let fence: i64 = row
+                        .try_get("fence")
+                        .map_err(|_| invalid_data(OPERATION_ACQUIRE))?;
+                    Ok(LeaseAttempt::Acquired(ExecutionLease {
+                        scope: scope.to_owned(),
+                        slot,
+                        fence,
+                    }))
+                }
+                None => Ok(LeaseAttempt::Full),
             }
-            None => Ok(LeaseAttempt::Full),
-        }
+        })
+        .await
     }
 
     async fn renew(&self, lease: &ExecutionLease) -> Result<bool, RepositoryError> {
         let holder = self.holder.to_string();
-        let client = self.pool.get().await.map_err(classify_pool_error)?;
-        let renewed = client
-            .execute(
-                "UPDATE greengateway.execution_leases
-                 SET renewed_at = now(),
-                     expires_at = now() + make_interval(secs => $6::double precision)
-                 WHERE deployment_id = $1 AND scope = $2 AND slot = $3
-                   AND fence = $4 AND holder_instance = $5::text::uuid
-                   AND expires_at > now()",
-                &[
-                    &self.deployment_id,
-                    &lease.scope,
-                    &lease.slot,
-                    &lease.fence,
-                    &holder,
-                    &self.ttl_secs(),
-                ],
-            )
-            .await
-            .map_err(|error| classify_query(error, OPERATION_RENEW))?;
-        Ok(renewed == 1)
+        let client = checkout(&self.pool, CheckoutClass::ExecutionLease).await?;
+        timed_operation(OPERATION_RENEW, async {
+            let renewed = client
+                .execute(
+                    "UPDATE greengateway.execution_leases
+                     SET renewed_at = now(),
+                         expires_at = now() + make_interval(secs => $6::double precision)
+                     WHERE deployment_id = $1 AND scope = $2 AND slot = $3
+                       AND fence = $4 AND holder_instance = $5::text::uuid
+                       AND expires_at > now()",
+                    &[
+                        &self.deployment_id,
+                        &lease.scope,
+                        &lease.slot,
+                        &lease.fence,
+                        &holder,
+                        &self.ttl_secs(),
+                    ],
+                )
+                .await
+                .map_err(|error| classify_query(error, OPERATION_RENEW))?;
+            Ok(renewed == 1)
+        })
+        .await
     }
 
     async fn release(&self, lease: &ExecutionLease) -> Result<(), RepositoryError> {
         let holder = self.holder.to_string();
-        let client = self.pool.get().await.map_err(classify_pool_error)?;
-        client
-            .execute(
-                "DELETE FROM greengateway.execution_leases
-                 WHERE deployment_id = $1 AND scope = $2 AND slot = $3
-                   AND fence = $4 AND holder_instance = $5::text::uuid",
-                &[
-                    &self.deployment_id,
-                    &lease.scope,
-                    &lease.slot,
-                    &lease.fence,
-                    &holder,
-                ],
-            )
-            .await
-            .map_err(|error| classify_query(error, OPERATION_RELEASE))?;
-        Ok(())
+        let client = checkout(&self.pool, CheckoutClass::ExecutionLease).await?;
+        timed_operation(OPERATION_RELEASE, async {
+            client
+                .execute(
+                    "DELETE FROM greengateway.execution_leases
+                     WHERE deployment_id = $1 AND scope = $2 AND slot = $3
+                       AND fence = $4 AND holder_instance = $5::text::uuid",
+                    &[
+                        &self.deployment_id,
+                        &lease.scope,
+                        &lease.slot,
+                        &lease.fence,
+                        &holder,
+                    ],
+                )
+                .await
+                .map_err(|error| classify_query(error, OPERATION_RELEASE))?;
+            Ok(())
+        })
+        .await
     }
 
     async fn is_current(&self, lease: &ExecutionLease) -> Result<bool, RepositoryError> {
         let holder = self.holder.to_string();
-        let client = self.pool.get().await.map_err(classify_pool_error)?;
-        let row = client
-            .query_one(
-                "SELECT EXISTS (
-                     SELECT 1 FROM greengateway.execution_leases
-                     WHERE deployment_id = $1 AND scope = $2 AND slot = $3
-                       AND fence = $4 AND holder_instance = $5::text::uuid
-                       AND expires_at > now()) AS current",
-                &[
-                    &self.deployment_id,
-                    &lease.scope,
-                    &lease.slot,
-                    &lease.fence,
-                    &holder,
-                ],
-            )
-            .await
-            .map_err(|error| classify_query(error, OPERATION_CHECK))?;
-        row.try_get("current")
-            .map_err(|_| invalid_data(OPERATION_CHECK))
+        let client = checkout(&self.pool, CheckoutClass::ExecutionLease).await?;
+        timed_operation(OPERATION_CHECK, async {
+            let row = client
+                .query_one(
+                    "SELECT EXISTS (
+                         SELECT 1 FROM greengateway.execution_leases
+                         WHERE deployment_id = $1 AND scope = $2 AND slot = $3
+                           AND fence = $4 AND holder_instance = $5::text::uuid
+                           AND expires_at > now()) AS current",
+                    &[
+                        &self.deployment_id,
+                        &lease.scope,
+                        &lease.slot,
+                        &lease.fence,
+                        &holder,
+                    ],
+                )
+                .await
+                .map_err(|error| classify_query(error, OPERATION_CHECK))?;
+            row.try_get("current")
+                .map_err(|_| invalid_data(OPERATION_CHECK))
+        })
+        .await
     }
 
     fn ttl(&self) -> Duration {

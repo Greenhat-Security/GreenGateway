@@ -43,7 +43,9 @@ use crate::auth::tokens::{
 };
 
 use super::{
-    log_classified, postgres::classify_pool_error, postgres_policy::SecurityRevisionSource,
+    log_classified,
+    postgres::{checkout, timed_operation, CheckoutClass},
+    postgres_policy::SecurityRevisionSource,
     RepositoryError, RepositoryErrorKind, ServiceTokenStore,
 };
 
@@ -108,18 +110,21 @@ impl PostgresServiceTokenStore {
     /// of the shared counter (set on every mutation), never a private
     /// count, so it compares directly against the gate's watermark.
     pub async fn state_revision(&self) -> Result<i64, RepositoryError> {
-        let client = self.pool.get().await.map_err(classify_pool_error)?;
-        let row = client
-            .query_opt(
-                "SELECT last_revision FROM greengateway.service_token_state_revision WHERE singleton",
-                &[],
-            )
-            .await
-            .map_err(|error| classify_query(error, OPERATION_STATE_REVISION))?;
-        // Seeded by migration 7 and never deleted; absence means the
-        // schema is not the one this build expects.
-        let row = row.ok_or_else(|| invalid_data(OPERATION_STATE_REVISION))?;
-        column(&row, 0, OPERATION_STATE_REVISION)
+        let client = checkout(&self.pool, CheckoutClass::SecurityStateRead).await?;
+        timed_operation(OPERATION_STATE_REVISION, async {
+            let row = client
+                .query_opt(
+                    "SELECT last_revision FROM greengateway.service_token_state_revision WHERE singleton",
+                    &[],
+                )
+                .await
+                .map_err(|error| classify_query(error, OPERATION_STATE_REVISION))?;
+            // Seeded by migration 7 and never deleted; absence means the
+            // schema is not the one this build expects.
+            let row = row.ok_or_else(|| invalid_data(OPERATION_STATE_REVISION))?;
+            column(&row, 0, OPERATION_STATE_REVISION)
+        })
+        .await
     }
 
     async fn load_by_id(
@@ -165,7 +170,7 @@ impl ServiceTokenStore for PostgresServiceTokenStore {
         let scopes_json =
             serde_json::to_string(&request.scopes).map_err(|_| invalid_data(OPERATION_CREATE))?;
 
-        let client = self.pool.get().await.map_err(classify_pool_error)?;
+        let client = checkout(&self.pool, CheckoutClass::ControlPlaneWrite).await?;
         begin_mutation(&client, OPERATION_CREATE).await?;
         let outcome: Result<TokenRecord, RepositoryError> = async {
             let security_revision = reserve_shared_revision(&client, OPERATION_CREATE).await?;
@@ -229,7 +234,7 @@ impl ServiceTokenStore for PostgresServiceTokenStore {
                 .map_err(|error| map_helper_error(OPERATION_LIST, error))?;
         }
         let limit = query_limit(filters.limit);
-        let client = self.pool.get().await.map_err(classify_pool_error)?;
+        let client = checkout(&self.pool, CheckoutClass::SecurityStateRead).await?;
         // The keyset predicate mirrors the SQLite store's
         // `build_token_list_query`: strictly older, or the same instant and
         // a greater id. The cursor's `created_at` is the text this store
@@ -289,14 +294,14 @@ impl ServiceTokenStore for PostgresServiceTokenStore {
     }
 
     async fn get_by_id(&self, id: &str) -> Result<Option<TokenRecord>, RepositoryError> {
-        let client = self.pool.get().await.map_err(classify_pool_error)?;
+        let client = checkout(&self.pool, CheckoutClass::SecurityStateRead).await?;
         Ok(Self::load_by_id(&client, id, OPERATION_GET, false)
             .await?
             .map(|row| row.record))
     }
 
     async fn revoke(&self, id: &str) -> Result<Option<TokenRecord>, RepositoryError> {
-        let client = self.pool.get().await.map_err(classify_pool_error)?;
+        let client = checkout(&self.pool, CheckoutClass::ControlPlaneWrite).await?;
         begin_mutation(&client, OPERATION_REVOKE).await?;
         let outcome: Result<Option<TokenRecord>, RepositoryError> = async {
             let Some(current) = Self::load_by_id(&client, id, OPERATION_REVOKE, true).await? else {
@@ -343,7 +348,7 @@ impl ServiceTokenStore for PostgresServiceTokenStore {
         let token_hash = hash_token(&plaintext_token);
         let token_prefix = display_prefix(&plaintext_token);
 
-        let client = self.pool.get().await.map_err(classify_pool_error)?;
+        let client = checkout(&self.pool, CheckoutClass::ControlPlaneWrite).await?;
         begin_mutation(&client, OPERATION_ROTATE).await?;
         let outcome: Result<Option<TokenRecord>, RepositoryError> = async {
             let Some(current) = Self::load_by_id(&client, id, OPERATION_ROTATE, true).await? else {
@@ -397,66 +402,69 @@ impl ServiceTokenStore for PostgresServiceTokenStore {
 
     async fn verify(&self, plaintext_token: &str) -> Result<TokenVerification, RepositoryError> {
         let token_hash = hash_token(plaintext_token);
-        let client = self.pool.get().await.map_err(classify_pool_error)?;
-        // One statement decides validity and records use. The guard is in
-        // the WHERE, so a revoke that committed first leaves nothing for
-        // this to touch: the revoked row can never be "resurrected" by a
-        // trailing last_used_at write, and expiry is judged by the
-        // database clock.
-        let sql = format!(
-            r#"
-            UPDATE greengateway.service_tokens
-            SET last_used_at = now()
-            WHERE token_hash = $1
-              AND revoked_at IS NULL
-              AND (expires_at IS NULL OR expires_at > now())
-            RETURNING {},
-              CASE WHEN expires_at IS NULL THEN NULL
-                   ELSE GREATEST(EXTRACT(EPOCH FROM (expires_at - now())), 0)::double precision
-              END
-            "#,
-            select_columns()
-        );
-        let touched = client
-            .query_opt(sql.as_str(), &[&token_hash])
-            .await
-            .map_err(|error| classify_query(error, OPERATION_VERIFY))?;
-        if let Some(row) = touched {
-            let raw = RawRow::from_row(&row, OPERATION_VERIFY)?;
-            return Ok(TokenVerification::Valid(VerifiedToken {
-                id: raw.record.id,
-                token_prefix: raw.record.token_prefix,
-                scopes: raw.record.scopes,
-                expires_at: raw.record.expires_at,
-                last_used_at: raw.record.last_used_at,
-                remaining_lifetime: remaining_lifetime_from_row(&row)?,
-            }));
-        }
-        // Not live: say why, without touching anything.
-        let sql = format!(
-            "SELECT {} FROM greengateway.service_tokens WHERE token_hash = $1",
-            select_columns()
-        );
-        let row = client
-            .query_opt(sql.as_str(), &[&token_hash])
-            .await
-            .map_err(|error| classify_query(error, OPERATION_VERIFY))?;
-        let failure = match row {
-            None => TokenVerificationFailure::NotFound,
-            Some(row) => {
+        let client = checkout(&self.pool, CheckoutClass::CredentialCheck).await?;
+        timed_operation(OPERATION_VERIFY, async {
+            // One statement decides validity and records use. The guard is
+            // in the WHERE, so a revoke that committed first leaves nothing
+            // for this to touch: the revoked row can never be "resurrected"
+            // by a trailing last_used_at write, and expiry is judged by the
+            // database clock.
+            let sql = format!(
+                r#"
+                UPDATE greengateway.service_tokens
+                SET last_used_at = now()
+                WHERE token_hash = $1
+                  AND revoked_at IS NULL
+                  AND (expires_at IS NULL OR expires_at > now())
+                RETURNING {},
+                  CASE WHEN expires_at IS NULL THEN NULL
+                       ELSE GREATEST(EXTRACT(EPOCH FROM (expires_at - now())), 0)::double precision
+                  END
+                "#,
+                select_columns()
+            );
+            let touched = client
+                .query_opt(sql.as_str(), &[&token_hash])
+                .await
+                .map_err(|error| classify_query(error, OPERATION_VERIFY))?;
+            if let Some(row) = touched {
                 let raw = RawRow::from_row(&row, OPERATION_VERIFY)?;
-                if raw.record.revoked_at.is_some() {
-                    TokenVerificationFailure::Revoked
-                } else {
-                    TokenVerificationFailure::Expired
-                }
+                return Ok(TokenVerification::Valid(VerifiedToken {
+                    id: raw.record.id,
+                    token_prefix: raw.record.token_prefix,
+                    scopes: raw.record.scopes,
+                    expires_at: raw.record.expires_at,
+                    last_used_at: raw.record.last_used_at,
+                    remaining_lifetime: remaining_lifetime_from_row(&row)?,
+                }));
             }
-        };
-        Ok(TokenVerification::Invalid(failure))
+            // Not live: say why, without touching anything.
+            let sql = format!(
+                "SELECT {} FROM greengateway.service_tokens WHERE token_hash = $1",
+                select_columns()
+            );
+            let row = client
+                .query_opt(sql.as_str(), &[&token_hash])
+                .await
+                .map_err(|error| classify_query(error, OPERATION_VERIFY))?;
+            let failure = match row {
+                None => TokenVerificationFailure::NotFound,
+                Some(row) => {
+                    let raw = RawRow::from_row(&row, OPERATION_VERIFY)?;
+                    if raw.record.revoked_at.is_some() {
+                        TokenVerificationFailure::Revoked
+                    } else {
+                        TokenVerificationFailure::Expired
+                    }
+                }
+            };
+            Ok(TokenVerification::Invalid(failure))
+        })
+        .await
     }
 
     async fn touch_last_used(&self, id: &str) -> Result<Option<TokenRecord>, RepositoryError> {
-        let client = self.pool.get().await.map_err(classify_pool_error)?;
+        let client = checkout(&self.pool, CheckoutClass::CredentialCheck).await?;
         let sql = format!(
             r#"
             UPDATE greengateway.service_tokens
@@ -785,7 +793,7 @@ pub(crate) async fn import_service_tokens_in(
 pub(crate) async fn exported_tokens(
     pool: &deadpool_postgres::Pool,
 ) -> Result<Vec<crate::auth::tokens::ExportedServiceToken>, RepositoryError> {
-    let client = pool.get().await.map_err(classify_pool_error)?;
+    let client = checkout(pool, CheckoutClass::Maintenance).await?;
     let sql = format!(
         "SELECT id, token_hash, token_prefix, scopes_json, created_by, \
          to_char(created_at AT TIME ZONE 'UTC', {f}), \

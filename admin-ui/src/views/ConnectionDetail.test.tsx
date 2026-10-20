@@ -294,6 +294,67 @@ describe('ConnectionDetail', () => {
     );
   });
 
+  it('shows a stored caller assertion as configured but not enforced', async () => {
+    vi.stubGlobal(
+      'fetch',
+      vi.fn().mockResolvedValue(
+        jsonResponse(
+          200,
+          connectionDetail({
+            configuration: {
+              endpoint: {
+                base_url: 'https://api.example',
+                base_path: '/',
+              },
+              authentication: { type: 'none' },
+              caller_assertion: {
+                signing_key_configured: true,
+                signing_key_id: 'SIGNING_KEY_ALIAS_CANARY',
+                kid: 'gw-2026-09',
+                algorithm: 'rs256',
+                issuer: 'https://gateway.example.test',
+                audience: 'https://api.example',
+                token_type: 'at+jwt',
+                header_name: 'x-caller-assertion',
+                lifetime_seconds: 120,
+                claims: ['email', 'roles'],
+                bind_request: false,
+                bind_approval: false,
+              },
+              tls: {
+                ca_bundle_configured: false,
+                client_certificate_configured: false,
+                client_private_key_configured: false,
+              },
+            },
+          }),
+          { ETag: '"connection-v1"' },
+        ),
+      ),
+    );
+
+    renderDetail();
+
+    expect(
+      await screen.findByText('Configured - not yet enforced'),
+    ).toBeTruthy();
+    const section = screen
+      .getByRole('heading', { name: 'Caller assertion' })
+      .closest('section');
+    expect(section?.textContent).toContain('Accepted, not yet enforced.');
+    expect(section?.textContent).toContain('caller_assertion_not_enforced');
+    expect(section?.textContent).toContain('"caller_assertion": null');
+    expect(specValue('Key ID')).toBe('gw-2026-09');
+    expect(specValue('Algorithm')).toBe('RS256');
+    expect(specValue('Assertion header')).toBe('x-caller-assertion');
+    expect(specValue('Lifetime')).toBe('120 seconds');
+    expect(specValue('Claims')).toBe('sub, email, roles');
+    expect(specValue('Signing key')).toBe('Configured');
+    expect(document.body.textContent).not.toContain(
+      'SIGNING_KEY_ALIAS_CANARY',
+    );
+  });
+
   it('stops on an ETag conflict and reloads before allowing another operation', async () => {
     let getCount = 0;
     const fetchMock = vi.fn(

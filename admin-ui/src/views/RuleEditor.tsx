@@ -955,10 +955,33 @@ function PreviewResult({
   response: PolicyRulePreviewResponse;
   windowHours: number;
 }) {
-  // A truncated scan counted only the newest events, so its match count is a
-  // lower bound for the window, never the window's count.
+  // A truncated scan counted only the newest observations, so its match
+  // count is a lower bound for the window, never the window's count.
   const truncated =
     response.scan_truncated === true || response.complete === false;
+
+  // Nothing in the window reached the matcher, so there was nothing to
+  // count: "would have matched 0 requests" would read as evidence that the
+  // rule matches nothing.
+  if (response.scanned_event_count === 0 && !truncated) {
+    return (
+      <div className="rule-preview-result">
+        <div className="error-panel alert info" role="status">
+          <h3>No observations in window</h3>
+          <p>
+            No requests recorded in the last {formatWindowHours(windowHours)}{' '}
+            passed this rule&apos;s method and path pre-filter, so the preview had
+            nothing to evaluate. That is not evidence the rule would match
+            nothing.
+          </p>
+        </div>
+        <div className="rule-preview-meta">
+          <span className="badge neutral">0 scanned</span>
+          <span className="badge neutral">{response.sample_strategy}</span>
+        </div>
+      </div>
+    );
+  }
 
   return (
     <div className="rule-preview-result">
@@ -970,9 +993,9 @@ function PreviewResult({
             <>
               This rule would have matched at least{' '}
               {formatCount(response.match_count)} requests in the last{' '}
-              {formatWindowHours(windowHours)}; only the newest{' '}
-              {formatCount(response.scanned_event_count)} events in that window
-              were scanned.
+              {formatWindowHours(windowHours)}; the scan stopped after the newest{' '}
+              {formatCount(response.scanned_event_count)} observations that passed
+              the rule&apos;s method and path pre-filter.
             </>
           ) : (
             <>

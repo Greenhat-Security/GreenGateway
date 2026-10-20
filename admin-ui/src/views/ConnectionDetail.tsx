@@ -12,6 +12,7 @@ import {
   refreshConnection,
   testConnection,
 } from '../lib/connections';
+import { CallerAssertionSummary } from './CallerAssertionSummary';
 
 type MutationKind = 'test' | 'refresh' | 'delete';
 
@@ -483,6 +484,14 @@ function ConnectionConfiguration({
               value={formatSafeAuthentication(configuration.authentication)}
             />
             <SpecRow
+              label="Caller assertion"
+              value={
+                configuration.caller_assertion
+                  ? 'Configured - not yet enforced'
+                  : 'Not configured'
+              }
+            />
+            <SpecRow
               label="Additional secret headers"
               value={formatSafeAdditionalHeaders(
                 configuration.additional_headers ?? [],
@@ -530,6 +539,16 @@ function ConnectionConfiguration({
               code={configuration.test_profile !== undefined}
             />
           </dl>
+          {configuration.caller_assertion ? (
+            <section aria-labelledby="connection-caller-assertion-heading">
+              <h4 id="connection-caller-assertion-heading">
+                Caller assertion
+              </h4>
+              <CallerAssertionSummary
+                assertion={configuration.caller_assertion}
+              />
+            </section>
+          ) : null}
           <p className="alert info">
             Secret values and secret locators are never returned by this page.
             "Configured" only confirms that a protected binding exists.

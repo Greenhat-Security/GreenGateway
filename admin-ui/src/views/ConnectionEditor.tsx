@@ -54,6 +54,7 @@ import {
 import {
   AdditionalHeadersSection,
   AuthenticationSection,
+  CallerAssertionSection,
   ConnectionIdentitySection,
   EditorAlert,
   LocalSecretManager,
@@ -692,6 +693,7 @@ export function ConnectionEditor() {
               onUpdate={updateAdditionalHeader}
               onRemove={removeAdditionalHeader}
             />
+            <CallerAssertionSection assertion={form.callerAssertion} />
             <TlsSection
               form={form}
               errors={fieldErrors}

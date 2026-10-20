@@ -41,8 +41,13 @@ use crate::{
             ConnectionAuthentication, ConnectionEndpoint, ConnectionId, ConnectionKind,
             ConnectionWrite, OAuthClientAuthMethod, TlsProfile,
         },
-        secret::{OperatorSecretAliasConfig, OperatorSecretAliasSource, SecretRootConfig},
+        secret::{
+            OperatorSecretAliasConfig, OperatorSecretAliasSource, ResolvedSecret,
+            SecretAliasMetadata, SecretProviderKind, SecretPurpose, SecretResolveError,
+            SecretResolveErrorKind, SecretResolver, SecretRootConfig,
+        },
         store::{StoredEnumSourceValue, StoredOpenApiCatalog, StoredOpenApiCatalogEntry},
+        vault_secret::VaultProviderConfig,
     },
     discovery::{
         aggregator::{EndpointAggregatorSink, EndpointAggregatorSinkConfig},
@@ -2167,13 +2172,17 @@ async fn connection_tool_with_unenforced_caller_assertion_is_refused_before_any_
         &signing_key,
     ));
     let (addr, ca_pem, server) = one_request_tls_server().await;
-    let connection = TemporaryStaticAuthRuntime::header_api_key_with_caller_assertion(
+    let (connection, secrets) = TemporaryStaticAuthRuntime::header_api_key_with_caller_assertion(
         addr,
         &ca_pem,
         API_KEY_CANARY.as_bytes(),
         signing_key.as_bytes(),
     )
     .await;
+    // Saving read each secret exactly once: the API key, and the signing key
+    // it loaded. Everything after this is measured against that count.
+    let saved = secrets.resolutions();
+    assert_eq!(saved, 2, "saving the Connection reads each secret once");
     let capture = CaptureSink::new();
     let audit = AuditLog::new(Arc::new(capture.clone()) as Arc<dyn AuditSink>);
     let runtime = ToolRuntime::new(
@@ -2242,46 +2251,30 @@ async fn connection_tool_with_unenforced_caller_assertion_is_refused_before_any_
         assert!(!rendered.contains(canary), "the audit leaked {canary}");
     }
 
-    // While both secrets resolve, a missing secret-resolution event proves
-    // nothing. Remove them: a provider read before the refusal would now fail
-    // as `credential_unavailable` and raise that event, so the same refusal
-    // with no such event shows the provider is never consulted.
-    fs::remove_file(&connection.secret_path).expect("the API key file should disappear");
-    fs::remove_file(connection.root.join("assertion-signing-key"))
-        .expect("the signing key file should disappear");
-    let error = executor
-        .execute(
-            "get_charge",
-            json!({ "charge_id": "ch_unattested_unreadable" }),
-            invocation_context(),
-            CancellationToken::new(),
-        )
-        .await
-        .expect_err("the refusal must not depend on the secrets resolving");
-    let ToolRuntimeError::WorkFailed { reason, .. } = error else {
-        panic!("the refusal should surface as a work failure");
-    };
-    assert_eq!(reason.as_deref(), Some("caller_assertion_not_enforced"));
-    wait_until(Duration::from_secs(1), || {
-        capture
-            .events()
-            .iter()
-            .filter(|event| event.event_type == audit::event::TOOL_INVOKE_FAILURE)
-            .count()
-            >= 2
-    })
-    .await;
-    let events = capture.events();
-    assert!(events
-        .iter()
-        .filter(|event| event.event_type == audit::event::TOOL_INVOKE_FAILURE)
-        .all(|event| event.payload["failure_reason"] == json!("caller_assertion_not_enforced")));
+    // Both secrets sit behind a provider that counts every resolution, so
+    // "never consulted" is no read beyond the save's rather than the absence
+    // of an event that a successful read would not raise either.
+    assert_eq!(
+        secrets.resolutions(),
+        saved,
+        "no secret provider may be consulted for a refused Connection"
+    );
     assert!(
         events
             .iter()
             .all(|event| event.event_type != audit::event::CONNECTION_SECRET_RESOLUTION_FAILED),
-        "no secret provider may be consulted for a refused Connection"
+        "a refused Connection must not report a secret-resolution failure"
     );
+    // The count is real: the resolver the runtime uses routes this alias to
+    // the counting provider.
+    let resolved = connection
+        .control_plane
+        .secret_resolver()
+        .resolve("billing-api-key", SecretPurpose::HeaderApiKey)
+        .await
+        .expect("the counting provider should serve the API key");
+    assert_eq!(resolved.expose(), API_KEY_CANARY.as_bytes());
+    assert_eq!(secrets.resolutions(), saved + 1);
     assert!(
         tokio::time::timeout(Duration::from_millis(100), server)
             .await
@@ -2295,13 +2288,15 @@ async fn composite_leaf_on_unenforced_caller_assertion_is_refused_before_member_
     // A composite reports its own `composite_failed`; the leaf's reason has to
     // survive into the caller's details so the operator can see why.
     let (addr, ca_pem, server) = scripted_tls_server(Vec::new()).await;
-    let connection = TemporaryStaticAuthRuntime::header_api_key_with_caller_assertion(
+    let (connection, secrets) = TemporaryStaticAuthRuntime::header_api_key_with_caller_assertion(
         addr,
         &ca_pem,
         b"composite-key",
         crate::connections::test_support::generated_es256_pem().as_bytes(),
     )
     .await;
+    let saved = secrets.resolutions();
+    assert_eq!(saved, 2, "saving the Connection reads each secret once");
     let definitions = composite_note_definitions(&connection.connection_id);
     let (executor, capture) = executor_for_composite_definitions(
         definitions,
@@ -2353,6 +2348,11 @@ async fn composite_leaf_on_unenforced_caller_assertion_is_refused_before_member_
         .find(|event| event.event_type == audit::event::TOOL_INVOKE_FAILURE)
         .expect("the composite refusal should be audited");
     assert_eq!(failure.payload["failure_reason"], json!("composite_failed"));
+    assert_eq!(
+        secrets.resolutions(),
+        saved,
+        "a refused composite leaf must not consult a secret provider"
+    );
     assert!(
         server
             .await
@@ -2921,6 +2921,369 @@ fn validation_failure_audit_paths_preserve_schema_properties_and_hide_dynamic_ke
         ),
         "/*",
         "an invalid object must not turn caller-selected numeric keys into array indices"
+    );
+}
+
+#[tokio::test]
+async fn numeric_keywords_judge_arguments_beyond_f64_exactly_and_audit_rejections() {
+    // 10^400 written out in full: past u64 and f64, with no exponent to shorten it.
+    let wide_integer = format!("1{}", "0".repeat(400));
+    let cases = [
+        (r#"{"minimum": 0}"#, "1e400".to_owned(), None),
+        (r#"{"minimum": 0}"#, "-1e400".to_owned(), Some("minimum")),
+        (r#"{"minimum": 0}"#, wide_integer.clone(), None),
+        (
+            r#"{"minimum": 0}"#,
+            format!("-{wide_integer}"),
+            Some("minimum"),
+        ),
+        (r#"{"maximum": 100}"#, "1e400".to_owned(), Some("maximum")),
+        (r#"{"maximum": 100}"#, "-1e400".to_owned(), None),
+        (r#"{"maximum": 100}"#, wide_integer.clone(), Some("maximum")),
+        (r#"{"exclusiveMinimum": 0}"#, "1e400".to_owned(), None),
+        (
+            r#"{"exclusiveMinimum": 0}"#,
+            "-1e400".to_owned(),
+            Some("exclusiveMinimum"),
+        ),
+        (
+            r#"{"exclusiveMaximum": 100}"#,
+            "1e400".to_owned(),
+            Some("exclusiveMaximum"),
+        ),
+        (r#"{"exclusiveMaximum": 100}"#, "-1e400".to_owned(), None),
+        (r#"{"multipleOf": 2}"#, "1e400".to_owned(), None),
+        (r#"{"multipleOf": 2}"#, "-1e400".to_owned(), None),
+        (r#"{"multipleOf": 0.5}"#, "1e400".to_owned(), None),
+        (
+            r#"{"multipleOf": 3}"#,
+            "1e400".to_owned(),
+            Some("multipleOf"),
+        ),
+        (
+            r#"{"multipleOf": 3}"#,
+            wide_integer.clone(),
+            Some("multipleOf"),
+        ),
+        (r#"{"enum": [1, 2]}"#, "1e400".to_owned(), Some("enum")),
+        (r#"{"enum": [1, 2]}"#, wide_integer.clone(), Some("enum")),
+        (r#"{"enum": [1e400]}"#, wide_integer.clone(), None),
+        (r#"{"const": 1}"#, "1e400".to_owned(), Some("const")),
+        (r#"{"const": 1}"#, "-1e400".to_owned(), Some("const")),
+        (r#"{"const": 1e400}"#, wide_integer.clone(), None),
+        (r#"{"type": "integer"}"#, "1e400".to_owned(), None),
+        (r#"{"type": "integer"}"#, "-1e400".to_owned(), None),
+        (r#"{"type": "integer"}"#, "1.5e400".to_owned(), None),
+        (r#"{"type": "integer"}"#, wide_integer.clone(), None),
+        (r#"{"type": "integer"}"#, "1e-400".to_owned(), Some("type")),
+        // Exact where comparing as f64 would round the two sides together.
+        (
+            r#"{"maximum": 18446744073709551615}"#,
+            "18446744073709551616".to_owned(),
+            Some("maximum"),
+        ),
+        (
+            r#"{"enum": [18446744073709551616]}"#,
+            "18446744073709551617".to_owned(),
+            Some("enum"),
+        ),
+        (
+            r#"{"maximum": 0.3}"#,
+            "0.30000000000000001".to_owned(),
+            Some("maximum"),
+        ),
+        // Limits beyond f64 in the schema itself.
+        (r#"{"maximum": 1e400}"#, "5".to_owned(), None),
+        (r#"{"minimum": 1e400}"#, "5".to_owned(), Some("minimum")),
+    ];
+
+    for (keyword_schema, argument, rejected_by) in cases {
+        let mut tool = echo_tool();
+        tool["input_json_schema"] = serde_json::from_str(&format!(
+            r#"{{"type": "object", "required": ["value"], "properties": {{"value": {keyword_schema}}}, "additionalProperties": false}}"#
+        ))
+        .expect("numeric keyword schema should parse");
+        let args: Value = serde_json::from_str(&format!(r#"{{"value": {argument}}}"#))
+            .expect("numeric argument should parse");
+        let shown = &argument[..argument.len().min(24)];
+
+        let Some(keyword) = rejected_by else {
+            let (addr, server) = one_request_server(StatusCode::OK, b"ok").await;
+            let (executor, _capture) = executor_for_tools(
+                addr,
+                [tool],
+                runtime_config([("echo", enabled_tool(500, 1))], 2, 1, 100),
+            );
+            let result = executor
+                .execute(
+                    "echo",
+                    args.clone(),
+                    invocation_context(),
+                    CancellationToken::new(),
+                )
+                .await
+                .unwrap_or_else(|error| {
+                    panic!("{keyword_schema} should accept {shown}: {error:?}")
+                });
+            assert_eq!(http_response(result).status, StatusCode::OK);
+            let request = server.await.expect("server task should join");
+            assert_eq!(
+                serde_json::from_slice::<Value>(&request.body)
+                    .expect("request body should be JSON"),
+                args,
+                "{keyword_schema} must forward {shown} exactly"
+            );
+            continue;
+        };
+
+        let (executor, capture) = executor_for_tools(
+            socket_addr(1),
+            [tool],
+            runtime_config([("echo", enabled_tool(500, 1))], 2, 1, 100),
+        );
+        let error = executor
+            .execute("echo", args, invocation_context(), CancellationToken::new())
+            .await
+            .expect_err("an out-of-range numeric argument should be rejected");
+        let ToolRuntimeError::WorkFailed {
+            reason: Some(reason),
+            details: Some(details),
+            ..
+        } = error
+        else {
+            panic!("{keyword_schema} must reject {shown} as invalid params");
+        };
+        assert_eq!(reason, TOOL_INVALID_PARAMS_REASON);
+        let problems = details["problems"]
+            .as_array()
+            .expect("caller problems should be present");
+        assert_eq!(problems.len(), 1, "{keyword_schema} with {shown}");
+        assert_eq!(problems[0]["path"], "/value");
+        assert_eq!(
+            problems[0]["keyword"], keyword,
+            "{keyword_schema} with {shown}"
+        );
+
+        let events = audit_events(&capture, 3).await;
+        let failure = events
+            .iter()
+            .find(|event| event.event_type == audit::event::TOOL_INVOKE_FAILURE)
+            .expect("the rejection should be audited");
+        assert_eq!(failure.payload["failure_reason"], "invalid_params");
+        assert_eq!(failure.payload["problems"][0]["path"], "/value");
+        assert_eq!(failure.payload["problems"][0]["keyword"], keyword);
+    }
+}
+
+#[tokio::test]
+async fn arguments_too_wide_to_compare_exactly_are_refused_and_audited_before_validation() {
+    let mut tool = echo_tool();
+    tool["input_json_schema"] = json!({
+        "type": "object",
+        "properties": {
+            "value": {"minimum": 0},
+            "values": {"type": "array", "items": {"exclusiveMaximum": 100.5}}
+        },
+        "additionalProperties": false
+    });
+    let refused = [
+        // Eight bytes that kept the validator busy for seconds when measured.
+        r#"{"value": 1e-99999}"#.to_owned(),
+        // One integer literal a digit wider than the whole budget.
+        format!(r#"{{"value": 1{}}}"#, "7".repeat(1_024)),
+        // Seven numbers that each fit, but not together.
+        format!(r#"{{"values": [{}]}}"#, ["1e400"; 7].join(", ")),
+    ];
+    for arguments in refused {
+        let (executor, capture) = executor_for_tools(
+            socket_addr(1),
+            [tool.clone()],
+            runtime_config([("echo", enabled_tool(500, 1))], 2, 1, 100),
+        );
+        let error = executor
+            .execute(
+                "echo",
+                serde_json::from_str(&arguments).expect("test arguments should parse"),
+                invocation_context(),
+                CancellationToken::new(),
+            )
+            .await
+            .expect_err("arguments too wide to compare exactly should be refused");
+        let ToolRuntimeError::WorkFailed {
+            reason: Some(reason),
+            details: Some(details),
+            ..
+        } = error
+        else {
+            panic!("arguments too wide to compare exactly must be invalid params");
+        };
+        assert_eq!(reason, TOOL_INVALID_PARAMS_REASON);
+        assert_eq!(
+            details["problems"],
+            json!([{
+                "path": "",
+                "keyword": "number_width",
+                "message": "numeric arguments are too wide to compare exactly"
+            }])
+        );
+
+        let events = audit_events(&capture, 3).await;
+        let failure = events
+            .iter()
+            .find(|event| event.event_type == audit::event::TOOL_INVOKE_FAILURE)
+            .expect("the refusal should be audited");
+        assert_eq!(failure.payload["failure_reason"], "invalid_params");
+        assert_eq!(
+            failure.payload["problems"],
+            json!([{
+                "path": "",
+                "keyword": "number_width",
+                "message": "numeric arguments are too wide to compare exactly"
+            }])
+        );
+    }
+
+    // The budget still admits six numbers of 401 digits, or one of 1,024.
+    for arguments in [
+        format!(r#"{{"values": [{}]}}"#, ["-1e400"; 6].join(", ")),
+        format!(r#"{{"value": 1{}}}"#, "7".repeat(1_023)),
+    ] {
+        let (addr, server) = one_request_server(StatusCode::OK, b"ok").await;
+        let (executor, _capture) = executor_for_tools(
+            addr,
+            [tool.clone()],
+            runtime_config([("echo", enabled_tool(500, 1))], 2, 1, 100),
+        );
+        let args: Value = serde_json::from_str(&arguments).expect("test arguments should parse");
+        let result = executor
+            .execute(
+                "echo",
+                args.clone(),
+                invocation_context(),
+                CancellationToken::new(),
+            )
+            .await
+            .expect("arguments inside the budget should validate");
+        assert_eq!(http_response(result).status, StatusCode::OK);
+        let request = server.await.expect("server task should join");
+        assert_eq!(
+            serde_json::from_slice::<Value>(&request.body).expect("request body should be JSON"),
+            args
+        );
+    }
+}
+
+#[tokio::test]
+async fn served_schema_too_wide_to_compare_exactly_fails_closed_before_compiling() {
+    let (executor, _capture) = executor_for_tools(
+        socket_addr(1),
+        [echo_tool()],
+        runtime_config([("echo", enabled_tool(500, 1))], 2, 1, 100),
+    );
+    // Loading holds registry schemas to the budget; a served schema can still
+    // gain enum values from a dynamic source afterwards.
+    let mut served = (*tool_definition(echo_tool(), "echo")).clone();
+    served.input_schema = serde_json::from_str(
+        r#"{"type": "object", "properties": {"message": {"enum": ["hello", 1e-99999]}}}"#,
+    )
+    .expect("served schema should parse");
+
+    match executor.validator_for(&served) {
+        Err(ToolExecutorError::SchemaCompile { message, .. }) => assert_eq!(
+            message,
+            "input schema contains numbers too wide to compare exactly"
+        ),
+        Err(other) => panic!("expected a schema compile failure, got {other}"),
+        Ok(_) => panic!("a served schema too wide to compare exactly must not compile"),
+    }
+}
+
+#[tokio::test]
+async fn idn_formats_still_reject_invalid_internationalized_arguments() {
+    // Without jsonschema's `idna` feature these are unknown formats, which
+    // accept anything. Draft 7 asserts `format`; 2020-12 only annotates it.
+    let mut tool = echo_tool();
+    tool["input_json_schema"] = json!({
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "type": "object",
+        "properties": {
+            "email": {"type": "string", "format": "idn-email"},
+            "host": {"type": "string", "format": "idn-hostname"}
+        },
+        "additionalProperties": false
+    });
+
+    let (executor, capture) = executor_for_tools(
+        socket_addr(1),
+        [tool.clone()],
+        runtime_config([("echo", enabled_tool(500, 1))], 2, 1, 100),
+    );
+    let error = executor
+        .execute(
+            "echo",
+            // A label may not start with a hyphen, nor hold "--" in its third
+            // and fourth positions unless it is an A-label.
+            json!({"email": "用户@-例子.广告", "host": "ab--cd.example"}),
+            invocation_context(),
+            CancellationToken::new(),
+        )
+        .await
+        .expect_err("invalid internationalized arguments should be rejected");
+    let ToolRuntimeError::WorkFailed {
+        reason: Some(reason),
+        details: Some(details),
+        ..
+    } = error
+    else {
+        panic!("invalid internationalized arguments must be invalid params");
+    };
+    assert_eq!(reason, TOOL_INVALID_PARAMS_REASON);
+    let mut problems = details["problems"]
+        .as_array()
+        .expect("caller problems should be present")
+        .iter()
+        .map(|problem| {
+            (
+                problem["path"].as_str().unwrap_or_default().to_owned(),
+                problem["keyword"].as_str().unwrap_or_default().to_owned(),
+            )
+        })
+        .collect::<Vec<_>>();
+    problems.sort();
+    assert_eq!(
+        problems,
+        vec![
+            ("/email".to_owned(), "format".to_owned()),
+            ("/host".to_owned(), "format".to_owned()),
+        ]
+    );
+    let events = audit_events(&capture, 3).await;
+    assert!(events.iter().any(|event| {
+        event.event_type == audit::event::TOOL_INVOKE_FAILURE
+            && event.payload["failure_reason"] == "invalid_params"
+    }));
+
+    let (addr, server) = one_request_server(StatusCode::OK, b"ok").await;
+    let (executor, _capture) = executor_for_tools(
+        addr,
+        [tool],
+        runtime_config([("echo", enabled_tool(500, 1))], 2, 1, 100),
+    );
+    let args = json!({"email": "用户@例子.广告", "host": "例子.测试"});
+    let result = executor
+        .execute(
+            "echo",
+            args.clone(),
+            invocation_context(),
+            CancellationToken::new(),
+        )
+        .await
+        .expect("valid internationalized arguments should pass");
+    assert_eq!(http_response(result).status, StatusCode::OK);
+    let request = server.await.expect("server task should join");
+    assert_eq!(
+        serde_json::from_slice::<Value>(&request.body).expect("request body should be JSON"),
+        args
     );
 }
 
@@ -5893,23 +6256,33 @@ impl TemporaryStaticAuthRuntime {
     }
 
     /// A header-API-key Connection that also asks for a signed caller
-    /// assertion, with `signing_key` stored behind the assertion's alias. It
-    /// must be a real PKCS#8 key: the Connection only saves once its key loads.
+    /// assertion. Its API key and the assertion's signing key are served by
+    /// the returned counting provider rather than by files, so a test can
+    /// count every read. The signing key must be a real PKCS#8 key: the
+    /// Connection is saved the way the admin API saves it, which resolves
+    /// both secrets once and loads the key.
     async fn header_api_key_with_caller_assertion(
         addr: SocketAddr,
         ca_pem: &str,
         secret: &[u8],
         signing_key: &[u8],
-    ) -> Self {
-        Self::header_api_key_with(addr, ca_pem, secret, &[], Some(signing_key)).await
+    ) -> (Self, Arc<CountingSecretProvider>) {
+        let secrets = Arc::new(CountingSecretProvider::new(vec![
+            ("billing-api-key", secret.to_vec()),
+            ("assertion-signing-key", signing_key.to_vec()),
+        ]));
+        let connection = Self::header_api_key_with(addr, ca_pem, secret, &[], Some(&secrets)).await;
+        (connection, secrets)
     }
 
+    /// With `counted_assertion`, the Connection also carries a caller
+    /// assertion, and its secrets resolve only through that provider.
     async fn header_api_key_with(
         addr: SocketAddr,
         ca_pem: &str,
         secret: &[u8],
         additional: &[(&str, &str, &[u8])],
-        assertion_signing_key: Option<&[u8]>,
+        counted_assertion: Option<&Arc<CountingSecretProvider>>,
     ) -> Self {
         let root = std::env::temp_dir().join(format!(
             "greengateway-tool-static-auth-{}",
@@ -5931,13 +6304,18 @@ impl TemporaryStaticAuthRuntime {
                 .expect("temporary CA permissions should set");
         }
 
-        let mut aliases = vec![OperatorSecretAliasConfig {
-            id: "billing-api-key".to_owned(),
-            label: "Billing API key".to_owned(),
-            source: OperatorSecretAliasSource::File {
-                key: "api-key".to_owned(),
-            },
-        }];
+        // A counted Connection resolves its API key through the provider, so
+        // the file written above is not registered as an alias for it.
+        let mut aliases = Vec::new();
+        if counted_assertion.is_none() {
+            aliases.push(OperatorSecretAliasConfig {
+                id: "billing-api-key".to_owned(),
+                label: "Billing API key".to_owned(),
+                source: OperatorSecretAliasSource::File {
+                    key: "api-key".to_owned(),
+                },
+            });
+        }
         for (_, alias_id, value) in additional {
             let path = root.join(alias_id);
             fs::write(&path, value).expect("temporary additional secret should write");
@@ -5955,80 +6333,75 @@ impl TemporaryStaticAuthRuntime {
                 },
             });
         }
-        let caller_assertion = match assertion_signing_key {
-            Some(signing_key) => {
-                let path = root.join("assertion-signing-key");
-                fs::write(&path, signing_key).expect("temporary signing key should write");
-                #[cfg(unix)]
-                {
-                    use std::os::unix::fs::PermissionsExt;
-                    fs::set_permissions(&path, fs::Permissions::from_mode(0o600))
-                        .expect("temporary signing key permissions should set");
-                }
-                aliases.push(OperatorSecretAliasConfig {
-                    id: "assertion-signing-key".to_owned(),
-                    label: "Caller assertion signing key".to_owned(),
-                    source: OperatorSecretAliasSource::File {
-                        key: "assertion-signing-key".to_owned(),
-                    },
-                });
-                Some(CallerAssertionSettings {
-                    signing_key_id: "assertion-signing-key".to_owned(),
-                    kid: "gw-test-1".to_owned(),
-                    algorithm: CallerAssertionAlgorithm::Es256,
-                    issuer: "https://gateway.example.test".to_owned(),
-                    audience: "https://billing.example.test".to_owned(),
-                    token_type: "at+jwt".to_owned(),
-                    header_name: "x-caller-assertion".to_owned(),
-                    lifetime_seconds: 60,
-                    claims: Vec::new(),
-                    bind_request: false,
-                    bind_approval: false,
-                    published_keys: Vec::new(),
-                })
-            }
-            None => None,
-        };
+        let caller_assertion = counted_assertion.map(|_| CallerAssertionSettings {
+            signing_key_id: "assertion-signing-key".to_owned(),
+            kid: "gw-test-1".to_owned(),
+            algorithm: CallerAssertionAlgorithm::Es256,
+            issuer: "https://gateway.example.test".to_owned(),
+            audience: "https://billing.example.test".to_owned(),
+            token_type: "at+jwt".to_owned(),
+            header_name: "x-caller-assertion".to_owned(),
+            lifetime_seconds: 60,
+            claims: Vec::new(),
+            bind_request: false,
+            bind_approval: false,
+            published_keys: Vec::new(),
+        });
 
         let mut config = Config::test_defaults();
         config.connections_sqlite_path =
             Some(root.join("connections.sqlite").display().to_string());
         config.connection_secrets_root = Some(SecretRootConfig::new(root.clone()));
         config.connection_secret_aliases = aliases;
+        if let Some(secrets) = counted_assertion {
+            config.connection_vault_provider = secrets.alias_declarations();
+        }
         let control_plane =
             ConnectionControlPlane::from_config(&config).expect("control plane should build");
+        if let Some(secrets) = counted_assertion {
+            control_plane.install_network_secret_providers(vec![
+                Arc::clone(secrets) as Arc<dyn SecretResolver>
+            ]);
+        }
+        let write = ConnectionWrite {
+            display_name: "Billing API".to_owned(),
+            description: None,
+            enabled: true,
+            kind: ConnectionKind::HttpApi,
+            endpoint: ConnectionEndpoint {
+                base_url: format!("https://127.0.0.1:{}", addr.port()),
+                base_path: "/v1".to_owned(),
+            },
+            authentication: ConnectionAuthentication::HeaderApiKey {
+                header_name: "x-api-key".to_owned(),
+                secret_id: Some("billing-api-key".to_owned()),
+            },
+            caller_assertion,
+            additional_headers: additional
+                .iter()
+                .map(|(header_name, alias_id, _)| AdditionalHeader {
+                    header_name: (*header_name).to_owned(),
+                    secret_id: Some((*alias_id).to_owned()),
+                })
+                .collect(),
+            tls: TlsProfile::default(),
+            timeouts: None,
+            discovery: None,
+            test_profile: None,
+        };
+        // The admin API resolves every binding a network provider owns before
+        // it saves, which for a counted Connection is both secrets, and loads
+        // the signing key for its algorithm. Saving through the same pass is
+        // what proves the generated key is a usable one.
+        if counted_assertion.is_some() {
+            control_plane
+                .ensure_deferred_bindings_resolvable(&write)
+                .await
+                .expect("the counted secrets should resolve, and the signing key load");
+        }
         let initial = control_plane.runtime_snapshot();
         let created = control_plane
-            .create_managed(
-                initial.collection_etag(),
-                ConnectionWrite {
-                    display_name: "Billing API".to_owned(),
-                    description: None,
-                    enabled: true,
-                    kind: ConnectionKind::HttpApi,
-                    endpoint: ConnectionEndpoint {
-                        base_url: format!("https://127.0.0.1:{}", addr.port()),
-                        base_path: "/v1".to_owned(),
-                    },
-                    authentication: ConnectionAuthentication::HeaderApiKey {
-                        header_name: "x-api-key".to_owned(),
-                        secret_id: Some("billing-api-key".to_owned()),
-                    },
-                    caller_assertion,
-                    additional_headers: additional
-                        .iter()
-                        .map(|(header_name, alias_id, _)| AdditionalHeader {
-                            header_name: (*header_name).to_owned(),
-                            secret_id: Some((*alias_id).to_owned()),
-                        })
-                        .collect(),
-                    tls: TlsProfile::default(),
-                    timeouts: None,
-                    discovery: None,
-                    test_profile: None,
-                },
-                "test-admin",
-            )
+            .create_managed(initial.collection_etag(), write, "test-admin")
             .await
             .expect("test Connection should create");
         let mut egress_config = EgressConfig {
@@ -6153,6 +6526,106 @@ impl TemporaryStaticAuthRuntime {
             runtime,
             egress_client,
         }
+    }
+}
+
+/// Serves fixed secret values and counts every resolution.
+///
+/// Installed as the network provider for the aliases it declares, which is
+/// the seam the control plane offers for substituting a provider in tests. A
+/// test can then show that a refusal never consulted a provider at all,
+/// rather than only that no resolution-failure event appeared.
+struct CountingSecretProvider {
+    values: Vec<(&'static str, Vec<u8>)>,
+    resolutions: AtomicUsize,
+}
+
+impl CountingSecretProvider {
+    fn new(values: Vec<(&'static str, Vec<u8>)>) -> Self {
+        Self {
+            values,
+            resolutions: AtomicUsize::new(0),
+        }
+    }
+
+    fn resolutions(&self) -> usize {
+        self.resolutions.load(Ordering::SeqCst)
+    }
+
+    /// Declares this provider's aliases as Vault aliases, so the control
+    /// plane defers them to an installed network provider. The profile is
+    /// never contacted: nothing activates the real providers in these tests.
+    fn alias_declarations(&self) -> VaultProviderConfig {
+        let aliases = self
+            .values
+            .iter()
+            .map(|(id, _)| {
+                json!({
+                    "id": id,
+                    "label": format!("Counted {id}"),
+                    "profile": "counted",
+                    "mount": "secret",
+                    "path": "gateway/counted",
+                    "key": id,
+                })
+            })
+            .collect::<Vec<_>>();
+        serde_json::from_value(json!({
+            "profiles": [{
+                "id": "counted",
+                "address": "https://vault.example.test:8200",
+                "auth": {
+                    "type": "workload_jwt",
+                    "mount": "kubernetes",
+                    "role": "gateway",
+                    "token_root": "/var/run/secrets/tokens",
+                    "token_file": "vault-token"
+                }
+            }],
+            "aliases": aliases,
+        }))
+        .expect("counted alias declarations should deserialize")
+    }
+}
+
+#[async_trait::async_trait]
+impl SecretResolver for CountingSecretProvider {
+    async fn resolve(
+        &self,
+        alias_id: &str,
+        purpose: SecretPurpose,
+    ) -> Result<ResolvedSecret, SecretResolveError> {
+        self.resolutions.fetch_add(1, Ordering::SeqCst);
+        let value = self
+            .values
+            .iter()
+            .find(|(id, _)| *id == alias_id)
+            .map(|(_, value)| value.clone())
+            .ok_or_else(|| {
+                SecretResolveError::new(alias_id, SecretResolveErrorKind::UnknownAlias)
+            })?;
+        ResolvedSecret::new(purpose, value)
+            .map_err(|_| SecretResolveError::new(alias_id, SecretResolveErrorKind::InvalidMaterial))
+    }
+
+    fn contains_alias(&self, alias_id: &str) -> bool {
+        self.values.iter().any(|(id, _)| *id == alias_id)
+    }
+
+    fn aliases(&self) -> Vec<SecretAliasMetadata> {
+        self.values
+            .iter()
+            .map(|(id, _)| SecretAliasMetadata {
+                id: (*id).to_owned(),
+                label: format!("Counted {id}"),
+                provider: SecretProviderKind::VaultKvV2,
+                configured: true,
+                purpose: None,
+                pinned: false,
+                version: None,
+                rotated_at: None,
+            })
+            .collect()
     }
 }
 

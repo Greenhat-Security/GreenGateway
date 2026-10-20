@@ -369,19 +369,24 @@ The refusal reason is the fixed string `caller_assertion_not_enforced`. Where
 it appears depends on the lane:
 
 - Tool call: the `failure_reason` of `tool.invoke_failure` and the `reason` of
-  `tool.upstream_request`. For a composite tool, `failure_reason` is
-  `composite_failed`; the failing step's `caller_assertion_not_enforced` is in
-  the error details returned to the caller, not in the audit event.
+  `tool.upstream_request`. A composite tool reports at the tool level: its
+  `failure_reason` is `composite_failed`, and the failing step's
+  `caller_assertion_not_enforced` is only in the error details returned to the
+  caller, not in any audit event.
 - Stored Connection test: the `authenticated` stage reason.
 - OpenAPI preview, registration and refresh, and MCP catalog refresh: the
-  `reason` of a `409 Conflict` response.
+  `reason` of a `409 Conflict` response. A refused registration is also
+  audited as `tool_registry.changed` with action
+  `managed_openapi_catalog_registration_rejected`, and a refused refresh as
+  `connection.refreshed`, both with outcome `failure` and this reason.
 - Enum source refresh: the `reason` of `connection.enum_source_refresh_failed`.
   Label sources compile during OpenAPI preview and registration, which are
   refused first.
 - Proxied request: the caller receives `502` with `{"error":"bad_gateway"}`.
-  The reason appears only as `error_category` on the gateway's warning log
-  line, not in a structured audit event. Every other Connection failure on a
-  proxy route behaves the same way.
+  The refusal is recorded by tracing only: the reason appears as
+  `error_category` on the gateway's warning log line, and no structured audit
+  event names it. Every other Connection failure on a proxy route behaves the
+  same way.
 
 Bindings to such a Connection fail the way bindings to a disabled Connection
 do. A `TOOLS_FILE` tool or a proxy route bound to it fails startup or the whole
@@ -390,11 +395,18 @@ is withdrawn from the tool list and kept in storage; refresh it after removing
 the block to publish it again. Managed MCP tools stay listed, and every call to
 one is refused.
 
-The admin UI does not edit the block. A replacement (`PUT`) that omits
-`caller_assertion` keeps the current block, so a routine edit in the UI cannot
-remove it by accident and put the Connection back into service unattested. To
-use the Connection before enforcement ships, remove the block deliberately:
-send `"caller_assertion": null` in a `PUT` through the admin API.
+The admin UI shows the block read only, on the Connection detail page and in
+the editor: every field except the signing key alias, which appears only as
+configured or not, with a note that the block is accepted but not yet enforced
+and that the Connection is refused. The UI has no controls for the block and
+never sends it. A replacement (`PUT`) that omits `caller_assertion` keeps the
+current block, so a save in the UI leaves it exactly as stored and cannot put
+the Connection back into service unattested. The gateway revalidates the kept
+block on every save, so the editor refuses a primary or additional header name
+that matches the assertion header before it writes, and a block stored with
+`bind_approval: true` has to be removed before the Connection can be saved
+again. To use the Connection before enforcement ships, remove the block
+deliberately: send `"caller_assertion": null` in a `PUT` through the admin API.
 
 New and replacement writes also reject `bind_approval: true`, because no
 approval subsystem exists for a mutation to be bound to, and an assertion

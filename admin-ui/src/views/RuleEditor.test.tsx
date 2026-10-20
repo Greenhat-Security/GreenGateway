@@ -322,6 +322,8 @@ describe('RuleEditor', () => {
       preview: {
         match_count: 2,
         scanned_event_count: 9,
+        scan_truncated: false,
+        complete: true,
         sample_strategy: 'newest_matches',
         samples: [
           previewSample({
@@ -416,10 +418,46 @@ describe('RuleEditor', () => {
           node instanceof HTMLElement &&
             node.classList.contains('body-copy') &&
             node.textContent ===
-              'This rule would have matched at least 3 requests in the last 24 hours; only the newest 900 events in that window were scanned.',
+              "This rule would have matched at least 3 requests in the last 24 hours; the scan stopped after the newest 900 observations that passed the rule's method and path pre-filter.",
         ),
       ),
     ).toBeTruthy();
+  });
+
+  it('presents a preview over a window with no observations as its own state, not zero matches', async () => {
+    const fetchMock = policyBackedFetch(policyFixture(), 'W/"policy-1"', {
+      preview: {
+        match_count: 0,
+        scanned_event_count: 0,
+        scan_truncated: false,
+        complete: true,
+        sample_strategy: 'newest_matches',
+        samples: [],
+      },
+    });
+    vi.stubGlobal('fetch', fetchMock);
+
+    renderRuleEditor();
+
+    await screen.findByLabelText('Path pattern');
+    vi.useFakeTimers();
+    fireEvent.change(screen.getByLabelText('Path pattern'), {
+      target: { value: '/api/users/{id}' },
+    });
+    await advanceTimersByTime(RULE_PREVIEW_DEBOUNCE_MS);
+    vi.useRealTimers();
+
+    const notice = await screen.findByText('No observations in window');
+    expect(notice.closest('[role="status"]')).toBeTruthy();
+    expect(
+      screen.getByText(
+        "No requests recorded in the last 24 hours passed this rule's method and path pre-filter, so the preview had nothing to evaluate. That is not evidence the rule would match nothing.",
+      ),
+    ).toBeTruthy();
+    expect(screen.getByText('0 scanned')).toBeTruthy();
+    expect(screen.queryByText(/would have matched/)).toBeNull();
+    expect(screen.queryByText('Matched requests')).toBeNull();
+    expect(screen.queryByText('No matched request samples returned.')).toBeNull();
   });
 
   it('presents a complete preview count without a truncation notice', async () => {
@@ -854,6 +892,8 @@ function policyBackedFetch(
             options.previewBody ?? {
               match_count: 0,
               scanned_event_count: 0,
+              scan_truncated: false,
+              complete: true,
               sample_strategy: 'newest_matches',
               samples: [],
             },
@@ -943,6 +983,8 @@ function previewResponseFixture(matchCount: number, path: string) {
   return {
     match_count: matchCount,
     scanned_event_count: 25,
+    scan_truncated: false,
+    complete: true,
     sample_strategy: 'newest_matches',
     samples: [
       previewSample({
