@@ -58,7 +58,10 @@
     },
     "tools": {
       "type": "object",
-      "description": "Optional per-tool runtime policy for generic MCP tool invocation admission. Each key is a tool name. Tool implementations and registry wiring are configured separately; this section controls generic enablement, role admission, timeout, and per-tool concurrency.",
+      "description": "Optional per-tool runtime policy for generic MCP tool invocation admission. Each key is a tool name of at most 4096 UTF-8 bytes; the gateway refuses a longer one. JSON Schema counts characters, so propertyNames.maxLength enforces only the looser character bound. Tool implementations and registry wiring are configured separately; this section controls generic enablement, role admission, timeout, and per-tool concurrency.",
+      "propertyNames": {
+        "maxLength": 4096
+      },
       "additionalProperties": {
         "$ref": "#/$defs/tool_policy_entry"
       }
@@ -353,8 +356,9 @@
         "tool_name": {
           "type": "string",
           "minLength": 1,
+          "maxLength": 4096,
           "pattern": "\\S",
-          "description": "Exact MCP tool name matched by this rule. Tool-name rules apply only to MCP tool calls and never to HTTP requests. Exactly one of path or tool_name must be set."
+          "description": "Exact MCP tool name matched by this rule, at most 4096 UTF-8 bytes; the gateway refuses a longer one. JSON Schema counts characters, so maxLength enforces only the looser character bound. Tool-name rules apply only to MCP tool calls and never to HTTP requests. Exactly one of path or tool_name must be set."
         },
         "dispatch": {
           "$ref": "#/$defs/rule_dispatch_matcher"

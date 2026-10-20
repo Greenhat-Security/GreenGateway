@@ -2149,6 +2149,35 @@ mod tests {
     /// the rule editor offered, and schema validation rejected, with nothing
     /// anywhere failing. The schema carries the list in three separate places,
     /// so all three are checked.
+    /// The published schema bounds tool names where policy validation does.
+    /// JSON Schema counts characters and the gateway bytes, so for an ASCII
+    /// name the bound is the same byte on both sides; a multibyte name can pass
+    /// the schema and still be refused by the gateway, never the reverse.
+    #[test]
+    fn the_published_schema_bounds_tool_names_where_policy_validation_does() {
+        let validator = policy_schema_validator();
+        let at_bound = "t".repeat(crate::request_bounds::MAX_TOOL_NAME_BYTES);
+        let past_bound = format!("{at_bound}t");
+        for (name, accepted) in [(at_bound, true), (past_bound, false)] {
+            let mut tools = serde_json::Map::new();
+            tools.insert(name.clone(), json!({}));
+            for document in [
+                json!({ "schema_version": "0.1.0", "tools": tools }),
+                json!({
+                    "schema_version": "0.1.0",
+                    "rules": [{ "tool_name": name, "action": "deny" }]
+                }),
+            ] {
+                assert_eq!(validator.is_valid(&document), accepted, "schema");
+                assert_eq!(
+                    Policy::validate_json_value(document).is_ok(),
+                    accepted,
+                    "policy validation"
+                );
+            }
+        }
+    }
+
     #[test]
     fn the_published_schema_lists_exactly_the_auth_methods_the_parser_accepts() {
         let repo_root = repo_root();
