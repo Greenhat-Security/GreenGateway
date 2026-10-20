@@ -6261,9 +6261,9 @@
         "network-or-process-reference"
       ],
       "scope": "gateway::app_state::AppState#1",
-      "sha256": "58e0481c4556759cd91b2dfbb0cc505b2e049975a54195abf5242e7745e2a5ec",
+      "sha256": "39aba223e62e6f3a94d5deb0d20480b96a3752aee37693be422c5b77caf10a13",
       "owner": "GreenGateway maintainers",
-      "purpose": "Reviewed standalone reliability changes: process-local readiness state, fixed-label metrics and exact audit loss accounting. No new outbound transport authority; SQLite probes use configured local paths and observation filtering preserves security findings."
+      "purpose": "Reviewed for #463 (PR #568): the struct change renames `_connections` to `connections` and adds a doc comment, nothing else. It adds no field type, client, socket, TLS configuration, DNS path or header injection; the network-or-process-reference reason comes from members already reviewed under this record (deadpool_postgres::Pool and the proxy and MCP state). The rename only exposes the existing ConnectionControlPlane to the public, unauthenticated JWKS handler caller_assertion_jwks_endpoint; there is no new transport construction. Through build_caller_assertion_jwks an unauthenticated GET can trigger existing secret-provider reads, including the network providers (Vault, AWS, GCP, Azure, Kubernetes) that already consume the checked EgressClient. Those reads go only to operator-configured provider destinations, under unchanged egress policy and the providers' own deadlines, and are bounded by the JWKS cache (a set is reused for 300 s, or for 30 s when a Connection's key could not be used), one read per alias per serialized build, and the global IP rate-limit lane. That is a new trigger for transport the gateway already has, not new transport authority."
     },
     {
       "file": "gateway/src/main.rs",
