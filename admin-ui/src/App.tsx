@@ -22,6 +22,13 @@ import {
 import { adminApiUrl, adminBasePath } from './lib/config';
 import { addCsrfHeader, adminFetchJson, AdminApiError, fetchAdminCapabilities } from './lib/api';
 import {
+  AdminAuthDiscovery,
+  AdminAuthDiscoverySource,
+  AdminSessionOffer,
+  createAdminAuthDiscovery,
+  isJsonRecord,
+} from './lib/adminAuthDiscovery';
+import {
   CapabilityDetail,
   CapabilityInventoryView,
 } from './views/CapabilityInventoryView';
@@ -102,7 +109,8 @@ export function AdminShell() {
   const [authCompletionStatus, setAuthCompletionStatus] = useState<string | null>(
     null,
   );
-  const [loadAuthDiscovery] = useState(() => sharedAdminAuthDiscovery());
+  // One discovery answer for this page load, shared by the completion and the panel.
+  const [authDiscovery] = useState(() => createAdminAuthDiscovery());
   const pageTitle = pageTitleForPath(location.pathname);
 
   useEffect(() => {
@@ -111,13 +119,13 @@ export function AdminShell() {
   }, [theme]);
 
   useEffect(() => {
-    void completeAuthFromFragment(loadAuthDiscovery).then((result) => {
+    void completeAuthFromFragment(authDiscovery).then((result) => {
       if (result) {
         setAuthCompletionStatus(result.status);
         setAuthRefreshKey((current) => current + 1);
       }
     });
-  }, [loadAuthDiscovery]);
+  }, [authDiscovery]);
 
   function toggleTheme() {
     setTheme((current) => (current === 'dark' ? 'light' : 'dark'));
@@ -216,7 +224,7 @@ export function AdminShell() {
               <Dashboard
                 authRefreshKey={authRefreshKey}
                 authCompletionStatus={authCompletionStatus}
-                loadAuthDiscovery={loadAuthDiscovery}
+                authDiscovery={authDiscovery}
               />
             }
           />
@@ -253,11 +261,11 @@ export function AdminShell() {
 function Dashboard({
   authRefreshKey,
   authCompletionStatus,
-  loadAuthDiscovery,
+  authDiscovery,
 }: {
   authRefreshKey: number;
   authCompletionStatus: string | null;
-  loadAuthDiscovery: () => Promise<AdminAuthDiscovery>;
+  authDiscovery: AdminAuthDiscoverySource;
 }) {
   return (
     <main className="content-grid page-content">
@@ -265,7 +273,7 @@ function Dashboard({
       <TokenPanel
         authRefreshKey={authRefreshKey}
         authCompletionStatus={authCompletionStatus}
-        loadAuthDiscovery={loadAuthDiscovery}
+        authDiscovery={authDiscovery}
       />
 
       <section className="panel" aria-labelledby="views-heading">
@@ -343,11 +351,11 @@ function Dashboard({
 function TokenPanel({
   authRefreshKey,
   authCompletionStatus,
-  loadAuthDiscovery,
+  authDiscovery,
 }: {
   authRefreshKey: number;
   authCompletionStatus: string | null;
-  loadAuthDiscovery: () => Promise<AdminAuthDiscovery>;
+  authDiscovery: AdminAuthDiscoverySource;
 }) {
   const inputRef = useRef<HTMLInputElement>(null);
   const [hasToken, setHasToken] = useState(() => getMemoryToken() !== null);
@@ -357,11 +365,13 @@ function TokenPanel({
   const [discovery, setDiscovery] = useState<AdminAuthDiscovery | null>(null);
   const [discoveryAttempt, setDiscoveryAttempt] = useState(0);
   const [loggingOut, setLoggingOut] = useState(false);
-  const session = discovery?.session ?? null;
-  const ssoConfigured = discovery?.loginConfigured ?? false;
+  const session = discovery?.kind === 'cookie' ? discovery.session : null;
+  const ssoConfigured = discovery?.kind === 'bearer' && discovery.loginConfigured;
   // Without an answer, a session cookie may still authenticate this tab, so
-  // the panel must not present it as signed out.
-  const discoveryUnavailable = discovery !== null && !discovery.available;
+  // the panel must not present it as signed out. An unconfirmed answer comes
+  // from a gateway that serves no session here, or from a proxy that hides
+  // the route; the panel offers neither SSO nor a session to log out of.
+  const discoveryUnavailable = discovery?.kind === 'unavailable';
   // An offered cookie session is the default; bearer mode is entered only by
   // an explicit switch or by saving a token.
   const cookieMode = session !== null && !bearerSelected;
@@ -379,7 +389,7 @@ function TokenPanel({
     let cancelled = false;
 
     async function loadAuthOptions() {
-      const result = await loadAuthDiscovery();
+      const result = await (discoveryAttempt === 0 ? authDiscovery.current() : authDiscovery.retry());
       if (!cancelled) {
         setDiscovery(result);
       }
@@ -390,7 +400,7 @@ function TokenPanel({
     return () => {
       cancelled = true;
     };
-  }, [loadAuthDiscovery, discoveryAttempt]);
+  }, [authDiscovery, discoveryAttempt]);
 
   useEffect(() => {
     if (authRefreshKey === 0) {
@@ -466,6 +476,8 @@ function TokenPanel({
     setDiscoveryAttempt((attempt) => attempt + 1);
   }
 
+  // Choosing credentials while logout is pending would change the identity,
+  // and the shared client would then discard the logout's answer.
   const logOutButton = (
     <button
       type="button"
@@ -514,7 +526,7 @@ function TokenPanel({
         </div>
       ) : discoveryUnavailable ? (
         <div className="sso-login-row">
-          <button type="button" className="secondary-button" onClick={retryDiscovery}>
+          <button type="button" className="secondary-button" disabled={loggingOut} onClick={retryDiscovery}>
             Retry sign-in options
           </button>
           {bearerSelected ? null : logOutButton}
@@ -546,12 +558,13 @@ function TokenPanel({
               aria-controls="admin-token" onClick={() => setVisible(!visible)}>
               {visible ? 'Hide token' : 'Show token'}
             </button>
-            <button type="submit" className="primary-button">
+            <button type="submit" className="primary-button" disabled={loggingOut}>
               Save
             </button>
             <button
               type="button"
               className="secondary-button"
+              disabled={loggingOut}
               onClick={clearToken}
             >
               Clear
@@ -581,8 +594,14 @@ type AuthCompletionResult = {
   status: string;
 };
 
+const UNCONFIRMED_COMPLETION_STATUS =
+  'SSO sign-in was not completed: the gateway did not confirm whether it issues a session cookie, so no token was requested. ' +
+  'Use a bearer token, or ask an operator to check that the admin auth/config route reaches the gateway.';
+const UNAVAILABLE_COMPLETION_STATUS =
+  'SSO sign-in was not completed: sign-in options are unavailable, so no token was requested. Start sign-in again.';
+
 async function completeAuthFromFragment(
-  loadAuthDiscovery: () => Promise<AdminAuthDiscovery>,
+  authDiscovery: AdminAuthDiscoverySource,
 ): Promise<AuthCompletionResult | null> {
   if (typeof window === 'undefined') {
     return null;
@@ -606,13 +625,17 @@ async function completeAuthFromFragment(
     const identity = getAdminIdentityVersion();
     const selection = getCredentialSelection();
     try {
-      // An unconfirmed server contract must not silently fall back to
-      // returning a bearer token to this page.
-      const discovery = await loadAuthDiscovery();
-      if (!discovery.available) {
-        throw new Error('SSO completion failed');
+      // Only an explicit answer lets the code be posted. Anything else would
+      // risk a bearer token reaching this page from a gateway that offers a
+      // session, so the completion stops before the code is exchanged.
+      const discovery = await authDiscovery.current();
+      if (discovery.kind === 'unconfirmed') {
+        return { status: UNCONFIRMED_COMPLETION_STATUS };
       }
-      const session = discovery.session;
+      if (discovery.kind === 'unavailable') {
+        return { status: UNAVAILABLE_COMPLETION_STATUS };
+      }
+      const session = discovery.kind === 'cookie' ? discovery.session : null;
       const headers = new Headers({
         'Content-Type': 'application/json',
         Accept: 'application/json',
@@ -731,120 +754,6 @@ async function revokeAdminSession(logoutUrl: string): Promise<boolean> {
   }
 }
 
-type AdminSessionOffer = Readonly<{
-  loginUrl: string;
-  completionUrl: string;
-  logoutUrl: string;
-}>;
-
-type AdminAuthDiscovery = Readonly<{
-  available: boolean;
-  loginConfigured: boolean;
-  session: AdminSessionOffer | null;
-}>;
-
-const ADMIN_AUTH_UNAVAILABLE: AdminAuthDiscovery = {
-  available: false,
-  loginConfigured: false,
-  session: null,
-};
-
-/**
- * One answer drives both the SSO completion and the panel, so they cannot
- * disagree about the credential mode. Only a confirmed answer is reused; the
- * next caller asks again after an unavailable one.
- */
-function sharedAdminAuthDiscovery(): () => Promise<AdminAuthDiscovery> {
-  let current: Promise<AdminAuthDiscovery> | null = null;
-  return () => {
-    if (current !== null) {
-      return current;
-    }
-    const request = discoverAdminAuth();
-    current = request;
-    void request.then((result) => {
-      if (!result.available && current === request) {
-        current = null;
-      }
-    });
-    return request;
-  };
-}
-
-/**
- * `/version` answers on a unified listener. A split management listener only
- * serves the prefix-aware `auth/config` route, which exists only while admin
- * sessions are enabled. Discovery bypasses the shared admin client, so it
- * never attaches a bearer token and a rejection cannot end the current session.
- */
-async function discoverAdminAuth(): Promise<AdminAuthDiscovery> {
-  try {
-    const response = await fetch('/version', { cache: 'no-store' });
-    if (response.ok) {
-      const body: unknown = await response.json();
-      if (isVersionResponse(body)) {
-        return adminAuthDiscovery(body.admin_login_configured, body.admin_session);
-      }
-    }
-  } catch {
-    // Fall back to the management-origin discovery route.
-  }
-
-  try {
-    const response = await fetch(adminApiUrl('/auth/config'), {
-      credentials: 'omit',
-      cache: 'no-store',
-      redirect: 'error',
-    });
-    // With sessions enabled the route is exempt from authentication and RBAC,
-    // so only a gateway without sessions (or a proxy that does not forward
-    // the route) answers these.
-    if (response.status === 401 || response.status === 403 || response.status === 404) {
-      return { available: true, loginConfigured: false, session: null };
-    }
-    if (!response.ok) {
-      return ADMIN_AUTH_UNAVAILABLE;
-    }
-    const body: unknown = await response.json();
-    return isJsonRecord(body)
-      ? adminAuthDiscovery(true, body.admin_session)
-      : ADMIN_AUTH_UNAVAILABLE;
-  } catch {
-    return ADMIN_AUTH_UNAVAILABLE;
-  }
-}
-
-function adminAuthDiscovery(loginConfigured: boolean, advertised: unknown): AdminAuthDiscovery {
-  if (advertised === undefined || advertised === null) {
-    return { available: true, loginConfigured, session: null };
-  }
-  const session = adminSessionOffer(advertised);
-  // A malformed advertisement is not an absent one: fail closed rather than
-  // completing SSO as a bearer token.
-  return session === null
-    ? ADMIN_AUTH_UNAVAILABLE
-    : { available: true, loginConfigured: true, session };
-}
-
-/** Accept only the cookie contract for this UI's own admin API prefix. */
-function adminSessionOffer(value: unknown): AdminSessionOffer | null {
-  const offer = {
-    loginUrl: adminApiUrl('/auth/login'),
-    completionUrl: adminApiUrl('/auth/callback'),
-    logoutUrl: adminApiUrl('/auth/logout'),
-  };
-  if (
-    !isJsonRecord(value) ||
-    value.completion_mode !== 'cookie' ||
-    value.login_url !== offer.loginUrl ||
-    value.completion_url !== offer.completionUrl ||
-    value.logout_url !== offer.logoutUrl
-  ) {
-    return null;
-  }
-  return offer;
-}
-
 function isCookieCompletionResponse(value: unknown): boolean {
   return (
     isJsonRecord(value) &&
@@ -853,24 +762,6 @@ function isCookieCompletionResponse(value: unknown): boolean {
     Number.isSafeInteger(value.expires_in) &&
     value.expires_in > 0
   );
-}
-
-type VersionResponse = {
-  admin_login_configured: boolean;
-  admin_session?: unknown;
-};
-
-function isVersionResponse(value: unknown): value is VersionResponse {
-  return (
-    value !== null &&
-    typeof value === 'object' &&
-    'admin_login_configured' in value &&
-    typeof value.admin_login_configured === 'boolean'
-  );
-}
-
-function isJsonRecord(value: unknown): value is Record<string, unknown> {
-  return value !== null && typeof value === 'object' && !Array.isArray(value);
 }
 
 function NotFoundPage() {
