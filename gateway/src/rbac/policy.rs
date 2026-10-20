@@ -2138,17 +2138,6 @@ mod tests {
         );
     }
 
-    /// Every `auth_methods` enum in the published schema lists exactly the
-    /// names the parser accepts.
-    ///
-    /// This is a pin on a divergence that had already happened. #324 added
-    /// `client_certificate` to `valid_auth_method_name`, to the admin UI's
-    /// `AuthMethodName` union, and to the rule editor's dropdown -- and not to
-    /// `docs/schemas/policy.v0.schema.json`, which is what operators and CI
-    /// validate policy files against. The result was a name the gateway loaded,
-    /// the rule editor offered, and schema validation rejected, with nothing
-    /// anywhere failing. The schema carries the list in three separate places,
-    /// so all three are checked.
     /// The published schema bounds tool names where policy validation does.
     /// JSON Schema counts characters and the gateway bytes, so for an ASCII
     /// name the bound is the same byte on both sides; a multibyte name can pass
@@ -2178,6 +2167,17 @@ mod tests {
         }
     }
 
+    /// Every `auth_methods` enum in the published schema lists exactly the
+    /// names the parser accepts.
+    ///
+    /// This is a pin on a divergence that had already happened. #324 added
+    /// `client_certificate` to `valid_auth_method_name`, to the admin UI's
+    /// `AuthMethodName` union, and to the rule editor's dropdown -- and not to
+    /// `docs/schemas/policy.v0.schema.json`, which is what operators and CI
+    /// validate policy files against. The result was a name the gateway loaded,
+    /// the rule editor offered, and schema validation rejected, with nothing
+    /// anywhere failing. The schema carries the list in three separate places,
+    /// so all three are checked.
     #[test]
     fn the_published_schema_lists_exactly_the_auth_methods_the_parser_accepts() {
         let repo_root = repo_root();
