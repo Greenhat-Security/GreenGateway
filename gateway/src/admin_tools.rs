@@ -163,8 +163,11 @@ pub(super) async fn tool_playground_execute_endpoint(
                 }
                 // The execute permission and the tool-policy eligibility behind
                 // the etag are judged together, by one policy snapshot: the
-                // request's (#422). Without the pin the two could come from two
-                // installs and grant what neither snapshot grants alone.
+                // invocation's, which the tool runtime pinned before admitting
+                // it, so they also agree with its admission and rendered-HTTP
+                // decisions (#422). Without the pin they could come from two
+                // installs and grant what neither snapshot grants alone. Inside
+                // the runtime's pin this re-enters the same snapshot.
                 rbac_state
                     .with_request_policy_snapshot(async {
                         if !rbac_state.request_snapshot_grants_permission(

@@ -2694,6 +2694,174 @@ async fn live_http_deny_published_during_precondition_fails_before_secret_or_ups
     );
 }
 
+/// The served playground path, through the runtime: the whole invocation is
+/// pinned to the snapshot it was admitted under (#422), so inside the
+/// precondition the rendered request is still allowed by that snapshot after
+/// a deny publishes. The last rendered-HTTP check reads the live lane and can
+/// only refuse, so that deny still stops the call before any secret or
+/// upstream I/O.
+#[tokio::test]
+async fn pinned_playground_invocation_still_refuses_a_deny_published_during_its_precondition() {
+    const ARGUMENT_CANARY: &str = "pinned-policy-race-argument-canary";
+    const SECRET_CANARY: &str = "pinned-policy-race-secret-canary";
+
+    let (addr, ca_pem, server) = one_request_tls_server().await;
+    let connection =
+        TemporaryStaticAuthRuntime::header_api_key(addr, &ca_pem, SECRET_CANARY.as_bytes()).await;
+    let capture = CaptureSink::new();
+    let audit = AuditLog::new(Arc::new(capture.clone()) as Arc<dyn AuditSink>);
+    let initial_policy = Policy::validate_json_value(json!({
+        "schema_version": "0.1.0",
+        "tools": {
+            "get_charge": {
+                "timeout_ms": 500,
+                "max_concurrent": 1
+            }
+        }
+    }))
+    .expect("initial live policy should validate");
+    let rbac_state =
+        crate::middleware::rbac::RbacState::new(initial_policy, Vec::new(), false, audit.clone());
+    let runtime = ToolRuntime::new_with_rbac_state(
+        runtime_config([("get_charge", enabled_tool(500, 1))], 2, 1, 100),
+        audit.clone(),
+        Some(rbac_state.clone()),
+    );
+    let pinned_probe = runtime.clone();
+    let executor = executor_for_connection_tool(
+        connection_charge_tool(&connection.connection_id),
+        &connection,
+        runtime,
+        audit,
+    );
+    let policy_path = connection.root.join("live-policy-pinned.json");
+    let rbac_state_for_precondition = rbac_state.clone();
+    let secret_path = connection.secret_path.clone();
+    let precondition = ToolExecutionPrecondition::new_async(move |_| {
+        let policy_path = policy_path.clone();
+        let rbac_state = rbac_state_for_precondition.clone();
+        let secret_path = secret_path.clone();
+        let pinned_probe = pinned_probe.clone();
+        Box::pin(async move {
+            let deny_policy = json!({
+                "schema_version": "0.1.0",
+                "tools": {
+                    "get_charge": {
+                        "timeout_ms": 500,
+                        "max_concurrent": 1
+                    }
+                },
+                "rules": [{
+                    "id": "deny-charge-during-pinned-precondition",
+                    "methods": ["GET"],
+                    "path": "/charges/{charge_id}",
+                    "action": "deny"
+                }]
+            });
+            fs::write(
+                &policy_path,
+                serde_json::to_vec(&deny_policy).expect("deny policy should serialize"),
+            )
+            .expect("deny policy should write");
+            crate::middleware::rbac::reload_policy_from_file(&rbac_state, &policy_path)
+                .await
+                .expect("deny policy should publish during the final precondition");
+            let mut context = invocation_context();
+            context.source = ToolInvocationSource::AdminPlayground;
+            assert!(
+                pinned_probe.authorize_http_operation(
+                    "get_charge",
+                    "GET",
+                    &format!("/charges/{ARGUMENT_CANARY}"),
+                    &context,
+                ),
+                "inside the invocation the admitted snapshot, with no rule, still answers"
+            );
+            fs::remove_file(&secret_path)
+                .expect("secret canary should disappear after the policy reload");
+            Ok(())
+        })
+    });
+    let mut context = invocation_context();
+    context.source = ToolInvocationSource::AdminPlayground;
+
+    let error = executor
+        .execute_with_precondition(
+            "get_charge",
+            json!({ "charge_id": ARGUMENT_CANARY }),
+            context,
+            CancellationToken::new(),
+            precondition,
+        )
+        .await
+        .expect_err("the deny published during the precondition must fail closed");
+
+    assert!(matches!(
+        error,
+        ToolRuntimeError::Rejected { ref tool_name, ref reason }
+            if tool_name == "get_charge" && reason == "matched_rule"
+    ));
+    let events = audit_events(&capture, 1).await;
+    let denied = events
+        .iter()
+        .filter(|event| event.event_type == "authz.denied")
+        .collect::<Vec<_>>();
+    assert_eq!(denied.len(), 1, "{events:#?}");
+    assert_eq!(
+        denied[0].payload["matched_rule_id"],
+        json!("deny-charge-during-pinned-precondition")
+    );
+    assert_eq!(
+        denied[0].payload["invocation_source"],
+        json!("admin_playground")
+    );
+    assert!(events.iter().all(|event| {
+        event.event_type != audit::event::CONNECTION_SECRET_RESOLUTION_FAILED
+            && event.event_type != audit::event::TOOL_UPSTREAM_REQUEST
+    }));
+    let rendered_events =
+        serde_json::to_string(&events).expect("policy-race audit events should serialize");
+    assert!(!rendered_events.contains(ARGUMENT_CANARY));
+    assert!(!rendered_events.contains(SECRET_CANARY));
+    assert!(
+        tokio::time::timeout(Duration::from_millis(100), server)
+            .await
+            .is_err(),
+        "the denied invocation must not send upstream bytes"
+    );
+}
+
+/// A tool-lane refusal is a policy block, observed as one: 403 with the
+/// refusal's own stable reason, as a denying rule is, never the 503 of an
+/// unexplained runtime rejection.
+#[test]
+fn tool_policy_refusals_are_observed_as_policy_blocks() {
+    for reason in crate::middleware::rbac::ToolPolicyRefusal::REASONS {
+        let outcome = runtime_admission_failure_observation_outcome(
+            7,
+            &ToolRuntimeError::Rejected {
+                tool_name: "reports.export".to_owned(),
+                reason: reason.to_owned(),
+            },
+            false,
+        )
+        .expect("a refusal is observed");
+        assert_eq!(outcome.status, StatusCode::FORBIDDEN.as_u16(), "{reason}");
+        assert_eq!(outcome.reason, Some(reason));
+    }
+    let other = runtime_admission_failure_observation_outcome(
+        7,
+        &ToolRuntimeError::Rejected {
+            tool_name: "reports.export".to_owned(),
+            reason: "something_else".to_owned(),
+        },
+        false,
+    )
+    .expect("a rejection is observed");
+    assert_eq!(other.status, StatusCode::SERVICE_UNAVAILABLE.as_u16());
+    assert_eq!(other.reason, Some(TOOL_RUNTIME_REJECTED_REASON));
+}
+
 #[tokio::test]
 async fn schema_validation_rejects_args_before_network() {
     let (addr, server) = one_request_server(StatusCode::OK, b"should-not-run").await;

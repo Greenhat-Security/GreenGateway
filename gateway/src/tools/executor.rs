@@ -1360,8 +1360,12 @@ impl ToolExecutor {
         };
         self.enforce_execution_precondition(context, &tool, precondition)
             .await?;
+        // The invocation is judged by its pinned policy snapshot, which allowed
+        // this request above. This last check reads the live lane instead, so a
+        // deny published while the precondition ran still refuses the call; it
+        // can only refuse, never allow what the pinned check refused (#422).
         if precondition.is_some()
-            && !self.runtime.authorize_http_operation(
+            && !self.runtime.authorize_http_operation_live(
                 &tool.name,
                 request.method.as_str(),
                 &request.path,
@@ -4054,10 +4058,18 @@ fn runtime_admission_failure_observation_outcome(
                     StatusCode::SERVICE_UNAVAILABLE.as_u16(),
                     TOOL_RUNTIME_CLOSED_REASON,
                 ),
-                _ => (
-                    StatusCode::SERVICE_UNAVAILABLE.as_u16(),
-                    TOOL_RUNTIME_REJECTED_REASON,
-                ),
+                // A tool-lane refusal blocks as policy, as a denying rule does,
+                // so it is observed as the same 403 the playground answers.
+                other => crate::middleware::rbac::ToolPolicyRefusal::REASONS
+                    .into_iter()
+                    .find(|refusal| *refusal == other)
+                    .map_or(
+                        (
+                            StatusCode::SERVICE_UNAVAILABLE.as_u16(),
+                            TOOL_RUNTIME_REJECTED_REASON,
+                        ),
+                        |refusal| (StatusCode::FORBIDDEN.as_u16(), refusal),
+                    ),
             };
             Some(ToolObservationOutcome {
                 status,

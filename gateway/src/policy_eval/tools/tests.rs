@@ -116,9 +116,14 @@ async fn assert_audit(
 }
 
 #[tokio::test]
-async fn policy_backed_invocation_visibility_inventory_and_composite_match_live_consumers() {
-    // Compare the unchanged authoritative consumers, including invocation's
-    // rule check AFTER policy entry admission. Local work never performs I/O.
+async fn live_adapters_translate_the_kernel_answer_for_invocation_visibility_inventory_and_composite(
+) {
+    // Since #422 PR 2 the live consumers decide through the kernel, so this is
+    // not parity evidence: it checks that each adapter translates the
+    // installed kernel's answer faithfully -- invocation errors, whether work
+    // ran, rule attribution after policy-entry admission, visibility,
+    // inventory reasons and composite enablement. The parity evidence is the
+    // frozen-oracle comparison further down. Local work never performs I/O.
     for global in ["enforce", "shadow"] {
         for default in ["deny", "allow"] {
             for action in [None, Some("allow"), Some("deny"), Some("shadow")] {
@@ -1053,10 +1058,12 @@ async fn the_tool_lane_bounds_are_exactly_the_bounds_policy_validation_and_the_a
 #[tokio::test]
 async fn refusals_block_with_stable_reasons_where_the_frozen_consumers_answered() {
     // Every disagreement between old and new, each resolved toward a block.
-    // None is reachable from a served call: no policy carries an over-long
-    // name, an authenticated principal has passed the evaluator's own shape
-    // check, and rendering refuses a path or method the evaluator would. They
-    // are pinned so the fail-closed mapping is a tested statement.
+    // No policy carries an over-long name, so the only served call that can
+    // carry one is to a TOOLS_FILE tool, whose names only the file size caps;
+    // old and new both block it. The rest are unreachable from a served call:
+    // an authenticated principal has passed the evaluator's own shape check,
+    // and rendering refuses a path or method the evaluator would. They are
+    // pinned so the fail-closed mapping is a tested statement.
     let mut value = base();
     value["rules"] = json!([
         {"id":"tool-allow","tool_name":"reports.export","action":"allow"},

@@ -453,13 +453,19 @@ pub(crate) enum ToolInvocationVerdict<'a> {
 /// Why the tool lane refused to answer rather than decide.
 ///
 /// Every variant blocks, in shadow mode too, as an incomplete or refused HTTP
-/// evaluation does (#422). None is reachable from a served call. Policy
-/// validation refuses a policy tool name over [`MAX_TOOL_NAME_BYTES`], so no
-/// policy can name a tool the evaluator cannot be asked about, and every
-/// registry source bounds tool names far below it. Tool rendering refuses a
-/// method or path the evaluator would refuse, and an authenticated principal
-/// has passed the same shape check the evaluator applies. The reason is a
-/// stable code; diagnostics are bounded enums, never a name, path or identity.
+/// evaluation does (#422).
+///
+/// Policy validation refuses a policy tool name over [`MAX_TOOL_NAME_BYTES`],
+/// so no policy can name a tool the evaluator cannot be asked about: a longer
+/// name could only ever be unknown to the policy, and refusing it blocks it as
+/// unknown would. Discovered MCP and OpenAPI tool names are bounded at 128
+/// characters, but a `TOOLS_FILE` definition's name is bounded only by that
+/// file's size cap, so a call to such a local tool is the one served call that
+/// reaches [`ToolPolicyRefusal::NameOutOfBounds`]. The other variants are not
+/// reachable from a served call: tool rendering refuses a method or path the
+/// evaluator would refuse, and an authenticated principal has passed the same
+/// shape check the evaluator applies. The reason is a stable code; diagnostics
+/// are bounded enums, never a name, path or identity.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ToolPolicyRefusal {
     /// A tool name over [`MAX_TOOL_NAME_BYTES`], refused before evaluation.
@@ -472,11 +478,19 @@ pub(crate) enum ToolPolicyRefusal {
 }
 
 impl ToolPolicyRefusal {
+    /// Every refusal's stable reason, for a consumer that sees only the reason
+    /// a runtime rejection carries and must still recognize a policy block.
+    pub(crate) const REASONS: [&'static str; 3] = [
+        "tool_name_out_of_bounds",
+        "policy_evaluation_incomplete",
+        "policy_evaluation_error",
+    ];
+
     pub(crate) fn reason(self) -> &'static str {
         match self {
-            Self::NameOutOfBounds => "tool_name_out_of_bounds",
-            Self::Incomplete(_) => "policy_evaluation_incomplete",
-            Self::Error(_) => "policy_evaluation_error",
+            Self::NameOutOfBounds => Self::REASONS[0],
+            Self::Incomplete(_) => Self::REASONS[1],
+            Self::Error(_) => Self::REASONS[2],
         }
     }
 }
@@ -652,11 +666,27 @@ impl RbacState {
     /// admission; in standalone mode it is the live lane, read once here. A
     /// check made of several such reads cannot then straddle a policy install
     /// and be answered by two snapshots (#422).
+    ///
+    /// The tool runtime runs every invocation inside it, from admission through
+    /// the queue wait to the rendered request, so one invocation is never judged
+    /// by two snapshots in either mode.
     pub(crate) async fn with_request_policy_snapshot<F: std::future::Future>(
         &self,
         future: F,
     ) -> F::Output {
         with_pinned_policy(self.effective_policy(), future).await
+    }
+
+    /// Run `check` against the live policy lane, even inside a pinned scope.
+    ///
+    /// Only for a final check that can refuse what the pinned snapshot has
+    /// already allowed, never for one that grants: the admin playground's last
+    /// rendered-HTTP check, made after its execution precondition, so that a
+    /// deny published while the precondition ran still stops the call. Every
+    /// decision that grants is made from one pinned snapshot first, so pairing
+    /// it with a refusal from a newer one cannot allow what neither allows.
+    pub(crate) fn with_live_policy<R>(&self, check: impl FnOnce() -> R) -> R {
+        PINNED_POLICY.sync_scope(self.policy.load_full(), check)
     }
 
     /// The live policy lane, for the security runtime to capture bundles
@@ -892,7 +922,9 @@ impl RbacState {
     ///
     /// Direct rules only, under unknown dispatch: no route or default applies,
     /// so `Ok(None)` (no rule matched) allows. The tool name binds the
-    /// question but does not decide it.
+    /// question but does not decide it. `Ok(None)` is returned only for the
+    /// evaluator's own no-rule allow; any other unmatched answer is refused,
+    /// so a kernel that ever answered differently would fail closed here.
     pub(crate) fn evaluate_tool_http_rule(
         &self,
         tool_name: &str,
@@ -911,6 +943,12 @@ impl RbacState {
             principal_fact(principal),
             Some((method, path.to_owned())),
         )?;
+        if evaluation.reason() != ToolReason::MatchedRule
+            && (evaluation.reason() != ToolReason::NoHttpRule
+                || evaluation.effect() != PolicyEffect::Allow)
+        {
+            return Err(refused(ToolOperation::RenderedHttp, internal_invariant()));
+        }
         policy
             .matched_tool_rule(&evaluation)
             .map_err(|refusal| refused(ToolOperation::RenderedHttp, refusal))
@@ -1152,10 +1190,16 @@ impl RbacPolicyState {
                     allowed_roles: &entry.allowed_roles,
                 }
             }
-            (ToolReason::Allowed, Some(tool), None) => ToolInvocationVerdict::Entry {
-                tool,
-                rule_decision: None,
-            },
+            // No rule decided, so only the evaluator's own allow admits; any
+            // other effect here is a kernel the adapter does not understand.
+            (ToolReason::Allowed, Some(tool), None)
+                if evaluation.effect() == PolicyEffect::Allow =>
+            {
+                ToolInvocationVerdict::Entry {
+                    tool,
+                    rule_decision: None,
+                }
+            }
             (ToolReason::MatchedRule, Some(tool), Some(rule_decision)) => {
                 ToolInvocationVerdict::Entry {
                     tool,

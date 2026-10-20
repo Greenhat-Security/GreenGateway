@@ -1,6 +1,7 @@
 //! Pure policy foundation for issue #421, used by the live HTTP/RBAC adapter
-//! and the live tool-lane adapters. Remaining rate and egress cutovers are
-//! tracked in #422.
+//! and the live tool-lane adapters. The remaining rate and egress cutovers,
+//! and the analysis consumers and legacy retirement (#422 PR 4), are tracked
+//! in #422.
 //!
 //! PR 1 supported contextless HTTP direct rules, ordinary permission routes and
 //! defaults. The routing lane added host-qualified routes and dispatch-scoped

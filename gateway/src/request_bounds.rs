@@ -41,8 +41,11 @@ pub(crate) const MAX_DISPATCH_FACT_BYTES: usize = 4096;
 /// Longest tool name the tool lane evaluates. Policy validation refuses a
 /// longer `tools` entry name or rule `tool_name`, so no policy can name a tool
 /// the kernel cannot be asked about, and the tool-lane adapter refuses a longer
-/// name before evaluation. Every tool registry source bounds names far below
-/// it (128 characters), so a served call never carries one.
+/// name before evaluation, which blocks the call as an unknown name would.
+/// Discovered MCP and OpenAPI tool names are bounded far below it (128
+/// characters). A `TOOLS_FILE` definition's name is bounded only by that file's
+/// size cap, so a call to a local tool can carry a longer name; it is refused
+/// with `tool_name_out_of_bounds`, and no policy entry could have named it.
 ///
 /// A rendered tool request's method and path are held to
 /// [`MAX_REQUEST_METHOD_BYTES`] and [`MAX_REQUEST_PATH_BYTES`] at rendering,
