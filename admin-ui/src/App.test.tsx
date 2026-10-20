@@ -25,6 +25,12 @@ const ADMIN_SESSION = {
   max_age_seconds: 3600,
 };
 
+const UNCONFIRMED_COMPLETION =
+  'SSO sign-in was not completed: the gateway did not confirm whether it issues a session cookie, so no token was requested. ' +
+  'Use a bearer token, or ask an operator to check that the admin auth/config route reaches the gateway.';
+const UNAVAILABLE_COMPLETION =
+  'SSO sign-in was not completed: sign-in options are unavailable, so no token was requested. Start sign-in again.';
+
 afterEach(() => {
   cleanup();
   clearMemoryToken();
@@ -575,12 +581,119 @@ describe('AdminShell', () => {
 
     render(<MemoryRouter><AdminShell /></MemoryRouter>);
 
-    await screen.findByText('SSO sign-in did not complete. Start sign-in again.');
+    await screen.findByText(UNAVAILABLE_COMPLETION);
     expect(fetch.mock.calls.some(([url]) => url === '/v1/admin/auth/callback')).toBe(false);
     expect(getMemoryToken()).toBeNull();
     // A session cookie may still exist, so the panel keeps Log out reachable.
     expect(await screen.findByRole('button', { name: 'Retry sign-in options' })).toBeTruthy();
     expect(screen.getByRole('button', { name: 'Log out' })).toBeTruthy();
+  });
+
+  it.each([401, 403, 404])('refuses SSO completion when the split-listener route answers %s', async (status) => {
+    const fetch = sessionFetchMock({
+      '/version': () => jsonResponse({ error: 'not found' }, 404),
+      '/v1/admin/auth/config': () => jsonResponse({ error: 'rejected' }, status),
+      // A gateway that offers sessions still answers a bearer completion with a token.
+      '/v1/admin/auth/callback': () => jsonResponse({ access_token: 'unexpected-token' }),
+    });
+    vi.stubGlobal('fetch', fetch);
+    window.history.replaceState(null, '', '/admin/#/auth/complete?code=code&state=state');
+
+    render(<MemoryRouter><AdminShell /></MemoryRouter>);
+
+    await screen.findByText(UNCONFIRMED_COMPLETION);
+    expect(fetch.mock.calls.some(([url]) => url === '/v1/admin/auth/callback')).toBe(false);
+    expect(getMemoryToken()).toBeNull();
+    expect(window.location.hash).toBe('');
+    // Such a gateway serves no session here, so the panel stays a plain bearer panel.
+    expect(screen.getByRole('heading', { level: 2, name: 'Bearer token' })).toBeTruthy();
+    expect(screen.getByLabelText('Token', { exact: true })).toBeTruthy();
+    expect(screen.queryByRole('link', { name: 'Log in with SSO' })).toBeNull();
+    expect(screen.queryByRole('button', { name: 'Retry sign-in options' })).toBeNull();
+    expect(screen.queryByRole('button', { name: 'Log out' })).toBeNull();
+  });
+
+  it('keeps the completed cookie mode for the page load when later discovery would fail', async () => {
+    let discoveryFails = false;
+    const server = cookieSessionServer();
+    const fetch = vi.fn((input: string, init?: RequestInit) => {
+      const path = new URL(input, 'http://localhost').pathname;
+      if (discoveryFails && (path === '/version' || path === '/v1/admin/auth/config')) {
+        return Promise.resolve(jsonResponse({ error: 'unavailable' }, 503));
+      }
+      return server.fetch(input, init);
+    });
+    vi.stubGlobal('fetch', fetch);
+    window.history.replaceState(null, '', '/admin/#/auth/complete?code=code&state=state');
+    render(<MemoryRouter><AdminShell /></MemoryRouter>);
+    await waitFor(() => expect(server.completions()).toHaveLength(1));
+    await act(async () => { server.complete(); });
+    await screen.findByText('Signed in with SSO. The session cookie lasts until logout or session expiry.');
+
+    // A transient failure after the completion cannot turn the remounted
+    // panel into a bearer panel without Log out.
+    discoveryFails = true;
+    fireEvent.click(screen.getByRole('link', { name: 'Status' }));
+    fireEvent.click(screen.getByRole('link', { name: 'Token/Dashboard' }));
+
+    expect(await screen.findByRole('heading', { level: 2, name: 'SSO session' })).toBeTruthy();
+    expect(screen.getByRole('button', { name: 'Log out' })).toBeTruthy();
+    expect(screen.queryByLabelText('Token', { exact: true })).toBeNull();
+    expect(fetch.mock.calls.filter(([url]) => url === '/version')).toHaveLength(1);
+    expect(fetch.mock.calls.some(([url]) => url === '/v1/admin/auth/config')).toBe(false);
+  });
+
+  it('keeps one unavailable answer for the completion and the panel until the operator retries', async () => {
+    const fetch = sessionFetchMock({
+      '/version': () => jsonResponse({ error: 'unavailable' }, 503),
+      '/v1/admin/auth/config': () => jsonResponse({ error: 'unavailable' }, 503),
+    });
+    vi.stubGlobal('fetch', fetch);
+    window.history.replaceState(null, '', '/admin/#/auth/complete?code=code&state=state');
+    render(<MemoryRouter><AdminShell /></MemoryRouter>);
+    await screen.findByText(UNAVAILABLE_COMPLETION);
+    await screen.findByRole('button', { name: 'Retry sign-in options' });
+    const discoveries = () => fetch.mock.calls.filter(([url]) => url === '/version').length;
+    expect(discoveries()).toBe(1);
+
+    // A remounted panel reuses the answer rather than asking on its own.
+    fireEvent.click(screen.getByRole('link', { name: 'Status' }));
+    fireEvent.click(screen.getByRole('link', { name: 'Token/Dashboard' }));
+    await screen.findByRole('button', { name: 'Retry sign-in options' });
+    expect(discoveries()).toBe(1);
+
+    fireEvent.click(screen.getByRole('button', { name: 'Retry sign-in options' }));
+    await waitFor(() => expect(discoveries()).toBe(2));
+  });
+
+  it.each([
+    { mode: 'cookie', version: offeredVersion, controls: ['Use bearer token'] },
+    {
+      mode: 'unavailable discovery',
+      version: () => jsonResponse({ error: 'unavailable' }, 503),
+      controls: ['Retry sign-in options', 'Save', 'Clear'],
+    },
+  ])('disables credential choices while logout is in flight ($mode)', async ({ version, controls }) => {
+    let finish!: () => void;
+    const logout = new Promise<Response>((resolve) => { finish = () => resolve(new Response(null, { status: 204 })); });
+    vi.stubGlobal('fetch', sessionFetchMock({
+      '/version': version,
+      '/v1/admin/auth/config': () => jsonResponse({ error: 'unavailable' }, 503),
+      '/v1/admin/auth/logout': () => logout,
+    }));
+    render(<MemoryRouter><AdminShell /></MemoryRouter>);
+    fireEvent.click(await screen.findByRole('button', { name: 'Log out' }));
+
+    expect((screen.getByRole('button', { name: 'Logging out' }) as HTMLButtonElement).disabled).toBe(true);
+    for (const name of controls) {
+      expect((screen.getByRole('button', { name }) as HTMLButtonElement).disabled).toBe(true);
+    }
+    await act(async () => { finish(); });
+
+    await screen.findByText('Logged out. Sign in again to continue.');
+    for (const name of controls) {
+      expect((screen.getByRole('button', { name }) as HTMLButtonElement).disabled).toBe(false);
+    }
   });
 
   it('registers the traffic inventory route and navigation entry', async () => {

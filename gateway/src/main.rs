@@ -103,6 +103,9 @@ mod mcp;
 mod metrics;
 mod middleware;
 mod path_match;
+#[cfg(test)]
+#[path = "../tests/support/policy_benchmark.rs"]
+mod policy_benchmark;
 mod policy_eval;
 mod proxy;
 mod rbac;
