@@ -1343,21 +1343,22 @@ async fn restarting_an_incumbent_while_a_new_configuration_is_live_costs_it_its_
 /// The consequence for a rolling upgrade is total: the instant the new
 /// version's `migrate up` commits, every replica still running the old
 /// version is `schema_incompatible` and serves nothing. There is no
-/// ordering that avoids it, because there is no pair of versions that
-/// accepts the same ledger.
+/// ordering that avoids it, because no pair of versions on either side of
+/// a migration accepts the same ledger. The pinned pair below shares one
+/// ledger only because its successor adds no migration.
 ///
-/// `docs/architecture/ha-state-model.md` §7 currently claims
-/// "expand/contract so version N and N+1 binaries coexist". That is a
-/// design intent the code has not implemented, and this row asserts the
-/// code: the range is a point, and the stall is total. The advertised
-/// range is a *pair* precisely so a future release can widen it without a
-/// schema change — and the day it widens, this row fails and says so.
+/// `docs/architecture/ha-state-model.md` §7 says the same: no pair has
+/// been qualified across a schema change, so the contract stays a point.
+/// This row asserts the code: the range is a point, and the stall is
+/// total. The advertised range is a *pair* precisely so a future release
+/// can widen it without a schema change — and the day it widens, this row
+/// fails and says so.
 ///
-/// The row also pins something the state model does not say: this is a
-/// **readiness** refusal, not a request refusal. A replica whose ledger it
-/// does not accept keeps serving whatever is still routed to it. See step
-/// 3b, which asserts that and explains why it makes the load balancer's
-/// `/readyz` wiring load-bearing rather than advisory.
+/// The row also pins that this is a **readiness** refusal, not a request
+/// refusal. A replica whose ledger it does not accept keeps serving
+/// whatever is still routed to it. See step 3b, which asserts that and
+/// explains why it makes the load balancer's `/readyz` wiring
+/// load-bearing rather than advisory.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn an_expand_migration_has_no_overlap_window_so_it_cannot_roll() {
     let Some(mut cluster) = start_rollout_cluster(2).await else {

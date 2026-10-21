@@ -875,10 +875,11 @@ jobs:
           # previous `v*` tag's own `gateway/Cargo.toml` (excluding HEAD)
           # and fails once a
           # released binary declares the PostgreSQL dependency -- the moment
-          # a mixed-version cluster becomes buildable and its documented
-          # substitution expires. `actions/checkout@v4` fetches no tags at
-          # its default depth, so without this the tripwire takes its (loud)
-          # skip path and the substitution never expires.
+          # a mixed-version cluster of released binaries becomes buildable
+          # and the pinned pair's tag substitution expires.
+          # `actions/checkout@v4` fetches no tags at its default depth, so
+          # without this the tripwire takes its (loud) skip path and the
+          # substitution never expires.
           fetch-depth: 0
 
       - name: Set up pinned build tools
