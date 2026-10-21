@@ -919,10 +919,25 @@ jobs:
           test -n "$PG_CONTAINER"
           docker exec "$PG_CONTAINER" pg_isready -U greengateway_ci -d greengateway_ci
 
+      - name: Build the pinned upgrade pair
+        # Issue #426: `ha_rolling_upgrade` runs a prepared release and its
+        # successor side by side, two real binaries each built from its own
+        # commit pinned in gateway/tests/ha/rolling-upgrade-pair.json (both
+        # are in this checkout's history: fetch-depth 0 above). The suite
+        # verifies both commits and binary hashes against its own copy of
+        # the pin, and fails rather than skips without them.
+        if: ${{ matrix.suite == 'ha_rolling_upgrade' }}
+        run: |
+          set -euo pipefail
+          python -m unittest discover -s scripts -p 'test_build_upgrade_pair.py' -v
+          python scripts/build_upgrade_pair.py --out "${RUNNER_TEMP}/upgrade-pair"
+
       - name: Run the release-gate suite
         env:
           GATEWAY_TEST_POSTGRES_URL_FILE: ${{ runner.temp }}/pg/database-url
           GATEWAY_TEST_HA_GATE: "1"
+          # Read only by `ha_rolling_upgrade`; the other suites ignore it.
+          GATEWAY_TEST_UPGRADE_PAIR_DIR: ${{ runner.temp }}/upgrade-pair
           RUST_BACKTRACE: "1"
         # The failure this gate is most exposed to is a suite that SKIPPED:
         # a mistyped variable, a locator that did not resolve, a missing
@@ -954,6 +969,19 @@ jobs:
             exit 1
           fi
           echo "${{ matrix.suite }} did real work: ${elapsed}s"
+
+      - name: Retain the upgrade-pair evidence
+        # Both binaries' commits and hashes, the schema state, the operation
+        # matrix and the readiness each pair row observed.
+        if: ${{ always() && matrix.suite == 'ha_rolling_upgrade' }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: ha-rolling-upgrade-pair-evidence
+          path: |
+            ${{ runner.temp }}/upgrade-pair/manifest.json
+            ${{ runner.temp }}/upgrade-pair/evidence
+          if-no-files-found: warn
+          retention-days: 30
 
   connections-acceptance:
     name: connections-acceptance

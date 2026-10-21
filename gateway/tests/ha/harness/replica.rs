@@ -192,6 +192,29 @@ impl Replica {
         &self.audit_path
     }
 
+    /// The binary this replica runs.
+    pub fn binary(&self) -> &std::path::Path {
+        &self.binary
+    }
+
+    /// Stop the replica cleanly, then start `binary` with the same
+    /// environment and wait for its listener: one member upgraded, or
+    /// rolled back, in place.
+    pub async fn replace_binary(&mut self, binary: &std::path::Path) {
+        self.relaunch_with(binary);
+        self.wait_until_listening(LISTEN_BUDGET).await;
+    }
+
+    /// [`Replica::relaunch`] with another binary, returning at once: for a
+    /// boot that must not come up.
+    pub fn relaunch_with(&mut self, binary: &std::path::Path) {
+        if self.is_running() {
+            self.stop();
+        }
+        self.binary = binary.to_owned();
+        self.launch();
+    }
+
     /// Everything the process has written to stdout and stderr so far.
     /// The secret-leak suite greps this; every other suite uses it to make
     /// a failure message say why the replica did not come up.
