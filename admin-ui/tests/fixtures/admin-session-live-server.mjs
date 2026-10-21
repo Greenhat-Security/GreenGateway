@@ -733,9 +733,10 @@ async function shutdown(exitCode) {
   }
   shuttingDown = true;
 
+  const exited = (child) => child.exitCode !== null || child.signalCode !== null;
   await Promise.all(GATEWAYS.map(async (gateway) => {
     const child = gateway.process;
-    if (!child || child.exitCode !== null) {
+    if (!child || exited(child)) {
       return;
     }
     child.kill();
@@ -743,11 +744,13 @@ async function shutdown(exitCode) {
       new Promise((resolve) => child.once('exit', resolve)),
       new Promise((resolve) => setTimeout(resolve, 1_000)),
     ]);
-    if (child.exitCode === null) {
+    if (!exited(child)) {
       child.kill('SIGKILL');
     }
   }));
 
+  // Keep-alive connections would otherwise hold close() open.
+  providerServer.closeAllConnections();
   await new Promise((resolve) => providerServer.close(resolve));
   cleanupRuntimeRoot();
   process.exit(exitCode);
@@ -760,7 +763,14 @@ function cleanupRuntimeRoot() {
     path.dirname(resolvedRoot) === canonicalTemp &&
     path.basename(resolvedRoot).startsWith(RUNTIME_PREFIX)
   ) {
-    rmSync(resolvedRoot, { force: true, recursive: true });
+    try {
+      rmSync(resolvedRoot, { force: true, recursive: true, maxRetries: 5, retryDelay: 100 });
+      console.log('[admin-session-fixture] removed the run\'s keys, certificates and gateway state');
+    } catch (error) {
+      console.error(
+        `[admin-session-fixture] could not remove the run's files: ${safeError(error)}`,
+      );
+    }
   }
 }
 

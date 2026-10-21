@@ -54,6 +54,9 @@ export default defineConfig({
       cwd: adminUiRoot,
       // Ready once every gateway answers over TLS verified against the run's CA.
       url: 'http://127.0.0.1:43211/__fixture/ready',
+      // SIGTERM lets the fixture stop its gateways and delete the run's keys
+      // and state; Playwright would otherwise SIGKILL it. Ignored on Windows.
+      gracefulShutdown: { signal: 'SIGTERM', timeout: 10_000 },
       reuseExistingServer: false,
       timeout: 300_000,
       stdout: 'pipe',
