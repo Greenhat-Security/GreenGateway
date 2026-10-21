@@ -1652,7 +1652,7 @@ newline"
         }));
 
         // A document persisted before the rule existed stays readable; the
-        // runtime refuses every Connection carrying an assertion regardless.
+        // runtime refuses a block that breaks a write rule on every lane.
         candidate
             .validated_persisted_v0()
             .expect("an already-persisted collision must remain readable");
