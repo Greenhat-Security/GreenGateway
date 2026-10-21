@@ -352,7 +352,7 @@ pub(super) async fn policy_rule_patch_endpoint(
         Ok(body) => body,
         Err(response) => return *response,
     };
-    let patch = match parse_rule_patch_body(&body) {
+    let mut patch = match parse_rule_patch_body(&body) {
         Ok(patch) => patch,
         Err(errors) => return policy_validation_failed(errors),
     };
@@ -361,19 +361,82 @@ pub(super) async fn policy_rule_patch_endpoint(
             "rule patch must include at least one of enabled, methods, path, tool_name, principal, action",
         );
     }
+    // A patch without a binding is an ordinary rule edit, exactly as before.
+    // With one, it is a promotion or disable from the shadow review, and it
+    // is applied only to the policy revision and evidence that were reviewed.
+    let bound = match patch.shadow_review.take() {
+        None => None,
+        Some(binding) => match prepare_bound_shadow_transition(
+            &state, &parts, &principal, rbac_state, &rule_id, &patch, binding,
+        ) {
+            Ok(bound) => Some(bound),
+            Err(response) => return *response,
+        },
+    };
 
     let _policy_write_guard = rbac_state.policy_write_guard().await;
 
-    let (before_policy, current_etag) =
+    let (before_policy, current_etag) = if let Some(bound) = bound.as_ref() {
+        match current_policy_matching_reviewed_revision(
+            &state,
+            rbac_state,
+            &parts.headers,
+            &bound.binding.policy_etag,
+        )
+        .await
+        {
+            Ok(view) => view,
+            Err(ReviewedRevisionError::Response(response)) => return *response,
+            Err(ReviewedRevisionError::Stale { current_etag }) => {
+                return refuse_bound_shadow_transition(
+                    BoundShadowRefusalContext {
+                        state: &state,
+                        parts: &parts,
+                        principal: &principal,
+                        rule_id: &rule_id,
+                        bound,
+                    },
+                    ShadowReviewRefusal::RevisionStale,
+                    Some(&current_etag),
+                    None,
+                );
+            }
+        }
+    } else {
         match current_policy_and_matching_if_match(&state, rbac_state, &parts.headers).await {
             Ok(view) => view,
             Err(response) => return *response,
-        };
+        }
+    };
 
     let rule_index = match rule_index_by_id(&before_policy, &rule_id) {
         Ok(rule_index) => rule_index,
         Err(error) => return rule_lookup_error_response(&rule_id, error),
     };
+
+    if let Some(bound) = bound.as_ref() {
+        match verify_shadow_review_binding(bound, &before_policy, &current_etag, rule_index).await {
+            Ok(()) => {}
+            Err(ShadowBindingMismatch::Failed(response)) => return *response,
+            Err(ShadowBindingMismatch::Refused {
+                refusal,
+                current_evidence_digest,
+            }) => {
+                return refuse_bound_shadow_transition(
+                    BoundShadowRefusalContext {
+                        state: &state,
+                        parts: &parts,
+                        principal: &principal,
+                        rule_id: &rule_id,
+                        bound,
+                    },
+                    refusal,
+                    Some(&current_etag),
+                    current_evidence_digest.as_deref(),
+                );
+            }
+        }
+    }
 
     let mut candidate = before_policy.clone();
     let before_rule = candidate.rules[rule_index].clone();
@@ -386,11 +449,14 @@ pub(super) async fn policy_rule_patch_endpoint(
     };
     let updated_rule = candidate.rules[rule_index].clone();
 
-    let diff_summary = json!({
+    let mut diff_summary = json!({
         "action": "rule_updated",
         "rule_id": rule_id,
         "changed_fields": changed_fields,
     });
+    if let (Some(bound), Some(summary)) = (bound.as_ref(), diff_summary.as_object_mut()) {
+        summary.insert("shadow_review".to_owned(), bound.diff_summary());
+    }
     let commit = match persist_policy_mutation(
         PolicyMutationCommitContext {
             state: &state,
@@ -681,18 +747,51 @@ pub(super) async fn policy_rule_shadow_review_endpoint(
     let Some(query_store) = state.query_store.as_ref() else {
         return policy_evidence_unavailable("policy shadow review requires an audit query store");
     };
-    let policy = rbac_state.current_policy();
+    // The same authority read a bound promotion compares against, so the
+    // `policy_etag` reported here is exactly what that write will check.
+    let (policy, policy_etag) = match authoritative_policy_and_etag(&state, rbac_state).await {
+        Ok(view) => view,
+        Err(response) => return *response,
+    };
+
+    match read_shadow_review(query_store, &policy, &policy_etag).await {
+        Ok(review) => Json(review).into_response(),
+        Err(response) => *response,
+    }
+}
+
+/// Media type and schema version of the payload a shadow-review evidence
+/// digest frames (ADR-0004, "Canonical digest contract"). Changing what the
+/// digest covers changes the version, so a binding minted by one build is
+/// never verified against a differently shaped payload by another.
+const SHADOW_EVIDENCE_DIGEST_MEDIA_TYPE: &str =
+    "application/vnd.greengateway.shadow-review-evidence+json";
+const SHADOW_EVIDENCE_DIGEST_SCHEMA_VERSION: &str = "0.1.0";
+
+/// Upper bounds on the strings a shadow-review binding carries. A review
+/// never mints anything longer: ETags and digests are fixed-length
+/// `sha256:` values and window bounds are recorded audit timestamps.
+const MAX_SHADOW_REVIEW_ETAG_BYTES: usize = 256;
+const MAX_SHADOW_REVIEW_TIMESTAMP_BYTES: usize = 128;
+
+/// The shadow review of `policy`: one entry per enabled shadow rule, each
+/// with the evidence window and digest a promotion or disable must later be
+/// bound to.
+///
+/// The review endpoint and the bound rule PATCH both build the review here,
+/// from the same audit query and the same policy, so a binding minted by one
+/// is verified by the other against an identically computed digest.
+pub(super) async fn read_shadow_review(
+    query_store: &storage::SqliteAuditEventStore,
+    policy: &rbac::Policy,
+    policy_etag: &str,
+) -> ResponseResult<PolicyRuleShadowReviewResponse> {
     let shadow_rules = policy
         .rules
         .iter()
         .enumerate()
         .filter(|(_, rule)| rule.enabled && rule.action == rbac::RuleAction::Shadow)
-        .map(|(rule_index, rule)| {
-            (
-                rule.id.clone().unwrap_or_else(|| rule_index.to_string()),
-                rule.clone(),
-            )
-        })
+        .map(|(rule_index, rule)| (effective_rule_id(rule, rule_index), rule.clone()))
         .collect::<Vec<_>>();
     let rule_ids = shadow_rules
         .iter()
@@ -706,32 +805,392 @@ pub(super) async fn policy_rule_shadow_review_endpoint(
         Ok(review) => review,
         Err(err) => {
             tracing::error!(error = %err, "failed to query shadow rule review summaries");
-            return internal_server_error("shadow rule review query failed");
+            return Err(Box::new(internal_server_error(
+                "shadow rule review query failed",
+            )));
         }
     };
 
-    Json(PolicyRuleShadowReviewResponse {
+    let mut rules = Vec::with_capacity(shadow_rules.len());
+    for (rule_id, rule) in shadow_rules {
+        let summary = review.summaries.get(&rule_id);
+        let mut entry = PolicyRuleShadowReviewSummary {
+            rule_id,
+            rule,
+            would_deny_count: summary.map(|summary| summary.would_deny_count).unwrap_or(0),
+            affected_principals: summary
+                .map(|summary| summary.affected_principals.clone())
+                .unwrap_or_default(),
+            samples: summary
+                .map(|summary| summary.samples.clone())
+                .unwrap_or_default(),
+            evidence_window: ShadowEvidenceWindow {
+                from: summary.and_then(|summary| summary.oldest_timestamp.clone()),
+                to: summary.and_then(|summary| summary.newest_timestamp.clone()),
+            },
+            evidence_digest: String::new(),
+        };
+        entry.evidence_digest =
+            match shadow_evidence_digest(&entry, review.scan_truncated, policy_etag) {
+                Ok(digest) => digest,
+                Err(err) => {
+                    tracing::error!(error = %err, "failed to digest shadow rule review evidence");
+                    return Err(Box::new(internal_server_error(
+                        "shadow rule review evidence digest failed",
+                    )));
+                }
+            };
+        rules.push(entry);
+    }
+
+    Ok(PolicyRuleShadowReviewResponse {
         scanned_event_count: review.scanned_event_count,
         scan_truncated: review.scan_truncated,
-        rules: shadow_rules
-            .into_iter()
-            .map(|(rule_id, rule)| {
-                let summary = review.summaries.get(&rule_id);
-                PolicyRuleShadowReviewSummary {
-                    rule_id,
-                    rule,
-                    would_deny_count: summary.map(|summary| summary.would_deny_count).unwrap_or(0),
-                    affected_principals: summary
-                        .map(|summary| summary.affected_principals.clone())
-                        .unwrap_or_default(),
-                    samples: summary
-                        .map(|summary| summary.samples.clone())
-                        .unwrap_or_default(),
-                }
-            })
-            .collect(),
+        policy_etag: policy_etag.to_owned(),
+        rules,
     })
-    .into_response()
+}
+
+/// What one shadow-review entry's digest covers: everything the operator is
+/// shown about the rule, whether the scan behind it was truncated, and the
+/// policy revision it was read under. The scan-wide `scanned_event_count` is
+/// left out on purpose: it moves whenever any shadow rule records an event,
+/// and only this rule's evidence justifies changing this rule.
+#[derive(Serialize)]
+struct ShadowEvidenceDigestSubject<'a> {
+    policy_etag: &'a str,
+    rule_id: &'a str,
+    rule: &'a rbac::Rule,
+    would_deny_count: u64,
+    affected_principals: &'a [audit::query::ShadowRuleAffectedPrincipal],
+    samples: &'a [audit::query::ShadowRuleWouldDenySample],
+    evidence_window: &'a ShadowEvidenceWindow,
+    scan_truncated: bool,
+}
+
+fn shadow_evidence_digest(
+    entry: &PolicyRuleShadowReviewSummary,
+    scan_truncated: bool,
+    policy_etag: &str,
+) -> Result<String, Box<dyn std::error::Error>> {
+    let subject = serde_json::to_value(ShadowEvidenceDigestSubject {
+        policy_etag,
+        rule_id: &entry.rule_id,
+        rule: &entry.rule,
+        would_deny_count: entry.would_deny_count,
+        affected_principals: &entry.affected_principals,
+        samples: &entry.samples,
+        evidence_window: &entry.evidence_window,
+        scan_truncated,
+    })?;
+    Ok(canonical_json::semantic_digest(
+        SHADOW_EVIDENCE_DIGEST_MEDIA_TYPE,
+        SHADOW_EVIDENCE_DIGEST_SCHEMA_VERSION,
+        &subject,
+    )?)
+}
+
+/// The change a rule PATCH bound to a shadow review makes. A binding vouches
+/// for exactly one of these: any other field would change the rule in a way
+/// the review never showed the operator.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum ShadowReviewTransition {
+    /// `{"action":"deny"}`: enforce what the rule only reported.
+    Promote,
+    /// `{"enabled":false}`: stop evaluating the rule.
+    Disable,
+}
+
+impl ShadowReviewTransition {
+    pub(super) fn of(patch: &RulePatch) -> Option<Self> {
+        if patch.methods.is_some()
+            || patch.path.is_some()
+            || patch.tool_name.is_some()
+            || patch.principal.is_some()
+        {
+            return None;
+        }
+        match (patch.enabled, patch.action.as_ref()) {
+            (None, Some(rbac::RuleAction::Deny)) => Some(Self::Promote),
+            (Some(false), None) => Some(Self::Disable),
+            _ => None,
+        }
+    }
+
+    pub(super) fn as_str(self) -> &'static str {
+        match self {
+            Self::Promote => "promote",
+            Self::Disable => "disable",
+        }
+    }
+}
+
+/// Why a promotion or disable bound to a shadow review was refused. Each has
+/// a stable `reason` so a client can tell them apart without parsing text.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum ShadowReviewRefusal {
+    /// The patch is not exactly a promotion or a disable.
+    TransitionUnsupported,
+    /// A binding field is empty or longer than any review produces.
+    BindingInvalid,
+    /// The policy changed after the review was read.
+    RevisionStale,
+    /// The target rule is not an enabled shadow rule, so no review covers it.
+    RuleNotShadow,
+    /// The rule's evidence now spans different events than were reviewed.
+    WindowStale,
+    /// Same window, but the evidence summary differs from what was reviewed.
+    DigestStale,
+}
+
+impl ShadowReviewRefusal {
+    pub(super) fn status(self) -> StatusCode {
+        match self {
+            Self::TransitionUnsupported | Self::BindingInvalid => StatusCode::BAD_REQUEST,
+            Self::RevisionStale => StatusCode::PRECONDITION_FAILED,
+            Self::RuleNotShadow | Self::WindowStale | Self::DigestStale => StatusCode::CONFLICT,
+        }
+    }
+
+    pub(super) fn reason(self) -> &'static str {
+        match self {
+            Self::TransitionUnsupported => "shadow_review_transition_unsupported",
+            Self::BindingInvalid => "shadow_review_binding_invalid",
+            Self::RevisionStale => "shadow_review_revision_stale",
+            Self::RuleNotShadow => "shadow_review_rule_not_shadow",
+            Self::WindowStale => "shadow_evidence_window_stale",
+            Self::DigestStale => "shadow_evidence_digest_stale",
+        }
+    }
+
+    fn message(self) -> &'static str {
+        match self {
+            Self::TransitionUnsupported => {
+                "a shadow review binding accepts only {\"action\":\"deny\"} or {\"enabled\":false}"
+            }
+            Self::BindingInvalid => "shadow review binding is malformed",
+            Self::RevisionStale => "policy changed after this shadow review was read",
+            Self::RuleNotShadow => "rule is not an enabled shadow rule",
+            Self::WindowStale => {
+                "shadow evidence for this rule covers different events than were reviewed"
+            }
+            Self::DigestStale => "shadow evidence for this rule changed since it was reviewed",
+        }
+    }
+
+    pub(super) fn response(self) -> Response {
+        (
+            self.status(),
+            Json(json!({
+                "error": self.message(),
+                "reason": self.reason(),
+            })),
+        )
+            .into_response()
+    }
+}
+
+/// A rule PATCH that carries a shadow-review binding, after the checks that
+/// need no policy read.
+pub(super) struct BoundShadowTransition {
+    pub(super) transition: ShadowReviewTransition,
+    pub(super) binding: ShadowReviewBinding,
+    pub(super) query_store: Arc<storage::SqliteAuditEventStore>,
+}
+
+impl BoundShadowTransition {
+    /// What the policy history and `policy.changed` record about the review
+    /// a successful change was bound to.
+    fn diff_summary(&self) -> Value {
+        json!({
+            "transition": self.transition.as_str(),
+            "policy_etag": self.binding.policy_etag,
+            "evidence_window": self.binding.evidence_window,
+            "evidence_digest": self.binding.evidence_digest,
+        })
+    }
+}
+
+impl ShadowReviewBinding {
+    fn is_well_formed(&self) -> bool {
+        let etag_ok =
+            !self.policy_etag.is_empty() && self.policy_etag.len() <= MAX_SHADOW_REVIEW_ETAG_BYTES;
+        let digest_ok = self
+            .evidence_digest
+            .strip_prefix("sha256:")
+            .is_some_and(|hex| {
+                hex.len() == 64
+                    && hex
+                        .bytes()
+                        .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+            });
+        let window_ok = [&self.evidence_window.from, &self.evidence_window.to]
+            .into_iter()
+            .flatten()
+            .all(|bound| !bound.is_empty() && bound.len() <= MAX_SHADOW_REVIEW_TIMESTAMP_BYTES);
+        etag_ok && digest_ok && window_ok
+    }
+}
+
+/// Everything a bound promotion or disable can be refused for before the
+/// policy is read: `admin:audit:read` (the review it re-reads carries
+/// audit-derived principals and samples, and a refusal would otherwise
+/// reveal whether new events arrived), the request shape, and whether there
+/// is any evidence to compare against.
+pub(super) fn prepare_bound_shadow_transition(
+    state: &PolicyAdminState,
+    parts: &http::request::Parts,
+    principal: &auth::Principal,
+    rbac_state: &middleware::rbac::RbacState,
+    rule_id: &str,
+    patch: &RulePatch,
+    binding: ShadowReviewBinding,
+) -> ResponseResult<BoundShadowTransition> {
+    if !rbac_state.principal_has_permission(principal, ADMIN_AUDIT_READ_PERMISSION) {
+        return Err(Box::new(admin_permission_denied_response(
+            ADMIN_AUDIT_READ_PERMISSION.to_owned(),
+        )));
+    }
+    let Some(transition) = ShadowReviewTransition::of(patch) else {
+        return Err(Box::new(
+            ShadowReviewRefusal::TransitionUnsupported.response(),
+        ));
+    };
+    if !binding.is_well_formed() {
+        return Err(Box::new(ShadowReviewRefusal::BindingInvalid.response()));
+    }
+    let Some(query_store) = state.query_store.clone() else {
+        emit_policy_shadow_transition_refused(
+            state,
+            parts,
+            principal,
+            ShadowTransitionRefusal {
+                transition,
+                rule_id,
+                reason: POLICY_EVIDENCE_UNAVAILABLE_REASON,
+                binding: &binding,
+                current_policy_etag: None,
+                current_evidence_digest: None,
+            },
+        );
+        return Err(Box::new(policy_evidence_unavailable(
+            "shadow rule promotion and disable require an audit query store",
+        )));
+    };
+
+    Ok(BoundShadowTransition {
+        transition,
+        binding,
+        query_store,
+    })
+}
+
+/// Compare a bound transition with the evidence as it stands now. The caller
+/// holds the policy write guard and has already matched the binding's
+/// revision, so `policy` is the revision that was reviewed and nothing can
+/// change it before the commit.
+///
+/// The review is re-read in full, exactly as the review endpoint reads it,
+/// rather than for this rule alone: the scan ceiling is shared across every
+/// shadow rule, so only the same query reproduces the same per-rule result.
+pub(super) async fn verify_shadow_review_binding(
+    bound: &BoundShadowTransition,
+    policy: &rbac::Policy,
+    policy_etag: &str,
+    rule_index: usize,
+) -> Result<(), ShadowBindingMismatch> {
+    let Some(rule) = policy.rules.get(rule_index) else {
+        return Err(ShadowBindingMismatch::refused(
+            ShadowReviewRefusal::RuleNotShadow,
+        ));
+    };
+    if !rule.enabled || rule.action != rbac::RuleAction::Shadow {
+        return Err(ShadowBindingMismatch::refused(
+            ShadowReviewRefusal::RuleNotShadow,
+        ));
+    }
+    let rule_id = effective_rule_id(rule, rule_index);
+
+    let review = read_shadow_review(bound.query_store.as_ref(), policy, policy_etag)
+        .await
+        .map_err(ShadowBindingMismatch::Failed)?;
+    let Some(current) = review
+        .rules
+        .into_iter()
+        .find(|entry| entry.rule_id == rule_id)
+    else {
+        return Err(ShadowBindingMismatch::refused(
+            ShadowReviewRefusal::RuleNotShadow,
+        ));
+    };
+
+    if current.evidence_window != bound.binding.evidence_window {
+        return Err(ShadowBindingMismatch::Refused {
+            refusal: ShadowReviewRefusal::WindowStale,
+            current_evidence_digest: Some(current.evidence_digest),
+        });
+    }
+    if current.evidence_digest != bound.binding.evidence_digest {
+        return Err(ShadowBindingMismatch::Refused {
+            refusal: ShadowReviewRefusal::DigestStale,
+            current_evidence_digest: Some(current.evidence_digest),
+        });
+    }
+    Ok(())
+}
+
+pub(super) enum ShadowBindingMismatch {
+    /// The binding no longer describes the current evidence.
+    Refused {
+        refusal: ShadowReviewRefusal,
+        current_evidence_digest: Option<String>,
+    },
+    /// The evidence could not be re-read; the change is refused with this
+    /// response, never applied on the strength of the old review.
+    Failed(Box<Response>),
+}
+
+impl ShadowBindingMismatch {
+    fn refused(refusal: ShadowReviewRefusal) -> Self {
+        Self::Refused {
+            refusal,
+            current_evidence_digest: None,
+        }
+    }
+}
+
+/// The request a refused bound promotion or disable belongs to.
+struct BoundShadowRefusalContext<'a> {
+    state: &'a PolicyAdminState,
+    parts: &'a http::request::Parts,
+    principal: &'a auth::Principal,
+    rule_id: &'a str,
+    bound: &'a BoundShadowTransition,
+}
+
+/// Answer a refused bound promotion or disable, after recording it: the
+/// refusal is a decision not to change enforcement, and like the change it
+/// prevented it belongs in the audit stream.
+fn refuse_bound_shadow_transition(
+    context: BoundShadowRefusalContext<'_>,
+    refusal: ShadowReviewRefusal,
+    current_policy_etag: Option<&str>,
+    current_evidence_digest: Option<&str>,
+) -> Response {
+    emit_policy_shadow_transition_refused(
+        context.state,
+        context.parts,
+        context.principal,
+        ShadowTransitionRefusal {
+            transition: context.bound.transition,
+            rule_id: context.rule_id,
+            reason: refusal.reason(),
+            binding: &context.bound.binding,
+            current_policy_etag,
+            current_evidence_digest,
+        },
+    );
+    refusal.response()
 }
 
 pub(super) fn split_authorized_policy_mutation_request(
@@ -1143,29 +1602,6 @@ pub(super) fn validate_policy_candidate(candidate: &rbac::Policy) -> ResponseRes
         .map_err(|err| Box::new(policy_validation_failed(vec![policy_error_message(&err)])))
 }
 
-pub(super) fn require_matching_if_match(
-    headers: &HeaderMap,
-    before_policy: &rbac::Policy,
-) -> ResponseResult<String> {
-    let current_etag = match policy_etag(before_policy) {
-        Ok(etag) => etag,
-        Err(err) => {
-            tracing::error!(error = %err, "failed to compute current policy ETag");
-            return Err(Box::new(internal_server_error(
-                "policy ETag computation failed",
-            )));
-        }
-    };
-
-    match if_match_matches(headers, &current_etag) {
-        Ok(true) => Ok(current_etag),
-        Ok(false) => Err(Box::new(precondition_failed(
-            "If-Match does not match the current policy ETag",
-        ))),
-        Err(error) => Err(Box::new(if_match_error_response(error))),
-    }
-}
-
 /// The current policy as its authority sees it, with no precondition:
 /// cluster mode reads the active document from the control plane,
 /// standalone reads the compiled snapshot, which IS the authority there.
@@ -1221,16 +1657,28 @@ pub(super) async fn current_policy_and_matching_if_match(
     rbac_state: &middleware::rbac::RbacState,
     headers: &HeaderMap,
 ) -> ResponseResult<(rbac::Policy, String)> {
+    let (before_policy, current_etag) = authoritative_policy_and_etag(state, rbac_state).await?;
+    match if_match_matches(headers, &current_etag) {
+        Ok(true) => Ok((before_policy, current_etag)),
+        Ok(false) => Err(Box::new(precondition_failed(
+            "If-Match does not match the current policy ETag",
+        ))),
+        Err(error) => Err(Box::new(if_match_error_response(error))),
+    }
+}
+
+/// The current policy and its ETag as the authority sees them, with no
+/// precondition: cluster mode reads the authoritative active document (whose
+/// recorded ETag `active()` already verified against the document body),
+/// standalone reads the compiled snapshot and hashes it.
+pub(super) async fn authoritative_policy_and_etag(
+    state: &PolicyAdminState,
+    rbac_state: &middleware::rbac::RbacState,
+) -> ResponseResult<(rbac::Policy, String)> {
     #[cfg(feature = "postgres")]
     if let Some(control_plane) = state.control_plane.as_ref() {
         return match control_plane.active().await {
-            Ok(Some(active)) => match if_match_matches(headers, &active.etag) {
-                Ok(true) => Ok((active.policy, active.etag)),
-                Ok(false) => Err(Box::new(precondition_failed(
-                    "If-Match does not match the current policy ETag",
-                ))),
-                Err(error) => Err(Box::new(if_match_error_response(error))),
-            },
+            Ok(Some(active)) => Ok((active.policy, active.etag)),
             // Startup refuses an uninitialized deployment and the pointer
             // is append-only, so both arms are defensive fail-closed paths.
             Ok(None) => {
@@ -1249,8 +1697,52 @@ pub(super) async fn current_policy_and_matching_if_match(
     }
     #[cfg(not(feature = "postgres"))]
     let _ = state;
-    let before_policy = rbac_state.current_policy();
-    let current_etag = require_matching_if_match(headers, &before_policy)?;
+    let policy = rbac_state.current_policy();
+    match policy_etag(&policy) {
+        Ok(etag) => Ok((policy, etag)),
+        Err(err) => {
+            tracing::error!(error = %err, "failed to compute current policy ETag");
+            Err(Box::new(internal_server_error(
+                "policy ETag computation failed",
+            )))
+        }
+    }
+}
+
+pub(super) enum ReviewedRevisionError {
+    /// The reviewed revision is no longer the current one.
+    Stale {
+        current_etag: String,
+    },
+    Response(Box<Response>),
+}
+
+/// [`current_policy_and_matching_if_match`] for a change bound to a shadow
+/// review, which also names the revision the review was read from.
+///
+/// A missing `If-Match` is still `428`. A reviewed revision that is no longer
+/// current is reported before an `If-Match` mismatch, so the usual stale case
+/// -- both carry the reviewed ETag -- gets the binding's stable reason.
+pub(super) async fn current_policy_matching_reviewed_revision(
+    state: &PolicyAdminState,
+    rbac_state: &middleware::rbac::RbacState,
+    headers: &HeaderMap,
+    reviewed_etag: &str,
+) -> Result<(rbac::Policy, String), ReviewedRevisionError> {
+    let (before_policy, current_etag) = authoritative_policy_and_etag(state, rbac_state)
+        .await
+        .map_err(ReviewedRevisionError::Response)?;
+    let if_match = if_match_matches(headers, &current_etag).map_err(|error| {
+        ReviewedRevisionError::Response(Box::new(if_match_error_response(error)))
+    })?;
+    if reviewed_etag != current_etag {
+        return Err(ReviewedRevisionError::Stale { current_etag });
+    }
+    if !if_match {
+        return Err(ReviewedRevisionError::Response(Box::new(
+            precondition_failed("If-Match does not match the current policy ETag"),
+        )));
+    }
     Ok((before_policy, current_etag))
 }
 

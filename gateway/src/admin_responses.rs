@@ -93,6 +93,10 @@ pub(super) fn policy_history_not_configured() -> Response {
         .into_response()
 }
 
+/// The stable `reason` of [`policy_evidence_unavailable`], which a bound
+/// shadow-rule promotion also records when it is refused for that cause.
+pub(super) const POLICY_EVIDENCE_UNAVAILABLE_REASON: &str = "audit_evidence_unavailable";
+
 /// A policy evidence endpoint (rule preview, hit counts, shadow review) has
 /// no audit store to read.
 ///
@@ -105,7 +109,7 @@ pub(super) fn policy_evidence_unavailable(error: &str) -> Response {
         StatusCode::SERVICE_UNAVAILABLE,
         Json(json!({
             "error": error,
-            "reason": "audit_evidence_unavailable",
+            "reason": POLICY_EVIDENCE_UNAVAILABLE_REASON,
         })),
     )
         .into_response()

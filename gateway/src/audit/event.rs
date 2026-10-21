@@ -4,6 +4,7 @@ use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 
 pub const SCHEMA_VERSION: &str = "0.2.0";
 pub const POLICY_CHANGED: &str = "policy.changed";
+pub const POLICY_SHADOW_TRANSITION_REFUSED: &str = "policy.shadow_transition_refused";
 pub const SIGNAL_OPENED: &str = "signal.opened";
 pub const SIGNAL_LIFECYCLE_CHANGED: &str = "signal.lifecycle_changed";
 pub const SUGGESTION_LIFECYCLE_CHANGED: &str = "suggestion.lifecycle_changed";

@@ -396,6 +396,10 @@ pub(super) struct PolicyRuleShadowReviewResponse {
     pub(super) rules: Vec<PolicyRuleShadowReviewSummary>,
     pub(super) scanned_event_count: u64,
     pub(super) scan_truncated: bool,
+    /// ETag of the policy revision the review was read from. A promotion or
+    /// disable bound to this review names it, and is refused once it is no
+    /// longer the current revision.
+    pub(super) policy_etag: String,
 }
 
 #[derive(Serialize)]
@@ -405,6 +409,31 @@ pub(super) struct PolicyRuleShadowReviewSummary {
     pub(super) would_deny_count: u64,
     pub(super) affected_principals: Vec<audit::query::ShadowRuleAffectedPrincipal>,
     pub(super) samples: Vec<audit::query::ShadowRuleWouldDenySample>,
+    pub(super) evidence_window: ShadowEvidenceWindow,
+    /// Opaque `sha256:` digest over this entry's evidence and the policy ETag
+    /// it was read under. Clients echo it; they never compute it.
+    pub(super) evidence_digest: String,
+}
+
+/// The span of `authz.would_deny` evidence one shadow-review entry
+/// summarizes: the recorded timestamps of the oldest and newest such events
+/// the review read for the rule, or both `null` when it read none.
+#[derive(Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct ShadowEvidenceWindow {
+    pub(super) from: Option<String>,
+    pub(super) to: Option<String>,
+}
+
+/// What a shadow-review entry was read under, sent back with the promotion
+/// or disable it justifies. Every field is copied from the review response
+/// unchanged.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct ShadowReviewBinding {
+    pub(super) policy_etag: String,
+    pub(super) evidence_window: ShadowEvidenceWindow,
+    pub(super) evidence_digest: String,
 }
 
 #[derive(Deserialize)]
@@ -677,6 +706,9 @@ pub(super) struct RulePatch {
     pub(super) tool_name: Option<RuleToolNamePatch>,
     pub(super) principal: Option<rbac::PrincipalMatcher>,
     pub(super) action: Option<rbac::RuleAction>,
+    /// Present only when this patch promotes or disables a shadow rule from
+    /// the shadow review; see `ShadowReviewTransition`.
+    pub(super) shadow_review: Option<ShadowReviewBinding>,
 }
 
 pub(super) enum RuleToolNamePatch {

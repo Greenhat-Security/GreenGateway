@@ -2,6 +2,9 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import { AdminApiError } from './api';
 import {
+  PolicyRuleShadowReviewResponse,
+  PolicyRuleShadowReviewSummary,
+  changeShadowRule,
   createPolicyRule,
   fetchPolicy,
   fetchPolicyRuleHits,
@@ -11,6 +14,7 @@ import {
   patchPolicyRule,
   policyRuleId,
   reorderPolicyRules,
+  shadowReviewBinding,
 } from './policy';
 
 afterEach(() => {
@@ -120,6 +124,124 @@ describe('policy evidence', () => {
     await expect(fetchPolicyRuleShadowReview()).rejects.toBeInstanceOf(
       AdminApiError,
     );
+  });
+});
+
+describe('shadow review bindings', () => {
+  const digest = `sha256:${'b'.repeat(64)}`;
+  const summary: PolicyRuleShadowReviewSummary = {
+    rule_id: 'shadow-reports',
+    rule: { id: 'shadow-reports', action: 'shadow' },
+    would_deny_count: 2,
+    affected_principals: [],
+    samples: [],
+    evidence_window: {
+      from: '2026-07-04T15:00:00Z',
+      to: '2026-07-04T16:00:00Z',
+    },
+    evidence_digest: digest,
+  };
+  const review: PolicyRuleShadowReviewResponse = {
+    scanned_event_count: 2,
+    scan_truncated: false,
+    policy_etag: '"policy:v1"',
+    rules: [summary],
+  };
+
+  it('binds an entry to the revision, window and digest the review reported', () => {
+    expect(shadowReviewBinding(review, summary)).toEqual({
+      policy_etag: '"policy:v1"',
+      evidence_window: {
+        from: '2026-07-04T15:00:00Z',
+        to: '2026-07-04T16:00:00Z',
+      },
+      evidence_digest: digest,
+    });
+    expect(
+      shadowReviewBinding(review, {
+        ...summary,
+        evidence_window: { from: null, to: null },
+      })?.evidence_window,
+    ).toEqual({ from: null, to: null });
+  });
+
+  it.each([
+    ['no policy revision', { ...review, policy_etag: undefined }, summary],
+    ['an empty policy revision', { ...review, policy_etag: '' }, summary],
+    ['no evidence digest', review, { ...summary, evidence_digest: undefined }],
+    ['no evidence window', review, { ...summary, evidence_window: undefined }],
+    [
+      'a malformed evidence window',
+      review,
+      {
+        ...summary,
+        evidence_window: { from: 7, to: null } as unknown as PolicyRuleShadowReviewSummary['evidence_window'],
+      },
+    ],
+  ])('has nothing to bind to when the review reports %s', (_name, reviewed, entry) => {
+    expect(shadowReviewBinding(reviewed, entry)).toBeNull();
+  });
+
+  it.each([
+    ['promote', { action: 'deny' }],
+    ['disable', { enabled: false }],
+  ] as const)(
+    'sends a %s with the binding and the reviewed revision as If-Match',
+    async (transition, change) => {
+      const binding = shadowReviewBinding(review, summary);
+      if (binding === null) {
+        throw new Error('fixture should bind');
+      }
+      const requests: Array<{ url: string; init?: RequestInit }> = [];
+      vi.stubGlobal(
+        'fetch',
+        vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
+          requests.push({ url: String(input), init });
+          return Promise.resolve(
+            new Response(JSON.stringify({ id: 'shadow-reports' }), {
+              status: 200,
+              headers: { 'Content-Type': 'application/json', ETag: '"policy:v2"' },
+            }),
+          );
+        }),
+      );
+
+      const result = await changeShadowRule('shadow-reports', transition, binding);
+
+      expect(result.etag).toBe('"policy:v2"');
+      expect(requests).toHaveLength(1);
+      expect(requests[0].url).toContain('/policy/rules/shadow-reports');
+      expect(requests[0].init?.method).toBe('PATCH');
+      expect(new Headers(requests[0].init?.headers).get('If-Match')).toBe('"policy:v1"');
+      expect(JSON.parse(String(requests[0].init?.body))).toEqual({
+        ...change,
+        shadow_review: binding,
+      });
+    },
+  );
+
+  it.each([
+    [409, 'shadow_evidence_window_stale'],
+    [409, 'shadow_evidence_digest_stale'],
+    [412, 'shadow_review_revision_stale'],
+    [503, 'audit_evidence_unavailable'],
+  ])('surfaces a %s %s refusal with its stable reason', async (status, reason) => {
+    const binding = shadowReviewBinding(review, summary);
+    if (binding === null) {
+      throw new Error('fixture should bind');
+    }
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(() => Promise.resolve(jsonResponse(status, { error: 'refused', reason }))),
+    );
+
+    const refusal = await changeShadowRule('shadow-reports', 'promote', binding).catch(
+      (error: unknown) => error,
+    );
+
+    expect(refusal).toBeInstanceOf(AdminApiError);
+    expect((refusal as AdminApiError).status).toBe(status);
+    expect((refusal as AdminApiError).code).toBe(reason);
   });
 });
 
