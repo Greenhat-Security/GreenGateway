@@ -358,9 +358,9 @@ place a purpose-built token broker behind an independently secured Connection.
 ### Signed caller assertions
 
 A Connection with a `caller_assertion` block tells its upstream who is
-calling. On every tool call it signs a short-lived JWT that names the validated
-calling principal and sends it in `header_name`, alongside the Connection's own
-credential. The credential says which system is calling; the assertion says on
+calling. On every call of a manual HTTP tool it signs a short-lived JWT that
+names the validated calling principal and sends it in `header_name`, alongside
+the Connection's own credential. The credential says which system is calling; the assertion says on
 whose behalf. An upstream the operator controls verifies the assertion against
 the gateway's published key set (see [The published JWKS](#the-published-jwks))
 and can then apply its own per-user ownership and entitlement checks, which a
@@ -401,8 +401,7 @@ On those lanes the refusal reason appears as follows:
   event names it. Every other Connection failure on a proxy route behaves the
   same way.
 
-A manual tool, from `TOOLS_FILE` or the admin API, may be bound to an attested
-Connection. Other bindings fail the way bindings to a disabled Connection do: a
+A manual tool may be bound to an attested Connection. Other bindings fail the way bindings to a disabled Connection do: a
 proxy route bound to it fails startup or the whole reload that contains it. A
 managed OpenAPI catalog on it is withdrawn from the tool list and kept in
 storage; refresh it after removing the block to publish it again. Managed MCP
@@ -425,8 +424,9 @@ The JOSE header carries `alg` (`ES256` or `RS256`, from `algorithm`), `kid`
 | `roles` | With `roles` in `claims`, the principal's roles, as an array. |
 | `method`, `path`, `request_sha256` | With `bind_request: true`: the request method, the request target exactly as it appears on the request line (path, then `?` and the query when there is one), and the lowercase hexadecimal SHA-256 of the exact body bytes sent, which is the hash of empty input for a request without a body. |
 
-Every value comes from the authenticated principal or the request the gateway
-builds, never from a tool argument. The assertion is signed once per call,
+Every identity claim comes from the authenticated principal, never from a tool
+argument; the bound request claims describe the request the gateway built
+from the arguments, as sent. The assertion is signed once per call,
 after every other header and the body are final, and written as the last
 header. The lane removes the header name from anything a caller supplied, and
 validation keeps it apart from the Connection's primary and additional header
