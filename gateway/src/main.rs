@@ -79,6 +79,7 @@ use admin_responses::*;
 
 mod audit;
 mod auth;
+mod authority_events;
 mod canonical_json;
 mod client_ip;
 #[cfg(feature = "postgres")]
