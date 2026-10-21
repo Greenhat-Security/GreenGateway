@@ -18,13 +18,24 @@
 //!   keeps are kept here, and a reader of the table or of a backup cannot
 //!   enumerate the IPv4 space against the digests without the key.
 //! - **The decision is GCRA on database time.** With emission interval
-//!   `T = 1/rps` and tolerance `tau = (burst - 1) * T`, a request is
-//!   allowed iff `GREATEST(tat, now()) - now() <= tau`, and an allowed
-//!   request advances `tat` to `GREATEST(tat, now()) + T`. That is the
+//!   `T = 1/rps` and tolerance `tau = (burst - 1) * T`, a request decided
+//!   at `t` is allowed iff `GREATEST(tat, t) - t <= tau`, and an allowed
+//!   request advances `tat` to `GREATEST(tat, t) + T`. That is the
 //!   local token bucket (burst `B`, starting full, refilling at `rps`)
 //!   written as one comparison and one assignment, including the local
 //!   store's rule that a zero burst denies the very first request
 //!   (`tau < 0`). No replica keeps a private count.
+//! - **Decision time follows the row lock.** `t` is `GREATEST(now(),
+//!   updated_at)`: the statement's start, or the bucket's last decision
+//!   when that is later. `now()` is fixed when the statement begins,
+//!   before it waits for the bucket row, so two decisions can take the row
+//!   in the opposite order to their starts; judged at its own start, the
+//!   one that took it second would be charged for debt accrued after it
+//!   began and denied below the configured burst. Clamping to the last
+//!   decision makes `t` monotonic per bucket, so decisions are judged in
+//!   the order the row lock serializes them, as the local bucket judges
+//!   its own. `t` never runs ahead of the database clock, so the clamp
+//!   never admits more than the configured burst and rate.
 //! - **Cardinality is bounded exactly.** `rate_limit_cardinality` counts
 //!   live buckets per deployment and moves in the same statement that
 //!   inserts or deletes rows, so it cannot drift; when a new key pushes
@@ -176,14 +187,16 @@ impl PostgresRateLimitStore {
                              $5::double precision >= 0,
                              now())
                          ON CONFLICT (deployment_id, lane, key_digest) DO UPDATE SET
-                             allowed = (GREATEST(b.tat, now()) - now())
+                             allowed = (GREATEST(b.tat, now(), b.updated_at)
+                                           - GREATEST(now(), b.updated_at))
                                  <= make_interval(secs => $5::double precision),
-                             tat = CASE WHEN (GREATEST(b.tat, now()) - now())
+                             tat = CASE WHEN (GREATEST(b.tat, now(), b.updated_at)
+                                                 - GREATEST(now(), b.updated_at))
                                              <= make_interval(secs => $5::double precision)
-                                        THEN GREATEST(b.tat, now())
+                                        THEN GREATEST(b.tat, now(), b.updated_at)
                                              + make_interval(secs => $4::double precision)
                                         ELSE b.tat END,
-                             updated_at = now()
+                             updated_at = GREATEST(now(), b.updated_at)
                          RETURNING b.allowed AS allowed, (b.xmax = 0) AS inserted
                      ),
                      counted AS (
