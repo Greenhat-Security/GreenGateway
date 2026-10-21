@@ -389,9 +389,11 @@ artifact (90 days). The producer is
 [`tests/ha/capacity.rs`](../../gateway/tests/ha/capacity.rs);
 `scripts/check-test-evidence.py capacity` validates its report and rebuilds the
 uploaded file from an allowlist of bounded fields (see
-[test evidence](../deployment/test-evidence.md)). If a cell is incomplete, the
-run publishes `ha-capacity-diagnostics` instead: the producer's report with
-each cell's reason codes.
+[test evidence](../deployment/test-evidence.md)). If a cell is incomplete, or
+the validator rejects the report, the run publishes `ha-capacity-diagnostics`
+instead: the producer's report as written, with each cell's reason codes. That
+file is sanitized by the producer alone; only `ha-capacity` is rebuilt from the
+allowlist.
 
 ### The cells
 
@@ -413,9 +415,11 @@ mixed load with concurrent control-plane and audit work:
   (`GET /v1{ADMIN_PREFIX}/policy`). The policy read adds a
   `security_state_read` checkout for the authoritative document.
 - The contention cell adds a writer and an audit feeder. The writer commits a
-  policy document every 250 ms on alternating replicas. Each commit forces
-  every replica to reconcile and makes the next request for every cached
-  service token a verification. The feeder appends a batch of 200
+  policy document on alternating replicas, waits until every replica has
+  compiled it (at most 10 s), then pauses 250 ms before the next commit, so
+  it commits at most four times a second. Each commit forces every replica to
+  reconcile and makes the next request for every cached service token a
+  verification. The feeder appends a batch of 200
   `http.request_observed` events to the audit stream every second, through the
   production statements and lock, for the discovery projector. This is on top
   of the audit rows every request writes.
@@ -436,11 +440,11 @@ numbers describe that machine, not yours.
 | Field | What it is |
 | --- | --- |
 | `requests` | Completed requests, throughput, status counts (`200` and `503` only in a complete cell), client timeouts, `rate_503`, `rate_client_timeout`, and nearest-rank p50/p95/p99/max latency over all requests (`latency_ms`) and over served ones (`served_latency_ms`), overall and per request kind. |
-| `pool.replicas[].acquire` | Per replica, one row per `operation_class` and `error_class` whose count moved during the window. Each row has the exact count and sum delta, and the exporter's p50/p95/p99/max in milliseconds. |
+| `pool.replicas[].acquire` | Per replica, one row per `operation_class` and `error_class` whose count moved during the window. Each row has the exact count and sum delta, and the exporter's p50/p95/p99/max in milliseconds (see [Reading it](#reading-it) for how those are computed). |
 | `pool.acquire_counts` | Deployment-wide counts for all 56 class and outcome pairs, zeros included. A `cancelled` of zero is stated, not left out. |
 | `pool.replicas[]` | The `greengateway_database_pool_timeouts_total` and `audit_events_dropped_total` deltas. Also the largest `size`, smallest `available` and largest `waiting` sampled every 500 ms. |
 | `pool.connection_ceiling` | `replicas x DATABASE_POOL_MAX`, as configured. |
-| `database` | `pg_stat_activity` sampled every 500 ms, as max and mean per sample. It covers the runtime role's sessions (`runtime_backends`, `active`, `idle`, `idle_in_transaction`), every session in the database waiting on `Lock`, `LWLock` and `IO`, and ungranted `pg_locks` entries. It also has the longest lock wait seen and `pg_stat_database` deltas (`xact_commit`, `xact_rollback`, `deadlocks`, `blks_hit`, `blks_read`, `temp_files`). |
+| `database` | `pg_stat_activity` sampled every 500 ms, as max and mean per sample. It covers the runtime role's sessions (`runtime_backends`, `active`, `idle`, `idle_in_transaction`), every session in the database waiting on `Lock`, `LWLock` and `IO`, and ungranted `pg_locks` entries. It also has `longest_lock_wait_ms`: the longest time any session seen waiting on `Lock` had spent in its current statement (`clock_timestamp() - query_start`), which is an upper bound on that lock wait rather than the wait itself. Last come the `pg_stat_database` deltas (`xact_commit`, `xact_rollback`, `deadlocks`, `blks_hit`, `blks_read`, `temp_files`). |
 | `control_plane` | Contention cell only. Commit status counts and latency, and convergence: the time from a commit returning to every replica's `greengateway_security_revision_compiled` reaching the committed revision. Commits that never converge within 10 s are counted, not dropped. |
 | `projector` | Contention cell only. Events the feeder appended, the projector's checkpoint and applied-observation deltas, and the stream lag after the window. |
 
@@ -466,6 +470,16 @@ metrics.
   cluster start and warm-up. Read a row's `count` before its quantiles: a
   class with few samples, like `security_state_read` or
   `control_plane_write`, is dominated by those.
+- The acquisition quantiles are not nearest-rank. The exporter keeps each
+  series in a DDSketch (metrics-util's default summary, accurate to within
+  0.01 % of the true value). It renders p50, p95 and p99 as the representative
+  value of the sketch bucket each rank falls in, and `max_ms` as the exact
+  largest sample. So a row's p99 can sit just above its `max_ms` when both
+  fall in one bucket, and a row with a single sample in the window shows
+  p50 = p95 = p99 slightly above `max_ms`. That is the sketch's rounding, not
+  a disordered row; the gate orders p50, p95 and p99 against each other only.
+  The request, commit and convergence latencies are nearest-rank over the
+  generator's own samples, so they are exact and fully ordered.
 - Use `database` to tell queueing from a slow database. Lock waits show as
   `lock_waiting`, `ungranted_locks` and `longest_lock_wait_ms`. Contention on
   shared buffers and internal structures shows as `lwlock_waiting`.
@@ -478,34 +492,44 @@ metrics.
 ### What the gate checks
 
 The nightly fails on the matrix only when evidence is incomplete. It checks
-each of the following. Every declared cell is present. Each cell completed at
-least one request per worker and has no status other than `200` or `503`. No
-client transport errors occurred. Every request kind in the mix completed.
-Every replica's scrape carries `revision_check` acquisitions. Every class the
-mix exercises appears in the deployment-wide counts. The database was sampled
-at least three times. In the contention cell, at least one commit converged
-and the projector advanced. It checks the matrix too: at least two replica
-counts by two pool ceilings by both mixes, plus one contention cell.
+each of the following. Every declared cell is present. Each cell ran for at
+least its measured window, completed at least one request per worker, served
+at least one of them, and has no status other than `200` or `503`. No client
+transport errors occurred. Every request kind in the mix completed. Every
+replica's scrape carries `revision_check` acquisitions, whatever their outcome,
+and a nonzero pool `size` gauge. Every class the mix exercises appears in the
+deployment-wide counts. The database was sampled at least three times. In the
+contention cell, at least one commit converged and the projector advanced. It
+checks the matrix too: at least two replica counts by two pool ceilings by
+both mixes, plus one contention cell that runs the mixed load on a
+configuration a plain cell also ran.
 
 The gate never compares a latency, a refusal rate or a wait with a threshold.
 A complete cell in which half the requests were refused passes, because that
-refusal is the result being recorded. No capacity budget exists, and this
-matrix does not set one.
+refusal is the result being recorded. A replica whose every revision read was
+cancelled passes for the same reason. A cell that served nothing fails: every
+request refused or timed out for a whole measured window means the harness was
+broken, for example a hung upstream, not that the pool was measured. No
+capacity budget exists, and this matrix does not set one.
 
 ### Collecting the same numbers in a deployment
 
-None of this needs privileges a deployment does not already have:
+The gateway itself needs no new privilege for any of this. The database side
+needs at most one grant, to a separate monitoring role:
 
 - The acquisition series and the pool gauges come from each replica's
   `/metrics`, which needs no credential. Scrape each replica separately.
   Quantiles are per replica and cannot be averaged across replicas.
 - Any role can read `pg_locks` and `pg_stat_database`. Any role can also read
-  `pg_stat_activity`. The `state`, `wait_event_type` and `query` columns of
-  another role's sessions are visible only to superusers and members of
-  `pg_read_all_stats`, which is part of `pg_monitor`. Grant `pg_monitor` to a
-  separate monitoring role. The gateway's runtime role needs no grant for any
-  of this, and should not get one. The harness reads these views as the CI
-  superuser and keeps only aggregate counts:
+  `pg_stat_activity`, and sees the `state`, `wait_event_type` and `query`
+  columns of its own role's sessions, so the runtime role can already see how
+  its own connections are spending their time. The same columns for another
+  role's sessions, which lock waits usually involve, are visible only to
+  superusers and members of `pg_read_all_stats`, which is part of
+  `pg_monitor`. To see the whole database, grant `pg_monitor` to a separate
+  monitoring role. The gateway's runtime role should not get that grant. The
+  harness reads these views as the CI superuser and keeps only aggregate
+  counts:
 
   ```sql
   SELECT state, wait_event_type, count(*)

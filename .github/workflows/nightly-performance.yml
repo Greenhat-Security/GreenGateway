@@ -103,13 +103,17 @@ jobs:
         # rename. The suite treats a missing baseline as a pass and logs it,
         # so a silent failure here degrades to "absolute budgets only" rather
         # than to a false green.
+        #
+        # The baseline is the last successful scheduled run on main. A manual
+        # run of a branch measures that branch, and must not become the
+        # number the next night on main is compared with.
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -u
           mkdir -p "${RUNNER_TEMP}/baseline"
           run_id="$(gh api \
-            "repos/${GITHUB_REPOSITORY}/actions/workflows/nightly-performance.yml/runs?status=success&per_page=1" \
+            "repos/${GITHUB_REPOSITORY}/actions/workflows/nightly-performance.yml/runs?branch=main&event=schedule&status=success&per_page=1" \
             --jq '.workflow_runs[0].id' 2>/dev/null || true)"
           if [ -z "${run_id}" ] || [ "${run_id}" = "null" ]; then
             echo "no previous successful run; the regression rule is a pass on this run"
@@ -223,6 +227,7 @@ jobs:
           echo "measured the capacity matrix for ${elapsed}s"
 
       - name: Validate the capacity report
+        id: capacity_evidence
         # Rebuilds the uploaded report from an allowlist of bounded fields and
         # fails unless every declared cell is complete
         # (`docs/deployment/test-evidence.md`).
@@ -240,10 +245,11 @@ jobs:
 
       - name: Retain available capacity diagnostics
         # The producer's own report, rewritten after every cell, so a failed
-        # matrix still shows which cells were incomplete and why. It carries
-        # the same sanitized fields; absence is normal when the step never
-        # started.
-        if: ${{ always() && steps.capacity.outcome != 'success' }}
+        # matrix still shows which cells were incomplete and why, and a report
+        # the validator rejected still shows what it said. It is the
+        # producer's sanitized output as written, not the allowlisted
+        # rebuild; absence is normal when the step never started.
+        if: ${{ always() && (steps.capacity.outcome != 'success' || steps.capacity_evidence.outcome != 'success') }}
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: ha-capacity-diagnostics

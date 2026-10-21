@@ -15,13 +15,14 @@
 //! this repository and this file does not invent any. Every number is
 //! recorded and published; nothing is compared with a threshold. The one
 //! assertion is that every cell of the matrix produced complete evidence:
-//! enough requests, only the outcomes a capacity run can legitimately
-//! produce (`200`, or `503` from a dependency the gateway could not
-//! consult), the acquisition series scraped from every replica, the
-//! classes the mix exercises present in it, and the database sampled while
-//! the load ran. A cell that falls short is recorded with fixed reason
-//! codes and the test fails after the whole matrix has run, so the report
-//! shows every cell rather than only the first that broke.
+//! enough requests, at least one of them served, only the outcomes a
+//! capacity run can legitimately produce (`200`, or `503` from a
+//! dependency the gateway could not consult), the acquisition series and
+//! pool gauges scraped from every replica, the classes the mix exercises
+//! present in it, and the database sampled while the load ran. A cell
+//! that falls short is recorded with fixed reason codes and the test fails
+//! after the whole matrix has run, so the report shows every cell rather
+//! than only the first that broke.
 //!
 //! The numbers come from one shared, hosted runner with the database, the
 //! replicas and the load generator on the same machine. They identify how
@@ -68,9 +69,14 @@
 //!   quantiles are the exporter's own: no buckets are configured, so it
 //!   renders a summary over a rolling window of about a minute, and the
 //!   scrape after the load covers the whole cell, cluster start and warm-up
-//!   included. A series is reported only when its count moved during the
-//!   window, and the deployment-wide counts list every class and outcome,
-//!   so a zero `cancelled` is stated rather than implied by absence.
+//!   included. Its p50, p95 and p99 are DDSketch bucket representatives,
+//!   within 0.01 % of the true value, while its maximum is exact, so a p99
+//!   that shares the maximum's bucket can sit just above it (one sample in
+//!   the window renders p50 = p95 = p99 above `max`); the validator orders
+//!   those three against each other only. A series is reported only when
+//!   its count moved during the window, and the deployment-wide counts
+//!   list every class and outcome, so a zero `cancelled` is stated rather
+//!   than implied by absence.
 //! * **Pool gauges** (`size`, `available`, `waiting`) are sampled from the
 //!   same endpoint every [`SAMPLE_INTERVAL`] while the load runs.
 //! * **The database** is sampled on the same cadence from
@@ -90,7 +96,9 @@
 //! the cell incomplete and is not copied. `scripts/check-test-evidence.py
 //! capacity` re-checks all of this and rebuilds the uploaded file from an
 //! allowlist, so a field this file starts emitting by mistake does not
-//! reach the artifact.
+//! reach the `ha-capacity` artifact. The `ha-capacity-diagnostics`
+//! artifact, kept only when that report is incomplete or rejected, is this
+//! file's report as written: it relies on the rules above alone.
 //!
 //! This is a module of the `ha_performance` target, not a target of its
 //! own: it shares that target's harness, fixtures and nearest-rank
@@ -834,9 +842,10 @@ async fn convergence(cluster: &Cluster, names: &[String], revision: i64) -> Opti
     }
 }
 
-/// Commit a policy document every [`COMMIT_INTERVAL`] on alternating
-/// replicas until `stop_at`, timing each commit and how long every replica
-/// takes to compile it.
+/// Commit policy documents on alternating replicas until `stop_at`, timing
+/// each commit and how long every replica takes to compile it. The next
+/// commit starts [`COMMIT_INTERVAL`] after the last one converged (or gave
+/// up after [`CONVERGENCE_BOUND`]), so commits are at most four a second.
 async fn churn_control_plane(
     cluster: &Cluster,
     names: &[String],
@@ -1156,6 +1165,12 @@ fn request_evidence(
     if counted.client_errors > 0 {
         flag(reasons, "client_errors");
     }
+    // Refusals are results, but a cell that served nothing at all, for
+    // example one whose every request timed out against a hung upstream,
+    // measured a broken harness rather than the pool.
+    if !counted.statuses.contains_key("200") {
+        flag(reasons, "no_request_served");
+    }
     let refused = counted.statuses.get("503").copied().unwrap_or(0);
     let seconds = elapsed.as_secs_f64().max(f64::EPSILON);
     json!({
@@ -1211,14 +1226,25 @@ fn pool_evidence(
                 "max_ms": seconds_to_ms(series.max),
             }));
         }
+        // Every replica's poller and gates read the revision, so a scrape
+        // without a `revision_check` row did not read this replica's
+        // series. How those checkouts ended is the result, not the check: a
+        // saturated replica whose every read was cancelled is still a
+        // replica that was measured.
         if !rows
             .iter()
-            .any(|row| row["operation_class"] == "revision_check" && row["error_class"] == "none")
+            .any(|row| row["operation_class"] == "revision_check")
         {
             flag(reasons, "replica_metrics_missing");
         }
         let counter = |text: &str, name: &str| harness::metric_sum(text, name);
         let gauge = gauges[index];
+        // A replica that served a checkout holds at least one connection.
+        // `metric_sum` reads a missing gauge as zero, so zero here means the
+        // gauge was not read, not that the pool was empty.
+        if gauge.size_max < 1.0 {
+            flag(reasons, "pool_gauges_missing");
+        }
         replicas.push(json!({
             "replica": name,
             "pool_timeouts": delta(
@@ -1660,4 +1686,86 @@ fn request_evidence_flags_only_what_a_capacity_run_cannot_produce() {
         &mut reasons,
     );
     assert_eq!(reasons, vec!["too_few_requests"]);
+
+    // Refusals and timeouts are results, but a cell that served nothing at
+    // all measured a broken harness, not the pool.
+    let unserved: Vec<Outcome> = (0..CONCURRENCY)
+        .map(|index| match index % 2 {
+            0 => outcome(RequestKind::JwtProxy, Ended::Status(503), 250.0),
+            _ => outcome(RequestKind::JwtProxy, Ended::ClientTimeout, 10_000.0),
+        })
+        .collect();
+    let mut reasons = Vec::new();
+    let evidence = request_evidence(
+        &unserved,
+        Mix::JwtProxy,
+        Duration::from_secs(2),
+        &mut reasons,
+    );
+    assert_eq!(reasons, vec!["no_request_served"]);
+    assert_eq!(evidence["served_latency_ms"], Value::Null);
+}
+
+#[test]
+fn pool_evidence_needs_every_replicas_revision_reads_and_gauges_but_not_their_outcome() {
+    let plan = matrix()[0];
+    assert_eq!(plan.name(), "r2-p2-jwt_proxy");
+    let names = vec!["a".to_owned(), "b".to_owned()];
+    // One sample: the sketch renders p99 as its bucket's representative,
+    // just above the exact maximum.
+    let series = |class: &str, error: &str| {
+        let labels = format!("operation_class=\"{class}\",error_class=\"{error}\"");
+        format!(
+            "{ACQUIRE_FAMILY}{{{labels},quantile=\"0.99\"}} 0.2580251\n\
+             {ACQUIRE_FAMILY}{{{labels},quantile=\"1\"}} 0.258\n\
+             {ACQUIRE_FAMILY}_sum{{{labels}}} 0.258\n\
+             {ACQUIRE_FAMILY}_count{{{labels}}} 1\n"
+        )
+    };
+    let before = vec![String::new(), String::new()];
+    let front = series("rate_limit", "none") + &series("credential_check", "none");
+    // Replica b is saturated: every revision read it made was cancelled.
+    let after = vec![
+        front.clone() + &series("revision_check", "none"),
+        front.clone() + &series("revision_check", "cancelled"),
+    ];
+    let read = PoolGauges {
+        size_max: 2.0,
+        available_min: 0.0,
+        waiting_max: 3.0,
+    };
+
+    let mut reasons = Vec::new();
+    let evidence = pool_evidence(&plan, &names, &before, &after, &[read, read], &mut reasons);
+    assert!(
+        reasons.is_empty(),
+        "a cancelled read is a result: {reasons:?}"
+    );
+    let cancelled = evidence["replicas"][1]["acquire"]
+        .as_array()
+        .and_then(|rows| {
+            rows.iter()
+                .find(|row| row["operation_class"] == "revision_check")
+        })
+        .expect("replica b's revision reads are reported");
+    assert_eq!(cancelled["error_class"], "cancelled");
+    assert_eq!(cancelled["p99_ms"], json!(258.025));
+    assert_eq!(cancelled["max_ms"], json!(258.0));
+
+    // `metric_sum` reads a gauge that is not there as zero.
+    let mut reasons = Vec::new();
+    pool_evidence(
+        &plan,
+        &names,
+        &before,
+        &after,
+        &[read, PoolGauges::default()],
+        &mut reasons,
+    );
+    assert_eq!(reasons, vec!["pool_gauges_missing"]);
+
+    let silent = vec![after[0].clone(), front];
+    let mut reasons = Vec::new();
+    pool_evidence(&plan, &names, &before, &silent, &[read, read], &mut reasons);
+    assert_eq!(reasons, vec!["replica_metrics_missing"]);
 }

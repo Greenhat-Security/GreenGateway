@@ -266,10 +266,28 @@ def capacity_choice(value, choices):
 
 
 def capacity_latency(value):
+    """Nearest-rank quantiles and the maximum of the same samples: exact, so ordered."""
     if value is None:
         return None
     latency = {key: capacity_number(value[key]) for key in ('p50_ms', 'p95_ms', 'p99_ms', 'max_ms')}
     if not latency['p50_ms'] <= latency['p95_ms'] <= latency['p99_ms'] <= latency['max_ms']:
+        raise ValueError('capacity quantiles are out of order')
+    return latency
+
+
+def capacity_exporter_latency(value):
+    """The exporter's summary quantiles for one acquisition series.
+
+    metrics-exporter-prometheus renders a quantile below 1 as the
+    representative of its DDSketch bucket (metrics-util's default summary,
+    within 0.01 % of the true value) and quantile 1 as the exact maximum. A
+    p99 in the maximum's bucket can therefore sit just above the maximum,
+    and a series with one sample in the window renders p50 = p95 = p99
+    above it. Only the sketch's own quantiles are ordered; the maximum is
+    checked on its own.
+    """
+    latency = {key: capacity_number(value[key]) for key in ('p50_ms', 'p95_ms', 'p99_ms', 'max_ms')}
+    if not latency['p50_ms'] <= latency['p95_ms'] <= latency['p99_ms']:
         raise ValueError('capacity quantiles are out of order')
     return latency
 
@@ -283,12 +301,15 @@ def capacity_statuses(value, total):
     return statuses
 
 
-def capacity_requests(requests, mix, concurrency):
+def capacity_requests(requests, mix, method):
     completed = count(requests['completed'])
     timeouts, errors = count(requests['client_timeouts']), count(requests['client_errors'])
     statuses = capacity_statuses(requests['status_counts'], completed)
-    if completed < concurrency or errors or sum(statuses.values()) + timeouts != completed:
+    if completed < method['concurrency'] or errors or sum(statuses.values()) + timeouts != completed:
         raise ValueError('a capacity cell has too few requests or failures outside the capacity outcomes')
+    # Refusals are results; a cell that served nothing measured a broken harness.
+    if statuses.get('200', 0) == 0:
+        raise ValueError('a capacity cell served no request')
     rates = {'rate_503': statuses.get('503', 0) / completed, 'rate_client_timeout': timeouts / completed}
     for key, expected in rates.items():
         if abs(capacity_number(requests[key], 1) - expected) > 1e-6:
@@ -311,8 +332,11 @@ def capacity_requests(requests, mix, concurrency):
         raise ValueError('capacity request kinds do not add up to the cell')
     latency, served = capacity_latency(requests['latency_ms']), capacity_latency(requests['served_latency_ms'])
     duration = capacity_number(requests['duration_ms'])
-    if latency is None or duration == 0 or (served is None) != (statuses.get('200', 0) == 0):
+    if latency is None or served is None:
         raise ValueError('capacity request latency is missing')
+    # The load runs until the measured window ends, so the cell cannot be shorter.
+    if duration < method['measured_seconds'] * 1000:
+        raise ValueError('a capacity cell ended before its measured window')
     return {'completed': completed, 'duration_ms': duration,
             'throughput_rps': capacity_number(requests['throughput_rps']),
             'status_counts': statuses, 'client_timeouts': timeouts, 'client_errors': errors,
@@ -340,13 +364,16 @@ def capacity_pool(pool, replicas, pool_max, classes):
             totals[pair] = totals.get(pair, 0) + samples
             series.append({'operation_class': pair[0], 'error_class': pair[1], 'count': samples,
                            'sum_seconds': capacity_number(entry['sum_seconds']),
-                           **capacity_latency(entry)})
-        if not any(entry['operation_class'] == 'revision_check' and entry['error_class'] == 'none'
-                   for entry in series):
+                           **capacity_exporter_latency(entry)})
+        # Every replica reads the revision; how those reads ended is the result.
+        if not any(entry['operation_class'] == 'revision_check' for entry in series):
             raise ValueError('a replica left no acquisition evidence')
         size, available = count(row['size_max']), count(row['available_min'])
         if size > pool_max or available > pool_max:
             raise ValueError('capacity pool gauges exceed the pool ceiling')
+        # A replica that handed out a connection holds one: zero is a gauge that was not read.
+        if size == 0:
+            raise ValueError('a replica left no pool gauge evidence')
         rebuilt.append({'replica': row['replica'], 'pool_timeouts': count(row['pool_timeouts']),
                         'audit_events_dropped': count(row['audit_events_dropped']),
                         'size_max': size, 'available_min': available,
@@ -405,7 +432,7 @@ def capacity_projector(projector):
     return fields
 
 
-def capacity_cell(cell, name, concurrency):
+def capacity_cell(cell, name, method):
     if cell['name'] != name:
         raise ValueError('capacity cells do not match the declared matrix')
     if cell['complete'] is not True or cell['incomplete_reasons'] != []:
@@ -422,7 +449,7 @@ def capacity_cell(cell, name, concurrency):
         raise ValueError('only the contention cell carries concurrent work')
     return {'name': name, 'replicas': replicas, 'pool_max': pool_max, 'mix': mix,
             'contention': contention,
-            'requests': capacity_requests(cell['requests'], mix, concurrency),
+            'requests': capacity_requests(cell['requests'], mix, method),
             'pool': capacity_pool(cell['pool'], replicas, pool_max, classes),
             'database': capacity_database(cell['database']),
             'control_plane': capacity_control_plane(cell['control_plane']) if contention else None,
@@ -439,17 +466,21 @@ def capacity_summary(report):
             or not 1 <= len(matrix) <= MAX_CAPACITY_CELLS or len(set(map(str, matrix))) != len(matrix)
             or len(cells) != len(matrix)):
         raise ValueError('capacity evidence does not cover every declared cell')
-    rebuilt = [capacity_cell(cell, name, method['concurrency']) for cell, name in zip(cells, matrix)]
+    rebuilt = [capacity_cell(cell, name, method) for cell, name in zip(cells, matrix)]
     # The matrix itself: every replica count by every pool ceiling by both
-    # mixes, at least two of each, plus exactly one contention cell.
+    # mixes, at least two of each, plus exactly one contention cell. That
+    # cell runs the mixed load on a configuration a plain cell also ran, so
+    # the two differ only by the concurrent work.
     plain = [(cell['replicas'], cell['pool_max'], cell['mix']) for cell in rebuilt if not cell['contention']]
+    contended = [(cell['replicas'], cell['pool_max'], cell['mix']) for cell in rebuilt if cell['contention']]
     replica_counts, ceilings = {cell[0] for cell in plain}, {cell[1] for cell in plain}
     crossed = {(replicas, ceiling, mix) for replicas in replica_counts
                for ceiling in ceilings for mix in CAPACITY_MIXES}
     if (len(replica_counts) < 2 or len(ceilings) < 2 or len(plain) != len(crossed)
-            or set(plain) != crossed or len(rebuilt) - len(plain) != 1):
+            or set(plain) != crossed or len(contended) != 1
+            or contended[0] not in crossed or contended[0][2] != 'mixed_credentials'):
         raise ValueError('the capacity matrix does not cross two replica counts, two pool ceilings '
-                         'and both mixes plus one contention cell')
+                         'and both mixes plus one mixed contention cell')
     return {'schema_version': 1, 'producer': 'ha-capacity',
             'recorded_at': capacity_text(report['recorded_at'],
                                          r'\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d{1,9})?Z|unknown'),

@@ -470,8 +470,17 @@ class CapacityEvidenceGate(unittest.TestCase):
             'too few': lambda cell: cell['requests'].update({'completed': 10}),
             'rate drift': lambda cell: cell['requests'].update({'rate_503': 0.5}),
             'unordered': lambda cell: cell['requests']['latency_ms'].update({'p95_ms': 9.0}),
+            # Nearest-rank over the generator's own samples: p99 never exceeds the maximum.
+            'p99 above max': lambda cell: cell['requests']['latency_ms'].update({'p99_ms': 4.001}),
             'boolean count': lambda cell: cell['requests'].update({'client_timeouts': False}),
             'nan': lambda cell: cell['requests'].update({'throughput_rps': float('nan')}),
+            'nothing served': lambda cell: cell['requests'].update(
+                {'status_counts': {'503': cell['requests']['completed']}, 'rate_503': 1.0,
+                 'served_latency_ms': None}),
+            'every request timed out': lambda cell: cell['requests'].update(
+                {'status_counts': {}, 'client_timeouts': cell['requests']['completed'], 'rate_503': 0.0,
+                 'rate_client_timeout': 1.0, 'served_latency_ms': None}),
+            'shorter than the window': lambda cell: cell['requests'].update({'duration_ms': 19999.0}),
         }
         for name, mutate in mutations.items():
             with self.subTest(mutation=name):
@@ -497,6 +506,15 @@ class CapacityEvidenceGate(unittest.TestCase):
         def oversized_pool(cell):
             cell['pool']['replicas'][0]['size_max'] = cell['pool_max'] + 1
 
+        def unread_size_gauge(cell):
+            cell['pool']['replicas'][1]['size_max'] = 0
+
+        def unordered_sketch(cell):
+            cell['pool']['replicas'][0]['acquire'][0].update({'p50_ms': 2.5})
+
+        def unreadable_maximum(cell):
+            cell['pool']['replicas'][0]['acquire'][0].update({'max_ms': -1.0})
+
         def unexercised(cell):
             for row in cell['pool']['replicas']:
                 row['acquire'] = [entry for entry in row['acquire']
@@ -506,7 +524,7 @@ class CapacityEvidenceGate(unittest.TestCase):
                     entry['count'] = 0
 
         for mutate in (hostile_label, drop_replica, miscount, no_revision_check, oversized_pool,
-                       unexercised):
+                       unread_size_gauge, unordered_sketch, unreadable_maximum, unexercised):
             with self.subTest(mutation=mutate.__name__):
                 report = self.report()
                 mutate(report['cells'][1])
@@ -529,12 +547,69 @@ class CapacityEvidenceGate(unittest.TestCase):
         def stray_concurrent_work(report):
             report['cells'][0]['projector'] = report['cells'][8]['projector']
 
+        def convergence_above_its_maximum(report):
+            report['cells'][8]['control_plane']['convergence_ms'].update({'p99_ms': 4.001})
+
+        def contention_on_an_unmatched_ceiling(report):
+            report['cells'][8] = self.cell(2, 4, 'mixed_credentials', contention=True)
+            report['matrix'][8] = report['cells'][8]['name']
+
+        def contention_without_the_mixed_load(report):
+            report['cells'][8] = self.cell(2, 10, 'jwt_proxy', contention=True)
+            report['matrix'][8] = report['cells'][8]['name']
+
         for mutate in (unsampled, idle_projector, nothing_committed, never_converged,
-                       stray_concurrent_work):
+                       stray_concurrent_work, convergence_above_its_maximum,
+                       contention_on_an_unmatched_ceiling, contention_without_the_mixed_load):
             with self.subTest(mutation=mutate.__name__):
                 report = self.report()
                 mutate(report)
                 self.rejects(report)
+
+    def series(self, cell, replica, operation_class, error_class):
+        return next(entry for entry in cell['pool']['replicas'][replica]['acquire']
+                    if (entry['operation_class'], entry['error_class']) == (operation_class, error_class))
+
+    def recount(self, cell, operation_class, error_class):
+        total = sum(entry['count'] for row in cell['pool']['replicas'] for entry in row['acquire']
+                    if (entry['operation_class'], entry['error_class']) == (operation_class, error_class))
+        for entry in cell['pool']['acquire_counts']:
+            if (entry['operation_class'], entry['error_class']) == (operation_class, error_class):
+                entry['count'] = total
+
+    def test_exporter_quantiles_may_sit_just_above_their_maximum(self):
+        # The exporter renders quantiles below 1 as DDSketch bucket
+        # representatives and quantile 1 as the exact maximum. One cancelled
+        # revision check alone in the window, waited 258.0 ms, renders as this.
+        single = {'p50_ms': 258.025, 'p95_ms': 258.025, 'p99_ms': 258.025, 'max_ms': 258.0}
+        report = self.report()
+        cell = report['cells'][0]
+        self.series(cell, 0, 'revision_check', 'cancelled').update({'count': 1, 'sum_seconds': 0.258, **single})
+        # A clustered tail: p99 in the maximum's bucket, just above it.
+        self.series(cell, 1, 'rate_limit', 'none').update(
+            {'p50_ms': 40.0, 'p95_ms': 2590.627, 'p99_ms': 2590.811, 'max_ms': 2590.756})
+        self.recount(cell, 'revision_check', 'cancelled')
+        self.source.write_text(json.dumps(report))
+        evidence.validate('capacity', self.source, self.summary)
+        rows = json.loads(self.summary.read_text())['cells'][0]['pool']['replicas'][0]['acquire']
+        self.assertIn({'operation_class': 'revision_check', 'error_class': 'cancelled', 'count': 1,
+                       'sum_seconds': 0.258, **single}, rows)
+        # The generator's own latencies are nearest-rank and stay strictly ordered.
+        report['cells'][0]['requests']['latency_ms'] = dict(single)
+        self.rejects(report)
+
+    def test_a_replica_whose_revision_checks_were_all_cancelled_was_measured(self):
+        report = self.report()
+        cell = report['cells'][2]
+        row = cell['pool']['replicas'][0]
+        row['acquire'] = [entry for entry in row['acquire']
+                          if (entry['operation_class'], entry['error_class']) != ('revision_check', 'none')]
+        self.recount(cell, 'revision_check', 'none')
+        self.source.write_text(json.dumps(report))
+        evidence.validate('capacity', self.source, self.summary)
+        rows = json.loads(self.summary.read_text())['cells'][2]['pool']['replicas'][0]['acquire']
+        self.assertEqual([entry['error_class'] for entry in rows if entry['operation_class'] == 'revision_check'],
+                         ['cancelled'])
 
     def test_free_text_outside_its_shape_fails(self):
         for key, value in [('git_sha', 'not-a-sha'), ('recorded_at', 'yesterday'),
@@ -638,14 +713,25 @@ class EvidenceWorkflowGate(unittest.TestCase):
         self.assertEqual(upload['with']['if-no-files-found'], 'error')
         self.assertEqual(producing['env']['GATEWAY_TEST_CAPACITY_REPORT'],
                          '${{ runner.temp }}/ha/capacity-raw.json')
-        # Best-effort diagnostics only when the producer did not succeed.
-        self.assertEqual(diagnostics['if'], "${{ always() && steps.capacity.outcome != 'success' }}")
+        # Best-effort diagnostics only when the producer did not succeed or
+        # its report was rejected, so a red night always leaves something.
+        self.assertEqual(checking['id'], 'capacity_evidence')
+        self.assertEqual(diagnostics['if'], "${{ always() && (steps.capacity.outcome != 'success'"
+                                            " || steps.capacity_evidence.outcome != 'success') }}")
         self.assertEqual(diagnostics['with']['if-no-files-found'], 'ignore')
         self.assertNotEqual(diagnostics['with']['name'], upload['with']['name'])
         self.assertLess(steps.index(producing), steps.index(checking))
         self.assertLess(steps.index(checking), steps.index(upload))
+        self.assertLess(steps.index(upload), steps.index(diagnostics))
         for step in (budgets, producing, checking, upload, diagnostics):
             self.assertNotIn('continue-on-error', step)
+
+    def test_nightly_baseline_is_the_last_scheduled_night_on_main(self):
+        # A manual run on a branch must never become the next night's budget baseline.
+        steps = self.nightly['jobs']['ha-performance']['steps']
+        baseline = next(step for step in steps if step.get('name') == "Fetch the previous night's report")
+        self.assertIn('runs?branch=main&event=schedule&status=success&per_page=1', baseline['run'])
+        self.assertNotIn('continue-on-error', baseline)
 
 
 if __name__ == '__main__':
