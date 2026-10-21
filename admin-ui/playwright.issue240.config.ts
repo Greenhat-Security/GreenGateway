@@ -11,7 +11,7 @@ const liveServer = path.join(
   'issue-240-live-server.mjs',
 );
 const fixtureCommand = `"${process.execPath}" "${liveServer}"`;
-// A real HTTPS gateway with admin sessions and a disposable OIDC provider.
+// Real HTTPS gateways with admin sessions behind a disposable OIDC provider.
 const adminSessionServer = path.join(
   adminUiRoot,
   'tests',
@@ -52,9 +52,8 @@ export default defineConfig({
       name: 'admin-session-real-gateway',
       command: `"${process.execPath}" "${adminSessionServer}"`,
       cwd: adminUiRoot,
-      url: 'https://127.0.0.1:43212/readyz',
-      // The fixture's certificate is generated for this run.
-      ignoreHTTPSErrors: true,
+      // Ready once every gateway answers over TLS verified against the run's CA.
+      url: 'http://127.0.0.1:43211/__fixture/ready',
       reuseExistingServer: false,
       timeout: 300_000,
       stdout: 'pipe',
