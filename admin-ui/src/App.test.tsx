@@ -566,6 +566,45 @@ describe('AdminShell', () => {
     expect(screen.queryByRole('button', { name: 'Use bearer token' })).toBeNull();
   });
 
+  it.each([false, true])('signs in with a bearer token that answers after admin requests were rejected (StrictMode %s)', async (strict) => {
+    const server = bearerCompletionServer();
+    vi.stubGlobal('fetch', server.fetch);
+    window.history.replaceState(null, '', '/admin/#/auth/complete?code=code&state=state');
+    const shell = <MemoryRouter><AdminShell /></MemoryRouter>;
+
+    render(strict ? <StrictMode>{shell}</StrictMode> : shell);
+    // The dashboard asks for permissions before the gateway's token exchange
+    // answers, and the gateway rejects that request without a token.
+    await waitFor(() => expect(isAdminUnauthenticated()).toBe(true));
+    await waitFor(() => expect(server.completions()).toHaveLength(1));
+    await act(async () => { server.complete(); });
+
+    await screen.findByText('Signed in with SSO in this tab until reload or session expiry.');
+    expect(getMemoryToken() === server.token).toBe(true);
+    expect(isBearerSelected()).toBe(true);
+    expect(isAdminUnauthenticated()).toBe(false);
+    expect(await screen.findByLabelText('Endpoint')).toBeTruthy();
+    expect(server.completions()).toHaveLength(1);
+    expect(document.documentElement.outerHTML.includes(server.token)).toBe(false);
+  });
+
+  it('does not apply a bearer SSO token that answers after the page was hidden', async () => {
+    const server = bearerCompletionServer();
+    vi.stubGlobal('fetch', server.fetch);
+    window.history.replaceState(null, '', '/admin/#/auth/complete?code=code&state=state');
+    render(<MemoryRouter><AdminShell /></MemoryRouter>);
+    // Already signed out by the rejected permissions request.
+    await waitFor(() => expect(isAdminUnauthenticated()).toBe(true));
+    await waitFor(() => expect(server.completions()).toHaveLength(1));
+
+    await act(async () => { window.dispatchEvent(new PageTransitionEvent('pagehide', { persisted: true })); });
+    await act(async () => { server.complete(); });
+
+    await screen.findByText('SSO completion discarded because the session changed. Start sign-in again.');
+    expect(getMemoryToken()).toBeNull();
+    expect(isBearerSelected()).toBe(false);
+  });
+
   it.each([
     ['a mismatched logout route', () => jsonResponse({ version: '0.5.0', admin_login_configured: true, admin_session: { ...ADMIN_SESSION, logout_url: '/v1/other/auth/logout' } })],
     ['a non-cookie completion mode', () => jsonResponse({ version: '0.5.0', admin_login_configured: true, admin_session: { ...ADMIN_SESSION, completion_mode: 'bearer' } })],
@@ -1399,6 +1438,32 @@ function cookieSessionServer({
     cookieGrants: () => cookieGrants,
     completions: () => calls('/v1/admin/auth/callback'),
     logouts: () => calls('/v1/admin/auth/logout'),
+  };
+}
+
+/**
+ * A gateway without sessions whose held completion answers with a bearer
+ * token, and which rejects admin requests that do not carry that token.
+ */
+function bearerCompletionServer() {
+  const token = `test-${crypto.randomUUID()}`;
+  let release!: () => void;
+  const completion = new Promise<Response>((resolve) => {
+    release = () => resolve(jsonResponse({ access_token: token }));
+  });
+  const fetch = sessionFetchMock({
+    '/version': () => jsonResponse({ version: '0.5.0', admin_login_configured: true }),
+    '/v1/admin/capabilities': (init) => new Headers(init?.headers).get('Authorization') === `Bearer ${token}`
+      ? jsonResponse({ permissions: ['admin:traffic:read'] })
+      : jsonResponse({ error: 'unauthenticated' }, 401),
+    '/v1/admin/traffic/endpoints': () => jsonResponse({ endpoints: [], next_cursor: null }),
+    '/v1/admin/auth/callback': () => completion,
+  });
+  return {
+    fetch,
+    token,
+    complete: () => release(),
+    completions: () => fetch.mock.calls.filter(([url]) => url === '/v1/admin/auth/callback'),
   };
 }
 
