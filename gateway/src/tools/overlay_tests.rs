@@ -1670,10 +1670,12 @@ fn agent_fragments_over_the_exact_comparison_budget_fail_before_compiling() {
     // `1e-99999` is eight bytes, but with exact comparison jsonschema would
     // parse it into a 100,000-digit fraction while compiling the fragment.
     // Each fragment must be refused by the budget before any compile runs.
+    // `validate` now refuses the whole document on the budget first, so the
+    // per-fragment check in front of each compile is exercised directly.
     let wide: Value = serde_json::from_str(r#"{"type": "number", "minimum": 1e-99999}"#)
         .expect("test fragment should parse");
 
-    let error = validate(&json!({
+    let document = json!({
         "schema_version": "0.1.0",
         "shapes": {
             "wide": {
@@ -1681,24 +1683,85 @@ fn agent_fragments_over_the_exact_comparison_budget_fail_before_compiling() {
                 "wire": {"/value": {"from": "value"}}
             }
         }
-    }))
-    .expect_err("a shape agent fragment over the budget must fail");
+    });
+    let overlay: OverlayDocument =
+        serde_json::from_value(document.clone()).expect("authoring model parses");
     assert!(
-        error.problems.iter().any(|problem| {
+        document_problems(&overlay).iter().any(|problem| {
             problem.path.ends_with("/agent/value")
                 && problem.message.contains("cost more to compare exactly")
         }),
+        "a shape agent fragment over the budget must fail before it compiles"
+    );
+    let error = validate(&document).expect_err("a shape agent fragment over the budget must fail");
+    assert!(
+        error
+            .problems
+            .iter()
+            .any(|problem| problem.message.contains("cost more to compare exactly")),
         "{error}"
     );
 
     let mut document = composite_overlay();
     document["composites"]["create_note_for_records"]["input"]["properties"]["title"] = wide;
+    let overlay: OverlayDocument =
+        serde_json::from_value(document.clone()).expect("authoring model parses");
+    assert!(
+        document_problems(&overlay).iter().any(|problem| {
+            problem.path.ends_with("/input/properties/title")
+                && problem.message.contains("cost more to compare exactly")
+        }),
+        "a composite fragment over the budget must fail before it compiles"
+    );
     let error = validate(&document).expect_err("a composite fragment over the budget must fail");
     assert!(
         error
             .problems
             .iter()
             .any(|problem| problem.message.contains("cost more to compare exactly")),
+        "{error}"
+    );
+}
+
+#[test]
+fn overlay_numbers_over_the_exact_comparison_budget_fail_before_the_overlay_schema() {
+    // The shipped overlay schema checks `cache.ttl_secs` against `type:
+    // integer`, `minimum` and `maximum`, and with exact comparison that work
+    // grows with the square of the number's span: the 79-byte overlay with
+    // `1e-99999` held a worker for minutes. The document must be refused by
+    // the budget before the overlay schema sees it, so the only problem is
+    // the budget's, reported at the root.
+    let overlay = r#"{"schema_version":"0.1.0","enum_sources":{"a":{"cache":{"ttl_secs":TTL}}}}"#;
+    for literal in ["1e-2000", "1e-99999"] {
+        let document: Value = serde_json::from_str(&overlay.replace("TTL", literal))
+            .expect("test overlay should parse");
+        let error = validate(&document).expect_err("an overlay over the budget must fail");
+        assert_eq!(error.problems.len(), 1, "{literal}: {error}");
+        assert_eq!(error.problems[0].path, "/", "{literal}: {error}");
+        assert!(
+            error.problems[0]
+                .message
+                .contains("cost more to compare exactly"),
+            "{literal}: {error}"
+        );
+    }
+
+    // The budget is spent across the whole document: 64 sources whose
+    // numbers each fit cannot all be compared.
+    let sources = (0..64)
+        .map(|index| format!(r#""s{index}":{{"cache":{{"ttl_secs":1e-200}}}}"#))
+        .collect::<Vec<_>>()
+        .join(",");
+    let document: Value = serde_json::from_str(&format!(
+        r#"{{"schema_version":"0.1.0","enum_sources":{{{sources}}}}}"#
+    ))
+    .expect("test overlay should parse");
+    let error = validate(&document).expect_err("an overlay over the budget must fail");
+    assert_eq!(error.problems.len(), 1, "{error}");
+    assert!(
+        error.problems[0]
+            .message
+            .contains("cost more to compare exactly"),
         "{error}"
     );
 }
