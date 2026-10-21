@@ -26,7 +26,7 @@ pods x DATABASE_POOL_MAX  +  headroom  <=  max_connections - superuser_reserved_
 | An operator's `psql` | 1-2 | at 3am, which is the moment the ceiling matters |
 | Anything else that connects to this server | whatever it opens | if the server is shared |
 
-Physical replication connections (a standby, `pg_basebackup`) take `max_wal_senders` slots on PostgreSQL 12 and later, not `max_connections` slots, so they are not on this list.
+Replication connections (a standby, `pg_basebackup`, a logical subscriber) take `max_wal_senders` slots on PostgreSQL 12 and later, not `max_connections` slots, so they are not on this list.
 
 The maintenance leader's pass session comes out of that replica's own `DATABASE_POOL_MAX`, so it does not add to the total — but it does mean the leader has one fewer connection for requests than its peers while a pass runs. With a pool of 10 that is 10%; with a pool of 2 it is half, which is a reason not to set the pool that low.
 
@@ -77,7 +77,7 @@ A pooler (PgBouncer and friends) is allowed only in **session** pooling mode. Tr
 The number to multiply by is the most gateway pods that can hold a pool at the same moment:
 
 - **The autoscaler's maximum.** A HorizontalPodAutoscaler takes the Deployment to `maxReplicas` whenever its metric says so, without anyone redoing this page. Budget `maxReplicas`, or `spec.replicas` if that is larger.
-- **Rollout surge.** A Kubernetes `RollingUpdate` starts up to `maxSurge` new pods (25% by default, rounded up) before old ones leave, and each opens its own pool while the old ones still hold theirs. `Recreate` adds none, and neither does a StatefulSet, which replaces pods one at a time. Docker Compose adds none unless a service's `deploy.update_config.order` is `start-first`.
+- **Rollout surge.** A Kubernetes `RollingUpdate` starts up to `maxSurge` new pods (25% by default, rounded up) before old ones leave, and each opens its own pool while the old ones still hold theirs. `Recreate` adds none, and neither does a StatefulSet, which replaces pods one at a time. `docker compose up` replaces a service's containers in place and adds none; a Swarm stack whose `deploy.update_config.order` is `start-first` starts each new task before stopping the old one.
 - **Pods still draining.** A terminating pod keeps its connections until it exits, up to its shutdown drain and timeout, and Kubernetes does not count it against `maxSurge`. Keep some spare for a rollout that replaces pods faster than they drain.
 - **Hand scaling.** `kubectl scale` and `docker compose up --scale` change the count without touching the files a review sees. Redo the arithmetic first.
 

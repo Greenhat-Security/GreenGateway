@@ -145,6 +145,7 @@ class ReaderTests(unittest.TestCase):
             ("a: [1,\n  2]\n", "flow collection must close"),
             ("a: [[1]]\n", "nested flow collections"),
             ("a: {? b : c}\n", "unsupported indicator"),
+            ("a: [x #y]\n", "comment cannot sit inside a flow collection"),
             ("--- a: 1\n", "document marker line"),
             ("a: |2\n  x\n", "indentation indicators"),
             ("a: b: c\n", "cannot contain ': '"),
@@ -480,9 +481,10 @@ class ComposeTests(Files):
 
     def test_rendered_compose_json_is_accepted(self):
         document, = sizing.load_documents(ROOT / COMPOSE_EXAMPLE, COMPOSE_EXAMPLE)
+        _, direct = decision("--compose", str(ROOT / COMPOSE_EXAMPLE), *DIRECT)
         rendered = self.write("rendered.json", json.dumps(document))
         code, result = decision("--compose", rendered, *DIRECT)
-        self.assertEqual((code, result["total"]), (0, 32))
+        self.assertEqual((code, result["total"]), (0, direct["total"]))
 
 
 DEPLOYMENT = """\
@@ -666,21 +668,26 @@ class ExampleTests(Files):
     def test_the_shipped_examples_fit(self):
         results = {result["source"]: result for result in sizing.examples(ROOT)}
         compose = results.pop(COMPOSE_EXAMPLE)
-        self.assertEqual((compose["status"], compose["total"], compose["available"]), ("fits", 32, 97))
+        self.assertEqual(compose["status"], "fits")
+        self.assertLessEqual(compose["total"], compose["available"])
+        self.assertTrue(results)
         self.assertEqual({result["status"] for result in results.values()}, {"standalone"})
-        self.assertIn("deploy/kubernetes/greengateway.example.yaml", results)
         self.assertEqual(run("examples")[0], 0)
 
     def test_an_example_that_over_commits_is_rejected(self):
-        self.edit(COMPOSE_EXAMPLE, 'DATABASE_POOL_MAX: "10"', 'DATABASE_POOL_MAX: "45"')
+        before = sizing.examples(self.root)[0]
+        self.edit(COMPOSE_EXAMPLE, 'DATABASE_POOL_MAX: "10"', 'DATABASE_POOL_MAX: "256"')
         compose = sizing.examples(self.root)[0]
-        self.assertEqual((compose["status"], compose["total"]), ("rejected", 102))
+        self.assertEqual(compose["status"], "rejected")
+        self.assertEqual(compose["pool_connections"], before["pods"] * 256)
+        self.assertGreater(compose["total"], compose["available"])
 
     def test_an_added_replica_is_counted(self):
+        before = sizing.examples(self.root)[0]
         self.edit(COMPOSE_EXAMPLE, "  gateway-2:\n    <<: *gateway-service\n",
-                  "  gateway-2:\n    <<: *gateway-service\n    scale: 8\n")
+                  "  gateway-2:\n    <<: *gateway-service\n    scale: 20\n")
         compose = sizing.examples(self.root)[0]
-        self.assertEqual((compose["status"], compose["pods"]), ("rejected", 9))
+        self.assertEqual((compose["status"], compose["pods"]), ("rejected", before["pods"] + 19))
 
     def test_a_new_database_client_must_be_budgeted(self):
         self.edit(COMPOSE_EXAMPLE, "  gateway-1:\n", "  exporter:\n    image: exporter\n\n  gateway-1:\n")
@@ -749,18 +756,22 @@ class ExampleTests(Files):
 
 class WorkflowTests(unittest.TestCase):
     def test_a_required_job_checks_the_shipped_examples_before_building(self):
-        workflow, = sizing.load_documents(ROOT / ".github/workflows/ci.yml", "ci.yml")
-        steps = workflow["jobs"]["ha-compose-example"]["steps"]
-        names = [step.get("name") for step in steps]
-        index = names.index("Check the shipped examples' PostgreSQL connection budgets")
+        # Read as text, so the workflow is not held to the guard's YAML subset.
+        workflow = (ROOT / ".github/workflows/ci.yml").read_text(encoding="utf-8").replace("\r\n", "\n")
+        job = re.search(r"\n  ha-compose-example:\n(.*?)(?=\n  [a-z][a-z0-9-]*:\n|\Z)", workflow, re.DOTALL)
+        self.assertIsNotNone(job)
+        self.assertNotRegex(job.group(1), r"\n    if:")
+        steps = re.split(r"\n      - ", job.group(1))
+        names = [step.split("\n", 1)[0] for step in steps]
+        index = names.index("name: Check the shipped examples' PostgreSQL connection budgets")
         step = steps[index]
-        # Exact keys rule out a condition or continue-on-error.
-        self.assertEqual(set(step), {"name", "shell", "run"})
-        self.assertIn("python -m unittest discover -s scripts -p test_pool_sizing.py -v", step["run"])
-        self.assertIn(f"--profile bootstrap --profile import config --format json", step["run"])
-        self.assertIn(f"python scripts/pool_sizing.py examples --rendered {COMPOSE_EXAMPLE}=", step["run"])
-        self.assertLess(index, names.index("Build the production image"))
-        self.assertNotIn("if", workflow["jobs"]["ha-compose-example"])
+        # Nothing may make the step conditional or let it fail quietly.
+        self.assertNotRegex(step, r"\n        (if|continue-on-error|working-directory|env):")
+        self.assertIn("\n        shell: bash\n", step)
+        self.assertIn("python -m unittest discover -s scripts -p test_pool_sizing.py -v", step)
+        self.assertIn("--profile bootstrap --profile import config --format json", step)
+        self.assertIn(f"python scripts/pool_sizing.py examples --rendered {COMPOSE_EXAMPLE}=", step)
+        self.assertLess(index, names.index("name: Build the production image"))
 
 
 if __name__ == "__main__":

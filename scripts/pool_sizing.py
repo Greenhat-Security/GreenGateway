@@ -413,6 +413,8 @@ class _Yaml:
         while end < len(text) and text[end] not in stops:
             end += 1
         plain = text[index:end].strip(" \t")
+        if re.search(r"[ \t]#", plain):
+            self.fail("a comment cannot sit inside a flow collection")
         if not key and re.search(r":([ \t]|$)", plain):
             self.fail("a flow scalar cannot contain ': '; quote it")
         return (None if plain in ("", "~", "null", "Null", "NULL") else plain), end
