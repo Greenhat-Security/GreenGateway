@@ -20,13 +20,22 @@
 //!   `WHERE`, so it either finds a live row and touches it, or finds
 //!   nothing and reports why -- there is no window in which it touches a
 //!   row a revoke has closed.
+//! - **Every committed rotate and revoke names who made it.** Beside its
+//!   outbox row, each writes one `service_token_change_evidence` row
+//!   (migration 18): actor, action, generated event and operation IDs, the
+//!   token's row revision before and after, the shared revision the change
+//!   took and the database clock's commit time. It has no foreign key, so
+//!   it outlives the token row, and it holds no token material. If it
+//!   cannot be written, the change rolls back; a repeat revoke or a refused
+//!   rotate writes none.
 //!
 //! Lock order, identical in every mutating path so no two paths can
 //! deadlock: (1) `service_token_state_revision` `FOR UPDATE`, which
 //! serializes token mutations against each other; (2) the token row
 //! `FOR UPDATE`; (3) `security_revision_state`, always last. No transaction
 //! in the tree takes another store's singleton after this one, so the
-//! order composes with the connection store's.
+//! order composes with the connection store's. The evidence insert comes
+//! after all three and locks no shared row.
 //!
 //! Errors carry a classification and a static operation label only -- no
 //! SQL, no values, no token material. The plaintext token exists in one
@@ -66,6 +75,7 @@ const OPERATION_ROTATE: &str = "service_token_rotate";
 const OPERATION_VERIFY: &str = "service_token_verify";
 const OPERATION_TOUCH: &str = "service_token_touch_last_used";
 const OPERATION_STATE_REVISION: &str = "service_token_state_revision_read";
+const OPERATION_CHANGE_EVIDENCE: &str = "service_token_change_evidence_append";
 
 /// The outbox label. `from_version`/`to_version` carry the token row's
 /// `revision` (a create is `NULL -> 1`), and `resource_id` the token id.
@@ -300,7 +310,15 @@ impl ServiceTokenStore for PostgresServiceTokenStore {
             .map(|row| row.record))
     }
 
-    async fn revoke(&self, id: &str) -> Result<Option<TokenRecord>, RepositoryError> {
+    async fn revoke(
+        &self,
+        id: &str,
+        actor_user_id: &str,
+    ) -> Result<Option<TokenRecord>, RepositoryError> {
+        validate_change_actor(OPERATION_REVOKE, actor_user_id)?;
+        // One logical operation, minted once per call and never
+        // regenerated: its evidence row carries it.
+        let operation_id = uuid::Uuid::new_v4();
         let client = checkout(&self.pool, CheckoutClass::ControlPlaneWrite).await?;
         begin_mutation(&client, OPERATION_REVOKE).await?;
         let outcome: Result<Option<TokenRecord>, RepositoryError> = async {
@@ -308,7 +326,8 @@ impl ServiceTokenStore for PostgresServiceTokenStore {
                 return Ok(None);
             };
             // Idempotent and monotonic: the first revoked_at is the one that
-            // stands, and a repeat neither rewrites it nor spends a revision.
+            // stands, and a repeat neither rewrites it, spends a revision,
+            // nor records evidence of a change that did not happen.
             if current.record.revoked_at.is_some() {
                 return Ok(Some(current.record));
             }
@@ -336,13 +355,32 @@ impl ServiceTokenStore for PostgresServiceTokenStore {
                 revoked.revision,
             )
             .await?;
+            record_change_evidence(
+                &client,
+                &ChangeEvidence {
+                    operation_id,
+                    action: crate::auth::tokens::TOKEN_CHANGE_ACTION_REVOKE,
+                    token_id: id,
+                    prior_version: current.revision,
+                    new_version: revoked.revision,
+                    security_revision,
+                    actor_user_id,
+                },
+            )
+            .await?;
             Ok(Some(revoked.record))
         }
         .await;
         finish(&client, OPERATION_REVOKE, outcome).await
     }
 
-    async fn rotate(&self, id: &str) -> Result<Option<CreatedToken>, RepositoryError> {
+    async fn rotate(
+        &self,
+        id: &str,
+        actor_user_id: &str,
+    ) -> Result<Option<CreatedToken>, RepositoryError> {
+        validate_change_actor(OPERATION_ROTATE, actor_user_id)?;
+        let operation_id = uuid::Uuid::new_v4();
         let plaintext_token = generate_plaintext_token()
             .map_err(|error| map_helper_error(OPERATION_ROTATE, error))?;
         let token_hash = hash_token(&plaintext_token);
@@ -388,6 +426,19 @@ impl ServiceTokenStore for PostgresServiceTokenStore {
                 id,
                 Some(current.revision),
                 rotated.revision,
+            )
+            .await?;
+            record_change_evidence(
+                &client,
+                &ChangeEvidence {
+                    operation_id,
+                    action: crate::auth::tokens::TOKEN_CHANGE_ACTION_ROTATE,
+                    token_id: id,
+                    prior_version: current.revision,
+                    new_version: rotated.revision,
+                    security_revision,
+                    actor_user_id,
+                },
             )
             .await?;
             Ok(Some(rotated.record))
@@ -606,6 +657,75 @@ async fn record_revision(
         )
         .await
         .map_err(|error| classify_query(error, operation))?;
+    Ok(())
+}
+
+/// Refuse an unattributable change before any connection is taken: there
+/// is no evidence to record for it. An authenticated principal always
+/// passes; migration 18's CHECK is the backstop. Plain `InvalidData`, not a
+/// parameter error: no caller input can produce it.
+fn validate_change_actor(
+    operation: &'static str,
+    actor_user_id: &str,
+) -> Result<(), RepositoryError> {
+    if crate::auth::tokens::is_valid_change_actor(actor_user_id) {
+        Ok(())
+    } else {
+        Err(invalid_data(operation))
+    }
+}
+
+/// One committed change's evidence: identifiers, revisions and the actor,
+/// never the plaintext, hash, prefix or scopes of the token it describes.
+struct ChangeEvidence<'a> {
+    operation_id: uuid::Uuid,
+    action: &'static str,
+    token_id: &'a str,
+    prior_version: i64,
+    new_version: i64,
+    security_revision: i64,
+    actor_user_id: &'a str,
+}
+
+/// Append one evidence row inside the caller's transaction, after its
+/// outbox row. The row's `event_id` is minted here, once; `committed_at`
+/// is the database clock's. Any failure is returned for the caller to roll
+/// back, so the change never commits without it -- and is never reported
+/// as `Conflict`, which on rotate means exactly "the token is revoked".
+async fn record_change_evidence(
+    client: &deadpool_postgres::Object,
+    evidence: &ChangeEvidence<'_>,
+) -> Result<(), RepositoryError> {
+    let event_id = uuid::Uuid::new_v4().to_string();
+    let operation_id = evidence.operation_id.to_string();
+    client
+        .execute(
+            r#"
+            INSERT INTO greengateway.service_token_change_evidence (
+                event_id, operation_id, actor_user_id, action, token_id,
+                prior_version, new_version, security_revision
+            ) VALUES ($1::text::uuid, $2::text::uuid, $3, $4, $5, $6, $7, $8)
+            "#,
+            &[
+                &event_id,
+                &operation_id,
+                &evidence.actor_user_id,
+                &evidence.action,
+                &evidence.token_id,
+                &evidence.prior_version,
+                &evidence.new_version,
+                &evidence.security_revision,
+            ],
+        )
+        .await
+        .map_err(|error| {
+            let classified = classify_query(error, OPERATION_CHANGE_EVIDENCE);
+            if classified.kind() == RepositoryErrorKind::Conflict {
+                RepositoryError::new(RepositoryErrorKind::Internal, OPERATION_CHANGE_EVIDENCE)
+            } else {
+                classified
+            }
+        })?;
     Ok(())
 }
 

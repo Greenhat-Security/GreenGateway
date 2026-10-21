@@ -63,6 +63,42 @@
     {
       "if": {
         "properties": {
+          "authentication": {
+            "properties": {
+              "type": {
+                "const": "delegated_issuer_token"
+              }
+            },
+            "required": [
+              "type"
+            ]
+          }
+        },
+        "required": [
+          "authentication"
+        ]
+      },
+      "then": {
+        "required": [
+          "caller_assertion"
+        ],
+        "properties": {
+          "kind": {
+            "const": "http_api"
+          },
+          "caller_assertion": {
+            "properties": {
+              "bind_request": {
+                "const": false
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
           "enabled": {
             "const": true
           }
@@ -111,6 +147,20 @@
                   "properties": {
                     "type": {
                       "const": "oauth2_client_credentials"
+                    }
+                  }
+                },
+                "then": {
+                  "required": [
+                    "client_secret_id"
+                  ]
+                }
+              },
+              {
+                "if": {
+                  "properties": {
+                    "type": {
+                      "const": "delegated_issuer_token"
                     }
                   }
                 },
@@ -322,6 +372,67 @@
             },
             "client_auth_method": {
               "const": "client_secret_basic"
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "description": "The calling user's own upstream token, obtained per caller from a trusted issuer by OAuth 2.0 token exchange (RFC 8693) and injected as Authorization: Bearer, instead of one service credential shared by every caller. On a cache miss the gateway POSTs grant_type urn:ietf:params:oauth:grant-type:token-exchange to token_exchange_url, authenticated with client_secret_basic, with requested_token_type urn:ietf:params:oauth:token-type:access_token and, as the subject token (subject_token_type urn:ietf:params:oauth:token-type:jwt), a JWT signed with this Connection's caller_assertion key naming the validated caller exactly as a caller assertion does, which the issuer verifies against /.well-known/caller-assertion-jwks.json. The caller's own inbound bearer token is never forwarded. The issued token is cached per caller until shortly before its expires_in, for at most 900 seconds. A call with no principal, a service token included, is refused with delegated_token_no_principal; an issuer refusal with delegated_token_denied; any other exchange failure with delegated_token_exchange_failed. Requires kind http_api and a caller_assertion block without bind_request; the assertion is sent to the issuer only, never upstream. Only manual HTTP tool calls are served.",
+          "required": [
+            "type",
+            "token_exchange_url",
+            "client_id",
+            "subject_token_source"
+          ],
+          "properties": {
+            "type": {
+              "const": "delegated_issuer_token"
+            },
+            "token_exchange_url": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 2048,
+              "format": "uri",
+              "pattern": "^https://",
+              "description": "The issuer's RFC 8693 endpoint. HTTPS only, without userinfo, query or fragment, and checked against the egress allowlist on every exchange before any secret is read."
+            },
+            "client_id": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 256
+            },
+            "client_secret_id": {
+              "$ref": "#/$defs/stable_id",
+              "description": "Secret alias of the client secret the gateway authenticates to the issuer with, resolved with the token_exchange_client_secret purpose, so it comes from an operator alias or an external secret provider, never the encrypted local store. No other field of any Connection may bind the same alias. Required once the Connection is enabled."
+            },
+            "requested_scopes": {
+              "type": "array",
+              "maxItems": 16,
+              "uniqueItems": true,
+              "items": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 128,
+                "pattern": "^\\S+$"
+              },
+              "description": "Sent as the space-separated scope parameter. Prefer read-only scopes: the issuer hands out exactly what is asked for."
+            },
+            "audience": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 512,
+              "description": "RFC 8693 audience: the logical name of the upstream the token is for."
+            },
+            "resource": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 512,
+              "description": "RFC 8693 resource: the URI of the upstream the token is for."
+            },
+            "subject_token_source": {
+              "const": "caller_assertion",
+              "description": "What names the caller to the issuer. caller_assertion, the only value, is a JWT the gateway signs with this Connection's caller_assertion key."
             }
           }
         }

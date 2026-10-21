@@ -49,7 +49,7 @@ fn this_binary_advertises_a_bounded_canonical_set_it_recognizes() {
     );
 }
 
-/// What a schema-17 gateway built before role descriptions advertises
+/// What a schema-18 gateway built before role descriptions advertises
 /// (the prepared release of issue #426's pair) is still understood, and
 /// grants this build exactly the protocol and nothing newer.
 #[test]

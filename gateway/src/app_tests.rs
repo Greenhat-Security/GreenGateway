@@ -14194,7 +14194,7 @@ async fn connection_secret_admin_crud_is_safe_permissioned_and_preconditioned() 
     assert_eq!(operator["actions"]["can_delete"], json!(false));
     assert_eq!(
         operator["compatible_purposes"].as_array().map(Vec::len),
-        Some(7)
+        Some(8)
     );
     let operator_etag = operator["etag"]
         .as_str()
@@ -15369,6 +15369,136 @@ async fn connection_secret_list_stays_safe_when_local_management_is_unconfigured
         assert!(!body.contains("operator-write-value-canary"));
         assert!(!body.contains("operator-token"));
     }
+}
+
+/// A `delegated_issuer_token` client secret's alias cannot be bound under any
+/// other purpose by another Connection (issue #441), because nothing else ties
+/// an operator alias to one purpose. The save is refused with the candidate's
+/// field and a fixed code, says nothing about the other Connection or the
+/// alias, and writes nothing.
+#[tokio::test]
+async fn connection_admin_refuses_a_token_exchange_secret_shared_with_another_purpose() {
+    let connection_db = TempDb::new("connection-admin-token-exchange-secret");
+    let policy = TempPolicyFile::new(&connection_policy_document_string());
+    let router = connection_admin_router(&connection_db, &policy, test_audit_log());
+    let secrets_editor = test_principal(&["connections-secrets-editor"]);
+    let collection_etag = |response: &Response| {
+        response
+            .headers()
+            .get(CONNECTION_COLLECTION_ETAG_HEADER)
+            .and_then(|value| value.to_str().ok())
+            .expect("collection response should include an ETag")
+            .to_owned()
+    };
+
+    let list = router
+        .clone()
+        .oneshot(connection_admin_request(
+            Method::GET,
+            CONNECTIONS_ADMIN_ROUTE,
+            Some(secrets_editor.clone()),
+            None,
+            None,
+            false,
+        ))
+        .await
+        .expect("connection list should complete");
+    let etag = collection_etag(&list);
+    let bearer = json!({
+        "display_name": "Billing API",
+        "enabled": false,
+        "kind": "http_api",
+        "endpoint": {
+            "base_url": "https://billing.example.test",
+            "base_path": "/v1"
+        },
+        "authentication": {
+            "type": "static_bearer",
+            "secret_id": "shared-alias-canary"
+        }
+    });
+    let created = router
+        .clone()
+        .oneshot(connection_admin_request(
+            Method::POST,
+            CONNECTIONS_ADMIN_ROUTE,
+            Some(secrets_editor.clone()),
+            Some(bearer.to_string()),
+            Some(&etag),
+            true,
+        ))
+        .await
+        .expect("bearer create should complete");
+    assert_eq!(created.status(), StatusCode::CREATED);
+    let etag = collection_etag(&created);
+
+    let mut assertion = admin_caller_assertion_json();
+    assertion["bind_request"] = json!(false);
+    let delegated = json!({
+        "display_name": "Mail",
+        "enabled": false,
+        "kind": "http_api",
+        "endpoint": {
+            "base_url": "https://mail.example.test",
+            "base_path": "/v1"
+        },
+        "authentication": {
+            "type": "delegated_issuer_token",
+            "token_exchange_url": "https://issuer.example.test/oauth2/token-exchange",
+            "client_id": "greengateway",
+            "client_secret_id": "shared-alias-canary",
+            "subject_token_source": "caller_assertion"
+        },
+        "caller_assertion": assertion
+    });
+    let refused = router
+        .clone()
+        .oneshot(connection_admin_request(
+            Method::POST,
+            CONNECTIONS_ADMIN_ROUTE,
+            Some(secrets_editor.clone()),
+            Some(delegated.to_string()),
+            Some(&etag),
+            true,
+        ))
+        .await
+        .expect("delegated create should complete");
+    assert_eq!(refused.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    assert_managed_admin_no_store(&refused);
+    let body = body_string(refused).await;
+    assert!(!body.contains("shared-alias-canary"), "{body}");
+    let body: Value = serde_json::from_str(&body).expect("refusal should be JSON");
+    assert_eq!(
+        body["problems"],
+        json!([{
+            "field": "authentication.client_secret_id",
+            "code": "secret_purpose_conflict"
+        }])
+    );
+
+    let list = router
+        .clone()
+        .oneshot(connection_admin_request(
+            Method::GET,
+            CONNECTIONS_ADMIN_ROUTE,
+            Some(secrets_editor),
+            None,
+            None,
+            false,
+        ))
+        .await
+        .expect("connection list should complete");
+    assert_eq!(
+        collection_etag(&list),
+        etag,
+        "the refused create wrote nothing"
+    );
+    assert_eq!(
+        json_body(list).await["connections"]
+            .as_array()
+            .map(Vec::len),
+        Some(1)
+    );
 }
 
 #[tokio::test]
@@ -32677,7 +32807,7 @@ mod cluster_policy_tests {
                       schema_version_min, schema_version_max,
                       document_version_min, document_version_max, fingerprint,
                       capabilities)
-                 VALUES ($1, $2::text::uuid, $3::text::uuid, '1.0.1', 17, 17, 0, 0,
+                 VALUES ($1, $2::text::uuid, $3::text::uuid, '1.0.1', 18, 18, 0, 0,
                          repeat('b', 64), 'operation_requirements')",
                 &[
                     &deployment,
@@ -33782,7 +33912,7 @@ mod cluster_tools_tests {
             .expect("replica B accepts and caches");
 
         // The revoke commits through replica A's admin path.
-        storage::ServiceTokenStore::revoke(&*store, &created.record.id)
+        storage::ServiceTokenStore::revoke(&*store, &created.record.id, "revoking-admin")
             .await
             .expect("revoke should commit")
             .expect("token exists");

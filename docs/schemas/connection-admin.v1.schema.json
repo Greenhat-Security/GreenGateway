@@ -182,6 +182,7 @@
         "header_api_key",
         "static_bearer",
         "oauth2_client_credentials",
+        "delegated_issuer_token",
         "legacy_configured"
       ]
     },
@@ -443,6 +444,72 @@
               "client_secret_configured"
             ]
           }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "description": "The calling user's own upstream token, obtained per caller from a trusted issuer by OAuth 2.0 token exchange (RFC 8693) and injected as Authorization: Bearer. The subject token is a JWT signed with this Connection's caller_assertion key naming the validated caller; the caller's own inbound bearer token is never forwarded. Requires kind http_api and a caller_assertion block without bind_request, whose assertion goes to the issuer only. Only manual HTTP tool calls are served; a call with no principal, a service token included, is refused with delegated_token_no_principal. The admin UI shows this type read only.",
+          "required": [
+            "type",
+            "token_exchange_url",
+            "client_id",
+            "subject_token_source"
+          ],
+          "properties": {
+            "type": {
+              "const": "delegated_issuer_token"
+            },
+            "token_exchange_url": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 2048,
+              "format": "uri",
+              "pattern": "^https://"
+            },
+            "client_id": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 256
+            },
+            "client_secret_id": {
+              "$ref": "#/$defs/StableId",
+              "description": "Resolved with the token_exchange_client_secret purpose: an operator alias or an external secret provider, never the encrypted local store. A save that binds this alias under any other field of any Connection is refused with secret_purpose_conflict."
+            },
+            "client_secret_configured": {
+              "type": "boolean",
+              "description": "PUT-only redaction marker. true retains the current hidden binding and false clears it."
+            },
+            "requested_scopes": {
+              "type": "array",
+              "maxItems": 16,
+              "uniqueItems": true,
+              "items": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 128,
+                "pattern": "^\\S+$"
+              }
+            },
+            "audience": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 512
+            },
+            "resource": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 512
+            },
+            "subject_token_source": {
+              "const": "caller_assertion"
+            }
+          },
+          "not": {
+            "required": [
+              "client_secret_id",
+              "client_secret_configured"
+            ]
+          }
         }
       ]
     },
@@ -581,6 +648,42 @@
         {
           "if": {
             "required": [
+              "authentication"
+            ],
+            "properties": {
+              "authentication": {
+                "required": [
+                  "type"
+                ],
+                "properties": {
+                  "type": {
+                    "const": "delegated_issuer_token"
+                  }
+                }
+              }
+            }
+          },
+          "then": {
+            "required": [
+              "caller_assertion"
+            ],
+            "properties": {
+              "kind": {
+                "const": "http_api"
+              },
+              "caller_assertion": {
+                "properties": {
+                  "bind_request": {
+                    "const": false
+                  }
+                }
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "required": [
               "caller_assertion"
             ],
             "properties": {
@@ -710,6 +813,40 @@
         }
       },
       "allOf": [
+        {
+          "if": {
+            "required": [
+              "authentication"
+            ],
+            "properties": {
+              "authentication": {
+                "required": [
+                  "type"
+                ],
+                "properties": {
+                  "type": {
+                    "const": "delegated_issuer_token"
+                  }
+                }
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "kind": {
+                "const": "http_api"
+              },
+              "caller_assertion": {
+                "type": "object",
+                "properties": {
+                  "bind_request": {
+                    "const": false
+                  }
+                }
+              }
+            }
+          }
+        },
         {
           "if": {
             "required": [
@@ -879,6 +1016,48 @@
             },
             "client_auth_method": {
               "const": "client_secret_basic"
+            },
+            "client_secret_configured": {
+              "type": "boolean"
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "type",
+            "token_exchange_url",
+            "client_id",
+            "requested_scopes",
+            "subject_token_source",
+            "client_secret_configured"
+          ],
+          "properties": {
+            "type": {
+              "const": "delegated_issuer_token"
+            },
+            "token_exchange_url": {
+              "type": "string",
+              "format": "uri"
+            },
+            "client_id": {
+              "type": "string"
+            },
+            "requested_scopes": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "audience": {
+              "type": "string"
+            },
+            "resource": {
+              "type": "string"
+            },
+            "subject_token_source": {
+              "const": "caller_assertion"
             },
             "client_secret_configured": {
               "type": "boolean"
@@ -1303,7 +1482,7 @@
       }
     },
     "SecretPurpose": {
-      "description": "What a secret alias may be resolved as. assertion_signing_key is the PKCS#8 private key a caller assertion signs with and whose public half the gateway publishes; it is never sent as a header value, and the encrypted local store cannot hold it, so it comes from an operator alias or an external secret provider.",
+      "description": "What a secret alias may be resolved as. A purpose sets size and encoding rules; an encrypted local secret is stored under one purpose and resolves under no other, while operator and external-provider aliases are not tied to a purpose. assertion_signing_key is the PKCS#8 private key a caller assertion signs with and whose public half the gateway publishes; it is never sent as a header value. token_exchange_client_secret is the client secret a delegated_issuer_token Connection authenticates to its token-exchange issuer with. The issuer hands out any user's upstream token to whoever holds it, so a Connection save that binds such an alias under any other field of any Connection, or binds another field to an alias a Connection exchanges with, is refused with secret_purpose_conflict. The encrypted local store can hold neither, so both come from an operator alias or an external secret provider.",
       "enum": [
         "header_api_key",
         "static_bearer",
@@ -1311,7 +1490,8 @@
         "tls_private_key",
         "tls_certificate",
         "tls_ca_bundle",
-        "assertion_signing_key"
+        "assertion_signing_key",
+        "token_exchange_client_secret"
       ]
     },
     "LocalSecretPurpose": {
@@ -5158,6 +5338,62 @@
             },
             "client_auth_method": {
               "const": "client_secret_basic"
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "description": "The calling user's own upstream token, obtained per caller from a trusted issuer by OAuth 2.0 token exchange (RFC 8693) and injected as Authorization: Bearer. The subject token is a JWT signed with this Connection's caller_assertion key naming the validated caller; the caller's own inbound bearer token is never forwarded. Requires kind http_api and a caller_assertion block without bind_request, whose assertion goes to the issuer only. Only manual HTTP tool calls are served; a call with no principal, a service token included, is refused with delegated_token_no_principal. The admin UI shows this type read only.",
+          "required": [
+            "type",
+            "token_exchange_url",
+            "client_id",
+            "subject_token_source"
+          ],
+          "properties": {
+            "type": {
+              "const": "delegated_issuer_token"
+            },
+            "token_exchange_url": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 2048,
+              "format": "uri",
+              "pattern": "^https://"
+            },
+            "client_id": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 256
+            },
+            "client_secret_id": {
+              "$ref": "#/$defs/StableId",
+              "description": "Resolved with the token_exchange_client_secret purpose: an operator alias or an external secret provider, never the encrypted local store. A save that binds this alias under any other field of any Connection is refused with secret_purpose_conflict."
+            },
+            "requested_scopes": {
+              "type": "array",
+              "maxItems": 16,
+              "uniqueItems": true,
+              "items": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 128,
+                "pattern": "^\\S+$"
+              }
+            },
+            "audience": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 512
+            },
+            "resource": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 512
+            },
+            "subject_token_source": {
+              "const": "caller_assertion"
             }
           }
         }

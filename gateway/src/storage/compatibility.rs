@@ -47,8 +47,8 @@
 //! returns later fails closed on the document rather than misreading it.
 //! The approved-extension list in `migrations.rs` stays empty: the operation
 //! changes no schema, and no schema overlap has been qualified. Every other
-//! operation this binary performs belongs to the schema-17 contract, which
-//! every schema-17 member shares.
+//! operation this binary performs belongs to the schema-18 contract, which
+//! every schema-18 member shares.
 
 use std::collections::BTreeSet;
 
@@ -253,11 +253,12 @@ mod gate {
     /// had; a starting one refuses to boot. That is failing closed, never a
     /// misreading, so live-roster agreement is enough
     /// ([`Activation::LiveMembers`]) and no durable fence is needed. The
-    /// field lives inside the policy document, so the operation needs
-    /// nothing the schema-17 contract does not already have, and the
-    /// document format stays major 0. `minimum_schema` is 17 because that
-    /// is the first schema whose members advertise capabilities at all; the
-    /// policy tables it writes are older.
+    /// field lives inside the policy document, so the operation adds no
+    /// schema object and no migration, and the document format stays
+    /// major 0. `minimum_schema` is 17 because that is the first schema
+    /// whose members advertise capabilities at all; the policy tables it
+    /// writes are older. Every member that shares this binary's schema-18
+    /// contract meets it, so among those the capability alone decides.
     pub(crate) const POLICY_ROLE_DESCRIPTIONS: OperationRequirement = OperationRequirement {
         operation: "policy.role_descriptions",
         minimum_schema: 17,
