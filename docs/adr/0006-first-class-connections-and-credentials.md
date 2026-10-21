@@ -176,10 +176,12 @@ HTTP authentication is one of:
 
 - `none`;
 - `header_api_key` with a validated header name and opaque secret ID;
-- `static_bearer` with an opaque token secret ID; or
+- `static_bearer` with an opaque token secret ID;
 - `oauth2_client_credentials` with explicit client ID, opaque client-secret ID,
   explicit HTTPS token URL, bounded scopes/audience/resource, and
-  `client_secret_basic`.
+  `client_secret_basic`; or
+- `delegated_issuer_token`, the caller's own token by RFC 8693 token exchange
+  (see [Delegated issuer tokens](#delegated-issuer-tokens-issue-441-phase-8)).
 
 TLS is independent of HTTP authentication. A custom CA alias and an optional
 paired client-certificate/private-key identity can accompany any authentication
@@ -265,6 +267,56 @@ are zeroized on replacement/drop. A `401` from the intended managed upstream
 invalidates only the matching token generation; it does not erase a newer
 generation. Connection tests mint within their own deadline and do not reuse
 the detached data-plane token cache.
+
+### Delegated issuer tokens (issue #441, Phase 8)
+
+`delegated_issuer_token` is the first credential that belongs to the caller
+rather than to the Connection. On a cache miss the gateway asks a trusted
+issuer, by RFC 8693 token exchange authenticated with `client_secret_basic`,
+for the calling user's own access token, and injects that as the bearer. This
+does not reverse the decision above against forwarding identity: the upstream
+receives a token its own provider issued for that user, not a gateway header
+it would have to trust.
+
+The subject token is a JWT signed with the Connection's `caller_assertion`
+key, naming the caller exactly as a caller assertion does, with no request
+binding and a fresh `jti`; the issuer verifies it against the published JWKS.
+The Connection must therefore carry a `caller_assertion` block without
+`bind_request`, and that assertion is sent to the issuer only, never upstream.
+Exchanging the caller's own inbound bearer token instead was deliberately not
+built: it would make the gateway retain and forward a credential presented to
+it alone, and needs its own security review. `subject_token_source` is a
+closed enum with the single value `caller_assertion` so that the later choice
+is explicit.
+
+- The client secret binds under its own `SecretPurpose::TokenExchangeClientSecret`,
+  never interchangeable with an OAuth client secret, and is not held by the
+  encrypted local store.
+- `token_exchange_url` follows the token-URL rule (HTTPS, no userinfo, query
+  or fragment) and passes the token client's egress check before any key or
+  secret is read.
+- Only the manual HTTP tool-call lane has a validated principal, so only it
+  serves such a Connection; every other lane refuses it through the
+  caller-assertion refusal. A call with no principal, or a service token's, is
+  refused with `delegated_token_no_principal`. There is no fallback to a
+  service identity.
+- The token cache reuses the OAuth cache's single flight and generation-bound
+  `401` invalidation, adds the attested caller to the key, holds at most 1,024
+  entries, never reuses a token for more than 900 seconds, and drops every
+  idle token of a Connection's earlier configuration on the first call after a
+  change.
+- Refusals carry distinct reasons (`delegated_token_denied`,
+  `delegated_token_exchange_failed`, `delegated_token_egress_denied`,
+  `delegated_token_unavailable`) and each exchange emits
+  `connection.delegated_token_exchange` with the caller as actor and no token
+  material.
+
+The trust boundary moves to the issuer's grant store: whoever holds the
+client secret can obtain any user's upstream token. Operators keep that secret
+in an external provider, grant read-only scopes, and require the issuer to
+store grants encrypted and log every hand-out. Purging a disabled user's
+cached tokens immediately is a documented follow-up; until then the cache
+lifetime bounds it.
 
 ### Secret trust and confidentiality
 

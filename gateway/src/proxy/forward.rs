@@ -22,7 +22,10 @@ use serde_json::json;
 use super::{retry, MatchedUpstream, ProxyState, RequestBodyMode, RouteRequestHeaderPolicy};
 use crate::{
     audit, auth,
-    connections::http::{ConnectionHttpError, ConnectionHttpTarget},
+    connections::{
+        caller_assertion::AttestedCaller,
+        http::{ConnectionHttpError, ConnectionHttpTarget},
+    },
     egress, middleware, upstream_route,
 };
 
@@ -601,12 +604,24 @@ async fn forward_to_upstream(
                 }
                 Ok(Ok(prepared)) => prepared,
             };
+            // Only a credential that belongs to the caller needs one named,
+            // so the principal is copied for nothing else.
+            let caller = target
+                .credential_belongs_to_caller()
+                .then(|| {
+                    parts
+                        .extensions
+                        .get::<auth::Principal>()
+                        .and_then(AttestedCaller::from_principal)
+                })
+                .flatten();
+            let resolution = runtime.resolve_credential_before(target, caller.as_ref(), deadline);
             let credential = tokio::select! {
                 biased;
                 () = forced_shutdown.cancelled() => {
                     return admission_unavailable_response(&upstream.pool.id, request_id);
                 }
-                credential = runtime.resolve_credential_before(target, deadline) => credential,
+                credential = resolution => credential,
             };
             let credential = match credential {
                 Err(error) => {
@@ -1920,6 +1935,7 @@ fn connection_failure_response(
         | ConnectionHttpError::CredentialUnavailable
         | ConnectionHttpError::TlsUnavailable
         | ConnectionHttpError::OAuthTokenUnavailable
+        | ConnectionHttpError::DelegatedTokenUnavailable
         | ConnectionHttpError::TransportUnavailable => StatusCode::SERVICE_UNAVAILABLE,
         ConnectionHttpError::InvalidConnectionId
         | ConnectionHttpError::ConnectionNotFound
@@ -1933,6 +1949,10 @@ fn connection_failure_response(
         | ConnectionHttpError::OAuthTokenEgressDenied
         | ConnectionHttpError::OAuthTokenRejected
         | ConnectionHttpError::OAuthTokenInvalidResponse
+        | ConnectionHttpError::DelegatedTokenNoPrincipal
+        | ConnectionHttpError::DelegatedTokenEgressDenied
+        | ConnectionHttpError::DelegatedTokenDenied
+        | ConnectionHttpError::DelegatedTokenExchangeFailed
         | ConnectionHttpError::UpstreamAuthenticationRejected => StatusCode::BAD_GATEWAY,
     };
     let code = if status == StatusCode::SERVICE_UNAVAILABLE {

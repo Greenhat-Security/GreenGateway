@@ -614,6 +614,10 @@ pub struct AttestedCaller {
     subject: String,
     email: Option<String>,
     roles: Vec<String>,
+    /// How the principal authenticated, as audit names it. Never signed: it
+    /// is here only so work done on this caller's behalf away from the call
+    /// itself, such as a delegated token exchange, can name the same actor.
+    auth_mode: &'static str,
 }
 
 impl fmt::Debug for AttestedCaller {
@@ -642,7 +646,26 @@ impl AttestedCaller {
             subject: principal.user_id.clone(),
             email: principal.email.clone(),
             roles: principal.roles.clone(),
+            auth_mode: principal.auth_method.audit_mode(),
         })
+    }
+
+    /// Audit's record of this caller: exactly what
+    /// [`crate::auth::actor_from_principal`] makes of the principal it was
+    /// built from, for an event this caller causes outside the call's own
+    /// audit trail.
+    pub fn audit_actor(&self) -> crate::audit::Actor {
+        crate::audit::Actor {
+            user_id: self.subject.clone(),
+            issuer: Some(self.issuer.clone()),
+            email: self.email.clone(),
+            roles: if self.roles.is_empty() {
+                None
+            } else {
+                Some(self.roles.clone())
+            },
+            auth_mode: self.auth_mode.to_owned(),
+        }
     }
 
     pub fn identity(&self) -> CallerIdentity<'_> {

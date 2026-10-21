@@ -33,9 +33,9 @@ use super::{
 
 pub(crate) const OAUTH_MAX_RESPONSE_BYTES: usize = 16 * 1024;
 pub(crate) const OAUTH_MAX_REQUEST_BYTES: usize = 16 * 1024;
-const MAX_TOKEN_TYPE_BYTES: usize = 32;
-const MAX_RESPONSE_SCOPE_BYTES: usize = 4 * 1024;
-const MAX_TOKEN_LIFETIME_SECS: u64 = 7 * 24 * 60 * 60;
+pub(super) const MAX_TOKEN_TYPE_BYTES: usize = 32;
+pub(super) const MAX_RESPONSE_SCOPE_BYTES: usize = 4 * 1024;
+pub(super) const MAX_TOKEN_LIFETIME_SECS: u64 = 7 * 24 * 60 * 60;
 const REFRESH_SKEW_SECS: u64 = 30;
 const MAX_REFRESH_JITTER_SECS: u64 = 5;
 const TOKEN_CACHE_CAPACITY: usize = MAX_CONNECTIONS;
@@ -60,9 +60,12 @@ pub(crate) struct OAuthBinding {
     pub token_client: Arc<EgressClient>,
 }
 
-pub(crate) struct OAuthTokenLease {
+/// One caller's use of a cached token. `E` is the failure vocabulary of the
+/// runtime that minted it, so a delegated exchange is never reported in the
+/// client-credentials runtime's terms, nor the reverse.
+pub(crate) struct OAuthTokenLease<E = OAuthError> {
     access_token: Zeroizing<Vec<u8>>,
-    slot: Option<Arc<OAuthTokenSlot>>,
+    slot: Option<Arc<OAuthTokenSlot<E>>>,
     generation: u64,
 }
 
@@ -76,28 +79,72 @@ pub(crate) enum OAuthError {
     InvalidTokenResponse,
 }
 
+/// How a token cache reports a failure it detects itself, rather than one a
+/// mint returned. Each runtime that shares the cache keeps its own failure
+/// vocabulary.
+pub(crate) trait TokenCacheFailure: Copy + Send + Sync + 'static {
+    /// Every slot is held by a caller or by a mint in flight, so none can be
+    /// evicted to make room for a new key.
+    const CACHE_FULL: Self;
+    /// The mint task panicked.
+    const MINT_PANICKED: Self;
+    /// A cached token could not be written as a header value.
+    const INVALID_TOKEN: Self;
+}
+
+impl TokenCacheFailure for OAuthError {
+    const CACHE_FULL: Self = Self::TokenUnavailable;
+    const MINT_PANICKED: Self = Self::TokenUnavailable;
+    const INVALID_TOKEN: Self = Self::InvalidTokenResponse;
+}
+
 #[derive(Clone, Debug, Hash, PartialEq, Eq)]
-struct OAuthTokenCacheKey {
-    connection_id: String,
-    connection_etag: String,
-    secret_version: Option<u64>,
-    egress_generation: [u8; 32],
+pub(super) struct OAuthTokenCacheKey {
+    pub(super) connection_id: String,
+    pub(super) connection_etag: String,
+    /// Whom a delegated token was exchanged for: a digest of the attested
+    /// caller. `None` for a client-credentials token, which serves every
+    /// caller of its Connection alike.
+    pub(super) subject: Option<[u8; 32]>,
+    pub(super) secret_version: Option<u64>,
+    pub(super) egress_generation: [u8; 32],
 }
 
-struct OAuthTokenCache {
-    slots: Mutex<HashMap<OAuthTokenCacheKey, Arc<OAuthTokenSlot>>>,
+impl OAuthTokenCacheKey {
+    /// Whether `other` belongs to the same Connection configuration: the same
+    /// revision, secret version and egress policy, whatever its subject.
+    fn same_configuration(&self, other: &Self) -> bool {
+        self.connection_id == other.connection_id
+            && self.connection_etag == other.connection_etag
+            && self.secret_version == other.secret_version
+            && self.egress_generation == other.egress_generation
+    }
+}
+
+pub(super) struct OAuthTokenCache<E = OAuthError> {
+    slots: Mutex<HashMap<OAuthTokenCacheKey, Arc<OAuthTokenSlot<E>>>>,
     clock: Arc<dyn OAuthClock>,
+    capacity: usize,
 }
 
-struct OAuthTokenSlot {
-    state: AsyncMutex<OAuthTokenSlotState>,
+struct OAuthTokenSlot<E> {
+    state: AsyncMutex<OAuthTokenSlotState<E>>,
 }
 
-#[derive(Default)]
-struct OAuthTokenSlotState {
+struct OAuthTokenSlotState<E> {
     cached: Option<CachedOAuthToken>,
     generation: u64,
-    in_flight: Option<Arc<OAuthMintFlight>>,
+    in_flight: Option<Arc<OAuthMintFlight<E>>>,
+}
+
+impl<E> Default for OAuthTokenSlotState<E> {
+    fn default() -> Self {
+        Self {
+            cached: None,
+            generation: 0,
+            in_flight: None,
+        }
+    }
 }
 
 struct CachedOAuthToken {
@@ -106,9 +153,9 @@ struct CachedOAuthToken {
     generation: u64,
 }
 
-struct MintedOAuthToken {
-    access_token: Zeroizing<Vec<u8>>,
-    lifetime: Duration,
+pub(super) struct MintedOAuthToken {
+    pub(super) access_token: Zeroizing<Vec<u8>>,
+    pub(super) lifetime: Duration,
 }
 
 struct OAuthRefreshAttempt {
@@ -118,25 +165,25 @@ struct OAuthRefreshAttempt {
     completed: bool,
 }
 
-struct OAuthMintFlight {
-    outcome: Mutex<Option<OAuthMintOutcome>>,
+struct OAuthMintFlight<E> {
+    outcome: Mutex<Option<OAuthMintOutcome<E>>>,
     completed: Notify,
 }
 
 #[derive(Clone)]
-enum OAuthMintOutcome {
+enum OAuthMintOutcome<E> {
     Success {
         access_token: Zeroizing<Vec<u8>>,
         generation: u64,
     },
-    Failure(OAuthError),
+    Failure(E),
 }
 
-trait OAuthClock: Send + Sync {
+pub(super) trait OAuthClock: Send + Sync {
     fn now(&self) -> Instant;
 }
 
-struct SystemOAuthClock;
+pub(super) struct SystemOAuthClock;
 
 impl OAuthClock for SystemOAuthClock {
     fn now(&self) -> Instant {
@@ -144,7 +191,7 @@ impl OAuthClock for SystemOAuthClock {
     }
 }
 
-struct SecretString(Zeroizing<String>);
+pub(super) struct SecretString(Zeroizing<String>);
 
 tokio::task_local! {
     static CONNECTION_TEST_OWNS_OAUTH_MINT: ();
@@ -160,11 +207,11 @@ impl<'de> Deserialize<'de> for SecretString {
 }
 
 impl SecretString {
-    fn as_str(&self) -> &str {
+    pub(super) fn as_str(&self) -> &str {
         self.0.as_str()
     }
 
-    fn take_bytes(&mut self) -> Zeroizing<Vec<u8>> {
+    pub(super) fn take_bytes(&mut self) -> Zeroizing<Vec<u8>> {
         Zeroizing::new(std::mem::take(&mut *self.0).into_bytes())
     }
 }
@@ -220,6 +267,7 @@ impl OAuthClientCredentialsRuntime {
         let key = OAuthTokenCacheKey {
             connection_id: binding.connection_id.to_string(),
             connection_etag: binding.connection_etag.clone(),
+            subject: None,
             secret_version,
             egress_generation: binding.token_client.configuration_generation(),
         };
@@ -357,15 +405,15 @@ impl fmt::Debug for OAuthClientCredentialsRuntime {
     }
 }
 
-impl OAuthTokenLease {
-    pub(crate) fn inject(&self, headers: &mut HeaderMap) -> Result<(), OAuthError> {
+impl<E: TokenCacheFailure> OAuthTokenLease<E> {
+    pub(crate) fn inject(&self, headers: &mut HeaderMap) -> Result<(), E> {
         let mut bearer = Zeroizing::new(Vec::with_capacity(
             "Bearer ".len() + self.access_token.len(),
         ));
         bearer.extend_from_slice(b"Bearer ");
         bearer.extend_from_slice(self.access_token.as_slice());
-        let mut authorization = HeaderValue::from_bytes(bearer.as_slice())
-            .map_err(|_| OAuthError::InvalidTokenResponse)?;
+        let mut authorization =
+            HeaderValue::from_bytes(bearer.as_slice()).map_err(|_| E::INVALID_TOKEN)?;
         authorization.set_sensitive(true);
         headers.insert(header::AUTHORIZATION, authorization);
         Ok(())
@@ -386,7 +434,7 @@ impl OAuthTokenLease {
     }
 }
 
-impl fmt::Debug for OAuthTokenLease {
+impl<E> fmt::Debug for OAuthTokenLease<E> {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str("<redacted-oauth-token>")
     }
@@ -407,20 +455,30 @@ impl OAuthError {
 
 impl OAuthTokenCache {
     fn new(clock: Arc<dyn OAuthClock>) -> Self {
+        Self::with_capacity(clock, TOKEN_CACHE_CAPACITY)
+    }
+}
+
+impl<E: TokenCacheFailure> OAuthTokenCache<E> {
+    /// A cache of at most `capacity` slots. A full cache evicts an idle slot
+    /// to admit a new key, and refuses with [`TokenCacheFailure::CACHE_FULL`]
+    /// only while every slot is held by a caller or by a mint in flight.
+    pub(super) fn with_capacity(clock: Arc<dyn OAuthClock>, capacity: usize) -> Self {
         Self {
             slots: Mutex::new(HashMap::new()),
             clock,
+            capacity,
         }
     }
 
-    async fn get_or_mint<F, Fut>(
+    pub(super) async fn get_or_mint<F, Fut>(
         &self,
         key: OAuthTokenCacheKey,
         mint: F,
-    ) -> Result<OAuthTokenLease, OAuthError>
+    ) -> Result<OAuthTokenLease<E>, E>
     where
         F: FnOnce() -> Fut,
-        Fut: Future<Output = Result<MintedOAuthToken, OAuthError>> + Send + 'static,
+        Fut: Future<Output = Result<MintedOAuthToken, E>> + Send + 'static,
     {
         let slot = self.slot_for(&key)?;
         let mut state = slot.state.lock().await;
@@ -465,16 +523,30 @@ impl OAuthTokenCache {
         }
     }
 
-    fn slot_for(&self, key: &OAuthTokenCacheKey) -> Result<Arc<OAuthTokenSlot>, OAuthError> {
+    fn slot_for(&self, key: &OAuthTokenCacheKey) -> Result<Arc<OAuthTokenSlot<E>>, E> {
         let mut slots = self.slot_guard();
         if let Some(slot) = slots.get(key) {
             return Ok(Arc::clone(slot));
         }
-        if slots.len() >= TOKEN_CACHE_CAPACITY {
+        // The first key for a Connection configuration nobody has asked for
+        // yet means the Connection changed: a save, a secret rotation or an
+        // egress policy change. Its idle tokens under every other
+        // configuration can never be served again, so they are dropped now
+        // rather than left for capacity pressure to find. A slot that a caller
+        // or a mint still holds stays until it is released.
+        if !slots
+            .keys()
+            .any(|existing| existing.same_configuration(key))
+        {
+            slots.retain(|existing, slot| {
+                existing.connection_id != key.connection_id || Arc::strong_count(slot) > 1
+            });
+        }
+        if slots.len() >= self.capacity {
             let idle_key = slots
                 .iter()
                 .find_map(|(key, slot)| (Arc::strong_count(slot) == 1).then(|| key.clone()))
-                .ok_or(OAuthError::TokenUnavailable)?;
+                .ok_or(E::CACHE_FULL)?;
             slots.remove(&idle_key);
         }
         let slot = Arc::new(OAuthTokenSlot {
@@ -484,7 +556,11 @@ impl OAuthTokenCache {
         Ok(slot)
     }
 
-    fn slot_guard(&self) -> MutexGuard<'_, HashMap<OAuthTokenCacheKey, Arc<OAuthTokenSlot>>> {
+    pub(super) fn slot_count(&self) -> usize {
+        self.slot_guard().len()
+    }
+
+    fn slot_guard(&self) -> MutexGuard<'_, HashMap<OAuthTokenCacheKey, Arc<OAuthTokenSlot<E>>>> {
         match self.slots.lock() {
             Ok(guard) => guard,
             Err(poisoned) => {
@@ -497,8 +573,8 @@ impl OAuthTokenCache {
     }
 }
 
-impl OAuthMintFlight {
-    async fn wait(&self) -> OAuthMintOutcome {
+impl<E: TokenCacheFailure> OAuthMintFlight<E> {
+    async fn wait(&self) -> OAuthMintOutcome<E> {
         loop {
             let completed = self.completed.notified();
             if let Some(outcome) = self.outcome_guard().clone() {
@@ -508,7 +584,7 @@ impl OAuthMintFlight {
         }
     }
 
-    fn complete(&self, outcome: OAuthMintOutcome) {
+    fn complete(&self, outcome: OAuthMintOutcome<E>) {
         let mut stored = self.outcome_guard();
         if stored.is_none() {
             *stored = Some(outcome);
@@ -517,7 +593,7 @@ impl OAuthMintFlight {
         self.completed.notify_waiters();
     }
 
-    fn outcome_guard(&self) -> MutexGuard<'_, Option<OAuthMintOutcome>> {
+    fn outcome_guard(&self) -> MutexGuard<'_, Option<OAuthMintOutcome<E>>> {
         match self.outcome.lock() {
             Ok(guard) => guard,
             Err(poisoned) => {
@@ -528,20 +604,21 @@ impl OAuthMintFlight {
     }
 }
 
-async fn complete_oauth_mint<Fut>(
-    slot: Arc<OAuthTokenSlot>,
+async fn complete_oauth_mint<E, Fut>(
+    slot: Arc<OAuthTokenSlot<E>>,
     key: OAuthTokenCacheKey,
     clock: Arc<dyn OAuthClock>,
-    flight: Arc<OAuthMintFlight>,
+    flight: Arc<OAuthMintFlight<E>>,
     mint: Fut,
 ) where
-    Fut: Future<Output = Result<MintedOAuthToken, OAuthError>> + Send + 'static,
+    E: TokenCacheFailure,
+    Fut: Future<Output = Result<MintedOAuthToken, E>> + Send + 'static,
 {
     let result = match AssertUnwindSafe(mint).catch_unwind().await {
         Ok(result) => result,
         Err(_) => {
             tracing::error!("OAuth token flight panicked; recovering fail closed");
-            Err(OAuthError::TokenUnavailable)
+            Err(E::MINT_PANICKED)
         }
     };
     let mut state = slot.state.lock().await;
@@ -585,10 +662,10 @@ async fn complete_oauth_mint<Fut>(
     }
 }
 
-fn lease_from_cached(
-    slot: Arc<OAuthTokenSlot>,
+fn lease_from_cached<E>(
+    slot: Arc<OAuthTokenSlot<E>>,
     cached: &CachedOAuthToken,
-) -> Result<OAuthTokenLease, OAuthError> {
+) -> Result<OAuthTokenLease<E>, E> {
     Ok(OAuthTokenLease {
         access_token: Zeroizing::new(cached.access_token.to_vec()),
         slot: Some(slot),
@@ -609,7 +686,10 @@ where
     CONNECTION_TEST_OWNS_OAUTH_MINT.scope((), future).await
 }
 
-fn token_request_headers(client_id: &str, client_secret: &[u8]) -> Result<HeaderMap, OAuthError> {
+pub(super) fn token_request_headers(
+    client_id: &str,
+    client_secret: &[u8],
+) -> Result<HeaderMap, OAuthError> {
     let encoded_client_id =
         Zeroizing::new(form_urlencoded::byte_serialize(client_id.as_bytes()).collect::<String>());
     let encoded_client_secret =
@@ -680,7 +760,7 @@ fn validate_token_response(token: &TokenResponse) -> Result<(), OAuthError> {
         .map_err(|_| OAuthError::InvalidTokenResponse)
 }
 
-fn is_json_content_type(value: Option<&HeaderValue>) -> bool {
+pub(super) fn is_json_content_type(value: Option<&HeaderValue>) -> bool {
     value
         .and_then(|value| value.to_str().ok())
         .and_then(|value| value.split(';').next())
@@ -732,6 +812,12 @@ fn deterministic_jitter(key: &OAuthTokenCacheKey) -> u64 {
     digest.update([0]);
     digest.update(key.secret_version.unwrap_or_default().to_be_bytes());
     digest.update(key.egress_generation);
+    // Only a delegated key has a subject, so a client-credentials token keeps
+    // exactly the jitter it had before subjects existed.
+    if let Some(subject) = key.subject {
+        digest.update([1]);
+        digest.update(subject);
+    }
     let digest = digest.finalize();
     u64::from_be_bytes(
         digest[..8]
@@ -740,7 +826,7 @@ fn deterministic_jitter(key: &OAuthTokenCacheKey) -> u64 {
     )
 }
 
-fn duration_millis(duration: Duration) -> u64 {
+pub(super) fn duration_millis(duration: Duration) -> u64 {
     u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
 }
 
@@ -785,6 +871,7 @@ mod tests {
         OAuthTokenCacheKey {
             connection_id: "connection-1".to_owned(),
             connection_etag: format!("etag-{revision}"),
+            subject: None,
             secret_version,
             egress_generation: [u8::try_from(revision).unwrap_or(u8::MAX); 32],
         }

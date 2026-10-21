@@ -13,6 +13,7 @@ import {
   testConnection,
 } from '../lib/connections';
 import { CallerAssertionSummary } from './CallerAssertionSummary';
+import { DelegatedIssuerTokenSummary } from './DelegatedIssuerTokenSummary';
 
 type MutationKind = 'test' | 'refresh' | 'delete';
 
@@ -539,6 +540,16 @@ function ConnectionConfiguration({
               code={configuration.test_profile !== undefined}
             />
           </dl>
+          {configuration.authentication.type === 'delegated_issuer_token' ? (
+            <section aria-labelledby="connection-delegated-token-heading">
+              <h4 id="connection-delegated-token-heading">
+                Delegated issuer token
+              </h4>
+              <DelegatedIssuerTokenSummary
+                authentication={configuration.authentication}
+              />
+            </section>
+          ) : null}
           {configuration.caller_assertion ? (
             <section aria-labelledby="connection-caller-assertion-heading">
               <h4 id="connection-caller-assertion-heading">
@@ -546,6 +557,10 @@ function ConnectionConfiguration({
               </h4>
               <CallerAssertionSummary
                 assertion={configuration.caller_assertion}
+                subjectTokenOnly={
+                  configuration.authentication.type ===
+                  'delegated_issuer_token'
+                }
               />
             </section>
           ) : null}
@@ -1148,6 +1163,12 @@ function formatSafeAuthentication(
       }`;
     case 'oauth2_client_credentials':
       return `OAuth 2 client credentials - ${
+        authentication.client_secret_configured
+          ? 'secret configured'
+          : 'secret not configured'
+      }`;
+    case 'delegated_issuer_token':
+      return `Delegated issuer token - ${
         authentication.client_secret_configured
           ? 'secret configured'
           : 'secret not configured'

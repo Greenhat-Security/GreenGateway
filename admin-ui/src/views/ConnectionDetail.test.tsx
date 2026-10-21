@@ -417,6 +417,87 @@ describe('ConnectionDetail', () => {
     expect(specValue('Also published')).toBe('gw-2026-10 (RS256, configured)');
   });
 
+  it('shows a delegated issuer token read only, with its assertion as the subject token', async () => {
+    vi.stubGlobal(
+      'fetch',
+      vi.fn().mockResolvedValue(
+        jsonResponse(
+          200,
+          connectionDetail({
+            authentication: 'delegated_issuer_token',
+            configuration: {
+              endpoint: {
+                base_url: 'https://mail.example.test',
+                base_path: '/v1',
+              },
+              authentication: {
+                type: 'delegated_issuer_token',
+                token_exchange_url:
+                  'https://issuer.example.test/oauth2/token-exchange',
+                client_id: 'greengateway',
+                client_secret_id: 'CLIENT_SECRET_ALIAS_CANARY',
+                requested_scopes: ['mail.read'],
+                audience: 'https://mail.example.test',
+                subject_token_source: 'caller_assertion',
+                client_secret_configured: true,
+              },
+              caller_assertion: {
+                signing_key_configured: true,
+                kid: 'gw-2026-09',
+                algorithm: 'es256',
+                issuer: 'https://gateway.example.test',
+                audience: 'https://issuer.example.test',
+                token_type: 'caller-assertion+jwt',
+                header_name: 'x-caller-assertion',
+                lifetime_seconds: 60,
+                bind_request: false,
+                bind_approval: false,
+              },
+              tls: {
+                ca_bundle_configured: false,
+                client_certificate_configured: false,
+                client_private_key_configured: false,
+              },
+            },
+          }),
+          { ETag: '"connection-v1"' },
+        ),
+      ),
+    );
+
+    renderDetail();
+
+    expect(
+      await screen.findByText('Delegated issuer token - secret configured'),
+    ).toBeTruthy();
+    const section = screen
+      .getByRole('heading', { name: 'Delegated issuer token' })
+      .closest('section');
+    expect(section?.textContent).toContain('delegated_token_no_principal');
+    expect(section?.textContent).toContain('delegated_token_denied');
+    expect(section?.textContent).toContain('delegated_token_exchange_failed');
+    expect(specValue('Token exchange URL')).toBe(
+      'https://issuer.example.test/oauth2/token-exchange',
+    );
+    expect(specValue('Client ID')).toBe('greengateway');
+    expect(specValue('Client secret')).toBe('Configured');
+    expect(specValue('Requested scopes')).toBe('mail.read');
+    expect(specValue('Resource')).toBe('Not set');
+    expect(specValue('Subject token')).toBe(
+      'Caller assertion signed by the gateway',
+    );
+    const assertion = screen
+      .getByRole('heading', { name: 'Caller assertion' })
+      .closest('section');
+    expect(assertion?.textContent).toContain(
+      'Caller assertion configured as the subject token.',
+    );
+    expect(assertion?.textContent).toContain('never sent to the upstream');
+    expect(document.body.textContent).not.toContain(
+      'CLIENT_SECRET_ALIAS_CANARY',
+    );
+  });
+
   it('stops on an ETag conflict and reloads before allowing another operation', async () => {
     let getCount = 0;
     const fetchMock = vi.fn(

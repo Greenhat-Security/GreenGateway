@@ -1,0 +1,663 @@
+//! Delegated issuer tokens (issue #441): the calling user's own upstream token, obtained by OAuth
+//! 2.0 token exchange (RFC 8693) and cached per caller.
+//!
+//! A `delegated_issuer_token` Connection does not hold an upstream credential at all. An issuer the
+//! operator trusts -- the wallet -- holds each user's grant for the upstream, and on a cache miss
+//! this asks it for the calling user's access token:
+//!
+//! - The gateway authenticates as itself with `client_secret_basic`, using a client secret bound
+//!   under [`SecretPurpose::TokenExchangeClientSecret`].
+//! - The subject token says who the caller is. It is a JWT signed with the Connection's
+//!   caller-assertion key, exactly as a caller assertion names its caller, and the issuer verifies
+//!   it against the published JWKS. It is never the caller's own inbound bearer token: forwarding
+//!   that is a separate decision this module does not make.
+//! - The answer is injected as `Authorization: Bearer` and cached under the Connection's revision,
+//!   the caller, the client secret's version and the egress policy, until shortly before the
+//!   issuer's `expires_in` and for at most [`MAX_DELEGATED_TOKEN_CACHE_SECONDS`].
+//!
+//! A call that names nobody is refused before anything is read or sent; so is one whose exchange
+//! fails, with a reason of its own, and never with a fallback to a shared identity. Every exchange
+//! is audited as [`audit::event::CONNECTION_DELEGATED_TOKEN_EXCHANGE`] with the caller as its
+//! actor. No token -- the subject token, the issued token, or anything the issuer answered with --
+//! reaches an error, a log line or an audit event.
+
+use std::{
+    fmt,
+    sync::Arc,
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+};
+
+use http::{header, HeaderValue, Method, StatusCode};
+use serde::Deserialize;
+use serde_json::json;
+use sha2::{Digest, Sha256};
+use url::form_urlencoded;
+use zeroize::Zeroizing;
+
+use crate::{
+    audit::{self, Actor, AuditEvent, AuditLog},
+    egress::{EgressClient, EgressError},
+};
+
+use super::{
+    caller_assertion::{
+        load_signing_key, sign_caller_assertion, AssertionAlgorithm, AttestedCaller,
+        CallerAssertionConfig, PrincipalClaim,
+    },
+    control_plane::ConnectionControlPlane,
+    model::ConnectionId,
+    oauth::{
+        duration_millis, is_json_content_type, token_request_headers, MintedOAuthToken,
+        OAuthTokenCache, OAuthTokenCacheKey, OAuthTokenLease, SecretString, SystemOAuthClock,
+        TokenCacheFailure, MAX_RESPONSE_SCOPE_BYTES, MAX_TOKEN_LIFETIME_SECS, MAX_TOKEN_TYPE_BYTES,
+        OAUTH_MAX_REQUEST_BYTES,
+    },
+    secret::{SecretPurpose, SecretResolveErrorKind, MAX_HTTP_CREDENTIAL_BYTES},
+};
+
+/// Most callers' tokens held at once, across every delegated Connection.
+///
+/// A full cache evicts an idle entry, which costs that caller one more exchange; it refuses a call,
+/// with `delegated_token_unavailable`, only while every entry is held by a call in flight.
+pub const MAX_DELEGATED_TOKEN_CACHE_ENTRIES: usize = 1_024;
+
+/// Longest a delegated token is reused, whatever the issuer's `expires_in` says.
+///
+/// A user's token is reused only for that user, but a grant the issuer revokes keeps working here
+/// until the cached token is refreshed. This bounds that window.
+pub const MAX_DELEGATED_TOKEN_CACHE_SECONDS: u64 = 900;
+
+const GRANT_TYPE_TOKEN_EXCHANGE: &str = "urn:ietf:params:oauth:grant-type:token-exchange";
+const SUBJECT_TOKEN_TYPE_JWT: &str = "urn:ietf:params:oauth:token-type:jwt";
+const TOKEN_TYPE_ACCESS_TOKEN: &str = "urn:ietf:params:oauth:token-type:access_token";
+
+/// The `request_id` of an exchange's audit event. An exchange serves every call of its caller
+/// until it is refreshed, so it belongs to none of them; its `subject_token.jti` is what an
+/// operator joins to the issuer's own log.
+const EXCHANGE_AUDIT_REQUEST_ID: &str = "connection-delegated-token";
+
+/// The error codes RFC 6749 section 5.2 and RFC 8693 section 2.2.2 register for a token endpoint.
+/// An issuer's code is recorded only when it is one of these, so audit never carries text the
+/// issuer chose.
+const REGISTERED_ERROR_CODES: &[&str] = &[
+    "invalid_request",
+    "invalid_client",
+    "invalid_grant",
+    "unauthorized_client",
+    "unsupported_grant_type",
+    "invalid_scope",
+    "invalid_target",
+    "access_denied",
+];
+
+/// Why a delegated token could not be obtained. Every variant refuses the call: nothing is sent
+/// upstream without the caller's own token.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DelegatedTokenError {
+    /// The call names nobody: it has no principal, or a service token's.
+    NoPrincipal,
+    /// The egress policy refuses the token-exchange endpoint.
+    EgressDenied,
+    /// The issuer refused this caller: no grant, a revoked grant, or a subject it does not accept
+    /// (`invalid_grant` or `access_denied`, or any `403`).
+    Denied,
+    /// No usable token came back: the issuer could not be reached, failed, refused the gateway's
+    /// own client authentication or request, or answered with something other than a bearer
+    /// access token with a bounded lifetime.
+    ExchangeFailed,
+    /// Every cache entry is held by a call or an exchange in flight.
+    Unavailable,
+    /// The client secret or the subject-token signing key is unknown, refused by its source, or not
+    /// valid for its purpose.
+    CredentialInvalid,
+    /// The client secret's or the signing key's source could not be read just now.
+    CredentialUnavailable,
+}
+
+impl DelegatedTokenError {
+    /// A stable, non-revealing reason for errors, audit and metrics.
+    pub const fn safe_reason(self) -> &'static str {
+        match self {
+            Self::NoPrincipal => "delegated_token_no_principal",
+            Self::EgressDenied => "delegated_token_egress_denied",
+            Self::Denied => "delegated_token_denied",
+            Self::ExchangeFailed => "delegated_token_exchange_failed",
+            Self::Unavailable => "delegated_token_unavailable",
+            Self::CredentialInvalid => "credential_invalid",
+            Self::CredentialUnavailable => "credential_unavailable",
+        }
+    }
+}
+
+impl fmt::Display for DelegatedTokenError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.safe_reason())
+    }
+}
+
+impl std::error::Error for DelegatedTokenError {}
+
+impl TokenCacheFailure for DelegatedTokenError {
+    const CACHE_FULL: Self = Self::Unavailable;
+    const MINT_PANICKED: Self = Self::ExchangeFailed;
+    const INVALID_TOKEN: Self = Self::ExchangeFailed;
+}
+
+/// One Connection's exchange, as a target built from one revision of it binds it.
+#[derive(Clone)]
+pub(crate) struct DelegatedTokenBinding {
+    pub connection_id: ConnectionId,
+    pub connection_etag: String,
+    pub client_id: String,
+    pub client_secret_id: String,
+    pub token_exchange_url: String,
+    pub requested_scopes: Vec<String>,
+    pub audience: Option<String>,
+    pub resource: Option<String>,
+    pub subject_token: SubjectTokenSettings,
+    pub token_client: Arc<EgressClient>,
+}
+
+/// How the subject token is signed: the Connection's `caller_assertion` settings, holding the key's
+/// alias and never the key, which is read and loaded on every exchange.
+#[derive(Clone)]
+pub(crate) struct SubjectTokenSettings {
+    pub signing_key_id: String,
+    pub kid: String,
+    pub algorithm: AssertionAlgorithm,
+    pub issuer: String,
+    pub audience: String,
+    pub token_type: String,
+    pub lifetime_seconds: u64,
+    pub claims: Vec<PrincipalClaim>,
+}
+
+/// A delegated token one call holds: injected as `Authorization: Bearer`, and dropped from the
+/// cache by an upstream `401`.
+pub(crate) type DelegatedTokenLease = OAuthTokenLease<DelegatedTokenError>;
+
+#[derive(Clone)]
+pub(crate) struct DelegatedTokenRuntime {
+    control_plane: ConnectionControlPlane,
+    cache: Arc<OAuthTokenCache<DelegatedTokenError>>,
+    audit: Option<AuditLog>,
+}
+
+impl fmt::Debug for DelegatedTokenRuntime {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("DelegatedTokenRuntime")
+            .field("cache_entries", &self.cache.slot_count())
+            .field("audit_configured", &self.audit.is_some())
+            .finish()
+    }
+}
+
+impl DelegatedTokenRuntime {
+    pub(crate) fn new(control_plane: ConnectionControlPlane) -> Self {
+        Self {
+            control_plane,
+            cache: Arc::new(OAuthTokenCache::with_capacity(
+                Arc::new(SystemOAuthClock),
+                MAX_DELEGATED_TOKEN_CACHE_ENTRIES,
+            )),
+            audit: None,
+        }
+    }
+
+    pub(crate) fn with_audit(mut self, audit: AuditLog) -> Self {
+        self.audit = Some(audit);
+        self
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_cache_for_test(
+        mut self,
+        clock: Arc<ManualTokenClock>,
+        capacity: usize,
+    ) -> Self {
+        self.cache = Arc::new(OAuthTokenCache::with_capacity(clock, capacity));
+        self
+    }
+
+    /// How many callers' tokens are cached now, across every delegated Connection.
+    pub(crate) fn cache_entry_count(&self) -> usize {
+        self.cache.slot_count()
+    }
+
+    /// The token `caller` holds for `binding`'s upstream: the cached one, or a fresh exchange.
+    ///
+    /// Concurrent calls of one caller share one exchange, and an exchange outlives a call that
+    /// stops waiting for it, so a cancelled call never cancels another caller's work or its audit.
+    pub(crate) async fn access_token(
+        &self,
+        binding: &DelegatedTokenBinding,
+        caller: &AttestedCaller,
+    ) -> Result<DelegatedTokenLease, DelegatedTokenError> {
+        let key = OAuthTokenCacheKey {
+            connection_id: binding.connection_id.to_string(),
+            connection_etag: binding.connection_etag.clone(),
+            subject: Some(subject_digest(caller)),
+            secret_version: self
+                .control_plane
+                .local_secret_version(&binding.client_secret_id),
+            egress_generation: binding.token_client.configuration_generation(),
+        };
+        let runtime = self.clone();
+        let binding = binding.clone();
+        let caller = caller.clone();
+        self.cache
+            .get_or_mint(key, move || async move {
+                runtime.exchange(&binding, &caller).await
+            })
+            .await
+    }
+
+    async fn exchange(
+        &self,
+        binding: &DelegatedTokenBinding,
+        caller: &AttestedCaller,
+    ) -> Result<MintedOAuthToken, DelegatedTokenError> {
+        let jti = uuid::Uuid::new_v4().to_string();
+        let mut attempt = ExchangeAttempt::new(self.audit.clone(), binding, caller, &jti);
+        let result = self
+            .exchange_inner(binding, caller, &jti, &mut attempt)
+            .await;
+        attempt.finish(&result);
+        result
+    }
+
+    async fn exchange_inner(
+        &self,
+        binding: &DelegatedTokenBinding,
+        caller: &AttestedCaller,
+        jti: &str,
+        attempt: &mut ExchangeAttempt,
+    ) -> Result<MintedOAuthToken, DelegatedTokenError> {
+        // The endpoint passes the egress policy before any key or secret is read.
+        let destination = binding
+            .token_client
+            .checked_destination(&binding.token_exchange_url)
+            .await
+            .map_err(|error| exchange_egress_error(&error))?;
+
+        let subject_token = self.sign_subject_token(binding, caller, jti).await?;
+        let client_secret = self
+            .control_plane
+            .secret_resolver()
+            .resolve(
+                &binding.client_secret_id,
+                SecretPurpose::TokenExchangeClientSecret,
+            )
+            .await
+            .map_err(|error| credential_error(error.kind()))?;
+        let headers = token_request_headers(&binding.client_id, client_secret.expose())
+            .map_err(|_| DelegatedTokenError::CredentialInvalid)?;
+        drop(client_secret);
+        let body = exchange_request_body(binding, &subject_token)?;
+        drop(subject_token);
+
+        let response = binding
+            .token_client
+            .sensitive_request_with_headers_at_checked_destination(
+                &destination,
+                Method::POST,
+                &binding.token_exchange_url,
+                headers,
+                Some(body),
+            )
+            .await
+            .map_err(|error| exchange_egress_error(&error))?;
+
+        attempt.issuer_status = Some(response.status.as_u16());
+        let json = is_json_content_type(response.headers.get(header::CONTENT_TYPE));
+        if response.status != StatusCode::OK {
+            let code = if json {
+                registered_error_code(response.body.as_slice())
+            } else {
+                None
+            };
+            attempt.issuer_error = code;
+            return Err(classify_refusal(response.status, code));
+        }
+        if !json {
+            return Err(DelegatedTokenError::ExchangeFailed);
+        }
+        let mut token: ExchangeResponse = serde_json::from_slice(response.body.as_slice())
+            .map_err(|_| DelegatedTokenError::ExchangeFailed)?;
+        let expires_in = validate_exchange_response(&token)?;
+        Ok(MintedOAuthToken {
+            access_token: token.access_token.take_bytes(),
+            lifetime: cache_lifetime(expires_in),
+        })
+    }
+
+    /// Signs the subject token: a caller assertion naming `caller`, as the Connection's
+    /// `caller_assertion` block configures it, bound to no request because the token it buys
+    /// serves many.
+    async fn sign_subject_token(
+        &self,
+        binding: &DelegatedTokenBinding,
+        caller: &AttestedCaller,
+        jti: &str,
+    ) -> Result<Zeroizing<String>, DelegatedTokenError> {
+        let settings = &binding.subject_token;
+        let material = self
+            .control_plane
+            .secret_resolver()
+            .resolve(&settings.signing_key_id, SecretPurpose::AssertionSigningKey)
+            .await
+            .map_err(|error| credential_error(error.kind()))?;
+        let key = load_signing_key(&settings.kid, settings.algorithm, material.expose())
+            .map_err(|_| DelegatedTokenError::CredentialInvalid)?;
+        drop(material);
+        let config = CallerAssertionConfig {
+            issuer: &settings.issuer,
+            audience: &settings.audience,
+            token_type: &settings.token_type,
+            lifetime_seconds: settings.lifetime_seconds,
+            claims: &settings.claims,
+            bind_request: false,
+            bind_approval: false,
+        };
+        let issued_at = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_err(|_| DelegatedTokenError::ExchangeFailed)?
+            .as_secs();
+        sign_caller_assertion(
+            &key,
+            &config,
+            Some(&caller.identity()),
+            jti,
+            issued_at,
+            None,
+            None,
+        )
+        .map(Zeroizing::new)
+        .map_err(|_| DelegatedTokenError::ExchangeFailed)
+    }
+}
+
+/// How long a token the issuer says lives `expires_in` seconds is offered to the cache, which
+/// refreshes it shortly before that ends: never longer than [`MAX_DELEGATED_TOKEN_CACHE_SECONDS`].
+fn cache_lifetime(expires_in: u64) -> Duration {
+    Duration::from_secs(expires_in.min(MAX_DELEGATED_TOKEN_CACHE_SECONDS))
+}
+
+/// Who a cached token belongs to: a digest of every attested field, so a caller whose email or
+/// roles changed at their provider is exchanged for again rather than served a token issued for
+/// claims that no longer hold. Length-prefixed so no two identities share an encoding.
+fn subject_digest(caller: &AttestedCaller) -> [u8; 32] {
+    let identity = caller.identity();
+    let mut digest = Sha256::new();
+    digest.update(b"greengateway:delegated-token-subject:v1\0");
+    for part in [identity.issuer, identity.subject] {
+        digest.update((part.len() as u64).to_be_bytes());
+        digest.update(part.as_bytes());
+    }
+    match identity.email {
+        Some(email) => {
+            digest.update([1]);
+            digest.update((email.len() as u64).to_be_bytes());
+            digest.update(email.as_bytes());
+        }
+        None => digest.update([0]),
+    }
+    digest.update((identity.roles.len() as u64).to_be_bytes());
+    for role in identity.roles {
+        digest.update((role.len() as u64).to_be_bytes());
+        digest.update(role.as_bytes());
+    }
+    digest.finalize().into()
+}
+
+fn exchange_request_body(
+    binding: &DelegatedTokenBinding,
+    subject_token: &str,
+) -> Result<Vec<u8>, DelegatedTokenError> {
+    let mut serializer = form_urlencoded::Serializer::new(String::new());
+    serializer.append_pair("grant_type", GRANT_TYPE_TOKEN_EXCHANGE);
+    serializer.append_pair("subject_token", subject_token);
+    serializer.append_pair("subject_token_type", SUBJECT_TOKEN_TYPE_JWT);
+    serializer.append_pair("requested_token_type", TOKEN_TYPE_ACCESS_TOKEN);
+    if !binding.requested_scopes.is_empty() {
+        serializer.append_pair("scope", &binding.requested_scopes.join(" "));
+    }
+    if let Some(audience) = binding.audience.as_deref() {
+        serializer.append_pair("audience", audience);
+    }
+    if let Some(resource) = binding.resource.as_deref() {
+        serializer.append_pair("resource", resource);
+    }
+    let body = Zeroizing::new(serializer.finish());
+    if body.len() > OAUTH_MAX_REQUEST_BYTES {
+        return Err(DelegatedTokenError::ExchangeFailed);
+    }
+    Ok(body.as_bytes().to_vec())
+}
+
+/// The fields of an RFC 8693 response this reads. Anything else an issuer adds -- a refresh token,
+/// a session identifier -- is skipped unread rather than refused: issuers routinely add fields,
+/// and none of them is kept.
+#[derive(Deserialize)]
+struct ExchangeResponse {
+    access_token: SecretString,
+    issued_token_type: String,
+    token_type: String,
+    #[serde(default)]
+    expires_in: Option<u64>,
+    #[serde(default)]
+    scope: Option<String>,
+}
+
+/// Accepts only what was asked for, an access token usable as a bearer header with a bounded,
+/// stated lifetime, and returns that lifetime in seconds. RFC 8693 only recommends `expires_in`;
+/// this requires it, because a token with no stated lifetime could only be cached on a guess.
+fn validate_exchange_response(token: &ExchangeResponse) -> Result<u64, DelegatedTokenError> {
+    let expires_in = token
+        .expires_in
+        .filter(|seconds| (1..=MAX_TOKEN_LIFETIME_SECS).contains(seconds))
+        .ok_or(DelegatedTokenError::ExchangeFailed)?;
+    let access_token = token.access_token.as_str();
+    if access_token.is_empty()
+        || access_token.len() > MAX_HTTP_CREDENTIAL_BYTES
+        || access_token.contains('\0')
+        || token.issued_token_type != TOKEN_TYPE_ACCESS_TOKEN
+        || token.token_type.len() > MAX_TOKEN_TYPE_BYTES
+        || !token.token_type.eq_ignore_ascii_case("bearer")
+        || token
+            .scope
+            .as_ref()
+            .is_some_and(|scope| scope.len() > MAX_RESPONSE_SCOPE_BYTES || scope.contains('\0'))
+        || HeaderValue::from_bytes(access_token.as_bytes()).is_err()
+    {
+        return Err(DelegatedTokenError::ExchangeFailed);
+    }
+    Ok(expires_in)
+}
+
+#[derive(Deserialize)]
+struct ExchangeErrorResponse {
+    #[serde(default)]
+    error: Option<String>,
+}
+
+/// The issuer's error code when it is a registered one, `unregistered` for any other, and `None`
+/// when the body names none.
+fn registered_error_code(body: &[u8]) -> Option<&'static str> {
+    let code = serde_json::from_slice::<ExchangeErrorResponse>(body)
+        .ok()?
+        .error?;
+    Some(
+        REGISTERED_ERROR_CODES
+            .iter()
+            .copied()
+            .find(|registered| *registered == code)
+            .unwrap_or("unregistered"),
+    )
+}
+
+/// A refusal is the issuer declining this caller only when it says so: `invalid_grant` (no grant,
+/// or one revoked) or `access_denied` on a client error, or a `403`. Everything else -- the gateway's
+/// own client authentication refused, a malformed request, a server error -- is the exchange
+/// failing, which no caller can fix by reconnecting.
+fn classify_refusal(status: StatusCode, code: Option<&'static str>) -> DelegatedTokenError {
+    if status == StatusCode::FORBIDDEN
+        || (status.is_client_error() && matches!(code, Some("invalid_grant" | "access_denied")))
+    {
+        DelegatedTokenError::Denied
+    } else {
+        DelegatedTokenError::ExchangeFailed
+    }
+}
+
+fn credential_error(kind: SecretResolveErrorKind) -> DelegatedTokenError {
+    match kind {
+        SecretResolveErrorKind::UnknownAlias
+        | SecretResolveErrorKind::SourceDenied
+        | SecretResolveErrorKind::InvalidMaterial => DelegatedTokenError::CredentialInvalid,
+        SecretResolveErrorKind::ProviderBusy
+        | SecretResolveErrorKind::SourceUnavailable
+        | SecretResolveErrorKind::UnsafeSource
+        | SecretResolveErrorKind::ProviderFailure => DelegatedTokenError::CredentialUnavailable,
+    }
+}
+
+fn exchange_egress_error(error: &EgressError) -> DelegatedTokenError {
+    match error {
+        EgressError::HostNotAllowed(_)
+        | EgressError::PortNotAllowed(_)
+        | EgressError::NonGlobalIpBlocked(_)
+        | EgressError::InvalidPolicy(_)
+        | EgressError::InvalidUrl(_)
+        | EgressError::SchemeNotAllowed(_) => DelegatedTokenError::EgressDenied,
+        EgressError::ResponseTooLarge { .. }
+        | EgressError::DnsResolutionFailed(_)
+        | EgressError::RequestBodyTooLarge { .. }
+        | EgressError::RequestBodyReadFailed
+        | EgressError::UnexpectedStatus(_)
+        | EgressError::ResponseIdleTimeout { .. }
+        | EgressError::InvalidTlsCaBundle { .. }
+        | EgressError::InvalidTlsClientIdentity
+        | EgressError::Http(_) => DelegatedTokenError::ExchangeFailed,
+        // Unreachable: the exchange goes through the pinned HTTP/1.1 transport, never through
+        // `egress::grpc`. Named rather than wildcarded so a new transport cannot land here
+        // silently.
+        EgressError::Grpc(_) => DelegatedTokenError::ExchangeFailed,
+    }
+}
+
+/// The audit record of one exchange, emitted exactly once: when it finishes, or, should the task
+/// running it be dropped first, as cancelled.
+struct ExchangeAttempt {
+    audit: Option<AuditLog>,
+    connection_id: String,
+    actor: Actor,
+    kid: String,
+    jti: String,
+    started: Instant,
+    issuer_status: Option<u16>,
+    issuer_error: Option<&'static str>,
+    completed: bool,
+}
+
+impl ExchangeAttempt {
+    fn new(
+        audit: Option<AuditLog>,
+        binding: &DelegatedTokenBinding,
+        caller: &AttestedCaller,
+        jti: &str,
+    ) -> Self {
+        Self {
+            audit,
+            connection_id: binding.connection_id.to_string(),
+            actor: caller.audit_actor(),
+            kid: binding.subject_token.kid.clone(),
+            jti: jti.to_owned(),
+            started: Instant::now(),
+            issuer_status: None,
+            issuer_error: None,
+            completed: false,
+        }
+    }
+
+    fn finish(&mut self, result: &Result<MintedOAuthToken, DelegatedTokenError>) {
+        let (outcome, reason) = match result {
+            Ok(_) => ("success", "exchanged"),
+            Err(error) => ("failure", error.safe_reason()),
+        };
+        self.completed = true;
+        self.emit(outcome, reason);
+    }
+
+    fn emit(&self, outcome: &'static str, reason: &'static str) {
+        metrics::counter!(
+            "connection_delegated_token_exchange_total",
+            "result" => outcome,
+            "reason" => reason
+        )
+        .increment(1);
+        let Some(audit) = self.audit.as_ref() else {
+            return;
+        };
+        audit.emit(AuditEvent::new(
+            audit::event::CONNECTION_DELEGATED_TOKEN_EXCHANGE,
+            EXCHANGE_AUDIT_REQUEST_ID,
+            "internal",
+            Some(self.actor.clone()),
+            json!({
+                "connection_id": self.connection_id,
+                "auth_type": "delegated_issuer_token",
+                "outcome": outcome,
+                "reason": reason,
+                "subject_token": { "kid": self.kid, "jti": self.jti },
+                "issuer_status": self.issuer_status,
+                "issuer_error": self.issuer_error,
+                "latency_ms": duration_millis(self.started.elapsed()),
+            }),
+        ));
+    }
+}
+
+impl Drop for ExchangeAttempt {
+    fn drop(&mut self) {
+        if !self.completed {
+            self.emit("failure", "delegated_token_exchange_cancelled");
+        }
+    }
+}
+
+/// A clock a test moves by hand, so expiry is tested without waiting for it.
+#[cfg(test)]
+pub(crate) struct ManualTokenClock {
+    base: Instant,
+    nanos: std::sync::atomic::AtomicU64,
+}
+
+#[cfg(test)]
+impl ManualTokenClock {
+    pub(crate) fn new() -> Self {
+        Self {
+            base: Instant::now(),
+            nanos: std::sync::atomic::AtomicU64::new(0),
+        }
+    }
+
+    pub(crate) fn advance(&self, duration: Duration) {
+        self.nanos.fetch_add(
+            u64::try_from(duration.as_nanos()).unwrap_or(u64::MAX),
+            std::sync::atomic::Ordering::AcqRel,
+        );
+    }
+}
+
+#[cfg(test)]
+impl super::oauth::OAuthClock for ManualTokenClock {
+    fn now(&self) -> Instant {
+        self.base + Duration::from_nanos(self.nanos.load(std::sync::atomic::Ordering::Acquire))
+    }
+}
+
+#[cfg(test)]
+#[path = "token_exchange_tests.rs"]
+mod tests;

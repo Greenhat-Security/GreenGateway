@@ -1,10 +1,11 @@
 import { adminFetchResource, type AdminResource } from './api';
 import { adminApiUrl } from './config';
 
-// `assertion_signing_key` is listed as a compatible purpose of operator and
-// external-provider aliases. This UI does not bind or create one -- the
-// encrypted local store cannot hold it -- but it must still accept the
-// purpose, or one new entry would reject the whole secret inventory.
+// `assertion_signing_key` and `token_exchange_client_secret` are listed as
+// compatible purposes of operator and external-provider aliases. This UI does
+// not bind or create either -- the encrypted local store cannot hold them --
+// but it must still accept both, or one new entry would reject the whole
+// secret inventory.
 export type ConnectionSecretPurpose =
   | 'header_api_key'
   | 'static_bearer'
@@ -12,7 +13,8 @@ export type ConnectionSecretPurpose =
   | 'tls_private_key'
   | 'tls_certificate'
   | 'tls_ca_bundle'
-  | 'assertion_signing_key';
+  | 'assertion_signing_key'
+  | 'token_exchange_client_secret';
 
 // Provider kinds this build knows how to name. The gateway's
 // `SecretProviderKind` is the authority; see the `SecretProvider` enum in
@@ -397,7 +399,8 @@ function isSecretPurpose(
     value === 'tls_private_key' ||
     value === 'tls_certificate' ||
     value === 'tls_ca_bundle' ||
-    value === 'assertion_signing_key'
+    value === 'assertion_signing_key' ||
+    value === 'token_exchange_client_secret'
   );
 }
 

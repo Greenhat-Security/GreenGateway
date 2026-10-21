@@ -6976,11 +6976,23 @@ pub(crate) fn expected_bindings<'a>(
             secret_id.as_str(),
             revisions.credential,
         )),
+        ConnectionAuthentication::DelegatedIssuerToken {
+            client_secret_id: Some(secret_id),
+            ..
+        } => bindings.push(binding(
+            "token_exchange_client_secret",
+            secret_id.as_str(),
+            revisions.credential,
+        )),
         ConnectionAuthentication::HeaderApiKey {
             secret_id: None, ..
         }
         | ConnectionAuthentication::StaticBearer { secret_id: None }
         | ConnectionAuthentication::OAuth2ClientCredentials {
+            client_secret_id: None,
+            ..
+        }
+        | ConnectionAuthentication::DelegatedIssuerToken {
             client_secret_id: None,
             ..
         } => {}
@@ -7017,12 +7029,20 @@ pub(crate) fn binding_count(write: &ConnectionWrite) -> usize {
         | ConnectionAuthentication::OAuth2ClientCredentials {
             client_secret_id: None,
             ..
+        }
+        | ConnectionAuthentication::DelegatedIssuerToken {
+            client_secret_id: None,
+            ..
         } => 0,
         ConnectionAuthentication::HeaderApiKey {
             secret_id: Some(_), ..
         }
         | ConnectionAuthentication::StaticBearer { secret_id: Some(_) }
         | ConnectionAuthentication::OAuth2ClientCredentials {
+            client_secret_id: Some(_),
+            ..
+        }
+        | ConnectionAuthentication::DelegatedIssuerToken {
             client_secret_id: Some(_),
             ..
         } => 1,
@@ -7179,6 +7199,9 @@ fn safe_authentication_kind(authentication: &ConnectionAuthentication) -> SafeAu
         ConnectionAuthentication::StaticBearer { .. } => SafeAuthenticationKind::StaticBearer,
         ConnectionAuthentication::OAuth2ClientCredentials { .. } => {
             SafeAuthenticationKind::Oauth2ClientCredentials
+        }
+        ConnectionAuthentication::DelegatedIssuerToken { .. } => {
+            SafeAuthenticationKind::DelegatedIssuerToken
         }
     }
 }

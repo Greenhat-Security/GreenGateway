@@ -177,12 +177,54 @@ pub enum ConnectionAuthentication {
         resource: Option<String>,
         client_auth_method: OAuthClientAuthMethod,
     },
+    /// The calling user's own upstream token, obtained from a trusted issuer
+    /// by OAuth 2.0 token exchange (RFC 8693) for each caller and cached per
+    /// caller, rather than one service credential shared by everyone.
+    ///
+    /// The issuer is the wallet: it holds each user's grant for the upstream
+    /// and hands out that user's access token when the gateway, authenticated
+    /// with `client_secret_basic`, presents a subject token naming the caller.
+    /// A call that names nobody -- no principal, or a service token -- is
+    /// refused; there is no fallback to a shared identity.
+    DelegatedIssuerToken {
+        token_exchange_url: String,
+        client_id: String,
+        /// Secret alias of the client secret the gateway authenticates to the
+        /// issuer with, resolved as
+        /// [`super::secret::SecretPurpose::TokenExchangeClientSecret`].
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        client_secret_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        requested_scopes: Vec<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        audience: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        resource: Option<String>,
+        subject_token_source: SubjectTokenSource,
+    },
 }
 
 impl ConnectionAuthentication {
     pub fn requires_confidential_transport(&self) -> bool {
         !matches!(self, Self::None)
     }
+}
+
+/// What a delegated token exchange presents to the issuer as the subject
+/// token: the evidence of who the caller is.
+///
+/// Closed, with one member. Exchanging the caller's own inbound bearer token
+/// instead would mean the gateway retaining and forwarding a credential the
+/// caller presented to it alone, which needs a security review of its own;
+/// until then the caller is named by an assertion this gateway signs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SubjectTokenSource {
+    /// A JWT signed with the Connection's `caller_assertion` key and naming
+    /// the validated caller exactly as a caller assertion does, sent with
+    /// `subject_token_type` `urn:ietf:params:oauth:token-type:jwt`. The
+    /// Connection must therefore carry a `caller_assertion` block.
+    CallerAssertion,
 }
 
 /// One secret-backed header beyond the primary credential. The secret is
@@ -464,6 +506,12 @@ impl ConnectionWrite {
             allow_legacy_options,
             &mut errors,
         );
+        validate_delegated_issuer_token(
+            self.kind,
+            &self.authentication,
+            self.caller_assertion.as_ref(),
+            &mut errors,
+        );
         validate_additional_headers(
             &mut self.additional_headers,
             &self.authentication,
@@ -603,6 +651,10 @@ impl ConnectionWrite {
             ConnectionAuthentication::OAuth2ClientCredentials {
                 client_secret_id: Some(secret_id),
                 ..
+            }
+            | ConnectionAuthentication::DelegatedIssuerToken {
+                client_secret_id: Some(secret_id),
+                ..
             } => {
                 if !binding_is_configured(secret_id) {
                     unresolved.push("authentication.client_secret_id");
@@ -613,6 +665,10 @@ impl ConnectionWrite {
             }
             | ConnectionAuthentication::StaticBearer { secret_id: None }
             | ConnectionAuthentication::OAuth2ClientCredentials {
+                client_secret_id: None,
+                ..
+            }
+            | ConnectionAuthentication::DelegatedIssuerToken {
                 client_secret_id: None,
                 ..
             } => {}
@@ -897,43 +953,11 @@ fn validate_authentication(
                 enabled,
                 errors,
             );
-            match normalize_token_url(token_url) {
+            match normalize_token_url("authentication.token_url", token_url) {
                 Ok(normalized) => *token_url = normalized,
                 Err(error) => errors.push(error),
             }
-            if scopes.len() > MAX_SCOPES {
-                errors.push(ConnectionValidationError::new(
-                    "authentication.scopes",
-                    "too_many",
-                    format!("must contain at most {MAX_SCOPES} entries"),
-                ));
-            }
-            let mut seen_scopes = std::collections::BTreeSet::new();
-            for scope in scopes.iter() {
-                validate_bounded_text(
-                    "authentication.scopes",
-                    scope,
-                    MAX_SCOPE_CHARS,
-                    false,
-                    errors,
-                );
-                if scope.chars().any(char::is_whitespace) {
-                    errors.push(ConnectionValidationError::new(
-                        "authentication.scopes",
-                        "invalid_scope",
-                        "scope entries must not contain whitespace",
-                    ));
-                }
-                if !seen_scopes.insert(scope.as_str()) {
-                    errors.push(ConnectionValidationError::new(
-                        "authentication.scopes",
-                        "duplicate_scope",
-                        "scope entries must be unique",
-                    ));
-                }
-            }
-            scopes.sort();
-            scopes.dedup();
+            validate_scopes("authentication.scopes", scopes, errors);
             validate_optional_bounded_bytes(
                 "authentication.audience",
                 audience.as_deref(),
@@ -947,6 +971,136 @@ fn validate_authentication(
                 errors,
             );
         }
+        ConnectionAuthentication::DelegatedIssuerToken {
+            token_exchange_url,
+            client_id,
+            client_secret_id,
+            requested_scopes,
+            audience,
+            resource,
+            subject_token_source: SubjectTokenSource::CallerAssertion,
+        } => {
+            validate_bounded_bytes(
+                "authentication.client_id",
+                client_id,
+                MAX_CLIENT_ID_BYTES,
+                false,
+                errors,
+            );
+            validate_optional_secret_id(
+                "authentication.client_secret_id",
+                client_secret_id.as_deref(),
+                enabled,
+                errors,
+            );
+            // The same rule as an OAuth token endpoint: HTTPS, no userinfo,
+            // query or fragment. The client secret and every caller's token
+            // cross this hop, and the egress policy checks the host on every
+            // exchange before the secret is read.
+            match normalize_token_url("authentication.token_exchange_url", token_exchange_url) {
+                Ok(normalized) => *token_exchange_url = normalized,
+                Err(error) => errors.push(error),
+            }
+            validate_scopes("authentication.requested_scopes", requested_scopes, errors);
+            validate_optional_bounded_bytes(
+                "authentication.audience",
+                audience.as_deref(),
+                MAX_AUDIENCE_RESOURCE_BYTES,
+                errors,
+            );
+            validate_optional_bounded_bytes(
+                "authentication.resource",
+                resource.as_deref(),
+                MAX_AUDIENCE_RESOURCE_BYTES,
+                errors,
+            );
+        }
+    }
+}
+
+/// Scope lists are bounded, unique, whitespace-free and stored sorted, so two
+/// documents that ask for the same scopes compare equal.
+fn validate_scopes(
+    field: &'static str,
+    scopes: &mut Vec<String>,
+    errors: &mut Vec<ConnectionValidationError>,
+) {
+    if scopes.len() > MAX_SCOPES {
+        errors.push(ConnectionValidationError::new(
+            field,
+            "too_many",
+            format!("must contain at most {MAX_SCOPES} entries"),
+        ));
+    }
+    let mut seen_scopes = std::collections::BTreeSet::new();
+    for scope in scopes.iter() {
+        validate_bounded_text(field, scope, MAX_SCOPE_CHARS, false, errors);
+        if scope.chars().any(char::is_whitespace) {
+            errors.push(ConnectionValidationError::new(
+                field,
+                "invalid_scope",
+                "scope entries must not contain whitespace",
+            ));
+        }
+        if !seen_scopes.insert(scope.as_str()) {
+            errors.push(ConnectionValidationError::new(
+                field,
+                "duplicate_scope",
+                "scope entries must be unique",
+            ));
+        }
+    }
+    scopes.sort();
+    scopes.dedup();
+}
+
+/// The rules a `delegated_issuer_token` Connection adds beyond its own
+/// fields.
+///
+/// Its subject token is signed with the Connection's caller-assertion key, so
+/// the block must be present; nothing else could name the caller. That token
+/// is exchanged once per caller and its result reused across that caller's
+/// requests, so it cannot bind any one request, and a block asking for that
+/// would be claiming a guarantee nothing provides. Only a manual HTTP tool
+/// call has a caller to exchange for (see `ConnectionHttpRuntime::
+/// tool_call_target`), so the credential is offered on `http_api`
+/// Connections only.
+///
+/// These apply to stored documents too: no earlier release wrote this type,
+/// so there is no legacy reading to keep.
+fn validate_delegated_issuer_token(
+    kind: ConnectionKind,
+    authentication: &ConnectionAuthentication,
+    caller_assertion: Option<&CallerAssertionSettings>,
+    errors: &mut Vec<ConnectionValidationError>,
+) {
+    if !matches!(
+        authentication,
+        ConnectionAuthentication::DelegatedIssuerToken { .. }
+    ) {
+        return;
+    }
+    if kind != ConnectionKind::HttpApi {
+        errors.push(ConnectionValidationError::new(
+            "authentication.type",
+            "kind_mismatch",
+            "delegated_issuer_token requires kind http_api",
+        ));
+    }
+    match caller_assertion {
+        None => errors.push(ConnectionValidationError::new(
+            "caller_assertion",
+            "required",
+            "a delegated_issuer_token Connection signs its subject token with the caller_assertion key, so caller_assertion must be configured",
+        )),
+        Some(assertion) if assertion.bind_request => {
+            errors.push(ConnectionValidationError::new(
+                "caller_assertion.bind_request",
+                "unsupported_binding",
+                "a delegated token is exchanged once per caller and reused across requests, so its subject token cannot bind a request; bind_request must be false",
+            ));
+        }
+        Some(_) => {}
     }
 }
 
@@ -974,7 +1128,8 @@ fn validate_additional_headers(
         }
         ConnectionAuthentication::None
         | ConnectionAuthentication::StaticBearer { .. }
-        | ConnectionAuthentication::OAuth2ClientCredentials { .. } => None,
+        | ConnectionAuthentication::OAuth2ClientCredentials { .. }
+        | ConnectionAuthentication::DelegatedIssuerToken { .. } => None,
     };
     let mut seen = std::collections::BTreeSet::new();
     for header in headers.iter_mut() {
@@ -1193,27 +1348,27 @@ fn normalize_base_url(value: &str) -> Result<String, ConnectionValidationError> 
     Ok(parsed.origin().ascii_serialization())
 }
 
-fn normalize_token_url(value: &str) -> Result<String, ConnectionValidationError> {
+fn normalize_token_url(
+    field: &'static str,
+    value: &str,
+) -> Result<String, ConnectionValidationError> {
     if value.is_empty() || value.len() > MAX_URL_BYTES {
         return Err(ConnectionValidationError::new(
-            "authentication.token_url",
+            field,
             "invalid_length",
             format!("must contain 1-{MAX_URL_BYTES} bytes"),
         ));
     }
-    let parsed = parse_http_url("authentication.token_url", value)?;
+    let parsed = parse_http_url(field, value)?;
     if parsed.scheme() != "https" || parsed.query().is_some() || parsed.fragment().is_some() {
         return Err(ConnectionValidationError::new(
-            "authentication.token_url",
+            field,
             "invalid_token_url",
             "must be an HTTPS URL without userinfo, query, or fragment",
         ));
     }
     let raw_path = raw_url_path(value).unwrap_or_default();
-    normalize_origin_relative_path(
-        "authentication.token_url",
-        if raw_path.is_empty() { "/" } else { raw_path },
-    )?;
+    normalize_origin_relative_path(field, if raw_path.is_empty() { "/" } else { raw_path })?;
     Ok(parsed.to_string())
 }
 
@@ -1886,6 +2041,181 @@ newline"
         let mut renamed = attested_plain.clone();
         renamed.display_name = "Renamed".to_owned();
         assert!(!attested_plain.requires_secrets_write_to_replace(&renamed));
+    }
+
+    /// A `delegated_issuer_token` Connection with the caller assertion its
+    /// subject token is signed with; `overrides` replace authentication
+    /// fields.
+    fn delegated(overrides: Value) -> Value {
+        let mut connection = with_caller_assertion(json!({}));
+        let mut authentication = json!({
+            "type": "delegated_issuer_token",
+            "token_exchange_url": "https://issuer.example.test/oauth2/token-exchange",
+            "client_id": "greengateway",
+            "client_secret_id": "issuer-exchange-secret",
+            "requested_scopes": ["mail.read", "calendar.read"],
+            "audience": "https://mail.example.test",
+            "subject_token_source": "caller_assertion"
+        });
+        for (key, value) in overrides.as_object().expect("overrides object") {
+            authentication[key] = value.clone();
+        }
+        connection["authentication"] = authentication;
+        connection
+    }
+
+    fn delegated_errors(document: Value) -> Vec<ConnectionValidationError> {
+        serde_json::from_value::<ConnectionWrite>(document)
+            .expect("candidate should deserialize")
+            .validated()
+            .expect_err("candidate should be rejected")
+    }
+
+    #[test]
+    fn a_delegated_issuer_token_matches_schema_and_rust_model() {
+        let document = delegated(json!({}));
+        connection_schema_validator()
+            .validate(&document)
+            .expect("published schema should accept a delegated issuer token");
+
+        let validated = serde_json::from_value::<ConnectionWrite>(document)
+            .expect("should deserialize")
+            .validated()
+            .expect("should validate");
+        let ConnectionAuthentication::DelegatedIssuerToken {
+            token_exchange_url,
+            requested_scopes,
+            subject_token_source,
+            ..
+        } = &validated.authentication
+        else {
+            panic!("the delegated authentication is kept");
+        };
+        assert_eq!(
+            token_exchange_url,
+            "https://issuer.example.test/oauth2/token-exchange"
+        );
+        // Stored sorted, like client-credentials scopes, so equal requests
+        // compare equal.
+        assert_eq!(requested_scopes, &["calendar.read", "mail.read"]);
+        assert_eq!(*subject_token_source, SubjectTokenSource::CallerAssertion);
+        assert!(validated.configures_credential_authority());
+        assert!(validated.sends_credentials());
+    }
+
+    #[test]
+    fn a_delegated_token_exchange_endpoint_must_be_https() {
+        for url in [
+            "http://issuer.example.test/oauth2/token-exchange",
+            "https://issuer.example.test/token?tenant=a",
+            "https://user@issuer.example.test/token",
+        ] {
+            let document = delegated(json!({ "token_exchange_url": url }));
+            let errors = delegated_errors(document.clone());
+            assert!(
+                errors
+                    .iter()
+                    .any(|error| error.field == "authentication.token_exchange_url"),
+                "{url} must be refused: {errors:?}"
+            );
+            if url.starts_with("http://") {
+                assert!(connection_schema_validator().validate(&document).is_err());
+            }
+        }
+    }
+
+    #[test]
+    fn a_delegated_issuer_token_needs_a_caller_assertion_to_sign_its_subject_token() {
+        let mut without = delegated(json!({}));
+        without
+            .as_object_mut()
+            .expect("connection object")
+            .remove("caller_assertion");
+        assert!(connection_schema_validator().validate(&without).is_err());
+        let errors = delegated_errors(without);
+        assert!(errors
+            .iter()
+            .any(|error| error.field == "caller_assertion" && error.code == "required"));
+
+        let mut bound = delegated(json!({}));
+        bound["caller_assertion"]["bind_request"] = json!(true);
+        assert!(connection_schema_validator().validate(&bound).is_err());
+        let errors = delegated_errors(bound);
+        assert!(errors.iter().any(|error| {
+            error.field == "caller_assertion.bind_request" && error.code == "unsupported_binding"
+        }));
+    }
+
+    #[test]
+    fn a_delegated_issuer_token_is_offered_on_http_apis_only() {
+        let mut mcp = delegated(json!({}));
+        mcp["kind"] = json!("mcp_streamable_http");
+        mcp["discovery"] = json!({
+            "type": "managed_mcp",
+            "use_connection_authentication": true
+        });
+        assert!(connection_schema_validator().validate(&mcp).is_err());
+        let errors = delegated_errors(mcp);
+        assert!(errors
+            .iter()
+            .any(|error| error.field == "authentication.type" && error.code == "kind_mismatch"));
+    }
+
+    #[test]
+    fn the_subject_token_source_is_closed_to_the_caller_assertion() {
+        // Forwarding the caller's own inbound token needs a security review of
+        // its own, so no document can ask for it yet.
+        for source in ["caller_bearer", "caller_subject", ""] {
+            let document = delegated(json!({ "subject_token_source": source }));
+            assert!(connection_schema_validator().validate(&document).is_err());
+            assert!(serde_json::from_value::<ConnectionWrite>(document).is_err());
+        }
+        let mut missing = delegated(json!({}));
+        missing["authentication"]
+            .as_object_mut()
+            .expect("authentication object")
+            .remove("subject_token_source");
+        assert!(connection_schema_validator().validate(&missing).is_err());
+        assert!(serde_json::from_value::<ConnectionWrite>(missing).is_err());
+    }
+
+    #[test]
+    fn a_delegated_draft_may_leave_its_client_secret_unbound_until_enabled() {
+        let mut draft = delegated(json!({}));
+        draft["authentication"]
+            .as_object_mut()
+            .expect("authentication object")
+            .remove("client_secret_id");
+        connection_schema_validator()
+            .validate(&draft)
+            .expect("a disabled draft may omit the secret");
+        let validated = serde_json::from_value::<ConnectionWrite>(draft.clone())
+            .expect("should deserialize")
+            .validated()
+            .expect("a disabled draft validates");
+        assert!(validated
+            .unresolved_enabled_binding_fields(|_| true)
+            .is_empty());
+
+        draft["enabled"] = json!(true);
+        assert!(connection_schema_validator().validate(&draft).is_err());
+        let errors = delegated_errors(draft);
+        assert!(errors.iter().any(|error| {
+            error.field == "authentication.client_secret_id" && error.code == "missing_binding"
+        }));
+    }
+
+    #[test]
+    fn a_delegated_client_secret_is_a_binding_an_enabled_connection_must_resolve() {
+        let mut document = delegated(json!({}));
+        document["enabled"] = json!(true);
+        let validated = serde_json::from_value::<ConnectionWrite>(document)
+            .expect("should deserialize")
+            .validated()
+            .expect("should validate");
+        let unresolved =
+            validated.unresolved_enabled_binding_fields(|id| id != "issuer-exchange-secret");
+        assert_eq!(unresolved, vec!["authentication.client_secret_id"]);
     }
 
     #[test]

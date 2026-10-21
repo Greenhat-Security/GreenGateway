@@ -2589,6 +2589,19 @@ impl ToolExecutor {
         if let Some(header_name) = target.caller_assertion_header_name() {
             request.headers.remove(header_name);
         }
+        // A credential that is the caller's own cannot be obtained for a call
+        // that names nobody, a service token included. Refused here, ahead of
+        // the caller-assertion admission a delegated Connection also carries,
+        // so the reason says which of the two could not be honoured.
+        if target.credential_belongs_to_caller() && context.caller.is_none() {
+            return Err(ClassifiedConnectionError {
+                error: Box::new(connection_tool_error(
+                    tool,
+                    ConnectionHttpError::DelegatedTokenNoPrincipal,
+                )),
+                request_sent: false,
+            });
+        }
         // A Connection that attests its caller refuses a call that names
         // nobody, and one whose keys no upstream could verify, before the
         // egress preflight resolves anything or any credential is read.
@@ -2677,7 +2690,10 @@ impl ToolExecutor {
                         request_sent: false,
                     }
                 })?;
-        let credential = run_before_deadline(deadline, runtime.resolve_credential(&target))
+        // Resolved for the caller the call was admitted for: a delegated
+        // credential is that caller's own token.
+        let caller = context.caller.as_deref();
+        let credential = run_before_deadline(deadline, runtime.resolve_credential(&target, caller))
             .await
             .map_err(|_| ClassifiedConnectionError {
                 error: Box::new(ToolExecutorError::Connection {

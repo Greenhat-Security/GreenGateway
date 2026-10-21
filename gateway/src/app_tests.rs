@@ -14194,7 +14194,7 @@ async fn connection_secret_admin_crud_is_safe_permissioned_and_preconditioned() 
     assert_eq!(operator["actions"]["can_delete"], json!(false));
     assert_eq!(
         operator["compatible_purposes"].as_array().map(Vec::len),
-        Some(7)
+        Some(8)
     );
     let operator_etag = operator["etag"]
         .as_str()

@@ -2029,9 +2029,11 @@ impl OpenApiConnectionCatalogService {
             .prepare_transport(&target, &destination)
             .await
             .map_err(connection_http_error)?;
+        // Discovery runs for no caller, so a credential that belongs to one
+        // is refused rather than resolved.
         let credential = self
             .http
-            .resolve_credential(&target)
+            .resolve_credential(&target, None)
             .await
             .map_err(connection_http_error)?;
         let mut headers = HeaderMap::new();
@@ -2863,12 +2865,20 @@ fn connection_http_error(error: ConnectionHttpError) -> OpenApiCatalogError {
         | ConnectionHttpError::OAuthTokenUnavailable
         | ConnectionHttpError::OAuthTokenRejected
         | ConnectionHttpError::OAuthTokenInvalidResponse => OpenApiCatalogError::SecretUnavailable,
-        ConnectionHttpError::OAuthTokenEgressDenied => OpenApiCatalogError::EgressDenied,
+        ConnectionHttpError::OAuthTokenEgressDenied
+        | ConnectionHttpError::DelegatedTokenEgressDenied => OpenApiCatalogError::EgressDenied,
+        // Unreachable: a delegated Connection carries a caller assertion,
+        // which discovery refuses before it resolves anything. Named so that
+        // stays a decision rather than a wildcard.
+        ConnectionHttpError::DelegatedTokenDenied
+        | ConnectionHttpError::DelegatedTokenExchangeFailed
+        | ConnectionHttpError::DelegatedTokenUnavailable => OpenApiCatalogError::SecretUnavailable,
         ConnectionHttpError::UpstreamAuthenticationRejected => {
             OpenApiCatalogError::AuthenticationFailed
         }
         ConnectionHttpError::UnsupportedAuthentication
-        | ConnectionHttpError::CredentialHeaderConflict => {
+        | ConnectionHttpError::CredentialHeaderConflict
+        | ConnectionHttpError::DelegatedTokenNoPrincipal => {
             OpenApiCatalogError::AuthenticationMismatch
         }
         ConnectionHttpError::CallerAssertionNotEnforced => {

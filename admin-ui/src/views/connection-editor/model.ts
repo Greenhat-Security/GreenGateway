@@ -163,6 +163,22 @@ export const ALL_SECRET_PURPOSES: ConnectionSecretPurpose[] = [
   'tls_private_key',
 ];
 
+/**
+ * Why the editor cannot open `detail`, or `null` when it can.
+ *
+ * A delegated issuer token is shown read only: the editor has no form for it,
+ * and saving through a form that cannot represent it would replace the
+ * credential with whichever type the form defaulted to.
+ */
+export function editorUnsupportedReason(
+  detail: ConnectionDetail,
+): string | null {
+  if (detail.configuration?.authentication.type === 'delegated_issuer_token') {
+    return 'This connection uses a delegated issuer token, which the editor cannot change yet. Its settings are shown on the connection page; change them through the admin API.';
+  }
+  return null;
+}
+
 export function formFromDetail(detail: ConnectionDetail): ConnectionFormState {
   const configuration = detail.configuration;
   if (configuration === undefined) {
@@ -176,6 +192,11 @@ export function formFromDetail(detail: ConnectionDetail): ConnectionFormState {
   }
 
   const authentication = configuration.authentication;
+  if (authentication.type === 'delegated_issuer_token') {
+    // The editor refuses such a connection before it builds a form; see
+    // `editorUnsupportedReason`.
+    throw new Error(editorUnsupportedReason(detail) ?? 'Unsupported connection');
+  }
   const authenticationConfigured =
     authentication.type === 'header_api_key' ||
       authentication.type === 'static_bearer'

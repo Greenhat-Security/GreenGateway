@@ -1909,6 +1909,13 @@ pub(super) fn retain_hidden_connection_bindings(
                 ..
             },
             "oauth2_client_credentials",
+        )
+        | (
+            connections::model::ConnectionAuthentication::DelegatedIssuerToken {
+                client_secret_id,
+                ..
+            },
+            "delegated_issuer_token",
         ) => retain_hidden_binding(
             authentication,
             "client_secret_id",
@@ -2119,6 +2126,10 @@ pub(super) fn connection_secret_dependency_counts(
                 secret_id.as_deref()
             }
             connections::model::ConnectionAuthentication::OAuth2ClientCredentials {
+                client_secret_id,
+                ..
+            }
+            | connections::model::ConnectionAuthentication::DelegatedIssuerToken {
                 client_secret_id,
                 ..
             } => client_secret_id.as_deref(),
