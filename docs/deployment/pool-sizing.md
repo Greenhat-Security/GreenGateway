@@ -58,6 +58,14 @@ Start at the default `DATABASE_POOL_MAX=10` and change it on evidence:
 - **Requests failing with `503` and a `Timeout` classification on `database_pool`** means acquisition is timing out — the pool is too small for the concurrency, or a query is holding connections too long. Look at query duration before raising the pool; a pool raise buys time against a slow query, it does not fix one.
 - **`max_connections` pressure across the deployment** means the pool is too large for the replica count. Lower it, or raise the server's limit, or put a connection pooler in front — with the caveat below.
 
+**What the nightly capacity matrix shows, and what it does not.** The `nightly-performance` workflow runs two and three replicas at pool ceilings of 2 and 10 under two request mixes, plus one cell with concurrent policy commits and audit-stream load. It publishes the result as the `ha-capacity` artifact; [authority cost](../performance/authority-cost.md#the-capacity-matrix) describes each field and how to read it. For sizing, three numbers in each cell matter:
+
+- `database.runtime_backends.max` against `pool.connection_ceiling`: the connections the deployment actually opened against the ones it was allowed. This is the left-hand side of the arithmetic above, observed.
+- The `cancelled` and `timeout` counts in `pool.acquire_counts`, with `requests.rate_503`: whether that ceiling left requests waiting past their deadlines under that load.
+- `waiting_max` and `available_min` per replica: whether the queue formed on every replica, or only on the maintenance leader, which runs with one fewer connection.
+
+Treat these as evidence about one hosted runner, not as limits. The matrix gates nothing on latency and recommends no pool size. Issue #439's sizing guard checks the arithmetic above against a deployment's real server limits and uses these cells as its tested inputs. To size your own deployment, scrape the same series and run the same `pg_stat_activity` counts under your own load. Neither needs any privilege beyond a monitoring role (see [collecting the same numbers](../performance/authority-cost.md#collecting-the-same-numbers-in-a-deployment)).
+
 A pooler (PgBouncer and friends) is allowed only in **session** pooling mode. Transaction pooling breaks this gateway: it holds session state the gateway relies on. The pooled sessions carry `search_path` pinned to `greengateway, pg_catalog` and the three server-side timeouts as connection-time startup parameters, and advisory locks — which `migrate up`, the maintenance pass, and the discovery projector all use — are session-scoped and would be released or misattributed under transaction pooling. Point the gateway at the writable primary directly unless you have a specific reason not to, and never at a read endpoint (see [the failover runbook](failover.md)).
 
 ## The timeouts

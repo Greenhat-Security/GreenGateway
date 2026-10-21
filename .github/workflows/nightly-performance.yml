@@ -4,10 +4,11 @@
 # rather than pushed, they need a `--release` build and a single test thread to
 # mean anything, and a night on which the runner was noisy must not read as a
 # broken pull request. `gateway/tests/ha/performance.rs`'s five measurement
-# tests are `#[ignore]`d for exactly that reason and run nowhere else; its one
-# always-on test -- the assertion that every budget row in
-# `docs/architecture/ha-state-model.md` §6 is covered by a measurement here --
-# runs on every pull request through `cargo test --workspace`.
+# tests and its capacity matrix are `#[ignore]`d for exactly that reason and
+# run nowhere else; its always-on tests -- the assertion that every budget row
+# in `docs/architecture/ha-state-model.md` §6 is covered by a measurement here,
+# and the capacity module's database-free parser and matrix checks -- run on
+# every pull request through `cargo test --workspace`.
 #
 # The budgets are absolute and come from the document, not from last night:
 # "a PR that cannot meet its budget redesigns, not re-baselines"
@@ -15,6 +16,11 @@
 # regression rule, which fires when a p99 has grown by more than 25 % AND has
 # reached 80 % of its budget -- a slide toward a ceiling, caught before it hits
 # one. A missing baseline is a pass, and the suite says so in the log.
+#
+# The capacity matrix (issue #439 PR 2, `gateway/tests/ha/capacity.rs`) is the
+# opposite kind of measurement and runs in its own step: it gates on nothing
+# but the completeness of its own evidence, never on a latency, and publishes
+# a validated report for pool sizing (`docs/performance/authority-cost.md`).
 name: nightly-performance
 
 on:
@@ -118,6 +124,7 @@ jobs:
           fi
 
       - name: Measure the blocking budgets
+        id: budgets
         env:
           GATEWAY_TEST_POSTGRES_URL_FILE: ${{ runner.temp }}/pg/database-url
           GATEWAY_TEST_HA_GATE: "1"
@@ -134,6 +141,8 @@ jobs:
         # what separates them -- the audit fixture alone loads a million
         # rows -- so elapsed time is the real check and the count check just
         # catches an empty target.
+        #
+        # `--skip capacity::` leaves the capacity matrix to its own step below.
         run: |
           set -euo pipefail
           baseline="${RUNNER_TEMP}/baseline/ha-performance.json"
@@ -141,7 +150,7 @@ jobs:
             export GATEWAY_TEST_PERF_BASELINE="${baseline}"
           fi
           cargo test -p gateway --test ha_performance --release \
-            -- --ignored --test-threads 1 2>&1 | tee performance.log
+            -- --ignored --skip capacity:: --test-threads 1 2>&1 | tee performance.log
           if grep -q 'test result: ok. 0 passed' performance.log; then
             echo "::error::the performance suite ran no measurements; the nightly would be vacuous"
             exit 1
@@ -169,3 +178,75 @@ jobs:
           path: ${{ runner.temp }}/ha/ha-performance.json
           if-no-files-found: error
           retention-days: 90
+
+      - name: Measure the capacity matrix
+        id: capacity
+        # Issue #439 PR 2: two replica counts by two pool ceilings by two
+        # request mixes, plus one cell with concurrent policy commits and
+        # audit-stream batches, each on a fresh cluster for a 20 s measured
+        # window. The test asserts only that every cell produced complete
+        # evidence; latency, refusals and pool waits are recorded, never
+        # judged, so there is nothing here to re-baseline.
+        #
+        # It runs whenever the budget step ran, pass or fail: a night with a
+        # budget failure still publishes its capacity evidence, and a
+        # capacity failure cannot hide a budget result. The step's own
+        # timeout keeps nine cells inside the job's 90 minutes.
+        #
+        # The same anti-vacuity guard as the budget step: a skipped matrix
+        # reports "1 passed" in 0.0Xs, while nine cells take minutes.
+        if: ${{ !cancelled() && steps.budgets.outcome != 'skipped' }}
+        timeout-minutes: 30
+        env:
+          GATEWAY_TEST_POSTGRES_URL_FILE: ${{ runner.temp }}/pg/database-url
+          GATEWAY_TEST_HA_GATE: "1"
+          GATEWAY_TEST_CAPACITY_REPORT: ${{ runner.temp }}/ha/capacity-raw.json
+          RUST_BACKTRACE: 1
+        run: |
+          set -euo pipefail
+          cargo test -p gateway --test ha_performance --release \
+            -- --ignored --exact capacity::the_capacity_matrix_records_complete_evidence_for_every_cell \
+            --test-threads 1 2>&1 | tee capacity.log
+          if ! grep -q 'test result: ok. 1 passed' capacity.log; then
+            echo "::error::the capacity matrix did not run; its evidence would be vacuous"
+            exit 1
+          fi
+          elapsed="$(sed -n 's/^test result:.*finished in \([0-9.]*\)s.*/\1/p' capacity.log | tail -n 1)"
+          if [ -z "${elapsed}" ]; then
+            echo "::error::the capacity matrix printed no test-result line; the run did not complete"
+            exit 1
+          fi
+          if awk -v e="${elapsed}" 'BEGIN { exit (e < 60.0) ? 0 : 1 }'; then
+            echo "::error::the capacity matrix finished in ${elapsed}s, which is the silent-skip path, not a measurement run. Check GATEWAY_TEST_POSTGRES_URL_FILE and GATEWAY_TEST_HA_GATE."
+            exit 1
+          fi
+          echo "measured the capacity matrix for ${elapsed}s"
+
+      - name: Validate the capacity report
+        # Rebuilds the uploaded report from an allowlist of bounded fields and
+        # fails unless every declared cell is complete
+        # (`docs/deployment/test-evidence.md`).
+        if: ${{ always() && steps.capacity.outcome == 'success' }}
+        run: python scripts/check-test-evidence.py capacity "${{ runner.temp }}/ha/capacity-raw.json" "${{ runner.temp }}/ha/ha-capacity.json"
+
+      - name: Publish the capacity report
+        if: ${{ always() && steps.capacity.outcome == 'success' }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: ha-capacity
+          path: ${{ runner.temp }}/ha/ha-capacity.json
+          if-no-files-found: error
+          retention-days: 90
+
+      - name: Retain available capacity diagnostics
+        # The producer's own report, rewritten after every cell, so a failed
+        # matrix still shows which cells were incomplete and why. It carries
+        # the same sanitized fields; absence is normal when the step never
+        # started.
+        if: ${{ always() && steps.capacity.outcome != 'success' }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: ha-capacity-diagnostics
+          path: ${{ runner.temp }}/ha/capacity-raw.json
+          if-no-files-found: ignore
+          retention-days: 30

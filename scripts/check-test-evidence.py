@@ -4,6 +4,7 @@ import argparse
 import json
 import math
 from pathlib import Path
+import re
 import struct
 import zlib
 
@@ -214,10 +215,261 @@ def stream_summary(report):
             'completed': completed, 'duration_ms': duration, 'status_counts': statuses}
 
 
+# The #439 capacity matrix (gateway/tests/ha/capacity.rs). The producer
+# sanitizes its report; this rebuilds it from the fields named here, so a field
+# the producer starts emitting by mistake never reaches the artifact, and fails
+# unless every declared cell produced complete evidence. Numbers are checked
+# for shape and consistency only: there are no capacity budgets to compare with.
+CAPACITY_OPERATION_CLASSES = ('revision_check', 'credential_check', 'rate_limit', 'execution_lease',
+                              'security_state_read', 'control_plane_write', 'maintenance')
+CAPACITY_ERROR_CLASSES = ('none', 'unavailable', 'timeout', 'conflict', 'invalid_data',
+                          'incompatible_schema', 'internal', 'cancelled')
+CAPACITY_MIXES = {
+    'jwt_proxy': {'kinds': ('jwt_proxy',),
+                  'classes': ('rate_limit', 'credential_check', 'revision_check')},
+    'mixed_credentials': {'kinds': ('jwt_proxy', 'service_token_proxy', 'admin_policy_read'),
+                          'classes': ('rate_limit', 'credential_check', 'revision_check',
+                                      'security_state_read')},
+}
+# Served, or refused because a dependency could not be consulted. Any other
+# status is a harness or configuration failure, not a capacity result.
+CAPACITY_STATUSES = ('200', '503')
+CAPACITY_SPREADS = ('runtime_backends', 'active', 'idle', 'idle_in_transaction', 'lock_waiting',
+                    'lwlock_waiting', 'io_waiting', 'ungranted_locks')
+CAPACITY_COUNTERS = ('xact_commit', 'xact_rollback', 'deadlocks', 'blks_hit', 'blks_read',
+                     'temp_files')
+CAPACITY_METHOD = ('concurrency', 'measured_seconds', 'warmup_seconds', 'client_timeout_ms',
+                   'sample_interval_ms')
+CAPACITY_REPLICA_NAMES = 'abcdefgh'
+MAX_CAPACITY_CELLS = 16
+MAX_CAPACITY_POOL = 256
+MIN_CAPACITY_SAMPLES = 3
+
+
+def capacity_number(value, high=None):
+    if (type(value) not in (int, float) or not math.isfinite(value) or value < 0
+            or (high is not None and value > high)):
+        raise ValueError('capacity evidence numbers must be finite, nonnegative and in range')
+    return value
+
+
+def capacity_text(value, pattern):
+    if type(value) is not str or not re.fullmatch(pattern, value):
+        raise ValueError('capacity evidence carries an unrecognised name or label')
+    return value
+
+
+def capacity_choice(value, choices):
+    if type(value) is not str or value not in choices:
+        raise ValueError('capacity evidence carries an unrecognised name or label')
+    return value
+
+
+def capacity_latency(value):
+    if value is None:
+        return None
+    latency = {key: capacity_number(value[key]) for key in ('p50_ms', 'p95_ms', 'p99_ms', 'max_ms')}
+    if not latency['p50_ms'] <= latency['p95_ms'] <= latency['p99_ms'] <= latency['max_ms']:
+        raise ValueError('capacity quantiles are out of order')
+    return latency
+
+
+def capacity_statuses(value, total):
+    if type(value) is not dict or any(key not in CAPACITY_STATUSES for key in value):
+        raise ValueError('capacity evidence has a status a capacity run cannot produce')
+    statuses = {key: count(value[key]) for key in CAPACITY_STATUSES if key in value}
+    if sum(statuses.values()) > total:
+        raise ValueError('capacity status counts exceed their requests')
+    return statuses
+
+
+def capacity_requests(requests, mix, concurrency):
+    completed = count(requests['completed'])
+    timeouts, errors = count(requests['client_timeouts']), count(requests['client_errors'])
+    statuses = capacity_statuses(requests['status_counts'], completed)
+    if completed < concurrency or errors or sum(statuses.values()) + timeouts != completed:
+        raise ValueError('a capacity cell has too few requests or failures outside the capacity outcomes')
+    rates = {'rate_503': statuses.get('503', 0) / completed, 'rate_client_timeout': timeouts / completed}
+    for key, expected in rates.items():
+        if abs(capacity_number(requests[key], 1) - expected) > 1e-6:
+            raise ValueError('capacity rates do not match their counts')
+    kinds = CAPACITY_MIXES[mix]['kinds']
+    if type(requests['by_kind']) is not dict or set(requests['by_kind']) != set(kinds):
+        raise ValueError('capacity request kinds do not match the mix')
+    by_kind = {}
+    for kind in kinds:
+        entry = requests['by_kind'][kind]
+        kind_completed, kind_timeouts = count(entry['completed']), count(entry['client_timeouts'])
+        kind_statuses = capacity_statuses(entry['status_counts'], kind_completed)
+        kind_latency = capacity_latency(entry['latency_ms'])
+        if (kind_completed == 0 or kind_latency is None
+                or sum(kind_statuses.values()) + kind_timeouts != kind_completed):
+            raise ValueError('a capacity request kind has no complete evidence')
+        by_kind[kind] = {'completed': kind_completed, 'status_counts': kind_statuses,
+                         'client_timeouts': kind_timeouts, 'latency_ms': kind_latency}
+    if sum(entry['completed'] for entry in by_kind.values()) != completed:
+        raise ValueError('capacity request kinds do not add up to the cell')
+    latency, served = capacity_latency(requests['latency_ms']), capacity_latency(requests['served_latency_ms'])
+    duration = capacity_number(requests['duration_ms'])
+    if latency is None or duration == 0 or (served is None) != (statuses.get('200', 0) == 0):
+        raise ValueError('capacity request latency is missing')
+    return {'completed': completed, 'duration_ms': duration,
+            'throughput_rps': capacity_number(requests['throughput_rps']),
+            'status_counts': statuses, 'client_timeouts': timeouts, 'client_errors': errors,
+            'rate_503': requests['rate_503'], 'rate_client_timeout': requests['rate_client_timeout'],
+            'latency_ms': latency, 'served_latency_ms': served, 'by_kind': by_kind}
+
+
+def capacity_pool(pool, replicas, pool_max, classes):
+    ceiling = count(pool['connection_ceiling'])
+    if ceiling != replicas * pool_max or type(pool['replicas']) is not list or len(pool['replicas']) != replicas:
+        raise ValueError('capacity pool evidence does not cover every replica')
+    pairs = [(name, error) for name in CAPACITY_OPERATION_CLASSES for error in CAPACITY_ERROR_CLASSES]
+    totals = {}
+    rebuilt = []
+    for index, row in enumerate(pool['replicas']):
+        if row['replica'] != CAPACITY_REPLICA_NAMES[index] or type(row['acquire']) is not list:
+            raise ValueError('capacity pool evidence does not cover every replica')
+        series = []
+        for entry in row['acquire']:
+            pair = (capacity_choice(entry['operation_class'], CAPACITY_OPERATION_CLASSES),
+                    capacity_choice(entry['error_class'], CAPACITY_ERROR_CLASSES))
+            samples = count(entry['count'])
+            if samples == 0 or any(pair == (seen['operation_class'], seen['error_class']) for seen in series):
+                raise ValueError('capacity acquisition series are empty or repeated')
+            totals[pair] = totals.get(pair, 0) + samples
+            series.append({'operation_class': pair[0], 'error_class': pair[1], 'count': samples,
+                           'sum_seconds': capacity_number(entry['sum_seconds']),
+                           **capacity_latency(entry)})
+        if not any(entry['operation_class'] == 'revision_check' and entry['error_class'] == 'none'
+                   for entry in series):
+            raise ValueError('a replica left no acquisition evidence')
+        size, available = count(row['size_max']), count(row['available_min'])
+        if size > pool_max or available > pool_max:
+            raise ValueError('capacity pool gauges exceed the pool ceiling')
+        rebuilt.append({'replica': row['replica'], 'pool_timeouts': count(row['pool_timeouts']),
+                        'audit_events_dropped': count(row['audit_events_dropped']),
+                        'size_max': size, 'available_min': available,
+                        'waiting_max': count(row['waiting_max']), 'acquire': series})
+    counts = pool['acquire_counts']
+    if type(counts) is not list or len(counts) != len(pairs):
+        raise ValueError('capacity acquisition counts must list every class and outcome')
+    acquire_counts = []
+    for (name, error), entry in zip(pairs, counts):
+        if ((entry['operation_class'], entry['error_class']) != (name, error)
+                or count(entry['count']) != totals.get((name, error), 0)):
+            raise ValueError('capacity acquisition counts do not match the replicas')
+        acquire_counts.append({'operation_class': name, 'error_class': error, 'count': entry['count']})
+    if any(not any(totals.get((name, error)) for error in CAPACITY_ERROR_CLASSES) for name in classes):
+        raise ValueError('a class the mix exercises left no acquisition evidence')
+    return {'connection_ceiling': ceiling, 'replicas': rebuilt, 'acquire_counts': acquire_counts}
+
+
+def capacity_database(database):
+    spreads = {}
+    for key in CAPACITY_SPREADS:
+        maximum, mean = count(database[key]['max']), capacity_number(database[key]['mean'])
+        if mean > maximum:
+            raise ValueError('capacity database samples are inconsistent')
+        spreads[key] = {'max': maximum, 'mean': mean}
+    samples = count(database['activity_samples'])
+    if samples < MIN_CAPACITY_SAMPLES or spreads['runtime_backends']['max'] < 1:
+        raise ValueError('capacity database activity was not sampled')
+    counters = database['stat_delta']
+    if type(counters) is not dict or set(counters) != set(CAPACITY_COUNTERS):
+        raise ValueError('capacity database counters are missing')
+    return {'activity_samples': samples, **spreads,
+            'longest_lock_wait_ms': capacity_number(database['longest_lock_wait_ms']),
+            'stat_delta': {key: count(counters[key]) for key in CAPACITY_COUNTERS}}
+
+
+def capacity_control_plane(churn):
+    attempted = count(churn['commits_attempted'])
+    statuses = capacity_statuses(churn['status_counts'], attempted)
+    samples, timeouts = count(churn['convergence_samples']), count(churn['convergence_timeouts'])
+    commit_latency, convergence = capacity_latency(churn['commit_latency_ms']), capacity_latency(churn['convergence_ms'])
+    committed = statuses.get('200', 0)
+    if (committed == 0 or samples == 0 or sum(statuses.values()) != attempted
+            or samples + timeouts != committed or commit_latency is None or convergence is None):
+        raise ValueError('the contention cell did not commit and converge')
+    return {'commits_attempted': attempted, 'status_counts': statuses,
+            'commit_latency_ms': commit_latency, 'convergence_samples': samples,
+            'convergence_timeouts': timeouts, 'convergence_ms': convergence}
+
+
+def capacity_projector(projector):
+    fields = {key: count(projector[key]) for key in
+              ('events_ingested', 'checkpoint_delta', 'projected_events_delta', 'lag_events_after')}
+    if not (fields['events_ingested'] and fields['checkpoint_delta'] and fields['projected_events_delta']):
+        raise ValueError('the contention cell left the discovery projector idle')
+    return fields
+
+
+def capacity_cell(cell, name, concurrency):
+    if cell['name'] != name:
+        raise ValueError('capacity cells do not match the declared matrix')
+    if cell['complete'] is not True or cell['incomplete_reasons'] != []:
+        raise ValueError('a capacity cell did not produce complete evidence')
+    replicas, pool_max = count(cell['replicas']), count(cell['pool_max'])
+    mix, contention = capacity_choice(cell['mix'], CAPACITY_MIXES), cell['contention']
+    if (type(contention) is not bool or not 1 <= replicas <= len(CAPACITY_REPLICA_NAMES)
+            or not 1 <= pool_max <= MAX_CAPACITY_POOL):
+        raise ValueError('a capacity cell configuration is out of range')
+    if name != f'r{replicas}-p{pool_max}-{mix}' + ('-contention' if contention else ''):
+        raise ValueError('a capacity cell name does not describe its configuration')
+    classes = CAPACITY_MIXES[mix]['classes'] + (('control_plane_write',) if contention else ())
+    if not contention and (cell['control_plane'] is not None or cell['projector'] is not None):
+        raise ValueError('only the contention cell carries concurrent work')
+    return {'name': name, 'replicas': replicas, 'pool_max': pool_max, 'mix': mix,
+            'contention': contention,
+            'requests': capacity_requests(cell['requests'], mix, concurrency),
+            'pool': capacity_pool(cell['pool'], replicas, pool_max, classes),
+            'database': capacity_database(cell['database']),
+            'control_plane': capacity_control_plane(cell['control_plane']) if contention else None,
+            'projector': capacity_projector(cell['projector']) if contention else None,
+            'complete': True}
+
+
+def capacity_summary(report):
+    if report.get('schema_version') != 1 or report.get('producer') != 'ha-capacity':
+        raise ValueError('capacity evidence has an unknown producer or schema')
+    method = {key: count(report['method'][key]) for key in CAPACITY_METHOD}
+    matrix, cells = report['matrix'], report['cells']
+    if (not all(method.values()) or type(matrix) is not list or type(cells) is not list
+            or not 1 <= len(matrix) <= MAX_CAPACITY_CELLS or len(set(map(str, matrix))) != len(matrix)
+            or len(cells) != len(matrix)):
+        raise ValueError('capacity evidence does not cover every declared cell')
+    rebuilt = [capacity_cell(cell, name, method['concurrency']) for cell, name in zip(cells, matrix)]
+    # The matrix itself: every replica count by every pool ceiling by both
+    # mixes, at least two of each, plus exactly one contention cell.
+    plain = [(cell['replicas'], cell['pool_max'], cell['mix']) for cell in rebuilt if not cell['contention']]
+    replica_counts, ceilings = {cell[0] for cell in plain}, {cell[1] for cell in plain}
+    crossed = {(replicas, ceiling, mix) for replicas in replica_counts
+               for ceiling in ceilings for mix in CAPACITY_MIXES}
+    if (len(replica_counts) < 2 or len(ceilings) < 2 or len(plain) != len(crossed)
+            or set(plain) != crossed or len(rebuilt) - len(plain) != 1):
+        raise ValueError('the capacity matrix does not cross two replica counts, two pool ceilings '
+                         'and both mixes plus one contention cell')
+    return {'schema_version': 1, 'producer': 'ha-capacity',
+            'recorded_at': capacity_text(report['recorded_at'],
+                                         r'\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d{1,9})?Z|unknown'),
+            'git_sha': capacity_text(report['git_sha'], r'[0-9a-f]{40}|unknown'),
+            'binary_version': capacity_text(report['binary_version'],
+                                            r'\d+\.\d+\.\d+([-+][0-9A-Za-z.-]{1,32})?'),
+            'runner': {'os': capacity_text(report['runner']['os'], r'[a-z]{1,16}'),
+                       'cores': count(report['runner']['cores'])},
+            'database': {key: count(report['database'][key]) for key in
+                         ('server_version_num', 'max_connections', 'superuser_reserved_connections')},
+            'method': method, 'matrix': [cell['name'] for cell in rebuilt], 'cells': rebuilt}
+
+
+SUMMARIES = {'playwright': playwright_summary, 'stream': stream_summary, 'capacity': capacity_summary}
+
+
 def validate(kind, source, destination, screenshots=None):
     report = read_json(source)
     try:
-        summary = playwright_summary(report) if kind == 'playwright' else stream_summary(report)
+        summary = SUMMARIES[kind](report)
         if screenshots is not None:
             summary['screenshots'] = screenshot_count(screenshots)
     except (AttributeError, KeyError, TypeError, OSError, RecursionError):
@@ -228,7 +480,7 @@ def validate(kind, source, destination, screenshots=None):
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('kind', choices=('playwright', 'stream'))
+    parser.add_argument('kind', choices=tuple(SUMMARIES))
     parser.add_argument('source', type=Path)
     parser.add_argument('summary', type=Path)
     parser.add_argument('--screenshots', type=Path)

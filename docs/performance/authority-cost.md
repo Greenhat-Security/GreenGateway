@@ -3,8 +3,9 @@
 Part of #439. This page counts, from the source, which cluster-mode request
 paths talk to PostgreSQL, how many pool checkouts, statements and network round
 trips each one spends, and how to read the series that separates waiting for a
-connection from the work done on it. It publishes no latency numbers. Measured
-capacity scenarios are the next step of #439, and results from a target
+connection from the work done on it. The counts publish no latency numbers;
+[the capacity matrix](#the-capacity-matrix) records what these paths cost
+under load on a hosted CI runner, every night. Results from a target
 environment remain a qualification item under #389; nothing here is a
 production SLO.
 
@@ -380,12 +381,159 @@ today. The product series measure the calls as they run, under whatever load a
 replica carries. They answer different questions and are not interchangeable
 evidence for a budget.
 
+## The capacity matrix
+
+The `nightly-performance` workflow runs the paths above under load and
+publishes what the series on this page said about them, as the `ha-capacity`
+artifact (90 days). The producer is
+[`tests/ha/capacity.rs`](../../gateway/tests/ha/capacity.rs);
+`scripts/check-test-evidence.py capacity` validates its report and rebuilds the
+uploaded file from an allowlist of bounded fields (see
+[test evidence](../deployment/test-evidence.md)). If a cell is incomplete, the
+run publishes `ha-capacity-diagnostics` instead: the producer's report with
+each cell's reason codes.
+
+### The cells
+
+| Axis | Values |
+| --- | --- |
+| Replicas | 2, 3 |
+| `DATABASE_POOL_MAX` per replica | 2, 10 (the product default) |
+| Request mix | `jwt_proxy`, `mixed_credentials` |
+
+The eight crossed cells are named `r<replicas>-p<pool>-<mix>`, for example
+`r3-p2-jwt_proxy`. A ninth, `r2-p10-mixed_credentials-contention`, runs the
+mixed load with concurrent control-plane and audit work:
+
+- `jwt_proxy`: every request is a proxied `GET` with a JWT carrying a `jti`.
+  That is the first row of the [summary](#summary): `rate_limit`,
+  `credential_check`, `revision_check`.
+- `mixed_credentials`: out of every ten requests, six are that `GET`, three are
+  the same `GET` with a service token, and one is an admin policy read
+  (`GET /v1{ADMIN_PREFIX}/policy`). The policy read adds a
+  `security_state_read` checkout for the authoritative document.
+- The contention cell adds a writer and an audit feeder. The writer commits a
+  policy document every 250 ms on alternating replicas. Each commit forces
+  every replica to reconcile and makes the next request for every cached
+  service token a verification. The feeder appends a batch of 200
+  `http.request_observed` events to the audit stream every second, through the
+  production statements and lock, for the discovery projector. This is on top
+  of the audit rows every request writes.
+
+Every cell starts its own cluster on a fresh database. The load generator runs
+24 closed-loop workers, spread evenly over the replicas, and sends straight to
+each replica rather than through the harness balancer. It discards a 2 s
+warm-up, then measures for 20 s. Each worker presents its own
+documentation-range client address through a proxy header trusted from
+loopback only. The global limiter's shared bucket is keyed by client address,
+so a generator on one address would queue the whole deployment on one bucket
+row. The replicas, PostgreSQL 16 and the generator share one hosted runner.
+The report records its cores, the server version and `max_connections`. The
+numbers describe that machine, not yours.
+
+### What a cell records
+
+| Field | What it is |
+| --- | --- |
+| `requests` | Completed requests, throughput, status counts (`200` and `503` only in a complete cell), client timeouts, `rate_503`, `rate_client_timeout`, and nearest-rank p50/p95/p99/max latency over all requests (`latency_ms`) and over served ones (`served_latency_ms`), overall and per request kind. |
+| `pool.replicas[].acquire` | Per replica, one row per `operation_class` and `error_class` whose count moved during the window. Each row has the exact count and sum delta, and the exporter's p50/p95/p99/max in milliseconds. |
+| `pool.acquire_counts` | Deployment-wide counts for all 56 class and outcome pairs, zeros included. A `cancelled` of zero is stated, not left out. |
+| `pool.replicas[]` | The `greengateway_database_pool_timeouts_total` and `audit_events_dropped_total` deltas. Also the largest `size`, smallest `available` and largest `waiting` sampled every 500 ms. |
+| `pool.connection_ceiling` | `replicas x DATABASE_POOL_MAX`, as configured. |
+| `database` | `pg_stat_activity` sampled every 500 ms, as max and mean per sample. It covers the runtime role's sessions (`runtime_backends`, `active`, `idle`, `idle_in_transaction`), every session in the database waiting on `Lock`, `LWLock` and `IO`, and ungranted `pg_locks` entries. It also has the longest lock wait seen and `pg_stat_database` deltas (`xact_commit`, `xact_rollback`, `deadlocks`, `blks_hit`, `blks_read`, `temp_files`). |
+| `control_plane` | Contention cell only. Commit status counts and latency, and convergence: the time from a commit returning to every replica's `greengateway_security_revision_compiled` reaching the committed revision. Commits that never converge within 10 s are counted, not dropped. |
+| `projector` | Contention cell only. Events the feeder appended, the projector's checkpoint and applied-observation deltas, and the stream lag after the window. |
+
+Database CPU is not collected. SQL has no portable view of it without an
+extension or host access. Read it from the database host or your provider's
+metrics.
+
+### Reading it
+
+- Change one axis at a time. Compare `r2-p2-<mix>` with `r2-p10-<mix>` for the
+  pool ceiling, `r2-p<n>-<mix>` with `r3-p<n>-<mix>` for scale-out, and a mixed
+  cell with the contention cell for concurrent control-plane and audit work.
+- Start with outcomes. When `rate_503` or `rate_client_timeout` rises with
+  `cancelled` and `timeout` counts in `pool.acquire_counts`, the cell has
+  passed the point where requests give up waiting for a connection. Check
+  `waiting_max` and `available_min` on the replicas beside it.
+- Then read the acquisition rows. The rules in
+  [Reading the series](#reading-the-series) apply. `none` quantiles are
+  censored at the callers' deadlines, so a `revision_check` `cancelled` row
+  sits near 250 ms. A `rate_limit` checkout has no deadline of its own, so its
+  `none` tail can run up to the pool's 5 s. The quantiles cover the
+  exporter's rolling window of about a minute, which on a 20 s cell includes
+  cluster start and warm-up. Read a row's `count` before its quantiles: a
+  class with few samples, like `security_state_read` or
+  `control_plane_write`, is dominated by those.
+- Use `database` to tell queueing from a slow database. Lock waits show as
+  `lock_waiting`, `ungranted_locks` and `longest_lock_wait_ms`. Contention on
+  shared buffers and internal structures shows as `lwlock_waiting`.
+  `runtime_backends.max` is how many connections the deployment actually
+  opened. Pools open lazily, so this can stay below `connection_ceiling`.
+- `stat_delta` is approximate. Each backend flushes its own counters at most
+  about once a second. `xact_commit` divided by `requests.completed` still
+  gives a rough count of database transactions per request.
+
+### What the gate checks
+
+The nightly fails on the matrix only when evidence is incomplete. It checks
+each of the following. Every declared cell is present. Each cell completed at
+least one request per worker and has no status other than `200` or `503`. No
+client transport errors occurred. Every request kind in the mix completed.
+Every replica's scrape carries `revision_check` acquisitions. Every class the
+mix exercises appears in the deployment-wide counts. The database was sampled
+at least three times. In the contention cell, at least one commit converged
+and the projector advanced. It checks the matrix too: at least two replica
+counts by two pool ceilings by both mixes, plus one contention cell.
+
+The gate never compares a latency, a refusal rate or a wait with a threshold.
+A complete cell in which half the requests were refused passes, because that
+refusal is the result being recorded. No capacity budget exists, and this
+matrix does not set one.
+
+### Collecting the same numbers in a deployment
+
+None of this needs privileges a deployment does not already have:
+
+- The acquisition series and the pool gauges come from each replica's
+  `/metrics`, which needs no credential. Scrape each replica separately.
+  Quantiles are per replica and cannot be averaged across replicas.
+- Any role can read `pg_locks` and `pg_stat_database`. Any role can also read
+  `pg_stat_activity`. The `state`, `wait_event_type` and `query` columns of
+  another role's sessions are visible only to superusers and members of
+  `pg_read_all_stats`, which is part of `pg_monitor`. Grant `pg_monitor` to a
+  separate monitoring role. The gateway's runtime role needs no grant for any
+  of this, and should not get one. The harness reads these views as the CI
+  superuser and keeps only aggregate counts:
+
+  ```sql
+  SELECT state, wait_event_type, count(*)
+  FROM pg_stat_activity
+  WHERE datname = 'greengateway' AND usename = '<runtime role>'
+  GROUP BY state, wait_event_type;
+
+  SELECT count(*) FROM pg_locks l JOIN pg_stat_activity a ON a.pid = l.pid
+  WHERE NOT l.granted AND a.datname = 'greengateway';
+  ```
+
+### How it feeds pool sizing
+
+[Pool sizing](../deployment/pool-sizing.md) keeps the arithmetic, and this
+matrix does not change it. For each pool ceiling and replica count, the report
+gives the observed side of that arithmetic: peak connections opened against
+the configured ceiling, at the server's recorded `max_connections` and
+`superuser_reserved_connections`. It also gives the ceiling at which
+cancelled waits and `503` refusals appeared under this load. Issue #439's next
+step, a sizing report and guard, takes those as tested inputs. It does not take
+them as limits: a benchmark result never changes a deployment's limits by
+itself, and a deployment still sizes against its own measured load.
+
 ## What this page does not establish
 
-- How long any of this takes. The counts are from the source at the time of
-  writing; the latency of each step depends on the database, the network, the
-  pool size and the load.
-- Where tail latency or timeouts start to degrade as replicas, pool ceilings
-  and request mix change. That is the capacity matrix #439 adds next.
+- How long any of this takes in your environment. The counts are from the
+  source at the time of writing. The latency of each step depends on the
+  database, the network, the pool size and the load, and the capacity matrix
+  measures only a hosted CI runner.
 - That a deployment's connection ceiling is safe. That is the arithmetic in
   [pool sizing](../deployment/pool-sizing.md), which this page does not change.

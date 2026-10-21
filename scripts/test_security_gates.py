@@ -346,6 +346,205 @@ class TestEvidenceGate(unittest.TestCase):
                     evidence.stream_summary(report)
 
 
+class CapacityEvidenceGate(unittest.TestCase):
+    """The #439 capacity matrix: complete evidence or nothing, from an allowlist."""
+
+    LATENCY = {'p50_ms': 1.0, 'p95_ms': 2.0, 'p99_ms': 3.0, 'max_ms': 4.0}
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.source = Path(self.temp.name) / 'raw.json'
+        self.summary = Path(self.temp.name) / 'summary.json'
+
+    def cell(self, replicas, pool_max, mix, contention=False):
+        kinds = evidence.CAPACITY_MIXES[mix]['kinds']
+        classes = evidence.CAPACITY_MIXES[mix]['classes'] + (('control_plane_write',) if contention else ())
+        completed = 40 * len(kinds)
+        totals = {}
+        replica_rows = []
+        for index in range(replicas):
+            series = []
+            for name, error, samples in [(name, 'none', 50) for name in classes] + [('revision_check', 'cancelled', 2)]:
+                totals[(name, error)] = totals.get((name, error), 0) + samples
+                series.append({'operation_class': name, 'error_class': error, 'count': samples,
+                               'sum_seconds': 0.05, **self.LATENCY})
+            replica_rows.append({'replica': 'abc'[index], 'pool_timeouts': 0, 'audit_events_dropped': 0,
+                                 'size_max': pool_max, 'available_min': 0, 'waiting_max': 3,
+                                 'acquire': series})
+        cell = {
+            'name': f'r{replicas}-p{pool_max}-{mix}' + ('-contention' if contention else ''),
+            'replicas': replicas, 'pool_max': pool_max, 'mix': mix, 'contention': contention,
+            'requests': {
+                'completed': completed, 'duration_ms': 20000.0, 'throughput_rps': completed / 20,
+                'status_counts': {'200': completed - 4 * len(kinds), '503': 4 * len(kinds)},
+                'client_timeouts': 0, 'client_errors': 0, 'rate_503': 0.1, 'rate_client_timeout': 0.0,
+                'latency_ms': dict(self.LATENCY), 'served_latency_ms': dict(self.LATENCY),
+                'by_kind': {kind: {'completed': 40, 'status_counts': {'200': 36, '503': 4},
+                                   'client_timeouts': 0, 'latency_ms': dict(self.LATENCY)}
+                            for kind in kinds}},
+            'pool': {'connection_ceiling': replicas * pool_max, 'replicas': replica_rows,
+                     'acquire_counts': [{'operation_class': name, 'error_class': error,
+                                         'count': totals.get((name, error), 0)}
+                                        for name in evidence.CAPACITY_OPERATION_CLASSES
+                                        for error in evidence.CAPACITY_ERROR_CLASSES]},
+            'database': {'activity_samples': 40,
+                         **{key: {'max': 4, 'mean': 2.5} for key in evidence.CAPACITY_SPREADS},
+                         'longest_lock_wait_ms': 0.0,
+                         'stat_delta': {key: 10 for key in evidence.CAPACITY_COUNTERS}},
+            'control_plane': None, 'projector': None,
+            'complete': True, 'incomplete_reasons': []}
+        if contention:
+            cell['control_plane'] = {'commits_attempted': 20, 'status_counts': {'200': 19, '503': 1},
+                                     'commit_latency_ms': dict(self.LATENCY), 'convergence_samples': 19,
+                                     'convergence_timeouts': 0, 'convergence_ms': dict(self.LATENCY)}
+            cell['projector'] = {'events_ingested': 4000, 'checkpoint_delta': 9000,
+                                 'projected_events_delta': 8000, 'lag_events_after': 10}
+        return cell
+
+    def report(self):
+        cells = [self.cell(replicas, pool_max, mix)
+                 for replicas in (2, 3) for pool_max in (2, 10)
+                 for mix in ('jwt_proxy', 'mixed_credentials')]
+        cells.append(self.cell(2, 10, 'mixed_credentials', contention=True))
+        return {'schema_version': 1, 'producer': 'ha-capacity',
+                'recorded_at': '2026-10-20T03:17:00.123456789Z', 'git_sha': 'a' * 40,
+                'binary_version': '1.0.1', 'runner': {'os': 'linux', 'cores': 4},
+                'database': {'server_version_num': 160010, 'max_connections': 100,
+                             'superuser_reserved_connections': 3},
+                'method': {'concurrency': 24, 'measured_seconds': 20, 'warmup_seconds': 2,
+                           'client_timeout_ms': 10000, 'sample_interval_ms': 500},
+                'matrix': [cell['name'] for cell in cells], 'cells': cells}
+
+    def rejects(self, report):
+        self.source.write_text(json.dumps(report))
+        with self.assertRaises(ValueError):
+            evidence.validate('capacity', self.source, self.summary)
+
+    def test_complete_matrix_is_rebuilt_from_its_allowlist(self):
+        report = self.report()
+        report['base_url'] = 'http://127.0.0.1:41234'
+        report['cells'][0]['error'] = 'fixture-private-locator'
+        report['cells'][0]['requests']['run_id'] = 'fixture-private-locator'
+        report['cells'][0]['pool']['replicas'][0]['dsn'] = 'postgres://fixture-private-locator'
+        self.source.write_text(json.dumps(report))
+        evidence.validate('capacity', self.source, self.summary)
+        rendered = self.summary.read_text()
+        self.assertNotIn('fixture-private-locator', rendered)
+        self.assertNotIn('127.0.0.1', rendered)
+        summary = json.loads(rendered)
+        self.assertEqual(summary['matrix'], report['matrix'])
+        self.assertEqual(len(summary['cells']), 9)
+        cancelled = [entry for entry in summary['cells'][0]['pool']['acquire_counts']
+                     if entry['error_class'] == 'cancelled' and entry['operation_class'] == 'revision_check']
+        self.assertEqual(cancelled[0]['count'], 4)
+        self.assertIsNone(summary['cells'][0]['control_plane'])
+        self.assertEqual(summary['cells'][8]['control_plane']['convergence_samples'], 19)
+
+    def test_an_incomplete_or_missing_cell_fails(self):
+        incomplete = self.report()
+        incomplete['cells'][3]['complete'] = False
+        incomplete['cells'][3]['incomplete_reasons'] = ['activity_not_sampled']
+        missing = self.report()
+        missing['cells'].pop()
+        renamed = self.report()
+        renamed['cells'][1]['name'] = renamed['cells'][0]['name']
+        for report in (incomplete, missing, renamed):
+            with self.subTest(report=report['cells'][-1]['name']):
+                self.rejects(report)
+
+    def test_a_shrunken_matrix_fails(self):
+        report = self.report()
+        report['cells'] = [cell for cell in report['cells'] if cell['replicas'] == 2]
+        report['matrix'] = [cell['name'] for cell in report['cells']]
+        self.rejects(report)
+        no_contention = self.report()
+        no_contention['cells'].pop()
+        no_contention['matrix'].pop()
+        self.rejects(no_contention)
+
+    def test_outcomes_a_capacity_run_cannot_produce_fail(self):
+        mutations = {
+            'unauthorized': lambda cell: cell['requests']['status_counts'].update({'401': 1}),
+            'client error': lambda cell: cell['requests'].update({'client_errors': 1}),
+            'too few': lambda cell: cell['requests'].update({'completed': 10}),
+            'rate drift': lambda cell: cell['requests'].update({'rate_503': 0.5}),
+            'unordered': lambda cell: cell['requests']['latency_ms'].update({'p95_ms': 9.0}),
+            'boolean count': lambda cell: cell['requests'].update({'client_timeouts': False}),
+            'nan': lambda cell: cell['requests'].update({'throughput_rps': float('nan')}),
+        }
+        for name, mutate in mutations.items():
+            with self.subTest(mutation=name):
+                report = self.report()
+                mutate(report['cells'][0])
+                self.rejects(report)
+
+    def test_acquisition_evidence_must_be_bounded_and_consistent(self):
+        def hostile_label(cell):
+            cell['pool']['replicas'][0]['acquire'][0]['operation_class'] = '/v1/admin/tokens'
+
+        def drop_replica(cell):
+            cell['pool']['replicas'].pop()
+
+        def miscount(cell):
+            cell['pool']['acquire_counts'][0]['count'] += 1
+
+        def no_revision_check(cell):
+            for row in cell['pool']['replicas']:
+                row['acquire'] = [entry for entry in row['acquire']
+                                  if entry['operation_class'] != 'revision_check']
+
+        def oversized_pool(cell):
+            cell['pool']['replicas'][0]['size_max'] = cell['pool_max'] + 1
+
+        def unexercised(cell):
+            for row in cell['pool']['replicas']:
+                row['acquire'] = [entry for entry in row['acquire']
+                                  if entry['operation_class'] != 'security_state_read']
+            for entry in cell['pool']['acquire_counts']:
+                if entry['operation_class'] == 'security_state_read':
+                    entry['count'] = 0
+
+        for mutate in (hostile_label, drop_replica, miscount, no_revision_check, oversized_pool,
+                       unexercised):
+            with self.subTest(mutation=mutate.__name__):
+                report = self.report()
+                mutate(report['cells'][1])
+                self.rejects(report)
+
+    def test_database_and_contention_evidence_is_required(self):
+        def unsampled(report):
+            report['cells'][0]['database']['activity_samples'] = 1
+
+        def idle_projector(report):
+            report['cells'][8]['projector']['checkpoint_delta'] = 0
+
+        def nothing_committed(report):
+            report['cells'][8]['control_plane']['status_counts'] = {'503': 20}
+
+        def never_converged(report):
+            report['cells'][8]['control_plane'].update(
+                {'convergence_samples': 0, 'convergence_timeouts': 19, 'convergence_ms': None})
+
+        def stray_concurrent_work(report):
+            report['cells'][0]['projector'] = report['cells'][8]['projector']
+
+        for mutate in (unsampled, idle_projector, nothing_committed, never_converged,
+                       stray_concurrent_work):
+            with self.subTest(mutation=mutate.__name__):
+                report = self.report()
+                mutate(report)
+                self.rejects(report)
+
+    def test_free_text_outside_its_shape_fails(self):
+        for key, value in [('git_sha', 'not-a-sha'), ('recorded_at', 'yesterday'),
+                           ('binary_version', '1.0.1; rm -rf')]:
+            with self.subTest(key=key):
+                report = self.report()
+                report[key] = value
+                self.rejects(report)
+
+
 class EvidenceWorkflowGate(unittest.TestCase):
     def setUp(self):
         root = Path(__file__).resolve().parents[1]
@@ -408,6 +607,45 @@ class EvidenceWorkflowGate(unittest.TestCase):
         measure = next(step for step in steps if step.get('name') == 'Measure the blocking budgets')
         self.assertIn('test result: ok. 0 passed', measure['run'])
         self.assertIn('e < 10.0', measure['run'])
+
+    def test_nightly_capacity_evidence_is_validated_and_uploaded_only_on_success(self):
+        job = self.nightly['jobs']['ha-performance']
+        steps = job['steps']
+        named = {step.get('name'): step for step in steps}
+        budgets = next(step for step in steps if step.get('id') == 'budgets')
+        producing = next(step for step in steps if step.get('id') == 'capacity')
+        checking = named['Validate the capacity report']
+        upload = named['Publish the capacity report']
+        diagnostics = named['Retain available capacity diagnostics']
+        # Scheduled and manual only: the matrix never becomes a pull-request check.
+        self.assertEqual(set(self.nightly['on']), {'schedule', 'workflow_dispatch'})
+        # The budget step leaves the matrix to its own step, which runs exactly it.
+        self.assertIn('--skip capacity::', budgets['run'])
+        self.assertIn('--exact capacity::the_capacity_matrix_records_complete_evidence_for_every_cell',
+                      producing['run'])
+        self.assertIn("test result: ok. 1 passed", producing['run'])
+        self.assertIn('e < 60.0', producing['run'])
+        self.assertEqual(producing['if'], "${{ !cancelled() && steps.budgets.outcome != 'skipped' }}")
+        self.assertLess(0, int(producing['timeout-minutes']))
+        self.assertLess(int(producing['timeout-minutes']), int(job['timeout-minutes']))
+        # Strict, success-only upload of the validator's output, never the raw report.
+        expression = "${{ always() && steps.capacity.outcome == 'success' }}"
+        self.assertEqual(checking['if'], expression)
+        self.assertEqual(upload['if'], expression)
+        self.assertIn('check-test-evidence.py capacity', checking['run'])
+        self.assertTrue(checking['run'].endswith('"${{ runner.temp }}/ha/ha-capacity.json"'))
+        self.assertEqual(upload['with']['path'], '${{ runner.temp }}/ha/ha-capacity.json')
+        self.assertEqual(upload['with']['if-no-files-found'], 'error')
+        self.assertEqual(producing['env']['GATEWAY_TEST_CAPACITY_REPORT'],
+                         '${{ runner.temp }}/ha/capacity-raw.json')
+        # Best-effort diagnostics only when the producer did not succeed.
+        self.assertEqual(diagnostics['if'], "${{ always() && steps.capacity.outcome != 'success' }}")
+        self.assertEqual(diagnostics['with']['if-no-files-found'], 'ignore')
+        self.assertNotEqual(diagnostics['with']['name'], upload['with']['name'])
+        self.assertLess(steps.index(producing), steps.index(checking))
+        self.assertLess(steps.index(checking), steps.index(upload))
+        for step in (budgets, producing, checking, upload, diagnostics):
+            self.assertNotIn('continue-on-error', step)
 
 
 if __name__ == '__main__':
