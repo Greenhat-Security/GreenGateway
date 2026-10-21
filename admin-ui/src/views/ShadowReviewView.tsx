@@ -3,16 +3,23 @@ import { Link } from 'react-router-dom';
 
 import { AdminApiError } from '../lib/api';
 import {
+  POLICY_EVIDENCE_UNAVAILABLE_REASON,
   PolicyDocument,
   PolicyRule,
-  PolicyRulePatch,
+  PolicyRuleShadowEvidenceWindow,
+  PolicyRuleShadowReviewBinding,
   PolicyRuleShadowReviewResponse,
   PolicyRuleShadowReviewSummary,
+  SHADOW_EVIDENCE_DIGEST_STALE_REASON,
+  SHADOW_EVIDENCE_WINDOW_STALE_REASON,
+  SHADOW_REVIEW_RULE_NOT_SHADOW_REASON,
+  ShadowRuleTransition,
+  changeShadowRule,
   fetchPolicy,
   fetchPolicyRuleShadowReview,
   isPolicyRuleEnabled,
-  patchPolicyRule,
   policyRuleId,
+  shadowReviewBinding,
 } from '../lib/policy';
 import { MethodList, formatPrincipal, ruleTarget } from './RuleTable';
 import { RuleWorkspaceNav } from './RuleWorkspaceNav';
@@ -23,6 +30,8 @@ type ShadowReviewError = {
     | 'forbidden'
     | 'unavailable'
     | 'policy-changed'
+    | 'evidence-changed'
+    | 'evidence-unavailable'
     | 'bad-request'
     | 'network'
     | 'generic';
@@ -31,12 +40,26 @@ type ShadowReviewError = {
 
 const POLICY_CHANGED_MESSAGE =
   'Policy changed since this page loaded; refresh and retry.';
+const RULE_NOT_SHADOW_MESSAGE =
+  'This rule is no longer an enabled shadow rule, so nothing was changed. Reload the review.';
+const EVIDENCE_WINDOW_STALE_MESSAGE =
+  'New would-deny events were recorded for this rule, or older ones left the review, after this review was read. Nothing was changed; reload the review and check the current evidence.';
+const EVIDENCE_DIGEST_STALE_MESSAGE =
+  'The evidence for this rule changed after this review was read. Nothing was changed; reload the review and check the current evidence.';
+const EVIDENCE_UNAVAILABLE_AT_CHANGE_MESSAGE =
+  'The gateway could not read shadow evidence when the change was sent, so it refused the change. Nothing was changed.';
 const EVIDENCE_REQUIRED_ACTION_MESSAGE =
   'Promote and Disable are unavailable while shadow evidence is unavailable: nothing shows which requests changing this rule would affect.';
 const POLICY_CHANGED_ACTION_MESSAGE =
   'Promote and Disable are unavailable because the policy changed after this review was read. Refresh to review the current rules.';
+const EVIDENCE_CHANGED_ACTION_MESSAGE =
+  'Promote and Disable are unavailable because the shadow evidence changed after this review was read. Reload the review to see the current evidence.';
+const EVIDENCE_UNAVAILABLE_AT_CHANGE_ACTION_MESSAGE =
+  'Promote and Disable are unavailable because the gateway could not read shadow evidence for the last change. Reload the review once evidence is available.';
 const MISSING_ETAG_ACTION_MESSAGE =
   'Promote and Disable are unavailable because the policy ETag was not returned, so a change could not be tied to the reviewed policy. Refresh and retry.';
+const MISSING_BINDING_ACTION_MESSAGE =
+  'Promote and Disable are unavailable because the review did not say which policy revision and evidence it describes, so a change could not be bound to it. Refresh and retry.';
 
 type ShadowReviewItem = {
   ruleId: string;
@@ -44,6 +67,19 @@ type ShadowReviewItem = {
   // Null when audit evidence is unavailable: nothing is known about what the
   // rule would have denied, which is not the same as "nothing".
   summary: PolicyRuleShadowReviewSummary | null;
+  // What a change to this rule is bound to: the revision, evidence window
+  // and digest of the entry on screen. Null when there is nothing to bind to.
+  binding: PolicyRuleShadowReviewBinding | null;
+};
+
+// Why a refused change blocks every other change until the review is read
+// again: the review on screen no longer describes the gateway's evidence.
+type EvidenceRefusal = 'changed' | 'unavailable';
+
+type ReviewRequest = {
+  sequence: number;
+  // A reload that follows a successful change keeps saying it succeeded.
+  keepNotice: boolean;
 };
 
 type ShadowReviewEvidence =
@@ -62,17 +98,25 @@ export function ShadowReviewView() {
   const [evidence, setEvidence] = useState<ShadowReviewEvidence>({
     status: 'complete',
   });
-  // The ETag of the policy the listed rules were read from. Every change is
-  // sent with it, never with a freshly fetched one: the gateway compares
-  // If-Match against the whole policy, so a write made since the operator
+  // The ETag of the policy read alongside the review. It must be the
+  // revision the review itself reports: only then do the listed rules,
+  // which may be addressed by position, name the rules a change would hit.
+  // Changes are sent with the review's own binding, never with an ETag
+  // fetched just before the change, so a write made since the operator
   // reviewed a rule answers 412 instead of changing whatever rule holds that
-  // id now. Rules without an explicit id are addressed by position, which
-  // any other write can move.
+  // id now.
   const [policyEtag, setPolicyEtag] = useState<string | null>(null);
   const [policyChanged, setPolicyChanged] = useState(false);
+  const [evidenceRefusal, setEvidenceRefusal] = useState<EvidenceRefusal | null>(
+    null,
+  );
   const [confirmingPromoteId, setConfirmingPromoteId] = useState<string | null>(
     null,
   );
+  const [reviewRequest, setReviewRequest] = useState<ReviewRequest>({
+    sequence: 0,
+    keepNotice: false,
+  });
 
   useEffect(() => {
     let isCurrent = true;
@@ -81,11 +125,15 @@ export function ShadowReviewView() {
       setIsLoading(true);
       setLoadError(null);
       setMutationError(null);
-      setMutationNotice(null);
+      if (!reviewRequest.keepNotice) {
+        setMutationNotice(null);
+      }
       setCanWritePolicy(false);
       setEvidence({ status: 'complete' });
       setPolicyEtag(null);
       setPolicyChanged(false);
+      setEvidenceRefusal(null);
+      setConfirmingPromoteId(null);
 
       try {
         const [policyResult, review] = await Promise.all([
@@ -104,6 +152,7 @@ export function ShadowReviewView() {
               ruleId: summary.rule_id,
               rule: summary.rule,
               summary,
+              binding: shadowReviewBinding(review.value, summary),
             })),
           );
           setEvidence(
@@ -112,7 +161,11 @@ export function ShadowReviewView() {
               : { status: 'complete' },
           );
           setPolicyChanged(
-            !reviewDescribesPolicy(review.value, policyResult.policy),
+            !reviewDescribesPolicy(
+              review.value,
+              policyResult.policy,
+              policyResult.etag,
+            ),
           );
         } else {
           setItems(enabledShadowRules(policyResult.policy));
@@ -141,7 +194,14 @@ export function ShadowReviewView() {
     return () => {
       isCurrent = false;
     };
-  }, []);
+  }, [reviewRequest]);
+
+  function reloadReview({ keepNotice }: { keepNotice: boolean }) {
+    setReviewRequest((current) => ({
+      sequence: current.sequence + 1,
+      keepNotice,
+    }));
+  }
 
   const resultCount = useMemo(() => {
     return `${items.length} ${items.length === 1 ? 'rule' : 'rules'}`;
@@ -156,49 +216,50 @@ export function ShadowReviewView() {
     evidence,
     policyEtag,
     policyChanged,
+    evidenceRefusal,
   });
+  const showReloadReview =
+    !isLoading && (policyChanged || evidenceRefusal !== null);
 
-  async function promoteRule(ruleId: string) {
-    const succeeded = await mutateRule(
-      ruleId,
-      { action: 'deny' },
-      'Rule promoted to deny.',
-    );
+  async function promoteRule(item: ShadowReviewItem) {
+    const succeeded = await changeRule(item, 'promote', 'Rule promoted to deny.');
     if (succeeded) {
       setConfirmingPromoteId(null);
     }
   }
 
-  async function disableRule(ruleId: string) {
-    await mutateRule(ruleId, { enabled: false }, 'Shadow rule disabled.');
+  async function disableRule(item: ShadowReviewItem) {
+    await changeRule(item, 'disable', 'Shadow rule disabled.');
   }
 
-  async function mutateRule(
-    ruleId: string,
-    patch: PolicyRulePatch,
+  async function changeRule(
+    item: ShadowReviewItem,
+    transition: ShadowRuleTransition,
     successMessage: string,
   ): Promise<boolean> {
-    const reviewedEtag = policyEtag;
+    const binding = item.binding;
     if (
       !canWritePolicy ||
+      isLoading ||
       mutatingRuleId !== null ||
       actionBlockReason !== null ||
-      reviewedEtag === null
+      binding === null
     ) {
       return false;
     }
 
-    setMutatingRuleId(ruleId);
+    setMutatingRuleId(item.ruleId);
     setMutationError(null);
     setMutationNotice(null);
 
     try {
-      const response = await patchPolicyRule(ruleId, reviewedEtag, patch);
-      // A patch changes one rule in place and moves none, so the returned
-      // ETag describes exactly the rules still listed here.
-      setPolicyEtag(response.etag);
-      setItems((current) => current.filter((item) => item.ruleId !== ruleId));
+      await changeShadowRule(item.ruleId, transition, binding);
+      setItems((current) => current.filter((entry) => entry.ruleId !== item.ruleId));
       setMutationNotice(successMessage);
+      // Every other entry was reviewed under the revision this change just
+      // replaced, so the gateway would refuse it. Read the review again so
+      // what is on screen, and what the next change is bound to, is current.
+      reloadReview({ keepNotice: true });
       return true;
     } catch (error) {
       const reviewError = toShadowReviewError(error);
@@ -207,6 +268,12 @@ export function ShadowReviewView() {
       }
       if (reviewError.kind === 'policy-changed') {
         setPolicyChanged(true);
+      }
+      if (reviewError.kind === 'evidence-changed') {
+        setEvidenceRefusal('changed');
+      }
+      if (reviewError.kind === 'evidence-unavailable') {
+        setEvidenceRefusal('unavailable');
       }
       setMutationError(reviewError);
       return false;
@@ -241,6 +308,17 @@ export function ShadowReviewView() {
               The shadow review and the policy were read from different versions.
               Refresh to review the current rules before promoting or disabling one.
             </p>
+          </div>
+        ) : null}
+        {showReloadReview ? (
+          <div className="shadow-review-reload">
+            <button
+              type="button"
+              className="secondary-button"
+              onClick={() => reloadReview({ keepNotice: false })}
+            >
+              Reload review
+            </button>
           </div>
         ) : null}
         {mutationNotice ? (
@@ -281,20 +359,23 @@ export function ShadowReviewView() {
           <ol className="policy-history-list shadow-review-list" aria-label="Shadow review queue">
             {items.map((item) => (
               <ShadowReviewEntry
-                actionBlockReason={actionBlockReason}
+                actionBlockReason={
+                  actionBlockReason ??
+                  (item.binding === null ? MISSING_BINDING_ACTION_MESSAGE : null)
+                }
                 canWritePolicy={canWritePolicy}
                 confirmingPromoteId={confirmingPromoteId}
                 evidence={evidence}
                 isMutating={mutatingRuleId === item.ruleId}
-                isMutationBusy={mutatingRuleId !== null}
+                isMutationBusy={mutatingRuleId !== null || isLoading}
                 item={item}
                 key={item.ruleId}
                 onConfirmingPromoteChange={setConfirmingPromoteId}
                 onDisable={() => {
-                  void disableRule(item.ruleId);
+                  void disableRule(item);
                 }}
                 onPromote={() => {
-                  void promoteRule(item.ruleId);
+                  void promoteRule(item);
                 }}
               />
             ))}
@@ -375,6 +456,12 @@ function ShadowReviewEntry({
             <dt>Principal</dt>
             <dd>{formatPrincipal(item.rule.principal)}</dd>
           </div>
+          {summary?.evidence_window ? (
+            <div>
+              <dt>Evidence window</dt>
+              <dd>{formatEvidenceWindow(summary.evidence_window)}</dd>
+            </div>
+          ) : null}
         </dl>
 
         <div className="shadow-review-section">
@@ -572,13 +659,47 @@ function ShadowReviewMutationError({ error }: { error: ShadowReviewError }) {
 
   return (
     <div
-      className={`error-panel alert ${error.kind === 'policy-changed' || error.kind === 'bad-request' ? 'warning' : 'error'}`}
+      className={`error-panel alert ${isStaleReviewError(error) || error.kind === 'bad-request' ? 'warning' : 'error'}`}
       role="alert"
     >
-      <h3>{error.kind === 'policy-changed' ? 'Policy changed' : 'Rule update failed'}</h3>
+      <h3>{mutationErrorHeading(error)}</h3>
       <p>{error.message}</p>
     </div>
   );
+}
+
+// A refusal because the review is out of date, not because anything failed:
+// nothing was changed, and reading the review again resolves it.
+function isStaleReviewError(error: ShadowReviewError): boolean {
+  return (
+    error.kind === 'policy-changed' ||
+    error.kind === 'evidence-changed' ||
+    error.kind === 'evidence-unavailable'
+  );
+}
+
+function mutationErrorHeading(error: ShadowReviewError): string {
+  if (error.kind === 'policy-changed') {
+    return 'Policy changed';
+  }
+  if (error.kind === 'evidence-changed') {
+    return 'Shadow evidence changed';
+  }
+  if (error.kind === 'evidence-unavailable') {
+    return 'Shadow evidence unavailable';
+  }
+  return 'Rule update failed';
+}
+
+// The span of events the counts above it summarize, which is also what a
+// change to this rule is bound to.
+function formatEvidenceWindow(window: PolicyRuleShadowEvidenceWindow): string {
+  if (window.from === null || window.to === null) {
+    return 'No would-deny events recorded';
+  }
+  const from = formatUtcTimestamp(window.from);
+  const to = formatUtcTimestamp(window.to);
+  return from === to ? from : `${from} to ${to}`;
 }
 
 // Unread evidence, a truncated scan, and a complete count must read
@@ -606,16 +727,24 @@ function shadowActionBlockReason({
   evidence,
   policyEtag,
   policyChanged,
+  evidenceRefusal,
 }: {
   evidence: ShadowReviewEvidence;
   policyEtag: string | null;
   policyChanged: boolean;
+  evidenceRefusal: EvidenceRefusal | null;
 }): string | null {
   if (evidence.status === 'unavailable') {
     return EVIDENCE_REQUIRED_ACTION_MESSAGE;
   }
   if (policyChanged) {
     return POLICY_CHANGED_ACTION_MESSAGE;
+  }
+  if (evidenceRefusal === 'changed') {
+    return EVIDENCE_CHANGED_ACTION_MESSAGE;
+  }
+  if (evidenceRefusal === 'unavailable') {
+    return EVIDENCE_UNAVAILABLE_AT_CHANGE_ACTION_MESSAGE;
   }
   if (policyEtag === null) {
     return MISSING_ETAG_ACTION_MESSAGE;
@@ -629,20 +758,29 @@ function shadowActionBlockReason({
 function enabledShadowRules(policy: PolicyDocument): ShadowReviewItem[] {
   return policy.rules.flatMap((rule, index) =>
     isPolicyRuleEnabled(rule) && rule.action === 'shadow'
-      ? [{ ruleId: policyRuleId(rule, index), rule, summary: null }]
+      ? [{ ruleId: policyRuleId(rule, index), rule, summary: null, binding: null }]
       : [],
   );
 }
 
 // The review and the policy (with its ETag) are separate reads, so a write
 // landing between them leaves the listed rules describing a different policy
-// than the ETag a change would be sent with. Only when the review lists
-// exactly the policy's enabled shadow rules, under the same ids, does that
-// ETag stand for the rules on screen.
+// than the one read alongside. The review names the revision it was read
+// from; when that is not the policy's ETag, or the review does not list
+// exactly the policy's enabled shadow rules under the same ids, the two
+// reads describe different policies.
 function reviewDescribesPolicy(
   review: PolicyRuleShadowReviewResponse,
   policy: PolicyDocument,
+  policyEtag: string | null,
 ): boolean {
+  if (
+    review.policy_etag !== undefined &&
+    policyEtag !== null &&
+    review.policy_etag !== policyEtag
+  ) {
+    return false;
+  }
   const policyShadowRules = enabledShadowRules(policy);
   return (
     policyShadowRules.length === review.rules.length &&
@@ -705,6 +843,21 @@ function toShadowReviewError(error: unknown): ShadowReviewError {
     }
     if (error.status === 412) {
       return { kind: 'policy-changed', message: POLICY_CHANGED_MESSAGE };
+    }
+    if (error.status === 409 && error.code === SHADOW_EVIDENCE_WINDOW_STALE_REASON) {
+      return { kind: 'evidence-changed', message: EVIDENCE_WINDOW_STALE_MESSAGE };
+    }
+    if (error.status === 409 && error.code === SHADOW_EVIDENCE_DIGEST_STALE_REASON) {
+      return { kind: 'evidence-changed', message: EVIDENCE_DIGEST_STALE_MESSAGE };
+    }
+    if (error.status === 409 && error.code === SHADOW_REVIEW_RULE_NOT_SHADOW_REASON) {
+      return { kind: 'policy-changed', message: RULE_NOT_SHADOW_MESSAGE };
+    }
+    if (error.status === 503 && error.code === POLICY_EVIDENCE_UNAVAILABLE_REASON) {
+      return {
+        kind: 'evidence-unavailable',
+        message: EVIDENCE_UNAVAILABLE_AT_CHANGE_MESSAGE,
+      };
     }
     if (error.status === 400) {
       return { kind: 'bad-request', message: error.message };
