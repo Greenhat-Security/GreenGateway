@@ -18939,6 +18939,549 @@ async fn policy_rule_shadow_review_checks_audit_read_before_evidence_availabilit
 }
 
 #[tokio::test]
+async fn policy_rule_shadow_review_binds_each_entry_to_revision_window_and_digest() {
+    let db = TempDb::new("shadow-review-binding");
+    create_audit_schema(&db.path);
+    seed_shadow_reports_would_deny_events(&db.path);
+    let policy = TempPolicyFile::new(&shadow_review_policy_document());
+    let router = policy_admin_router_with_sqlite(Some(&policy), test_audit_log(), Some(&db.path));
+    let (policy_etag, _) = current_policy(&router).await;
+
+    let body = shadow_review_body(&router).await;
+
+    // The revision the review was read from is the one a write compares
+    // against, so a client can send it straight back as If-Match.
+    assert_eq!(body["policy_etag"], json!(policy_etag));
+    let reports =
+        shadow_review_rule(&body, "shadow-reports").expect("shadow reports rule should be present");
+    assert_eq!(
+        reports["evidence_window"],
+        json!({"from": "2024-06-01T12:00:00Z", "to": "2024-06-01T12:00:03Z"})
+    );
+    let reports_digest = reports["evidence_digest"]
+        .as_str()
+        .expect("evidence digest should be a string");
+    assert!(is_sha256_digest(reports_digest), "{reports_digest}");
+    // No events read: the window says so rather than inventing bounds.
+    let exports =
+        shadow_review_rule(&body, "shadow-exports").expect("shadow exports rule should be present");
+    assert_eq!(
+        exports["evidence_window"],
+        json!({"from": null, "to": null})
+    );
+    assert_ne!(exports["evidence_digest"], reports["evidence_digest"]);
+
+    // Unchanged evidence and policy read back to an identical binding.
+    assert_eq!(shadow_review_body(&router).await, body);
+}
+
+#[tokio::test]
+async fn bound_shadow_promotion_applies_when_revision_window_and_digest_match() {
+    let db = TempDb::new("shadow-promotion-match");
+    create_audit_schema(&db.path);
+    seed_shadow_reports_would_deny_events(&db.path);
+    let policy = TempPolicyFile::new(&shadow_review_policy_document());
+    let capture = audit::sink::tests::CaptureSink::new();
+    let audit_log = audit::AuditLog::new(Arc::new(capture.clone()) as Arc<dyn audit::AuditSink>);
+    let router = policy_admin_router_with_sqlite(Some(&policy), audit_log, Some(&db.path));
+    let binding = shadow_review_binding(&router, "shadow-reports").await;
+    let reviewed_etag = binding_policy_etag(&binding);
+
+    let response = router
+        .clone()
+        .oneshot(bound_shadow_patch(
+            "shadow-reports",
+            json!({ "action": "deny" }),
+            &binding,
+            Some(&reviewed_etag),
+        ))
+        .await
+        .expect("bound promotion should complete");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_ne!(policy_etag_header(&response), reviewed_etag);
+    let promoted = json_body(response).await;
+    assert_eq!(promoted["id"], json!("shadow-reports"));
+    assert_eq!(promoted["action"], json!("deny"));
+
+    let event = captured_policy_change(&capture, "rule_updated");
+    assert_policy_change_actor(&event);
+    assert_eq!(
+        event.payload["diff_summary"],
+        json!({
+            "action": "rule_updated",
+            "rule_id": "shadow-reports",
+            "changed_fields": ["action"],
+            "shadow_review": {
+                "transition": "promote",
+                "policy_etag": reviewed_etag,
+                "evidence_window": binding["evidence_window"],
+                "evidence_digest": binding["evidence_digest"]
+            }
+        })
+    );
+    assert!(shadow_transition_refusals(&capture).is_empty());
+
+    // An enforced rule is no longer in the shadow review queue.
+    assert_eq!(
+        shadow_review_rule_ids(&shadow_review_body(&router).await),
+        vec!["shadow-exports".to_owned()]
+    );
+}
+
+#[tokio::test]
+async fn bound_shadow_disable_applies_and_the_next_change_needs_a_fresh_review() {
+    let db = TempDb::new("shadow-disable-match");
+    create_audit_schema(&db.path);
+    seed_shadow_reports_would_deny_events(&db.path);
+    let policy = TempPolicyFile::new(&shadow_review_policy_document());
+    let router = policy_admin_router_with_sqlite(Some(&policy), test_audit_log(), Some(&db.path));
+    let exports_binding = shadow_review_binding(&router, "shadow-exports").await;
+    let reports_binding = shadow_review_binding(&router, "shadow-reports").await;
+    let reviewed_etag = binding_policy_etag(&exports_binding);
+
+    let disabled = router
+        .clone()
+        .oneshot(bound_shadow_patch(
+            "shadow-exports",
+            json!({ "enabled": false }),
+            &exports_binding,
+            Some(&reviewed_etag),
+        ))
+        .await
+        .expect("bound disable should complete");
+    assert_eq!(disabled.status(), StatusCode::OK);
+    let next_etag = policy_etag_header(&disabled);
+    assert_eq!(json_body(disabled).await["enabled"], json!(false));
+
+    // The other entry was reviewed under the revision the disable replaced.
+    // A fresh If-Match does not make that review current again.
+    for if_match in [next_etag.as_str(), reviewed_etag.as_str()] {
+        let refused = router
+            .clone()
+            .oneshot(bound_shadow_patch(
+                "shadow-reports",
+                json!({ "action": "deny" }),
+                &reports_binding,
+                Some(if_match),
+            ))
+            .await
+            .expect("stale bound promotion should complete");
+        assert_shadow_refusal(
+            refused,
+            StatusCode::PRECONDITION_FAILED,
+            "shadow_review_revision_stale",
+        )
+        .await;
+    }
+
+    let fresh_binding = shadow_review_binding(&router, "shadow-reports").await;
+    assert_eq!(binding_policy_etag(&fresh_binding), next_etag);
+    let promoted = router
+        .clone()
+        .oneshot(bound_shadow_patch(
+            "shadow-reports",
+            json!({ "action": "deny" }),
+            &fresh_binding,
+            Some(&next_etag),
+        ))
+        .await
+        .expect("re-reviewed promotion should complete");
+    assert_eq!(promoted.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn bound_shadow_promotion_refuses_a_stale_revision() {
+    let db = TempDb::new("shadow-promotion-stale-revision");
+    create_audit_schema(&db.path);
+    seed_shadow_reports_would_deny_events(&db.path);
+    let policy = TempPolicyFile::new(&shadow_review_policy_document());
+    let capture = audit::sink::tests::CaptureSink::new();
+    let audit_log = audit::AuditLog::new(Arc::new(capture.clone()) as Arc<dyn audit::AuditSink>);
+    let router = policy_admin_router_with_sqlite(Some(&policy), audit_log, Some(&db.path));
+    let binding = shadow_review_binding(&router, "shadow-reports").await;
+    let reviewed_etag = binding_policy_etag(&binding);
+
+    // An unrelated edit lands after the review was read. The promoted rule
+    // itself is untouched, but what reaches it, and what was reviewed, is
+    // a property of the whole policy.
+    let edit = router
+        .clone()
+        .oneshot(policy_admin_request(
+            Method::PATCH,
+            &format!("{POLICY_RULES_ADMIN_ROUTE}/allow-reports"),
+            Some(test_principal(&["admin"])),
+            Some(json!({ "methods": ["GET", "HEAD"] }).to_string()),
+            Some(&reviewed_etag),
+        ))
+        .await
+        .expect("unrelated edit should complete");
+    assert_eq!(edit.status(), StatusCode::OK);
+    let current_etag = policy_etag_header(&edit);
+
+    let refused = router
+        .clone()
+        .oneshot(bound_shadow_patch(
+            "shadow-reports",
+            json!({ "action": "deny" }),
+            &binding,
+            Some(&reviewed_etag),
+        ))
+        .await
+        .expect("stale bound promotion should complete");
+
+    assert_shadow_refusal(
+        refused,
+        StatusCode::PRECONDITION_FAILED,
+        "shadow_review_revision_stale",
+    )
+    .await;
+    assert_shadow_rule_unchanged(&router, "shadow-reports", &current_etag).await;
+    let refusals = await_shadow_transition_refusals(&capture, 1);
+    assert_eq!(
+        refusals[0].payload,
+        json!({
+            "transition": "promote",
+            "rule_id": "shadow-reports",
+            "reason": "shadow_review_revision_stale",
+            "reviewed_policy_etag": reviewed_etag,
+            "reviewed_evidence_digest": binding["evidence_digest"],
+            "current_policy_etag": current_etag
+        })
+    );
+    assert_policy_change_actor(&refusals[0]);
+}
+
+#[tokio::test]
+async fn bound_shadow_promotion_refuses_a_stale_evidence_window() {
+    let db = TempDb::new("shadow-promotion-stale-window");
+    create_audit_schema(&db.path);
+    seed_shadow_reports_would_deny_events(&db.path);
+    let policy = TempPolicyFile::new(&shadow_review_policy_document());
+    let capture = audit::sink::tests::CaptureSink::new();
+    let audit_log = audit::AuditLog::new(Arc::new(capture.clone()) as Arc<dyn audit::AuditSink>);
+    let router = policy_admin_router_with_sqlite(Some(&policy), audit_log, Some(&db.path));
+    let binding = shadow_review_binding(&router, "shadow-reports").await;
+    let reviewed_etag = binding_policy_etag(&binding);
+
+    // The rule would have denied another request after the review was read:
+    // evidence the operator never saw.
+    insert_authz_event(
+        &db.path,
+        shadow_would_deny_seed("shadow-reports-3", "2024-06-01T12:00:09Z", "shadow-reports"),
+    );
+
+    let refused = router
+        .clone()
+        .oneshot(bound_shadow_patch(
+            "shadow-reports",
+            json!({ "action": "deny" }),
+            &binding,
+            Some(&reviewed_etag),
+        ))
+        .await
+        .expect("bound promotion should complete");
+
+    assert_shadow_refusal(
+        refused,
+        StatusCode::CONFLICT,
+        "shadow_evidence_window_stale",
+    )
+    .await;
+    assert_shadow_rule_unchanged(&router, "shadow-reports", &reviewed_etag).await;
+    let refusals = await_shadow_transition_refusals(&capture, 1);
+    assert_eq!(
+        refusals[0].payload["reason"],
+        json!("shadow_evidence_window_stale")
+    );
+    assert_eq!(
+        refusals[0].payload["current_policy_etag"],
+        json!(reviewed_etag)
+    );
+    let current_digest = refusals[0].payload["current_evidence_digest"]
+        .as_str()
+        .expect("current digest should be recorded");
+    assert!(is_sha256_digest(current_digest));
+    assert_ne!(json!(current_digest), binding["evidence_digest"]);
+}
+
+#[tokio::test]
+async fn bound_shadow_promotion_refuses_a_stale_evidence_digest() {
+    let db = TempDb::new("shadow-promotion-stale-digest");
+    create_audit_schema(&db.path);
+    seed_shadow_reports_would_deny_events(&db.path);
+    let policy = TempPolicyFile::new(&shadow_review_policy_document());
+    let router = policy_admin_router_with_sqlite(Some(&policy), test_audit_log(), Some(&db.path));
+    let binding = shadow_review_binding(&router, "shadow-reports").await;
+    let reviewed_etag = binding_policy_etag(&binding);
+
+    // A late-arriving event recorded with the newest reviewed timestamp: the
+    // window bounds read back the same, but the count, principals and
+    // samples behind them do not.
+    insert_authz_event(
+        &db.path,
+        SeedAuthzEvent {
+            actor_user_id: Some("analyst-9"),
+            ..shadow_would_deny_seed(
+                "shadow-reports-late",
+                "2024-06-01T12:00:03Z",
+                "shadow-reports",
+            )
+        },
+    );
+    let current = shadow_review_body(&router).await;
+    let current_reports = shadow_review_rule(&current, "shadow-reports")
+        .expect("shadow reports rule should be present");
+    assert_eq!(
+        current_reports["evidence_window"],
+        binding["evidence_window"]
+    );
+    assert_ne!(
+        current_reports["evidence_digest"],
+        binding["evidence_digest"]
+    );
+
+    let refused = router
+        .clone()
+        .oneshot(bound_shadow_patch(
+            "shadow-reports",
+            json!({ "action": "deny" }),
+            &binding,
+            Some(&reviewed_etag),
+        ))
+        .await
+        .expect("bound promotion should complete");
+
+    assert_shadow_refusal(
+        refused,
+        StatusCode::CONFLICT,
+        "shadow_evidence_digest_stale",
+    )
+    .await;
+    assert_shadow_rule_unchanged(&router, "shadow-reports", &reviewed_etag).await;
+
+    // A digest the review never minted is refused the same way.
+    let mut forged = binding.clone();
+    forged["evidence_digest"] = json!(format!("sha256:{}", "0".repeat(64)));
+    forged["evidence_window"] = current_reports["evidence_window"].clone();
+    let refused = router
+        .clone()
+        .oneshot(bound_shadow_patch(
+            "shadow-reports",
+            json!({ "enabled": false }),
+            &forged,
+            Some(&reviewed_etag),
+        ))
+        .await
+        .expect("bound disable should complete");
+    assert_shadow_refusal(
+        refused,
+        StatusCode::CONFLICT,
+        "shadow_evidence_digest_stale",
+    )
+    .await;
+    assert_shadow_rule_unchanged(&router, "shadow-reports", &reviewed_etag).await;
+}
+
+#[tokio::test]
+async fn bound_shadow_promotion_refuses_when_evidence_is_unavailable() {
+    let policy = TempPolicyFile::new(&shadow_review_policy_document());
+    let capture = audit::sink::tests::CaptureSink::new();
+    let audit_log = audit::AuditLog::new(Arc::new(capture.clone()) as Arc<dyn audit::AuditSink>);
+    let router = policy_admin_router(Some(&policy), audit_log);
+    let (current_etag, _) = current_policy(&router).await;
+    // Shaped like a binding, but there is no evidence it could describe.
+    let binding = json!({
+        "policy_etag": current_etag,
+        "evidence_window": {"from": null, "to": null},
+        "evidence_digest": format!("sha256:{}", "a".repeat(64)),
+    });
+
+    for (attempt, (patch, transition)) in [
+        (json!({ "action": "deny" }), "promote"),
+        (json!({ "enabled": false }), "disable"),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let refused = router
+            .clone()
+            .oneshot(bound_shadow_patch(
+                "shadow-reports",
+                patch,
+                &binding,
+                Some(&current_etag),
+            ))
+            .await
+            .expect("bound change should complete");
+        assert_eq!(refused.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            json_body(refused).await,
+            json!({
+                "error": "shadow rule promotion and disable require an audit query store",
+                "reason": "audit_evidence_unavailable"
+            })
+        );
+        let refusals = await_shadow_transition_refusals(&capture, attempt + 1);
+        assert_eq!(refusals[attempt].payload["transition"], json!(transition));
+    }
+
+    assert_shadow_rule_unchanged(&router, "shadow-reports", &current_etag).await;
+    let refusals = await_shadow_transition_refusals(&capture, 2);
+    assert!(refusals
+        .iter()
+        .all(|event| event.payload["reason"] == json!("audit_evidence_unavailable")));
+}
+
+#[tokio::test]
+async fn bound_shadow_change_requires_audit_read_permission() {
+    let db = TempDb::new("shadow-promotion-audit-forbidden");
+    create_audit_schema(&db.path);
+    seed_shadow_reports_would_deny_events(&db.path);
+    let policy = TempPolicyFile::new(&shadow_review_policy_document());
+    let capture = audit::sink::tests::CaptureSink::new();
+    let log = audit::AuditLog::new(Arc::new(capture.clone()));
+    let router = policy_admin_router_with_sqlite(Some(&policy), log.clone(), Some(&db.path));
+    let binding = shadow_review_binding(&router, "shadow-reports").await;
+    let reviewed_etag = binding_policy_etag(&binding);
+
+    let mut request = bound_shadow_patch(
+        "shadow-reports",
+        json!({ "action": "deny" }),
+        &binding,
+        Some(&reviewed_etag),
+    );
+    request
+        .extensions_mut()
+        .insert(test_principal(&["policy-writer"]));
+    let response = router
+        .clone()
+        .oneshot(request)
+        .await
+        .expect("bound promotion should complete");
+
+    assert_shadow_rule_unchanged(&router, "shadow-reports", &reviewed_etag).await;
+    assert_admin_denial(&response, &log, &capture, ADMIN_AUDIT_READ_PERMISSION).await;
+}
+
+#[tokio::test]
+async fn bound_shadow_change_accepts_only_a_reviewed_promotion_or_disable() {
+    let db = TempDb::new("shadow-promotion-shape");
+    create_audit_schema(&db.path);
+    seed_shadow_reports_would_deny_events(&db.path);
+    let policy = TempPolicyFile::new(&shadow_review_policy_document());
+    let router = policy_admin_router_with_sqlite(Some(&policy), test_audit_log(), Some(&db.path));
+    let binding = shadow_review_binding(&router, "shadow-reports").await;
+    let reviewed_etag = binding_policy_etag(&binding);
+
+    // Anything but exactly a promotion or a disable changes the rule in a
+    // way the review never showed.
+    for patch in [
+        json!({ "action": "allow" }),
+        json!({ "action": "shadow" }),
+        json!({ "enabled": true }),
+        json!({ "action": "deny", "enabled": false }),
+        json!({ "action": "deny", "path": "/reports/archive/**" }),
+        json!({ "enabled": false, "principal": { "roles": [] } }),
+    ] {
+        let refused = router
+            .clone()
+            .oneshot(bound_shadow_patch(
+                "shadow-reports",
+                patch.clone(),
+                &binding,
+                Some(&reviewed_etag),
+            ))
+            .await
+            .expect("bound change should complete");
+        assert_shadow_refusal(
+            refused,
+            StatusCode::BAD_REQUEST,
+            "shadow_review_transition_unsupported",
+        )
+        .await;
+    }
+
+    for (field, value) in [
+        ("evidence_digest", json!("sha256:not-hex")),
+        (
+            "evidence_digest",
+            json!(format!("SHA256:{}", "a".repeat(64))),
+        ),
+        ("policy_etag", json!("")),
+        ("policy_etag", json!("x".repeat(257))),
+        ("evidence_window", json!({"from": "", "to": null})),
+    ] {
+        let mut malformed = binding.clone();
+        malformed[field] = value;
+        let refused = router
+            .clone()
+            .oneshot(bound_shadow_patch(
+                "shadow-reports",
+                json!({ "action": "deny" }),
+                &malformed,
+                Some(&reviewed_etag),
+            ))
+            .await
+            .expect("bound change should complete");
+        assert_shadow_refusal(
+            refused,
+            StatusCode::BAD_REQUEST,
+            "shadow_review_binding_invalid",
+        )
+        .await;
+    }
+
+    // Unknown binding fields are rejected like any unknown patch field.
+    let mut unknown = binding.clone();
+    unknown["force"] = json!(true);
+    let refused = router
+        .clone()
+        .oneshot(bound_shadow_patch(
+            "shadow-reports",
+            json!({ "action": "deny" }),
+            &unknown,
+            Some(&reviewed_etag),
+        ))
+        .await
+        .expect("bound change should complete");
+    assert_eq!(refused.status(), StatusCode::BAD_REQUEST);
+
+    // A rule outside the review has no evidence to be bound to.
+    let refused = router
+        .clone()
+        .oneshot(bound_shadow_patch(
+            "allow-reports",
+            json!({ "action": "deny" }),
+            &binding,
+            Some(&reviewed_etag),
+        ))
+        .await
+        .expect("bound change should complete");
+    assert_shadow_refusal(
+        refused,
+        StatusCode::CONFLICT,
+        "shadow_review_rule_not_shadow",
+    )
+    .await;
+
+    // The binding adds to If-Match; it never replaces it.
+    let refused = router
+        .clone()
+        .oneshot(bound_shadow_patch(
+            "shadow-reports",
+            json!({ "action": "deny" }),
+            &binding,
+            None,
+        ))
+        .await
+        .expect("bound change should complete");
+    assert_eq!(refused.status(), StatusCode::PRECONDITION_REQUIRED);
+
+    assert_shadow_rule_unchanged(&router, "shadow-reports", &reviewed_etag).await;
+}
+
+#[tokio::test]
 async fn policy_rule_preview_moderate_scale_completes_under_two_seconds() {
     let db = TempDb::new("rule-preview-performance");
     create_audit_schema(&db.path);
@@ -28940,6 +29483,9 @@ fn shadow_review_policy_document() -> String {
             "policy-reader": {
                 "permissions": [ADMIN_POLICY_READ_PERMISSION]
             },
+            "policy-writer": {
+                "permissions": [ADMIN_POLICY_READ_PERMISSION, ADMIN_POLICY_WRITE_PERMISSION]
+            },
             "reader": {
                 "permissions": []
             }
@@ -29271,6 +29817,143 @@ fn shadow_review_rule<'a>(body: &'a Value, rule_id: &str) -> Option<&'a Value> {
         .as_array()?
         .iter()
         .find(|rule| rule["rule_id"] == json!(rule_id))
+}
+
+/// Two would-deny events for `shadow-reports`, three seconds apart, and none
+/// for `shadow-exports`.
+fn seed_shadow_reports_would_deny_events(path: &PathBuf) {
+    insert_authz_event(
+        path,
+        shadow_would_deny_seed("shadow-reports-1", "2024-06-01T12:00:00Z", "shadow-reports"),
+    );
+    insert_authz_event(
+        path,
+        SeedAuthzEvent {
+            actor_user_id: Some("analyst-2"),
+            method: "DELETE",
+            request_path: "/reports/2",
+            ..shadow_would_deny_seed("shadow-reports-2", "2024-06-01T12:00:03Z", "shadow-reports")
+        },
+    );
+}
+
+fn shadow_would_deny_seed<'a>(
+    event_id: &'a str,
+    timestamp: &'a str,
+    matched_rule_id: &'a str,
+) -> SeedAuthzEvent<'a> {
+    SeedAuthzEvent {
+        event_id,
+        event_type: "authz.would_deny",
+        timestamp,
+        actor_user_id: Some("analyst-1"),
+        roles: &["analyst"],
+        method: "GET",
+        request_path: "/reports/1",
+        matched_rule_id: Some(matched_rule_id),
+    }
+}
+
+async fn shadow_review_body(router: &Router) -> Value {
+    let response = router
+        .clone()
+        .oneshot(policy_admin_request(
+            Method::GET,
+            POLICY_RULE_SHADOW_REVIEW_ADMIN_ROUTE,
+            Some(test_principal(&["admin"])),
+            None,
+            None,
+        ))
+        .await
+        .expect("policy shadow review should complete");
+    assert_eq!(response.status(), StatusCode::OK);
+    json_body(response).await
+}
+
+/// The binding one shadow-review entry carries, assembled the way a client
+/// sends it back with a promotion or disable.
+async fn shadow_review_binding(router: &Router, rule_id: &str) -> Value {
+    let body = shadow_review_body(router).await;
+    let entry = shadow_review_rule(&body, rule_id).expect("rule should be in the shadow review");
+    json!({
+        "policy_etag": body["policy_etag"],
+        "evidence_window": entry["evidence_window"],
+        "evidence_digest": entry["evidence_digest"],
+    })
+}
+
+fn binding_policy_etag(binding: &Value) -> String {
+    binding["policy_etag"]
+        .as_str()
+        .expect("binding should carry the reviewed policy ETag")
+        .to_owned()
+}
+
+fn bound_shadow_patch(
+    rule_id: &str,
+    mut patch: Value,
+    binding: &Value,
+    if_match: Option<&str>,
+) -> Request<Body> {
+    patch["shadow_review"] = binding.clone();
+    policy_admin_request(
+        Method::PATCH,
+        &format!("{POLICY_RULES_ADMIN_ROUTE}/{rule_id}"),
+        Some(test_principal(&["admin"])),
+        Some(patch.to_string()),
+        if_match,
+    )
+}
+
+async fn assert_shadow_refusal(response: Response, status: StatusCode, reason: &str) {
+    assert_eq!(response.status(), status);
+    let body = json_body(response).await;
+    assert_eq!(body["reason"], json!(reason), "{body}");
+    assert!(body["error"].is_string(), "{body}");
+}
+
+/// The rule is still an enabled shadow rule and the policy is still at
+/// `expected_etag`: a refused change wrote nothing.
+async fn assert_shadow_rule_unchanged(router: &Router, rule_id: &str, expected_etag: &str) {
+    let (etag, policy) = current_policy(router).await;
+    assert_eq!(etag, expected_etag);
+    let rule = policy["rules"]
+        .as_array()
+        .expect("policy rules should be an array")
+        .iter()
+        .find(|rule| rule["id"] == json!(rule_id))
+        .expect("rule should still exist");
+    assert_eq!(rule["action"], json!("shadow"));
+    assert_ne!(rule["enabled"], json!(false));
+}
+
+fn shadow_transition_refusals(capture: &audit::sink::tests::CaptureSink) -> Vec<audit::AuditEvent> {
+    capture
+        .events()
+        .into_iter()
+        .filter(|event| event.event_type == audit::event::POLICY_SHADOW_TRANSITION_REFUSED)
+        .collect()
+}
+
+fn await_shadow_transition_refusals(
+    capture: &audit::sink::tests::CaptureSink,
+    expected: usize,
+) -> Vec<audit::AuditEvent> {
+    assert_eventually(Duration::from_secs(1), || {
+        shadow_transition_refusals(capture).len() >= expected
+    });
+    let refusals = shadow_transition_refusals(capture);
+    assert_eq!(refusals.len(), expected);
+    refusals
+}
+
+fn is_sha256_digest(value: &str) -> bool {
+    value.strip_prefix("sha256:").is_some_and(|hex| {
+        hex.len() == 64
+            && hex
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    })
 }
 
 fn event_ids_from_body(body: &Value) -> Vec<String> {
