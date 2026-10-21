@@ -78,7 +78,7 @@ class ManifestTests(unittest.TestCase):
         manifest, mutants = mutations.load_manifest(root, root / "security-mutations.json")
         self.assertGreater(len(mutants), 0)
         self.assertEqual(len({mutant["id"] for mutant in mutants}), len(mutants))
-        self.assertEqual(len(manifest["targets"]), 4)
+        self.assertEqual(len(manifest["targets"]), 8)
 
     def test_current_registry_passes_the_pull_request_drift_check(self):
         root = Path(__file__).resolve().parents[1]
