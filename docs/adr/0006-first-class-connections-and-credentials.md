@@ -313,8 +313,9 @@ is explicit.
   idle token of a Connection's earlier configuration on the first call after a
   change. Its client-secret version is always absent, because only the
   encrypted local store reports one: a rotation behind an operator alias or an
-  external provider does not partition the cache, and saving the Connection is
-  the flush.
+  external provider does not partition the cache, and a save that changes the
+  Connection (disabling it, for an incident) is the flush; an unchanged save is
+  a no-op.
 - Refusals carry distinct reasons (`delegated_token_denied`,
   `delegated_token_exchange_failed`, `delegated_token_egress_denied`,
   `delegated_token_unavailable`) and each exchange emits

@@ -965,15 +965,20 @@ with no principal, or a service token's, is refused with
   full cache evicts an idle entry, which costs that caller one more exchange,
   and refuses a call with `delegated_token_unavailable` only while every entry
   is held by a call in flight.
-- A save of the Connection or an egress policy change moves the cache key: the
-  first call afterwards exchanges again and drops every idle token held for
-  the Connection's earlier configuration.
+- A save that changes the stored Connection, or an egress policy change,
+  moves the cache key: the first call afterwards exchanges again and drops
+  every idle token held for the Connection's earlier configuration. A save
+  that changes nothing is a no-op: the stored document, its ETag and every
+  cached token stay as they were.
 - Rotating the client secret does not. The gateway cannot see a rotation
   behind an operator alias or an external provider, so tokens already cached
   keep being served until they are refreshed, for at most 900 seconds; the
   next exchange simply uses the new secret. Rotating the secret does not
   revoke the tokens the issuer already handed out, either. After an incident,
-  revoke at the issuer and save the Connection to drop its cached tokens.
+  disable the Connection: that changes the stored document, so each replica
+  refuses its calls and stops using its cached tokens once it has applied the
+  change. Then revoke the grant at the issuer, rotate the client secret, and
+  re-enable the Connection.
 - An upstream `401` drops the token that request used, so the caller's next
   call exchanges again. The rejected call is not replayed.
 - Nothing is persisted. A restart starts with an empty cache.
@@ -1052,10 +1057,11 @@ the trust sits:
   issuer revokes stops being used here within the cache lifetime. Purging a
   user's cached tokens the moment they are disabled, and audited revocation
   at the issuer, are follow-ups. Until then, revoke the grant at the issuer and,
-  for an immediate stop, save the Connection, which drops every cached token
-  for it. In cluster mode each replica holds its own cache and stops using the
-  old tokens only once it has applied the save, at its next reconcile; until
-  then it keeps serving them.
+  for an immediate stop, disable the Connection (or make any other real change
+  to it): that moves its cache key, so no token cached before it is served.
+  Saving it unchanged is a no-op and keeps them. In cluster mode each replica
+  holds its own cache and stops using the old tokens only once it has applied
+  the change, at its next reconcile; until then it keeps serving them.
 - Policy is unchanged: tool policy and `rules[]` apply per principal before any
   exchange, so read-only deny rules and per-tool roles limit what a caller can
   do with their own token.

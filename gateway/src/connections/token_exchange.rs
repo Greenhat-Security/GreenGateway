@@ -14,7 +14,8 @@
 //! - The answer is injected as `Authorization: Bearer` and cached under the Connection's revision,
 //!   the caller and the egress policy, until shortly before the issuer's `expires_in` and for at
 //!   most [`MAX_DELEGATED_TOKEN_CACHE_SECONDS`]. Rotating the client secret behind its alias does
-//!   not move that key (see [`DelegatedTokenRuntime::access_token`]); saving the Connection does.
+//!   not move that key (see [`DelegatedTokenRuntime::access_token`]); a save that changes the
+//!   Connection does, and an unchanged save is a no-op.
 //!
 //! A call that names nobody is refused before anything is read or sent; so is one whose exchange
 //! fails, with a reason of its own, and never with a fallback to a shared identity. Every exchange
@@ -245,7 +246,8 @@ impl DelegatedTokenRuntime {
             // provider's alias is read afresh on each exchange, with nothing
             // to say it changed. So rotating the client secret does not drop
             // cached tokens (nor does it revoke the tokens the issuer already
-            // handed out); saving the Connection, which moves its etag, does.
+            // handed out); a save that changes the Connection, which moves its
+            // etag, does. An unchanged save keeps the etag and the cache.
             // Kept rather than written as `None`, so that a local store able
             // to hold the purpose would partition the cache by rotation.
             secret_version: self
