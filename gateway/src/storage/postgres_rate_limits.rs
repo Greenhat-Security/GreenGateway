@@ -28,9 +28,10 @@
 //! - **Cardinality is bounded exactly.** `rate_limit_cardinality` counts
 //!   live buckets per deployment and moves in the same statement that
 //!   inserts or deletes rows, so it cannot drift; when a new key pushes
-//!   the count past the bound, one bounded statement evicts the oldest
-//!   buckets. An idle sweep for the cluster's maintenance singleton
-//!   reclaims buckets nobody has touched for the configured TTL.
+//!   the count past the bound, one bounded statement on the same
+//!   connection evicts the oldest buckets. An idle sweep for the cluster's
+//!   maintenance singleton reclaims buckets nobody has touched for the
+//!   configured TTL.
 //!
 //! A store that cannot be consulted is a [`RepositoryError`]; the
 //! middleware answers `503` with zero upstream attempts. It is never a
@@ -152,7 +153,9 @@ impl PostgresRateLimitStore {
     /// Decide one request for `key` in `lane` against `limit`: one atomic
     /// statement that creates or advances the bucket and, for a new key,
     /// counts it; then, only when the count passed the bound, one bounded
-    /// eviction of the oldest buckets.
+    /// eviction of the oldest buckets on the same connection. The decision
+    /// is the statement's: an eviction that fails after it is logged, not
+    /// returned.
     pub async fn decide(
         &self,
         lane: SharedLane,
@@ -220,7 +223,20 @@ impl PostgresRateLimitStore {
         if inserted {
             if let Some(live) = live {
                 if live > self.max_buckets {
-                    self.evict_oldest(live - self.max_buckets).await?;
+                    // On this decision's own connection. A second checkout
+                    // would hold this one while it waited, and a pool's
+                    // worth of new keys at the bound would then wait on
+                    // each other until the acquire timeout, with every
+                    // other authority call on the pool queued behind them.
+                    //
+                    // The decision committed with its statement, so a
+                    // failed eviction (classified and logged by
+                    // `classify_query`, counted by `timed_operation`)
+                    // cannot take it back, and refusing the request would
+                    // not remove the bucket either: the next key past the
+                    // bound evicts the excess, and the idle sweep reclaims
+                    // what nobody touches.
+                    let _ = self.evict_oldest(&client, live - self.max_buckets).await;
                 }
             }
         }
@@ -232,10 +248,14 @@ impl PostgresRateLimitStore {
     }
 
     /// Remove the `excess` oldest buckets (bounded per statement) and
-    /// bring the count down with them, in one statement.
-    async fn evict_oldest(&self, excess: i64) -> Result<(), RepositoryError> {
+    /// bring the count down with them, in one statement, over the
+    /// connection the deciding caller already holds.
+    async fn evict_oldest(
+        &self,
+        client: &tokio_postgres::Client,
+        excess: i64,
+    ) -> Result<(), RepositoryError> {
         let batch = excess.clamp(1, EVICTION_BATCH);
-        let client = checkout(&self.pool, CheckoutClass::RateLimit).await?;
         timed_operation(OPERATION_EVICT, async {
             client
                 .execute(

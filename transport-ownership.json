@@ -12486,6 +12486,16 @@
       "reasons": [
         "network-or-process-reference"
       ],
+      "scope": "gateway::storage::postgres_rate_limits::impl  PostgresRateLimitStore::evict_oldest#1",
+      "sha256": "06aeca465b9d6bd180b176ba36b606f7ce483bda5e3c1d85b2f52098e6fe9202",
+      "owner": "GreenGateway maintainers",
+      "purpose": "PostgreSQL repository operations through the shared infrastructure pool; no caller-selected HTTP authority."
+    },
+    {
+      "file": "gateway/src/storage/postgres_rate_limits.rs",
+      "reasons": [
+        "network-or-process-reference"
+      ],
       "scope": "gateway::storage::postgres_rate_limits::impl  PostgresRateLimitStore::cleanup_idle_with#1",
       "sha256": "39bfb8f51e485b9d622f8e7acd1b5aca76d03f4bbbb96c591cac94a596672829",
       "owner": "GreenGateway maintainers",

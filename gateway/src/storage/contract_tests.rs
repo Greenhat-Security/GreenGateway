@@ -2991,6 +2991,134 @@ pub(crate) mod postgres_audit_tests {
         assert_eq!(store.cleanup_idle(3_600.0, 100).await.expect("sweep"), 0);
     }
 
+    /// A new key past the bound is evicted for on its decision's own
+    /// connection, never a second one. A decision that held its connection
+    /// while it waited for another would, a pool's worth at a time, wait on
+    /// the others until the acquire timeout, and every other authority call
+    /// on the pool -- the revision gate, credential checks, leases -- would
+    /// wait behind them. On a one-connection pool any single such decision
+    /// is that pool's worth, so several new keys at the bound at once must
+    /// each be decided in turn rather than refused for want of a connection.
+    #[tokio::test]
+    async fn new_keys_at_the_bound_never_wait_on_a_second_connection() {
+        let Some(admin_dsn) = locator() else {
+            eprintln!("skipping: no test database locator; CI runs this test");
+            return;
+        };
+        let _guard = DATABASE.lock().await;
+        let database = create_test_database(&admin_dsn).await;
+        let _migrated = migrated_limits_pool(&database).await;
+        let one_connection = one_connection_foundation(&database, 2_000).await;
+        let store = Arc::new(PostgresRateLimitStore::new(
+            one_connection.pool().clone(),
+            "deploy-limits",
+            limits_keyring(),
+            1,
+        ));
+        let one = SharedLimit {
+            requests_per_second: 0.0,
+            burst: 1,
+        };
+        // The bound is one bucket, and this fills it.
+        assert_eq!(
+            decide(&store, SharedLane::Read, "ip:198.51.100.0", one).await,
+            SharedDecision::Allowed
+        );
+        let decisions: Vec<_> = (1..=8)
+            .map(|index| {
+                let store = Arc::clone(&store);
+                tokio::spawn(async move {
+                    store
+                        .decide(SharedLane::Read, &format!("ip:198.51.100.{index}"), one)
+                        .await
+                })
+            })
+            .collect();
+        for decision in decisions {
+            assert_eq!(
+                decision
+                    .await
+                    .expect("the decision task")
+                    .map_err(|error| error.kind()),
+                Ok(SharedDecision::Allowed),
+                "a new key at the bound is decided, not refused for want of a second connection"
+            );
+        }
+        assert_eq!(
+            store.live_buckets().await.expect("counter"),
+            1,
+            "every one of them still evicted down to the bound"
+        );
+    }
+
+    /// The decision is committed before its eviction runs, so an eviction
+    /// that fails cannot take the decision back: the request gets the
+    /// decision it was given -- an allowance or a denial -- rather than a
+    /// `503` for housekeeping, and the next key past the bound evicts the
+    /// excess the failed one left.
+    #[tokio::test]
+    async fn a_failed_eviction_does_not_refuse_the_committed_decision() {
+        let Some(admin_dsn) = locator() else {
+            eprintln!("skipping: no test database locator; CI runs this test");
+            return;
+        };
+        let _guard = DATABASE.lock().await;
+        let database = create_test_database(&admin_dsn).await;
+        let pool = migrated_limits_pool(&database).await;
+        let store = PostgresRateLimitStore::new(pool.clone(), "deploy-limits", limits_keyring(), 1);
+        let one = SharedLimit {
+            requests_per_second: 0.0,
+            burst: 1,
+        };
+        let zero = SharedLimit {
+            requests_per_second: 0.0,
+            burst: 0,
+        };
+        assert_eq!(
+            decide(&store, SharedLane::Read, "ip:198.51.100.0", one).await,
+            SharedDecision::Allowed
+        );
+        let client = pool.get().await.expect("client");
+        client
+            .batch_execute(
+                "CREATE FUNCTION greengateway.refuse_bucket_delete() RETURNS trigger
+                     LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'eviction refused'; END $$;
+                 CREATE TRIGGER refuse_bucket_delete
+                     BEFORE DELETE ON greengateway.rate_limit_buckets
+                     FOR EACH ROW EXECUTE FUNCTION greengateway.refuse_bucket_delete();",
+            )
+            .await
+            .expect("make every eviction fail");
+        assert_eq!(
+            decide(&store, SharedLane::Read, "ip:198.51.100.1", one).await,
+            SharedDecision::Allowed,
+            "the committed allowance stands"
+        );
+        assert_eq!(
+            decide(&store, SharedLane::Read, "ip:198.51.100.2", zero).await,
+            SharedDecision::Denied,
+            "the committed denial stands"
+        );
+        assert_eq!(
+            store.live_buckets().await.expect("counter"),
+            3,
+            "neither eviction removed anything, and the count says so"
+        );
+        client
+            .batch_execute("DROP TRIGGER refuse_bucket_delete ON greengateway.rate_limit_buckets")
+            .await
+            .expect("let evictions run again");
+        assert_eq!(
+            decide(&store, SharedLane::Read, "ip:198.51.100.3", one).await,
+            SharedDecision::Allowed
+        );
+        assert_eq!(
+            store.live_buckets().await.expect("counter"),
+            1,
+            "the next key past the bound evicts the excess the failed ones left"
+        );
+    }
+
     /// Fail closed: a shared limiter that cannot be consulted answers 503
     /// with zero upstream attempts; it is never a silent allow and never a
     /// 429. Then, with the authority back, two replicas' middleware share
