@@ -2,7 +2,7 @@
 
 Mutation checks ask whether the selected tests detect a deliberate change to
 a security predicate. `scripts/security_mutations.py` is an in-tree, Python
-standard-library harness, version **1.0.0**, with an explicit target and mutation
+standard-library harness, version **1.1.0**, with an explicit target and mutation
 registry in `security-mutations.json`. This is the compatible equivalent tool
 selected for issue #436; it does not install or invoke `cargo-mutants`.
 
@@ -30,6 +30,14 @@ that every selected test still exists, before merge; see
 | `path_match::is_unsafe_request_path` | Ambiguous request-path rejection | Permit backslashes; permit empty interior segments |
 | `egress::host_glob_matches` | Egress exact and wildcard host matching | Remove the wildcard label boundary; skip request-host case folding |
 | `policy_eval::route_host_matches` | Shared evaluator host binding | Ignore a required binding; accept an absent request host |
+
+A target is a module-level function, or a method one indentation level into a
+module-level inherent `impl Type {` block. A method's registry name ends
+`Type::method`, its start marker carries the four-space indentation, and its
+end marker is `"\n    }\n"`, the closing brace at that indentation. The
+nearest line above the method that starts in column zero must be exactly
+`impl Type {`, so a method moved to another type, a trait impl or a generic
+impl fails as drift instead of being matched by name.
 
 The shared evaluator already exists, so the host-binding target belongs to
 `policy_eval` from the start. The live adapter migration tracked by #422 is
@@ -249,9 +257,10 @@ calibration build and real process-limit checks.
 `--validate-registry` runs the campaign's registry loader against the
 checked-out tree: schema and harness version, safe regular-file paths, a start
 marker that occurs once at the beginning of a line, the function scope it
-opens, the function SHA-256, each mutation's `old` text occurring exactly once
-in that function, selected test names' syntax, count and uniqueness, and each
-exception's binding to a current mutation identity. A pass prints
+opens, for a method the inherent impl around it, the function SHA-256, each
+mutation's `old` text occurring exactly once in that function, selected test
+names' syntax, count and uniqueness, and each exception's binding to a current
+mutation identity. A pass prints
 `security mutation registry check: passed (registry_valid)` and reports
 `source_state: checkout_registry_only`. Nothing is compiled, discovered,
 tested or mutated, so its counts stay zero and it is not a mutation score.
@@ -286,7 +295,8 @@ asserts that behavior. Measured outcomes still come from a complete campaign,
 as described above.
 
 The digest covers the committed bytes from the start of the `start_marker` line
-through the first following `\n}\n`, inclusive. To recompute one, for example:
+through the first following `end_marker`, inclusive: `\n}\n` for a
+module-level function, `\n    }\n` for a method. To recompute one, for example:
 
 ```sh
 python - <<'PY'
@@ -294,6 +304,9 @@ import hashlib, pathlib
 source = pathlib.Path("gateway/src/path_match.rs").read_bytes()
 start = source.index(b"pub fn path_prefix_matches(")
 print(hashlib.sha256(source[start:source.index(b"\n}\n", start) + 3]).hexdigest())
+source = pathlib.Path("gateway/src/policy_eval/mod.rs").read_bytes()
+start = source.index(b"    pub(crate) fn select_rate_lane(")
+print(hashlib.sha256(source[start:source.index(b"\n    }\n", start) + 7]).hexdigest())
 PY
 ```
 

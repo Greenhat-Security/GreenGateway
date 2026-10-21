@@ -17,6 +17,8 @@ import security_mutations as mutations
 
 
 SOURCE = b"fn allowed(value: u8) -> bool {\n    value < 4\n}\n"
+METHOD_BODY = b"    fn allowed(value: u8) -> bool {\n        if value < 4 {\n            return true;\n        }\n        false\n    }\n"
+METHOD_SOURCE = b"struct Gate;\n\nimpl Gate {\n    /// Reviewed boundary.\n" + METHOD_BODY + b"\n    fn other() {}\n}\n"
 TEST_NAME = "security::rejects_boundary"
 
 
@@ -129,6 +131,45 @@ class ManifestTests(unittest.TestCase):
     def test_ambiguous_function_fails(self):
         (self.root / "source.rs").write_bytes(SOURCE + SOURCE)
         self.assert_rejected("function_scope_drift")
+
+    def use_method_target(self, source=METHOD_SOURCE):
+        (self.root / "source.rs").write_bytes(source)
+        self.manifest["targets"][0].update(function="Gate::allowed", start_marker="    fn allowed(", end_marker="\n    }\n",
+                                           source_sha256=mutations.sha256(METHOD_BODY))
+
+    def test_inherent_method_target_covers_only_its_own_body(self):
+        self.use_method_target()
+        _, mutants = self.load()
+        start, end = mutants[0]["span"]
+        # Neither a deeper closing brace nor the impl's own ends the method.
+        self.assertEqual(METHOD_BODY, METHOD_SOURCE[start:end])
+        self.assertEqual(b"\n    fn other() {}\n}\n", METHOD_SOURCE[end:])
+
+    def test_method_outside_its_named_inherent_impl_fails(self):
+        for label, source in (("other type", METHOD_SOURCE.replace(b"impl Gate {", b"impl Other {")),
+                              ("trait impl", METHOD_SOURCE.replace(b"impl Gate {", b"impl Check for Gate {")),
+                              ("generic impl", METHOD_SOURCE.replace(b"impl Gate {", b"impl<T> Gate<T> {")),
+                              ("nested module", METHOD_SOURCE.replace(b"impl Gate {", b"mod nested {"))):
+            with self.subTest(label=label):
+                self.use_method_target(source)
+                self.assert_rejected("function_scope_drift")
+
+    def test_method_closes_at_its_own_indentation(self):
+        self.use_method_target()
+        self.manifest["targets"][0]["end_marker"] = "\n}\n"
+        self.assert_rejected("function_scope_drift")
+        self.use_method_target()
+        self.manifest["targets"][0]["start_marker"] = "fn allowed("
+        self.assert_rejected("function_scope_drift")
+
+    def test_method_marker_needs_one_indentation_level_and_a_type(self):
+        for function, marker in (("allowed", "    fn allowed("), ("gate::allowed", "    fn allowed("),
+                                 ("Gate::allowed", "        fn allowed("), ("Gate::allowed", "\tfn allowed("),
+                                 ("Gate::allowed", "  fn allowed("), ("Gate::other", "    fn allowed(")):
+            with self.subTest(function=function, marker=marker):
+                self.use_method_target()
+                self.manifest["targets"][0].update(function=function, start_marker=marker)
+                self.assert_rejected("invalid_function_marker")
 
     def test_traversal_and_absolute_paths_fail(self):
         for path in ("../source.rs", "/source.rs", "./source.rs", "part/../source.rs"):
