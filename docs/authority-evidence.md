@@ -1,16 +1,20 @@
 # Durable authority-change evidence inventory and contract
 
 Part of [#425](https://github.com/Greenhat-Security/GreenGateway/issues/425), PR 1
-and the first PR 2 slice (PostgreSQL Connection deletion evidence).
-Reviewed source: `05c295a52763ba09701ef38bb030e30e5bc7e4d7`.
+and the first two PR 2 slices (PostgreSQL Connection deletion evidence; service-token
+rotate/revoke and JWT revocation evidence).
+Reviewed source: `4a32d10e38d2ac36d6bcbee627443b1fbb80d059`.
 
 This inventory identifies existing atomic records and the work needed for required
 authority-change evidence. PR 1 added the inventory and the proposed event
-contract. The first PR 2 slice adds one durable evidence table, migration 16's
+contract. The first PR 2 slice adds migration 16's
 `greengateway.connection_change_evidence`, written by PostgreSQL Connection
-deletes. Neither implements or enables required-durability mode, a dispatcher,
+deletes. The second adds migration 18's `greengateway.service_token_change_evidence`
+and `greengateway.jwt_revocation_evidence`, written by PostgreSQL token rotate/revoke
+and JWT revokes, and the same token evidence table inside the standalone SQLite token
+database. None of them implements or enables required-durability mode, a dispatcher,
 or a standalone revision ledger, and no row is qualified for that future mode.
-Storage selection and standalone behavior are unchanged.
+Storage selection is unchanged.
 
 Run the executable inventory and proposed event-contract tests with the pinned
 Node version from `build-tools.json`:
@@ -46,8 +50,9 @@ or unconfigured individual stores.
 | Connection and credential binding changes | Record, bindings, immutable version, shared revision and outbox | Actor/history must survive Connection deletion; safe per-operation metadata and delivery |
 | Connection deletion | Outbox tombstone with prior version and shared revision, plus a non-cascading `connection_change_evidence` row (actor, action, event/operation UUIDs, prior version, the tombstone's shared revision, database-clock time) in the same transaction | Issuer/auth mode, caller-bound operation identity, safe-reference projection, durable delivery and retention |
 | Managed MCP/OpenAPI catalog and overlay publication | Catalog/overlay CAS, entries, dependencies, reservations, revision and outbox | Current actor rows are replaced or cascaded; retain per-change evidence |
-| Service-token issue/rotate/revoke | Token change, row/shared revisions and outbox; repeated revoke is a no-op | Creation retains original creator, but rotate/revoke store APIs receive no mutation actor; preserve action and operation identity |
-| JWT revocation | Scoped JTI digest, actor row, shared revision and outbox | Extension/reactivation overwrites actor; expiry cleanup removes row. CLI actor is system provenance, not a named human |
+| Service-token issue | Token row with creator, row/shared revisions and outbox | Creation retains only `created_by`; no issue evidence row, operation identity or delivery |
+| Service-token rotate/revoke | Token change, row/shared revisions and outbox, plus a non-cascading `service_token_change_evidence` row (actor, action, event/operation UUIDs, prior/new row revision, the outbox row's shared revision, database-clock time) in the same transaction; repeated revoke and refused rotate write none. Standalone writes the same evidence in the token database's own transaction | Issuer/auth mode, caller-bound operation identity, safe-reference projection, durable delivery and retention |
+| JWT revocation | Scoped JTI digest, actor row, shared revision and outbox, plus one non-cascading `jwt_revocation_evidence` row per effective revoke (actor, JTI digest, resulting expiry, shared revision) that extension, reactivation and expiry cleanup never rewrite | CLI actor is system provenance, not a named human; no actor kind, issuer/auth mode or delivery |
 
 These foundations are already sufficient for their **existing atomic change-record
 purpose**. The inventory uses `missing_metadata` and `missing_delivery` for
@@ -69,7 +74,10 @@ Important standalone and operator boundaries:
   publication/evidence record.
 - Connections, local secrets and service tokens each have an owning SQLite
   store. Required evidence must join that same store's mutation transaction.
-  A separate audit SQLite database is not an atomic alternative.
+  A separate audit SQLite database is not an atomic alternative. Service-token
+  rotate/revoke now does: the token store writes its evidence row in the same
+  IMMEDIATE transaction as the change. `import-standalone` does not carry those
+  rows; the cluster's evidence starts with its first change.
 - Local-secret CRUD/rotation and master-key re-encryption are standalone-only.
   PostgreSQL configuration rejects the local keyring. External secret providers
   own their rotations; a gateway transaction cannot certify an independent
@@ -97,8 +105,10 @@ before asserting required durability for them.
 [The closed JSON schema](schemas/authority_event.v1.schema.json) and the checker
 define a **proposed** safe projection. Current `security_outbox` rows,
 `connection_change_evidence` rows and `audit_event.v0` events do not already
-satisfy this schema: the evidence rows hold the internal actor ID, not a keyed
-safe reference, and no `authority_id`. Runtime producer, identity derivation and
+satisfy this schema, and neither do migration 18's `service_token_change_evidence`
+and `jwt_revocation_evidence` rows or the standalone token evidence rows: the
+evidence rows hold the internal actor ID, not a keyed safe reference, and no
+`authority_id`. Runtime producer, identity derivation and
 dispatcher integration belong to later slices.
 
 Revision transitions are operation-specific. Resource creation (`connection.create`,
@@ -207,11 +217,26 @@ become a call inside the authority transaction.
    from the evidence row; CI runs them against its disposable loopback database,
    not verified TLS. Still open for this row: issuer/auth mode and a
    caller-bound operation identity at the store boundary.
-2. **Service-token and JWT metadata.** Carry mutation actor/action through
-   `ServiceTokenStore` and both adapters; retain rotate/revoke history and JWT
-   extension/cleanup provenance. Exercise repeat revoke, rotate/revoke races,
-   expired cleanup and synthetic-secret exclusion. Do not recover the changing
-   actor from `created_by`.
+2. **Service-token and JWT metadata (landed).** `ServiceTokenStore` rotate and
+   revoke now take the mutating actor, and both adapters write one evidence row
+   per committed change in the change's own transaction: migration 18's
+   `service_token_change_evidence` beside the PostgreSQL outbox row (same shared
+   revision, same row-revision step), and the same table inside the standalone
+   token database's IMMEDIATE transaction. JWT revokes append
+   `jwt_revocation_evidence`, copied from the row they wrote, so an extension or
+   reactivation adds a row instead of overwriting the actor and expiry cleanup
+   leaves it. A failed evidence insert rolls the change back and is never
+   reported as the rotate conflict; repeat revoke, refused rotate and refused
+   JWT revokes write nothing. Migration 18 moves the serving contract from
+   exactly schema 17 to exactly schema 18, a coordinated drain/migrate/restart.
+   Tests cover both adapters through one shared contract, repeat revoke,
+   rotate/revoke races, actor survival after token deletion and restart, a
+   forced evidence-insert failure and its rollback, extension, reactivation and
+   cleanup, and synthetic token-material exclusion; the PostgreSQL ones run in
+   CI against its disposable loopback database, not verified TLS. Still open:
+   issuer/auth mode, an actor kind for the CLI's system label, a caller-bound
+   operation identity, and token issue evidence (`created_by` remains its only
+   actor record).
 3. **Shared documents/catalog metadata.** Extend the existing document core once
    for policy/tools, retaining suggestion transaction composition. Add immutable
    catalog/overlay evidence before replacement/cascade. Cover CAS rollback, name

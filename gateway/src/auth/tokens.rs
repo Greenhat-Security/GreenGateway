@@ -32,7 +32,57 @@ ON service_tokens(created_at DESC, id ASC);
 
 CREATE INDEX IF NOT EXISTS idx_service_tokens_revoked
 ON service_tokens(revoked_at);
+
+-- Change evidence (issue #425): one append-only row per committed rotate
+-- or revoke, written in the same transaction as the token change, naming
+-- who made it. Created on open like the table above, so a database an
+-- older binary wrote gains it on the first open by this one and an older
+-- binary simply never reads it. No foreign key, so a removed token row
+-- leaves its evidence; identifiers and the actor only, never the
+-- plaintext, hash, prefix or scopes. The actor bound is the principal
+-- subject bound (MAX_TOKEN_CHANGE_ACTOR_BYTES).
+CREATE TABLE IF NOT EXISTS service_token_change_evidence (
+    sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+    event_id TEXT NOT NULL UNIQUE CHECK (length(event_id) = 36),
+    operation_id TEXT NOT NULL CHECK (length(operation_id) = 36),
+    actor_user_id TEXT NOT NULL CHECK (
+        length(CAST(actor_user_id AS BLOB)) BETWEEN 1 AND 4096
+    ),
+    action TEXT NOT NULL CHECK (
+        action IN ('service_token.rotate', 'service_token.revoke')
+    ),
+    token_id TEXT NOT NULL CHECK (length(CAST(token_id AS BLOB)) BETWEEN 1 AND 128),
+    committed_at TEXT NOT NULL,
+    UNIQUE (operation_id, action)
+);
+
+CREATE INDEX IF NOT EXISTS idx_service_token_change_evidence_token
+ON service_token_change_evidence(token_id, sequence);
 "#;
+
+/// The longest actor a rotate or revoke records as its change evidence, in
+/// both the SQLite table above and PostgreSQL migration 18. It is exactly
+/// the principal subject bound authentication enforces, so evidence never
+/// refuses a principal a validator produced; the assertion keeps the SQL
+/// bounds and the Rust bound from drifting apart silently.
+pub(crate) const MAX_TOKEN_CHANGE_ACTOR_BYTES: usize = 4096;
+const _: () =
+    assert!(MAX_TOKEN_CHANGE_ACTOR_BYTES == crate::auth::principal::MAX_PRINCIPAL_SUBJECT_BYTES);
+
+/// The closed action vocabulary of service-token change evidence. Values are
+/// the proposed authority-event operation codes
+/// (`docs/schemas/authority_event.v1.schema.json`); both stores' CHECK
+/// constraints refuse anything else.
+pub(crate) const TOKEN_CHANGE_ACTION_ROTATE: &str = "service_token.rotate";
+pub(crate) const TOKEN_CHANGE_ACTION_REVOKE: &str = "service_token.revoke";
+
+/// An unattributable change has no evidence to record, so a store refuses
+/// it before it changes anything rather than committing it anonymously. An
+/// authenticated principal always satisfies this; the CHECK constraints
+/// are the backstop.
+pub(crate) fn is_valid_change_actor(actor_user_id: &str) -> bool {
+    !actor_user_id.is_empty() && actor_user_id.len() <= MAX_TOKEN_CHANGE_ACTOR_BYTES
+}
 
 const TOKEN_MARKER: &str = "ggw_";
 const TOKEN_RANDOM_BYTES: usize = 32;
@@ -52,9 +102,20 @@ pub trait TokenStore: Send + Sync {
 
     fn get_by_id(&self, id: &str) -> Result<Option<TokenRecord>, TokenStoreError>;
 
-    fn revoke(&self, id: &str) -> Result<Option<TokenRecord>, TokenStoreError>;
+    /// Revoke on behalf of `actor_user_id`, who is recorded as the change's
+    /// evidence in the same transaction. A repeat revoke changes nothing
+    /// and records nothing.
+    fn revoke(&self, id: &str, actor_user_id: &str)
+        -> Result<Option<TokenRecord>, TokenStoreError>;
 
-    fn rotate(&self, id: &str) -> Result<Option<CreatedToken>, TokenStoreError>;
+    /// Rotate on behalf of `actor_user_id`, who is recorded as the change's
+    /// evidence in the same transaction. Rotating a revoked token is a
+    /// conflict and records nothing.
+    fn rotate(
+        &self,
+        id: &str,
+        actor_user_id: &str,
+    ) -> Result<Option<CreatedToken>, TokenStoreError>;
 
     fn verify(&self, plaintext_token: &str) -> Result<TokenVerification, TokenStoreError>;
 
@@ -187,6 +248,15 @@ pub enum TokenStoreError {
     RevokedToken {
         id: String,
     },
+    /// A rotate or revoke named no actor, or one longer than
+    /// [`MAX_TOKEN_CHANGE_ACTOR_BYTES`]; refused before anything changed.
+    InvalidChangeActor,
+    /// The change's evidence could not be written, so the change was
+    /// rolled back with it.
+    ChangeEvidence {
+        path: PathBuf,
+        source: rusqlite::Error,
+    },
 }
 
 impl SqliteTokenStore {
@@ -257,6 +327,13 @@ impl SqliteTokenStore {
                 source,
             });
         tokens
+    }
+
+    fn sqlite_error(&self, source: rusqlite::Error) -> TokenStoreError {
+        TokenStoreError::Sqlite {
+            path: self.path.clone(),
+            source,
+        }
     }
 
     fn connection_guard(&self) -> MutexGuard<'_, Connection> {
@@ -401,59 +478,119 @@ impl TokenStore for SqliteTokenStore {
         load_record_by_id(&connection, &self.path, id)
     }
 
-    fn revoke(&self, id: &str) -> Result<Option<TokenRecord>, TokenStoreError> {
+    fn revoke(
+        &self,
+        id: &str,
+        actor_user_id: &str,
+    ) -> Result<Option<TokenRecord>, TokenStoreError> {
+        if !is_valid_change_actor(actor_user_id) {
+            return Err(TokenStoreError::InvalidChangeActor);
+        }
         let revoked_at = utc_timestamp_rfc3339()?;
-        let connection = self.connection_guard();
-        let Some(record) = load_record_by_id(&connection, &self.path, id)? else {
+        let mut connection = self.connection_guard();
+        // IMMEDIATE takes the write lock before the read, so the revoked
+        // guard, the update and its evidence are judged and written as one
+        // unit: another connection to this file waits rather than
+        // interleaving. Every early return drops the transaction, which
+        // rolls it back with nothing written.
+        let transaction = connection
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .map_err(|source| self.sqlite_error(source))?;
+        let Some(record) = load_record_by_id(&transaction, &self.path, id)? else {
             return Ok(None);
         };
+        // Idempotent and monotonic: the first revoked_at stands, and a
+        // repeat neither rewrites it nor records evidence of a change that
+        // did not happen.
         if record.revoked_at.is_some() {
             return Ok(Some(record));
         }
 
-        connection
+        let changed = transaction
             .execute(
-                "UPDATE service_tokens SET revoked_at = ?1 WHERE id = ?2",
+                "UPDATE service_tokens SET revoked_at = ?1 WHERE id = ?2 AND revoked_at IS NULL",
                 params![revoked_at.as_str(), id],
             )
-            .map_err(|source| TokenStoreError::Sqlite {
-                path: self.path.clone(),
-                source,
-            })?;
-
-        load_record_by_id(&connection, &self.path, id)
+            .map_err(|source| self.sqlite_error(source))?;
+        // The evidence describes exactly one changed row or nothing commits.
+        if changed != 1 {
+            return Err(self.sqlite_error(rusqlite::Error::StatementChangedRows(changed)));
+        }
+        record_change_evidence(
+            &transaction,
+            &self.path,
+            &ChangeEvidence {
+                action: TOKEN_CHANGE_ACTION_REVOKE,
+                token_id: id,
+                actor_user_id,
+                committed_at: &revoked_at,
+            },
+        )?;
+        let record = load_record_by_id(&transaction, &self.path, id)?;
+        transaction
+            .commit()
+            .map_err(|source| self.sqlite_error(source))?;
+        Ok(record)
     }
 
-    fn rotate(&self, id: &str) -> Result<Option<CreatedToken>, TokenStoreError> {
-        let connection = self.connection_guard();
-        let Some(record) = load_record_by_id(&connection, &self.path, id)? else {
+    fn rotate(
+        &self,
+        id: &str,
+        actor_user_id: &str,
+    ) -> Result<Option<CreatedToken>, TokenStoreError> {
+        if !is_valid_change_actor(actor_user_id) {
+            return Err(TokenStoreError::InvalidChangeActor);
+        }
+        let plaintext_token = generate_plaintext_token()?;
+        let token_hash = hash_token(&plaintext_token);
+        let token_prefix = display_prefix(&plaintext_token);
+        let rotated_at = utc_timestamp_rfc3339()?;
+
+        let mut connection = self.connection_guard();
+        // One unit, as in `revoke`: a rotate cannot interleave with a
+        // revoke on another connection and mint a plaintext for a token
+        // that revoke has already withdrawn.
+        let transaction = connection
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .map_err(|source| self.sqlite_error(source))?;
+        let Some(record) = load_record_by_id(&transaction, &self.path, id)? else {
             return Ok(None);
         };
         if record.revoked_at.is_some() {
             return Err(TokenStoreError::RevokedToken { id: id.to_owned() });
         }
 
-        let plaintext_token = generate_plaintext_token()?;
-        let token_hash = hash_token(&plaintext_token);
-        let token_prefix = display_prefix(&plaintext_token);
-
-        connection
+        let changed = transaction
             .execute(
                 r#"
                 UPDATE service_tokens
                 SET token_hash = ?1,
                     token_prefix = ?2
-                WHERE id = ?3
+                WHERE id = ?3 AND revoked_at IS NULL
                 "#,
                 params![token_hash.as_str(), token_prefix.as_str(), id],
             )
-            .map_err(|source| TokenStoreError::Sqlite {
-                path: self.path.clone(),
-                source,
-            })?;
-
-        let record = load_record_by_id(&connection, &self.path, id)?
-            .expect("rotated token should still exist");
+            .map_err(|source| self.sqlite_error(source))?;
+        if changed != 1 {
+            return Err(self.sqlite_error(rusqlite::Error::StatementChangedRows(changed)));
+        }
+        record_change_evidence(
+            &transaction,
+            &self.path,
+            &ChangeEvidence {
+                action: TOKEN_CHANGE_ACTION_ROTATE,
+                token_id: id,
+                actor_user_id,
+                committed_at: &rotated_at,
+            },
+        )?;
+        // The row was read inside this transaction, which holds the write
+        // lock, so it cannot be gone; if it somehow is, nothing commits.
+        let record = load_record_by_id(&transaction, &self.path, id)?
+            .ok_or_else(|| self.sqlite_error(rusqlite::Error::QueryReturnedNoRows))?;
+        transaction
+            .commit()
+            .map_err(|source| self.sqlite_error(source))?;
         Ok(Some(CreatedToken {
             record,
             plaintext_token,
@@ -581,6 +718,19 @@ impl fmt::Display for TokenStoreError {
             Self::RevokedToken { id } => {
                 write!(formatter, "cannot rotate revoked service token {id}")
             }
+            Self::InvalidChangeActor => {
+                write!(
+                    formatter,
+                    "a service-token change actor must be between 1 and {MAX_TOKEN_CHANGE_ACTOR_BYTES} bytes"
+                )
+            }
+            Self::ChangeEvidence { path, source } => {
+                write!(
+                    formatter,
+                    "failed to record service-token change evidence at {}: {source}",
+                    path.display()
+                )
+            }
         }
     }
 }
@@ -588,11 +738,15 @@ impl fmt::Display for TokenStoreError {
 impl Error for TokenStoreError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
-            Self::Open { source, .. } | Self::Sqlite { source, .. } => Some(source),
+            Self::Open { source, .. }
+            | Self::Sqlite { source, .. }
+            | Self::ChangeEvidence { source, .. } => Some(source),
             Self::Json { source, .. } => Some(source),
             Self::TimeFormat(source) => Some(source),
             Self::TimeParse { source, .. } => Some(source),
-            Self::InvalidCursor { .. } | Self::RevokedToken { .. } => None,
+            Self::InvalidCursor { .. } | Self::RevokedToken { .. } | Self::InvalidChangeActor => {
+                None
+            }
             Self::Random(source) => Some(source),
         }
     }
@@ -650,6 +804,51 @@ impl RawTokenRecord {
             revoked_at: self.revoked_at,
         })
     }
+}
+
+/// One committed change's evidence: identifiers and the actor, never the
+/// plaintext, hash, prefix or scopes of the token it describes.
+struct ChangeEvidence<'a> {
+    action: &'static str,
+    token_id: &'a str,
+    actor_user_id: &'a str,
+    committed_at: &'a str,
+}
+
+/// Append one evidence row inside the caller's transaction. Its event and
+/// operation IDs are minted here, once per store call. Any failure is
+/// returned for the caller to roll back, so the change it describes never
+/// commits without it, and it is reported as an evidence failure rather
+/// than as whatever constraint class SQLite gave it: a rotate whose
+/// evidence failed is not a revoked-token conflict.
+fn record_change_evidence(
+    connection: &Connection,
+    path: &Path,
+    evidence: &ChangeEvidence<'_>,
+) -> Result<(), TokenStoreError> {
+    let event_id = uuid::Uuid::new_v4().to_string();
+    let operation_id = uuid::Uuid::new_v4().to_string();
+    connection
+        .execute(
+            r#"
+            INSERT INTO service_token_change_evidence (
+                event_id, operation_id, actor_user_id, action, token_id, committed_at
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+            "#,
+            params![
+                event_id.as_str(),
+                operation_id.as_str(),
+                evidence.actor_user_id,
+                evidence.action,
+                evidence.token_id,
+                evidence.committed_at,
+            ],
+        )
+        .map_err(|source| TokenStoreError::ChangeEvidence {
+            path: path.to_path_buf(),
+            source,
+        })?;
+    Ok(())
 }
 
 pub fn configure_connection(connection: &Connection) -> rusqlite::Result<()> {
@@ -953,7 +1152,7 @@ mod tests {
         );
 
         store
-            .revoke(&revoked.record.id)
+            .revoke(&revoked.record.id, "revoking-admin")
             .expect("revocation should succeed")
             .expect("revoked token should exist");
         assert_eq!(
@@ -985,18 +1184,37 @@ mod tests {
             .expect("token should create");
 
         let first = store
-            .revoke(&created.record.id)
+            .revoke(&created.record.id, "revoking-admin")
             .expect("first revoke should succeed")
             .expect("token should exist");
         let first_revoked_at = first.revoked_at.clone().expect("token should be revoked");
         let second = store
-            .revoke(&created.record.id)
+            .revoke(&created.record.id, "revoking-admin")
             .expect("second revoke should succeed")
             .expect("token should still exist");
 
         assert_eq!(
             second.revoked_at.as_deref(),
             Some(first_revoked_at.as_str())
+        );
+    }
+
+    /// The change-evidence actor bound is written three times -- the
+    /// SQLite table here and both tables of PostgreSQL migration 18 -- and
+    /// asserted equal to the principal subject bound at compile time. Pin
+    /// the SQL literals to that same constant so none can drift alone.
+    #[test]
+    fn change_evidence_actor_bound_matches_both_schemas() {
+        let bound = format!("BETWEEN 1 AND {MAX_TOKEN_CHANGE_ACTOR_BYTES}");
+        assert!(CREATE_SERVICE_TOKEN_SCHEMA_SQL
+            .contains(&format!("length(CAST(actor_user_id AS BLOB)) {bound}")));
+        let migration =
+            include_str!("../storage/migrations/0018_service_token_and_jwt_evidence.sql");
+        assert_eq!(
+            migration
+                .matches(&format!("octet_length(actor_user_id) {bound}"))
+                .count(),
+            2
         );
     }
 
@@ -1018,7 +1236,7 @@ mod tests {
             .expect("hash should exist");
 
         let rotated = store
-            .rotate(&created.record.id)
+            .rotate(&created.record.id, "rotating-admin")
             .expect("rotate should succeed")
             .expect("token should exist");
         let rotated_hash = token_hashes(&db.path)

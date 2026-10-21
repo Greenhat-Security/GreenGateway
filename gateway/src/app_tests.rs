@@ -33529,7 +33529,7 @@ mod cluster_tools_tests {
             .expect("replica B accepts and caches");
 
         // The revoke commits through replica A's admin path.
-        storage::ServiceTokenStore::revoke(&*store, &created.record.id)
+        storage::ServiceTokenStore::revoke(&*store, &created.record.id, "revoking-admin")
             .await
             .expect("revoke should commit")
             .expect("token exists");

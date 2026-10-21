@@ -1623,7 +1623,9 @@ Optional SQLite store path for service tokens managed by `POST /v1{ADMIN_PREFIX}
 
 Default: empty, which disables the service-token admin API storage backend and does not add the service-token validator to the auth chain.
 
-Format and validation: unset, empty, or whitespace-only values become `None`. Non-empty values must be valid Unicode and are used as a filesystem path. When set, GreenGateway creates or opens the SQLite database at startup and initializes the `service_tokens` table if needed.
+Format and validation: unset, empty, or whitespace-only values become `None`. Non-empty values must be valid Unicode and are used as a filesystem path. When set, GreenGateway creates or opens the SQLite database at startup and initializes the `service_tokens` and `service_token_change_evidence` tables if needed, so a database an older release wrote gains the evidence table on its first open.
+
+Every committed rotate and revoke also writes one `service_token_change_evidence` row in the same SQLite transaction: the acting principal, the action (`service_token.rotate` or `service_token.revoke`), generated event and operation IDs, the token ID and the commit time. A change whose evidence cannot be written fails and changes nothing; a repeat revoke, a rotate of a revoked token and an unknown token write no row. The rows hold no plaintext, hash, display prefix or scopes, have no foreign key to the token row, and are never deleted by the gateway. `import-standalone` does not carry them into cluster mode.
 
 When `GATEWAY_PUBLIC_URL` is configured, a service token used against `/mcp` must carry the exact `mcp:tools` scope advertised by the OAuth protected-resource metadata document. This scope is a credential-binding requirement for MCP access; route and tool authorization still uses the normal RBAC policy and tool `allowed_roles` checks after authentication.
 

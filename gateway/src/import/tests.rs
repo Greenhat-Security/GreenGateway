@@ -933,7 +933,7 @@ mod database {
             },
         )
         .expect("the revoked fixture token should mint");
-        TokenStore::revoke(&token_store, &revoked.record.id)
+        TokenStore::revoke(&token_store, &revoked.record.id, "operator@example.test")
             .expect("the fixture token should revoke");
         drop(live);
         drop(revoked);

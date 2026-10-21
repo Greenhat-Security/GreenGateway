@@ -120,7 +120,7 @@ pub(crate) const IMPORT_ACTOR: &str = "import-standalone";
 /// validation pass proves each of these tables is empty after an apply,
 /// so this list is a checked property and not a promise.
 ///
-/// The last two entries are different, and are named for honesty rather
+/// The entries after those are different, and are named for honesty rather
 /// than safety:
 ///
 /// - `security_outbox` is not carried because it is a change feed for
@@ -141,6 +141,11 @@ pub(crate) const IMPORT_ACTOR: &str = "import-standalone";
 ///   in the report's `source.connection_local_secrets`, so the size of that
 ///   job is a number an operator reads during the rehearsal rather than a
 ///   surprise after scale-out.
+/// - `service_token_change_evidence` is the standalone token database's
+///   record of who rotated and revoked each token (issue #425). The token
+///   section carries token rows only, so that history stays in the
+///   standalone database: the cluster's own evidence table starts empty and
+///   records the cluster's first change.
 const NOT_IMPORTED: &[&str] = &[
     "cluster_members",
     "maintenance_jobs",
@@ -154,6 +159,8 @@ const NOT_IMPORTED: &[&str] = &[
     "connection_local_secrets (the local-secret keyring stays with the standalone deployment; \
      credential bindings cross as references and must be re-provisioned in the cluster's \
      secret store)",
+    "service_token_change_evidence (standalone rotate/revoke evidence stays in the standalone \
+     token database; the cluster records its own from its first change)",
 ];
 
 /// The command line, after `import-standalone`.

@@ -475,7 +475,7 @@ mod tests {
             .await
             .expect("token should create");
         store
-            .revoke(&revoked.record.id)
+            .revoke(&revoked.record.id, "revoking-admin")
             .await
             .expect("token should revoke")
             .expect("token should exist");
@@ -724,11 +724,19 @@ mod tests {
             unimplemented!("not needed by this validator test")
         }
 
-        async fn revoke(&self, _id: &str) -> Result<Option<TokenRecord>, RepositoryError> {
+        async fn revoke(
+            &self,
+            _id: &str,
+            _actor_user_id: &str,
+        ) -> Result<Option<TokenRecord>, RepositoryError> {
             unimplemented!("not needed by this validator test")
         }
 
-        async fn rotate(&self, _id: &str) -> Result<Option<CreatedToken>, RepositoryError> {
+        async fn rotate(
+            &self,
+            _id: &str,
+            _actor_user_id: &str,
+        ) -> Result<Option<CreatedToken>, RepositoryError> {
             unimplemented!("not needed by this validator test")
         }
 
@@ -769,11 +777,19 @@ mod tests {
             unimplemented!("not needed by this validator test")
         }
 
-        async fn revoke(&self, _id: &str) -> Result<Option<TokenRecord>, RepositoryError> {
+        async fn revoke(
+            &self,
+            _id: &str,
+            _actor_user_id: &str,
+        ) -> Result<Option<TokenRecord>, RepositoryError> {
             unimplemented!("not needed by this validator test")
         }
 
-        async fn rotate(&self, _id: &str) -> Result<Option<CreatedToken>, RepositoryError> {
+        async fn rotate(
+            &self,
+            _id: &str,
+            _actor_user_id: &str,
+        ) -> Result<Option<CreatedToken>, RepositoryError> {
             unimplemented!("not needed by this validator test")
         }
 
@@ -834,11 +850,19 @@ mod tests {
             unimplemented!("not needed by this validator test")
         }
 
-        async fn revoke(&self, _id: &str) -> Result<Option<TokenRecord>, RepositoryError> {
+        async fn revoke(
+            &self,
+            _id: &str,
+            _actor_user_id: &str,
+        ) -> Result<Option<TokenRecord>, RepositoryError> {
             unimplemented!("not needed by this validator test")
         }
 
-        async fn rotate(&self, _id: &str) -> Result<Option<CreatedToken>, RepositoryError> {
+        async fn rotate(
+            &self,
+            _id: &str,
+            _actor_user_id: &str,
+        ) -> Result<Option<CreatedToken>, RepositoryError> {
             unimplemented!("not needed by this validator test")
         }
 
@@ -886,11 +910,19 @@ mod tests {
             unimplemented!("not needed by this validator test")
         }
 
-        async fn revoke(&self, _id: &str) -> Result<Option<TokenRecord>, RepositoryError> {
+        async fn revoke(
+            &self,
+            _id: &str,
+            _actor_user_id: &str,
+        ) -> Result<Option<TokenRecord>, RepositoryError> {
             unimplemented!("not needed by this validator test")
         }
 
-        async fn rotate(&self, _id: &str) -> Result<Option<CreatedToken>, RepositoryError> {
+        async fn rotate(
+            &self,
+            _id: &str,
+            _actor_user_id: &str,
+        ) -> Result<Option<CreatedToken>, RepositoryError> {
             unimplemented!("not needed by this validator test")
         }
 
@@ -944,11 +976,19 @@ mod tests {
                 unimplemented!("not needed by this validator test")
             }
 
-            async fn revoke(&self, _id: &str) -> Result<Option<TokenRecord>, RepositoryError> {
+            async fn revoke(
+                &self,
+                _id: &str,
+                _actor_user_id: &str,
+            ) -> Result<Option<TokenRecord>, RepositoryError> {
                 unimplemented!("not needed by this validator test")
             }
 
-            async fn rotate(&self, _id: &str) -> Result<Option<CreatedToken>, RepositoryError> {
+            async fn rotate(
+                &self,
+                _id: &str,
+                _actor_user_id: &str,
+            ) -> Result<Option<CreatedToken>, RepositoryError> {
                 unimplemented!("not needed by this validator test")
             }
 
