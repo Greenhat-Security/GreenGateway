@@ -853,14 +853,16 @@ async fn the_authority_operations_are_within_their_per_operation_budgets() {
                      $5::double precision >= 0,
                      now())
                  ON CONFLICT (deployment_id, lane, key_digest) DO UPDATE SET
-                     allowed = (GREATEST(b.tat, now()) - now())
+                     allowed = (GREATEST(b.tat, now(), b.updated_at)
+                                   - GREATEST(now(), b.updated_at))
                          <= make_interval(secs => $5::double precision),
-                     tat = CASE WHEN (GREATEST(b.tat, now()) - now())
+                     tat = CASE WHEN (GREATEST(b.tat, now(), b.updated_at)
+                                         - GREATEST(now(), b.updated_at))
                                      <= make_interval(secs => $5::double precision)
-                                THEN GREATEST(b.tat, now())
+                                THEN GREATEST(b.tat, now(), b.updated_at)
                                      + make_interval(secs => $4::double precision)
                                 ELSE b.tat END,
-                     updated_at = now()
+                     updated_at = GREATEST(now(), b.updated_at)
                  RETURNING b.allowed AS allowed, (b.xmax = 0) AS inserted
              ),
              counted AS (

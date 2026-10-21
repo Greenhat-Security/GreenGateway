@@ -2847,6 +2847,109 @@ pub(crate) mod postgres_audit_tests {
         assert_eq!(replica_a.live_buckets().await.expect("count"), 4);
     }
 
+    /// The row lock, not the statement start, orders the decisions. A
+    /// decision whose statement started first can still reach the bucket
+    /// row second -- planning or scheduling jitter, an `ON CONFLICT` waiter
+    /// retrying behind a newer version -- and must not be charged for the
+    /// time between its own start and the decision that overtook it: a
+    /// burst of two still permits two concurrent requests, and only two.
+    #[tokio::test]
+    async fn a_decision_overtaken_on_the_bucket_row_is_not_denied_below_the_burst() {
+        let Some(admin_dsn) = locator() else {
+            eprintln!("skipping: no test database locator; CI runs this test");
+            return;
+        };
+        let _guard = DATABASE.lock().await;
+        let database = create_test_database(&admin_dsn).await;
+        let pool = migrated_limits_pool(&database).await;
+        let replica_a =
+            PostgresRateLimitStore::new(pool.clone(), "deploy-limits", limits_keyring(), 1_000);
+        let replica_b =
+            PostgresRateLimitStore::new(pool.clone(), "deploy-limits", limits_keyring(), 1_000);
+        // A slow refill, so the burst is the only credit in play while the
+        // test runs.
+        let limit = SharedLimit {
+            requests_per_second: 0.1,
+            burst: 2,
+        };
+        let caller = "ip:203.0.113.7";
+
+        // Park the first decision after its statement has started, so its
+        // `now()` is fixed, and before it reaches the bucket row: a BEFORE
+        // INSERT trigger fires ahead of the conflict check, and the first
+        // statement to claim its advisory lock then waits on one this
+        // session holds. Every other statement finds the claim taken and
+        // goes straight through.
+        let gate = pool.get().await.expect("client");
+        gate.batch_execute(
+            "CREATE FUNCTION greengateway.test_park_first_decision() RETURNS trigger
+             LANGUAGE plpgsql AS $$
+             BEGIN
+                 IF pg_try_advisory_xact_lock(241001) THEN
+                     PERFORM pg_advisory_xact_lock_shared(241002);
+                 END IF;
+                 RETURN NEW;
+             END $$;
+             CREATE TRIGGER test_park_first_decision
+                 BEFORE INSERT ON greengateway.rate_limit_buckets
+                 FOR EACH ROW EXECUTE FUNCTION greengateway.test_park_first_decision();
+             SELECT pg_advisory_lock(241002);",
+        )
+        .await
+        .expect("install the parking trigger");
+        let parked = tokio::spawn({
+            let replica_a = replica_a.clone();
+            async move { replica_a.decide(SharedLane::Read, caller, limit).await }
+        });
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            let waiting: i64 = gate
+                .query_one(
+                    "SELECT count(*) FROM pg_locks
+                     WHERE locktype = 'advisory' AND objid = 241002 AND NOT granted
+                       AND database = (SELECT oid FROM pg_database
+                                       WHERE datname = current_database())",
+                    &[],
+                )
+                .await
+                .expect("lock probe")
+                .get(0);
+            if waiting == 1 {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the first decision never parked"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        // The later statement takes the row first, then the parked one.
+        assert_eq!(
+            decide(&replica_b, SharedLane::Read, caller, limit).await,
+            SharedDecision::Allowed,
+            "the overtaking decision is the burst's first"
+        );
+        gate.batch_execute("SELECT pg_advisory_unlock(241002)")
+            .await
+            .expect("release the parked decision");
+        let overtaken = parked
+            .await
+            .expect("the parked decision completes")
+            .expect("the shared limiter decides");
+        assert_eq!(
+            overtaken,
+            SharedDecision::Allowed,
+            "a burst of two permits two, whatever order the row lock took them in"
+        );
+        assert_eq!(
+            decide(&replica_a, SharedLane::Read, caller, limit).await,
+            SharedDecision::Denied,
+            "and only two: the third is denied"
+        );
+        assert_eq!(replica_a.live_buckets().await.expect("count"), 1);
+    }
+
     /// The policy lane keys buckets by rule as well as principal, and what
     /// the table holds is a keyed digest: never the caller key, and never
     /// the plain hash of it that a table reader could precompute.
