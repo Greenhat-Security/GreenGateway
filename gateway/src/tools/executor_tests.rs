@@ -2807,7 +2807,16 @@ async fn pinned_playground_invocation_still_refuses_a_deny_published_during_its_
         ToolRuntimeError::Rejected { ref tool_name, ref reason }
             if tool_name == "get_charge" && reason == "matched_rule"
     ));
-    let events = audit_events(&capture, 1).await;
+    // Audit delivery is asynchronous: waiting for any one event can return
+    // before the denial is recorded, so wait for the denial itself.
+    wait_until(Duration::from_secs(1), || {
+        capture
+            .events()
+            .iter()
+            .any(|event| event.event_type == "authz.denied")
+    })
+    .await;
+    let events = capture.events();
     let denied = events
         .iter()
         .filter(|event| event.event_type == "authz.denied")
