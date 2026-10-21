@@ -493,6 +493,15 @@ describe('ConnectionDetail', () => {
       'Caller assertion configured as the subject token.',
     );
     expect(assertion?.textContent).toContain('never sent to the upstream');
+    // The gateway refuses to remove the block from a delegated connection,
+    // so the page must not offer that as the way to stop it.
+    expect(assertion?.textContent).not.toContain('"caller_assertion": null');
+    expect(assertion?.textContent).toContain(
+      'cannot be removed while this connection authenticates with a delegated issuer token',
+    );
+    expect(assertion?.textContent).toContain(
+      'disable the connection through the admin API',
+    );
     expect(document.body.textContent).not.toContain(
       'CLIENT_SECRET_ALIAS_CANARY',
     );
