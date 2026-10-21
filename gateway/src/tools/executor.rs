@@ -25,7 +25,10 @@ use crate::{
     audit::{self, AuditEvent, AuditLog},
     config::{Config, McpUpstreamServerConfig},
     connections::{
-        http::{ConnectionHttpError, ConnectionHttpRuntime, ConnectionHttpTarget},
+        caller_assertion::CallerAssertionError,
+        http::{
+            ConnectionHttpError, ConnectionHttpRuntime, ConnectionHttpTarget, IssuedCallerAssertion,
+        },
         mcp::McpConnectionCatalogRuntime,
         openapi::OpenApiConnectionCatalogRuntime,
     },
@@ -1340,7 +1343,7 @@ impl ToolExecutor {
                 );
                 return Err(error);
             }
-            (Some(ToolTarget::Http { connection_id, .. }), _) => {
+            (Some(ToolTarget::Http { connection_id, .. }), source) => {
                 let target = self
                     .connection_http
                     .as_ref()
@@ -1349,9 +1352,17 @@ impl ToolExecutor {
                         reason: "connection_runtime_unavailable",
                     })
                     .and_then(|runtime| {
-                        runtime
-                            .target(connection_id, &request.path_and_query)
-                            .map_err(|error| connection_tool_error(&tool, error))
+                        // A manual tool is the lane that signs a caller
+                        // assertion. A managed OpenAPI tool keeps refusing an
+                        // attesting Connection, as its catalog's discovery and
+                        // refresh do, so its registry binding and its calls
+                        // cannot disagree.
+                        if matches!(source, ToolSource::Manual) {
+                            runtime.tool_call_target(connection_id, &request.path_and_query)
+                        } else {
+                            runtime.target(connection_id, &request.path_and_query)
+                        }
+                        .map_err(|error| connection_tool_error(&tool, error))
                     });
                 Some(target)
             }
@@ -1392,6 +1403,7 @@ impl ToolExecutor {
             });
         }
 
+        let mut issued_assertion = None;
         let (result, connection_id) = match (&tool.target, captured_connection_target) {
             (Some(ToolTarget::Http { connection_id, .. }), target) => {
                 let target = target.unwrap_or_else(|| {
@@ -1402,8 +1414,14 @@ impl ToolExecutor {
                 });
                 let result = match target {
                     Ok(target) => {
-                        self.execute_connection_http(context, &tool, target, request)
-                            .await
+                        self.execute_connection_http(
+                            context,
+                            &tool,
+                            target,
+                            request,
+                            &mut issued_assertion,
+                        )
+                        .await
                     }
                     Err(error) => Err(error),
                 };
@@ -1455,6 +1473,7 @@ impl ToolExecutor {
                         latency_ms,
                         reason: None,
                     },
+                    issued_assertion.as_ref(),
                 );
                 self.emit_tool_observation(
                     context,
@@ -1485,6 +1504,7 @@ impl ToolExecutor {
                         latency_ms,
                         reason: outcome.reason,
                     },
+                    issued_assertion.as_ref(),
                 );
                 self.emit_tool_observation(context, &tool, outcome);
                 Err(error)
@@ -2300,6 +2320,7 @@ impl ToolExecutor {
         let started = Instant::now();
         let method = prepared.request.method.clone();
         let connection_id = prepared.target.connection_id().to_string();
+        let mut issued_assertion = None;
         let result = self
             .execute_connection_http_classified(
                 context,
@@ -2307,6 +2328,7 @@ impl ToolExecutor {
                 prepared.target,
                 prepared.request,
                 Some(deadline),
+                &mut issued_assertion,
             )
             .await;
         let latency_ms = duration_millis(started.elapsed());
@@ -2324,6 +2346,7 @@ impl ToolExecutor {
                         latency_ms,
                         reason: None,
                     },
+                    issued_assertion.as_ref(),
                 );
                 self.emit_tool_observation(
                     context,
@@ -2356,6 +2379,7 @@ impl ToolExecutor {
                         latency_ms,
                         reason: Some(reason),
                     },
+                    issued_assertion.as_ref(),
                 );
                 self.emit_tool_observation(context, &prepared.tool, outcome);
                 if reason == "timeout" || reason == "response_idle_timeout" {
@@ -2495,12 +2519,24 @@ impl ToolExecutor {
         tool: &ToolDefinition,
         target: ConnectionHttpTarget,
         request: ToolUpstreamRequest,
+        issued_assertion: &mut Option<IssuedCallerAssertion>,
     ) -> Result<EgressResponse, ToolExecutorError> {
-        self.execute_connection_http_classified(context, tool, target, request, None)
-            .await
-            .map_err(|classified| *classified.error)
+        self.execute_connection_http_classified(
+            context,
+            tool,
+            target,
+            request,
+            None,
+            issued_assertion,
+        )
+        .await
+        .map_err(|classified| *classified.error)
     }
 
+    /// Sends one Connection-bound request. When the target attests its
+    /// caller, `issued_assertion` is set to the assertion's `kid` and `jti`
+    /// as soon as it is on the request, so the caller's audit names it
+    /// whatever happens after.
     async fn execute_connection_http_classified(
         &self,
         context: &ToolInvocationContext,
@@ -2508,6 +2544,7 @@ impl ToolExecutor {
         target: ConnectionHttpTarget,
         mut request: ToolUpstreamRequest,
         deadline: Option<tokio::time::Instant>,
+        issued_assertion: &mut Option<IssuedCallerAssertion>,
     ) -> Result<EgressResponse, ClassifiedConnectionError> {
         let runtime = self
             .connection_http
@@ -2549,6 +2586,28 @@ impl ToolExecutor {
         for header_name in target.credential_header_names() {
             request.headers.remove(header_name);
         }
+        if let Some(header_name) = target.caller_assertion_header_name() {
+            request.headers.remove(header_name);
+        }
+        // A Connection that attests its caller refuses a call that names
+        // nobody, and one whose keys no upstream could verify, before the
+        // egress preflight resolves anything or any credential is read.
+        run_before_deadline(
+            deadline,
+            runtime.admit_caller_assertion(&target, context.caller.as_deref()),
+        )
+        .await
+        .map_err(|_| ClassifiedConnectionError {
+            error: Box::new(ToolExecutorError::Connection {
+                tool_name: tool.name.clone(),
+                reason: "timeout",
+            }),
+            request_sent: false,
+        })?
+        .map_err(|error| ClassifiedConnectionError {
+            error: Box::new(caller_assertion_tool_error(tool, error)),
+            request_sent: false,
+        })?;
 
         let destination = run_before_deadline(
             deadline,
@@ -2590,6 +2649,34 @@ impl ToolExecutor {
                         request_sent: false,
                     }
                 })?;
+        // The assertion's signing key is read and loaded before the
+        // credential, so a key that cannot sign refuses the call before any
+        // token endpoint is asked for a token. It signs once the request is
+        // final, below.
+        let assertion_signer =
+            run_before_deadline(deadline, runtime.caller_assertion_signer(&target))
+                .await
+                .map_err(|_| ClassifiedConnectionError {
+                    error: Box::new(ToolExecutorError::Connection {
+                        tool_name: tool.name.clone(),
+                        reason: "timeout",
+                    }),
+                    request_sent: false,
+                })?
+                .map_err(|error| {
+                    if error.is_key_resolution_failure() {
+                        self.emit_connection_secret_resolution_failed(
+                            context,
+                            tool,
+                            &target,
+                            error.safe_reason(),
+                        );
+                    }
+                    ClassifiedConnectionError {
+                        error: Box::new(caller_assertion_tool_error(tool, error)),
+                        request_sent: false,
+                    }
+                })?;
         let credential = run_before_deadline(deadline, runtime.resolve_credential(&target))
             .await
             .map_err(|_| ClassifiedConnectionError {
@@ -2628,6 +2715,26 @@ impl ToolExecutor {
                     request_sent: false,
                 }
             })?;
+        }
+        // The assertion is signed last, once, over the request exactly as it
+        // is about to be sent, and written as the last header so nothing
+        // after it can replace or repeat it.
+        if let Some(signer) = assertion_signer {
+            let refused = |error| ClassifiedConnectionError {
+                error: Box::new(caller_assertion_tool_error(tool, error)),
+                request_sent: false,
+            };
+            let issued = signer
+                .sign(
+                    context.caller.as_deref(),
+                    &context.request_id,
+                    &request.method,
+                    request.body.as_deref().unwrap_or_default(),
+                )
+                .map_err(refused)?
+                .inject(&mut request.headers)
+                .map_err(refused)?;
+            *issued_assertion = Some(issued);
         }
 
         let response = run_before_deadline(
@@ -3045,6 +3152,7 @@ impl ToolExecutor {
         method: &Method,
         connection_id: Option<&str>,
         outcome: UpstreamAuditOutcome,
+        caller_assertion: Option<&IssuedCallerAssertion>,
     ) {
         let mut payload = json!({
             "tool_name": tool.name,
@@ -3063,6 +3171,13 @@ impl ToolExecutor {
         }
         if let Some(connection_id) = connection_id {
             payload["connection_id"] = json!(connection_id);
+        }
+        // Which key signed the assertion on this request and the `jti` the
+        // upstream saw: enough to join the upstream's log to this event, and
+        // nothing an attacker could replay. The attested caller is the
+        // event's actor.
+        if let Some(caller_assertion) = caller_assertion {
+            payload["caller_assertion"] = json!(caller_assertion);
         }
 
         self.audit.emit(AuditEvent::new(
@@ -3854,6 +3969,18 @@ fn egress_error_observation_status(error: &EgressError) -> u16 {
 
 fn mcp_upstream_error_observation_status(_error: &mcp_upstream::McpUpstreamCallError) -> u16 {
     StatusCode::BAD_GATEWAY.as_u16()
+}
+
+/// A refusal to attest the caller, reported through the same fixed-reason
+/// path as every other Connection failure, so it reaches `failure_reason`.
+fn caller_assertion_tool_error(
+    tool: &ToolDefinition,
+    error: CallerAssertionError,
+) -> ToolExecutorError {
+    ToolExecutorError::Connection {
+        tool_name: tool.name.clone(),
+        reason: error.safe_reason(),
+    }
 }
 
 fn connection_tool_error(tool: &ToolDefinition, error: ConnectionHttpError) -> ToolExecutorError {

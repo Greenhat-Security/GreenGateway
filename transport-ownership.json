@@ -9998,9 +9998,9 @@
         "network-or-process-reference"
       ],
       "scope": "gateway::mcp::invocation_context_from_request#1",
-      "sha256": "1784a42e076dc1d5bd019b1912e8cec94747260c9276c33cb1468a5b7f314ab2",
+      "sha256": "1d2210f8eb3aec9cb1a92a08f5a2c5a8522e5a507c13b7f64b31d92735eb9cfd",
       "owner": "GreenGateway maintainers",
-      "purpose": "Existing application transport references or syntax in this exact item; new or changed authority requires explicit review."
+      "purpose": "Existing application transport references or syntax in this exact item; new or changed authority requires explicit review. Reviewed for #463: the item now also projects the authenticated Principal into the caller a signed caller assertion names (AttestedCaller::from_principal), a pure data copy that adds no network, process or transport capability."
     },
     {
       "file": "gateway/src/mcp.rs",

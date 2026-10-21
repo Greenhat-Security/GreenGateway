@@ -70,6 +70,25 @@ pub(crate) fn write_assertion_signing_key(root: &Path, pem: &str) -> OperatorSec
     }
 }
 
+/// Writes `value` into the secrets root `root` as the file behind `alias`, an
+/// operator file alias for a header-safe secret, and returns that alias.
+pub(crate) fn write_secret_file(
+    root: &Path,
+    alias: &str,
+    value: &[u8],
+) -> OperatorSecretAliasConfig {
+    let path = root.join(alias);
+    fs::write(&path, value).expect("fixture secret should write");
+    restrict(&path, 0o600);
+    OperatorSecretAliasConfig {
+        id: alias.to_owned(),
+        label: format!("Fixture secret {alias}"),
+        source: OperatorSecretAliasSource::File {
+            key: alias.to_owned(),
+        },
+    }
+}
+
 /// A secrets root of its own holding a generated signing key, for a test that
 /// has no root yet. Removed on drop.
 pub(crate) struct AssertionSigningKeyRoot {

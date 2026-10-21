@@ -8,7 +8,7 @@
     "CallerAssertion": {
       "type": "object",
       "additionalProperties": false,
-      "description": "Accepted and stored but not yet enforced: once request-path injection ships, this block will attest the calling principal to the upstream, and until then the gateway refuses every call, test and discovery on a Connection carrying it, with the failure reason caller_assertion_not_enforced. Its keys are already published. Saving an enabled Connection resolves its signing key and every published key, from whichever secret source holds it, and loads each for its algorithm; a key that cannot be used refuses the save. The public halves of every enabled Connection's keys are served at /.well-known/caller-assertion-jwks.json. A stored Connection whose keys can no longer be used is left out of that set, with a diagnostic, rather than stopping the gateway. When enforced, the assertion will travel alongside the primary credential rather than instead of it: the credential says which system is calling, the assertion says on whose behalf, so an upstream the operator controls can apply its own per-user checks. The gateway will sign a short-lived JWT naming the validated principal and send it in the named header, and the upstream will verify it against that JWKS. Omit the block to send only the credential.",
+      "description": "Attests the calling principal to the upstream on every call of a manual HTTP tool bound to this Connection, alongside the primary credential rather than instead of it: the credential says which system is calling, the assertion says on whose behalf, so an upstream the operator controls can apply its own per-user checks. Per call the gateway signs one short-lived JWT naming the validated principal (sub is the identity provider's issuer, '#', and its subject; jti is the gateway request ID) and writes it, as the last header, in header_name; with bind_request it also binds the method, the request target and the SHA-256 of the exact body sent. A call with no principal to name, a service token included, is refused with caller_assertion_no_principal before any network or secret I/O. The endpoint must use https. Every other lane on the Connection (managed OpenAPI and composite tools, proxied requests, managed MCP, discovery, enum and label sources, stored tests) is refused with caller_assertion_not_enforced, as is a stored block only an earlier release accepted. Saving an enabled Connection resolves its signing key and every published key, from whichever secret source holds it, and loads each for its algorithm; a key that cannot be used refuses the save, and every call reads and loads the signing key again. The public halves of every enabled Connection's keys are served at /.well-known/caller-assertion-jwks.json, which the upstream verifies against. A stored Connection whose keys can no longer be used is left out of that set, with a diagnostic, rather than stopping the gateway, and its tool calls are refused with caller_assertion_key_not_published until its keys load again. Omit the block to send only the credential.",
       "required": [
         "signing_key_id",
         "kid",
@@ -52,7 +52,7 @@
     "SafeCallerAssertion": {
       "type": "object",
       "additionalProperties": false,
-      "description": "Accepted and stored but not yet enforced: once request-path injection ships, this block will attest the calling principal to the upstream, and until then the gateway refuses every call, test and discovery on a Connection carrying it, with the failure reason caller_assertion_not_enforced. Its keys are already published. Saving an enabled Connection resolves its signing key and every published key, from whichever secret source holds it, and loads each for its algorithm; a key that cannot be used refuses the save. The public halves of every enabled Connection's keys are served at /.well-known/caller-assertion-jwks.json. A stored Connection whose keys can no longer be used is left out of that set, with a diagnostic, rather than stopping the gateway. When enforced, the assertion will travel alongside the primary credential rather than instead of it: the credential says which system is calling, the assertion says on whose behalf, so an upstream the operator controls can apply its own per-user checks. The gateway will sign a short-lived JWT naming the validated principal and send it in the named header, and the upstream will verify it against that JWKS. Omit the block to send only the credential.",
+      "description": "Attests the calling principal to the upstream on every call of a manual HTTP tool bound to this Connection, alongside the primary credential rather than instead of it: the credential says which system is calling, the assertion says on whose behalf, so an upstream the operator controls can apply its own per-user checks. Per call the gateway signs one short-lived JWT naming the validated principal (sub is the identity provider's issuer, '#', and its subject; jti is the gateway request ID) and writes it, as the last header, in header_name; with bind_request it also binds the method, the request target and the SHA-256 of the exact body sent. A call with no principal to name, a service token included, is refused with caller_assertion_no_principal before any network or secret I/O. The endpoint must use https. Every other lane on the Connection (managed OpenAPI and composite tools, proxied requests, managed MCP, discovery, enum and label sources, stored tests) is refused with caller_assertion_not_enforced, as is a stored block only an earlier release accepted. Saving an enabled Connection resolves its signing key and every published key, from whichever secret source holds it, and loads each for its algorithm; a key that cannot be used refuses the save, and every call reads and loads the signing key again. The public halves of every enabled Connection's keys are served at /.well-known/caller-assertion-jwks.json, which the upstream verifies against. A stored Connection whose keys can no longer be used is left out of that set, with a diagnostic, rather than stopping the gateway, and its tool calls are refused with caller_assertion_key_not_published until its keys load again. Omit the block to send only the credential.",
       "required": [
         "signing_key_configured",
         "kid",
@@ -74,7 +74,7 @@
         "lifetime_seconds": { "type": "integer", "minimum": 1, "maximum": 300, "description": "An assertion is a bearer credential for as long as it is valid, so this is a replay window rather than a convenience setting." },
         "claims": { "type": "array", "maxItems": 2, "uniqueItems": true, "items": { "enum": ["email", "roles"] }, "description": "Principal fields to attest beyond sub, which is always present. A closed set rather than free-form templating, so a configuration mistake cannot attest something a caller supplied." },
         "bind_request": { "type": "boolean", "description": "Include the method, path and a SHA-256 of the body actually sent, so an assertion cannot be lifted onto different arguments. The digest covers the transmitted bytes, not a canonical form, so an upstream verifies it with its standard library." },
-        "bind_approval": { "type": "boolean", "description": "Reserved: would require, and include, the approval that authorised a mutation. New writes accept only false; a Connection persisted earlier may still report true, and is refused at runtime like every Connection carrying an assertion." },
+        "bind_approval": { "type": "boolean", "description": "Reserved: would require, and include, the approval that authorised a mutation. New writes accept only false; a Connection persisted earlier may still report true, and such a block is refused on every lane with caller_assertion_not_enforced." },
         "published_keys": {
           "type": "array",
           "maxItems": 4,
@@ -94,7 +94,7 @@
           "type": "object",
           "additionalProperties": false,
           "required": ["field", "code"],
-          "description": "Present only when this replica leaves the block's keys out of the published JWKS, from its last check of exactly these keys: at startup, at a cluster reconcile, or in the last JWKS build. A Connection publishes all of its keys or none. field names where the key that cannot be used is configured and code says why; neither carries the alias or anything about the material. The Connection is refused at runtime either way while caller assertions are not enforced. A save that keeps the block enabled checks its keys again and is refused while one still cannot be used.",
+          "description": "Present only when this replica leaves the block's keys out of the published JWKS, from its last check of exactly these keys: at startup, at a cluster reconcile, or in the last JWKS build. A Connection publishes all of its keys or none. field names where the key that cannot be used is configured and code says why; neither carries the alias or anything about the material. While this field is present, the Connection's manual tool calls on this replica are refused with caller_assertion_key_not_published, even if the signing key loads, until its keys load again; every other lane refuses an attested Connection with caller_assertion_not_enforced in any case. A save that keeps the block enabled checks its keys again and is refused while one still cannot be used.",
           "properties": {
             "field": {
               "enum": [
@@ -581,6 +581,29 @@
         {
           "if": {
             "required": [
+              "caller_assertion"
+            ],
+            "properties": {
+              "caller_assertion": {
+                "type": "object"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "endpoint": {
+                "properties": {
+                  "base_url": {
+                    "pattern": "^https://"
+                  }
+                }
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "required": [
               "additional_headers"
             ],
             "properties": {
@@ -687,6 +710,29 @@
         }
       },
       "allOf": [
+        {
+          "if": {
+            "required": [
+              "caller_assertion"
+            ],
+            "properties": {
+              "caller_assertion": {
+                "type": "object"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "endpoint": {
+                "properties": {
+                  "base_url": {
+                    "pattern": "^https://"
+                  }
+                }
+              }
+            }
+          }
+        },
         {
           "if": {
             "required": [

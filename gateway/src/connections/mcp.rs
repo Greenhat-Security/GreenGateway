@@ -72,8 +72,8 @@ pub enum McpCatalogRefreshError {
     ConnectionDisabled,
     ConnectionKindMismatch,
     DiscoveryNotConfigured,
-    /// The Connection asks for a signed caller assertion, which this gateway
-    /// does not yet inject; discovery is refused before any session opens.
+    /// The Connection asks for a signed caller assertion, which managed MCP
+    /// does not sign; discovery is refused before any session opens.
     CallerAssertionNotEnforced,
     PreconditionFailed,
     /// A discovered tool's registry name is already published by another
@@ -1203,7 +1203,7 @@ mod tests {
             "enabled": true,
             "kind": "mcp_streamable_http",
             "endpoint": {
-                "base_url": "http://127.0.0.1:9",
+                "base_url": "https://127.0.0.1:9",
                 "base_path": "/mcp"
             },
             "authentication": { "type": "none" },

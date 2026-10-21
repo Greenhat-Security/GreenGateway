@@ -12774,7 +12774,8 @@ async fn caller_assertion_refusals_are_conflicts_with_their_own_reason() {
 
 /// A caller assertion as an operator would send one. Saving it loads the key
 /// behind its alias, which [`attested_connection_admin_router`] provides;
-/// nothing signs with it, because every lane refuses the Connection first.
+/// nothing these tests drive signs with it, because only a manual tool call
+/// does and every catalog lane refuses the Connection first.
 fn admin_caller_assertion_json() -> Value {
     json!({
         "signing_key_id": "assertion-signing-key",
