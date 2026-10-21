@@ -72,9 +72,11 @@ x-gateway-environment: &gateway-environment
   DATABASE_TLS_MODE: verify
   DATABASE_TLS_CA_FILE: /etc/greengateway/tls/ca.pem
   # Pool ceiling per replica. The sizing math is
-  # `replicas x DATABASE_POOL_MAX + migrator/leader headroom <= max_connections
-  # - superuser_reserved_connections`; see `pool-sizing.md`. Two replicas at 10
-  # plus headroom fits the `max_connections=100` this example's db starts with.
+  # `replicas x DATABASE_POOL_MAX + headroom <= max_connections
+  # - superuser_reserved_connections - reserved_connections`; see
+  # `pool-sizing.md`. Two replicas at 10 plus headroom fits the
+  # `max_connections=100` this example's db starts with, and CI checks that
+  # with `python scripts/pool_sizing.py examples`.
   DATABASE_POOL_MAX: "10"
   DATABASE_CONNECT_TIMEOUT_MS: "5000"
   DATABASE_ACQUIRE_TIMEOUT_MS: "5000"

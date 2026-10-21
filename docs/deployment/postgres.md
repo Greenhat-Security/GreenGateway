@@ -164,10 +164,10 @@ There is no way back to a schema-15 binary against the migrated database; recove
 The pool math against the server's `max_connections`:
 
 ```
-replicas x DATABASE_POOL_MAX + migrator/leader headroom  <=  max_connections - superuser_reserved_connections
+pods x DATABASE_POOL_MAX + headroom  <=  max_connections - superuser_reserved_connections - reserved_connections
 ```
 
-With the default `DATABASE_POOL_MAX=10`, three replicas need `3 x 10 + headroom`: 35 of the server's connections, leaving the rest for the migration job, operators, and other clients. The pool opens connections lazily; the ceiling is a ceiling, not a startup cost.
+`pods` is the replica ceiling: the autoscaler's maximum and any rollout surge included. With the default `DATABASE_POOL_MAX=10`, three replicas need `3 x 10 + headroom`, 42 of the server's connections once the migration job, the import, maintenance commands, a backup, monitoring and two operator sessions are named. The pool opens connections lazily; the ceiling is a ceiling, not a startup cost. `python scripts/pool_sizing.py` checks a deployment against this before rollout.
 
 Every pooled session carries server-side bounds set at connection time, so no statement can outlive them regardless of what code runs later:
 
@@ -179,7 +179,7 @@ Every pooled session carries server-side bounds set at connection time, so no st
 
 Client-side bounds: `DATABASE_CONNECT_TIMEOUT_MS` (default 5000) caps establishing one connection, and `DATABASE_ACQUIRE_TIMEOUT_MS` (default 5000) caps checking one out of the pool.
 
-The headroom term itemized, worked examples at three and eight replicas, the session-pooling-only rule for connection poolers, and the `pg_stat_activity` queries to run when the pool is the suspect are in [the pool sizing runbook](pool-sizing.md).
+The headroom term itemized, worked examples at three and eight replicas, replica ceilings under autoscaling and rollouts, the sizing guard, the session-pooling-only rule for connection poolers, and the `pg_stat_activity` queries to run when the pool is the suspect are in [the pool sizing runbook](pool-sizing.md).
 
 ## The policy control plane
 
@@ -568,7 +568,7 @@ One entry per `/readyz` reason: the first three things to look at, then the reme
 
 The smallest shape this guide supports, written out end to end. Two replicas, one primary, two database roles.
 
-**The database.** One writable PostgreSQL primary — managed, or your own HA pair; the [compose example](docker-compose.ha.yml)'s single container is labelled an example for a reason. Two roles from [Database roles and grants](roles-and-grants.md): a migration role that owns the schema, and a runtime role with no DDL that the replicas run as. Size `max_connections` against the pool arithmetic in [Pool sizing and timeouts](#pool-sizing-and-timeouts): `replicas × DATABASE_POOL_MAX` plus headroom for the migrator, the leader's dedicated maintenance session and your own psql. At the default `DATABASE_POOL_MAX=10`, two replicas need 20 plus roughly 5 of headroom, so a server at the PostgreSQL default of 100 is comfortable and one shared with other applications may not be.
+**The database.** One writable PostgreSQL primary — managed, or your own HA pair; the [compose example](docker-compose.ha.yml)'s single container is labelled an example for a reason. Two roles from [Database roles and grants](roles-and-grants.md): a migration role that owns the schema, and a runtime role with no DDL that the replicas run as. Size `max_connections` against the pool arithmetic in [Pool sizing and timeouts](#pool-sizing-and-timeouts): `replicas × DATABASE_POOL_MAX` plus named headroom for the migrator, the import, maintenance commands, backups, monitoring and your own psql. At the default `DATABASE_POOL_MAX=10`, two replicas need 20 plus about 12 of headroom, so a server at the PostgreSQL default of 100 is comfortable and one shared with other applications may not be; `python scripts/pool_sizing.py` checks the numbers.
 
 **The replicas.** Identical static configuration on both — anything security-relevant that differs holds the second replica at the fingerprint door — plus the same `DEPLOYMENT_ID` and the same DSN through `DATABASE_URL_FILE`:
 
