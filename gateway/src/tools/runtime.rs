@@ -2796,7 +2796,9 @@ mod tests {
             .expect("the invocation was admitted before the deny published");
         assert!(pinned, "the admitted snapshot has no rule for the request");
         assert!(!live, "the live check refuses under the published deny");
-        let events = audit_events(&capture, 1).await;
+        // `tool.invoke_start` is written ahead of the deny, and the writer
+        // thread delivers in order, so the deny is the second event.
+        let events = audit_events(&capture, 2).await;
         let denied = events
             .iter()
             .find(|event| event.event_type == AUTHZ_DENIED)

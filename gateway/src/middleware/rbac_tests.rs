@@ -2665,6 +2665,7 @@ fn test_policy_with_enforcement(
                             .collect(),
                         issuers: Vec::new(),
                         auth_methods: Vec::new(),
+                        description: None,
                     },
                 )
             })

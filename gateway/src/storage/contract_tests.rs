@@ -2847,6 +2847,109 @@ pub(crate) mod postgres_audit_tests {
         assert_eq!(replica_a.live_buckets().await.expect("count"), 4);
     }
 
+    /// The row lock, not the statement start, orders the decisions. A
+    /// decision whose statement started first can still reach the bucket
+    /// row second -- planning or scheduling jitter, an `ON CONFLICT` waiter
+    /// retrying behind a newer version -- and must not be charged for the
+    /// time between its own start and the decision that overtook it: a
+    /// burst of two still permits two concurrent requests, and only two.
+    #[tokio::test]
+    async fn a_decision_overtaken_on_the_bucket_row_is_not_denied_below_the_burst() {
+        let Some(admin_dsn) = locator() else {
+            eprintln!("skipping: no test database locator; CI runs this test");
+            return;
+        };
+        let _guard = DATABASE.lock().await;
+        let database = create_test_database(&admin_dsn).await;
+        let pool = migrated_limits_pool(&database).await;
+        let replica_a =
+            PostgresRateLimitStore::new(pool.clone(), "deploy-limits", limits_keyring(), 1_000);
+        let replica_b =
+            PostgresRateLimitStore::new(pool.clone(), "deploy-limits", limits_keyring(), 1_000);
+        // A slow refill, so the burst is the only credit in play while the
+        // test runs.
+        let limit = SharedLimit {
+            requests_per_second: 0.1,
+            burst: 2,
+        };
+        let caller = "ip:203.0.113.7";
+
+        // Park the first decision after its statement has started, so its
+        // `now()` is fixed, and before it reaches the bucket row: a BEFORE
+        // INSERT trigger fires ahead of the conflict check, and the first
+        // statement to claim its advisory lock then waits on one this
+        // session holds. Every other statement finds the claim taken and
+        // goes straight through.
+        let gate = pool.get().await.expect("client");
+        gate.batch_execute(
+            "CREATE FUNCTION greengateway.test_park_first_decision() RETURNS trigger
+             LANGUAGE plpgsql AS $$
+             BEGIN
+                 IF pg_try_advisory_xact_lock(241001) THEN
+                     PERFORM pg_advisory_xact_lock_shared(241002);
+                 END IF;
+                 RETURN NEW;
+             END $$;
+             CREATE TRIGGER test_park_first_decision
+                 BEFORE INSERT ON greengateway.rate_limit_buckets
+                 FOR EACH ROW EXECUTE FUNCTION greengateway.test_park_first_decision();
+             SELECT pg_advisory_lock(241002);",
+        )
+        .await
+        .expect("install the parking trigger");
+        let parked = tokio::spawn({
+            let replica_a = replica_a.clone();
+            async move { replica_a.decide(SharedLane::Read, caller, limit).await }
+        });
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            let waiting: i64 = gate
+                .query_one(
+                    "SELECT count(*) FROM pg_locks
+                     WHERE locktype = 'advisory' AND objid = 241002 AND NOT granted
+                       AND database = (SELECT oid FROM pg_database
+                                       WHERE datname = current_database())",
+                    &[],
+                )
+                .await
+                .expect("lock probe")
+                .get(0);
+            if waiting == 1 {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the first decision never parked"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        // The later statement takes the row first, then the parked one.
+        assert_eq!(
+            decide(&replica_b, SharedLane::Read, caller, limit).await,
+            SharedDecision::Allowed,
+            "the overtaking decision is the burst's first"
+        );
+        gate.batch_execute("SELECT pg_advisory_unlock(241002)")
+            .await
+            .expect("release the parked decision");
+        let overtaken = parked
+            .await
+            .expect("the parked decision completes")
+            .expect("the shared limiter decides");
+        assert_eq!(
+            overtaken,
+            SharedDecision::Allowed,
+            "a burst of two permits two, whatever order the row lock took them in"
+        );
+        assert_eq!(
+            decide(&replica_a, SharedLane::Read, caller, limit).await,
+            SharedDecision::Denied,
+            "and only two: the third is denied"
+        );
+        assert_eq!(replica_a.live_buckets().await.expect("count"), 1);
+    }
+
     /// The policy lane keys buckets by rule as well as principal, and what
     /// the table holds is a keyed digest: never the caller key, and never
     /// the plain hash of it that a table reader could precompute.
@@ -2989,6 +3092,134 @@ pub(crate) mod postgres_audit_tests {
         assert_eq!(store.cleanup_idle(0.0, 100).await.expect("sweep"), 3);
         assert_eq!(store.live_buckets().await.expect("counter"), 0);
         assert_eq!(store.cleanup_idle(3_600.0, 100).await.expect("sweep"), 0);
+    }
+
+    /// A new key past the bound is evicted for on its decision's own
+    /// connection, never a second one. A decision that held its connection
+    /// while it waited for another would, a pool's worth at a time, wait on
+    /// the others until the acquire timeout, and every other authority call
+    /// on the pool -- the revision gate, credential checks, leases -- would
+    /// wait behind them. On a one-connection pool any single such decision
+    /// is that pool's worth, so several new keys at the bound at once must
+    /// each be decided in turn rather than refused for want of a connection.
+    #[tokio::test]
+    async fn new_keys_at_the_bound_never_wait_on_a_second_connection() {
+        let Some(admin_dsn) = locator() else {
+            eprintln!("skipping: no test database locator; CI runs this test");
+            return;
+        };
+        let _guard = DATABASE.lock().await;
+        let database = create_test_database(&admin_dsn).await;
+        let _migrated = migrated_limits_pool(&database).await;
+        let one_connection = one_connection_foundation(&database, 2_000).await;
+        let store = Arc::new(PostgresRateLimitStore::new(
+            one_connection.pool().clone(),
+            "deploy-limits",
+            limits_keyring(),
+            1,
+        ));
+        let one = SharedLimit {
+            requests_per_second: 0.0,
+            burst: 1,
+        };
+        // The bound is one bucket, and this fills it.
+        assert_eq!(
+            decide(&store, SharedLane::Read, "ip:198.51.100.0", one).await,
+            SharedDecision::Allowed
+        );
+        let decisions: Vec<_> = (1..=8)
+            .map(|index| {
+                let store = Arc::clone(&store);
+                tokio::spawn(async move {
+                    store
+                        .decide(SharedLane::Read, &format!("ip:198.51.100.{index}"), one)
+                        .await
+                })
+            })
+            .collect();
+        for decision in decisions {
+            assert_eq!(
+                decision
+                    .await
+                    .expect("the decision task")
+                    .map_err(|error| error.kind()),
+                Ok(SharedDecision::Allowed),
+                "a new key at the bound is decided, not refused for want of a second connection"
+            );
+        }
+        assert_eq!(
+            store.live_buckets().await.expect("counter"),
+            1,
+            "every one of them still evicted down to the bound"
+        );
+    }
+
+    /// The decision is committed before its eviction runs, so an eviction
+    /// that fails cannot take the decision back: the request gets the
+    /// decision it was given -- an allowance or a denial -- rather than a
+    /// `503` for housekeeping, and the next key past the bound evicts the
+    /// excess the failed one left.
+    #[tokio::test]
+    async fn a_failed_eviction_does_not_refuse_the_committed_decision() {
+        let Some(admin_dsn) = locator() else {
+            eprintln!("skipping: no test database locator; CI runs this test");
+            return;
+        };
+        let _guard = DATABASE.lock().await;
+        let database = create_test_database(&admin_dsn).await;
+        let pool = migrated_limits_pool(&database).await;
+        let store = PostgresRateLimitStore::new(pool.clone(), "deploy-limits", limits_keyring(), 1);
+        let one = SharedLimit {
+            requests_per_second: 0.0,
+            burst: 1,
+        };
+        let zero = SharedLimit {
+            requests_per_second: 0.0,
+            burst: 0,
+        };
+        assert_eq!(
+            decide(&store, SharedLane::Read, "ip:198.51.100.0", one).await,
+            SharedDecision::Allowed
+        );
+        let client = pool.get().await.expect("client");
+        client
+            .batch_execute(
+                "CREATE FUNCTION greengateway.refuse_bucket_delete() RETURNS trigger
+                     LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'eviction refused'; END $$;
+                 CREATE TRIGGER refuse_bucket_delete
+                     BEFORE DELETE ON greengateway.rate_limit_buckets
+                     FOR EACH ROW EXECUTE FUNCTION greengateway.refuse_bucket_delete();",
+            )
+            .await
+            .expect("make every eviction fail");
+        assert_eq!(
+            decide(&store, SharedLane::Read, "ip:198.51.100.1", one).await,
+            SharedDecision::Allowed,
+            "the committed allowance stands"
+        );
+        assert_eq!(
+            decide(&store, SharedLane::Read, "ip:198.51.100.2", zero).await,
+            SharedDecision::Denied,
+            "the committed denial stands"
+        );
+        assert_eq!(
+            store.live_buckets().await.expect("counter"),
+            3,
+            "neither eviction removed anything, and the count says so"
+        );
+        client
+            .batch_execute("DROP TRIGGER refuse_bucket_delete ON greengateway.rate_limit_buckets")
+            .await
+            .expect("let evictions run again");
+        assert_eq!(
+            decide(&store, SharedLane::Read, "ip:198.51.100.3", one).await,
+            SharedDecision::Allowed
+        );
+        assert_eq!(
+            store.live_buckets().await.expect("counter"),
+            1,
+            "the next key past the bound evicts the excess the failed ones left"
+        );
     }
 
     /// Fail closed: a shared limiter that cannot be consulted answers 503
@@ -9082,9 +9313,14 @@ pub(crate) mod postgres_audit_tests {
             .await
             .expect("boot heartbeat");
         let members = store.members(window).await.expect("members");
-        assert_eq!(members[0].capabilities, "operation_requirements");
+        assert_eq!(
+            members[0].capabilities,
+            "operation_requirements,policy_role_descriptions"
+        );
         assert!(RecognizedCapabilities::parse(&members[0].capabilities)
             .contains(Capability::OperationRequirements));
+        assert!(RecognizedCapabilities::parse(&members[0].capabilities)
+            .contains(Capability::PolicyRoleDescriptions));
 
         // A newer gateway on the same instance would write names this one
         // does not know; the next heartbeat writes this binary's own set
@@ -9110,7 +9346,7 @@ pub(crate) mod postgres_audit_tests {
             .expect("refresh");
         assert_eq!(
             store.members(window).await.expect("members")[0].capabilities,
-            "operation_requirements"
+            "operation_requirements,policy_role_descriptions"
         );
 
         let older = insert_pre_protocol_member(&pool).await;
@@ -9138,7 +9374,7 @@ pub(crate) mod postgres_audit_tests {
         use crate::cluster_membership::GatedWriteRequest;
         use crate::storage::compatibility::{
             Activation, Backfill, Capability, OperationAdmission, OperationRefusal,
-            OperationRequirement,
+            OperationRequirement, POLICY_ROLE_DESCRIPTIONS,
         };
 
         let Some(admin_dsn) = locator() else {
@@ -9200,6 +9436,17 @@ pub(crate) mod postgres_audit_tests {
                 .await,
             Err(OperationRefusal::MembersLackRequirement { .. })
         ));
+        // The shipped operation is held by the same member: it advertises
+        // nothing, so certainly not role descriptions.
+        assert_eq!(
+            first
+                .admit_operation(&POLICY_ROLE_DESCRIPTIONS, &audit, &request)
+                .await,
+            Err(OperationRefusal::MembersLackRequirement {
+                lacking: vec![older],
+                live: 3
+            })
+        );
 
         // A draining member is still answering what was routed to it.
         pool.get()
@@ -9226,6 +9473,13 @@ pub(crate) mod postgres_audit_tests {
             Ok(OperationAdmission { live_members: 2 }),
             "a stale row no longer holds the operation"
         );
+        assert_eq!(
+            first
+                .admit_operation(&POLICY_ROLE_DESCRIPTIONS, &audit, &request)
+                .await,
+            Ok(OperationAdmission { live_members: 2 }),
+            "both live members are this build, so the shipped operation is admitted"
+        );
 
         // Only a registered requirement can be admitted.
         let unregistered = OperationRequirement {
@@ -9241,7 +9495,7 @@ pub(crate) mod postgres_audit_tests {
         assert_eq!(
             first.admit_operation(&requirement, &audit, &request).await,
             Err(OperationRefusal::NotSupportedByThisBinary),
-            "the shipped registry registers nothing"
+            "the shipped registry does not register the fixture"
         );
 
         // This replica's own row missing: the read cannot be shown to
@@ -9287,6 +9541,7 @@ pub(crate) mod postgres_audit_tests {
             "capability_not_advertised",
             "capability_not_advertised",
             "capability_not_advertised",
+            "capability_not_advertised",
             "operation_not_supported",
             "operation_not_supported",
             "roster_missing_this_replica",
@@ -9312,7 +9567,9 @@ pub(crate) mod postgres_audit_tests {
         assert_eq!(events[0].payload["capability"], "operation_requirements");
         assert_eq!(events[0].payload["lacking_members"], 1);
         assert_eq!(events[0].payload["live_members"], 3);
-        assert_eq!(events[4].payload["operation"], "fixture.gated_write");
+        assert_eq!(events[2].payload["operation"], "policy.role_descriptions");
+        assert_eq!(events[2].payload["capability"], "policy_role_descriptions");
+        assert_eq!(events[5].payload["operation"], "fixture.gated_write");
     }
 
     /// A swept row comes back as the same boot: a replica partitioned past

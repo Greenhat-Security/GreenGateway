@@ -122,6 +122,7 @@ fn test_policy(entries: &[(&str, &[&str])]) -> Policy {
                         .collect(),
                     issuers: Vec::new(),
                     auth_methods: Vec::new(),
+                    description: None,
                 },
             )
         })

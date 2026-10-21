@@ -2870,11 +2870,17 @@ async fn a_security_incident_rehearsal_holds_through_a_replica_replacement() {
     // ---- 4. the audit evidence -------------------------------------------
     //
     // The decisions made through the admin API are in the audit of record,
-    // each naming its subject; the JWT's, made by a one-shot command with
-    // no audit sink, is the denylist row and the outbox row above, both
-    // attributed; the refusals that followed are in each refusing replica's
-    // own audit. What none of it may carry is swept for at the end, once
-    // the replacement's boot has been added to it.
+    // each naming its subject. Both withdrawals also wrote a change-evidence
+    // row (migration 18) in their own transaction, naming who made them:
+    // the service token's names the responder, and the JWT's -- made by a
+    // one-shot command with no audit sink -- the command's system label.
+    // That row is the JWT withdrawal's attribution: the outbox row above
+    // names no actor, and the denylist row's actor survives neither a later
+    // extension, which overwrites it, nor expiry cleanup, which deletes the
+    // row; the evidence row outlives both. The refusals that followed are
+    // in each refusing replica's own audit. What none of it may carry is
+    // swept for at the end, once the replacement's boot has been added to
+    // it.
     wait_for_audit_record(
         &cluster,
         "the service-token withdrawal",
@@ -2909,6 +2915,47 @@ async fn a_security_incident_rehearsal_holds_through_a_replica_replacement() {
         denylist,
         vec![("operator:revoke-jwt".to_owned(), jwt_revocation_revision)],
         "the denylist should hold one attributed withdrawal at the revision it committed"
+    );
+    let jwt_evidence: Vec<(String, String, String, i64)> = cluster
+        .database
+        .query_all(
+            "SELECT actor_user_id, action, jti_hash, security_revision \
+             FROM greengateway.jwt_revocation_evidence ORDER BY security_revision",
+        )
+        .await
+        .iter()
+        .map(|row| (row.get(0), row.get(1), row.get(2), row.get(3)))
+        .collect();
+    assert_eq!(
+        jwt_evidence,
+        vec![(
+            "operator:revoke-jwt".to_owned(),
+            "jwt.revoke".to_owned(),
+            revocation_digest.clone(),
+            jwt_revocation_revision,
+        )],
+        "the JWT withdrawal should leave one evidence row, naming the command, at its revision"
+    );
+    let token_evidence: Vec<(String, String, String, i64)> = cluster
+        .database
+        .query_all(
+            "SELECT actor_user_id, action, token_id, security_revision \
+             FROM greengateway.service_token_change_evidence ORDER BY security_revision",
+        )
+        .await
+        .iter()
+        .map(|row| (row.get(0), row.get(1), row.get(2), row.get(3)))
+        .collect();
+    assert_eq!(
+        token_evidence,
+        vec![(
+            "responder@ha.test".to_owned(),
+            "service_token.revoke".to_owned(),
+            token_id.clone(),
+            decisions[1].0,
+        )],
+        "the service-token withdrawal should leave one evidence row, naming the responder, at \
+         its revision"
     );
     for replica in ["a", "b"] {
         // Two withdrawn credentials, each refused here at least once.
@@ -3055,7 +3102,9 @@ async fn a_security_incident_rehearsal_holds_through_a_replica_replacement() {
     // auditor: each replica's audit file and process output (the drained
     // replica's shutdown and the replacement's boot included), the
     // break-glass command's output, and every row of every table the
-    // incident wrote.
+    // incident wrote: its change evidence included, and the Connection's
+    // too, which only a delete writes today, so evidence a later slice
+    // records for a rebind is swept from its first row.
     let mut evidence: Vec<(String, String)> = Vec::new();
     for replica in &cluster.replicas {
         evidence.push((
@@ -3077,6 +3126,15 @@ async fn a_security_incident_rehearsal_holds_through_a_replica_replacement() {
         ("greengateway.jwt_revocations", "revoked_at"),
         ("greengateway.service_tokens", "id"),
         ("greengateway.connection_credential_bindings", "purpose"),
+        (
+            "greengateway.service_token_change_evidence",
+            "security_revision",
+        ),
+        ("greengateway.jwt_revocation_evidence", "security_revision"),
+        (
+            "greengateway.connection_change_evidence",
+            "security_revision",
+        ),
     ] {
         evidence.push((
             format!("the {table} rows"),

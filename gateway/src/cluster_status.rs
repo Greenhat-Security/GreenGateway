@@ -1227,7 +1227,7 @@ mod tests {
         assert_eq!(only.last_heartbeat_at, None);
         assert_eq!(
             only.capabilities,
-            vec!["operation_requirements"],
+            vec!["operation_requirements", "policy_role_descriptions"],
             "standalone reports what this binary advertises"
         );
         assert_eq!(only.unrecognized_capabilities, 0);

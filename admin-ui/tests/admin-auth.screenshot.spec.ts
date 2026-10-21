@@ -99,3 +99,36 @@ test('keeps a cookie sign-in whose completion answers after the first permission
   expect(await page.evaluate(() => document.cookie.includes('gg_test_session'))).toBe(false);
   expect(await page.evaluate(() => ({ local: Object.keys(localStorage), session: Object.keys(sessionStorage) }))).toEqual({ local: ['greengateway_admin_theme'], session: [] });
 });
+
+test('keeps a bearer sign-in whose token answers after the first permissions rejection', async ({ page }) => {
+  await page.route('**/version', (route) => route.fulfill({ json: { admin_login_configured: true } }));
+  const token = `test-${randomUUID()}`;
+  let rejectedBeforeSignIn!: () => void;
+  const rejection = new Promise<void>((resolve) => { rejectedBeforeSignIn = resolve; });
+  const completions: string[] = [];
+  await page.route('**/v1/admin/**', async (route) => {
+    const request = route.request();
+    const path = new URL(request.url()).pathname;
+    if (path === '/v1/admin/auth/callback') {
+      completions.push(request.postData() ?? '');
+      // The gateway's token exchange answers only after the dashboard's
+      // token-less request was rejected.
+      await rejection;
+      return route.fulfill({ json: { access_token: token } });
+    }
+    if (path === '/v1/admin/traffic/endpoints') return route.fulfill({ json: { endpoints: [], next_cursor: null } });
+    if ((await request.allHeaders()).authorization === `Bearer ${token}`) {
+      return route.fulfill({ json: { permissions: ['admin:traffic:read'] } });
+    }
+    rejectedBeforeSignIn();
+    return route.fulfill({ status: 401, json: { error: 'unauthenticated' } });
+  });
+
+  await page.goto('/admin/#/auth/complete?code=code&state=state');
+
+  await expect(page.getByText('Signed in with SSO in this tab until reload or session expiry.', { exact: true })).toBeVisible();
+  await expect(page.getByLabel('Endpoint', { exact: true })).toBeVisible();
+  expect(completions).toEqual([JSON.stringify({ code: 'code', state: 'state' })]);
+  expect((await page.content()).includes(token)).toBe(false);
+  expect(await page.evaluate(() => ({ local: Object.keys(localStorage), session: Object.keys(sessionStorage) }))).toEqual({ local: ['greengateway_admin_theme'], session: [] });
+});

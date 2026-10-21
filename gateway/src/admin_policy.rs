@@ -1879,6 +1879,7 @@ pub(super) async fn persist_policy_mutation(
     // a racing writer (on this replica or another) makes this a `412`.
     #[cfg(feature = "postgres")]
     if let Some(control_plane) = context.state.control_plane.as_ref() {
+        admit_policy_document(context.state, context.parts, context.principal, candidate).await?;
         let commit = control_plane
             .commit(storage::PolicyCommitRequest {
                 precondition: storage::PolicyCommitPrecondition::Expected {
@@ -1991,6 +1992,58 @@ pub(super) async fn persist_policy_mutation(
         new_etag,
         history_append_failed,
     })
+}
+
+/// Ask the cluster's operation gate before committing a document that uses
+/// a feature an older member cannot read (issue #426).
+///
+/// A document without such a feature needs nothing beyond the schema-18
+/// contract every member shares, and passes without a roster read. One that
+/// gives a role a `description` is the registered operation
+/// `policy.role_descriptions`: it is committed only while every live member,
+/// draining ones included, advertises `policy_role_descriptions`, because a
+/// member built before the field refuses the whole document. The gate reads
+/// the roster for every such write, logs and audits each refusal
+/// (`cluster.operation_refused`), and the refused write commits nothing.
+///
+/// Every cluster-mode policy commit calls this: the policy API's mutations
+/// through [`persist_policy_mutation`] and a discovery suggestion's
+/// acceptance, which commits the whole document with the new rule in it. A
+/// control plane with no roster to read refuses rather than admits.
+#[cfg(feature = "postgres")]
+pub(super) async fn admit_policy_document(
+    state: &PolicyAdminState,
+    parts: &http::request::Parts,
+    principal: &auth::Principal,
+    candidate: &rbac::Policy,
+) -> ResponseResult<()> {
+    if !candidate.uses_role_descriptions() {
+        return Ok(());
+    }
+    let requirement = &storage::compatibility::POLICY_ROLE_DESCRIPTIONS;
+    let Some(membership) = state.membership.as_ref() else {
+        tracing::error!(
+            operation = requirement.operation,
+            "a cluster-mode policy commit has no roster to ask; the gated write is refused"
+        );
+        return Err(Box::new(operation_refused(
+            &storage::compatibility::OperationRefusal::RosterUnavailable,
+        )));
+    };
+    let request = cluster_membership::GatedWriteRequest {
+        request_id: client_ip::request_id(&parts.headers, &parts.extensions),
+        source_ip: client_ip::canonical_client_ip(
+            &parts.headers,
+            &parts.extensions,
+            &state.client_ip_policy,
+        ),
+        actor: Some(auth::actor_from_principal(principal)),
+    };
+    membership
+        .admit_operation(requirement, &state.audit, &request)
+        .await
+        .map(|_| ())
+        .map_err(|refusal| Box::new(operation_refused(&refusal)))
 }
 
 pub(super) async fn append_policy_version_after_commit(

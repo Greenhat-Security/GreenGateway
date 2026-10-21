@@ -2044,6 +2044,8 @@ pub(super) fn gateway_app_with_process_started_at_and_overrides(
         history_store: policy_history_store,
         #[cfg(feature = "postgres")]
         control_plane: policy_control_plane,
+        #[cfg(feature = "postgres")]
+        membership: build_overrides.pg_membership.clone(),
         event_store: audit_event_store.clone(),
         query_store: audit_query_store.clone(),
         audit: audit_log.clone(),

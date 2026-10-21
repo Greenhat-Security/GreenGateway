@@ -6,32 +6,39 @@
 //! with expand/contract migrations while traffic and control-plane writes
 //! continue, and prove the old binary never parses or writes unsupported
 //! document versions." Writing it against the real repository turned that
-//! sentence into one documented substitution and five executable claims,
-//! and the substitution is the first thing to read.
+//! sentence into one pinned pair, one documented substitution and five
+//! executable claims about a single binary.
 //!
-//! ## Why there is no second binary here
+//! ## The pinned pair (issue #426, PR 2)
 //!
-//! The newest release tag in this repository is **v1.0.1** (2026-07-16).
-//! Its `gateway/src` has no `storage/` directory, no `postgres` feature in
-//! `gateway/Cargo.toml`, and no `STATE_BACKEND=postgres`: cluster mode is
-//! what issue #241 is *adding*, and no released binary can join a
-//! PostgreSQL deployment at all. A mixed-version cluster is therefore not
-//! something this suite declined to build — it is something no pair of
-//! GreenGateway binaries can currently form. The first release that ships
-//! this sequence is the first one a mixed-version rollout can be measured
-//! against.
+//! No release tag ships cluster mode yet: the newest, **v1.0.1**
+//! (2026-07-16), has no `storage/` directory and no `postgres` feature, so
+//! no released binary can join a PostgreSQL deployment. Two real binaries
+//! still can, built from pinned commits rather than tags.
+//! `rolling-upgrade-pair.json` names them: the *prepared* release, which
+//! implements the compatibility protocol and serves exactly schema 18, and
+//! its *successor*, which adds one change and no migration — a role may carry a
+//! `description`, and committing such a document is the registered
+//! operation `policy.role_descriptions`. `scripts/build_upgrade_pair.py`
+//! builds each from its own commit and the release gate passes both to
+//! this suite ([`harness::pair`]), which verifies the commits and hashes
+//! before it runs either.
 //!
-//! That is stated twice, on purpose, in two different registers:
+//! [`a_prepared_release_and_its_successor_serve_one_deployment`] and
+//! [`the_successors_new_operation_waits_for_every_prepared_member_to_leave`]
+//! run the two together against one database and write what they observed
+//! to the pair's `evidence/` directory. What they do *not* prove is listed
+//! in `docs/architecture/ha-state-model.md` section 7: this pair shares one
+//! schema point, so no schema overlap, backfill or contraction is
+//! exercised, and the gate they exercise judges live membership, not a
+//! durable fence.
 //!
-//! * [`mixed_binary_replicas_need_a_release_that_ships_cluster_mode`] is
-//!   the `#[ignore]`d row that names the missing coverage, so a reader
-//!   counting rows finds a reason rather than an absence.
-//! * [`the_newest_release_tag_still_predates_cluster_mode`] is the
-//!   tripwire that makes the reason expire. It reads the newest previous
-//!   `v*` tag's own `gateway/Cargo.toml` (excluding the current commit) and
-//!   **fails** the moment one
-//!   carries the `postgres` feature — which is the moment the substitution
-//!   stops being honest and the real mixed-binary row becomes writable.
+//! [`the_newest_release_tag_still_predates_cluster_mode`] is the tripwire
+//! that keeps the tag question honest. It reads the newest previous `v*`
+//! tag's own `gateway/Cargo.toml` (excluding the current commit) and
+//! **fails** the moment one carries the `postgres` feature: from then on the
+//! previous *release* is what a rollout upgrades from, and it belongs in
+//! the pinned pair.
 //!
 //! Everything else here runs one binary against a deployment put into the
 //! states a rolling upgrade puts it in, with the *other* version's effects
@@ -51,9 +58,9 @@
 //!    applied mid-rollout makes every not-yet-upgraded replica
 //!    `schema_incompatible` the moment it lands
 //!    ([`an_expand_migration_has_no_overlap_window_so_it_cannot_roll`]).
-//!    `docs/architecture/ha-state-model.md` §7 says "expand/contract so
-//!    version N and N+1 binaries coexist"; the code does not implement
-//!    that yet, and this row asserts the code.
+//!    No schema extension has been approved, so this is still true of
+//!    every pair, the pinned one included: its two builds share one
+//!    schema point rather than an overlap.
 //! 2. **The static-configuration fingerprint.** PR 13 holds a replica
 //!    unready while any *live* member runs a different fingerprint, and
 //!    agreement is sticky once granted. So an incumbent keeps serving when
@@ -89,6 +96,7 @@
 mod harness;
 
 use std::{
+    path::Path,
     sync::{
         atomic::{AtomicBool, AtomicUsize, Ordering},
         Arc,
@@ -99,6 +107,7 @@ use std::{
 use serde_json::{json, Value};
 
 use harness::{
+    pair::UpgradePair,
     replica::{Replica, LISTEN_BUDGET},
     AuthShape, Cluster, ClusterOptions, FakeOidcIssuer, Target, TempDir, ADMIN_API_PREFIX,
 };
@@ -686,7 +695,13 @@ impl LedgerRow {
     async fn insert_above_the_manifest(dsn: &str, highest: i64) -> Self {
         // Far enough above the manifest that no future migration count
         // can accidentally make this compatible.
-        let version = highest + 1_000;
+        Self::insert_version(dsn, highest + 1_000).await
+    }
+
+    /// Add one ledger row at exactly `version`, with a checksum no build
+    /// carries: the next migration, as a successor nobody prepared for
+    /// would apply it.
+    async fn insert_version(dsn: &str, version: i64) -> Self {
         run_sql(
             dsn,
             &format!(
@@ -1328,21 +1343,22 @@ async fn restarting_an_incumbent_while_a_new_configuration_is_live_costs_it_its_
 /// The consequence for a rolling upgrade is total: the instant the new
 /// version's `migrate up` commits, every replica still running the old
 /// version is `schema_incompatible` and serves nothing. There is no
-/// ordering that avoids it, because there is no pair of versions that
-/// accepts the same ledger.
+/// ordering that avoids it, because no pair of versions on either side of
+/// a migration accepts the same ledger. The pinned pair below shares one
+/// ledger only because its successor adds no migration.
 ///
-/// `docs/architecture/ha-state-model.md` §7 currently claims
-/// "expand/contract so version N and N+1 binaries coexist". That is a
-/// design intent the code has not implemented, and this row asserts the
-/// code: the range is a point, and the stall is total. The advertised
-/// range is a *pair* precisely so a future release can widen it without a
-/// schema change — and the day it widens, this row fails and says so.
+/// `docs/architecture/ha-state-model.md` §7 says the same: no pair has
+/// been qualified across a schema change, so the contract stays a point.
+/// This row asserts the code: the range is a point, and the stall is
+/// total. The advertised range is a *pair* precisely so a future release
+/// can widen it without a schema change — and the day it widens, this row
+/// fails and says so.
 ///
-/// The row also pins something the state model does not say: this is a
-/// **readiness** refusal, not a request refusal. A replica whose ledger it
-/// does not accept keeps serving whatever is still routed to it. See step
-/// 3b, which asserts that and explains why it makes the load balancer's
-/// `/readyz` wiring load-bearing rather than advisory.
+/// The row also pins that this is a **readiness** refusal, not a request
+/// refusal. A replica whose ledger it does not accept keeps serving
+/// whatever is still routed to it. See step 3b, which asserts that and
+/// explains why it makes the load balancer's `/readyz` wiring
+/// load-bearing rather than advisory.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn an_expand_migration_has_no_overlap_window_so_it_cannot_roll() {
     let Some(mut cluster) = start_rollout_cluster(2).await else {
@@ -1776,68 +1792,955 @@ async fn this_binary_refuses_to_write_a_document_version_it_does_not_support() {
 }
 
 // =====================================================================
-// The substitution, named twice
+// Rows 5 and 6 — the pinned pair (issue #426)
 // =====================================================================
 
-/// **Not injectable: two binaries.**
-///
-/// The mixed-version half of the parent contract — "build the previous
-/// release tag's binary and the current one, run mixed replicas" — cannot
-/// be built from anything this repository has released. The newest tag,
-/// v1.0.1 (2026-07-16), predates cluster mode entirely: its
-/// `gateway/Cargo.toml` has no `postgres` feature, its `gateway/src` has
-/// no `storage/` module, and `STATE_BACKEND=postgres` is not a setting it
-/// knows. A v1.0.1 process cannot register a membership row, cannot read
-/// the schema ledger, and cannot join a deployment; there is no
-/// configuration under which it and a current binary form one cluster.
-///
-/// What the rows above substitute for it, and why each substitution is
-/// faithful:
-///
-/// * **A newer binary's migration** →
-///   [`an_expand_migration_has_no_overlap_window_so_it_cannot_roll`]
-///   writes the ledger row `migrate up` would have written. The old binary
-///   reads the ledger, not the other process, so what it sees is
-///   identical.
-/// * **A newer binary's control-plane write** →
-///   [`an_unsupported_document_version_is_never_compiled_and_never_served`]
-///   writes the document through the authority in the same six steps and
-///   the same order as a commit, with the revision counter advanced and
-///   the outbox row appended. A serving replica reads the authority, not
-///   the writer, so again what it sees is identical.
-/// * **A newer binary's configuration** →
-///   [`a_new_static_configuration_stalls_at_the_gate_instead_of_serving_mismatched`]
-///   changes one fingerprint-covered setting on a real second process.
-///   This substitution is the weakest of the three and it is worth saying
-///   why: a genuine version change would alter the fingerprint *and* the
-///   schema range *and* the document range at once, and the gate would
-///   report whichever it evaluates first. Here only the fingerprint moves.
-///
-/// What no substitution reaches, and what the real row will have to add
-/// when a cluster-capable release exists: a binary whose *code* differs —
-/// an old parser meeting a new document shape it can deserialize but
-/// misinterprets, a new column an old `SELECT *` does not expect, a
-/// behaviour change inside a version both binaries call `0.1.0`. Those are
-/// the failures a version range cannot catch, and only two binaries can
-/// find them.
-#[tokio::test]
-#[ignore = "no released GreenGateway binary supports cluster mode; see the doc comment"]
-async fn mixed_binary_replicas_need_a_release_that_ships_cluster_mode() {
-    panic!(
-        "this row is a placeholder for the mixed-binary rollout described in its doc comment. \
-         It becomes writable when a release tag ships the `postgres` feature, which \
-         the_newest_release_tag_still_predates_cluster_mode watches for."
-    );
+/// The admin role description the successor's operation writes. Inert:
+/// it grants and restricts nothing, so a row that observes a difference
+/// in behaviour is observing the binaries, not the policy.
+const ROLE_DESCRIPTION: &str = "Administers the rolling-upgrade deployment";
+
+/// The pair gate row's stale window. Long enough that a prepared member
+/// stopped a moment earlier is certainly still inside it when the next
+/// write asks, which is the draining half of the gate; the row pays it once
+/// while that member's row ages out.
+const PAIR_GATE_STALE_WINDOW_MS: u64 = 15_000;
+
+/// How long a policy write is re-asked while the replica answers `503`.
+/// A `503` here is the revision gate or the operation gate declining to
+/// decide, and neither writes anything, so asking again cannot write twice.
+const WRITE_RETRY_BUDGET: Duration = Duration::from_secs(20);
+
+/// `admin:status:read`, the cheapest authenticated route: what a credential
+/// probe asks.
+const STATUS_ROUTE: &str = "/v1/admin/status";
+
+/// A cluster of the two pinned builds, one binary per replica, migrated by
+/// the prepared one: the release the deployment ran before the rollout.
+fn pair_options(binaries: &[&Path], prepared: &Path, member_stale_ms: u64) -> ClusterOptions {
+    ClusterOptions {
+        replica_binaries: binaries.iter().map(|path| path.to_path_buf()).collect(),
+        migrator_binary: Some(prepared.to_owned()),
+        member_stale_ms,
+        ..rollout_options(binaries.len())
+    }
 }
 
-/// The tripwire that makes the substitution above expire.
+/// [`policy_document`] whose admin role says what it is for: the data the
+/// successor's registered operation writes, and the field the prepared
+/// release cannot parse.
+fn described_policy_document(marker: &str) -> String {
+    let mut document: Value =
+        serde_json::from_str(&policy_document(Some(marker))).expect("the policy document is JSON");
+    document["roles"][ADMIN_ROLE]["description"] = json!(ROLE_DESCRIPTION);
+    document.to_string()
+}
+
+/// One conditional policy write on a named replica: `(status, ETag, body)`.
+async fn put_policy(
+    cluster: &Cluster,
+    replica: &str,
+    admin: &str,
+    if_match: &str,
+    document: &str,
+) -> (u16, Option<String>, Value) {
+    let document: Value = serde_json::from_str(document).expect("the policy document is JSON");
+    let deadline = Instant::now() + WRITE_RETRY_BUDGET;
+    loop {
+        let (status, headers, body) = cluster
+            .put(replica, &policy_route())
+            .bearer(admin)
+            .if_match(if_match)
+            .json(&document)
+            .send_with_headers()
+            .await;
+        if status != 503 || Instant::now() >= deadline {
+            let etag = headers
+                .get(reqwest::header::ETAG)
+                .and_then(|value| value.to_str().ok())
+                .map(ToOwned::to_owned);
+            return (status, etag, body);
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+}
+
+/// `GET /policy` on one replica, re-asked while it answers `503`:
+/// `(ETag, document)`.
+async fn served_policy(cluster: &Cluster, replica: &str, admin: &str) -> (String, Value) {
+    let deadline = Instant::now() + ADMIN_RETRY_BUDGET;
+    loop {
+        let (status, headers, body) = cluster
+            .get(replica, &policy_route())
+            .bearer(admin)
+            .send_with_headers()
+            .await;
+        if status == 200 {
+            let etag = headers
+                .get(reqwest::header::ETAG)
+                .and_then(|value| value.to_str().ok())
+                .unwrap_or_default()
+                .to_owned();
+            return (etag, body);
+        }
+        assert!(
+            status == 503 && Instant::now() < deadline,
+            "replica {replica} should serve the policy, and said {status} {body}"
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+}
+
+/// Whether `credential` is accepted on `replica`. A `503` is the replica
+/// declining to judge, and is asked again within a bound.
+async fn authenticates(cluster: &Cluster, replica: &str, credential: &str) -> bool {
+    let deadline = Instant::now() + ADMIN_RETRY_BUDGET;
+    loop {
+        let (status, body) = cluster
+            .get(replica, STATUS_ROUTE)
+            .bearer(credential)
+            .send()
+            .await;
+        match status {
+            200 => return true,
+            401 => return false,
+            503 if Instant::now() < deadline => {
+                tokio::time::sleep(Duration::from_millis(200)).await;
+            }
+            other => panic!(
+                "a credential probe on {replica} should be accepted or refused, not {other}: {body}"
+            ),
+        }
+    }
+}
+
+/// The authority's own numbers.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct AuthorityState {
+    versions: i64,
+    missing_versions: i64,
+    last_revision: i64,
+    active_etag: String,
+}
+
+impl AuthorityState {
+    async fn read(cluster: &Cluster) -> Self {
+        let row = cluster
+            .database
+            .query_one(
+                "SELECT (SELECT count(*) FROM greengateway.policy_documents)::bigint, \
+                        (SELECT max(version) - min(version) + 1 - count(*) \
+                           FROM greengateway.policy_documents)::bigint, \
+                        (SELECT last_revision FROM greengateway.security_revision_state \
+                          WHERE singleton)::bigint, \
+                        (SELECT document_etag FROM greengateway.policy_active WHERE singleton)",
+            )
+            .await;
+        Self {
+            versions: row.get(0),
+            missing_versions: row.get(1),
+            last_revision: row.get(2),
+            active_etag: row.get(3),
+        }
+    }
+
+    fn evidence(&self) -> Value {
+        json!({
+            "policy_versions": self.versions,
+            "missing_versions": self.missing_versions,
+            "security_revision": self.last_revision,
+            "active_policy_etag": self.active_etag,
+        })
+    }
+}
+
+/// This replica's own instance ID, from its own status surface.
+async fn instance_of(cluster: &Cluster, replica: &str, admin: &str) -> String {
+    let status = cluster_status(cluster, replica, admin).await;
+    status["local"]["instance_id"]
+        .as_str()
+        .unwrap_or_else(|| panic!("replica {replica} should report its instance: {status}"))
+        .to_owned()
+}
+
+/// The roster as `observer` reports it, keyed by instance ID:
+/// `(capabilities, unrecognized_capabilities)`.
+async fn advertisements(
+    cluster: &Cluster,
+    observer: &str,
+    admin: &str,
+) -> std::collections::BTreeMap<String, (Vec<String>, u64)> {
+    cluster_replicas(cluster, observer, admin)
+        .await
+        .iter()
+        .filter(|row| row["live"] == true)
+        .map(|row| {
+            let capabilities = row["capabilities"]
+                .as_array()
+                .unwrap_or_else(|| panic!("a roster row should list capabilities: {row}"))
+                .iter()
+                .map(|name| name.as_str().unwrap_or_default().to_owned())
+                .collect();
+            (
+                row["instance_id"].as_str().unwrap_or_default().to_owned(),
+                (
+                    capabilities,
+                    row["unrecognized_capabilities"]
+                        .as_u64()
+                        .unwrap_or(u64::MAX),
+                ),
+            )
+        })
+        .collect()
+}
+
+/// Rows heartbeating inside `window_ms` on the database clock, draining or
+/// not: what the operation gate counts as live.
+async fn heartbeating_members(cluster: &Cluster, window_ms: u64) -> i64 {
+    let seconds = window_ms as f64 / 1000.0;
+    cluster
+        .database
+        .count(&format!(
+            "SELECT count(*)::bigint FROM greengateway.cluster_members \
+             WHERE last_heartbeat_at > now() - make_interval(secs => {seconds})"
+        ))
+        .await
+}
+
+/// Poll until every live member's roster row reports `revision` compiled.
+async fn wait_for_compiled_revision(cluster: &Cluster, revision: i64, members: i64) {
+    let deadline = Instant::now() + AUTHORITY_BUDGET;
+    let seconds = cluster.member_stale_ms as f64 / 1000.0;
+    loop {
+        let converged = cluster
+            .database
+            .count(&format!(
+                "SELECT count(*)::bigint FROM greengateway.cluster_members \
+                 WHERE draining_at IS NULL \
+                   AND last_heartbeat_at > now() - make_interval(secs => {seconds}) \
+                   AND compiled_security_revision = {revision}"
+            ))
+            .await;
+        if converged == members {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "{converged} of {members} live members reported revision {revision} compiled within \
+             {AUTHORITY_BUDGET:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+}
+
+/// Each named replica's `/readyz`, as evidence.
+async fn readiness(cluster: &Cluster, pair: &UpgradePair, step: &str, names: &[&str]) -> Value {
+    let mut observed = Vec::new();
+    for name in names {
+        let replica = cluster.replica(name);
+        let (status, body) = replica.readyz().await;
+        assert_reason_is_in_the_vocabulary(name, &body);
+        observed.push(json!({
+            "replica": name,
+            "binary": pair.role_of(replica.binary()),
+            "status": status,
+            "reason": body["reason"],
+        }));
+    }
+    json!({ "step": step, "replicas": observed })
+}
+
+fn command_succeeded(output: &std::process::Output, context: &str) -> String {
+    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+    assert!(
+        output.status.success(),
+        "{context} should succeed ({})\n--- stdout ---\n{stdout}\n--- stderr ---\n{}",
+        output.status,
+        String::from_utf8_lossy(&output.stderr)
+    );
+    stdout
+}
+
+/// **Issue #426's pinned pair serves one deployment.**
 ///
-/// A documented substitution is only honest while its reason holds. This
-/// reads the newest `v*` tag on a different commit's `gateway/Cargo.toml` and
-/// fails if it declares the `postgres` feature — because at that moment a
-/// previous release's binary *can* be built and *can* join a cluster, and
-/// the row above stops being a description of reality and becomes an
-/// excuse.
+/// Two real binaries, each built from its own pinned commit
+/// (`gateway/tests/ha/rolling-upgrade-pair.json`): the prepared release,
+/// which implements the compatibility protocol, and its successor, which
+/// adds one change and no migration. Both run against one disposable
+/// database with the migration role and the no-DDL runtime role kept
+/// apart, as the harness always does.
+///
+/// What the row establishes, in order:
+///
+/// 1. The two processes are two different builds and say so: each
+///    advertises what it was compiled with, and each reads the other's
+///    advertisement through its own vocabulary. They serve one schema
+///    point and agree on the static-configuration fingerprint.
+/// 2. Neither changes the schema: the successor's `migrate up` is a no-op
+///    and both binaries' `migrate check` call the shared ledger current.
+/// 3. Conditional policy writes alternate between the builds with one
+///    `If-Match` chain: the ETag one computes is the precondition the
+///    other accepts, a stale one is refused by both, the history stays
+///    contiguous, the revision counter advances once per commit, and every
+///    live member reports the last revision compiled.
+/// 4. A JWT revoked through either build's operator command is refused by
+///    both replicas.
+/// 5. Rolling the successor back to the prepared binary before anything
+///    was contracted serves the same authority state: the same document,
+///    the same revision counter, revocations still in force, and the
+///    control plane still writes. Rolling forward again does the same.
+/// 6. A migration neither binary was prepared for is refused by both: the
+///    next ledger version, unknown to both, makes both replicas
+///    `schema_incompatible` and both `migrate check`s fail, until it is
+///    removed. No schema overlap is accepted, because none was approved.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_prepared_release_and_its_successor_serve_one_deployment() {
+    if harness::locator().is_none() {
+        return skipped();
+    }
+    let pair = UpgradePair::load();
+    let prepared = pair.prepared.path.clone();
+    let successor = pair.successor.path.clone();
+    let mut cluster = Cluster::start(pair_options(
+        &[&prepared, &successor],
+        &prepared,
+        STALE_WINDOW_MS,
+    ))
+    .await
+    .expect("the locator was checked above");
+    cluster.wait_until_all_ready().await;
+    let admin = admin_token(&cluster.oidc, "admin@ha.test");
+    let mut readiness_log = vec![readiness(&cluster, &pair, "mixed", &["a", "b"]).await];
+
+    // 1. Two builds, one schema point, one fingerprint.
+    for name in ["a", "b"] {
+        let status = cluster_status(&cluster, name, &admin).await;
+        assert_eq!(
+            (
+                status["schema"]["binary_min"].as_i64(),
+                status["schema"]["binary_max"].as_i64(),
+                status["schema"]["compatible"].as_bool(),
+            ),
+            (
+                Some(pair.schema_version),
+                Some(pair.schema_version),
+                Some(true)
+            ),
+            "replica {name} ({}) should serve exactly schema {}: {status}",
+            pair.role_of(cluster.replica(name).binary()),
+            pair.schema_version
+        );
+    }
+    let fingerprints = cluster
+        .database
+        .count("SELECT count(DISTINCT fingerprint)::bigint FROM greengateway.cluster_members")
+        .await;
+    assert_eq!(
+        fingerprints, 1,
+        "the two builds must agree on the fingerprint"
+    );
+
+    let prepared_instance = instance_of(&cluster, "a", &admin).await;
+    let successor_instance = instance_of(&cluster, "b", &admin).await;
+    let protocol = vec!["operation_requirements".to_owned()];
+    let successor_set = vec!["operation_requirements".to_owned(), pair.capability.clone()];
+    let seen_by_prepared = advertisements(&cluster, "a", &admin).await;
+    let seen_by_successor = advertisements(&cluster, "b", &admin).await;
+    assert_eq!(
+        seen_by_successor.get(&successor_instance),
+        Some(&(successor_set.clone(), 0)),
+        "the successor advertises the protocol and its new capability"
+    );
+    assert_eq!(
+        seen_by_successor.get(&prepared_instance),
+        Some(&(protocol.clone(), 0)),
+        "the prepared release advertises only the protocol"
+    );
+    assert_eq!(
+        seen_by_prepared.get(&successor_instance),
+        Some(&(protocol.clone(), 1)),
+        "the prepared release recognizes the protocol in the successor's advertisement and counts \
+         the capability it was not built with, granting it nothing"
+    );
+    assert_eq!(
+        seen_by_prepared.get(&prepared_instance),
+        Some(&(protocol.clone(), 0))
+    );
+
+    // 2. Neither binary changes the schema.
+    let migrated = command_succeeded(
+        &cluster.run_migrator_command_with(&successor, &["migrate", "up"]),
+        "the successor's migrate up",
+    );
+    assert!(
+        migrated.contains(&format!("already current at {}", pair.schema_version)),
+        "the successor carries no migration of its own: {migrated}"
+    );
+    for (role, binary) in [("prepared", &prepared), ("successor", &successor)] {
+        let checked = command_succeeded(
+            &cluster.run_command_with(binary, &["migrate", "check"]),
+            &format!("the {role} binary's migrate check"),
+        );
+        assert!(checked.contains("schema: current"), "{role}: {checked}");
+    }
+    let ledger = cluster
+        .database
+        .query_one(&format!(
+            "SELECT count(*)::bigint, coalesce(max(version), 0)::bigint FROM {LEDGER_TABLE}"
+        ))
+        .await;
+    let ledger_versions: (i64, i64) = (ledger.get(0), ledger.get(1));
+    assert_eq!(
+        ledger_versions,
+        (pair.schema_version, pair.schema_version),
+        "the shared ledger is the prepared release's, unchanged"
+    );
+
+    // 3. One If-Match chain across both builds.
+    let before = AuthorityState::read(&cluster).await;
+    let mut etag = cluster.seed_policy_etag.clone();
+    let writers = ["a", "b", "a", "b"];
+    let mut chain = Vec::new();
+    for (index, writer) in writers.iter().enumerate() {
+        let marker = format!("pair-{index}");
+        let (status, next, body) = put_policy(
+            &cluster,
+            writer,
+            &admin,
+            &etag,
+            &policy_document(Some(&marker)),
+        )
+        .await;
+        assert_eq!(
+            status,
+            200,
+            "replica {writer} ({}) should accept the precondition the other build computed: {body}",
+            pair.role_of(cluster.replica(writer).binary())
+        );
+        etag = next.expect("a committed write returns its ETag");
+        chain.push(json!({
+            "writer": pair.role_of(cluster.replica(writer).binary()),
+            "status": status,
+            "etag": etag,
+        }));
+    }
+    for writer in ["a", "b"] {
+        let (status, _, body) = put_policy(
+            &cluster,
+            writer,
+            &admin,
+            &cluster.seed_policy_etag,
+            &policy_document(Some("stale")),
+        )
+        .await;
+        assert_eq!(
+            status, 412,
+            "a stale precondition is refused by replica {writer}: {body}"
+        );
+        chain.push(json!({
+            "writer": pair.role_of(cluster.replica(writer).binary()),
+            "status": status,
+            "precondition": "stale",
+        }));
+    }
+    let after = AuthorityState::read(&cluster).await;
+    assert_eq!(
+        after.versions,
+        before.versions + 4,
+        "one version per commit"
+    );
+    assert_eq!(after.missing_versions, 0, "the history stays contiguous");
+    assert_eq!(
+        after.last_revision,
+        before.last_revision + 4,
+        "the revision counter advances once per commit, whichever build committed"
+    );
+    assert_eq!(after.active_etag, etag);
+    for name in ["a", "b"] {
+        let (served_etag, document) = served_policy(&cluster, name, &admin).await;
+        assert_eq!(
+            served_etag, etag,
+            "replica {name} serves the last commit's ETag"
+        );
+        assert!(document["roles"].get("pair-3").is_some(), "{document}");
+    }
+    wait_for_compiled_revision(&cluster, after.last_revision, 2).await;
+
+    // 4. A revocation through either build binds both.
+    let mint = |subject: &str| {
+        let jti = format!("jti-{}", uuid::Uuid::new_v4().simple());
+        let token = cluster.oidc.mint_role_token(
+            harness::oidc::PRIMARY_KID,
+            subject,
+            &jti,
+            &[ADMIN_ROLE],
+            3_600,
+        );
+        (jti, token)
+    };
+    let (jti_by_prepared, revoked_by_prepared) = mint("revoked-by-prepared@ha.test");
+    let (jti_by_successor, revoked_by_successor) = mint("revoked-by-successor@ha.test");
+    for name in ["a", "b"] {
+        assert!(authenticates(&cluster, name, &revoked_by_prepared).await);
+        assert!(authenticates(&cluster, name, &revoked_by_successor).await);
+    }
+    command_succeeded(
+        &cluster.run_command_with(
+            &prepared,
+            &["revoke-jwt", &cluster.oidc.issuer, &jti_by_prepared],
+        ),
+        "the prepared binary's revoke-jwt",
+    );
+    command_succeeded(
+        &cluster.run_command_with(
+            &successor,
+            &["revoke-jwt", &cluster.oidc.issuer, &jti_by_successor],
+        ),
+        "the successor's revoke-jwt",
+    );
+    for name in ["a", "b"] {
+        assert!(
+            !authenticates(&cluster, name, &revoked_by_prepared).await,
+            "replica {name} must refuse a token the prepared release revoked"
+        );
+        assert!(
+            !authenticates(&cluster, name, &revoked_by_successor).await,
+            "replica {name} must refuse a token the successor revoked"
+        );
+        assert!(authenticates(&cluster, name, &admin).await);
+    }
+    let revoked = AuthorityState::read(&cluster).await;
+    assert_eq!(
+        revoked.last_revision,
+        after.last_revision + 2,
+        "each revocation advances the shared revision"
+    );
+
+    // 5. Roll the successor back to the prepared binary, then forward.
+    cluster.replace_binary("b", &prepared).await;
+    wait_until_ready(cluster.replica("b"), JOIN_BUDGET).await;
+    readiness_log.push(readiness(&cluster, &pair, "rolled back", &["a", "b"]).await);
+    let rolled_back = AuthorityState::read(&cluster).await;
+    assert_eq!(
+        rolled_back, revoked,
+        "a rollback replaces binaries and nothing else: the authority is not rewound"
+    );
+    let (served_etag, _) = served_policy(&cluster, "b", &admin).await;
+    assert_eq!(served_etag, etag);
+    assert!(
+        !authenticates(&cluster, "b", &revoked_by_successor).await,
+        "a revocation the successor wrote stays in force on the binary it was rolled back to"
+    );
+    let (status, next, body) = put_policy(
+        &cluster,
+        "b",
+        &admin,
+        &etag,
+        &policy_document(Some("after-rollback")),
+    )
+    .await;
+    assert_eq!(status, 200, "the rolled-back member still writes: {body}");
+    etag = next.expect("a committed write returns its ETag");
+    cluster.replace_binary("b", &successor).await;
+    wait_until_ready(cluster.replica("b"), JOIN_BUDGET).await;
+    readiness_log.push(readiness(&cluster, &pair, "rolled forward", &["a", "b"]).await);
+    let (served_etag, _) = served_policy(&cluster, "b", &admin).await;
+    assert_eq!(
+        served_etag, etag,
+        "the successor serves what the rollback wrote"
+    );
+    let rolled_forward = AuthorityState::read(&cluster).await;
+
+    // 6. A migration neither binary was prepared for is refused by both.
+    let highest: i64 = cluster
+        .database
+        .query_one(&format!(
+            "SELECT coalesce(max(version), 0)::bigint FROM {LEDGER_TABLE}"
+        ))
+        .await
+        .get(0);
+    let mut unapproved =
+        LedgerRow::insert_version(&cluster.database.migrator_dsn, highest + 1).await;
+    for name in ["a", "b"] {
+        wait_for_reason(cluster.replica(name), SCHEMA_INCOMPATIBLE, AUTHORITY_BUDGET).await;
+    }
+    readiness_log.push(readiness(&cluster, &pair, "unapproved migration", &["a", "b"]).await);
+    let mut refused_checks = Vec::new();
+    for (role, binary) in [("prepared", &prepared), ("successor", &successor)] {
+        let output = cluster.run_command_with(binary, &["migrate", "check"]);
+        let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+        assert!(
+            !output.status.success() && stderr.contains("does not carry"),
+            "the {role} binary must refuse a ledger version it was not built with: {stderr}"
+        );
+        refused_checks.push(json!({ "binary": role, "exit": output.status.code() }));
+    }
+    unapproved.revert().await;
+    for name in ["a", "b"] {
+        wait_until_ready(cluster.replica(name), AUTHORITY_BUDGET).await;
+    }
+    readiness_log.push(readiness(&cluster, &pair, "migration removed", &["a", "b"]).await);
+
+    pair.write_evidence(
+        "a_prepared_release_and_its_successor_serve_one_deployment",
+        json!({
+            "schema": {
+                "ledger_versions": ledger_versions.0,
+                "ledger_max_version": ledger_versions.1,
+                "served": { "min": pair.schema_version, "max": pair.schema_version },
+                "approved_extensions": [],
+                "unapproved_next_version": {
+                    "version": highest + 1,
+                    "readiness": SCHEMA_INCOMPATIBLE,
+                    "migrate_check": refused_checks,
+                },
+            },
+            "advertisements": {
+                "prepared": protocol,
+                "successor": successor_set,
+                "prepared_sees_successor_unrecognized": 1,
+            },
+            "fingerprints": fingerprints,
+            "conditional_writes": chain,
+            "authority": {
+                "before": before.evidence(),
+                "after_writes": after.evidence(),
+                "after_revocations": revoked.evidence(),
+                "after_rollback": rolled_back.evidence(),
+                "after_roll_forward": rolled_forward.evidence(),
+            },
+            "revocations": [
+                { "revoked_by": "prepared", "refused_by": ["prepared", "successor"] },
+                { "revoked_by": "successor", "refused_by": ["prepared", "successor"] },
+            ],
+            "readiness": readiness_log,
+        }),
+    );
+    cluster.shutdown();
+}
+
+/// **The successor's new operation waits for every prepared member to
+/// leave, and is accepted after.**
+///
+/// The successor's one change is that a role may carry a `description`,
+/// and committing such a document is the registered operation
+/// `policy.role_descriptions`. The prepared release cannot parse that
+/// document at all. The row walks the operation through a rollout:
+///
+/// 1. With a prepared member live, the successor refuses the write with
+///    `409 capability_not_advertised`, writes nothing, and audits the
+///    refusal without naming the member. The prepared member never leaves
+///    ready, because it never saw the document.
+/// 2. The prepared release cannot write the document either: its parser
+///    refuses the field.
+/// 3. A draining prepared member still holds the operation: it still
+///    answers what was routed to it.
+/// 4. Once its row is stale on the database clock, the same write is
+///    admitted and the description is served.
+/// 5. Rolling back to the prepared binary after the operation fails
+///    closed: it refuses to start against a document it cannot parse, and
+///    the authority is not rewound to let it.
+/// 6. Recovery is forward: a document without the field brings the
+///    prepared member back, and the gate closes again while it is live.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_successors_new_operation_waits_for_every_prepared_member_to_leave() {
+    if harness::locator().is_none() {
+        return skipped();
+    }
+    let pair = UpgradePair::load();
+    let prepared = pair.prepared.path.clone();
+    let successor = pair.successor.path.clone();
+    let mut cluster = Cluster::start(pair_options(
+        &[&prepared, &successor],
+        &prepared,
+        PAIR_GATE_STALE_WINDOW_MS,
+    ))
+    .await
+    .expect("the locator was checked above");
+    cluster.wait_until_all_ready().await;
+    let admin = admin_token(&cluster.oidc, "admin@ha.test");
+    let prepared_instance = instance_of(&cluster, "a", &admin).await;
+    let mut matrix = Vec::new();
+    let mut readiness_log = vec![readiness(&cluster, &pair, "mixed", &["a", "b"]).await];
+    let start = AuthorityState::read(&cluster).await;
+    let seed = cluster.seed_policy_etag.clone();
+
+    // 1. A live prepared member holds the operation.
+    let (status, _, body) = put_policy(
+        &cluster,
+        "b",
+        &admin,
+        &seed,
+        &described_policy_document("held"),
+    )
+    .await;
+    assert_eq!(
+        status, 409,
+        "the successor must refuse while a prepared member is live: {body}"
+    );
+    assert_eq!(body["reason"], "capability_not_advertised", "{body}");
+    assert!(
+        !body.to_string().contains(&prepared_instance),
+        "a refusal names no member: {body}"
+    );
+    assert_eq!(
+        AuthorityState::read(&cluster).await,
+        start,
+        "a refused write commits nothing"
+    );
+    matrix.push(json!({
+        "operation": pair.operation,
+        "writer": "successor",
+        "live_members": ["prepared", "successor"],
+        "status": status,
+        "reason": body["reason"],
+        "outcome": "refused",
+    }));
+    let deadline = Instant::now() + AUTHORITY_BUDGET;
+    let refusal = loop {
+        let found = cluster
+            .replica("b")
+            .audit_events()
+            .into_iter()
+            .find(|event| event["event_type"] == "cluster.operation_refused");
+        if let Some(event) = found {
+            break event;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the successor should audit the refusal as cluster.operation_refused"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    };
+    let payload = &refusal["payload"];
+    assert_eq!(payload["operation"], pair.operation.as_str(), "{refusal}");
+    assert_eq!(payload["capability"], pair.capability.as_str(), "{refusal}");
+    assert_eq!(payload["reason"], "capability_not_advertised", "{refusal}");
+    assert_eq!(payload["lacking_members"], 1, "{refusal}");
+    assert_eq!(payload["live_members"], 2, "{refusal}");
+    assert!(
+        !refusal.to_string().contains(&prepared_instance),
+        "the audit event names no member: {refusal}"
+    );
+    assert_ready_across(
+        &cluster,
+        Duration::from_secs(3),
+        "after the successor refused the operation",
+    )
+    .await;
+
+    // 2. The prepared release cannot write the document at all.
+    let (status, _, body) = put_policy(
+        &cluster,
+        "a",
+        &admin,
+        &seed,
+        &described_policy_document("prepared"),
+    )
+    .await;
+    assert_eq!(
+        status, 400,
+        "the prepared release refuses a field it was not built with: {body}"
+    );
+    assert_eq!(AuthorityState::read(&cluster).await, start);
+    matrix.push(json!({
+        "operation": pair.operation,
+        "writer": "prepared",
+        "live_members": ["prepared", "successor"],
+        "status": status,
+        "outcome": "rejected_by_the_prepared_parser",
+    }));
+
+    // 3. A draining prepared member still holds it.
+    cluster.stop("a");
+    let draining = cluster
+        .database
+        .count(&format!(
+            "SELECT count(*)::bigint FROM greengateway.cluster_members \
+             WHERE instance_id = '{prepared_instance}'::uuid AND draining_at IS NOT NULL"
+        ))
+        .await;
+    assert_eq!(
+        draining, 1,
+        "the stopped prepared member stamped itself draining"
+    );
+    let (status, _, body) = put_policy(
+        &cluster,
+        "b",
+        &admin,
+        &seed,
+        &described_policy_document("draining"),
+    )
+    .await;
+    assert_eq!(
+        status, 409,
+        "a draining prepared member still answers what was routed to it, so it still holds \
+         the operation: {body}"
+    );
+    assert_eq!(AuthorityState::read(&cluster).await, start);
+    matrix.push(json!({
+        "operation": pair.operation,
+        "writer": "successor",
+        "live_members": ["prepared (draining)", "successor"],
+        "status": status,
+        "reason": body["reason"],
+        "outcome": "refused",
+    }));
+
+    // 4. Its row goes stale; the same write is admitted.
+    let deadline = Instant::now() + Duration::from_millis(PAIR_GATE_STALE_WINDOW_MS * 4);
+    while heartbeating_members(&cluster, PAIR_GATE_STALE_WINDOW_MS).await != 1 {
+        assert!(
+            Instant::now() < deadline,
+            "the prepared member's row never aged out of the stale window"
+        );
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+    let (status, described_etag, body) = put_policy(
+        &cluster,
+        "b",
+        &admin,
+        &seed,
+        &described_policy_document("admitted"),
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "with only the successor live, the operation is admitted: {body}"
+    );
+    let described_etag = described_etag.expect("a committed write returns its ETag");
+    let admitted = AuthorityState::read(&cluster).await;
+    assert_eq!(admitted.versions, start.versions + 1);
+    assert_eq!(admitted.last_revision, start.last_revision + 1);
+    let (_, document) = served_policy(&cluster, "b", &admin).await;
+    assert_eq!(
+        document["roles"][ADMIN_ROLE]["description"], ROLE_DESCRIPTION,
+        "the successor serves the description it wrote: {document}"
+    );
+    matrix.push(json!({
+        "operation": pair.operation,
+        "writer": "successor",
+        "live_members": ["successor"],
+        "status": status,
+        "outcome": "admitted",
+    }));
+
+    // 5. Rolling back after the operation fails closed.
+    cluster.replica_mut("a").relaunch_with(&prepared);
+    assert!(
+        cluster
+            .replica_mut("a")
+            .wait_until_exited(LISTEN_BUDGET)
+            .await,
+        "the prepared binary must not start against a document it cannot parse"
+    );
+    let output = cluster.replica("a").output_since_launch();
+    assert!(
+        output.contains("policy control plane could not be read at startup"),
+        "the prepared binary should say why it refused to start:\n{output}"
+    );
+    assert_eq!(
+        heartbeating_members(&cluster, PAIR_GATE_STALE_WINDOW_MS).await,
+        1,
+        "the refused boot joined nothing"
+    );
+    assert_eq!(
+        AuthorityState::read(&cluster).await,
+        admitted,
+        "nothing rewinds the authority to fit the older binary"
+    );
+    wait_until_ready(cluster.replica("b"), AUTHORITY_BUDGET).await;
+    readiness_log.push(json!({
+        "step": "prepared binary started after the operation",
+        "replicas": [
+            { "replica": "a", "binary": "prepared", "outcome": "refused to start" },
+            { "replica": "b", "binary": "successor", "status": 200 },
+        ],
+    }));
+
+    // 6. Recover forward; the gate closes again behind the returning member.
+    let (status, forward_etag, body) = put_policy(
+        &cluster,
+        "b",
+        &admin,
+        &described_etag,
+        &policy_document(Some("rolled-forward")),
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "a document without the field needs no gate: {body}"
+    );
+    let forward_etag = forward_etag.expect("a committed write returns its ETag");
+    cluster.replace_binary("a", &prepared).await;
+    wait_until_ready(cluster.replica("a"), JOIN_BUDGET).await;
+    let (served_etag, _) = served_policy(&cluster, "a", &admin).await;
+    assert_eq!(
+        served_etag, forward_etag,
+        "the prepared member serves the rolled-forward document"
+    );
+    readiness_log.push(readiness(&cluster, &pair, "recovered forward", &["a", "b"]).await);
+    let recovered = AuthorityState::read(&cluster).await;
+    let (status, _, body) = put_policy(
+        &cluster,
+        "b",
+        &admin,
+        &forward_etag,
+        &described_policy_document("again"),
+    )
+    .await;
+    assert_eq!(
+        status, 409,
+        "admission is never sticky: the returning prepared member holds the operation again: \
+         {body}"
+    );
+    assert_eq!(AuthorityState::read(&cluster).await, recovered);
+    matrix.push(json!({
+        "operation": pair.operation,
+        "writer": "successor",
+        "live_members": ["prepared", "successor"],
+        "status": status,
+        "reason": body["reason"],
+        "outcome": "refused",
+    }));
+
+    pair.write_evidence(
+        "the_successors_new_operation_waits_for_every_prepared_member_to_leave",
+        json!({
+            "operation_matrix": matrix,
+            "authority": {
+                "start": start.evidence(),
+                "admitted": admitted.evidence(),
+                "recovered": recovered.evidence(),
+            },
+            "readiness": readiness_log,
+        }),
+    );
+    cluster.shutdown();
+}
+
+// =====================================================================
+// The release-tag tripwire
+// =====================================================================
+
+/// **What the pinned pair stands in for, and the tripwire that ends it.**
+///
+/// The parent contract's mixed-version half asks for "the previous release
+/// tag's binary and the current one". No release tag ships cluster mode, so
+/// the pinned pair above is two builds of pinned commits instead, and
+/// everything a version range cannot catch — an old parser meeting a field
+/// it cannot read, a behaviour change inside one document version — is
+/// caught there by running both binaries' code. The single-binary rows
+/// above still substitute a newer binary's *effects* (a ledger row, a
+/// document written straight to the authority, a changed setting), and say
+/// so where they do.
+///
+/// This tripwire makes the tag substitution expire. A documented
+/// substitution is only honest while its reason holds. This reads the
+/// newest `v*` tag on a different commit's `gateway/Cargo.toml` and fails if
+/// it declares the `postgres` feature — because at that moment a previous
+/// *release* can join a cluster, and a rollout upgrades from it, so it is
+/// the binary the pinned pair's prepared side must be.
 /// Tags on HEAD name the current candidate, not a previous binary. This
 /// distinction lets the first cluster-capable release pass its own tag CI;
 /// subsequent commits still trip the guard until mixed-binary coverage exists.
@@ -1893,10 +2796,10 @@ async fn the_newest_release_tag_still_predates_cluster_mode() {
     assert!(
         !ships_cluster_mode,
         "release {newest} declares the PostgreSQL dependency, so a previous release's binary \
-         can now be built and can now join a cluster. The documented substitution in \
-         mixed_binary_replicas_need_a_release_that_ships_cluster_mode has expired: build \
-         {newest} into a second binary, run it beside the current one against one database, \
-         and assert the mixed-version claims for real."
+         can now join a cluster, and a rollout upgrades from it. The pinned pair in \
+         gateway/tests/ha/rolling-upgrade-pair.json stands in for released binaries only while \
+         none can: pin {newest}'s commit as the prepared side (or show it is not an adjacent \
+         pair with the successor) and run the pair rows against it."
     );
 }
 

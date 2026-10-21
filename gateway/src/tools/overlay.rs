@@ -732,6 +732,16 @@ pub fn validate(document: &Value) -> Result<OverlayDocument, OverlayError> {
             ),
         ));
     }
+    // The overlay schema compares numbers exactly, at a cost that grows with
+    // the square of their digits, so the document spends the same budget as a
+    // tool call's arguments before the schema sees it. Preview needs only
+    // `admin:tools:read`, and both preview and PUT validate on a runtime worker.
+    if numbers_exceed_exact_comparison_budget(document) {
+        return Err(OverlayError::one(
+            "/",
+            format!("overlay {}", exact_comparison_budget_problem()),
+        ));
+    }
 
     let schema_problems = OVERLAY_SCHEMA_VALIDATOR
         .iter_errors(document)

@@ -37,13 +37,27 @@ fn every_capability_name_is_bounded_shaped_and_in_canonical_order() {
 #[test]
 fn this_binary_advertises_a_bounded_canonical_set_it_recognizes() {
     let rendered = advertisement(BINARY_CAPABILITIES).expect("the shipped set fits the column");
-    assert_eq!(rendered, "operation_requirements");
+    assert_eq!(rendered, "operation_requirements,policy_role_descriptions");
     let recognized = RecognizedCapabilities::parse(&rendered);
     assert_eq!(recognized.unrecognized(), 0);
     for capability in BINARY_CAPABILITIES {
         assert!(recognized.contains(*capability));
     }
-    assert_eq!(recognized.names(), vec!["operation_requirements"]);
+    assert_eq!(
+        recognized.names(),
+        vec!["operation_requirements", "policy_role_descriptions"]
+    );
+}
+
+/// What a schema-18 gateway built before role descriptions advertises
+/// (the prepared release of issue #426's pair) is still understood, and
+/// grants this build exactly the protocol and nothing newer.
+#[test]
+fn a_prepared_members_advertisement_lacks_the_successors_capability() {
+    let prepared = RecognizedCapabilities::parse("operation_requirements");
+    assert!(prepared.contains(Capability::OperationRequirements));
+    assert!(!prepared.contains(Capability::PolicyRoleDescriptions));
+    assert_eq!(prepared.unrecognized(), 0);
 }
 
 #[test]
@@ -207,11 +221,23 @@ mod gate_tests {
     }
 
     #[test]
-    fn the_shipped_registry_is_empty_and_its_checks_reject_malformed_entries() {
-        assert!(
-            OPERATION_REQUIREMENTS.is_empty(),
+    fn the_shipped_registry_is_pinned_and_its_checks_reject_malformed_entries() {
+        assert_eq!(
+            OPERATION_REQUIREMENTS,
+            &[POLICY_ROLE_DESCRIPTIONS],
             "registering an operation is a protocol change: review its requirement, its new \
              capability and the docs in ha-state-model.md section 7 before updating this test"
+        );
+        assert_eq!(
+            POLICY_ROLE_DESCRIPTIONS,
+            OperationRequirement {
+                operation: "policy.role_descriptions",
+                minimum_schema: 17,
+                document_format: Some(0),
+                capability: Capability::PolicyRoleDescriptions,
+                backfill: Backfill::NotRequired,
+                activation: Activation::LiveMembers,
+            }
         );
         assert!(registry_problems(OPERATION_REQUIREMENTS, &BinaryContract::shipped()).is_empty());
 
@@ -251,6 +277,37 @@ mod gate_tests {
             ..contract()
         };
         assert_eq!(registry_problems(&[good], &bare).len(), 1);
+    }
+
+    /// The registered operation against the prepared release's
+    /// advertisement: refused while a prepared member is live, admitted
+    /// once only members of this build remain.
+    #[test]
+    fn role_descriptions_wait_for_a_prepared_member_to_leave() {
+        let prepared = member(PEER, true, "operation_requirements");
+        let successor = member(OWN, true, "operation_requirements,policy_role_descriptions");
+        assert_eq!(
+            evaluate(
+                &POLICY_ROLE_DESCRIPTIONS,
+                &BinaryContract::shipped(),
+                OWN,
+                &[successor.clone(), prepared]
+            ),
+            Err(OperationRefusal::MembersLackRequirement {
+                lacking: vec![PEER],
+                live: 2
+            })
+        );
+        let departed = member(PEER, false, "operation_requirements");
+        assert_eq!(
+            evaluate(
+                &POLICY_ROLE_DESCRIPTIONS,
+                &BinaryContract::shipped(),
+                OWN,
+                &[successor, departed]
+            ),
+            Ok(OperationAdmission { live_members: 1 })
+        );
     }
 
     #[test]

@@ -47,13 +47,24 @@ export function CallerAssertionSummary({
             connection, or a plain HTTP endpoint.
           </p>
         )}
-        <p>
-          The admin UI shows this block read only, and saving the connection
-          here keeps it unchanged. To stop attesting callers, remove the block
-          through the admin API by sending{' '}
-          <code>&quot;caller_assertion&quot;: null</code>, which needs the
-          secrets-write permission.
-        </p>
+        {subjectTokenOnly ? (
+          <p>
+            The admin UI shows this block read only. It cannot be removed
+            while this connection authenticates with a delegated issuer token:
+            the gateway signs the subject token with it, and refuses a change
+            that removes it. To stop this connection, disable the connection
+            through the admin API. After an incident, also revoke the grants at
+            the issuer and rotate the client secret before enabling it again.
+          </p>
+        ) : (
+          <p>
+            The admin UI shows this block read only, and saving the connection
+            here keeps it unchanged. To stop attesting callers, remove the
+            block through the admin API by sending{' '}
+            <code>&quot;caller_assertion&quot;: null</code>, which needs the
+            secrets-write permission.
+          </p>
+        )}
         {assertion.bind_approval ? (
           <p>
             This block asks for approval binding, which the gateway no longer

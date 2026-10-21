@@ -2711,6 +2711,8 @@ fn input_schema_precheck_problem(
 /// compiles, at a cost that grows with the square of their digits, so every
 /// compile of a schema that did not ship with the gateway checks
 /// [`numbers_exceed_exact_comparison_budget`] first and reports this instead.
+/// An overlay document is checked the same way before the shipped overlay
+/// schema compares its numbers.
 pub(crate) fn exact_comparison_budget_problem() -> String {
     format!(
         "contains numbers that would cost more to compare exactly than one {MAX_EXACT_NUMBER_DIGITS}-digit number"

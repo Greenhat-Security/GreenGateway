@@ -96,9 +96,12 @@ earlier).
 
 A local-limiter denial spends no round trip. A decision that creates a new
 bucket and pushes the live count past `RATE_LIMIT_MAX_BUCKETS` adds one bounded
-eviction: one more checkout and statement (`rate_limit_evict`, three more round
-trips), taken while the decision's own connection is still held, so that
-request briefly holds two connections.
+eviction: one more statement (`rate_limit_evict`, two more round trips) on the
+decision's own connection, with no checkout of its own. No request holds two
+connections, so new keys arriving at the bound together cannot each hold one
+connection while waiting for another. The decision commits with its own
+statement; an eviction that fails after it is logged and does not refuse the
+request, and the next key past the bound evicts the excess.
 
 ### Credentials
 
@@ -253,7 +256,7 @@ that was dropped before it started waiting has no wait to record.
 | --- | --- |
 | `revision_check` | The security-revision counter read: the gates, the service-token validator and the background poller |
 | `credential_check` | Service-token verification and the JWT revocation lookup |
-| `rate_limit` | Shared rate-limit decisions and their bounded evictions |
+| `rate_limit` | Shared rate-limit decisions (a decision's bounded eviction runs on its connection) |
 | `execution_lease` | Tool and singleton lease acquire, renew and release |
 | `security_state_read` | Activation revisions and active documents for reconciliation, and admin reads of policy, history and tokens |
 | `control_plane_write` | Policy commits, service-token create, revoke and rotate, JWT revocations |

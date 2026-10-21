@@ -1076,8 +1076,9 @@ pub(crate) enum CheckoutClass {
     RevisionCheck,
     /// Service-token verification and the JWT revocation lookup.
     CredentialCheck,
-    /// A shared rate-limit decision, and the bounded eviction a new key
-    /// past the bucket bound triggers.
+    /// A shared rate-limit decision. The bounded eviction a new key past
+    /// the bucket bound triggers runs on the decision's connection and
+    /// takes no checkout of its own.
     RateLimit,
     /// Execution-lease acquire, renew, release and fence checks: tool
     /// invocations, and the singleton leader terms that share the store.
