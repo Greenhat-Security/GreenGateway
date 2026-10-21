@@ -103,6 +103,13 @@
               "client_certificate"
             ]
           }
+        },
+        "description": {
+          "type": "string",
+          "description": "What the role is for, for the people who maintain the policy. It grants and restricts nothing. At most 512 UTF-8 bytes, not blank, and no control characters; JSON Schema counts characters, so maxLength enforces only the looser character bound. A gateway that predates this field refuses a document that sets it, so in cluster mode the gateway commits such a document only while every live replica advertises the policy_role_descriptions capability.",
+          "minLength": 1,
+          "maxLength": 512,
+          "pattern": "^[^\u0000-\u001f\u007f-\u009f]*$"
         }
       }
     },

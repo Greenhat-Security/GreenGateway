@@ -1,7 +1,7 @@
-//! Pure policy foundation for issue #421, used by the live HTTP/RBAC adapter
-//! and the live tool-lane adapters. The remaining rate and egress cutovers,
-//! and the analysis consumers and legacy retirement (#422 PR 4), are tracked
-//! in #422.
+//! Pure policy foundation for issue #421, used by the live HTTP/RBAC adapter,
+//! the live tool-lane adapters and the live rate-lane selector. The static
+//! egress cutover, and the analysis consumers and legacy retirement (#422 PR
+//! 4), are tracked in #422.
 //!
 //! PR 1 supported contextless HTTP direct rules, ordinary permission routes and
 //! defaults. The routing lane added host-qualified routes and dispatch-scoped
@@ -55,12 +55,13 @@
 //! and their capacity stay where they are, and `mutable_capacity` stays listed as
 //! not evaluated.
 //!
-//! Alias identities do not participate: the live selector matches the request
-//! path only, so consulting a canonical identity here would invent a second
-//! behaviour rather than mirror the existing one. An anonymous caller reaches no
-//! override at all, because `policy_rate_limit_request` returns before consulting
-//! the selector when a request carries no principal -- that is the live bypass
-//! reproduced, and changing it is a cutover decision taken in both paths at once.
+//! Alias identities do not participate: the pre-cutover selector matched the
+//! request path only, so consulting a canonical identity here would invent a
+//! second behaviour rather than mirror the existing one. An anonymous caller
+//! reaches no override at all, because `policy_rate_limit_request` returns
+//! before selecting when a request carries no principal -- that is the live
+//! bypass reproduced. The cutover kept it, in both places at once: the adapter
+//! still returns early, and the kernel still answers `NoOverride`.
 //!
 //! ## Facts, not guesses
 //!
@@ -95,7 +96,8 @@ use crate::{
     rbac::{
         matcher::{method_matches, path_pattern_matches, RuleDecision, RuleDispatchContext},
         policy::{RouteRule, KNOWN_TOP_LEVEL_KEYS},
-        DefaultAction, EnforcementMode, Policy, PolicyEngine, RuleAction, RuleMatcher,
+        DefaultAction, EnforcementMode, Policy, PolicyEngine, RateLimitRule, RuleAction,
+        RuleMatcher,
     },
     request_bounds::{
         MAX_DISPATCH_FACT_BYTES, MAX_REQUEST_HOST_BYTES, MAX_REQUEST_METHOD_BYTES,
@@ -303,6 +305,17 @@ impl CompiledPolicy {
         self.snapshot
     }
 
+    /// The rate-limit overrides [`Self::select_rate_lane`] indexes, in source
+    /// order.
+    ///
+    /// The live rate stage builds its token buckets from this exact vector,
+    /// rather than from another copy of the policy, so a selected index can
+    /// only name the bucket built for that override. The policy data is
+    /// handed out; capacity is not, and stays with the limiter.
+    pub(crate) fn rate_limit_rules(&self) -> &[RateLimitRule] {
+        &self.engine.policy().rate_limits
+    }
+
     /// First deciding direct rule, over one path identity or an alias pair.
     ///
     /// The two cases use **different precedence orders**, and neither is a
@@ -365,24 +378,20 @@ impl CompiledPolicy {
     /// exactly where they are. An allow here is not a statement that a request
     /// will be admitted.
     ///
-    /// Alias identities do not apply: the live selector matches the request path
-    /// only, so reading a canonical identity here would invent a second
-    /// behaviour rather than mirror one.
+    /// Alias identities do not apply: the pre-cutover selector matched the
+    /// request path only, so reading a canonical identity here would invent a
+    /// second behaviour rather than mirror one. Routing and host facts are not
+    /// read either; the live rate adapter supplies them as missing, so a later
+    /// change that started reading them would answer incomplete there rather
+    /// than mistake an uncaptured fact for an absent one.
     ///
     /// An anonymous caller reaches no override at all. That is the live bypass,
-    /// not a simplification: `policy_rate_limit_request` returns before consulting
-    /// the selector when a request carries no `Principal`, so it only ever selects
-    /// for an authenticated one. Passing `None` to the matcher here instead would
-    /// let an unconstrained override match, and simulation and replay would report
-    /// a lane governing traffic that live never rate-limits. Changing that is a
-    /// deliberate decision for the cutover, in both paths at once.
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "rate selection cutover is a separate slice of issue #422"
-        )
-    )]
+    /// not a simplification: `policy_rate_limit_request` returns before selecting
+    /// when a request carries no `Principal`, so it only ever selects for an
+    /// authenticated one. Passing `None` to the matcher here instead would let an
+    /// unconstrained override match, and simulation and replay would report a
+    /// lane governing traffic that live never rate-limits. The cutover kept the
+    /// bypass in both places, so the two cannot drift apart.
     pub(crate) fn select_rate_lane(
         &self,
         context: &PolicyEvaluationContext,
@@ -772,15 +781,12 @@ pub(crate) enum HttpTarget {
 /// Collapsing the two would let an uncaptured host be answered as though the
 /// request had none, which for a host-qualified route is the difference between
 /// no match and an unanswerable question.
+///
+/// The HTTP adapter always captures the host, so it never supplies `Missing`.
+/// The rate adapter does, because rate selection does not read the host: it
+/// states that the fact was not captured rather than claim the request had none.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum HostFact {
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "live admission always supplies this fact; analysis may not"
-        )
-    )]
     Missing,
     Absent,
     Present(String),
@@ -1365,13 +1371,6 @@ fn framed_digest(kind: &str, media_type: &str, version: &str, payload: &[u8]) ->
 /// the value would say so. Validating the context before producing the value
 /// protects the production of it, not its later use.
 #[derive(Clone, Copy, Debug, PartialEq, Serialize)]
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "rate selection cutover is a separate slice of issue #422"
-    )
-)]
 pub(crate) struct RateLaneSelection {
     binding: InputBinding,
     outcome: RateLaneOutcome,
@@ -1379,13 +1378,6 @@ pub(crate) struct RateLaneSelection {
 
 #[derive(Clone, Copy, Debug, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "rate selection cutover is a separate slice of issue #422"
-    )
-)]
 pub(crate) enum RateLaneOutcome {
     /// No configured override governs this request: either none matched, or the
     /// caller is anonymous and the live path never consults an override for one.
@@ -1403,31 +1395,26 @@ pub(crate) enum RateLaneOutcome {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Serialize)]
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "rate selection cutover is a separate slice of issue #422"
-    )
-)]
 pub(crate) struct RateLimit {
     requests_per_second: f64,
     burst: u32,
 }
 
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "rate selection cutover is a separate slice of issue #422"
-    )
-)]
 impl RateLaneSelection {
+    /// The selection's answer. The live rate adapter matches on this, and on
+    /// nothing narrower, so a variant added here is a decision it must make.
     pub(crate) fn outcome(&self) -> RateLaneOutcome {
         self.outcome
     }
 
     /// The override index, for a selection that found one.
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "offline analysis reads a selection this way; the live rate adapter matches on its outcome"
+        )
+    )]
     pub(crate) fn matched(&self) -> Option<usize> {
         match self.outcome {
             RateLaneOutcome::Override { index, .. } => Some(index),
@@ -1435,6 +1422,13 @@ impl RateLaneSelection {
         }
     }
 
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "offline analysis reads a selection this way; the live rate adapter matches on its outcome"
+        )
+    )]
     pub(crate) fn limit(&self) -> Option<RateLimit> {
         match self.outcome {
             RateLaneOutcome::Override { limit, .. } => Some(limit),
@@ -1442,6 +1436,13 @@ impl RateLaneSelection {
         }
     }
 
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "offline analysis reads a selection this way; the live rate adapter matches on its outcome"
+        )
+    )]
     pub(crate) fn limitation(&self) -> Option<Limitation> {
         match self.outcome {
             RateLaneOutcome::Indeterminate(limitation) => Some(limitation),
@@ -1454,6 +1455,13 @@ impl RateLaneSelection {
     /// An indeterminate selection is never reusable: it is the absence of an
     /// answer, and reusing it would hand a caller a stale "no lane" where the
     /// facts may since have arrived.
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "trace reuse remains outside the live rate adapter, which selects afresh for every request"
+        )
+    )]
     pub(crate) fn reusable_for(&self, context: &PolicyEvaluationContext) -> bool {
         !matches!(self.outcome, RateLaneOutcome::Indeterminate(_))
             && context.validate(self.binding.snapshot).is_ok()
@@ -1463,13 +1471,6 @@ impl RateLaneSelection {
     }
 }
 
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "rate selection cutover is a separate slice of issue #422"
-    )
-)]
 impl RateLimit {
     pub(crate) fn requests_per_second(&self) -> f64 {
         self.requests_per_second

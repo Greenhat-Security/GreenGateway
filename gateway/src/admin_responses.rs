@@ -93,6 +93,10 @@ pub(super) fn policy_history_not_configured() -> Response {
         .into_response()
 }
 
+/// The stable `reason` of [`policy_evidence_unavailable`], which a bound
+/// shadow-rule promotion also records when it is refused for that cause.
+pub(super) const POLICY_EVIDENCE_UNAVAILABLE_REASON: &str = "audit_evidence_unavailable";
+
 /// A policy evidence endpoint (rule preview, hit counts, shadow review) has
 /// no audit store to read.
 ///
@@ -105,7 +109,7 @@ pub(super) fn policy_evidence_unavailable(error: &str) -> Response {
         StatusCode::SERVICE_UNAVAILABLE,
         Json(json!({
             "error": error,
-            "reason": "audit_evidence_unavailable",
+            "reason": POLICY_EVIDENCE_UNAVAILABLE_REASON,
         })),
     )
         .into_response()
@@ -541,6 +545,31 @@ pub(super) fn egress_reload_unsupported() -> Response {
     conflict(
         "egress allowlist changes cannot be applied via the policy API; edit POLICY_FILE and restart the gateway to change egress rules",
     )
+}
+
+/// A write the cluster's operation gate refused (issue #426). Nothing was
+/// written. A live member that does not advertise what the write needs is a
+/// conflict with the deployment's current membership -- finish the rollout,
+/// or wait for departed members to go stale -- so it is a `409`; every other
+/// refusal means the gate could not decide, so it is a `503`. The body
+/// carries the refusal's stable reason and its member counts, never a
+/// member identifier.
+#[cfg(feature = "postgres")]
+pub(super) fn operation_refused(refusal: &storage::compatibility::OperationRefusal) -> Response {
+    let status = match refusal {
+        storage::compatibility::OperationRefusal::MembersLackRequirement { .. } => {
+            StatusCode::CONFLICT
+        }
+        _ => StatusCode::SERVICE_UNAVAILABLE,
+    };
+    (
+        status,
+        Json(json!({
+            "error": refusal.to_string(),
+            "reason": refusal.reason(),
+        })),
+    )
+        .into_response()
 }
 
 pub(super) fn service_unavailable(error: &str) -> Response {

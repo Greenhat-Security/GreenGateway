@@ -1045,7 +1045,7 @@ async fn execute_oauth_batch(
         let destination = destination.clone();
         async move {
             let credential = runtime
-                .resolve_credential(&target)
+                .resolve_credential(&target, None)
                 .await
                 .expect("OAuth credential should resolve")
                 .expect("OAuth target should have a credential");

@@ -35,6 +35,8 @@ pub(crate) const KNOWN_TOP_LEVEL_KEYS: &[&str] = &[
     "tools",
 ];
 const MAX_POLICY_FILE_BYTES: u64 = 1_048_576;
+/// The longest role description, in bytes.
+pub(crate) const MAX_ROLE_DESCRIPTION_BYTES: usize = 512;
 #[allow(dead_code)]
 const TEMP_FILE_CREATE_ATTEMPTS: u8 = 16;
 
@@ -119,6 +121,12 @@ pub struct RoleEntry {
     /// Authentication methods allowed to activate this role's permissions.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub auth_methods: Vec<String>,
+    /// What the role is for, for the people who maintain the policy. It
+    /// grants and restricts nothing. A gateway that predates it refuses a
+    /// document that sets it, so in cluster mode writing one is a gated
+    /// operation (`storage::compatibility`, issue #426).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
 }
 
 impl RoleEntry {
@@ -272,6 +280,15 @@ impl Policy {
 
     pub fn validate_json_value(value: Value) -> Result<Self, PolicyError> {
         Self::from_json_value(value, None)
+    }
+
+    /// Whether any role carries a `description`, which a gateway that
+    /// predates the field cannot parse. Cluster-mode writers ask the
+    /// operation gate before committing such a document, so a build without
+    /// cluster mode has no caller outside the tests.
+    #[cfg(any(test, feature = "postgres"))]
+    pub(crate) fn uses_role_descriptions(&self) -> bool {
+        self.roles.values().any(|role| role.description.is_some())
     }
 
     #[allow(dead_code)]
@@ -607,8 +624,34 @@ fn validate_roles(roles: &HashMap<String, RoleEntry>) -> Result<(), PolicyError>
             &entry.auth_methods,
             &format!("roles.{role_name}"),
         )?;
+        if let Some(description) = entry.description.as_deref() {
+            validate_role_description(description, role_name)?;
+        }
     }
 
+    Ok(())
+}
+
+/// A role description is free text shown to policy maintainers, so it is
+/// bounded and printable: no control characters that could forge a log
+/// line or a terminal sequence, and no empty or blank value (omit the field
+/// instead).
+fn validate_role_description(description: &str, role_name: &str) -> Result<(), PolicyError> {
+    if description.trim().is_empty() {
+        return Err(PolicyError::Invalid(format!(
+            "roles.{role_name}.description must not be empty; omit it instead"
+        )));
+    }
+    if description.len() > MAX_ROLE_DESCRIPTION_BYTES {
+        return Err(PolicyError::Invalid(format!(
+            "roles.{role_name}.description must not exceed {MAX_ROLE_DESCRIPTION_BYTES} bytes"
+        )));
+    }
+    if description.chars().any(char::is_control) {
+        return Err(PolicyError::Invalid(format!(
+            "roles.{role_name}.description must not contain control characters"
+        )));
+    }
     Ok(())
 }
 
@@ -2865,6 +2908,113 @@ mod tests {
         );
     }
 
+    #[test]
+    fn a_role_description_round_trips_and_grants_nothing() {
+        let described = Policy::validate_json_value(json!({
+            "schema_version": "0.1.0",
+            "roles": {
+                "reader": {
+                    "permissions": ["data:read"],
+                    "description": "Read-only access for the reporting team"
+                }
+            }
+        }))
+        .expect("a described role is valid");
+        assert!(described.uses_role_descriptions());
+        assert_eq!(
+            described.roles["reader"].description.as_deref(),
+            Some("Read-only access for the reporting team")
+        );
+        let serialized = serde_json::to_value(&described).expect("serialize");
+        assert_eq!(
+            serialized["roles"]["reader"]["description"],
+            "Read-only access for the reporting team"
+        );
+
+        // The same role without one is the document an older gateway wrote,
+        // and it serializes exactly as that gateway does: no `description`
+        // key at all, so both builds compute the same ETag for it.
+        let plain = Policy::validate_json_value(json!({
+            "schema_version": "0.1.0",
+            "roles": { "reader": { "permissions": ["data:read"] } }
+        }))
+        .expect("a plain role is valid");
+        assert!(!plain.uses_role_descriptions());
+        let serialized = serde_json::to_value(&plain).expect("serialize");
+        assert_eq!(
+            serialized["roles"]["reader"],
+            json!({ "permissions": ["data:read"] })
+        );
+        let mut without = described.clone();
+        without
+            .roles
+            .get_mut("reader")
+            .expect("the role is present")
+            .description = None;
+        assert_eq!(without, plain, "a description changes nothing else");
+    }
+
+    #[test]
+    fn role_descriptions_are_bounded_printable_and_never_blank() {
+        let with_description = |description: Value| {
+            Policy::validate_json_value(json!({
+                "schema_version": "0.1.0",
+                "roles": {
+                    "reader": { "permissions": ["data:read"], "description": description }
+                }
+            }))
+        };
+        assert!(with_description(json!("x".repeat(MAX_ROLE_DESCRIPTION_BYTES))).is_ok());
+        // Counted in bytes, not characters.
+        let multibyte = "\u{e9}".repeat(MAX_ROLE_DESCRIPTION_BYTES / 2 + 1);
+        for (description, expected) in [
+            (json!(""), "must not be empty"),
+            (json!("   "), "must not be empty"),
+            (
+                json!("x".repeat(MAX_ROLE_DESCRIPTION_BYTES + 1)),
+                "must not exceed 512 bytes",
+            ),
+            (json!(multibyte), "must not exceed 512 bytes"),
+            (json!("first line\nsecond line"), "control characters"),
+            (json!("escape \u{1b}[31m"), "control characters"),
+            (json!("next line \u{85}"), "control characters"),
+        ] {
+            let error = with_description(description.clone())
+                .expect_err("an invalid description is refused");
+            assert!(
+                error.to_string().contains(expected),
+                "{description} should be refused with {expected:?}: {error}"
+            );
+            assert!(
+                error.to_string().contains("roles.reader.description"),
+                "{error}"
+            );
+        }
+        let error = with_description(json!(7)).expect_err("a description is a string");
+        assert!(matches!(error, PolicyError::Parse { .. }), "{error}");
+    }
+
+    #[test]
+    fn published_schema_accepts_a_bounded_role_description() {
+        let validator = policy_schema_validator();
+        let described = |description: &str| {
+            json!({
+                "schema_version": "0.1.0",
+                "roles": {
+                    "reader": { "permissions": ["data:read"], "description": description }
+                }
+            })
+        };
+        assert_schema_accepts(&validator, &described("Read-only reporting access"));
+        for invalid in ["", "line\nbreak"] {
+            assert!(
+                !validator.is_valid(&described(invalid)),
+                "published schema should reject the description {invalid:?}"
+            );
+        }
+        assert!(!validator.is_valid(&described(&"x".repeat(MAX_ROLE_DESCRIPTION_BYTES + 1))));
+    }
+
     fn policy_schema_validator() -> Validator {
         let repo_root = repo_root();
         let schema_path = repo_root.join("docs/schemas/policy.v0.schema.json");
@@ -2903,6 +3053,7 @@ mod tests {
                         permissions: vec!["*".to_owned()],
                         issuers: Vec::new(),
                         auth_methods: Vec::new(),
+                        description: None,
                     },
                 ),
                 (
@@ -2911,6 +3062,7 @@ mod tests {
                         permissions: vec!["data:read".to_owned(), "reports:read".to_owned()],
                         issuers: Vec::new(),
                         auth_methods: Vec::new(),
+                        description: None,
                     },
                 ),
             ]),

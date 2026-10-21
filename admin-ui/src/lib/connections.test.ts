@@ -253,6 +253,69 @@ describe('connections API client', () => {
     }
   });
 
+  it('projects a delegated issuer token without its secret alias, and refuses a malformed one', async () => {
+    const canary = 'UNEXPECTED_DELEGATED_TOKEN_SECRET_CANARY';
+    const stored = {
+      type: 'delegated_issuer_token',
+      token_exchange_url: 'https://issuer.example.test/oauth2/token-exchange',
+      client_id: 'greengateway',
+      requested_scopes: ['mail.read'],
+      audience: 'https://mail.example.test',
+      subject_token_source: 'caller_assertion',
+      client_secret_configured: true,
+    };
+    const detail = connectionDetail();
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(() =>
+        Promise.resolve(
+          jsonResponse(200, {
+            ...detail,
+            authentication: 'delegated_issuer_token',
+            configuration: {
+              ...detail.configuration,
+              authentication: {
+                ...stored,
+                client_secret_id: canary,
+                access_token: canary,
+              },
+            },
+          }),
+        ),
+      ),
+    );
+
+    const { value } = await getConnection('connection/one');
+    expect(value.authentication).toBe('delegated_issuer_token');
+    expect(value.configuration?.authentication).toEqual(stored);
+    expect(JSON.stringify(value)).not.toContain(canary);
+
+    for (const malformed of [
+      { ...stored, token_exchange_url: 'http://issuer.example.test/token' },
+      { ...stored, subject_token_source: 'caller_bearer' },
+      { ...stored, requested_scopes: 'mail.read' },
+      { ...stored, client_secret_configured: 'yes' },
+    ]) {
+      vi.stubGlobal(
+        'fetch',
+        vi.fn(() =>
+          Promise.resolve(
+            jsonResponse(200, {
+              ...detail,
+              configuration: {
+                ...detail.configuration,
+                authentication: malformed,
+              },
+            }),
+          ),
+        ),
+      );
+      await expect(getConnection('connection/one')).rejects.toMatchObject({
+        name: ConnectionContractError.name,
+      });
+    }
+  });
+
   it('projects a caller assertion exactly as stored and drops anything else', async () => {
     const canary = 'UNEXPECTED_CALLER_ASSERTION_SECRET_CANARY';
     const withClaims = callerAssertion();
@@ -489,9 +552,9 @@ describe('connections API client', () => {
   });
 
   it('accepts a test refused because the caller assertion is not enforced', async () => {
-    // The gateway refuses every test on a Connection carrying a caller
-    // assertion until request-path injection ships; the operator must see that
-    // reason rather than a contract error.
+    // The gateway refuses every stored test on a Connection carrying a caller
+    // assertion, since a test has no caller to attest; the operator must see
+    // that reason rather than a contract error.
     vi.stubGlobal(
       'fetch',
       vi.fn(() =>

@@ -415,6 +415,12 @@ pub(super) struct PolicyAdminState {
     /// CAS transaction instead of the file, and history is its documents.
     #[cfg(feature = "postgres")]
     pub(super) control_plane: Option<Arc<dyn storage::PolicyControlPlane>>,
+    /// Cluster mode's roster, for the operation gate a commit asks before
+    /// writing a document an older member could not read (issue #426).
+    /// Present exactly when `control_plane` is; a control plane without it
+    /// refuses every gated write.
+    #[cfg(feature = "postgres")]
+    pub(super) membership: Option<Arc<cluster_membership::ClusterMembership>>,
     pub(super) event_store: Option<Arc<dyn storage::AuditEventStore>>,
     pub(super) query_store: Option<Arc<storage::SqliteAuditEventStore>>,
     pub(super) audit: audit::AuditLog,

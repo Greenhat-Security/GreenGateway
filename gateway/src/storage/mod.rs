@@ -17,6 +17,10 @@
 //!   contract.
 
 mod audit;
+/// Member capability advertisements and per-operation requirements
+/// (issue #426, PR 1): the closed vocabulary every build can recognize, and
+/// in cluster mode the gate a write of a registered operation passes first.
+pub(crate) mod compatibility;
 /// Versioned migrations and the schema lifecycle (issue #241, PR 4), on the
 /// same `postgres` feature as the pool it runs on. A feature-off build
 /// refuses the `migrate` subcommand in `main` with a clear message rather

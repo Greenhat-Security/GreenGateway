@@ -500,7 +500,7 @@ async fn service_token_store_contract(store: &dyn ServiceTokenStore) {
 
     // Revoke is idempotent and keeps the first revoked_at.
     let first_revoke = store
-        .revoke(&created.record.id)
+        .revoke(&created.record.id, "contract-revoker")
         .await
         .expect("revoke should query")
         .expect("revoked token should exist");
@@ -509,7 +509,7 @@ async fn service_token_store_contract(store: &dyn ServiceTokenStore) {
         .clone()
         .expect("revoke must set revoked_at");
     let second_revoke = store
-        .revoke(&created.record.id)
+        .revoke(&created.record.id, "contract-revoker")
         .await
         .expect("second revoke should query")
         .expect("revoked token should still exist");
@@ -529,7 +529,7 @@ async fn service_token_store_contract(store: &dyn ServiceTokenStore) {
     );
 
     // Rotating a revoked token is a conflict, not a silent success.
-    let rotate_error = match store.rotate(&created.record.id).await {
+    let rotate_error = match store.rotate(&created.record.id, "contract-rotator").await {
         // `CreatedToken` deliberately has no `Debug`: the plaintext token
         // must never be formattable into a panic message.
         Ok(_) => panic!("rotating a revoked token must fail"),
@@ -552,7 +552,7 @@ async fn service_token_store_contract(store: &dyn ServiceTokenStore) {
         .await
         .expect("live token should create");
     let rotated = store
-        .rotate(&live.record.id)
+        .rotate(&live.record.id, "contract-rotator")
         .await
         .expect("live rotate should query")
         .expect("live token should exist");
@@ -581,6 +581,580 @@ async fn sqlite_service_token_store_satisfies_the_contract() {
     let db = TempDb::new("token-contract");
     let store = SqliteTokenStore::open(&db.path).expect("token store should open");
     service_token_store_contract(&store).await;
+}
+
+// ---------------------------------------------------------------------------
+// Service-token change evidence (issue #425, PR 2b)
+// ---------------------------------------------------------------------------
+
+/// One change-evidence row as both stores record it: the generated
+/// identifiers, who acted, what they did and to which token.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct TokenChangeEvidence {
+    event_id: String,
+    operation_id: String,
+    actor_user_id: String,
+    action: String,
+    token_id: String,
+}
+
+/// How the shared contract reads a store's evidence. Test-only: nothing in
+/// production reads evidence yet (delivery is a later #425 slice), so each
+/// backend's reader queries its own table directly.
+#[async_trait::async_trait]
+trait TokenChangeEvidenceReader: Send + Sync {
+    /// Every row, in commit order.
+    async fn rows(&self) -> Vec<TokenChangeEvidence>;
+
+    /// Every stored column of every row as text, for the no-token-material
+    /// check and for comparing the table across a restart.
+    async fn stored_text(&self) -> Vec<String>;
+}
+
+struct SqliteTokenEvidence {
+    path: PathBuf,
+}
+
+#[async_trait::async_trait]
+impl TokenChangeEvidenceReader for SqliteTokenEvidence {
+    async fn rows(&self) -> Vec<TokenChangeEvidence> {
+        sqlite_token_evidence(&self.path)
+    }
+
+    async fn stored_text(&self) -> Vec<String> {
+        sqlite_token_evidence_text(&self.path)
+    }
+}
+
+fn sqlite_token_evidence(path: &PathBuf) -> Vec<TokenChangeEvidence> {
+    let connection = rusqlite::Connection::open(path).expect("evidence database should open");
+    let mut statement = connection
+        .prepare(
+            "SELECT event_id, operation_id, actor_user_id, action, token_id \
+             FROM service_token_change_evidence ORDER BY sequence",
+        )
+        .expect("evidence query should prepare");
+    statement
+        .query_map([], |row| {
+            Ok(TokenChangeEvidence {
+                event_id: row.get(0)?,
+                operation_id: row.get(1)?,
+                actor_user_id: row.get(2)?,
+                action: row.get(3)?,
+                token_id: row.get(4)?,
+            })
+        })
+        .expect("evidence query should run")
+        .collect::<Result<Vec<_>, _>>()
+        .expect("evidence rows should decode")
+}
+
+/// Every column the SQLite evidence table holds, rendered as text whatever
+/// its storage class, one string per row in commit order.
+fn sqlite_token_evidence_text(path: &PathBuf) -> Vec<String> {
+    use rusqlite::types::ValueRef;
+
+    let connection = rusqlite::Connection::open(path).expect("evidence database should open");
+    let mut statement = connection
+        .prepare("SELECT * FROM service_token_change_evidence ORDER BY sequence")
+        .expect("evidence query should prepare");
+    let columns = statement.column_count();
+    statement
+        .query_map([], |row| {
+            (0..columns)
+                .map(|index| {
+                    row.get_ref(index).map(|value| match value {
+                        ValueRef::Null => "NULL".to_owned(),
+                        ValueRef::Integer(value) => value.to_string(),
+                        ValueRef::Real(value) => value.to_string(),
+                        ValueRef::Text(text) => String::from_utf8_lossy(text).into_owned(),
+                        ValueRef::Blob(blob) => hex::encode(blob),
+                    })
+                })
+                .collect::<Result<Vec<_>, _>>()
+                .map(|values| values.join("|"))
+        })
+        .expect("evidence query should run")
+        .collect::<Result<Vec<_>, _>>()
+        .expect("evidence rows should decode")
+}
+
+/// Assert the change-evidence contract both service-token stores share
+/// (issue #425): every committed rotate and revoke records its actor and
+/// action exactly once, in commit order and under its own operation; a call
+/// that changes nothing records nothing; an unattributable change is
+/// refused before anything changes; the creator stays the creator; and no
+/// row carries token material.
+async fn service_token_change_evidence_contract(
+    store: &dyn ServiceTokenStore,
+    evidence: &dyn TokenChangeEvidenceReader,
+) {
+    let created = store
+        .create(CreateTokenRequest {
+            scopes: vec!["admin:tokens:read".to_owned()],
+            created_by: "creating-admin".to_owned(),
+            expires_at: None,
+        })
+        .await
+        .expect("token should create");
+    let id = created.record.id.clone();
+    assert!(
+        evidence.rows().await.is_empty(),
+        "issuing a token is not a rotate or a revoke"
+    );
+
+    let rotated = store
+        .rotate(&id, "rotating-admin")
+        .await
+        .expect("rotate should commit")
+        .expect("token should exist");
+    let revoked = store
+        .revoke(&id, "revoking-admin")
+        .await
+        .expect("revoke should commit")
+        .expect("token should exist");
+    let revoked_at = revoked.revoked_at.clone().expect("revoke sets revoked_at");
+
+    // Calls that change nothing record nothing: a repeat revoke, a rotate
+    // of a revoked token, and either change against an unknown token.
+    let repeat = store
+        .revoke(&id, "second-revoker")
+        .await
+        .expect("a repeat revoke should answer")
+        .expect("token should still exist");
+    assert_eq!(repeat.revoked_at.as_deref(), Some(revoked_at.as_str()));
+    let refused = match store.rotate(&id, "late-rotator").await {
+        Ok(_) => panic!("rotating a revoked token must fail"),
+        Err(error) => error,
+    };
+    assert_eq!(refused.kind(), RepositoryErrorKind::Conflict, "{refused}");
+    assert!(store
+        .revoke("token_absent", "revoking-admin")
+        .await
+        .expect("an unknown revoke should answer")
+        .is_none());
+    assert!(matches!(
+        store.rotate("token_absent", "rotating-admin").await,
+        Ok(None)
+    ));
+
+    let rows = evidence.rows().await;
+    assert_eq!(
+        rows.iter()
+            .map(|row| (
+                row.action.as_str(),
+                row.actor_user_id.as_str(),
+                row.token_id.as_str()
+            ))
+            .collect::<Vec<_>>(),
+        [
+            ("service_token.rotate", "rotating-admin", id.as_str()),
+            ("service_token.revoke", "revoking-admin", id.as_str()),
+        ],
+        "one row per committed change, naming who made it"
+    );
+    for row in &rows {
+        for generated in [&row.event_id, &row.operation_id] {
+            uuid::Uuid::parse_str(generated).expect("generated identifiers are UUIDs");
+        }
+        assert_ne!(row.event_id, row.operation_id);
+    }
+    assert_ne!(
+        rows[0].operation_id, rows[1].operation_id,
+        "each store call is its own operation"
+    );
+    assert_eq!(
+        store
+            .get_by_id(&id)
+            .await
+            .expect("token should read")
+            .expect("token should exist")
+            .created_by,
+        "creating-admin",
+        "the creator is not rewritten; the evidence names who changed the token"
+    );
+
+    // An unattributable change is refused before anything changes, and is
+    // not mistaken for the caller's parameter error.
+    let live = store
+        .create(CreateTokenRequest {
+            scopes: vec!["admin:tokens:read".to_owned()],
+            created_by: "creating-admin".to_owned(),
+            expires_at: None,
+        })
+        .await
+        .expect("live token should create");
+    let oversized = "a".repeat(crate::auth::tokens::MAX_TOKEN_CHANGE_ACTOR_BYTES + 1);
+    for actor in ["", oversized.as_str()] {
+        let rotate_error = match store.rotate(&live.record.id, actor).await {
+            Ok(_) => panic!("an unattributable rotate must be refused"),
+            Err(error) => error,
+        };
+        let revoke_error = store
+            .revoke(&live.record.id, actor)
+            .await
+            .expect_err("an unattributable revoke must be refused");
+        for error in [rotate_error, revoke_error] {
+            assert_eq!(error.kind(), RepositoryErrorKind::InvalidData, "{error}");
+            assert_eq!(error.invalid_parameter_name(), None);
+        }
+    }
+    assert!(
+        matches!(
+            store
+                .verify(&live.plaintext_token)
+                .await
+                .expect("verification should query"),
+            TokenVerification::Valid(_)
+        ),
+        "the refused changes changed nothing"
+    );
+    assert_eq!(evidence.rows().await.len(), 2);
+    let longest = "a".repeat(crate::auth::tokens::MAX_TOKEN_CHANGE_ACTOR_BYTES);
+    let rerotated = store
+        .rotate(&live.record.id, &longest)
+        .await
+        .expect("an actor at the principal bound is recorded")
+        .expect("token should exist");
+    let rows = evidence.rows().await;
+    assert_eq!(rows.len(), 3);
+    assert_eq!(rows[2].actor_user_id, longest);
+
+    // Identifiers and actors only: no plaintext, hash, display prefix or
+    // scope reaches a row.
+    let stored = evidence.stored_text().await.join("\n");
+    for plaintext in [
+        &created.plaintext_token,
+        &rotated.plaintext_token,
+        &live.plaintext_token,
+        &rerotated.plaintext_token,
+    ] {
+        assert!(
+            !stored.contains(plaintext.as_str()),
+            "plaintext in evidence"
+        );
+        assert!(
+            !stored.contains(crate::auth::tokens::hash_token(plaintext).as_str()),
+            "token hash in evidence"
+        );
+    }
+    assert!(!stored.contains("ggw_"), "no display prefix: {stored}");
+    assert!(!stored.contains("admin:tokens:read"), "no scopes: {stored}");
+}
+
+#[tokio::test]
+async fn sqlite_service_token_change_evidence_satisfies_the_contract() {
+    let db = TempDb::new("token-evidence-contract");
+    let store = SqliteTokenStore::open(&db.path).expect("token store should open");
+    service_token_change_evidence_contract(
+        &store,
+        &SqliteTokenEvidence {
+            path: db.path.clone(),
+        },
+    )
+    .await;
+}
+
+/// The evidence outlives the token row and the process: a token row
+/// removed outside the gateway leaves its evidence exactly as it was, a
+/// reopened store reads it unchanged, and a retry against the removed token
+/// records nothing. The revoke row's commit time is the token's own
+/// `revoked_at`.
+#[tokio::test]
+async fn sqlite_change_evidence_survives_token_deletion_and_restart() {
+    let db = TempDb::new("token-evidence-restart");
+    let store = SqliteTokenStore::open(&db.path).expect("token store should open");
+    let created = store
+        .create(CreateTokenRequest {
+            scopes: vec!["admin:tokens:read".to_owned()],
+            created_by: "creating-admin".to_owned(),
+            expires_at: None,
+        })
+        .await
+        .expect("token should create");
+    let id = created.record.id.clone();
+    store
+        .rotate(&id, "rotating-admin")
+        .await
+        .expect("rotate should commit")
+        .expect("token should exist");
+    let revoked = store
+        .revoke(&id, "revoking-admin")
+        .await
+        .expect("revoke should commit")
+        .expect("token should exist");
+    let before = sqlite_token_evidence_text(&db.path);
+    assert_eq!(before.len(), 2, "{before:?}");
+    let revoked_at = revoked.revoked_at.expect("revoke sets revoked_at");
+    assert!(
+        before[1].ends_with(&format!("|{revoked_at}")),
+        "the revoke's evidence carries the revoke's own instant: {before:?}"
+    );
+    drop(store);
+
+    // No gateway path deletes a token row; an operator with the file can.
+    rusqlite::Connection::open(&db.path)
+        .expect("token database should open")
+        .execute("DELETE FROM service_tokens WHERE id = ?1", [&id])
+        .expect("token row should delete");
+
+    let reopened = SqliteTokenStore::open(&db.path).expect("token store should reopen");
+    assert_eq!(reopened.get_by_id(&id).await.expect("token read"), None);
+    assert_eq!(
+        sqlite_token_evidence_text(&db.path),
+        before,
+        "the evidence survives the token row and the restart unchanged"
+    );
+    assert!(reopened
+        .revoke(&id, "revoking-admin")
+        .await
+        .expect("a retry should answer")
+        .is_none());
+    assert_eq!(sqlite_token_evidence_text(&db.path), before);
+}
+
+/// The evidence is required, not best effort: when its insert fails, the
+/// rotate and the revoke each report failure -- not the revoked-token
+/// conflict, although SQLite raises a constraint error -- and leave the
+/// token exactly as it was. Once evidence can be written, the same revoke
+/// commits with its one row.
+#[tokio::test]
+async fn sqlite_failed_evidence_insert_rolls_back_rotate_and_revoke() {
+    let db = TempDb::new("token-evidence-fault");
+    let store = SqliteTokenStore::open(&db.path).expect("token store should open");
+    let created = store
+        .create(CreateTokenRequest {
+            scopes: vec!["admin:tokens:read".to_owned()],
+            created_by: "creating-admin".to_owned(),
+            expires_at: None,
+        })
+        .await
+        .expect("token should create");
+    let id = created.record.id.clone();
+    let token_row = |path: &PathBuf| -> (String, String, Option<String>) {
+        rusqlite::Connection::open(path)
+            .expect("token database should open")
+            .query_row(
+                "SELECT token_hash, token_prefix, revoked_at FROM service_tokens WHERE id = ?1",
+                [&id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .expect("token row should read")
+    };
+    let before = token_row(&db.path);
+
+    // Test-only fault injection through a second connection; no production
+    // hook exists for it.
+    rusqlite::Connection::open(&db.path)
+        .expect("token database should open")
+        .execute_batch(
+            "CREATE TRIGGER fail_token_change_evidence \
+             BEFORE INSERT ON service_token_change_evidence \
+             BEGIN SELECT RAISE(ABORT, 'injected evidence failure'); END;",
+        )
+        .expect("failure trigger should install");
+    let rotate_error = match store.rotate(&id, "faulted-admin").await {
+        Ok(_) => panic!("a rotate whose evidence cannot commit must fail"),
+        Err(error) => error,
+    };
+    let revoke_error = store
+        .revoke(&id, "faulted-admin")
+        .await
+        .expect_err("a revoke whose evidence cannot commit must fail");
+    for error in [rotate_error, revoke_error] {
+        assert_eq!(
+            error.kind(),
+            RepositoryErrorKind::Internal,
+            "an evidence failure is a store failure, never a revoked-token conflict: {error}"
+        );
+    }
+    rusqlite::Connection::open(&db.path)
+        .expect("token database should open")
+        .execute_batch("DROP TRIGGER fail_token_change_evidence;")
+        .expect("failure trigger should drop");
+
+    assert_eq!(
+        token_row(&db.path),
+        before,
+        "no hash, prefix or revoked_at change survived the failed evidence"
+    );
+    assert!(sqlite_token_evidence(&db.path).is_empty());
+    assert!(
+        matches!(
+            store
+                .verify(&created.plaintext_token)
+                .await
+                .expect("verification should query"),
+            TokenVerification::Valid(_)
+        ),
+        "the original plaintext is still the live one"
+    );
+
+    store
+        .revoke(&id, "recovered-admin")
+        .await
+        .expect("the revoke commits once evidence can be written")
+        .expect("token should exist");
+    let rows = sqlite_token_evidence(&db.path);
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    assert_eq!(rows[0].actor_user_id, "recovered-admin");
+}
+
+/// A rotate and a revoke race on two connections to one standalone token
+/// database. Each runs as one immediate transaction, so the loser sees the
+/// winner's committed state: revoke-first refuses the rotate and records
+/// only the revoke; rotate-first records the rotate and then the revoke.
+/// The evidence is exactly the changes that committed, and no plaintext is
+/// live afterwards.
+#[test]
+fn sqlite_rotate_and_revoke_race_records_exactly_the_committed_changes() {
+    use crate::auth::tokens::{TokenStore, TokenStoreError};
+
+    let db = TempDb::new("token-evidence-race");
+    let revoker = SqliteTokenStore::open(&db.path).expect("token store should open");
+    let rotator = SqliteTokenStore::open(&db.path).expect("second connection should open");
+    let mut saw_revoke_first = false;
+    let mut saw_rotate_first = false;
+    for _ in 0..8 {
+        let created = TokenStore::create(
+            &revoker,
+            CreateTokenRequest {
+                scopes: vec!["admin:tokens:read".to_owned()],
+                created_by: "creating-admin".to_owned(),
+                expires_at: None,
+            },
+        )
+        .expect("token should create");
+        let id = created.record.id.clone();
+        let barrier = Arc::new(std::sync::Barrier::new(2));
+        let revoke = {
+            let store = revoker.clone();
+            let id = id.clone();
+            let barrier = barrier.clone();
+            std::thread::spawn(move || {
+                barrier.wait();
+                TokenStore::revoke(&store, &id, "revoking-admin")
+            })
+        };
+        let rotate = {
+            let store = rotator.clone();
+            let id = id.clone();
+            let barrier = barrier.clone();
+            std::thread::spawn(move || {
+                barrier.wait();
+                TokenStore::rotate(&store, &id, "rotating-admin")
+            })
+        };
+        let revoked = revoke
+            .join()
+            .expect("revoke thread")
+            .expect("revoke should commit")
+            .expect("token should exist");
+        assert!(revoked.revoked_at.is_some());
+
+        let mut plaintexts = vec![created.plaintext_token.clone()];
+        let expected: &[(&str, &str)] = match rotate.join().expect("rotate thread") {
+            Err(TokenStoreError::RevokedToken { .. }) => {
+                saw_revoke_first = true;
+                &[("service_token.revoke", "revoking-admin")]
+            }
+            Ok(Some(rotated)) => {
+                saw_rotate_first = true;
+                plaintexts.push(rotated.plaintext_token);
+                &[
+                    ("service_token.rotate", "rotating-admin"),
+                    ("service_token.revoke", "revoking-admin"),
+                ]
+            }
+            Ok(None) => panic!("the token exists"),
+            Err(error) => panic!("the rotate must either commit or be refused: {error}"),
+        };
+        let recorded = sqlite_token_evidence(&db.path)
+            .into_iter()
+            .filter(|row| row.token_id == id)
+            .map(|row| (row.action, row.actor_user_id))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            recorded,
+            expected
+                .iter()
+                .map(|(action, actor)| ((*action).to_owned(), (*actor).to_owned()))
+                .collect::<Vec<_>>(),
+            "the evidence is exactly the committed changes, in order"
+        );
+        for plaintext in &plaintexts {
+            assert!(
+                matches!(
+                    TokenStore::verify(&revoker, plaintext).expect("verification should query"),
+                    TokenVerification::Invalid(_)
+                ),
+                "no plaintext may be live after a revoke, whichever order won"
+            );
+        }
+    }
+    eprintln!("orders observed: revoke-first={saw_revoke_first} rotate-first={saw_rotate_first}");
+}
+
+/// The standalone store versions its schema by creating what is missing on
+/// open. A token database written before change evidence existed gains the
+/// table on the first open by this binary, keeps its tokens, fabricates no
+/// history for them, and records the first change after it.
+#[tokio::test]
+async fn sqlite_store_adds_change_evidence_to_a_database_written_without_it() {
+    let db = TempDb::new("token-evidence-upgrade");
+    let created = {
+        let store = SqliteTokenStore::open(&db.path).expect("token store should open");
+        store
+            .create(CreateTokenRequest {
+                scopes: vec!["admin:tokens:read".to_owned()],
+                created_by: "creating-admin".to_owned(),
+                expires_at: None,
+            })
+            .await
+            .expect("token should create")
+    };
+    // The database an older binary left behind: its token, no evidence table.
+    let connection = rusqlite::Connection::open(&db.path).expect("token database should open");
+    connection
+        .execute_batch(
+            "DROP INDEX idx_service_token_change_evidence_token; \
+             DROP TABLE service_token_change_evidence;",
+        )
+        .expect("evidence table should drop");
+    let tables: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE name = 'service_token_change_evidence'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("schema should read");
+    assert_eq!(tables, 0);
+    drop(connection);
+
+    let upgraded = SqliteTokenStore::open(&db.path).expect("older database should open");
+    assert!(
+        sqlite_token_evidence(&db.path).is_empty(),
+        "no evidence is fabricated for the token that predates the table"
+    );
+    assert!(matches!(
+        upgraded
+            .verify(&created.plaintext_token)
+            .await
+            .expect("verification should query"),
+        TokenVerification::Valid(_)
+    ));
+    upgraded
+        .revoke(&created.record.id, "upgraded-admin")
+        .await
+        .expect("revoke should commit")
+        .expect("token should exist");
+    let rows = sqlite_token_evidence(&db.path);
+    assert_eq!(
+        rows.iter()
+            .map(|row| (row.action.as_str(), row.actor_user_id.as_str()))
+            .collect::<Vec<_>>(),
+        [("service_token.revoke", "upgraded-admin")]
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -1030,6 +1604,7 @@ impl ServiceTokenStore for GatedTokenStore {
     async fn revoke(
         &self,
         _id: &str,
+        _actor_user_id: &str,
     ) -> Result<Option<crate::auth::tokens::TokenRecord>, RepositoryError> {
         unimplemented!("not needed by the executor proof")
     }
@@ -1037,6 +1612,7 @@ impl ServiceTokenStore for GatedTokenStore {
     async fn rotate(
         &self,
         _id: &str,
+        _actor_user_id: &str,
     ) -> Result<Option<crate::auth::tokens::CreatedToken>, RepositoryError> {
         unimplemented!("not needed by the executor proof")
     }
@@ -2271,6 +2847,109 @@ pub(crate) mod postgres_audit_tests {
         assert_eq!(replica_a.live_buckets().await.expect("count"), 4);
     }
 
+    /// The row lock, not the statement start, orders the decisions. A
+    /// decision whose statement started first can still reach the bucket
+    /// row second -- planning or scheduling jitter, an `ON CONFLICT` waiter
+    /// retrying behind a newer version -- and must not be charged for the
+    /// time between its own start and the decision that overtook it: a
+    /// burst of two still permits two concurrent requests, and only two.
+    #[tokio::test]
+    async fn a_decision_overtaken_on_the_bucket_row_is_not_denied_below_the_burst() {
+        let Some(admin_dsn) = locator() else {
+            eprintln!("skipping: no test database locator; CI runs this test");
+            return;
+        };
+        let _guard = DATABASE.lock().await;
+        let database = create_test_database(&admin_dsn).await;
+        let pool = migrated_limits_pool(&database).await;
+        let replica_a =
+            PostgresRateLimitStore::new(pool.clone(), "deploy-limits", limits_keyring(), 1_000);
+        let replica_b =
+            PostgresRateLimitStore::new(pool.clone(), "deploy-limits", limits_keyring(), 1_000);
+        // A slow refill, so the burst is the only credit in play while the
+        // test runs.
+        let limit = SharedLimit {
+            requests_per_second: 0.1,
+            burst: 2,
+        };
+        let caller = "ip:203.0.113.7";
+
+        // Park the first decision after its statement has started, so its
+        // `now()` is fixed, and before it reaches the bucket row: a BEFORE
+        // INSERT trigger fires ahead of the conflict check, and the first
+        // statement to claim its advisory lock then waits on one this
+        // session holds. Every other statement finds the claim taken and
+        // goes straight through.
+        let gate = pool.get().await.expect("client");
+        gate.batch_execute(
+            "CREATE FUNCTION greengateway.test_park_first_decision() RETURNS trigger
+             LANGUAGE plpgsql AS $$
+             BEGIN
+                 IF pg_try_advisory_xact_lock(241001) THEN
+                     PERFORM pg_advisory_xact_lock_shared(241002);
+                 END IF;
+                 RETURN NEW;
+             END $$;
+             CREATE TRIGGER test_park_first_decision
+                 BEFORE INSERT ON greengateway.rate_limit_buckets
+                 FOR EACH ROW EXECUTE FUNCTION greengateway.test_park_first_decision();
+             SELECT pg_advisory_lock(241002);",
+        )
+        .await
+        .expect("install the parking trigger");
+        let parked = tokio::spawn({
+            let replica_a = replica_a.clone();
+            async move { replica_a.decide(SharedLane::Read, caller, limit).await }
+        });
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            let waiting: i64 = gate
+                .query_one(
+                    "SELECT count(*) FROM pg_locks
+                     WHERE locktype = 'advisory' AND objid = 241002 AND NOT granted
+                       AND database = (SELECT oid FROM pg_database
+                                       WHERE datname = current_database())",
+                    &[],
+                )
+                .await
+                .expect("lock probe")
+                .get(0);
+            if waiting == 1 {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the first decision never parked"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        // The later statement takes the row first, then the parked one.
+        assert_eq!(
+            decide(&replica_b, SharedLane::Read, caller, limit).await,
+            SharedDecision::Allowed,
+            "the overtaking decision is the burst's first"
+        );
+        gate.batch_execute("SELECT pg_advisory_unlock(241002)")
+            .await
+            .expect("release the parked decision");
+        let overtaken = parked
+            .await
+            .expect("the parked decision completes")
+            .expect("the shared limiter decides");
+        assert_eq!(
+            overtaken,
+            SharedDecision::Allowed,
+            "a burst of two permits two, whatever order the row lock took them in"
+        );
+        assert_eq!(
+            decide(&replica_a, SharedLane::Read, caller, limit).await,
+            SharedDecision::Denied,
+            "and only two: the third is denied"
+        );
+        assert_eq!(replica_a.live_buckets().await.expect("count"), 1);
+    }
+
     /// The policy lane keys buckets by rule as well as principal, and what
     /// the table holds is a keyed digest: never the caller key, and never
     /// the plain hash of it that a table reader could precompute.
@@ -2415,6 +3094,134 @@ pub(crate) mod postgres_audit_tests {
         assert_eq!(store.cleanup_idle(3_600.0, 100).await.expect("sweep"), 0);
     }
 
+    /// A new key past the bound is evicted for on its decision's own
+    /// connection, never a second one. A decision that held its connection
+    /// while it waited for another would, a pool's worth at a time, wait on
+    /// the others until the acquire timeout, and every other authority call
+    /// on the pool -- the revision gate, credential checks, leases -- would
+    /// wait behind them. On a one-connection pool any single such decision
+    /// is that pool's worth, so several new keys at the bound at once must
+    /// each be decided in turn rather than refused for want of a connection.
+    #[tokio::test]
+    async fn new_keys_at_the_bound_never_wait_on_a_second_connection() {
+        let Some(admin_dsn) = locator() else {
+            eprintln!("skipping: no test database locator; CI runs this test");
+            return;
+        };
+        let _guard = DATABASE.lock().await;
+        let database = create_test_database(&admin_dsn).await;
+        let _migrated = migrated_limits_pool(&database).await;
+        let one_connection = one_connection_foundation(&database, 2_000).await;
+        let store = Arc::new(PostgresRateLimitStore::new(
+            one_connection.pool().clone(),
+            "deploy-limits",
+            limits_keyring(),
+            1,
+        ));
+        let one = SharedLimit {
+            requests_per_second: 0.0,
+            burst: 1,
+        };
+        // The bound is one bucket, and this fills it.
+        assert_eq!(
+            decide(&store, SharedLane::Read, "ip:198.51.100.0", one).await,
+            SharedDecision::Allowed
+        );
+        let decisions: Vec<_> = (1..=8)
+            .map(|index| {
+                let store = Arc::clone(&store);
+                tokio::spawn(async move {
+                    store
+                        .decide(SharedLane::Read, &format!("ip:198.51.100.{index}"), one)
+                        .await
+                })
+            })
+            .collect();
+        for decision in decisions {
+            assert_eq!(
+                decision
+                    .await
+                    .expect("the decision task")
+                    .map_err(|error| error.kind()),
+                Ok(SharedDecision::Allowed),
+                "a new key at the bound is decided, not refused for want of a second connection"
+            );
+        }
+        assert_eq!(
+            store.live_buckets().await.expect("counter"),
+            1,
+            "every one of them still evicted down to the bound"
+        );
+    }
+
+    /// The decision is committed before its eviction runs, so an eviction
+    /// that fails cannot take the decision back: the request gets the
+    /// decision it was given -- an allowance or a denial -- rather than a
+    /// `503` for housekeeping, and the next key past the bound evicts the
+    /// excess the failed one left.
+    #[tokio::test]
+    async fn a_failed_eviction_does_not_refuse_the_committed_decision() {
+        let Some(admin_dsn) = locator() else {
+            eprintln!("skipping: no test database locator; CI runs this test");
+            return;
+        };
+        let _guard = DATABASE.lock().await;
+        let database = create_test_database(&admin_dsn).await;
+        let pool = migrated_limits_pool(&database).await;
+        let store = PostgresRateLimitStore::new(pool.clone(), "deploy-limits", limits_keyring(), 1);
+        let one = SharedLimit {
+            requests_per_second: 0.0,
+            burst: 1,
+        };
+        let zero = SharedLimit {
+            requests_per_second: 0.0,
+            burst: 0,
+        };
+        assert_eq!(
+            decide(&store, SharedLane::Read, "ip:198.51.100.0", one).await,
+            SharedDecision::Allowed
+        );
+        let client = pool.get().await.expect("client");
+        client
+            .batch_execute(
+                "CREATE FUNCTION greengateway.refuse_bucket_delete() RETURNS trigger
+                     LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'eviction refused'; END $$;
+                 CREATE TRIGGER refuse_bucket_delete
+                     BEFORE DELETE ON greengateway.rate_limit_buckets
+                     FOR EACH ROW EXECUTE FUNCTION greengateway.refuse_bucket_delete();",
+            )
+            .await
+            .expect("make every eviction fail");
+        assert_eq!(
+            decide(&store, SharedLane::Read, "ip:198.51.100.1", one).await,
+            SharedDecision::Allowed,
+            "the committed allowance stands"
+        );
+        assert_eq!(
+            decide(&store, SharedLane::Read, "ip:198.51.100.2", zero).await,
+            SharedDecision::Denied,
+            "the committed denial stands"
+        );
+        assert_eq!(
+            store.live_buckets().await.expect("counter"),
+            3,
+            "neither eviction removed anything, and the count says so"
+        );
+        client
+            .batch_execute("DROP TRIGGER refuse_bucket_delete ON greengateway.rate_limit_buckets")
+            .await
+            .expect("let evictions run again");
+        assert_eq!(
+            decide(&store, SharedLane::Read, "ip:198.51.100.3", one).await,
+            SharedDecision::Allowed
+        );
+        assert_eq!(
+            store.live_buckets().await.expect("counter"),
+            1,
+            "the next key past the bound evicts the excess the failed ones left"
+        );
+    }
+
     /// Fail closed: a shared limiter that cannot be consulted answers 503
     /// with zero upstream attempts; it is never a silent allow and never a
     /// 429. Then, with the authority back, two replicas' middleware share
@@ -2446,10 +3253,8 @@ pub(crate) mod postgres_audit_tests {
         config.rate_limit_read_burst = 2;
         let upstream_attempts = Arc::new(AtomicUsize::new(0));
         let replica = |store: &Arc<PostgresRateLimitStore>| {
-            let state = crate::middleware::rate_limit::RateLimitState::from_config_and_policy(
-                &config, None,
-            )
-            .with_shared_store(Arc::clone(store));
+            let state = crate::middleware::rate_limit::RateLimitState::from_config(&config)
+                .with_shared_store(Arc::clone(store));
             let counter = Arc::clone(&upstream_attempts);
             Router::new()
                 .route(
@@ -3610,19 +4415,25 @@ pub(crate) mod postgres_audit_tests {
             "verify is observational and reserves no revision"
         );
 
-        store.rotate(&created.record.id).await.expect("rotate");
+        store
+            .rotate(&created.record.id, "contract-rotator")
+            .await
+            .expect("rotate");
         let after_rotate = scalar_i64(&pool, SHARED).await;
         assert_eq!(after_rotate, after_create + 1);
         assert_eq!(store.state_revision().await.expect("mark"), after_rotate);
 
-        store.revoke(&created.record.id).await.expect("revoke");
+        store
+            .revoke(&created.record.id, "contract-revoker")
+            .await
+            .expect("revoke");
         let after_revoke = scalar_i64(&pool, SHARED).await;
         assert_eq!(after_revoke, after_rotate + 1);
         assert_eq!(store.state_revision().await.expect("mark"), after_revoke);
 
         // A second revoke is idempotent: no revision, no outbox row.
         store
-            .revoke(&created.record.id)
+            .revoke(&created.record.id, "contract-revoker")
             .await
             .expect("revoke again");
         assert_eq!(scalar_i64(&pool, SHARED).await, after_revoke);
@@ -3666,7 +4477,9 @@ pub(crate) mod postgres_audit_tests {
     /// them; both succeed; the documented outcome is that the LATER
     /// rotation's plaintext is the live one and every earlier plaintext --
     /// the original and the first rotation's -- is dead. Exactly two
-    /// revisions are spent.
+    /// revisions are spent, and exactly two evidence rows record them: one
+    /// per replica's actor, chained 1 -> 2 -> 3, the later one naming the
+    /// actor whose plaintext is live.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn concurrent_rotations_serialize_and_leave_exactly_one_live_plaintext() {
         let Some(admin_dsn) = locator() else {
@@ -3684,34 +4497,38 @@ pub(crate) mod postgres_audit_tests {
         let id = created.record.id.clone();
 
         let barrier = Arc::new(tokio::sync::Barrier::new(2));
-        let rotate_on = |store: Arc<PostgresServiceTokenStore>, id: String| {
+        let rotate_on = |store: Arc<PostgresServiceTokenStore>, id: String, actor: &'static str| {
             let barrier = barrier.clone();
             tokio::spawn(async move {
                 barrier.wait().await;
-                store.rotate(&id).await
+                store.rotate(&id, actor).await
             })
         };
         let (first, second) = tokio::join!(
-            rotate_on(replica_a.clone(), id.clone()),
-            rotate_on(replica_b.clone(), id.clone())
+            rotate_on(replica_a.clone(), id.clone(), "replica-a-admin"),
+            rotate_on(replica_b.clone(), id.clone(), "replica-b-admin")
         );
         let first = first.expect("task").expect("rotate a").expect("exists");
         let second = second.expect("task").expect("rotate b").expect("exists");
 
-        let mut live = 0;
-        for plaintext in [
-            &created.plaintext_token,
-            &first.plaintext_token,
-            &second.plaintext_token,
+        let mut live = Vec::new();
+        for (plaintext, actor) in [
+            (&created.plaintext_token, "creating-admin"),
+            (&first.plaintext_token, "replica-a-admin"),
+            (&second.plaintext_token, "replica-b-admin"),
         ] {
             if matches!(
                 replica_a.verify(plaintext).await.expect("verify"),
                 TokenVerification::Valid(_)
             ) {
-                live += 1;
+                live.push(actor);
             }
         }
-        assert_eq!(live, 1, "exactly one plaintext survives two rotations");
+        assert_eq!(
+            live.len(),
+            1,
+            "exactly one plaintext survives two rotations"
+        );
         assert_eq!(
             replica_a
                 .verify(&created.plaintext_token)
@@ -3726,6 +4543,29 @@ pub(crate) mod postgres_audit_tests {
         )
         .await;
         assert_eq!(revision, 3, "two committed rotations, two revisions");
+
+        let evidence = token_evidence_rows(&pool).await;
+        assert_eq!(
+            evidence
+                .iter()
+                .map(|row| (row.action.as_str(), row.prior_version, row.new_version))
+                .collect::<Vec<_>>(),
+            [
+                ("service_token.rotate", 1, 2),
+                ("service_token.rotate", 2, 3)
+            ],
+            "one evidence row per committed rotation, chained"
+        );
+        let mut actors = evidence
+            .iter()
+            .map(|row| row.actor_user_id.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            actors[1], live[0],
+            "the later rotation is the one whose plaintext is live"
+        );
+        actors.sort_unstable();
+        assert_eq!(actors, ["replica-a-admin", "replica-b-admin"]);
     }
 
     /// A revoke and a rotate race on two replicas. The row lock picks a
@@ -3733,7 +4573,9 @@ pub(crate) mod postgres_audit_tests {
     /// makes the rotate a conflict; rotate-first lets the revoke close the
     /// rotated token. Either way NO plaintext -- original or rotated -- is
     /// live afterwards, which is the property that matters: a rotation can
-    /// never race a revoke into a live token.
+    /// never race a revoke into a live token. The evidence is exactly the
+    /// changes that committed: the revoke alone, or the rotate then the
+    /// revoke.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn revoke_and_rotate_race_never_leaves_a_live_plaintext() {
         let Some(admin_dsn) = locator() else {
@@ -3742,7 +4584,7 @@ pub(crate) mod postgres_audit_tests {
         };
         let _guard = DATABASE.lock().await;
         let database = create_test_database(&admin_dsn).await;
-        let (replica_a, _pool) = migrated_service_token_store(&database).await;
+        let (replica_a, pool) = migrated_service_token_store(&database).await;
         let (replica_b, _) = migrated_service_token_store(&database).await;
 
         let mut saw_revoke_first = false;
@@ -3760,7 +4602,7 @@ pub(crate) mod postgres_audit_tests {
                 let barrier = barrier.clone();
                 tokio::spawn(async move {
                     barrier.wait().await;
-                    store.revoke(&id).await
+                    store.revoke(&id, "revoking-replica").await
                 })
             };
             let rotate = {
@@ -3769,7 +4611,7 @@ pub(crate) mod postgres_audit_tests {
                 let barrier = barrier.clone();
                 tokio::spawn(async move {
                     barrier.wait().await;
-                    store.rotate(&id).await
+                    store.rotate(&id, "rotating-replica").await
                 })
             };
             let (revoke, rotate) = tokio::join!(revoke, rotate);
@@ -3780,7 +4622,7 @@ pub(crate) mod postgres_audit_tests {
             assert!(revoked.revoked_at.is_some(), "the revoke always lands");
 
             let mut plaintexts = vec![created.plaintext_token.clone()];
-            match rotate.expect("task") {
+            let expected: &[(&str, &str, i64, i64)] = match rotate.expect("task") {
                 Err(error) => {
                     assert_eq!(
                         error.kind(),
@@ -3788,13 +4630,18 @@ pub(crate) mod postgres_audit_tests {
                         "revoke-first: the rotate is refused as a conflict"
                     );
                     saw_revoke_first = true;
+                    &[("service_token.revoke", "revoking-replica", 1, 2)]
                 }
                 Ok(Some(rotated)) => {
                     plaintexts.push(rotated.plaintext_token);
                     saw_rotate_first = true;
+                    &[
+                        ("service_token.rotate", "rotating-replica", 1, 2),
+                        ("service_token.revoke", "revoking-replica", 2, 3),
+                    ]
                 }
                 Ok(None) => panic!("the token exists"),
-            }
+            };
             for plaintext in &plaintexts {
                 assert!(
                     matches!(
@@ -3804,6 +4651,24 @@ pub(crate) mod postgres_audit_tests {
                     "no plaintext may be live after a revoke, whichever order won"
                 );
             }
+            let recorded = token_evidence_rows(&pool)
+                .await
+                .into_iter()
+                .filter(|row| row.token_id == id)
+                .collect::<Vec<_>>();
+            assert_eq!(
+                recorded
+                    .iter()
+                    .map(|row| (
+                        row.action.as_str(),
+                        row.actor_user_id.as_str(),
+                        row.prior_version,
+                        row.new_version
+                    ))
+                    .collect::<Vec<_>>(),
+                expected,
+                "the evidence is exactly the committed changes, in commit order"
+            );
         }
         // Eight rounds through a barrier on two pools reliably produce both
         // orders; if a scheduler ever does not, the property above still
@@ -3811,6 +4676,759 @@ pub(crate) mod postgres_audit_tests {
         eprintln!(
             "orders observed: revoke-first={saw_revoke_first} rotate-first={saw_rotate_first}"
         );
+    }
+
+    // ------------------------------------------------------------------
+    // Service-token and JWT revocation change evidence (issue #425,
+    // PR 2b; migration 18)
+    // ------------------------------------------------------------------
+
+    /// One `service_token_change_evidence` row, every column, read as text
+    /// where the column is a UUID or timestamp.
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    struct TokenEvidenceRow {
+        event_id: String,
+        operation_id: String,
+        actor_user_id: String,
+        action: String,
+        token_id: String,
+        prior_version: i64,
+        new_version: i64,
+        security_revision: i64,
+        committed_at: String,
+    }
+
+    /// The whole token evidence table in commit order.
+    async fn token_evidence_rows(pool: &deadpool_postgres::Pool) -> Vec<TokenEvidenceRow> {
+        pool.get()
+            .await
+            .expect("evidence checkout")
+            .query(
+                r#"
+                SELECT event_id::text, operation_id::text, actor_user_id, action, token_id,
+                       prior_version, new_version, security_revision, committed_at::text
+                FROM greengateway.service_token_change_evidence
+                ORDER BY security_revision, event_id
+                "#,
+                &[],
+            )
+            .await
+            .expect("evidence rows should read")
+            .iter()
+            .map(|row| TokenEvidenceRow {
+                event_id: row.get(0),
+                operation_id: row.get(1),
+                actor_user_id: row.get(2),
+                action: row.get(3),
+                token_id: row.get(4),
+                prior_version: row.get(5),
+                new_version: row.get(6),
+                security_revision: row.get(7),
+                committed_at: row.get(8),
+            })
+            .collect()
+    }
+
+    /// Every row of a table as JSON text, in a stable order.
+    async fn table_json(pool: &deadpool_postgres::Pool, table: &str) -> Vec<String> {
+        pool.get()
+            .await
+            .expect("table checkout")
+            .query(
+                &format!(
+                    "SELECT row_to_json(t)::text FROM greengateway.{table} t \
+                     ORDER BY row_to_json(t)::text"
+                ),
+                &[],
+            )
+            .await
+            .expect("table rows should read")
+            .iter()
+            .map(|row| row.get(0))
+            .collect()
+    }
+
+    async fn table_columns(pool: &deadpool_postgres::Pool, table: &str) -> Vec<String> {
+        pool.get()
+            .await
+            .expect("column checkout")
+            .query(
+                "SELECT column_name::text FROM information_schema.columns \
+                 WHERE table_schema = 'greengateway' AND table_name = $1 \
+                 ORDER BY ordinal_position",
+                &[&table],
+            )
+            .await
+            .expect("columns should read")
+            .iter()
+            .map(|row| row.get(0))
+            .collect()
+    }
+
+    struct PostgresTokenEvidence {
+        pool: deadpool_postgres::Pool,
+    }
+
+    #[async_trait::async_trait]
+    impl super::TokenChangeEvidenceReader for PostgresTokenEvidence {
+        async fn rows(&self) -> Vec<super::TokenChangeEvidence> {
+            token_evidence_rows(&self.pool)
+                .await
+                .into_iter()
+                .map(|row| super::TokenChangeEvidence {
+                    event_id: row.event_id,
+                    operation_id: row.operation_id,
+                    actor_user_id: row.actor_user_id,
+                    action: row.action,
+                    token_id: row.token_id,
+                })
+                .collect()
+        }
+
+        async fn stored_text(&self) -> Vec<String> {
+            table_json(&self.pool, "service_token_change_evidence").await
+        }
+    }
+
+    #[tokio::test]
+    async fn postgres_service_token_change_evidence_satisfies_the_contract() {
+        let Some(admin_dsn) = locator() else {
+            eprintln!("skipping: no test database locator; CI runs this test");
+            return;
+        };
+        let _guard = DATABASE.lock().await;
+        let database = create_test_database(&admin_dsn).await;
+        let (store, pool) = migrated_service_token_store(&database).await;
+        super::service_token_change_evidence_contract(&*store, &PostgresTokenEvidence { pool })
+            .await;
+    }
+
+    /// The cluster evidence row is bound to the change's outbox row -- the
+    /// same shared revision and the same row-revision step -- carries the
+    /// database clock's commit time, and outlives both the token row and
+    /// the process that wrote it. A repeat revoke spends nothing and records
+    /// nothing, and a retry against a removed token records nothing either.
+    #[tokio::test]
+    async fn service_token_change_evidence_matches_the_outbox_and_survives_deletion_and_restart() {
+        let Some(admin_dsn) = locator() else {
+            eprintln!("skipping: no test database locator; CI runs this test");
+            return;
+        };
+        let _guard = DATABASE.lock().await;
+        let database = create_test_database(&admin_dsn).await;
+        let (store, pool) = migrated_service_token_store(&database).await;
+        assert_eq!(
+            table_columns(&pool, "service_token_change_evidence").await,
+            [
+                "event_id",
+                "operation_id",
+                "actor_user_id",
+                "action",
+                "token_id",
+                "prior_version",
+                "new_version",
+                "security_revision",
+                "committed_at"
+            ],
+            "evidence holds identifiers, revisions and the actor; a new column needs review"
+        );
+
+        let created = store.create(token_request(&["a"])).await.expect("create");
+        let id = created.record.id.clone();
+        store
+            .rotate(&id, "rotating-admin")
+            .await
+            .expect("rotate")
+            .expect("exists");
+        store
+            .revoke(&id, "revoking-admin")
+            .await
+            .expect("revoke")
+            .expect("exists");
+        const SHARED: &str =
+            "SELECT last_revision FROM greengateway.security_revision_state WHERE singleton";
+        let shared = scalar_i64(&pool, SHARED).await;
+        store
+            .revoke(&id, "second-revoker")
+            .await
+            .expect("repeat revoke")
+            .expect("exists");
+        assert_eq!(scalar_i64(&pool, SHARED).await, shared);
+
+        let outbox = pool
+            .get()
+            .await
+            .expect("outbox checkout")
+            .query(
+                "SELECT revision, from_version, to_version FROM greengateway.security_outbox \
+                 WHERE resource_type = 'service_token' AND resource_id = $1 ORDER BY revision",
+                &[&id],
+            )
+            .await
+            .expect("outbox rows")
+            .iter()
+            .map(|row| {
+                (
+                    row.get::<_, i64>(0),
+                    row.get::<_, Option<i64>>(1),
+                    row.get::<_, i64>(2),
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(outbox.len(), 3, "create, rotate, revoke: {outbox:?}");
+        let evidence = token_evidence_rows(&pool).await;
+        assert_eq!(evidence.len(), 2, "{evidence:?}");
+        for (row, (revision, from_version, to_version)) in evidence.iter().zip(&outbox[1..]) {
+            assert_eq!(row.token_id, id);
+            assert_eq!(
+                row.security_revision, *revision,
+                "the outbox row's revision"
+            );
+            assert_eq!(Some(row.prior_version), *from_version);
+            assert_eq!(row.new_version, *to_version);
+            assert_ne!(row.event_id, row.operation_id);
+        }
+        assert_eq!(
+            (
+                evidence[0].action.as_str(),
+                evidence[0].actor_user_id.as_str()
+            ),
+            ("service_token.rotate", "rotating-admin")
+        );
+        assert_eq!(
+            (
+                evidence[1].action.as_str(),
+                evidence[1].actor_user_id.as_str()
+            ),
+            ("service_token.revoke", "revoking-admin")
+        );
+        assert_eq!(
+            scalar_i64(
+                &pool,
+                "SELECT COUNT(*) FROM greengateway.service_token_change_evidence \
+                 WHERE committed_at <= now() AND committed_at > now() - interval '1 hour'",
+            )
+            .await,
+            2,
+            "committed_at is the database clock's"
+        );
+        let stored = table_json(&pool, "service_token_change_evidence")
+            .await
+            .join("\n");
+        let token_hash = crate::auth::tokens::hash_token(&created.plaintext_token);
+        for material in [
+            created.plaintext_token.as_str(),
+            token_hash.as_str(),
+            created.record.token_prefix.as_str(),
+            "scopes",
+        ] {
+            assert!(
+                !stored.contains(material),
+                "evidence must not carry token material ({material}): {stored}"
+            );
+        }
+
+        // No gateway path deletes a token row; the evidence does not depend
+        // on one existing.
+        pool.get()
+            .await
+            .expect("delete checkout")
+            .execute(
+                "DELETE FROM greengateway.service_tokens WHERE id = $1",
+                &[&id],
+            )
+            .await
+            .expect("the token row should delete");
+        assert_eq!(store.get_by_id(&id).await.expect("get"), None);
+        assert_eq!(token_evidence_rows(&pool).await, evidence);
+
+        // A restart is a new process over the same authority.
+        drop(store);
+        drop(pool);
+        let (restarted, restarted_pool) = migrated_service_token_store(&database).await;
+        assert_eq!(
+            token_evidence_rows(&restarted_pool).await,
+            evidence,
+            "the evidence survives the token row and the restart unchanged"
+        );
+        assert!(restarted
+            .revoke(&id, "revoking-admin")
+            .await
+            .expect("a retry should answer")
+            .is_none());
+        assert_eq!(token_evidence_rows(&restarted_pool).await, evidence);
+    }
+
+    /// Install a test-only trigger that fails every insert into `table`
+    /// with a unique-violation SQLSTATE -- the class that would otherwise
+    /// read as a conflict -- and return the statement that removes it.
+    /// This follows the existing fault-injection pattern; no production
+    /// hook exists for it.
+    async fn fail_inserts_into(pool: &deadpool_postgres::Pool, table: &str) -> String {
+        pool.get()
+            .await
+            .expect("failure trigger checkout")
+            .batch_execute(&format!(
+                r#"
+                CREATE FUNCTION greengateway.fail_{table}()
+                RETURNS trigger LANGUAGE plpgsql AS $$
+                BEGIN
+                    RAISE EXCEPTION 'injected evidence failure' USING ERRCODE = 'unique_violation';
+                END;
+                $$;
+                CREATE TRIGGER fail_{table}
+                BEFORE INSERT ON greengateway.{table}
+                FOR EACH ROW EXECUTE FUNCTION greengateway.fail_{table}();
+                "#
+            ))
+            .await
+            .expect("failure trigger should install");
+        format!(
+            "DROP TRIGGER fail_{table} ON greengateway.{table}; \
+             DROP FUNCTION greengateway.fail_{table}();"
+        )
+    }
+
+    /// The evidence is required, not best effort: when its insert fails,
+    /// the rotate and the revoke each report a store failure -- never the
+    /// revoked-token conflict, even though the injected failure carries a
+    /// unique-violation code -- and nothing of either commits: token row,
+    /// outbox, shared revision, high-water mark. The aborted attempts
+    /// consume no revision, and the same revoke commits once evidence can
+    /// be written.
+    #[tokio::test]
+    async fn a_failed_token_evidence_insert_rolls_back_the_rotate_and_the_revoke() {
+        let Some(admin_dsn) = locator() else {
+            eprintln!("skipping: no test database locator; CI runs this test");
+            return;
+        };
+        let _guard = DATABASE.lock().await;
+        let database = create_test_database(&admin_dsn).await;
+        let (store, pool) = migrated_service_token_store(&database).await;
+        let created = store.create(token_request(&["a"])).await.expect("create");
+        let id = created.record.id.clone();
+        const SHARED: &str =
+            "SELECT last_revision FROM greengateway.security_revision_state WHERE singleton";
+        let shared_before = scalar_i64(&pool, SHARED).await;
+        let mark_before = store.state_revision().await.expect("mark");
+        let outbox_before =
+            scalar_i64(&pool, "SELECT COUNT(*) FROM greengateway.security_outbox").await;
+        let tokens_before = table_json(&pool, "service_tokens").await;
+
+        let restore = fail_inserts_into(&pool, "service_token_change_evidence").await;
+        let rotate_error = match store.rotate(&id, "faulted-admin").await {
+            Ok(_) => panic!("a rotate whose evidence cannot commit must fail"),
+            Err(error) => error,
+        };
+        let revoke_error = store
+            .revoke(&id, "faulted-admin")
+            .await
+            .expect_err("a revoke whose evidence cannot commit must fail");
+        for error in [rotate_error, revoke_error] {
+            assert_eq!(
+                error.kind(),
+                RepositoryErrorKind::Internal,
+                "an evidence failure is a store failure, never a revoked-token conflict: {error}"
+            );
+        }
+        pool.get()
+            .await
+            .expect("failure trigger cleanup checkout")
+            .batch_execute(&restore)
+            .await
+            .expect("failure trigger should drop");
+
+        assert_eq!(
+            table_json(&pool, "service_tokens").await,
+            tokens_before,
+            "no hash, prefix, revision or revoked_at change committed"
+        );
+        assert_eq!(
+            scalar_i64(&pool, "SELECT COUNT(*) FROM greengateway.security_outbox").await,
+            outbox_before,
+            "the outbox rows rolled back with the evidence"
+        );
+        assert_eq!(scalar_i64(&pool, SHARED).await, shared_before);
+        assert_eq!(store.state_revision().await.expect("mark"), mark_before);
+        assert!(token_evidence_rows(&pool).await.is_empty());
+        assert!(
+            matches!(
+                store
+                    .verify(&created.plaintext_token)
+                    .await
+                    .expect("verify"),
+                TokenVerification::Valid(_)
+            ),
+            "the original plaintext is still the live one"
+        );
+
+        store
+            .revoke(&id, "recovered-admin")
+            .await
+            .expect("the revoke commits once evidence can be written")
+            .expect("exists");
+        let evidence = token_evidence_rows(&pool).await;
+        assert_eq!(evidence.len(), 1, "{evidence:?}");
+        assert_eq!(evidence[0].actor_user_id, "recovered-admin");
+        assert_eq!(
+            evidence[0].security_revision,
+            shared_before + 1,
+            "the aborted attempts consumed no revision"
+        );
+    }
+
+    /// One `jwt_revocation_evidence` row. The expiry is read as epoch
+    /// seconds so rows can be ordered by it.
+    #[derive(Clone, Debug, PartialEq)]
+    struct JwtEvidenceRow {
+        event_id: String,
+        operation_id: String,
+        actor_user_id: String,
+        action: String,
+        issuer: String,
+        jti_hash: String,
+        expires_at: Option<f64>,
+        security_revision: i64,
+        committed_at: String,
+    }
+
+    async fn jwt_evidence_rows(pool: &deadpool_postgres::Pool) -> Vec<JwtEvidenceRow> {
+        pool.get()
+            .await
+            .expect("evidence checkout")
+            .query(
+                r#"
+                SELECT event_id::text, operation_id::text, actor_user_id, action, issuer,
+                       jti_hash, EXTRACT(EPOCH FROM expires_at)::double precision,
+                       security_revision, committed_at::text
+                FROM greengateway.jwt_revocation_evidence
+                ORDER BY security_revision, event_id
+                "#,
+                &[],
+            )
+            .await
+            .expect("evidence rows should read")
+            .iter()
+            .map(|row| JwtEvidenceRow {
+                event_id: row.get(0),
+                operation_id: row.get(1),
+                actor_user_id: row.get(2),
+                action: row.get(3),
+                issuer: row.get(4),
+                jti_hash: row.get(5),
+                expires_at: row.get(6),
+                security_revision: row.get(7),
+                committed_at: row.get(8),
+            })
+            .collect()
+    }
+
+    /// Who revoked a JWT, and until when, survives everything the denylist
+    /// row does not: an extension by another actor overwrites the row's
+    /// actor but adds a second evidence row rather than replacing the
+    /// first; a reactivation of a lapsed row is its own row; expiry cleanup
+    /// deletes the denylist row and leaves its evidence; and a restart reads
+    /// all of it unchanged. Revokes that change nothing, or are refused,
+    /// record nothing, and no row carries the raw `jti`.
+    #[tokio::test]
+    async fn jwt_revocation_evidence_survives_extension_reactivation_and_cleanup() {
+        use crate::auth::RevocationStore;
+        use crate::storage::JwtRevocationOutcome;
+        let Some(admin_dsn) = locator() else {
+            eprintln!("skipping: no test database locator; CI runs this test");
+            return;
+        };
+        let _guard = DATABASE.lock().await;
+        let database = create_test_database(&admin_dsn).await;
+        let (_tokens, pool) = migrated_service_token_store(&database).await;
+        assert_eq!(
+            table_columns(&pool, "jwt_revocation_evidence").await,
+            [
+                "event_id",
+                "operation_id",
+                "actor_user_id",
+                "action",
+                "issuer",
+                "jti_hash",
+                "expires_at",
+                "security_revision",
+                "committed_at"
+            ],
+            "evidence holds the key, the expiry, the revision and the actor; a new column needs review"
+        );
+        let issuer = "https://issuer.example";
+        let store = crate::storage::PostgresJwtRevocationStore::new(
+            pool.clone(),
+            "deploy-jwt-evidence",
+            issuer,
+        )
+        .with_retention_leeway_for_test(1.0);
+        let in_seconds = |seconds: u64| {
+            (time::OffsetDateTime::now_utc() + std::time::Duration::from_secs(seconds))
+                .format(&time::format_description::well_known::Rfc3339)
+                .expect("rfc3339")
+        };
+        let revoked = |outcome: JwtRevocationOutcome| match outcome {
+            JwtRevocationOutcome::Revoked { security_revision } => security_revision,
+            JwtRevocationOutcome::AlreadyRevoked => panic!("the revoke should change the denylist"),
+        };
+
+        // An extension by a second actor: the row now names only that
+        // actor, and the evidence keeps both.
+        let first = revoked(
+            store
+                .revoke("jti-extended", Some(&in_seconds(1)), "operator:revoke-jwt")
+                .await
+                .expect("revoke"),
+        );
+        let extended = revoked(
+            store
+                .revoke("jti-extended", Some(&in_seconds(60)), "second-operator")
+                .await
+                .expect("extend"),
+        );
+        assert_eq!(
+            store
+                .revoke("jti-extended", Some(&in_seconds(1)), "third-operator")
+                .await
+                .expect("repeat"),
+            JwtRevocationOutcome::AlreadyRevoked
+        );
+        let extended_digest = store.jti_digest("jti-extended");
+        let row_actor: String = pool
+            .get()
+            .await
+            .expect("row checkout")
+            .query_one(
+                "SELECT actor_user_id FROM greengateway.jwt_revocations WHERE jti_hash = $1",
+                &[&extended_digest],
+            )
+            .await
+            .expect("the denylist row")
+            .get(0);
+        assert_eq!(
+            row_actor, "second-operator",
+            "the row's actor is overwritten"
+        );
+        let evidence = jwt_evidence_rows(&pool).await;
+        assert_eq!(
+            evidence
+                .iter()
+                .map(|row| (row.actor_user_id.as_str(), row.security_revision))
+                .collect::<Vec<_>>(),
+            [
+                ("operator:revoke-jwt", first),
+                ("second-operator", extended)
+            ],
+            "the extension is a second row, and the first actor is kept"
+        );
+        for row in &evidence {
+            assert_eq!(row.action, "jwt.revoke");
+            assert_eq!(row.issuer, issuer);
+            assert_eq!(row.jti_hash, extended_digest);
+            assert_ne!(row.event_id, row.operation_id);
+        }
+        let (Some(first_expiry), Some(extended_expiry)) =
+            (evidence[0].expires_at, evidence[1].expires_at)
+        else {
+            panic!("both revokes carried an expiry: {evidence:?}");
+        };
+        assert!(
+            extended_expiry > first_expiry + 30.0,
+            "each row records the expiry the denylist held after its change"
+        );
+        // Each row is bound to its revoke's outbox row.
+        assert_eq!(
+            scalar_i64(
+                &pool,
+                &format!(
+                    "SELECT COUNT(*) FROM greengateway.security_outbox \
+                     WHERE resource_type = 'jwt_revocation' AND resource_id = '{extended_digest}' \
+                       AND revision IN ({first}, {extended})"
+                ),
+            )
+            .await,
+            2
+        );
+
+        // Refused revokes record nothing.
+        let past = (time::OffsetDateTime::now_utc() - std::time::Duration::from_secs(60))
+            .format(&time::format_description::well_known::Rfc3339)
+            .expect("rfc3339");
+        for (jti, expires_at) in [("jti-stale", Some(past.as_str())), ("  ", None)] {
+            store
+                .revoke(jti, expires_at, "operator:revoke-jwt")
+                .await
+                .expect_err("a refused revoke");
+        }
+        for actor in [
+            String::new(),
+            "a".repeat(crate::auth::tokens::MAX_TOKEN_CHANGE_ACTOR_BYTES + 1),
+        ] {
+            let refused = store
+                .revoke("jti-unattributed", None, &actor)
+                .await
+                .expect_err("an unattributable revoke is refused");
+            assert_eq!(refused.kind(), RepositoryErrorKind::InvalidData);
+        }
+        assert!(!store.is_revoked("jti-unattributed").await.expect("lookup"));
+        assert_eq!(jwt_evidence_rows(&pool).await.len(), 2);
+
+        // A row that lapses and is reactivated in place, and one that lapses
+        // and is cleaned up: two more rows, and cleanup removes neither.
+        let reactivated_first = revoked(
+            store
+                .revoke(
+                    "jti-reactivated",
+                    Some(&in_seconds(1)),
+                    "operator:revoke-jwt",
+                )
+                .await
+                .expect("revoke"),
+        );
+        let cleaned = revoked(
+            store
+                .revoke("jti-cleaned", Some(&in_seconds(1)), "operator:revoke-jwt")
+                .await
+                .expect("revoke"),
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(2300)).await;
+        assert!(!store.is_revoked("jti-reactivated").await.expect("lookup"));
+        let reactivated = revoked(
+            store
+                .revoke("jti-reactivated", None, "reactivating-operator")
+                .await
+                .expect("reactivate"),
+        );
+        assert_eq!(store.cleanup_expired(100).await.expect("cleanup"), 1);
+        let cleaned_digest = store.jti_digest("jti-cleaned");
+        assert_eq!(
+            scalar_i64(
+                &pool,
+                &format!(
+                    "SELECT COUNT(*) FROM greengateway.jwt_revocations \
+                     WHERE jti_hash = '{cleaned_digest}'"
+                ),
+            )
+            .await,
+            0,
+            "cleanup removed the lapsed denylist row"
+        );
+        let evidence = jwt_evidence_rows(&pool).await;
+        let reactivated_digest = store.jti_digest("jti-reactivated");
+        assert_eq!(
+            evidence
+                .iter()
+                .map(|row| (
+                    row.jti_hash.as_str(),
+                    row.actor_user_id.as_str(),
+                    row.security_revision,
+                    row.expires_at.is_some()
+                ))
+                .collect::<Vec<_>>(),
+            [
+                (extended_digest.as_str(), "operator:revoke-jwt", first, true),
+                (extended_digest.as_str(), "second-operator", extended, true),
+                (
+                    reactivated_digest.as_str(),
+                    "operator:revoke-jwt",
+                    reactivated_first,
+                    true
+                ),
+                (
+                    cleaned_digest.as_str(),
+                    "operator:revoke-jwt",
+                    cleaned,
+                    true
+                ),
+                (
+                    reactivated_digest.as_str(),
+                    "reactivating-operator",
+                    reactivated,
+                    false
+                ),
+            ],
+            "every change is a row, the reactivation records its unbounded expiry, \
+             and cleanup leaves the evidence of the row it removed"
+        );
+        let stored = table_json(&pool, "jwt_revocation_evidence")
+            .await
+            .join("\n");
+        for raw in ["jti-extended", "jti-reactivated", "jti-cleaned"] {
+            assert!(!stored.contains(raw), "no raw jti in evidence: {stored}");
+        }
+
+        // A restart is a new process over the same authority.
+        drop(store);
+        drop(pool);
+        let (_restarted_tokens, restarted_pool) = migrated_service_token_store(&database).await;
+        assert_eq!(jwt_evidence_rows(&restarted_pool).await, evidence);
+    }
+
+    /// A JWT revoke whose evidence cannot be written fails and leaves
+    /// nothing: no denylist row, no outbox row, no revision. It succeeds,
+    /// with its one row, once evidence can be written.
+    #[tokio::test]
+    async fn a_failed_jwt_evidence_insert_rolls_back_the_revoke() {
+        use crate::auth::RevocationStore;
+        let Some(admin_dsn) = locator() else {
+            eprintln!("skipping: no test database locator; CI runs this test");
+            return;
+        };
+        let _guard = DATABASE.lock().await;
+        let database = create_test_database(&admin_dsn).await;
+        let (_tokens, pool) = migrated_service_token_store(&database).await;
+        let store = crate::storage::PostgresJwtRevocationStore::new(
+            pool.clone(),
+            "deploy-jwt-evidence-fault",
+            "https://issuer.example",
+        );
+        const SHARED: &str =
+            "SELECT last_revision FROM greengateway.security_revision_state WHERE singleton";
+        let shared_before = scalar_i64(&pool, SHARED).await;
+        let outbox_before =
+            scalar_i64(&pool, "SELECT COUNT(*) FROM greengateway.security_outbox").await;
+
+        let restore = fail_inserts_into(&pool, "jwt_revocation_evidence").await;
+        let refused = store
+            .revoke("jti-faulted", None, "operator:revoke-jwt")
+            .await
+            .expect_err("a revoke whose evidence cannot commit must fail");
+        assert_eq!(refused.kind(), RepositoryErrorKind::Internal, "{refused}");
+        pool.get()
+            .await
+            .expect("failure trigger cleanup checkout")
+            .batch_execute(&restore)
+            .await
+            .expect("failure trigger should drop");
+
+        assert!(!store.is_revoked("jti-faulted").await.expect("lookup"));
+        assert_eq!(
+            scalar_i64(&pool, "SELECT COUNT(*) FROM greengateway.jwt_revocations").await,
+            0
+        );
+        assert_eq!(
+            scalar_i64(&pool, "SELECT COUNT(*) FROM greengateway.security_outbox").await,
+            outbox_before
+        );
+        assert_eq!(scalar_i64(&pool, SHARED).await, shared_before);
+        assert!(jwt_evidence_rows(&pool).await.is_empty());
+
+        let outcome = store
+            .revoke("jti-faulted", None, "operator:revoke-jwt")
+            .await
+            .expect("the revoke commits once evidence can be written");
+        assert_eq!(
+            outcome,
+            crate::storage::JwtRevocationOutcome::Revoked {
+                security_revision: shared_before + 1
+            },
+            "the aborted attempt consumed no revision"
+        );
+        let evidence = jwt_evidence_rows(&pool).await;
+        assert_eq!(evidence.len(), 1, "{evidence:?}");
+        assert_eq!(evidence[0].security_revision, shared_before + 1);
+        assert_eq!(evidence[0].expires_at, None);
     }
 
     /// A verify that lands after a revoke reports Revoked and writes
@@ -3838,7 +5456,10 @@ pub(crate) mod postgres_audit_tests {
             .expect("get")
             .expect("exists");
         assert!(before.last_used_at.is_some());
-        store.revoke(&created.record.id).await.expect("revoke");
+        store
+            .revoke(&created.record.id, "contract-revoker")
+            .await
+            .expect("revoke");
 
         assert_eq!(
             store
@@ -7134,6 +8755,7 @@ pub(crate) mod postgres_audit_tests {
             schema_version: migrations::schema_version_range(),
             document_version: crate::cluster_membership::DOCUMENT_VERSION_RANGE,
             fingerprint: std::iter::repeat_n(fingerprint_byte, 64).collect(),
+            capabilities: crate::storage::compatibility::BINARY_CAPABILITIES.to_vec(),
         }
     }
 
@@ -7641,6 +9263,313 @@ pub(crate) mod postgres_audit_tests {
             FingerprintAgreement::Agreed,
             "the same fingerprint as every live member is admitted at once"
         );
+    }
+
+    /// Write a roster row the way a gateway that predates migration 17
+    /// does: its heartbeat names no capabilities, so the row advertises
+    /// nothing. Returns the row's instance ID.
+    async fn insert_pre_protocol_member(pool: &deadpool_postgres::Pool) -> uuid::Uuid {
+        let instance = uuid::Uuid::new_v4();
+        pool.get()
+            .await
+            .expect("client")
+            .execute(
+                "INSERT INTO greengateway.cluster_members
+                     (deployment_id, instance_id, boot_id, binary_version,
+                      schema_version_min, schema_version_max,
+                      document_version_min, document_version_max, fingerprint)
+                 VALUES ($1, $2::text::uuid, $3::text::uuid, '1.0.1', 16, 16, 0, 0, repeat('a', 64))",
+                &[
+                    &MEMBERS_DEPLOYMENT,
+                    &instance.to_string(),
+                    &uuid::Uuid::new_v4().to_string(),
+                ],
+            )
+            .await
+            .expect("a pre-protocol member row inserts");
+        instance
+    }
+
+    /// The heartbeat persists this binary's capability advertisement on
+    /// every refresh, the roster returns it as written, and what a reader
+    /// recognizes is decided by the reader: a newer gateway's name grants
+    /// nothing here, and a row from a gateway that predates the column
+    /// advertises nothing.
+    #[tokio::test]
+    async fn heartbeats_advertise_this_binarys_capabilities() {
+        use crate::storage::compatibility::{Capability, RecognizedCapabilities};
+
+        let Some(admin_dsn) = locator() else {
+            eprintln!("skipping: no test database locator; CI runs this test");
+            return;
+        };
+        let _guard = DATABASE.lock().await;
+        let database = create_test_database(&admin_dsn).await;
+        let pool = migrated_limits_pool(&database).await;
+        let store = member_store(&pool);
+        let window = Duration::from_secs(30);
+        store
+            .heartbeat(&registration('a'), MemberRevisions::default(), None)
+            .await
+            .expect("boot heartbeat");
+        let members = store.members(window).await.expect("members");
+        assert_eq!(
+            members[0].capabilities,
+            "operation_requirements,policy_role_descriptions"
+        );
+        assert!(RecognizedCapabilities::parse(&members[0].capabilities)
+            .contains(Capability::OperationRequirements));
+        assert!(RecognizedCapabilities::parse(&members[0].capabilities)
+            .contains(Capability::PolicyRoleDescriptions));
+
+        // A newer gateway on the same instance would write names this one
+        // does not know; the next heartbeat writes this binary's own set
+        // back, because the advertisement is the running process's.
+        pool.get()
+            .await
+            .expect("client")
+            .execute(
+                "UPDATE greengateway.cluster_members
+                 SET capabilities = 'future_capability,operation_requirements'
+                 WHERE instance_id = $1::text::uuid",
+                &[&store.instance_id().to_string()],
+            )
+            .await
+            .expect("plant a newer advertisement");
+        let planted = store.members(window).await.expect("members");
+        let recognized = RecognizedCapabilities::parse(&planted[0].capabilities);
+        assert_eq!(recognized.names(), vec!["operation_requirements"]);
+        assert_eq!(recognized.unrecognized(), 1);
+        store
+            .heartbeat(&registration('a'), MemberRevisions::default(), None)
+            .await
+            .expect("refresh");
+        assert_eq!(
+            store.members(window).await.expect("members")[0].capabilities,
+            "operation_requirements,policy_role_descriptions"
+        );
+
+        let older = insert_pre_protocol_member(&pool).await;
+        let members = store.members(window).await.expect("members");
+        let older = members
+            .iter()
+            .find(|member| member.instance_id == older)
+            .expect("the older member is on the roster");
+        assert_eq!(older.capabilities, "");
+        assert!(RecognizedCapabilities::parse(&older.capabilities)
+            .names()
+            .is_empty());
+    }
+
+    /// The operation gate over a real roster: a registered operation is
+    /// admitted while every live member advertises it; a live member that
+    /// does not -- a gateway that predates the protocol, still
+    /// heartbeating -- holds it, draining or not, until its row goes stale
+    /// on the database clock; every refusal is audited; and an
+    /// unregistered requirement, an unreadable roster, or a roster missing
+    /// this replica's own row is refused too.
+    #[tokio::test]
+    async fn a_gated_operation_waits_for_every_live_member_to_advertise_it() {
+        use crate::audit::{sink::tests::CaptureSink, AuditLog};
+        use crate::cluster_membership::GatedWriteRequest;
+        use crate::storage::compatibility::{
+            Activation, Backfill, Capability, OperationAdmission, OperationRefusal,
+            OperationRequirement, POLICY_ROLE_DESCRIPTIONS,
+        };
+
+        let Some(admin_dsn) = locator() else {
+            eprintln!("skipping: no test database locator; CI runs this test");
+            return;
+        };
+        let _guard = DATABASE.lock().await;
+        let database = create_test_database(&admin_dsn).await;
+        let pool = migrated_limits_pool(&database).await;
+        let heartbeat = Duration::from_secs(1);
+        let window = Duration::from_secs(30);
+
+        let requirement = OperationRequirement {
+            operation: "fixture.gated_write",
+            minimum_schema: migrations::schema_version_range().0,
+            document_format: Some(crate::cluster_membership::DOCUMENT_VERSION_RANGE.0),
+            capability: Capability::OperationRequirements,
+            backfill: Backfill::NotRequired,
+            activation: Activation::LiveMembers,
+        };
+        let registry = [requirement];
+        let capture = CaptureSink::new();
+        let audit = AuditLog::new(Arc::new(capture.clone()));
+        let request = GatedWriteRequest {
+            request_id: "request-gate".to_owned(),
+            source_ip: "203.0.113.9".to_owned(),
+            actor: None,
+        };
+
+        let first_store = member_store(&pool);
+        let first =
+            ClusterMembership::new(first_store.clone(), registration('a'), heartbeat, window);
+        first.register_boot().await.expect("boot");
+        let second =
+            ClusterMembership::new(member_store(&pool), registration('a'), heartbeat, window);
+        second.register_boot().await.expect("boot");
+        assert_eq!(
+            first
+                .admit_registered(&requirement, &registry, &audit, &request)
+                .await,
+            Ok(OperationAdmission { live_members: 2 })
+        );
+
+        let older = insert_pre_protocol_member(&pool).await;
+        let refused = first
+            .admit_registered(&requirement, &registry, &audit, &request)
+            .await;
+        assert_eq!(
+            refused,
+            Err(OperationRefusal::MembersLackRequirement {
+                lacking: vec![older],
+                live: 3
+            })
+        );
+        // Every replica answers the same way: the decision is the roster's.
+        assert!(matches!(
+            second
+                .admit_registered(&requirement, &registry, &audit, &request)
+                .await,
+            Err(OperationRefusal::MembersLackRequirement { .. })
+        ));
+        // The shipped operation is held by the same member: it advertises
+        // nothing, so certainly not role descriptions.
+        assert_eq!(
+            first
+                .admit_operation(&POLICY_ROLE_DESCRIPTIONS, &audit, &request)
+                .await,
+            Err(OperationRefusal::MembersLackRequirement {
+                lacking: vec![older],
+                live: 3
+            })
+        );
+
+        // A draining member is still answering what was routed to it.
+        pool.get()
+            .await
+            .expect("client")
+            .execute(
+                "UPDATE greengateway.cluster_members SET draining_at = now()
+                 WHERE instance_id = $1::text::uuid",
+                &[&older.to_string()],
+            )
+            .await
+            .expect("drain the older member");
+        assert!(matches!(
+            first
+                .admit_registered(&requirement, &registry, &audit, &request)
+                .await,
+            Err(OperationRefusal::MembersLackRequirement { .. })
+        ));
+        backdate_heartbeat(&pool, older, 60.0).await;
+        assert_eq!(
+            first
+                .admit_registered(&requirement, &registry, &audit, &request)
+                .await,
+            Ok(OperationAdmission { live_members: 2 }),
+            "a stale row no longer holds the operation"
+        );
+        assert_eq!(
+            first
+                .admit_operation(&POLICY_ROLE_DESCRIPTIONS, &audit, &request)
+                .await,
+            Ok(OperationAdmission { live_members: 2 }),
+            "both live members are this build, so the shipped operation is admitted"
+        );
+
+        // Only a registered requirement can be admitted.
+        let unregistered = OperationRequirement {
+            operation: "fixture.unregistered",
+            ..requirement
+        };
+        assert_eq!(
+            first
+                .admit_registered(&unregistered, &registry, &audit, &request)
+                .await,
+            Err(OperationRefusal::NotSupportedByThisBinary)
+        );
+        assert_eq!(
+            first.admit_operation(&requirement, &audit, &request).await,
+            Err(OperationRefusal::NotSupportedByThisBinary),
+            "the shipped registry does not register the fixture"
+        );
+
+        // This replica's own row missing: the read cannot be shown to
+        // describe the deployment.
+        pool.get()
+            .await
+            .expect("client")
+            .execute(
+                "DELETE FROM greengateway.cluster_members WHERE instance_id = $1::text::uuid",
+                &[&first_store.instance_id().to_string()],
+            )
+            .await
+            .expect("remove this replica's row");
+        assert_eq!(
+            first
+                .admit_registered(&requirement, &registry, &audit, &request)
+                .await,
+            Err(OperationRefusal::RosterMissingThisReplica)
+        );
+
+        // An unreadable roster refuses rather than admits.
+        let client = pool.get().await.expect("client");
+        client
+            .batch_execute(
+                "ALTER TABLE greengateway.cluster_members RENAME TO cluster_members_hidden",
+            )
+            .await
+            .expect("hide the roster");
+        let unreadable = second
+            .admit_registered(&requirement, &registry, &audit, &request)
+            .await;
+        client
+            .batch_execute(
+                "ALTER TABLE greengateway.cluster_members_hidden RENAME TO cluster_members",
+            )
+            .await
+            .expect("restore the roster");
+        assert_eq!(unreadable, Err(OperationRefusal::RosterUnavailable));
+
+        // Every refusal above left one audit event naming the operation
+        // and its reason, and none carries a member identifier.
+        let expected_reasons = [
+            "capability_not_advertised",
+            "capability_not_advertised",
+            "capability_not_advertised",
+            "capability_not_advertised",
+            "operation_not_supported",
+            "operation_not_supported",
+            "roster_missing_this_replica",
+            "roster_unavailable",
+        ];
+        let started = std::time::Instant::now();
+        while capture.len() < expected_reasons.len() && started.elapsed() < Duration::from_secs(5) {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let events = capture.events();
+        let reasons: Vec<&str> = events
+            .iter()
+            .map(|event| {
+                assert_eq!(event.event_type, "cluster.operation_refused");
+                assert_eq!(event.request_id, "request-gate");
+                assert_eq!(event.source_ip, "203.0.113.9");
+                assert!(!event.payload.to_string().contains(&older.to_string()));
+                event.payload["reason"].as_str().expect("a reason")
+            })
+            .collect();
+        assert_eq!(reasons, expected_reasons);
+        assert_eq!(events[0].payload["operation"], "fixture.gated_write");
+        assert_eq!(events[0].payload["capability"], "operation_requirements");
+        assert_eq!(events[0].payload["lacking_members"], 1);
+        assert_eq!(events[0].payload["live_members"], 3);
+        assert_eq!(events[2].payload["operation"], "policy.role_descriptions");
+        assert_eq!(events[2].payload["capability"], "policy_role_descriptions");
+        assert_eq!(events[5].payload["operation"], "fixture.gated_write");
     }
 
     /// A swept row comes back as the same boot: a replica partitioned past

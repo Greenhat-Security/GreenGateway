@@ -302,6 +302,9 @@ async function installMockRoutes(page) {
     await json(route, {
       scanned_event_count: 416,
       scan_truncated: false,
+      // The revision the policy route serves, so Promote and Disable stay
+      // bound to the policy on screen.
+      policy_etag: '"demo-shadow-policy-etag"',
       rules: [
         {
           rule_id: 'shadow-report-deletes',
@@ -318,6 +321,8 @@ async function installMockRoutes(page) {
             { user_id: 'analyst-ada', roles: ['analyst'] },
             { user_id: 'ops-mira', roles: ['ops', 'analyst'] },
           ],
+          evidence_window: { from: isoMinutesAgo(52), to: isoMinutesAgo(7) },
+          evidence_digest: `sha256:${'1'.repeat(64)}`,
           samples: [
             shadowSample({
               event_id: 'sample-report-delete',
@@ -347,6 +352,8 @@ async function installMockRoutes(page) {
             { user_id: 'support-jules', roles: ['support'] },
             { user_id: 'support-lee', roles: ['support', 'tier2'] },
           ],
+          evidence_window: { from: isoMinutesAgo(44), to: isoMinutesAgo(17) },
+          evidence_digest: `sha256:${'2'.repeat(64)}`,
           samples: [
             shadowSample({
               event_id: 'sample-admin-patch',

@@ -37,6 +37,52 @@ pub(super) fn emit_policy_changed_payload(
     ));
 }
 
+/// A promotion or disable bound to a shadow review that was refused, and
+/// the bindings it was compared on. Digests, ETags and the stable reason
+/// only: no principals, samples, paths or policy contents.
+pub(super) struct ShadowTransitionRefusal<'a> {
+    pub(super) transition: ShadowReviewTransition,
+    pub(super) rule_id: &'a str,
+    pub(super) reason: &'static str,
+    pub(super) binding: &'a ShadowReviewBinding,
+    pub(super) current_policy_etag: Option<&'a str>,
+    pub(super) current_evidence_digest: Option<&'a str>,
+}
+
+pub(super) fn emit_policy_shadow_transition_refused(
+    state: &PolicyAdminState,
+    parts: &http::request::Parts,
+    principal: &auth::Principal,
+    refusal: ShadowTransitionRefusal<'_>,
+) {
+    let request_id = client_ip::request_id(&parts.headers, &parts.extensions);
+    let source_ip =
+        client_ip::canonical_client_ip(&parts.headers, &parts.extensions, &state.client_ip_policy);
+    let mut payload = json!({
+        "transition": refusal.transition.as_str(),
+        "rule_id": refusal.rule_id,
+        "reason": refusal.reason,
+        "reviewed_policy_etag": refusal.binding.policy_etag,
+        "reviewed_evidence_digest": refusal.binding.evidence_digest,
+    });
+    if let Some(payload) = payload.as_object_mut() {
+        if let Some(etag) = refusal.current_policy_etag {
+            payload.insert("current_policy_etag".to_owned(), json!(etag));
+        }
+        if let Some(digest) = refusal.current_evidence_digest {
+            payload.insert("current_evidence_digest".to_owned(), json!(digest));
+        }
+    }
+
+    state.audit.emit(audit::AuditEvent::new(
+        audit::event::POLICY_SHADOW_TRANSITION_REFUSED,
+        request_id,
+        source_ip,
+        Some(auth::actor_from_principal(principal)),
+        payload,
+    ));
+}
+
 pub(super) fn emit_service_token_changed(
     state: &TokenAdminState,
     parts: &http::request::Parts,

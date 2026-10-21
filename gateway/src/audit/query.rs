@@ -302,6 +302,14 @@ pub struct ShadowRuleWouldDenySummary {
     pub would_deny_count: u64,
     pub affected_principals: Vec<ShadowRuleAffectedPrincipal>,
     pub samples: Vec<ShadowRuleWouldDenySample>,
+    /// Recorded timestamp of the newest would-deny event the scan read for
+    /// this rule, in audit-log order. `None` only for an empty summary.
+    pub newest_timestamp: Option<String>,
+    /// Recorded timestamp of the oldest would-deny event the scan read for
+    /// this rule. With `newest_timestamp` this is the evidence window a
+    /// shadow-review binding names, so it is kept even when the event is
+    /// past the sample limit.
+    pub oldest_timestamp: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -901,6 +909,7 @@ impl AuditQueryStore {
             let actor = row.actor()?;
             let entry = accumulators.entry(row.matched_rule_id.clone()).or_default();
             entry.would_deny_count = entry.would_deny_count.saturating_add(1);
+            entry.observe_timestamp(&row.timestamp);
             if let Some(actor) = actor.as_ref() {
                 entry.add_affected_principal(actor);
             }
@@ -1167,6 +1176,8 @@ struct ShadowRuleWouldDenyAccumulator {
     affected_principals: Vec<ShadowRuleAffectedPrincipal>,
     seen_principal_keys: BTreeSet<(String, Option<String>, String, Vec<String>)>,
     samples: Vec<ShadowRuleWouldDenySample>,
+    newest_timestamp: Option<String>,
+    oldest_timestamp: Option<String>,
 }
 
 impl RawAuditEventRow {
@@ -1247,6 +1258,15 @@ impl RawShadowWouldDenyRow {
 }
 
 impl ShadowRuleWouldDenyAccumulator {
+    /// Rows arrive newest first, so the first timestamp seen is the newest
+    /// and every later one is the oldest so far.
+    fn observe_timestamp(&mut self, timestamp: &str) {
+        if self.newest_timestamp.is_none() {
+            self.newest_timestamp = Some(timestamp.to_owned());
+        }
+        self.oldest_timestamp = Some(timestamp.to_owned());
+    }
+
     fn add_affected_principal(&mut self, actor: &Actor) {
         if self.affected_principals.len() >= MAX_SHADOW_REVIEW_AFFECTED_PRINCIPALS {
             return;
@@ -1290,6 +1310,8 @@ impl ShadowRuleWouldDenyAccumulator {
             would_deny_count: self.would_deny_count,
             affected_principals: self.affected_principals,
             samples: self.samples,
+            newest_timestamp: self.newest_timestamp,
+            oldest_timestamp: self.oldest_timestamp,
         }
     }
 }
@@ -2080,11 +2102,77 @@ mod tests {
             Some("user-1")
         );
 
+        assert_eq!(
+            reports.newest_timestamp.as_deref(),
+            Some("2024-06-01T12:00:03Z")
+        );
+        assert_eq!(
+            reports.oldest_timestamp.as_deref(),
+            Some("2024-06-01T12:00:00Z")
+        );
+
         let exports = review
             .summaries
             .get("shadow-exports")
             .expect("shadow exports summary should be present");
         assert_eq!(exports.would_deny_count, 1);
+        assert_eq!(
+            exports.newest_timestamp.as_deref(),
+            Some("2024-06-01T12:00:01Z")
+        );
+        assert_eq!(
+            exports.oldest_timestamp.as_deref(),
+            Some("2024-06-01T12:00:01Z")
+        );
+    }
+
+    #[test]
+    fn shadow_rule_would_deny_summaries_window_spans_events_past_the_sample_limit() {
+        let db = TempDb::new("shadow-rule-review-window");
+        create_schema(&db.path);
+        let event_count = MAX_SHADOW_REVIEW_SAMPLE_EVENTS + 2;
+        for index in 0..event_count {
+            let event_id = format!("rule-a-{index}");
+            let timestamp = format!("2024-06-01T12:00:{index:02}Z");
+            insert_authz_event(
+                &db.path,
+                SeedAuthzEvent {
+                    event_id: &event_id,
+                    event_type: "authz.would_deny",
+                    timestamp: &timestamp,
+                    actor_user_id: Some("user-1"),
+                    actor_roles: &["reader"],
+                    method: "GET",
+                    path: "/reports/1",
+                    matched_rule_id: Some("shadow-reports"),
+                },
+            );
+        }
+
+        let review = AuditQueryStore::open(&db.path)
+            .expect("query store should open")
+            .shadow_rule_would_deny_summaries(&["shadow-reports".to_owned()])
+            .expect("shadow review should query");
+
+        let reports = review
+            .summaries
+            .get("shadow-reports")
+            .expect("shadow reports summary should be present");
+        assert_eq!(reports.samples.len(), MAX_SHADOW_REVIEW_SAMPLE_EVENTS);
+        assert_eq!(
+            reports.would_deny_count,
+            u64::try_from(event_count).expect("count fits")
+        );
+        // The window is every event counted, not just the sampled ones: the
+        // oldest event is past the sample limit but still bounds the window.
+        assert_eq!(
+            reports.newest_timestamp.as_deref(),
+            Some("2024-06-01T12:00:11Z")
+        );
+        assert_eq!(
+            reports.oldest_timestamp.as_deref(),
+            Some("2024-06-01T12:00:00Z")
+        );
     }
 
     #[test]

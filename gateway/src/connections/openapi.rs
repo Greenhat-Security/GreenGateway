@@ -248,8 +248,8 @@ pub enum OpenApiCatalogError {
     InvalidSpec,
     InvalidSelection,
     AuthenticationMismatch,
-    /// The Connection asks for a signed caller assertion, which this gateway
-    /// does not yet inject; nothing is fetched or published for it.
+    /// The Connection asks for a signed caller assertion, which OpenAPI
+    /// discovery does not sign; nothing is fetched or published for it.
     CallerAssertionNotEnforced,
     ToolConflict,
     EgressDenied,
@@ -2029,9 +2029,11 @@ impl OpenApiConnectionCatalogService {
             .prepare_transport(&target, &destination)
             .await
             .map_err(connection_http_error)?;
+        // Discovery runs for no caller, so a credential that belongs to one
+        // is refused rather than resolved.
         let credential = self
             .http
-            .resolve_credential(&target)
+            .resolve_credential(&target, None)
             .await
             .map_err(connection_http_error)?;
         let mut headers = HeaderMap::new();
@@ -2781,10 +2783,11 @@ fn supports_managed_openapi_catalog(record: &StoredConnection) -> bool {
 /// Whether a Connection's stored OpenAPI catalog may be live in the registry.
 ///
 /// A catalog on a Connection that carries a `caller_assertion` is withdrawn
-/// like one on a disabled Connection. Every call on it is refused until the
-/// request path injects the assertion, and the binding validation each
-/// registry change runs refuses its tools, so leaving them installed would
-/// fail every later change to any lane, and a restart.
+/// like one on a disabled Connection. Only manual tools sign the assertion:
+/// a managed OpenAPI tool, like the discovery and refresh that produce it, is
+/// refused on such a Connection, and the binding validation each registry
+/// change runs refuses its tools, so leaving them installed would fail every
+/// later change to any lane, and a restart.
 fn serves_managed_openapi_catalog(record: &StoredConnection) -> bool {
     record.write.enabled
         && record.write.caller_assertion.is_none()
@@ -2862,12 +2865,20 @@ fn connection_http_error(error: ConnectionHttpError) -> OpenApiCatalogError {
         | ConnectionHttpError::OAuthTokenUnavailable
         | ConnectionHttpError::OAuthTokenRejected
         | ConnectionHttpError::OAuthTokenInvalidResponse => OpenApiCatalogError::SecretUnavailable,
-        ConnectionHttpError::OAuthTokenEgressDenied => OpenApiCatalogError::EgressDenied,
+        ConnectionHttpError::OAuthTokenEgressDenied
+        | ConnectionHttpError::DelegatedTokenEgressDenied => OpenApiCatalogError::EgressDenied,
+        // Unreachable: a delegated Connection carries a caller assertion,
+        // which discovery refuses before it resolves anything. Named so that
+        // stays a decision rather than a wildcard.
+        ConnectionHttpError::DelegatedTokenDenied
+        | ConnectionHttpError::DelegatedTokenExchangeFailed
+        | ConnectionHttpError::DelegatedTokenUnavailable => OpenApiCatalogError::SecretUnavailable,
         ConnectionHttpError::UpstreamAuthenticationRejected => {
             OpenApiCatalogError::AuthenticationFailed
         }
         ConnectionHttpError::UnsupportedAuthentication
-        | ConnectionHttpError::CredentialHeaderConflict => {
+        | ConnectionHttpError::CredentialHeaderConflict
+        | ConnectionHttpError::DelegatedTokenNoPrincipal => {
             OpenApiCatalogError::AuthenticationMismatch
         }
         ConnectionHttpError::CallerAssertionNotEnforced => {
@@ -3652,8 +3663,9 @@ paths:
     }
 
     /// A caller assertion as an operator would configure one. Its signing key is
-    /// loaded when the Connection is saved, and nothing signs with it: every
-    /// lane refuses the Connection first.
+    /// loaded when the Connection is saved, and nothing here signs with it:
+    /// only a manual tool call does, and every OpenAPI lane refuses the
+    /// Connection first.
     fn caller_assertion_json() -> Value {
         json!({
             "signing_key_id": "assertion-signing-key",

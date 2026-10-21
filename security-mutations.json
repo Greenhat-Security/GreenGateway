@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "harness_version": "1.0.0",
+  "harness_version": "1.1.0",
   "targets": [
     {
       "id": "path-prefix",
@@ -99,6 +99,104 @@
           "id": "accept-absent-host",
           "old": "request_host.is_some_and(|request_host| {",
           "new": "request_host.is_none_or(|request_host| {"
+        }
+      ]
+    },
+    {
+      "id": "kernel-rate-lane",
+      "path": "gateway/src/policy_eval/mod.rs",
+      "function": "policy_eval::CompiledPolicy::select_rate_lane",
+      "start_marker": "    pub(crate) fn select_rate_lane(",
+      "end_marker": "\n    }\n",
+      "source_sha256": "dd7cf96a7f31d345ec61973f1b2c4ab665ab126c2570f372f9ec41177135e924",
+      "tests": [
+        "policy_eval::tests::rate_lane_selection_matches_the_frozen_selector"
+      ],
+      "mutations": [
+        {
+          "id": "ignore-principal-constraint",
+          "old": "rule.principal.matches(Some(principal))",
+          "new": "true"
+        },
+        {
+          "id": "ignore-path-pattern",
+          "old": ".is_none_or(|pattern| path_pattern_matches(pattern, path))",
+          "new": ".is_none_or(|_| true)"
+        },
+        {
+          "id": "select-last-match",
+          "old": ".find(|(_, rule)| {",
+          "new": ".rfind(|(_, rule)| {"
+        }
+      ]
+    },
+    {
+      "id": "kernel-tool",
+      "path": "gateway/src/policy_eval/tools.rs",
+      "function": "policy_eval::CompiledPolicy::evaluate_tool",
+      "start_marker": "    pub(crate) fn evaluate_tool(",
+      "end_marker": "\n    }\n",
+      "source_sha256": "da25c8ec84e8f14d814741a55b1ed0a94339a986275ab1bb09fe8bf375ad86d5",
+      "tests": [
+        "policy_eval::tools::tests::a_disabled_entry_and_a_denying_tool_or_rendered_rule_each_block_on_their_own",
+        "policy_eval::tools::tests::rendered_http_accepts_valid_segment_escapes_and_rejects_malformed_escapes"
+      ],
+      "mutations": [
+        {
+          "id": "admit-disabled-tool",
+          "old": "if !tool.enabled {",
+          "new": "if false {"
+        },
+        {
+          "id": "ignore-deny-rule",
+          "old": "RuleAction::Deny => result = result.deny(ToolReason::MatchedRule),",
+          "new": "RuleAction::Deny => {}"
+        },
+        {
+          "id": "skip-rendered-http-rule",
+          "old": "self.matcher.evaluate_with_dispatch(\n                method.as_str(),\n                path,\n                principal,\n                RuleDispatchContext::unknown(),\n            )",
+          "new": "None"
+        }
+      ]
+    },
+    {
+      "id": "kernel-tool-identity",
+      "path": "gateway/src/policy_eval/tools.rs",
+      "function": "policy_eval::tools::tool_principal_matches",
+      "start_marker": "fn tool_principal_matches(",
+      "end_marker": "\n}\n",
+      "source_sha256": "a43b2e6eb69d0b00893a3243c83714bce9035b4927ab59ffbea1164fdcb09424",
+      "tests": [
+        "policy_eval::tools::tests::each_tool_identity_constraint_refuses_a_caller_without_it_and_an_anonymous_one"
+      ],
+      "mutations": [
+        {
+          "id": "accept-anonymous",
+          "old": "principal.is_some_and(|principal| {",
+          "new": "principal.is_none_or(|principal| {"
+        },
+        {
+          "id": "ignore-allowed-roles",
+          "old": ".any(|role| principal.roles.contains(role))",
+          "new": ".any(|_| true)"
+        }
+      ]
+    },
+    {
+      "id": "kernel-rendered-path",
+      "path": "gateway/src/policy_eval/tools.rs",
+      "function": "policy_eval::tools::validate_rendered_http_path",
+      "start_marker": "pub(crate) fn validate_rendered_http_path(",
+      "end_marker": "\n}\n",
+      "source_sha256": "11e8769c4c3c9869e8c49f34ea704b02e5aa6198e982ccc5bfe86a3ec65add5f",
+      "tests": [
+        "policy_eval::tools::tests::incomplete_invalid_and_inconsistent_facts_fail_closed"
+      ],
+      "mutations": [
+        {
+          "id": "allow-dot-dot-segment",
+          "old": ".any(|segment| segment == \".\" || segment == \"..\")",
+          "new": ".any(|segment| segment == \".\")"
         }
       ]
     }

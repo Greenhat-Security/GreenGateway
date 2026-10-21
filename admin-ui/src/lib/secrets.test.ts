@@ -122,8 +122,9 @@ describe('connection secrets API client', () => {
   });
 
   it('accepts an operator alias that may also hold a caller-assertion signing key', async () => {
-    // The gateway lists `assertion_signing_key` among an operator alias's
-    // compatible purposes. Rejecting it would discard the whole inventory and
+    // The gateway lists `assertion_signing_key` and
+    // `token_exchange_client_secret` among an operator alias's compatible
+    // purposes. Rejecting either would discard the whole inventory and
     // disable every secret bind in this UI.
     vi.stubGlobal(
       'fetch',
@@ -146,6 +147,7 @@ describe('connection secrets API client', () => {
                     'tls_certificate',
                     'tls_ca_bundle',
                     'assertion_signing_key',
+                    'token_exchange_client_secret',
                   ],
                   version: undefined,
                   actions: { can_rotate: false, can_delete: false },
@@ -173,6 +175,9 @@ describe('connection secrets API client', () => {
     expect(result.value.secrets).toHaveLength(2);
     expect(result.value.secrets[0].compatible_purposes).toContain(
       'assertion_signing_key',
+    );
+    expect(result.value.secrets[0].compatible_purposes).toContain(
+      'token_exchange_client_secret',
     );
   });
 

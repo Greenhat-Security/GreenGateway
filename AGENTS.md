@@ -4,6 +4,8 @@
 
 This is the orientation doc for anyone, human or AI agent, picking up an issue in this repository.
 
+[`CLAUDE.md`](CLAUDE.md) is its companion, not a competitor: this file stays canonical for conventions, commands, and guardrails, and `CLAUDE.md` adds what this file leaves out — the workspace shape including the `admin-ui` build coupling, the seven ADRs, and the `.env.example` drift test. Keep the two in step; when one changes a fact the other repeats, change both in the same commit.
+
 ## Project Summary
 
 GreenGateway is an open-source, self-hosted universal MCP and API gateway written in Rust. It is intended to point at any HTTP backend, enforce authentication and authorization on every call, discover traffic, support a visual rule builder, and provide native MCP support.

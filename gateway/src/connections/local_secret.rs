@@ -1180,9 +1180,11 @@ fn purpose_as_str(purpose: SecretPurpose) -> &'static str {
         SecretPurpose::TlsPrivateKey => "tls_private_key",
         SecretPurpose::TlsCertificate => "tls_certificate",
         SecretPurpose::TlsCaBundle => "tls_ca_bundle",
-        // Never written: the table's purpose constraint predates it, and
-        // `create` refuses it first. Named here only so the match stays total.
+        // Never written: the table's purpose constraint predates them, and
+        // `create` refuses them first. Named here only so the match stays
+        // total.
         SecretPurpose::AssertionSigningKey => "assertion_signing_key",
+        SecretPurpose::TokenExchangeClientSecret => "token_exchange_client_secret",
     }
 }
 

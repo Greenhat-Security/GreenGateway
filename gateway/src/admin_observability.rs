@@ -668,6 +668,13 @@ pub(super) async fn accept_suggestion_in_cluster(
             Ok(prepared) => prepared,
             Err(response) => return *response,
         };
+    // The acceptance commits the whole document, so a role description
+    // already in it is written again and the gate is asked again.
+    if let Err(response) =
+        admit_policy_document(&state.policy, parts, principal, &prepared.candidate).await
+    {
+        return *response;
+    }
 
     let accepted = engine
         .suggestion_store()

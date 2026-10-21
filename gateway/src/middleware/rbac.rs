@@ -162,6 +162,15 @@ pub(crate) async fn with_pinned_policy<F: std::future::Future>(
     PINNED_POLICY.scope(policy, future).await
 }
 
+/// The policy snapshot pinned for the running task, if one is.
+///
+/// [`RbacState::effective_policy`] answers from it before the live lane, and
+/// so does the rate stage, which binds its lane selection to it (see
+/// `rate_limit::RateLimitPolicyState::select`).
+pub(crate) fn pinned_policy_snapshot() -> Option<Arc<RbacPolicyState>> {
+    PINNED_POLICY.try_with(Arc::clone).ok()
+}
+
 /// The snapshots the revision gate pinned for one admitted request: the
 /// Connection snapshot it dispatches under and the bundle of lanes it is
 /// judged by. The pins are task-locals, which a spawned task does not
@@ -608,7 +617,12 @@ impl RbacState {
         }
     }
 
+    /// Attach the rate stage, which from now on selects policy rate lanes with
+    /// the compiled instance of every snapshot this state installs, paired with
+    /// token buckets built for that snapshot. The snapshot installed right now
+    /// is handed over first, so the stage never selects with a copy.
     pub(crate) fn with_rate_limit_state(mut self, rate_limit: RateLimitState) -> Self {
+        rate_limit.install_policy_snapshot(self.policy.load_full(), &self.audit);
         self.rate_limit = Some(rate_limit);
         self
     }
@@ -653,10 +667,7 @@ impl RbacState {
     /// (by the gate at admission in cluster mode, or by
     /// [`RbacState::with_request_policy_snapshot`]), else the live lane.
     fn effective_policy(&self) -> Arc<RbacPolicyState> {
-        if let Ok(pinned) = PINNED_POLICY.try_with(Arc::clone) {
-            return pinned;
-        }
-        self.policy.load_full()
+        pinned_policy_snapshot().unwrap_or_else(|| self.policy.load_full())
     }
 
     /// Run `future` with the request's policy snapshot pinned, so every
@@ -697,12 +708,12 @@ impl RbacState {
     }
 
     fn replace_policy(&self, policy: Policy) {
+        let snapshot = Arc::new(RbacPolicyState::from_policy(policy));
         if let Some(rate_limit) = &self.rate_limit {
-            rate_limit.replace_policy(&policy);
+            rate_limit.install_policy_snapshot(Arc::clone(&snapshot), &self.audit);
         }
 
-        self.policy
-            .store(Arc::new(RbacPolicyState::from_policy(policy)));
+        self.policy.store(snapshot);
     }
 
     /// Install a snapshot compiled for a specific authoritative security
@@ -750,20 +761,15 @@ impl RbacState {
         security_revision: i64,
         _guard: &PolicyWriteGuard<'_>,
     ) -> Result<(), crate::policy_eval::CompileError> {
-        // One candidate Arc built up front: `Arc::ptr_eq` against the rcu's
-        // result then distinguishes "this call installed the snapshot" from
-        // "another install already held this revision", so a duplicate
-        // install does not re-run `replace_policy` and gratuitously reset
-        // the policy-lane rate-limit buckets.
         // A candidate that cannot be compiled is refused before the swap, so the
         // installed snapshot keeps serving. The monotonic guard below would have
         // discarded an impossible revision anyway; refusing here is what makes
         // that visible to the caller instead of silent.
         let candidate = Arc::new(RbacPolicyState::from_policy_at_revision(
-            policy.clone(),
+            policy,
             security_revision,
         )?);
-        let installed = self.policy.rcu(|current| {
+        let replaced = self.policy.rcu(|current| {
             if security_revision <= current.security_revision {
                 // Already at or past this revision (another install won the
                 // race, or this is a duplicate): keep what is installed.
@@ -771,9 +777,15 @@ impl RbacState {
             }
             candidate.clone()
         });
-        if Arc::ptr_eq(&installed, &candidate) {
+        // `rcu` returns the snapshot its successful round replaced -- the one
+        // that round judged, not the one it installed -- so this call installed
+        // the candidate exactly when that snapshot was behind it. Only then is
+        // the rate stage handed the candidate: a duplicate install must not
+        // reset the policy-lane buckets, and a real one must not leave the rate
+        // stage selecting with the previous revision.
+        if security_revision > replaced.security_revision {
             if let Some(rate_limit) = &self.rate_limit {
-                rate_limit.replace_policy(&policy);
+                rate_limit.install_policy_snapshot(candidate, &self.audit);
             }
         }
         Ok(())
@@ -1811,6 +1823,39 @@ fn evaluation_failed(
     )
 }
 
+/// Refuse a request that no policy evaluation answered, the way this stage
+/// refuses one before it evaluates: `403 {"error":"forbidden"}`, an
+/// `authz.denied` record with `reason` and no rule, and a denied policy
+/// decision with the same reason.
+///
+/// For the rate stage, which runs before this one and selects a policy rate
+/// lane with the same evaluator (#422). When it cannot select one it refuses the
+/// request rather than let it pass unmetered, and it refuses with this answer,
+/// so a request this stage would have refused for the same reason -- an unsafe
+/// path, or a path the evaluator does not accept -- is answered and audited
+/// exactly as before. No upstream, credential or DNS work has started, and the
+/// cluster revision gate has not run, so the record carries no served revision.
+pub(crate) fn refuse_unevaluated(
+    audit: &AuditLog,
+    client_ip_policy: &ClientIpPolicy,
+    req: &Request,
+    principal: Option<&auth::Principal>,
+    reason: &'static str,
+) -> Response {
+    let context = audit_context(req, client_ip_policy);
+    emit_denial_event(audit, &context, principal, reason, None, AUTHZ_DENIED);
+    with_policy_decision(
+        forbidden(),
+        PolicyDecision {
+            outcome: PolicyDecisionOutcome::Denied,
+            reason,
+            permission: None,
+            path_prefix: None,
+            matched_rule_id: None,
+        },
+    )
+}
+
 fn audit_context(req: &Request, client_ip_policy: &ClientIpPolicy) -> AuditContext {
     AuditContext {
         request_id: request_id(req.headers(), req.extensions()),
@@ -1861,7 +1906,7 @@ fn emit_denied(
     reason: &'static str,
     rule: Option<&RouteRule>,
 ) {
-    emit_denial_event(state, context, principal, reason, rule, AUTHZ_DENIED);
+    emit_denial_event(&state.audit, context, principal, reason, rule, AUTHZ_DENIED);
 }
 
 fn emit_would_deny(
@@ -1871,7 +1916,14 @@ fn emit_would_deny(
     reason: &'static str,
     rule: Option<&RouteRule>,
 ) {
-    emit_denial_event(state, context, principal, reason, rule, AUTHZ_WOULD_DENY);
+    emit_denial_event(
+        &state.audit,
+        context,
+        principal,
+        reason,
+        rule,
+        AUTHZ_WOULD_DENY,
+    );
 }
 
 fn emit_rule_allowed(
@@ -1949,7 +2001,7 @@ fn emit_direct_rule_event(
 }
 
 fn emit_denial_event(
-    state: &RbacState,
+    audit: &AuditLog,
     context: &AuditContext,
     principal: Option<&auth::Principal>,
     reason: &'static str,
@@ -1973,7 +2025,7 @@ fn emit_denial_event(
     };
     apply_security_revision(&mut payload, context);
 
-    state.audit.emit(AuditEvent::new(
+    audit.emit(AuditEvent::new(
         event_type,
         &context.request_id,
         &context.source_ip,
