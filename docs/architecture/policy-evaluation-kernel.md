@@ -2,9 +2,10 @@
 
 Issue #421 introduces `gateway/src/policy_eval/`. **The HTTP/RBAC adapter now
 uses it for live decisions**, including routes, host qualification, dispatch
-constraints and raw/canonical MCP HTTP identities (#422, PR 1). Tool admission,
-rate selection and egress retain their existing authorities. This does not
-complete #422 or add Policy Studio simulation/replay endpoints.
+constraints and raw/canonical MCP HTTP identities (#422, PR 1), and so do tool
+admission (#422, PR 2) and policy rate-lane selection (#422, PR 3a). Static
+egress retains its existing authority. This does not complete #422 or add Policy
+Studio simulation/replay endpoints.
 
 It now covers contextless HTTP direct rules and permission routes, host-qualified
 routes and dispatch-scoped direct rules, MCP alias identities, and rate-lane
@@ -47,8 +48,8 @@ freshness or perform a live cluster-revision check.
 | Default and observe behavior | RBAC default branches | Default allow or deny; shadow converts a logical deny to observation within this lane |
 | Host/dispatch-qualified rules | RBAC matching/direct/host helpers | Host-bound routes and dispatch-scoped rules evaluated; a selected upstream narrows direct rules to denies and is refused outright when no host-bound route authorizes it |
 | MCP raw/canonical aliases | `evaluate_equivalent_paths_with_dispatch`, exact-then-prefix route search | Both identities decide, under action-major precedence; the request path is matched exactly and only the canonical identity by prefix |
-| Rate lane selection | `policy_rate_limit_request` guard, `RateLimitState::matching_limiter` | First matching override; anonymous reaches none, reproducing the live early return; enforcement and buckets untouched |
-| Policy-backed tools | `ToolRuntime` invocation, visibility, composite enablement, rendered HTTP rules; `RbacState::tool_policy_eligibility` | Separate pure operations preserve each consumer's precedence and shadow behavior; no live cutover |
+| Rate lane selection | `policy_rate_limit_request` guard, `RateLimitPolicyState::matching_limiter` | First matching override; anonymous reaches none, reproducing the live early return; live since #422 PR 3a, with buckets, capacity and enforcement left to the limiter |
+| Policy-backed tools | `ToolRuntime` invocation, visibility, composite enablement, rendered HTTP rules; `RbacState::tool_policy_eligibility` | Separate pure operations preserve each consumer's precedence and shadow behavior; live since #422 PR 2 |
 | Static egress | Existing egress authority | Not evaluated; #421 PR 2 still owns extraction |
 
 Every target is evaluated, so there is no `unsupported_target` limitation and no
@@ -194,7 +195,7 @@ The matrices cover contextless HTTP over enforcement modes, defaults, direct
 actions, order, path boundaries, methods and principal activation; host-bound and
 dispatch-scoped requests including the direct-shadow observation that precedes a
 route decision; MCP aliases over rulebases where the two precedence orders
-disagree; and rate-lane selection against the live selector with its guard.
+disagree; and rate-lane selection against the frozen selector with its guard.
 Further tests cover missing versus anonymous facts, malformed and oversized
 inputs, exact digest/revision/context/semantics binding, duplicate and future
 source rejection, redaction, and deterministic concurrent evaluation with no async
@@ -232,3 +233,31 @@ shape violations documented in the parity matrix before this stage.
 
 Rollback is a code rollback; policy schemas, persistence and revisions are
 unchanged. The legacy implementation is not a runtime fallback.
+
+## Live rate adapter (#422, PR 3a)
+
+The policy rate stage asks `select_rate_lane` which override governs an
+authenticated request and charges that override's bucket. The question carries
+the method, the exact request path and the principal projection; routing and
+host facts are not captured there and are supplied as missing, which selection
+does not read. A request with no principal still returns before selection, as
+it always has, and the kernel answers the same case `NoOverride`.
+
+The stage selects with the compiled instance of the snapshot the RBAC lane
+installed, handed over by every install path, and builds its buckets from the
+rule vector that instance indexes (`CompiledPolicy::rate_limit_rules`). The
+two are swapped as one value. The question is bound to the request's pinned
+snapshot when there is one; the stage runs before the RBAC middleware pins
+anything, so today that is the installed snapshot, and a different pin is
+refused as a snapshot mismatch rather than charged against another policy's
+buckets.
+
+A selection the evaluator refuses or cannot complete refuses the request with
+the authorization stage's answer for an unevaluated request: `403`, an
+`authz.denied` record with `policy_evaluation_error` or
+`policy_evaluation_incomplete`, and a denied policy decision. A path
+`is_unsafe_request_path` refuses is refused before the evaluator is asked, with
+`unsafe_path`, as the authorization stage refuses it. Both reachable cases,
+unsafe paths and asterisk-form targets, were already refused by the
+authorization stage with the same answer. Mutable capacity, the shared store and
+the global lanes are unchanged and stay outside the evaluator.
