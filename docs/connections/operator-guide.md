@@ -357,23 +357,35 @@ place a purpose-built token broker behind an independently secured Connection.
 
 ### Signed caller assertions
 
-`caller_assertion` is accepted and stored but **not yet enforced**: GreenGateway
-does not mint or inject the assertion on the request path. Until that ships, a
-Connection carrying a `caller_assertion` block is refused for every tool call,
-proxied request, managed MCP session, OpenAPI or MCP discovery, enum or label
-source fetch, and stored test, before any DNS lookup, secret read, OAuth mint,
-or upstream request, rather than sent without the assertion the operator asked
-for. Its keys are already live, though: a save checks them, and their public
-halves are published (see [The published JWKS](#the-published-jwks)).
+A Connection with a `caller_assertion` block tells its upstream who is
+calling. On every tool call it signs a short-lived JWT that names the validated
+calling principal and sends it in `header_name`, alongside the Connection's own
+credential. The credential says which system is calling; the assertion says on
+whose behalf. An upstream the operator controls verifies the assertion against
+the gateway's published key set (see [The published JWKS](#the-published-jwks))
+and can then apply its own per-user ownership and entitlement checks, which a
+single shared credential makes impossible. It is the same shape as Google IAP's
+`X-Goog-IAP-JWT-Assertion` and Cloudflare Access's `Cf-Access-Jwt-Assertion`.
 
-The refusal reason is the fixed string `caller_assertion_not_enforced`. Where
-it appears depends on the lane:
+#### Which calls are attested
 
-- Tool call: the `failure_reason` of `tool.invoke_failure` and the `reason` of
-  `tool.upstream_request`. A composite tool reports at the tool level: its
-  `failure_reason` is `composite_failed`, and the failing step's
-  `caller_assertion_not_enforced` is only in the error details returned to the
-  caller, not in any audit event.
+Manual HTTP tools bound to the Connection are attested, whether they are called
+through the MCP endpoint or the admin tool playground. Every other lane on such
+a Connection is refused with `caller_assertion_not_enforced`, before any DNS
+lookup, secret read, OAuth mint or upstream request, rather than sent without
+the assertion: managed OpenAPI tools and composite tools, proxied requests,
+managed MCP sessions and MCP tool calls, OpenAPI and MCP discovery, enum and
+label source fetches, and stored Connection tests. Those lanes either have no
+calling principal to attest, or do not hold the exact request before it is
+sent.
+
+On those lanes the refusal reason appears as follows:
+
+- Managed OpenAPI or MCP tool call: the `failure_reason` of
+  `tool.invoke_failure` and the `reason` of `tool.upstream_request`. A
+  composite tool reports at the tool level: its `failure_reason` is
+  `composite_failed`, and the failing step's `caller_assertion_not_enforced` is
+  only in the error details returned to the caller, not in any audit event.
 - Stored Connection test: the `authenticated` stage reason.
 - OpenAPI preview, registration and refresh, and MCP catalog refresh: the
   `reason` of a `409 Conflict` response. A refused registration is also
@@ -389,29 +401,165 @@ it appears depends on the lane:
   event names it. Every other Connection failure on a proxy route behaves the
   same way.
 
-Bindings to such a Connection fail the way bindings to a disabled Connection
-do. A `TOOLS_FILE` tool or a proxy route bound to it fails startup or the whole
-reload that contains it, not only that binding. A managed OpenAPI catalog on it
-is withdrawn from the tool list and kept in storage; refresh it after removing
-the block to publish it again. Managed MCP tools stay listed, and every call to
-one is refused.
+A manual tool, from `TOOLS_FILE` or the admin API, may be bound to an attested
+Connection. Other bindings fail the way bindings to a disabled Connection do: a
+proxy route bound to it fails startup or the whole reload that contains it. A
+managed OpenAPI catalog on it is withdrawn from the tool list and kept in
+storage; refresh it after removing the block to publish it again. Managed MCP
+tools stay listed, and every call to one is refused.
+
+#### What the assertion says
+
+The JOSE header carries `alg` (`ES256` or `RS256`, from `algorithm`), `kid`
+(from `kid`) and `typ` (from `token_type`). The claims are:
+
+| Claim | Value |
+| --- | --- |
+| `iss` | `issuer` |
+| `aud` | `audience` |
+| `sub` | The caller's identity provider issuer, `#`, then the provider's subject, for example `https://idp.example#alice`. The provider issuer scopes the subject because two providers can issue the same subject for different people. |
+| `caller_iss`, `caller_sub` | The two halves of `sub`, unscoped. An upstream that matches its own user records reads these and never parses `sub`. |
+| `iat`, `exp` | Signing time and `iat` plus `lifetime_seconds`. |
+| `jti` | The gateway request ID of the call (`X-Request-Id`), the same ID its audit events carry. |
+| `email` | With `email` in `claims`, the principal's email, when it has one. |
+| `roles` | With `roles` in `claims`, the principal's roles, as an array. |
+| `method`, `path`, `request_sha256` | With `bind_request: true`: the request method, the request target exactly as it appears on the request line (path, then `?` and the query when there is one), and the lowercase hexadecimal SHA-256 of the exact body bytes sent, which is the hash of empty input for a request without a body. |
+
+Every value comes from the authenticated principal or the request the gateway
+builds, never from a tool argument. The assertion is signed once per call,
+after every other header and the body are final, and written as the last
+header. The lane removes the header name from anything a caller supplied, and
+validation keeps it apart from the Connection's primary and additional header
+names and from the headers a tool sets. If a value were still present at
+injection the call would be refused with `caller_assertion_header_conflict`
+rather than send two values or replace one. The signing key is read and
+loaded on every call, through the same secret resolution and loader that admit
+it on a save and publish it in the JWKS, so a key that stops loading stops
+signing on the next call.
+
+`request_sha256` is over the bytes on the wire, not a canonical form of the
+JSON: the upstream hashes exactly what it received. A body that parses to the
+same JSON with its keys in another order has a different digest.
+
+#### Which callers can be attested
+
+A principal that an identity provider vouched for can be attested: a bearer
+JWT, a session cookie, a client certificate, or the admin session that runs a
+tool in the playground. A call is refused with `caller_assertion_no_principal`
+before any DNS lookup, secret read or upstream request when there is nobody to
+name: an anonymous call, a service token (a credential the gateway issued to a
+system, not a person), or a principal without an issuer to scope its subject
+by. The refusal is audited like any other: `tool.invoke_failure` names the
+reason and the caller's actor, and `tool.upstream_request` records the
+refused request.
+
+#### HTTPS only
+
+An assertion is a bearer credential for its lifetime: anyone who reads it can
+present it as the caller until it expires. A new or replacement write of a
+Connection that carries the block must use an `https://` `base_url`, or it is
+refused with `422`, `endpoint.base_url` and `https_required`, as a credentialed
+Connection is. A document stored over plain HTTP by an earlier release still
+loads, and every call on it is refused with `caller_assertion_not_enforced`.
+
+#### Failure reasons
+
+Each refusal is a fixed string in the `failure_reason` of `tool.invoke_failure`
+(its `reason` is `work_error`) and the `reason` of `tool.upstream_request`:
+
+| Reason | Meaning |
+| --- | --- |
+| `caller_assertion_no_principal` | The call has nobody to attest: anonymous, a service token, or a principal without an issuer. |
+| `caller_assertion_key_not_published` | Another enabled Connection publishes a different key under one of this Connection's `kid`s, so the JWKS leaves both out and no upstream could verify what either signed; or the Connection is no longer configured. |
+| `caller_assertion_key_unusable` | At call time, the signing key's alias is unknown or refused, or holds material that is not a usable key for `algorithm`. |
+| `caller_assertion_key_unavailable` | At call time, the signing key's source could not be read. |
+| `caller_assertion_claim_invalid` | A value would not survive as a claim: a subject longer than 256 bytes, an issuer longer than 512 bytes or containing `#`, a role longer than 128 bytes, an email longer than 320 bytes, a request ID longer than 128 bytes, or any of them containing a control character. |
+| `caller_assertion_header_conflict` | Another header source had already set the assertion header. |
+| `caller_assertion_signature_failed`, `caller_assertion_token_too_long` | Signing failed, or the assertion would exceed 8 KiB. |
+| `caller_assertion_not_enforced` | The lane does not attest its caller, or the stored block is one only an earlier release accepted: `bind_approval: true`, an assertion header that matches an additional header, or a plain HTTP endpoint. |
+
+A signing key that cannot be read or loaded at call time also raises
+`connection.secret_resolution_failed` with the same reason. None of these
+responses, logs or events carries the assertion, the key or anything derived
+from either.
+
+#### Audit
+
+`tool.upstream_request` for a request that carried an assertion records which
+key signed it and its `jti`, whatever the outcome:
+
+```json
+"caller_assertion": { "kid": "gw-2026-09", "jti": "6f1c2a4e-..." }
+```
+
+The attested caller is the event's `actor`. To find the gateway's record of a
+request an upstream logged, search the audit for its `jti`.
+
+#### Verifying an assertion
+
+An upstream verifies the signature against the published JWKS, pins `iss`,
+`aud`, `typ` and the algorithm, checks `exp`, and, with `bind_request`, compares
+the bound request with the one it received. For example, in Python with PyJWT
+2.8 or later:
+
+```python
+import hashlib
+
+import jwt
+
+JWKS = jwt.PyJWKClient("https://gateway.example/.well-known/caller-assertion-jwks.json")
+
+
+def verified_caller(method, request_target, body, headers):
+    token = headers["X-Caller-Assertion"]
+    if jwt.get_unverified_header(token).get("typ") != "at+jwt":
+        raise PermissionError("not a caller assertion")
+    claims = jwt.decode(
+        token,
+        JWKS.get_signing_key_from_jwt(token).key,
+        algorithms=["ES256"],  # the Connection's algorithm, never the token's
+        issuer="https://gateway.example",
+        audience="https://internal.example/api",
+        options={"require": ["iss", "aud", "sub", "iat", "exp", "jti"]},
+    )
+    # With bind_request: the method, the request target as it appeared on the
+    # request line, and the exact body bytes received.
+    if claims["method"] != method or claims["path"] != request_target:
+        raise PermissionError("assertion is for another request")
+    if claims["request_sha256"] != hashlib.sha256(body).hexdigest():
+        raise PermissionError("body changed after signing")
+    # Reject a second use of the same assertion until it expires.
+    if not remember_once((claims["sub"], claims["jti"]), until=claims["exp"]):
+        raise PermissionError("assertion replayed")
+    return claims["caller_iss"], claims["caller_sub"]
+```
+
+`remember_once` stands for the upstream's own replay cache. Key it on `sub` and
+`jti` together: `jti` is the gateway request ID, which a client may supply
+itself, so it is unique per call but not across callers. Compare `path` with the
+request target before any proxy in front of the upstream rewrote it. `exp` is
+`iat` plus `lifetime_seconds` on the gateway's clock; if the two clocks can
+drift apart, allow a few seconds of leeway (`leeway=` in PyJWT) rather than
+lengthening the lifetime.
+
+#### The block in the admin UI
 
 The admin UI shows the block read only, on the Connection detail page and in
 the editor: every field except the key aliases, which appear only as
-configured or not, with a note that the block is accepted but not yet enforced
-and that the Connection is refused. The UI has no controls for the block and
-never sends it. A replacement (`PUT`) that omits `caller_assertion` keeps the
-current block, so a save in the UI leaves it exactly as stored and cannot put
-the Connection back into service unattested. The gateway revalidates the kept
-block on every save, so the editor refuses a primary or additional header name
-that matches the assertion header before it writes, and a block stored with
-`bind_approval: true` has to be removed before the Connection can be saved
-again. To use the Connection before enforcement ships, remove the block
+configured or not, with a note on which calls are attested. The UI has no
+controls for the block and never sends it. A replacement (`PUT`) that omits
+`caller_assertion` keeps the current block, so a save in the UI leaves it
+exactly as stored and cannot put the Connection back into service unattested.
+The gateway revalidates the kept block on every save, so the editor refuses a
+primary or additional header name that matches the assertion header before it
+writes, and a block stored with `bind_approval: true` has to be removed before
+the Connection can be saved again. To stop attesting, remove the block
 deliberately: send `"caller_assertion": null` in a `PUT` through the admin API.
 
-New and replacement writes also reject `bind_approval: true`, because no
-approval subsystem exists for a mutation to be bound to, and an assertion
-`header_name` that matches any additional header name regardless of case.
+New and replacement writes reject `bind_approval: true`, because no approval
+subsystem exists for a mutation to be bound to, an assertion `header_name` that
+matches any additional header name regardless of case, and a plain HTTP
+endpoint.
 
 A caller assertion binds private keys, so it is credential authority: creating
 a Connection that carries one, deleting it, and any change to the block,
@@ -423,8 +571,7 @@ rename, does not.
 
 #### Signing keys
 
-The block's keys are live even though nothing signs with them yet. The
-`signing_key_id` and the `signing_key_id` of each entry in `published_keys`
+The `signing_key_id` and the `signing_key_id` of each entry in `published_keys`
 name a secret alias that must hold exactly one PKCS#8 PEM private key block
 (`-----BEGIN PRIVATE KEY-----`, at most 16 KiB): a P-256 key for `es256`, or an
 RSA key of at least 2048 bits for `rs256`. A PKCS#1 (`BEGIN RSA PRIVATE KEY`)
@@ -530,11 +677,17 @@ the set is built.
 #### Stored Connections whose keys cannot be used
 
 A stored Connection whose keys cannot be used never stops the gateway starting
-and never fails a cluster reconcile. Its keys are left out of the JWKS, the
-problem is logged and shown as above, and the Connection stays refused on every
-lane with `caller_assertion_not_enforced`, exactly as before. Startup and
-reconcile still refuse a stored Connection whose other bindings this replica
-cannot resolve, as they always have.
+and never fails a cluster reconcile. Its keys are left out of the JWKS and the
+problem is logged and shown as above. Each of its tool calls still reads and
+loads the signing key, and is refused with `caller_assertion_key_unusable` or
+`caller_assertion_key_unavailable` while that key cannot be used, or with
+`caller_assertion_key_not_published` while another Connection publishes a
+different key under one of its `kid`s. The calls do not wait for the next JWKS
+build: a verifier still holding the key from an earlier fetch can verify what
+is signed meanwhile. Every other lane refuses the Connection with
+`caller_assertion_not_enforced`, as it refuses every attested Connection.
+Startup and reconcile still refuse a stored Connection whose other bindings
+this replica cannot resolve, as they always have.
 
 A save is held to the stricter rule. A save that keeps such a Connection
 enabled checks its keys again and is refused until they are usable, including
@@ -556,7 +709,8 @@ placeholder, or a key in a format this release refuses. After upgrading:
 
 - The gateway starts, and a cluster reconcile succeeds, as before. Each such
   Connection publishes no keys, reports `key_problem`, logs the warning above,
-  and stays refused with `caller_assertion_not_enforced`.
+  and its tool calls are refused while its signing key cannot be read or
+  loaded.
 - Its next save is stricter. A save that keeps it enabled, including an admin
   UI save of another field, loads its keys and is refused with `422` and the
   field and code until they are usable.
@@ -592,10 +746,47 @@ signed has expired:
    block, which withdraws it at the next fetch, and publish a new key under a
    new `kid`.
 
-The gateway does not enforce these waits yet. Nothing signs until request-path
-injection ships, so today the steps only shape what the JWKS publishes; follow
-them now so a rotation started before enforcement is already safe when it
-arrives.
+The gateway does not enforce these waits. A tool call signs with whichever key
+is `signing_key_id` when it runs, so skipping step 2 leaves every verifier that
+has not fetched the next key rejecting calls until its cache expires, and
+skipping step 4 rejects assertions the previous key signed that have not
+expired yet.
+
+#### Upgrade note: attested Connections start serving tool calls
+
+Earlier releases refused every lane on a Connection carrying `caller_assertion`
+with `caller_assertion_not_enforced`. From this release, manual HTTP tools on
+such a Connection are served, and every one of their requests carries the
+signed assertion, once its stored block passes every rule a new write is held
+to:
+
+- `bind_approval` is `false`;
+- the assertion `header_name` matches no primary or additional header name;
+- the endpoint is `https://`;
+- the signing key loads for its `algorithm` when the call is made, and no other
+  enabled Connection publishes a different key under one of its `kid`s.
+
+A block that fails one of the first three rules stays refused with
+`caller_assertion_not_enforced`; a key that does not load refuses each call
+with its own reason (see [Failure reasons](#failure-reasons)). A save of an
+attested Connection whose endpoint is still plain HTTP, including an admin UI
+save of another field, is now refused with `https_required` until the endpoint
+uses HTTPS or the block is removed. A `TOOLS_FILE`
+manual tool bound to such a Connection used to fail startup or the reload that
+contained it; it now loads.
+
+Before upgrading, check every enabled Connection that carries the block:
+
+- Its upstream verifies the assertion, or at least tolerates the extra header,
+  because it starts arriving on the first call.
+- Its callers are principals an identity provider vouched for: anonymous calls
+  and service tokens are refused with `caller_assertion_no_principal`.
+- To keep a Connection refused until its upstream is ready, disable it or
+  remove the block with `"caller_assertion": null` before upgrading.
+
+Managed OpenAPI tools, composite tools, proxied requests, managed MCP, discovery,
+enum and label sources and stored tests on such a Connection stay refused, as
+before.
 
 ## TLS, Custom CAs, and Mutual TLS
 

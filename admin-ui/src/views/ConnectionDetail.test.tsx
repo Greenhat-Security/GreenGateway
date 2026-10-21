@@ -336,12 +336,13 @@ describe('ConnectionDetail', () => {
     renderDetail();
 
     expect(
-      await screen.findByText('Configured - not yet enforced'),
+      await screen.findByText('Configured - attests manual tool calls'),
     ).toBeTruthy();
     const section = screen
       .getByRole('heading', { name: 'Caller assertion' })
       .closest('section');
-    expect(section?.textContent).toContain('Accepted, not yet enforced.');
+    expect(section?.textContent).toContain('Manual tool calls are attested.');
+    expect(section?.textContent).toContain('caller_assertion_no_principal');
     expect(section?.textContent).toContain('caller_assertion_not_enforced');
     expect(section?.textContent).toContain('"caller_assertion": null');
     expect(specValue('Key ID')).toBe('gw-2026-09');

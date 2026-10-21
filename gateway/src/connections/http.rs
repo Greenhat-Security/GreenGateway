@@ -15,11 +15,15 @@ use zeroize::Zeroizing;
 use crate::egress::{CheckedEgressDestination, EgressClient, EgressConfig};
 
 use super::{
+    caller_assertion::{
+        load_signing_key, sign_caller_assertion, AssertionAlgorithm, AttestedCaller,
+        CallerAssertionConfig, CallerAssertionError, PrincipalClaim, RequestBinding,
+    },
     control_plane::ConnectionControlPlane,
     model::{
-        normalize_origin_relative_path, ConnectionAuthentication, ConnectionId, ConnectionKind,
-        ConnectionTestProfile, ConnectionTimeouts, DiscoveryConfig, OAuthClientAuthMethod,
-        TlsProfile, MAX_CONNECTIONS, MAX_EXPECTED_STATUSES, MAX_URL_BYTES,
+        normalize_origin_relative_path, CallerAssertionSettings, ConnectionAuthentication,
+        ConnectionId, ConnectionKind, ConnectionTestProfile, ConnectionTimeouts, DiscoveryConfig,
+        OAuthClientAuthMethod, TlsProfile, MAX_CONNECTIONS, MAX_EXPECTED_STATUSES, MAX_URL_BYTES,
     },
     oauth::{
         OAuthBinding, OAuthClientCredentialsRuntime, OAuthError, OAuthTokenLease,
@@ -62,6 +66,101 @@ pub struct ConnectionHttpTarget {
     /// strips exactly this set from the inbound request before injection.
     credential_header_names: Vec<HeaderName>,
     transport: ConnectionTransportBinding,
+    /// What a tool call signs and where it sends it, when the Connection
+    /// attests its caller. Only [`ConnectionHttpRuntime::tool_call_target`]
+    /// ever sets this; every other constructor refuses such a Connection.
+    caller_assertion: Option<CallerAssertionBinding>,
+}
+
+/// A Connection's caller assertion, as a tool call signs it.
+///
+/// Holds the key's alias, never the key: the key is read and loaded on every
+/// call that signs, exactly like every other secret a Connection binds, so a
+/// rotated or withdrawn key takes effect on the next call.
+#[derive(Clone)]
+struct CallerAssertionBinding {
+    header_name: HeaderName,
+    signing_key_id: String,
+    kid: String,
+    algorithm: AssertionAlgorithm,
+    issuer: String,
+    audience: String,
+    token_type: String,
+    lifetime_seconds: u64,
+    claims: Vec<PrincipalClaim>,
+    bind_request: bool,
+}
+
+impl CallerAssertionBinding {
+    fn from_settings(settings: &CallerAssertionSettings) -> Result<Self, ConnectionHttpError> {
+        Ok(Self {
+            header_name: HeaderName::from_bytes(settings.header_name.as_bytes())
+                .map_err(|_| ConnectionHttpError::CallerAssertionNotEnforced)?,
+            signing_key_id: settings.signing_key_id.clone(),
+            kid: settings.kid.clone(),
+            algorithm: settings.algorithm.into(),
+            issuer: settings.issuer.clone(),
+            audience: settings.audience.clone(),
+            token_type: settings.token_type.clone(),
+            lifetime_seconds: u64::from(settings.lifetime_seconds),
+            claims: settings.claims.iter().copied().map(Into::into).collect(),
+            bind_request: settings.bind_request,
+        })
+    }
+}
+
+/// One signed caller assertion, ready to go on exactly one request.
+///
+/// Its `Debug` and every error it can produce name only the `kid` and `jti`:
+/// the token is a bearer credential until it expires.
+pub struct SignedCallerAssertion {
+    header_name: HeaderName,
+    value: HeaderValue,
+    record: IssuedCallerAssertion,
+}
+
+/// What audit records about an assertion this gateway sent: which key signed
+/// it and the identifier the upstream sees as `jti`. Never the token.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct IssuedCallerAssertion {
+    pub kid: String,
+    pub jti: String,
+}
+
+impl fmt::Debug for SignedCallerAssertion {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("SignedCallerAssertion")
+            .field("header_name", &self.header_name)
+            .field("kid", &self.record.kid)
+            .field("jti", &self.record.jti)
+            .finish_non_exhaustive()
+    }
+}
+
+impl SignedCallerAssertion {
+    /// Puts the assertion on `headers`, as the last header written.
+    ///
+    /// Refuses, rather than replaces, a value already under the name: by the
+    /// time this runs every other header source has written, so anything
+    /// there would leave the upstream with a second or substitute assertion
+    /// it did not get from this gateway. Validation keeps the name apart from
+    /// every header the Connection or the tool sets; this is the check that
+    /// holds even if one of those rules were to change.
+    pub fn inject(
+        self,
+        headers: &mut HeaderMap,
+    ) -> Result<IssuedCallerAssertion, CallerAssertionError> {
+        if headers.contains_key(&self.header_name) {
+            return Err(CallerAssertionError::HeaderConflict);
+        }
+        headers.insert(self.header_name, self.value);
+        Ok(self.record)
+    }
+
+    pub fn issued(&self) -> &IssuedCallerAssertion {
+        &self.record
+    }
 }
 
 impl ConnectionHttpTarget {
@@ -99,6 +198,7 @@ impl ConnectionHttpTarget {
             additional_headers,
             credential_header_names,
             transport,
+            caller_assertion: None,
         }
     }
 }
@@ -171,10 +271,10 @@ pub enum ConnectionHttpError {
     ConnectionDisabled,
     WrongConnectionKind,
     UnsupportedAuthentication,
-    /// The Connection carries a `caller_assertion` block, and this gateway
-    /// does not yet inject the assertion on the request path. Sending the
-    /// call anyway would hand the upstream a request it cannot attribute
-    /// while the operator believes every call is attested.
+    /// The Connection carries a `caller_assertion` block that this lane does
+    /// not sign, or that only the legacy reading of a stored document admits.
+    /// Sending the call anyway would hand the upstream a request it cannot
+    /// attribute while the operator believes every call is attested.
     CallerAssertionNotEnforced,
     TlsInvalid,
     TlsUnavailable,
@@ -276,6 +376,194 @@ impl ConnectionHttpRuntime {
             additional_headers,
             connection_transport_binding(record),
         ))
+    }
+
+    /// The target of one tool call, and the only constructor that serves a
+    /// Connection carrying a `caller_assertion`.
+    ///
+    /// A tool call is the one lane that has a validated principal to attest
+    /// and the exact bytes it sends in hand before it sends them. Every other
+    /// lane -- proxied requests, managed MCP sessions, discovery, enum and
+    /// label sources, stored tests -- builds its target elsewhere and keeps
+    /// refusing such a Connection with `caller_assertion_not_enforced`, as
+    /// does this constructor for a stored assertion that only the legacy
+    /// reading admits ([`ConnectionWrite::caller_assertion_enforceable`]).
+    ///
+    /// The returned target carries the assertion's settings, and the caller
+    /// must sign with [`Self::sign_caller_assertion`] once the request is
+    /// final; a call without a principal is refused by
+    /// [`Self::admit_caller_assertion`] before any I/O.
+    ///
+    /// [`ConnectionWrite::caller_assertion_enforceable`]:
+    ///     super::model::ConnectionWrite::caller_assertion_enforceable
+    pub fn tool_call_target(
+        &self,
+        connection_id: &str,
+        path_and_query: &str,
+    ) -> Result<ConnectionHttpTarget, ConnectionHttpError> {
+        let connection_id = ConnectionId::parse(connection_id.to_owned())
+            .map_err(|_| ConnectionHttpError::InvalidConnectionId)?;
+        let snapshot = self.effective_snapshot();
+        let record = snapshot
+            .managed()
+            .get(&connection_id)
+            .ok_or(ConnectionHttpError::ConnectionNotFound)?;
+        let caller_assertion = match record.write.caller_assertion.as_ref() {
+            None => None,
+            Some(_) if !record.write.caller_assertion_enforceable() => {
+                return Err(ConnectionHttpError::CallerAssertionNotEnforced);
+            }
+            Some(settings) => Some(CallerAssertionBinding::from_settings(settings)?),
+        };
+        validate_http_connection(record)?;
+        let url = connection_target_url(record, path_and_query)?;
+        let client = self.client_for(record)?;
+        let authentication = self.authentication_binding(record)?;
+        let additional_headers = additional_header_bindings(record)?;
+
+        let mut target = ConnectionHttpTarget::assemble(
+            connection_id,
+            record.etag().to_string(),
+            url,
+            client,
+            authentication,
+            additional_headers,
+            connection_transport_binding(record),
+        );
+        target.caller_assertion = caller_assertion;
+        Ok(target)
+    }
+
+    /// Whether a manual tool may be bound to `connection_id`: the same checks
+    /// [`Self::tool_call_target`] applies, so a binding the registry accepts
+    /// is a binding a call can use.
+    pub fn validate_tool_binding(&self, connection_id: &str) -> Result<(), ConnectionHttpError> {
+        self.tool_call_target(connection_id, "/").map(|_| ())
+    }
+
+    /// Refuses, before any DNS lookup, secret read or upstream byte, a call
+    /// `target` cannot attest.
+    ///
+    /// A Connection configured to name its caller must never send a request
+    /// that names nobody: a call with no principal, which includes a service
+    /// token (see [`AttestedCaller`]), is refused here. So is a call on a
+    /// Connection that publishes a `kid` another enabled Connection publishes
+    /// for a different key, or one that is no longer configured: the JWKS
+    /// leaves out every key of such a Connection, so no upstream could verify
+    /// what it signed, and the failure would look like an attack on the
+    /// upstream's side.
+    ///
+    /// Both are judged from configuration alone, as it stands for this
+    /// request. Whether the key itself still loads is the secret source's to
+    /// answer, on the read [`Self::sign_caller_assertion`] makes; this replica's
+    /// last JWKS build is deliberately not consulted, because a provider that
+    /// failed one build would otherwise refuse every call until a verifier
+    /// happened to fetch the set again, while the verifiers still hold the key.
+    pub fn admit_caller_assertion(
+        &self,
+        target: &ConnectionHttpTarget,
+        caller: Option<&AttestedCaller>,
+    ) -> Result<(), CallerAssertionError> {
+        if target.caller_assertion.is_none() {
+            return Ok(());
+        }
+        if caller.is_none() {
+            return Err(CallerAssertionError::NoPrincipal);
+        }
+        let snapshot = self.effective_snapshot();
+        let record = snapshot
+            .managed()
+            .get(target.connection_id())
+            .ok_or(CallerAssertionError::KeyNotPublished)?;
+        if super::control_plane::publishes_an_ambiguous_kid(&snapshot, record) {
+            return Err(CallerAssertionError::KeyNotPublished);
+        }
+        Ok(())
+    }
+
+    /// Signs the one assertion this request carries, or `None` for a target
+    /// that attests nobody.
+    ///
+    /// Called once per request, after every other header and the body are
+    /// final, because with `bind_request` the assertion covers the method, the
+    /// request target exactly as it goes on the wire, and the exact body bytes.
+    /// `request_id` becomes `jti`, which is how an upstream joins its log line
+    /// to this gateway's audit event for the call.
+    ///
+    /// The key is read and loaded here, through the same resolver and loader
+    /// that admit it on a save and publish it in the JWKS, so this signs only
+    /// with a key that would also be published.
+    pub async fn sign_caller_assertion(
+        &self,
+        target: &ConnectionHttpTarget,
+        caller: Option<&AttestedCaller>,
+        request_id: &str,
+        method: &Method,
+        body: &[u8],
+    ) -> Result<Option<SignedCallerAssertion>, CallerAssertionError> {
+        let Some(binding) = target.caller_assertion.as_ref() else {
+            return Ok(None);
+        };
+        let caller = caller.ok_or(CallerAssertionError::NoPrincipal)?;
+        let material = self
+            .control_plane
+            .secret_resolver()
+            .resolve(&binding.signing_key_id, SecretPurpose::AssertionSigningKey)
+            .await
+            .map_err(|error| match error.kind() {
+                SecretResolveErrorKind::UnknownAlias
+                | SecretResolveErrorKind::SourceDenied
+                | SecretResolveErrorKind::InvalidMaterial => CallerAssertionError::KeyUnusable,
+                SecretResolveErrorKind::ProviderBusy
+                | SecretResolveErrorKind::SourceUnavailable
+                | SecretResolveErrorKind::UnsafeSource
+                | SecretResolveErrorKind::ProviderFailure => CallerAssertionError::KeyUnavailable,
+            })?;
+        let key = load_signing_key(&binding.kid, binding.algorithm, material.expose())
+            .map_err(|_| CallerAssertionError::KeyUnusable)?;
+        drop(material);
+
+        let request_target = if binding.bind_request {
+            Some(origin_form_request_target(target.url())?)
+        } else {
+            None
+        };
+        let request_binding = request_target.as_deref().map(|path| RequestBinding {
+            method: method.as_str(),
+            path,
+            body,
+        });
+        let config = CallerAssertionConfig {
+            issuer: &binding.issuer,
+            audience: &binding.audience,
+            token_type: &binding.token_type,
+            lifetime_seconds: binding.lifetime_seconds,
+            claims: &binding.claims,
+            bind_request: binding.bind_request,
+            // Validation refuses `bind_approval` on every Connection this
+            // target can be built for.
+            bind_approval: false,
+        };
+        let token = sign_caller_assertion(
+            &key,
+            &config,
+            Some(&caller.identity()),
+            request_id,
+            unix_now(),
+            request_binding.as_ref(),
+            None,
+        )?;
+        let mut value =
+            HeaderValue::from_str(&token).map_err(|_| CallerAssertionError::SignatureFailed)?;
+        value.set_sensitive(true);
+        Ok(Some(SignedCallerAssertion {
+            header_name: binding.header_name.clone(),
+            value,
+            record: IssuedCallerAssertion {
+                kid: binding.kid.clone(),
+                jti: request_id.to_owned(),
+            },
+        }))
     }
 
     pub fn mcp_target(
@@ -904,9 +1192,20 @@ impl ConnectionHttpTarget {
     }
 
     /// Whether this target injects any secret-backed header at all; the
-    /// upstream's `401`/`403` is only a credential rejection when it does.
+    /// upstream's `401`/`403` is only a credential rejection when it does. A
+    /// caller assertion counts: it is signed with a secret key and is a
+    /// bearer credential for its lifetime, so a `TRACE` must not echo it back.
     pub fn is_credentialed(&self) -> bool {
-        !self.credential_header_names.is_empty()
+        !self.credential_header_names.is_empty() || self.caller_assertion.is_some()
+    }
+
+    /// The header the caller assertion travels in, when this target attests
+    /// its caller. A lane strips it from anything a caller supplied, like the
+    /// credential headers, before the gateway writes its own.
+    pub fn caller_assertion_header_name(&self) -> Option<&HeaderName> {
+        self.caller_assertion
+            .as_ref()
+            .map(|binding| &binding.header_name)
     }
 
     pub fn authentication_kind(&self) -> &'static str {
@@ -1130,6 +1429,25 @@ fn connection_transport_partition(
     hasher.finalize().into()
 }
 
+/// The request target a client sends for `url` in origin form: the path and,
+/// when present, `?` and the query, exactly as the egress client serializes
+/// them onto the request line. This is what `bind_request` attests, so an
+/// upstream compares it with the request line it received rather than with a
+/// reconstruction.
+fn origin_form_request_target(url: &str) -> Result<String, CallerAssertionError> {
+    let parsed = url::Url::parse(url).map_err(|_| CallerAssertionError::InvalidClaim("path"))?;
+    Ok(parsed[url::Position::BeforePath..url::Position::AfterQuery].to_owned())
+}
+
+/// Seconds since the Unix epoch, for `iat`. A clock before the epoch is a
+/// broken host, and signing with `iat` 0 would issue an already-expired
+/// assertion, which the upstream refuses; nothing is gained by refusing first.
+fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.as_secs())
+}
+
 fn connection_tls_secret_error(error: SecretResolveError) -> ConnectionHttpError {
     match error.kind() {
         SecretResolveErrorKind::UnknownAlias
@@ -1163,14 +1481,15 @@ fn managed_record<'a>(
     Ok(record)
 }
 
-/// Refuses a Connection that asks for a signed caller assertion.
+/// Refuses a Connection that asks for a signed caller assertion, on every lane
+/// that does not sign one.
 ///
-/// The model and the admin API accept and persist `caller_assertion`, but the
-/// request path does not yet mint or inject it. Serving such a Connection would
-/// be a silent fail-open: the operator configured "every call names its caller"
-/// and the upstream would receive anonymous calls instead, including calls that
-/// arrived with no principal at all. Until injection ships, the configured
-/// intent is honoured the only way it can be -- by not sending the call.
+/// Only a tool call attests its caller (see
+/// [`ConnectionHttpRuntime::tool_call_target`]). Serving such a Connection on
+/// any other lane would be a silent fail-open: the operator configured "every
+/// call names its caller" and the upstream would receive a request naming
+/// nobody. On those lanes the configured intent is honoured the only way it
+/// can be -- by not sending the call.
 fn refuse_unenforced_caller_assertion(
     record: &StoredConnection,
 ) -> Result<(), ConnectionHttpError> {
@@ -2245,8 +2564,8 @@ mod tests {
     }
 
     /// A caller assertion as an operator would configure one. Its signing key
-    /// is loaded when the Connection is saved; every target must still refuse
-    /// before anything would sign with it.
+    /// is loaded when the Connection is saved; every target but a tool call's
+    /// must still refuse before anything would sign with it.
     fn unenforced_caller_assertion() -> CallerAssertionSettings {
         CallerAssertionSettings {
             signing_key_id: crate::connections::test_support::ASSERTION_SIGNING_KEY_ALIAS
@@ -2274,14 +2593,20 @@ mod tests {
             &root,
             &crate::connections::test_support::generated_es256_pem(),
         );
-        TemporaryManagedRuntime::build_with_root(name, root, write, vec![alias], None).await
+        // A header-safe secret too, for a test that adds an additional header.
+        let header = crate::connections::test_support::write_secret_file(
+            &root,
+            "proxy-header-secret",
+            b"proxy-header-value",
+        );
+        TemporaryManagedRuntime::build_with_root(name, root, write, vec![alias, header], None).await
     }
 
     #[tokio::test]
     async fn every_http_target_refuses_an_unenforced_caller_assertion_before_preparation() {
-        // Nothing injects the assertion yet, so serving this Connection would
-        // send the upstream calls it cannot attribute while the operator
-        // believes every call names its caller.
+        // Only a tool call signs the assertion, so serving this Connection on
+        // any other lane would send the upstream calls it cannot attribute
+        // while the operator believes every call names its caller.
         let mut write = record("/v1").write;
         write.caller_assertion = Some(unenforced_caller_assertion());
         write.discovery = Some(DiscoveryConfig::ManagedOpenapi {
@@ -2299,12 +2624,12 @@ mod tests {
         let etag = stored.etag().to_string();
         let refused = Some(ConnectionHttpError::CallerAssertionNotEnforced);
 
-        // Tool calls, enum sources and the proxy.
+        // Managed OpenAPI tools, composite steps, enum sources and the proxy.
         assert_eq!(
             temporary.runtime.target(connection_id, "/charges").err(),
             refused
         );
-        // Tool and route binding validation.
+        // OpenAPI tool and route binding validation.
         assert_eq!(
             temporary.runtime.validate_binding(connection_id).err(),
             refused
@@ -2399,6 +2724,263 @@ mod tests {
             ConnectionStatusReason::RequestFailed
         );
         assert_eq!(temporary.cached_client_count(), 0);
+    }
+
+    fn principal(auth_method: crate::auth::AuthMethod) -> crate::auth::Principal {
+        crate::auth::Principal {
+            user_id: "alice".to_owned(),
+            issuer: Some("https://idp.example.test".to_owned()),
+            email: None,
+            org_id: None,
+            roles: Vec::new(),
+            session_id: "session-alice".to_owned(),
+            auth_method,
+        }
+    }
+
+    #[tokio::test]
+    async fn a_manual_tool_call_is_the_one_target_that_carries_the_assertion() {
+        let mut write = record("/v1").write;
+        write.caller_assertion = Some(unenforced_caller_assertion());
+        let temporary = attested_runtime("caller-assertion-tool-target", write).await;
+        let connection_id = temporary.connection_id.as_str();
+
+        let target = temporary
+            .runtime
+            .tool_call_target(connection_id, "/charges?limit=2")
+            .expect("a valid attested Connection serves tool calls");
+        assert_eq!(
+            target
+                .caller_assertion_header_name()
+                .map(HeaderName::as_str),
+            Some("x-caller-assertion")
+        );
+        // It is a credential even with `authentication: none`: a TRACE must
+        // not reflect it, and an upstream 401 is a rejection of it.
+        assert!(target.is_credentialed());
+        assert!(target.credential_header_names().is_empty());
+        assert!(temporary
+            .runtime
+            .validate_tool_binding(connection_id)
+            .is_ok());
+        // Every other lane still refuses the same Connection.
+        assert_eq!(
+            temporary.runtime.target(connection_id, "/charges").err(),
+            Some(ConnectionHttpError::CallerAssertionNotEnforced)
+        );
+
+        // No principal, or a service token, is nobody to attest.
+        let alice = AttestedCaller::from_principal(&principal(crate::auth::AuthMethod::Bearer))
+            .expect("a provider-vouched principal is attestable");
+        assert!(
+            AttestedCaller::from_principal(&principal(crate::auth::AuthMethod::ServiceToken))
+                .is_none()
+        );
+        let mut issuerless = principal(crate::auth::AuthMethod::Bearer);
+        issuerless.issuer = None;
+        assert!(AttestedCaller::from_principal(&issuerless).is_none());
+        assert_eq!(
+            temporary.runtime.admit_caller_assertion(&target, None),
+            Err(CallerAssertionError::NoPrincipal)
+        );
+        assert_eq!(
+            temporary
+                .runtime
+                .sign_caller_assertion(&target, None, "request-1", &Method::GET, b"")
+                .await
+                .err(),
+            Some(CallerAssertionError::NoPrincipal)
+        );
+        assert_eq!(
+            temporary
+                .runtime
+                .admit_caller_assertion(&target, Some(&alice)),
+            Ok(())
+        );
+
+        let signed = temporary
+            .runtime
+            .sign_caller_assertion(&target, Some(&alice), "request-1", &Method::GET, b"")
+            .await
+            .expect("the key loads and signs")
+            .expect("an attested target signs");
+        assert_eq!(
+            signed.issued(),
+            &IssuedCallerAssertion {
+                kid: "gw-test-1".to_owned(),
+                jti: "request-1".to_owned(),
+            }
+        );
+        let token = signed
+            .value
+            .to_str()
+            .expect("an assertion is visible ASCII")
+            .to_owned();
+        assert!(signed.value.is_sensitive());
+        assert!(
+            !format!("{signed:?}").contains(&token),
+            "Debug must not print the assertion"
+        );
+
+        // Written once, last: a value already under the name is refused, not
+        // replaced or joined.
+        let mut headers = HeaderMap::new();
+        headers.insert("x-caller-assertion", HeaderValue::from_static("forged"));
+        assert_eq!(
+            signed.inject(&mut headers),
+            Err(CallerAssertionError::HeaderConflict)
+        );
+        assert_eq!(headers.get_all("x-caller-assertion").iter().count(), 1);
+        assert_eq!(
+            headers.get("x-caller-assertion"),
+            Some(&HeaderValue::from_static("forged"))
+        );
+
+        // A target without an assertion signs nothing and admits anybody.
+        let mut plain = temporary.stored_connection().write;
+        plain.caller_assertion = None;
+        let stored = temporary.stored_connection();
+        temporary
+            .runtime
+            .control_plane
+            .replace_managed(&stored.id, &stored.etag(), plain, "test-admin")
+            .await
+            .expect("the Connection without an assertion should save");
+        let unattested = temporary
+            .runtime
+            .tool_call_target(connection_id, "/charges")
+            .expect("an unattested Connection serves tool calls");
+        assert!(unattested.caller_assertion_header_name().is_none());
+        assert_eq!(
+            temporary.runtime.admit_caller_assertion(&unattested, None),
+            Ok(())
+        );
+        assert!(temporary
+            .runtime
+            .sign_caller_assertion(&unattested, None, "request-2", &Method::GET, b"")
+            .await
+            .expect("nothing to sign")
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn a_kid_another_connection_publishes_for_a_different_key_refuses_the_call() {
+        let mut write = record("/v1").write;
+        write.caller_assertion = Some(unenforced_caller_assertion());
+        let temporary = attested_runtime("caller-assertion-kid-clash", write).await;
+        let connection_id = temporary.connection_id.as_str();
+        let stored = temporary.stored_connection();
+        let alice = AttestedCaller::from_principal(&principal(crate::auth::AuthMethod::Bearer))
+            .expect("a provider-vouched principal is attestable");
+
+        // Another replica admitted a second Connection that publishes the same
+        // kid for an RS256 key. The JWKS leaves both out, so neither may sign.
+        let mut other = stored.clone();
+        other.id = ConnectionId::parse("billing-two").expect("test connection ID");
+        if let Some(assertion) = other.write.caller_assertion.as_mut() {
+            assertion.algorithm = CallerAssertionAlgorithm::Rs256;
+        }
+        temporary
+            .runtime
+            .control_plane
+            .publish_authoritative_records(vec![stored.clone(), other.clone()])
+            .await
+            .expect("the clash still loads");
+        let target = temporary
+            .runtime
+            .tool_call_target(connection_id, "/charges")
+            .expect("the document itself is valid");
+        assert_eq!(
+            temporary
+                .runtime
+                .admit_caller_assertion(&target, Some(&alice)),
+            Err(CallerAssertionError::KeyNotPublished)
+        );
+
+        // A disabled Connection publishes nothing, so it clashes with nothing.
+        other.write.enabled = false;
+        temporary
+            .runtime
+            .control_plane
+            .publish_authoritative_records(vec![stored, other])
+            .await
+            .expect("the disabled Connection loads");
+        assert_eq!(
+            temporary
+                .runtime
+                .admit_caller_assertion(&target, Some(&alice)),
+            Ok(())
+        );
+    }
+
+    #[tokio::test]
+    async fn a_stored_assertion_only_the_legacy_reading_admits_is_never_served() {
+        let mut write = record("/v1").write;
+        write.caller_assertion = Some(unenforced_caller_assertion());
+        let temporary = attested_runtime("caller-assertion-legacy", write).await;
+        let connection_id = temporary.connection_id.as_str();
+        let stored = temporary.stored_connection();
+        assert!(stored.write.caller_assertion_enforceable());
+
+        let mut approval = stored.clone();
+        if let Some(assertion) = approval.write.caller_assertion.as_mut() {
+            assertion.bind_approval = true;
+        }
+        let mut collision = stored.clone();
+        collision.write.additional_headers.push(AdditionalHeader {
+            header_name: "X-Caller-Assertion".to_owned(),
+            secret_id: Some("proxy-header-secret".to_owned()),
+        });
+        let mut plain_http = stored.clone();
+        plain_http.write.endpoint.base_url = "http://billing.example.test".to_owned();
+
+        for legacy in [approval, collision, plain_http] {
+            // Readable, as a document an earlier release stored ...
+            assert!(legacy.write.clone().validated_persisted_v0().is_ok());
+            // ... refused for any new or replacement write ...
+            assert!(legacy.write.clone().validated().is_err());
+            // ... and not served.
+            assert!(!legacy.write.caller_assertion_enforceable());
+            temporary
+                .runtime
+                .control_plane
+                .publish_authoritative_records(vec![legacy])
+                .await
+                .expect("a legacy document still loads");
+            assert_eq!(
+                temporary
+                    .runtime
+                    .tool_call_target(connection_id, "/charges")
+                    .err(),
+                Some(ConnectionHttpError::CallerAssertionNotEnforced)
+            );
+            assert_eq!(
+                temporary.runtime.validate_tool_binding(connection_id),
+                Err(ConnectionHttpError::CallerAssertionNotEnforced)
+            );
+        }
+        assert_eq!(temporary.cached_client_count(), 0);
+    }
+
+    #[test]
+    fn the_bound_request_target_is_the_origin_form_sent_on_the_wire() {
+        assert_eq!(
+            origin_form_request_target("https://billing.example.test/v1/charges?limit=2&q=a+b")
+                .as_deref(),
+            Ok("/v1/charges?limit=2&q=a+b")
+        );
+        assert_eq!(
+            origin_form_request_target("https://billing.example.test:8443/v1/charges").as_deref(),
+            Ok("/v1/charges")
+        );
+        assert_eq!(
+            origin_form_request_target("https://billing.example.test").as_deref(),
+            Ok("/")
+        );
+        assert_eq!(
+            origin_form_request_target("not a url"),
+            Err(CallerAssertionError::InvalidClaim("path"))
+        );
     }
 
     #[test]

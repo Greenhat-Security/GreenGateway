@@ -722,6 +722,7 @@ fn differential_context(
         } else {
             ToolInvocationSource::AdminPlayground
         },
+        caller: None,
         admitted_deadline: None,
     }
 }

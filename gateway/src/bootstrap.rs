@@ -2434,7 +2434,10 @@ pub(super) fn validate_connection_bound_tools(
     for definition in definitions {
         match (&definition.source, definition.target.as_ref()) {
             (ToolSource::Manual, Some(ToolTarget::Http { connection_id, .. })) => {
-                if let Err(error) = runtime.validate_binding(connection_id) {
+                // A manual tool may be bound to a Connection that attests its
+                // caller: its calls sign the assertion. Every other binding
+                // below keeps refusing one.
+                if let Err(error) = runtime.validate_tool_binding(connection_id) {
                     problems.push(format!(
                         "tool '{}' Connection target is unavailable: {}",
                         definition.name,

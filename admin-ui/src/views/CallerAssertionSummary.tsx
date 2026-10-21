@@ -18,15 +18,18 @@ export function CallerAssertionSummary({
     <>
       <div className="alert warning" role="status">
         <p>
-          <strong>Accepted, not yet enforced.</strong> GreenGateway does not
-          sign or send caller assertions yet, so it refuses every call, test,
-          and discovery on a connection that carries one, with the reason{' '}
+          <strong>Manual tool calls are attested.</strong> Every call of a
+          manual HTTP tool on this connection carries an assertion signed for
+          the calling principal, and a call without one, such as a service
+          token, is refused with <code>caller_assertion_no_principal</code>.
+          Every other use of the connection, including OpenAPI tools, proxied
+          requests, discovery, and tests, is refused with{' '}
           <code>caller_assertion_not_enforced</code>.
         </p>
         <p>
           The admin UI shows this block read only, and saving the connection
-          here keeps it unchanged. To use the connection before enforcement
-          ships, remove the block through the admin API by sending{' '}
+          here keeps it unchanged. To stop attesting callers, remove the block
+          through the admin API by sending{' '}
           <code>&quot;caller_assertion&quot;: null</code>, which needs the
           secrets-write permission.
         </p>
@@ -114,9 +117,13 @@ function KeyProblemAlert({ problem }: { problem: CallerAssertionKeyProblem }) {
         {KEY_PROBLEM_REASONS[problem.code]} (<code>{problem.code}</code>).
       </p>
       <p>
-        Every other connection&apos;s keys are still published. A save that
-        keeps this connection enabled checks its keys again and is refused
-        until the key is fixed; disabling the connection needs no key.
+        Tool calls on this connection still load the signing key on every
+        call and are refused while it cannot be used; a key ID another
+        connection publishes for a different key refuses them with{' '}
+        <code>caller_assertion_key_not_published</code>. Every other
+        connection&apos;s keys are still published. A save that keeps this connection enabled
+        checks its keys again and is refused until the key is fixed; disabling
+        the connection needs no key.
       </p>
     </div>
   );

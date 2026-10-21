@@ -487,7 +487,7 @@ function ConnectionConfiguration({
               label="Caller assertion"
               value={
                 configuration.caller_assertion
-                  ? 'Configured - not yet enforced'
+                  ? 'Configured - attests manual tool calls'
                   : 'Not configured'
               }
             />

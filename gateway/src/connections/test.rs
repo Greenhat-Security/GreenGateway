@@ -85,8 +85,8 @@ pub enum ConnectionTestReason {
     TlsInvalid,
     TlsUnavailable,
     AuthenticationNotSupported,
-    /// The Connection asks for a signed caller assertion, which this gateway
-    /// does not yet inject, so the test is refused before any request.
+    /// The Connection asks for a signed caller assertion, which a stored test
+    /// has no caller to sign for, so it is refused before any request.
     CallerAssertionNotEnforced,
     CredentialInvalid,
     CredentialUnavailable,
