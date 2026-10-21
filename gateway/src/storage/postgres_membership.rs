@@ -22,6 +22,14 @@
 //!   `document_version_*`, `binary_version`), advertised for operators and
 //!   PR 14's status view; the store bounds every text column at a
 //!   character boundary rather than refusing a long value.
+//! - **The capability advertisement** (`capabilities`, migration 17, issue
+//!   #426): the closed set of capabilities the replica implements, which
+//!   the operation gate in `storage/compatibility.rs` requires of every
+//!   live member before a registered operation writes. It is rendered from
+//!   the registration on every heartbeat and is never truncated: a set the
+//!   column cannot hold is refused, because a cut list would claim less
+//!   than the replica does and a guessed one could claim more. The store
+//!   returns the column as written; recognition belongs to the reader.
 //! - **`maintenance_jobs`**: one row per singleton job with the lease
 //!   fence the current leader adopted it at. Every write of a job's
 //!   timestamps carries two predicates in one statement: `fence = $fence`
@@ -57,6 +65,7 @@ use uuid::Uuid;
 use crate::ha::InstanceIdentity;
 
 use super::{
+    compatibility::{self, Capability},
     log_classified,
     postgres::{classify_pool_error, timed_operation},
     RepositoryError, RepositoryErrorKind,
@@ -120,6 +129,9 @@ pub struct MemberRegistration {
     pub document_version: (i32, i32),
     /// The static-configuration fingerprint as 64 lowercase hex characters.
     pub fingerprint: String,
+    /// The capabilities this binary implements
+    /// (`compatibility::BINARY_CAPABILITIES`).
+    pub capabilities: Vec<Capability>,
 }
 
 /// The security revisions a heartbeat carries: the watermark the replica
@@ -152,6 +164,9 @@ pub struct ClusterMember {
     pub compiled_security_revision: i64,
     pub observed_security_revision: i64,
     pub last_error_code: Option<String>,
+    /// The raw capability advertisement, exactly as stored. Only
+    /// `compatibility::RecognizedCapabilities` decides what it grants.
+    pub capabilities: String,
     /// `last_heartbeat_at` is within the stale window the reader supplied.
     pub live: bool,
 }
@@ -253,6 +268,8 @@ impl PostgresMembershipStore {
         {
             return Err(invalid_data(OPERATION_HEARTBEAT));
         }
+        let capabilities = compatibility::advertisement(&registration.capabilities)
+            .ok_or_else(|| invalid_data(OPERATION_HEARTBEAT))?;
         let instance_id = self.identity.instance_id().to_string();
         let boot_id = self.identity.boot_id().to_string();
         let binary_version = match bounded_short_text(&registration.binary_version) {
@@ -275,10 +292,11 @@ impl PostgresMembershipStore {
                           schema_version_min, schema_version_max,
                           document_version_min, document_version_max, fingerprint,
                           started_at, last_heartbeat_at, ready_at,
-                          compiled_security_revision, observed_security_revision, last_error_code)
+                          compiled_security_revision, observed_security_revision, last_error_code,
+                          capabilities)
                      VALUES ($1, $2::text::uuid, $3::text::uuid, $4, $5, $6, $7, $8, $9,
                              COALESCE($13::text::timestamptz, now()), now(), $14::text::timestamptz,
-                             $10, $11, $12)
+                             $10, $11, $12, $15)
                      ON CONFLICT (instance_id) DO UPDATE SET
                          boot_id = EXCLUDED.boot_id,
                          binary_version = EXCLUDED.binary_version,
@@ -291,7 +309,8 @@ impl PostgresMembershipStore {
                          ready_at = COALESCE(m.ready_at, EXCLUDED.ready_at),
                          compiled_security_revision = EXCLUDED.compiled_security_revision,
                          observed_security_revision = EXCLUDED.observed_security_revision,
-                         last_error_code = EXCLUDED.last_error_code
+                         last_error_code = EXCLUDED.last_error_code,
+                         capabilities = EXCLUDED.capabilities
                      WHERE m.deployment_id = EXCLUDED.deployment_id
                      RETURNING to_char(m.started_at AT TIME ZONE 'UTC', {f}) AS started_at,
                                to_char(m.ready_at AT TIME ZONE 'UTC', {f}) AS ready_at",
@@ -312,6 +331,7 @@ impl PostgresMembershipStore {
                     &last_error_code,
                     &remembered_started_at,
                     &remembered_ready_at,
+                    &capabilities,
                 ],
             )
             .await
@@ -431,6 +451,7 @@ impl PostgresMembershipStore {
                             to_char(ready_at AT TIME ZONE 'UTC', {f}) AS ready_at,
                             to_char(draining_at AT TIME ZONE 'UTC', {f}) AS draining_at,
                             compiled_security_revision, observed_security_revision, last_error_code,
+                            capabilities,
                             (last_heartbeat_at > now() - make_interval(secs => $2::double precision)) AS live
                      FROM greengateway.cluster_members
                      WHERE deployment_id = $1
@@ -707,6 +728,7 @@ fn member_from_row(row: &tokio_postgres::Row) -> Result<ClusterMember, Repositor
         compiled_security_revision: column(row, "compiled_security_revision", OPERATION_LIST)?,
         observed_security_revision: column(row, "observed_security_revision", OPERATION_LIST)?,
         last_error_code: column(row, "last_error_code", OPERATION_LIST)?,
+        capabilities: column(row, "capabilities", OPERATION_LIST)?,
         live: column(row, "live", OPERATION_LIST)?,
     })
 }

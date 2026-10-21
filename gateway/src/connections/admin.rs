@@ -324,8 +324,9 @@ pub struct SafeCallerAssertion {
     pub published_keys: Vec<SafePublishedAssertionKey>,
     /// Present when this replica leaves the block's keys out of the published
     /// JWKS: the field configuring the key that cannot be used and a fixed
-    /// code, never the alias or anything about the material. The Connection
-    /// is refused at runtime either way while assertions are not enforced.
+    /// code, never the alias or anything about the material. While it is
+    /// present, the Connection's tool calls on this replica are refused with
+    /// `caller_assertion_key_not_published`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub key_problem: Option<CallerAssertionKeyProblem>,
 }

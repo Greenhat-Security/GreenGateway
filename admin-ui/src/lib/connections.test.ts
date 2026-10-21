@@ -489,9 +489,9 @@ describe('connections API client', () => {
   });
 
   it('accepts a test refused because the caller assertion is not enforced', async () => {
-    // The gateway refuses every test on a Connection carrying a caller
-    // assertion until request-path injection ships; the operator must see that
-    // reason rather than a contract error.
+    // The gateway refuses every stored test on a Connection carrying a caller
+    // assertion, since a test has no caller to attest; the operator must see
+    // that reason rather than a contract error.
     vi.stubGlobal(
       'fetch',
       vi.fn(() =>

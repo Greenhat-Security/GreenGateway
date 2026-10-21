@@ -1848,10 +1848,12 @@ fn a_canonical_alias_identity_is_checked_exactly_as_the_request_path_is() {
 }
 
 #[test]
-fn rate_lane_selection_matches_the_live_selector() {
-    // Compared against the live selector directly rather than inferred from
-    // whether a burst was exhausted: the question is which override governs a
-    // request, and exhaustion only reveals that indirectly and after the fact.
+fn rate_lane_selection_matches_the_frozen_selector() {
+    // Compared against the frozen pre-cutover selector directly rather than
+    // inferred from whether a burst was exhausted: the question is which
+    // override governs a request, and exhaustion only reveals that indirectly
+    // and after the fact. The live middleware is compared against the frozen
+    // one, bucket for bucket, in `middleware::rate_limit::differential`.
     let value = json!({
         "schema_version":"0.1.0","default_action":"allow",
         "roles":{"reader":{"permissions":["read"]},"admin":{"permissions":["*"]}},
@@ -1868,7 +1870,8 @@ fn rate_lane_selection_matches_the_live_selector() {
     });
     let compiled = compile(value.clone());
     let policy = Policy::validate_json_value(value).unwrap();
-    let live = crate::middleware::rate_limit::RateLimitPolicyState::for_selection_parity(&policy);
+    let frozen =
+        crate::middleware::rate_limit::RateLimitPolicyState::legacy_for_selection_parity(&policy);
 
     for path in ["/first/item", "/first", "/elsewhere", "/"] {
         for method in [Method::GET, Method::POST, Method::DELETE] {
@@ -1887,13 +1890,13 @@ fn rate_lane_selection_matches_the_live_selector() {
                     });
                 let selection = compiled.select_rate_lane(&input).unwrap();
 
-                // The oracle is the live path's behaviour, guard included:
-                // `policy_rate_limit_request` returns before consulting the
-                // selector when a request carries no principal, so an anonymous
+                // The oracle is the frozen path's behaviour, guard included:
+                // `policy_rate_limit_request` returned before consulting the
+                // selector when a request carried no principal, so an anonymous
                 // caller reaches no override however permissive the rules are.
                 // Comparing against the bare selector is what hid that.
                 let expected = identity.as_ref().and_then(|identity| {
-                    live.selected_override_limit(method.as_str(), path, Some(identity))
+                    frozen.legacy_selected_override_limit(method.as_str(), path, Some(identity))
                 });
                 let label = format!("{method} {path} {:?}", identity.as_ref().map(|p| &p.roles));
                 match expected {

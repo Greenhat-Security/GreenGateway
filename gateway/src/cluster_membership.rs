@@ -35,7 +35,21 @@
 //!
 //! The heartbeat also carries the replica's security-revision
 //! acknowledgement (`compiled` and `observed`, from the cluster security
-//! runtime), so the roster shows each replica's reconciliation lag.
+//! runtime), so the roster shows each replica's reconciliation lag, and the
+//! capabilities this binary implements (issue #426, PR 1).
+//!
+//! **Operation gating.** [`ClusterMembership::admit_operation`] is the
+//! write-path gate for an operation registered in
+//! `storage::compatibility::OPERATION_REQUIREMENTS`: it reads the roster on
+//! the database clock immediately before the write and admits the
+//! operation only when every live member -- draining members included --
+//! advertises what the operation requires. A refusal is logged with the
+//! lacking members' instance IDs, audited as `cluster.operation_refused`,
+//! and returned with a stable reason; the caller writes nothing. Unlike
+//! fingerprint agreement, admission is never sticky: every write asks
+//! again, because a member that lacks the capability can join at any time.
+//! The gate is not a durable fence, which is why an operation that needs
+//! one is refused outright (see `storage/compatibility.rs`).
 
 use std::{
     sync::{
@@ -48,10 +62,15 @@ use std::{
 use uuid::Uuid;
 
 use crate::{
+    audit::{self, AuditLog},
     ha::ClusterReadiness,
     lifecycle::GatewayLifecycle,
     security_cluster::ClusterSecurityRuntime,
     storage::{
+        compatibility::{
+            self, BinaryContract, MemberAdvertisement, OperationAdmission, OperationRefusal,
+            OperationRequirement, OPERATION_REQUIREMENTS,
+        },
         ClusterMember, MemberRegistration, MemberRevisions, PostgresMembershipStore,
         RepositoryError,
     },
@@ -76,6 +95,17 @@ pub(crate) enum FingerprintAgreement {
     Agreed,
     /// These live members carry another fingerprint.
     Disagreeing(Vec<Uuid>),
+}
+
+/// Who asked for a gated write: the request facts a refusal is audited
+/// with, gathered the way every admin audit event gathers them
+/// (`client_ip::request_id`, `client_ip::canonical_client_ip`,
+/// `auth::actor_from_principal`).
+#[derive(Clone, Debug)]
+pub(crate) struct GatedWriteRequest {
+    pub(crate) request_id: String,
+    pub(crate) source_ip: String,
+    pub(crate) actor: Option<audit::Actor>,
 }
 
 pub(crate) struct ClusterMembership {
@@ -174,6 +204,75 @@ impl ClusterMembership {
             }
         }
         Ok(FingerprintAgreement::Disagreeing(disagreeing))
+    }
+
+    /// The write-path gate for a registered operation (issue #426, PR 1).
+    /// Call it immediately before the operation's write and write nothing
+    /// unless it admits; answer a refusal with its reason. Only an
+    /// operation in `OPERATION_REQUIREMENTS` can be admitted, so an ad hoc
+    /// requirement cannot bypass the registry's review.
+    #[allow(dead_code)] // The registry is empty until #426's first qualified operation, whose write path is the first production caller; until then the contract tests are the only one.
+    pub(crate) async fn admit_operation(
+        &self,
+        requirement: &OperationRequirement,
+        audit: &AuditLog,
+        request: &GatedWriteRequest,
+    ) -> Result<OperationAdmission, OperationRefusal> {
+        self.admit_registered(requirement, OPERATION_REQUIREMENTS, audit, request)
+            .await
+    }
+
+    /// [`Self::admit_operation`] against an explicit registry, so the
+    /// contract tests can register a fixture operation without shipping
+    /// one.
+    pub(crate) async fn admit_registered(
+        &self,
+        requirement: &OperationRequirement,
+        registry: &[OperationRequirement],
+        audit: &AuditLog,
+        request: &GatedWriteRequest,
+    ) -> Result<OperationAdmission, OperationRefusal> {
+        let outcome = self.evaluate_operation(requirement, registry).await;
+        match &outcome {
+            Ok(admission) => tracing::debug!(
+                operation = requirement.operation,
+                capability = requirement.capability.as_str(),
+                live_members = admission.live_members,
+                "cluster mode: every live member advertises what the operation requires; admitted"
+            ),
+            Err(refusal) => record_operation_refusal(requirement, refusal, audit, request),
+        }
+        outcome
+    }
+
+    async fn evaluate_operation(
+        &self,
+        requirement: &OperationRequirement,
+        registry: &[OperationRequirement],
+    ) -> Result<OperationAdmission, OperationRefusal> {
+        if !registry.contains(requirement) {
+            return Err(OperationRefusal::NotSupportedByThisBinary);
+        }
+        let members = match self.store.members(self.stale_window).await {
+            Ok(members) => members,
+            Err(error) => {
+                self.note_failure(&error);
+                tracing::warn!(
+                    error = %error,
+                    operation = requirement.operation,
+                    "cluster membership could not be read for an operation gate; the operation is refused"
+                );
+                return Err(OperationRefusal::RosterUnavailable);
+            }
+        };
+        let advertisements: Vec<MemberAdvertisement> =
+            members.iter().map(MemberAdvertisement::from).collect();
+        compatibility::evaluate(
+            requirement,
+            &BinaryContract::shipped(),
+            self.store.instance_id(),
+            &advertisements,
+        )
     }
 
     /// The heartbeat task: every interval, refresh the row with the
@@ -318,6 +417,42 @@ impl ClusterMembership {
     }
 }
 
+/// Make a refusal observable: one warning per lacking member (by instance
+/// ID, as the fingerprint check names a disagreeing one), one warning for
+/// the decision, and one `cluster.operation_refused` audit event carrying
+/// names, codes and counts only.
+fn record_operation_refusal(
+    requirement: &OperationRequirement,
+    refusal: &OperationRefusal,
+    audit: &AuditLog,
+    request: &GatedWriteRequest,
+) {
+    if let OperationRefusal::MembersLackRequirement { lacking, .. } = refusal {
+        for member in lacking {
+            tracing::warn!(
+                member_instance_id = %member,
+                operation = requirement.operation,
+                capability = requirement.capability.as_str(),
+                "cluster mode: a live member does not advertise what a gated operation requires"
+            );
+        }
+    }
+    tracing::warn!(
+        operation = requirement.operation,
+        capability = requirement.capability.as_str(),
+        reason = refusal.reason(),
+        error = %refusal,
+        "cluster mode: refused a gated operation; nothing was written"
+    );
+    audit.emit(audit::AuditEvent::new(
+        audit::event::CLUSTER_OPERATION_REFUSED,
+        request.request_id.clone(),
+        request.source_ip.clone(),
+        request.actor.clone(),
+        refusal.audit_payload(requirement),
+    ));
+}
+
 /// The emission itself, split from the task that owns the values so the
 /// registry label audit can drive it (`metrics.rs`) without a database.
 pub(crate) fn record_membership_gauges(heartbeat_age: Duration, fingerprint_agreed: bool) {
@@ -371,6 +506,7 @@ mod tests {
             compiled_security_revision: 0,
             observed_security_revision: 0,
             last_error_code: None,
+            capabilities: String::new(),
             live,
         }
     }

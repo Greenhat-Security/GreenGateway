@@ -2446,10 +2446,8 @@ pub(crate) mod postgres_audit_tests {
         config.rate_limit_read_burst = 2;
         let upstream_attempts = Arc::new(AtomicUsize::new(0));
         let replica = |store: &Arc<PostgresRateLimitStore>| {
-            let state = crate::middleware::rate_limit::RateLimitState::from_config_and_policy(
-                &config, None,
-            )
-            .with_shared_store(Arc::clone(store));
+            let state = crate::middleware::rate_limit::RateLimitState::from_config(&config)
+                .with_shared_store(Arc::clone(store));
             let counter = Arc::clone(&upstream_attempts);
             Router::new()
                 .route(
@@ -7134,6 +7132,7 @@ pub(crate) mod postgres_audit_tests {
             schema_version: migrations::schema_version_range(),
             document_version: crate::cluster_membership::DOCUMENT_VERSION_RANGE,
             fingerprint: std::iter::repeat_n(fingerprint_byte, 64).collect(),
+            capabilities: crate::storage::compatibility::BINARY_CAPABILITIES.to_vec(),
         }
     }
 
@@ -7641,6 +7640,287 @@ pub(crate) mod postgres_audit_tests {
             FingerprintAgreement::Agreed,
             "the same fingerprint as every live member is admitted at once"
         );
+    }
+
+    /// Write a roster row the way a gateway that predates migration 17
+    /// does: its heartbeat names no capabilities, so the row advertises
+    /// nothing. Returns the row's instance ID.
+    async fn insert_pre_protocol_member(pool: &deadpool_postgres::Pool) -> uuid::Uuid {
+        let instance = uuid::Uuid::new_v4();
+        pool.get()
+            .await
+            .expect("client")
+            .execute(
+                "INSERT INTO greengateway.cluster_members
+                     (deployment_id, instance_id, boot_id, binary_version,
+                      schema_version_min, schema_version_max,
+                      document_version_min, document_version_max, fingerprint)
+                 VALUES ($1, $2::text::uuid, $3::text::uuid, '1.0.1', 16, 16, 0, 0, repeat('a', 64))",
+                &[
+                    &MEMBERS_DEPLOYMENT,
+                    &instance.to_string(),
+                    &uuid::Uuid::new_v4().to_string(),
+                ],
+            )
+            .await
+            .expect("a pre-protocol member row inserts");
+        instance
+    }
+
+    /// The heartbeat persists this binary's capability advertisement on
+    /// every refresh, the roster returns it as written, and what a reader
+    /// recognizes is decided by the reader: a newer gateway's name grants
+    /// nothing here, and a row from a gateway that predates the column
+    /// advertises nothing.
+    #[tokio::test]
+    async fn heartbeats_advertise_this_binarys_capabilities() {
+        use crate::storage::compatibility::{Capability, RecognizedCapabilities};
+
+        let Some(admin_dsn) = locator() else {
+            eprintln!("skipping: no test database locator; CI runs this test");
+            return;
+        };
+        let _guard = DATABASE.lock().await;
+        let database = create_test_database(&admin_dsn).await;
+        let pool = migrated_limits_pool(&database).await;
+        let store = member_store(&pool);
+        let window = Duration::from_secs(30);
+        store
+            .heartbeat(&registration('a'), MemberRevisions::default(), None)
+            .await
+            .expect("boot heartbeat");
+        let members = store.members(window).await.expect("members");
+        assert_eq!(members[0].capabilities, "operation_requirements");
+        assert!(RecognizedCapabilities::parse(&members[0].capabilities)
+            .contains(Capability::OperationRequirements));
+
+        // A newer gateway on the same instance would write names this one
+        // does not know; the next heartbeat writes this binary's own set
+        // back, because the advertisement is the running process's.
+        pool.get()
+            .await
+            .expect("client")
+            .execute(
+                "UPDATE greengateway.cluster_members
+                 SET capabilities = 'future_capability,operation_requirements'
+                 WHERE instance_id = $1::text::uuid",
+                &[&store.instance_id().to_string()],
+            )
+            .await
+            .expect("plant a newer advertisement");
+        let planted = store.members(window).await.expect("members");
+        let recognized = RecognizedCapabilities::parse(&planted[0].capabilities);
+        assert_eq!(recognized.names(), vec!["operation_requirements"]);
+        assert_eq!(recognized.unrecognized(), 1);
+        store
+            .heartbeat(&registration('a'), MemberRevisions::default(), None)
+            .await
+            .expect("refresh");
+        assert_eq!(
+            store.members(window).await.expect("members")[0].capabilities,
+            "operation_requirements"
+        );
+
+        let older = insert_pre_protocol_member(&pool).await;
+        let members = store.members(window).await.expect("members");
+        let older = members
+            .iter()
+            .find(|member| member.instance_id == older)
+            .expect("the older member is on the roster");
+        assert_eq!(older.capabilities, "");
+        assert!(RecognizedCapabilities::parse(&older.capabilities)
+            .names()
+            .is_empty());
+    }
+
+    /// The operation gate over a real roster: a registered operation is
+    /// admitted while every live member advertises it; a live member that
+    /// does not -- a gateway that predates the protocol, still
+    /// heartbeating -- holds it, draining or not, until its row goes stale
+    /// on the database clock; every refusal is audited; and an
+    /// unregistered requirement, an unreadable roster, or a roster missing
+    /// this replica's own row is refused too.
+    #[tokio::test]
+    async fn a_gated_operation_waits_for_every_live_member_to_advertise_it() {
+        use crate::audit::{sink::tests::CaptureSink, AuditLog};
+        use crate::cluster_membership::GatedWriteRequest;
+        use crate::storage::compatibility::{
+            Activation, Backfill, Capability, OperationAdmission, OperationRefusal,
+            OperationRequirement,
+        };
+
+        let Some(admin_dsn) = locator() else {
+            eprintln!("skipping: no test database locator; CI runs this test");
+            return;
+        };
+        let _guard = DATABASE.lock().await;
+        let database = create_test_database(&admin_dsn).await;
+        let pool = migrated_limits_pool(&database).await;
+        let heartbeat = Duration::from_secs(1);
+        let window = Duration::from_secs(30);
+
+        let requirement = OperationRequirement {
+            operation: "fixture.gated_write",
+            minimum_schema: migrations::schema_version_range().0,
+            document_format: Some(crate::cluster_membership::DOCUMENT_VERSION_RANGE.0),
+            capability: Capability::OperationRequirements,
+            backfill: Backfill::NotRequired,
+            activation: Activation::LiveMembers,
+        };
+        let registry = [requirement];
+        let capture = CaptureSink::new();
+        let audit = AuditLog::new(Arc::new(capture.clone()));
+        let request = GatedWriteRequest {
+            request_id: "request-gate".to_owned(),
+            source_ip: "203.0.113.9".to_owned(),
+            actor: None,
+        };
+
+        let first_store = member_store(&pool);
+        let first =
+            ClusterMembership::new(first_store.clone(), registration('a'), heartbeat, window);
+        first.register_boot().await.expect("boot");
+        let second =
+            ClusterMembership::new(member_store(&pool), registration('a'), heartbeat, window);
+        second.register_boot().await.expect("boot");
+        assert_eq!(
+            first
+                .admit_registered(&requirement, &registry, &audit, &request)
+                .await,
+            Ok(OperationAdmission { live_members: 2 })
+        );
+
+        let older = insert_pre_protocol_member(&pool).await;
+        let refused = first
+            .admit_registered(&requirement, &registry, &audit, &request)
+            .await;
+        assert_eq!(
+            refused,
+            Err(OperationRefusal::MembersLackRequirement {
+                lacking: vec![older],
+                live: 3
+            })
+        );
+        // Every replica answers the same way: the decision is the roster's.
+        assert!(matches!(
+            second
+                .admit_registered(&requirement, &registry, &audit, &request)
+                .await,
+            Err(OperationRefusal::MembersLackRequirement { .. })
+        ));
+
+        // A draining member is still answering what was routed to it.
+        pool.get()
+            .await
+            .expect("client")
+            .execute(
+                "UPDATE greengateway.cluster_members SET draining_at = now()
+                 WHERE instance_id = $1::text::uuid",
+                &[&older.to_string()],
+            )
+            .await
+            .expect("drain the older member");
+        assert!(matches!(
+            first
+                .admit_registered(&requirement, &registry, &audit, &request)
+                .await,
+            Err(OperationRefusal::MembersLackRequirement { .. })
+        ));
+        backdate_heartbeat(&pool, older, 60.0).await;
+        assert_eq!(
+            first
+                .admit_registered(&requirement, &registry, &audit, &request)
+                .await,
+            Ok(OperationAdmission { live_members: 2 }),
+            "a stale row no longer holds the operation"
+        );
+
+        // Only a registered requirement can be admitted.
+        let unregistered = OperationRequirement {
+            operation: "fixture.unregistered",
+            ..requirement
+        };
+        assert_eq!(
+            first
+                .admit_registered(&unregistered, &registry, &audit, &request)
+                .await,
+            Err(OperationRefusal::NotSupportedByThisBinary)
+        );
+        assert_eq!(
+            first.admit_operation(&requirement, &audit, &request).await,
+            Err(OperationRefusal::NotSupportedByThisBinary),
+            "the shipped registry registers nothing"
+        );
+
+        // This replica's own row missing: the read cannot be shown to
+        // describe the deployment.
+        pool.get()
+            .await
+            .expect("client")
+            .execute(
+                "DELETE FROM greengateway.cluster_members WHERE instance_id = $1::text::uuid",
+                &[&first_store.instance_id().to_string()],
+            )
+            .await
+            .expect("remove this replica's row");
+        assert_eq!(
+            first
+                .admit_registered(&requirement, &registry, &audit, &request)
+                .await,
+            Err(OperationRefusal::RosterMissingThisReplica)
+        );
+
+        // An unreadable roster refuses rather than admits.
+        let client = pool.get().await.expect("client");
+        client
+            .batch_execute(
+                "ALTER TABLE greengateway.cluster_members RENAME TO cluster_members_hidden",
+            )
+            .await
+            .expect("hide the roster");
+        let unreadable = second
+            .admit_registered(&requirement, &registry, &audit, &request)
+            .await;
+        client
+            .batch_execute(
+                "ALTER TABLE greengateway.cluster_members_hidden RENAME TO cluster_members",
+            )
+            .await
+            .expect("restore the roster");
+        assert_eq!(unreadable, Err(OperationRefusal::RosterUnavailable));
+
+        // Every refusal above left one audit event naming the operation
+        // and its reason, and none carries a member identifier.
+        let expected_reasons = [
+            "capability_not_advertised",
+            "capability_not_advertised",
+            "capability_not_advertised",
+            "operation_not_supported",
+            "operation_not_supported",
+            "roster_missing_this_replica",
+            "roster_unavailable",
+        ];
+        let started = std::time::Instant::now();
+        while capture.len() < expected_reasons.len() && started.elapsed() < Duration::from_secs(5) {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let events = capture.events();
+        let reasons: Vec<&str> = events
+            .iter()
+            .map(|event| {
+                assert_eq!(event.event_type, "cluster.operation_refused");
+                assert_eq!(event.request_id, "request-gate");
+                assert_eq!(event.source_ip, "203.0.113.9");
+                assert!(!event.payload.to_string().contains(&older.to_string()));
+                event.payload["reason"].as_str().expect("a reason")
+            })
+            .collect();
+        assert_eq!(reasons, expected_reasons);
+        assert_eq!(events[0].payload["operation"], "fixture.gated_write");
+        assert_eq!(events[0].payload["capability"], "operation_requirements");
+        assert_eq!(events[0].payload["lacking_members"], 1);
+        assert_eq!(events[0].payload["live_members"], 3);
+        assert_eq!(events[4].payload["operation"], "fixture.gated_write");
     }
 
     /// A swept row comes back as the same boot: a replica partitioned past

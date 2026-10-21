@@ -664,6 +664,22 @@ jobs:
           # losing, so it is asserted rather than trusted to review.
           grep -qi 'EXAMPLE ONLY' "$example"
 
+      # Every shipped Compose and Kubernetes example must fit its PostgreSQL
+      # connection budget, so an example change cannot over-commit the server.
+      # The guard reads YAML with its own reader for the subset deployment
+      # files use, which is not a full YAML parser, so Compose's rendering of
+      # the HA example, both profiles included, must agree with its reading.
+      - name: Check the shipped examples' PostgreSQL connection budgets
+        shell: bash
+        run: |
+          set -eu
+          python -m unittest discover -s scripts -p test_pool_sizing.py -v
+          mkdir -p target/pool-sizing
+          docker compose -f docs/deployment/docker-compose.ha.yml \
+            --profile bootstrap --profile import config --format json \
+            > target/pool-sizing/docker-compose.ha.json
+          python scripts/pool_sizing.py examples --rendered docs/deployment/docker-compose.ha.yml=target/pool-sizing/docker-compose.ha.json
+
       - name: Build the production image
         run: docker build -t greengateway:bootstrap .
 

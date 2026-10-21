@@ -58,6 +58,13 @@
 //! quad and a leaked host. Instance and boot identifiers are `Uuid`
 //! values, which cannot carry text at all.
 //!
+//! Capability advertisements (issue #426) follow the same rule from the
+//! other direction: a replica's `capabilities` lists only the names this
+//! binary compiled in and recognized, and everything else on the row is
+//! reduced to a count, `unrecognized_capabilities`. A newer gateway's
+//! capability therefore shows up as a number until this binary learns it,
+//! and a hostile one never shows up at all.
+//!
 //! Everything else in the response is a number or a fixed enum. There is
 //! no field here through which a DSN, a database host or user, an IP
 //! address, policy or tool content, query text, or a raw error string can
@@ -76,7 +83,10 @@ use std::time::Duration;
 use serde::Serialize;
 use uuid::Uuid;
 
-use crate::storage::RepositoryErrorKind;
+use crate::storage::{
+    compatibility::{self, RecognizedCapabilities},
+    RepositoryErrorKind,
+};
 
 /// What replaces any string that is not recognizably of its field's shape.
 const UNKNOWN: &str = "unknown";
@@ -139,6 +149,9 @@ pub(crate) struct ReplicaFacts {
     pub compiled_security_revision: i64,
     pub observed_security_revision: i64,
     pub last_error_code: Option<String>,
+    /// The raw capability advertisement (migration 17), recognized only in
+    /// the assembly.
+    pub capabilities: String,
     pub live: bool,
 }
 
@@ -405,6 +418,12 @@ pub(crate) struct ReplicaView {
     pub compiled_security_revision: i64,
     pub observed_security_revision: i64,
     pub last_error_code: Option<String>,
+    /// The capabilities this binary recognized on the row, in name order.
+    /// Only compiled-in names can appear.
+    pub capabilities: Vec<&'static str>,
+    /// How many advertised names this binary did not recognize: a newer
+    /// gateway's capabilities, or anything else written to the row.
+    pub unrecognized_capabilities: usize,
     pub live: bool,
 }
 
@@ -445,6 +464,8 @@ fn local_replica(local: &LocalFacts) -> ReplicaFacts {
         compiled_security_revision: local.compiled_security_revision,
         observed_security_revision: local.observed_security_revision,
         last_error_code: None,
+        capabilities: compatibility::advertisement(compatibility::BINARY_CAPABILITIES)
+            .unwrap_or_default(),
         live: true,
     }
 }
@@ -653,6 +674,7 @@ fn leader_task_view(task: &LeaderTaskFacts, leading: bool) -> LeaderTaskView {
 }
 
 fn replica_view(member: &ReplicaFacts) -> ReplicaView {
+    let capabilities = RecognizedCapabilities::parse(&member.capabilities);
     ReplicaView {
         instance_id: member.instance_id.to_string(),
         boot_id: member.boot_id.to_string(),
@@ -670,6 +692,8 @@ fn replica_view(member: &ReplicaFacts) -> ReplicaView {
         compiled_security_revision: member.compiled_security_revision,
         observed_security_revision: member.observed_security_revision,
         last_error_code: member.last_error_code.as_deref().map(safe_error_code),
+        capabilities: capabilities.names(),
+        unrecognized_capabilities: capabilities.unrecognized(),
         live: member.live,
     }
 }
@@ -835,6 +859,7 @@ impl From<&crate::storage::ClusterMember> for ReplicaFacts {
             compiled_security_revision: member.compiled_security_revision,
             observed_security_revision: member.observed_security_revision,
             last_error_code: member.last_error_code.clone(),
+            capabilities: member.capabilities.clone(),
             live: member.live,
         }
     }
@@ -1008,6 +1033,7 @@ pub(crate) mod test_support {
             compiled_security_revision: 7,
             observed_security_revision: 7,
             last_error_code: None,
+            capabilities: "operation_requirements".to_owned(),
             live: true,
         };
         ClusterReadout {
@@ -1120,6 +1146,7 @@ mod tests {
             compiled_security_revision: 7,
             observed_security_revision: 7,
             last_error_code: None,
+            capabilities: "operation_requirements".to_owned(),
             live,
         }
     }
@@ -1198,6 +1225,12 @@ mod tests {
         assert!(only.live);
         assert_eq!(only.started_at, None);
         assert_eq!(only.last_heartbeat_at, None);
+        assert_eq!(
+            only.capabilities,
+            vec!["operation_requirements"],
+            "standalone reports what this binary advertises"
+        );
+        assert_eq!(only.unrecognized_capabilities, 0);
     }
 
     /// Cluster mode with two live members: the counts, the version
@@ -1244,6 +1277,40 @@ mod tests {
         let replicas = cluster_replicas(&local_facts(), &readout);
         assert_eq!(replicas.replicas.len(), 2);
         assert!(replicas.replicas.iter().all(|replica| replica.live));
+        assert!(replicas
+            .replicas
+            .iter()
+            .all(|replica| replica.capabilities == ["operation_requirements"]));
+    }
+
+    /// A replica's capabilities are reported as this binary recognizes
+    /// them: compiled-in names only, everything else a count, and a row
+    /// that predates the advertisement (an empty column) reports none.
+    #[test]
+    fn replica_capabilities_report_only_recognized_names() {
+        let readout = ClusterReadout {
+            members: Some(vec![
+                ReplicaFacts {
+                    capabilities: "future_capability,operation_requirements".to_owned(),
+                    ..member(1, true, true)
+                },
+                ReplicaFacts {
+                    capabilities: String::new(),
+                    ..member(2, true, true)
+                },
+            ]),
+            ..ClusterReadout::default()
+        };
+        let replicas = cluster_replicas(&local_facts(), &readout);
+        assert_eq!(
+            replicas.replicas[0].capabilities,
+            ["operation_requirements"]
+        );
+        assert_eq!(replicas.replicas[0].unrecognized_capabilities, 1);
+        assert!(replicas.replicas[1].capabilities.is_empty());
+        assert_eq!(replicas.replicas[1].unrecognized_capabilities, 0);
+        let body = json(&replicas);
+        assert!(!body.contains("future_capability"), "{body}");
     }
 
     /// A projector whose row names a leader that is no longer a live
@@ -1414,6 +1481,7 @@ mod tests {
                     ready_at: Some(hostile.to_owned()),
                     draining_at: Some(hostile.to_owned()),
                     last_error_code: Some(hostile.to_owned()),
+                    capabilities: hostile.to_owned(),
                     ..member(1, true, true)
                 }]),
                 leader_tasks: Some(vec![LeaderTaskFacts {

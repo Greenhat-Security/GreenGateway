@@ -6371,7 +6371,7 @@
         "network-or-process-reference"
       ],
       "scope": "gateway::bootstrap::run#1",
-      "sha256": "8873a5a0fcf49a59a618ff17ab0ee7bb49634e2c2f8af135291540c14f0d8be3",
+      "sha256": "bcb0cdac3e011fce7b321439220c88cf091200fc82b1fb3fbf1e1ca926056a19",
       "owner": "GreenGateway maintainers",
       "purpose": "Existing application transport references or syntax in this exact item; new or changed authority requires explicit review."
     },
@@ -9998,9 +9998,9 @@
         "network-or-process-reference"
       ],
       "scope": "gateway::mcp::invocation_context_from_request#1",
-      "sha256": "1784a42e076dc1d5bd019b1912e8cec94747260c9276c33cb1468a5b7f314ab2",
+      "sha256": "1d2210f8eb3aec9cb1a92a08f5a2c5a8522e5a507c13b7f64b31d92735eb9cfd",
       "owner": "GreenGateway maintainers",
-      "purpose": "Existing application transport references or syntax in this exact item; new or changed authority requires explicit review."
+      "purpose": "Existing application transport references or syntax in this exact item; new or changed authority requires explicit review. Reviewed for #463: the item now also projects the authenticated Principal into the caller a signed caller assertion names (AttestedCaller::from_principal), a pure data copy that adds no network, process or transport capability."
     },
     {
       "file": "gateway/src/mcp.rs",
@@ -10298,26 +10298,6 @@
       "reasons": [
         "unexpanded-attribute"
       ],
-      "scope": "gateway::policy_eval::impl  CompiledPolicy::select_rate_lane#1",
-      "sha256": "5f645b34d2d8cbf1865fe89ed6317350b86252e0ed43f38adad4576cab2069bb",
-      "owner": "GreenGateway maintainers",
-      "purpose": "Narrow cfg_attr(not(test), expect(dead_code)) for the existing offline analysis or rate-selection contract pending its separate adapter. Replaces the policy evaluator module-wide allowance; no transport or process capability is introduced."
-    },
-    {
-      "file": "gateway/src/policy_eval/mod.rs",
-      "reasons": [
-        "unexpanded-attribute"
-      ],
-      "scope": "gateway::policy_eval::HostFact#1",
-      "sha256": "e1f624621dd927252eab69cd33b51298246b2176e864a2f68f9896e8d4dad449",
-      "owner": "GreenGateway maintainers",
-      "purpose": "Narrow cfg_attr(not(test), expect(dead_code)) for the existing offline analysis or rate-selection contract pending its separate adapter. Replaces the policy evaluator module-wide allowance; no transport or process capability is introduced."
-    },
-    {
-      "file": "gateway/src/policy_eval/mod.rs",
-      "reasons": [
-        "unexpanded-attribute"
-      ],
       "scope": "gateway::policy_eval::EvaluationError#1",
       "sha256": "188b4f6cee35138742cfe96af0a09904e768b365ed193b785eb72c4b343c2625",
       "owner": "GreenGateway maintainers",
@@ -10348,60 +10328,10 @@
       "reasons": [
         "unexpanded-attribute"
       ],
-      "scope": "gateway::policy_eval::RateLaneSelection#1",
-      "sha256": "0c5003e83677daedbf708b7a2ed45e4be73e7652197573c9f9374155ec7ce08e",
-      "owner": "GreenGateway maintainers",
-      "purpose": "Narrow cfg_attr(not(test), expect(dead_code)) for the existing offline analysis or rate-selection contract pending its separate adapter. Replaces the policy evaluator module-wide allowance; no transport or process capability is introduced."
-    },
-    {
-      "file": "gateway/src/policy_eval/mod.rs",
-      "reasons": [
-        "unexpanded-attribute"
-      ],
-      "scope": "gateway::policy_eval::RateLaneOutcome#1",
-      "sha256": "fc5a127c4b484ab2008ce94202340dc869daae8e4377e09295a2907db57e27e6",
-      "owner": "GreenGateway maintainers",
-      "purpose": "Narrow cfg_attr(not(test), expect(dead_code)) for the existing offline analysis or rate-selection contract pending its separate adapter. Replaces the policy evaluator module-wide allowance; no transport or process capability is introduced."
-    },
-    {
-      "file": "gateway/src/policy_eval/mod.rs",
-      "reasons": [
-        "unexpanded-attribute"
-      ],
-      "scope": "gateway::policy_eval::RateLimit#1",
-      "sha256": "d7d90c8e90cf2cf72cd7885ed1c01ea3155c7c98e67c140674e912b1b36da41e",
-      "owner": "GreenGateway maintainers",
-      "purpose": "Narrow cfg_attr(not(test), expect(dead_code)) for the existing offline analysis or rate-selection contract pending its separate adapter. Replaces the policy evaluator module-wide allowance; no transport or process capability is introduced."
-    },
-    {
-      "file": "gateway/src/policy_eval/mod.rs",
-      "reasons": [
-        "unexpanded-attribute"
-      ],
-      "scope": "gateway::policy_eval::impl  RateLaneSelection::header#1",
-      "sha256": "f8719bbce0819008207d0efd5137bed6dd2e76eef93826346283602694851418",
-      "owner": "GreenGateway maintainers",
-      "purpose": "Narrow cfg_attr(not(test), expect(dead_code)) for the existing offline analysis or rate-selection contract pending its separate adapter. Replaces the policy evaluator module-wide allowance; no transport or process capability is introduced."
-    },
-    {
-      "file": "gateway/src/policy_eval/mod.rs",
-      "reasons": [
-        "unexpanded-attribute"
-      ],
-      "scope": "gateway::policy_eval::impl  RateLaneSelection::outcome#1",
-      "sha256": "a00be01ec5cafab511d9809e7a222424c3785cfca236ed27c9143b4a71982f98",
-      "owner": "GreenGateway maintainers",
-      "purpose": "Narrow cfg_attr(not(test), expect(dead_code)) for the existing offline analysis or rate-selection contract pending its separate adapter. Replaces the policy evaluator module-wide allowance; no transport or process capability is introduced."
-    },
-    {
-      "file": "gateway/src/policy_eval/mod.rs",
-      "reasons": [
-        "unexpanded-attribute"
-      ],
       "scope": "gateway::policy_eval::impl  RateLaneSelection::matched#1",
-      "sha256": "594cffcac5dee8daa9ccce489395b3e202c10ff38674f6c3dde9328c051a3a76",
+      "sha256": "702d6a3838f7f20f294e36f410df95e216bfcda2a58b499729e49a9a01e46f7d",
       "owner": "GreenGateway maintainers",
-      "purpose": "Narrow cfg_attr(not(test), expect(dead_code)) for the existing offline analysis or rate-selection contract pending its separate adapter. Replaces the policy evaluator module-wide allowance; no transport or process capability is introduced."
+      "purpose": "Per-method cfg_attr(not(test), expect(dead_code)) for a rate-lane selection accessor that offline analysis and the differential tests read; the live rate adapter (#422 PR 3a) matches on the outcome instead. Dead-code gating only; no transport or process capability is introduced."
     },
     {
       "file": "gateway/src/policy_eval/mod.rs",
@@ -10409,9 +10339,9 @@
         "unexpanded-attribute"
       ],
       "scope": "gateway::policy_eval::impl  RateLaneSelection::limit#1",
-      "sha256": "b89d303aa1c02a9f5b530f4e705287770030148972e32db485b489ff01fd60aa",
+      "sha256": "c309ec491de24254205bae6753f4aea422b809fa7c85b09e16a41174712cdf37",
       "owner": "GreenGateway maintainers",
-      "purpose": "Narrow cfg_attr(not(test), expect(dead_code)) for the existing offline analysis or rate-selection contract pending its separate adapter. Replaces the policy evaluator module-wide allowance; no transport or process capability is introduced."
+      "purpose": "Per-method cfg_attr(not(test), expect(dead_code)) for a rate-lane selection accessor that offline analysis and the differential tests read; the live rate adapter (#422 PR 3a) matches on the outcome instead. Dead-code gating only; no transport or process capability is introduced."
     },
     {
       "file": "gateway/src/policy_eval/mod.rs",
@@ -10419,9 +10349,9 @@
         "unexpanded-attribute"
       ],
       "scope": "gateway::policy_eval::impl  RateLaneSelection::limitation#1",
-      "sha256": "c3023721e5e1356b59cc77e82a3af38a2f918e27b63b5741627fd92f44b02a9c",
+      "sha256": "33dd7deb317b14dfcdba5e0a5b5efb56b8de8644f9d1bc615665d81d87df9560",
       "owner": "GreenGateway maintainers",
-      "purpose": "Narrow cfg_attr(not(test), expect(dead_code)) for the existing offline analysis or rate-selection contract pending its separate adapter. Replaces the policy evaluator module-wide allowance; no transport or process capability is introduced."
+      "purpose": "Per-method cfg_attr(not(test), expect(dead_code)) for a rate-lane selection accessor that offline analysis and the differential tests read; the live rate adapter (#422 PR 3a) matches on the outcome instead. Dead-code gating only; no transport or process capability is introduced."
     },
     {
       "file": "gateway/src/policy_eval/mod.rs",
@@ -10429,39 +10359,9 @@
         "unexpanded-attribute"
       ],
       "scope": "gateway::policy_eval::impl  RateLaneSelection::reusable_for#1",
-      "sha256": "352924343e070833ee4944956aeba79ee3e9579ae2bfce362baa654643fbf2e3",
+      "sha256": "60c8f08cad04845af850c1c4acede53ea4d03ffcc8dd7f77fae476a3dfcc9889",
       "owner": "GreenGateway maintainers",
-      "purpose": "Narrow cfg_attr(not(test), expect(dead_code)) for the existing offline analysis or rate-selection contract pending its separate adapter. Replaces the policy evaluator module-wide allowance; no transport or process capability is introduced."
-    },
-    {
-      "file": "gateway/src/policy_eval/mod.rs",
-      "reasons": [
-        "unexpanded-attribute"
-      ],
-      "scope": "gateway::policy_eval::impl  RateLimit::header#1",
-      "sha256": "c011f9f870c763d20f8cfbf80b6312da898efca4de2df3c3c8f76e8a3f007fb6",
-      "owner": "GreenGateway maintainers",
-      "purpose": "Narrow cfg_attr(not(test), expect(dead_code)) for the existing offline analysis or rate-selection contract pending its separate adapter. Replaces the policy evaluator module-wide allowance; no transport or process capability is introduced."
-    },
-    {
-      "file": "gateway/src/policy_eval/mod.rs",
-      "reasons": [
-        "unexpanded-attribute"
-      ],
-      "scope": "gateway::policy_eval::impl  RateLimit::requests_per_second#1",
-      "sha256": "23a17e9e8160d77811ea82dd8da155b0e14f9496881e310d367f9199ebc43dac",
-      "owner": "GreenGateway maintainers",
-      "purpose": "Narrow cfg_attr(not(test), expect(dead_code)) for the existing offline analysis or rate-selection contract pending its separate adapter. Replaces the policy evaluator module-wide allowance; no transport or process capability is introduced."
-    },
-    {
-      "file": "gateway/src/policy_eval/mod.rs",
-      "reasons": [
-        "unexpanded-attribute"
-      ],
-      "scope": "gateway::policy_eval::impl  RateLimit::burst#1",
-      "sha256": "677e297768ed4be46122c1eb78bf8f7e1fd7e77467de8220aab874003916fc0a",
-      "owner": "GreenGateway maintainers",
-      "purpose": "Narrow cfg_attr(not(test), expect(dead_code)) for the existing offline analysis or rate-selection contract pending its separate adapter. Replaces the policy evaluator module-wide allowance; no transport or process capability is introduced."
+      "purpose": "Per-method cfg_attr(not(test), expect(dead_code)) for a rate-lane selection accessor that offline analysis and the differential tests read; the live rate adapter (#422 PR 3a) matches on the outcome instead. Dead-code gating only; no transport or process capability is introduced."
     },
     {
       "file": "gateway/src/proxy/admission.rs",
@@ -12317,7 +12217,7 @@
         "network-or-process-reference"
       ],
       "scope": "gateway::storage::postgres_membership::impl  PostgresMembershipStore::members_with_inner#1",
-      "sha256": "7ffc604d0da26ced22bf40f22df19baa0ac0eca7c543bd03c1982c84869323dc",
+      "sha256": "2a11ef04abeb129092ce291325dac0538d320eb46d622a83bc697fa4bffd3dc8",
       "owner": "GreenGateway maintainers",
       "purpose": "PostgreSQL repository operations through the shared infrastructure pool; no caller-selected HTTP authority."
     },
@@ -12347,7 +12247,7 @@
         "network-or-process-reference"
       ],
       "scope": "gateway::storage::postgres_membership::member_from_row#1",
-      "sha256": "c8ef3079a210b340a073081eff7d75c5321fd8c7de8c2a06e914ea417b70124b",
+      "sha256": "e58126de2e90b82abb483652428650f8d1638425f3ebbfc8f58c555435637422",
       "owner": "GreenGateway maintainers",
       "purpose": "PostgreSQL repository operations through the shared infrastructure pool; no caller-selected HTTP authority."
     },

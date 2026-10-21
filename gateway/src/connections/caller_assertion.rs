@@ -71,7 +71,8 @@ use sha2::{Digest, Sha256};
 use tokio_rustls::rustls::pki_types::pem::SectionKind;
 use zeroize::Zeroizing;
 
-use super::model::CallerAssertionAlgorithm;
+use super::model::{CallerAssertionAlgorithm, CallerAssertionClaim};
+use crate::auth::principal::{canonical_issuer, AuthMethod, Principal};
 
 /// Where this gateway publishes the public half of every caller-assertion key.
 ///
@@ -158,6 +159,15 @@ pub enum PrincipalClaim {
     Roles,
 }
 
+impl From<CallerAssertionClaim> for PrincipalClaim {
+    fn from(claim: CallerAssertionClaim) -> Self {
+        match claim {
+            CallerAssertionClaim::Email => Self::Email,
+            CallerAssertionClaim::Roles => Self::Roles,
+        }
+    }
+}
+
 impl PrincipalClaim {
     fn claim_name(self) -> &'static str {
         match self {
@@ -181,8 +191,16 @@ pub enum CallerAssertionError {
     InvalidClaim(&'static str),
     /// The configured lifetime is zero or longer than this gateway will issue.
     InvalidLifetime,
-    /// The configured signing key is not usable for the chosen algorithm.
+    /// The configured signing key is not usable for the chosen algorithm: its
+    /// alias is unknown or refused, or the material is not a key for it.
     KeyUnusable,
+    /// The signing key's secret source could not be read just now.
+    KeyUnavailable,
+    /// The Connection's keys are left out of the published JWKS, so no
+    /// upstream could verify what this gateway signed with them.
+    KeyNotPublished,
+    /// Something else on the request already set the assertion header.
+    HeaderConflict,
     /// A mutation required an approval binding and none was supplied.
     ApprovalRequired,
     /// Signing itself failed.
@@ -199,10 +217,19 @@ impl CallerAssertionError {
             Self::InvalidClaim(_) => "caller_assertion_claim_invalid",
             Self::InvalidLifetime => "caller_assertion_lifetime_invalid",
             Self::KeyUnusable => "caller_assertion_key_unusable",
+            Self::KeyUnavailable => "caller_assertion_key_unavailable",
+            Self::KeyNotPublished => "caller_assertion_key_not_published",
+            Self::HeaderConflict => "caller_assertion_header_conflict",
             Self::ApprovalRequired => "caller_assertion_approval_required",
             Self::SignatureFailed => "caller_assertion_signature_failed",
             Self::TokenTooLong => "caller_assertion_token_too_long",
         }
+    }
+
+    /// Whether this is a failure to read or load the signing key, which is
+    /// reported like any other secret this gateway could not resolve.
+    pub fn is_key_resolution_failure(self) -> bool {
+        matches!(self, Self::KeyUnusable | Self::KeyUnavailable)
     }
 }
 
@@ -566,6 +593,66 @@ pub struct CallerIdentity<'a> {
     pub subject: &'a str,
     pub email: Option<&'a str>,
     pub roles: &'a [String],
+}
+
+/// The caller a tool call would attest, taken from the authenticated
+/// [`Principal`] when the call is admitted and carried with it to the upstream
+/// request.
+///
+/// Built from the principal itself, never from the audit actor projected from
+/// it: the actor is a record of who called, shaped for audit, and nothing that
+/// signs should depend on how audit chooses to present a caller.
+///
+/// There is deliberately no way to build one for a service token. A service
+/// token is a credential the gateway issued to a system, not an identity a
+/// provider vouched for, so an upstream doing per-user checks has nobody to
+/// apply them to; a Connection that attests its caller refuses such a call
+/// rather than name the token as if it were a person.
+#[derive(Clone, PartialEq, Eq)]
+pub struct AttestedCaller {
+    issuer: String,
+    subject: String,
+    email: Option<String>,
+    roles: Vec<String>,
+}
+
+impl fmt::Debug for AttestedCaller {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // The attested identity is not a secret, but it is personal data, and
+        // a Debug rendering can end up anywhere. The issuer is enough to tell
+        // contexts apart.
+        formatter
+            .debug_struct("AttestedCaller")
+            .field("issuer", &self.issuer)
+            .finish_non_exhaustive()
+    }
+}
+
+impl AttestedCaller {
+    /// The caller `principal` names, or `None` when there is nobody a
+    /// provider vouched for: a service token, or a principal without an
+    /// issuer to scope its subject by.
+    pub fn from_principal(principal: &Principal) -> Option<Self> {
+        if principal.auth_method == AuthMethod::ServiceToken {
+            return None;
+        }
+        let issuer = principal.issuer.as_deref().and_then(canonical_issuer)?;
+        Some(Self {
+            issuer,
+            subject: principal.user_id.clone(),
+            email: principal.email.clone(),
+            roles: principal.roles.clone(),
+        })
+    }
+
+    pub fn identity(&self) -> CallerIdentity<'_> {
+        CallerIdentity {
+            issuer: &self.issuer,
+            subject: &self.subject,
+            email: self.email.as_deref(),
+            roles: &self.roles,
+        }
+    }
 }
 
 /// The `sub` this gateway asserts for a caller: the provider issuer, `#`, then the provider subject.

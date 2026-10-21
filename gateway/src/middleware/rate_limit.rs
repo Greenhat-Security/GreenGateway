@@ -1,4 +1,13 @@
 //! Token-bucket rate limiting middleware.
+//!
+//! Two stages. The global lanes key by canonical client IP and run before
+//! authentication. The policy stage runs after it, for authenticated requests
+//! only: it asks the shared policy evaluator which `rate_limits` override governs
+//! the request ([`CompiledPolicy::select_rate_lane`]), and then charges that
+//! override's token bucket. Selection is policy and pure; the buckets, their
+//! capacity and the shared store's decision are mutable state and stay here.
+//!
+//! [`CompiledPolicy::select_rate_lane`]: crate::policy_eval::CompiledPolicy::select_rate_lane
 
 use std::{
     collections::{hash_map::RandomState, HashMap, VecDeque},
@@ -22,16 +31,20 @@ use serde::Serialize;
 use sha2::{Digest, Sha256};
 
 use crate::{
+    audit::AuditLog,
     auth,
     client_ip::{canonical_client_ip, ClientIpPolicy},
     config::Config,
     metrics::{
         LOCK_POISON_RECOVERIES_TOTAL, RATE_LIMIT_BUCKETS, RATE_LIMIT_BUCKET_EVICTIONS_TOTAL,
     },
-    rbac::{
-        matcher::{method_matches, path_pattern_matches},
-        Policy, RateLimitRule,
+    middleware::rbac::{pinned_policy_snapshot, refuse_unevaluated, RbacPolicyState},
+    path_match::is_unsafe_request_path,
+    policy_eval::{
+        EvaluationError, HostFact, HttpTarget, Limitation, PolicyEvaluationContext, PrincipalFact,
+        PrincipalIdentity, RateLaneOutcome, CONTEXT_VERSION,
     },
+    rbac::RateLimitRule,
 };
 
 #[derive(Clone)]
@@ -126,8 +139,33 @@ struct TokenBucket {
     referenced: bool,
 }
 
+/// The policy stage's view of one installed policy snapshot: the snapshot
+/// whose compiled evaluator selects a lane, and a token bucket store for each
+/// of its `rate_limits` overrides, built from the very rule vector that
+/// evaluator indexes.
+///
+/// Both live in this one value, swapped as one, on purpose. Selection answers
+/// with an index, and an index is only meaningful against the overrides of the
+/// policy that produced it. Held apart -- the selector read from one lane and
+/// the buckets from another -- a request racing an install could take its index
+/// from one policy and charge the bucket at that index in the next.
 pub(crate) struct RateLimitPolicyState {
+    /// `None` until an RBAC state attaches this stage, which happens exactly
+    /// when a policy is loaded (`RbacState::with_rate_limit_state`). With no
+    /// policy there is no override to select, and `overrides` is empty.
+    selector: Option<RateLaneSelector>,
     overrides: Vec<RateLimitOverride>,
+}
+
+/// The snapshot a policy stage selects with, and where it records a refusal.
+struct RateLaneSelector {
+    /// The `RbacPolicyState` the RBAC lane installed -- the same `Arc`, not a
+    /// recompiled copy -- so the rate lane is decided by the instance the
+    /// authorization lane serves.
+    snapshot: Arc<RbacPolicyState>,
+    /// The RBAC state's audit log: a refusal here is audited as the
+    /// authorization stage audits its own.
+    audit: AuditLog,
 }
 
 struct RateLimitOverride {
@@ -147,6 +185,52 @@ struct PolicyMatch {
     limit: LaneLimit,
 }
 
+/// Why the policy stage refused to select a lane, rather than select one.
+///
+/// Every variant refuses the request. A lane that cannot be selected cannot be
+/// enforced, and letting the request through unmetered on that account would be
+/// the stage failing open (#422). The refusal is the authorization stage's own
+/// answer for a request it does not evaluate ([`refuse_unevaluated`]): `403`,
+/// `authz.denied` with the reason, and a denied policy decision.
+///
+/// Only [`RateLaneRefusal::UnsafePath`], and a malformed path among
+/// [`RateLaneRefusal::Error`]'s causes (an asterisk-form target such as
+/// `OPTIONS *`), are reachable from a served request. The authorization stage
+/// refuses both of those with this same answer, so the refusal moves one stage
+/// earlier without changing what the caller or the audit trail sees. The other
+/// causes are not reachable: request admission and authentication refuse an
+/// oversized method or path and a principal outside its bounds before this
+/// stage (#488), and the context version and snapshot are this adapter's own.
+/// Diagnostics are bounded enums, never a path, identity or policy value.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RateLaneRefusal {
+    /// A path [`is_unsafe_request_path`] refuses. The authorization stage
+    /// refuses it before evaluating, with this reason, and so does this one:
+    /// the evaluator would only refuse it as malformed, under another reason.
+    UnsafePath,
+    /// The evaluator lacked a fact it selects on.
+    Incomplete(Limitation),
+    /// The evaluator refused the question, or its answer did not name a bucket
+    /// built for the snapshot the question was bound to.
+    Error(EvaluationError),
+}
+
+impl RateLaneRefusal {
+    fn reason(self) -> &'static str {
+        match self {
+            Self::UnsafePath => "unsafe_path",
+            Self::Incomplete(_) => "policy_evaluation_incomplete",
+            Self::Error(_) => "policy_evaluation_error",
+        }
+    }
+}
+
+/// A refusal, with the audit log of the snapshot that refused.
+struct RateLaneRefused {
+    refusal: RateLaneRefusal,
+    audit: AuditLog,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Lane {
     Read,
@@ -159,7 +243,9 @@ struct TooManyRequestsBody {
 }
 
 impl RateLimitState {
-    pub fn from_config_and_policy(config: &Config, policy: Option<&Policy>) -> Self {
+    /// The global lanes from configuration. The policy stage has no overrides
+    /// until an RBAC state attaches it with the policy that state installed.
+    pub fn from_config(config: &Config) -> Self {
         Self {
             read: RateLimiter::new(
                 config.rate_limit_read_rps,
@@ -177,11 +263,7 @@ impl RateLimitState {
                 "write",
                 Arc::new(AtomicUsize::new(0)),
             ),
-            policy: Arc::new(ArcSwap::from_pointee(RateLimitPolicyState::from_policy(
-                policy,
-                config.rate_limit_max_buckets,
-                config.rate_limit_bucket_idle_ttl(),
-            ))),
+            policy: Arc::new(ArcSwap::from_pointee(RateLimitPolicyState::unattached())),
             client_ip_policy: ClientIpPolicy::from_config(config),
             bucket_capacity: config.rate_limit_max_buckets,
             bucket_idle_ttl: config.rate_limit_bucket_idle_ttl(),
@@ -247,10 +329,18 @@ impl RateLimitState {
         SharedGate::None
     }
 
-    pub(crate) fn replace_policy(&self, policy: &Policy) {
+    /// Install the snapshot the RBAC lane installed, with fresh token buckets
+    /// for its overrides. Every RBAC install path calls this, and so does
+    /// attaching the stage; nothing else does, so the stage never selects with
+    /// a snapshot the RBAC lane did not install.
+    ///
+    /// Buckets reset on every install, as they did when this stage rebuilt its
+    /// overrides from each reloaded policy.
+    pub(crate) fn install_policy_snapshot(&self, snapshot: Arc<RbacPolicyState>, audit: &AuditLog) {
         self.policy
-            .store(Arc::new(RateLimitPolicyState::from_policy(
-                Some(policy),
+            .store(Arc::new(RateLimitPolicyState::for_snapshot(
+                snapshot,
+                audit.clone(),
                 self.bucket_capacity,
                 self.bucket_idle_ttl,
             )));
@@ -261,16 +351,6 @@ impl RateLimitState {
             Lane::Read => self.read.clone(),
             Lane::Write => self.write.clone(),
         }
-    }
-
-    fn policy_limiter(
-        &self,
-        method: &Method,
-        path: &str,
-        principal: Option<&auth::Principal>,
-    ) -> Option<PolicyMatch> {
-        let policy = self.policy.load();
-        policy.matching_limiter(method.as_str(), path, principal)
     }
 }
 
@@ -452,84 +532,154 @@ impl BucketStore {
 }
 
 impl RateLimitPolicyState {
-    #[cfg(test)]
-    pub(crate) fn for_selection_parity(policy: &Policy) -> Self {
-        Self::from_policy(Some(policy), 1, Duration::from_secs(1))
+    fn unattached() -> Self {
+        Self {
+            selector: None,
+            overrides: Vec::new(),
+        }
     }
 
-    fn from_policy(
-        policy: Option<&Policy>,
+    fn for_snapshot(
+        snapshot: Arc<RbacPolicyState>,
+        audit: AuditLog,
         bucket_capacity: usize,
         bucket_idle_ttl: Duration,
     ) -> Self {
         // One counter shared by every rule's store, so the policy lane's
         // gauge is the sum across rules rather than whichever store happened
-        // to change last. Rebuilt on policy replace, alongside the stores.
+        // to change last. Rebuilt on every install, alongside the stores.
         let live_buckets = Arc::new(AtomicUsize::new(0));
+        let overrides = snapshot
+            .compiled()
+            .rate_limit_rules()
+            .iter()
+            .cloned()
+            .map(|rule| {
+                RateLimitOverride::new(
+                    rule,
+                    bucket_capacity,
+                    bucket_idle_ttl,
+                    Arc::clone(&live_buckets),
+                )
+            })
+            .collect();
         Self {
-            overrides: policy
-                .map(|policy| {
-                    policy
-                        .rate_limits
-                        .iter()
-                        .cloned()
-                        .map(|rule| {
-                            RateLimitOverride::new(
-                                rule,
-                                bucket_capacity,
-                                bucket_idle_ttl,
-                                Arc::clone(&live_buckets),
-                            )
-                        })
-                        .collect()
-                })
-                .unwrap_or_default(),
+            selector: Some(RateLaneSelector { snapshot, audit }),
+            overrides,
         }
     }
 
-    /// The limit the first matching override declares, without touching a
-    /// limiter or a bucket.
+    /// The override that governs an authenticated request, selected by the
+    /// shared evaluator, with the bucket this snapshot built for it.
     ///
-    /// Exists so the pure kernel's rate-lane selection can be compared against
-    /// this selector directly, rather than inferred from whether a burst was
-    /// exhausted. Selection and enforcement stay separate either way.
-    #[cfg(test)]
-    pub(crate) fn selected_override_limit(
+    /// The question is bound to the request's policy snapshot: the one pinned
+    /// for the running task if there is one, otherwise this snapshot, the one
+    /// the RBAC lane installed last. This stage runs before the authorization
+    /// stage and its cluster revision gate (`routing::apply_middleware`), so no
+    /// request is pinned here today and the two are the same. The answer comes
+    /// from this snapshot's evaluator, because these are the buckets it built;
+    /// a question bound to any other snapshot is refused by the evaluator itself
+    /// (`SnapshotMismatch`) rather than answered with an index into overrides
+    /// it did not produce.
+    ///
+    /// Selection reads the method, the exact request path and the principal.
+    /// Routing and host facts are not captured here, and the context says so
+    /// (`HttpTarget::Missing`, `HostFact::Missing`) rather than claim the
+    /// request had none.
+    fn select(
         &self,
-        method: &str,
+        method: &Method,
         path: &str,
-        principal: Option<&auth::Principal>,
-    ) -> Option<(usize, f64, u32)> {
-        self.overrides
-            .iter()
-            .enumerate()
-            .find(|(_, override_rule)| override_rule.matches(method, path, principal))
-            .map(|(index, override_rule)| {
-                (
-                    index,
-                    override_rule.rule.requests_per_second,
-                    override_rule.rule.burst,
-                )
-            })
+        principal: &auth::Principal,
+    ) -> Result<Option<PolicyMatch>, RateLaneRefused> {
+        let Some(selector) = &self.selector else {
+            // Not attached, so no policy is loaded and no override exists.
+            return Ok(None);
+        };
+        let refused = |refusal| RateLaneRefused {
+            refusal,
+            audit: selector.audit.clone(),
+        };
+        // The authorization stage's own guard, applied before it evaluates. A
+        // path that fails it is one the evaluator would refuse as malformed.
+        if is_unsafe_request_path(path) {
+            return Err(refused(RateLaneRefusal::UnsafePath));
+        }
+        let compiled = selector.snapshot.compiled();
+        let snapshot = pinned_policy_snapshot().map_or_else(
+            || compiled.snapshot(),
+            |pinned| pinned.compiled().snapshot(),
+        );
+        let context = PolicyEvaluationContext {
+            version: CONTEXT_VERSION,
+            snapshot,
+            method: Some(method.clone()),
+            path: Some(path.to_owned()),
+            principal: PrincipalFact::Authenticated(PrincipalIdentity::from_principal(principal)),
+            target: HttpTarget::Missing,
+            request_host: HostFact::Missing,
+            dispatch: None,
+        };
+        let selection = compiled
+            .select_rate_lane(&context)
+            .map_err(|error| refused(RateLaneRefusal::Error(error)))?;
+        match selection.outcome() {
+            RateLaneOutcome::NoOverride => Ok(None),
+            RateLaneOutcome::Override { index, limit } => {
+                // The overrides were built from the rule vector the evaluator
+                // indexes, so this always finds the bucket built for the rule
+                // it read. Checked anyway: a bucket that is not that rule's
+                // would enforce another rule's limit, so it is refused.
+                let Some(selected) = self.overrides.get(index).filter(|selected| {
+                    selected.rule.requests_per_second == limit.requests_per_second()
+                        && selected.rule.burst == limit.burst()
+                }) else {
+                    return Err(refused(RateLaneRefusal::Error(
+                        EvaluationError::InternalInvariant,
+                    )));
+                };
+                Ok(Some(PolicyMatch {
+                    limiter: selected.limiter.clone(),
+                    fingerprint: Arc::clone(&selected.fingerprint),
+                    limit: LaneLimit {
+                        requests_per_second: selected.rule.requests_per_second,
+                        burst: selected.rule.burst,
+                    },
+                }))
+            }
+            RateLaneOutcome::Indeterminate(limitation) => {
+                Err(refused(RateLaneRefusal::Incomplete(limitation)))
+            }
+        }
     }
+}
 
-    fn matching_limiter(
-        &self,
-        method: &str,
-        path: &str,
-        principal: Option<&auth::Principal>,
-    ) -> Option<PolicyMatch> {
-        self.overrides
-            .iter()
-            .find(|override_rule| override_rule.matches(method, path, principal))
-            .map(|override_rule| PolicyMatch {
-                limiter: override_rule.limiter.clone(),
-                fingerprint: Arc::clone(&override_rule.fingerprint),
-                limit: LaneLimit {
-                    requests_per_second: override_rule.rule.requests_per_second,
-                    burst: override_rule.rule.burst,
-                },
-            })
+impl RateLaneRefused {
+    /// The request's answer: refused by the authorization stage's rule for a
+    /// request it does not evaluate, after a bounded warning for an evaluator
+    /// refusal. An unsafe path is not warned about here, because the
+    /// authorization stage does not warn about one either; its audit record is
+    /// the same.
+    fn respond(
+        self,
+        req: &Request,
+        principal: &auth::Principal,
+        client_ip_policy: &ClientIpPolicy,
+    ) -> Response {
+        if self.refusal != RateLaneRefusal::UnsafePath {
+            tracing::warn!(
+                reason = self.refusal.reason(),
+                refusal = ?self.refusal,
+                "rate lane policy evaluation refused"
+            );
+        }
+        refuse_unevaluated(
+            &self.audit,
+            client_ip_policy,
+            req,
+            Some(principal),
+            self.refusal.reason(),
+        )
     }
 }
 
@@ -559,16 +709,6 @@ impl RateLimitOverride {
             limiter,
             fingerprint,
         }
-    }
-
-    fn matches(&self, method: &str, path: &str, principal: Option<&auth::Principal>) -> bool {
-        self.rule.principal.matches(principal)
-            && method_matches(&self.rule.methods, method)
-            && self
-                .rule
-                .path
-                .as_ref()
-                .is_none_or(|pattern| path_pattern_matches(pattern, path))
     }
 }
 
@@ -617,6 +757,16 @@ pub async fn rate_limit_request(
     check_rate_limit(limiter, &key, &client_ip, lane, &path, shared, req, next).await
 }
 
+/// The policy stage: an authenticated request's `rate_limits` override,
+/// selected by the shared evaluator, then that override's bucket.
+///
+/// A request with no principal returns before anything is selected. That is
+/// the live contract this stage has always had -- overrides never govern
+/// unauthenticated traffic, which the global lanes alone limit -- and the
+/// evaluator reproduces it as `NoOverride`, so the two cannot disagree.
+///
+/// A selection the evaluator refuses, or cannot complete, refuses the request
+/// (see [`RateLaneRefusal`]); it never lets the request past unmetered.
 pub async fn policy_rate_limit_request(
     State(state): State<RateLimitState>,
     req: Request,
@@ -629,8 +779,12 @@ pub async fn policy_rate_limit_request(
     let Some(principal) = req.extensions().get::<auth::Principal>() else {
         return next.run(req).await;
     };
-    let Some(matched) = state.policy_limiter(&method, &path, Some(principal)) else {
-        return next.run(req).await;
+    // One load: the selector and the buckets it indexes come from one install.
+    let selection = state.policy.load().select(&method, &path, principal);
+    let matched = match selection {
+        Ok(Some(matched)) => matched,
+        Ok(None) => return next.run(req).await,
+        Err(refused) => return refused.respond(&req, principal, &state.client_ip_policy),
     };
     let key = principal_rate_limit_key(principal);
     let shared = state.shared_policy_gate(&matched, &key);
@@ -848,10 +1002,7 @@ mod tests {
         write_burst: u32,
         rate_limits: Vec<RateLimitRule>,
     ) -> RateLimitState {
-        let policy = policy_with_rate_limits(rate_limits);
-        let policy_state =
-            RateLimitPolicyState::from_policy(Some(&policy), TEST_BUCKET_CAPACITY, TEST_BUCKET_TTL);
-        RateLimitState {
+        let state = RateLimitState {
             read: RateLimiter::new(
                 read_rps,
                 read_burst,
@@ -868,7 +1019,7 @@ mod tests {
                 "write",
                 Arc::new(AtomicUsize::new(0)),
             ),
-            policy: Arc::new(ArcSwap::from_pointee(policy_state)),
+            policy: Arc::new(ArcSwap::from_pointee(RateLimitPolicyState::unattached())),
             client_ip_policy: ClientIpPolicy::default(),
             bucket_capacity: TEST_BUCKET_CAPACITY,
             bucket_idle_ttl: TEST_BUCKET_TTL,
@@ -882,7 +1033,17 @@ mod tests {
                 requests_per_second: write_rps,
                 burst: write_burst,
             },
-        }
+        };
+        // Attached as production attaches it: an RBAC state hands over the
+        // snapshot it installed, and the policy stage selects with that.
+        let _attached = RbacState::new(
+            policy_with_rate_limits(rate_limits),
+            Vec::new(),
+            false,
+            test_audit_log(),
+        )
+        .with_rate_limit_state(state.clone());
+        state
     }
 
     fn test_router(state: RateLimitState) -> Router {
@@ -1986,3 +2147,11 @@ mod tests {
             .unwrap_or_default()
     }
 }
+
+#[cfg(test)]
+#[path = "rate_limit_legacy_tests.rs"]
+pub(crate) mod legacy;
+
+#[cfg(test)]
+#[path = "rate_limit_differential_tests.rs"]
+mod differential;

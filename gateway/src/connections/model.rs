@@ -414,12 +414,12 @@ impl ConnectionWrite {
     /// Validate a document already persisted under the v0 write contract.
     ///
     /// Early v0 releases accepted `OPTIONS` test profiles, and a
-    /// `caller_assertion` that asked for `bind_approval` or reused an
-    /// additional header's name. Keep those historical values readable across
-    /// upgrades, while [`Self::validated`] remains the only validator for new
-    /// and replacement writes. Reading one is not serving it: every Connection
-    /// carrying a `caller_assertion` is refused at runtime until the request
-    /// path injects the assertion.
+    /// `caller_assertion` that asked for `bind_approval`, reused an additional
+    /// header's name, or was sent over plain HTTP. Keep those historical values
+    /// readable across upgrades, while [`Self::validated`] remains the only
+    /// validator for new and replacement writes. Reading one is not serving it:
+    /// a Connection whose `caller_assertion` only this legacy reading admits is
+    /// refused at runtime (see [`Self::caller_assertion_enforceable`]).
     pub(crate) fn validated_persisted_v0(self) -> Result<Self, Vec<ConnectionValidationError>> {
         self.validated_with_legacy_options(true)
     }
@@ -479,14 +479,19 @@ impl ConnectionWrite {
             &mut errors,
         );
 
+        // A caller assertion is a bearer credential for its lifetime: anyone who
+        // reads it off the wire can present it as the caller until it expires.
+        // A stored document from before this rule stays readable and is
+        // refused at runtime instead.
         let requires_tls = self.authentication.requires_confidential_transport()
             || !self.additional_headers.is_empty()
-            || !self.tls.is_empty();
+            || !self.tls.is_empty()
+            || (self.caller_assertion.is_some() && !allow_legacy_options);
         if requires_tls && !self.endpoint.base_url.starts_with("https://") {
             errors.push(ConnectionValidationError::new(
                 "endpoint.base_url",
                 "https_required",
-                "credentialed connections and TLS profiles must use HTTPS",
+                "credentialed connections, caller assertions and TLS profiles must use HTTPS",
             ));
         }
 
@@ -495,6 +500,38 @@ impl ConnectionWrite {
         } else {
             Err(errors)
         }
+    }
+
+    /// Whether this Connection's `caller_assertion` can be honoured: present,
+    /// and holding to every rule [`Self::validated`] applies to it that
+    /// [`Self::validated_persisted_v0`] relaxes for documents stored by
+    /// earlier releases.
+    ///
+    /// Such a document is readable but not servable. Attesting the caller over
+    /// plain HTTP would put a bearer credential on the wire in the clear; an
+    /// approval binding names an approval nothing can supply; and an
+    /// assertion header that an additional header also sets would leave the
+    /// upstream reading whichever value the transport happened to keep. Each
+    /// of those is refused rather than sent, with the key never read.
+    ///
+    /// Key usability is not judged here: it is the secret source's to answer,
+    /// and is checked on every call that signs.
+    pub fn caller_assertion_enforceable(&self) -> bool {
+        let Some(assertion) = self.caller_assertion.as_ref() else {
+            return false;
+        };
+        let header_collides = self.additional_headers.iter().any(|header| {
+            header
+                .header_name
+                .eq_ignore_ascii_case(&assertion.header_name)
+        }) || matches!(
+            &self.authentication,
+            ConnectionAuthentication::HeaderApiKey { header_name, .. }
+                if header_name.eq_ignore_ascii_case(&assertion.header_name)
+        ) || is_reserved_credential_header(&assertion.header_name);
+        !assertion.bind_approval
+            && !header_collides
+            && self.endpoint.base_url.starts_with("https://")
     }
 
     /// Whether this Connection binds secret material of any kind. A caller
@@ -1615,7 +1652,7 @@ newline"
         }));
 
         // A document persisted before the rule existed stays readable; the
-        // runtime refuses every Connection carrying an assertion regardless.
+        // runtime refuses a block that breaks a write rule on every lane.
         candidate
             .validated_persisted_v0()
             .expect("an already-persisted collision must remain readable");

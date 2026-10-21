@@ -24,6 +24,7 @@ use tower::ServiceExt;
 
 use crate::{
     auth, client_ip,
+    connections::caller_assertion::AttestedCaller,
     egress::EgressResponse,
     tools::{
         definitions::{ToolDefinition, ToolRegistry},
@@ -361,6 +362,11 @@ fn invocation_context_from_request(
             .extensions
             .get::<auth::Principal>()
             .map(auth::actor_from_principal),
+        caller: parts
+            .extensions
+            .get::<auth::Principal>()
+            .and_then(AttestedCaller::from_principal)
+            .map(Arc::new),
         source: ToolInvocationSource::Mcp,
         admitted_deadline: None,
     }

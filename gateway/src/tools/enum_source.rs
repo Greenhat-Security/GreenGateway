@@ -98,8 +98,9 @@ pub enum EnumSourceFailureReason {
     ToolDisabled,
     EgressDenied,
     CredentialUnavailable,
-    /// The source's Connection asks for a signed caller assertion, which this
-    /// gateway does not yet inject, so the fetch is refused before any I/O.
+    /// The source's Connection asks for a signed caller assertion, which a
+    /// source fetch has no caller to sign for, so it is refused before any
+    /// I/O.
     CallerAssertionNotEnforced,
     UpstreamStatus(u16),
     ResponseTooLarge,
