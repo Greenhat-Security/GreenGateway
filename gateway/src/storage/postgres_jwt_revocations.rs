@@ -33,6 +33,16 @@
 //!   nothing; one whose earlier finite row has lapsed, or that carries a
 //!   later or unbounded expiry, replaces the row -- a lapsed row must never
 //!   turn a break-glass revoke into a silent no-op.
+//! - **Every revoke that changes the denylist leaves evidence that outlives
+//!   the row.** Replacing a row overwrites its actor, and cleanup deletes
+//!   it, so the same transaction also appends one `jwt_revocation_evidence`
+//!   row (migration 18): the actor, the action, generated event and
+//!   operation IDs, the key (issuer and digest, never the raw `jti`), the
+//!   expiry the row now carries, its shared revision and the database
+//!   clock's commit time. An extension or reactivation is a second row, not
+//!   an overwrite, and cleanup never touches the table. If the evidence
+//!   cannot be written, the revoke rolls back; a repeat that changes nothing
+//!   writes none.
 //!
 //! Failure classification on the read path: a store that cannot be
 //! consulted is `AuthError::Upstream`, which the middleware answers with
@@ -55,6 +65,10 @@ use super::{
 const OPERATION_LOOKUP: &str = "jwt_revocation_lookup";
 const OPERATION_REVOKE: &str = "jwt_revocation_revoke";
 const OPERATION_CLEANUP: &str = "jwt_revocation_cleanup";
+const OPERATION_EVIDENCE: &str = "jwt_revocation_evidence_append";
+/// The closed action vocabulary of `jwt_revocation_evidence` (migration
+/// 18), the proposed authority-event operation code.
+const EVIDENCE_ACTION_REVOKE: &str = "jwt.revoke";
 const RESOURCE_TYPE: &str = "jwt_revocation";
 /// Retained past the validator's `exp` leeway as well: the validator
 /// samples a whole-second clock and accepts while `exp < now - leeway` is
@@ -133,6 +147,9 @@ impl PostgresJwtRevocationStore {
 
     /// Record a JWT as withdrawn. `expires_at` is RFC 3339 (the token's
     /// own `exp` when known); `None` keeps the row until cleanup.
+    /// `actor_user_id` is recorded on the row and, for a revoke that changes
+    /// the denylist, as its append-only evidence; the `revoke-jwt` command
+    /// passes its fixed system label, which names no authenticated human.
     pub async fn revoke(
         &self,
         jti: &str,
@@ -144,6 +161,15 @@ impl PostgresJwtRevocationStore {
         if jti.trim().is_empty() {
             return Err(RepositoryError::invalid_parameter(OPERATION_REVOKE, "jti"));
         }
+        // An unattributable revocation has no evidence to record, so it is
+        // refused before anything is written; the column checks are the
+        // backstop. No caller input can produce it.
+        if !crate::auth::tokens::is_valid_change_actor(actor_user_id) {
+            return Err(invalid_data(OPERATION_REVOKE));
+        }
+        // One logical operation, minted once per call and never
+        // regenerated: its evidence row carries it.
+        let operation_id = uuid::Uuid::new_v4().to_string();
         // The expiry is RFC 3339 by contract: parsed here, so a value only
         // PostgreSQL would accept (`tomorrow`, a zone-less date,
         // `infinity`) is the caller's error rather than a server-dependent
@@ -272,6 +298,42 @@ impl PostgresJwtRevocationStore {
                 )
                 .await
                 .map_err(|error| classify_query(error, OPERATION_REVOKE))?;
+            // The evidence copies the key, expiry and revision from the row
+            // this transaction just wrote, so it records exactly what the
+            // denylist now holds -- for an extension, the extended expiry.
+            let event_id = uuid::Uuid::new_v4().to_string();
+            let recorded = client
+                .execute(
+                    r#"
+                    INSERT INTO greengateway.jwt_revocation_evidence (
+                        event_id, operation_id, actor_user_id, action,
+                        issuer, jti_hash, expires_at, security_revision
+                    )
+                    SELECT $1::text::uuid, $2::text::uuid, $3, $4,
+                           issuer, jti_hash, expires_at, security_revision
+                    FROM greengateway.jwt_revocations
+                    WHERE issuer = $5 AND jti_hash = $6 AND security_revision = $7
+                    "#,
+                    &[
+                        &event_id,
+                        &operation_id,
+                        &actor_user_id,
+                        &EVIDENCE_ACTION_REVOKE,
+                        &self.issuer.as_ref(),
+                        &digest,
+                        &security_revision,
+                    ],
+                )
+                .await
+                .map_err(|error| evidence_failure(error, OPERATION_EVIDENCE))?;
+            // Exactly the one row written above. Anything else means the
+            // evidence does not describe this revoke, and nothing commits.
+            if recorded != 1 {
+                return Err(RepositoryError::new(
+                    RepositoryErrorKind::Internal,
+                    OPERATION_EVIDENCE,
+                ));
+            }
             Ok(JwtRevocationOutcome::Revoked { security_revision })
         }
         .await;
@@ -297,7 +359,9 @@ impl PostgresJwtRevocationStore {
 
     /// Delete up to `limit` rows whose `expires_at` has passed. Idempotent
     /// and bounded; the singleton scheduling of this work arrives with the
-    /// membership PR. Returns how many rows were deleted.
+    /// membership PR. Returns how many rows were deleted. Only denylist rows
+    /// are deleted: their `jwt_revocation_evidence` is kept, so who revoked
+    /// a JWT, and until when, survives the row's removal.
     pub async fn cleanup_expired(&self, limit: usize) -> Result<u64, RepositoryError> {
         let client = checkout(&self.pool, CheckoutClass::Maintenance).await?;
         self.cleanup_expired_with(&client, limit).await
@@ -383,6 +447,18 @@ fn canonical_rfc3339(
 fn classify_query(error: tokio_postgres::Error, operation: &'static str) -> RepositoryError {
     let kind = super::postgres::classify_postgres_error(&error);
     log_classified(operation, &error, RepositoryError::new(kind, operation))
+}
+
+/// An evidence insert that fails rolls the revoke back. Keep an
+/// availability classification, but report a constraint failure on the
+/// evidence row as the internal defect it is rather than as `Conflict`.
+fn evidence_failure(error: tokio_postgres::Error, operation: &'static str) -> RepositoryError {
+    let classified = classify_query(error, operation);
+    if classified.kind() == RepositoryErrorKind::Conflict {
+        RepositoryError::new(RepositoryErrorKind::Internal, operation)
+    } else {
+        classified
+    }
 }
 
 fn invalid_data(operation: &'static str) -> RepositoryError {

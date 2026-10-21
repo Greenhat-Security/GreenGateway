@@ -9,6 +9,7 @@ pub enum SafeAuthenticationKind {
     HeaderApiKey,
     StaticBearer,
     Oauth2ClientCredentials,
+    DelegatedIssuerToken,
     LegacyConfigured,
 }
 

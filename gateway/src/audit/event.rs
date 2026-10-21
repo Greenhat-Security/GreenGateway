@@ -21,6 +21,10 @@ pub const CONNECTION_SECRET_CHANGED: &str = "connection.secret_changed";
 pub const CONNECTION_REFRESHED: &str = "connection.refreshed";
 pub const CONNECTION_TESTED: &str = "connection.tested";
 pub const CONNECTION_OAUTH_TOKEN_REFRESH: &str = "connection.oauth_token_refresh";
+/// One RFC 8693 exchange a `delegated_issuer_token` Connection made for a
+/// caller (issue #441): the actor it was made for, the outcome and the
+/// issuer's decision, never any token.
+pub const CONNECTION_DELEGATED_TOKEN_EXCHANGE: &str = "connection.delegated_token_exchange";
 pub const CONNECTION_SECRET_RESOLUTION_FAILED: &str = "connection.secret_resolution_failed";
 pub const CONNECTION_UNSAFE_METHOD_REJECTED: &str = "connection.unsafe_method_rejected";
 pub const GATEWAY_READY: &str = "gateway.ready";

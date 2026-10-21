@@ -493,8 +493,10 @@ pub async fn discover_connection_catalog(
     }
     let runtime_config = McpUpstreamRuntimeConfig::from_connection_target(&target);
     let client = managed_mcp_http_client(runtime, &target).await?;
+    // Discovery runs for no caller, so a credential that belongs to one is
+    // refused rather than resolved.
     let credential = runtime
-        .resolve_credential(&target)
+        .resolve_credential(&target, None)
         .await
         .map_err(connection_mcp_error)?
         .map(Arc::new);
@@ -580,14 +582,16 @@ pub async fn probe_connection_protocol_before(
         .client()
         .mcp_reqwest_client_at_checked_destination(prepared.destination(), target.url())
         .map_err(|error| protocol_probe_egress_error(&error))?;
-    let credential =
-        tokio::time::timeout_at(operation_deadline, runtime.resolve_credential(&target))
-            .await
-            .map_err(|_| protocol_probe_timeout(ConnectionTestStageName::SecretAvailable))?
-            .map_err(|error| {
-                protocol_probe_connection_error(error, ConnectionTestStageName::SecretAvailable)
-            })?
-            .map(Arc::new);
+    // A probe runs for no caller, so a credential that belongs to one is
+    // refused rather than resolved.
+    let resolution = runtime.resolve_credential(&target, None);
+    let credential = tokio::time::timeout_at(operation_deadline, resolution)
+        .await
+        .map_err(|_| protocol_probe_timeout(ConnectionTestStageName::SecretAvailable))?
+        .map_err(|error| {
+            protocol_probe_connection_error(error, ConnectionTestStageName::SecretAvailable)
+        })?
+        .map(Arc::new);
     run_bounded_protocol_probe(
         target.connection_id().as_str().to_owned(),
         target.url().to_owned(),
@@ -1023,8 +1027,11 @@ pub async fn call_connection_tool_at_target(
     let request = CallToolRequestParams::new(remote_tool_name.to_owned()).with_arguments(arguments);
     enforce_mcp_call_request_size_before_egress(&request, runtime_config.max_request_body_bytes)?;
     let client = managed_mcp_http_client(runtime, &target).await?;
+    // A managed MCP session is shared by every caller of the Connection, so it
+    // is opened for none of them: a credential that belongs to one is refused
+    // rather than resolved.
     let credential = runtime
-        .resolve_credential(&target)
+        .resolve_credential(&target, None)
         .await
         .map_err(connection_mcp_error)?
         .map(Arc::new);
@@ -1155,10 +1162,30 @@ fn protocol_probe_connection_error(
             ConnectionTestReason::CredentialUnavailable,
             ConnectionStatusReason::SecretUnavailable,
         ),
-        ConnectionHttpError::OAuthTokenEgressDenied => (
+        ConnectionHttpError::OAuthTokenEgressDenied
+        | ConnectionHttpError::DelegatedTokenEgressDenied => (
             ConnectionTestStageName::EgressPolicy,
             ConnectionTestReason::OauthTokenEgressDenied,
             ConnectionStatusReason::EgressDenied,
+        ),
+        // Unreachable: a delegated Connection is an HTTP API with a caller
+        // assertion, which no MCP lane serves. Mapped onto the token reasons
+        // a probe already reports rather than widening that set.
+        ConnectionHttpError::DelegatedTokenNoPrincipal => (
+            ConnectionTestStageName::SecretAvailable,
+            ConnectionTestReason::AuthenticationNotSupported,
+            ConnectionStatusReason::SecretUnavailable,
+        ),
+        ConnectionHttpError::DelegatedTokenDenied => (
+            ConnectionTestStageName::SecretAvailable,
+            ConnectionTestReason::OauthTokenRejected,
+            ConnectionStatusReason::SecretUnavailable,
+        ),
+        ConnectionHttpError::DelegatedTokenExchangeFailed
+        | ConnectionHttpError::DelegatedTokenUnavailable => (
+            ConnectionTestStageName::SecretAvailable,
+            ConnectionTestReason::OauthTokenUnavailable,
+            ConnectionStatusReason::SecretUnavailable,
         ),
         ConnectionHttpError::OAuthTokenUnavailable => (
             ConnectionTestStageName::SecretAvailable,

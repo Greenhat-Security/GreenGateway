@@ -1,7 +1,7 @@
 {
   "version": 1,
   "issue": 425,
-  "reviewed_revision": "05c295a52763ba09701ef38bb030e30e5bc7e4d7",
+  "reviewed_revision": "4a32d10e38d2ac36d6bcbee627443b1fbb80d059",
   "storage_modes": [
     "postgres",
     "standalone"
@@ -999,30 +999,58 @@
           "anchor": "async fn token_revoke_endpoint("
         }
       ],
-      "boundary": "rotate/revoke serializes token state/row, changes token row, reserves revision and appends outbox in one transaction. Repeated revoke does not advance revision or emit another outbox row.",
-      "record": "Outbox revision chain is already durable. Token row keeps creator, current revision and latest revoked_at, but does not identify each rotate/revoke actor/action.",
-      "actor": "Store rotate/revoke accept ID only; created_by is the original creator, not the rotating/revoking actor.",
-      "identity": "Token ID + from/to row versions + shared revision; rotate and revoke are not distinguished by resource_type alone; no operation ID.",
+      "boundary": "rotate/revoke refuse an empty or oversized actor before checkout, then serialize on the token high-water mark and row, change the token row, reserve the shared revision, append the outbox row and one service_token_change_evidence row carrying the same revision and row-revision step, and commit once. An evidence insert failure rolls the whole change back and is reported as a store failure, never as the rotate conflict. Repeated revoke, rotate of a revoked token (a conflict) and an unknown ID write no outbox or evidence row.",
+      "record": "Outbox revision chain unchanged. service_token_change_evidence (migration 18) has no foreign key, so it survives removal of the token row and a restart; it holds the actor, action, event/operation UUIDs, prior/new row revision, shared revision and database-clock committed_at, never the plaintext, hash, display prefix or scopes. The token row still names only its creator.",
+      "actor": "actor_user_id: the authenticated principal subject the admin endpoint passes through ServiceTokenStore (1 to 4096 bytes, the principal bound), committed with each rotate and revoke and retained after it. Issuer, auth mode and a keyed safe actor reference are still absent.",
+      "identity": "Generated event_id and operation_id UUIDs per store call (not bound to a client idempotency key), token ID, from/to row revisions and shared revision equal to the outbox row, database-clock committed_at; the action distinguishes rotate from revoke. A lost revoke response is reconciled from the token's evidence, and the repeat revoke records nothing. A lost rotate response cannot return its plaintext: the evidence shows the rotation committed, and rotating again records a second row.",
       "delivery": "post_commit_telemetry",
       "disposition": [
         "missing_metadata",
         "missing_delivery"
       ],
-      "follow_up": "PR2: thread mutation actor/action through ServiceTokenStore and both adapters, add immutable evidence in existing PostgreSQL transaction; preserve repeat-revoke and races.",
+      "follow_up": "PR2 follow-up: carry issuer/auth mode and a caller-bound operation identity to the store; token issue still records only created_by. PR3: dispatch these rows with a persisted cursor and own their retention so undelivered evidence is never erased. Keyed safe-reference derivation precedes any authority_event.v1 projection.",
       "sources": [
         {
-          "path": "gateway/src/storage/service_token.rs",
-          "anchor": "async fn revoke("
+          "path": "gateway/src/storage/migrations/0018_service_token_and_jwt_evidence.sql",
+          "anchor": "CREATE TABLE greengateway.service_token_change_evidence ("
         },
         {
           "path": "gateway/src/storage/postgres_service_tokens.rs",
-          "anchor": "async fn rotate("
+          "anchor": "validate_change_actor(OPERATION_REVOKE, actor_user_id)?;"
+        },
+        {
+          "path": "gateway/src/storage/postgres_service_tokens.rs",
+          "anchor": "validate_change_actor(OPERATION_ROTATE, actor_user_id)?;"
+        },
+        {
+          "path": "gateway/src/storage/postgres_service_tokens.rs",
+          "anchor": "async fn record_change_evidence("
+        },
+        {
+          "path": "gateway/src/storage/service_token.rs",
+          "anchor": "Rotate and revoke are told who is acting."
+        },
+        {
+          "path": "gateway/src/admin_tokens.rs",
+          "anchor": "store.revoke(&token_id, &principal.user_id)"
+        },
+        {
+          "path": "gateway/src/admin_tokens.rs",
+          "anchor": "store.rotate(&token_id, &principal.user_id)"
         }
       ],
       "tests": [
         {
           "path": "gateway/src/storage/contract_tests.rs",
-          "anchor": "async fn service_token_mutations_advance_the_shared_revision_and_set_the_high_water_mark("
+          "anchor": "async fn postgres_service_token_change_evidence_satisfies_the_contract("
+        },
+        {
+          "path": "gateway/src/storage/contract_tests.rs",
+          "anchor": "async fn service_token_change_evidence_matches_the_outbox_and_survives_deletion_and_restart("
+        },
+        {
+          "path": "gateway/src/storage/contract_tests.rs",
+          "anchor": "async fn a_failed_token_evidence_insert_rolls_back_the_rotate_and_the_revoke("
         },
         {
           "path": "gateway/src/storage/contract_tests.rs",
@@ -1031,10 +1059,18 @@
         {
           "path": "gateway/src/storage/contract_tests.rs",
           "anchor": "async fn revoke_and_rotate_race_never_leaves_a_live_plaintext("
+        },
+        {
+          "path": "gateway/src/storage/contract_tests.rs",
+          "anchor": "async fn service_token_mutations_advance_the_shared_revision_and_set_the_high_water_mark("
+        },
+        {
+          "path": "gateway/src/storage/migrations.rs",
+          "anchor": "async fn migration_eighteen_fabricates_no_evidence_for_existing_tokens_or_revocations("
         }
       ],
       "required_durability_supported": false,
-      "test_claim": "Existing behavior regression anchors only; these tests do not certify the proposed authority-event contract or delivery."
+      "test_claim": "PostgreSQL-gated regression anchors for the transactional rotate/revoke evidence. They do not certify the proposed authority-event contract, delivery or retention."
     },
     {
       "id": "token_change_standalone",
@@ -1055,27 +1091,55 @@
           "anchor": "async fn token_revoke_endpoint("
         }
       ],
-      "boundary": "SQLite token mutex protects a read-time revoked guard, then an UPDATE and reload; no separate evidence transaction. The mutation SQL itself is keyed by ID.",
-      "record": "Current hash/revoked_at replaces earlier state; creator remains unchanged.",
-      "actor": "Mutation store takes token ID only; rotating/revoking actor exists in post-write HTTP telemetry.",
-      "identity": "Token ID, current timestamp; no persisted operation or revision chain.",
+      "boundary": "SqliteTokenStore rotate/revoke refuse an empty or oversized actor, then run one IMMEDIATE transaction on the SERVICE_TOKEN_SQLITE_PATH database: read the revoked guard, update the guarded row, append one service_token_change_evidence row, reload and commit. An evidence insert failure rolls the change back and is reported as a store failure, never as the rotate conflict. A second connection to the file waits rather than interleaving.",
+      "record": "Current hash/revoked_at replaces earlier state and the creator is unchanged. The same database's service_token_change_evidence table (created on open, no foreign key) keeps one append-only row per committed rotate/revoke: actor, action, event/operation UUIDs and committed_at, never token material. Repeated revoke, rotate of a revoked token and an unknown ID write none. import-standalone does not carry these rows.",
+      "actor": "The authenticated principal subject the admin endpoint passes through ServiceTokenStore (1 to 4096 bytes), committed with the change. Issuer and auth mode are absent.",
+      "identity": "Generated event_id/operation_id UUIDs, token ID, a store sequence and the process-clock committed_at (the revoke's own revoked_at). SQLite token rows have no revision chain, so the row records no prior/new revision; no caller-bound operation ID.",
       "delivery": "post_commit_telemetry",
       "disposition": [
         "missing_metadata",
         "missing_delivery"
       ],
-      "follow_up": "PR4: same SQLite transaction for guarded token update and evidence, with actor context from shared interface; no events for ineffective repeated revoke.",
+      "follow_up": "PR4: issuer/auth mode and a store-owned revision per change; delivery from this same database, with no audit-database dual write. Token issue evidence remains open.",
       "sources": [
         {
           "path": "gateway/src/auth/tokens.rs",
-          "anchor": "fn revoke(&self, id:"
+          "anchor": "CREATE TABLE IF NOT EXISTS service_token_change_evidence ("
         },
         {
           "path": "gateway/src/auth/tokens.rs",
-          "anchor": "fn rotate(&self, id:"
+          "anchor": ".transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)"
+        },
+        {
+          "path": "gateway/src/auth/tokens.rs",
+          "anchor": "fn record_change_evidence("
+        },
+        {
+          "path": "gateway/src/auth/tokens.rs",
+          "anchor": "assert!(MAX_TOKEN_CHANGE_ACTOR_BYTES == crate::auth::principal::MAX_PRINCIPAL_SUBJECT_BYTES)"
         }
       ],
       "tests": [
+        {
+          "path": "gateway/src/storage/contract_tests.rs",
+          "anchor": "async fn sqlite_service_token_change_evidence_satisfies_the_contract("
+        },
+        {
+          "path": "gateway/src/storage/contract_tests.rs",
+          "anchor": "async fn sqlite_change_evidence_survives_token_deletion_and_restart("
+        },
+        {
+          "path": "gateway/src/storage/contract_tests.rs",
+          "anchor": "async fn sqlite_failed_evidence_insert_rolls_back_rotate_and_revoke("
+        },
+        {
+          "path": "gateway/src/storage/contract_tests.rs",
+          "anchor": "fn sqlite_rotate_and_revoke_race_records_exactly_the_committed_changes("
+        },
+        {
+          "path": "gateway/src/storage/contract_tests.rs",
+          "anchor": "async fn sqlite_store_adds_change_evidence_to_a_database_written_without_it("
+        },
         {
           "path": "gateway/src/auth/tokens.rs",
           "anchor": "fn revoke_is_idempotent_and_does_not_double_write_revoked_at("
@@ -1086,7 +1150,7 @@
         }
       ],
       "required_durability_supported": false,
-      "test_claim": "Existing behavior regression anchors only; these tests do not certify the proposed authority-event contract or delivery."
+      "test_claim": "Standalone regression anchors for the transactional rotate/revoke evidence in the token store's own database. They do not certify the proposed authority-event contract or delivery."
     },
     {
       "id": "jwt_postgres",
@@ -1097,16 +1161,16 @@
         "postgres"
       ],
       "entrypoints": [],
-      "boundary": "CLI revoke-jwt -> PostgresJwtRevocationStore::revoke; revoke row, shared revision and outbox commit together; already-effective duplicate rolls back reserved revision.",
-      "record": "Outbox keeps scoped JTI digest/revision; revocation row actor can be overwritten when extension/reactivation occurs and row is deleted after expiry.",
-      "actor": "CLI persists literal operator:revoke-jwt (system action, not authenticated human identity). Store supports actor_user_id but prior actor is not retained through later changes/cleanup.",
-      "identity": "Deployment+issuer-scoped JTI digest and security revision; outbox to_version=1 is not a per-JWT version chain; no operation ID.",
+      "boundary": "CLI revoke-jwt -> PostgresJwtRevocationStore::revoke; an empty or oversized actor is refused first. The revoke row, shared revision, outbox row and one jwt_revocation_evidence row copied from the row just written commit together; an already-effective duplicate rolls the reserved revision back and writes no evidence. An evidence insert failure rolls the revoke back.",
+      "record": "Outbox keeps scoped JTI digest/revision. The revocation row's actor is still overwritten by an extension or reactivation and the row is deleted by expiry cleanup, but jwt_revocation_evidence (migration 18, no foreign key, never touched by cleanup) keeps one append-only row per effective revoke: actor, action, issuer, JTI digest, the expiry the row then carried, shared revision and database-clock committed_at. No raw JTI.",
+      "actor": "The CLI records its literal system label operator:revoke-jwt on the row and in the evidence: system provenance, not an authenticated human identity. Each extension or reactivation keeps its own actor in its own evidence row. No actor kind, issuer or auth mode column yet.",
+      "identity": "Deployment+issuer-scoped JTI digest, generated event_id/operation_id UUIDs and the committed shared revision, equal to the outbox row's; outbox to_version=1 is still not a per-JWT version chain. No caller-bound operation ID.",
       "delivery": "operator_output",
       "disposition": [
         "missing_metadata",
         "missing_delivery"
       ],
-      "follow_up": "PR2: immutable bounded revocation event in existing transaction, retain action/scoped operator provenance after expiry cleanup; no raw JTI. Do not pretend the CLI authenticates a named operator.",
+      "follow_up": "PR2 follow-up: an explicit system/principal actor kind if an authenticated revoke path ships; do not pretend the CLI authenticates a named operator. PR3: dispatch the evidence and own its retention independently of denylist cleanup.",
       "sources": [
         {
           "path": "gateway/src/bootstrap.rs",
@@ -1118,10 +1182,26 @@
         },
         {
           "path": "gateway/src/storage/postgres_jwt_revocations.rs",
+          "anchor": "INSERT INTO greengateway.jwt_revocation_evidence ("
+        },
+        {
+          "path": "gateway/src/storage/postgres_jwt_revocations.rs",
           "anchor": "pub async fn cleanup_expired("
+        },
+        {
+          "path": "gateway/src/storage/migrations/0018_service_token_and_jwt_evidence.sql",
+          "anchor": "CREATE TABLE greengateway.jwt_revocation_evidence ("
         }
       ],
       "tests": [
+        {
+          "path": "gateway/src/storage/contract_tests.rs",
+          "anchor": "async fn jwt_revocation_evidence_survives_extension_reactivation_and_cleanup("
+        },
+        {
+          "path": "gateway/src/storage/contract_tests.rs",
+          "anchor": "async fn a_failed_jwt_evidence_insert_rolls_back_the_revoke("
+        },
         {
           "path": "gateway/src/storage/contract_tests.rs",
           "anchor": "async fn jwt_revocations_are_shared_issuer_scoped_and_expire_on_database_time("
@@ -1136,7 +1216,7 @@
         }
       ],
       "required_durability_supported": false,
-      "test_claim": "Existing behavior regression anchors only; these tests do not certify the proposed authority-event contract or delivery."
+      "test_claim": "PostgreSQL-gated regression anchors for the transactional JWT revocation evidence. They do not certify the proposed authority-event contract, delivery or retention."
     },
     {
       "id": "jwt_standalone",
@@ -1174,6 +1254,119 @@
       ],
       "required_durability_supported": false,
       "test_claim": "Existing behavior regression anchors only; these tests do not certify the proposed authority-event contract or delivery."
+    },
+    {
+      "id": "admin_session_standalone",
+      "operations": [
+        "admin_session.grant",
+        "admin_session.withdraw"
+      ],
+      "modes": [
+        "standalone"
+      ],
+      "entrypoints": [
+        {
+          "path": "gateway/src/admin_identity.rs",
+          "anchor": "async fn admin_auth_completion_endpoint("
+        },
+        {
+          "path": "gateway/src/admin_identity.rs",
+          "anchor": "async fn admin_auth_logout_endpoint("
+        }
+      ],
+      "boundary": "Only with ADMIN_SESSION_MODE=standalone_memory. AdminSessions::issue validates the provider access token, then admits one capability-digest entry to a bounded process-local map under its mutex; an admitted replacement removes the browser's prior session in the same critical section. Withdrawal is logout (AdminSessions::revoke under the same mutex), expiry, an access token the provider now rejects, an identity change, or a process restart, which discards the whole map. No database or file transaction is involved.",
+      "record": "No durable record. The entry (cookie digest, server-held access token, expiry, subject and issuer, random session ID) exists in memory only. The handler emits an admin_login.transaction audit event (phase, outcome, reason) after a grant or logout through the optional bounded audit sinks; implicit withdrawals emit none.",
+      "actor": "The granted principal's subject and issuer are held in memory only. The admin_login.transaction event carries no actor, session ID or principal, and logout is authentication-exempt and names no actor.",
+      "identity": "A random per-session UUID, exposed to later requests as Principal.session_id; it is not persisted, not on the grant or logout event, and gone after restart. No operation, event or revision identity.",
+      "delivery": "post_commit_telemetry",
+      "disposition": [
+        "unsupported_future_operation"
+      ],
+      "follow_up": "#424: the shipped session authority is process-local memory by design, so no store exists that could own atomic evidence. Required-durability mode must refuse ADMIN_SESSION_MODE=standalone_memory rather than relabel the post-change audit event as durable. A durable session authority, if one ships, adds grant/withdrawal evidence in its own transaction, including a decision for implicit withdrawal by expiry or restart.",
+      "sources": [
+        {
+          "path": "gateway/src/auth/admin_session.rs",
+          "anchor": "Opt-in, single-process admin sessions. There is deliberately no HA fallback."
+        },
+        {
+          "path": "gateway/src/auth/admin_session.rs",
+          "anchor": "pub async fn issue("
+        },
+        {
+          "path": "gateway/src/auth/admin_session.rs",
+          "anchor": "pub fn revoke(&self, headers: &HeaderMap"
+        },
+        {
+          "path": "gateway/src/app_state.rs",
+          "anchor": "json!({\"phase\": phase, \"outcome\": outcome, \"reason\": reason})"
+        }
+      ],
+      "tests": [
+        {
+          "path": "gateway/src/auth/admin_session_tests.rs",
+          "anchor": "async fn admin_session_cookie_is_independent_and_authority_is_rechecked("
+        },
+        {
+          "path": "gateway/src/auth/admin_session_tests.rs",
+          "anchor": "async fn admin_session_outage_preserves_session_but_rejection_revokes_it("
+        },
+        {
+          "path": "gateway/src/auth/admin_session_tests.rs",
+          "anchor": "async fn admin_session_expiry_identity_change_and_restart_fail_closed("
+        },
+        {
+          "path": "gateway/src/auth/admin_session_tests.rs",
+          "anchor": "async fn admin_session_logout_wins_over_validation_in_flight("
+        },
+        {
+          "path": "gateway/src/auth/admin_session_tests.rs",
+          "anchor": "async fn admin_session_logout_cancels_pending_and_undelivered_completion("
+        },
+        {
+          "path": "gateway/src/admin_session_app_tests.rs",
+          "anchor": "async fn admin_session_oidc_contract_preserves_csrf_origins_prefix_and_listener_boundaries("
+        }
+      ],
+      "required_durability_supported": false,
+      "test_claim": "Existing behavior regression anchors for the in-memory session authority only; no durable session evidence exists for a test to certify."
+    },
+    {
+      "id": "admin_session_postgres",
+      "operations": [
+        "admin_session.grant",
+        "admin_session.withdraw"
+      ],
+      "modes": [
+        "postgres"
+      ],
+      "entrypoints": [],
+      "boundary": "Configuration refuses ADMIN_SESSION_MODE=standalone_memory with STATE_BACKEND=postgres, so no admin session is granted or withdrawn in this mode. Cookie completion answers cookie_session_unavailable; bearer completion returns the access token to the browser, and the server holds no session. The admin_pending_logins rows are the login transaction, not a session.",
+      "record": "No session authority or record in this mode.",
+      "actor": "Not applicable.",
+      "identity": "Not applicable.",
+      "delivery": "unsupported_no_delivery",
+      "disposition": [
+        "unsupported_future_operation"
+      ],
+      "follow_up": "#424: a shared session authority would be a new operation in this mode and must ship with grant/withdrawal evidence in its own transaction before any required-durability claim.",
+      "sources": [
+        {
+          "path": "gateway/src/config.rs",
+          "anchor": "standalone_memory is unsupported with {STATE_BACKEND}=postgres"
+        },
+        {
+          "path": "gateway/src/admin_identity.rs",
+          "anchor": "\"cookie_completion_unavailable\""
+        }
+      ],
+      "tests": [
+        {
+          "path": "gateway/src/config_tests.rs",
+          "anchor": "fn admin_session_config_is_explicit_bounded_and_standalone_only("
+        }
+      ],
+      "required_durability_supported": false,
+      "test_claim": "Existing configuration regression anchor only; it proves the mode is refused, not any evidence contract."
     },
     {
       "id": "configuration_activation",

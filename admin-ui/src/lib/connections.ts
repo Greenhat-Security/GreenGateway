@@ -14,6 +14,7 @@ export type ConnectionAuthenticationKind =
   | 'header_api_key'
   | 'static_bearer'
   | 'oauth2_client_credentials'
+  | 'delegated_issuer_token'
   | 'legacy_configured';
 
 export type ConnectionOperationalState =
@@ -151,7 +152,24 @@ export type SafeConnectionAuthentication =
       resource?: string;
       client_auth_method: OAuthClientAuthMethod;
       client_secret_configured: boolean;
-    };
+    }
+  | SafeDelegatedIssuerToken;
+
+/**
+ * The calling user's own upstream token, obtained per caller by RFC 8693
+ * token exchange. Read only: the admin UI shows it and never writes it, so it
+ * has no counterpart in `ConnectionAuthentication`.
+ */
+export type SafeDelegatedIssuerToken = {
+  type: 'delegated_issuer_token';
+  token_exchange_url: string;
+  client_id: string;
+  requested_scopes: string[];
+  audience?: string;
+  resource?: string;
+  subject_token_source: 'caller_assertion';
+  client_secret_configured: boolean;
+};
 
 export type ConnectionAdditionalHeader = {
   header_name: string;
@@ -1197,6 +1215,34 @@ function projectSafeConnectionAuthentication(
       client_secret_configured: source.client_secret_configured,
     };
   }
+  if (
+    source.type === 'delegated_issuer_token' &&
+    isSafeHttpsTokenUrl(source.token_exchange_url) &&
+    typeof source.client_id === 'string' &&
+    Array.isArray(source.requested_scopes) &&
+    source.requested_scopes.every((scope) => typeof scope === 'string') &&
+    (source.audience === undefined ||
+      typeof source.audience === 'string') &&
+    (source.resource === undefined ||
+      typeof source.resource === 'string') &&
+    source.subject_token_source === 'caller_assertion' &&
+    typeof source.client_secret_configured === 'boolean'
+  ) {
+    return {
+      type: 'delegated_issuer_token',
+      token_exchange_url: source.token_exchange_url,
+      client_id: source.client_id,
+      requested_scopes: [...source.requested_scopes],
+      ...(source.audience === undefined
+        ? {}
+        : { audience: source.audience }),
+      ...(source.resource === undefined
+        ? {}
+        : { resource: source.resource }),
+      subject_token_source: source.subject_token_source,
+      client_secret_configured: source.client_secret_configured,
+    };
+  }
 
   throw invalidConnectionResponse('safe connection authentication');
 }
@@ -1343,6 +1389,7 @@ function isConnectionAuthenticationKind(
     value === 'header_api_key' ||
     value === 'static_bearer' ||
     value === 'oauth2_client_credentials' ||
+    value === 'delegated_issuer_token' ||
     value === 'legacy_configured'
   );
 }

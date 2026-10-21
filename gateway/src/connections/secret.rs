@@ -882,14 +882,29 @@ pub enum SecretPurpose {
     /// ever handed to the signer and to the public-key derivation behind the
     /// published JWKS: no lane injects it, and it is never a header value.
     AssertionSigningKey,
+    /// The client secret a `delegated_issuer_token` Connection authenticates
+    /// to its token-exchange issuer with. It is worth far more than an
+    /// ordinary [`Self::OAuthClientSecret`]: the issuer hands out any user's
+    /// upstream token to whoever holds it.
+    ///
+    /// Like every purpose, this sets the material's byte bound and encoding
+    /// rules, and the encrypted local store refuses an alias stored under
+    /// another purpose. It does not keep an operator or external-provider
+    /// alias out of other bindings: those carry no purpose, and resolve under
+    /// any. What does is the store refusing a write that would bind this
+    /// secret's alias under any other field of any Connection, or bind
+    /// another field to an alias some Connection exchanges with (see
+    /// `model::token_exchange_secret_conflict`).
+    TokenExchangeClientSecret,
 }
 
 impl SecretPurpose {
     pub(crate) const fn max_bytes(self) -> usize {
         match self {
-            Self::HeaderApiKey | Self::StaticBearer | Self::OAuthClientSecret => {
-                MAX_HTTP_CREDENTIAL_BYTES
-            }
+            Self::HeaderApiKey
+            | Self::StaticBearer
+            | Self::OAuthClientSecret
+            | Self::TokenExchangeClientSecret => MAX_HTTP_CREDENTIAL_BYTES,
             Self::TlsPrivateKey => MAX_TLS_PRIVATE_KEY_BYTES,
             Self::TlsCertificate | Self::TlsCaBundle => MAX_TLS_CERTIFICATE_BYTES,
             Self::AssertionSigningKey => MAX_ASSERTION_SIGNING_KEY_BYTES,
@@ -899,9 +914,10 @@ impl SecretPurpose {
     /// Whether material for this purpose is sent verbatim as an HTTP header
     /// value.
     ///
-    /// The OAuth client secret is deliberately excluded: it is URL-encoded and
-    /// then base64-encoded into a Basic credential, so bytes that no header may
-    /// carry survive that transformation harmlessly. The assertion signing key
+    /// The OAuth and token-exchange client secrets are deliberately excluded:
+    /// each is URL-encoded and then base64-encoded into a Basic credential, so
+    /// bytes that no header may carry survive that transformation harmlessly.
+    /// The assertion signing key
     /// is excluded because it never leaves the gateway at all; only signatures
     /// made with it do.
     pub(crate) const fn is_http_header_value(self) -> bool {
@@ -911,11 +927,14 @@ impl SecretPurpose {
     /// Whether the encrypted local store can hold material for this purpose.
     ///
     /// Its table constrains the purpose column to the purposes it was created
-    /// with, so a signing key is provisioned through an operator alias or a
-    /// network provider instead, and a local create for one is refused before
-    /// anything is written.
+    /// with, so a signing key or a token-exchange client secret is
+    /// provisioned through an operator alias or a network provider instead,
+    /// and a local create for one is refused before anything is written.
     pub(crate) const fn is_locally_storable(self) -> bool {
-        !matches!(self, Self::AssertionSigningKey)
+        !matches!(
+            self,
+            Self::AssertionSigningKey | Self::TokenExchangeClientSecret
+        )
     }
 }
 

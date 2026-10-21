@@ -8,27 +8,45 @@ import type {
  * A Connection's caller assertion, read only. Shared by the detail page and
  * the editor; nothing in the admin UI edits the block, and saving a
  * Connection keeps it exactly as stored.
+ *
+ * `subjectTokenOnly` is set for a delegated issuer token Connection, whose
+ * assertion is signed as the subject token of its token exchange and sent to
+ * the issuer alone, never upstream.
  */
 export function CallerAssertionSummary({
   assertion,
+  subjectTokenOnly = false,
 }: {
   assertion: SafeCallerAssertion;
+  subjectTokenOnly?: boolean;
 }) {
   return (
     <>
       <div className="alert warning" role="status">
-        <p>
-          <strong>Caller assertion configured.</strong> Once the gateway
-          accepts this block, every call of a manual HTTP tool on this
-          connection carries an assertion signed for the calling principal,
-          and a call without one, such as a service token, is refused with{' '}
-          <code>caller_assertion_no_principal</code>. Every other use of the
-          connection, including OpenAPI tools, proxied requests, discovery,
-          and tests, is refused with <code>caller_assertion_not_enforced</code>
-          , and so is every call when the block is one only an earlier release
-          accepted: approval binding, an assertion header that matches another
-          header on this connection, or a plain HTTP endpoint.
-        </p>
+        {subjectTokenOnly ? (
+          <p>
+            <strong>Caller assertion configured as the subject token.</strong>{' '}
+            This connection signs the assertion only to name the calling
+            principal to its token-exchange issuer, which verifies it against
+            the gateway&apos;s published keys. It is never sent to the
+            upstream, and its assertion header is only cleared from what a
+            caller sends.
+          </p>
+        ) : (
+          <p>
+            <strong>Caller assertion configured.</strong> Once the gateway
+            accepts this block, every call of a manual HTTP tool on this
+            connection carries an assertion signed for the calling principal,
+            and a call without one, such as a service token, is refused with{' '}
+            <code>caller_assertion_no_principal</code>. Every other use of the
+            connection, including OpenAPI tools, proxied requests, discovery,
+            and tests, is refused with{' '}
+            <code>caller_assertion_not_enforced</code>, and so is every call
+            when the block is one only an earlier release accepted: approval
+            binding, an assertion header that matches another header on this
+            connection, or a plain HTTP endpoint.
+          </p>
+        )}
         <p>
           The admin UI shows this block read only, and saving the connection
           here keeps it unchanged. To stop attesting callers, remove the block

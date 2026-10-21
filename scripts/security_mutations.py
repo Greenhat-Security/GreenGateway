@@ -28,7 +28,7 @@ import tempfile
 import time
 from typing import Any
 
-VERSION = "1.0.0"
+VERSION = "1.1.0"
 MAX_MANIFEST = 131072
 MAX_SOURCE = 2097152
 MAX_REPORT = 262144
@@ -110,13 +110,27 @@ def read_json(path: Path, limit: int) -> Any:
         raise HarnessError("invalid_json") from None
 
 
+def enclosing_item(source: bytes, start: int) -> bytes:
+    """The nearest line above `start` that begins at column zero."""
+    for line in reversed(source[:start].split(b"\n")):
+        if line and not line[:1].isspace():
+            return line
+    return b""
+
+
 def function_span(source: bytes, target: dict) -> tuple[int, int]:
     start_marker = target["start_marker"].encode()
     end_marker = target["end_marker"].encode()
-    if source.count(start_marker) != 1 or end_marker != b"\n}\n":
+    indent = start_marker[:len(start_marker) - len(start_marker.lstrip(b" "))]
+    # A function closes with the first brace at its own indentation.
+    if source.count(start_marker) != 1 or end_marker != b"\n" + indent + b"}\n":
         raise HarnessError("function_scope_drift")
     start = source.index(start_marker)
     if start > 0 and source[start - 1] != 10:
+        raise HarnessError("function_scope_drift")
+    # A method belongs to the inherent impl its registry name gives, not to
+    # another type's block or a trait impl that happens to share the file.
+    if indent and enclosing_item(source, start) != b"impl " + target["function"].split("::")[-2].encode() + b" {":
         raise HarnessError("function_scope_drift")
     end = source.find(end_marker, start + len(start_marker))
     if end < 0:
@@ -150,8 +164,13 @@ def load_manifest(root: Path, path: Path) -> tuple[dict, list[dict]]:
         target_ids.add(target["id"])
         bounded_text(target["start_marker"], 1024)
         bounded_text(target["end_marker"], 32)
-        # The declaration itself anchors the named top-level function, not a comment.
-        if not re.fullmatch(r"(?:pub(?:\(crate\))? )?fn " + re.escape(target["function"].split("::")[-1]) + r"\([^\n]*", target["start_marker"]):
+        # The declaration itself anchors the named function, not a comment: a
+        # module-level function, or a method one level into a module-level
+        # inherent impl, whose registry name then ends `Type::method`.
+        segments = target["function"].split("::")
+        method = target["start_marker"].startswith(" ")
+        if not re.fullmatch(("    " if method else "") + r"(?:pub(?:\(crate\))? )?fn " + re.escape(segments[-1]) + r"\([^\n]*", target["start_marker"]) \
+                or (method and (len(segments) < 2 or not re.fullmatch(r"[A-Z][A-Za-z0-9]*", segments[-2]))):
             raise HarnessError("invalid_function_marker")
         if not isinstance(target["source_sha256"], str) or not SHA.fullmatch(target["source_sha256"]):
             raise HarnessError("invalid_digest")

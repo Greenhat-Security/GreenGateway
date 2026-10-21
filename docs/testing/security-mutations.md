@@ -2,7 +2,7 @@
 
 Mutation checks ask whether the selected tests detect a deliberate change to
 a security predicate. `scripts/security_mutations.py` is an in-tree, Python
-standard-library harness, version **1.0.0**, with an explicit target and mutation
+standard-library harness, version **1.1.0**, with an explicit target and mutation
 registry in `security-mutations.json`. This is the compatible equivalent tool
 selected for issue #436; it does not install or invoke `cargo-mutants`.
 
@@ -14,7 +14,7 @@ measure every possible mutation or prove the gateway correct.
 
 ## Owned scope
 
-The initial registry names four functions and eight source changes. Each
+The registry names eight functions and seventeen source changes. Each
 target records its file, fully qualified function name, unique source markers,
 function SHA-256, exact test names and exact replacement text. Missing or moved
 functions, changed source, ambiguous anchors and absent tests fail the campaign
@@ -30,14 +30,39 @@ that every selected test still exists, before merge; see
 | `path_match::is_unsafe_request_path` | Ambiguous request-path rejection | Permit backslashes; permit empty interior segments |
 | `egress::host_glob_matches` | Egress exact and wildcard host matching | Remove the wildcard label boundary; skip request-host case folding |
 | `policy_eval::route_host_matches` | Shared evaluator host binding | Ignore a required binding; accept an absent request host |
+| `policy_eval::CompiledPolicy::select_rate_lane` | Which `rate_limits` override governs an authenticated request | Ignore the override's principal constraint; ignore its path pattern; select the last matching override instead of the first |
+| `policy_eval::CompiledPolicy::evaluate_tool` | Tool admission, previews and the rendered-HTTP rule | Admit a disabled tool; ignore a matching deny rule; never consult the rendered request's HTTP rule |
+| `policy_eval::tools::tool_principal_matches` | A tool entry's role, issuer and authentication-method constraints | Admit an anonymous caller to a constrained tool; ignore `allowed_roles` |
+| `policy_eval::tools::validate_rendered_http_path` | Rendered tool paths the HTTP rule is evaluated over | Accept a `..` segment |
 
-The shared evaluator already exists, so the host-binding target belongs to
-`policy_eval` from the start. The live adapter migration tracked by #422 is
-separate and incomplete; this campaign does not claim that every production
-decision has moved to that kernel. When ownership moves, update the target,
-function hash and exact tests in the same reviewed change, remove the retired
-target, and remeasure. Keep shared path and egress functions selected while
-they remain authoritative for those decisions.
+A target is a module-level function, or a method one indentation level into a
+module-level inherent `impl Type {` block. A method's registry name ends
+`Type::method`, its start marker carries the four-space indentation, and its
+end marker is `"\n    }\n"`, the closing brace at that indentation. The
+nearest line above the method that starts in column zero must be exactly
+`impl Type {`, so a method moved to another type, a trait impl or a generic
+impl fails as drift instead of being matched by name.
+
+The host-binding target belonged to the shared evaluator from the start. Since
+#569 the live tool lane decides through `CompiledPolicy::evaluate_tool`:
+invocation admission, MCP visibility, inventory eligibility, composite leaf
+enablement and the rendered-HTTP rule. Since #598 the policy rate stage selects
+its override through `CompiledPolicy::select_rate_lane`. The registry targets
+those evaluator functions, not the frozen pre-cutover consumers that remain
+only as test oracles. Executor rendering refuses a path with the evaluator's
+own `validate_rendered_http_path` before the rule is asked, so that guard is
+selected too. The cutovers retired no registered function. The static egress
+cutover and legacy retirement tracked by #422 are still open, so
+`egress::host_glob_matches` stays selected, and so do the shared path
+functions, which the evaluator and the HTTP lane still call. When ownership
+moves again, update the target, function hash and exact tests in the same
+reviewed change, remove the retired target, and remeasure.
+
+The tool-lane targets select tests that state the evaluator's answers
+outright. The live adapters ask this same evaluator, so a test that only
+compares the evaluator with them would compare it with itself and kill
+nothing. The rate-lane target compares each selection with the frozen
+pre-cutover selector.
 
 Only these pure tests run during mutation execution. They need no DNS,
 credential provider, database, upstream server or third-party API. Dependency
@@ -200,6 +225,46 @@ their own report. Consult the current registry and that report for its selected
 tests and observed outcomes, rather than treating this initial failing run as
 the final baseline.
 
+## Evaluator adoption
+
+Issue #436 PR 4 followed the tool lane (#569) and rate-lane selection (#598)
+onto the shared evaluator. It added the four `policy_eval` targets above and
+nine mutations, so the registry has 17. Two tests were added with it:
+`a_disabled_entry_and_a_denying_tool_or_rendered_rule_each_block_on_their_own`
+and
+`each_tool_identity_constraint_refuses_a_caller_without_it_and_an_anonymous_one`.
+Existing tests already stated a rendered-request deny and an anonymous refusal
+outright. A disabled entry, a tool deny rule and each identity constraint were
+otherwise checked only through the frozen-oracle corpus, or against live
+adapters that ask the same evaluator and so change with it. Production code
+did not change.
+
+Pull requests build no mutants. The scheduled workflow runs only on the
+default branch, so a dispatch against a pull-request branch skips the job.
+The first hosted campaign of this registry is therefore the first scheduled or
+manual run after merge, and its report is the reviewed baseline.
+
+Before review, the registry was measured locally with the same loader, spans,
+`old`/`new` replacements and `--exact --test-threads=1` test commands. It ran
+on a Windows working tree of the change, based on `4a32d10`, with Rust CI
+1.98.1 and a local manifest that skipped the embedded UI build. It did not
+have the controller's rlimits, process groups or pinned Python and Node. All
+17 selected baseline tests passed, each within 1.3 seconds of wall time, most
+of it the test binary's start-up. All 17 mutants were killed; none survived,
+failed to build or timed out. Each original mutant was killed by the same test
+as in the nightly reports, and each new mutant by the first test listed for
+it. Mutant rebuilds took 59–217 seconds on a shared workstation. This is
+review evidence, not a substitute for the controller's report.
+
+On GitHub-hosted runners, two nightly campaigns of the eight-mutant registry
+on `main`, on 2026-10-13 and 2026-10-20, took 1,358 and 2,232 seconds. Their
+baseline builds took 284 and 467 seconds, and mutant rebuilds 133–228
+seconds. At those rates 17 mutants take about 2,550–4,350 seconds, inside the
+7,200-second campaign bound and the 150-minute job. With a baseline like
+those, mutant rebuilds would have to average about 390 seconds to exceed the
+bound. The controller then fails the campaign as timed out rather than
+reporting a partial score. Re-measure before adding more mutations.
+
 ## Survivor review and baseline ownership
 
 The checked-in registry is the reviewed baseline, with no exceptions initially.
@@ -249,9 +314,10 @@ calibration build and real process-limit checks.
 `--validate-registry` runs the campaign's registry loader against the
 checked-out tree: schema and harness version, safe regular-file paths, a start
 marker that occurs once at the beginning of a line, the function scope it
-opens, the function SHA-256, each mutation's `old` text occurring exactly once
-in that function, selected test names' syntax, count and uniqueness, and each
-exception's binding to a current mutation identity. A pass prints
+opens, for a method the inherent impl around it, the function SHA-256, each
+mutation's `old` text occurring exactly once in that function, selected test
+names' syntax, count and uniqueness, and each exception's binding to a current
+mutation identity. A pass prints
 `security mutation registry check: passed (registry_valid)` and reports
 `source_state: checkout_registry_only`. Nothing is compiled, discovered,
 tested or mutated, so its counts stay zero and it is not a mutation score.
@@ -286,7 +352,8 @@ asserts that behavior. Measured outcomes still come from a complete campaign,
 as described above.
 
 The digest covers the committed bytes from the start of the `start_marker` line
-through the first following `\n}\n`, inclusive. To recompute one, for example:
+through the first following `end_marker`, inclusive: `\n}\n` for a
+module-level function, `\n    }\n` for a method. To recompute one, for example:
 
 ```sh
 python - <<'PY'
@@ -294,6 +361,9 @@ import hashlib, pathlib
 source = pathlib.Path("gateway/src/path_match.rs").read_bytes()
 start = source.index(b"pub fn path_prefix_matches(")
 print(hashlib.sha256(source[start:source.index(b"\n}\n", start) + 3]).hexdigest())
+source = pathlib.Path("gateway/src/policy_eval/mod.rs").read_bytes()
+start = source.index(b"    pub(crate) fn select_rate_lane(")
+print(hashlib.sha256(source[start:source.index(b"\n    }\n", start) + 7]).hexdigest())
 PY
 ```
 

@@ -42,7 +42,7 @@
 //! ([`OPERATION_REQUIREMENTS`]) is empty, exactly as the approved-extension
 //! list in `migrations.rs` is: the first entry arrives with the first
 //! qualified adjacent release pair. Every operation this binary performs is
-//! part of the schema-17 contract, which no other binary shares.
+//! part of the schema-18 contract, which no other binary shares.
 
 use std::collections::BTreeSet;
 

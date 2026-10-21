@@ -96,6 +96,35 @@ test("all current authentication modes including certificates have a valid actor
   }
 });
 
+test("admin session grant and withdrawal project as creation and deletion of a session", () => {
+  const granted = fixture();
+  granted.operation = "admin_session.grant";
+  granted.resource.kind = "admin_session";
+  granted.actor.auth_mode = "session_cookie";
+  granted.revision = { axis: "session", before: null, after: "1", security: null };
+  assert.doesNotThrow(() => validateEvent(granted));
+  granted.revision.before = "1";
+  assert.throws(() => validateEvent(granted), /creation must not claim/);
+  const withdrawn = fixture();
+  withdrawn.operation = "admin_session.withdraw";
+  withdrawn.resource.kind = "admin_session";
+  withdrawn.revision = { axis: "session", before: "1", after: null, security: null };
+  assert.doesNotThrow(() => validateEvent(withdrawn));
+  withdrawn.revision.after = "2";
+  assert.throws(() => validateEvent(withdrawn), /tombstone/);
+  withdrawn.revision = { axis: "token", before: "1", after: null, security: null };
+  assert.throws(() => validateEvent(withdrawn), /axis mismatch/);
+});
+
+test("the shipped in-memory session authority is in the matrix and unsupported for required durability", () => {
+  const sessions = inventory().groups.filter((group) => group.operations.includes("admin_session.grant"));
+  assert.deepEqual(sessions.flatMap((group) => group.modes).sort(), ["postgres", "standalone"]);
+  for (const group of sessions) {
+    assert.deepEqual(group.operations, ["admin_session.grant", "admin_session.withdraw"]);
+    assert.deepEqual(group.disposition, ["unsupported_future_operation"]);
+  }
+});
+
 test("export evidence binds an existing configuration revision without inventing a mutation", () => {
   const value = fixture();
   value.operation = "configuration.export";
