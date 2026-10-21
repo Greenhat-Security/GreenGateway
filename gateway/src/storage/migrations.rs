@@ -238,6 +238,13 @@ static MANIFEST: LazyLock<Vec<Migration>> = LazyLock::new(|| {
         )
         .finalize()
         .with_pinned_checksum("dfa271439d8833474d2ce622e818ca52aca5710fab996a26218af0794a74bab4"),
+        Migration::new(
+            17,
+            "cluster_member_capabilities",
+            include_str!("migrations/0017_cluster_member_capabilities.sql"),
+        )
+        .finalize()
+        .with_pinned_checksum("c40bc32a3dcbf77cbd0a7ad3ac3becc4e3abe3174347c52bd96fb996df79c89a"),
     ]
 });
 
@@ -272,18 +279,20 @@ impl SchemaCompatibility {
 
 // No adjacent release pair has been qualified. Do not widen these bounds or
 // add an extension without the pinned SQL and two-binary gate in issue #426.
-// Moving the point from 15 to 16 (Connection change evidence, #425) is not
-// an overlap: a schema-15 binary refuses schema 16 and this binary refuses
-// schema 15, so that upgrade is a coordinated drain/migrate/restart.
+// Moving the point from 16 to 17 (member capability advertisements, #426
+// PR 1) is not an overlap: a schema-16 binary refuses schema 17 and this
+// binary refuses schema 16, so that upgrade is a coordinated
+// drain/migrate/restart, as the move from 15 to 16 (#425) was.
 const BINARY_SCHEMA_COMPATIBILITY: SchemaCompatibility = SchemaCompatibility {
-    read: (16, 16),
-    write: (16, 16),
+    read: (17, 17),
+    write: (17, 17),
     approved_extensions: &[],
 };
 
 /// The intersection of the explicit read/write contracts, advertised to the
-/// roster. This is a summary, not proof of ledger integrity or permission to
-/// contract the schema. The shipped contract still accepts only schema 16.
+/// roster. This is a summary, not proof of ledger integrity, permission to
+/// write a gated operation (`storage/compatibility.rs`), or permission to
+/// contract the schema. The shipped contract accepts only schema 17.
 pub(crate) fn schema_version_range() -> (i32, i32) {
     BINARY_SCHEMA_COMPATIBILITY.serving_range()
 }
@@ -1063,12 +1072,12 @@ mod tests {
     fn the_shipped_contract_has_no_unproved_overlap() {
         assert_eq!(
             MANIFEST.len(),
-            16,
+            17,
             "review the compatibility contract when adding SQL"
         );
-        assert_eq!(BINARY_SCHEMA_COMPATIBILITY.read, (16, 16));
-        assert_eq!(BINARY_SCHEMA_COMPATIBILITY.write, (16, 16));
-        assert_eq!(schema_version_range(), (16, 16));
+        assert_eq!(BINARY_SCHEMA_COMPATIBILITY.read, (17, 17));
+        assert_eq!(BINARY_SCHEMA_COMPATIBILITY.write, (17, 17));
+        assert_eq!(schema_version_range(), (17, 17));
         assert!(BINARY_SCHEMA_COMPATIBILITY.approved_extensions.is_empty());
         assert_eq!(
             validate_runtime_ledger(&ledger_for(&MANIFEST, MANIFEST.len(), "")),
@@ -1079,8 +1088,17 @@ mod tests {
         assert_eq!(
             validate_runtime_ledger(&ledger_for(&MANIFEST, MANIFEST.len() - 1, "")),
             Ok(SchemaStatus::NeedsUpgrade {
-                applied: 15,
+                applied: 16,
                 missing: 1
+            })
+        );
+        // And the release before that is two migrations behind, not
+        // somehow inside a widened window.
+        assert_eq!(
+            validate_runtime_ledger(&ledger_for(&MANIFEST, MANIFEST.len() - 2, "")),
+            Ok(SchemaStatus::NeedsUpgrade {
+                applied: 15,
+                missing: 2
             })
         );
     }
@@ -1539,7 +1557,7 @@ mod tests {
         let authority = PostgresReadinessAuthority::new(foundation.pool().clone());
         assert_eq!(
             authority.observe().await,
-            AuthorityObservation::Writable { schema_version: 16 }
+            AuthorityObservation::Writable { schema_version: 17 }
         );
         let client = foundation.pool().get().await.expect("fixture client");
         client
@@ -1551,7 +1569,7 @@ mod tests {
             .expect("change fixture checksum without changing extent");
         assert_eq!(
             authority.observe().await,
-            AuthorityObservation::IncompatibleSchema { schema_version: 16 }
+            AuthorityObservation::IncompatibleSchema { schema_version: 17 }
         );
         client
             .execute(
@@ -1562,7 +1580,7 @@ mod tests {
             .expect("restore fixture checksum");
         assert_eq!(
             authority.observe().await,
-            AuthorityObservation::Writable { schema_version: 16 }
+            AuthorityObservation::Writable { schema_version: 17 }
         );
         client
             .execute(
@@ -1573,7 +1591,7 @@ mod tests {
             .expect("remove a fixture history row");
         assert_eq!(
             authority.observe().await,
-            AuthorityObservation::IncompatibleSchema { schema_version: 16 }
+            AuthorityObservation::IncompatibleSchema { schema_version: 17 }
         );
         drop(client);
         clean_database(foundation.pool()).await;
@@ -1819,9 +1837,9 @@ mod tests {
         drop(store);
 
         // Reconstruct the exact v12 shape while retaining populated v12
-        // rows, then let migrations 13 through 16 run. Each later
-        // migration's DDL is undone explicitly, so appending one fails
-        // here until its reconstruction is added.
+        // rows, then let migrations 13 onward run. Each later migration's
+        // DDL is undone explicitly, so appending one fails here until its
+        // reconstruction is added.
         foundation
             .pool()
             .get()
@@ -1835,6 +1853,7 @@ mod tests {
                  ALTER TABLE greengateway.connection_mcp_catalog_entries \
                      DROP COLUMN annotations_json, DROP COLUMN title; \
                  DROP TABLE greengateway.connection_change_evidence; \
+                 ALTER TABLE greengateway.cluster_members DROP COLUMN capabilities; \
                  DELETE FROM {LEDGER_TABLE} WHERE version >= 13;"
             ))
             .await
@@ -1843,8 +1862,10 @@ mod tests {
         assert_eq!(
             apply_missing(foundation.pool(), &test_settings())
                 .await
-                .expect("migrations 13 through 16 should apply"),
-            MigrateOutput::Applied { applied: 4 }
+                .expect("migrations 13 onward should apply"),
+            MigrateOutput::Applied {
+                applied: MANIFEST.len() - 12
+            }
         );
         let reopened = crate::connections::pg_store::PostgresConnectionStore::new(
             foundation.pool().clone(),
@@ -1890,6 +1911,131 @@ mod tests {
             .expect("the evidence table should resolve after migration 16")
             .get(0);
         assert_eq!(evidence, 0);
+    }
+
+    /// Migration 17 adds the roster's capability advertisement without
+    /// inventing one: a member row a schema-16 gateway wrote (it is still
+    /// heartbeating while the upgrade runs) comes through advertising
+    /// nothing, the gateway that predates the column can keep refreshing
+    /// that row with its own unchanged statement, and the column refuses
+    /// anything outside its bounds.
+    #[tokio::test]
+    async fn migration_seventeen_advertises_nothing_for_a_member_that_predates_it() {
+        let Some(dsn) = real_dsn() else {
+            eprintln!("skipping: no test database locator; CI runs this test");
+            return;
+        };
+        let _guard = REAL_DATABASE.lock().await;
+        let dsn_file = write_dsn_file(&dsn);
+        let config = migration_config(&dsn_file);
+        let foundation = establish(&config).await;
+        clean_database(foundation.pool()).await;
+        let client = foundation.pool().get().await.expect("checkout");
+        bootstrap_ledger(&client)
+            .await
+            .expect("migration ledger should bootstrap");
+        let through_v16 = MANIFEST
+            .iter()
+            .take_while(|migration| migration.version <= 16)
+            .count();
+        for migration in &MANIFEST[..through_v16] {
+            apply_one(&client, migration, &test_settings())
+                .await
+                .expect("migrations through 16 should apply");
+        }
+        // A schema-16 gateway's heartbeat, reduced to the columns that
+        // matter here: like the real statement, it names no capabilities.
+        let schema_16_heartbeat = "INSERT INTO greengateway.cluster_members AS m
+                 (deployment_id, instance_id, boot_id, binary_version,
+                  schema_version_min, schema_version_max,
+                  document_version_min, document_version_max, fingerprint)
+             VALUES ('deploy-migration-tests', $1::text::uuid, $2::text::uuid, '1.0.1',
+                     16, 16, 0, 0, repeat('a', 64))
+             ON CONFLICT (instance_id) DO UPDATE SET
+                 boot_id = EXCLUDED.boot_id,
+                 last_heartbeat_at = now()";
+        let instance = uuid::Uuid::new_v4().to_string();
+        let boot = uuid::Uuid::new_v4().to_string();
+        client
+            .execute(schema_16_heartbeat, &[&instance, &boot])
+            .await
+            .expect("a schema-16 member row should insert");
+        drop(client);
+
+        assert_eq!(
+            apply_missing(foundation.pool(), &test_settings())
+                .await
+                .expect("migration 17 should apply"),
+            MigrateOutput::Applied {
+                applied: MANIFEST.len() - through_v16
+            }
+        );
+        let client = foundation
+            .pool()
+            .get()
+            .await
+            .expect("verification checkout");
+        let advertised = "SELECT capabilities FROM greengateway.cluster_members
+             WHERE instance_id = $1::text::uuid";
+        assert_eq!(
+            client
+                .query_one(advertised, &[&instance])
+                .await
+                .expect("the member row should read")
+                .get::<_, String>(0),
+            "",
+            "a row that predates the column advertises nothing"
+        );
+        client
+            .execute(schema_16_heartbeat, &[&instance, &boot])
+            .await
+            .expect("the older gateway's heartbeat still runs against schema 17");
+        assert_eq!(
+            client
+                .query_one(advertised, &[&instance])
+                .await
+                .expect("the member row should read")
+                .get::<_, String>(0),
+            ""
+        );
+
+        let set_capabilities = "UPDATE greengateway.cluster_members SET capabilities = $2
+             WHERE instance_id = $1::text::uuid";
+        let within_bounds = std::iter::repeat_n("a".repeat(64), 32)
+            .collect::<Vec<_>>()
+            .join(",");
+        for accepted in ["operation_requirements", "a,b_2", within_bounds.as_str()] {
+            client
+                .execute(set_capabilities, &[&instance, &accepted])
+                .await
+                .unwrap_or_else(|error| panic!("{accepted:?} is within bounds: {error}"));
+        }
+        let too_many = std::iter::repeat_n("a", 33).collect::<Vec<_>>().join(",");
+        let too_long = "a".repeat(65);
+        for refused in [
+            ",",
+            "a,",
+            ",a",
+            "a,,b",
+            "Operation_requirements",
+            "1a",
+            "_a",
+            "a b",
+            "a;b",
+            "a-b",
+            too_many.as_str(),
+            too_long.as_str(),
+        ] {
+            let error = client
+                .execute(set_capabilities, &[&instance, &refused])
+                .await
+                .expect_err("an out-of-bounds advertisement must be refused");
+            assert_eq!(
+                error.code().map(|state| state.code()),
+                Some("23514"),
+                "{refused:?} must fail the check constraint: {error}"
+            );
+        }
     }
 
     #[tokio::test]

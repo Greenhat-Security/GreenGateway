@@ -277,8 +277,14 @@ pub(super) async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 (true, false, true) => "ready",
                 (true, false, false) => "starting",
             };
+            // Recognized names only, plus a count of the rest: the roster
+            // column is written by other replicas, and this line prints
+            // what this binary can vouch for.
+            let capabilities =
+                storage::compatibility::RecognizedCapabilities::parse(&member.capabilities);
+            let capability_names = capabilities.names();
             println!(
-                "{state:<9} instance={} boot={} version={} schema={}..{} document={}..{} fingerprint={} started={} heartbeat={} age_secs={:.1} revisions=compiled:{}/observed:{} last_error={}",
+                "{state:<9} instance={} boot={} version={} schema={}..{} document={}..{} fingerprint={} started={} heartbeat={} age_secs={:.1} revisions=compiled:{}/observed:{} last_error={} capabilities={} unrecognized_capabilities={}",
                 member.instance_id,
                 member.boot_id,
                 member.binary_version,
@@ -293,6 +299,12 @@ pub(super) async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 member.compiled_security_revision,
                 member.observed_security_revision,
                 member.last_error_code.as_deref().unwrap_or("-"),
+                if capability_names.is_empty() {
+                    "-".to_owned()
+                } else {
+                    capability_names.join(",")
+                },
+                capabilities.unrecognized(),
             );
         }
         return Ok(());
@@ -821,6 +833,7 @@ pub(super) async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 schema_version: storage::migrations::schema_version_range(),
                 document_version: cluster_membership::DOCUMENT_VERSION_RANGE,
                 fingerprint: ha_foundation.fingerprint().hex(),
+                capabilities: storage::compatibility::BINARY_CAPABILITIES.to_vec(),
             };
             let membership = cluster_membership::ClusterMembership::new(
                 store,

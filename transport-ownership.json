@@ -6371,7 +6371,7 @@
         "network-or-process-reference"
       ],
       "scope": "gateway::bootstrap::run#1",
-      "sha256": "8873a5a0fcf49a59a618ff17ab0ee7bb49634e2c2f8af135291540c14f0d8be3",
+      "sha256": "bcb0cdac3e011fce7b321439220c88cf091200fc82b1fb3fbf1e1ca926056a19",
       "owner": "GreenGateway maintainers",
       "purpose": "Existing application transport references or syntax in this exact item; new or changed authority requires explicit review."
     },
@@ -12317,7 +12317,7 @@
         "network-or-process-reference"
       ],
       "scope": "gateway::storage::postgres_membership::impl  PostgresMembershipStore::members_with_inner#1",
-      "sha256": "7ffc604d0da26ced22bf40f22df19baa0ac0eca7c543bd03c1982c84869323dc",
+      "sha256": "2a11ef04abeb129092ce291325dac0538d320eb46d622a83bc697fa4bffd3dc8",
       "owner": "GreenGateway maintainers",
       "purpose": "PostgreSQL repository operations through the shared infrastructure pool; no caller-selected HTTP authority."
     },
@@ -12347,7 +12347,7 @@
         "network-or-process-reference"
       ],
       "scope": "gateway::storage::postgres_membership::member_from_row#1",
-      "sha256": "c8ef3079a210b340a073081eff7d75c5321fd8c7de8c2a06e914ea417b70124b",
+      "sha256": "e58126de2e90b82abb483652428650f8d1638425f3ebbfc8f58c555435637422",
       "owner": "GreenGateway maintainers",
       "purpose": "PostgreSQL repository operations through the shared infrastructure pool; no caller-selected HTTP authority."
     },
