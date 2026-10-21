@@ -433,6 +433,146 @@ async fn tool_rules_use_exact_names_and_first_matching_principal() {
 }
 
 #[test]
+fn a_disabled_entry_and_a_denying_tool_or_rendered_rule_each_block_on_their_own() {
+    // The answers are spelled out rather than compared with the live adapters:
+    // since #422 PR 2 those ask this same evaluator, so agreeing with them
+    // cannot show the evaluator refusing what it must. The frozen-oracle
+    // corpus below covers breadth; this pins each refusal on its own.
+    let reader = principal();
+    let decide = |compiled: &CompiledPolicy, operation| {
+        let answer = compiled
+            .evaluate_tool(&input(compiled, operation, Some(&reader)))
+            .unwrap();
+        assert!(answer.is_complete());
+        (answer.effect(), answer.reason(), answer.matched())
+    };
+
+    // Nothing in this policy refuses, so the questions below are allowed.
+    let open = compile(base());
+    assert_eq!(
+        decide(&open, ToolOperation::Invocation),
+        (PolicyEffect::Allow, ToolReason::Allowed, None)
+    );
+    assert_eq!(
+        decide(&open, ToolOperation::CompositeLeaf),
+        (PolicyEffect::Allow, ToolReason::Allowed, None)
+    );
+    assert_eq!(
+        decide(&open, ToolOperation::RenderedHttp),
+        (PolicyEffect::Allow, ToolReason::NoHttpRule, None)
+    );
+
+    // A disabled entry refuses before any rule is read, even an allow.
+    let mut value = base();
+    value["tools"]["reports.export"] = json!({"enabled": false});
+    value["rules"] = json!([{"tool_name":"reports.export","action":"allow"}]);
+    let disabled = compile(value);
+    for operation in [ToolOperation::Invocation, ToolOperation::CompositeLeaf] {
+        assert_eq!(
+            decide(&disabled, operation),
+            (PolicyEffect::Block, ToolReason::Disabled, None),
+            "{operation:?}"
+        );
+    }
+    assert_eq!(
+        decide(&disabled, ToolOperation::Visibility),
+        (PolicyEffect::Block, ToolReason::PolicyDisabled, None)
+    );
+
+    // A deny rule for the tool refuses the invocation and hides the tool. A
+    // deny rule for the rendered request refuses that request, although the
+    // entry admits the tool.
+    let mut value = base();
+    value["rules"] = json!([
+        {"tool_name":"reports.export","action":"deny"},
+        {"path":"/reports/{id}","methods":["GET"],"action":"deny"}
+    ]);
+    let denied = compile(value);
+    assert_eq!(
+        decide(&denied, ToolOperation::Invocation),
+        (
+            PolicyEffect::Block,
+            ToolReason::MatchedRule,
+            Some(RuleReference::Direct(0))
+        )
+    );
+    assert_eq!(
+        decide(&denied, ToolOperation::Visibility),
+        (
+            PolicyEffect::Block,
+            ToolReason::PolicyDenied,
+            Some(RuleReference::Direct(0))
+        )
+    );
+    assert_eq!(
+        decide(&denied, ToolOperation::RenderedHttp),
+        (
+            PolicyEffect::Block,
+            ToolReason::MatchedRule,
+            Some(RuleReference::Direct(1))
+        )
+    );
+}
+
+#[test]
+fn each_tool_identity_constraint_refuses_a_caller_without_it_and_an_anonymous_one() {
+    // Spelled out for the same reason as above. Role, issuer and
+    // authentication-method constraints each admit a caller who has the fact
+    // and refuse one who lacks it, for invocation and for both previews.
+    let mut other_role = principal();
+    other_role.roles = vec!["other".into()];
+    let mut other_issuer = principal();
+    other_issuer.issuer = Some("https://other.example.test".into());
+    let mut cookie = principal();
+    cookie.auth_method = AuthMethod::Cookie;
+    for (constraint, outsider) in [
+        (json!({"allowed_roles":["reader"]}), other_role),
+        (
+            json!({"issuers":["https://idp.example.test"]}),
+            other_issuer,
+        ),
+        (json!({"auth_methods":["bearer_token"]}), cookie),
+    ] {
+        let mut value = base();
+        value["tools"]["reports.export"] = constraint.clone();
+        let compiled = compile(value);
+        let decide = |operation, identity: Option<&Principal>| {
+            let answer = compiled
+                .evaluate_tool(&input(&compiled, operation, identity))
+                .unwrap();
+            (answer.effect(), answer.reason())
+        };
+        assert_eq!(
+            decide(ToolOperation::Invocation, Some(&principal())),
+            (PolicyEffect::Allow, ToolReason::Allowed),
+            "{constraint}"
+        );
+        assert_eq!(
+            decide(ToolOperation::PolicyEligibility, Some(&principal())),
+            (PolicyEffect::Allow, ToolReason::Eligible),
+            "{constraint}"
+        );
+        for identity in [None, Some(&outsider)] {
+            assert_eq!(
+                decide(ToolOperation::Invocation, identity),
+                (PolicyEffect::Block, ToolReason::RoleNotAllowed),
+                "{constraint}"
+            );
+            assert_eq!(
+                decide(ToolOperation::Visibility, identity),
+                (PolicyEffect::Block, ToolReason::PrincipalNotEligible),
+                "{constraint}"
+            );
+        }
+        assert_eq!(
+            decide(ToolOperation::PolicyEligibility, Some(&outsider)),
+            (PolicyEffect::Block, ToolReason::PrincipalNotEligible),
+            "{constraint}"
+        );
+    }
+}
+
+#[test]
 fn incomplete_invalid_and_inconsistent_facts_fail_closed() {
     let compiled = compile(base());
     for op in [
