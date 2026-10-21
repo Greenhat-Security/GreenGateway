@@ -464,6 +464,8 @@ class ComposeTests(Files):
                 text = COMPOSE.replace("    environment: *env\n  migrate", "    environment: *env\n" + extra
                                        + "  migrate", 1)
                 self.assertInvalid(["check", "--compose", self.write("compose.yml", text), *DIRECT], message)
+        self.assertInvalid(["check", "--compose", self.write("compose.yml", "include:\n  - other.yml\n" + COMPOSE),
+                            *DIRECT], "includes other Compose files")
 
     def test_the_gateway_entrypoint_may_be_named_explicitly(self):
         text = COMPOSE.replace("    command: [migrate, up]", "    entrypoint: [/usr/local/bin/gateway, migrate, up]")
@@ -549,6 +551,16 @@ class KubernetesTests(Files):
         code, result = self.kubernetes(DEPLOYMENT + HPA.replace("maxReplicas: 6", "maxReplicas: 7"))
         self.assertEqual((code, result["pods"], result["total"]), (1, 9, 102))
 
+    def test_an_autoscaler_without_a_namespace_may_scale_a_namespaced_deployment(self):
+        namespaced = DEPLOYMENT.replace("metadata:\n  name: gateway\nspec:", "metadata:\n  name: gateway\n"
+                                        "  namespace: prod\nspec:").replace(
+            "metadata:\n  name: gateway\ndata:", "metadata:\n  name: gateway\n  namespace: prod\ndata:")
+        _, result = self.kubernetes(namespaced + HPA)
+        self.assertEqual(result["pools"][0]["autoscaler_max"], 6)
+        _, result = self.kubernetes(namespaced + HPA.replace("  name: gateway\nspec", "  name: gateway\n"
+                                                             "  namespace: staging\nspec"))
+        self.assertIsNone(result["pools"][0]["autoscaler_max"])
+
     def test_rollout_strategies(self):
         cases = [
             ("  strategy:\n    type: Recreate\n", 0),
@@ -569,7 +581,7 @@ class KubernetesTests(Files):
 
     def test_autoscalers_the_guard_cannot_read_are_refused(self):
         self.invalid(DEPLOYMENT + HPA.replace("minReplicas: 2", "minReplicas: 8"), "exceeds maxReplicas")
-        self.invalid(DEPLOYMENT + HPA + HPA.replace("name: gateway\nspec", "name: second\nspec"), "both scale")
+        self.invalid(DEPLOYMENT + HPA + HPA.replace("name: gateway\nspec", "name: second\nspec"), "scaled by both")
         keda = HPA.replace("autoscaling/v2", "keda.sh/v1alpha1").replace("HorizontalPodAutoscaler", "ScaledObject")
         self.invalid(DEPLOYMENT + keda, "reads only HorizontalPodAutoscaler")
         self.invalid(DEPLOYMENT + HPA.replace("  maxReplicas: 6\n", ""), "maxReplicas must be a whole number")
@@ -630,6 +642,11 @@ class KubernetesTests(Files):
 
     def test_workloads_the_guard_cannot_bound_are_refused(self):
         self.invalid(DEPLOYMENT.replace("kind: Deployment", "kind: DaemonSet"), "no replica count")
+        rollout = DEPLOYMENT.replace("apiVersion: apps/v1\nkind: Deployment", "apiVersion: argoproj.io/v1alpha1\n"
+                                     "kind: Rollout")
+        self.invalid(rollout, "cannot bound a Rollout's replicas")
+        code, result = self.kubernetes(rollout.replace("  STATE_BACKEND: postgres\n", ""))
+        self.assertEqual((code, result["pools"]), (0, []))
         self.invalid(DEPLOYMENT + "          args: [migrate, up]\n", "restarts `migrate` for ever")
         self.invalid(DEPLOYMENT + "          command: [/bin/sh]\n", "replaces the gateway's entrypoint")
         self.invalid(DEPLOYMENT + DEPLOYMENT.split("---\n")[1].join(["---\n", ""]), "also defined in")

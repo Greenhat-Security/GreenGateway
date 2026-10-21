@@ -699,6 +699,9 @@ def compose_facts(document, source):
     services = document.get("services") if isinstance(document, dict) else None
     if not isinstance(services, dict) or not services:
         raise InputError(f"{source}: a Compose file needs a non-empty services mapping")
+    if document.get("include") is not None:
+        raise InputError(f"{source} includes other Compose files; render it with `docker compose config --format json` "
+                         "and check the rendered output")
     facts = {"pools": [], "jobs": [], "uncounted": [], "server": None, "server_service": None}
     servers = []
     for name, service in services.items():
@@ -869,6 +872,18 @@ def job_instances(kind, workload, command, where):
     raise InputError(f"{where}: a {kind} restarts `{command}` for ever; run one-shot commands from a Job")
 
 
+def embedded_pod_specs(node):
+    """Every mapping with a containers list, anywhere inside an object."""
+    if isinstance(node, dict):
+        if isinstance(node.get("containers"), list):
+            yield node
+        for value in node.values():
+            yield from embedded_pod_specs(value)
+    elif isinstance(node, list):
+        for item in node:
+            yield from embedded_pod_specs(item)
+
+
 def kubernetes_facts(documents, external=()):
     """Gateway pools, one-shot jobs and uncounted workloads in rendered manifests.
 
@@ -876,7 +891,7 @@ def kubernetes_facts(documents, external=()):
     supplied outside these files that the operator declares set neither
     sizing variable.
     """
-    sources, scalers, workloads, seen = {}, {}, [], {}
+    sources, scalers, workloads, others, seen = {}, [], [], [], {}
     for source, item in kubernetes_objects(documents):
         if not isinstance(item, dict):
             raise InputError(f"{source}: every document must be a Kubernetes object")
@@ -897,13 +912,35 @@ def kubernetes_facts(documents, external=()):
         spec = item.get("spec")
         if isinstance(spec, dict) and spec.get("scaleTargetRef") is not None:
             target = mapping(spec["scaleTargetRef"], f"{where} scaleTargetRef")
-            key = (target.get("kind"), namespace, target.get("name"))
-            if key in scalers:
-                raise InputError(f"{where} and {scalers[key][2]}: {scalers[key][0]} both scale {key[0]}/{key[2]}")
-            scalers[key] = (kind, item, source)
+            scalers.append((target.get("kind"), namespace, target.get("name"), (kind, item, source)))
         if kind in POD_TEMPLATES:
             workloads.append((source, kind, namespace, name, item))
+        else:
+            others.append((source, kind, namespace, name, item))
+
+    def scaler_for(kind, namespace, name, where):
+        # An object without a namespace lands in whichever one it is applied
+        # to, so it may be the same namespace as any other.
+        found = [entry for target_kind, scope, target, entry in scalers
+                 if (target_kind, target) == (kind, name) and (scope == namespace or "" in (scope, namespace))]
+        if len(found) > 1:
+            raise InputError(f"{where} is scaled by both {found[0][0]}/{found[0][1]['metadata']['name']} and "
+                             f"{found[1][0]}/{found[1][1]['metadata']['name']}")
+        return found[0] if found else None
+
     facts = {"pools": [], "jobs": [], "uncounted": [], "uncounted_files": {}, "external": set()}
+    for source, kind, namespace, name, item in others:
+        # A kind the guard does not model (a Knative Service, an Argo Rollout)
+        # may still run gateway pods; refuse one that runs them in cluster mode.
+        for pod in embedded_pod_specs(item.get("spec")):
+            for container in items_of(pod.get("initContainers"), "initContainers") + pod["containers"]:
+                if not isinstance(container, dict):
+                    continue
+                where = f"{source}: {kind}/{name} container {container.get('name')}"
+                env = container_env(container, namespace, sources, external, where, facts["external"])
+                if backend_of(env, where) == "postgres":
+                    raise InputError(f"{where} runs the gateway in cluster mode, and the guard cannot bound a "
+                                     f"{kind}'s replicas; run serving replicas from a Deployment or StatefulSet")
     for source, kind, namespace, name, workload in workloads:
         label = f"{kind}/{name}"
         pod = workload
@@ -930,7 +967,7 @@ def kubernetes_facts(documents, external=()):
                                  "bound; run serving replicas from a Deployment or StatefulSet")
             spec = mapping(workload.get("spec"), f"{where} spec")
             replicas = 1 if spec.get("replicas") is None else count(spec["replicas"], f"{source}: {label} replicas")
-            maximum = autoscaler_max(scalers.get((kind, namespace, name)), where)
+            maximum = autoscaler_max(scaler_for(kind, namespace, name, where), where)
             pods = max(replicas, maximum or 0)
             pool_max, origin = pool_max_of(env, where)
             facts["pools"].append({"name": entry_name, "file": source, "replicas": replicas,
