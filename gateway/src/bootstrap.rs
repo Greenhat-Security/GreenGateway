@@ -1350,10 +1350,10 @@ pub(super) fn gateway_app_with_process_started_at_and_overrides(
         }
         None => tools::runtime::ToolRuntimeConfig::from_env_defaults(&config),
     };
-    let rate_limit_state = middleware::rate_limit::RateLimitState::from_config_and_policy(
-        &config,
-        loaded_policy.as_ref(),
-    );
+    // The policy stage's overrides arrive when the RBAC state is built below
+    // and attaches it with the snapshot it installed: there are none without
+    // a policy, and the stage selects with no other copy of one.
+    let rate_limit_state = middleware::rate_limit::RateLimitState::from_config(&config);
     // Cluster mode: every locally-allowed request is also decided at the
     // shared store, so one configured burst permits that many requests
     // across the cluster (issue #241, PR 10).

@@ -2446,10 +2446,8 @@ pub(crate) mod postgres_audit_tests {
         config.rate_limit_read_burst = 2;
         let upstream_attempts = Arc::new(AtomicUsize::new(0));
         let replica = |store: &Arc<PostgresRateLimitStore>| {
-            let state = crate::middleware::rate_limit::RateLimitState::from_config_and_policy(
-                &config, None,
-            )
-            .with_shared_store(Arc::clone(store));
+            let state = crate::middleware::rate_limit::RateLimitState::from_config(&config)
+                .with_shared_store(Arc::clone(store));
             let counter = Arc::clone(&upstream_attempts);
             Router::new()
                 .route(
