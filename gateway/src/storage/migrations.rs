@@ -245,6 +245,13 @@ static MANIFEST: LazyLock<Vec<Migration>> = LazyLock::new(|| {
         )
         .finalize()
         .with_pinned_checksum("c40bc32a3dcbf77cbd0a7ad3ac3becc4e3abe3174347c52bd96fb996df79c89a"),
+        Migration::new(
+            18,
+            "service_token_and_jwt_evidence",
+            include_str!("migrations/0018_service_token_and_jwt_evidence.sql"),
+        )
+        .finalize()
+        .with_pinned_checksum("717ae43889bebb583002601a8515e62d5b7d705b22faa195b6e9d760f2618cd0"),
     ]
 });
 
@@ -279,20 +286,21 @@ impl SchemaCompatibility {
 
 // No adjacent release pair has been qualified. Do not widen these bounds or
 // add an extension without the pinned SQL and two-binary gate in issue #426.
-// Moving the point from 16 to 17 (member capability advertisements, #426
-// PR 1) is not an overlap: a schema-16 binary refuses schema 17 and this
-// binary refuses schema 16, so that upgrade is a coordinated
-// drain/migrate/restart, as the move from 15 to 16 (#425) was.
+// Moving the point from 17 to 18 (service-token and JWT revocation change
+// evidence, #425 PR 2b) is not an overlap: a schema-17 binary refuses
+// schema 18 and this binary refuses schema 17, so that upgrade is a
+// coordinated drain/migrate/restart, as the moves from 15 to 16 (#425) and
+// from 16 to 17 (member capability advertisements, #426 PR 1) were.
 const BINARY_SCHEMA_COMPATIBILITY: SchemaCompatibility = SchemaCompatibility {
-    read: (17, 17),
-    write: (17, 17),
+    read: (18, 18),
+    write: (18, 18),
     approved_extensions: &[],
 };
 
 /// The intersection of the explicit read/write contracts, advertised to the
 /// roster. This is a summary, not proof of ledger integrity, permission to
 /// write a gated operation (`storage/compatibility.rs`), or permission to
-/// contract the schema. The shipped contract accepts only schema 17.
+/// contract the schema. The shipped contract accepts only schema 18.
 pub(crate) fn schema_version_range() -> (i32, i32) {
     BINARY_SCHEMA_COMPATIBILITY.serving_range()
 }
@@ -1072,12 +1080,12 @@ mod tests {
     fn the_shipped_contract_has_no_unproved_overlap() {
         assert_eq!(
             MANIFEST.len(),
-            17,
+            18,
             "review the compatibility contract when adding SQL"
         );
-        assert_eq!(BINARY_SCHEMA_COMPATIBILITY.read, (17, 17));
-        assert_eq!(BINARY_SCHEMA_COMPATIBILITY.write, (17, 17));
-        assert_eq!(schema_version_range(), (17, 17));
+        assert_eq!(BINARY_SCHEMA_COMPATIBILITY.read, (18, 18));
+        assert_eq!(BINARY_SCHEMA_COMPATIBILITY.write, (18, 18));
+        assert_eq!(schema_version_range(), (18, 18));
         assert!(BINARY_SCHEMA_COMPATIBILITY.approved_extensions.is_empty());
         assert_eq!(
             validate_runtime_ledger(&ledger_for(&MANIFEST, MANIFEST.len(), "")),
@@ -1088,17 +1096,24 @@ mod tests {
         assert_eq!(
             validate_runtime_ledger(&ledger_for(&MANIFEST, MANIFEST.len() - 1, "")),
             Ok(SchemaStatus::NeedsUpgrade {
-                applied: 16,
+                applied: 17,
                 missing: 1
             })
         );
-        // And the release before that is two migrations behind, not
-        // somehow inside a widened window.
+        // And the releases before that are further behind, not somehow
+        // inside a widened window.
         assert_eq!(
             validate_runtime_ledger(&ledger_for(&MANIFEST, MANIFEST.len() - 2, "")),
             Ok(SchemaStatus::NeedsUpgrade {
-                applied: 15,
+                applied: 16,
                 missing: 2
+            })
+        );
+        assert_eq!(
+            validate_runtime_ledger(&ledger_for(&MANIFEST, MANIFEST.len() - 3, "")),
+            Ok(SchemaStatus::NeedsUpgrade {
+                applied: 15,
+                missing: 3
             })
         );
     }
@@ -1557,7 +1572,7 @@ mod tests {
         let authority = PostgresReadinessAuthority::new(foundation.pool().clone());
         assert_eq!(
             authority.observe().await,
-            AuthorityObservation::Writable { schema_version: 17 }
+            AuthorityObservation::Writable { schema_version: 18 }
         );
         let client = foundation.pool().get().await.expect("fixture client");
         client
@@ -1569,7 +1584,7 @@ mod tests {
             .expect("change fixture checksum without changing extent");
         assert_eq!(
             authority.observe().await,
-            AuthorityObservation::IncompatibleSchema { schema_version: 17 }
+            AuthorityObservation::IncompatibleSchema { schema_version: 18 }
         );
         client
             .execute(
@@ -1580,7 +1595,7 @@ mod tests {
             .expect("restore fixture checksum");
         assert_eq!(
             authority.observe().await,
-            AuthorityObservation::Writable { schema_version: 17 }
+            AuthorityObservation::Writable { schema_version: 18 }
         );
         client
             .execute(
@@ -1591,7 +1606,7 @@ mod tests {
             .expect("remove a fixture history row");
         assert_eq!(
             authority.observe().await,
-            AuthorityObservation::IncompatibleSchema { schema_version: 17 }
+            AuthorityObservation::IncompatibleSchema { schema_version: 18 }
         );
         drop(client);
         clean_database(foundation.pool()).await;
@@ -1854,6 +1869,8 @@ mod tests {
                      DROP COLUMN annotations_json, DROP COLUMN title; \
                  DROP TABLE greengateway.connection_change_evidence; \
                  ALTER TABLE greengateway.cluster_members DROP COLUMN capabilities; \
+                 DROP TABLE greengateway.service_token_change_evidence; \
+                 DROP TABLE greengateway.jwt_revocation_evidence; \
                  DELETE FROM {LEDGER_TABLE} WHERE version >= 13;"
             ))
             .await
@@ -1965,7 +1982,7 @@ mod tests {
         assert_eq!(
             apply_missing(foundation.pool(), &test_settings())
                 .await
-                .expect("migration 17 should apply"),
+                .expect("migrations 17 onward should apply"),
             MigrateOutput::Applied {
                 applied: MANIFEST.len() - through_v16
             }
@@ -1989,7 +2006,7 @@ mod tests {
         client
             .execute(schema_16_heartbeat, &[&instance, &boot])
             .await
-            .expect("the older gateway's heartbeat still runs against schema 17");
+            .expect("the older gateway's heartbeat still runs against the migrated schema");
         assert_eq!(
             client
                 .query_one(advertised, &[&instance])
@@ -2036,6 +2053,131 @@ mod tests {
                 "{refused:?} must fail the check constraint: {error}"
             );
         }
+    }
+
+    /// Migration 18 is additive and records no history it did not see: a
+    /// service token rotated and revoked before it, and a JWT revocation
+    /// written before it, keep their rows exactly and gain no fabricated
+    /// change evidence. The first change after it is the first evidence.
+    #[tokio::test]
+    async fn migration_eighteen_fabricates_no_evidence_for_existing_tokens_or_revocations() {
+        use crate::storage::ServiceTokenStore;
+
+        let Some(dsn) = real_dsn() else {
+            eprintln!("skipping: no test database locator; CI runs this test");
+            return;
+        };
+        let _guard = REAL_DATABASE.lock().await;
+        let dsn_file = write_dsn_file(&dsn);
+        let config = migration_config(&dsn_file);
+        let foundation = establish(&config).await;
+        clean_database(foundation.pool()).await;
+        let client = foundation.pool().get().await.expect("checkout");
+        bootstrap_ledger(&client)
+            .await
+            .expect("migration ledger should bootstrap");
+        let through_v17 = MANIFEST
+            .iter()
+            .take_while(|migration| migration.version <= 17)
+            .count();
+        for migration in &MANIFEST[..through_v17] {
+            apply_one(&client, migration, &test_settings())
+                .await
+                .expect("migrations through 17 should apply");
+        }
+        drop(client);
+
+        // Schema-17 state: a create needs no evidence table, and the
+        // rotate, the revoke and the JWT revocation are written the way a
+        // schema-17 gateway wrote them, without any.
+        let store = crate::storage::postgres_service_tokens::PostgresServiceTokenStore::new(
+            foundation.pool().clone(),
+        );
+        let request = || crate::auth::tokens::CreateTokenRequest {
+            scopes: vec!["admin:tokens:read".to_owned()],
+            created_by: "schema-17-admin".to_owned(),
+            expires_at: None,
+        };
+        let live = store.create(request()).await.expect("live token");
+        let revoked = store.create(request()).await.expect("revoked token");
+        let client = foundation.pool().get().await.expect("fixture checkout");
+        client
+            .execute(
+                "UPDATE greengateway.service_tokens SET revision = 2 WHERE id = $1",
+                &[&live.record.id],
+            )
+            .await
+            .expect("a schema-17 rotate");
+        client
+            .execute(
+                "UPDATE greengateway.service_tokens SET revoked_at = now(), revision = 2 \
+                 WHERE id = $1",
+                &[&revoked.record.id],
+            )
+            .await
+            .expect("a schema-17 revoke");
+        client
+            .execute(
+                "INSERT INTO greengateway.jwt_revocations \
+                     (issuer, jti_hash, actor_user_id, security_revision) \
+                 VALUES ('https://issuer.example', repeat('b', 64), 'operator:revoke-jwt', 1)",
+                &[],
+            )
+            .await
+            .expect("a schema-17 JWT revocation");
+        let snapshot = |table: &'static str| {
+            let pool = foundation.pool().clone();
+            async move {
+                pool.get()
+                    .await
+                    .expect("snapshot checkout")
+                    .query(
+                        &format!(
+                            "SELECT row_to_json(t)::text FROM greengateway.{table} t \
+                             ORDER BY row_to_json(t)::text"
+                        ),
+                        &[],
+                    )
+                    .await
+                    .expect("snapshot rows")
+                    .iter()
+                    .map(|row| row.get::<_, String>(0))
+                    .collect::<Vec<_>>()
+            }
+        };
+        let tokens_before = snapshot("service_tokens").await;
+        let revocations_before = snapshot("jwt_revocations").await;
+        drop(client);
+
+        assert_eq!(
+            apply_missing(foundation.pool(), &test_settings())
+                .await
+                .expect("migration 18 should apply"),
+            MigrateOutput::Applied {
+                applied: MANIFEST.len() - through_v17
+            }
+        );
+        assert_eq!(snapshot("service_tokens").await, tokens_before);
+        assert_eq!(snapshot("jwt_revocations").await, revocations_before);
+        assert!(
+            snapshot("service_token_change_evidence").await.is_empty(),
+            "no evidence is fabricated for changes that predate the table"
+        );
+        assert!(snapshot("jwt_revocation_evidence").await.is_empty());
+
+        store
+            .rotate(&live.record.id, "schema-18-admin")
+            .await
+            .expect("rotate after the migration")
+            .expect("the token exists");
+        let evidence = snapshot("service_token_change_evidence").await;
+        assert_eq!(evidence.len(), 1, "{evidence:?}");
+        assert!(
+            evidence[0].contains("\"actor_user_id\":\"schema-18-admin\"")
+                && evidence[0].contains("\"prior_version\":2")
+                && evidence[0].contains("\"new_version\":3"),
+            "{evidence:?}"
+        );
     }
 
     #[tokio::test]

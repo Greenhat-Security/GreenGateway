@@ -38,6 +38,8 @@
     "operation": {
       "type": "string",
       "enum": [
+        "admin_session.grant",
+        "admin_session.withdraw",
         "catalog.mcp.publish",
         "catalog.openapi.publish",
         "catalog.overlay.delete",
@@ -133,7 +135,8 @@
             "external_secret",
             "service_token",
             "jwt_revocation",
-            "configuration"
+            "configuration",
+            "admin_session"
           ]
         },
         "ref": {
@@ -164,7 +167,8 @@
             "token",
             "jwt_revocation",
             "configuration",
-            "maintenance"
+            "maintenance",
+            "session"
           ]
         },
         "before": {
