@@ -93,8 +93,9 @@ both. `arbitrary-precision` matches the workspace's `serde_json`
 fits a `u64`, `i64` or `f64` and panics on one that does not, which 0.58.6 still
 does for `type: integer`. Without `idna`, `idn-email` and `idn-hostname` silently
 become unknown formats that accept anything. Exact comparison costs grow with
-the square of a number's width, so the tool registry and executor bound the
-numbers in input schemas and tool arguments before the validator sees them.
+the square of a number's width, so the tool registry, executor and overlay
+validator bound the numbers in input schemas, tool arguments and overlay
+documents before the validator sees them.
 The feature reaches jsonschema-macros only through a weak optional-dependency
 feature, so Cargo.lock and `cargo metadata` resolve jsonschema-macros,
 jsonschema-macros-core, proc-macro-crate, toml_edit, toml_parser,
