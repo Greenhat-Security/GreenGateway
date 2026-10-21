@@ -91,6 +91,35 @@ fn admin_session_csrf_rejects_missing_empty_mismatched_or_ambiguous_tokens() {
     assert!(!admin_session_csrf_matches(&config, &headers));
 }
 
+#[test]
+fn admin_session_csrf_token_is_the_matched_pair_and_its_bound_cookie_replaces_the_minted_one() {
+    let mut config = test_config(true);
+    config.cookie_domain = Some("management.example.test".to_owned());
+    let mut headers = HeaderMap::new();
+    headers.insert(COOKIE, HeaderValue::from_static("csrf_token=csrf-fixture"));
+    headers.insert("x-csrf-token", HeaderValue::from_static("csrf-fixture"));
+    assert_eq!(
+        admin_session_csrf_token(&config, &headers),
+        Some("csrf-fixture")
+    );
+    headers.insert("x-csrf-token", HeaderValue::from_static("other-fixture"));
+    assert_eq!(admin_session_csrf_token(&config, &headers), None);
+
+    // Same name, path, domain and flags as the minted cookie, so a browser
+    // replaces it; only the lifetime is added.
+    let minted = set_cookie_header_value(&config, "csrf-fixture").unwrap();
+    let bound = session_bound_cookie(&config, "csrf-fixture", 600).unwrap();
+    assert_eq!(
+        bound.to_str().unwrap(),
+        format!("{}; Max-Age=600", minted.to_str().unwrap())
+    );
+    assert_eq!(
+        bound.to_str().unwrap(),
+        "csrf_token=csrf-fixture; Path=/; SameSite=Lax; Domain=management.example.test; \
+         Secure; Max-Age=600"
+    );
+}
+
 #[tokio::test]
 async fn disabled_post_without_token_passes_through() {
     let response = test_router(test_config(false))

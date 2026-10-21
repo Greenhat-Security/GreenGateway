@@ -31,6 +31,8 @@ mod policy_history;
 #[cfg(feature = "postgres")]
 pub mod postgres;
 #[cfg(feature = "postgres")]
+pub mod postgres_admin_sessions;
+#[cfg(feature = "postgres")]
 pub mod postgres_audit;
 #[cfg(feature = "postgres")]
 pub mod postgres_discovery;

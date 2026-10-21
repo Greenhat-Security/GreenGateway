@@ -243,6 +243,7 @@ const GRPC_MAX_METADATA_BYTES: &str = "GRPC_MAX_METADATA_BYTES";
 const ADMIN_LOGIN_PROVIDER: &str = "ADMIN_LOGIN_PROVIDER";
 const ADMIN_SESSION_MODE: &str = "ADMIN_SESSION_MODE";
 const ADMIN_SESSION_TTL_SECS: &str = "ADMIN_SESSION_TTL_SECS";
+const ADMIN_SESSION_IDLE_TIMEOUT_SECS: &str = "ADMIN_SESSION_IDLE_TIMEOUT_SECS";
 const ADMIN_SESSION_MAX_ENTRIES: &str = "ADMIN_SESSION_MAX_ENTRIES";
 const ADMIN_LOGIN_PENDING_TTL_SECS: &str = "ADMIN_LOGIN_PENDING_TTL_SECS";
 const ADMIN_LOGIN_PENDING_MAX_ENTRIES: &str = "ADMIN_LOGIN_PENDING_MAX_ENTRIES";
@@ -1798,10 +1799,24 @@ impl Config {
             get_var(ADMIN_SESSION_MODE),
             &mut problems,
         );
-        let admin_session = match admin_session_mode.as_deref() {
+        let admin_session_storage = match admin_session_mode.as_deref() {
             None | Some("disabled") => None,
-            Some("standalone_memory") => Some(crate::auth::admin_session::AdminSessionConfig {
-                ttl: std::time::Duration::from_secs(validate_positive_bounded_u64(
+            Some("standalone_memory") => {
+                Some(crate::auth::admin_session::AdminSessionStorage::StandaloneMemory)
+            }
+            Some("cluster_postgres") => {
+                Some(crate::auth::admin_session::AdminSessionStorage::ClusterPostgres)
+            }
+            Some(_) => {
+                problems.push(format!(
+                    "{ADMIN_SESSION_MODE} must be disabled, standalone_memory or cluster_postgres"
+                ));
+                None
+            }
+        };
+        let admin_session = match admin_session_storage {
+            Some(storage) => {
+                let ttl = validate_positive_bounded_u64(
                     ADMIN_SESSION_TTL_SECS,
                     parse_optional_var(
                         ADMIN_SESSION_TTL_SECS,
@@ -1813,31 +1828,54 @@ impl Config {
                     86_400,
                     3600,
                     &mut problems,
-                )),
-                max_entries: validate_positive_bounded_u64(
-                    ADMIN_SESSION_MAX_ENTRIES,
-                    parse_optional_var(
-                        ADMIN_SESSION_MAX_ENTRIES,
-                        get_var(ADMIN_SESSION_MAX_ENTRIES),
-                        "entry count",
-                        &mut problems,
-                    )
-                    .unwrap_or(1024),
-                    100_000,
-                    1024,
+                );
+                // Unset, the idle limit is the absolute lifetime: it never
+                // binds, which is the behavior before the setting existed.
+                let idle_timeout = match parse_optional_var(
+                    ADMIN_SESSION_IDLE_TIMEOUT_SECS,
+                    get_var(ADMIN_SESSION_IDLE_TIMEOUT_SECS),
+                    "second duration",
                     &mut problems,
-                ) as usize,
-            }),
-            Some(_) => {
-                problems.push(format!("{ADMIN_SESSION_MODE} must be disabled or standalone_memory; shared HA sessions are not supported"));
-                None
+                ) {
+                    Some(idle) => validate_positive_bounded_u64(
+                        ADMIN_SESSION_IDLE_TIMEOUT_SECS,
+                        idle,
+                        ttl,
+                        ttl,
+                        &mut problems,
+                    ),
+                    None => ttl,
+                };
+                Some(crate::auth::admin_session::AdminSessionConfig {
+                    storage,
+                    ttl: std::time::Duration::from_secs(ttl),
+                    idle_timeout: std::time::Duration::from_secs(idle_timeout),
+                    max_entries: validate_positive_bounded_u64(
+                        ADMIN_SESSION_MAX_ENTRIES,
+                        parse_optional_var(
+                            ADMIN_SESSION_MAX_ENTRIES,
+                            get_var(ADMIN_SESSION_MAX_ENTRIES),
+                            "entry count",
+                            &mut problems,
+                        )
+                        .unwrap_or(1024),
+                        100_000,
+                        1024,
+                        &mut problems,
+                    ) as usize,
+                })
             }
+            None => None,
         };
+        let admin_session_mode = admin_session
+            .as_ref()
+            .map(|session| session.storage.as_str());
         if admin_session.is_none()
             && (is_var_set(get_var(ADMIN_SESSION_TTL_SECS))
+                || is_var_set(get_var(ADMIN_SESSION_IDLE_TIMEOUT_SECS))
                 || is_var_set(get_var(ADMIN_SESSION_MAX_ENTRIES)))
         {
-            problems.push(format!("{ADMIN_SESSION_TTL_SECS} and {ADMIN_SESSION_MAX_ENTRIES} require {ADMIN_SESSION_MODE}=standalone_memory"));
+            problems.push(format!("{ADMIN_SESSION_TTL_SECS}, {ADMIN_SESSION_IDLE_TIMEOUT_SECS} and {ADMIN_SESSION_MAX_ENTRIES} require {ADMIN_SESSION_MODE}=standalone_memory or cluster_postgres"));
         }
         let admin_login_pending_ttl_secs = validate_positive_u64(
             ADMIN_LOGIN_PENDING_TTL_SECS,
@@ -2719,13 +2757,13 @@ impl Config {
             &default_paths(DEFAULT_CSRF_EXEMPT_PATHS),
             &mut problems,
         );
-        if admin_session.is_some() {
+        if let Some(mode) = admin_session_mode {
             if admin_login_provider.is_none()
                 || !auth_enabled
                 || auth_mode != AuthMode::Required
                 || !csrf_enabled
             {
-                problems.push(format!("{ADMIN_SESSION_MODE}=standalone_memory requires {ADMIN_LOGIN_PROVIDER}, {AUTH_ENABLED}=true, {AUTH_MODE}=required and {CSRF_ENABLED}=true"));
+                problems.push(format!("{ADMIN_SESSION_MODE}={mode} requires {ADMIN_LOGIN_PROVIDER}, {AUTH_ENABLED}=true, {AUTH_MODE}=required and {CSRF_ENABLED}=true"));
             }
             if let Some(provider) = auth_providers
                 .iter()
@@ -2736,7 +2774,9 @@ impl Config {
                     .as_deref()
                     .is_some_and(|uri| uri.starts_with("https://"))
                 {
-                    problems.push(format!("{ADMIN_SESSION_MODE}=standalone_memory requires an HTTPS admin login redirect_uri"));
+                    problems.push(format!(
+                        "{ADMIN_SESSION_MODE}={mode} requires an HTTPS admin login redirect_uri"
+                    ));
                 }
             }
             let api_prefix = format!("/v1{admin_prefix}");
@@ -2744,7 +2784,9 @@ impl Config {
                 .iter()
                 .any(|path| path == &api_prefix || path.starts_with(&format!("{api_prefix}/")))
             {
-                problems.push(format!("{CSRF_EXEMPT_PATHS} cannot exempt admin API routes while {ADMIN_SESSION_MODE}=standalone_memory"));
+                problems.push(format!(
+                    "{CSRF_EXEMPT_PATHS} cannot exempt admin API routes while {ADMIN_SESSION_MODE}={mode}"
+                ));
             }
             // Logout is usable after expiry, but always checks its own exact
             // origin and configured CSRF pair before revoking/clearing anything.
@@ -3140,7 +3182,7 @@ impl Config {
         // namespace that does not exist in standalone mode.
         match state_backend {
             StateBackend::Postgres => {
-                if admin_session.is_some() {
+                if admin_session_mode == Some("standalone_memory") {
                     problems.push(format!("{ADMIN_SESSION_MODE}=standalone_memory is unsupported with {STATE_BACKEND}=postgres; no process-local HA fallback is provided"));
                 }
                 if admin_login_provider.is_some() && admin_login_keyring.is_empty() {
@@ -3155,6 +3197,11 @@ impl Config {
                 }
             }
             StateBackend::Sqlite => {
+                if admin_session_mode == Some("cluster_postgres") {
+                    problems.push(format!(
+                        "{ADMIN_SESSION_MODE}=cluster_postgres requires {STATE_BACKEND}=postgres; standalone mode keeps admin sessions in process memory (standalone_memory)"
+                    ));
+                }
                 if !admin_login_keyring.is_empty() {
                     problems.push(format!(
                         "{ADMIN_LOGIN_KEYRING} is set while {STATE_BACKEND} is sqlite; standalone mode keeps pending admin logins in memory and never reads it"

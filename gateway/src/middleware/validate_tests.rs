@@ -62,7 +62,9 @@ async fn bodyless_logout_exception_requires_enabled_exact_registered_post() {
         let mut config = test_config(1024, vec!["application/json"]);
         config.admin_prefix = "/operations".to_owned();
         config.admin_session = enabled.then_some(crate::auth::admin_session::AdminSessionConfig {
+            storage: crate::auth::admin_session::AdminSessionStorage::StandaloneMemory,
             ttl: std::time::Duration::from_secs(60),
+            idle_timeout: std::time::Duration::from_secs(60),
             max_entries: 8,
         });
         let router = if registered {

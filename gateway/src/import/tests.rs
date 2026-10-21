@@ -2217,6 +2217,8 @@ mod database {
             "rate_limit_buckets",
             "rate_limit_cardinality",
             "admin_pending_logins",
+            "admin_session_logins",
+            "admin_sessions",
             "jwt_revocations",
         ] {
             assert_eq!(
@@ -2225,6 +2227,16 @@ mod database {
                 "{table} is runtime state a replica rebuilds; the import must not write it"
             );
         }
+        // No admin session is imported, so no session evidence is either: a
+        // grant row would claim a sign-in this cluster never saw.
+        assert_eq!(
+            count_of(
+                &pool,
+                "SELECT count(*) FROM greengateway.admin_session_evidence"
+            )
+            .await,
+            0
+        );
 
         // --- the report is redacted ---------------------------------------
         let rendered = applied.to_string();
