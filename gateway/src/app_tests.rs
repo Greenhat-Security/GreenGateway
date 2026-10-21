@@ -22958,6 +22958,8 @@ async fn suggestions_admin_without_engine_answers_not_configured() {
                 history_store: None,
                 #[cfg(feature = "postgres")]
                 control_plane: None,
+                #[cfg(feature = "postgres")]
+                membership: None,
                 event_store: None,
                 query_store: None,
                 audit: test_audit_log(),
@@ -32476,6 +32478,16 @@ mod cluster_policy_tests {
     fn cluster_policy_router(
         store: Arc<PostgresPolicyStore>,
     ) -> (Router, middleware::rbac::RbacState) {
+        cluster_policy_router_with(store, None, test_audit_log())
+    }
+
+    /// [`cluster_policy_router`] with a roster for the operation gate and
+    /// an audit log a test can read back.
+    fn cluster_policy_router_with(
+        store: Arc<PostgresPolicyStore>,
+        membership: Option<Arc<cluster_membership::ClusterMembership>>,
+        audit: audit::AuditLog,
+    ) -> (Router, middleware::rbac::RbacState) {
         let rbac_state = middleware::rbac::RbacState::new(
             cluster_policy("router-seed"),
             Vec::new(),
@@ -32500,9 +32512,10 @@ mod cluster_policy_tests {
                 rbac_state: Some(rbac_state.clone().with_revision_gate(gate.clone())),
                 history_store: Some(store.clone() as Arc<dyn storage::PolicyHistory>),
                 control_plane: Some(store as Arc<dyn storage::PolicyControlPlane>),
+                membership,
                 event_store: None,
                 query_store: None,
-                audit: test_audit_log(),
+                audit,
                 client_ip_policy: client_ip::ClientIpPolicy::default(),
                 max_body_size: 1024 * 1024,
             })
@@ -32539,6 +32552,246 @@ mod cluster_policy_tests {
             .and_then(|value| value.to_str().ok())
             .expect("ETag header")
             .to_owned()
+    }
+
+    fn described_cluster_policy_json(id: &str) -> String {
+        format!(
+            r#"{{
+                    "schema_version": "0.1.0",
+                    "id": "{id}",
+                    "default_action": "deny",
+                    "roles": {{
+                        "admin": {{
+                            "permissions": ["admin:policy:read", "admin:policy:write"],
+                            "description": "Maintains the gateway policy"
+                        }}
+                    }}
+                }}"#
+        )
+    }
+
+    async fn policy_version_count(pool: &deadpool_postgres::Pool) -> i64 {
+        pool.get()
+            .await
+            .expect("client")
+            .query_one(
+                "SELECT count(*)::bigint FROM greengateway.policy_documents",
+                &[],
+            )
+            .await
+            .expect("count policy versions")
+            .get(0)
+    }
+
+    async fn refusal_of(response: Response) -> (StatusCode, Value) {
+        let status = response.status();
+        let body = axum::body::to_bytes(response.into_body(), 1 << 20)
+            .await
+            .expect("refusal body");
+        (
+            status,
+            serde_json::from_slice(&body).expect("refusal body is JSON"),
+        )
+    }
+
+    /// Issue #426's registered operation through the policy API. A document
+    /// whose roles carry a `description` is committed only while every live
+    /// member advertises `policy_role_descriptions`: a refusal is a `409`
+    /// with the stable reason, writes no version, and is audited; a control
+    /// plane with no roster refuses with `503`; and a document without the
+    /// feature never asks.
+    #[tokio::test]
+    async fn cluster_policy_role_descriptions_wait_for_every_live_member() {
+        use crate::storage::{MemberRegistration, PostgresMembershipStore};
+
+        let Some(admin_dsn) = locator() else {
+            eprintln!("skipping: no test database locator; CI runs this test");
+            return;
+        };
+        let database = create_test_database(&admin_dsn).await;
+        let (store, pool) = migrated_policy_foundation(&database.dsn).await;
+        let active = initialize(&store, "gate-init").await;
+
+        // No roster to ask: the gated write is refused, the plain one is not.
+        let (router, rbac_state) = cluster_policy_router(store.clone());
+        rbac_state
+            .install_revision_snapshot(active.policy.clone(), active.security_revision)
+            .await
+            .expect("the authority's revision should install");
+        let before = policy_version_count(&pool).await;
+        let (status, body) = refusal_of(
+            router
+                .clone()
+                .oneshot(admin_request(
+                    Method::PUT,
+                    POLICY_ADMIN_ROUTE,
+                    Some((&active.etag, &described_cluster_policy_json("gate-orphan"))),
+                ))
+                .await
+                .expect("PUT should complete"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+        assert_eq!(body["reason"], "roster_unavailable");
+        assert_eq!(policy_version_count(&pool).await, before);
+        let plain_etag = etag_of(
+            router
+                .clone()
+                .oneshot(admin_request(
+                    Method::PUT,
+                    POLICY_ADMIN_ROUTE,
+                    Some((&active.etag, &cluster_policy_json("gate-plain"))),
+                ))
+                .await
+                .expect("PUT should complete"),
+        )
+        .await;
+
+        // A roster holding this replica and a prepared member: the
+        // protocol, without role descriptions.
+        let deployment = "deploy-cluster-policy";
+        let membership = cluster_membership::ClusterMembership::new(
+            PostgresMembershipStore::new(
+                pool.clone(),
+                deployment,
+                crate::ha::InstanceIdentity::generate(),
+            ),
+            MemberRegistration {
+                binary_version: env!("CARGO_PKG_VERSION").to_owned(),
+                schema_version: migrations::schema_version_range(),
+                document_version: cluster_membership::DOCUMENT_VERSION_RANGE,
+                fingerprint: "b".repeat(64),
+                capabilities: storage::compatibility::BINARY_CAPABILITIES.to_vec(),
+            },
+            Duration::from_secs(1),
+            Duration::from_secs(30),
+        );
+        membership.register_boot().await.expect("boot row");
+        let prepared = uuid::Uuid::new_v4();
+        pool.get()
+            .await
+            .expect("client")
+            .execute(
+                "INSERT INTO greengateway.cluster_members
+                     (deployment_id, instance_id, boot_id, binary_version,
+                      schema_version_min, schema_version_max,
+                      document_version_min, document_version_max, fingerprint,
+                      capabilities)
+                 VALUES ($1, $2::text::uuid, $3::text::uuid, '1.0.1', 17, 17, 0, 0,
+                         repeat('b', 64), 'operation_requirements')",
+                &[
+                    &deployment,
+                    &prepared.to_string(),
+                    &uuid::Uuid::new_v4().to_string(),
+                ],
+            )
+            .await
+            .expect("a prepared member row inserts");
+
+        let capture = audit::sink::tests::CaptureSink::new();
+        let (router, rbac_state) = cluster_policy_router_with(
+            store.clone(),
+            Some(membership),
+            audit::AuditLog::new(Arc::new(capture.clone())),
+        );
+        let current = store
+            .active()
+            .await
+            .expect("active read")
+            .expect("the deployment is initialized");
+        assert_eq!(current.etag, plain_etag);
+        rbac_state
+            .install_revision_snapshot(current.policy.clone(), current.security_revision)
+            .await
+            .expect("the authority's revision should install");
+
+        let before = policy_version_count(&pool).await;
+        let (status, body) = refusal_of(
+            router
+                .clone()
+                .oneshot(admin_request(
+                    Method::PUT,
+                    POLICY_ADMIN_ROUTE,
+                    Some((&plain_etag, &described_cluster_policy_json("gate-held"))),
+                ))
+                .await
+                .expect("PUT should complete"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT, "{body}");
+        assert_eq!(body["reason"], "capability_not_advertised");
+        assert!(
+            !body.to_string().contains(&prepared.to_string()),
+            "a refusal names no member: {body}"
+        );
+        assert_eq!(
+            policy_version_count(&pool).await,
+            before,
+            "a refused write commits nothing"
+        );
+        let started = std::time::Instant::now();
+        while capture.len() < 1 && started.elapsed() < Duration::from_secs(5) {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let events = capture.events();
+        assert_eq!(events.len(), 1, "one refusal, one audit event");
+        assert_eq!(events[0].event_type, "cluster.operation_refused");
+        assert_eq!(events[0].payload["operation"], "policy.role_descriptions");
+        assert_eq!(events[0].payload["capability"], "policy_role_descriptions");
+        assert_eq!(events[0].payload["lacking_members"], 1);
+        assert_eq!(events[0].payload["live_members"], 2);
+
+        // The prepared member's row goes stale on the database clock: the
+        // same write is admitted and the description is served back.
+        pool.get()
+            .await
+            .expect("client")
+            .execute(
+                "UPDATE greengateway.cluster_members
+                 SET last_heartbeat_at = now() - interval '60 seconds'
+                 WHERE instance_id = $1::text::uuid",
+                &[&prepared.to_string()],
+            )
+            .await
+            .expect("backdate the prepared member");
+        let admitted = router
+            .clone()
+            .oneshot(admin_request(
+                Method::PUT,
+                POLICY_ADMIN_ROUTE,
+                Some((&plain_etag, &described_cluster_policy_json("gate-admitted"))),
+            ))
+            .await
+            .expect("PUT should complete");
+        assert_eq!(admitted.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(admitted.into_body(), 1 << 20)
+            .await
+            .expect("admitted body");
+        let served: Value = serde_json::from_slice(&body).expect("policy JSON");
+        assert_eq!(
+            served["roles"]["admin"]["description"],
+            "Maintains the gateway policy"
+        );
+        assert_eq!(policy_version_count(&pool).await, before + 1);
+        let started = std::time::Instant::now();
+        while capture.len() < 2 && started.elapsed() < Duration::from_secs(5) {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let events = capture.events();
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event.event_type == "cluster.operation_refused")
+                .count(),
+            1,
+            "an admission is not audited as a refusal"
+        );
+        assert!(
+            events
+                .iter()
+                .any(|event| event.event_type == audit::event::POLICY_CHANGED),
+            "the admitted commit is audited as the policy change it is"
+        );
     }
 
     #[tokio::test]
@@ -34856,6 +35109,7 @@ mod cluster_discovery_tests {
                     control_plane: Some(
                         policy_store.clone() as Arc<dyn storage::PolicyControlPlane>
                     ),
+                    membership: None,
                     event_store: None,
                     query_store: None,
                     audit: audit_log,

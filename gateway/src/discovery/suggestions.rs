@@ -2310,6 +2310,7 @@ mod tests {
                 permissions: vec!["billing:read".to_owned()],
                 issuers: Vec::new(),
                 auth_methods: Vec::new(),
+                description: None,
             },
         );
         covered_policy.routes.push(crate::rbac::RouteRule {

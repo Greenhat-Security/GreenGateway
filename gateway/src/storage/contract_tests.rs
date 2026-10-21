@@ -7690,9 +7690,14 @@ pub(crate) mod postgres_audit_tests {
             .await
             .expect("boot heartbeat");
         let members = store.members(window).await.expect("members");
-        assert_eq!(members[0].capabilities, "operation_requirements");
+        assert_eq!(
+            members[0].capabilities,
+            "operation_requirements,policy_role_descriptions"
+        );
         assert!(RecognizedCapabilities::parse(&members[0].capabilities)
             .contains(Capability::OperationRequirements));
+        assert!(RecognizedCapabilities::parse(&members[0].capabilities)
+            .contains(Capability::PolicyRoleDescriptions));
 
         // A newer gateway on the same instance would write names this one
         // does not know; the next heartbeat writes this binary's own set
@@ -7718,7 +7723,7 @@ pub(crate) mod postgres_audit_tests {
             .expect("refresh");
         assert_eq!(
             store.members(window).await.expect("members")[0].capabilities,
-            "operation_requirements"
+            "operation_requirements,policy_role_descriptions"
         );
 
         let older = insert_pre_protocol_member(&pool).await;
@@ -7746,7 +7751,7 @@ pub(crate) mod postgres_audit_tests {
         use crate::cluster_membership::GatedWriteRequest;
         use crate::storage::compatibility::{
             Activation, Backfill, Capability, OperationAdmission, OperationRefusal,
-            OperationRequirement,
+            OperationRequirement, POLICY_ROLE_DESCRIPTIONS,
         };
 
         let Some(admin_dsn) = locator() else {
@@ -7808,6 +7813,17 @@ pub(crate) mod postgres_audit_tests {
                 .await,
             Err(OperationRefusal::MembersLackRequirement { .. })
         ));
+        // The shipped operation is held by the same member: it advertises
+        // nothing, so certainly not role descriptions.
+        assert_eq!(
+            first
+                .admit_operation(&POLICY_ROLE_DESCRIPTIONS, &audit, &request)
+                .await,
+            Err(OperationRefusal::MembersLackRequirement {
+                lacking: vec![older],
+                live: 3
+            })
+        );
 
         // A draining member is still answering what was routed to it.
         pool.get()
@@ -7834,6 +7850,13 @@ pub(crate) mod postgres_audit_tests {
             Ok(OperationAdmission { live_members: 2 }),
             "a stale row no longer holds the operation"
         );
+        assert_eq!(
+            first
+                .admit_operation(&POLICY_ROLE_DESCRIPTIONS, &audit, &request)
+                .await,
+            Ok(OperationAdmission { live_members: 2 }),
+            "both live members are this build, so the shipped operation is admitted"
+        );
 
         // Only a registered requirement can be admitted.
         let unregistered = OperationRequirement {
@@ -7849,7 +7872,7 @@ pub(crate) mod postgres_audit_tests {
         assert_eq!(
             first.admit_operation(&requirement, &audit, &request).await,
             Err(OperationRefusal::NotSupportedByThisBinary),
-            "the shipped registry registers nothing"
+            "the shipped registry does not register the fixture"
         );
 
         // This replica's own row missing: the read cannot be shown to
@@ -7895,6 +7918,7 @@ pub(crate) mod postgres_audit_tests {
             "capability_not_advertised",
             "capability_not_advertised",
             "capability_not_advertised",
+            "capability_not_advertised",
             "operation_not_supported",
             "operation_not_supported",
             "roster_missing_this_replica",
@@ -7920,7 +7944,9 @@ pub(crate) mod postgres_audit_tests {
         assert_eq!(events[0].payload["capability"], "operation_requirements");
         assert_eq!(events[0].payload["lacking_members"], 1);
         assert_eq!(events[0].payload["live_members"], 3);
-        assert_eq!(events[4].payload["operation"], "fixture.gated_write");
+        assert_eq!(events[2].payload["operation"], "policy.role_descriptions");
+        assert_eq!(events[2].payload["capability"], "policy_role_descriptions");
+        assert_eq!(events[5].payload["operation"], "fixture.gated_write");
     }
 
     /// A swept row comes back as the same boot: a replica partitioned past
