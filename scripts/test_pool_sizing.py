@@ -709,6 +709,15 @@ class ExampleTests(Files):
         # One replica plus a 25% surge of one pod, at the default pool of 10.
         self.assertEqual((kubernetes["status"], kubernetes["pool_connections"], kubernetes["total"]),
                          ("rejected", 20, 32))
+        entry = budgets["deploy/kubernetes/greengateway.example.yaml"]
+        for broken, message in [({k: v for k, v in entry.items() if k != "server"}, "must name the server's"),
+                                ({**entry, "headrooms": {}}, "needs pooler, headroom and uncounted"),
+                                ({**entry, "headroom": {**entry["headroom"], "backup": "one"}}, "whole number")]:
+            with self.subTest(broken=broken):
+                with mock.patch.object(sizing, "EXAMPLE_BUDGETS", {
+                        **budgets, "deploy/kubernetes/greengateway.example.yaml": broken}):
+                    with self.assertRaisesRegex(sizing.InputError, message):
+                        sizing.examples(self.root)
 
     def test_a_stale_budget_is_refused(self):
         budgets = {**sizing.EXAMPLE_BUDGETS, "docs/deployment/gone.yml": {}}

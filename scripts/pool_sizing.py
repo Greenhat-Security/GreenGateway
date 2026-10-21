@@ -962,13 +962,15 @@ def plan(source, server, pooler, pooler_connections, facts, headroom):
     if (pooler == "session") != (pooler_connections is not None):
         raise InputError(f"{source}: the pooler's server connections are required with a session pooler and "
                          "meaningless without one")
+    if pooler_connections is not None:
+        pooler_connections = count(pooler_connections, f"{source}: the pooler's server connections")
     unknown = set(headroom) - set(HEADROOM_NAMES)
     if unknown:
         raise InputError(f"{source}: unknown headroom {', '.join(sorted(unknown))}")
     entries = {}
     for name, default, _ in HEADROOM:
         if name in headroom and headroom[name] is not None:
-            entries[name] = (headroom[name], "declared")
+            entries[name] = (count(headroom[name], f"{source}: the {name} headroom"), "declared")
         elif default is not None:
             entries[name] = (default, "default")
         else:
@@ -1199,14 +1201,23 @@ def example_result(source, facts):
     if budget is None:
         raise InputError(f"{source} runs the gateway in cluster mode, and EXAMPLE_BUDGETS in "
                          "scripts/pool_sizing.py names no connection budget for it")
+    keys = set(budget)
+    if not {"pooler", "headroom", "uncounted"} <= keys <= {"pooler", "pooler_connections", "headroom",
+                                                             "uncounted", "server"}:
+        raise InputError(f"{source}: its EXAMPLE_BUDGETS entry needs pooler, headroom and uncounted, and may add "
+                         "only pooler_connections and server")
     if sorted(facts["uncounted"]) != sorted(budget["uncounted"]):
         raise InputError(f"{source}: {sorted(facts['uncounted'])} open no gateway pool, but the reviewed list is "
                          f"{sorted(budget['uncounted'])}; budget a new database client before it ships")
     server = facts.get("server")
     if server is not None and "server" in budget:
         raise InputError(f"{source} runs its own PostgreSQL; its budget cannot name other server limits")
-    if server is None and "server" in budget:
-        server = {key: (budget["server"][key], "example budget") for key in SERVER_SETTINGS}
+    if server is None:
+        if set(budget.get("server") or ()) != set(SERVER_SETTINGS):
+            raise InputError(f"{source} runs no PostgreSQL of its own, so its EXAMPLE_BUDGETS entry must name "
+                             f"the server's {', '.join(SERVER_SETTINGS)}")
+        server = {key: (count(budget["server"][key], f"{source} budget {key}"), "example budget")
+                  for key in SERVER_SETTINGS}
     return decide(plan(source, server, budget["pooler"], budget.get("pooler_connections"), facts,
                        budget["headroom"]))
 
