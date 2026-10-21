@@ -210,8 +210,8 @@ impl ClusterMembership {
     /// Call it immediately before the operation's write and write nothing
     /// unless it admits; answer a refusal with its reason. Only an
     /// operation in `OPERATION_REQUIREMENTS` can be admitted, so an ad hoc
-    /// requirement cannot bypass the registry's review.
-    #[allow(dead_code)] // The registry is empty until #426's first qualified operation, whose write path is the first production caller; until then the contract tests are the only one.
+    /// requirement cannot bypass the registry's review. The policy commit
+    /// paths call it for a document with role descriptions (PR 2).
     pub(crate) async fn admit_operation(
         &self,
         requirement: &OperationRequirement,

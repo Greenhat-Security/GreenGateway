@@ -1,0 +1,15 @@
+{
+  "schema": 1,
+  "issue": 426,
+  "prepared": {
+    "commit": "b4c663ad128b4a8c1c8f3fac590cb43aed5c1254",
+    "describes": "main after round B of the merge train (#606): the compatibility protocol (#594) and migration 18 (#602). Serves exactly schema 18, advertises operation_requirements, registers no operation."
+  },
+  "successor": {
+    "commit": "cd5331ab03c46de73910289c4847052920c866f7",
+    "describes": "The prepared release plus one change and no migration (the merge of the prepared commit into this change): roles may carry a description, and committing such a document is the registered operation policy.role_descriptions, gated on the policy_role_descriptions capability."
+  },
+  "schema_version": 18,
+  "operation": "policy.role_descriptions",
+  "capability": "policy_role_descriptions"
+}

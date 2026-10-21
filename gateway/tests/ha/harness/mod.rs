@@ -46,12 +46,13 @@
 //! matrix rows that are *not* asserted are listed here rather than left to
 //! be inferred from absence:
 //!
-//! * The mixed-version half of `rolling_upgrade.rs` — no released
-//!   GreenGateway binary supports cluster mode (v1.0.1 has no `postgres`
-//!   feature at all), so no pair of binaries can form one deployment.
-//!   That suite substitutes the *states* a newer version produces, names
-//!   each substitution, and carries a tripwire that fails the day a
-//!   cluster-capable release is tagged.
+//! * A mixed-version deployment of two *released* binaries —
+//!   no release tag ships cluster mode yet (v1.0.1 has no `postgres`
+//!   feature at all). `rolling_upgrade.rs` instead runs issue #426's
+//!   pinned pair: a prepared build and its successor, each built from its
+//!   own pinned commit by `scripts/build_upgrade_pair.py` ([`pair`]). Its
+//!   other rows still substitute the *states* a newer version produces,
+//!   and a tripwire fails the day a cluster-capable release is tagged.
 //! * `performance.rs` is `#[ignore]`d by default and belongs to the
 //!   nightly workflow, not to the merge gate; the exception is its
 //!   documentation-coverage test, which needs no database and runs
@@ -73,6 +74,7 @@
 pub mod balancer;
 pub mod database;
 pub mod oidc;
+pub mod pair;
 pub mod replica;
 pub mod sse;
 pub mod upstream;
@@ -405,6 +407,17 @@ pub struct ClusterOptions {
     /// The block is identical on every replica, so the static-configuration
     /// fingerprint still agrees.
     pub upstream_required_for_readiness: bool,
+    /// The binary each replica runs, by index (`a` first). A replica past
+    /// the end of the list runs [`gateway_binary`].
+    ///
+    /// Issue #426's pair rows mix a prepared release and its successor in
+    /// one deployment ([`pair`]). Nothing else differs between those
+    /// replicas, so their fingerprints agree exactly as two replicas of one
+    /// binary would.
+    pub replica_binaries: Vec<PathBuf>,
+    /// The binary that applies the schema before any replica boots, when
+    /// it is not [`gateway_binary`]: the release a deployment already runs.
+    pub migrator_binary: Option<PathBuf>,
 }
 
 impl Default for ClusterOptions {
@@ -426,6 +439,8 @@ impl Default for ClusterOptions {
             adopt_database: None,
             deployment_id: None,
             upstream_required_for_readiness: false,
+            replica_binaries: Vec::new(),
+            migrator_binary: None,
         }
     }
 }
@@ -460,6 +475,9 @@ pub struct Cluster {
     shared: Vec<(String, String)>,
     /// The DSN file the replicas read, for the same reason.
     runtime_dsn_file: PathBuf,
+    /// The migration role's DSN file, for a one-shot command that must run
+    /// as the role that owns the schema.
+    migrator_dsn_file: PathBuf,
     /// The options this cluster was started with, minus the adopted
     /// database (which was moved into [`Self::database`]).
     options: ClusterOptions,
@@ -550,7 +568,11 @@ impl Cluster {
             // The schema is applied by a one-shot command as the migration
             // role, exactly as `docs/deployment/postgres.md` prescribes;
             // serving replicas validate only and never migrate.
-            run_migrate_up(&binary, &shared, &migrator_dsn_file);
+            run_migrate_up(
+                options.migrator_binary.as_deref().unwrap_or(&binary),
+                &shared,
+                &migrator_dsn_file,
+            );
             // Cluster mode refuses to serve an uninitialized deployment, so
             // the policy control plane gets its first active document
             // before any replica boots.
@@ -598,7 +620,11 @@ impl Cluster {
                 &upstream,
                 &options,
             );
-            let mut replica = Replica::spawn(&name, &binary, env, audit_path);
+            let replica_binary = options
+                .replica_binaries
+                .get(index)
+                .map_or(binary.as_path(), PathBuf::as_path);
+            let mut replica = Replica::spawn(&name, replica_binary, env, audit_path);
             replica.wait_until_listening(LISTEN_BUDGET).await;
             replicas.push(replica);
         }
@@ -627,6 +653,7 @@ impl Cluster {
             one_shot_env,
             shared,
             runtime_dsn_file,
+            migrator_dsn_file,
             options,
             secrets,
             files,
@@ -645,6 +672,13 @@ impl Cluster {
     /// `ready` — and how fast — is the caller's assertion, not the
     /// harness's precondition.
     pub async fn add_replica(&mut self) -> String {
+        let binary = self.binary.clone();
+        self.add_replica_running(&binary).await
+    }
+
+    /// [`Cluster::add_replica`] with a binary other than the cluster's
+    /// default: a member of the other release joining the deployment.
+    pub async fn add_replica_running(&mut self, binary: &std::path::Path) -> String {
         let name = replica_name(self.replicas.len());
         let audit_path = self.files.path().join(format!("audit-{name}.jsonl"));
         let env = replica_environment(
@@ -655,11 +689,19 @@ impl Cluster {
             &self.upstream,
             &self.options,
         );
-        let mut replica = Replica::spawn(&name, &self.binary, env, audit_path);
+        let mut replica = Replica::spawn(&name, binary, env, audit_path);
         replica.wait_until_listening(LISTEN_BUDGET).await;
         self.replicas.push(replica);
         self.refresh_balancer_targets();
         name
+    }
+
+    /// Stop a replica cleanly and start it again running `binary`, with the
+    /// same environment: an in-place upgrade, or a rollback, of one member.
+    /// It gets a fresh instance ID and port; the balancer is refreshed.
+    pub async fn replace_binary(&mut self, name: &str, binary: &std::path::Path) {
+        self.replica_mut(name).replace_binary(binary).await;
+        self.refresh_balancer_targets();
     }
 
     /// Run a one-shot gateway command (`revoke-jwt`, `migrate check`)
@@ -669,20 +711,39 @@ impl Cluster {
     /// DSN — never the ambient one — so the command reaches this
     /// disposable database and no other.
     pub fn run_command(&self, arguments: &[&str]) -> std::process::Output {
-        let mut command = std::process::Command::new(&self.binary);
-        command.env_clear();
-        for key in INHERITED_ENVIRONMENT {
-            if let Ok(value) = std::env::var(key) {
-                command.env(key, value);
-            }
-        }
-        for (key, value) in &self.one_shot_env {
-            command.env(key, value);
-        }
-        command
-            .args(arguments)
-            .output()
-            .unwrap_or_else(|error| panic!("the gateway command {arguments:?} should run: {error}"))
+        self.run_command_with(&self.binary, arguments)
+    }
+
+    /// [`Cluster::run_command`] with a particular binary: the same
+    /// operator command as the other release would run it.
+    pub fn run_command_with(
+        &self,
+        binary: &std::path::Path,
+        arguments: &[&str],
+    ) -> std::process::Output {
+        one_shot(binary, &self.one_shot_env, arguments)
+    }
+
+    /// A one-shot command as the migration role, which owns the schema:
+    /// `migrate up` from a migration job. The replicas' runtime role cannot
+    /// run DDL.
+    pub fn run_migrator_command_with(
+        &self,
+        binary: &std::path::Path,
+        arguments: &[&str],
+    ) -> std::process::Output {
+        let mut env: Vec<(String, String)> = self
+            .one_shot_env
+            .iter()
+            .filter(|(key, _)| key != "DATABASE_URL_FILE")
+            .cloned()
+            .collect();
+        env.push((
+            "DATABASE_URL_FILE".to_owned(),
+            self.migrator_dsn_file.display().to_string(),
+        ));
+        env.push(("DATABASE_POOL_MAX".to_owned(), "2".to_owned()));
+        one_shot(binary, &env, arguments)
     }
 
     /// The second issuer, or a panic naming what the test forgot to ask
@@ -953,6 +1014,29 @@ impl Drop for Cluster {
             replica.kill();
         }
     }
+}
+
+/// Run one gateway command with exactly `env` on top of the platform
+/// variables, never the ambient environment.
+fn one_shot(
+    binary: &std::path::Path,
+    env: &[(String, String)],
+    arguments: &[&str],
+) -> std::process::Output {
+    let mut command = std::process::Command::new(binary);
+    command.env_clear();
+    for key in INHERITED_ENVIRONMENT {
+        if let Ok(value) = std::env::var(key) {
+            command.env(key, value);
+        }
+    }
+    for (key, value) in env {
+        command.env(key, value);
+    }
+    command
+        .args(arguments)
+        .output()
+        .unwrap_or_else(|error| panic!("the gateway command {arguments:?} should run: {error}"))
 }
 
 fn replica_name(index: usize) -> String {

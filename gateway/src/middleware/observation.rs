@@ -3352,6 +3352,7 @@ paths:
                                 .collect(),
                             issuers: Vec::new(),
                             auth_methods: Vec::new(),
+                            description: None,
                         },
                     )
                 })

@@ -38,11 +38,17 @@
 //! completed backfill ([`Backfill::Required`]) is refused. Schema presence
 //! alone never enables an operation.
 //!
-//! No operation in this release postdates the protocol, so the registry
-//! ([`OPERATION_REQUIREMENTS`]) is empty, exactly as the approved-extension
-//! list in `migrations.rs` is: the first entry arrives with the first
-//! qualified adjacent release pair. Every operation this binary performs is
-//! part of the schema-18 contract, which no other binary shares.
+//! The registry ([`OPERATION_REQUIREMENTS`]) holds one operation (issue
+//! #426, PR 2): committing a policy document in which a role carries a
+//! `description` ([`POLICY_ROLE_DESCRIPTIONS`]). A gateway built before the
+//! field refuses such a document outright -- the role's fields are closed --
+//! so the write waits until every live member advertises
+//! [`Capability::PolicyRoleDescriptions`], and a member that lacks it and
+//! returns later fails closed on the document rather than misreading it.
+//! The approved-extension list in `migrations.rs` stays empty: the operation
+//! changes no schema, and no schema overlap has been qualified. Every other
+//! operation this binary performs belongs to the schema-18 contract, which
+//! every schema-18 member shares.
 
 use std::collections::BTreeSet;
 
@@ -72,15 +78,20 @@ pub(crate) enum Capability {
     /// without it predates the protocol and can be shown to support
     /// nothing.
     OperationRequirements,
+    /// The member reads, validates and serves a policy document whose roles
+    /// carry a `description` (issue #426, PR 2). A member without it refuses
+    /// such a document, so [`POLICY_ROLE_DESCRIPTIONS`] waits for it.
+    PolicyRoleDescriptions,
 }
 
 impl Capability {
     /// Every capability, in name order.
-    pub(crate) const KNOWN: [Self; 1] = [Self::OperationRequirements];
+    pub(crate) const KNOWN: [Self; 2] = [Self::OperationRequirements, Self::PolicyRoleDescriptions];
 
     pub(crate) const fn as_str(self) -> &'static str {
         match self {
             Self::OperationRequirements => "operation_requirements",
+            Self::PolicyRoleDescriptions => "policy_role_descriptions",
         }
     }
 
@@ -92,7 +103,10 @@ impl Capability {
 }
 
 /// What this binary advertises: every capability it implements.
-pub(crate) const BINARY_CAPABILITIES: &[Capability] = &[Capability::OperationRequirements];
+pub(crate) const BINARY_CAPABILITIES: &[Capability] = &[
+    Capability::OperationRequirements,
+    Capability::PolicyRoleDescriptions,
+];
 
 /// The roster column's value for a capability set: the names sorted,
 /// deduplicated and comma-separated. `None` when the set is larger than
@@ -168,12 +182,10 @@ impl RecognizedCapabilities {
 #[cfg(feature = "postgres")]
 pub(crate) use gate::{
     evaluate, BinaryContract, MemberAdvertisement, OperationAdmission, OperationRefusal,
-    OperationRequirement, OPERATION_REQUIREMENTS,
+    OperationRequirement, OPERATION_REQUIREMENTS, POLICY_ROLE_DESCRIPTIONS,
 };
-// Named only by registry entries, of which this release ships none, and by
-// their tests.
-#[cfg(feature = "postgres")]
-#[allow(unused_imports)]
+// Named by registry entries and their tests.
+#[cfg(all(feature = "postgres", test))]
 pub(crate) use gate::{Activation, Backfill};
 
 #[cfg(feature = "postgres")]
@@ -186,7 +198,7 @@ mod gate {
 
     /// Whether an operation depends on a backfill having completed.
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-    #[allow(dead_code)] // Constructed by registry entries; none ships yet.
+    #[allow(dead_code)] // `Required` is constructed only by tests: no shipped operation needs a backfill.
     pub(crate) enum Backfill {
         /// The operation reads nothing a backfill must first produce.
         NotRequired,
@@ -199,7 +211,7 @@ mod gate {
     /// What keeps a member that lacks the capability from serving the
     /// operation's data later.
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-    #[allow(dead_code)] // Constructed by registry entries; none ships yet.
+    #[allow(dead_code)] // `DurableFence` is constructed only by tests: no shipped operation needs one.
     pub(crate) enum Activation {
         /// Live-roster agreement is enough: a lacking member that returns
         /// after the operation wrote refuses the data (fails closed)
@@ -231,10 +243,35 @@ mod gate {
         pub(crate) activation: Activation,
     }
 
-    /// Every operation this binary gates. Empty: no operation postdates the
-    /// protocol. An operation added later registers here, advertises a new
-    /// capability, and calls the gate before its write.
-    pub(crate) const OPERATION_REQUIREMENTS: &[OperationRequirement] = &[];
+    /// Committing a policy document in which any role carries a
+    /// `description`.
+    ///
+    /// A gateway that predates the field cannot parse the document at all:
+    /// `RoleEntry` refuses unknown fields. A running one stops compiling the
+    /// active revision and holds readiness at
+    /// `security_revision_not_compiled`, serving nothing under the policy it
+    /// had; a starting one refuses to boot. That is failing closed, never a
+    /// misreading, so live-roster agreement is enough
+    /// ([`Activation::LiveMembers`]) and no durable fence is needed. The
+    /// field lives inside the policy document, so the operation adds no
+    /// schema object and no migration, and the document format stays
+    /// major 0. `minimum_schema` is 17 because that is the first schema
+    /// whose members advertise capabilities at all; the policy tables it
+    /// writes are older. Every member that shares this binary's schema-18
+    /// contract meets it, so among those the capability alone decides.
+    pub(crate) const POLICY_ROLE_DESCRIPTIONS: OperationRequirement = OperationRequirement {
+        operation: "policy.role_descriptions",
+        minimum_schema: 17,
+        document_format: Some(0),
+        capability: Capability::PolicyRoleDescriptions,
+        backfill: Backfill::NotRequired,
+        activation: Activation::LiveMembers,
+    };
+
+    /// Every operation this binary gates. An operation added later
+    /// registers here, advertises a new capability, and calls the gate
+    /// before its write.
+    pub(crate) const OPERATION_REQUIREMENTS: &[OperationRequirement] = &[POLICY_ROLE_DESCRIPTIONS];
 
     /// What this binary serves and advertises: the left-hand side of every
     /// requirement.
