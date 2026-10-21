@@ -30,6 +30,8 @@ Replication connections (a standby, `pg_basebackup`, a logical subscriber) take 
 
 The maintenance leader's pass session comes out of that replica's own `DATABASE_POOL_MAX`, so it does not add to the total — but it does mean the leader has one fewer connection for requests than its peers while a pass runs. With a pool of 10 that is 10%; with a pool of 2 it is half, which is a reason not to set the pool that low.
 
+`DATABASE_POOL_MAX` bounds the connections a replica's pool holds, not, for a moment, the server backends it leaves behind. When a checkout's statement does not answer in time (the readiness probe, the startup connectivity check, a dedicated session that breaks), the gateway detaches that connection from the pool and drops it rather than reuse a session in an unknown state. The pool may then open a replacement while the old backend lives on until its statement finishes or reaches `statement_timeout` or `lock_timeout`. That is brief, and it happens when the database is already slow, which is when the ceiling matters: keep some spare rather than budgeting to the last connection.
+
 Worked example, the default `DATABASE_POOL_MAX=10` against a stock `max_connections=100` with `superuser_reserved_connections=3` and `reserved_connections=0`, budgeting one `pg_dump`, one monitoring connection and two operator sessions:
 
 ```
@@ -91,9 +93,16 @@ python scripts/pool_sizing.py check --replicas 3 --autoscaler-max 6 --surge 2 --
   --max-connections 200 --superuser-reserved-connections 3 --reserved-connections 0 \
   --pooler none --backup 1 --monitoring 1 --operator 2 --other 0
 
-# A Compose deployment. A file that runs its own PostgreSQL supplies the
-# server's limits from that service's command line.
-python scripts/pool_sizing.py check --compose docs/deployment/docker-compose.ha.yml \
+# A Compose deployment whose own PostgreSQL service, db, is the server the
+# gateways use: that service's command line supplies the server's limits.
+python scripts/pool_sizing.py check --compose docs/deployment/docker-compose.ha.yml --server-service db \
+  --pooler none --backup 1 --monitoring 1 --operator 2 --other 0
+
+# Compose's own rendering, which also applies override files, every -f file
+# and interpolation, is the surest input.
+docker compose -f compose.yaml -f compose.prod.yaml config --format json > rendered.json
+python scripts/pool_sizing.py check --compose rendered.json \
+  --max-connections 200 --superuser-reserved-connections 3 --reserved-connections 0 \
   --pooler none --backup 1 --monitoring 1 --operator 2 --other 0
 
 # Kubernetes: check what will be applied, rendered, rather than overlay sources.
@@ -109,16 +118,24 @@ What it counts:
 
 - **Gateway pools.** Every container or Compose service whose environment selects `STATE_BACKEND=postgres` is a gateway process. With no command it serves, and counts `DATABASE_POOL_MAX` (10 when unset) times its replica ceiling: the larger of `spec.replicas` and its HorizontalPodAutoscaler's `maxReplicas`, plus the Deployment's `maxSurge`; or the Compose `scale` or `deploy.replicas`. One that runs `migrate`, `import-standalone` or another one-shot command is a job, and its connections from the table above must fit inside the matching headroom entry.
 - **Headroom, by name.** `--migrator` (default 2), `--import` (default 2) and `--maintenance` (default 4: one `maintenance-run` and one other one-shot command at once) are the gateway's own consumers. Lower one only when that consumer cannot run, such as `--import 0` once the cutover is done. `--backup`, `--monitoring`, `--operator` and `--other` have no default, because only you know them: name each, even as 0.
-- **The server.** `max_connections - superuser_reserved_connections - reserved_connections`, from the flags or from the Compose file's own PostgreSQL service. Take them from `SHOW` on the real server.
+- **The server.** `max_connections - superuser_reserved_connections - reserved_connections`. Take them from `SHOW` on the real server and pass them as flags. The gateways' DSN is a secret file the guard does not read, so a PostgreSQL service in a Compose file is never assumed to be their server: it may be another application's database, such as an identity provider's. Either confirm it with `--server-service NAME`, and that service's command line supplies the limits (a setting it does not pass is taken as PostgreSQL's default, which the server's own configuration files can change, and the report says so), or pass the flags, and the report lists the file's PostgreSQL services as ignored. A file that runs PostgreSQL with neither is refused.
 - **The pooler.** `--pooler none` when the gateway connects to the primary directly. `--pooler session` takes `--pooler-server-connections`, the most server connections the pooler can open, which is budgeted on the server in place of the gateway pools and must be at least what the pools can ask for. `transaction` and `statement` are rejected whatever the arithmetic says, for the reasons above.
 
-What it refuses rather than guesses, with exit status 2: YAML outside the plain block style deployment files use (tags, multi-line plain scalars, complex keys); a Compose file that uses `include`, `env_file` or `extends`, or interpolates a sizing variable (render it with `docker compose config --format json` and check that instead); a Kustomization (render it); an `envFrom` source that is not in the files (`--external-env secret/NAME` declares one supplied elsewhere that sets neither `STATE_BACKEND` nor `DATABASE_POOL_MAX`); an autoscaler other than a HorizontalPodAutoscaler; a cluster-mode gateway in a DaemonSet, a bare Pod or a kind it does not model, such as an Argo Rollout; a CronJob whose runs can overlap; a replaced entrypoint; and any value the gateway would itself refuse at startup.
+JSON input, such as Compose's rendering, goes through Python's own JSON parser. YAML goes through the guard's own reader for the block style deployment files use. It is not a full YAML parser: it refuses what it does not support and what YAML tools read differently from each other, and its readings were compared with go-yaml and PyYAML on fuzzed documents, but a construct it still read differently from Compose or kubectl would be a misread rather than a refusal. CI also compares its reading of the HA example with Compose's rendering. When in doubt about a Compose file, check its JSON rendering instead.
 
-What it cannot see: hand scaling after the fact, server settings changed after the files were written, a role's or database's own `CONNECTION LIMIT`, and clients that are not in the files. The report lists the services it did not count; budget them under `--other`.
+What it refuses, with exit status 2:
+
+- YAML it does not support, or that YAML tools read differently from each other: tags, multi-line plain scalars, complex keys, null keys; a lone carriage return, NEL, LINE SEPARATOR, PARAGRAPH SEPARATOR, a control character, or a byte-order mark anywhere but the start, which Compose and kubectl read as line breaks or refuse; and a plain flow scalar that YAML tools split differently, such as `{DATABASE_POOL_MAX:5}`, which to YAML is one key `DATABASE_POOL_MAX:5` with no value rather than a pool of 5 (write `{DATABASE_POOL_MAX: 5}`). A `DATABASE_POOL_MAX` with a leading zero, which Compose reads as octal, and a document whose aliases would expand past a million nodes are refused too.
+- A Compose file that uses `include`, `env_file` or `extends`, or interpolates a sizing variable; a `compose.yaml` or `docker-compose.yml` with an override file beside it, which Compose merges over it when run without `-f`; and a file that runs PostgreSQL when neither `--server-service` nor the server's limits are given. Render the first two with `docker compose config --format json` and check that instead.
+- A Kustomization (render it); an `envFrom` source that is not in the files (`--external-env secret/NAME` declares one supplied elsewhere that sets neither `STATE_BACKEND` nor `DATABASE_POOL_MAX`); an autoscaler other than a HorizontalPodAutoscaler.
+- A cluster-mode gateway in a DaemonSet, a bare Pod, or an object of a kind the guard does not model that embeds the container anywhere (an Argo Rollout with a template, a Knative Service, an OpenShift Template). An object of such a kind that names a cluster-mode workload in the files by kind and name is refused too, because it runs or replaces that workload's pods where the guard cannot count them: an Argo Rollout's `workloadRef` (Argo scales the Deployment to 0 and runs the Rollout's own pods), a Flagger Canary's `targetRef` (Flagger runs a primary copy beside it), a VerticalPodAutoscaler (which evicts and replaces pods). A HorizontalPodAutoscaler is counted, not refused.
+- A CronJob whose runs can overlap; a replaced entrypoint; and any value the gateway would itself refuse at startup.
+
+What it cannot see: hand scaling after the fact; Compose files combined at deploy time with several `-f` flags or `COMPOSE_FILE` (check the rendering of the combination); environment baked into the image, so a custom image whose `ENV` sets `STATE_BACKEND=postgres` is reported as not counted; server settings changed after the files were written, or set in the server's configuration files rather than on its command line; a role's or database's own `CONNECTION LIMIT`; pods still draining (see [Replica ceilings](#replica-ceilings); the report notes them); and clients that are not in the files. The report lists the services it did not count; budget them under `--other`.
 
 ### The shipped examples
 
-The required `ha-compose-example` CI job runs `python scripts/pool_sizing.py examples`. It checks the Compose examples in `docs/deployment` and every manifest under `deploy/` against the headroom that `EXAMPLE_BUDGETS` in the script names for each cluster-mode example, so an example change that over-commits fails the build. The job also renders the HA example with `docker compose config` and requires the guard's reading of the file to match Compose's. A cluster-mode example without a budget, a budget for an example that no longer runs in cluster mode, an unreviewed new service beside the gateways, and a Kustomize overlay or patch that could move a replica count or pool size all fail too. Run the command before changing an example.
+The required `ha-compose-example` CI job runs `python scripts/pool_sizing.py examples`. It checks the Compose examples in `docs/deployment` and every manifest under `deploy/` against the headroom and the server that `EXAMPLE_BUDGETS` in the script names for each cluster-mode example (`server_service` for the PostgreSQL service in the file that its gateways use, or `server` for the limits of a server outside it), so an example change that over-commits fails the build. The job also renders the HA example with `docker compose config` and requires the guard's reading of the file to match Compose's. The Compose files at the repository root are overlays combined with `-f`, so no one file's budget would be the stack's; each must stay standalone, and then no combination of them can select cluster mode either. A cluster-mode example without a budget, a budget for an example that no longer runs in cluster mode, an unreviewed new service beside the gateways, and a Kustomize overlay or patch that could move a replica count or pool size all fail too. Run the command before changing an example.
 
 ## The timeouts
 

@@ -161,6 +161,70 @@ class ReaderTests(unittest.TestCase):
                 with self.assertRaisesRegex(sizing.InputError, message):
                     parse(text)
 
+    def test_flow_mapping_keys_end_only_at_a_value_indicator(self):
+        # A plain key's ':' is a value indicator only when a space, a tab or
+        # the end of the line follows it; otherwise it belongs to the key.
+        document, = parse("a: {k8s.io/x:y: v, url: http://h:80/p, 'q': \"r\"}\n"
+                          "b: [http://h:80/p, a:b]\n"
+                          "c: {x : y, z: }\n")
+        self.assertEqual(document["a"], {"k8s.io/x:y": "v", "url": "http://h:80/p", "q": "r"})
+        self.assertEqual(document["b"], ["http://h:80/p", "a:b"])
+        self.assertEqual(document["c"], {"x": "y", "z": None})
+
+    def test_flow_scalars_yaml_tools_split_differently_are_refused(self):
+        cases = [
+            # One key `DATABASE_POOL_MAX:5` with a null value to YAML, not a pool of 5.
+            ("e: {STATE_BACKEND: postgres, DATABASE_POOL_MAX:5}\n", "expected ':' in a flow mapping"),
+            ("e: {DATABASE_POOL_MAX:'5'}\n", "expected ':' in a flow mapping"),
+            # A ':' before a flow indicator or after a space.
+            ("e: {a:}\n", "beside a space or a flow indicator"),
+            ("e: {a:, b: c}\n", "beside a space or a flow indicator"),
+            ("e: {a :b}\n", "beside a space or a flow indicator"),
+            ("e: [a:]\n", "beside a space or a flow indicator"),
+            ("e: [a :b]\n", "beside a space or a flow indicator"),
+            ("e: [a: b]\n", "cannot contain ': '"),
+            # PyYAML ends a plain flow scalar at any '?'; go-yaml does not.
+            ("e: [a?b]\n", "at a '?'"),
+            ("e: {a: b?c}\n", "at a '?'"),
+            # Indicators that cannot open a plain flow scalar.
+            ("e: [:a]\n", "unsupported indicator ':'"),
+            ("e: [- a]\n", "unsupported indicator '-'"),
+            ("e: [a, , b]\n", "empty entry"),
+            ("e: {, a: b}\n", "empty entry"),
+        ]
+        for text, message in cases:
+            with self.subTest(text=text):
+                with self.assertRaisesRegex(sizing.InputError, message):
+                    parse(text)
+
+    def test_characters_yaml_tools_read_differently_are_refused(self):
+        for char in ("\r", "\x85", "\u2028", "\u2029", "\x0b", "\x0c", "\x1c", "\x7f", "\x00", "\ufeff"):
+            with self.subTest(char=repr(char)):
+                with self.assertRaisesRegex(sizing.InputError, r"fixture\.yaml:2: contains"):
+                    parse("a: 1\nb: x" + char + "  c: 2\n")
+        # CRLF line breaks are line breaks to every tool.
+        self.assertEqual(parse("a: 1\r\nb:\r\n  c: 2\r\n"), [{"a": "1", "b": {"c": "2"}}])
+
+    def test_a_byte_order_mark_may_only_open_the_file(self):
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "bom.yaml"
+            path.write_bytes(b"\xef\xbb\xbfa: 1\n")
+            self.assertEqual(sizing.load_documents(path, "bom"), [{"a": "1"}])
+            path.write_bytes(b"\xef\xbb\xbf\xef\xbb\xbfa: 1\n")
+            with self.assertRaisesRegex(sizing.InputError, "U\\+FEFF"):
+                sizing.load_documents(path, "bom")
+            path.write_bytes(b'{"a": "x\xe2\x80\xa8"}')
+            with self.assertRaisesRegex(sizing.InputError, "U\\+2028"):
+                sizing.load_documents(path, "json")
+
+    def test_aliases_cannot_expand_without_bound(self):
+        # Each level doubles the expanded size: 2**40 nodes in under 2 KB.
+        text = "a0: &a0 [x, x]\n" + "".join(f"a{n}: &a{n}\n  - *a{n - 1}\n  - *a{n - 1}\n" for n in range(1, 41))
+        self.assertLess(len(text), 2048)
+        with self.assertRaisesRegex(sizing.InputError, "expands to more than"):
+            parse(text)
+        self.assertEqual(parse("a0: &a0 [x, x]\na1:\n  - *a0\n  - *a0\n")[0]["a1"], [["x", "x"], ["x", "x"]])
+
     def test_json_input_is_read_and_duplicate_keys_are_refused(self):
         with tempfile.TemporaryDirectory() as temp:
             good, bad = Path(temp) / "good.json", Path(temp) / "bad.json"
@@ -350,9 +414,16 @@ services:
 """
 
 
+CONFIRMED = ["--server-service", "db"]
+
+
 class ComposeTests(Files):
-    def compose(self, text, *extra, flags=DIRECT):
-        return decision("--compose", self.write("compose.yml", text), *flags, *extra)
+    def compose(self, text, *extra, flags=DIRECT, server=CONFIRMED):
+        return decision("--compose", self.write("compose.yml", text), *server, *flags, *extra)
+
+    def compose_invalid(self, text, message, *extra, server=CONFIRMED):
+        self.assertInvalid(["check", "--compose", self.write("compose.yml", text), *server, *DIRECT, *extra],
+                           message)
 
     def test_the_shipped_example_reads_as_two_pools_two_jobs_and_its_own_server(self):
         document, = sizing.load_documents(ROOT / COMPOSE_EXAMPLE, COMPOSE_EXAMPLE)
@@ -360,23 +431,56 @@ class ComposeTests(Files):
         self.assertEqual([(pool["name"], pool["replicas"], pool["pool_max"]) for pool in facts["pools"]],
                          [("service gateway-1", 1, 10), ("service gateway-2", 1, 10)])
         self.assertEqual(sorted(job["command"] for job in facts["jobs"]), ["import-standalone", "migrate"])
-        self.assertEqual(facts["server_service"], "db")
-        self.assertEqual(facts["server"]["max_connections"], (100, "service db command"))
-        self.assertEqual(facts["server"]["superuser_reserved_connections"], (3, "PostgreSQL default"))
+        self.assertEqual(list(facts["servers"]), ["db"])
+        limits = sizing.compose_server_limits("db", facts["servers"]["db"], "db")
+        self.assertEqual(limits["max_connections"], (100, "service db command"))
+        self.assertEqual(limits["superuser_reserved_connections"][0], 3)
+        self.assertIn("PostgreSQL default", limits["superuser_reserved_connections"][1])
         self.assertEqual(sorted(facts["uncounted"]), ["db-bootstrap", "db-grants", "lb"])
 
-    def test_server_limits_come_from_the_database_service_command(self):
+    def test_server_limits_come_from_the_confirmed_database_service_command(self):
         code, result = self.compose(COMPOSE)
         self.assertEqual(code, 0)
         self.assertEqual(result["available"], 58)
+        self.assertEqual(result["server_service"], "db")
         self.assertEqual(result["server"]["superuser_reserved_connections"]["origin"], "service db command")
+        self.assertIn("not on the service's command line", result["server"]["reserved_connections"]["origin"])
+        self.assertTrue(any("SHOW it on the running server" in note for note in result["notes"]))
         self.assertEqual(result["uncounted"], ["lb"])
         self.assertEqual(result["required"], {"migrator": 2})
 
-    def test_server_flags_conflict_with_a_compose_database(self):
-        code, _, err = run("check", "--compose", self.write("compose.yml", COMPOSE), *SERVER, *DIRECT)
-        self.assertEqual(code, 2)
-        self.assertIn("runs its own PostgreSQL (service db)", err)
+    def test_a_postgres_service_is_never_assumed_to_be_the_gateways_server(self):
+        # The gateways' DSN is a secret file, so a PostgreSQL service beside
+        # them may be some other application's database.
+        self.compose_invalid(COMPOSE, r"runs PostgreSQL \(db\).*--server-service NAME", server=())
+
+    def test_declared_server_limits_are_authoritative_and_the_files_postgres_is_ignored(self):
+        # An identity provider's database beside four gateways that use a
+        # managed server with max_connections=40: 40 + 12 = 52 of 37.
+        text = ("x-env: &env\n  STATE_BACKEND: postgres\nservices:\n  keycloak-db:\n    image: postgres:16\n"
+                "  gateway:\n    image: gateway\n    scale: 4\n    environment: *env\n")
+        flags = ["--max-connections", "40", "--superuser-reserved-connections", "3", "--reserved-connections", "0"]
+        self.compose_invalid(text, r"runs PostgreSQL \(keycloak-db\)", server=())
+        code, result = self.compose(text, server=flags)
+        self.assertEqual((code, result["status"], result["total"], result["available"]), (1, "rejected", 52, 37))
+        self.assertEqual((result["server_service"], result["ignored_servers"]), (None, ["keycloak-db"]))
+        self.assertEqual(result["server"]["max_connections"], {"value": 40, "origin": "declared"})
+        code, out, _ = run("check", "--compose", self.write("compose.yml", text), *flags, *DIRECT)
+        self.assertEqual(code, 1)
+        self.assertIn("ignored, runs PostgreSQL that is not the gateways' server: keycloak-db", out)
+        # The ignored server's own settings are not read, so they cannot refuse the check.
+        broken = text.replace("    image: postgres:16\n", "    image: postgres:16\n"
+                              "    command: [postgres, -c, config_file=/etc/pg.conf]\n")
+        self.assertEqual(self.compose(broken, server=flags)[0], 1)
+
+    def test_the_server_service_must_be_a_postgres_service_and_excludes_declared_limits(self):
+        self.compose_invalid(COMPOSE, "name either the server service or the server's limits, not both",
+                             server=CONFIRMED + SERVER)
+        self.compose_invalid(COMPOSE, "service lb is named as the gateways' PostgreSQL server.*runs PostgreSQL as db",
+                             server=["--server-service", "lb"])
+        self.compose_invalid(COMPOSE, "service nope is named", server=["--server-service", "nope"])
+        self.assertInvalid(["check", "--replicas", "1", "--surge", "0", "--server-service", "db", *SERVER, *DIRECT],
+                           "names a service of a Compose file")
 
     def test_postgres_command_line_forms(self):
         cases = [
@@ -400,9 +504,11 @@ class ComposeTests(Files):
             with self.subTest(command=command):
                 text = COMPOSE.replace("[postgres, -c, max_connections=60, -c, superuser_reserved_connections=2]",
                                        command)
-                self.assertInvalid(["check", "--compose", self.write("compose.yml", text), *DIRECT], message)
+                self.compose_invalid(text, message)
         two = COMPOSE + "  db2:\n    image: postgres:16\n"
-        self.assertInvalid(["check", "--compose", self.write("compose.yml", two), *DIRECT], "both run PostgreSQL")
+        self.compose_invalid(two, r"runs PostgreSQL \(db, db2\)", server=())
+        code, result = self.compose(two)
+        self.assertEqual((code, result["server_service"], result["ignored_servers"]), (0, "db", ["db2"]))
 
     def test_replicas_scale_and_start_first_surge(self):
         gateway = "  gateway:\n    image: gateway\n    environment: *env\n"
@@ -422,8 +528,28 @@ class ComposeTests(Files):
                                ("    deploy:\n      mode: global\n", "deploy.mode"),
                                ("    scale: two\n", "whole number")]:
             with self.subTest(extra=extra):
-                self.assertInvalid(["check", "--compose", self.write("compose.yml", COMPOSE.replace(
-                    gateway, gateway + extra)), *DIRECT], message)
+                self.compose_invalid(COMPOSE.replace(gateway, gateway + extra), message)
+
+    def test_line_breaks_yaml_tools_disagree_about_are_refused(self):
+        # Compose reads a lone CR, NEL, LS or PS as a line break, so this is a
+        # cluster-mode gateway at pool 50 to it; it must not read as an image.
+        for char in ("\r", "\x85", "\u2028", "\u2029"):
+            with self.subTest(char=repr(char)):
+                gateway = char.join(["    image: gateway", "    environment:", "      - STATE_BACKEND=postgres",
+                                     "      - DATABASE_POOL_MAX=50\n"])
+                text = ("services:\n  db:\n    image: postgres:16\n    command: [postgres, -c, max_connections=20]\n"
+                        "  gw:\n" + gateway)
+                self.compose_invalid(text, r"compose\.yml:6: contains")
+
+    def test_a_flow_mapping_key_with_a_colon_is_not_a_sizing_variable(self):
+        # To Compose this is `DATABASE_POOL_MAX:5` with no value, so the four
+        # gateways run at the default pool of 10, not at 5.
+        text = ("services:\n  db:\n    image: postgres:16\n    command: [postgres, -c, max_connections=40]\n"
+                "  gateway:\n    image: gateway\n    scale: 4\n"
+                "    environment: {STATE_BACKEND: postgres, DATABASE_POOL_MAX:5}\n")
+        self.compose_invalid(text, r"compose\.yml:8: expected ':' in a flow mapping")
+        _, result = self.compose(text.replace("DATABASE_POOL_MAX:5", "DATABASE_POOL_MAX: 5"))
+        self.assertEqual(result["pools"][0]["pool_max"], 5)
 
     def test_environment_list_form_and_trimmed_backend(self):
         text = COMPOSE.replace("    environment: *env\n  migrate", "    environment:\n"
@@ -441,16 +567,16 @@ class ComposeTests(Files):
             ('DATABASE_POOL_MAX: "257"', "between 1 and 256"),
             ('DATABASE_POOL_MAX: "+10"', "between 1 and 256"),
             ('DATABASE_POOL_MAX: " 10"', "between 1 and 256"),
+            # Compose reads a plain 010 as octal 8; the gateway would read "010" as 10.
+            ("DATABASE_POOL_MAX: 010", "leading zero"),
         ]
         for line, message in cases:
             with self.subTest(line=line):
-                text = COMPOSE.replace('DATABASE_POOL_MAX: "10"', line)
-                self.assertInvalid(["check", "--compose", self.write("compose.yml", text), *DIRECT], message)
+                self.compose_invalid(COMPOSE.replace('DATABASE_POOL_MAX: "10"', line), message)
         for value in ("postgresql", '""', "${MODE}"):
             with self.subTest(value=value):
-                text = COMPOSE.replace("STATE_BACKEND: postgres", f"STATE_BACKEND: {value}")
-                self.assertInvalid(["check", "--compose", self.write("compose.yml", text), *DIRECT],
-                                   "STATE_BACKEND")
+                self.compose_invalid(COMPOSE.replace("STATE_BACKEND: postgres", f"STATE_BACKEND: {value}"),
+                                     "STATE_BACKEND")
 
     def test_files_the_guard_cannot_see_through_are_refused(self):
         cases = [
@@ -461,11 +587,24 @@ class ComposeTests(Files):
         ]
         for extra, message in cases:
             with self.subTest(extra=extra):
-                text = COMPOSE.replace("    environment: *env\n  migrate", "    environment: *env\n" + extra
-                                       + "  migrate", 1)
-                self.assertInvalid(["check", "--compose", self.write("compose.yml", text), *DIRECT], message)
-        self.assertInvalid(["check", "--compose", self.write("compose.yml", "include:\n  - other.yml\n" + COMPOSE),
-                            *DIRECT], "includes other Compose files")
+                self.compose_invalid(COMPOSE.replace("    environment: *env\n  migrate", "    environment: *env\n"
+                                                     + extra + "  migrate", 1), message)
+        self.compose_invalid("include:\n  - other.yml\n" + COMPOSE, "includes other Compose files")
+
+    def test_a_default_named_file_with_an_override_beside_it_is_refused(self):
+        # Compose run without -f merges the override file over compose.yaml.
+        for name, override in [("compose.yaml", "compose.override.yaml"),
+                               ("docker-compose.yml", "docker-compose.override.yml")]:
+            with self.subTest(name=name):
+                path = self.write(name, COMPOSE)
+                self.assertEqual(decision("--compose", path, *CONFIRMED, *DIRECT)[0], 0)
+                self.write(override, "services:\n  gateway:\n    scale: 9\n")
+                self.assertInvalid(["check", "--compose", path, *CONFIRMED, *DIRECT], f"merges {override} over")
+                (self.root / override).unlink()
+        # A file Compose reads only through -f takes no override.
+        self.write("docker-compose.override.yml", "services: {}\n")
+        self.assertEqual(decision("--compose", self.write("docker-compose.ha.yml", COMPOSE), *CONFIRMED, *DIRECT)[0],
+                         0)
 
     def test_the_gateway_entrypoint_may_be_named_explicitly(self):
         text = COMPOSE.replace("    command: [migrate, up]", "    entrypoint: [/usr/local/bin/gateway, migrate, up]")
@@ -483,9 +622,9 @@ class ComposeTests(Files):
 
     def test_rendered_compose_json_is_accepted(self):
         document, = sizing.load_documents(ROOT / COMPOSE_EXAMPLE, COMPOSE_EXAMPLE)
-        _, direct = decision("--compose", str(ROOT / COMPOSE_EXAMPLE), *DIRECT)
+        _, direct = decision("--compose", str(ROOT / COMPOSE_EXAMPLE), *CONFIRMED, *DIRECT)
         rendered = self.write("rendered.json", json.dumps(document))
-        code, result = decision("--compose", rendered, *DIRECT)
+        code, result = decision("--compose", rendered, *CONFIRMED, *DIRECT)
         self.assertEqual((code, result["total"]), (0, direct["total"]))
 
 
@@ -653,6 +792,71 @@ class KubernetesTests(Files):
         self.invalid("apiVersion: kustomize.config.k8s.io/v1beta1\nkind: Kustomization\nmetadata:\n  name: k\n",
                      "render it with `kubectl kustomize`")
 
+    def test_unmodelled_kinds_that_run_a_gateway_workload_by_reference_are_refused(self):
+        scaled_to_zero = DEPLOYMENT.replace("  replicas: 3\n", "  replicas: 0\n")
+        rollout = ("---\napiVersion: argoproj.io/v1alpha1\nkind: Rollout\nmetadata:\n  name: gateway\nspec:\n"
+                   "  replicas: 20\n  workloadRef:\n    apiVersion: apps/v1\n    kind: Deployment\n"
+                   "    name: gateway\n    scaleDown: onsuccess\n")
+        # Argo scales the Deployment to 0 and runs the Rollout's 20 pods.
+        self.invalid(scaled_to_zero + rollout, "Rollout/gateway refers to .*Deployment/gateway, which runs the "
+                     "gateway in cluster mode")
+        canary = ("---\napiVersion: flagger.app/v1beta1\nkind: Canary\nmetadata:\n  name: gateway\nspec:\n"
+                  "  targetRef:\n    apiVersion: apps/v1\n    kind: Deployment\n    name: gateway\n"
+                  "  autoscalerRef:\n    apiVersion: autoscaling/v2\n    kind: HorizontalPodAutoscaler\n"
+                  "    name: gateway\n")
+        self.invalid(DEPLOYMENT + canary, "Canary/gateway refers to")
+        vpa = ("---\napiVersion: autoscaling.k8s.io/v1\nkind: VerticalPodAutoscaler\nmetadata:\n  name: gateway\n"
+               "spec:\n  targetRef:\n    apiVersion: apps/v1\n    kind: Deployment\n    name: gateway\n")
+        self.invalid(DEPLOYMENT + vpa, "VerticalPodAutoscaler/gateway refers to")
+        # A StatefulSet is matched too, and a missing namespace may be any namespace.
+        self.invalid(DEPLOYMENT.replace("kind: Deployment", "kind: StatefulSet").replace(
+            "metadata:\n  name: gateway\nspec:", "metadata:\n  name: gateway\n  namespace: prod\nspec:")
+            .replace("metadata:\n  name: gateway\ndata:", "metadata:\n  name: gateway\n  namespace: prod\ndata:")
+            + rollout.replace("kind: Deployment", "kind: StatefulSet"), "refers to")
+        # A reference to a standalone workload, or to one in another namespace, runs no pool.
+        code, result = self.kubernetes(scaled_to_zero.replace("  STATE_BACKEND: postgres\n", "") + rollout)
+        self.assertEqual((code, result["pools"]), (0, []))
+        elsewhere = rollout.replace("  name: gateway\nspec:", "  name: gateway\n  namespace: other\nspec:")
+        namespaced = DEPLOYMENT.replace("metadata:\n  name: gateway\nspec:",
+                                        "metadata:\n  name: gateway\n  namespace: prod\nspec:").replace(
+            "metadata:\n  name: gateway\ndata:", "metadata:\n  name: gateway\n  namespace: prod\ndata:")
+        self.assertEqual(self.kubernetes(namespaced + elsewhere)[0], 0)
+        # The HorizontalPodAutoscaler is modelled, so its reference is counted, not refused.
+        self.assertEqual(self.kubernetes(DEPLOYMENT + HPA)[1]["pools"][0]["autoscaler_max"], 6)
+
+    def test_a_scaler_that_leaves_out_the_target_kind_matches_any_workload(self):
+        keda = ("---\napiVersion: keda.sh/v1alpha1\nkind: ScaledObject\nmetadata:\n  name: gateway\nspec:\n"
+                "  scaleTargetRef:\n    name: gateway\n  maxReplicaCount: 50\n")
+        self.invalid(DEPLOYMENT + keda, "reads only HorizontalPodAutoscaler")
+
+    def test_unmodelled_kinds_that_embed_a_cluster_mode_container_anywhere_are_refused(self):
+        template = ("apiVersion: template.openshift.io/v1\nkind: Template\nmetadata:\n  name: gateway\nobjects:\n"
+                    "  - apiVersion: apps/v1\n    kind: Deployment\n    metadata:\n      name: gateway\n"
+                    "    spec:\n      template:\n        spec:\n          containers:\n            - name: gateway\n"
+                    "              image: gateway\n              env:\n                - name: STATE_BACKEND\n"
+                    "                  value: postgres\n")
+        self.invalid(template, "Template/gateway container gateway runs the gateway in cluster mode")
+        workflow = ("apiVersion: argoproj.io/v1alpha1\nkind: Workflow\nmetadata:\n  name: w\nspec:\n  templates:\n"
+                    "    - name: serve\n      container:\n        image: gateway\n        env:\n"
+                    "          - name: STATE_BACKEND\n            value: postgres\n")
+        self.invalid(workflow, "Workflow/w container None runs the gateway in cluster mode")
+        self.assertEqual(self.kubernetes(workflow.replace("value: postgres", "value: sqlite"))[0], 0)
+
+    def test_any_object_with_items_is_a_list(self):
+        configmap, deployment = (part for part in DEPLOYMENT.split("---\n"))
+        items = [sizing._Yaml(configmap, "c").documents()[0], sizing._Yaml(deployment, "d").documents()[0]]
+        listed = self.write("list.json", json.dumps({"apiVersion": "apps/v1", "kind": "DeploymentList",
+                                                     "metadata": {"name": "x"}, "items": [
+                                                         {"kind": "List", "items": items}]}))
+        code, result = decision("--kubernetes", listed, *SERVER, *DIRECT)
+        self.assertEqual((code, result["pool_connections"]), (0, 40))
+
+    def test_reports_with_pools_note_pods_that_are_still_draining(self):
+        _, result = self.kubernetes(DEPLOYMENT)
+        self.assertTrue(any("shutting down keeps its pool" in note for note in result["notes"]))
+        _, result = self.kubernetes(DEPLOYMENT.replace("  STATE_BACKEND: postgres\n", ""))
+        self.assertFalse(any("shutting down" in note for note in result["notes"]))
+
     def test_standalone_workloads_open_no_pool(self):
         code, result = self.kubernetes(DEPLOYMENT.replace("  STATE_BACKEND: postgres\n", ""))
         self.assertEqual((code, result["pools"], result["uncounted"]), (0, [], ["Deployment/gateway"]))
@@ -663,6 +867,14 @@ class KubernetesTests(Files):
         listed = self.write("list.json", json.dumps({"apiVersion": "v1", "kind": "List", "items": items}))
         code, result = decision("--kubernetes", listed, *SERVER, *DIRECT)
         self.assertEqual((code, result["pool_connections"]), (0, 40))
+
+    def test_line_breaks_yaml_tools_disagree_about_are_refused(self):
+        # kubectl reads the ConfigMap below as setting STATE_BACKEND=postgres.
+        for char in ("\r", "\x85", "\u2028", "\u2029"):
+            with self.subTest(char=repr(char)):
+                text = DEPLOYMENT.replace("  STATE_BACKEND: postgres\n", "  LOG: info" + char + "  STATE_BACKEND: "
+                                          "postgres\n")
+                self.invalid(text, r"manifests\.yaml:6: contains")
 
     def test_external_env_belongs_to_kubernetes_input(self):
         self.assertInvalid(["check", "--replicas", "1", "--surge", "0", "--external-env", "secret/x", *SERVER,
@@ -685,6 +897,7 @@ class ExampleTests(Files):
     def test_the_shipped_examples_fit(self):
         results = {result["source"]: result for result in sizing.examples(ROOT)}
         compose = results.pop(COMPOSE_EXAMPLE)
+        self.assertEqual(compose["server_service"], "db")
         self.assertEqual(compose["status"], "fits")
         self.assertLessEqual(compose["total"], compose["available"])
         self.assertTrue(results)
@@ -727,8 +940,12 @@ class ExampleTests(Files):
         self.assertEqual((kubernetes["status"], kubernetes["pool_connections"], kubernetes["total"]),
                          ("rejected", 20, 32))
         entry = budgets["deploy/kubernetes/greengateway.example.yaml"]
-        for broken, message in [({k: v for k, v in entry.items() if k != "server"}, "must name the server's"),
-                                ({**entry, "headrooms": {}}, "needs pooler, headroom and uncounted"),
+        for broken, message in [({k: v for k, v in entry.items() if k != "server"}, "exactly one of server"),
+                                ({**entry, "server_service": "db"}, "exactly one of server"),
+                                ({**entry, "headrooms": {}}, "needs pooler, headroom, uncounted"),
+                                ({**entry, "server": {"max_connections": 20}}, "must name the server's"),
+                                ({**{k: v for k, v in entry.items() if k != "server"}, "server_service": "db"},
+                                 "this is not a Compose file"),
                                 ({**entry, "headroom": {**entry["headroom"], "backup": "one"}}, "whole number")]:
             with self.subTest(broken=broken):
                 with mock.patch.object(sizing, "EXAMPLE_BUDGETS", {
@@ -776,8 +993,46 @@ class ExampleTests(Files):
         differing = self.write("differing.json", json.dumps({**document, "services": services}))
         with self.assertRaisesRegex(sizing.InputError, "reads pools differently from Compose's rendering"):
             sizing.examples(self.root, {COMPOSE_EXAMPLE: differing})
-        with self.assertRaisesRegex(sizing.InputError, "not a shipped Compose example"):
+        with self.assertRaisesRegex(sizing.InputError, "not a Compose example in docs/deployment"):
             sizing.examples(self.root, {"docker-compose.yml": agreeing})
+
+    def test_the_example_budget_names_the_server_its_gateways_use(self):
+        budget = sizing.EXAMPLE_BUDGETS[COMPOSE_EXAMPLE]
+        self.assertEqual(budget["server_service"], "db")
+        compose = sizing.examples(self.root)[0]
+        self.assertEqual((compose["server_service"], compose["ignored_servers"]), ("db", []))
+        for broken, message in [({**budget, "server_service": "lb"}, "service lb is named"),
+                                ({**budget, "server": dict(sizing.POSTGRES_DEFAULTS)}, "exactly one of server")]:
+            with self.subTest(broken=broken):
+                with mock.patch.object(sizing, "EXAMPLE_BUDGETS", {COMPOSE_EXAMPLE: broken}):
+                    with self.assertRaisesRegex(sizing.InputError, message):
+                        sizing.examples(self.root)
+        # Limits in the budget instead: the file's own PostgreSQL is reported as ignored.
+        declared = {k: v for k, v in budget.items() if k != "server_service"}
+        declared["server"] = {"max_connections": 40, "superuser_reserved_connections": 3, "reserved_connections": 0}
+        with mock.patch.object(sizing, "EXAMPLE_BUDGETS", {COMPOSE_EXAMPLE: declared}):
+            compose = sizing.examples(self.root)[0]
+        self.assertEqual((compose["status"], compose["available"], compose["ignored_servers"]),
+                         ("fits", 37, ["db"]))
+
+    def test_repository_root_compose_overlays_must_stay_standalone(self):
+        self.write("docker-compose.yml", "services:\n  gateway:\n    image: gateway\n")
+        self.write("docker-compose.load.yml", "services:\n  gateway:\n    environment:\n      X: '1'\n")
+        results = {result["source"]: result for result in sizing.examples(self.root)}
+        self.assertEqual(results["docker-compose.load.yml"]["status"], "standalone")
+        self.write("docker-compose.load.yml", "services:\n  gateway:\n    environment:\n"
+                   "      STATE_BACKEND: postgres\n")
+        with self.assertRaisesRegex(sizing.InputError, "overlays combined with -f"):
+            sizing.examples(self.root)
+        self.write("docker-compose.load.yml", "services:\n  gateway:\n    env_file: gateway.env\n")
+        with self.assertRaisesRegex(sizing.InputError, "uses env_file"):
+            sizing.examples(self.root)
+
+    def test_the_shipped_repository_root_compose_files_are_checked(self):
+        sources = {result["source"] for result in sizing.examples(ROOT)}
+        shipped = {path.name for pattern in ("docker-compose*.y*ml", "compose*.y*ml") for path in ROOT.glob(pattern)}
+        self.assertTrue(shipped)
+        self.assertLessEqual(shipped, sources)
 
 
 class WorkflowTests(unittest.TestCase):

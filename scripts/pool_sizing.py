@@ -59,11 +59,16 @@ COMMANDS = {
 # What the shipped cluster-mode examples budget beyond their gateway pools.
 # `uncounted` is the reviewed list of services that open no gateway pool, so a
 # client added to an example is rejected until its connections are budgeted.
+# Each names the server its gateways use: `server_service`, a PostgreSQL
+# service in the file, or `server`, that server's three limits.
 EXAMPLE_BUDGETS = {
     "docs/deployment/docker-compose.ha.yml": {
         "pooler": "none",
         "headroom": {"backup": 1, "monitoring": 1, "operator": 2, "other": 0},
         "uncounted": ["db-bootstrap", "db-grants", "lb"],
+        # The example's own PostgreSQL container is the server its gateways'
+        # DSN files name.
+        "server_service": "db",
     },
 }
 KUSTOMIZATION_KEYS = {"apiVersion", "kind", "resources", "patches", "namespace", "commonLabels",
@@ -81,6 +86,11 @@ POD_TEMPLATES = {
     "CronJob": ("spec", "jobTemplate", "spec", "template", "spec"),
     "Pod": ("spec",),
 }
+# The files Compose reads when it is run without -f, and the override file it
+# then merges over them.
+COMPOSE_DEFAULT_FILES = ("compose.yaml", "compose.yml", "docker-compose.yml", "docker-compose.yaml")
+COMPOSE_OVERRIDE_FILES = ("compose.override.yml", "compose.override.yaml", "docker-compose.override.yml",
+                          "docker-compose.override.yaml")
 POSTGRES_IMAGE = re.compile(
     r"(?:(?:docker\.io|index\.docker\.io|registry-1\.docker\.io)/)?(?:library/)?postgres(?:[:@].*)?")
 
@@ -97,21 +107,64 @@ class Unresolved:
 
 
 # ---------------------------------------------------------------------------
-# A strict reader for the block-style YAML that deployment files use.
+# A conservative reader for the block-style YAML that deployment files use.
+
+# Characters YAML tools disagree about. Compose, kubectl and PyYAML break lines
+# on a lone carriage return, NEL, LINE SEPARATOR and PARAGRAPH SEPARATOR, where
+# this reader would not, and YAML refuses the remaining control characters. A
+# byte-order mark may only open the file. Refusing all of them keeps the guard
+# from reading a document other than the one the deployment tool reads.
+AMBIGUOUS_CHARACTER = re.compile(
+    "[^\t\n\r\x20-\x7e\xa0-\u2027\u202a-\ud7ff\ue000-\ufefe\uff00-\ufffd\U00010000-\U0010ffff]|\r(?!\n)")
+# How many nodes a document may expand to once its aliases are followed, so a
+# small file of nested aliases cannot make every later walk take for ever.
+MAX_EXPANDED_NODES = 1_000_000
+NULLS = ("~", "null", "Null", "NULL")
+
+
+def refuse_ambiguous_characters(text, source):
+    match = AMBIGUOUS_CHARACTER.search(text)
+    if match is None:
+        return
+    line = text.count("\n", 0, match.start()) + 1
+    char = match.group(0)
+    what = ("a carriage return that does not end a CRLF line break" if char == "\r"
+            else f"the character U+{ord(char):04X}")
+    raise InputError(f"{source}:{line}: contains {what}, which YAML tools read as a line break or refuse; "
+                     "the guard refuses it rather than read the file differently from them")
+
+
+def expanded_size(node, where, sizes=None):
+    """How many nodes `node` holds, a shared (aliased) node counted each time it appears."""
+    sizes = {} if sizes is None else sizes
+    if not isinstance(node, (dict, list)):
+        return 1
+    if id(node) in sizes:
+        return sizes[id(node)]
+    total = 1
+    for child in node.values() if isinstance(node, dict) else node:
+        total += expanded_size(child, where, sizes)
+        if total > MAX_EXPANDED_NODES:
+            raise InputError(f"{where}: expands to more than {MAX_EXPANDED_NODES} nodes once its aliases are "
+                             "followed")
+    sizes[id(node)] = total
+    return total
 
 
 class _Yaml:
     """Block mappings and sequences, single-line plain and quoted scalars,
     literal and folded block scalars, single-line flow collections of scalars,
-    anchors, aliases, merge keys and comments. Anything else (tags,
-    directives, complex keys, multi-line plain, quoted or flow scalars) is
-    refused rather than guessed at: a misread pool size is worse than none.
+    anchors, aliases, merge keys and comments. Anything else it knows of
+    (tags, directives, complex keys, multi-line plain, quoted or flow scalars,
+    characters YAML tools disagree about, flow scalars that YAML tools split
+    differently) is refused: a misread pool size is worse than none. It is
+    not a full YAML parser, so CI also compares its reading of the HA example
+    with Compose's own rendering.
     """
 
     def __init__(self, text, source):
         self.source = source
-        if text.startswith("\ufeff"):
-            text = text[1:]
+        refuse_ambiguous_characters(text, source)
         self.lines = text.replace("\r\n", "\n").split("\n")
         if self.lines[-1] == "":
             # The last line break ends a line; it does not start another.
@@ -141,9 +194,11 @@ class _Yaml:
                 self.index += 1
                 continue
             self.anchors = {}
+            start = self.index
             node = self.node(0)
             if self.peek() is not None:
                 self.fail("unexpected content after the document")
+            expanded_size(node, f"{self.source}:{start + 1}: the document")
             if node is not None:
                 documents.append(node)
 
@@ -184,7 +239,9 @@ class _Yaml:
             return self.sequence(indent)
         if self.split_key(content) is not None:
             return self.mapping(indent)
-        return self.value(content, indent, "node")
+        # A node on a line of its own belongs to the collection above it, so a
+        # block scalar here may indent its content less than its header.
+        return self.value(content, indent, "node", minimum - 1)
 
     @staticmethod
     def sequence_entry(content):
@@ -204,6 +261,8 @@ class _Yaml:
             if split is None:
                 self.fail("expected a mapping entry")
             key, rest, quoted = split
+            if not quoted and key in NULLS:
+                self.fail("a null mapping key is not supported")
             start = self.index
             value = self.value(rest, indent, "map")
             if key == "<<" and not quoted:
@@ -233,6 +292,8 @@ class _Yaml:
             if not self.sequence_entry(head[1]):
                 break
             rest = head[1][1:]
+            if "\t" in rest[:len(rest) - len(rest.lstrip(" \t"))]:
+                self.fail("a tab cannot follow a sequence entry's dash")
             stripped = rest.lstrip(" ")
             if stripped == "" or stripped.startswith("#"):
                 self.index += 1
@@ -268,8 +329,8 @@ class _Yaml:
             if after[:1] == ":" and after[1:2] in ("", " ", "\t"):
                 return key, after[1:].strip(" \t"), True
             return None
-        if content[:1] in tuple("[]{},#&*!|>%@`") or self.sequence_entry(content) or content == "?" \
-                or content.startswith("? "):
+        if content[:1] in tuple("[]{},#&*!|>%@`") or self.sequence_entry(content) \
+                or (content[:1] == "?" and content[1:2] in ("", " ", "\t")):
             return None
         comment = re.search(r"[ \t]#", content)
         match = re.search(r":(?=[ \t]|$)", content[:comment.start()] if comment else content)
@@ -277,8 +338,12 @@ class _Yaml:
             return None
         return content[:match.start()].rstrip(" \t"), content[match.end():].strip(" \t"), False
 
-    def value(self, text, indent, context):
-        """The node a line's text starts, leaving the index after it."""
+    def value(self, text, indent, context, parent=None):
+        """The node a line's text starts, leaving the index after it.
+
+        `parent` is the indentation a block scalar's content must exceed,
+        when that is not the line's own.
+        """
         if text == "" or text.startswith("#"):
             self.index += 1
             return self.nested(indent, context)
@@ -297,17 +362,17 @@ class _Yaml:
                 return self.anchors[name]
             if rest[:1] in ("&", "*"):
                 self.fail("an anchored node cannot be an alias or carry two anchors")
-            node = self.value(rest, indent, context)
+            node = self.value(rest, indent, context, parent)
             self.anchors[name] = node
             return node
         if text[0] == "!":
             self.fail("YAML tags are not supported")
         if text[0] in "%@`":
             self.fail(f"reserved indicator {text[0]!r}")
-        if text[:2] in ("? ", "?"):
+        if text[:1] == "?" and text[1:2] in ("", " ", "\t"):
             self.fail("complex mapping keys are not supported")
         if text[0] in "|>":
-            return self.block_scalar(text, indent)
+            return self.block_scalar(text, indent if parent is None else parent)
         if text[0] in "[{":
             node, end = self.flow(text, 0)
             self.trailing(text[end:])
@@ -325,7 +390,7 @@ class _Yaml:
         if re.search(r":([ \t]|$)", plain):
             self.fail("a plain scalar cannot contain ': '; quote it")
         self.end_of_value(indent)
-        return None if plain in ("~", "null", "Null", "NULL") else plain
+        return None if plain in NULLS else plain
 
     def trailing(self, rest):
         rest = rest.strip(" \t")
@@ -382,8 +447,11 @@ class _Yaml:
                 self.fail("a flow collection must close on its own line")
             if text[index] == closer:
                 return result, index + 1
+            plain = text[index] not in "'\""
             item, index = self.flow_scalar(text, index, closer, closer == "}")
             if closer == "}":
+                if plain and item is None:
+                    self.fail("a null mapping key is not supported")
                 index = self.skip_spaces(text, index)
                 if text[index:index + 1] != ":":
                     self.fail("expected ':' in a flow mapping")
@@ -400,24 +468,40 @@ class _Yaml:
                 self.fail("expected ',' or the end of the flow collection")
 
     def flow_scalar(self, text, index, closer, key):
+        """A flow entry's scalar. A plain one ends at a flow indicator, or as a
+        key at a ':' that a space, a tab or the end of the line follows; any
+        other ':' belongs to the scalar, as YAML has it. Where YAML tools split
+        a plain flow scalar differently from each other (a '?', a ':' beside a
+        space or a flow indicator) it is refused."""
         if index >= len(text):
             self.fail("a flow collection must close on its own line")
-        if text[index] in "[{":
+        char, after = text[index], text[index + 1:index + 2]
+        if char in "[{":
             self.fail("nested flow collections are not supported")
-        if text[index] in "&*!|>%@`#" or (text[index] == "?" and text[index + 1:index + 2] in ("", " ", "\t")):
-            self.fail(f"unsupported indicator {text[index]!r} in a flow collection")
-        if text[index] in "'\"":
+        if char in "&*!|>%@`#?:" or (char == "-" and after in ("", " ", "\t", ",", "]", "}")):
+            self.fail(f"unsupported indicator {char!r} in a flow collection")
+        if char in "'\"":
             return self.quoted(text, index)
-        stops = ",[]{}" + (":" if key else "")
         end = index
-        while end < len(text) and text[end] not in stops:
+        while end < len(text) and text[end] not in ",[]{}":
+            char, after = text[end], text[end + 1:end + 2]
+            if char == "?":
+                self.fail("YAML tools split a plain flow scalar at a '?' differently; quote the scalar")
+            if char == ":":
+                if after in ("", " ", "\t"):
+                    if key:
+                        break
+                    self.fail("a flow scalar cannot contain ': '; quote it")
+                if after in ",[]{}" or text[end - 1] in " \t":
+                    self.fail("YAML tools read a ':' beside a space or a flow indicator differently; quote the "
+                              "scalar or put one space after the ':'")
             end += 1
         plain = text[index:end].strip(" \t")
         if re.search(r"[ \t]#", plain):
             self.fail("a comment cannot sit inside a flow collection")
-        if not key and re.search(r":([ \t]|$)", plain):
-            self.fail("a flow scalar cannot contain ': '; quote it")
-        return (None if plain in ("", "~", "null", "Null", "NULL") else plain), end
+        if plain == "" and (key or closer == "]"):
+            self.fail("an empty entry in a flow collection is not supported")
+        return (None if plain == "" or plain in NULLS else plain), end
 
     @staticmethod
     def skip_spaces(text, index):
@@ -447,7 +531,16 @@ class _Yaml:
             if "\t" in raw[:width]:
                 self.fail("tabs cannot indent YAML", index)
             index += 1
-        lines = [raw[width:] if width is not None and raw.strip(" ") else "" for raw in self.lines[start:index]]
+        if width is None:
+            lines = [""] * (index - start)
+        else:
+            # Spaces past the content's indentation are content, even on a
+            # line that holds nothing else; before the first line YAML
+            # refuses them.
+            lines = [raw[width:] for raw in self.lines[start:index]]
+            leading = next(number for number, line in enumerate(lines) if line.strip(" "))
+            if any(lines[:leading]):
+                self.fail("a block scalar's leading blank line is indented more than its first line", start)
         trailing = 0
         while lines and lines[-1] == "":
             lines.pop()
@@ -496,7 +589,8 @@ def load_documents(path, source):
         text = data.decode("utf-8-sig")
     except UnicodeDecodeError as error:
         raise InputError(f"{source}: is not UTF-8") from error
-    if text.lstrip()[:1] in ("{", "["):
+    refuse_ambiguous_characters(text, source)
+    if text.lstrip(" \t\r\n")[:1] in ("{", "["):
         try:
             return [json.loads(text, object_pairs_hook=_unique_pairs)]
         except json.JSONDecodeError as error:
@@ -551,6 +645,10 @@ def pool_max_of(env, where):
         raise InputError(f"{where}: DATABASE_POOL_MAX {value.reason}")
     if isinstance(value, int) and not isinstance(value, bool):
         value = str(value)
+    if isinstance(value, str) and re.fullmatch(r"0[0-9]+", value):
+        # The gateway reads 010 as ten, but Compose's YAML reads it as octal.
+        raise InputError(f"{where}: DATABASE_POOL_MAX {value!r} has a leading zero, which YAML tools read as "
+                         "octal; write it without one")
     if not isinstance(value, str) or not re.fullmatch(r"[0-9]+", value) or not 1 <= int(value) <= MAX_POOL_MAX:
         raise InputError(f"{where}: DATABASE_POOL_MAX must be a whole number between 1 and {MAX_POOL_MAX}, "
                          f"got {value!r}; the gateway refuses to start")
@@ -684,26 +782,49 @@ def server_settings(args, where):
 
 
 def compose_server(service, where):
-    """The settings of a PostgreSQL server service, or None for any other."""
+    """The arguments a PostgreSQL server service passes the server, or None for any other service."""
     argv = string_list(service["command"], f"{where} command") if service.get("command") is not None else []
     image = service.get("image")
     postgres_image = isinstance(image, str) and POSTGRES_IMAGE.fullmatch(image) is not None
     if argv[:1] == ["postgres"]:
-        argv = argv[1:]
-    elif not (postgres_image and service.get("entrypoint") is None and (not argv or argv[0].startswith("-"))):
-        return None
-    return server_settings(argv, where)
+        return argv[1:]
+    if postgres_image and service.get("entrypoint") is None and (not argv or argv[0].startswith("-")):
+        return argv
+    return None
+
+
+def compose_server_limits(name, args, where):
+    """A confirmed server service's limits: its command line, else PostgreSQL's defaults."""
+    settings = server_settings(args, where)
+    return {key: (settings[key], f"service {name} command") if key in settings
+            else (POSTGRES_DEFAULTS[key], "PostgreSQL default; not on the service's command line")
+            for key in SERVER_SETTINGS}
+
+
+def refuse_compose_overrides(path):
+    """Refuse a file Compose would read with an override file merged over it."""
+    path = Path(path)
+    if path.name.lower() not in COMPOSE_DEFAULT_FILES:
+        return
+    for name in COMPOSE_OVERRIDE_FILES:
+        if (path.parent / name).is_file():
+            raise InputError(f"{path}: Compose merges {name} over this file when it runs without -f; render the "
+                             "two with `docker compose config --format json` and check the rendered output")
 
 
 def compose_facts(document, source):
+    """Gateway pools, one-shot jobs, uncounted services and PostgreSQL servers in a Compose file.
+
+    A PostgreSQL service is only a candidate: the gateways' DSN is a secret
+    file, so which server they use is the operator's to confirm.
+    """
     services = document.get("services") if isinstance(document, dict) else None
     if not isinstance(services, dict) or not services:
         raise InputError(f"{source}: a Compose file needs a non-empty services mapping")
     if document.get("include") is not None:
         raise InputError(f"{source} includes other Compose files; render it with `docker compose config --format json` "
                          "and check the rendered output")
-    facts = {"pools": [], "jobs": [], "uncounted": [], "server": None, "server_service": None}
-    servers = []
+    facts = {"pools": [], "jobs": [], "uncounted": [], "servers": {}}
     for name, service in services.items():
         where = f"{source}: service {name}"
         if not isinstance(service, dict):
@@ -712,9 +833,9 @@ def compose_facts(document, source):
             if service.get(key) is not None:
                 raise InputError(f"{where} uses {key}; render the file with `docker compose config --format json` "
                                  "and check the rendered output")
-        settings = compose_server(service, where)
-        if settings is not None:
-            servers.append((name, settings))
+        server_args = compose_server(service, where)
+        if server_args is not None:
+            facts["servers"][name] = server_args
             continue
         env = compose_environment(service.get("environment"), where)
         if backend_of(env, where) != "postgres":
@@ -729,16 +850,40 @@ def compose_facts(document, source):
         pool_max, origin = pool_max_of(env, where)
         facts["pools"].append({"name": f"service {name}", "replicas": replicas, "autoscaler_max": None,
                                "surge": surge, "pool_max": pool_max, "pool_origin": origin})
-    if len(servers) > 1:
-        names = " and ".join(name for name, _ in servers)
-        raise InputError(f"{source}: services {names} both run PostgreSQL, and the guard cannot tell which one "
-                         "the gateways use")
-    if servers:
-        name, settings = servers[0]
-        facts["server_service"] = name
-        facts["server"] = {key: (settings[key], f"service {name} command") if key in settings
-                           else (POSTGRES_DEFAULTS[key], "PostgreSQL default") for key in SERVER_SETTINGS}
     return facts
+
+
+def select_server(facts, source, server_service, declared, origin):
+    """(limits, confirmed service or None, PostgreSQL services ignored).
+
+    `declared` maps the three settings to numbers, or is None. The operator
+    either names the service in the file that is the gateways' server, or
+    declares the server's limits, in which case every PostgreSQL service in
+    the file is reported as ignored. Without either, a file that runs
+    PostgreSQL is refused rather than assumed to be the gateways' server.
+    """
+    servers = facts.get("servers", {})
+    if server_service is not None and declared is not None:
+        raise InputError(f"{source}: name either the server service or the server's limits, not both")
+    if server_service is not None:
+        if server_service not in servers:
+            found = f" (the file runs PostgreSQL as {', '.join(servers)})" if servers else ""
+            raise InputError(f"{source}: service {server_service} is named as the gateways' PostgreSQL server, but it "
+                             "is not a PostgreSQL service the guard recognises, one that runs the official postgres "
+                             f"image or a command that starts with postgres{found}; name the server's limits instead")
+        limits = compose_server_limits(server_service, servers[server_service],
+                                       f"{source}: service {server_service}")
+        return limits, server_service, [name for name in servers if name != server_service]
+    if declared is not None:
+        return {key: (value, origin) for key, value in declared.items()}, None, list(servers)
+    if servers:
+        names = ", ".join(servers)
+        raise InputError(f"{source} runs PostgreSQL ({names}), and its gateways' DSN is a secret file, so the guard "
+                         f"cannot tell whether they use it; confirm the server with --server-service NAME, or name "
+                         "the server the gateways use with --max-connections, --superuser-reserved-connections and "
+                         "--reserved-connections")
+    raise InputError("name the server's limits with --max-connections, --superuser-reserved-connections "
+                     "and --reserved-connections (0 before PostgreSQL 16); check them with SHOW")
 
 
 # ---------------------------------------------------------------------------
@@ -746,11 +891,17 @@ def compose_facts(document, source):
 
 
 def kubernetes_objects(documents):
-    """(source, object) for every object, with List items expanded."""
-    for source, document in documents:
-        if isinstance(document, dict) and document.get("kind") == "List":
-            for item in items_of(document.get("items"), f"{source}: List items"):
-                yield source, item
+    """(source, object) for every object, lists expanded.
+
+    kubectl reads any object with an `items` field as a list, whatever its
+    kind (a `List`, a `DeploymentList`), and flattens lists inside lists.
+    """
+    pending = list(reversed(documents))
+    while pending:
+        source, document = pending.pop()
+        if isinstance(document, dict) and "items" in document:
+            items = items_of(document["items"], f"{source}: {document.get('kind')} items")
+            pending.extend((source, item) for item in reversed(items))
         else:
             yield source, document
 
@@ -872,16 +1023,21 @@ def job_instances(kind, workload, command, where):
     raise InputError(f"{where}: a {kind} restarts `{command}` for ever; run one-shot commands from a Job")
 
 
-def embedded_pod_specs(node):
-    """Every mapping with a containers list, anywhere inside an object."""
-    if isinstance(node, dict):
-        if isinstance(node.get("containers"), list):
+def nested_mappings(item):
+    """Every mapping inside an object, its own metadata aside."""
+    stack = [value for key, value in item.items() if key not in ("apiVersion", "kind", "metadata")]
+    while stack:
+        node = stack.pop()
+        if isinstance(node, dict):
             yield node
-        for value in node.values():
-            yield from embedded_pod_specs(value)
-    elif isinstance(node, list):
-        for item in node:
-            yield from embedded_pod_specs(item)
+            stack.extend(node.values())
+        elif isinstance(node, list):
+            stack.extend(node)
+
+
+def container_like(node):
+    """A mapping shaped like a container: an image, or an environment."""
+    return isinstance(node.get("image"), str) or any(isinstance(node.get(key), list) for key in ("env", "envFrom"))
 
 
 def kubernetes_facts(documents, external=()):
@@ -918,11 +1074,16 @@ def kubernetes_facts(documents, external=()):
         else:
             others.append((source, kind, namespace, name, item))
 
-    def scaler_for(kind, namespace, name, where):
+    def same_namespace(one, other):
         # An object without a namespace lands in whichever one it is applied
         # to, so it may be the same namespace as any other.
+        return one == other or "" in (one, other)
+
+    def scaler_for(kind, namespace, name, where):
+        # A KEDA ScaledObject may leave the target's kind out (it means a
+        # Deployment), so a missing kind matches any workload.
         found = [entry for target_kind, scope, target, entry in scalers
-                 if (target_kind, target) == (kind, name) and (scope == namespace or "" in (scope, namespace))]
+                 if target_kind in (kind, None) and target == name and same_namespace(scope, namespace)]
         if len(found) > 1:
             raise InputError(f"{where} is scaled by both {found[0][0]}/{found[0][1]['metadata']['name']} and "
                              f"{found[1][0]}/{found[1][1]['metadata']['name']}")
@@ -930,17 +1091,20 @@ def kubernetes_facts(documents, external=()):
 
     facts = {"pools": [], "jobs": [], "uncounted": [], "uncounted_files": {}, "external": set()}
     for source, kind, namespace, name, item in others:
-        # A kind the guard does not model (a Knative Service, an Argo Rollout)
-        # may still run gateway pods; refuse one that runs them in cluster mode.
-        for pod in embedded_pod_specs(item.get("spec")):
-            for container in items_of(pod.get("initContainers"), "initContainers") + pod["containers"]:
-                if not isinstance(container, dict):
-                    continue
-                where = f"{source}: {kind}/{name} container {container.get('name')}"
-                env = container_env(container, namespace, sources, external, where, facts["external"])
-                if backend_of(env, where) == "postgres":
-                    raise InputError(f"{where} runs the gateway in cluster mode, and the guard cannot bound a "
-                                     f"{kind}'s replicas; run serving replicas from a Deployment or StatefulSet")
+        # A kind the guard does not model (a Knative Service, an Argo Rollout
+        # with a template, an OpenShift Template) may still run gateway
+        # containers; refuse one that runs them in cluster mode.
+        if kind in ("ConfigMap", "Secret"):
+            continue
+        for container in nested_mappings(item):
+            if not container_like(container):
+                continue
+            where = f"{source}: {kind}/{name} container {container.get('name')}"
+            env = container_env(container, namespace, sources, external, where, facts["external"])
+            if backend_of(env, where) == "postgres":
+                raise InputError(f"{where} runs the gateway in cluster mode, and the guard cannot bound a "
+                                 f"{kind}'s replicas; run serving replicas from a Deployment or StatefulSet")
+    cluster_workloads = []
     for source, kind, namespace, name, workload in workloads:
         label = f"{kind}/{name}"
         pod = workload
@@ -973,9 +1137,32 @@ def kubernetes_facts(documents, external=()):
             facts["pools"].append({"name": entry_name, "file": source, "replicas": replicas,
                                    "autoscaler_max": maximum, "surge": rollout_surge(kind, workload, pods, where),
                                    "pool_max": pool_max, "pool_origin": origin})
-        if not counted:
+        if counted:
+            cluster_workloads.append((kind, namespace, name, f"{source}: {label}"))
+        else:
             facts["uncounted"].append(label)
             facts["uncounted_files"][label] = source
+    for source, kind, namespace, name, item in others:
+        # A kind the guard does not model may run pods from a workload it
+        # names rather than embeds: an Argo Rollout's workloadRef (whose
+        # Deployment Argo scales to 0 while the Rollout runs its own pods), a
+        # Flagger Canary's targetRef (which Flagger clones into a primary and
+        # runs beside it), a VerticalPodAutoscaler's targetRef (which evicts
+        # and replaces pods). The HorizontalPodAutoscaler is the one modelled.
+        if kind == "HorizontalPodAutoscaler":
+            continue
+        for ref in nested_mappings(item):
+            ref_kind, ref_name = ref.get("kind"), ref.get("name")
+            if not isinstance(ref_kind, str) or not isinstance(ref_name, str):
+                continue
+            ref_namespace = ref.get("namespace") if isinstance(ref.get("namespace"), str) else namespace
+            for target_kind, target_namespace, target_name, label in cluster_workloads:
+                if (ref_kind.lower(), ref_name) == (target_kind.lower(), target_name) \
+                        and same_namespace(ref_namespace, target_namespace):
+                    raise InputError(f"{source}: {kind}/{name} refers to {label}, which runs the gateway in cluster "
+                                     f"mode, and the guard does not model how a {kind} runs or scales that "
+                                     "workload's pods; run serving replicas from a Deployment or StatefulSet that "
+                                     "nothing else manages")
     return facts
 
 
@@ -983,7 +1170,7 @@ def kubernetes_facts(documents, external=()):
 # The arithmetic.
 
 
-def plan(source, server, pooler, pooler_connections, facts, headroom):
+def plan(source, server, pooler, pooler_connections, facts, headroom, server_service=None, ignored_servers=()):
     """Validate one deployment's inputs; `headroom` maps names to declared values."""
     if server is None:
         raise InputError(f"{source}: the server's limits are unknown; pass --max-connections, "
@@ -1014,8 +1201,8 @@ def plan(source, server, pooler, pooler_connections, facts, headroom):
             raise InputError(f"{source}: name the {name} headroom, even if it is 0")
     return {"source": source, "server": server, "pooler": pooler, "pooler_connections": pooler_connections,
             "pools": facts["pools"], "jobs": facts["jobs"], "uncounted": facts["uncounted"],
-            "server_service": facts.get("server_service"), "external": sorted(facts.get("external", ())),
-            "headroom": entries}
+            "server_service": server_service, "ignored_servers": list(ignored_servers),
+            "external": sorted(facts.get("external", ())), "headroom": entries}
 
 
 def decide(budget):
@@ -1072,6 +1259,13 @@ def decide(budget):
         minimum = total + server["superuser_reserved_connections"] + server["reserved_connections"]
         advice.append(f"or raise max_connections to at least {minimum}, after checking the server's memory and "
                       "its own limits; every connection costs the server memory whether or not it is used")
+    if budget["pools"]:
+        notes.append("a gateway that is shutting down keeps its pool until it exits and is not in this count "
+                     "(Kubernetes does not count a terminating pod against maxSurge either); keep spare for a "
+                     "rollout or scale-down that replaces gateways faster than they drain")
+    if any("not on the service's command line" in origin for _, origin in budget["server"].values()):
+        notes.append("a setting the server's command line does not pass is taken as PostgreSQL's default, but its "
+                     "configuration files can change it; SHOW it on the running server")
     smallest = min((pool["pool_max"] for pool in budget["pools"]), default=None)
     if smallest is not None and smallest <= 2:
         notes.append(f"the maintenance leader's dedicated pass session comes out of its own pool, so a pool of "
@@ -1106,6 +1300,9 @@ def render(result):
         lines.append(row(key, value, origin))
     lines.append(row("available to ordinary roles", result["available"],
                      "max_connections - superuser_reserved_connections - reserved_connections"))
+    if result["ignored_servers"]:
+        lines.append(f"  ignored, runs PostgreSQL that is not the gateways' server: "
+                     f"{', '.join(result['ignored_servers'])}")
     lines += ["", f"Gateway pools (pooler: {result['pooler']})"]
     for pool in result["pools"]:
         connections, detail = describe_pool(pool)
@@ -1222,13 +1419,13 @@ def kubernetes_examples(root, paths):
 
 def compare_rendered(ours, theirs, source):
     """Fail unless Compose's own rendering yields the same sizing facts."""
-    for key in ("pools", "jobs", "uncounted", "server", "server_service"):
+    for key in ("pools", "jobs", "uncounted", "servers"):
         mine, rendered = ours[key], theirs[key]
         if isinstance(mine, list):
             mine, rendered = (sorted(json.dumps(item, sort_keys=True) for item in value) for value in (mine, rendered))
         if json.dumps(mine, sort_keys=True) != json.dumps(rendered, sort_keys=True):
             raise InputError(f"{source}: the guard reads {key} differently from Compose's rendering of the file; "
-                             "the strict YAML reader and Compose disagree, so the reading cannot be trusted")
+                             "the guard's YAML reader and Compose disagree, so the reading cannot be trusted")
 
 
 def example_result(source, facts):
@@ -1239,24 +1436,38 @@ def example_result(source, facts):
         raise InputError(f"{source} runs the gateway in cluster mode, and EXAMPLE_BUDGETS in "
                          "scripts/pool_sizing.py names no connection budget for it")
     keys = set(budget)
-    if not {"pooler", "headroom", "uncounted"} <= keys <= {"pooler", "pooler_connections", "headroom",
-                                                             "uncounted", "server"}:
-        raise InputError(f"{source}: its EXAMPLE_BUDGETS entry needs pooler, headroom and uncounted, and may add "
-                         "only pooler_connections and server")
+    allowed = {"pooler", "pooler_connections", "headroom", "uncounted", "server", "server_service"}
+    if not {"pooler", "headroom", "uncounted"} <= keys <= allowed or ("server" in keys) == ("server_service" in keys):
+        raise InputError(f"{source}: its EXAMPLE_BUDGETS entry needs pooler, headroom, uncounted and exactly one of "
+                         "server (the limits of the server its gateways use) or server_service (the service in "
+                         "the file that is that server), and may add only pooler_connections")
     if sorted(facts["uncounted"]) != sorted(budget["uncounted"]):
         raise InputError(f"{source}: {sorted(facts['uncounted'])} open no gateway pool, but the reviewed list is "
                          f"{sorted(budget['uncounted'])}; budget a new database client before it ships")
-    server = facts.get("server")
-    if server is not None and "server" in budget:
-        raise InputError(f"{source} runs its own PostgreSQL; its budget cannot name other server limits")
-    if server is None:
-        if set(budget.get("server") or ()) != set(SERVER_SETTINGS):
-            raise InputError(f"{source} runs no PostgreSQL of its own, so its EXAMPLE_BUDGETS entry must name "
-                             f"the server's {', '.join(SERVER_SETTINGS)}")
-        server = {key: (count(budget["server"][key], f"{source} budget {key}"), "example budget")
-                  for key in SERVER_SETTINGS}
+    if "server_service" in budget and "servers" not in facts:
+        raise InputError(f"{source}: server_service names a Compose service, and this is not a Compose file")
+    declared = None
+    if "server" in budget:
+        if not isinstance(budget["server"], dict) or set(budget["server"]) != set(SERVER_SETTINGS):
+            raise InputError(f"{source}: its EXAMPLE_BUDGETS server must name the server's "
+                             f"{', '.join(SERVER_SETTINGS)}")
+        declared = {key: count(budget["server"][key], f"{source} budget {key}") for key in SERVER_SETTINGS}
+    server, server_service, ignored = select_server(facts, source, budget.get("server_service"), declared,
+                                                    "example budget")
     return decide(plan(source, server, budget["pooler"], budget.get("pooler_connections"), facts,
-                       budget["headroom"]))
+                       budget["headroom"], server_service, ignored))
+
+
+def compose_files(directory):
+    return sorted({path for pattern in ("docker-compose*.y*ml", "compose*.y*ml") for path in directory.glob(pattern)})
+
+
+def read_compose(path, source):
+    documents = load_documents(path, source)
+    if len(documents) != 1:
+        raise InputError(f"{source}: a Compose file is exactly one document")
+    refuse_compose_overrides(path)
+    return compose_facts(documents[0], source)
 
 
 def examples(root=ROOT, rendered=None):
@@ -1264,18 +1475,29 @@ def examples(root=ROOT, rendered=None):
     root = Path(root)
     rendered = dict(rendered or {})
     results = []
-    for path in sorted((root / "docs/deployment").glob("docker-compose*.y*ml")):
+    for path in compose_files(root / "docs/deployment"):
         source = relative(path, root)
-        documents = load_documents(path, source)
-        if len(documents) != 1:
-            raise InputError(f"{source}: a Compose file is exactly one document")
-        facts = compose_facts(documents[0], source)
+        facts = read_compose(path, source)
         if source in rendered:
             theirs = load_documents(rendered.pop(source), f"{source} (rendered)")
+            if len(theirs) != 1:
+                raise InputError(f"{source} (rendered): a Compose file is exactly one document")
             compare_rendered(facts, compose_facts(theirs[0], f"{source} (rendered)"), source)
         results.append(example_result(source, facts))
     if rendered:
-        raise InputError(f"--rendered names {', '.join(sorted(rendered))}, which is not a shipped Compose example")
+        raise InputError(f"--rendered names {', '.join(sorted(rendered))}, which is not a Compose example in "
+                         "docs/deployment")
+    # The repository-root Compose files are overlays, combined with -f, so no
+    # one file's budget is the stack's. Each must stay standalone: then no
+    # combination of them can select cluster mode either.
+    for path in compose_files(root):
+        source = relative(path, root)
+        facts = read_compose(path, source)
+        if facts["pools"] or facts["jobs"]:
+            raise InputError(f"{source} runs the gateway in cluster mode, but the repository-root Compose files are "
+                             "overlays combined with -f; ship a cluster-mode example as one file in docs/deployment "
+                             "with a budget in EXAMPLE_BUDGETS")
+        results.append({"source": source, "status": "standalone", "uncounted": facts["uncounted"]})
     paths = sorted((root / "deploy").rglob("*.y*ml"))
     pairs = kubernetes_examples(root, paths)
     facts = kubernetes_facts(pairs)
@@ -1312,6 +1534,8 @@ def check_arguments(args):
                          "hand; a deployment file is the source of its own replica counts")
     if args.external_env and not args.kubernetes:
         raise InputError("--external-env applies to Kubernetes manifests only")
+    if args.server_service is not None and not args.compose:
+        raise InputError("--server-service names a service of a Compose file; give the server's limits instead")
     for entry in args.external_env:
         if not re.fullmatch(r"(configmap|secret)/[^/\s]+", entry):
             raise InputError(f"--external-env expects configmap/NAME or secret/NAME, got {entry!r}")
@@ -1332,6 +1556,7 @@ def check_arguments(args):
         documents = load_documents(args.compose, args.compose)
         if len(documents) != 1:
             raise InputError(f"{args.compose}: a Compose file is exactly one document")
+        refuse_compose_overrides(args.compose)
         facts, source = compose_facts(documents[0], args.compose), args.compose
     else:
         pairs = [(path, document) for path in args.kubernetes for document in load_documents(path, path)]
@@ -1339,18 +1564,15 @@ def check_arguments(args):
     flags = {"max_connections": args.max_connections,
              "superuser_reserved_connections": args.superuser_reserved_connections,
              "reserved_connections": args.reserved_connections}
-    server = facts.get("server")
     given = [key for key, value in flags.items() if value is not None]
-    if server is not None and given:
-        raise InputError(f"{source} runs its own PostgreSQL (service {facts['server_service']}); its command line "
-                         "is the source of the server's limits")
-    if server is None:
-        if len(given) != len(flags):
-            raise InputError("name the server's limits with --max-connections, --superuser-reserved-connections "
-                             "and --reserved-connections (0 before PostgreSQL 16); check them with SHOW")
-        server = {key: (value, "declared") for key, value in flags.items()}
+    if given and len(given) != len(flags):
+        raise InputError("name the server's limits with all of --max-connections, --superuser-reserved-connections "
+                         "and --reserved-connections (0 before PostgreSQL 16); check them with SHOW")
+    server, server_service, ignored = select_server(facts, source, args.server_service, flags if given else None,
+                                                    "declared")
     headroom = {name: getattr(args, name) for name in HEADROOM_NAMES}
-    return decide(plan(source, server, args.pooler, args.pooler_server_connections, facts, headroom))
+    return decide(plan(source, server, args.pooler, args.pooler_server_connections, facts, headroom,
+                       server_service, ignored))
 
 
 def main(argv=None):
@@ -1370,7 +1592,10 @@ def main(argv=None):
     check.add_argument("--external-env", metavar="KIND/NAME", action="append", default=[],
                        help="an envFrom configmap/NAME or secret/NAME supplied elsewhere that sets neither "
                        "STATE_BACKEND nor DATABASE_POOL_MAX")
-    server = check.add_argument_group("the server (SHOW each one)")
+    server = check.add_argument_group("the server (SHOW each one, or confirm a Compose service)")
+    server.add_argument("--server-service", metavar="NAME",
+                        help="with --compose: the PostgreSQL service in the file that the gateways use; its "
+                        "command line supplies the server's limits")
     server.add_argument("--max-connections", type=plain_count)
     server.add_argument("--superuser-reserved-connections", type=plain_count)
     server.add_argument("--reserved-connections", type=plain_count, help="0 before PostgreSQL 16")

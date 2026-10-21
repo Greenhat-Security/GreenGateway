@@ -666,8 +666,9 @@ jobs:
 
       # Every shipped Compose and Kubernetes example must fit its PostgreSQL
       # connection budget, so an example change cannot over-commit the server.
-      # The guard reads YAML with its own strict reader; Compose's rendering of
-      # the HA example, both profiles included, must agree with that reading.
+      # The guard reads YAML with its own reader for the subset deployment
+      # files use, which is not a full YAML parser, so Compose's rendering of
+      # the HA example, both profiles included, must agree with its reading.
       - name: Check the shipped examples' PostgreSQL connection budgets
         shell: bash
         run: |
