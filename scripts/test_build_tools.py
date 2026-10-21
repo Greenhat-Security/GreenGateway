@@ -101,6 +101,13 @@ class ToolContractTests(unittest.TestCase):
                 self.rejects("saved only from main pushes")
         path.write_text(original.replace("\n        with:\n          " + trusted, "", 1))
         self.rejects("saved only from main pushes")
+        # Restoring without ever saving is allowed; only the literal never-save is.
+        path.write_text(original.replace(trusted, "save-if: false", 1))
+        self.assertEqual(build_tools.check(self.root), [])
+        for replacement in ["save-if: ${{ false }}", "save-if: 'no'", "save-if: ''"]:
+            with self.subTest(replacement=replacement):
+                path.write_text(original.replace(trusted, replacement, 1))
+                self.rejects("saved only from main pushes")
         for step in ["      - uses: actions/cache@" + "c" * 40 + "\n        with:\n          path: x\n          key: y\n",
                      "      - uses: actions/cache/save@" + "c" * 40 + "\n        with:\n          path: x\n          key: y\n",
                      "      - uses: docker/build-push-action@" + "c" * 40 + "\n        with:\n          cache-to: type=gha\n"]:

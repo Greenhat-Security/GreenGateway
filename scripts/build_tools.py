@@ -22,6 +22,9 @@ IMAGE_BUILD = re.compile(
 # a cache: a push to main, whose code is reviewed. A pull request can then
 # read main's caches but never write one a later run would restore.
 TRUSTED_CACHE_WRITE = "${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}"
+# A job may also restore a cache it never writes: one that reads another
+# job's dependency cache but builds something that cache must not hold.
+NEVER_CACHE_WRITE = "false"
 
 
 def pull_request_triggered(doc):
@@ -34,7 +37,7 @@ def cache_write_errors(where, steps):
     errors = []
     for step in steps:
         use, opts = step.get("uses", ""), step.get("with", {})
-        if use.startswith("Swatinem/rust-cache@") and opts.get("save-if") != TRUSTED_CACHE_WRITE:
+        if use.startswith("Swatinem/rust-cache@") and opts.get("save-if") not in (TRUSTED_CACHE_WRITE, NEVER_CACHE_WRITE):
             errors.append(f"{where}: Rust caches may be saved only from main pushes")
         if use.startswith(("actions/cache@", "actions/cache/save@")):
             errors.append(f"{where}: pull request jobs may only restore caches")

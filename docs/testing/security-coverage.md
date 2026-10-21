@@ -36,6 +36,33 @@ python scripts/check-security-coverage.py target/security-coverage.json
 python scripts/test_security_gates.py
 ```
 
+CI also compiles the instrumented gateway crate faster with three settings for
+that one package, written to the runner's user-level Cargo configuration
+(`%CARGO_HOME%\config.toml`) rather than the repository's:
+
+```toml
+[unstable]
+profile-rustflags = true
+[profile.test.package.gateway]
+debug = 0
+rustflags = ["-Zthreads=4", "-Clinker=rust-lld"]
+```
+
+No debug information for the crate (coverage comes from the instrumentation's
+counters and coverage mapping, not from debug information), the nightly
+compiler's parallel front end, and the LLVM linker shipped in the pinned
+toolchain instead of the MSVC linker. They change how fast the test binary is
+built, not what is instrumented, run or measured: on October 21, 2026 the same
+command with and without them produced reports with identical line, branch,
+function, region and instantiation counts in all 165 instrumented files, and
+identical covered counts in every file `.github/security-coverage.json`
+names. The covered counts of a few
+timing-dependent modules outside the floors (connection administration, the
+PostgreSQL audit sink, the proxy health and forwarding paths) vary between
+runs of the same build either way. Locally the crate then compiled in 208
+instead of 475 seconds. Reproducing without the configuration gives the same
+measurements, only more slowly.
+
 Wrapper-free mode is intentional: Cargo can pass the long Windows compiler
 command through a response file, which cargo-llvm-cov 0.9.0's wrapper does not
 inspect for the crate name. Without the flag, tests can pass while the gateway

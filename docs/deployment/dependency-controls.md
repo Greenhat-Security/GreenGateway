@@ -105,14 +105,19 @@ transport inventory and the syn 2 duplicate exception record them as resolved.
 
 CI caches are written only by pushes to `main`. Every Rust cache in a workflow
 that pull requests trigger saves under `save-if: ${{ github.event_name == 'push'
-&& github.ref == 'refs/heads/main' }}`, and `scripts/build_tools.py check`
-rejects any other condition, a cache save action or an image build cache export
-in such a workflow or in a composite action. A pull request reads `main`'s
-caches but cannot write one that a later run would restore; Cargo still checks
-every restored artifact against its own fingerprint and rebuilds what differs.
+&& github.ref == 'refs/heads/main' }}` or never saves (`save-if: false`, for a
+job that only restores another job's dependency cache), and
+`scripts/build_tools.py check` rejects any other condition, a cache save action
+or an image build cache export in such a workflow or in a composite action. A
+pull request reads `main`'s caches but cannot write one that a later run would
+restore; Cargo still checks every restored artifact against its own fingerprint
+and rebuilds what differs.
 Within one run, the production image is built once by `gateway-image` and handed
 to its consumers as an artifact, and each consumer checks the loaded image ID
-against the one that job recorded before using it.
+against the one that job recorded before using it. The HA release-gate
+executables are built once by `ha-release-gate-build` and the rolling-upgrade
+pair by `ha-upgrade-pair` in the same way: each leg requires its producer's
+success and unpacks the archive only when its SHA-256 matches the one recorded.
 
 Buildx is selected explicitly and its BuildKit daemon image is digest-pinned
 for every CI image build, which `scripts/build_tools.py check` recognises by
