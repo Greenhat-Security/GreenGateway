@@ -7,6 +7,8 @@ import { fileURLToPath } from "node:url";
 
 export const ROOT = resolve(fileURLToPath(new URL("..", import.meta.url)));
 export const OPERATIONS = [
+  "admin_session.grant",
+  "admin_session.withdraw",
   "catalog.mcp.publish",
   "catalog.openapi.publish",
   "catalog.overlay.delete",
@@ -39,13 +41,13 @@ export const OPERATIONS = [
 ];
 const MODES = ["postgres", "standalone"];
 const REVISION_OPERATIONS = {
-  create: ["connection.create", "secret.create", "service_token.issue"],
+  create: ["admin_session.grant", "connection.create", "secret.create", "service_token.issue"],
   advance: ["connection.replace", "credential.binding_change", "catalog.overlay.delete", "catalog.overlay.replace",
     "policy.rollback", "policy.rule.create", "policy.rule.delete", "policy.rule.reorder", "policy.rule.update", "policy.suggestion.accept",
     "secret.rotate", "secret.external_rotate", "service_token.rotate", "service_token.revoke"],
   publish: ["catalog.mcp.publish", "catalog.openapi.publish", "configuration.activate", "configuration.import",
     "jwt.revoke", "policy.file_reload", "policy.publish", "tools.publish"],
-  delete: ["connection.delete", "secret.delete"],
+  delete: ["admin_session.withdraw", "connection.delete", "secret.delete"],
   export: ["configuration.export"],
   maintenance: ["secret.reencrypt"],
 };
@@ -108,6 +110,7 @@ function validateSchemaValue(value, definition, location = "$") {
 }
 
 const resourceFor = (operation) => ({
+  admin_session: "admin_session",
   policy: "policy", tools: "tools", connection: "connection", credential: "credential_binding",
   catalog: "catalog", service_token: "service_token", jwt: "jwt_revocation", configuration: "configuration",
   secret: operation === "secret.external_rotate" ? "external_secret" : "local_secret",
@@ -141,7 +144,8 @@ export function validateEvent(event) {
     if (before !== null) check(BigInt(after) > BigInt(before), "revision must advance");
   }
   if (event.operation === "jwt.revoke") check(security !== null && after === security, "JWT event axis must use the shared security revision");
-  const expectedAxis = event.operation.startsWith("policy.") ? "policy"
+  const expectedAxis = event.operation.startsWith("admin_session.") ? "session"
+    : event.operation.startsWith("policy.") ? "policy"
     : event.operation.startsWith("tools.") ? "tools"
     : event.operation.startsWith("connection.") ? "connection"
     : event.operation.startsWith("credential.") ? "credential"

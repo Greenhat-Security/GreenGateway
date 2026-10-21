@@ -24,7 +24,7 @@ node scripts/check-authority-evidence.mjs
 node --test scripts/test-authority-evidence.mjs
 ```
 
-The existing CI `supply-chain` job runs both commands. The checker covers 29
+The existing CI `supply-chain` job runs both commands. The checker covers 31
 operations in both storage modes, checks live source/test anchors, rejects
 missing/duplicate dispositions, and discovers unreviewed mutation endpoints in
 the four reviewed admin modules. It checks source traceability and contract
@@ -53,6 +53,7 @@ or unconfigured individual stores.
 | Service-token issue | Token row with creator, row/shared revisions and outbox | Creation retains only `created_by`; no issue evidence row, operation identity or delivery |
 | Service-token rotate/revoke | Token change, row/shared revisions and outbox, plus a non-cascading `service_token_change_evidence` row (actor, action, event/operation UUIDs, prior/new row revision, the outbox row's shared revision, database-clock time) in the same transaction; repeated revoke and refused rotate write none. Standalone writes the same evidence in the token database's own transaction | Issuer/auth mode, caller-bound operation identity, safe-reference projection, durable delivery and retention |
 | JWT revocation | Scoped JTI digest, actor row, shared revision and outbox, plus one non-cascading `jwt_revocation_evidence` row per effective revoke (actor, JTI digest, resulting expiry, shared revision) that extension, reactivation and expiry cleanup never rewrite | CLI actor is system provenance, not a named human; no actor kind, issuer/auth mode or delivery |
+| Admin session grant/withdrawal (#424) | Not shipped in this mode: configuration refuses `ADMIN_SESSION_MODE=standalone_memory` | Standalone sessions are process-local memory with no durable record; both modes stay `unsupported_future_operation` |
 
 These foundations are already sufficient for their **existing atomic change-record
 purpose**. The inventory uses `missing_metadata` and `missing_delivery` for
@@ -96,9 +97,19 @@ Status observations, enum-source value caching, token verification/last-use
 updates, principal/discovery projections and expired-row cleanup do not newly
 grant authority. They are outside the operation matrix; their cleanup can still
 affect evidence retention. The inventory includes JWT expiry and Connection
-cascade consequences explicitly. Authentication sessions belong to #424; when a
-new session authority ships, add its grant/withdrawal operations to this contract
-before asserting required durability for them.
+cascade consequences explicitly.
+
+Admin sessions (#424) are in the matrix as `admin_session.grant` and
+`admin_session.withdraw`. The shipped authority, `ADMIN_SESSION_MODE=standalone_memory`,
+keeps each session in a bounded process-local map: a grant follows a successful
+cookie completion, and withdrawal is logout, expiry, a rejected access token, an
+identity change or a restart. Nothing about it is durable, and the
+`admin_login.transaction` event the handler emits after a grant or logout carries
+no actor or session identity; implicit withdrawals emit nothing. Cluster mode
+refuses the setting, so no session authority exists there. Both rows are
+`unsupported_future_operation`: required-durability mode must refuse in-memory
+sessions rather than relabel that event durable, and a durable session authority
+must ship with its own transactional evidence.
 
 ## Proposed authority event v1
 
@@ -112,11 +123,12 @@ evidence rows hold the internal actor ID, not a keyed safe reference, and no
 dispatcher integration belong to later slices.
 
 Revision transitions are operation-specific. Resource creation (`connection.create`,
-`secret.create`, `service_token.issue`) has no prior revision; replacement,
+`secret.create`, `service_token.issue`, `admin_session.grant`) has no prior revision; replacement,
 rotation, revocation and edits to existing authority require one. In particular,
 creating a policy rule advances its containing policy rather than creating a new
 policy authority. Publication and activation may initialize or advance a snapshot.
-Deletion requires a positive prior revision and a null successor, export binds
+Deletion (including `admin_session.withdraw`) requires a positive prior revision and a
+null successor, export binds
 an unchanged revision, and re-encryption uses the maintenance shape. The checker
 assigns every operation exactly one transition contract.
 
