@@ -35,12 +35,13 @@ export function CallerAssertionSummary({
         ) : (
           <p>
             <strong>Caller assertion configured.</strong> Once the gateway
-            accepts this block, every call of a manual HTTP tool on this
-            connection carries an assertion signed for the calling principal,
-            and a call without one, such as a service token, is refused with{' '}
-            <code>caller_assertion_no_principal</code>. Every other use of the
-            connection, including OpenAPI tools, proxied requests, discovery,
-            and tests, is refused with{' '}
+            accepts this block, every manual HTTP, OpenAPI, and MCP tool call
+            and every proxied request on this connection carries an assertion
+            signed for the calling principal, and a call without one, such as
+            a service token, is refused with{' '}
+            <code>caller_assertion_no_principal</code>. Uses with no caller to
+            name, such as discovery, enum and label sources, and tests, and
+            the steps of composite tools are refused with{' '}
             <code>caller_assertion_not_enforced</code>, and so is every call
             when the block is one only an earlier release accepted: approval
             binding, an assertion header that matches another header on this

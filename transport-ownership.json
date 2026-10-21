@@ -10480,9 +10480,9 @@
         "unexpanded-macro"
       ],
       "scope": "gateway::proxy::forward::forward_to_upstream#1",
-      "sha256": "c3ec5d82cb334397c056576b7cf2d24cab1cdc28c650af2bb5f303129f8efa6f",
+      "sha256": "d741b9d3ce983b60447cb7a66002368745949bf8aca8368f50ae11a9d2ca5873",
       "owner": "GreenGateway maintainers",
-      "purpose": "Reviewed exact GreenPM research byte budgets, bounded single-export buffering, retained admission lifetime and replica agreement; no additional transport authority."
+      "purpose": "Reviewed exact GreenPM research byte budgets, bounded single-export buffering, retained admission lifetime and replica agreement; no additional transport authority. Caller-assertion admission, signing-key load and signing for attested Connection routes (#463), and buffering a body the assertion binds within the existing size and deadline bounds, add one header on the same checked destination; no additional transport authority."
     },
     {
       "file": "gateway/src/proxy/forward.rs",
@@ -13087,7 +13087,7 @@
         "network-or-process-reference"
       ],
       "scope": "gateway::tools::mcp_upstream::probe_connection_protocol_before#1",
-      "sha256": "1f48a6d3caeb49c4734194297952089e280def173295b3246582fcd10ad8ccd0",
+      "sha256": "20795d491d501a4b0f1c59fb00f1605f7987fd54610d947fec206dddd5490093",
       "owner": "GreenGateway maintainers",
       "purpose": "Bounded managed MCP protocol probe: validate connection etag, checked destination and prepared transport before acquiring the concrete client; use it only in the deadline-controlled limited probe with credential and cleanup checks."
     },
@@ -13148,9 +13148,19 @@
         "network-or-process-reference"
       ],
       "scope": "gateway::tools::mcp_upstream::call_connection_tool_at_target#1",
-      "sha256": "d912b8ff2a497132c047ac3281455fee837fb73d1900994f8e982684846ea83f",
+      "sha256": "c597c418843ddb039323daaf5569cb7623f2f72519218a9b8be6d68557d42c1a",
       "owner": "GreenGateway maintainers",
       "purpose": "MCP protocol adaptation over checked destinations; preserve session, URL, body and deadline checks."
+    },
+    {
+      "file": "gateway/src/tools/mcp_upstream.rs",
+      "reasons": [
+        "network-or-process-reference"
+      ],
+      "scope": "gateway::tools::mcp_upstream::call_tool_in_session#1",
+      "sha256": "9a3aa4c804a8be54181c281fcb0b6c22c960c702dc67ecdc89e0ec830962894f",
+      "owner": "GreenGateway maintainers",
+      "purpose": "MCP protocol adaptation over checked destinations; preserve session, URL, body and deadline checks. The tool call's credential resolution, session and close, moved out of call_connection_tool_at_target, now also handing the session its caller assertions (#463); no additional transport authority."
     },
     {
       "file": "gateway/src/tools/mcp_upstream.rs",
@@ -13258,7 +13268,7 @@
         "network-or-process-reference"
       ],
       "scope": "gateway::tools::mcp_upstream::connect_connection#1",
-      "sha256": "319687457362bf21f207754a2e89fd75789c562359d7a580d026c4c8adf3da3a",
+      "sha256": "246f1a9a88e7abe38d5ee86fc48912ffca008a2c43417bb97077fc83a5b948e9",
       "owner": "GreenGateway maintainers",
       "purpose": "MCP protocol adaptation over checked destinations; preserve session, URL, body and deadline checks."
     },
@@ -13278,7 +13288,7 @@
         "network-or-process-reference"
       ],
       "scope": "gateway::tools::mcp_upstream::connect_endpoint_with_client#1",
-      "sha256": "6f01cf61abf3bfd35bf57f4804b0c90f46b5adb607f2894b4d5dc662e14733bb",
+      "sha256": "0f8743aadb7e38ebb84ded87cef5f22ff681d99bc1d332dc8d3c491359bad35f",
       "owner": "GreenGateway maintainers",
       "purpose": "MCP protocol adaptation over checked destinations; preserve session, URL, body and deadline checks."
     },
@@ -13288,7 +13298,7 @@
         "network-or-process-reference"
       ],
       "scope": "gateway::tools::mcp_upstream::LimitedMcpHttpClient#1",
-      "sha256": "571947a64e5737fd9c91fc1429dea5e87b61a8e470ffd58f05f93a9048c0d9ef",
+      "sha256": "9ed70b969dc08b36b53beb4fc98b87f9892200c7b4bc4049ed0939ba81668fa7",
       "owner": "GreenGateway maintainers",
       "purpose": "MCP protocol adaptation over checked destinations; preserve session, URL, body and deadline checks."
     },
@@ -13298,9 +13308,19 @@
         "network-or-process-reference"
       ],
       "scope": "gateway::tools::mcp_upstream::impl  LimitedMcpHttpClient::new#1",
-      "sha256": "67567c5d94886bb167340eeb0b117737914ed6f62d4b97d7a966b0fd462f97ea",
+      "sha256": "8319b840c4d1a6a97cf10b857eef185ed923f3cd314b314ddfa4ae79c97facfd",
       "owner": "GreenGateway maintainers",
       "purpose": "MCP protocol adaptation over checked destinations; preserve session, URL, body and deadline checks."
+    },
+    {
+      "file": "gateway/src/tools/mcp_upstream.rs",
+      "reasons": [
+        "network-or-process-reference"
+      ],
+      "scope": "gateway::tools::mcp_upstream::impl  LimitedMcpHttpClient::apply_caller_assertion#1",
+      "sha256": "84a0c9992ec3cab25b51efac21e3567fa228ff387db0fa8a6e47ee38878f39e7",
+      "owner": "GreenGateway maintainers",
+      "purpose": "Writes one signed caller-assertion header onto a request already built for the checked destination and refuses rather than replaces an existing value (#463); rebuilds that same request with build_split/from_parts and adds no destination, client or send."
     },
     {
       "file": "gateway/src/tools/mcp_upstream.rs",
@@ -13379,7 +13399,7 @@
         "network-or-process-reference"
       ],
       "scope": "gateway::tools::mcp_upstream::impl StreamableHttpClient LimitedMcpHttpClient::get_stream#1",
-      "sha256": "2617f812daca3caa63461be63797adf13c01393d0069478bf3599b8f83d8f9c3",
+      "sha256": "6cff836f36b5f4d5b4246478c1feda63153d69e55dae1bd757a3202192479f71",
       "owner": "GreenGateway maintainers",
       "purpose": "MCP protocol adaptation over checked destinations; preserve session, URL, body and deadline checks."
     },
@@ -13389,7 +13409,7 @@
         "network-or-process-reference"
       ],
       "scope": "gateway::tools::mcp_upstream::impl StreamableHttpClient LimitedMcpHttpClient::delete_session#1",
-      "sha256": "7776b7b8987cbd4acf87ad48cf89bf7ffa65331ca66667d0869a1980d81dba22",
+      "sha256": "26977734d5f0843035fd159cc4c3bdba932b7dfaf3de6d3452580fcb6590671b",
       "owner": "GreenGateway maintainers",
       "purpose": "MCP protocol adaptation over checked destinations; preserve session, URL, body and deadline checks."
     },
@@ -13400,7 +13420,7 @@
         "network-or-process-reference"
       ],
       "scope": "gateway::tools::mcp_upstream::impl StreamableHttpClient LimitedMcpHttpClient::post_message#1",
-      "sha256": "63ace08c55cbd63b2c0baacd683a6de2b088c3bde39ae38d9c1921dc07b2dcf5",
+      "sha256": "eadf053bc56d22d38ba966cc95c92ca523d56bda9b7f8b16522c441e1ea20c43",
       "owner": "GreenGateway maintainers",
       "purpose": "MCP protocol adaptation over checked destinations; preserve session, URL, body and deadline checks."
     },
@@ -13575,6 +13595,16 @@
       "sha256": "437afd5f7030bd316ae6882eecc5af1ea71f2e5d50cac477b5d46b3a9c38edd1",
       "owner": "GreenGateway maintainers",
       "purpose": "MCP protocol adaptation over checked destinations; preserve session, URL, body and deadline checks."
+    },
+    {
+      "file": "gateway/src/tools/mcp_upstream.rs",
+      "reasons": [
+        "network-or-process-reference"
+      ],
+      "scope": "gateway::tools::mcp_upstream::mcp_caller_assertion_refusal#1",
+      "sha256": "597b18e36d4d1fa4b71df465dbf962dddd232a66055553c0541a350f44de18ff",
+      "owner": "GreenGateway maintainers",
+      "purpose": "Finds a caller-assertion signing refusal inside an MCP transport error chain so the call reports its reason (#463); inspects error types only, no transport authority."
     },
     {
       "file": "gateway/src/tools/mcp_upstream.rs",

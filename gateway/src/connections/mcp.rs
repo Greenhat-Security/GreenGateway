@@ -72,8 +72,9 @@ pub enum McpCatalogRefreshError {
     ConnectionDisabled,
     ConnectionKindMismatch,
     DiscoveryNotConfigured,
-    /// The Connection asks for a signed caller assertion, which managed MCP
-    /// does not sign; discovery is refused before any session opens.
+    /// The Connection asks for a signed caller assertion. Discovery has no
+    /// caller to attest, so it is refused before any session opens; only a
+    /// tool call's session signs one.
     CallerAssertionNotEnforced,
     PreconditionFailed,
     /// A discovered tool's registry name is already published by another
@@ -1002,6 +1003,11 @@ fn refresh_transport_error(error: &McpUpstreamCallError) -> McpCatalogRefreshErr
         McpUpstreamCallError::Connection {
             reason: "caller_assertion_not_enforced",
         } => McpCatalogRefreshError::CallerAssertionNotEnforced,
+        // Discovery signs nothing: its target refuses a Connection that
+        // attests its caller before any session opens.
+        McpUpstreamCallError::CallerAssertion(_) => {
+            McpCatalogRefreshError::CallerAssertionNotEnforced
+        }
         McpUpstreamCallError::Connection { reason }
             if matches!(
                 *reason,

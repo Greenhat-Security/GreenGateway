@@ -12774,8 +12774,8 @@ async fn caller_assertion_refusals_are_conflicts_with_their_own_reason() {
 
 /// A caller assertion as an operator would send one. Saving it loads the key
 /// behind its alias, which [`attested_connection_admin_router`] provides;
-/// nothing these tests drive signs with it, because only a manual tool call
-/// does and every catalog lane refuses the Connection first.
+/// nothing these tests drive signs with it: a catalog operation makes no
+/// call for a caller, and the discovery ones refuse the Connection first.
 fn admin_caller_assertion_json() -> Value {
     json!({
         "signing_key_id": "assertion-signing-key",
@@ -12841,19 +12841,23 @@ async fn create_attested_connection(router: &Router, mut body: Value) -> (String
 }
 
 #[tokio::test]
-async fn attested_connection_catalog_operations_are_conflicts_over_http() {
-    // The refusal reaches an admin client as a 409 naming the reason, and the
-    // register and refresh failures are audited with it, through the real
-    // handlers rather than only the error mappers.
+async fn attested_connection_catalog_discovery_is_a_conflict_over_http() {
+    // A catalog registered from an uploaded specification is served on an
+    // attested Connection, because its tools sign the assertion. Discovery,
+    // which has no caller to attest, reaches an admin client as a 409 naming
+    // the reason and is audited with it, through the real handlers rather
+    // than only the error mappers.
     let connection_db = TempDb::new("connection-caller-assertion-catalogs");
     let policy = TempPolicyFile::new(&connection_policy_document_string());
     let capture = audit::sink::tests::CaptureSink::new();
     let audit_log = audit::AuditLog::new(Arc::new(capture.clone()) as Arc<dyn audit::AuditSink>);
     let router = attested_connection_admin_router(&connection_db, &policy, audit_log);
 
-    let openapi_body: Value =
+    let mut openapi_body: Value =
         serde_json::from_str(&managed_openapi_connection_body("Attested OpenAPI"))
             .expect("managed OpenAPI body should parse");
+    // A refresh fetches the specification from this path: discovery.
+    openapi_body["discovery"]["path"] = json!("/openapi.json");
     let (openapi_id, openapi_etag) = create_attested_connection(&router, openapi_body).await;
     let spec = widget_openapi_spec();
 
@@ -12869,14 +12873,22 @@ async fn attested_connection_catalog_operations_are_conflicts_over_http() {
         ))
         .await
         .expect("attested preview should complete");
-    assert_eq!(preview.status(), StatusCode::CONFLICT);
-    assert_eq!(
-        json_body(preview).await["reason"],
-        json!("caller_assertion_not_enforced")
-    );
+    assert_eq!(preview.status(), StatusCode::OK);
+    let preview = json_body(preview).await;
+    let selected_tool_name = preview["tools"][0]["name"]
+        .as_str()
+        .expect("preview should include a generated tool")
+        .to_owned();
+    let selected_security_confirmation = preview["security_confirmations"]
+        .as_array()
+        .and_then(|confirmations| {
+            confirmations.iter().find(|confirmation| {
+                confirmation["tool_name"].as_str() == Some(selected_tool_name.as_str())
+            })
+        })
+        .cloned()
+        .expect("selected tool should include an exact security confirmation");
 
-    // A correct digest and a non-empty selection, so only the refusal can
-    // stop the registration.
     let register = router
         .clone()
         .oneshot(connection_admin_request(
@@ -12886,11 +12898,11 @@ async fn attested_connection_catalog_operations_are_conflicts_over_http() {
             Some(
                 json!({
                     "spec": spec,
-                    "spec_digest": hex::encode(Sha256::digest(spec.as_bytes())),
-                    "expected_spec_revision": 0,
-                    "expected_catalog_revision": 0,
-                    "selected_tool_names": ["getWidget"],
-                    "security_confirmations": [],
+                    "spec_digest": preview["spec_digest"],
+                    "expected_spec_revision": preview["spec_revision"],
+                    "expected_catalog_revision": preview["catalog_revision"],
+                    "selected_tool_names": [selected_tool_name],
+                    "security_confirmations": [selected_security_confirmation],
                 })
                 .to_string(),
             ),
@@ -12899,11 +12911,8 @@ async fn attested_connection_catalog_operations_are_conflicts_over_http() {
         ))
         .await
         .expect("attested register should complete");
-    assert_eq!(register.status(), StatusCode::CONFLICT);
-    assert_eq!(
-        json_body(register).await["reason"],
-        json!("caller_assertion_not_enforced")
-    );
+    assert_eq!(register.status(), StatusCode::CREATED);
+    assert_eq!(json_body(register).await["total_count"], json!(1));
 
     let openapi_refresh = router
         .clone()
@@ -12966,17 +12975,16 @@ async fn attested_connection_catalog_operations_are_conflicts_over_http() {
     };
     assert_eventually(Duration::from_secs(1), || {
         let events = capture.events();
-        events.iter().any(|event| {
-            event.event_type == audit::event::TOOL_REGISTRY_CHANGED
-                && event.payload["action"] == json!("managed_openapi_catalog_registration_rejected")
-                && refused(event, openapi_id.as_str())
-        }) && [&openapi_id, &mcp_id].into_iter().all(|id| {
+        [&openapi_id, &mcp_id].into_iter().all(|id| {
             events.iter().any(|event| {
                 event.event_type == audit::event::CONNECTION_REFRESHED
                     && refused(event, id.as_str())
             })
         })
     });
+    assert!(capture.events().iter().all(|event| {
+        event.payload["action"] != json!("managed_openapi_catalog_registration_rejected")
+    }));
 }
 
 #[tokio::test]
