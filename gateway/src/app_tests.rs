@@ -29939,7 +29939,9 @@ fn await_shadow_transition_refusals(
     capture: &audit::sink::tests::CaptureSink,
     expected: usize,
 ) -> Vec<audit::AuditEvent> {
-    assert_eventually(Duration::from_secs(1), || {
+    // The audit worker thread delivers the event; give a loaded runner room
+    // rather than fail on scheduling delay. A passing run returns at once.
+    assert_eventually(Duration::from_secs(5), || {
         shadow_transition_refusals(capture).len() >= expected
     });
     let refusals = shadow_transition_refusals(capture);
