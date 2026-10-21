@@ -921,11 +921,22 @@ a `refresh_token` included, are skipped unread and never kept.
   the signing key or the client secret is read, and a refused host fails the
   call with `delegated_token_egress_denied`. Redirects are not followed.
 - `client_secret_id` is resolved with the `token_exchange_client_secret`
-  purpose. It is kept apart from `oauth_client_secret` so an alias provisioned
-  for an ordinary OAuth client cannot be bound here by mistake. As with a
-  signing key, the encrypted local store cannot hold one: provision it through
-  an operator alias or an external secret provider. A disabled draft may leave
-  it unset.
+  purpose. As with a signing key, the encrypted local store cannot hold one:
+  provision it through an operator alias or an external secret provider. A
+  disabled draft may leave it unset.
+- The purpose sets the secret's size and encoding rules only. Operator and
+  external-provider aliases are not tied to a purpose: one alias resolves
+  under any. So the gateway keeps this secret apart itself. A save is refused
+  with `422`, the candidate's field and `secret_purpose_conflict` when it would
+  bind a token-exchange client secret's alias under any other field -- an
+  OAuth client secret, a static bearer or API key, an additional header, TLS
+  material or a caller-assertion key -- on the same Connection or any other,
+  enabled or not; and when it would bind such a field to an alias any
+  Connection exchanges with. Two delegated Connections may share one client
+  secret. The check runs inside the store's write transaction, under the lock
+  every mutation takes, so in cluster mode two replicas cannot each pass it.
+  Still give the token-exchange client secret an alias of its own: a provider
+  object behind two aliases is two aliases to the gateway.
 
 #### Which calls are served
 
@@ -941,9 +952,9 @@ with no principal, or a service token's, is refused with
 #### The cache
 
 - Tokens are cached in memory per Connection revision, per caller (a digest of
-  the caller's issuer, subject, email and roles), per client-secret version and
-  per egress policy. Two callers never share a token, and a caller whose
-  attested claims changed is exchanged for again.
+  the caller's issuer, subject, email and roles) and per egress policy. Two
+  callers never share a token, and a caller whose attested claims changed is
+  exchanged for again.
 - A token is refreshed shortly before the issuer's `expires_in` -- a fifth of
   its lifetime, at most thirty seconds early, plus up to five seconds of jitter
   -- and is never reused for longer than 900 seconds whatever `expires_in`
@@ -954,9 +965,15 @@ with no principal, or a service token's, is refused with
   full cache evicts an idle entry, which costs that caller one more exchange,
   and refuses a call with `delegated_token_unavailable` only while every entry
   is held by a call in flight.
-- A save, a client-secret rotation or an egress policy change moves the cache
-  key: the first call afterwards exchanges again and drops every idle token
-  held for the Connection's earlier configuration.
+- A save of the Connection or an egress policy change moves the cache key: the
+  first call afterwards exchanges again and drops every idle token held for
+  the Connection's earlier configuration.
+- Rotating the client secret does not. The gateway cannot see a rotation
+  behind an operator alias or an external provider, so tokens already cached
+  keep being served until they are refreshed, for at most 900 seconds; the
+  next exchange simply uses the new secret. Rotating the secret does not
+  revoke the tokens the issuer already handed out, either. After an incident,
+  revoke at the issuer and save the Connection to drop its cached tokens.
 - An upstream `401` drops the token that request used, so the caller's next
   call exchanges again. The rejected call is not replayed.
 - Nothing is persisted. A restart starts with an empty cache.
@@ -1023,7 +1040,11 @@ the trust sits:
 - **The issuer must verify the subject token.** It is the only proof of who
   the caller is. Pin the gateway's `iss`, the `aud` and `typ` the block
   configures, and the JWKS URL; never accept an unsigned subject or one the
-  gateway did not sign.
+  gateway did not sign. Every Connection's assertions verify against the same
+  JWKS, so give the delegated Connection's block an `aud` (or `typ`) that
+  no other attested Connection uses: otherwise an assertion sent to that
+  Connection's upstream is also a subject token the issuer accepts, and only
+  the client secret stands between that upstream and the caller's grant.
 - **The gateway keeps tokens only in the bounded cache above**, never on disk,
   and for at most 900 seconds.
 - **Revocation on user disable is not automatic yet.** A disabled user cannot
@@ -1032,7 +1053,9 @@ the trust sits:
   user's cached tokens the moment they are disabled, and audited revocation
   at the issuer, are follow-ups. Until then, revoke the grant at the issuer and,
   for an immediate stop, save the Connection, which drops every cached token
-  for it.
+  for it. In cluster mode each replica holds its own cache and stops using the
+  old tokens only once it has applied the save, at its next reconcile; until
+  then it keeps serving them.
 - Policy is unchanged: tool policy and `rules[]` apply per principal before any
   exchange, so read-only deny rules and per-tool roles limit what a caller can
   do with their own token.

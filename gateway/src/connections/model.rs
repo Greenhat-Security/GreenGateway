@@ -311,6 +311,74 @@ pub const CALLER_ASSERTION_SIGNING_KEY_FIELD: &str = "caller_assertion.signing_k
 pub const CALLER_ASSERTION_PUBLISHED_KEY_FIELD: &str =
     "caller_assertion.published_keys.signing_key_id";
 
+/// The code a write is refused with when the alias of a
+/// `delegated_issuer_token` client secret is also bound under another field,
+/// by the same Connection or by another one. See
+/// [`token_exchange_secret_conflict`].
+pub const SECRET_PURPOSE_CONFLICT_CODE: &str = "secret_purpose_conflict";
+
+/// The field a `delegated_issuer_token` client secret is bound under.
+const TOKEN_EXCHANGE_CLIENT_SECRET_FIELD: &str = "authentication.client_secret_id";
+
+/// One secret alias a Connection document binds, and the field binding it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct BoundSecretAlias<'a> {
+    pub(crate) field: &'static str,
+    pub(crate) alias: &'a str,
+    /// Bound as a `delegated_issuer_token` client secret.
+    pub(crate) token_exchange_client_secret: bool,
+}
+
+/// The field of `candidate` that would share a token-exchange client secret's
+/// alias with another purpose, if any: an alias `candidate` binds as a
+/// `delegated_issuer_token` client secret that it, or one of `others`, also
+/// binds under another field; or an alias `candidate` binds under another
+/// field that one of `others` binds as such a client secret.
+///
+/// That secret is worth more than any other a Connection binds: the issuer
+/// hands any user's upstream token to whoever holds it. Its purpose sets only
+/// its byte bound and encoding, and an operator alias or an external
+/// provider's alias carries no purpose of its own, so nothing else stops one
+/// alias being bound as this secret on one Connection and, say, as an OAuth
+/// client secret on another, which would send it to that Connection's token
+/// endpoint. This rule does. Every binding counts, whether its Connection is
+/// enabled or not: the credential, every additional header, the TLS profile
+/// and every caller-assertion key. Two delegated Connections may share one
+/// client secret.
+pub(crate) fn token_exchange_secret_conflict<'a>(
+    candidate: &ConnectionWrite,
+    others: impl IntoIterator<Item = &'a ConnectionWrite>,
+) -> Option<&'static str> {
+    let ours = candidate.bound_secret_aliases();
+    if binds_token_exchange_alias_elsewhere(&ours) {
+        return Some(TOKEN_EXCHANGE_CLIENT_SECRET_FIELD);
+    }
+    for other in others {
+        for theirs in other.bound_secret_aliases() {
+            if let Some(conflict) = ours.iter().find(|ours| {
+                ours.alias == theirs.alias
+                    && ours.token_exchange_client_secret != theirs.token_exchange_client_secret
+            }) {
+                return Some(conflict.field);
+            }
+        }
+    }
+    None
+}
+
+/// Whether one document binds its token-exchange client secret's alias under
+/// another field too.
+fn binds_token_exchange_alias_elsewhere(bound: &[BoundSecretAlias<'_>]) -> bool {
+    bound
+        .iter()
+        .filter(|secret| secret.token_exchange_client_secret)
+        .any(|secret| {
+            bound
+                .iter()
+                .any(|other| !other.token_exchange_client_secret && other.alias == secret.alias)
+        })
+}
+
 /// One key a caller assertion publishes, with the fields it is configured in.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CallerAssertionKeyRef<'a> {
@@ -519,6 +587,17 @@ impl ConnectionWrite {
             &mut errors,
         );
         validate_tls(&self.tls, self.enabled, &mut errors);
+        // Another Connection's bindings are the store's to check, inside the
+        // transaction that writes this one; this document's own are checked
+        // here. Like the rest of the delegated rules this applies to stored
+        // documents too, since no earlier release wrote one.
+        if binds_token_exchange_alias_elsewhere(&self.bound_secret_aliases()) {
+            errors.push(ConnectionValidationError::new(
+                TOKEN_EXCHANGE_CLIENT_SECRET_FIELD,
+                SECRET_PURPOSE_CONFLICT_CODE,
+                "the token-exchange client secret's alias must not be bound under any other field",
+            ));
+        }
         validate_timeouts(self.timeouts.as_ref(), &mut errors);
         validate_discovery(self.kind, self.discovery.as_mut(), &mut errors);
         validate_test_profile(
@@ -706,6 +785,92 @@ impl ConnectionWrite {
             }
         }
         unresolved
+    }
+
+    /// Whether this document binds a `delegated_issuer_token` client secret.
+    pub(crate) fn binds_token_exchange_client_secret(&self) -> bool {
+        matches!(
+            &self.authentication,
+            ConnectionAuthentication::DelegatedIssuerToken {
+                client_secret_id: Some(_),
+                ..
+            }
+        )
+    }
+
+    /// Every secret alias this document binds, with the field binding it: the
+    /// credential, every additional header, the TLS profile and every
+    /// caller-assertion key. A binding a draft leaves unset is not listed.
+    pub(crate) fn bound_secret_aliases(&self) -> Vec<BoundSecretAlias<'_>> {
+        let mut bound = Vec::new();
+        let (field, alias, token_exchange_client_secret) = match &self.authentication {
+            ConnectionAuthentication::None => ("authentication", None, false),
+            ConnectionAuthentication::HeaderApiKey { secret_id, .. }
+            | ConnectionAuthentication::StaticBearer { secret_id } => {
+                ("authentication.secret_id", secret_id.as_deref(), false)
+            }
+            ConnectionAuthentication::OAuth2ClientCredentials {
+                client_secret_id, ..
+            } => (
+                "authentication.client_secret_id",
+                client_secret_id.as_deref(),
+                false,
+            ),
+            ConnectionAuthentication::DelegatedIssuerToken {
+                client_secret_id, ..
+            } => (
+                TOKEN_EXCHANGE_CLIENT_SECRET_FIELD,
+                client_secret_id.as_deref(),
+                true,
+            ),
+        };
+        if let Some(alias) = alias {
+            bound.push(BoundSecretAlias {
+                field,
+                alias,
+                token_exchange_client_secret,
+            });
+        }
+        for alias in self
+            .additional_headers
+            .iter()
+            .filter_map(|header| header.secret_id.as_deref())
+        {
+            bound.push(BoundSecretAlias {
+                field: "additional_headers.secret_id",
+                alias,
+                token_exchange_client_secret: false,
+            });
+        }
+        for (field, alias) in [
+            ("tls.ca_bundle_alias", self.tls.ca_bundle_alias.as_deref()),
+            (
+                "tls.client_certificate_id",
+                self.tls.client_certificate_id.as_deref(),
+            ),
+            (
+                "tls.client_private_key_id",
+                self.tls.client_private_key_id.as_deref(),
+            ),
+        ] {
+            if let Some(alias) = alias {
+                bound.push(BoundSecretAlias {
+                    field,
+                    alias,
+                    token_exchange_client_secret: false,
+                });
+            }
+        }
+        if let Some(assertion) = &self.caller_assertion {
+            for key in assertion.keys() {
+                bound.push(BoundSecretAlias {
+                    field: key.field,
+                    alias: key.signing_key_id,
+                    token_exchange_client_secret: false,
+                });
+            }
+        }
+        bound
     }
 }
 
@@ -2216,6 +2381,139 @@ newline"
         let unresolved =
             validated.unresolved_enabled_binding_fields(|id| id != "issuer-exchange-secret");
         assert_eq!(unresolved, vec!["authentication.client_secret_id"]);
+    }
+
+    fn write(document: Value) -> ConnectionWrite {
+        serde_json::from_value(document).expect("candidate should deserialize")
+    }
+
+    #[test]
+    fn a_delegated_client_secret_alias_is_bound_nowhere_else_in_its_own_document() {
+        // Each of these would hand the secret to something other than the
+        // issuer: a header sent upstream, TLS or signing material.
+        let mut header = delegated(json!({}));
+        header["additional_headers"] = json!([
+            {"header_name": "X-Proxy-Token", "secret_id": "issuer-exchange-secret"}
+        ]);
+        let mut tls = delegated(json!({}));
+        tls["tls"]["ca_bundle_alias"] = json!("issuer-exchange-secret");
+        let mut signing = delegated(json!({}));
+        signing["caller_assertion"]["signing_key_id"] = json!("issuer-exchange-secret");
+        let mut published = delegated(json!({}));
+        published["caller_assertion"]["published_keys"] = json!([
+            {"signing_key_id": "issuer-exchange-secret", "kid": "gw-next", "algorithm": "es256"}
+        ]);
+        for document in [header, tls, signing, published] {
+            let errors = delegated_errors(document.clone());
+            assert!(
+                errors.iter().any(|error| {
+                    error.field == "authentication.client_secret_id"
+                        && error.code == SECRET_PURPOSE_CONFLICT_CODE
+                }),
+                "{errors:?}"
+            );
+            // A stored document is held to it too: no earlier release wrote
+            // this credential.
+            assert!(write(document).validated_persisted_v0().is_err());
+        }
+
+        // Other credentials keep their existing freedom: an OAuth client
+        // secret may still share an alias with a header.
+        let mut oauth = example();
+        oauth["additional_headers"] = json!([
+            {"header_name": "X-Proxy-Token", "secret_id": "billing-client-secret"}
+        ]);
+        write(oauth)
+            .validated()
+            .expect("only the token-exchange client secret is exclusive");
+    }
+
+    #[test]
+    fn a_token_exchange_client_secret_alias_conflicts_with_any_other_purpose_across_connections() {
+        let mail = write(delegated(json!({})));
+        let oauth_reusing = write(example())
+            .validated()
+            .map(|mut oauth| {
+                if let ConnectionAuthentication::OAuth2ClientCredentials {
+                    client_secret_id, ..
+                } = &mut oauth.authentication
+                {
+                    *client_secret_id = Some("issuer-exchange-secret".to_owned());
+                }
+                oauth
+            })
+            .expect("example validates");
+
+        // Both directions, reported as the candidate's own field.
+        assert_eq!(
+            token_exchange_secret_conflict(&mail, [&oauth_reusing]),
+            Some("authentication.client_secret_id")
+        );
+        assert_eq!(
+            token_exchange_secret_conflict(&oauth_reusing, [&mail]),
+            Some("authentication.client_secret_id")
+        );
+
+        // Any other binding of another Connection counts: a header, TLS
+        // material, a caller-assertion key.
+        let mut header = write(example());
+        header.additional_headers.push(AdditionalHeader {
+            header_name: "x-proxy-token".to_owned(),
+            secret_id: Some("issuer-exchange-secret".to_owned()),
+        });
+        assert_eq!(
+            token_exchange_secret_conflict(&header, [&mail]),
+            Some("additional_headers.secret_id")
+        );
+        assert_eq!(
+            token_exchange_secret_conflict(&mail, [&header]),
+            Some("authentication.client_secret_id")
+        );
+        let mut tls = write(example());
+        tls.tls.client_private_key_id = Some("issuer-exchange-secret".to_owned());
+        assert_eq!(
+            token_exchange_secret_conflict(&tls, [&mail]),
+            Some("tls.client_private_key_id")
+        );
+        let mut signer = write(with_caller_assertion(json!({})));
+        if let Some(assertion) = signer.caller_assertion.as_mut() {
+            assertion.signing_key_id = "issuer-exchange-secret".to_owned();
+        }
+        assert_eq!(
+            token_exchange_secret_conflict(&signer, [&mail]),
+            Some(CALLER_ASSERTION_SIGNING_KEY_FIELD)
+        );
+        // The delegated Connection's own signing key is an ordinary binding:
+        // another delegated Connection may not exchange with it.
+        let mut exchanging_with_a_signing_key = write(delegated(json!({
+            "client_secret_id": "assertion-signing-key"
+        })));
+        if let Some(assertion) = exchanging_with_a_signing_key.caller_assertion.as_mut() {
+            assertion.signing_key_id = "calendar-assertion-key".to_owned();
+        }
+        assert_eq!(
+            token_exchange_secret_conflict(&exchanging_with_a_signing_key, [&mail]),
+            Some("authentication.client_secret_id")
+        );
+
+        // Two delegated Connections may share one client secret and one
+        // signing key, and unrelated aliases never conflict.
+        let sibling = write(delegated(json!({})));
+        assert_eq!(token_exchange_secret_conflict(&sibling, [&mail]), None);
+        assert_eq!(
+            token_exchange_secret_conflict(&write(example()), [&mail]),
+            None
+        );
+        // A draft that leaves its secret unset binds nothing.
+        let mut draft = delegated(json!({}));
+        draft["authentication"]
+            .as_object_mut()
+            .expect("authentication object")
+            .remove("client_secret_id");
+        assert_eq!(
+            token_exchange_secret_conflict(&oauth_reusing, [&write(draft)]),
+            None
+        );
     }
 
     #[test]

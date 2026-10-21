@@ -933,6 +933,79 @@ mod tests {
         assert_eq!(mints.load(Ordering::Acquire), 2);
     }
 
+    /// The first call under a client-credentials Connection's new
+    /// configuration drops that Connection's idle tokens under every other
+    /// one. While pinned snapshots still alternate the old and the new
+    /// configuration, each switch to a dropped one mints again: a bounded cost
+    /// of a change, never a token served across configurations. A token a
+    /// call still holds is never dropped.
+    #[tokio::test]
+    async fn a_new_configuration_drops_idle_tokens_of_the_others_and_alternating_mints_again() {
+        let cache = OAuthTokenCache::new(Arc::new(FakeClock::new()));
+        let mints = Arc::new(AtomicUsize::new(0));
+        let mint = |value: &'static str| {
+            let mints = Arc::clone(&mints);
+            move || async move {
+                mints.fetch_add(1, Ordering::AcqRel);
+                Ok(token(value, Duration::from_secs(3_600)))
+            }
+        };
+        let bearer = |lease: &OAuthTokenLease| {
+            let mut headers = HeaderMap::new();
+            lease.inject(&mut headers).expect("token should inject");
+            headers.get(header::AUTHORIZATION).cloned()
+        };
+
+        let old = cache
+            .get_or_mint(key(1, None), mint("old-token"))
+            .await
+            .expect("the old configuration mints");
+        drop(old);
+        let new = cache
+            .get_or_mint(key(2, None), mint("new-token"))
+            .await
+            .expect("the new configuration mints");
+        assert_eq!(cache.slot_count(), 1, "the old idle token is dropped");
+        drop(new);
+
+        // A pinned snapshot still on the old configuration mints again, and
+        // drops the new one's idle token in turn; the next call on the new
+        // configuration mints again too.
+        let old_again = cache
+            .get_or_mint(key(1, None), mint("old-again-token"))
+            .await
+            .expect("the old configuration mints again");
+        assert_eq!(
+            bearer(&old_again),
+            Some(HeaderValue::from_static("Bearer old-again-token"))
+        );
+        assert_eq!(cache.slot_count(), 1);
+        let new_again = cache
+            .get_or_mint(key(2, None), mint("new-again-token"))
+            .await
+            .expect("the new configuration mints again");
+        assert_eq!(mints.load(Ordering::Acquire), 4);
+        assert_eq!(
+            bearer(&new_again),
+            Some(HeaderValue::from_static("Bearer new-again-token"))
+        );
+        // `old_again` is still held, so its slot stays beside the new one.
+        assert_eq!(cache.slot_count(), 2, "a held token is never dropped");
+        drop(old_again);
+        drop(new_again);
+
+        // Without a change, a cached token keeps serving.
+        let cached = cache
+            .get_or_mint(key(2, None), mint("unexpected"))
+            .await
+            .expect("the cached token serves");
+        assert_eq!(mints.load(Ordering::Acquire), 4);
+        assert_eq!(
+            bearer(&cached),
+            Some(HeaderValue::from_static("Bearer new-again-token"))
+        );
+    }
+
     #[tokio::test]
     async fn revision_and_secret_rotation_partition_tokens_without_reviving_old_generation() {
         let clock = Arc::new(FakeClock::new());

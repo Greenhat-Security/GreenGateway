@@ -18,9 +18,9 @@ use crate::tools::definitions::ToolDefinition;
 
 use super::{
     model::{
-        ConnectionAuthentication, ConnectionId, ConnectionKind, ConnectionManagementSource,
-        ConnectionWrite, DiscoveryConfig, CONNECTION_SCHEMA_VERSION, MAX_CATALOG_ENTRIES,
-        MAX_CONNECTIONS, MAX_CREDENTIALS, MAX_MANAGED_OPENAPI_CATALOG_BYTES,
+        token_exchange_secret_conflict, ConnectionAuthentication, ConnectionId, ConnectionKind,
+        ConnectionManagementSource, ConnectionWrite, DiscoveryConfig, CONNECTION_SCHEMA_VERSION,
+        MAX_CATALOG_ENTRIES, MAX_CONNECTIONS, MAX_CREDENTIALS, MAX_MANAGED_OPENAPI_CATALOG_BYTES,
         MAX_MANAGED_SPEC_BYTES, MAX_STATUS_HISTORY_ROWS,
     },
     status::{
@@ -1396,6 +1396,15 @@ pub enum ConnectionStoreError {
         id: String,
         count: usize,
     },
+    /// A secret alias the candidate binds would be both a
+    /// `delegated_issuer_token` client secret and some other binding, on the
+    /// candidate or on another Connection (see
+    /// [`token_exchange_secret_conflict`]). `field` is the candidate's. The
+    /// caller surfaces `422` with `secret_purpose_conflict`. Nothing was
+    /// written.
+    SecretPurposeConflict {
+        field: &'static str,
+    },
     RevisionOverflow {
         id: String,
     },
@@ -1504,6 +1513,10 @@ impl fmt::Display for ConnectionStoreError {
             } => write!(
                 formatter,
                 "connection '{id}' cannot publish tool '{tool_name}': it is already published by the {lane} lane ({owner_id})"
+            ),
+            Self::SecretPurposeConflict { field } => write!(
+                formatter,
+                "{field} binds a secret alias that a token-exchange client secret shares with another binding"
             ),
             Self::RevisionOverflow { id } => {
                 write!(
@@ -3389,6 +3402,7 @@ impl ConnectionStore for SqliteConnectionStore {
             });
         }
         ensure_binding_capacity(&transaction, &self.path, None, 0, binding_count(&candidate))?;
+        ensure_token_exchange_secret_exclusive_in(&transaction, &self.path, None, &candidate)?;
         transaction
             .execute(
                 r#"
@@ -3515,6 +3529,7 @@ impl ConnectionStore for SqliteConnectionStore {
             binding_count(&current.write),
             binding_count(&candidate),
         )?;
+        ensure_token_exchange_secret_exclusive_in(&transaction, &self.path, Some(id), &candidate)?;
         let revisions = replacement_revisions(id, &current, &candidate)?;
         transaction
             .execute(
@@ -6943,6 +6958,8 @@ pub(crate) struct ExpectedBinding<'a> {
 }
 
 pub(crate) const ADDITIONAL_HEADER_BINDING_PURPOSE: &str = "additional_header";
+pub(crate) const TOKEN_EXCHANGE_CLIENT_SECRET_BINDING_PURPOSE: &str =
+    "token_exchange_client_secret";
 
 pub(crate) fn expected_bindings<'a>(
     write: &'a ConnectionWrite,
@@ -6980,7 +6997,7 @@ pub(crate) fn expected_bindings<'a>(
             client_secret_id: Some(secret_id),
             ..
         } => bindings.push(binding(
-            "token_exchange_client_secret",
+            TOKEN_EXCHANGE_CLIENT_SECRET_BINDING_PURPOSE,
             secret_id.as_str(),
             revisions.credential,
         )),
@@ -7136,6 +7153,61 @@ fn ensure_binding_capacity(
         });
     }
     Ok(())
+}
+
+/// Refuses `candidate` when it would share a token-exchange client secret's
+/// alias with another purpose (see [`token_exchange_secret_conflict`]).
+/// `others` are every other stored Connection. Both stores call this inside
+/// the transaction that writes `candidate`, so the rule is the authority's
+/// and holds across replicas.
+pub(crate) fn ensure_token_exchange_secret_exclusive<'a>(
+    candidate: &ConnectionWrite,
+    others: impl IntoIterator<Item = &'a ConnectionWrite>,
+) -> Result<(), ConnectionStoreError> {
+    match token_exchange_secret_conflict(candidate, others) {
+        Some(field) => Err(ConnectionStoreError::SecretPurposeConflict { field }),
+        None => Ok(()),
+    }
+}
+
+/// [`ensure_token_exchange_secret_exclusive`] against every other record in
+/// this transaction. With no token-exchange client secret on either side
+/// there is nothing to compare, and the records are not read: the binding
+/// rows always match their documents, which every read verifies.
+fn ensure_token_exchange_secret_exclusive_in(
+    transaction: &Transaction<'_>,
+    path: &Path,
+    replaced_id: Option<&ConnectionId>,
+    candidate: &ConnectionWrite,
+) -> Result<(), ConnectionStoreError> {
+    if !candidate.binds_token_exchange_client_secret() {
+        let others_bind_one: bool = transaction
+            .query_row(
+                r#"
+                SELECT EXISTS (
+                    SELECT 1 FROM connection_credential_bindings
+                    WHERE purpose = ?1 AND connection_id <> ?2
+                )
+                "#,
+                params![
+                    TOKEN_EXCHANGE_CLIENT_SECRET_BINDING_PURPOSE,
+                    replaced_id.map_or("", ConnectionId::as_str),
+                ],
+                |row| row.get(0),
+            )
+            .map_err(|source| sqlite_error(path, "token-exchange binding lookup", source))?;
+        if !others_bind_one {
+            return Ok(());
+        }
+    }
+    let records = load_all_records(transaction, path)?;
+    ensure_token_exchange_secret_exclusive(
+        candidate,
+        records
+            .iter()
+            .filter(|record| Some(&record.id) != replaced_id)
+            .map(|record| &record.write),
+    )
 }
 
 pub(crate) fn validate_candidate(

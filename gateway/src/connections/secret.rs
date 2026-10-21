@@ -883,11 +883,18 @@ pub enum SecretPurpose {
     /// published JWKS: no lane injects it, and it is never a header value.
     AssertionSigningKey,
     /// The client secret a `delegated_issuer_token` Connection authenticates
-    /// to its token-exchange issuer with. Kept apart from
-    /// [`Self::OAuthClientSecret`] because it is worth far more: the issuer
-    /// hands out any user's upstream token to whoever holds it, so an alias
-    /// provisioned for an ordinary OAuth client can never be bound here by
-    /// mistake, nor this one there.
+    /// to its token-exchange issuer with. It is worth far more than an
+    /// ordinary [`Self::OAuthClientSecret`]: the issuer hands out any user's
+    /// upstream token to whoever holds it.
+    ///
+    /// Like every purpose, this sets the material's byte bound and encoding
+    /// rules, and the encrypted local store refuses an alias stored under
+    /// another purpose. It does not keep an operator or external-provider
+    /// alias out of other bindings: those carry no purpose, and resolve under
+    /// any. What does is the store refusing a write that would bind this
+    /// secret's alias under any other field of any Connection, or bind
+    /// another field to an alias some Connection exchanges with (see
+    /// `model::token_exchange_secret_conflict`).
     TokenExchangeClientSecret,
 }
 

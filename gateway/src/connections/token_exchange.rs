@@ -12,8 +12,9 @@
 //!   it against the published JWKS. It is never the caller's own inbound bearer token: forwarding
 //!   that is a separate decision this module does not make.
 //! - The answer is injected as `Authorization: Bearer` and cached under the Connection's revision,
-//!   the caller, the client secret's version and the egress policy, until shortly before the
-//!   issuer's `expires_in` and for at most [`MAX_DELEGATED_TOKEN_CACHE_SECONDS`].
+//!   the caller and the egress policy, until shortly before the issuer's `expires_in` and for at
+//!   most [`MAX_DELEGATED_TOKEN_CACHE_SECONDS`]. Rotating the client secret behind its alias does
+//!   not move that key (see [`DelegatedTokenRuntime::access_token`]); saving the Connection does.
 //!
 //! A call that names nobody is refused before anything is read or sent; so is one whose exchange
 //! fails, with a reason of its own, and never with a fallback to a shared identity. Every exchange
@@ -238,6 +239,15 @@ impl DelegatedTokenRuntime {
             connection_id: binding.connection_id.to_string(),
             connection_etag: binding.connection_etag.clone(),
             subject: Some(subject_digest(caller)),
+            // Always `None` today. The encrypted local store's version is the
+            // only one a rotation moves while the gateway runs, and that store
+            // cannot hold this purpose; an operator alias or an external
+            // provider's alias is read afresh on each exchange, with nothing
+            // to say it changed. So rotating the client secret does not drop
+            // cached tokens (nor does it revoke the tokens the issuer already
+            // handed out); saving the Connection, which moves its etag, does.
+            // Kept rather than written as `None`, so that a local store able
+            // to hold the purpose would partition the cache by rotation.
             secret_version: self
                 .control_plane
                 .local_secret_version(&binding.client_secret_id),

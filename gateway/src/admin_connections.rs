@@ -2470,6 +2470,19 @@ pub(super) fn connection_store_error_response(
             }),
         )
             .into_response(),
+        // The candidate's field and a fixed code. Which other Connection, or
+        // which alias, is not said: the field is enough to fix the write.
+        connections::store::ConnectionStoreError::SecretPurposeConflict { field } => (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(ConnectionValidationResponse {
+                error: "connection validation failed",
+                problems: vec![ConnectionValidationProblem {
+                    field,
+                    code: connections::model::SECRET_PURPOSE_CONFLICT_CODE,
+                }],
+            }),
+        )
+            .into_response(),
         connections::store::ConnectionStoreError::NotFound { .. } => {
             not_found("connection was not found")
         }

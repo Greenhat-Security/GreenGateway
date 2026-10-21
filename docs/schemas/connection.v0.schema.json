@@ -404,7 +404,7 @@
             },
             "client_secret_id": {
               "$ref": "#/$defs/stable_id",
-              "description": "Secret alias of the client secret the gateway authenticates to the issuer with, resolved with the token_exchange_client_secret purpose, so it comes from an operator alias or an external secret provider, never the encrypted local store. Required once the Connection is enabled."
+              "description": "Secret alias of the client secret the gateway authenticates to the issuer with, resolved with the token_exchange_client_secret purpose, so it comes from an operator alias or an external secret provider, never the encrypted local store. No other field of any Connection may bind the same alias. Required once the Connection is enabled."
             },
             "requested_scopes": {
               "type": "array",

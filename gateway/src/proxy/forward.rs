@@ -22,10 +22,7 @@ use serde_json::json;
 use super::{retry, MatchedUpstream, ProxyState, RequestBodyMode, RouteRequestHeaderPolicy};
 use crate::{
     audit, auth,
-    connections::{
-        caller_assertion::AttestedCaller,
-        http::{ConnectionHttpError, ConnectionHttpTarget},
-    },
+    connections::http::{ConnectionHttpError, ConnectionHttpTarget},
     egress, middleware, upstream_route,
 };
 
@@ -604,18 +601,12 @@ async fn forward_to_upstream(
                 }
                 Ok(Ok(prepared)) => prepared,
             };
-            // Only a credential that belongs to the caller needs one named,
-            // so the principal is copied for nothing else.
-            let caller = target
-                .credential_belongs_to_caller()
-                .then(|| {
-                    parts
-                        .extensions
-                        .get::<auth::Principal>()
-                        .and_then(AttestedCaller::from_principal)
-                })
-                .flatten();
-            let resolution = runtime.resolve_credential_before(target, caller.as_ref(), deadline);
+            // No caller is named: a proxied request is never served by a
+            // credential that belongs to the caller. `target()` refuses such a
+            // Connection with `caller_assertion_not_enforced` before this, and
+            // were that lifted, resolution would still refuse with
+            // `delegated_token_no_principal` rather than exchange for nobody.
+            let resolution = runtime.resolve_credential_before(target, None, deadline);
             let credential = tokio::select! {
                 biased;
                 () = forced_shutdown.cancelled() => {

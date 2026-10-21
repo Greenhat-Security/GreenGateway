@@ -38,20 +38,21 @@ use crate::storage::{
 
 use super::store::{
     binding_count, decode_enum_source_values, encode_enum_source_values, ensure_etag,
-    expected_bindings, increment_revision, initial_revisions, managed_tool_dependency_id,
-    optional_i64_to_u64, optional_u64_to_i64, parse_reason, parse_state, persisted_revision,
-    reason_as_str, replacement_revisions, revision_from_i64, state_as_str,
-    supports_managed_mcp_catalog, supports_managed_openapi_catalog, u64_to_i64, utc_timestamp,
-    valid_enum_source_timestamp, valid_overlay_local_name, valid_sha256_hex,
-    validate_activity_timestamp, validate_candidate, validate_dependency_id, validate_mcp_catalog,
-    validate_openapi_catalog_entries, validate_openapi_overlay_write, validate_openapi_spec,
-    ConnectionActivityTimes, ConnectionDependency, ConnectionDependencyKind, ConnectionEtag,
-    ConnectionStatusUpdate, ConnectionStoreError, ExportedConnectionStatuses,
-    PersistedConnectionStatus, StoredConnection, StoredEnumSourceRevision, StoredEnumSourceValue,
-    StoredEnumSourceValueWrite, StoredMcpCatalog, StoredMcpCatalogEntry, StoredMcpResource,
-    StoredMcpResourceTemplate, StoredOpenApiCatalog, StoredOpenApiCatalogEntry,
-    StoredOpenApiInventoryCatalog, StoredOpenApiOverlay, StoredOpenApiSourceReports,
-    StoredOverlayWrite, MAX_CONNECTION_DEPENDENCIES, MAX_OPENAPI_ENUM_SOURCES, SOURCE_MANAGED,
+    ensure_token_exchange_secret_exclusive, expected_bindings, increment_revision,
+    initial_revisions, managed_tool_dependency_id, optional_i64_to_u64, optional_u64_to_i64,
+    parse_reason, parse_state, persisted_revision, reason_as_str, replacement_revisions,
+    revision_from_i64, state_as_str, supports_managed_mcp_catalog,
+    supports_managed_openapi_catalog, u64_to_i64, utc_timestamp, valid_enum_source_timestamp,
+    valid_overlay_local_name, valid_sha256_hex, validate_activity_timestamp, validate_candidate,
+    validate_dependency_id, validate_mcp_catalog, validate_openapi_catalog_entries,
+    validate_openapi_overlay_write, validate_openapi_spec, ConnectionActivityTimes,
+    ConnectionDependency, ConnectionDependencyKind, ConnectionEtag, ConnectionStatusUpdate,
+    ConnectionStoreError, ExportedConnectionStatuses, PersistedConnectionStatus, StoredConnection,
+    StoredEnumSourceRevision, StoredEnumSourceValue, StoredEnumSourceValueWrite, StoredMcpCatalog,
+    StoredMcpCatalogEntry, StoredMcpResource, StoredMcpResourceTemplate, StoredOpenApiCatalog,
+    StoredOpenApiCatalogEntry, StoredOpenApiInventoryCatalog, StoredOpenApiOverlay,
+    StoredOpenApiSourceReports, StoredOverlayWrite, MAX_CONNECTION_DEPENDENCIES,
+    MAX_OPENAPI_ENUM_SOURCES, SOURCE_MANAGED, TOKEN_EXCHANGE_CLIENT_SECRET_BINDING_PURPOSE,
 };
 use super::{
     model::{ConnectionId, ConnectionWrite, MAX_CONNECTIONS, MAX_CREDENTIALS},
@@ -397,6 +398,8 @@ impl PostgresConnectionStore {
                 });
             }
             ensure_binding_capacity(&client, None, 0, binding_count(&candidate)).await?;
+            ensure_token_exchange_secret_exclusive_in(&client, None, &candidate, OPERATION_CREATE)
+                .await?;
             client
                 .execute(
                     r#"
@@ -533,6 +536,13 @@ impl PostgresConnectionStore {
                 Some(id),
                 binding_count(&current.write),
                 binding_count(&candidate),
+            )
+            .await?;
+            ensure_token_exchange_secret_exclusive_in(
+                &client,
+                Some(id),
+                &candidate,
+                OPERATION_REPLACE,
             )
             .await?;
             let revisions = replacement_revisions(id, &current, &candidate)?;
@@ -4704,6 +4714,49 @@ async fn ensure_binding_capacity(
         });
     }
     Ok(())
+}
+
+/// The cross-Connection half of the token-exchange client secret's
+/// exclusivity (see `store::ensure_token_exchange_secret_exclusive`), judged
+/// under the lock every mutation takes, so two replicas cannot each pass it
+/// against the records they last saw. With no token-exchange client secret on
+/// either side there is nothing to compare, and the records are not read: the
+/// binding rows always match their documents, which every read verifies.
+async fn ensure_token_exchange_secret_exclusive_in(
+    client: &deadpool_postgres::Object,
+    replaced_id: Option<&ConnectionId>,
+    candidate: &ConnectionWrite,
+    operation: &'static str,
+) -> Result<(), ConnectionStoreError> {
+    if !candidate.binds_token_exchange_client_secret() {
+        let row = client
+            .query_one(
+                r#"
+                SELECT EXISTS (
+                    SELECT 1 FROM greengateway.connection_credential_bindings
+                    WHERE purpose = $1 AND connection_id::text <> $2
+                )
+                "#,
+                &[
+                    &TOKEN_EXCHANGE_CLIENT_SECRET_BINDING_PURPOSE,
+                    &replaced_id.map_or("", ConnectionId::as_str),
+                ],
+            )
+            .await
+            .map_err(|error| pg_error(operation, error))?;
+        let others_bind_one: bool = scalar(&row, 0, operation)?;
+        if !others_bind_one {
+            return Ok(());
+        }
+    }
+    let records = load_all_records(client, operation).await?;
+    ensure_token_exchange_secret_exclusive(
+        candidate,
+        records
+            .iter()
+            .filter(|record| Some(&record.id) != replaced_id)
+            .map(|record| &record.write),
+    )
 }
 
 /// Append the immutable specification version for a committed write. The

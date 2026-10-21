@@ -8252,6 +8252,16 @@
       "reasons": [
         "network-or-process-reference"
       ],
+      "scope": "gateway::connections::pg_store::ensure_token_exchange_secret_exclusive_in#1",
+      "sha256": "fc46dec9870956bd64d93486c737ed39db5e63980d219f3b7206a7e34a7a62e5",
+      "owner": "GreenGateway maintainers",
+      "purpose": "PostgreSQL repository operations through the shared infrastructure pool; no caller-selected HTTP authority."
+    },
+    {
+      "file": "gateway/src/connections/pg_store.rs",
+      "reasons": [
+        "network-or-process-reference"
+      ],
       "scope": "gateway::connections::pg_store::append_version#1",
       "sha256": "76b79cae6ef9403e3731efcbbbe8a430b80d3e700f15b4c16b3bb0d5f3c584d9",
       "owner": "GreenGateway maintainers",
@@ -10470,7 +10480,7 @@
         "unexpanded-macro"
       ],
       "scope": "gateway::proxy::forward::forward_to_upstream#1",
-      "sha256": "4afe686bcb99547d8d353a1225641b6e6d3c11e52f884c1158dd21e570e0242b",
+      "sha256": "c3ec5d82cb334397c056576b7cf2d24cab1cdc28c650af2bb5f303129f8efa6f",
       "owner": "GreenGateway maintainers",
       "purpose": "Reviewed exact GreenPM research byte budgets, bounded single-export buffering, retained admission lifetime and replica agreement; no additional transport authority."
     },

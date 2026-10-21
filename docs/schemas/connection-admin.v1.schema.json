@@ -473,7 +473,7 @@
             },
             "client_secret_id": {
               "$ref": "#/$defs/StableId",
-              "description": "Resolved with the token_exchange_client_secret purpose: an operator alias or an external secret provider, never the encrypted local store."
+              "description": "Resolved with the token_exchange_client_secret purpose: an operator alias or an external secret provider, never the encrypted local store. A save that binds this alias under any other field of any Connection is refused with secret_purpose_conflict."
             },
             "client_secret_configured": {
               "type": "boolean",
@@ -1482,7 +1482,7 @@
       }
     },
     "SecretPurpose": {
-      "description": "What a secret alias may be resolved as. assertion_signing_key is the PKCS#8 private key a caller assertion signs with and whose public half the gateway publishes; it is never sent as a header value. token_exchange_client_secret is the client secret a delegated_issuer_token Connection authenticates to its token-exchange issuer with; it is kept apart from oauth_client_secret because the issuer hands out any user's upstream token to whoever holds it. The encrypted local store can hold neither, so both come from an operator alias or an external secret provider.",
+      "description": "What a secret alias may be resolved as. A purpose sets size and encoding rules; an encrypted local secret is stored under one purpose and resolves under no other, while operator and external-provider aliases are not tied to a purpose. assertion_signing_key is the PKCS#8 private key a caller assertion signs with and whose public half the gateway publishes; it is never sent as a header value. token_exchange_client_secret is the client secret a delegated_issuer_token Connection authenticates to its token-exchange issuer with. The issuer hands out any user's upstream token to whoever holds it, so a Connection save that binds such an alias under any other field of any Connection, or binds another field to an alias a Connection exchanges with, is refused with secret_purpose_conflict. The encrypted local store can hold neither, so both come from an operator alias or an external secret provider.",
       "enum": [
         "header_api_key",
         "static_bearer",
@@ -5369,7 +5369,7 @@
             },
             "client_secret_id": {
               "$ref": "#/$defs/StableId",
-              "description": "Resolved with the token_exchange_client_secret purpose: an operator alias or an external secret provider, never the encrypted local store."
+              "description": "Resolved with the token_exchange_client_secret purpose: an operator alias or an external secret provider, never the encrypted local store. A save that binds this alias under any other field of any Connection is refused with secret_purpose_conflict."
             },
             "requested_scopes": {
               "type": "array",

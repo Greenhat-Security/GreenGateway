@@ -289,9 +289,16 @@ it alone, and needs its own security review. `subject_token_source` is a
 closed enum with the single value `caller_assertion` so that the later choice
 is explicit.
 
-- The client secret binds under its own `SecretPurpose::TokenExchangeClientSecret`,
-  never interchangeable with an OAuth client secret, and is not held by the
-  encrypted local store.
+- The client secret binds under its own `SecretPurpose::TokenExchangeClientSecret`
+  and is not held by the encrypted local store. A purpose sets size and
+  encoding rules; it does not tie an operator or external-provider alias to
+  one use, since those aliases carry no purpose. Exclusivity is therefore a
+  store rule: a write that would bind a token-exchange client secret's alias
+  under any other field of any Connection (credential, additional header, TLS
+  or caller-assertion key), or bind such a field to an alias a Connection
+  exchanges with, is refused with `secret_purpose_conflict`. Both stores judge
+  it inside the write transaction, the PostgreSQL one under the singleton lock
+  every mutation takes, so replicas cannot race past it.
 - `token_exchange_url` follows the token-URL rule (HTTPS, no userinfo, query
   or fragment) and passes the token client's egress check before any key or
   secret is read.
@@ -304,7 +311,10 @@ is explicit.
   `401` invalidation, adds the attested caller to the key, holds at most 1,024
   entries, never reuses a token for more than 900 seconds, and drops every
   idle token of a Connection's earlier configuration on the first call after a
-  change.
+  change. Its client-secret version is always absent, because only the
+  encrypted local store reports one: a rotation behind an operator alias or an
+  external provider does not partition the cache, and saving the Connection is
+  the flush.
 - Refusals carry distinct reasons (`delegated_token_denied`,
   `delegated_token_exchange_failed`, `delegated_token_egress_denied`,
   `delegated_token_unavailable`) and each exchange emits
