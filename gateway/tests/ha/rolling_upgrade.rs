@@ -16,8 +16,8 @@
 //! no released binary can join a PostgreSQL deployment. Two real binaries
 //! still can, built from pinned commits rather than tags.
 //! `rolling-upgrade-pair.json` names them: the *prepared* release, which
-//! implements the compatibility protocol and migration 17, and its
-//! *successor*, which adds one change and no migration — a role may carry a
+//! implements the compatibility protocol and serves exactly schema 18, and
+//! its *successor*, which adds one change and no migration — a role may carry a
 //! `description`, and committing such a document is the registered
 //! operation `policy.role_descriptions`. `scripts/build_upgrade_pair.py`
 //! builds each from its own commit and the release gate passes both to
