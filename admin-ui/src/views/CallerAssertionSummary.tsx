@@ -8,28 +8,63 @@ import type {
  * A Connection's caller assertion, read only. Shared by the detail page and
  * the editor; nothing in the admin UI edits the block, and saving a
  * Connection keeps it exactly as stored.
+ *
+ * `subjectTokenOnly` is set for a delegated issuer token Connection, whose
+ * assertion is signed as the subject token of its token exchange and sent to
+ * the issuer alone, never upstream.
  */
 export function CallerAssertionSummary({
   assertion,
+  subjectTokenOnly = false,
 }: {
   assertion: SafeCallerAssertion;
+  subjectTokenOnly?: boolean;
 }) {
   return (
     <>
       <div className="alert warning" role="status">
-        <p>
-          <strong>Accepted, not yet enforced.</strong> GreenGateway does not
-          sign or send caller assertions yet, so it refuses every call, test,
-          and discovery on a connection that carries one, with the reason{' '}
-          <code>caller_assertion_not_enforced</code>.
-        </p>
-        <p>
-          The admin UI shows this block read only, and saving the connection
-          here keeps it unchanged. To use the connection before enforcement
-          ships, remove the block through the admin API by sending{' '}
-          <code>&quot;caller_assertion&quot;: null</code>, which needs the
-          secrets-write permission.
-        </p>
+        {subjectTokenOnly ? (
+          <p>
+            <strong>Caller assertion configured as the subject token.</strong>{' '}
+            This connection signs the assertion only to name the calling
+            principal to its token-exchange issuer, which verifies it against
+            the gateway&apos;s published keys. It is never sent to the
+            upstream, and its assertion header is only cleared from what a
+            caller sends.
+          </p>
+        ) : (
+          <p>
+            <strong>Caller assertion configured.</strong> Once the gateway
+            accepts this block, every call of a manual HTTP tool on this
+            connection carries an assertion signed for the calling principal,
+            and a call without one, such as a service token, is refused with{' '}
+            <code>caller_assertion_no_principal</code>. Every other use of the
+            connection, including OpenAPI tools, proxied requests, discovery,
+            and tests, is refused with{' '}
+            <code>caller_assertion_not_enforced</code>, and so is every call
+            when the block is one only an earlier release accepted: approval
+            binding, an assertion header that matches another header on this
+            connection, or a plain HTTP endpoint.
+          </p>
+        )}
+        {subjectTokenOnly ? (
+          <p>
+            The admin UI shows this block read only. It cannot be removed
+            while this connection authenticates with a delegated issuer token:
+            the gateway signs the subject token with it, and refuses a change
+            that removes it. To stop this connection, disable the connection
+            through the admin API. After an incident, also revoke the grants at
+            the issuer and rotate the client secret before enabling it again.
+          </p>
+        ) : (
+          <p>
+            The admin UI shows this block read only, and saving the connection
+            here keeps it unchanged. To stop attesting callers, remove the
+            block through the admin API by sending{' '}
+            <code>&quot;caller_assertion&quot;: null</code>, which needs the
+            secrets-write permission.
+          </p>
+        )}
         {assertion.bind_approval ? (
           <p>
             This block asks for approval binding, which the gateway no longer
@@ -114,9 +149,13 @@ function KeyProblemAlert({ problem }: { problem: CallerAssertionKeyProblem }) {
         {KEY_PROBLEM_REASONS[problem.code]} (<code>{problem.code}</code>).
       </p>
       <p>
-        Every other connection&apos;s keys are still published. A save that
-        keeps this connection enabled checks its keys again and is refused
-        until the key is fixed; disabling the connection needs no key.
+        Tool calls on this connection are refused with{' '}
+        <code>caller_assertion_key_not_published</code> while its keys are
+        left out, even if the signing key still loads, because no upstream
+        could verify what it signs. They are served again once every key
+        loads. Every other connection&apos;s keys are still published. A save
+        that keeps this connection enabled checks its keys again and is
+        refused until the key is fixed; disabling the connection needs no key.
       </p>
     </div>
   );

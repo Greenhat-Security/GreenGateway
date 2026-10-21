@@ -98,8 +98,9 @@ pub enum EnumSourceFailureReason {
     ToolDisabled,
     EgressDenied,
     CredentialUnavailable,
-    /// The source's Connection asks for a signed caller assertion, which this
-    /// gateway does not yet inject, so the fetch is refused before any I/O.
+    /// The source's Connection asks for a signed caller assertion, which a
+    /// source fetch has no caller to sign for, so it is refused before any
+    /// I/O.
     CallerAssertionNotEnforced,
     UpstreamStatus(u16),
     ResponseTooLarge,
@@ -1052,10 +1053,12 @@ impl EnumSourceRuntime {
                 .prepare_transport(&target, &destination)
                 .await
                 .map_err(connection_failure)?;
+            // A source is read for the catalog, not for a caller, so a
+            // credential that belongs to one is refused rather than resolved.
             let credential = self
                 .inner
                 .http
-                .resolve_credential(&target)
+                .resolve_credential(&target, None)
                 .await
                 .map_err(connection_failure)?;
             let mut headers = HeaderMap::new();

@@ -4,17 +4,27 @@ use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 
 pub const SCHEMA_VERSION: &str = "0.2.0";
 pub const POLICY_CHANGED: &str = "policy.changed";
+pub const POLICY_SHADOW_TRANSITION_REFUSED: &str = "policy.shadow_transition_refused";
 pub const SIGNAL_OPENED: &str = "signal.opened";
 pub const SIGNAL_LIFECYCLE_CHANGED: &str = "signal.lifecycle_changed";
 pub const SUGGESTION_LIFECYCLE_CHANGED: &str = "suggestion.lifecycle_changed";
 pub const SERVICE_TOKEN_CHANGED: &str = "service_token.changed";
 pub const SERVICE_TOKEN_DELEGATION_REJECTED: &str = "service_token.delegation_rejected";
+/// A write of an operation gated on member capabilities was refused because
+/// not every live cluster member advertises what it requires (issue #426).
+/// Cluster mode only: standalone mode has no roster to gate on.
+#[cfg(feature = "postgres")]
+pub const CLUSTER_OPERATION_REFUSED: &str = "cluster.operation_refused";
 pub const CONNECTION_CHANGED: &str = "connection.changed";
 pub const CONNECTION_CREDENTIAL_CHANGED: &str = "connection.credential_changed";
 pub const CONNECTION_SECRET_CHANGED: &str = "connection.secret_changed";
 pub const CONNECTION_REFRESHED: &str = "connection.refreshed";
 pub const CONNECTION_TESTED: &str = "connection.tested";
 pub const CONNECTION_OAUTH_TOKEN_REFRESH: &str = "connection.oauth_token_refresh";
+/// One RFC 8693 exchange a `delegated_issuer_token` Connection made for a
+/// caller (issue #441): the actor it was made for, the outcome and the
+/// issuer's decision, never any token.
+pub const CONNECTION_DELEGATED_TOKEN_EXCHANGE: &str = "connection.delegated_token_exchange";
 pub const CONNECTION_SECRET_RESOLUTION_FAILED: &str = "connection.secret_resolution_failed";
 pub const CONNECTION_UNSAFE_METHOD_REJECTED: &str = "connection.unsafe_method_rejected";
 pub const GATEWAY_READY: &str = "gateway.ready";

@@ -75,9 +75,19 @@ FROM greengateway.security_outbox WHERE revision > :start ORDER BY revision;
 
 SELECT actor_user_id, security_revision, revoked_at, expires_at
 FROM greengateway.jwt_revocations ORDER BY revoked_at;
+
+-- Who made each token and JWT change (migration 18); these rows survive
+-- a later extension and expiry cleanup that the denylist row does not.
+SELECT action, actor_user_id, token_id, security_revision, committed_at
+FROM greengateway.service_token_change_evidence
+WHERE security_revision > :start ORDER BY security_revision;
+
+SELECT actor_user_id, security_revision, expires_at, committed_at
+FROM greengateway.jwt_revocation_evidence
+WHERE security_revision > :start ORDER BY security_revision;
 ```
 
-Expected for the incident above: one `jwt_revocation` row (its `resource_id` is a digest, never the `jti`), one `service_token` row naming the token, one `connection` row naming the Connection, and a denylist row attributed to `operator:revoke-jwt` at the revision the command printed. The admin decisions are in `greengateway.audit_events` as `service_token.changed` and `connection.credential_changed`; each refusal of a withdrawn credential is an `auth.failure` record on the replica that refused it.
+Expected for the incident above: one `jwt_revocation` row (its `resource_id` is a digest, never the `jti`), one `service_token` row naming the token, one `connection` row naming the Connection, and a denylist row attributed to `operator:revoke-jwt` at the revision the command printed. The evidence tables add one `service_token.revoke` row naming the principal who withdrew the token, and one JWT evidence row attributed to `operator:revoke-jwt`, each at its outbox row's revision. The admin decisions are in `greengateway.audit_events` as `service_token.changed` and `connection.credential_changed`; each refusal of a withdrawn credential is an `auth.failure` record on the replica that refused it.
 
 Keep tokens, `jti` values, secret material, secret locators, request IDs, hostnames and raw audit payloads out of shared incident summaries and alert annotations, as [audit delivery](operational-alerts.md#audit-delivery) already requires. Record counts, revisions, event types and times; keep the raw records in restricted storage.
 
@@ -105,7 +115,7 @@ Record the starting and final revisions, the decisions in step 5's order, and th
 | 2. Withdraw | A session JWT withdrawn by `revoke-jwt`, and a service token created on one replica and withdrawn on the other, are refused by both replicas on the very next request; the responder's own credential still authenticates on both. |
 | 3. Rotate | A credentialed, enabled Connection is rebound on the replica that did not create it, from one operator file alias to a standby alias, under `If-Match`; its credential revision and `ETag` advance; the old material is then unmounted; both replicas serve the new `ETag` and report the old alias with no dependents; the authority's binding row names only the standby alias. |
 | 4. Converge | The authority's revision advanced exactly once per decision, in order (`jwt_revocation`, `service_token`, `connection`), the first at the revision `revoke-jwt` printed; both replicas report that revision compiled with zero lag, and so does the roster for every live member. |
-| 5. Evidence | The audit of record holds exactly one `service_token.changed` withdrawal and one `connection.credential_changed` rebind for the subjects involved; the denylist holds one withdrawal attributed to `operator:revoke-jwt`; each replica audited its refusals. Every replica's audit file and process output, the command's output, and every row of `audit_events`, `security_outbox`, `jwt_revocations`, `service_tokens` and `connection_credential_bindings` are then swept: no JWT, `jti`, service-token plaintext, Connection material or file-alias locator appears in any of them, nor any compact-JWS prefix. |
+| 5. Evidence | The audit of record holds exactly one `service_token.changed` withdrawal and one `connection.credential_changed` rebind for the subjects involved; the denylist holds one withdrawal attributed to `operator:revoke-jwt`; `jwt_revocation_evidence` holds one `jwt.revoke` row attributed to `operator:revoke-jwt` and `service_token_change_evidence` one `service_token.revoke` row naming the responder, each at its outbox row's revision; each replica audited its refusals. Every replica's audit file and process output, the command's output, and every row of `audit_events`, `security_outbox`, `jwt_revocations`, `service_tokens`, `connection_credential_bindings`, `service_token_change_evidence`, `jwt_revocation_evidence` and `connection_change_evidence` are then swept: no JWT, `jti`, service-token plaintext, Connection material or file-alias locator appears in any of them, nor any compact-JWS prefix. |
 | 7. Replace | One replica takes the controlled drain and writes both shutdown records; a new process of the same binary joins the same database as a new member with the survivor's binary version and fingerprint, becomes ready although the old material is gone, refuses both withdrawn credentials, serves the rotated Connection, and compiles the incident's revision — while the authority's revision stays exactly where the incident left it and both withdrawals remain recorded. |
 
 What the rehearsal substitutes, and what it leaves to other gates:

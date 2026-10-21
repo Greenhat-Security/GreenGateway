@@ -85,8 +85,8 @@ pub enum ConnectionTestReason {
     TlsInvalid,
     TlsUnavailable,
     AuthenticationNotSupported,
-    /// The Connection asks for a signed caller assertion, which this gateway
-    /// does not yet inject, so the test is refused before any request.
+    /// The Connection asks for a signed caller assertion, which a stored test
+    /// has no caller to sign for, so it is refused before any request.
     CallerAssertionNotEnforced,
     CredentialInvalid,
     CredentialUnavailable,
@@ -523,7 +523,9 @@ impl ConnectionTestService {
             }
         };
 
-        let credential = match self.runtime.resolve_credential(target).await {
+        // A stored test runs for no caller, so a credential that belongs to
+        // one is refused rather than resolved.
+        let credential = match self.runtime.resolve_credential(target, None).await {
             Ok(credential) => {
                 stages.push(if uses_authentication || uses_tls {
                     ConnectionTestStage::success(ConnectionTestStageName::SecretAvailable)
@@ -854,12 +856,17 @@ pub(crate) fn connection_failure_classification(
         | ConnectionHttpError::UnsupportedAuthentication
         | ConnectionHttpError::OAuthTokenUnavailable
         | ConnectionHttpError::OAuthTokenRejected
-        | ConnectionHttpError::OAuthTokenInvalidResponse => (
+        | ConnectionHttpError::OAuthTokenInvalidResponse
+        | ConnectionHttpError::DelegatedTokenNoPrincipal
+        | ConnectionHttpError::DelegatedTokenDenied
+        | ConnectionHttpError::DelegatedTokenExchangeFailed
+        | ConnectionHttpError::DelegatedTokenUnavailable => (
             ConnectionTestStageName::SecretAvailable,
             ConnectionOperationalState::Unavailable,
             ConnectionStatusReason::SecretUnavailable,
         ),
-        ConnectionHttpError::OAuthTokenEgressDenied => (
+        ConnectionHttpError::OAuthTokenEgressDenied
+        | ConnectionHttpError::DelegatedTokenEgressDenied => (
             ConnectionTestStageName::EgressPolicy,
             ConnectionOperationalState::Unavailable,
             ConnectionStatusReason::EgressDenied,
@@ -947,6 +954,21 @@ fn test_reason_from_connection(error: ConnectionHttpError) -> ConnectionTestReas
         ConnectionHttpError::OAuthTokenRejected => ConnectionTestReason::OauthTokenRejected,
         ConnectionHttpError::OAuthTokenInvalidResponse => {
             ConnectionTestReason::OauthTokenInvalidResponse
+        }
+        // Unreachable: a delegated Connection carries a caller assertion,
+        // which a stored test refuses before it resolves anything, and a test
+        // has no caller to exchange a token for. Mapped onto the token
+        // reasons a test already reports rather than widening that set.
+        ConnectionHttpError::DelegatedTokenNoPrincipal => {
+            ConnectionTestReason::AuthenticationNotSupported
+        }
+        ConnectionHttpError::DelegatedTokenEgressDenied => {
+            ConnectionTestReason::OauthTokenEgressDenied
+        }
+        ConnectionHttpError::DelegatedTokenDenied => ConnectionTestReason::OauthTokenRejected,
+        ConnectionHttpError::DelegatedTokenExchangeFailed
+        | ConnectionHttpError::DelegatedTokenUnavailable => {
+            ConnectionTestReason::OauthTokenUnavailable
         }
         ConnectionHttpError::UpstreamAuthenticationRejected => {
             ConnectionTestReason::AuthenticationFailed

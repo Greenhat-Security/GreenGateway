@@ -10,7 +10,7 @@ use super::{
         CallerAssertionAlgorithm, CallerAssertionClaim, ConnectionAuthentication,
         ConnectionEndpoint, ConnectionId, ConnectionKind, ConnectionManagementSource,
         ConnectionTestProfile, ConnectionTimeouts, ConnectionWrite, DiscoveryConfig,
-        OAuthClientAuthMethod,
+        OAuthClientAuthMethod, SubjectTokenSource,
     },
     secret::{SecretAliasMetadata, SecretProviderKind, SecretPurpose},
     status::{ConnectionOperationalState, SafeConnectionStatus, SafeConnectionSummary},
@@ -138,6 +138,7 @@ impl SafeSecretAliasView {
                     SecretPurpose::TlsCertificate,
                     SecretPurpose::TlsCaBundle,
                     SecretPurpose::AssertionSigningKey,
+                    SecretPurpose::TokenExchangeClientSecret,
                 ]
             },
             |purpose| vec![purpose],
@@ -324,8 +325,9 @@ pub struct SafeCallerAssertion {
     pub published_keys: Vec<SafePublishedAssertionKey>,
     /// Present when this replica leaves the block's keys out of the published
     /// JWKS: the field configuring the key that cannot be used and a fixed
-    /// code, never the alias or anything about the material. The Connection
-    /// is refused at runtime either way while assertions are not enforced.
+    /// code, never the alias or anything about the material. While it is
+    /// present, the Connection's tool calls on this replica are refused with
+    /// `caller_assertion_key_not_published`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub key_problem: Option<CallerAssertionKeyProblem>,
 }
@@ -418,6 +420,19 @@ pub enum SafeConnectionAuthentication {
         client_auth_method: OAuthClientAuthMethod,
         client_secret_configured: bool,
     },
+    /// Every field but the client secret's alias, which is reported only as
+    /// configured or not, like every other secret binding.
+    DelegatedIssuerToken {
+        token_exchange_url: String,
+        client_id: String,
+        requested_scopes: Vec<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        audience: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        resource: Option<String>,
+        subject_token_source: SubjectTokenSource,
+        client_secret_configured: bool,
+    },
 }
 
 impl SafeConnectionAuthentication {
@@ -449,6 +464,23 @@ impl SafeConnectionAuthentication {
                 audience: audience.clone(),
                 resource: resource.clone(),
                 client_auth_method: *client_auth_method,
+                client_secret_configured: client_secret_id.is_some(),
+            },
+            ConnectionAuthentication::DelegatedIssuerToken {
+                token_exchange_url,
+                client_id,
+                client_secret_id,
+                requested_scopes,
+                audience,
+                resource,
+                subject_token_source,
+            } => Self::DelegatedIssuerToken {
+                token_exchange_url: token_exchange_url.clone(),
+                client_id: client_id.clone(),
+                requested_scopes: requested_scopes.clone(),
+                audience: audience.clone(),
+                resource: resource.clone(),
+                subject_token_source: *subject_token_source,
                 client_secret_configured: client_secret_id.is_some(),
             },
         }

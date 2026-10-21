@@ -203,6 +203,28 @@ identifiers rather than relying on the artifacts. The scheduled
 microbenchmarks; its run 38537287732 on 2026-10-14 passed the `ha-performance`
 job on commit `0c264de0f75911c804f854d7a285f983e372c127`.
 
+## Authoritative HTTP policy decision
+
+Budget schema 2 adds a fifth target, `http_policy`. It counts the allocations
+of `CompiledPolicy::evaluate`, the call the live RBAC adapter makes, over the
+fixed synthetic policy and request set in
+`gateway/tests/support/policy_benchmark.rs`. The benchmark is an ignored test
+in the gateway test binary, behind a counting global allocator that exists
+only in `cfg(test)` builds, so production binaries are unaffected.
+`scripts/microbench.py` builds each revision's own test binary: it cleans the
+gateway package before each build, so a shared target directory cannot hand
+one revision's binary to the other.
+
+The target was adopted in two reviewed steps. First, the harness landed with no
+budget entry (`pending`: measured, never blocking). Then
+`microbench-budget.json` moved to schema 2, approving the harness digest in
+`kernel_harness_sha256` and adding a zero-growth `http_policy` entry. That PR
+ran in the `proposed` state against its schema-1 base. Every later comparison
+whose base carries schema 2 is `enforced`: like the pure paths, any increase in
+allocation count or allocated bytes fails the job, and a head budget cannot
+retire the target. Changing the harness follows the same two-hash procedure as
+the pure-path harness below.
+
 ## Base ownership and reviewed updates
 
 `microbench-budget.json` versions the benchmark schema and regression budget.

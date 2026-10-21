@@ -4150,3 +4150,151 @@ fn mismatched_persisted_binding_fails_closed() {
         })
     ));
 }
+
+/// A disabled `delegated_issuer_token` Connection exchanging with
+/// `client_secret_id` and signing its subject token with `signing_key_id`.
+fn delegated_candidate(client_secret_id: &str, signing_key_id: &str) -> ConnectionWrite {
+    serde_json::from_value(json!({
+        "display_name": "Mail",
+        "enabled": false,
+        "kind": "http_api",
+        "endpoint": {
+            "base_url": "https://mail.example.test",
+            "base_path": "/v1"
+        },
+        "authentication": {
+            "type": "delegated_issuer_token",
+            "token_exchange_url": "https://issuer.example.test/oauth2/token-exchange",
+            "client_id": "greengateway",
+            "client_secret_id": client_secret_id,
+            "subject_token_source": "caller_assertion"
+        },
+        "caller_assertion": {
+            "signing_key_id": signing_key_id,
+            "kid": "gw-2026-10",
+            "algorithm": "es256",
+            "issuer": "https://gateway.example.test",
+            "audience": "https://issuer.example.test",
+            "token_type": "caller-assertion+jwt",
+            "header_name": "x-caller-assertion",
+            "lifetime_seconds": 60
+        }
+    }))
+    .expect("delegated candidate should deserialize")
+}
+
+fn oauth_candidate(client_secret_id: &str) -> ConnectionWrite {
+    serde_json::from_value(json!({
+        "display_name": "Billing API",
+        "enabled": false,
+        "kind": "http_api",
+        "endpoint": {
+            "base_url": "https://billing.example.test",
+            "base_path": "/v1"
+        },
+        "authentication": {
+            "type": "oauth2_client_credentials",
+            "client_id": "greengateway",
+            "client_secret_id": client_secret_id,
+            "token_url": "https://idp.example.test/oauth/token",
+            "client_auth_method": "client_secret_basic"
+        }
+    }))
+    .expect("OAuth candidate should deserialize")
+}
+
+fn assert_secret_purpose_conflict(
+    result: Result<StoredConnection, ConnectionStoreError>,
+    expected_field: &'static str,
+) {
+    match result {
+        Err(ConnectionStoreError::SecretPurposeConflict { field }) => {
+            assert_eq!(field, expected_field);
+        }
+        other => panic!("expected a secret purpose conflict on {expected_field}, got {other:?}"),
+    }
+}
+
+#[test]
+fn a_token_exchange_client_secret_alias_is_never_bound_under_another_purpose() {
+    let (_directory, _path, store) = temporary_store("token-exchange-exclusive");
+    let oauth = store
+        .create(oauth_candidate("shared-client-secret"))
+        .expect("an OAuth Connection should create");
+
+    // An alias an OAuth client already binds cannot become a token-exchange
+    // client secret, which the issuer would honour for any user...
+    assert_secret_purpose_conflict(
+        store.create(delegated_candidate(
+            "shared-client-secret",
+            "mail-assertion-key",
+        )),
+        "authentication.client_secret_id",
+    );
+
+    // ...and once one is bound as such, no other binding may name it, on
+    // create or on replace: an OAuth client secret, a header, TLS material
+    // or a caller-assertion key.
+    let delegated = store
+        .create(delegated_candidate("exchange-secret", "mail-assertion-key"))
+        .expect("a delegated Connection should create");
+    assert_secret_purpose_conflict(
+        store.create(oauth_candidate("exchange-secret")),
+        "authentication.client_secret_id",
+    );
+    let mut with_header = oauth.write.clone();
+    with_header.additional_headers = serde_json::from_value(json!([
+        {"header_name": "X-Proxy-Token", "secret_id": "exchange-secret"}
+    ]))
+    .expect("additional headers should deserialize");
+    assert_secret_purpose_conflict(
+        store.replace(&oauth.id, &oauth.etag(), with_header),
+        "additional_headers.secret_id",
+    );
+    let mut with_tls = oauth.write.clone();
+    with_tls.tls.ca_bundle_alias = Some("exchange-secret".to_owned());
+    assert_secret_purpose_conflict(
+        store.replace(&oauth.id, &oauth.etag(), with_tls),
+        "tls.ca_bundle_alias",
+    );
+    assert_secret_purpose_conflict(
+        store.create(delegated_candidate("calendar-secret", "exchange-secret")),
+        "caller_assertion.signing_key_id",
+    );
+    // Nor may a client secret be an alias another Connection signs with.
+    assert_secret_purpose_conflict(
+        store.create(delegated_candidate("mail-assertion-key", "calendar-key")),
+        "authentication.client_secret_id",
+    );
+    // A refused write wrote nothing.
+    assert_eq!(store.count().expect("count"), 2);
+    assert_eq!(
+        store.get(&oauth.id).expect("get").expect("still stored"),
+        oauth
+    );
+
+    // Two delegated Connections may share one client secret and signing key,
+    // and a delegated Connection's own replace never conflicts with itself.
+    store
+        .create(delegated_candidate("exchange-secret", "mail-assertion-key"))
+        .expect("delegated Connections may share a client secret");
+    let mut renamed = delegated.write.clone();
+    renamed.display_name = "Mailbox".to_owned();
+    let renamed = store
+        .replace(&delegated.id, &delegated.etag(), renamed)
+        .expect("a delegated Connection replaces itself");
+
+    // A replace is held to the rule like a create: the delegated Connection
+    // cannot move to the alias the OAuth client binds.
+    let mut moved = renamed.write.clone();
+    if let ConnectionAuthentication::DelegatedIssuerToken {
+        client_secret_id, ..
+    } = &mut moved.authentication
+    {
+        *client_secret_id = Some("shared-client-secret".to_owned());
+    }
+    assert_secret_purpose_conflict(
+        store.replace(&delegated.id, &renamed.etag(), moved),
+        "authentication.client_secret_id",
+    );
+}

@@ -418,7 +418,7 @@ describe('ConnectionEditor', () => {
       .getByRole('heading', { name: 'Caller assertion' })
       .closest('section');
     expect(section).toBeTruthy();
-    expect(section?.textContent).toContain('Accepted, not yet enforced.');
+    expect(section?.textContent).toContain('Caller assertion configured.');
     expect(section?.textContent).toContain('caller_assertion_not_enforced');
     expect(section?.textContent).toContain('gw-2026-09');
     expect(section?.textContent).toContain('x-caller-assertion');
@@ -2311,6 +2311,30 @@ describe('ConnectionEditor', () => {
     expect(writes).toBe(0);
   });
 
+  it('refuses to edit a delegated issuer token connection rather than save over it', async () => {
+    const fetchMock = vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
+      const url = requestUrl(input);
+      if (url.pathname === '/v1/admin/connections/billing' && !init?.method) {
+        return Promise.resolve(
+          jsonResponse(200, delegatedDetail(), { ETag: '"record-7"' }),
+        );
+      }
+      return Promise.reject(new Error(`unexpected request: ${url.pathname}`));
+    });
+    vi.stubGlobal('fetch', fetchMock);
+
+    renderEditor('/connections/billing/edit');
+
+    expect(await screen.findByText('Editing not available')).toBeTruthy();
+    expect(
+      screen.getByText(/delegated issuer token, which the editor cannot change/),
+    ).toBeTruthy();
+    // No form that could replace the credential with another type.
+    expect(screen.queryByLabelText('Display name')).toBeNull();
+    expect(screen.queryByRole('button', { name: 'Save connection' })).toBeNull();
+    expect(fetchMock.mock.calls.every(([, init]) => !init?.method)).toBe(true);
+  });
+
   it('renders legacy projections as read only without an editor form', async () => {
     vi.stubGlobal(
       'fetch',
@@ -2332,6 +2356,40 @@ describe('ConnectionEditor', () => {
     expect(screen.queryByLabelText('Display name')).toBeNull();
   });
 });
+
+function delegatedDetail(): ConnectionDetail {
+  const detail = managedDetail();
+  if (detail.configuration === undefined) {
+    throw new Error('the managed fixture carries a configuration');
+  }
+  return {
+    ...detail,
+    authentication: 'delegated_issuer_token',
+    configuration: {
+      ...detail.configuration,
+      authentication: {
+        type: 'delegated_issuer_token',
+        token_exchange_url: 'https://issuer.example.test/oauth2/token-exchange',
+        client_id: 'greengateway',
+        requested_scopes: ['mail.read'],
+        subject_token_source: 'caller_assertion',
+        client_secret_configured: true,
+      },
+      caller_assertion: {
+        signing_key_configured: true,
+        kid: 'gw-2026-09',
+        algorithm: 'es256',
+        issuer: 'https://gateway.example.test',
+        audience: 'https://issuer.example.test',
+        token_type: 'caller-assertion+jwt',
+        header_name: 'x-caller-assertion',
+        lifetime_seconds: 60,
+        bind_request: false,
+        bind_approval: false,
+      },
+    },
+  };
+}
 
 function renderEditor(path: string) {
   return render(

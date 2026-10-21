@@ -277,8 +277,14 @@ pub(super) async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 (true, false, true) => "ready",
                 (true, false, false) => "starting",
             };
+            // Recognized names only, plus a count of the rest: the roster
+            // column is written by other replicas, and this line prints
+            // what this binary can vouch for.
+            let capabilities =
+                storage::compatibility::RecognizedCapabilities::parse(&member.capabilities);
+            let capability_names = capabilities.names();
             println!(
-                "{state:<9} instance={} boot={} version={} schema={}..{} document={}..{} fingerprint={} started={} heartbeat={} age_secs={:.1} revisions=compiled:{}/observed:{} last_error={}",
+                "{state:<9} instance={} boot={} version={} schema={}..{} document={}..{} fingerprint={} started={} heartbeat={} age_secs={:.1} revisions=compiled:{}/observed:{} last_error={} capabilities={} unrecognized_capabilities={}",
                 member.instance_id,
                 member.boot_id,
                 member.binary_version,
@@ -293,6 +299,12 @@ pub(super) async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 member.compiled_security_revision,
                 member.observed_security_revision,
                 member.last_error_code.as_deref().unwrap_or("-"),
+                if capability_names.is_empty() {
+                    "-".to_owned()
+                } else {
+                    capability_names.join(",")
+                },
+                capabilities.unrecognized(),
             );
         }
         return Ok(());
@@ -821,6 +833,7 @@ pub(super) async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 schema_version: storage::migrations::schema_version_range(),
                 document_version: cluster_membership::DOCUMENT_VERSION_RANGE,
                 fingerprint: ha_foundation.fingerprint().hex(),
+                capabilities: storage::compatibility::BINARY_CAPABILITIES.to_vec(),
             };
             let membership = cluster_membership::ClusterMembership::new(
                 store,
@@ -1337,10 +1350,10 @@ pub(super) fn gateway_app_with_process_started_at_and_overrides(
         }
         None => tools::runtime::ToolRuntimeConfig::from_env_defaults(&config),
     };
-    let rate_limit_state = middleware::rate_limit::RateLimitState::from_config_and_policy(
-        &config,
-        loaded_policy.as_ref(),
-    );
+    // The policy stage's overrides arrive when the RBAC state is built below
+    // and attaches it with the snapshot it installed: there are none without
+    // a policy, and the stage selects with no other copy of one.
+    let rate_limit_state = middleware::rate_limit::RateLimitState::from_config(&config);
     // Cluster mode: every locally-allowed request is also decided at the
     // shared store, so one configured burst permits that many requests
     // across the cluster (issue #241, PR 10).
@@ -2031,6 +2044,8 @@ pub(super) fn gateway_app_with_process_started_at_and_overrides(
         history_store: policy_history_store,
         #[cfg(feature = "postgres")]
         control_plane: policy_control_plane,
+        #[cfg(feature = "postgres")]
+        membership: build_overrides.pg_membership.clone(),
         event_store: audit_event_store.clone(),
         query_store: audit_query_store.clone(),
         audit: audit_log.clone(),
@@ -2434,7 +2449,10 @@ pub(super) fn validate_connection_bound_tools(
     for definition in definitions {
         match (&definition.source, definition.target.as_ref()) {
             (ToolSource::Manual, Some(ToolTarget::Http { connection_id, .. })) => {
-                if let Err(error) = runtime.validate_binding(connection_id) {
+                // A manual tool may be bound to a Connection that attests its
+                // caller: its calls sign the assertion. Every other binding
+                // below keeps refusing one.
+                if let Err(error) = runtime.validate_tool_binding(connection_id) {
                     problems.push(format!(
                         "tool '{}' Connection target is unavailable: {}",
                         definition.name,

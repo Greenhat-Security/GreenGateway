@@ -8,7 +8,7 @@
     "CallerAssertion": {
       "type": "object",
       "additionalProperties": false,
-      "description": "Accepted and stored but not yet enforced: once request-path injection ships, this block will attest the calling principal to the upstream, and until then the gateway refuses every call, test and discovery on a Connection carrying it, with the failure reason caller_assertion_not_enforced. Its keys are already published. Saving an enabled Connection resolves its signing key and every published key, from whichever secret source holds it, and loads each for its algorithm; a key that cannot be used refuses the save. The public halves of every enabled Connection's keys are served at /.well-known/caller-assertion-jwks.json. A stored Connection whose keys can no longer be used is left out of that set, with a diagnostic, rather than stopping the gateway. When enforced, the assertion will travel alongside the primary credential rather than instead of it: the credential says which system is calling, the assertion says on whose behalf, so an upstream the operator controls can apply its own per-user checks. The gateway will sign a short-lived JWT naming the validated principal and send it in the named header, and the upstream will verify it against that JWKS. Omit the block to send only the credential.",
+      "description": "Attests the calling principal to the upstream on every call of a manual HTTP tool bound to this Connection, alongside the primary credential rather than instead of it: the credential says which system is calling, the assertion says on whose behalf, so an upstream the operator controls can apply its own per-user checks. Per call the gateway signs one short-lived JWT naming the validated principal (sub is the identity provider's issuer, '#', and its subject; jti is the gateway request ID) and writes it, as the last header, in header_name; with bind_request it also binds the method, the request target and the SHA-256 of the exact body sent. A call with no principal to name, a service token included, is refused with caller_assertion_no_principal before any network or secret I/O. The endpoint must use https. Every other lane on the Connection (managed OpenAPI and composite tools, proxied requests, managed MCP, discovery, enum and label sources, stored tests) is refused with caller_assertion_not_enforced, as is a stored block only an earlier release accepted. Saving an enabled Connection resolves its signing key and every published key, from whichever secret source holds it, and loads each for its algorithm; a key that cannot be used refuses the save, and every call reads and loads the signing key again. The public halves of every enabled Connection's keys are served at /.well-known/caller-assertion-jwks.json, which the upstream verifies against. A stored Connection whose keys can no longer be used is left out of that set, with a diagnostic, rather than stopping the gateway, and its tool calls are refused with caller_assertion_key_not_published until its keys load again. Omit the block to send only the credential.",
       "required": [
         "signing_key_id",
         "kid",
@@ -52,7 +52,7 @@
     "SafeCallerAssertion": {
       "type": "object",
       "additionalProperties": false,
-      "description": "Accepted and stored but not yet enforced: once request-path injection ships, this block will attest the calling principal to the upstream, and until then the gateway refuses every call, test and discovery on a Connection carrying it, with the failure reason caller_assertion_not_enforced. Its keys are already published. Saving an enabled Connection resolves its signing key and every published key, from whichever secret source holds it, and loads each for its algorithm; a key that cannot be used refuses the save. The public halves of every enabled Connection's keys are served at /.well-known/caller-assertion-jwks.json. A stored Connection whose keys can no longer be used is left out of that set, with a diagnostic, rather than stopping the gateway. When enforced, the assertion will travel alongside the primary credential rather than instead of it: the credential says which system is calling, the assertion says on whose behalf, so an upstream the operator controls can apply its own per-user checks. The gateway will sign a short-lived JWT naming the validated principal and send it in the named header, and the upstream will verify it against that JWKS. Omit the block to send only the credential.",
+      "description": "Attests the calling principal to the upstream on every call of a manual HTTP tool bound to this Connection, alongside the primary credential rather than instead of it: the credential says which system is calling, the assertion says on whose behalf, so an upstream the operator controls can apply its own per-user checks. Per call the gateway signs one short-lived JWT naming the validated principal (sub is the identity provider's issuer, '#', and its subject; jti is the gateway request ID) and writes it, as the last header, in header_name; with bind_request it also binds the method, the request target and the SHA-256 of the exact body sent. A call with no principal to name, a service token included, is refused with caller_assertion_no_principal before any network or secret I/O. The endpoint must use https. Every other lane on the Connection (managed OpenAPI and composite tools, proxied requests, managed MCP, discovery, enum and label sources, stored tests) is refused with caller_assertion_not_enforced, as is a stored block only an earlier release accepted. Saving an enabled Connection resolves its signing key and every published key, from whichever secret source holds it, and loads each for its algorithm; a key that cannot be used refuses the save, and every call reads and loads the signing key again. The public halves of every enabled Connection's keys are served at /.well-known/caller-assertion-jwks.json, which the upstream verifies against. A stored Connection whose keys can no longer be used is left out of that set, with a diagnostic, rather than stopping the gateway, and its tool calls are refused with caller_assertion_key_not_published until its keys load again. Omit the block to send only the credential.",
       "required": [
         "signing_key_configured",
         "kid",
@@ -74,7 +74,7 @@
         "lifetime_seconds": { "type": "integer", "minimum": 1, "maximum": 300, "description": "An assertion is a bearer credential for as long as it is valid, so this is a replay window rather than a convenience setting." },
         "claims": { "type": "array", "maxItems": 2, "uniqueItems": true, "items": { "enum": ["email", "roles"] }, "description": "Principal fields to attest beyond sub, which is always present. A closed set rather than free-form templating, so a configuration mistake cannot attest something a caller supplied." },
         "bind_request": { "type": "boolean", "description": "Include the method, path and a SHA-256 of the body actually sent, so an assertion cannot be lifted onto different arguments. The digest covers the transmitted bytes, not a canonical form, so an upstream verifies it with its standard library." },
-        "bind_approval": { "type": "boolean", "description": "Reserved: would require, and include, the approval that authorised a mutation. New writes accept only false; a Connection persisted earlier may still report true, and is refused at runtime like every Connection carrying an assertion." },
+        "bind_approval": { "type": "boolean", "description": "Reserved: would require, and include, the approval that authorised a mutation. New writes accept only false; a Connection persisted earlier may still report true, and such a block is refused on every lane with caller_assertion_not_enforced." },
         "published_keys": {
           "type": "array",
           "maxItems": 4,
@@ -94,7 +94,7 @@
           "type": "object",
           "additionalProperties": false,
           "required": ["field", "code"],
-          "description": "Present only when this replica leaves the block's keys out of the published JWKS, from its last check of exactly these keys: at startup, at a cluster reconcile, or in the last JWKS build. A Connection publishes all of its keys or none. field names where the key that cannot be used is configured and code says why; neither carries the alias or anything about the material. The Connection is refused at runtime either way while caller assertions are not enforced. A save that keeps the block enabled checks its keys again and is refused while one still cannot be used.",
+          "description": "Present only when this replica leaves the block's keys out of the published JWKS, from its last check of exactly these keys: at startup, at a cluster reconcile, or in the last JWKS build. A Connection publishes all of its keys or none. field names where the key that cannot be used is configured and code says why; neither carries the alias or anything about the material. While this field is present, the Connection's manual tool calls on this replica are refused with caller_assertion_key_not_published, even if the signing key loads, until its keys load again; every other lane refuses an attested Connection with caller_assertion_not_enforced in any case. A save that keeps the block enabled checks its keys again and is refused while one still cannot be used.",
           "properties": {
             "field": {
               "enum": [
@@ -182,6 +182,7 @@
         "header_api_key",
         "static_bearer",
         "oauth2_client_credentials",
+        "delegated_issuer_token",
         "legacy_configured"
       ]
     },
@@ -443,6 +444,72 @@
               "client_secret_configured"
             ]
           }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "description": "The calling user's own upstream token, obtained per caller from a trusted issuer by OAuth 2.0 token exchange (RFC 8693) and injected as Authorization: Bearer. The subject token is a JWT signed with this Connection's caller_assertion key naming the validated caller; the caller's own inbound bearer token is never forwarded. Requires kind http_api and a caller_assertion block without bind_request, whose assertion goes to the issuer only. Only manual HTTP tool calls are served; a call with no principal, a service token included, is refused with delegated_token_no_principal. The admin UI shows this type read only.",
+          "required": [
+            "type",
+            "token_exchange_url",
+            "client_id",
+            "subject_token_source"
+          ],
+          "properties": {
+            "type": {
+              "const": "delegated_issuer_token"
+            },
+            "token_exchange_url": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 2048,
+              "format": "uri",
+              "pattern": "^https://"
+            },
+            "client_id": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 256
+            },
+            "client_secret_id": {
+              "$ref": "#/$defs/StableId",
+              "description": "Resolved with the token_exchange_client_secret purpose: an operator alias or an external secret provider, never the encrypted local store. A save that binds this alias under any other field of any Connection is refused with secret_purpose_conflict."
+            },
+            "client_secret_configured": {
+              "type": "boolean",
+              "description": "PUT-only redaction marker. true retains the current hidden binding and false clears it."
+            },
+            "requested_scopes": {
+              "type": "array",
+              "maxItems": 16,
+              "uniqueItems": true,
+              "items": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 128,
+                "pattern": "^\\S+$"
+              }
+            },
+            "audience": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 512
+            },
+            "resource": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 512
+            },
+            "subject_token_source": {
+              "const": "caller_assertion"
+            }
+          },
+          "not": {
+            "required": [
+              "client_secret_id",
+              "client_secret_configured"
+            ]
+          }
         }
       ]
     },
@@ -581,6 +648,65 @@
         {
           "if": {
             "required": [
+              "authentication"
+            ],
+            "properties": {
+              "authentication": {
+                "required": [
+                  "type"
+                ],
+                "properties": {
+                  "type": {
+                    "const": "delegated_issuer_token"
+                  }
+                }
+              }
+            }
+          },
+          "then": {
+            "required": [
+              "caller_assertion"
+            ],
+            "properties": {
+              "kind": {
+                "const": "http_api"
+              },
+              "caller_assertion": {
+                "properties": {
+                  "bind_request": {
+                    "const": false
+                  }
+                }
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "required": [
+              "caller_assertion"
+            ],
+            "properties": {
+              "caller_assertion": {
+                "type": "object"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "endpoint": {
+                "properties": {
+                  "base_url": {
+                    "pattern": "^https://"
+                  }
+                }
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "required": [
               "additional_headers"
             ],
             "properties": {
@@ -687,6 +813,63 @@
         }
       },
       "allOf": [
+        {
+          "if": {
+            "required": [
+              "authentication"
+            ],
+            "properties": {
+              "authentication": {
+                "required": [
+                  "type"
+                ],
+                "properties": {
+                  "type": {
+                    "const": "delegated_issuer_token"
+                  }
+                }
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "kind": {
+                "const": "http_api"
+              },
+              "caller_assertion": {
+                "type": "object",
+                "properties": {
+                  "bind_request": {
+                    "const": false
+                  }
+                }
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "required": [
+              "caller_assertion"
+            ],
+            "properties": {
+              "caller_assertion": {
+                "type": "object"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "endpoint": {
+                "properties": {
+                  "base_url": {
+                    "pattern": "^https://"
+                  }
+                }
+              }
+            }
+          }
+        },
         {
           "if": {
             "required": [
@@ -833,6 +1016,48 @@
             },
             "client_auth_method": {
               "const": "client_secret_basic"
+            },
+            "client_secret_configured": {
+              "type": "boolean"
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "type",
+            "token_exchange_url",
+            "client_id",
+            "requested_scopes",
+            "subject_token_source",
+            "client_secret_configured"
+          ],
+          "properties": {
+            "type": {
+              "const": "delegated_issuer_token"
+            },
+            "token_exchange_url": {
+              "type": "string",
+              "format": "uri"
+            },
+            "client_id": {
+              "type": "string"
+            },
+            "requested_scopes": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "audience": {
+              "type": "string"
+            },
+            "resource": {
+              "type": "string"
+            },
+            "subject_token_source": {
+              "const": "caller_assertion"
             },
             "client_secret_configured": {
               "type": "boolean"
@@ -1257,7 +1482,7 @@
       }
     },
     "SecretPurpose": {
-      "description": "What a secret alias may be resolved as. assertion_signing_key is the PKCS#8 private key a caller assertion signs with and whose public half the gateway publishes; it is never sent as a header value, and the encrypted local store cannot hold it, so it comes from an operator alias or an external secret provider.",
+      "description": "What a secret alias may be resolved as. A purpose sets size and encoding rules; an encrypted local secret is stored under one purpose and resolves under no other, while operator and external-provider aliases are not tied to a purpose. assertion_signing_key is the PKCS#8 private key a caller assertion signs with and whose public half the gateway publishes; it is never sent as a header value. token_exchange_client_secret is the client secret a delegated_issuer_token Connection authenticates to its token-exchange issuer with. The issuer hands out any user's upstream token to whoever holds it, so a Connection save that binds such an alias under any other field of any Connection, or binds another field to an alias a Connection exchanges with, is refused with secret_purpose_conflict. The encrypted local store can hold neither, so both come from an operator alias or an external secret provider.",
       "enum": [
         "header_api_key",
         "static_bearer",
@@ -1265,7 +1490,8 @@
         "tls_private_key",
         "tls_certificate",
         "tls_ca_bundle",
-        "assertion_signing_key"
+        "assertion_signing_key",
+        "token_exchange_client_secret"
       ]
     },
     "LocalSecretPurpose": {
@@ -5112,6 +5338,62 @@
             },
             "client_auth_method": {
               "const": "client_secret_basic"
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "description": "The calling user's own upstream token, obtained per caller from a trusted issuer by OAuth 2.0 token exchange (RFC 8693) and injected as Authorization: Bearer. The subject token is a JWT signed with this Connection's caller_assertion key naming the validated caller; the caller's own inbound bearer token is never forwarded. Requires kind http_api and a caller_assertion block without bind_request, whose assertion goes to the issuer only. Only manual HTTP tool calls are served; a call with no principal, a service token included, is refused with delegated_token_no_principal. The admin UI shows this type read only.",
+          "required": [
+            "type",
+            "token_exchange_url",
+            "client_id",
+            "subject_token_source"
+          ],
+          "properties": {
+            "type": {
+              "const": "delegated_issuer_token"
+            },
+            "token_exchange_url": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 2048,
+              "format": "uri",
+              "pattern": "^https://"
+            },
+            "client_id": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 256
+            },
+            "client_secret_id": {
+              "$ref": "#/$defs/StableId",
+              "description": "Resolved with the token_exchange_client_secret purpose: an operator alias or an external secret provider, never the encrypted local store. A save that binds this alias under any other field of any Connection is refused with secret_purpose_conflict."
+            },
+            "requested_scopes": {
+              "type": "array",
+              "maxItems": 16,
+              "uniqueItems": true,
+              "items": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 128,
+                "pattern": "^\\S+$"
+              }
+            },
+            "audience": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 512
+            },
+            "resource": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 512
+            },
+            "subject_token_source": {
+              "const": "caller_assertion"
             }
           }
         }

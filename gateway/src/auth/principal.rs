@@ -15,7 +15,7 @@ pub enum AuthMethod {
 }
 
 impl AuthMethod {
-    fn audit_mode(&self) -> &'static str {
+    pub(crate) fn audit_mode(&self) -> &'static str {
         match self {
             Self::Cookie => "session_cookie",
             Self::Bearer => "bearer_token",

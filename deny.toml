@@ -13,7 +13,7 @@ unused-allowed-license = "deny"
 allow = ["Apache-2.0", "MIT", "MIT-0", "ISC", "BSD-3-Clause", "Unicode-3.0", "Zlib"]
 exceptions = [
   { crate = "notify@8.2.0", allow = ["CC0-1.0"] },
-  { crate = "webpki-root-certs@1.0.9", allow = ["CDLA-Permissive-2.0"] },
+  { crate = "webpki-root-certs@1.0.10", allow = ["CDLA-Permissive-2.0"] },
   { crate = "winx@0.36.4", allow = ["Apache-2.0 WITH LLVM-exception"] },
 ]
 

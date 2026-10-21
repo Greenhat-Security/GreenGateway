@@ -2588,6 +2588,11 @@ textarea:focus-visible {
   gap: 10px;
 }
 
+.shadow-review-reload {
+  display: flex;
+  margin-bottom: 12px;
+}
+
 .expand-button {
   display: inline-grid;
   width: 30px;

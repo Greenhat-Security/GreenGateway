@@ -1,5 +1,5 @@
 import { useAdminIdentityVersion, useAdminUnauthenticated } from './lib/adminCapabilities';
-import { adminIdentityChanged, adminNavigationChanged, getAdminIdentityVersion, subscribeAdminSession } from './lib/adminSession';
+import { adminIdentityChanged, adminNavigationChanged, subscribeAdminSession } from './lib/adminSession';
 import { FormEvent, useEffect, useRef, useState } from 'react';
 import {
   BrowserRouter,
@@ -622,8 +622,12 @@ async function completeAuthFromFragment(
     ) {
       return { status: 'SSO sign-in did not complete. Start sign-in again.' };
     }
-    const identity = getAdminIdentityVersion();
     const selection = getCredentialSelection();
+    // Hiding the page drops memory credentials without changing the
+    // selection, so the bearer completion watches for it.
+    let hidden = false;
+    const hide = () => { hidden = true; };
+    window.addEventListener('pagehide', hide);
     try {
       // Only an explicit answer lets the code be posted. Anything else would
       // risk a bearer token reaching this page from a gateway that offers a
@@ -664,13 +668,18 @@ async function completeAuthFromFragment(
       ) {
         throw new Error('SSO completion failed');
       }
-      if (identity !== getAdminIdentityVersion()) {
+      // A request rejected before the token arrives, such as the dashboard's
+      // first permissions check, changes only the identity version. Choosing
+      // other credentials or hiding the page while it was pending discards it.
+      if (hidden || selection !== getCredentialSelection()) {
         return { status: 'SSO completion discarded because the session changed. Start sign-in again.' };
       }
       setMemoryToken(body.access_token);
       return { status: 'Signed in with SSO in this tab until reload or session expiry.' };
     } catch {
       return { status: 'SSO sign-in did not complete. Start sign-in again.' };
+    } finally {
+      window.removeEventListener('pagehide', hide);
     }
   }
 

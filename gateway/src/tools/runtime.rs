@@ -22,7 +22,7 @@ use crate::{
         Config, DEFAULT_TOOL_RUNTIME_DEFAULT_TIMEOUT_MS, DEFAULT_TOOL_RUNTIME_GLOBAL_CONCURRENCY,
         DEFAULT_TOOL_RUNTIME_QUEUE_DEPTH, DEFAULT_TOOL_RUNTIME_QUEUE_TIMEOUT_MS,
     },
-    connections::model::ConnectionId,
+    connections::{caller_assertion::AttestedCaller, model::ConnectionId},
     middleware::rbac::{MatchedRuleDecision, RbacState, ToolInvocationVerdict},
     rbac::{
         policy, rule::principal_identity_matches, Policy, Rule, RuleAction, RuleDispatchContext,
@@ -148,6 +148,12 @@ pub struct ToolInvocationContext {
     pub request_id: String,
     pub source_ip: String,
     pub actor: Option<Actor>,
+    /// The caller a Connection's signed caller assertion names, built from the
+    /// authenticated principal where the call entered the gateway. Kept apart
+    /// from `actor`, which is audit's projection of the same principal: only
+    /// this is ever signed. `None` for an anonymous call or a service token,
+    /// which an attesting Connection refuses.
+    pub caller: Option<Arc<AttestedCaller>>,
     pub source: ToolInvocationSource,
     /// The hard execution deadline assigned after runtime admission. Internal
     /// work such as composite compensation uses this to reserve time without
@@ -164,6 +170,7 @@ impl Default for ToolInvocationContext {
             request_id: "tool-runtime".to_owned(),
             source_ip: "127.0.0.1".to_owned(),
             actor: None,
+            caller: None,
             source: ToolInvocationSource::Internal,
             admitted_deadline: None,
         }
@@ -2789,7 +2796,9 @@ mod tests {
             .expect("the invocation was admitted before the deny published");
         assert!(pinned, "the admitted snapshot has no rule for the request");
         assert!(!live, "the live check refuses under the published deny");
-        let events = audit_events(&capture, 1).await;
+        // `tool.invoke_start` is written ahead of the deny, and the writer
+        // thread delivers in order, so the deny is the second event.
+        let events = audit_events(&capture, 2).await;
         let denied = events
             .iter()
             .find(|event| event.event_type == AUTHZ_DENIED)
@@ -4261,6 +4270,7 @@ mod tests {
                         auth_mode: "bearer_token".to_owned(),
                     }),
                     source: ToolInvocationSource::AdminPlayground,
+                    caller: None,
                     admitted_deadline: None,
                 },
                 CancellationToken::new(),
@@ -4688,6 +4698,7 @@ mod tests {
             source_ip: "127.0.0.1".to_owned(),
             actor: None,
             source: ToolInvocationSource::Internal,
+            caller: None,
             admitted_deadline: None,
         }
     }
@@ -4712,6 +4723,7 @@ mod tests {
                 auth_mode: auth_mode.to_owned(),
             }),
             source: ToolInvocationSource::Internal,
+            caller: None,
             admitted_deadline: None,
         }
     }

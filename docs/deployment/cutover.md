@@ -31,6 +31,8 @@ The **principal directory is never imported**: cluster mode has no principal dir
 
 The report's `not_imported` field lists everything else deliberately left out — `cluster_members`, `maintenance_jobs`, `execution_leases`, the two rate-limit tables, pending logins, JWT revocations — and the validation pass **proves** those tables empty rather than asserting it in prose. `security_outbox` is named there too, with a caveat worth reading once: the import writes no outbox row of its own, but the policy and tools sections run the ordinary reviewed control-plane commits, and a commit appends one. So that table holds two rows after an import. They describe this deployment's initialization, and they are the reason `security_outbox` is on the `not_imported` list but not on the list of tables proven empty.
 
+Standalone service-token change evidence — the `service_token_change_evidence` rows that name who rotated or revoked each token — is also left behind and named in `not_imported`. The import carries the token rows only, so that history stays in the `SERVICE_TOKEN_SQLITE_PATH` database; keep the file with the rest of the standalone deployment's records if you need it. The cluster's own evidence table starts empty and records its first rotate or revoke.
+
 The command also never moves secret material. Credential bindings are imported as references; the secrets stay in your secret store, and local-secret keyring material is not touched. A cluster deployment binds credentials through an external secret provider — `CONNECTION_LOCAL_SECRET_KEYRING` is rejected in cluster mode.
 
 If your standalone deployment used the encrypted local-secret keyring, that has a consequence you should see as a **number** before the night rather than as a failed request after it: those secrets live in rows inside `CONNECTIONS_SQLITE_PATH`, nothing carries them across, and every binding that resolved through one resolves through nothing until you re-provision it. The report says how many there are (`source.connection_local_secrets`) and names the omission in `not_imported` (`connection_local_secrets`). A non-zero count is a re-provisioning task on the checklist below, not a defect.
@@ -134,7 +136,8 @@ Expected output: pretty-printed JSON on stdout and exit `0`. The shape:
     "admin_pending_logins", "jwt_revocations",
     "security_outbox (the import announces nothing; a commit appends its own row)",
     "principal_directory (cluster mode has none; the audit log it projects from is imported)",
-    "connection_local_secrets (the local-secret keyring stays with the standalone deployment; credential bindings cross as references and must be re-provisioned in the cluster's secret store)"
+    "connection_local_secrets (the local-secret keyring stays with the standalone deployment; credential bindings cross as references and must be re-provisioned in the cluster's secret store)",
+    "service_token_change_evidence (standalone rotate/revoke evidence stays in the standalone token database; the cluster records its own from its first change)"
   ],
   "duration_ms": 8590
 }

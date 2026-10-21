@@ -19,6 +19,16 @@ use super::{
 /// tokens it has already re-checked. Revocation is idempotent and monotonic
 /// — a revoked token never becomes valid again, and rotating a revoked token
 /// is a conflict.
+///
+/// Rotate and revoke are told who is acting. Each committed change records
+/// that actor and its action as append-only change evidence in the same
+/// transaction as the change itself (issue #425): if the evidence cannot be
+/// written, the change rolls back and the call fails. A call that changes
+/// nothing -- a repeat revoke, a rotate refused as a conflict, an unknown
+/// token -- records nothing. An empty or oversized actor
+/// ([`crate::auth::tokens::MAX_TOKEN_CHANGE_ACTOR_BYTES`]) is refused
+/// before anything changes. The evidence never holds the plaintext, the
+/// hash, the display prefix or the scopes.
 #[async_trait]
 pub trait ServiceTokenStore: Send + Sync {
     async fn create(&self, request: CreateTokenRequest) -> Result<CreatedToken, RepositoryError>;
@@ -27,9 +37,17 @@ pub trait ServiceTokenStore: Send + Sync {
 
     async fn get_by_id(&self, id: &str) -> Result<Option<TokenRecord>, RepositoryError>;
 
-    async fn revoke(&self, id: &str) -> Result<Option<TokenRecord>, RepositoryError>;
+    async fn revoke(
+        &self,
+        id: &str,
+        actor_user_id: &str,
+    ) -> Result<Option<TokenRecord>, RepositoryError>;
 
-    async fn rotate(&self, id: &str) -> Result<Option<CreatedToken>, RepositoryError>;
+    async fn rotate(
+        &self,
+        id: &str,
+        actor_user_id: &str,
+    ) -> Result<Option<CreatedToken>, RepositoryError>;
 
     async fn verify(&self, plaintext_token: &str) -> Result<TokenVerification, RepositoryError>;
 
@@ -76,21 +94,31 @@ impl ServiceTokenStore for SqliteTokenStore {
         .await
     }
 
-    async fn revoke(&self, id: &str) -> Result<Option<TokenRecord>, RepositoryError> {
+    async fn revoke(
+        &self,
+        id: &str,
+        actor_user_id: &str,
+    ) -> Result<Option<TokenRecord>, RepositoryError> {
         let store = self.clone();
         let id = id.to_owned();
+        let actor_user_id = actor_user_id.to_owned();
         run_blocking(move || {
-            TokenStore::revoke(&store, &id)
+            TokenStore::revoke(&store, &id, &actor_user_id)
                 .map_err(|error| map_token_store_error("service_token_revoke", error))
         })
         .await
     }
 
-    async fn rotate(&self, id: &str) -> Result<Option<CreatedToken>, RepositoryError> {
+    async fn rotate(
+        &self,
+        id: &str,
+        actor_user_id: &str,
+    ) -> Result<Option<CreatedToken>, RepositoryError> {
         let store = self.clone();
         let id = id.to_owned();
+        let actor_user_id = actor_user_id.to_owned();
         run_blocking(move || {
-            TokenStore::rotate(&store, &id)
+            TokenStore::rotate(&store, &id, &actor_user_id)
                 .map_err(|error| map_token_store_error("service_token_rotate", error))
         })
         .await
@@ -147,6 +175,24 @@ fn map_token_store_error(operation: &'static str, error: TokenStoreError) -> Rep
         }
         TokenStoreError::RevokedToken { .. } => {
             RepositoryError::new(RepositoryErrorKind::Conflict, operation)
+        }
+        // Only an authenticated principal reaches a store, so a missing or
+        // oversized actor is the gateway's defect, not the caller's input:
+        // refused, and not answered as a parameter error.
+        TokenStoreError::InvalidChangeActor => {
+            RepositoryError::new(RepositoryErrorKind::InvalidData, operation)
+        }
+        // The change rolled back with its evidence. Keep an availability
+        // classification (busy, I/O, read-only), but never let a constraint
+        // failure on the evidence row surface as `Conflict`: on rotate that
+        // kind means exactly "the token is revoked".
+        TokenStoreError::ChangeEvidence { source, .. } => {
+            let classified = classify_rusqlite(operation, source);
+            if classified.kind() == RepositoryErrorKind::Conflict {
+                RepositoryError::new(RepositoryErrorKind::Internal, operation)
+            } else {
+                classified
+            }
         }
     };
     log_classified(operation, &error, classified)

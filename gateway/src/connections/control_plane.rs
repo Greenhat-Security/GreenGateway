@@ -85,6 +85,11 @@ const JWKS_RETRY_INTERVAL: Duration = Duration::from_secs(30);
 /// a fetch that would wait longer is answered `503` instead of held open.
 const JWKS_BUILD_WAIT: Duration = Duration::from_secs(10);
 
+/// How many builds one fetch runs before giving up when every one of them is
+/// overtaken by a save. Two covers the race one save can cause; a fetch that
+/// keeps losing to saves answers `503` rather than keep asking the provider.
+const JWKS_BUILD_ATTEMPTS: usize = 2;
+
 /// Dependency rows waiting to be written, keyed by the consumer kind whose
 /// whole set they replace. One entry per kind: a later derivation for the
 /// same kind supersedes the earlier one rather than adding to it, which is
@@ -138,34 +143,97 @@ pub struct ConnectionControlPlane {
 /// The published caller-assertion key set, and the reasons this replica
 /// leaves any Connection's keys out of it.
 struct CallerAssertionKeys {
-    /// The last set built. Locked only to read or replace the pointer, never
-    /// across an await, so a fetch that finds a current set never waits on a
-    /// build.
-    last: Mutex<Option<Arc<CachedJwks>>>,
+    /// The last set built, and the save epoch it belongs to. Locked only to
+    /// read or replace them, never across an await, so a fetch that finds a
+    /// current set never waits on a build.
+    last: Mutex<BuiltJwksSlot>,
     /// Serializes builds, so concurrent fetches after a change share one. It
     /// is held across secret resolution; a fetch that may serve the set it
     /// already has does not wait for it.
     build: AsyncMutex<()>,
     /// Why a Connection's keys are left out, from the last check of them: at
     /// startup, at a cluster reconcile, or in the last build.
+    ///
+    /// Lock order: a holder of `last` may take this, never the reverse.
     problems: Mutex<BTreeMap<ConnectionId, KeyProblemRecord>>,
+    /// Test seam: runs once, at the start of the next reconcile's install,
+    /// before it takes the lock a build commits under.
+    #[cfg(test)]
+    before_reconcile: Mutex<Option<Box<dyn FnOnce() + Send>>>,
+}
+
+/// The cached set and the epoch that decides whether a build may replace it.
+struct BuiltJwksSlot {
+    built: Option<Arc<CachedJwks>>,
+    /// Moves on every local save and on every reconcile that changes an
+    /// attested record. A build records the epoch before it reads any
+    /// configuration or key, and its result is kept only if no save happened
+    /// meanwhile.
+    ///
+    /// Without it, a build that read an alias before a save repaired the key
+    /// behind it would finish after the save's [`CallerAssertionKeys::forget`]
+    /// and cache what it read: the pre-save set, and the pre-save problem,
+    /// under bindings that compare equal because the alias, `kid` and
+    /// algorithm did not change. That set would then be served, and the
+    /// Connection reported as broken, for a whole refresh interval.
+    epoch: u64,
 }
 
 impl CallerAssertionKeys {
     fn new(problems: BTreeMap<ConnectionId, KeyProblemRecord>) -> Self {
         Self {
-            last: Mutex::new(None),
+            last: Mutex::new(BuiltJwksSlot {
+                built: None,
+                epoch: 0,
+            }),
             build: AsyncMutex::new(()),
             problems: Mutex::new(problems),
+            #[cfg(test)]
+            before_reconcile: Mutex::new(None),
         }
     }
 
-    fn last_built(&self) -> Option<Arc<CachedJwks>> {
-        lock_recovering(&self.last, "caller-assertion JWKS cache").clone()
+    fn slot(&self) -> MutexGuard<'_, BuiltJwksSlot> {
+        lock_recovering(&self.last, "caller-assertion JWKS cache")
     }
 
+    fn last_built(&self) -> Option<Arc<CachedJwks>> {
+        self.slot().built.clone()
+    }
+
+    /// The epoch a build must still see when it finishes for its result to be
+    /// kept. Read before the build reads the configuration.
+    fn epoch(&self) -> u64 {
+        self.slot().epoch
+    }
+
+    #[cfg(test)]
     fn store_built(&self, built: Arc<CachedJwks>) {
-        *lock_recovering(&self.last, "caller-assertion JWKS cache") = Some(built);
+        self.slot().built = Some(built);
+    }
+
+    #[cfg(test)]
+    fn set_before_reconcile_for_test(&self, hook: Box<dyn FnOnce() + Send>) {
+        *lock_recovering(&self.before_reconcile, "reconcile test hook") = Some(hook);
+    }
+
+    /// Keeps what a build found, unless a save forgot the earlier verdict
+    /// after the build began: then the build may have read material the save
+    /// replaced, so neither its set nor its problems are kept and the next
+    /// fetch builds again. Returns whether the build was kept.
+    fn commit_build(
+        &self,
+        started_epoch: u64,
+        built: Arc<CachedJwks>,
+        record_problems: impl FnOnce(&mut BTreeMap<ConnectionId, KeyProblemRecord>),
+    ) -> bool {
+        let mut slot = self.slot();
+        if slot.epoch != started_epoch {
+            return false;
+        }
+        record_problems(&mut self.problems());
+        slot.built = Some(built);
+        true
     }
 
     fn problems(&self) -> MutexGuard<'_, BTreeMap<ConnectionId, KeyProblemRecord>> {
@@ -174,11 +242,78 @@ impl CallerAssertionKeys {
 
     /// A save just loaded every key `id` configures: drop what an earlier
     /// check found, and the set built before the save, so the next fetch
-    /// reads the keys again rather than serving the old verdict.
+    /// reads the keys again rather than serving the old verdict. Moving the
+    /// epoch, under the same lock a build commits under, also stops a build
+    /// already in flight from putting either back.
     fn forget(&self, id: &ConnectionId) {
+        let mut slot = self.slot();
+        Self::invalidate(&mut slot);
         self.problems().remove(id);
-        *lock_recovering(&self.last, "caller-assertion JWKS cache") = None;
     }
+
+    /// Installs what a cluster reconcile found. When the reconcile changed an
+    /// attested record -- a save on another replica -- the set built before
+    /// it is dropped and any build in flight is voided, exactly as for a
+    /// local save.
+    ///
+    /// `found` is what the reconcile's own checks found. `deferred` names
+    /// each Connection those checks passed without reading all of its keys,
+    /// because one lives behind a network provider, with the keys it
+    /// configures: for those, the problem the last build recorded for the
+    /// same keys is kept. It is read here, under the lock a build commits
+    /// under, not when the reconcile began: a build that committed while the
+    /// reconcile ran recorded the problems that match the set it cached, and
+    /// putting back an older verdict would refuse calls on keys that set
+    /// publishes, or let calls sign with keys it leaves out.
+    fn reconcile(
+        &self,
+        mut found: BTreeMap<ConnectionId, KeyProblemRecord>,
+        deferred: Vec<(ConnectionId, Vec<ConfiguredAssertionKey>)>,
+        attested_changed: bool,
+    ) {
+        #[cfg(test)]
+        {
+            let hook = lock_recovering(&self.before_reconcile, "reconcile test hook").take();
+            if let Some(hook) = hook {
+                hook();
+            }
+        }
+        let mut slot = self.slot();
+        if attested_changed {
+            Self::invalidate(&mut slot);
+        }
+        let mut problems = self.problems();
+        for (id, keys) in deferred {
+            if let Some(kept) = problems.remove(&id).filter(|kept| kept.keys == keys) {
+                found.insert(id, kept);
+            }
+        }
+        *problems = found;
+    }
+
+    fn invalidate(slot: &mut BuiltJwksSlot) {
+        slot.epoch = slot.epoch.wrapping_add(1);
+        slot.built = None;
+    }
+}
+
+/// Whether any Connection that carries a caller assertion, before or after,
+/// was added, removed or saved between `before` and `after`.
+fn attested_records_changed(
+    before: &BTreeMap<ConnectionId, StoredConnection>,
+    after: &BTreeMap<ConnectionId, StoredConnection>,
+) -> bool {
+    let attested = |record: &StoredConnection| record.write.caller_assertion.is_some();
+    let changed = |id: &ConnectionId,
+                   record: &StoredConnection,
+                   other: &BTreeMap<ConnectionId, StoredConnection>| {
+        attested(record)
+            && other
+                .get(id)
+                .is_none_or(|other| other.etag() != record.etag() || other.write != record.write)
+    };
+    before.iter().any(|(id, record)| changed(id, record, after))
+        || after.iter().any(|(id, record)| changed(id, record, before))
 }
 
 /// Locks a diagnostic or cache mutex, recovering it if a panic poisoned it:
@@ -192,6 +327,45 @@ fn lock_recovering<'a, T>(mutex: &'a Mutex<T>, what: &'static str) -> MutexGuard
             poisoned.into_inner()
         }
     }
+}
+
+/// What one build found for one Connection it read.
+struct BuildFinding {
+    id: ConnectionId,
+    keys: Vec<ConfiguredAssertionKey>,
+    problem: Option<CallerAssertionKeyProblem>,
+}
+
+/// Keeps what a build found for each Connection it read, logging only a
+/// change, and forgets every Connection it did not read: one disabled,
+/// deleted, or no longer carrying a caller assertion publishes nothing.
+fn record_build_problems(
+    problems: &mut BTreeMap<ConnectionId, KeyProblemRecord>,
+    findings: &[BuildFinding],
+) {
+    for finding in findings {
+        match finding.problem {
+            Some(problem) => {
+                let found = KeyProblemRecord {
+                    keys: finding.keys.clone(),
+                    problem,
+                };
+                if problems.get(&finding.id) != Some(&found) {
+                    log_assertion_key_problem(&finding.id, problem);
+                }
+                problems.insert(finding.id.clone(), found);
+            }
+            None => {
+                if problems.remove(&finding.id).is_some() {
+                    tracing::info!(
+                        connection_id = %finding.id,
+                        "a Connection's caller-assertion keys load again and are published"
+                    );
+                }
+            }
+        }
+    }
+    problems.retain(|id, _| findings.iter().any(|finding| &finding.id == id));
 }
 
 /// A caller-assertion key as configured: the alias holding it, the `kid` it
@@ -784,8 +958,8 @@ impl ConnectionControlPlane {
             // A stored document's caller-assertion keys are checked apart from
             // its credentials: a key that cannot be used leaves that
             // Connection's keys out of the JWKS, rather than stopping the
-            // gateway for every other Connection. The Connection itself stays
-            // refused at runtime, like every Connection carrying the block.
+            // gateway for every other Connection. The Connection's tool calls
+            // are refused until its keys load again.
             if let Some(problem) = secret_resolver.stored_assertion_key_problem(&record.write) {
                 log_assertion_key_problem(&record.id, problem);
                 caller_assertion_problems.insert(
@@ -910,11 +1084,19 @@ impl ConnectionControlPlane {
                 client_secret_id: Some(secret_id),
                 ..
             } => bindings.push(("oauth_client_secret", secret_id)),
+            ConnectionAuthentication::DelegatedIssuerToken {
+                client_secret_id: Some(secret_id),
+                ..
+            } => bindings.push(("token_exchange_client_secret", secret_id)),
             ConnectionAuthentication::HeaderApiKey {
                 secret_id: None, ..
             }
             | ConnectionAuthentication::StaticBearer { secret_id: None }
             | ConnectionAuthentication::OAuth2ClientCredentials {
+                client_secret_id: None,
+                ..
+            }
+            | ConnectionAuthentication::DelegatedIssuerToken {
                 client_secret_id: None,
                 ..
             } => return None,
@@ -1445,9 +1627,10 @@ impl ConnectionControlPlane {
     ///
     /// A caller-assertion key this replica cannot use is the exception, as
     /// it is at startup: it leaves only that Connection's keys out of the
-    /// JWKS, and the Connection stays refused at runtime like every
-    /// Connection carrying the block. Failing the whole reconcile for it
-    /// would stop this replica serving every other Connection.
+    /// JWKS, and its tool calls are refused with
+    /// `caller_assertion_key_not_published` until its keys load again.
+    /// Failing the whole reconcile for it would stop this replica serving
+    /// every other Connection.
     ///
     /// It takes the mutation lock so a concurrent local mutation cannot
     /// publish a snapshot derived from the map this call is replacing. The
@@ -1459,6 +1642,7 @@ impl ConnectionControlPlane {
         let _guard = self.mutation_guard().await;
         let previous_problems = self.caller_assertion_keys.problems().clone();
         let mut caller_assertion_problems = BTreeMap::new();
+        let mut deferred_assertion_keys = Vec::new();
         let total = records.len().saturating_add(self.legacy.len());
         if total > MAX_CONNECTIONS {
             tracing::error!(
@@ -1513,25 +1697,31 @@ impl ConnectionControlPlane {
                     log_assertion_key_problem(&record.id, problem);
                 }
                 caller_assertion_problems.insert(record.id.clone(), found);
-            } else if let Some(kept) = previous.filter(|previous| {
-                record.write.enabled
-                    && previous.keys == keys
-                    && self
-                        .secret_resolver
-                        .has_deferred_assertion_key(&record.write)
-            }) {
+            } else if record.write.enabled
+                && self
+                    .secret_resolver
+                    .has_deferred_assertion_key(&record.write)
+            {
                 // Only a JWKS build reads a network provider, so this check
                 // cannot clear what the last build found behind one. Keep it
                 // until the next build reads the keys again.
-                caller_assertion_problems.insert(record.id.clone(), kept.clone());
+                deferred_assertion_keys.push((record.id.clone(), keys));
             }
         }
-        *self.caller_assertion_keys.problems() = caller_assertion_problems;
-        self.publish_runtime(
-            records
-                .into_iter()
-                .map(|record| (record.id.clone(), record))
-                .collect(),
+        let managed: BTreeMap<ConnectionId, StoredConnection> = records
+            .into_iter()
+            .map(|record| (record.id.clone(), record))
+            .collect();
+        // A save on another replica arrives here, so treat a changed attested
+        // record the way a local save is treated: what an earlier build read
+        // for it, or a build still reading, may predate the save.
+        let attested_changed =
+            attested_records_changed(self.runtime.load_full().managed(), &managed);
+        self.publish_runtime(managed);
+        self.caller_assertion_keys.reconcile(
+            caller_assertion_problems,
+            deferred_assertion_keys,
+            attested_changed,
         );
         Ok(())
     }
@@ -1659,10 +1849,19 @@ impl ConnectionControlPlane {
                 secret_id.clone(),
                 SecretPurpose::OAuthClientSecret,
             )),
+            ConnectionAuthentication::DelegatedIssuerToken {
+                client_secret_id: Some(secret_id),
+                ..
+            } => Some((
+                "authentication.client_secret_id",
+                secret_id.clone(),
+                SecretPurpose::TokenExchangeClientSecret,
+            )),
             ConnectionAuthentication::None
             | ConnectionAuthentication::HeaderApiKey { .. }
             | ConnectionAuthentication::StaticBearer { .. }
-            | ConnectionAuthentication::OAuth2ClientCredentials { .. } => None,
+            | ConnectionAuthentication::OAuth2ClientCredentials { .. }
+            | ConnectionAuthentication::DelegatedIssuerToken { .. } => None,
         };
         if let Some((field, secret_id, purpose)) = deferred_auth {
             if resolver.is_deferred_alias(&secret_id) {
@@ -1843,8 +2042,8 @@ impl ConnectionControlPlane {
     /// logged and kept for the admin API, and every other Connection's keys
     /// are still published. That is the rule startup and reconcile follow for
     /// a stored Connection: its keys going bad degrades that Connection, not
-    /// the gateway. Leaving a Connection out fails closed for its verifiers,
-    /// and while nothing signs yet it costs them nothing.
+    /// the gateway. Leaving a Connection out fails closed for its verifiers:
+    /// one that has not fetched the key yet rejects what it signs.
     ///
     /// A set built for other keys than the configured ones is never served,
     /// so a key withdrawn from configuration leaves the set at the next fetch.
@@ -1859,19 +2058,23 @@ impl ConnectionControlPlane {
     ) -> Result<Arc<JwksDocument>, CallerAssertionJwksUnavailable> {
         let keys = &self.caller_assertion_keys;
         let bindings = published_key_bindings(&self.runtime.load_full());
-        let previous = keys
+        if let Some(current) = keys
             .last_built()
-            .filter(|previous| previous.bindings == bindings);
-        if let Some(current) = previous
-            .as_ref()
-            .filter(|previous| previous.is_current_for(&bindings))
+            .filter(|built| built.is_current_for(&bindings))
         {
             return Ok(Arc::clone(&current.document));
         }
         let _build = match keys.build.try_lock() {
             Ok(guard) => guard,
             Err(_) => {
-                if let Some(previous) = previous {
+                // Read the slot now, after the lock was found taken, rather
+                // than reuse what was read above: a save that landed in
+                // between dropped that set, and a set a save dropped is never
+                // served, not even once.
+                if let Some(previous) = keys
+                    .last_built()
+                    .filter(|previous| previous.bindings == bindings)
+                {
                     return Ok(Arc::clone(&previous.document));
                 }
                 tokio::time::timeout(JWKS_BUILD_WAIT, keys.build.lock())
@@ -1879,24 +2082,47 @@ impl ConnectionControlPlane {
                     .map_err(|_| CallerAssertionJwksUnavailable)?
             }
         };
-        // Read the configuration again now that this is the only build. A
-        // fetch that waited for another build must neither repeat it nor
-        // publish from a snapshot older than the one that build used.
-        let bindings = published_key_bindings(&self.runtime.load_full());
-        if let Some(current) = keys
-            .last_built()
-            .filter(|built| built.is_current_for(&bindings))
-        {
-            return Ok(Arc::clone(&current.document));
+        for _ in 0..JWKS_BUILD_ATTEMPTS {
+            // The epoch comes first: a save that lands after this point, even
+            // one that changes nothing the bindings compare, voids the build.
+            let started_epoch = keys.epoch();
+            // Read the configuration again now that this is the only build. A
+            // fetch that waited for another build must neither repeat it nor
+            // publish from a snapshot older than the one that build used.
+            let bindings = published_key_bindings(&self.runtime.load_full());
+            if let Some(current) = keys
+                .last_built()
+                .filter(|built| built.is_current_for(&bindings))
+            {
+                return Ok(Arc::clone(&current.document));
+            }
+            let (built, findings) = self.build_caller_assertion_jwks(bindings).await;
+            let built = Arc::new(built);
+            if keys.commit_build(started_epoch, Arc::clone(&built), |problems| {
+                record_build_problems(problems, &findings)
+            }) {
+                return Ok(Arc::clone(&built.document));
+            }
+            // A save forgot the earlier verdict while this build was reading
+            // keys, so what it read may be what the save replaced. Serving it
+            // would hand a verifier that set for a whole cache lifetime.
+            tracing::debug!(
+                "a Connection was saved during a caller-assertion JWKS build; building again"
+            );
         }
-        let built = Arc::new(self.build_caller_assertion_jwks(bindings).await);
-        keys.store_built(Arc::clone(&built));
-        Ok(Arc::clone(&built.document))
+        // Saves kept overtaking the build. Answer `503`, which a verifier
+        // treats as "keep the set you have", rather than serve a set the
+        // latest save may already have made wrong.
+        Err(CallerAssertionJwksUnavailable)
     }
 
     /// Reads and loads every key in `bindings` and builds the set from the
-    /// Connections whose keys all load, recording why any other was left out.
-    async fn build_caller_assertion_jwks(&self, bindings: Vec<PublishedKeyBinding>) -> CachedJwks {
+    /// Connections whose keys all load, with why any other was left out. What
+    /// it found is recorded only when the caller commits the build.
+    async fn build_caller_assertion_jwks(
+        &self,
+        bindings: Vec<PublishedKeyBinding>,
+    ) -> (CachedJwks, Vec<BuildFinding>) {
         // One read per alias, however many keys or Connections name it.
         let mut materials = BTreeMap::new();
         for binding in &bindings {
@@ -1995,7 +2221,14 @@ impl ConnectionControlPlane {
             }
         }
 
-        self.record_build_problems(&connections);
+        let findings = connections
+            .iter()
+            .map(|connection| BuildFinding {
+                id: connection.id.clone(),
+                keys: connection.keys.clone(),
+                problem: connection.problem,
+            })
+            .collect::<Vec<_>>();
         let complete = connections
             .iter()
             .all(|connection| connection.problem.is_none());
@@ -2012,46 +2245,19 @@ impl ConnectionControlPlane {
                 "enabled Connections publish different caller-assertion keys under one kid; neither is published"
             );
         }
-        CachedJwks {
-            bindings,
-            built_at: Instant::now(),
-            serve_for: if complete {
-                JWKS_REFRESH_INTERVAL
-            } else {
-                JWKS_RETRY_INTERVAL
+        (
+            CachedJwks {
+                bindings,
+                built_at: Instant::now(),
+                serve_for: if complete {
+                    JWKS_REFRESH_INTERVAL
+                } else {
+                    JWKS_RETRY_INTERVAL
+                },
+                document: Arc::new(build.document),
             },
-            document: Arc::new(build.document),
-        }
-    }
-
-    /// Keeps what a build found for each Connection it read, logging only a
-    /// change, and forgets every Connection it did not read: one disabled,
-    /// deleted, or no longer carrying a caller assertion publishes nothing.
-    fn record_build_problems(&self, connections: &[BuiltConnectionKeys]) {
-        let mut problems = self.caller_assertion_keys.problems();
-        for connection in connections {
-            match connection.problem {
-                Some(problem) => {
-                    let found = KeyProblemRecord {
-                        keys: connection.keys.clone(),
-                        problem,
-                    };
-                    if problems.get(&connection.id) != Some(&found) {
-                        log_assertion_key_problem(&connection.id, problem);
-                    }
-                    problems.insert(connection.id.clone(), found);
-                }
-                None => {
-                    if problems.remove(&connection.id).is_some() {
-                        tracing::info!(
-                            connection_id = %connection.id,
-                            "a Connection's caller-assertion keys load again and are published"
-                        );
-                    }
-                }
-            }
-        }
-        problems.retain(|id, _| connections.iter().any(|connection| &connection.id == id));
+            findings,
+        )
     }
 
     /// Why this replica leaves `record`'s caller-assertion keys out of the
@@ -2070,6 +2276,22 @@ impl ConnectionControlPlane {
             .get(&record.id)
             .filter(|found| found.keys == keys)
             .map(|found| found.problem)
+    }
+
+    /// Ends the current caller-assertion JWKS's refresh interval, so the
+    /// next fetch rebuilds it exactly as it would once the interval had
+    /// passed.
+    #[cfg(test)]
+    pub(crate) fn expire_caller_assertion_jwks(&self) {
+        let keys = &self.caller_assertion_keys;
+        if let Some(built) = keys.last_built() {
+            keys.store_built(Arc::new(CachedJwks {
+                bindings: built.bindings.clone(),
+                built_at: built.built_at,
+                serve_for: Duration::ZERO,
+                document: Arc::clone(&built.document),
+            }));
+        }
     }
 
     /// Serialize this mutation against every other control-plane and
@@ -2311,8 +2533,9 @@ impl ConnectionSecretResolver {
     /// checked for being configured here; the JWKS build reads it.
     ///
     /// This is the startup and reconcile check. It never refuses the load: a
-    /// Connection it finds a problem in keeps its keys out of the JWKS and
-    /// stays refused at runtime, and every other Connection is unaffected.
+    /// Connection it finds a problem in keeps its keys out of the JWKS, and
+    /// its tool calls are refused with `caller_assertion_key_not_published`
+    /// until its keys load again; every other Connection is unaffected.
     fn stored_assertion_key_problem(
         &self,
         candidate: &ConnectionWrite,
@@ -2445,9 +2668,20 @@ impl ConnectionSecretResolver {
                     SecretPurpose::OAuthClientSecret,
                 )?;
             }
+            ConnectionAuthentication::DelegatedIssuerToken {
+                client_secret_id: Some(secret_id),
+                ..
+            } if !self.is_deferred_alias(secret_id) => {
+                self.resolve_required(
+                    "authentication.client_secret_id",
+                    secret_id,
+                    SecretPurpose::TokenExchangeClientSecret,
+                )?;
+            }
             ConnectionAuthentication::HeaderApiKey { .. }
             | ConnectionAuthentication::StaticBearer { .. }
-            | ConnectionAuthentication::OAuth2ClientCredentials { .. } => {}
+            | ConnectionAuthentication::OAuth2ClientCredentials { .. }
+            | ConnectionAuthentication::DelegatedIssuerToken { .. } => {}
         }
 
         for header in &candidate.additional_headers {
@@ -2558,6 +2792,10 @@ impl ConnectionSecretResolver {
                 client_secret_id: Some(secret_id),
                 ..
             } if secret_id == rotated_id => Some(SecretPurpose::OAuthClientSecret),
+            ConnectionAuthentication::DelegatedIssuerToken {
+                client_secret_id: Some(secret_id),
+                ..
+            } if secret_id == rotated_id => Some(SecretPurpose::TokenExchangeClientSecret),
             _ => None,
         };
         if authentication_purpose.is_some_and(|purpose| replacement.purpose() != purpose) {
@@ -2780,7 +3018,7 @@ fn log_assertion_key_problem(id: &ConnectionId, problem: CallerAssertionKeyProbl
         connection_id = %id,
         field = problem.field,
         code = problem.code,
-        "an enabled Connection's caller-assertion keys cannot all be used; its keys are left out of the published JWKS and the Connection stays refused"
+        "an enabled Connection's caller-assertion keys cannot all be used; its keys are left out of the published JWKS and its tool calls are refused until they load"
     );
 }
 
@@ -2791,6 +3029,35 @@ fn assertion_keys_conflict(
 ) -> bool {
     left.kid == right.kid
         && (left.signing_key_id != right.signing_key_id || left.algorithm != right.algorithm)
+}
+
+/// Whether `record`, if enabled, publishes a `kid` that another enabled
+/// Connection in `snapshot` publishes for a different key: the clash the save
+/// check refuses and the JWKS build leaves both Connections out for.
+pub(crate) fn publishes_an_ambiguous_kid(
+    snapshot: &ConnectionRuntimeSnapshot,
+    record: &StoredConnection,
+) -> bool {
+    let Some(assertion) = record
+        .write
+        .caller_assertion
+        .as_ref()
+        .filter(|_| record.write.enabled)
+    else {
+        return false;
+    };
+    snapshot
+        .managed()
+        .iter()
+        .filter(|(other_id, other)| **other_id != record.id && other.write.enabled)
+        .filter_map(|(_, other)| other.write.caller_assertion.as_ref())
+        .any(|other| {
+            assertion.keys().any(|key| {
+                other
+                    .keys()
+                    .any(|published| assertion_keys_conflict(&key, &published))
+            })
+        })
 }
 
 /// Every key the enabled managed Connections of `snapshot` publish, in
@@ -5299,19 +5566,21 @@ mod tests {
     /// Ends the current set's refresh interval, so the next fetch rebuilds it
     /// exactly as it would once the interval had passed.
     fn expire_built_jwks(control_plane: &ConnectionControlPlane) {
-        let keys = &control_plane.caller_assertion_keys;
-        let built = keys.last_built().expect("a set should have been built");
-        keys.store_built(Arc::new(CachedJwks {
-            bindings: built.bindings.clone(),
-            built_at: built.built_at,
-            serve_for: Duration::ZERO,
-            document: Arc::clone(&built.document),
-        }));
+        assert!(
+            control_plane.caller_assertion_keys.last_built().is_some(),
+            "a set should have been built"
+        );
+        control_plane.expire_caller_assertion_jwks();
     }
 
-    /// Whether `id` is refused by the data path, as every Connection carrying
-    /// a caller assertion is until injection ships.
-    fn refused_at_runtime(control_plane: &ConnectionControlPlane, id: &ConnectionId) -> bool {
+    /// The verdict a manual tool call on `id` gets from caller-assertion
+    /// admission, which runs before any egress or credential read. Every
+    /// other lane refuses an attested Connection outright, which this checks
+    /// first.
+    async fn tool_call_admission(
+        control_plane: &ConnectionControlPlane,
+        id: &ConnectionId,
+    ) -> Result<(), crate::connections::caller_assertion::CallerAssertionError> {
         let egress = crate::egress::EgressConfig::default();
         let client = Arc::new(
             crate::egress::EgressClient::new(egress.clone()).expect("egress client should build"),
@@ -5321,8 +5590,26 @@ mod tests {
             egress,
             client,
         );
-        runtime.target(id.as_str(), "/charges").err()
-            == Some(crate::connections::http::ConnectionHttpError::CallerAssertionNotEnforced)
+        assert_eq!(
+            runtime.target(id.as_str(), "/charges").err(),
+            Some(crate::connections::http::ConnectionHttpError::CallerAssertionNotEnforced)
+        );
+        let target = runtime
+            .tool_call_target(id.as_str(), "/charges")
+            .expect("a valid attested Connection serves tool calls");
+        let caller = crate::connections::caller_assertion::AttestedCaller::from_principal(
+            &crate::auth::Principal {
+                user_id: "alice".to_owned(),
+                issuer: Some("https://idp.example.test".to_owned()),
+                email: None,
+                org_id: None,
+                roles: Vec::new(),
+                session_id: "session-alice".to_owned(),
+                auth_method: crate::auth::AuthMethod::Bearer,
+            },
+        )
+        .expect("a provider-vouched principal is attestable");
+        runtime.admit_caller_assertion(&target, Some(&caller)).await
     }
 
     #[tokio::test]
@@ -5330,7 +5617,7 @@ mod tests {
         // #556 stored an enabled Connection's caller assertion whatever its
         // alias held. A gateway upgraded over such a document, or one whose
         // key went bad after it was saved, must keep starting: only that
-        // Connection's keys leave the JWKS, and it stays refused.
+        // Connection's keys leave the JWKS, and its tool calls are refused.
         let temporary = TemporaryLocalControlPlane::new("assertion-stored-degraded");
         let config = with_assertion_keys(
             &temporary,
@@ -5385,15 +5672,23 @@ mod tests {
             key_problem("caller_assertion.signing_key_id", "unresolvable_binding")
         );
 
-        // Only the healthy Connection's key is published, and every
-        // Connection carrying the block is still refused on the data path.
+        // Only the healthy Connection's key is published, and only its tool
+        // calls are admitted: the others would be signed with keys no
+        // verifier that fetched this set holds.
         let published = restarted
             .caller_assertion_jwks()
             .await
             .expect("the healthy key should publish");
         assert_eq!(published_kids(&published), vec!["gw-a"]);
-        for record in &created {
-            assert!(refused_at_runtime(&restarted, &record.id));
+        assert_eq!(
+            tool_call_admission(&restarted, &created[0].id).await,
+            Ok(())
+        );
+        for record in &created[1..] {
+            assert_eq!(
+                tool_call_admission(&restarted, &record.id).await,
+                Err(crate::connections::caller_assertion::CallerAssertionError::KeyNotPublished)
+            );
         }
 
         // A save is still held to the write-time rule, with the same safe code.
@@ -5437,6 +5732,7 @@ mod tests {
             .await
             .expect("the repaired key should publish");
         assert_eq!(published_kids(&published), vec!["gw-a", "gw-b"]);
+        assert_eq!(tool_call_admission(&restarted, &fixed.id).await, Ok(()));
 
         // Disabling a degraded Connection needs no key, and withdraws its
         // diagnostic with its keys.
@@ -5507,9 +5803,39 @@ mod tests {
             .await
             .expect("the cached set should serve");
         assert!(Arc::ptr_eq(&again, &partial));
+        // Tool calls follow the published set: key-b's would be signed with a
+        // key no verifier that fetched it holds.
+        assert_eq!(
+            tool_call_admission(&control_plane, &created[0].id).await,
+            Ok(())
+        );
+        assert_eq!(
+            tool_call_admission(&control_plane, &created[1].id).await,
+            Err(crate::connections::caller_assertion::CallerAssertionError::KeyNotPublished)
+        );
 
+        // The key comes back. Within the retry interval a call reads nothing
+        // and is still refused, so calls cannot make the gateway ask its
+        // provider more often than fetches can.
         write_assertion_key(&temporary, "key-b", &key_b);
+        assert_eq!(
+            tool_call_admission(&control_plane, &created[1].id).await,
+            Err(crate::connections::caller_assertion::CallerAssertionError::KeyNotPublished)
+        );
+        assert!(Arc::ptr_eq(
+            &control_plane
+                .caller_assertion_jwks()
+                .await
+                .expect("the cached set should serve"),
+            &partial
+        ));
+        // Once it has passed, the call itself reads the keys again, publishes
+        // key-b and is admitted, without waiting for a verifier to fetch.
         expire_built_jwks(&control_plane);
+        assert_eq!(
+            tool_call_admission(&control_plane, &created[1].id).await,
+            Ok(())
+        );
         let restored = control_plane
             .caller_assertion_jwks()
             .await
@@ -5568,7 +5894,10 @@ mod tests {
                 .key_count(),
             0
         );
-        assert!(refused_at_runtime(&control_plane, &foreign.id));
+        assert_eq!(
+            tool_call_admission(&control_plane, &foreign.id).await,
+            Err(crate::connections::caller_assertion::CallerAssertionError::KeyNotPublished)
+        );
 
         // A credential this replica cannot resolve still fails the reconcile
         // closed, exactly as before.
@@ -5679,9 +6008,14 @@ mod tests {
 
     /// Network provider serving one key that counts every read and holds each
     /// read until the test releases it.
+    ///
+    /// The material is taken when a read starts, not when it is released, so
+    /// a read held across a change of material answers with what the alias
+    /// held before -- a provider read that was in flight while the key was
+    /// replaced.
     struct GatedKeyProvider {
         alias_id: &'static str,
-        pem: String,
+        pem: Mutex<String>,
         reads: std::sync::atomic::AtomicUsize,
         gate: Semaphore,
     }
@@ -5690,7 +6024,7 @@ mod tests {
         fn new(alias_id: &'static str, pem: String) -> Self {
             Self {
                 alias_id,
-                pem,
+                pem: Mutex::new(pem),
                 reads: std::sync::atomic::AtomicUsize::new(0),
                 gate: Semaphore::new(0),
             }
@@ -5703,6 +6037,21 @@ mod tests {
         fn release_one(&self) {
             self.gate.add_permits(1);
         }
+
+        fn replace_material(&self, pem: String) {
+            *self.pem.lock().expect("gated material lock") = pem;
+        }
+
+        async fn wait_for_reads(&self, reads: usize) {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while self.reads() < reads {
+                assert!(
+                    Instant::now() < deadline,
+                    "the build should reach the provider"
+                );
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        }
     }
 
     #[async_trait]
@@ -5712,6 +6061,7 @@ mod tests {
             alias_id: &str,
             purpose: SecretPurpose,
         ) -> Result<ResolvedSecret, SecretResolveError> {
+            let material = self.pem.lock().expect("gated material lock").clone();
             self.reads.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             self.gate
                 .acquire()
@@ -5726,7 +6076,7 @@ mod tests {
                     SecretResolveErrorKind::UnknownAlias,
                 ));
             }
-            ResolvedSecret::new(purpose, self.pem.as_bytes().to_vec()).map_err(|_| {
+            ResolvedSecret::new(purpose, material.into_bytes()).map_err(|_| {
                 SecretResolveError::new(alias_id, SecretResolveErrorKind::InvalidMaterial)
             })
         }
@@ -5806,6 +6156,357 @@ mod tests {
         assert!(!Arc::ptr_eq(&rebuilt, &first));
         assert_eq!(rebuilt.etag(), first.etag());
         assert_eq!(provider.reads(), 2);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_build_that_read_a_key_before_a_save_repaired_it_is_not_cached() {
+        let temporary = TemporaryLocalControlPlane::new("assertion-jwks-repair-race");
+        let mut config = temporary.config();
+        config.connection_vault_provider = vault_config_declaring("gated-key");
+        let control_plane =
+            ConnectionControlPlane::from_config(&config).expect("control plane should build");
+        // The alias starts out holding something that is not a key at all.
+        let provider = Arc::new(GatedKeyProvider::new(
+            "gated-key",
+            "not a private key".to_owned(),
+        ));
+        control_plane.install_network_secret_providers(vec![
+            Arc::clone(&provider) as Arc<dyn SecretResolver>
+        ]);
+        let snapshot = control_plane.runtime_snapshot();
+        let created = control_plane
+            .create_managed(
+                snapshot.collection_etag(),
+                attested_candidate("gated-key", "gw-repaired", "es256", serde_json::json!([])),
+                "test-admin",
+            )
+            .await
+            .expect("a deferred key is not read on save");
+        provider.release_one();
+        let broken = control_plane
+            .caller_assertion_jwks()
+            .await
+            .expect("the set builds without the broken key");
+        assert_eq!(broken.key_count(), 0);
+        assert_eq!(
+            control_plane.caller_assertion_key_problem(&created),
+            key_problem("caller_assertion.signing_key_id", "invalid_signing_key")
+        );
+
+        // A rebuild reads the alias while it still holds the broken material,
+        // and its answer is held.
+        expire_built_jwks(&control_plane);
+        let rebuilding = {
+            let control_plane = control_plane.clone();
+            tokio::spawn(async move { control_plane.caller_assertion_jwks().await })
+        };
+        provider.wait_for_reads(2).await;
+
+        // Meanwhile the operator repairs the key and saves the Connection,
+        // which loads the key and forgets the old verdict. The alias, `kid`
+        // and algorithm are unchanged, so only the save itself can tell the
+        // in-flight build that what it read is out of date.
+        provider.replace_material(es256_pem());
+        let saved = control_plane
+            .replace_managed(
+                &created.id,
+                &created.etag(),
+                created.write.clone(),
+                "test-admin",
+            )
+            .await
+            .expect("the repaired Connection should save");
+        assert_eq!(control_plane.caller_assertion_key_problem(&saved), None);
+
+        // The held read now answers with the broken material. The fetch that
+        // started before the save must not cache that, nor put the problem
+        // back: it builds again and serves the repaired key.
+        provider.release_one();
+        provider.release_one();
+        let rebuilt = rebuilding
+            .await
+            .expect("the rebuild task should finish")
+            .expect("the repaired key should publish");
+        assert_eq!(published_kids(&rebuilt), vec!["gw-repaired"]);
+        assert_eq!(provider.reads(), 3, "the stale build is repeated once");
+        assert_eq!(control_plane.caller_assertion_key_problem(&saved), None);
+        let cached = control_plane
+            .caller_assertion_jwks()
+            .await
+            .expect("the repaired set should be cached");
+        assert!(Arc::ptr_eq(&cached, &rebuilt));
+        assert_eq!(provider.reads(), 3);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_save_another_replica_made_voids_a_build_in_flight_like_a_local_one() {
+        let temporary = TemporaryLocalControlPlane::new("assertion-jwks-reconcile-race");
+        let mut config = temporary.config();
+        config.connection_vault_provider = vault_config_declaring("gated-key");
+        let control_plane =
+            ConnectionControlPlane::from_config(&config).expect("control plane should build");
+        let provider = Arc::new(GatedKeyProvider::new(
+            "gated-key",
+            "not a private key".to_owned(),
+        ));
+        control_plane.install_network_secret_providers(vec![
+            Arc::clone(&provider) as Arc<dyn SecretResolver>
+        ]);
+        let snapshot = control_plane.runtime_snapshot();
+        let created = control_plane
+            .create_managed(
+                snapshot.collection_etag(),
+                attested_candidate("gated-key", "gw-remote", "es256", serde_json::json!([])),
+                "test-admin",
+            )
+            .await
+            .expect("a deferred key is not read on save");
+        provider.release_one();
+        assert_eq!(
+            control_plane
+                .caller_assertion_jwks()
+                .await
+                .expect("the set builds without the broken key")
+                .key_count(),
+            0
+        );
+
+        expire_built_jwks(&control_plane);
+        let rebuilding = {
+            let control_plane = control_plane.clone();
+            tokio::spawn(async move { control_plane.caller_assertion_jwks().await })
+        };
+        provider.wait_for_reads(2).await;
+
+        // The repair is saved on another replica; this one learns of it from
+        // the authority, as a new revision of the same record.
+        provider.replace_material(es256_pem());
+        let mut repaired = created.clone();
+        repaired.revisions.connection += 1;
+        control_plane
+            .publish_authoritative_records(vec![repaired])
+            .await
+            .expect("the repaired record should reconcile");
+
+        provider.release_one();
+        provider.release_one();
+        let rebuilt = rebuilding
+            .await
+            .expect("the rebuild task should finish")
+            .expect("the repaired key should publish");
+        assert_eq!(published_kids(&rebuilt), vec!["gw-remote"]);
+        assert_eq!(provider.reads(), 3, "the stale build is repeated once");
+
+        // A reconcile that changes no attested record leaves the cache alone.
+        let current = control_plane
+            .runtime_snapshot()
+            .managed()
+            .values()
+            .cloned()
+            .collect::<Vec<_>>();
+        control_plane
+            .publish_authoritative_records(current)
+            .await
+            .expect("an unchanged reconcile should succeed");
+        let cached = control_plane
+            .caller_assertion_jwks()
+            .await
+            .expect("the repaired set is still cached");
+        assert!(Arc::ptr_eq(&cached, &rebuilt));
+        assert_eq!(provider.reads(), 3);
+    }
+
+    /// One attested Connection whose key sits behind a network provider,
+    /// with a first set built from what the alias holds, `pem`.
+    async fn overlap_fixture(
+        name: &str,
+        pem: String,
+    ) -> (
+        TemporaryLocalControlPlane,
+        ConnectionControlPlane,
+        Arc<GatedKeyProvider>,
+        StoredConnection,
+    ) {
+        let temporary = TemporaryLocalControlPlane::new(name);
+        let mut config = temporary.config();
+        config.connection_vault_provider = vault_config_declaring("gated-key");
+        let control_plane =
+            ConnectionControlPlane::from_config(&config).expect("control plane should build");
+        let provider = Arc::new(GatedKeyProvider::new("gated-key", pem));
+        control_plane.install_network_secret_providers(vec![
+            Arc::clone(&provider) as Arc<dyn SecretResolver>
+        ]);
+        let snapshot = control_plane.runtime_snapshot();
+        let created = control_plane
+            .create_managed(
+                snapshot.collection_etag(),
+                attested_candidate("gated-key", "gw-overlap", "es256", serde_json::json!([])),
+                "test-admin",
+            )
+            .await
+            .expect("a deferred key is not read on save");
+        provider.release_one();
+        control_plane
+            .caller_assertion_jwks()
+            .await
+            .expect("the first set should build");
+        (temporary, control_plane, provider, created)
+    }
+
+    /// Runs a JWKS build to completion at the start of the next reconcile's
+    /// install, after its checks: a fetch that rebuilt the set while the
+    /// reconcile was running them.
+    fn build_during_next_reconcile(
+        control_plane: &ConnectionControlPlane,
+        provider: &Arc<GatedKeyProvider>,
+    ) {
+        let handle = tokio::runtime::Handle::current();
+        let building = control_plane.clone();
+        let provider = Arc::clone(provider);
+        control_plane
+            .caller_assertion_keys
+            .set_before_reconcile_for_test(Box::new(move || {
+                provider.release_one();
+                tokio::task::block_in_place(|| handle.block_on(building.caller_assertion_jwks()))
+                    .expect("the build should finish");
+            }));
+    }
+
+    /// A reconcile that changes nothing, as another replica's save of a
+    /// different Connection arrives.
+    async fn reconcile_unchanged(control_plane: &ConnectionControlPlane) {
+        let current = control_plane
+            .runtime_snapshot()
+            .managed()
+            .values()
+            .cloned()
+            .collect::<Vec<_>>();
+        control_plane
+            .publish_authoritative_records(current)
+            .await
+            .expect("an unchanged reconcile should succeed");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_reconcile_keeps_a_key_problem_a_build_found_while_it_ran() {
+        let (_temporary, control_plane, provider, created) =
+            overlap_fixture("assertion-jwks-reconcile-found", es256_pem()).await;
+        assert_eq!(control_plane.caller_assertion_key_problem(&created), None);
+
+        // The key goes bad, and a build finds that while a reconcile is
+        // running checks that cannot read a key behind a network provider.
+        provider.replace_material("not a private key".to_owned());
+        expire_built_jwks(&control_plane);
+        build_during_next_reconcile(&control_plane, &provider);
+        reconcile_unchanged(&control_plane).await;
+
+        // The set the build cached leaves the Connection out, and so must
+        // admission: the reconcile may not drop what the build found and let
+        // calls be signed with a key no verifier that fetched the set holds.
+        let cached = control_plane
+            .caller_assertion_jwks()
+            .await
+            .expect("the set without the broken key is cached");
+        assert_eq!(cached.key_count(), 0);
+        assert_eq!(
+            control_plane.caller_assertion_key_problem(&created),
+            key_problem("caller_assertion.signing_key_id", "invalid_signing_key")
+        );
+        assert_eq!(
+            tool_call_admission(&control_plane, &created.id).await,
+            Err(crate::connections::caller_assertion::CallerAssertionError::KeyNotPublished)
+        );
+        assert_eq!(provider.reads(), 2);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_reconcile_does_not_restore_a_key_problem_a_build_cleared_while_it_ran() {
+        let (_temporary, control_plane, provider, created) = overlap_fixture(
+            "assertion-jwks-reconcile-cleared",
+            "not a private key".to_owned(),
+        )
+        .await;
+        assert_eq!(
+            control_plane.caller_assertion_key_problem(&created),
+            key_problem("caller_assertion.signing_key_id", "invalid_signing_key")
+        );
+
+        // The key is repaired, and a build finds it loads while a reconcile
+        // is running its checks.
+        provider.replace_material(es256_pem());
+        expire_built_jwks(&control_plane);
+        build_during_next_reconcile(&control_plane, &provider);
+        reconcile_unchanged(&control_plane).await;
+
+        // The set the build cached publishes the key for a whole refresh
+        // interval, and admission must follow it rather than refuse every
+        // call on the problem the reconcile saw before the build cleared it.
+        let cached = control_plane
+            .caller_assertion_jwks()
+            .await
+            .expect("the repaired set is cached");
+        assert_eq!(published_kids(&cached), vec!["gw-overlap"]);
+        assert_eq!(control_plane.caller_assertion_key_problem(&created), None);
+        assert_eq!(
+            tool_call_admission(&control_plane, &created.id).await,
+            Ok(())
+        );
+        assert_eq!(provider.reads(), 2);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_fetch_that_keeps_losing_to_saves_is_answered_unavailable() {
+        let temporary = TemporaryLocalControlPlane::new("assertion-jwks-save-storm");
+        let mut config = temporary.config();
+        config.connection_vault_provider = vault_config_declaring("gated-key");
+        let control_plane =
+            ConnectionControlPlane::from_config(&config).expect("control plane should build");
+        let provider = Arc::new(GatedKeyProvider::new("gated-key", es256_pem()));
+        control_plane.install_network_secret_providers(vec![
+            Arc::clone(&provider) as Arc<dyn SecretResolver>
+        ]);
+        let snapshot = control_plane.runtime_snapshot();
+        let mut current = control_plane
+            .create_managed(
+                snapshot.collection_etag(),
+                attested_candidate("gated-key", "gw-busy", "es256", serde_json::json!([])),
+                "test-admin",
+            )
+            .await
+            .expect("attested Connection should create");
+        let fetch = {
+            let control_plane = control_plane.clone();
+            tokio::spawn(async move { control_plane.caller_assertion_jwks().await })
+        };
+        // Every build the fetch starts is overtaken by a save before its read
+        // returns.
+        for attempt in 1..=JWKS_BUILD_ATTEMPTS {
+            provider.wait_for_reads(attempt).await;
+            current = control_plane
+                .replace_managed(
+                    &current.id,
+                    &current.etag(),
+                    current.write.clone(),
+                    "test-admin",
+                )
+                .await
+                .expect("the Connection should save");
+            provider.release_one();
+        }
+        assert_eq!(
+            fetch.await.expect("the fetch task should finish"),
+            Err(CallerAssertionJwksUnavailable)
+        );
+        assert!(
+            control_plane.caller_assertion_keys.last_built().is_none(),
+            "no overtaken build may be cached"
+        );
+        provider.release_one();
+        let settled = control_plane
+            .caller_assertion_jwks()
+            .await
+            .expect("a fetch with no save in its way publishes");
+        assert_eq!(published_kids(&settled), vec!["gw-busy"]);
     }
 
     #[tokio::test]

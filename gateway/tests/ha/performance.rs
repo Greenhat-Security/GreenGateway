@@ -77,11 +77,13 @@
 //! product's operation time. A product sample is also recorded only when
 //! its call finishes, so one a request deadline cut off is absent.
 //! Swapping one for the other changes what each budget is measured
-//! against, which is a decision for the capacity scenarios that will
-//! scrape the product series under load (issue #439's second PR), not a
-//! side effect of the change that added the series. Recorded here rather
-//! than in a commit message because the `method` field is where a reader
-//! will ask the question.
+//! against, so it was not a side effect of the change that added the
+//! series. Issue #439's second PR, the capacity matrix in [`capacity`],
+//! scrapes the product series under load and publishes them beside this
+//! report without replacing any budget measured here: it gates nothing on
+//! latency, so it is sizing evidence, not a second budget. Recorded here
+//! rather than in a commit message because the `method` field is where a
+//! reader will ask the question.
 //!
 //! ## What the artifact is for
 //!
@@ -94,11 +96,22 @@
 //! toward a ceiling before it hits one. A missing baseline is a pass, and
 //! says so in the log.
 //!
+//! ## The capacity matrix
+//!
+//! [`capacity`] is a module of this target with a report of its own
+//! (`GATEWAY_TEST_CAPACITY_REPORT`). It reuses this file's cluster options,
+//! fixtures and quantiles, records acquisition waits, request outcomes and
+//! database activity across a small matrix of replica counts, pool
+//! ceilings and request mixes, and asserts only that every cell produced
+//! complete evidence. The nightly runs it in a step of its own and the
+//! budget step skips it.
+//!
 //! Skips silently without `GATEWAY_TEST_POSTGRES_URL_FILE`, and without
 //! `GATEWAY_TEST_HA_GATE`, like every other suite under `tests/ha/`.
 
 #![cfg(feature = "postgres")]
 
+mod capacity;
 mod harness;
 
 use std::{
@@ -840,14 +853,16 @@ async fn the_authority_operations_are_within_their_per_operation_budgets() {
                      $5::double precision >= 0,
                      now())
                  ON CONFLICT (deployment_id, lane, key_digest) DO UPDATE SET
-                     allowed = (GREATEST(b.tat, now()) - now())
+                     allowed = (GREATEST(b.tat, now(), b.updated_at)
+                                   - GREATEST(now(), b.updated_at))
                          <= make_interval(secs => $5::double precision),
-                     tat = CASE WHEN (GREATEST(b.tat, now()) - now())
+                     tat = CASE WHEN (GREATEST(b.tat, now(), b.updated_at)
+                                         - GREATEST(now(), b.updated_at))
                                      <= make_interval(secs => $5::double precision)
-                                THEN GREATEST(b.tat, now())
+                                THEN GREATEST(b.tat, now(), b.updated_at)
                                      + make_interval(secs => $4::double precision)
                                 ELSE b.tat END,
-                     updated_at = now()
+                     updated_at = GREATEST(now(), b.updated_at)
                  RETURNING b.allowed AS allowed, (b.xmax = 0) AS inserted
              ),
              counted AS (
