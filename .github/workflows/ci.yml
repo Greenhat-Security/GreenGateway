@@ -144,7 +144,12 @@ jobs:
         with:
           rust: ci
           node: 'true'
+      # One dependency cache serves every job that builds the default-feature
+      # test graph without RUSTFLAGS; see postgres-foundation-pg.
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          shared-key: postgres-foundation
+          save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
       - name: Install workflow test parser
         run: python -m pip install PyYAML==6.0.3
       - name: Test bounded corpus runner
@@ -178,13 +183,18 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           workspaces: ". -> target/llvm-cov-target"
+          save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
       - name: Install the pinned coverage tool
         run: cargo install cargo-llvm-cov --version 0.9.0 --locked
       - name: Measure security branches
         id: coverage
         # The mandatory uninstrumented test job enforces the SQLite wall-clock
         # budget. Instrumentation changes that measurement on hosted Windows.
-        run: cargo llvm-cov --no-rustc-wrapper --branch --json --output-path target/security-coverage.json -p gateway --bin gateway --locked --jobs 2 -- --test-threads=8 --skip audit::sqlite_sink::tests::moderate_scale_batched_inserts_complete_quickly
+        # `--jobs 4` matches the runner's four vCPUs. The job count only
+        # bounds how many compiler threads run at once (the single gateway
+        # crate dominates the build); it changes neither the instrumentation
+        # nor the tests, so the floors measure exactly what they did.
+        run: cargo llvm-cov --no-rustc-wrapper --branch --json --output-path target/security-coverage.json -p gateway --bin gateway --locked --jobs 4 -- --test-threads=8 --skip audit::sqlite_sink::tests::moderate_scale_batched_inserts_complete_quickly
       - name: Enforce production-code coverage floors
         if: ${{ always() && steps.coverage.outcome == 'success' }}
         run: python scripts/check-security-coverage.py target/security-coverage.json
@@ -306,6 +316,15 @@ jobs:
         with:
           rust: ci
           node: 'true'
+      # The transport guard compiles every gateway dependency, dev
+      # dependencies included, to run its example; without a cache that was
+      # a cold dependency build per run. It is the default-feature test
+      # graph, so it shares postgres-foundation-pg's cache.
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          shared-key: postgres-foundation
+          save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
       - name: Enforce egress-only outbound HTTP
         run: bash scripts/check-egress-only.sh
       - name: Enforce structural transport ownership
@@ -335,9 +354,7 @@ jobs:
         with:
           rust: ci
           node: 'true'
-      - name: Cache Rust dependencies
-        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
-
+      # `cargo fmt` compiles nothing, so this job restores no Rust cache.
       - name: Check formatting
         run: cargo fmt --check
 
@@ -356,6 +373,8 @@ jobs:
           node: 'true'
       - name: Cache Rust dependencies
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
 
       - name: Lint
         run: cargo clippy --workspace --locked -- -D warnings
@@ -382,6 +401,8 @@ jobs:
           node: 'true'
       - name: Cache Rust dependencies
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
 
       - name: Test
         run: cargo test --workspace --locked
@@ -409,8 +430,15 @@ jobs:
   # `POSTGRES_HOST_AUTH_METHOD: trust` means the CI DSN carries no password:
   # there is no secret to leak and nothing for gitleaks to flag. The
   # disposable database is recreated per run.
-  postgres-foundation:
-    name: postgres-foundation
+  #
+  # The job's three passes -- the suite against PostgreSQL with the feature
+  # on, the suite without the feature, and the lint without the feature --
+  # share no build, so they run as three parallel shards. The required
+  # `postgres-foundation` check is the aggregator below: it passes only when
+  # every shard reports `success`, so a failed, skipped or cancelled shard
+  # fails the check rather than disappearing from it.
+  postgres-foundation-pg:
+    name: postgres-foundation-pg
     runs-on: ubuntu-latest
     timeout-minutes: 40
     services:
@@ -438,6 +466,14 @@ jobs:
           node: 'true'
       - name: Cache Rust dependencies
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          # The dependency cache of the default-feature test graph built
+          # without RUSTFLAGS, under the key this pass has always used. The
+          # HA legs, security-corpus and egress-only build that same graph
+          # and share it, instead of each keeping its own copy of it in the
+          # repository's 10 GB cache budget.
+          shared-key: postgres-foundation
+          save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
 
       - name: Write the test DSN files
         run: |
@@ -467,13 +503,94 @@ jobs:
         env:
           GATEWAY_TEST_POSTGRES_URL_FILE: ${{ runner.temp }}/pg/database-url
           GATEWAY_TEST_POSTGRES_NODDL_URL_FILE: ${{ runner.temp }}/pg/database-url-noddl
-        run: cargo test -p gateway
+        run: cargo test -p gateway --locked
+
+  # The second pass. It never set the PostgreSQL locator, so it needs no
+  # database service.
+  postgres-foundation-no-default:
+    name: postgres-foundation-no-default
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up pinned build tools
+        uses: ./.github/actions/build-tools
+        with:
+          rust: ci
+          node: 'true'
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
 
       - name: Test without the postgres feature
-        run: cargo test -p gateway --no-default-features
+        run: cargo test -p gateway --locked --no-default-features
+
+  postgres-foundation-lint:
+    name: postgres-foundation-lint
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up pinned build tools
+        uses: ./.github/actions/build-tools
+        with:
+          rust: ci
+          node: 'true'
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
 
       - name: Lint without the postgres feature
-        run: cargo clippy -p gateway --no-default-features --all-targets -- -D warnings
+        run: cargo clippy -p gateway --locked --no-default-features --all-targets -- -D warnings
+
+  # The required check. `always()` makes it run, and fail, when a shard
+  # failed, was skipped or was cancelled: a required job skipped because a
+  # dependency failed would otherwise report as passing.
+  postgres-foundation:
+    name: postgres-foundation
+    needs:
+      - postgres-foundation-pg
+      - postgres-foundation-no-default
+      - postgres-foundation-lint
+    if: ${{ always() }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up pinned build tools
+        uses: ./.github/actions/build-tools
+        with:
+          rust: none
+          node: 'false'
+      - name: Require every PostgreSQL foundation pass
+        shell: bash
+        env:
+          FEATURE_ON_RESULT: ${{ needs.postgres-foundation-pg.result }}
+          NO_DEFAULT_RESULT: ${{ needs.postgres-foundation-no-default.result }}
+          LINT_RESULT: ${{ needs.postgres-foundation-lint.result }}
+        run: |
+          status=0
+          for shard in "postgres-foundation-pg=${FEATURE_ON_RESULT:-}" \
+                       "postgres-foundation-no-default=${NO_DEFAULT_RESULT:-}" \
+                       "postgres-foundation-lint=${LINT_RESULT:-}"; do
+            name="${shard%%=*}"
+            result="${shard#*=}"
+            if [ "${result}" != "success" ]; then
+              echo "::error::${name} completed with result '${result}'"
+              status=1
+            fi
+          done
+          exit "${status}"
 
   admin-ui:
     name: admin-ui
@@ -490,6 +607,8 @@ jobs:
           node: 'true'
       - name: Cache Rust dependencies
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
 
       - name: Build gateway for live admin UI
         timeout-minutes: 15
@@ -626,8 +745,65 @@ jobs:
       - name: Type-check Cloudflare wrapper
         run: npm run typecheck
 
+  # The production image, built once per run from this checkout's Dockerfile
+  # for every job that exercises it: ha-compose-example, dev-traffic-smoke and
+  # the PR preview scan. Each of those used to build the same image itself.
+  # It is handed over as this run's artifact, never pushed: the job holds
+  # read-only permissions and no registry credentials. Consumers load it
+  # through ./.github/actions/gateway-image, which requires this job's
+  # success and checks the loaded image ID against `image-id`.
+  gateway-image:
+    name: gateway-image
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    outputs:
+      image-id: ${{ steps.export.outputs.image-id }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Set up pinned build tools
+        uses: ./.github/actions/build-tools
+        with:
+          rust: none
+          node: 'false'
+      - name: Set up verified Buildx and pinned BuildKit
+        uses: ./.github/actions/buildx
+      - name: Build the production image without publishing
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          file: ./Dockerfile
+          push: false
+          load: true
+          tags: greengateway:ci
+      - name: Export the image for this run
+        id: export
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "${RUNNER_TEMP}/gateway-image"
+          docker save --output "${RUNNER_TEMP}/gateway-image/gateway-image.tar" greengateway:ci
+          image_id="$(docker image inspect --format '{{.Id}}' greengateway:ci)"
+          [[ "${image_id}" =~ ^sha256:[0-9a-f]{64}$ ]]
+          echo "image-id=${image_id}" >> "${GITHUB_OUTPUT}"
+      - name: Hand the image to this run's consumers
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: gateway-image
+          path: ${{ runner.temp }}/gateway-image/gateway-image.tar
+          if-no-files-found: error
+          retention-days: 1
+
   ha-compose-example:
     name: ha-compose-example
+    needs: gateway-image
+    # Runs, and fails in the image step, when gateway-image did not succeed:
+    # skipping instead would report this required check as passing.
+    if: ${{ always() }}
     runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:
@@ -640,8 +816,6 @@ jobs:
         with:
           rust: none
           node: 'false'
-      - name: Set up verified Buildx and pinned BuildKit
-        uses: ./.github/actions/buildx
       - name: Validate the HA compose example
         shell: bash
         run: |
@@ -680,14 +854,21 @@ jobs:
             > target/pool-sizing/docker-compose.ha.json
           python scripts/pool_sizing.py examples --rendered docs/deployment/docker-compose.ha.yml=target/pool-sizing/docker-compose.ha.json
 
-      - name: Build the production image
-        run: docker build -t greengateway:bootstrap .
+      - name: Load the production image
+        uses: ./.github/actions/gateway-image
+        with:
+          producer-result: ${{ needs.gateway-image.result }}
+          image-id: ${{ needs.gateway-image.outputs.image-id }}
+          tag: greengateway:bootstrap
 
       - name: Rehearse clean bootstrap and restore
         run: sudo python3 scripts/check-ha-bootstrap.py --image greengateway:bootstrap
 
   dev-traffic-smoke:
     name: dev-traffic-smoke
+    needs: gateway-image
+    # As for ha-compose-example: run, and fail, unless the image was built.
+    if: ${{ always() }}
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
@@ -699,8 +880,16 @@ jobs:
         with:
           rust: none
           node: 'true'
-      - name: Set up verified Buildx and pinned BuildKit
-        uses: ./.github/actions/buildx
+      # Compose names the gateway service's image `<project>-gateway`; the
+      # project is pinned below so that name is fixed, and `--no-build` runs
+      # exactly this run's production image (Compose's build of the same
+      # context and Dockerfile is what produced it before).
+      - name: Load the production image
+        uses: ./.github/actions/gateway-image
+        with:
+          producer-result: ${{ needs.gateway-image.result }}
+          image-id: ${{ needs.gateway-image.outputs.image-id }}
+          tag: greengateway-dev-gateway
       - name: Run dev traffic smoke test
         id: dev-smoke
         shell: bash
@@ -708,10 +897,10 @@ jobs:
           set -eu
 
           node scripts/init-dev-jwks.mjs
-          compose_files=(-f docker-compose.yml -f docker-compose.dev.yml)
-          trap 'docker compose -f docker-compose.yml -f docker-compose.dev.yml down -v || true' EXIT
+          compose_files=(-p greengateway-dev -f docker-compose.yml -f docker-compose.dev.yml)
+          trap 'docker compose -p greengateway-dev -f docker-compose.yml -f docker-compose.dev.yml down -v || true' EXIT
 
-          docker compose "${compose_files[@]}" up -d --build
+          docker compose "${compose_files[@]}" up -d --no-build
 
           healthy=0
           for _ in {1..60}; do
@@ -798,9 +987,8 @@ jobs:
         with:
           rust: ci
           node: 'true'
-      - name: Cache Rust dependencies
-        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
-
+      # `cargo audit` reads Cargo.lock and the advisory database and compiles
+      # nothing, so this job restores no Rust cache.
       - name: Install cargo-audit
         uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2
         with:
@@ -887,8 +1075,12 @@ jobs:
         with:
           rust: ci
           node: 'true'
+      # The default-feature test graph again; see postgres-foundation-pg.
       - name: Cache Rust dependencies
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          shared-key: postgres-foundation
+          save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
 
       - name: Write the test DSN file
         # The harness connects as this role to CREATE DATABASE and CREATE
@@ -927,10 +1119,23 @@ jobs:
         # are in this checkout's history: fetch-depth 0 above). The suite
         # verifies both commits and binary hashes against its own copy of
         # the pin, and fails rather than skips without them.
+        #
+        # The pair builds into its own target directory, which the shared
+        # cache never held, so every run compiled the whole dependency graph
+        # again before the first pinned binary. Copying the restored
+        # dependency artifacts in first lets Cargo reuse each one whose
+        # version, features and flags match exactly (its fingerprint decides,
+        # and rebuilds anything that differs); both gateway binaries are
+        # still compiled from their pinned commits. It is a copy, so neither
+        # target directory can write into the other.
         if: ${{ matrix.suite == 'ha_rolling_upgrade' }}
         run: |
           set -euo pipefail
           python -m unittest discover -s scripts -p 'test_build_upgrade_pair.py' -v
+          if [ -d target/debug/deps ]; then
+            mkdir -p target/upgrade-pair
+            cp -a target/debug target/upgrade-pair/
+          fi
           python scripts/build_upgrade_pair.py --out "${RUNNER_TEMP}/upgrade-pair"
 
       - name: Run the release-gate suite
@@ -1018,6 +1223,7 @@ jobs:
           TEST_RESULT: ${{ needs.test.result }}
           ADMIN_UI_RESULT: ${{ needs.admin-ui.result }}
           CLOUDFLARE_RESULT: ${{ needs.cloudflare.result }}
+          NPM_POLICY_WINDOWS_RESULT: ${{ needs.npm-policy-windows.result }}
           DEV_TRAFFIC_SMOKE_RESULT: ${{ needs.dev-traffic-smoke.result }}
           AUDIT_RESULT: ${{ needs.audit.result }}
         run: |
@@ -1027,7 +1233,7 @@ jobs:
           acceptance_status=$?
 
           dependency_status=0
-          names=(egress-only fmt clippy test admin-ui cloudflare dev-traffic-smoke audit)
+          names=(egress-only fmt clippy test admin-ui cloudflare npm-policy-windows dev-traffic-smoke audit)
           results=(
             "$EGRESS_ONLY_RESULT"
             "$FMT_RESULT"
@@ -1035,6 +1241,7 @@ jobs:
             "$TEST_RESULT"
             "$ADMIN_UI_RESULT"
             "$CLOUDFLARE_RESULT"
+            "$NPM_POLICY_WINDOWS_RESULT"
             "$DEV_TRAFFIC_SMOKE_RESULT"
             "$AUDIT_RESULT"
           )
@@ -1106,8 +1313,10 @@ jobs:
           python -m unittest discover -s scripts -p 'test_candidate_scan.py' -v
           python -m unittest discover -s scripts -p 'test_image_evidence.py' -v
 
+  # Scans the PR's image, which gateway-image built without publishing.
   image-preview:
     name: Build image
+    needs: gateway-image
     if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
     timeout-minutes: 30
@@ -1121,16 +1330,12 @@ jobs:
         with:
           rust: none
           node: 'false'
-      - name: Set up verified Buildx and pinned BuildKit
-        uses: ./.github/actions/buildx
-      - name: Build without publishing
-        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+      - name: Load the PR image built without publishing
+        uses: ./.github/actions/gateway-image
         with:
-          context: .
-          file: ./Dockerfile
-          push: false
-          load: true
-          tags: greengateway:preview
+          producer-result: ${{ needs.gateway-image.result }}
+          image-id: ${{ needs.gateway-image.outputs.image-id }}
+          tag: greengateway:preview
       - name: Verify runtime compatibility and scan the PR image
         run: python scripts/check-runtime-image.py --image greengateway:preview --scan-preview
       - name: Preserve preview runtime and scan evidence
@@ -1255,6 +1460,8 @@ jobs:
           rust: production
           node: 'true'
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
       - run: cargo check --workspace --all-targets --locked
 
   promote-image:
@@ -1273,12 +1480,16 @@ jobs:
       - fmt
       - clippy
       - test
+      - postgres-foundation-pg
+      - postgres-foundation-no-default
+      - postgres-foundation-lint
       - postgres-foundation
       - admin-ui
       - cloudflare
       - npm-policy-windows
       - dev-traffic-smoke
       - audit
+      - gateway-image
       - ha-compose-example
       - ha-release-gate
       - connections-acceptance

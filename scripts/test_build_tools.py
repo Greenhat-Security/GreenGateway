@@ -22,6 +22,7 @@ class ToolContractTests(unittest.TestCase):
                  "admin-ui/package.json", ".npmrc", "admin-ui/.npmrc",
                  ".github/actions/build-tools/action.yml", ".github/actions/buildx/action.yml"]
         files += [str(p.relative_to(ROOT)) for p in (ROOT / ".github/workflows").glob("*.y*ml")]
+        files += [str(p.relative_to(ROOT)) for p in (ROOT / ".github/actions").glob("*/action.y*ml")]
         for file in files:
             target = self.root / file
             target.parent.mkdir(parents=True, exist_ok=True)
@@ -72,6 +73,47 @@ class ToolContractTests(unittest.TestCase):
         self.rejects("verified Buildx setup")
         with self.assertRaisesRegex(ValueError, "checksum mismatch"):
             build_tools.verify_download(b"substituted binary", "a" * 64)
+
+    def test_image_builds_in_run_commands_require_verified_buildx(self):
+        path = self.root / ".github/workflows/ci.yml"
+        original = path.read_text()
+        for command in ["docker build -t example .", "docker buildx build .", "docker image build .",
+                        "docker compose -f a.yml up -d --build", "docker compose -f a.yml build"]:
+            with self.subTest(command=command):
+                path.write_text(original + "\n  unpinned:\n    runs-on: ubuntu-latest\n    steps:\n"
+                                "      - uses: ./.github/actions/build-tools\n"
+                                f"      - run: {command}\n")
+                self.rejects("verified Buildx setup")
+        # Running an already-built image is not a build.
+        path.write_text(original + "\n  loader:\n    runs-on: ubuntu-latest\n    steps:\n"
+                        "      - uses: ./.github/actions/build-tools\n"
+                        "      - run: docker compose -f a.yml up -d --no-build\n")
+        self.assertEqual(build_tools.check(self.root), [])
+
+    def test_pull_request_runs_cannot_write_caches(self):
+        trusted = "save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}"
+        path = self.root / ".github/workflows/ci.yml"
+        original = path.read_text()
+        self.assertIn(trusted, original)
+        for replacement in ["save-if: true", "save-if: ${{ github.ref == 'refs/heads/main' }}"]:
+            with self.subTest(replacement=replacement):
+                path.write_text(original.replace(trusted, replacement, 1))
+                self.rejects("saved only from main pushes")
+        path.write_text(original.replace("\n        with:\n          " + trusted, "", 1))
+        self.rejects("saved only from main pushes")
+        for step in ["      - uses: actions/cache@" + "c" * 40 + "\n        with:\n          path: x\n          key: y\n",
+                     "      - uses: actions/cache/save@" + "c" * 40 + "\n        with:\n          path: x\n          key: y\n",
+                     "      - uses: docker/build-push-action@" + "c" * 40 + "\n        with:\n          cache-to: type=gha\n"]:
+            with self.subTest(step=step.split("@")[0]):
+                path.write_text(original + "\n  writer:\n    runs-on: ubuntu-latest\n    steps:\n"
+                                "      - uses: ./.github/actions/build-tools\n"
+                                "      - uses: ./.github/actions/buildx\n" + step)
+                self.rejects("pull request jobs may")
+        path.write_text(original)
+        # A composite action runs inside pull request jobs as well.
+        action = self.root / ".github/actions/buildx/action.yml"
+        action.write_text(action.read_text() + "    - uses: actions/cache@" + "c" * 40 + "\n")
+        self.rejects("pull request jobs may only restore caches")
 
     def test_coverage_profile_cannot_silently_become_stable(self):
         self.replace(".github/workflows/ci.yml", "rust: coverage", "rust: ci")

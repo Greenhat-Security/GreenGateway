@@ -13,6 +13,34 @@ import urllib.request
 
 ROOT = Path(__file__).resolve().parents[1]
 EXACT = re.compile(r"\d+\.\d+\.\d+")
+# A `run` command that builds an image: `docker build`, `docker buildx build`,
+# `docker image build`, `compose build` or `compose ... --build`. Compose's
+# `--no-build` is not a build.
+IMAGE_BUILD = re.compile(
+    r"\bdocker\s+(?:buildx\s+|image\s+)?build\b|\bcompose\b[^\n]*?\s(?:--build|build)\b")
+# The only condition under which a pull-request-triggered workflow may write
+# a cache: a push to main, whose code is reviewed. A pull request can then
+# read main's caches but never write one a later run would restore.
+TRUSTED_CACHE_WRITE = "${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}"
+
+
+def pull_request_triggered(doc):
+    events = doc.get("on", {})
+    names = events if isinstance(events, list) else [events] if isinstance(events, str) else list(events)
+    return bool({"pull_request", "pull_request_target"} & set(names))
+
+
+def cache_write_errors(where, steps):
+    errors = []
+    for step in steps:
+        use, opts = step.get("uses", ""), step.get("with", {})
+        if use.startswith("Swatinem/rust-cache@") and opts.get("save-if") != TRUSTED_CACHE_WRITE:
+            errors.append(f"{where}: Rust caches may be saved only from main pushes")
+        if use.startswith(("actions/cache@", "actions/cache/save@")):
+            errors.append(f"{where}: pull request jobs may only restore caches")
+        if use.startswith("docker/build-push-action@") and "cache-to" in opts:
+            errors.append(f"{where}: pull request jobs may not export image build caches")
+    return errors
 
 
 def versions(root=ROOT):
@@ -162,8 +190,15 @@ def check(root=ROOT):
         builder = yaml.load((root / ".github/actions/buildx/action.yml").read_text(), Loader=yaml.BaseLoader)
         if builder.get("runs", {}).get("steps") != [{"shell": "bash", "run": "python scripts/build_tools.py install-buildx"}]:
             errors.append("Buildx setup must use the verified installer")
+        for path in sorted((root / ".github/actions").glob("*/action.y*ml")):
+            composite = yaml.load(path.read_text(), Loader=yaml.BaseLoader)
+            # Composite actions run inside pull request jobs too.
+            errors += cache_write_errors(path.parent.name, composite.get("runs", {}).get("steps", []))
         for path in (root / ".github/workflows").glob("*.y*ml"):
             doc = yaml.load(path.read_text(), Loader=yaml.BaseLoader)
+            if pull_request_triggered(doc):
+                for job_name, job in doc.get("jobs", {}).items():
+                    errors += cache_write_errors(f"{path.name}/{job_name}", job.get("steps", []))
             if path.name == "ci.yml" and "cargo-policy" not in doc.get("jobs", {}):
                 errors.append("CI must retain the required Cargo policy job")
             if path.name == "ci.yml" and "egress-only" not in doc.get("jobs", {}):
@@ -184,7 +219,9 @@ def check(root=ROOT):
                     errors.append("coverage compiler profile must not change implicitly")
                 commands = "\n".join(s.get("run", "") for s in steps)
                 builds_image = any(s.get("uses", "").startswith("docker/build-push-action@") for s in steps)
-                builds_image |= job_name in {"ha-compose-example", "dev-traffic-smoke", "promote-image"}
+                builds_image |= bool(IMAGE_BUILD.search(commands))
+                # promote_image.py drives `docker buildx imagetools` itself.
+                builds_image |= job_name == "promote-image"
                 if builds_image and not any(s.get("uses") == "./.github/actions/buildx" for s in steps):
                     errors.append(f"{job_name}: verified Buildx setup is required")
                 if re.search(r"\bcargo\b", commands) and rust_profile == "none":

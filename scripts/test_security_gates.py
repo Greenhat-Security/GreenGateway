@@ -1,6 +1,7 @@
 """Offline regressions for supply-chain, coverage and test-evidence gates."""
 import importlib.util
 import json
+import os
 from pathlib import Path
 import tempfile
 import struct
@@ -732,6 +733,150 @@ class EvidenceWorkflowGate(unittest.TestCase):
         baseline = next(step for step in steps if step.get('name') == "Fetch the previous night's report")
         self.assertIn('runs?branch=main&event=schedule&status=success&per_page=1', baseline['run'])
         self.assertNotIn('continue-on-error', baseline)
+
+
+def run_bash(script, env, path_prefix=None):
+    environment = {'PATH': os.environ.get('PATH', '/usr/bin:/bin'), **env}
+    if path_prefix:
+        environment['PATH'] = str(path_prefix) + os.pathsep + environment['PATH']
+    return subprocess.run(['bash', '-c', script], env=environment, capture_output=True, text=True, timeout=30)
+
+
+class DependentRequiredJobGate(unittest.TestCase):
+    """A required check that waits on other jobs must fail, not vanish, when one of them did not succeed.
+
+    GitHub reports a job skipped because a dependency failed as passing a
+    required check, so every such job runs under `always()` and itself
+    requires `success` from each job it waits on.
+    """
+    SHARDS = ['postgres-foundation-pg', 'postgres-foundation-no-default', 'postgres-foundation-lint']
+    OUTCOMES = ['failure', 'skipped', 'cancelled', '']
+
+    def setUp(self):
+        self.root = Path(__file__).resolve().parents[1]
+        self.ci = yaml.load((self.root / '.github/workflows/ci.yml').read_text(), Loader=yaml.BaseLoader)
+        self.jobs = self.ci['jobs']
+        action = yaml.load((self.root / '.github/actions/gateway-image/action.yml').read_text(), Loader=yaml.BaseLoader)
+        self.load_steps = action['runs']['steps']
+
+    def test_every_pull_request_job_with_dependencies_runs_and_checks_them(self):
+        # Push-only publication jobs and the non-required PR preview scan are
+        # the only dependents that may be skipped.
+        exempt = {'promote-image', 'image-scan', 'image-verification', 'image-preview'}
+        dependents = {name for name, job in self.jobs.items() if 'needs' in job} - exempt
+        self.assertEqual(dependents, {'connections-acceptance', 'postgres-foundation',
+                                      'ha-compose-example', 'dev-traffic-smoke'})
+        for name in dependents:
+            with self.subTest(job=name):
+                job = self.jobs[name]
+                self.assertEqual(job['if'], '${{ always() }}')
+                self.assertNotIn('continue-on-error', job)
+                needs = job['needs'] if isinstance(job['needs'], list) else [job['needs']]
+                text = json.dumps(job['steps'])
+                for need in needs:
+                    self.assertIn('${{ needs.' + need + '.result }}', text)
+        for name in ('image-scan', 'image-verification'):
+            self.assertEqual(self.jobs[name]['if'], "github.event_name == 'push'")
+
+    def test_postgres_foundation_is_exactly_its_three_original_passes(self):
+        aggregator = self.jobs['postgres-foundation']
+        self.assertEqual(aggregator['needs'], self.SHARDS)
+        self.assertEqual(aggregator['name'], 'postgres-foundation')
+        commands = {
+            'postgres-foundation-pg': 'cargo test -p gateway --locked',
+            'postgres-foundation-no-default': 'cargo test -p gateway --locked --no-default-features',
+            'postgres-foundation-lint': 'cargo clippy -p gateway --locked --no-default-features --all-targets -- -D warnings',
+        }
+        for shard, command in commands.items():
+            with self.subTest(shard=shard):
+                job = self.jobs[shard]
+                for optional in ('if', 'needs', 'continue-on-error', 'strategy', 'env'):
+                    self.assertNotIn(optional, job)
+                runs = [step for step in job['steps'] if step.get('run') == command]
+                self.assertEqual(len(runs), 1)
+                self.assertNotIn('if', runs[0])
+                self.assertNotIn('continue-on-error', runs[0])
+                self.assertIn(shard, self.jobs['promote-image']['needs'])
+        pg = self.jobs['postgres-foundation-pg']
+        self.assertIn('postgres', pg['services'])
+        test = next(step for step in pg['steps'] if step.get('run') == commands['postgres-foundation-pg'])
+        self.assertEqual(test['env'], {
+            'GATEWAY_TEST_POSTGRES_URL_FILE': '${{ runner.temp }}/pg/database-url',
+            'GATEWAY_TEST_POSTGRES_NODDL_URL_FILE': '${{ runner.temp }}/pg/database-url-noddl',
+        })
+        names = [step.get('name') for step in pg['steps']]
+        self.assertLess(names.index('Create the no-DDL runtime role'), names.index('Test against a real PostgreSQL (feature on)'))
+
+    def aggregate(self, results):
+        step = next(step for step in self.jobs['postgres-foundation']['steps']
+                    if step.get('name') == 'Require every PostgreSQL foundation pass')
+        self.assertEqual(step['shell'], 'bash')
+        expected = {f'{key}': '${{ needs.' + shard + '.result }}' for key, shard in
+                    zip(('FEATURE_ON_RESULT', 'NO_DEFAULT_RESULT', 'LINT_RESULT'), self.SHARDS)}
+        self.assertEqual(step['env'], expected)
+        return run_bash(step['run'], dict(zip(expected, results)))
+
+    def test_the_aggregate_passes_only_when_every_shard_succeeded(self):
+        self.assertEqual(self.aggregate(['success'] * 3).returncode, 0)
+        for index in range(3):
+            for outcome in self.OUTCOMES:
+                with self.subTest(shard=self.SHARDS[index], outcome=outcome):
+                    results = ['success'] * 3
+                    results[index] = outcome
+                    result = self.aggregate(results)
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertIn(self.SHARDS[index], result.stdout)
+
+    def test_an_image_consumer_stops_unless_the_build_succeeded(self):
+        names = [step['name'] for step in self.load_steps]
+        self.assertEqual(names, ['Require the image build', 'Download this run\'s production image',
+                                 'Load and identify the production image'])
+        require = self.load_steps[0]
+        self.assertEqual(require['env'], {'PRODUCER_RESULT': '${{ inputs.producer-result }}'})
+        self.assertEqual(run_bash(require['run'], {'PRODUCER_RESULT': 'success'}).returncode, 0)
+        for outcome in self.OUTCOMES:
+            with self.subTest(outcome=outcome):
+                self.assertNotEqual(run_bash(require['run'], {'PRODUCER_RESULT': outcome}).returncode, 0)
+        for step in self.load_steps:
+            self.assertNotIn('if', step)
+            self.assertNotIn('continue-on-error', step)
+
+    def test_a_consumer_refuses_an_image_other_than_the_one_built(self):
+        load = self.load_steps[2]
+        built = 'sha256:' + 'a' * 64
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            log = directory / 'docker.log'
+            fake = directory / 'docker'
+            # Records every call; `image inspect` reports the ID in $LOADED_ID.
+            fake.write_text('#!/bin/sh\necho "$@" >> "$DOCKER_LOG"\n'
+                            'if [ "$1" = image ] && [ "$2" = inspect ]; then echo "$LOADED_ID"; fi\n')
+            fake.chmod(0o755)
+            def attempt(expected, loaded):
+                log.write_text('')
+                return run_bash(load['run'], {'EXPECTED_IMAGE_ID': expected, 'IMAGE_TAG': 'example:tag',
+                                              'LOADED_ID': loaded, 'DOCKER_LOG': str(log),
+                                              'RUNNER_TEMP': temporary}, path_prefix=directory)
+            accepted = attempt(built, built)
+            self.assertEqual(accepted.returncode, 0, accepted.stderr)
+            self.assertIn('tag greengateway:ci example:tag', log.read_text().splitlines())
+            for expected, loaded in [(built, 'sha256:' + 'b' * 64), ('', built), ('latest', 'latest')]:
+                with self.subTest(expected=expected, loaded=loaded):
+                    result = attempt(expected, loaded)
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertFalse([line for line in log.read_text().splitlines() if line.startswith('tag ')])
+
+    def test_the_dev_stack_runs_the_loaded_image_without_rebuilding(self):
+        smoke = next(step for step in self.jobs['dev-traffic-smoke']['steps'] if step.get('id') == 'dev-smoke')
+        self.assertIn('up -d --no-build', smoke['run'])
+        self.assertNotRegex(smoke['run'], r'\s--build\b')
+        load = next(step for step in self.jobs['dev-traffic-smoke']['steps']
+                    if step.get('uses') == './.github/actions/gateway-image')
+        # Compose names a built service image `<project>-<service>`.
+        self.assertIn('compose_files=(-p greengateway-dev ', smoke['run'])
+        self.assertEqual(load['with']['tag'], 'greengateway-dev-gateway')
+        steps = self.jobs['dev-traffic-smoke']['steps']
+        self.assertLess(steps.index(load), steps.index(smoke))
 
 
 if __name__ == '__main__':
