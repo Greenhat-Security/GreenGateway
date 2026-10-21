@@ -156,6 +156,10 @@ struct CallerAssertionKeys {
     ///
     /// Lock order: a holder of `last` may take this, never the reverse.
     problems: Mutex<BTreeMap<ConnectionId, KeyProblemRecord>>,
+    /// Test seam: runs once, at the start of the next reconcile's install,
+    /// before it takes the lock a build commits under.
+    #[cfg(test)]
+    before_reconcile: Mutex<Option<Box<dyn FnOnce() + Send>>>,
 }
 
 /// The cached set and the epoch that decides whether a build may replace it.
@@ -184,6 +188,8 @@ impl CallerAssertionKeys {
             }),
             build: AsyncMutex::new(()),
             problems: Mutex::new(problems),
+            #[cfg(test)]
+            before_reconcile: Mutex::new(None),
         }
     }
 
@@ -204,6 +210,11 @@ impl CallerAssertionKeys {
     #[cfg(test)]
     fn store_built(&self, built: Arc<CachedJwks>) {
         self.slot().built = Some(built);
+    }
+
+    #[cfg(test)]
+    fn set_before_reconcile_for_test(&self, hook: Box<dyn FnOnce() + Send>) {
+        *lock_recovering(&self.before_reconcile, "reconcile test hook") = Some(hook);
     }
 
     /// Keeps what a build found, unless a save forgot the earlier verdict
@@ -244,16 +255,40 @@ impl CallerAssertionKeys {
     /// attested record -- a save on another replica -- the set built before
     /// it is dropped and any build in flight is voided, exactly as for a
     /// local save.
+    ///
+    /// `found` is what the reconcile's own checks found. `deferred` names
+    /// each Connection those checks passed without reading all of its keys,
+    /// because one lives behind a network provider, with the keys it
+    /// configures: for those, the problem the last build recorded for the
+    /// same keys is kept. It is read here, under the lock a build commits
+    /// under, not when the reconcile began: a build that committed while the
+    /// reconcile ran recorded the problems that match the set it cached, and
+    /// putting back an older verdict would refuse calls on keys that set
+    /// publishes, or let calls sign with keys it leaves out.
     fn reconcile(
         &self,
-        problems: BTreeMap<ConnectionId, KeyProblemRecord>,
+        mut found: BTreeMap<ConnectionId, KeyProblemRecord>,
+        deferred: Vec<(ConnectionId, Vec<ConfiguredAssertionKey>)>,
         attested_changed: bool,
     ) {
+        #[cfg(test)]
+        {
+            let hook = lock_recovering(&self.before_reconcile, "reconcile test hook").take();
+            if let Some(hook) = hook {
+                hook();
+            }
+        }
         let mut slot = self.slot();
         if attested_changed {
             Self::invalidate(&mut slot);
         }
-        *self.problems() = problems;
+        let mut problems = self.problems();
+        for (id, keys) in deferred {
+            if let Some(kept) = problems.remove(&id).filter(|kept| kept.keys == keys) {
+                found.insert(id, kept);
+            }
+        }
+        *problems = found;
     }
 
     fn invalidate(slot: &mut BuiltJwksSlot) {
@@ -1607,6 +1642,7 @@ impl ConnectionControlPlane {
         let _guard = self.mutation_guard().await;
         let previous_problems = self.caller_assertion_keys.problems().clone();
         let mut caller_assertion_problems = BTreeMap::new();
+        let mut deferred_assertion_keys = Vec::new();
         let total = records.len().saturating_add(self.legacy.len());
         if total > MAX_CONNECTIONS {
             tracing::error!(
@@ -1661,17 +1697,15 @@ impl ConnectionControlPlane {
                     log_assertion_key_problem(&record.id, problem);
                 }
                 caller_assertion_problems.insert(record.id.clone(), found);
-            } else if let Some(kept) = previous.filter(|previous| {
-                record.write.enabled
-                    && previous.keys == keys
-                    && self
-                        .secret_resolver
-                        .has_deferred_assertion_key(&record.write)
-            }) {
+            } else if record.write.enabled
+                && self
+                    .secret_resolver
+                    .has_deferred_assertion_key(&record.write)
+            {
                 // Only a JWKS build reads a network provider, so this check
                 // cannot clear what the last build found behind one. Keep it
                 // until the next build reads the keys again.
-                caller_assertion_problems.insert(record.id.clone(), kept.clone());
+                deferred_assertion_keys.push((record.id.clone(), keys));
             }
         }
         let managed: BTreeMap<ConnectionId, StoredConnection> = records
@@ -1684,8 +1718,11 @@ impl ConnectionControlPlane {
         let attested_changed =
             attested_records_changed(self.runtime.load_full().managed(), &managed);
         self.publish_runtime(managed);
-        self.caller_assertion_keys
-            .reconcile(caller_assertion_problems, attested_changed);
+        self.caller_assertion_keys.reconcile(
+            caller_assertion_problems,
+            deferred_assertion_keys,
+            attested_changed,
+        );
         Ok(())
     }
 
@@ -6277,6 +6314,144 @@ mod tests {
             .expect("the repaired set is still cached");
         assert!(Arc::ptr_eq(&cached, &rebuilt));
         assert_eq!(provider.reads(), 3);
+    }
+
+    /// One attested Connection whose key sits behind a network provider,
+    /// with a first set built from what the alias holds, `pem`.
+    async fn overlap_fixture(
+        name: &str,
+        pem: String,
+    ) -> (
+        TemporaryLocalControlPlane,
+        ConnectionControlPlane,
+        Arc<GatedKeyProvider>,
+        StoredConnection,
+    ) {
+        let temporary = TemporaryLocalControlPlane::new(name);
+        let mut config = temporary.config();
+        config.connection_vault_provider = vault_config_declaring("gated-key");
+        let control_plane =
+            ConnectionControlPlane::from_config(&config).expect("control plane should build");
+        let provider = Arc::new(GatedKeyProvider::new("gated-key", pem));
+        control_plane.install_network_secret_providers(vec![
+            Arc::clone(&provider) as Arc<dyn SecretResolver>
+        ]);
+        let snapshot = control_plane.runtime_snapshot();
+        let created = control_plane
+            .create_managed(
+                snapshot.collection_etag(),
+                attested_candidate("gated-key", "gw-overlap", "es256", serde_json::json!([])),
+                "test-admin",
+            )
+            .await
+            .expect("a deferred key is not read on save");
+        provider.release_one();
+        control_plane
+            .caller_assertion_jwks()
+            .await
+            .expect("the first set should build");
+        (temporary, control_plane, provider, created)
+    }
+
+    /// Runs a JWKS build to completion at the start of the next reconcile's
+    /// install, after its checks: a fetch that rebuilt the set while the
+    /// reconcile was running them.
+    fn build_during_next_reconcile(
+        control_plane: &ConnectionControlPlane,
+        provider: &Arc<GatedKeyProvider>,
+    ) {
+        let handle = tokio::runtime::Handle::current();
+        let building = control_plane.clone();
+        let provider = Arc::clone(provider);
+        control_plane
+            .caller_assertion_keys
+            .set_before_reconcile_for_test(Box::new(move || {
+                provider.release_one();
+                tokio::task::block_in_place(|| handle.block_on(building.caller_assertion_jwks()))
+                    .expect("the build should finish");
+            }));
+    }
+
+    /// A reconcile that changes nothing, as another replica's save of a
+    /// different Connection arrives.
+    async fn reconcile_unchanged(control_plane: &ConnectionControlPlane) {
+        let current = control_plane
+            .runtime_snapshot()
+            .managed()
+            .values()
+            .cloned()
+            .collect::<Vec<_>>();
+        control_plane
+            .publish_authoritative_records(current)
+            .await
+            .expect("an unchanged reconcile should succeed");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_reconcile_keeps_a_key_problem_a_build_found_while_it_ran() {
+        let (_temporary, control_plane, provider, created) =
+            overlap_fixture("assertion-jwks-reconcile-found", es256_pem()).await;
+        assert_eq!(control_plane.caller_assertion_key_problem(&created), None);
+
+        // The key goes bad, and a build finds that while a reconcile is
+        // running checks that cannot read a key behind a network provider.
+        provider.replace_material("not a private key".to_owned());
+        expire_built_jwks(&control_plane);
+        build_during_next_reconcile(&control_plane, &provider);
+        reconcile_unchanged(&control_plane).await;
+
+        // The set the build cached leaves the Connection out, and so must
+        // admission: the reconcile may not drop what the build found and let
+        // calls be signed with a key no verifier that fetched the set holds.
+        let cached = control_plane
+            .caller_assertion_jwks()
+            .await
+            .expect("the set without the broken key is cached");
+        assert_eq!(cached.key_count(), 0);
+        assert_eq!(
+            control_plane.caller_assertion_key_problem(&created),
+            key_problem("caller_assertion.signing_key_id", "invalid_signing_key")
+        );
+        assert_eq!(
+            tool_call_admission(&control_plane, &created.id).await,
+            Err(crate::connections::caller_assertion::CallerAssertionError::KeyNotPublished)
+        );
+        assert_eq!(provider.reads(), 2);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_reconcile_does_not_restore_a_key_problem_a_build_cleared_while_it_ran() {
+        let (_temporary, control_plane, provider, created) = overlap_fixture(
+            "assertion-jwks-reconcile-cleared",
+            "not a private key".to_owned(),
+        )
+        .await;
+        assert_eq!(
+            control_plane.caller_assertion_key_problem(&created),
+            key_problem("caller_assertion.signing_key_id", "invalid_signing_key")
+        );
+
+        // The key is repaired, and a build finds it loads while a reconcile
+        // is running its checks.
+        provider.replace_material(es256_pem());
+        expire_built_jwks(&control_plane);
+        build_during_next_reconcile(&control_plane, &provider);
+        reconcile_unchanged(&control_plane).await;
+
+        // The set the build cached publishes the key for a whole refresh
+        // interval, and admission must follow it rather than refuse every
+        // call on the problem the reconcile saw before the build cleared it.
+        let cached = control_plane
+            .caller_assertion_jwks()
+            .await
+            .expect("the repaired set is cached");
+        assert_eq!(published_kids(&cached), vec!["gw-overlap"]);
+        assert_eq!(control_plane.caller_assertion_key_problem(&created), None);
+        assert_eq!(
+            tool_call_admission(&control_plane, &created.id).await,
+            Ok(())
+        );
+        assert_eq!(provider.reads(), 2);
     }
 
     #[tokio::test(flavor = "multi_thread")]
