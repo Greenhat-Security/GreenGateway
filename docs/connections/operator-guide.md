@@ -420,7 +420,7 @@ The JOSE header carries `alg` (`ES256` or `RS256`, from `algorithm`), `kid`
 | `caller_iss`, `caller_sub` | The two halves of `sub`, unscoped. An upstream that matches its own user records reads these and never parses `sub`. |
 | `iat`, `exp` | Signing time and `iat` plus `lifetime_seconds`. |
 | `jti` | The gateway request ID of the call (`X-Request-Id`), the same ID its audit events carry. |
-| `email` | With `email` in `claims`, the principal's email, when it has one. |
+| `email` | With `email` in `claims`, the principal's email, when it has one. Copied from the principal as its identity provider gave it; see the note below the table. |
 | `roles` | With `roles` in `claims`, the principal's roles, as an array. |
 | `method`, `path`, `request_sha256` | With `bind_request: true`: the request method, the request target exactly as it appears on the request line (path, then `?` and the query when there is one), and the lowercase hexadecimal SHA-256 of the exact body bytes sent, which is the hash of empty input for a request without a body. |
 
@@ -435,7 +435,15 @@ injection the call would be refused with `caller_assertion_header_conflict`
 rather than send two values or replace one. The signing key is read and
 loaded on every call, through the same secret resolution and loader that admit
 it on a save and publish it in the JWKS, so a key that stops loading stops
-signing on the next call.
+signing on the next call. It is loaded before the Connection's credential is
+resolved, so a key that cannot sign refuses the call before any OAuth token is
+requested.
+
+Identify a user by `caller_iss` and `caller_sub`, or by `sub`, never by
+`email`. The gateway copies `email` from the principal without checking that
+the identity provider verified it (`email_verified` is not consulted), so it
+is advisory: use it for display or notifications, not to look up who the
+caller is.
 
 `request_sha256` is over the bytes on the wire, not a canonical form of the
 JSON: the upstream hashes exactly what it received. A body that parses to the
@@ -470,18 +478,30 @@ Each refusal is a fixed string in the `failure_reason` of `tool.invoke_failure`
 | Reason | Meaning |
 | --- | --- |
 | `caller_assertion_no_principal` | The call has nobody to attest: anonymous, a service token, or a principal without an issuer. |
-| `caller_assertion_key_not_published` | Another enabled Connection publishes a different key under one of this Connection's `kid`s, so the JWKS leaves both out and no upstream could verify what either signed; or the Connection is no longer configured. |
+| `caller_assertion_key_not_published` | This replica leaves the Connection's keys out of the published JWKS, so no upstream that fetched it could verify what the Connection signed: one of its keys, the signing key or a published key, did not resolve or load at the last check, or another enabled Connection publishes a different key under one of its `kid`s. See [Stored Connections whose keys cannot be used](#stored-connections-whose-keys-cannot-be-used). |
 | `caller_assertion_key_unusable` | At call time, the signing key's alias is unknown or refused, or holds material that is not a usable key for `algorithm`. |
 | `caller_assertion_key_unavailable` | At call time, the signing key's source could not be read. |
-| `caller_assertion_claim_invalid` | A value would not survive as a claim: a subject longer than 256 bytes, an issuer longer than 512 bytes or containing `#`, a role longer than 128 bytes, an email longer than 320 bytes, a request ID longer than 128 bytes, or any of them containing a control character. |
+| `caller_assertion_claim_invalid` | A value would not survive as a claim: a subject longer than 256 bytes, an issuer longer than 512 bytes or containing `#`, a role longer than 128 bytes, an email longer than 320 bytes, a request ID longer than 128 bytes, with `bind_request` a request target longer than 2048 bytes or a method longer than 16 bytes, or any of them containing a control character. |
 | `caller_assertion_header_conflict` | Another header source had already set the assertion header. |
-| `caller_assertion_signature_failed`, `caller_assertion_token_too_long` | Signing failed, or the assertion would exceed 8 KiB. |
+| `caller_assertion_signature_failed`, `caller_assertion_token_too_long` | Signing failed, including on a host whose clock reads before 1970, or the assertion would exceed 8 KiB. |
 | `caller_assertion_not_enforced` | The lane does not attest its caller, or the stored block is one only an earlier release accepted: `bind_approval: true`, an assertion header that matches an additional header, or a plain HTTP endpoint. |
 
 A signing key that cannot be read or loaded at call time also raises
 `connection.secret_resolution_failed` with the same reason. None of these
 responses, logs or events carries the assertion, the key or anything derived
 from either.
+
+An assertion counts as a credential when the upstream answers. A `401` or
+`403` from the upstream of an attested Connection fails the call with
+`upstream_authentication_rejected`, as on any Connection with a credential, and
+the upstream's body is not returned to the caller: an error body that echoed
+the assertion would hand the caller a bearer token it could present to the
+upstream directly until it expires. A per-user denial therefore reaches the
+caller as that reason rather than as the upstream's message; the upstream's own
+log, found by `jti`, has the detail. On an OAuth Connection every upstream
+`401` also drops the cached access token, so the next call mints a new one: an
+upstream should answer a user it denies with `403`, and keep `401` for a
+credential or assertion it cannot verify.
 
 #### Audit
 
@@ -536,11 +556,13 @@ def verified_caller(method, request_target, body, headers):
 
 `remember_once` stands for the upstream's own replay cache. Key it on `sub` and
 `jti` together: `jti` is the gateway request ID, which a client may supply
-itself, so it is unique per call but not across callers. Compare `path` with the
-request target before any proxy in front of the upstream rewrote it. `exp` is
-`iat` plus `lifetime_seconds` on the gateway's clock; if the two clocks can
-drift apart, allow a few seconds of leeway (`leeway=` in PyJWT) rather than
-lengthening the lifetime.
+itself in `X-Request-Id`, so it is not guaranteed unique per call, and two
+callers can send the same one. Keyed on both, a repeat can only be the same
+caller's, and a client that reuses an ID sees its own second call rejected.
+Compare `path` with the request target before any proxy in front of the
+upstream rewrote it. `exp` is `iat` plus `lifetime_seconds` on the gateway's
+clock; if the two clocks can drift apart, allow a few seconds of leeway
+(`leeway=` in PyJWT) rather than lengthening the lifetime.
 
 #### The block in the admin UI
 
@@ -638,8 +660,9 @@ gateway may publish for itself.
   save or reconcile that adds, removes or disables one) and otherwise every
   300 seconds, so a change of material behind an alias reaches a verifier that
   honours `max-age` within about 600 seconds. A set that left a Connection out
-  is read again every 30 seconds, and a save of a Connection rebuilds that
-  replica's set at the next fetch, so a repaired key comes back promptly.
+  is read again every 30 seconds, by the next fetch or the next tool call on
+  that Connection, whichever comes first, and a save of a Connection rebuilds
+  that replica's set at the next fetch, so a repaired key comes back promptly.
   However often the set is fetched, the gateway reads each alias at most once
   per build, and a fetch that arrives while the set is being rebuilt for the
   same keys is answered from the previous build rather than held on the secret
@@ -664,8 +687,8 @@ Connections are left out. Every other Connection's keys are still published.
 
 When a Connection's keys are left out, the gateway logs a warning,
 `an enabled Connection's caller-assertion keys cannot all be used; its keys are
-left out of the published JWKS and the Connection stays refused`, with
-`connection_id`, `field` and `code`, when it first finds the problem and
+left out of the published JWKS and its tool calls are refused until they load`,
+with `connection_id`, `field` and `code`, when it first finds the problem and
 whenever the problem changes. The Connection's admin detail reports the same
 pair as `configuration.caller_assertion.key_problem`, and the admin UI shows it
 as "Keys not published". The codes are those in the table above, plus
@@ -678,14 +701,28 @@ the set is built.
 
 A stored Connection whose keys cannot be used never stops the gateway starting
 and never fails a cluster reconcile. Its keys are left out of the JWKS and the
-problem is logged and shown as above. Each of its tool calls still reads and
-loads the signing key, and is refused with `caller_assertion_key_unusable` or
-`caller_assertion_key_unavailable` while that key cannot be used, or with
-`caller_assertion_key_not_published` while another Connection publishes a
-different key under one of its `kid`s. The calls do not wait for the next JWKS
-build: a verifier still holding the key from an earlier fetch can verify what
-is signed meanwhile. Every other lane refuses the Connection with
-`caller_assertion_not_enforced`, as it refuses every attested Connection.
+problem is logged and shown as above.
+
+While a replica leaves a Connection's keys out of the set it publishes, it
+refuses every tool call on that Connection with
+`caller_assertion_key_not_published`, before any DNS lookup, credential read or
+upstream request, even when the signing key itself still loads: an upstream
+that fetched that set could not verify what the Connection signs. The verdict
+is per replica, from its own last check of exactly the keys the Connection
+configures now, so a replica that reads the keys can serve while another that
+cannot refuses.
+
+The refusal does not wait for a verifier to fetch the set. A call that finds
+the keys left out first reads them again, the way a fetch would and at most
+once per 30-second retry interval however many calls arrive, so once every
+key loads the set publishes them and the same call is served. Within the
+interval a call reads nothing and is refused. A save of the Connection clears
+the problem at once, because the save loads every key.
+
+A key that cannot be read or loaded when a call signs, after the keys were
+last published, refuses that call with `caller_assertion_key_unusable` or
+`caller_assertion_key_unavailable`. Every other lane refuses the Connection
+with `caller_assertion_not_enforced`, as it refuses every attested Connection.
 Startup and reconcile still refuse a stored Connection whose other bindings
 this replica cannot resolve, as they always have.
 
@@ -709,8 +746,8 @@ placeholder, or a key in a format this release refuses. After upgrading:
 
 - The gateway starts, and a cluster reconcile succeeds, as before. Each such
   Connection publishes no keys, reports `key_problem`, logs the warning above,
-  and its tool calls are refused while its signing key cannot be read or
-  loaded.
+  and its tool calls are refused with `caller_assertion_key_not_published`
+  until its keys load.
 - Its next save is stricter. A save that keeps it enabled, including an admin
   UI save of another field, loads its keys and is refused with `422` and the
   field and code until they are usable.
@@ -763,12 +800,13 @@ to:
 - `bind_approval` is `false`;
 - the assertion `header_name` matches no primary or additional header name;
 - the endpoint is `https://`;
-- the signing key loads for its `algorithm` when the call is made, and no other
-  enabled Connection publishes a different key under one of its `kid`s.
+- every key it configures loads, so the replica publishes them, and no other
+  enabled Connection publishes a different key under one of its `kid`s;
+- the signing key loads for its `algorithm` when the call is made.
 
 A block that fails one of the first three rules stays refused with
-`caller_assertion_not_enforced`; a key that does not load refuses each call
-with its own reason (see [Failure reasons](#failure-reasons)). A save of an
+`caller_assertion_not_enforced`; a key problem refuses each call with its own
+reason (see [Failure reasons](#failure-reasons)). A save of an
 attested Connection whose endpoint is still plain HTTP, including an admin UI
 save of another field, is now refused with `https_required` until the endpoint
 uses HTTPS or the block is removed. A `TOOLS_FILE`

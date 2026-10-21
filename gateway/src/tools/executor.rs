@@ -2591,13 +2591,23 @@ impl ToolExecutor {
         }
         // A Connection that attests its caller refuses a call that names
         // nobody, and one whose keys no upstream could verify, before the
-        // egress preflight resolves anything or any secret is read.
-        runtime
-            .admit_caller_assertion(&target, context.caller.as_deref())
-            .map_err(|error| ClassifiedConnectionError {
-                error: Box::new(caller_assertion_tool_error(tool, error)),
-                request_sent: false,
-            })?;
+        // egress preflight resolves anything or any credential is read.
+        run_before_deadline(
+            deadline,
+            runtime.admit_caller_assertion(&target, context.caller.as_deref()),
+        )
+        .await
+        .map_err(|_| ClassifiedConnectionError {
+            error: Box::new(ToolExecutorError::Connection {
+                tool_name: tool.name.clone(),
+                reason: "timeout",
+            }),
+            request_sent: false,
+        })?
+        .map_err(|error| ClassifiedConnectionError {
+            error: Box::new(caller_assertion_tool_error(tool, error)),
+            request_sent: false,
+        })?;
 
         let destination = run_before_deadline(
             deadline,
@@ -2636,6 +2646,34 @@ impl ToolExecutor {
                     }
                     ClassifiedConnectionError {
                         error: Box::new(connection_tool_error(tool, error)),
+                        request_sent: false,
+                    }
+                })?;
+        // The assertion's signing key is read and loaded before the
+        // credential, so a key that cannot sign refuses the call before any
+        // token endpoint is asked for a token. It signs once the request is
+        // final, below.
+        let assertion_signer =
+            run_before_deadline(deadline, runtime.caller_assertion_signer(&target))
+                .await
+                .map_err(|_| ClassifiedConnectionError {
+                    error: Box::new(ToolExecutorError::Connection {
+                        tool_name: tool.name.clone(),
+                        reason: "timeout",
+                    }),
+                    request_sent: false,
+                })?
+                .map_err(|error| {
+                    if error.is_key_resolution_failure() {
+                        self.emit_connection_secret_resolution_failed(
+                            context,
+                            tool,
+                            &target,
+                            error.safe_reason(),
+                        );
+                    }
+                    ClassifiedConnectionError {
+                        error: Box::new(caller_assertion_tool_error(tool, error)),
                         request_sent: false,
                     }
                 })?;
@@ -2681,45 +2719,21 @@ impl ToolExecutor {
         // The assertion is signed last, once, over the request exactly as it
         // is about to be sent, and written as the last header so nothing
         // after it can replace or repeat it.
-        let assertion = run_before_deadline(
-            deadline,
-            runtime.sign_caller_assertion(
-                &target,
-                context.caller.as_deref(),
-                &context.request_id,
-                &request.method,
-                request.body.as_deref().unwrap_or_default(),
-            ),
-        )
-        .await
-        .map_err(|_| ClassifiedConnectionError {
-            error: Box::new(ToolExecutorError::Connection {
-                tool_name: tool.name.clone(),
-                reason: "timeout",
-            }),
-            request_sent: false,
-        })?
-        .map_err(|error| {
-            if error.is_key_resolution_failure() {
-                self.emit_connection_secret_resolution_failed(
-                    context,
-                    tool,
-                    &target,
-                    error.safe_reason(),
-                );
-            }
-            ClassifiedConnectionError {
+        if let Some(signer) = assertion_signer {
+            let refused = |error| ClassifiedConnectionError {
                 error: Box::new(caller_assertion_tool_error(tool, error)),
                 request_sent: false,
-            }
-        })?;
-        if let Some(assertion) = assertion {
-            let issued = assertion.inject(&mut request.headers).map_err(|error| {
-                ClassifiedConnectionError {
-                    error: Box::new(caller_assertion_tool_error(tool, error)),
-                    request_sent: false,
-                }
-            })?;
+            };
+            let issued = signer
+                .sign(
+                    context.caller.as_deref(),
+                    &context.request_id,
+                    &request.method,
+                    request.body.as_deref().unwrap_or_default(),
+                )
+                .map_err(refused)?
+                .inject(&mut request.headers)
+                .map_err(refused)?;
             *issued_assertion = Some(issued);
         }
 

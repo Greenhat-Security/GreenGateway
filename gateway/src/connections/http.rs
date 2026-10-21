@@ -16,8 +16,9 @@ use crate::egress::{CheckedEgressDestination, EgressClient, EgressConfig};
 
 use super::{
     caller_assertion::{
-        load_signing_key, sign_caller_assertion, AssertionAlgorithm, AttestedCaller,
-        CallerAssertionConfig, CallerAssertionError, PrincipalClaim, RequestBinding,
+        load_signing_key, sign_caller_assertion, AssertionAlgorithm, AssertionSigningKey,
+        AttestedCaller, CallerAssertionConfig, CallerAssertionError, PrincipalClaim,
+        RequestBinding,
     },
     control_plane::ConnectionControlPlane,
     model::{
@@ -89,10 +90,18 @@ struct CallerAssertionBinding {
     lifetime_seconds: u64,
     claims: Vec<PrincipalClaim>,
     bind_request: bool,
+    /// The configuration this binding was read from. Admission judges the
+    /// Connection against this snapshot rather than reading the live one
+    /// again, so the verdict and the key the call signs with always describe
+    /// the same record.
+    configuration: Arc<super::control_plane::ConnectionRuntimeSnapshot>,
 }
 
 impl CallerAssertionBinding {
-    fn from_settings(settings: &CallerAssertionSettings) -> Result<Self, ConnectionHttpError> {
+    fn from_settings(
+        settings: &CallerAssertionSettings,
+        configuration: Arc<super::control_plane::ConnectionRuntimeSnapshot>,
+    ) -> Result<Self, ConnectionHttpError> {
         Ok(Self {
             header_name: HeaderName::from_bytes(settings.header_name.as_bytes())
                 .map_err(|_| ConnectionHttpError::CallerAssertionNotEnforced)?,
@@ -105,6 +114,86 @@ impl CallerAssertionBinding {
             lifetime_seconds: u64::from(settings.lifetime_seconds),
             claims: settings.claims.iter().copied().map(Into::into).collect(),
             bind_request: settings.bind_request,
+            configuration,
+        })
+    }
+}
+
+/// The signing key of one tool call's caller assertion, read and loaded, and
+/// the request target it will bind.
+///
+/// The key is loaded before the call resolves its credential, so a key that
+/// cannot sign refuses the call before any token endpoint is asked for a
+/// token; the assertion itself is signed only once the request is final, by
+/// [`Self::sign`], which consumes the signer so a call signs exactly once.
+pub struct CallerAssertionSigner<'target> {
+    binding: &'target CallerAssertionBinding,
+    key: AssertionSigningKey,
+    /// The origin-form request target, when the assertion binds the request.
+    request_target: Option<String>,
+}
+
+impl fmt::Debug for CallerAssertionSigner<'_> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("CallerAssertionSigner")
+            .field("kid", &self.binding.kid)
+            .finish_non_exhaustive()
+    }
+}
+
+impl CallerAssertionSigner<'_> {
+    /// Signs the one assertion this request carries.
+    ///
+    /// Called once, after every other header and the body are final, because
+    /// with `bind_request` the assertion covers the method, the request
+    /// target exactly as it goes on the wire, and the exact body bytes.
+    /// `request_id` becomes `jti`, which is how an upstream joins its log
+    /// line to this gateway's audit event for the call.
+    pub fn sign(
+        self,
+        caller: Option<&AttestedCaller>,
+        request_id: &str,
+        method: &Method,
+        body: &[u8],
+    ) -> Result<SignedCallerAssertion, CallerAssertionError> {
+        let caller = caller.ok_or(CallerAssertionError::NoPrincipal)?;
+        let binding = self.binding;
+        let request_binding = self.request_target.as_deref().map(|path| RequestBinding {
+            method: method.as_str(),
+            path,
+            body,
+        });
+        let config = CallerAssertionConfig {
+            issuer: &binding.issuer,
+            audience: &binding.audience,
+            token_type: &binding.token_type,
+            lifetime_seconds: binding.lifetime_seconds,
+            claims: &binding.claims,
+            bind_request: binding.bind_request,
+            // Validation refuses `bind_approval` on every Connection this
+            // target can be built for.
+            bind_approval: false,
+        };
+        let token = sign_caller_assertion(
+            &self.key,
+            &config,
+            Some(&caller.identity()),
+            request_id,
+            unix_now()?,
+            request_binding.as_ref(),
+            None,
+        )?;
+        let mut value =
+            HeaderValue::from_str(&token).map_err(|_| CallerAssertionError::SignatureFailed)?;
+        value.set_sensitive(true);
+        Ok(SignedCallerAssertion {
+            header_name: binding.header_name.clone(),
+            value,
+            record: IssuedCallerAssertion {
+                kid: binding.kid.clone(),
+                jti: request_id.to_owned(),
+            },
         })
     }
 }
@@ -389,10 +478,11 @@ impl ConnectionHttpRuntime {
     /// does this constructor for a stored assertion that only the legacy
     /// reading admits ([`ConnectionWrite::caller_assertion_enforceable`]).
     ///
-    /// The returned target carries the assertion's settings, and the caller
-    /// must sign with [`Self::sign_caller_assertion`] once the request is
-    /// final; a call without a principal is refused by
-    /// [`Self::admit_caller_assertion`] before any I/O.
+    /// The returned target carries the assertion's settings. The caller must
+    /// admit the call with [`Self::admit_caller_assertion`] before any I/O,
+    /// load the key with [`Self::caller_assertion_signer`] before it resolves
+    /// the credential, and sign with [`CallerAssertionSigner::sign`] once the
+    /// request is final.
     ///
     /// [`ConnectionWrite::caller_assertion_enforceable`]:
     ///     super::model::ConnectionWrite::caller_assertion_enforceable
@@ -413,7 +503,10 @@ impl ConnectionHttpRuntime {
             Some(_) if !record.write.caller_assertion_enforceable() => {
                 return Err(ConnectionHttpError::CallerAssertionNotEnforced);
             }
-            Some(settings) => Some(CallerAssertionBinding::from_settings(settings)?),
+            Some(settings) => Some(CallerAssertionBinding::from_settings(
+                settings,
+                Arc::clone(&snapshot),
+            )?),
         };
         validate_http_connection(record)?;
         let url = connection_target_url(record, path_and_query)?;
@@ -441,70 +534,82 @@ impl ConnectionHttpRuntime {
         self.tool_call_target(connection_id, "/").map(|_| ())
     }
 
-    /// Refuses, before any DNS lookup, secret read or upstream byte, a call
-    /// `target` cannot attest.
+    /// Refuses, before any DNS lookup, credential read or upstream byte, a
+    /// call `target` cannot attest.
     ///
     /// A Connection configured to name its caller must never send a request
     /// that names nobody: a call with no principal, which includes a service
-    /// token (see [`AttestedCaller`]), is refused here. So is a call on a
-    /// Connection that publishes a `kid` another enabled Connection publishes
-    /// for a different key, or one that is no longer configured: the JWKS
-    /// leaves out every key of such a Connection, so no upstream could verify
-    /// what it signed, and the failure would look like an attack on the
-    /// upstream's side.
+    /// token (see [`AttestedCaller`]), is refused with
+    /// [`CallerAssertionError::NoPrincipal`].
     ///
-    /// Both are judged from configuration alone, as it stands for this
-    /// request. Whether the key itself still loads is the secret source's to
-    /// answer, on the read [`Self::sign_caller_assertion`] makes; this replica's
-    /// last JWKS build is deliberately not consulted, because a provider that
-    /// failed one build would otherwise refuse every call until a verifier
-    /// happened to fetch the set again, while the verifiers still hold the key.
-    pub fn admit_caller_assertion(
+    /// Nor does it sign with keys this replica does not publish: no upstream
+    /// that fetched the current JWKS could verify such an assertion, and its
+    /// rejection would look like an attack on the upstream's side. A call is
+    /// refused with [`CallerAssertionError::KeyNotPublished`] when the
+    /// Connection publishes a `kid` another enabled Connection publishes for
+    /// a different key, and while this replica's last check of exactly the
+    /// keys it configures left them out of the JWKS: one of its keys, the
+    /// signing key or any published key, did not resolve or load.
+    ///
+    /// A recorded problem is checked again before it refuses: the keys are
+    /// read the way a JWKS fetch reads them, at most once per retry interval
+    /// however many calls ask, so a key that loads again is published, and
+    /// serves calls, without waiting for a verifier to fetch the set. Those
+    /// reads, the JWKS build's own, are the only I/O a call can cause before
+    /// this answers.
+    ///
+    /// Every verdict is reached on the configuration `target` was built from.
+    pub async fn admit_caller_assertion(
         &self,
         target: &ConnectionHttpTarget,
         caller: Option<&AttestedCaller>,
     ) -> Result<(), CallerAssertionError> {
-        if target.caller_assertion.is_none() {
+        let Some(binding) = target.caller_assertion.as_ref() else {
             return Ok(());
-        }
+        };
         if caller.is_none() {
             return Err(CallerAssertionError::NoPrincipal);
         }
-        let snapshot = self.effective_snapshot();
-        let record = snapshot
+        let record = binding
+            .configuration
             .managed()
             .get(target.connection_id())
             .ok_or(CallerAssertionError::KeyNotPublished)?;
-        if super::control_plane::publishes_an_ambiguous_kid(&snapshot, record) {
+        if super::control_plane::publishes_an_ambiguous_kid(&binding.configuration, record) {
+            return Err(CallerAssertionError::KeyNotPublished);
+        }
+        if self
+            .control_plane
+            .caller_assertion_key_problem(record)
+            .is_none()
+        {
+            return Ok(());
+        }
+        // A set that cannot be built at all leaves the problem recorded.
+        if self.control_plane.caller_assertion_jwks().await.is_err()
+            || self
+                .control_plane
+                .caller_assertion_key_problem(record)
+                .is_some()
+        {
             return Err(CallerAssertionError::KeyNotPublished);
         }
         Ok(())
     }
 
-    /// Signs the one assertion this request carries, or `None` for a target
-    /// that attests nobody.
+    /// Reads and loads the key `target` signs its caller assertion with, or
+    /// `None` for a target that attests nobody.
     ///
-    /// Called once per request, after every other header and the body are
-    /// final, because with `bind_request` the assertion covers the method, the
-    /// request target exactly as it goes on the wire, and the exact body bytes.
-    /// `request_id` becomes `jti`, which is how an upstream joins its log line
-    /// to this gateway's audit event for the call.
-    ///
-    /// The key is read and loaded here, through the same resolver and loader
-    /// that admit it on a save and publish it in the JWKS, so this signs only
-    /// with a key that would also be published.
-    pub async fn sign_caller_assertion(
+    /// The key is read through the same resolver and loaded by the same
+    /// loader that admit it on a save and publish it in the JWKS, on every
+    /// call, so a key that stops loading stops signing on the next call.
+    pub async fn caller_assertion_signer<'target>(
         &self,
-        target: &ConnectionHttpTarget,
-        caller: Option<&AttestedCaller>,
-        request_id: &str,
-        method: &Method,
-        body: &[u8],
-    ) -> Result<Option<SignedCallerAssertion>, CallerAssertionError> {
+        target: &'target ConnectionHttpTarget,
+    ) -> Result<Option<CallerAssertionSigner<'target>>, CallerAssertionError> {
         let Some(binding) = target.caller_assertion.as_ref() else {
             return Ok(None);
         };
-        let caller = caller.ok_or(CallerAssertionError::NoPrincipal)?;
         let material = self
             .control_plane
             .secret_resolver()
@@ -522,47 +627,15 @@ impl ConnectionHttpRuntime {
         let key = load_signing_key(&binding.kid, binding.algorithm, material.expose())
             .map_err(|_| CallerAssertionError::KeyUnusable)?;
         drop(material);
-
         let request_target = if binding.bind_request {
             Some(origin_form_request_target(target.url())?)
         } else {
             None
         };
-        let request_binding = request_target.as_deref().map(|path| RequestBinding {
-            method: method.as_str(),
-            path,
-            body,
-        });
-        let config = CallerAssertionConfig {
-            issuer: &binding.issuer,
-            audience: &binding.audience,
-            token_type: &binding.token_type,
-            lifetime_seconds: binding.lifetime_seconds,
-            claims: &binding.claims,
-            bind_request: binding.bind_request,
-            // Validation refuses `bind_approval` on every Connection this
-            // target can be built for.
-            bind_approval: false,
-        };
-        let token = sign_caller_assertion(
-            &key,
-            &config,
-            Some(&caller.identity()),
-            request_id,
-            unix_now(),
-            request_binding.as_ref(),
-            None,
-        )?;
-        let mut value =
-            HeaderValue::from_str(&token).map_err(|_| CallerAssertionError::SignatureFailed)?;
-        value.set_sensitive(true);
-        Ok(Some(SignedCallerAssertion {
-            header_name: binding.header_name.clone(),
-            value,
-            record: IssuedCallerAssertion {
-                kid: binding.kid.clone(),
-                jti: request_id.to_owned(),
-            },
+        Ok(Some(CallerAssertionSigner {
+            binding,
+            key,
+            request_target,
         }))
     }
 
@@ -1439,13 +1512,15 @@ fn origin_form_request_target(url: &str) -> Result<String, CallerAssertionError>
     Ok(parsed[url::Position::BeforePath..url::Position::AfterQuery].to_owned())
 }
 
-/// Seconds since the Unix epoch, for `iat`. A clock before the epoch is a
-/// broken host, and signing with `iat` 0 would issue an already-expired
-/// assertion, which the upstream refuses; nothing is gained by refusing first.
-fn unix_now() -> u64 {
+/// Seconds since the Unix epoch, for `iat`. A clock that reads before the
+/// epoch is a broken host: rather than sign with a made-up time, which would
+/// send the upstream an assertion that expired decades ago, the call is
+/// refused.
+fn unix_now() -> Result<u64, CallerAssertionError> {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |elapsed| elapsed.as_secs())
+        .map(|elapsed| elapsed.as_secs())
+        .map_err(|_| CallerAssertionError::SignatureFailed)
 }
 
 fn connection_tls_secret_error(error: SecretResolveError) -> ConnectionHttpError {
@@ -2780,30 +2855,44 @@ mod tests {
         issuerless.issuer = None;
         assert!(AttestedCaller::from_principal(&issuerless).is_none());
         assert_eq!(
-            temporary.runtime.admit_caller_assertion(&target, None),
+            temporary
+                .runtime
+                .admit_caller_assertion(&target, None)
+                .await,
             Err(CallerAssertionError::NoPrincipal)
         );
         assert_eq!(
             temporary
                 .runtime
-                .sign_caller_assertion(&target, None, "request-1", &Method::GET, b"")
+                .caller_assertion_signer(&target)
                 .await
+                .expect("the key loads")
+                .expect("an attested target signs")
+                .sign(None, "request-1", &Method::GET, b"")
                 .err(),
             Some(CallerAssertionError::NoPrincipal)
         );
         assert_eq!(
             temporary
                 .runtime
-                .admit_caller_assertion(&target, Some(&alice)),
+                .admit_caller_assertion(&target, Some(&alice))
+                .await,
             Ok(())
         );
 
-        let signed = temporary
+        let loaded = temporary
             .runtime
-            .sign_caller_assertion(&target, Some(&alice), "request-1", &Method::GET, b"")
+            .caller_assertion_signer(&target)
             .await
-            .expect("the key loads and signs")
+            .expect("the key loads")
             .expect("an attested target signs");
+        assert!(
+            format!("{loaded:?}").contains("gw-test-1"),
+            "the signer names its kid"
+        );
+        let signed = loaded
+            .sign(Some(&alice), "request-1", &Method::GET, b"")
+            .expect("the loaded key signs");
         assert_eq!(
             signed.issued(),
             &IssuedCallerAssertion {
@@ -2852,14 +2941,17 @@ mod tests {
             .expect("an unattested Connection serves tool calls");
         assert!(unattested.caller_assertion_header_name().is_none());
         assert_eq!(
-            temporary.runtime.admit_caller_assertion(&unattested, None),
+            temporary
+                .runtime
+                .admit_caller_assertion(&unattested, None)
+                .await,
             Ok(())
         );
         assert!(temporary
             .runtime
-            .sign_caller_assertion(&unattested, None, "request-2", &Method::GET, b"")
+            .caller_assertion_signer(&unattested)
             .await
-            .expect("nothing to sign")
+            .expect("nothing to load")
             .is_none());
     }
 
@@ -2893,7 +2985,8 @@ mod tests {
         assert_eq!(
             temporary
                 .runtime
-                .admit_caller_assertion(&target, Some(&alice)),
+                .admit_caller_assertion(&target, Some(&alice))
+                .await,
             Err(CallerAssertionError::KeyNotPublished)
         );
 
@@ -2905,10 +2998,24 @@ mod tests {
             .publish_authoritative_records(vec![stored, other])
             .await
             .expect("the disabled Connection loads");
+        // A target is judged on the configuration it was built from, so the
+        // call already in hand is still refused; the next one is admitted.
         assert_eq!(
             temporary
                 .runtime
-                .admit_caller_assertion(&target, Some(&alice)),
+                .admit_caller_assertion(&target, Some(&alice))
+                .await,
+            Err(CallerAssertionError::KeyNotPublished)
+        );
+        let target = temporary
+            .runtime
+            .tool_call_target(connection_id, "/charges")
+            .expect("the document itself is valid");
+        assert_eq!(
+            temporary
+                .runtime
+                .admit_caller_assertion(&target, Some(&alice))
+                .await,
             Ok(())
         );
     }

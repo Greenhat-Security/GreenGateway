@@ -6533,10 +6533,31 @@ impl TemporaryStaticAuthRuntime {
         settings: CallerAssertionSettings,
         additional: &[(&str, &str, &[u8])],
     ) -> (Self, Arc<CountingSecretProvider>) {
-        let secrets = Arc::new(CountingSecretProvider::new(vec![
-            ("billing-api-key", secret.to_vec()),
-            ("assertion-signing-key", signing_key.to_vec()),
-        ]));
+        Self::attested_with_keys(
+            addr,
+            ca_pem,
+            secret,
+            &[("assertion-signing-key", signing_key)],
+            settings,
+            additional,
+        )
+        .await
+    }
+
+    /// [`Self::attested`] with every alias in `keys` served by the counting
+    /// provider beside the API key, for a Connection that also publishes
+    /// keys it does not sign with.
+    async fn attested_with_keys(
+        addr: SocketAddr,
+        ca_pem: &str,
+        secret: &[u8],
+        keys: &[(&'static str, &[u8])],
+        settings: CallerAssertionSettings,
+        additional: &[(&str, &str, &[u8])],
+    ) -> (Self, Arc<CountingSecretProvider>) {
+        let mut values = vec![("billing-api-key", secret.to_vec())];
+        values.extend(keys.iter().map(|(alias, key)| (*alias, key.to_vec())));
+        let secrets = Arc::new(CountingSecretProvider::new(values));
         let connection =
             Self::header_api_key_with(addr, ca_pem, secret, additional, Some((&secrets, settings)))
                 .await;

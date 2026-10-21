@@ -923,8 +923,8 @@ impl ConnectionControlPlane {
             // A stored document's caller-assertion keys are checked apart from
             // its credentials: a key that cannot be used leaves that
             // Connection's keys out of the JWKS, rather than stopping the
-            // gateway for every other Connection. The Connection itself stays
-            // refused at runtime, like every Connection carrying the block.
+            // gateway for every other Connection. The Connection's tool calls
+            // are refused until its keys load again.
             if let Some(problem) = secret_resolver.stored_assertion_key_problem(&record.write) {
                 log_assertion_key_problem(&record.id, problem);
                 caller_assertion_problems.insert(
@@ -1584,9 +1584,10 @@ impl ConnectionControlPlane {
     ///
     /// A caller-assertion key this replica cannot use is the exception, as
     /// it is at startup: it leaves only that Connection's keys out of the
-    /// JWKS, and the Connection stays refused at runtime like every
-    /// Connection carrying the block. Failing the whole reconcile for it
-    /// would stop this replica serving every other Connection.
+    /// JWKS, and its tool calls are refused with
+    /// `caller_assertion_key_not_published` until its keys load again.
+    /// Failing the whole reconcile for it would stop this replica serving
+    /// every other Connection.
     ///
     /// It takes the mutation lock so a concurrent local mutation cannot
     /// publish a snapshot derived from the map this call is replacing. The
@@ -2003,19 +2004,23 @@ impl ConnectionControlPlane {
     ) -> Result<Arc<JwksDocument>, CallerAssertionJwksUnavailable> {
         let keys = &self.caller_assertion_keys;
         let bindings = published_key_bindings(&self.runtime.load_full());
-        let previous = keys
+        if let Some(current) = keys
             .last_built()
-            .filter(|previous| previous.bindings == bindings);
-        if let Some(current) = previous
-            .as_ref()
-            .filter(|previous| previous.is_current_for(&bindings))
+            .filter(|built| built.is_current_for(&bindings))
         {
             return Ok(Arc::clone(&current.document));
         }
         let _build = match keys.build.try_lock() {
             Ok(guard) => guard,
             Err(_) => {
-                if let Some(previous) = previous {
+                // Read the slot now, after the lock was found taken, rather
+                // than reuse what was read above: a save that landed in
+                // between dropped that set, and a set a save dropped is never
+                // served, not even once.
+                if let Some(previous) = keys
+                    .last_built()
+                    .filter(|previous| previous.bindings == bindings)
+                {
                     return Ok(Arc::clone(&previous.document));
                 }
                 tokio::time::timeout(JWKS_BUILD_WAIT, keys.build.lock())
@@ -2217,6 +2222,22 @@ impl ConnectionControlPlane {
             .get(&record.id)
             .filter(|found| found.keys == keys)
             .map(|found| found.problem)
+    }
+
+    /// Ends the current caller-assertion JWKS's refresh interval, so the
+    /// next fetch rebuilds it exactly as it would once the interval had
+    /// passed.
+    #[cfg(test)]
+    pub(crate) fn expire_caller_assertion_jwks(&self) {
+        let keys = &self.caller_assertion_keys;
+        if let Some(built) = keys.last_built() {
+            keys.store_built(Arc::new(CachedJwks {
+                bindings: built.bindings.clone(),
+                built_at: built.built_at,
+                serve_for: Duration::ZERO,
+                document: Arc::clone(&built.document),
+            }));
+        }
     }
 
     /// Serialize this mutation against every other control-plane and
@@ -2458,8 +2479,9 @@ impl ConnectionSecretResolver {
     /// checked for being configured here; the JWKS build reads it.
     ///
     /// This is the startup and reconcile check. It never refuses the load: a
-    /// Connection it finds a problem in keeps its keys out of the JWKS and
-    /// stays refused at runtime, and every other Connection is unaffected.
+    /// Connection it finds a problem in keeps its keys out of the JWKS, and
+    /// its tool calls are refused with `caller_assertion_key_not_published`
+    /// until its keys load again; every other Connection is unaffected.
     fn stored_assertion_key_problem(
         &self,
         candidate: &ConnectionWrite,
@@ -2927,7 +2949,7 @@ fn log_assertion_key_problem(id: &ConnectionId, problem: CallerAssertionKeyProbl
         connection_id = %id,
         field = problem.field,
         code = problem.code,
-        "an enabled Connection's caller-assertion keys cannot all be used; its keys are left out of the published JWKS and the Connection stays refused"
+        "an enabled Connection's caller-assertion keys cannot all be used; its keys are left out of the published JWKS and its tool calls are refused until they load"
     );
 }
 
@@ -5475,19 +5497,21 @@ mod tests {
     /// Ends the current set's refresh interval, so the next fetch rebuilds it
     /// exactly as it would once the interval had passed.
     fn expire_built_jwks(control_plane: &ConnectionControlPlane) {
-        let keys = &control_plane.caller_assertion_keys;
-        let built = keys.last_built().expect("a set should have been built");
-        keys.store_built(Arc::new(CachedJwks {
-            bindings: built.bindings.clone(),
-            built_at: built.built_at,
-            serve_for: Duration::ZERO,
-            document: Arc::clone(&built.document),
-        }));
+        assert!(
+            control_plane.caller_assertion_keys.last_built().is_some(),
+            "a set should have been built"
+        );
+        control_plane.expire_caller_assertion_jwks();
     }
 
-    /// Whether `id` is refused by the lanes that do not sign a caller
-    /// assertion, as every Connection carrying one is.
-    fn refused_at_runtime(control_plane: &ConnectionControlPlane, id: &ConnectionId) -> bool {
+    /// The verdict a manual tool call on `id` gets from caller-assertion
+    /// admission, which runs before any egress or credential read. Every
+    /// other lane refuses an attested Connection outright, which this checks
+    /// first.
+    async fn tool_call_admission(
+        control_plane: &ConnectionControlPlane,
+        id: &ConnectionId,
+    ) -> Result<(), crate::connections::caller_assertion::CallerAssertionError> {
         let egress = crate::egress::EgressConfig::default();
         let client = Arc::new(
             crate::egress::EgressClient::new(egress.clone()).expect("egress client should build"),
@@ -5497,8 +5521,26 @@ mod tests {
             egress,
             client,
         );
-        runtime.target(id.as_str(), "/charges").err()
-            == Some(crate::connections::http::ConnectionHttpError::CallerAssertionNotEnforced)
+        assert_eq!(
+            runtime.target(id.as_str(), "/charges").err(),
+            Some(crate::connections::http::ConnectionHttpError::CallerAssertionNotEnforced)
+        );
+        let target = runtime
+            .tool_call_target(id.as_str(), "/charges")
+            .expect("a valid attested Connection serves tool calls");
+        let caller = crate::connections::caller_assertion::AttestedCaller::from_principal(
+            &crate::auth::Principal {
+                user_id: "alice".to_owned(),
+                issuer: Some("https://idp.example.test".to_owned()),
+                email: None,
+                org_id: None,
+                roles: Vec::new(),
+                session_id: "session-alice".to_owned(),
+                auth_method: crate::auth::AuthMethod::Bearer,
+            },
+        )
+        .expect("a provider-vouched principal is attestable");
+        runtime.admit_caller_assertion(&target, Some(&caller)).await
     }
 
     #[tokio::test]
@@ -5506,7 +5548,7 @@ mod tests {
         // #556 stored an enabled Connection's caller assertion whatever its
         // alias held. A gateway upgraded over such a document, or one whose
         // key went bad after it was saved, must keep starting: only that
-        // Connection's keys leave the JWKS, and it stays refused.
+        // Connection's keys leave the JWKS, and its tool calls are refused.
         let temporary = TemporaryLocalControlPlane::new("assertion-stored-degraded");
         let config = with_assertion_keys(
             &temporary,
@@ -5561,15 +5603,23 @@ mod tests {
             key_problem("caller_assertion.signing_key_id", "unresolvable_binding")
         );
 
-        // Only the healthy Connection's key is published, and every
-        // Connection carrying the block is still refused on the data path.
+        // Only the healthy Connection's key is published, and only its tool
+        // calls are admitted: the others would be signed with keys no
+        // verifier that fetched this set holds.
         let published = restarted
             .caller_assertion_jwks()
             .await
             .expect("the healthy key should publish");
         assert_eq!(published_kids(&published), vec!["gw-a"]);
-        for record in &created {
-            assert!(refused_at_runtime(&restarted, &record.id));
+        assert_eq!(
+            tool_call_admission(&restarted, &created[0].id).await,
+            Ok(())
+        );
+        for record in &created[1..] {
+            assert_eq!(
+                tool_call_admission(&restarted, &record.id).await,
+                Err(crate::connections::caller_assertion::CallerAssertionError::KeyNotPublished)
+            );
         }
 
         // A save is still held to the write-time rule, with the same safe code.
@@ -5613,6 +5663,7 @@ mod tests {
             .await
             .expect("the repaired key should publish");
         assert_eq!(published_kids(&published), vec!["gw-a", "gw-b"]);
+        assert_eq!(tool_call_admission(&restarted, &fixed.id).await, Ok(()));
 
         // Disabling a degraded Connection needs no key, and withdraws its
         // diagnostic with its keys.
@@ -5683,9 +5734,39 @@ mod tests {
             .await
             .expect("the cached set should serve");
         assert!(Arc::ptr_eq(&again, &partial));
+        // Tool calls follow the published set: key-b's would be signed with a
+        // key no verifier that fetched it holds.
+        assert_eq!(
+            tool_call_admission(&control_plane, &created[0].id).await,
+            Ok(())
+        );
+        assert_eq!(
+            tool_call_admission(&control_plane, &created[1].id).await,
+            Err(crate::connections::caller_assertion::CallerAssertionError::KeyNotPublished)
+        );
 
+        // The key comes back. Within the retry interval a call reads nothing
+        // and is still refused, so calls cannot make the gateway ask its
+        // provider more often than fetches can.
         write_assertion_key(&temporary, "key-b", &key_b);
+        assert_eq!(
+            tool_call_admission(&control_plane, &created[1].id).await,
+            Err(crate::connections::caller_assertion::CallerAssertionError::KeyNotPublished)
+        );
+        assert!(Arc::ptr_eq(
+            &control_plane
+                .caller_assertion_jwks()
+                .await
+                .expect("the cached set should serve"),
+            &partial
+        ));
+        // Once it has passed, the call itself reads the keys again, publishes
+        // key-b and is admitted, without waiting for a verifier to fetch.
         expire_built_jwks(&control_plane);
+        assert_eq!(
+            tool_call_admission(&control_plane, &created[1].id).await,
+            Ok(())
+        );
         let restored = control_plane
             .caller_assertion_jwks()
             .await
@@ -5744,7 +5825,10 @@ mod tests {
                 .key_count(),
             0
         );
-        assert!(refused_at_runtime(&control_plane, &foreign.id));
+        assert_eq!(
+            tool_call_admission(&control_plane, &foreign.id).await,
+            Err(crate::connections::caller_assertion::CallerAssertionError::KeyNotPublished)
+        );
 
         // A credential this replica cannot resolve still fails the reconcile
         // closed, exactly as before.

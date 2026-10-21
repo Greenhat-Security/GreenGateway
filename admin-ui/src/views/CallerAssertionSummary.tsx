@@ -18,13 +18,16 @@ export function CallerAssertionSummary({
     <>
       <div className="alert warning" role="status">
         <p>
-          <strong>Manual tool calls are attested.</strong> Every call of a
-          manual HTTP tool on this connection carries an assertion signed for
-          the calling principal, and a call without one, such as a service
-          token, is refused with <code>caller_assertion_no_principal</code>.
-          Every other use of the connection, including OpenAPI tools, proxied
-          requests, discovery, and tests, is refused with{' '}
-          <code>caller_assertion_not_enforced</code>.
+          <strong>Caller assertion configured.</strong> Once the gateway
+          accepts this block, every call of a manual HTTP tool on this
+          connection carries an assertion signed for the calling principal,
+          and a call without one, such as a service token, is refused with{' '}
+          <code>caller_assertion_no_principal</code>. Every other use of the
+          connection, including OpenAPI tools, proxied requests, discovery,
+          and tests, is refused with <code>caller_assertion_not_enforced</code>
+          , and so is every call when the block is one only an earlier release
+          accepted: approval binding, an assertion header that matches another
+          header on this connection, or a plain HTTP endpoint.
         </p>
         <p>
           The admin UI shows this block read only, and saving the connection
@@ -117,13 +120,13 @@ function KeyProblemAlert({ problem }: { problem: CallerAssertionKeyProblem }) {
         {KEY_PROBLEM_REASONS[problem.code]} (<code>{problem.code}</code>).
       </p>
       <p>
-        Tool calls on this connection still load the signing key on every
-        call and are refused while it cannot be used; a key ID another
-        connection publishes for a different key refuses them with{' '}
-        <code>caller_assertion_key_not_published</code>. Every other
-        connection&apos;s keys are still published. A save that keeps this connection enabled
-        checks its keys again and is refused until the key is fixed; disabling
-        the connection needs no key.
+        Tool calls on this connection are refused with{' '}
+        <code>caller_assertion_key_not_published</code> while its keys are
+        left out, even if the signing key still loads, because no upstream
+        could verify what it signs. They are served again once every key
+        loads. Every other connection&apos;s keys are still published. A save
+        that keeps this connection enabled checks its keys again and is
+        refused until the key is fixed; disabling the connection needs no key.
       </p>
     </div>
   );

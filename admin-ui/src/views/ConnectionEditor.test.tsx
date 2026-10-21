@@ -418,7 +418,7 @@ describe('ConnectionEditor', () => {
       .getByRole('heading', { name: 'Caller assertion' })
       .closest('section');
     expect(section).toBeTruthy();
-    expect(section?.textContent).toContain('Manual tool calls are attested.');
+    expect(section?.textContent).toContain('Caller assertion configured.');
     expect(section?.textContent).toContain('caller_assertion_not_enforced');
     expect(section?.textContent).toContain('gw-2026-09');
     expect(section?.textContent).toContain('x-caller-assertion');

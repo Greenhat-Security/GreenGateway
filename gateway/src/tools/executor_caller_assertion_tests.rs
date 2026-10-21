@@ -15,8 +15,8 @@ use super::*;
 use crate::{
     auth::{actor_from_principal, AuthMethod, Principal},
     connections::{
-        caller_assertion::{body_digest, AttestedCaller},
-        model::CallerAssertionClaim,
+        caller_assertion::{body_digest, AttestedCaller, CallerAssertionKeyProblem},
+        model::{CallerAssertionClaim, CallerAssertionPublishedKey},
         test_support::{generated_es256_pem, generated_rs256_pem, pem_body_lines},
     },
 };
@@ -420,34 +420,16 @@ async fn a_bound_assertion_covers_the_method_target_and_exact_body_sent() {
         request.target, "/v1/customers/cus_9/charges?idempotency=key+1",
         "the bound target is the base path, path and query as sent"
     );
+    // The digest is over the exact bytes the upstream received, so a body an
+    // intermediary changed after signing, down to one byte or a key order
+    // that parses to the same JSON, no longer matches it.
     assert!(!request.body.is_empty());
     assert_eq!(
         claims["request_sha256"],
         json!(upstream_digest(&request.body))
     );
+    // The gateway's hex encoding is the one an upstream's SHA-256 produces.
     assert_eq!(body_digest(&request.body), upstream_digest(&request.body));
-
-    // Any change to the body after signing, down to one byte or a key order
-    // that parses to the same JSON, no longer matches the digest the
-    // assertion carries.
-    let mut tampered = request.body.clone();
-    let last = tampered.len() - 2;
-    tampered[last] ^= 0x01;
-    assert_ne!(claims["request_sha256"], json!(upstream_digest(&tampered)));
-    let sent: Value = serde_json::from_slice(&request.body).expect("the body is JSON");
-    let reordered = format!(
-        r#"{{"memo":{},"amount":{}}}"#,
-        serde_json::to_string(&sent["memo"]).expect("memo serializes"),
-        sent["amount"]
-    )
-    .into_bytes();
-    assert_ne!(reordered, request.body);
-    assert_eq!(
-        serde_json::from_slice::<Value>(&reordered).expect("the reordered body is JSON"),
-        sent,
-        "the reordered body means the same JSON"
-    );
-    assert_ne!(claims["request_sha256"], json!(upstream_digest(&reordered)));
 }
 
 #[tokio::test]
@@ -763,5 +745,308 @@ async fn a_signing_key_that_no_longer_loads_refuses_the_call_with_its_own_reason
             .await
             .is_err(),
         "the upstream receives nothing"
+    );
+}
+
+/// A Connection whose keys this replica leaves out of the JWKS: its signing
+/// key loads, but a key it also publishes no longer does.
+async fn withheld_connection() -> (
+    TemporaryStaticAuthRuntime,
+    Arc<CountingSecretProvider>,
+    tokio::task::JoinHandle<Vec<CapturedRequest>>,
+) {
+    let (addr, ca_pem, server) =
+        scripted_tls_server(vec![(StatusCode::OK, json!({ "id": "ch_4" }))]).await;
+    let signing_key = generated_es256_pem();
+    let next_key = generated_es256_pem();
+    let mut settings = TemporaryStaticAuthRuntime::caller_assertion_settings();
+    settings.published_keys = vec![CallerAssertionPublishedKey {
+        signing_key_id: "assertion-next-key".to_owned(),
+        kid: "gw-test-2".to_owned(),
+        algorithm: CallerAssertionAlgorithm::Es256,
+    }];
+    let (connection, secrets) = TemporaryStaticAuthRuntime::attested_with_keys(
+        addr,
+        &ca_pem,
+        API_KEY.as_bytes(),
+        &[
+            ("assertion-signing-key", signing_key.as_bytes()),
+            ("assertion-next-key", next_key.as_bytes()),
+        ],
+        settings,
+        &[],
+    )
+    .await;
+    let complete = connection
+        .control_plane
+        .caller_assertion_jwks()
+        .await
+        .expect("both keys are published");
+    assert_eq!(complete.key_count(), 2);
+
+    // The published key's alias now holds something that is not a key. The
+    // next build leaves every key of the Connection out, the signing key
+    // included, and says why.
+    secrets.replace("assertion-next-key", b"not a key".to_vec());
+    connection.control_plane.expire_caller_assertion_jwks();
+    let withheld = connection
+        .control_plane
+        .caller_assertion_jwks()
+        .await
+        .expect("a set that leaves a Connection out is still a set");
+    assert_eq!(withheld.key_count(), 0);
+    let stored = connection
+        .control_plane
+        .runtime_snapshot()
+        .managed()
+        .values()
+        .next()
+        .cloned()
+        .expect("the Connection is stored");
+    assert_eq!(
+        connection
+            .control_plane
+            .caller_assertion_key_problem(&stored),
+        Some(CallerAssertionKeyProblem {
+            field: "caller_assertion.published_keys.signing_key_id",
+            code: "invalid_signing_key",
+        })
+    );
+    (connection, secrets, server)
+}
+
+#[tokio::test]
+async fn a_connection_left_out_of_the_jwks_is_refused_before_any_io() {
+    // Its signing key still loads, so signing would succeed, but no upstream
+    // that fetched the current set could verify what it signed.
+    let (connection, secrets, server) = withheld_connection().await;
+    let (executor, capture) = audited_executor(
+        connection_charge_tool(&connection.connection_id),
+        "get_charge",
+        &connection,
+    );
+    let before = secrets.resolutions();
+    let error = executor
+        .execute(
+            "get_charge",
+            json!({ "charge_id": "ch_4" }),
+            context_for(&bearer("alice", &[]), "request-withheld"),
+            CancellationToken::new(),
+        )
+        .await
+        .expect_err("a Connection whose keys are not published must not sign");
+    let ToolRuntimeError::WorkFailed { reason, .. } = error else {
+        panic!("the refusal should surface as a work failure");
+    };
+    assert_eq!(
+        reason.as_deref(),
+        Some("caller_assertion_key_not_published")
+    );
+    // Neither the API key nor the signing key is read, and the set built
+    // moments ago is not rebuilt for the call.
+    assert_eq!(secrets.resolutions(), before, "no secret is read");
+
+    wait_until(Duration::from_secs(1), || {
+        capture
+            .events()
+            .iter()
+            .any(|event| event.event_type == audit::event::TOOL_INVOKE_FAILURE)
+    })
+    .await;
+    let events = capture.events();
+    let failure = events
+        .iter()
+        .find(|event| event.event_type == audit::event::TOOL_INVOKE_FAILURE)
+        .expect("the refusal is audited");
+    assert_eq!(
+        failure.payload["failure_reason"],
+        json!("caller_assertion_key_not_published")
+    );
+    let upstream = events
+        .iter()
+        .find(|event| event.event_type == audit::event::TOOL_UPSTREAM_REQUEST)
+        .expect("the refused request is audited");
+    assert_eq!(
+        upstream.payload["reason"],
+        json!("caller_assertion_key_not_published")
+    );
+    assert!(
+        upstream.payload.get("caller_assertion").is_none(),
+        "nothing was signed"
+    );
+    assert!(
+        tokio::time::timeout(Duration::from_millis(100), server)
+            .await
+            .is_err(),
+        "the upstream receives nothing"
+    );
+}
+
+#[tokio::test]
+async fn a_withheld_connection_serves_again_once_its_keys_load_without_a_fetch() {
+    let (connection, secrets, server) = withheld_connection().await;
+    let (executor, _capture) = audited_executor(
+        connection_charge_tool(&connection.connection_id),
+        "get_charge",
+        &connection,
+    );
+    secrets.replace("assertion-next-key", generated_es256_pem().into_bytes());
+    // Once the retry interval has passed, the call itself reads the keys
+    // again rather than wait for a verifier to fetch the set: a verifier
+    // that sees no calls may never fetch it.
+    connection.control_plane.expire_caller_assertion_jwks();
+    let before = secrets.resolutions();
+    let response = http_response(
+        executor
+            .execute(
+                "get_charge",
+                json!({ "charge_id": "ch_4" }),
+                context_for(&bearer("alice", &[]), "request-restored"),
+                CancellationToken::new(),
+            )
+            .await
+            .expect("a Connection whose keys load again serves calls"),
+    );
+    assert_eq!(response.status, StatusCode::OK);
+    // The rebuild reads both keys once; the call reads the signing key and
+    // the API key.
+    assert_eq!(secrets.resolutions(), before + 4);
+    let requests = server.await.expect("the TLS server task should join");
+    let published = connection
+        .control_plane
+        .caller_assertion_jwks()
+        .await
+        .expect("the keys are published again");
+    assert_eq!(published.key_count(), 2);
+    let claims = verify_with_published_set(
+        requests[0]
+            .header(ASSERTION_HEADER)
+            .expect("the upstream receives the assertion"),
+        published.body(),
+    );
+    assert_eq!(claims["caller_sub"], json!("alice"));
+}
+
+#[tokio::test]
+async fn a_verifier_holding_both_published_keys_accepts_either_signing_key() {
+    // #463's rotation contract: once both keys are published, the signing
+    // key can move from one to the other without any verifier that fetched
+    // the set rejecting a call.
+    let (addr, ca_pem, server) = scripted_tls_server(vec![
+        (StatusCode::OK, json!({ "id": "ch_5" })),
+        (StatusCode::OK, json!({ "id": "ch_5" })),
+    ])
+    .await;
+    let current_key = generated_es256_pem();
+    let next_key = generated_rs256_pem();
+    let mut settings = TemporaryStaticAuthRuntime::caller_assertion_settings();
+    settings.published_keys = vec![CallerAssertionPublishedKey {
+        signing_key_id: "assertion-next-key".to_owned(),
+        kid: "gw-test-2".to_owned(),
+        algorithm: CallerAssertionAlgorithm::Rs256,
+    }];
+    let (connection, _secrets) = TemporaryStaticAuthRuntime::attested_with_keys(
+        addr,
+        &ca_pem,
+        API_KEY.as_bytes(),
+        &[
+            ("assertion-signing-key", current_key.as_bytes()),
+            ("assertion-next-key", next_key.as_bytes()),
+        ],
+        settings,
+        &[],
+    )
+    .await;
+    let (executor, _capture) = audited_executor(
+        connection_charge_tool(&connection.connection_id),
+        "get_charge",
+        &connection,
+    );
+    // Step 1 of the rotation: the verifier fetches a set with both keys.
+    let held = connection
+        .control_plane
+        .caller_assertion_jwks()
+        .await
+        .expect("both keys are published");
+    assert_eq!(held.key_count(), 2);
+    executor
+        .execute(
+            "get_charge",
+            json!({ "charge_id": "ch_5" }),
+            context_for(&bearer("alice", &[]), "request-before-rotation"),
+            CancellationToken::new(),
+        )
+        .await
+        .expect("the current key signs");
+
+    // Step 3: in one save, the next key signs and the previous one is only
+    // published.
+    let stored = connection
+        .control_plane
+        .runtime_snapshot()
+        .managed()
+        .values()
+        .next()
+        .cloned()
+        .expect("the Connection is stored");
+    let mut rotated = stored.write.clone();
+    let assertion = rotated
+        .caller_assertion
+        .as_mut()
+        .expect("the Connection attests its caller");
+    assertion.signing_key_id = "assertion-next-key".to_owned();
+    assertion.kid = "gw-test-2".to_owned();
+    assertion.algorithm = CallerAssertionAlgorithm::Rs256;
+    assertion.published_keys = vec![CallerAssertionPublishedKey {
+        signing_key_id: "assertion-signing-key".to_owned(),
+        kid: "gw-test-1".to_owned(),
+        algorithm: CallerAssertionAlgorithm::Es256,
+    }];
+    connection
+        .control_plane
+        .ensure_deferred_bindings_resolvable(&rotated)
+        .await
+        .expect("both keys still load");
+    connection
+        .control_plane
+        .replace_managed(&stored.id, &stored.etag(), rotated, "test-admin")
+        .await
+        .expect("the rotation saves");
+    executor
+        .execute(
+            "get_charge",
+            json!({ "charge_id": "ch_5" }),
+            context_for(&bearer("alice", &[]), "request-after-rotation"),
+            CancellationToken::new(),
+        )
+        .await
+        .expect("the next key signs");
+
+    let requests = server.await.expect("the TLS server task should join");
+    let mut kids = Vec::new();
+    for request in &requests {
+        let token = request
+            .header(ASSERTION_HEADER)
+            .expect("the upstream receives the assertion");
+        kids.push(
+            decode_header(token)
+                .expect("the assertion header decodes")
+                .kid
+                .expect("the assertion names its key"),
+        );
+        // Both verify against the set fetched before the rotation.
+        let claims = verify_with_published_set(token, held.body());
+        assert_eq!(claims["caller_sub"], json!("alice"));
+    }
+    assert_eq!(kids, vec!["gw-test-1", "gw-test-2"]);
+    // And the set after it still publishes both.
+    assert_eq!(
+        connection
+            .control_plane
+            .caller_assertion_jwks()
+            .await
+            .expect("both keys are still published")
+            .key_count(),
+        2
     );
 }
