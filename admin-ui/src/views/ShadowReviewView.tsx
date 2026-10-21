@@ -259,6 +259,10 @@ export function ShadowReviewView() {
       // Every other entry was reviewed under the revision this change just
       // replaced, so the gateway would refuse it. Read the review again so
       // what is on screen, and what the next change is bound to, is current.
+      // Mark it loading now, in the same update that clears the mutation, so
+      // no render between this one and the reload's start offers the stale
+      // bindings.
+      setIsLoading(true);
       reloadReview({ keepNotice: true });
       return true;
     } catch (error) {
@@ -329,8 +333,9 @@ export function ShadowReviewView() {
         {evidence.status === 'truncated' ? (
           <div className="error-panel alert warning" role="status">
             <p>
-              Audit scan limit reached; counts, principals, and samples cover only the
-              newest scanned events, so each count is a lower bound.
+              Audit scan limit reached; counts, principals, samples, and evidence
+              windows cover only the newest scanned events, so each count is a lower
+              bound and a rule can have older events the review did not read.
             </p>
           </div>
         ) : null}
@@ -459,7 +464,7 @@ function ShadowReviewEntry({
           {summary?.evidence_window ? (
             <div>
               <dt>Evidence window</dt>
-              <dd>{formatEvidenceWindow(summary.evidence_window)}</dd>
+              <dd>{formatEvidenceWindow(summary.evidence_window, evidence)}</dd>
             </div>
           ) : null}
         </dl>
@@ -692,14 +697,28 @@ function mutationErrorHeading(error: ShadowReviewError): string {
 }
 
 // The span of events the counts above it summarize, which is also what a
-// change to this rule is bound to.
-function formatEvidenceWindow(window: PolicyRuleShadowEvidenceWindow): string {
+// change to this rule is bound to. It describes the events the review read,
+// not every event that exists: a truncated scan read only the newest events
+// across all shadow rules, so this rule can have older would-deny events the
+// review never saw, and an empty window there is not "none recorded".
+function formatEvidenceWindow(
+  window: PolicyRuleShadowEvidenceWindow,
+  evidence: ShadowReviewEvidence,
+): string {
+  if (evidence.status === 'unavailable') {
+    return 'Evidence unavailable';
+  }
+
+  const truncated = evidence.status === 'truncated';
   if (window.from === null || window.to === null) {
-    return 'No would-deny events recorded';
+    return truncated
+      ? 'None among the newest scanned events (scan truncated)'
+      : 'No would-deny events in the scanned events';
   }
   const from = formatUtcTimestamp(window.from);
   const to = formatUtcTimestamp(window.to);
-  return from === to ? from : `${from} to ${to}`;
+  const span = from === to ? from : `${from} to ${to}`;
+  return truncated ? `${span} (scan truncated)` : span;
 }
 
 // Unread evidence, a truncated scan, and a complete count must read

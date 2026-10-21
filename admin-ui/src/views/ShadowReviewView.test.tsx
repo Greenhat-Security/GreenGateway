@@ -166,8 +166,53 @@ describe('ShadowReviewView', () => {
     expect(
       await screen.findByText('Jul 3, 2026, 9:00 AM UTC to Jul 4, 2026, 4:10 PM UTC'),
     ).toBeTruthy();
-    expect(screen.getByText('No would-deny events recorded')).toBeTruthy();
+    expect(screen.getByText('No would-deny events in the scanned events')).toBeTruthy();
     expect(screen.getAllByText('Evidence window')).toHaveLength(2);
+  });
+
+  it('describes an empty evidence window from a truncated scan as what was read, not what exists', async () => {
+    vi.stubGlobal(
+      'fetch',
+      shadowReviewFetchMock({
+        review: shadowReviewResponse({
+          scanned_event_count: 100_000,
+          scan_truncated: true,
+          rules: [
+            shadowSummary({
+              rule_id: 'busy-shadow',
+              would_deny_count: 2,
+              evidence_window: {
+                from: '2026-07-03T09:00:00Z',
+                to: '2026-07-04T16:10:00Z',
+              },
+            }),
+            shadowSummary({
+              rule_id: 'quiet-shadow',
+              would_deny_count: 0,
+              affected_principals: [],
+              samples: [],
+              evidence_window: { from: null, to: null },
+            }),
+          ],
+        }),
+      }).fetch,
+    );
+
+    renderShadowReviewView();
+
+    // The newest scanned events held nothing for this rule, but older events
+    // were never read, so the review cannot say none were recorded.
+    expect(
+      await screen.findByText('None among the newest scanned events (scan truncated)'),
+    ).toBeTruthy();
+    expect(
+      screen.getByText(
+        'Jul 3, 2026, 9:00 AM UTC to Jul 4, 2026, 4:10 PM UTC (scan truncated)',
+      ),
+    ).toBeTruthy();
+    expect(screen.getByText('0 would-deny events (scan truncated)')).toBeTruthy();
+    expect(screen.queryByText('No would-deny events recorded')).toBeNull();
+    expect(screen.queryByText('No would-deny events in the scanned events')).toBeNull();
   });
 
   it('cancels a pending promote confirmation without patching the rule', async () => {
@@ -719,7 +764,7 @@ describe('ShadowReviewView', () => {
     expect(screen.queryByText('0 would-deny events')).toBeNull();
     expect(
       screen.getByText(
-        'Audit scan limit reached; counts, principals, and samples cover only the newest scanned events, so each count is a lower bound.',
+        'Audit scan limit reached; counts, principals, samples, and evidence windows cover only the newest scanned events, so each count is a lower bound and a rule can have older events the review did not read.',
       ),
     ).toBeTruthy();
   });

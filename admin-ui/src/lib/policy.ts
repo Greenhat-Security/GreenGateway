@@ -135,7 +135,9 @@ export type PolicyRuleShadowReviewSample = {
 };
 
 // The recorded timestamps of the oldest and newest would-deny events a
-// review read for one rule; both null when it read none.
+// review read for one rule; both null when it read none. It describes what
+// was read: after a truncated scan the rule can have older events outside it,
+// so a null window is not proof that none were recorded.
 export type PolicyRuleShadowEvidenceWindow = {
   from: string | null;
   to: string | null;
