@@ -2450,8 +2450,8 @@ pub(super) fn validate_connection_bound_tools(
         match (&definition.source, definition.target.as_ref()) {
             (ToolSource::Manual, Some(ToolTarget::Http { connection_id, .. })) => {
                 // A manual tool may be bound to a Connection that attests its
-                // caller: its calls sign the assertion. Every other binding
-                // below keeps refusing one.
+                // caller, delegated ones included: its calls sign the
+                // assertion.
                 if let Err(error) = runtime.validate_tool_binding(connection_id) {
                     problems.push(format!(
                         "tool '{}' Connection target is unavailable: {}",
@@ -2490,7 +2490,10 @@ pub(super) fn validate_connection_bound_tools(
                     ));
                     continue;
                 }
-                if let Err(error) = runtime.validate_binding(target_connection_id) {
+                // Its calls sign a caller assertion as a manual tool's do, so
+                // an attesting Connection is accepted; a composite's steps
+                // still refuse one when they run.
+                if let Err(error) = runtime.validate_openapi_tool_binding(target_connection_id) {
                     problems.push(format!(
                         "OpenAPI tool '{}' Connection target is unavailable: {}",
                         definition.name,

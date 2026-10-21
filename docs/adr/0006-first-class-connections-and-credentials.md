@@ -302,9 +302,10 @@ is explicit.
 - `token_exchange_url` follows the token-URL rule (HTTPS, no userinfo, query
   or fragment) and passes the token client's egress check before any key or
   secret is read.
-- Only the manual HTTP tool-call lane has a validated principal, so only it
-  serves such a Connection; every other lane refuses it through the
-  caller-assertion refusal. A call with no principal, or a service token's, is
+- Only the manual HTTP tool-call lane obtains a caller's own token, so only it
+  serves such a Connection; every other lane, the ones that attest an ordinary
+  Connection's caller included, refuses it through the caller-assertion
+  refusal. A call with no principal, or a service token's, is
   refused with `delegated_token_no_principal`. There is no fallback to a
   service identity.
 - The token cache reuses the OAuth cache's single flight and generation-bound

@@ -22,7 +22,10 @@ use serde_json::json;
 use super::{retry, MatchedUpstream, ProxyState, RequestBodyMode, RouteRequestHeaderPolicy};
 use crate::{
     audit, auth,
-    connections::http::{ConnectionHttpError, ConnectionHttpTarget},
+    connections::{
+        caller_assertion::{AttestedCaller, CallerAssertionError},
+        http::{ConnectionHttpError, ConnectionHttpTarget, IssuedCallerAssertion},
+    },
     egress, middleware, upstream_route,
 };
 
@@ -377,7 +380,21 @@ async fn forward_to_upstream(
         );
         return admission_unavailable_response(&upstream.pool.id, request_id);
     }
-    let mut body = match upstream.request_body_mode {
+    // The Connection target is built before the body is read, from the same
+    // snapshot the request was admitted under, because an assertion that
+    // binds the request covers the exact body sent: on a route that streams
+    // bodies, such a request is held in full, within the route's size limit,
+    // before anything is signed, and one over the limit is refused rather
+    // than signed in part. A refusal to build the target is still answered
+    // after the body is read, as it always was.
+    let connection_target = proxy_connection_target(proxy, &upstream, &parts);
+    let request_body_mode = match &connection_target {
+        Ok(Some(target)) if target.caller_assertion_binds_request_body() => {
+            RequestBodyMode::Buffered
+        }
+        _ => upstream.request_body_mode,
+    };
+    let mut body = match request_body_mode {
         RequestBodyMode::Buffered => {
             // The admission permit is already held here, so an unbounded read let a
             // client that opens a request and then stops writing pin pool capacity for
@@ -452,51 +469,17 @@ async fn forward_to_upstream(
             )))
         }
     };
-    let connection_target = match upstream.connection_id.as_deref() {
-        Some(connection_id) => {
-            let Some(runtime) = proxy.connection_http.as_ref() else {
-                return connection_failure_response(
-                    ConnectionHttpError::TransportUnavailable,
-                    &upstream.pool.id,
-                    request_id,
-                    Vec::new(),
-                    Duration::ZERO,
-                );
-            };
-            let path_and_query = parts
-                .uri
-                .path_and_query()
-                .map_or("/", http::uri::PathAndQuery::as_str);
-            match runtime.target(connection_id, path_and_query) {
-                Ok(target) => {
-                    if super::validate_connection_header_policy(
-                        &upstream.request_header_policy,
-                        &target,
-                    )
-                    .is_err()
-                    {
-                        return connection_failure_response(
-                            ConnectionHttpError::CredentialHeaderConflict,
-                            &upstream.pool.id,
-                            request_id,
-                            Vec::new(),
-                            Duration::ZERO,
-                        );
-                    }
-                    Some(target)
-                }
-                Err(error) => {
-                    return connection_failure_response(
-                        error,
-                        &upstream.pool.id,
-                        request_id,
-                        Vec::new(),
-                        Duration::ZERO,
-                    );
-                }
-            }
+    let connection_target = match connection_target {
+        Ok(target) => target,
+        Err(error) => {
+            return connection_failure_response(
+                error,
+                &upstream.pool.id,
+                request_id,
+                Vec::new(),
+                Duration::ZERO,
+            );
         }
-        None => None,
     };
     if let Some(target) = connection_target.as_ref() {
         if parts.method == Method::TRACE && target.is_credentialed() {
@@ -522,6 +505,72 @@ async fn forward_to_upstream(
     let deadline = tokio::time::Instant::now() + request_timeout;
     let (prepared_connection_transport, connection_headers) =
         if let Some(target) = connection_target.as_ref() {
+            // `proxy_connection_target` builds a target only through the
+            // runtime, so this holds; were that to change, it fails closed.
+            let Some(runtime) = proxy.connection_http.as_ref() else {
+                return connection_failure_response(
+                    ConnectionHttpError::TransportUnavailable,
+                    &upstream.pool.id,
+                    request_id,
+                    Vec::new(),
+                    Duration::ZERO,
+                );
+            };
+            // Who an attesting Connection names: the authenticated principal,
+            // never anything the request carries. `None` for an anonymous
+            // request or a service token, which such a Connection refuses.
+            let caller = if target.attests_caller() {
+                parts
+                    .extensions
+                    .get::<auth::Principal>()
+                    .and_then(AttestedCaller::from_principal)
+            } else {
+                None
+            };
+            // A Connection that attests its caller refuses a request that
+            // names nobody, and one whose keys no upstream could verify,
+            // before the egress preflight resolves anything or any credential
+            // is read.
+            if target.attests_caller() {
+                let admitted = tokio::select! {
+                    biased;
+                    () = forced_shutdown.cancelled() => {
+                        return admission_unavailable_response(&upstream.pool.id, request_id);
+                    }
+                    admitted = tokio::time::timeout_at(
+                        deadline,
+                        runtime.admit_caller_assertion(target, caller.as_ref()),
+                    ) => admitted,
+                };
+                match admitted {
+                    Err(_) => {
+                        return connection_failure_response(
+                            ConnectionHttpError::TransportUnavailable,
+                            &upstream.pool.id,
+                            request_id,
+                            Vec::new(),
+                            request_started.elapsed(),
+                        );
+                    }
+                    Ok(Err(error)) => {
+                        emit_caller_assertion_decision(
+                            proxy,
+                            &parts,
+                            source_ip,
+                            &upstream.pool.id,
+                            target,
+                            Err(error),
+                        );
+                        return caller_assertion_failure_response(
+                            error,
+                            &upstream.pool.id,
+                            request_id,
+                            request_started.elapsed(),
+                        );
+                    }
+                    Ok(Ok(())) => {}
+                }
+            }
             let checked = tokio::select! {
                 biased;
                 () = forced_shutdown.cancelled() => {
@@ -556,10 +605,6 @@ async fn forward_to_upstream(
                 Ok(Ok(checked)) => checked,
             };
 
-            let runtime = proxy
-                .connection_http
-                .as_ref()
-                .expect("connection target requires a Connection HTTP runtime");
             let prepared = tokio::select! {
                 biased;
                 () = forced_shutdown.cancelled() => {
@@ -601,11 +646,68 @@ async fn forward_to_upstream(
                 }
                 Ok(Ok(prepared)) => prepared,
             };
+            // The assertion's signing key is read and loaded before the
+            // credential, so a key that cannot sign refuses the request before
+            // any token endpoint is asked for a token. It signs once the
+            // request is final, below.
+            let assertion_signer = if target.attests_caller() {
+                let loaded = tokio::select! {
+                    biased;
+                    () = forced_shutdown.cancelled() => {
+                        return admission_unavailable_response(&upstream.pool.id, request_id);
+                    }
+                    loaded = tokio::time::timeout_at(
+                        deadline,
+                        runtime.caller_assertion_signer(target),
+                    ) => loaded,
+                };
+                match loaded {
+                    Err(_) => {
+                        return connection_failure_response(
+                            ConnectionHttpError::TransportUnavailable,
+                            &upstream.pool.id,
+                            request_id,
+                            Vec::new(),
+                            request_started.elapsed(),
+                        );
+                    }
+                    Ok(Err(error)) => {
+                        if error.is_key_resolution_failure() {
+                            emit_connection_secret_resolution_failed(
+                                proxy,
+                                &parts,
+                                source_ip,
+                                &upstream.pool.id,
+                                target,
+                                error.safe_reason(),
+                            );
+                        }
+                        emit_caller_assertion_decision(
+                            proxy,
+                            &parts,
+                            source_ip,
+                            &upstream.pool.id,
+                            target,
+                            Err(error),
+                        );
+                        return caller_assertion_failure_response(
+                            error,
+                            &upstream.pool.id,
+                            request_id,
+                            request_started.elapsed(),
+                        );
+                    }
+                    Ok(Ok(signer)) => signer,
+                }
+            } else {
+                None
+            };
             // No caller is named: a proxied request is never served by a
-            // credential that belongs to the caller. `target()` refuses such a
-            // Connection with `caller_assertion_not_enforced` before this, and
-            // were that lifted, resolution would still refuse with
-            // `delegated_token_no_principal` rather than exchange for nobody.
+            // credential that belongs to the caller. `proxy_route_target()`
+            // refuses such a Connection with `caller_assertion_not_enforced`
+            // before this, and were that lifted, resolution would still refuse
+            // with `delegated_token_no_principal` rather than exchange for
+            // nobody.
             let resolution = runtime.resolve_credential_before(target, None, deadline);
             let credential = tokio::select! {
                 biased;
@@ -640,7 +742,7 @@ async fn forward_to_upstream(
                 &parts.headers,
                 source_ip,
                 &upstream.request_header_policy,
-                target.credential_header_names(),
+                &connection_owned_headers(target),
             );
             if let Some(credential) = credential.as_ref() {
                 if let Err(error) = credential.inject(&mut headers) {
@@ -657,6 +759,44 @@ async fn forward_to_upstream(
                         &upstream.pool.id,
                         request_id,
                         Vec::new(),
+                        request_started.elapsed(),
+                    );
+                }
+            }
+            // The assertion is signed last, once, over the request exactly as
+            // it is about to be sent, and written as the last header so
+            // nothing after it can replace or repeat it. Every attempt sends
+            // these same headers, so a retry carries the same assertion and
+            // the same `jti`, which is how an upstream recognises a retry.
+            if let Some(signer) = assertion_signer {
+                let jti = request_id
+                    .as_ref()
+                    .and_then(|value| value.to_str().ok())
+                    .unwrap_or_default();
+                let signed = match bound_request_body(&body) {
+                    Some(bytes) => signer.sign(caller.as_ref(), jti, &parts.method, bytes),
+                    // A binding target's body was held in full above. Were
+                    // that to change, this refuses rather than sign an
+                    // assertion over part of a body.
+                    None if signer.binds_request_body() => {
+                        Err(CallerAssertionError::InvalidClaim("request_binding"))
+                    }
+                    None => signer.sign(caller.as_ref(), jti, &parts.method, &[]),
+                };
+                let decision = signed.and_then(|signed| signed.inject(&mut headers));
+                emit_caller_assertion_decision(
+                    proxy,
+                    &parts,
+                    source_ip,
+                    &upstream.pool.id,
+                    target,
+                    decision.as_ref().map_err(|error| *error),
+                );
+                if let Err(error) = decision {
+                    return caller_assertion_failure_response(
+                        error,
+                        &upstream.pool.id,
+                        request_id,
                         request_started.elapsed(),
                     );
                 }
@@ -2009,6 +2149,157 @@ fn emit_connection_secret_resolution_failed(
     ));
 }
 
+/// The Connection target a connection-bound route forwards this request to,
+/// `None` for a route without a Connection, or the refusal to build one.
+///
+/// Reads only the in-memory snapshot the request was admitted under: no DNS,
+/// secret read or egress happens here.
+fn proxy_connection_target(
+    proxy: &ProxyState,
+    upstream: &MatchedUpstream,
+    parts: &http::request::Parts,
+) -> Result<Option<ConnectionHttpTarget>, ConnectionHttpError> {
+    let Some(connection_id) = upstream.connection_id.as_deref() else {
+        return Ok(None);
+    };
+    let runtime = proxy
+        .connection_http
+        .as_ref()
+        .ok_or(ConnectionHttpError::TransportUnavailable)?;
+    let path_and_query = parts
+        .uri
+        .path_and_query()
+        .map_or("/", http::uri::PathAndQuery::as_str);
+    let target = runtime.proxy_route_target(connection_id, path_and_query)?;
+    if super::validate_connection_header_policy(&upstream.request_header_policy, &target).is_err() {
+        return Err(ConnectionHttpError::CredentialHeaderConflict);
+    }
+    Ok(Some(target))
+}
+
+/// Every header the Connection writes on a forwarded request, which is
+/// stripped from what the caller sent before anything is injected: its
+/// credential headers and, when it attests its caller, the assertion header.
+fn connection_owned_headers(target: &ConnectionHttpTarget) -> std::borrow::Cow<'_, [HeaderName]> {
+    match target.caller_assertion_header_name() {
+        None => std::borrow::Cow::Borrowed(target.credential_header_names()),
+        Some(assertion_header) => {
+            let mut owned = target.credential_header_names().to_vec();
+            owned.push(assertion_header.clone());
+            std::borrow::Cow::Owned(owned)
+        }
+    }
+}
+
+/// The exact bytes a request sends, when the gateway holds them: empty for a
+/// request without a body, `None` for a body that is streamed.
+fn bound_request_body(body: &PreparedRequestBody) -> Option<&[u8]> {
+    match body {
+        PreparedRequestBody::Empty => Some(&[]),
+        PreparedRequestBody::Buffered(bytes) => Some(bytes),
+        PreparedRequestBody::Streaming(_) => None,
+    }
+}
+
+/// Records one decision about the caller assertion of a proxied request: the
+/// `kid` and `jti` of the assertion it carries, or why it carries none and was
+/// refused. The attested caller, or whoever the request named, is the actor.
+/// The token and the key are never recorded.
+fn emit_caller_assertion_decision(
+    proxy: &ProxyState,
+    parts: &http::request::Parts,
+    source_ip: &str,
+    route_id: &str,
+    target: &ConnectionHttpTarget,
+    decision: Result<&IssuedCallerAssertion, CallerAssertionError>,
+) {
+    let request_id = parts
+        .headers
+        .get(REQUEST_ID_HEADER)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("unknown");
+    let actor = parts
+        .extensions
+        .get::<auth::Principal>()
+        .map(auth::actor_from_principal);
+    let mut payload = json!({
+        "connection_id": target.connection_id(),
+        "auth_type": target.authentication_kind(),
+        "consumer_kind": "proxy_route",
+        "consumer_id": route_id,
+    });
+    match decision {
+        Ok(issued) => {
+            payload["outcome"] = json!("success");
+            payload["caller_assertion"] = json!(issued);
+        }
+        Err(error) => {
+            payload["outcome"] = json!("failure");
+            payload["reason"] = json!(error.safe_reason());
+        }
+    }
+    proxy.audit.emit(audit::AuditEvent::new(
+        audit::event::CONNECTION_CALLER_ASSERTION,
+        request_id,
+        source_ip,
+        actor,
+        payload,
+    ));
+}
+
+/// The response to a proxied request refused because its caller assertion
+/// could not be issued.
+///
+/// A request that names nobody is the caller's to fix, so it is answered
+/// `403` with the reason; a signing key whose source could not be read is
+/// `503`, as an unavailable credential is; everything else is a
+/// configuration fault answered `502` with no detail, like every other
+/// Connection failure on a proxy route.
+fn caller_assertion_failure_response(
+    error: CallerAssertionError,
+    pool_id: &str,
+    request_id: Option<HeaderValue>,
+    latency: Duration,
+) -> Response {
+    let (status, code) = match error {
+        CallerAssertionError::NoPrincipal => (StatusCode::FORBIDDEN, error.safe_reason()),
+        CallerAssertionError::KeyUnavailable => {
+            (StatusCode::SERVICE_UNAVAILABLE, "service_unavailable")
+        }
+        CallerAssertionError::InvalidClaim(_)
+        | CallerAssertionError::InvalidLifetime
+        | CallerAssertionError::KeyUnusable
+        | CallerAssertionError::KeyNotPublished
+        | CallerAssertionError::HeaderConflict
+        | CallerAssertionError::ApprovalRequired
+        | CallerAssertionError::SignatureFailed
+        | CallerAssertionError::TokenTooLong => (StatusCode::BAD_GATEWAY, "bad_gateway"),
+    };
+    tracing::warn!(
+        pool_id,
+        error_category = error.safe_reason(),
+        "connection-bound proxied request failed closed"
+    );
+    let mut response = (status, Json(json!({ "error": code }))).into_response();
+    response
+        .extensions_mut()
+        .insert(middleware::decision::UpstreamOutcome {
+            latency_ms: crate::duration_millis(latency),
+            status: None,
+            pool_id: Some(pool_id.to_owned()),
+            endpoint_id: None,
+            attempts: Vec::new(),
+            retry_exhausted: false,
+            stream_terminal_pending: false,
+        });
+    if let Some(request_id) = request_id {
+        response
+            .headers_mut()
+            .insert(request_id_header(), request_id);
+    }
+    response
+}
+
 fn emit_connection_unsafe_method_rejected(
     proxy: &ProxyState,
     parts: &http::request::Parts,
@@ -3203,9 +3494,10 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn unenforced_caller_assertion_is_refused_before_secret_or_upstream_io() {
-        // A proxied call on a Connection configured to attest its caller would
-        // otherwise leave carrying only the service credential. The proxy's
-        // only record of why is its fail-closed log line, so capture it.
+        // A block only an earlier release accepted is honoured by no lane, the
+        // proxy included: a proxied call would otherwise leave carrying only
+        // the service credential. The proxy's only record of why is its
+        // fail-closed log line, so capture it.
         let logs = CapturedLogs::default();
         let subscriber = tracing_subscriber::fmt()
             .with_ansi(false)
@@ -3287,6 +3579,17 @@ mod tests {
             .await
             .expect("assertion test Connection should create");
         let connection_id = created.id.to_string();
+        // An earlier release stored this block with `bind_approval: true`,
+        // which no lane can honour: it still loads, and is refused.
+        let mut legacy = created.clone();
+        if let Some(assertion) = legacy.write.caller_assertion.as_mut() {
+            assertion.bind_approval = true;
+        }
+        assert!(!legacy.write.caller_assertion_enforceable());
+        control_plane
+            .publish_authoritative_records(vec![legacy])
+            .await
+            .expect("a legacy document still loads");
         let egress_config = egress::EgressConfig {
             allowed_hosts: HashSet::from(["billing.example.test".to_owned()]),
             ..egress::EgressConfig::default()
@@ -3364,6 +3667,763 @@ mod tests {
         }
 
         let _ = fs::remove_dir_all(&root);
+    }
+
+    const ATTESTED_API_KEY: &str = "attested-route-api-key-canary";
+    const ATTESTED_PROVIDER: &str = "https://idp.example.test";
+
+    /// An HTTPS upstream on 127.0.0.1 that answers every request `200` and
+    /// keeps what it received, and the PEM of the CA that signed its
+    /// certificate.
+    async fn spawn_capturing_tls_upstream() -> (
+        SocketAddr,
+        String,
+        Arc<Mutex<Vec<CapturedTlsRequest>>>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        spawn_capturing_tls_upstream_answering(Vec::new()).await
+    }
+
+    /// As [`spawn_capturing_tls_upstream`], but answers the first requests
+    /// with `statuses`, in order and without a body, before it answers `200`.
+    async fn spawn_capturing_tls_upstream_answering(
+        statuses: Vec<u16>,
+    ) -> (
+        SocketAddr,
+        String,
+        Arc<Mutex<Vec<CapturedTlsRequest>>>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        use tokio::io::AsyncWriteExt;
+
+        let _ = tokio_rustls::rustls::crypto::ring::default_provider().install_default();
+        let mut ca_params = rcgen::CertificateParams::default();
+        ca_params.distinguished_name = rcgen::DistinguishedName::new();
+        ca_params.distinguished_name.push(
+            rcgen::DnType::CommonName,
+            "GreenGateway Attested Route Test CA",
+        );
+        ca_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+        let ca_key = rcgen::KeyPair::generate().expect("test CA key should generate");
+        let ca = ca_params
+            .self_signed(&ca_key)
+            .expect("test CA certificate should build");
+        let mut server_params = rcgen::CertificateParams::default();
+        server_params.distinguished_name = rcgen::DistinguishedName::new();
+        server_params
+            .distinguished_name
+            .push(rcgen::DnType::CommonName, "127.0.0.1");
+        server_params
+            .subject_alt_names
+            .push(rcgen::SanType::IpAddress(IpAddr::V4(
+                std::net::Ipv4Addr::LOCALHOST,
+            )));
+        let server_key = rcgen::KeyPair::generate().expect("test server key should generate");
+        let server = server_params
+            .signed_by(
+                &server_key,
+                &rcgen::Issuer::from_params(&ca_params, &ca_key),
+            )
+            .expect("test server certificate should build");
+        let server_config = tokio_rustls::rustls::ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(
+                vec![tokio_rustls::rustls::pki_types::CertificateDer::from(
+                    server.der().as_ref().to_vec(),
+                )],
+                tokio_rustls::rustls::pki_types::PrivateKeyDer::Pkcs8(
+                    tokio_rustls::rustls::pki_types::PrivatePkcs8KeyDer::from(
+                        server_key.serialize_der(),
+                    ),
+                ),
+            )
+            .expect("test TLS server config should build");
+        let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(server_config));
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .expect("test TLS listener");
+        let addr = listener.local_addr().expect("test TLS listener address");
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let captured = Arc::clone(&requests);
+        let statuses = Arc::new(Mutex::new(std::collections::VecDeque::from(statuses)));
+        let task = tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                let acceptor = acceptor.clone();
+                let captured = Arc::clone(&captured);
+                let statuses = Arc::clone(&statuses);
+                tokio::spawn(async move {
+                    let Ok(mut stream) = acceptor.accept(stream).await else {
+                        return;
+                    };
+                    let Some(request) = read_captured_tls_request(&mut stream).await else {
+                        return;
+                    };
+                    captured
+                        .lock()
+                        .expect("captured requests should not be poisoned")
+                        .push(request);
+                    let status = statuses
+                        .lock()
+                        .expect("scripted statuses should not be poisoned")
+                        .pop_front();
+                    let response = match status {
+                        Some(status) => format!(
+                            "HTTP/1.1 {status} Scripted\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                        )
+                        .into_bytes(),
+                        None => b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 11\r\nConnection: close\r\n\r\n{\"ok\":true}"
+                            .to_vec(),
+                    };
+                    let _ = stream.write_all(&response).await;
+                    let _ = stream.shutdown().await;
+                });
+            }
+        });
+        (addr, ca.pem(), requests, task)
+    }
+
+    struct CapturedTlsRequest {
+        method: String,
+        target: String,
+        /// Every header line in the order received, names lowercased, so a
+        /// test can tell one value from two under the same name.
+        header_lines: Vec<(String, String)>,
+        body: Vec<u8>,
+    }
+
+    impl CapturedTlsRequest {
+        fn headers_named(&self, name: &str) -> Vec<&str> {
+            self.header_lines
+                .iter()
+                .filter(|(candidate, _)| candidate == name)
+                .map(|(_, value)| value.as_str())
+                .collect()
+        }
+    }
+
+    async fn read_captured_tls_request<S>(stream: &mut S) -> Option<CapturedTlsRequest>
+    where
+        S: tokio::io::AsyncRead + Unpin,
+    {
+        use tokio::io::AsyncReadExt;
+
+        let mut bytes = Vec::new();
+        let mut buffer = [0; 4096];
+        let (header_end, content_length) = loop {
+            let count = stream.read(&mut buffer).await.ok()?;
+            if count == 0 {
+                return None;
+            }
+            bytes.extend_from_slice(&buffer[..count]);
+            if let Some(end) = bytes.windows(4).position(|window| window == b"\r\n\r\n") {
+                let head = String::from_utf8_lossy(&bytes[..end]).to_ascii_lowercase();
+                let length = head
+                    .lines()
+                    .find_map(|line| line.strip_prefix("content-length:"))
+                    .and_then(|value| value.trim().parse::<usize>().ok())
+                    .unwrap_or(0);
+                break (end, length);
+            }
+        };
+        while bytes.len() < header_end + 4 + content_length {
+            let count = stream.read(&mut buffer).await.ok()?;
+            if count == 0 {
+                return None;
+            }
+            bytes.extend_from_slice(&buffer[..count]);
+        }
+        let head = String::from_utf8_lossy(&bytes[..header_end]).into_owned();
+        let mut lines = head.lines();
+        let mut request_line = lines.next()?.split_whitespace();
+        let method = request_line.next()?.to_owned();
+        let target = request_line.next()?.to_owned();
+        let header_lines = lines
+            .filter_map(|line| {
+                let (name, value) = line.split_once(':')?;
+                Some((name.trim().to_ascii_lowercase(), value.trim().to_owned()))
+            })
+            .collect();
+        Some(CapturedTlsRequest {
+            method,
+            target,
+            header_lines,
+            body: bytes[header_end + 4..header_end + 4 + content_length].to_vec(),
+        })
+    }
+
+    /// One attested Connection on an HTTPS upstream, with its API key and a
+    /// generated signing key behind operator aliases. Removed on drop.
+    struct AttestedRouteFixture {
+        root: std::path::PathBuf,
+        connection_id: String,
+        control_plane: ConnectionControlPlane,
+        runtime: ConnectionHttpRuntime,
+        signing_key: String,
+    }
+
+    impl Drop for AttestedRouteFixture {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.root);
+        }
+    }
+
+    async fn attested_route_fixture(
+        addr: SocketAddr,
+        ca_pem: &str,
+        bind_request: bool,
+    ) -> AttestedRouteFixture {
+        let root = std::env::temp_dir().join(format!(
+            "greengateway-proxy-attested-route-{}",
+            uuid::Uuid::new_v4()
+        ));
+        fs::create_dir(&root).expect("attested route secret root should create");
+        let signing_key = crate::connections::test_support::generated_es256_pem();
+        for (file, value) in [
+            ("primary", ATTESTED_API_KEY.as_bytes()),
+            ("assertion-signing-key", signing_key.as_bytes()),
+            ("test-ca.pem", ca_pem.as_bytes()),
+        ] {
+            fs::write(root.join(file), value).expect("attested route secret should write");
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+
+            fs::set_permissions(&root, fs::Permissions::from_mode(0o700))
+                .expect("attested route secret root permissions should set");
+            for file in ["primary", "assertion-signing-key", "test-ca.pem"] {
+                fs::set_permissions(root.join(file), fs::Permissions::from_mode(0o600))
+                    .expect("attested route secret permissions should set");
+            }
+        }
+        let mut connection_config = config::Config::test_defaults();
+        connection_config.connections_sqlite_path =
+            Some(root.join("connections.sqlite").display().to_string());
+        connection_config.connection_secrets_root = Some(SecretRootConfig::new(root.clone()));
+        connection_config.connection_secret_aliases = [
+            ("primary", "Primary"),
+            ("assertion-signing-key", "Assertion signing key"),
+        ]
+        .into_iter()
+        .map(|(id, label)| OperatorSecretAliasConfig {
+            id: id.to_owned(),
+            label: label.to_owned(),
+            source: OperatorSecretAliasSource::File { key: id.to_owned() },
+        })
+        .collect();
+        let control_plane = ConnectionControlPlane::from_config(&connection_config)
+            .expect("attested route control plane should build");
+        let write: ConnectionWrite = serde_json::from_value(json!({
+            "display_name": "Attested route",
+            "enabled": true,
+            "kind": "http_api",
+            "endpoint": {
+                "base_url": format!("https://127.0.0.1:{}", addr.port()),
+                "base_path": "/v1"
+            },
+            "authentication": {
+                "type": "header_api_key",
+                "header_name": "x-api-key",
+                "secret_id": "primary"
+            },
+            "caller_assertion": {
+                "signing_key_id": "assertion-signing-key",
+                "kid": "gw-route-1",
+                "algorithm": "es256",
+                "issuer": "https://gateway.example.test",
+                "audience": "https://billing.example.test",
+                "token_type": "at+jwt",
+                "header_name": "X-Caller-Assertion",
+                "lifetime_seconds": 60,
+                "claims": ["email"],
+                "bind_request": bind_request
+            }
+        }))
+        .expect("attested route Connection should deserialize");
+        let initial = control_plane.runtime_snapshot();
+        let created = control_plane
+            .create_managed(initial.collection_etag(), write, "test-admin")
+            .await
+            .expect("attested route Connection should create");
+        let mut egress_config = egress::EgressConfig {
+            allowed_hosts: HashSet::from(["127.0.0.1".to_owned()]),
+            deny_private_ips: false,
+            timeout: Duration::from_secs(5),
+            ..egress::EgressConfig::default()
+        };
+        egress_config
+            .apply_tls_ca_bundle_path(root.join("test-ca.pem"))
+            .expect("attested route test CA should configure");
+        let egress_client = Arc::new(
+            egress::EgressClient::new(egress_config.clone())
+                .expect("attested route egress client should build"),
+        );
+        let runtime =
+            ConnectionHttpRuntime::new(control_plane.clone(), egress_config, egress_client);
+        AttestedRouteFixture {
+            root,
+            connection_id: created.id.to_string(),
+            control_plane,
+            runtime,
+            signing_key,
+        }
+    }
+
+    fn attested_route_proxy(
+        fixture: &AttestedRouteFixture,
+        request_body_mode: RequestBodyMode,
+        retry: Option<config::UpstreamRetryConfig>,
+    ) -> (ProxyState, CaptureSink) {
+        // The pool's own endpoints are never used: a connection-bound route
+        // sends every attempt to the Connection's target.
+        let nowhere = SocketAddr::from(([127, 0, 0, 1], 9));
+        let (mut proxy, sink, _) = retry_proxy_with_options(
+            [nowhere, nowhere],
+            RetryProxyOptions {
+                retry,
+                timeout: Duration::from_secs(5),
+                request_body_mode,
+                ..RetryProxyOptions::default()
+            },
+        );
+        let ProxyRoutes::RoutingTable { routes } = &mut proxy.routes else {
+            panic!("attested route proxy should use a routing table");
+        };
+        routes[0].connection_id = Some(fixture.connection_id.clone());
+        proxy.connection_http = Some(fixture.runtime.clone());
+        (proxy, sink)
+    }
+
+    fn attested_principal(subject: &str, auth_method: auth::AuthMethod) -> auth::Principal {
+        auth::Principal {
+            user_id: subject.to_owned(),
+            issuer: Some(ATTESTED_PROVIDER.to_owned()),
+            email: Some(format!("{subject}@example.test")),
+            org_id: None,
+            roles: Vec::new(),
+            session_id: format!("session-{subject}"),
+            auth_method,
+        }
+    }
+
+    /// What an upstream does with the header it received: select the key by
+    /// `kid` from the published set, and check the signature, `iss`, `aud`
+    /// and `exp`.
+    fn verified_route_assertion(token: &str, jwks: &str) -> serde_json::Value {
+        let header = jsonwebtoken::decode_header(token).expect("the assertion header decodes");
+        assert_eq!(header.typ.as_deref(), Some("at+jwt"));
+        let set: jsonwebtoken::jwk::JwkSet =
+            serde_json::from_str(jwks).expect("the JWKS is a standard JWK Set");
+        let jwk = set
+            .find(&header.kid.expect("the assertion names its key"))
+            .expect("the signing key is published");
+        let key = jsonwebtoken::DecodingKey::from_jwk(jwk).expect("the published key loads");
+        let mut validation = jsonwebtoken::Validation::new(jsonwebtoken::Algorithm::ES256);
+        validation.set_issuer(&["https://gateway.example.test"]);
+        validation.set_audience(&["https://billing.example.test"]);
+        validation.set_required_spec_claims(&["exp", "iss", "aud", "sub"]);
+        jsonwebtoken::decode::<serde_json::Value>(token, &key, &validation)
+            .expect("the assertion verifies against the published set")
+            .claims
+    }
+
+    async fn wait_for_captured(requests: &Arc<Mutex<Vec<CapturedTlsRequest>>>, count: usize) {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while requests
+                .lock()
+                .expect("captured requests should not be poisoned")
+                .len()
+                < count
+            {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the upstream should receive the expected requests");
+    }
+
+    fn caller_assertion_events(sink: &CaptureSink) -> Vec<audit::AuditEvent> {
+        sink.events()
+            .into_iter()
+            .filter(|event| event.event_type == audit::event::CONNECTION_CALLER_ASSERTION)
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn an_attested_route_names_each_caller_and_never_forwards_a_supplied_assertion() {
+        let (addr, ca_pem, requests, upstream) = spawn_capturing_tls_upstream().await;
+        let fixture = attested_route_fixture(addr, &ca_pem, false).await;
+        let (mut proxy, sink) = attested_route_proxy(&fixture, RequestBodyMode::Buffered, None);
+
+        let callers = [("alice", "request-alice"), ("bob", "request-bob")];
+        for (subject, request_id) in callers {
+            let request = Request::builder()
+                .method(Method::GET)
+                .uri("/charges?limit=2")
+                .header(REQUEST_ID_HEADER, request_id)
+                // A caller cannot supply, replace or add to the assertion.
+                .header("x-caller-assertion", "forged.assertion.value")
+                .extension(attested_principal(subject, auth::AuthMethod::Bearer))
+                .body(Body::empty())
+                .expect("attested request should build");
+            let response = proxy.forward_request(request, "203.0.113.8").await;
+            assert_eq!(response.status(), StatusCode::OK);
+            let _ = axum::body::to_bytes(response.into_body(), 1024).await;
+        }
+        wait_for_captured(&requests, 2).await;
+
+        let jwks = fixture
+            .control_plane
+            .caller_assertion_jwks()
+            .await
+            .expect("the signing key is published");
+        let mut tokens = Vec::new();
+        {
+            let captured = requests
+                .lock()
+                .expect("captured requests should not be poisoned");
+            assert_eq!(captured.len(), 2);
+            let mut subjects = Vec::new();
+            for request in captured.iter() {
+                assert_eq!(request.method, "GET");
+                assert_eq!(request.target, "/v1/charges?limit=2");
+                // The assertion rides beside the credential, arrives exactly
+                // once, and is the gateway's.
+                assert_eq!(request.headers_named("x-api-key"), vec![ATTESTED_API_KEY]);
+                let assertions = request.headers_named("x-caller-assertion");
+                assert_eq!(assertions.len(), 1, "exactly one assertion arrives");
+                assert_ne!(assertions[0], "forged.assertion.value");
+                let claims = verified_route_assertion(assertions[0], jwks.body());
+                let subject = claims["caller_sub"]
+                    .as_str()
+                    .expect("caller_sub is a string")
+                    .to_owned();
+                assert_eq!(
+                    claims["sub"],
+                    json!(format!("{ATTESTED_PROVIDER}#{subject}"))
+                );
+                assert_eq!(claims["caller_iss"], json!(ATTESTED_PROVIDER));
+                assert_eq!(claims["email"], json!(format!("{subject}@example.test")));
+                assert_eq!(claims["jti"], json!(format!("request-{subject}")));
+                // Not bound to the request unless the Connection asks.
+                assert!(claims.get("request_sha256").is_none());
+                subjects.push(subject);
+                tokens.push(assertions[0].to_owned());
+            }
+            subjects.sort();
+            assert_eq!(subjects, vec!["alice".to_owned(), "bob".to_owned()]);
+        }
+
+        let events = caller_assertion_events(&sink);
+        assert_eq!(events.len(), 2);
+        for (subject, request_id) in callers {
+            let event = events
+                .iter()
+                .find(|event| event.request_id == request_id)
+                .expect("each issued assertion is audited");
+            assert_eq!(event.payload["outcome"], json!("success"));
+            assert_eq!(
+                event.payload["caller_assertion"],
+                json!({ "kid": "gw-route-1", "jti": request_id })
+            );
+            assert_eq!(event.payload["connection_id"], json!(fixture.connection_id));
+            assert_eq!(event.payload["consumer_kind"], json!("proxy_route"));
+            assert_eq!(event.payload["consumer_id"], json!("payments"));
+            assert_eq!(
+                event.actor.as_ref().map(|actor| actor.user_id.as_str()),
+                Some(subject)
+            );
+        }
+        let rendered = serde_json::to_string(&sink.events()).expect("audits should serialize");
+        let mut canaries = vec![ATTESTED_API_KEY];
+        canaries.extend(crate::connections::test_support::pem_body_lines(
+            &fixture.signing_key,
+        ));
+        canaries.extend(tokens.iter().map(String::as_str));
+        for canary in canaries {
+            assert!(!rendered.contains(canary), "the audit leaked {canary:?}");
+        }
+
+        // A route that would set the assertion header itself is refused
+        // before anything is read or sent.
+        let ProxyRoutes::RoutingTable { routes } = &mut proxy.routes else {
+            panic!("attested route proxy should use a routing table");
+        };
+        routes[0].request_header_policy.add_request_headers = vec![(
+            HeaderName::from_static("x-caller-assertion"),
+            HeaderValue::from_static("route-value"),
+        )];
+        let request = Request::builder()
+            .method(Method::GET)
+            .uri("/charges")
+            .header(REQUEST_ID_HEADER, "request-route-header")
+            .extension(attested_principal("alice", auth::AuthMethod::Bearer))
+            .body(Body::empty())
+            .expect("route-header request should build");
+        let response = proxy.forward_request(request, "203.0.113.8").await;
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(
+            requests
+                .lock()
+                .expect("captured requests should not be poisoned")
+                .len(),
+            2,
+            "the refused request reaches nothing"
+        );
+        upstream.abort();
+    }
+
+    #[tokio::test]
+    async fn a_bound_assertion_holds_a_streamed_body_and_refuses_one_over_the_limit() {
+        let (addr, ca_pem, requests, upstream) = spawn_capturing_tls_upstream().await;
+        let fixture = attested_route_fixture(addr, &ca_pem, true).await;
+        // The route streams bodies; an assertion over the body makes this
+        // Connection's requests the exception.
+        let (proxy, sink) = attested_route_proxy(&fixture, RequestBodyMode::Stream, None);
+        let streamed = |bytes: Vec<u8>| {
+            // No `Content-Length`: the length is known only once it is read.
+            Body::from_stream(stream::iter(vec![Ok::<_, Infallible>(bytes::Bytes::from(
+                bytes,
+            ))]))
+        };
+
+        let sent = "{\"amount\":1250,\"memo\":\"caf\u{e9} \u{1f600}\"}"
+            .as_bytes()
+            .to_vec();
+        let request = Request::builder()
+            .method(Method::POST)
+            .uri("/charges?idempotency=key+1")
+            .header(REQUEST_ID_HEADER, "request-bound")
+            .header(CONTENT_TYPE, "application/json")
+            .extension(attested_principal("alice", auth::AuthMethod::Bearer))
+            .body(streamed(sent.clone()))
+            .expect("bound request should build");
+        let response = proxy.forward_request(request, "203.0.113.8").await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let _ = axum::body::to_bytes(response.into_body(), 1024).await;
+        wait_for_captured(&requests, 1).await;
+
+        let jwks = fixture
+            .control_plane
+            .caller_assertion_jwks()
+            .await
+            .expect("the signing key is published");
+        {
+            let captured = requests
+                .lock()
+                .expect("captured requests should not be poisoned");
+            let request = &captured[0];
+            assert_eq!(request.body, sent, "the upstream receives the whole body");
+            let claims = verified_route_assertion(
+                request.headers_named("x-caller-assertion")[0],
+                jwks.body(),
+            );
+            // The upstream compares with the request line and the bytes it
+            // received, never with a reconstruction of them.
+            assert_eq!(claims["method"], json!(request.method));
+            assert_eq!(claims["path"], json!(request.target));
+            assert_eq!(request.target, "/v1/charges?idempotency=key+1");
+            assert_eq!(
+                claims["request_sha256"],
+                json!(hex::encode(<sha2::Sha256 as sha2::Digest>::digest(
+                    &request.body
+                )))
+            );
+        }
+
+        // A body over the route's limit is refused, never signed in part,
+        // and nothing reaches the upstream.
+        let request = Request::builder()
+            .method(Method::POST)
+            .uri("/charges")
+            .header(REQUEST_ID_HEADER, "request-oversized")
+            .extension(attested_principal("alice", auth::AuthMethod::Bearer))
+            .body(streamed(vec![b'a'; proxy.max_request_body_bytes + 1]))
+            .expect("oversized request should build");
+        let response = proxy.forward_request(request, "203.0.113.8").await;
+        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(
+            requests
+                .lock()
+                .expect("captured requests should not be poisoned")
+                .len(),
+            1
+        );
+        assert!(caller_assertion_events(&sink)
+            .iter()
+            .all(|event| event.request_id != "request-oversized"));
+        upstream.abort();
+    }
+
+    #[tokio::test]
+    async fn a_retry_carries_the_same_assertion_and_is_signed_once() {
+        // The first attempt is answered `503`, which the route retries.
+        let (addr, ca_pem, requests, upstream) =
+            spawn_capturing_tls_upstream_answering(vec![503]).await;
+        let fixture = attested_route_fixture(addr, &ca_pem, true).await;
+        let (proxy, sink) = attested_route_proxy(
+            &fixture,
+            RequestBodyMode::Buffered,
+            Some(config::UpstreamRetryConfig {
+                max_attempts: 2,
+                methods: vec!["GET".to_owned()],
+                statuses: vec![503],
+            }),
+        );
+        let request = Request::builder()
+            .method(Method::GET)
+            .uri("/charges/ch_1")
+            .header(REQUEST_ID_HEADER, "request-retried")
+            .extension(attested_principal("alice", auth::AuthMethod::Bearer))
+            .body(Body::empty())
+            .expect("retried request should build");
+        let response = proxy.forward_request(request, "203.0.113.8").await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let _ = axum::body::to_bytes(response.into_body(), 1024).await;
+        wait_for_captured(&requests, 2).await;
+
+        let jwks = fixture
+            .control_plane
+            .caller_assertion_jwks()
+            .await
+            .expect("the signing key is published");
+        {
+            let captured = requests
+                .lock()
+                .expect("captured requests should not be poisoned");
+            assert_eq!(captured.len(), 2, "the request was retried once");
+            let first = captured[0].headers_named("x-caller-assertion");
+            let second = captured[1].headers_named("x-caller-assertion");
+            assert_eq!(first.len(), 1);
+            // The same assertion, so the upstream can tell the retry for what
+            // it is, and it still verifies and binds what was sent.
+            assert_eq!(first, second);
+            let claims = verified_route_assertion(second[0], jwks.body());
+            assert_eq!(claims["jti"], json!("request-retried"));
+            assert_eq!(claims["method"], json!("GET"));
+            assert_eq!(claims["path"], json!("/v1/charges/ch_1"));
+            assert_eq!(
+                claims["request_sha256"],
+                json!(hex::encode(<sha2::Sha256 as sha2::Digest>::digest(b"")))
+            );
+        }
+        let events = caller_assertion_events(&sink);
+        assert_eq!(events.len(), 1, "one assertion was issued for the request");
+        assert_eq!(events[0].payload["outcome"], json!("success"));
+        upstream.abort();
+    }
+
+    #[tokio::test]
+    async fn a_request_naming_nobody_is_refused_before_secret_or_upstream_io() {
+        let (addr, ca_pem, requests, upstream) = spawn_capturing_tls_upstream().await;
+        let fixture = attested_route_fixture(addr, &ca_pem, false).await;
+        // If the refusal regressed below secret resolution, these missing
+        // files would turn it into a different failure and a
+        // secret-resolution event.
+        for file in ["primary", "assertion-signing-key"] {
+            fs::remove_file(fixture.root.join(file)).expect("route secret should be removed");
+        }
+        let (proxy, sink) = attested_route_proxy(&fixture, RequestBodyMode::Buffered, None);
+
+        let mut issuerless = attested_principal("carol", auth::AuthMethod::Bearer);
+        issuerless.issuer = None;
+        let callers = [
+            ("request-anonymous", None),
+            (
+                "request-service-token",
+                Some(attested_principal(
+                    "service-token:svc_1",
+                    auth::AuthMethod::ServiceToken,
+                )),
+            ),
+            ("request-issuerless", Some(issuerless)),
+        ];
+        for (request_id, principal) in callers {
+            let mut builder = Request::builder()
+                .method(Method::GET)
+                .uri("/charges")
+                .header(REQUEST_ID_HEADER, request_id);
+            if let Some(principal) = principal {
+                builder = builder.extension(principal);
+            }
+            let response = proxy
+                .forward_request(
+                    builder.body(Body::empty()).expect("request should build"),
+                    "203.0.113.8",
+                )
+                .await;
+            assert_eq!(response.status(), StatusCode::FORBIDDEN);
+            assert_eq!(
+                response.headers().get(REQUEST_ID_HEADER),
+                Some(&HeaderValue::from_static(request_id))
+            );
+            let body = axum::body::to_bytes(response.into_body(), 1024)
+                .await
+                .expect("refusal body should read");
+            assert_eq!(
+                body.as_ref(),
+                br#"{"error":"caller_assertion_no_principal"}"#
+            );
+        }
+
+        let events = caller_assertion_events(&sink);
+        assert_eq!(events.len(), 3);
+        for event in &events {
+            assert_eq!(event.payload["outcome"], json!("failure"));
+            assert_eq!(
+                event.payload["reason"],
+                json!("caller_assertion_no_principal")
+            );
+            assert!(event.payload.get("caller_assertion").is_none());
+        }
+        // The service token is still the event's actor: who was refused is
+        // recorded even though nobody could be attested.
+        assert_eq!(
+            events
+                .iter()
+                .find(|event| event.request_id == "request-service-token")
+                .and_then(|event| event.actor.as_ref())
+                .map(|actor| actor.auth_mode.as_str()),
+            Some("service_token")
+        );
+        assert!(sink.events().iter().all(|event| {
+            event.event_type != audit::event::CONNECTION_SECRET_RESOLUTION_FAILED
+        }));
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(requests
+            .lock()
+            .expect("captured requests should not be poisoned")
+            .is_empty());
+        upstream.abort();
+    }
+
+    #[test]
+    fn caller_assertion_refusals_use_safe_statuses() {
+        let refused = |error| {
+            caller_assertion_failure_response(error, "payments", None, Duration::ZERO).status()
+        };
+        // The caller's to fix: authenticate as a person.
+        assert_eq!(
+            refused(CallerAssertionError::NoPrincipal),
+            StatusCode::FORBIDDEN
+        );
+        // A key source that could not be read may answer on a retry.
+        assert_eq!(
+            refused(CallerAssertionError::KeyUnavailable),
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+        // Configuration refusals that will not clear by retrying.
+        for error in [
+            CallerAssertionError::KeyUnusable,
+            CallerAssertionError::KeyNotPublished,
+            CallerAssertionError::HeaderConflict,
+            CallerAssertionError::InvalidClaim("jti"),
+            CallerAssertionError::SignatureFailed,
+        ] {
+            assert_eq!(refused(error), StatusCode::BAD_GATEWAY);
+        }
     }
 
     #[test]
