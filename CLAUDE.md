@@ -48,14 +48,3 @@ matches `.env.example` **in both directions** — a var read but undocumented fa
 a var documented but no longer read. Adding, renaming or removing an env var means editing
 `.env.example` in the same change. A second test forbids hardcoding `AUTH_EXEMPT_PATHS` and
 `RBAC_EXEMPT_PATHS` there.
-
-## In the full Greenhat workspace
-
-When this repo is checked out as a sibling inside the Greenhat multi-repo workspace, the
-private `../greenhat-tools-admin` (the production Rust gateway behind `api.greenhatsec.com`)
-is the reference implementation for the hardened middleware being ported here — prior art on
-middleware ordering, the `SplitValidator` credential split, and the deny-by-default RBAC
-policy shape. It is a **different, private** codebase: never copy its policy files, env
-values, or anything Doppler-managed into this public repo. CI runs
-`gitleaks detect --source . --no-git=false`, which reads the whole history, so a credential
-committed here stays a finding until the commit is rewritten.
