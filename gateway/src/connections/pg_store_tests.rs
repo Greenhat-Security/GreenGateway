@@ -3895,3 +3895,153 @@ async fn a_failed_evidence_insert_rolls_back_the_whole_delete() {
         "the aborted attempt consumed no revision"
     );
 }
+
+/// A disabled `delegated_issuer_token` Connection exchanging with
+/// `client_secret_id`.
+fn delegated_candidate(client_secret_id: &str) -> ConnectionWrite {
+    serde_json::from_value(json!({
+        "display_name": "Mail",
+        "enabled": false,
+        "kind": "http_api",
+        "endpoint": {
+            "base_url": "https://mail.example.test",
+            "base_path": "/v1"
+        },
+        "authentication": {
+            "type": "delegated_issuer_token",
+            "token_exchange_url": "https://issuer.example.test/oauth2/token-exchange",
+            "client_id": "greengateway",
+            "client_secret_id": client_secret_id,
+            "subject_token_source": "caller_assertion"
+        },
+        "caller_assertion": {
+            "signing_key_id": "mail-assertion-key",
+            "kid": "gw-2026-10",
+            "algorithm": "es256",
+            "issuer": "https://gateway.example.test",
+            "audience": "https://issuer.example.test",
+            "token_type": "caller-assertion+jwt",
+            "header_name": "x-caller-assertion",
+            "lifetime_seconds": 60
+        }
+    }))
+    .expect("delegated candidate should deserialize")
+}
+
+fn bearer_candidate(secret_id: &str) -> ConnectionWrite {
+    let mut write = http_candidate("Billing API");
+    write.authentication = crate::connections::model::ConnectionAuthentication::StaticBearer {
+        secret_id: Some(secret_id.to_owned()),
+    };
+    write
+}
+
+fn is_secret_purpose_conflict(
+    result: &Result<StoredConnection, ConnectionStoreError>,
+    expected_field: &str,
+) -> bool {
+    matches!(
+        result,
+        Err(ConnectionStoreError::SecretPurposeConflict { field }) if *field == expected_field
+    )
+}
+
+#[tokio::test]
+async fn a_token_exchange_client_secret_alias_is_never_bound_under_another_purpose() {
+    let Some(admin_dsn) = locator() else {
+        eprintln!("skipping: no test database locator; CI runs this test");
+        return;
+    };
+    let database = create_test_database(&admin_dsn).await;
+    let (store, pool) = migrated_store(&database.dsn, 64).await;
+
+    let bearer = store
+        .create(bearer_candidate("shared-secret"), "op-1", None)
+        .await
+        .expect("a bearer Connection should create");
+    let refused = store
+        .create(delegated_candidate("shared-secret"), "op-1", None)
+        .await;
+    assert!(
+        is_secret_purpose_conflict(&refused, "authentication.client_secret_id"),
+        "{refused:?}"
+    );
+
+    let delegated = store
+        .create(delegated_candidate("exchange-secret"), "op-1", None)
+        .await
+        .expect("a delegated Connection should create");
+    let refused = store
+        .create(bearer_candidate("exchange-secret"), "op-1", None)
+        .await;
+    assert!(
+        is_secret_purpose_conflict(&refused, "authentication.secret_id"),
+        "{refused:?}"
+    );
+    let mut with_header = bearer.write.clone();
+    with_header.additional_headers = serde_json::from_value(json!([
+        {"header_name": "X-Proxy-Token", "secret_id": "exchange-secret"}
+    ]))
+    .expect("additional headers should deserialize");
+    let refused = store
+        .replace(&bearer.id, &bearer.etag(), with_header, "op-1")
+        .await;
+    assert!(
+        is_secret_purpose_conflict(&refused, "additional_headers.secret_id"),
+        "{refused:?}"
+    );
+
+    // A refused write wrote nothing, and sharing between delegated
+    // Connections, or a delegated Connection's own replace, is allowed.
+    assert_eq!(
+        count(
+            &pool,
+            "SELECT COUNT(*) FROM greengateway.connection_records"
+        )
+        .await,
+        2
+    );
+    store
+        .create(delegated_candidate("exchange-secret"), "op-1", None)
+        .await
+        .expect("delegated Connections may share a client secret");
+    let mut renamed = delegated.write.clone();
+    renamed.display_name = "Mailbox".to_owned();
+    store
+        .replace(&delegated.id, &delegated.etag(), renamed, "op-1")
+        .await
+        .expect("a delegated Connection replaces itself");
+}
+
+/// Two replicas each saving one half of a conflict at once: the check runs
+/// under the lock every mutation takes, so exactly one of them commits.
+#[tokio::test]
+async fn concurrent_writes_cannot_both_bind_one_alias_under_two_purposes() {
+    let Some(admin_dsn) = locator() else {
+        eprintln!("skipping: no test database locator; CI runs this test");
+        return;
+    };
+    let database = create_test_database(&admin_dsn).await;
+    let (store_a, pool) = migrated_store(&database.dsn, 64).await;
+    let (store_b, _pool_b) = migrated_store(&database.dsn, 64).await;
+
+    let (a, b) = tokio::join!(
+        store_a.create(delegated_candidate("contested-secret"), "replica-a", None),
+        store_b.create(bearer_candidate("contested-secret"), "replica-b", None)
+    );
+    let winners = usize::from(a.is_ok()) + usize::from(b.is_ok());
+    assert_eq!(winners, 1, "exactly one purpose wins the alias");
+    assert!(
+        is_secret_purpose_conflict(&a, "authentication.client_secret_id")
+            || is_secret_purpose_conflict(&b, "authentication.secret_id"),
+        "{a:?} {b:?}"
+    );
+    assert_eq!(
+        count(
+            &pool,
+            "SELECT COUNT(*) FROM greengateway.connection_records"
+        )
+        .await,
+        1
+    );
+}

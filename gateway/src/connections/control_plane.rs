@@ -1049,11 +1049,19 @@ impl ConnectionControlPlane {
                 client_secret_id: Some(secret_id),
                 ..
             } => bindings.push(("oauth_client_secret", secret_id)),
+            ConnectionAuthentication::DelegatedIssuerToken {
+                client_secret_id: Some(secret_id),
+                ..
+            } => bindings.push(("token_exchange_client_secret", secret_id)),
             ConnectionAuthentication::HeaderApiKey {
                 secret_id: None, ..
             }
             | ConnectionAuthentication::StaticBearer { secret_id: None }
             | ConnectionAuthentication::OAuth2ClientCredentials {
+                client_secret_id: None,
+                ..
+            }
+            | ConnectionAuthentication::DelegatedIssuerToken {
                 client_secret_id: None,
                 ..
             } => return None,
@@ -1804,10 +1812,19 @@ impl ConnectionControlPlane {
                 secret_id.clone(),
                 SecretPurpose::OAuthClientSecret,
             )),
+            ConnectionAuthentication::DelegatedIssuerToken {
+                client_secret_id: Some(secret_id),
+                ..
+            } => Some((
+                "authentication.client_secret_id",
+                secret_id.clone(),
+                SecretPurpose::TokenExchangeClientSecret,
+            )),
             ConnectionAuthentication::None
             | ConnectionAuthentication::HeaderApiKey { .. }
             | ConnectionAuthentication::StaticBearer { .. }
-            | ConnectionAuthentication::OAuth2ClientCredentials { .. } => None,
+            | ConnectionAuthentication::OAuth2ClientCredentials { .. }
+            | ConnectionAuthentication::DelegatedIssuerToken { .. } => None,
         };
         if let Some((field, secret_id, purpose)) = deferred_auth {
             if resolver.is_deferred_alias(&secret_id) {
@@ -2614,9 +2631,20 @@ impl ConnectionSecretResolver {
                     SecretPurpose::OAuthClientSecret,
                 )?;
             }
+            ConnectionAuthentication::DelegatedIssuerToken {
+                client_secret_id: Some(secret_id),
+                ..
+            } if !self.is_deferred_alias(secret_id) => {
+                self.resolve_required(
+                    "authentication.client_secret_id",
+                    secret_id,
+                    SecretPurpose::TokenExchangeClientSecret,
+                )?;
+            }
             ConnectionAuthentication::HeaderApiKey { .. }
             | ConnectionAuthentication::StaticBearer { .. }
-            | ConnectionAuthentication::OAuth2ClientCredentials { .. } => {}
+            | ConnectionAuthentication::OAuth2ClientCredentials { .. }
+            | ConnectionAuthentication::DelegatedIssuerToken { .. } => {}
         }
 
         for header in &candidate.additional_headers {
@@ -2727,6 +2755,10 @@ impl ConnectionSecretResolver {
                 client_secret_id: Some(secret_id),
                 ..
             } if secret_id == rotated_id => Some(SecretPurpose::OAuthClientSecret),
+            ConnectionAuthentication::DelegatedIssuerToken {
+                client_secret_id: Some(secret_id),
+                ..
+            } if secret_id == rotated_id => Some(SecretPurpose::TokenExchangeClientSecret),
             _ => None,
         };
         if authentication_purpose.is_some_and(|purpose| replacement.purpose() != purpose) {

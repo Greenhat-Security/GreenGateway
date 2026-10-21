@@ -33,4 +33,5 @@ pub mod store;
 pub mod test;
 #[cfg(test)]
 pub(crate) mod test_support;
+pub mod token_exchange;
 pub mod vault_secret;

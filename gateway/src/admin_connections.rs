@@ -1909,6 +1909,13 @@ pub(super) fn retain_hidden_connection_bindings(
                 ..
             },
             "oauth2_client_credentials",
+        )
+        | (
+            connections::model::ConnectionAuthentication::DelegatedIssuerToken {
+                client_secret_id,
+                ..
+            },
+            "delegated_issuer_token",
         ) => retain_hidden_binding(
             authentication,
             "client_secret_id",
@@ -2119,6 +2126,10 @@ pub(super) fn connection_secret_dependency_counts(
                 secret_id.as_deref()
             }
             connections::model::ConnectionAuthentication::OAuth2ClientCredentials {
+                client_secret_id,
+                ..
+            }
+            | connections::model::ConnectionAuthentication::DelegatedIssuerToken {
                 client_secret_id,
                 ..
             } => client_secret_id.as_deref(),
@@ -2455,6 +2466,19 @@ pub(super) fn connection_store_error_response(
                 problems: vec![ConnectionValidationProblem {
                     field: "connection",
                     code: "invalid",
+                }],
+            }),
+        )
+            .into_response(),
+        // The candidate's field and a fixed code. Which other Connection, or
+        // which alias, is not said: the field is enough to fix the write.
+        connections::store::ConnectionStoreError::SecretPurposeConflict { field } => (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(ConnectionValidationResponse {
+                error: "connection validation failed",
+                problems: vec![ConnectionValidationProblem {
+                    field,
+                    code: connections::model::SECRET_PURPOSE_CONFLICT_CODE,
                 }],
             }),
         )

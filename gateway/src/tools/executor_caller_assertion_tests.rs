@@ -1050,3 +1050,6 @@ async fn a_verifier_holding_both_published_keys_accepts_either_signing_key() {
         2
     );
 }
+
+#[path = "executor_delegated_token_tests.rs"]
+mod delegated_token_tests;

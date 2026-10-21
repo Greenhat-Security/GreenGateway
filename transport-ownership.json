@@ -8252,6 +8252,16 @@
       "reasons": [
         "network-or-process-reference"
       ],
+      "scope": "gateway::connections::pg_store::ensure_token_exchange_secret_exclusive_in#1",
+      "sha256": "fc46dec9870956bd64d93486c737ed39db5e63980d219f3b7206a7e34a7a62e5",
+      "owner": "GreenGateway maintainers",
+      "purpose": "PostgreSQL repository operations through the shared infrastructure pool; no caller-selected HTTP authority."
+    },
+    {
+      "file": "gateway/src/connections/pg_store.rs",
+      "reasons": [
+        "network-or-process-reference"
+      ],
       "scope": "gateway::connections::pg_store::append_version#1",
       "sha256": "76b79cae6ef9403e3731efcbbbe8a430b80d3e700f15b4c16b3bb0d5f3c584d9",
       "owner": "GreenGateway maintainers",
@@ -10470,7 +10480,7 @@
         "unexpanded-macro"
       ],
       "scope": "gateway::proxy::forward::forward_to_upstream#1",
-      "sha256": "b5130d2a45182a6d96511b92f4100f0c2b2feae883c3d8ccd0d555f01f808d91",
+      "sha256": "c3ec5d82cb334397c056576b7cf2d24cab1cdc28c650af2bb5f303129f8efa6f",
       "owner": "GreenGateway maintainers",
       "purpose": "Reviewed exact GreenPM research byte budgets, bounded single-export buffering, retained admission lifetime and replica agreement; no additional transport authority."
     },
@@ -13067,7 +13077,7 @@
         "network-or-process-reference"
       ],
       "scope": "gateway::tools::mcp_upstream::probe_connection_protocol_before#1",
-      "sha256": "193b2ce88844a957334c9aa496cb7f4d03afaca030c583f54232d359baa1c640",
+      "sha256": "1f48a6d3caeb49c4734194297952089e280def173295b3246582fcd10ad8ccd0",
       "owner": "GreenGateway maintainers",
       "purpose": "Bounded managed MCP protocol probe: validate connection etag, checked destination and prepared transport before acquiring the concrete client; use it only in the deadline-controlled limited probe with credential and cleanup checks."
     },
@@ -13128,7 +13138,7 @@
         "network-or-process-reference"
       ],
       "scope": "gateway::tools::mcp_upstream::call_connection_tool_at_target#1",
-      "sha256": "0552e8bae16809e409a91b0e498f43192431cd09904e93e562bb19539fee8d33",
+      "sha256": "d912b8ff2a497132c047ac3281455fee837fb73d1900994f8e982684846ea83f",
       "owner": "GreenGateway maintainers",
       "purpose": "MCP protocol adaptation over checked destinations; preserve session, URL, body and deadline checks."
     },

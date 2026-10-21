@@ -246,10 +246,12 @@ recovery method.
 
 ## Authentication Profiles
 
-Connections support `none`, a header API key, a static bearer token, and OAuth
-2.0 client credentials. Every enabled secret-backed primary or additional
-binding requires a compatible configured alias. Authentication and TLS material
-require HTTPS.
+Connections support `none`, a header API key, a static bearer token, OAuth
+2.0 client credentials, and a delegated issuer token, which calls the upstream
+as each caller with that caller's own token (see
+[Delegated issuer tokens](#delegated-issuer-tokens)). Every enabled
+secret-backed primary or additional binding requires a compatible configured
+alias. Authentication and TLS material require HTTPS.
 
 For header API keys, choose a dedicated upstream header. GreenGateway rejects
 headers that it or HTTP owns, including `Authorization`, `Cookie`, `Host`,
@@ -349,8 +351,9 @@ single-flight operation. An upstream `401` invalidates only the token
 generation used by that request and does not replay the rejected operation.
 
 Authorization-code, PKCE, device-code, resource-owner-password, refresh-token,
-implicit, token-exchange, and JWT assertion flows are not Connection
-authentication modes. `client_secret_post`, `private_key_jwt`, and automatic
+implicit, and JWT assertion flows are not Connection authentication modes, and
+token exchange is offered only as a per-caller
+[delegated issuer token](#delegated-issuer-tokens). `client_secret_post`, `private_key_jwt`, and automatic
 issuer/token-endpoint discovery are also unsupported. Do not emulate them with
 custom request headers or a tool argument; retain the legacy integration or
 place a purpose-built token broker behind an independently secured Connection.
@@ -825,6 +828,251 @@ Before upgrading, check every enabled Connection that carries the block:
 Managed OpenAPI tools, composite tools, proxied requests, managed MCP, discovery,
 enum and label sources and stored tests on such a Connection stay refused, as
 before.
+
+### Delegated issuer tokens
+
+A Connection with `delegated_issuer_token` authentication calls its upstream
+as the calling user, with that user's own token, instead of as one service
+identity shared by every caller. It is for per-user systems -- a mailbox, a
+calendar, a document store, a chat workspace -- where a shared credential
+would let every caller read one account.
+
+The gateway never holds anybody's provider grant. A trusted issuer does: an
+identity provider or token broker that stores each user's grant for the
+upstream (Auth0, Keycloak, Entra or a small purpose-built service) and
+answers OAuth 2.0 token exchange ([RFC 8693](https://www.rfc-editor.org/rfc/rfc8693)).
+For each caller the gateway asks it for that caller's access token, caches the
+answer for that caller only, and sends it upstream as
+`Authorization: Bearer`.
+
+```json
+"authentication": {
+  "type": "delegated_issuer_token",
+  "token_exchange_url": "https://issuer.example/oauth2/token-exchange",
+  "client_id": "greengateway",
+  "client_secret_id": "issuer-exchange-secret",
+  "requested_scopes": ["https://www.googleapis.com/auth/gmail.readonly"],
+  "audience": "https://gmail.googleapis.com",
+  "subject_token_source": "caller_assertion"
+},
+"caller_assertion": {
+  "signing_key_id": "gateway-assertion-key",
+  "kid": "gw-2026-10",
+  "algorithm": "es256",
+  "issuer": "https://gateway.example",
+  "audience": "https://issuer.example",
+  "token_type": "caller-assertion+jwt",
+  "header_name": "x-caller-assertion",
+  "lifetime_seconds": 60
+}
+```
+
+#### What the issuer receives
+
+On a cache miss the gateway POSTs a form to `token_exchange_url`,
+authenticated with `client_secret_basic` (`client_id` and the secret behind
+`client_secret_id`):
+
+| Field | Value |
+| --- | --- |
+| `grant_type` | `urn:ietf:params:oauth:grant-type:token-exchange` |
+| `subject_token` | A caller assertion naming the caller (below). |
+| `subject_token_type` | `urn:ietf:params:oauth:token-type:jwt` |
+| `requested_token_type` | `urn:ietf:params:oauth:token-type:access_token` |
+| `scope` | `requested_scopes`, space-separated, when configured. |
+| `audience`, `resource` | As configured, when configured. |
+
+`subject_token_source` has one value, `caller_assertion`: the subject token is
+a JWT the gateway signs with the Connection's `caller_assertion` key, built
+exactly as a [signed caller assertion](#signed-caller-assertions) is -- `iss`,
+`aud` and `typ` from the block, `sub` as the provider issuer, `#` and the
+provider subject, `caller_iss` and `caller_sub` beside it, and the configured
+`email` and `roles` claims -- with a fresh `jti` and no request binding,
+because the token it buys serves many requests. The issuer verifies it against
+`/.well-known/caller-assertion-jwks.json`, pins `iss`, `aud` and `typ`, and
+looks up the stored grant for `caller_iss` and `caller_sub`. Set the block's
+`audience` to the value the issuer expects, never to an upstream's.
+
+The caller's own inbound bearer token is never forwarded to the issuer.
+Exchanging it would mean the gateway retaining a credential the caller gave to
+the gateway alone; that is a separate decision with its own security review.
+
+On a delegated Connection the assertion goes to the issuer only. It is not sent
+upstream, and its `header_name` is only cleared from anything a caller sends.
+The block is otherwise required and checked as usual: a write without one is
+refused with `caller_assertion` and `required`, and one with
+`bind_request: true` with `caller_assertion.bind_request` and
+`unsupported_binding`. The Connection must be `http_api`.
+
+The issuer must answer `200` with JSON carrying `access_token`,
+`issued_token_type` `urn:ietf:params:oauth:token-type:access_token`,
+`token_type` `Bearer` and a positive `expires_in` of at most seven days.
+RFC 8693 only recommends `expires_in`; the gateway requires it, because a
+token with no stated lifetime could only be cached on a guess. Other fields,
+a `refresh_token` included, are skipped unread and never kept.
+
+#### Endpoint, secrets and egress
+
+- `token_exchange_url` must be `https://`, without userinfo, query or
+  fragment; anything else is refused on write with
+  `authentication.token_exchange_url` and `invalid_token_url` (or
+  `invalid_authority`).
+- Its host must be in the egress allowlist. Every exchange checks it before
+  the signing key or the client secret is read, and a refused host fails the
+  call with `delegated_token_egress_denied`. Redirects are not followed.
+- `client_secret_id` is resolved with the `token_exchange_client_secret`
+  purpose. As with a signing key, the encrypted local store cannot hold one:
+  provision it through an operator alias or an external secret provider. A
+  disabled draft may leave it unset.
+- The purpose sets the secret's size and encoding rules only. Operator and
+  external-provider aliases are not tied to a purpose: one alias resolves
+  under any. So the gateway keeps this secret apart itself. A save is refused
+  with `422`, the candidate's field and `secret_purpose_conflict` when it would
+  bind a token-exchange client secret's alias under any other field -- an
+  OAuth client secret, a static bearer or API key, an additional header, TLS
+  material or a caller-assertion key -- on the same Connection or any other,
+  enabled or not; and when it would bind such a field to an alias any
+  Connection exchanges with. Two delegated Connections may share one client
+  secret. The check runs inside the store's write transaction, under the lock
+  every mutation takes, so in cluster mode two replicas cannot each pass it.
+  Still give the token-exchange client secret an alias of its own: a provider
+  object behind two aliases is two aliases to the gateway.
+
+#### Which calls are served
+
+Only manual HTTP tool calls, whether from `/mcp` or the admin playground: they
+are the one lane that has a validated principal to exchange a token for. Every
+other lane -- managed OpenAPI and composite tools, proxied requests, managed MCP,
+discovery, enum and label sources and stored Connection tests -- is refused with
+`caller_assertion_not_enforced`, as on any Connection carrying a
+`caller_assertion` block. There is no service-principal fallback: a call
+with no principal, or a service token's, is refused with
+`delegated_token_no_principal` before anything is read or sent.
+
+#### The cache
+
+- Tokens are cached in memory per Connection revision, per caller (a digest of
+  the caller's issuer, subject, email and roles) and per egress policy. Two
+  callers never share a token, and a caller whose attested claims changed is
+  exchanged for again.
+- A token is refreshed shortly before the issuer's `expires_in` -- a fifth of
+  its lifetime, at most thirty seconds early, plus up to five seconds of jitter
+  -- and is never reused for longer than 900 seconds whatever `expires_in`
+  says, which bounds how long a grant the issuer revokes keeps working here.
+- Concurrent calls of one caller share one exchange, and an exchange a
+  cancelled call started still completes for the others.
+- At most 1,024 callers' tokens are held across every delegated Connection. A
+  full cache evicts an idle entry, which costs that caller one more exchange,
+  and refuses a call with `delegated_token_unavailable` only while every entry
+  is held by a call in flight.
+- A save that changes the stored Connection, or an egress policy change,
+  moves the cache key: the first call afterwards exchanges again and drops
+  every idle token held for the Connection's earlier configuration. A save
+  that changes nothing is a no-op: the stored document, its ETag and every
+  cached token stay as they were.
+- Rotating the client secret does not. The gateway cannot see a rotation
+  behind an operator alias or an external provider, so tokens already cached
+  keep being served until they are refreshed, for at most 900 seconds; the
+  next exchange simply uses the new secret. Rotating the secret does not
+  revoke the tokens the issuer already handed out, either. After an incident,
+  disable the Connection: that changes the stored document, so each replica
+  refuses its calls and stops using its cached tokens once it has applied the
+  change. Then revoke the grant at the issuer, rotate the client secret, and
+  re-enable the Connection.
+- An upstream `401` drops the token that request used, so the caller's next
+  call exchanges again. The rejected call is not replayed.
+- Nothing is persisted. A restart starts with an empty cache.
+
+#### Failure reasons
+
+Each refusal is a fixed string in the `failure_reason` of
+`tool.invoke_failure` and the `reason` of `tool.upstream_request`, and no
+upstream request is made:
+
+| Reason | Meaning |
+| --- | --- |
+| `delegated_token_no_principal` | The call names nobody: anonymous, or a service token. |
+| `delegated_token_egress_denied` | The egress policy refuses `token_exchange_url`. |
+| `delegated_token_denied` | The issuer refused this caller: `invalid_grant` or `access_denied` on a `4xx`, or any `403`. Usually the user has not connected the upstream at the issuer, or the grant was revoked; reconnecting there fixes it. |
+| `delegated_token_exchange_failed` | No usable token came back for a reason no caller can fix: the issuer was unreachable or failed, rejected the gateway's client authentication (`invalid_client`) or request, or answered with something other than a bounded bearer access token. |
+| `delegated_token_unavailable` | Every cache entry is held by a call in flight. |
+| `credential_invalid`, `credential_unavailable` | The client secret or the signing key could not be resolved or loaded. Also raises `connection.secret_resolution_failed`. |
+
+A failed exchange is not cached: the caller's next call asks the issuer again.
+
+#### Audit and metrics
+
+Every exchange emits `connection.delegated_token_exchange` with the caller as
+its `actor`:
+
+```json
+{
+  "connection_id": "mail",
+  "auth_type": "delegated_issuer_token",
+  "outcome": "failure",
+  "reason": "delegated_token_denied",
+  "subject_token": { "kid": "gw-2026-10", "jti": "3a1f0c9e-..." },
+  "issuer_status": 400,
+  "issuer_error": "invalid_grant",
+  "latency_ms": 41
+}
+```
+
+`issuer_error` is recorded only when it is one of the error codes RFC 6749 and
+RFC 8693 register, and as `unregistered` otherwise, so an issuer's own text
+never reaches the audit trail. Search the issuer's log for the
+`subject_token.jti` to find its side of an exchange. A tool call served from
+the cache emits no exchange event; its `tool.upstream_request` carries the
+caller as `actor` as usual. `connection_delegated_token_exchange_total`, labelled
+by `result` and `reason`, counts exchanges.
+
+No token -- the subject token, the issued access token, a refresh token, the
+client secret or anything the issuer said in an error body -- reaches a caller
+error, a log line, a metric or an audit event.
+
+#### Trust boundary
+
+Phase 8 moves per-user systems behind the gateway; this credential is where
+the trust sits:
+
+- **The issuer's grant store is the most sensitive component in the
+  deployment.** Whoever holds this Connection's client secret can ask the
+  issuer for any user's upstream token, so one leaked secret unlocks every
+  stored grant. Keep the secret in an external provider, restrict the issuer
+  to this client's subject tokens and audience, have it store grants
+  encrypted, grant read-only scopes wherever the upstream allows it, and
+  have it log every hand-out.
+- **The issuer must verify the subject token.** It is the only proof of who
+  the caller is. Pin the gateway's `iss`, the `aud` and `typ` the block
+  configures, and the JWKS URL; never accept an unsigned subject or one the
+  gateway did not sign. Every Connection's assertions verify against the same
+  JWKS, so give the delegated Connection's block an `aud` (or `typ`) that
+  no other attested Connection uses: otherwise an assertion sent to that
+  Connection's upstream is also a subject token the issuer accepts, and only
+  the client secret stands between that upstream and the caller's grant.
+- **The gateway keeps tokens only in the bounded cache above**, never on disk,
+  and for at most 900 seconds.
+- **Revocation on user disable is not automatic yet.** A disabled user cannot
+  call the gateway once their sign-in no longer validates, and a token the
+  issuer revokes stops being used here within the cache lifetime. Purging a
+  user's cached tokens the moment they are disabled, and audited revocation
+  at the issuer, are follow-ups. Until then, revoke the grant at the issuer and,
+  for an immediate stop, disable the Connection (or make any other real change
+  to it): that moves its cache key, so no token cached before it is served.
+  Saving it unchanged is a no-op and keeps them. In cluster mode each replica
+  holds its own cache and stops using the old tokens only once it has applied
+  the change, at its next reconcile; until then it keeps serving them.
+- Policy is unchanged: tool policy and `rules[]` apply per principal before any
+  exchange, so read-only deny rules and per-tool roles limit what a caller can
+  do with their own token.
+
+#### In the admin UI
+
+The Connection detail page shows this credential read only -- every field but
+the client secret's alias, which appears only as configured or not -- and the
+caller assertion as its subject token. The editor does not open such a
+Connection, because saving through a form that cannot represent the credential
+would replace it; create and change it through the admin API.
 
 ## TLS, Custom CAs, and Mutual TLS
 

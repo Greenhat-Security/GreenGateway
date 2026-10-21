@@ -601,12 +601,18 @@ async fn forward_to_upstream(
                 }
                 Ok(Ok(prepared)) => prepared,
             };
+            // No caller is named: a proxied request is never served by a
+            // credential that belongs to the caller. `target()` refuses such a
+            // Connection with `caller_assertion_not_enforced` before this, and
+            // were that lifted, resolution would still refuse with
+            // `delegated_token_no_principal` rather than exchange for nobody.
+            let resolution = runtime.resolve_credential_before(target, None, deadline);
             let credential = tokio::select! {
                 biased;
                 () = forced_shutdown.cancelled() => {
                     return admission_unavailable_response(&upstream.pool.id, request_id);
                 }
-                credential = runtime.resolve_credential_before(target, deadline) => credential,
+                credential = resolution => credential,
             };
             let credential = match credential {
                 Err(error) => {
@@ -1920,6 +1926,7 @@ fn connection_failure_response(
         | ConnectionHttpError::CredentialUnavailable
         | ConnectionHttpError::TlsUnavailable
         | ConnectionHttpError::OAuthTokenUnavailable
+        | ConnectionHttpError::DelegatedTokenUnavailable
         | ConnectionHttpError::TransportUnavailable => StatusCode::SERVICE_UNAVAILABLE,
         ConnectionHttpError::InvalidConnectionId
         | ConnectionHttpError::ConnectionNotFound
@@ -1933,6 +1940,10 @@ fn connection_failure_response(
         | ConnectionHttpError::OAuthTokenEgressDenied
         | ConnectionHttpError::OAuthTokenRejected
         | ConnectionHttpError::OAuthTokenInvalidResponse
+        | ConnectionHttpError::DelegatedTokenNoPrincipal
+        | ConnectionHttpError::DelegatedTokenEgressDenied
+        | ConnectionHttpError::DelegatedTokenDenied
+        | ConnectionHttpError::DelegatedTokenExchangeFailed
         | ConnectionHttpError::UpstreamAuthenticationRejected => StatusCode::BAD_GATEWAY,
     };
     let code = if status == StatusCode::SERVICE_UNAVAILABLE {

@@ -24,7 +24,8 @@ use super::{
     model::{
         normalize_origin_relative_path, CallerAssertionSettings, ConnectionAuthentication,
         ConnectionId, ConnectionKind, ConnectionTestProfile, ConnectionTimeouts, DiscoveryConfig,
-        OAuthClientAuthMethod, TlsProfile, MAX_CONNECTIONS, MAX_EXPECTED_STATUSES, MAX_URL_BYTES,
+        OAuthClientAuthMethod, SubjectTokenSource, TlsProfile, MAX_CONNECTIONS,
+        MAX_EXPECTED_STATUSES, MAX_URL_BYTES,
     },
     oauth::{
         OAuthBinding, OAuthClientCredentialsRuntime, OAuthError, OAuthTokenLease,
@@ -33,6 +34,10 @@ use super::{
     secret::{ResolvedSecret, SecretPurpose, SecretResolveError, SecretResolveErrorKind},
     status::ConnectionRevisions,
     store::{ConnectionDependencyKind, StoredConnection},
+    token_exchange::{
+        DelegatedTokenBinding, DelegatedTokenError, DelegatedTokenLease, DelegatedTokenRuntime,
+        SubjectTokenSettings,
+    },
 };
 
 #[derive(Clone)]
@@ -42,6 +47,7 @@ pub struct ConnectionHttpRuntime {
     base_egress_client: Arc<EgressClient>,
     clients: Arc<Mutex<HashMap<ConnectionClientCacheKey, Arc<EgressClient>>>>,
     oauth: OAuthClientCredentialsRuntime,
+    delegated: DelegatedTokenRuntime,
     #[cfg(test)]
     additional_resolution_delay: Option<std::time::Duration>,
 }
@@ -51,6 +57,10 @@ impl fmt::Debug for ConnectionHttpRuntime {
         formatter
             .debug_struct("ConnectionHttpRuntime")
             .field("cached_client_count", &self.client_guard().len())
+            .field(
+                "delegated_token_cache_entries",
+                &self.delegated.cache_entry_count(),
+            )
             .finish_non_exhaustive()
     }
 }
@@ -90,6 +100,13 @@ struct CallerAssertionBinding {
     lifetime_seconds: u64,
     claims: Vec<PrincipalClaim>,
     bind_request: bool,
+    /// Whether the assertion goes upstream as `header_name`. A
+    /// `delegated_issuer_token` Connection sends it only to its issuer, as the
+    /// subject token: the upstream there is a third party that receives the
+    /// caller's own token and has no use for a statement it could replay at
+    /// the issuer. Admission still applies, because the issuer verifies the
+    /// subject token against the same published keys.
+    signs_upstream: bool,
     /// The configuration this binding was read from. Admission judges the
     /// Connection against this snapshot rather than reading the live one
     /// again, so the verdict and the key the call signs with always describe
@@ -114,6 +131,7 @@ impl CallerAssertionBinding {
             lifetime_seconds: u64::from(settings.lifetime_seconds),
             claims: settings.claims.iter().copied().map(Into::into).collect(),
             bind_request: settings.bind_request,
+            signs_upstream: true,
             configuration,
         })
     }
@@ -269,7 +287,8 @@ impl ConnectionHttpTarget {
                 credential_header_names.push(header_name.clone());
             }
             HttpAuthenticationBinding::StaticBearer { .. }
-            | HttpAuthenticationBinding::OAuth2ClientCredentials(_) => {
+            | HttpAuthenticationBinding::OAuth2ClientCredentials(_)
+            | HttpAuthenticationBinding::DelegatedIssuerToken(_) => {
                 credential_header_names.push(header::AUTHORIZATION);
             }
         }
@@ -330,6 +349,7 @@ enum HttpAuthenticationBinding {
         secret_id: String,
     },
     OAuth2ClientCredentials(OAuthBinding),
+    DelegatedIssuerToken(DelegatedTokenBinding),
 }
 
 pub struct ResolvedConnectionCredential {
@@ -351,6 +371,8 @@ enum ResolvedCredentialMaterial {
         secret: ResolvedSecret,
     },
     OAuthBearer(OAuthTokenLease),
+    /// The caller's own token, from the Connection's token-exchange issuer.
+    DelegatedBearer(DelegatedTokenLease),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -375,6 +397,19 @@ pub enum ConnectionHttpError {
     OAuthTokenUnavailable,
     OAuthTokenRejected,
     OAuthTokenInvalidResponse,
+    /// A `delegated_issuer_token` Connection was asked for a call that names
+    /// nobody: no principal, or a service token. There is no shared identity
+    /// to fall back to.
+    DelegatedTokenNoPrincipal,
+    /// The egress policy refuses the token-exchange endpoint.
+    DelegatedTokenEgressDenied,
+    /// The issuer refused this caller: no grant for the upstream, or a
+    /// revoked one.
+    DelegatedTokenDenied,
+    /// The exchange produced no usable token for a reason no caller can fix.
+    DelegatedTokenExchangeFailed,
+    /// Every cached delegated token is held by a call in flight.
+    DelegatedTokenUnavailable,
     UpstreamAuthenticationRejected,
     TransportUnavailable,
 }
@@ -407,20 +442,41 @@ impl ConnectionHttpRuntime {
         base_egress_client: Arc<EgressClient>,
     ) -> Self {
         let oauth = OAuthClientCredentialsRuntime::new(control_plane.clone());
+        let delegated = DelegatedTokenRuntime::new(control_plane.clone());
         Self {
             control_plane,
             base_egress_config,
             base_egress_client,
             clients: Arc::new(Mutex::new(HashMap::new())),
             oauth,
+            delegated,
             #[cfg(test)]
             additional_resolution_delay: None,
         }
     }
 
     pub fn with_audit(mut self, audit: crate::audit::AuditLog) -> Self {
-        self.oauth = self.oauth.with_audit(audit);
+        self.oauth = self.oauth.with_audit(audit.clone());
+        self.delegated = self.delegated.with_audit(audit);
         self
+    }
+
+    /// Replaces the delegated-token cache with one of `capacity` entries
+    /// driven by `clock`, so a test can expire and evict tokens on purpose.
+    #[cfg(test)]
+    pub(crate) fn with_delegated_token_cache_for_test(
+        mut self,
+        clock: Arc<super::token_exchange::ManualTokenClock>,
+        capacity: usize,
+    ) -> Self {
+        self.delegated = self.delegated.with_cache_for_test(clock, capacity);
+        self
+    }
+
+    /// How many callers' delegated tokens are cached now.
+    #[cfg(test)]
+    pub(crate) fn delegated_token_cache_entries(&self) -> usize {
+        self.delegated.cache_entry_count()
     }
 
     #[cfg(test)]
@@ -514,6 +570,15 @@ impl ConnectionHttpRuntime {
         let authentication = self.authentication_binding(record)?;
         let additional_headers = additional_header_bindings(record)?;
 
+        // A delegated Connection's assertion is its subject token, which goes
+        // to the issuer alone; see `CallerAssertionBinding::signs_upstream`.
+        let caller_assertion = caller_assertion.map(|mut binding| {
+            binding.signs_upstream = !matches!(
+                authentication,
+                HttpAuthenticationBinding::DelegatedIssuerToken(_)
+            );
+            binding
+        });
         let mut target = ConnectionHttpTarget::assemble(
             connection_id,
             record.etag().to_string(),
@@ -598,7 +663,9 @@ impl ConnectionHttpRuntime {
     }
 
     /// Reads and loads the key `target` signs its caller assertion with, or
-    /// `None` for a target that attests nobody.
+    /// `None` for a target that sends no assertion upstream: one that attests
+    /// nobody, or a `delegated_issuer_token` target, whose assertion is signed
+    /// as the subject token of its exchange instead.
     ///
     /// The key is read through the same resolver and loaded by the same
     /// loader that admit it on a save and publish it in the JWKS, on every
@@ -607,7 +674,11 @@ impl ConnectionHttpRuntime {
         &self,
         target: &'target ConnectionHttpTarget,
     ) -> Result<Option<CallerAssertionSigner<'target>>, CallerAssertionError> {
-        let Some(binding) = target.caller_assertion.as_ref() else {
+        let Some(binding) = target
+            .caller_assertion
+            .as_ref()
+            .filter(|binding| binding.signs_upstream)
+        else {
             return Ok(None);
         };
         let material = self
@@ -850,14 +921,22 @@ impl ConnectionHttpRuntime {
     /// owns no header at all. Every secret is read on every call; a failure
     /// anywhere fails the whole request, so a request never leaves with a
     /// partial set of the Connection's headers.
+    ///
+    /// `caller` is who the call is made for, as the lane that admitted it
+    /// attested them (see [`AttestedCaller::from_principal`]); a lane with no
+    /// caller to name passes `None`. A credential that belongs to the caller
+    /// rather than to the Connection -- `delegated_issuer_token` -- is refused
+    /// with [`ConnectionHttpError::DelegatedTokenNoPrincipal`] without one,
+    /// before any secret is read or any byte is sent.
     pub async fn resolve_credential(
         &self,
         target: &ConnectionHttpTarget,
+        caller: Option<&AttestedCaller>,
     ) -> Result<Option<ResolvedConnectionCredential>, ConnectionHttpError> {
         if target.credential_header_names.is_empty() {
             return Ok(None);
         }
-        let material = self.resolve_primary_credential(target).await?;
+        let material = self.resolve_primary_credential(target, caller).await?;
         let additional_headers = self.resolve_additional_headers(target).await?;
 
         Ok(Some(ResolvedConnectionCredential {
@@ -870,18 +949,21 @@ impl ConnectionHttpRuntime {
     /// deadline without losing which phase exhausted it. OAuth minting owns
     /// the primary phase; once that completes, every additional header is a
     /// static credential-provider read and therefore reports the ordinary
-    /// credential-unavailable category on timeout.
+    /// credential-unavailable category on timeout. `caller` is as for
+    /// [`Self::resolve_credential`].
     pub async fn resolve_credential_before(
         &self,
         target: &ConnectionHttpTarget,
+        caller: Option<&AttestedCaller>,
         deadline: tokio::time::Instant,
     ) -> Result<Option<ResolvedConnectionCredential>, ConnectionHttpError> {
         if target.credential_header_names.is_empty() {
             return Ok(None);
         }
-        let material = tokio::time::timeout_at(deadline, self.resolve_primary_credential(target))
-            .await
-            .map_err(|_| target.primary_credential_timeout_error())??;
+        let material =
+            tokio::time::timeout_at(deadline, self.resolve_primary_credential(target, caller))
+                .await
+                .map_err(|_| target.primary_credential_timeout_error())??;
         let additional_headers =
             tokio::time::timeout_at(deadline, self.resolve_additional_headers(target))
                 .await
@@ -896,6 +978,7 @@ impl ConnectionHttpRuntime {
     async fn resolve_primary_credential(
         &self,
         target: &ConnectionHttpTarget,
+        caller: Option<&AttestedCaller>,
     ) -> Result<Option<ResolvedCredentialMaterial>, ConnectionHttpError> {
         let material = match &target.authentication {
             HttpAuthenticationBinding::None => None,
@@ -922,6 +1005,15 @@ impl ConnectionHttpRuntime {
                     .await
                     .map_err(connection_oauth_error)?;
                 Some(ResolvedCredentialMaterial::OAuthBearer(token))
+            }
+            HttpAuthenticationBinding::DelegatedIssuerToken(binding) => {
+                let caller = caller.ok_or(ConnectionHttpError::DelegatedTokenNoPrincipal)?;
+                let token = self
+                    .delegated
+                    .access_token(binding, caller)
+                    .await
+                    .map_err(connection_delegated_error)?;
+                Some(ResolvedCredentialMaterial::DelegatedBearer(token))
             }
         };
         Ok(material)
@@ -1070,11 +1162,58 @@ impl ConnectionHttpRuntime {
                     token_client: self.oauth_client_for(record)?,
                 },
             )),
+            ConnectionAuthentication::DelegatedIssuerToken {
+                token_exchange_url,
+                client_id,
+                client_secret_id: Some(client_secret_id),
+                requested_scopes,
+                audience,
+                resource,
+                subject_token_source: SubjectTokenSource::CallerAssertion,
+            } => {
+                // Validation guarantees the block on every stored document;
+                // this is the check that holds if that rule were to change.
+                let assertion = record
+                    .write
+                    .caller_assertion
+                    .as_ref()
+                    .filter(|assertion| {
+                        !assertion.bind_request && record.write.caller_assertion_enforceable()
+                    })
+                    .ok_or(ConnectionHttpError::UnsupportedAuthentication)?;
+                Ok(HttpAuthenticationBinding::DelegatedIssuerToken(
+                    DelegatedTokenBinding {
+                        connection_id: record.id.clone(),
+                        connection_etag: record.etag().to_string(),
+                        client_id: client_id.clone(),
+                        client_secret_id: client_secret_id.clone(),
+                        token_exchange_url: token_exchange_url.clone(),
+                        requested_scopes: requested_scopes.clone(),
+                        audience: audience.clone(),
+                        resource: resource.clone(),
+                        subject_token: SubjectTokenSettings {
+                            signing_key_id: assertion.signing_key_id.clone(),
+                            kid: assertion.kid.clone(),
+                            algorithm: assertion.algorithm.into(),
+                            issuer: assertion.issuer.clone(),
+                            audience: assertion.audience.clone(),
+                            token_type: assertion.token_type.clone(),
+                            lifetime_seconds: u64::from(assertion.lifetime_seconds),
+                            claims: assertion.claims.iter().copied().map(Into::into).collect(),
+                        },
+                        token_client: self.oauth_client_for(record)?,
+                    },
+                ))
+            }
             ConnectionAuthentication::HeaderApiKey {
                 secret_id: None, ..
             }
             | ConnectionAuthentication::StaticBearer { secret_id: None }
             | ConnectionAuthentication::OAuth2ClientCredentials {
+                client_secret_id: None,
+                ..
+            }
+            | ConnectionAuthentication::DelegatedIssuerToken {
                 client_secret_id: None,
                 ..
             } => Err(ConnectionHttpError::UnsupportedAuthentication),
@@ -1272,6 +1411,16 @@ impl ConnectionHttpTarget {
         !self.credential_header_names.is_empty() || self.caller_assertion.is_some()
     }
 
+    /// Whether the primary credential is the caller's own rather than the
+    /// Connection's, so resolving it needs the caller named
+    /// (`delegated_issuer_token`).
+    pub fn credential_belongs_to_caller(&self) -> bool {
+        matches!(
+            self.authentication,
+            HttpAuthenticationBinding::DelegatedIssuerToken(_)
+        )
+    }
+
     /// The header the caller assertion travels in, when this target attests
     /// its caller. A lane strips it from anything a caller supplied, like the
     /// credential headers, before the gateway writes its own.
@@ -1287,17 +1436,23 @@ impl ConnectionHttpTarget {
             HttpAuthenticationBinding::HeaderApiKey { .. } => "header_api_key",
             HttpAuthenticationBinding::StaticBearer { .. } => "static_bearer",
             HttpAuthenticationBinding::OAuth2ClientCredentials(_) => "oauth2_client_credentials",
+            HttpAuthenticationBinding::DelegatedIssuerToken(_) => "delegated_issuer_token",
         }
     }
 
     fn primary_credential_timeout_error(&self) -> ConnectionHttpError {
-        if matches!(
-            self.authentication,
-            HttpAuthenticationBinding::OAuth2ClientCredentials(_)
-        ) {
-            ConnectionHttpError::OAuthTokenUnavailable
-        } else {
-            ConnectionHttpError::CredentialUnavailable
+        match self.authentication {
+            HttpAuthenticationBinding::OAuth2ClientCredentials(_) => {
+                ConnectionHttpError::OAuthTokenUnavailable
+            }
+            HttpAuthenticationBinding::DelegatedIssuerToken(_) => {
+                ConnectionHttpError::DelegatedTokenExchangeFailed
+            }
+            HttpAuthenticationBinding::None
+            | HttpAuthenticationBinding::HeaderApiKey { .. }
+            | HttpAuthenticationBinding::StaticBearer { .. } => {
+                ConnectionHttpError::CredentialUnavailable
+            }
         }
     }
 }
@@ -1324,6 +1479,9 @@ impl ResolvedConnectionCredential {
             Some(ResolvedCredentialMaterial::OAuthBearer(token)) => {
                 token.inject(headers).map_err(connection_oauth_error)?;
             }
+            Some(ResolvedCredentialMaterial::DelegatedBearer(token)) => {
+                token.inject(headers).map_err(connection_delegated_error)?;
+            }
         }
         for additional in &self.additional_headers {
             insert_sensitive_header(
@@ -1336,15 +1494,32 @@ impl ResolvedConnectionCredential {
     }
 
     pub async fn invalidate_after_unauthorized(&self) {
-        if let Some(ResolvedCredentialMaterial::OAuthBearer(token)) = &self.material {
-            token.invalidate_after_unauthorized().await;
+        match &self.material {
+            Some(ResolvedCredentialMaterial::OAuthBearer(token)) => {
+                token.invalidate_after_unauthorized().await;
+            }
+            Some(ResolvedCredentialMaterial::DelegatedBearer(token)) => {
+                token.invalidate_after_unauthorized().await;
+            }
+            Some(
+                ResolvedCredentialMaterial::HeaderApiKey { .. }
+                | ResolvedCredentialMaterial::StaticBearer { .. },
+            )
+            | None => {}
         }
     }
 
+    /// Whether the primary credential is an OAuth access token this gateway
+    /// obtained from a token endpoint and caches -- a client-credentials
+    /// token, or a caller's delegated one -- so that an upstream `401` must
+    /// drop it from the cache.
     pub fn is_oauth(&self) -> bool {
         matches!(
             self.material,
-            Some(ResolvedCredentialMaterial::OAuthBearer(_))
+            Some(
+                ResolvedCredentialMaterial::OAuthBearer(_)
+                    | ResolvedCredentialMaterial::DelegatedBearer(_)
+            )
         )
     }
 
@@ -1433,6 +1608,11 @@ impl ConnectionHttpError {
             Self::OAuthTokenUnavailable => "oauth_token_unavailable",
             Self::OAuthTokenRejected => "oauth_token_rejected",
             Self::OAuthTokenInvalidResponse => "oauth_token_invalid_response",
+            Self::DelegatedTokenNoPrincipal => DelegatedTokenError::NoPrincipal.safe_reason(),
+            Self::DelegatedTokenEgressDenied => DelegatedTokenError::EgressDenied.safe_reason(),
+            Self::DelegatedTokenDenied => DelegatedTokenError::Denied.safe_reason(),
+            Self::DelegatedTokenExchangeFailed => DelegatedTokenError::ExchangeFailed.safe_reason(),
+            Self::DelegatedTokenUnavailable => DelegatedTokenError::Unavailable.safe_reason(),
             Self::UpstreamAuthenticationRejected => "auth_failed",
             Self::TransportUnavailable => "transport_unavailable",
         }
@@ -1595,12 +1775,21 @@ fn validate_authentication(record: &StoredConnection) -> Result<(), ConnectionHt
             client_secret_id: Some(_),
             client_auth_method: OAuthClientAuthMethod::ClientSecretBasic,
             ..
+        }
+        | ConnectionAuthentication::DelegatedIssuerToken {
+            client_secret_id: Some(_),
+            subject_token_source: SubjectTokenSource::CallerAssertion,
+            ..
         } => Ok(()),
         ConnectionAuthentication::HeaderApiKey {
             secret_id: None, ..
         }
         | ConnectionAuthentication::StaticBearer { secret_id: None }
         | ConnectionAuthentication::OAuth2ClientCredentials {
+            client_secret_id: None,
+            ..
+        }
+        | ConnectionAuthentication::DelegatedIssuerToken {
             client_secret_id: None,
             ..
         } => Err(ConnectionHttpError::UnsupportedAuthentication),
@@ -1686,6 +1875,18 @@ fn connection_oauth_error(error: OAuthError) -> ConnectionHttpError {
         OAuthError::TokenUnavailable => ConnectionHttpError::OAuthTokenUnavailable,
         OAuthError::TokenRejected => ConnectionHttpError::OAuthTokenRejected,
         OAuthError::InvalidTokenResponse => ConnectionHttpError::OAuthTokenInvalidResponse,
+    }
+}
+
+fn connection_delegated_error(error: DelegatedTokenError) -> ConnectionHttpError {
+    match error {
+        DelegatedTokenError::NoPrincipal => ConnectionHttpError::DelegatedTokenNoPrincipal,
+        DelegatedTokenError::EgressDenied => ConnectionHttpError::DelegatedTokenEgressDenied,
+        DelegatedTokenError::Denied => ConnectionHttpError::DelegatedTokenDenied,
+        DelegatedTokenError::ExchangeFailed => ConnectionHttpError::DelegatedTokenExchangeFailed,
+        DelegatedTokenError::Unavailable => ConnectionHttpError::DelegatedTokenUnavailable,
+        DelegatedTokenError::CredentialInvalid => ConnectionHttpError::CredentialInvalid,
+        DelegatedTokenError::CredentialUnavailable => ConnectionHttpError::CredentialUnavailable,
     }
 }
 
@@ -2956,6 +3157,150 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_delegated_connection_serves_tool_calls_only_and_sends_no_assertion_upstream() {
+        let mut write = record("/v1").write;
+        write.caller_assertion = Some(unenforced_caller_assertion());
+        write.authentication = ConnectionAuthentication::DelegatedIssuerToken {
+            token_exchange_url: "https://token.example.test/oauth2/token-exchange".to_owned(),
+            client_id: "greengateway".to_owned(),
+            client_secret_id: Some("issuer-exchange-secret".to_owned()),
+            requested_scopes: vec!["mail.read".to_owned()],
+            audience: Some("https://billing.example.test".to_owned()),
+            resource: None,
+            subject_token_source: SubjectTokenSource::CallerAssertion,
+        };
+        let root = temporary_managed_root("delegated-tool-target");
+        fs::create_dir(&root).expect("temporary managed root should create");
+        let aliases = vec![
+            crate::connections::test_support::write_assertion_signing_key(
+                &root,
+                &crate::connections::test_support::generated_es256_pem(),
+            ),
+            crate::connections::test_support::write_secret_file(
+                &root,
+                "issuer-exchange-secret",
+                b"issuer-exchange-value",
+            ),
+        ];
+        let temporary = TemporaryManagedRuntime::build_with_root(
+            "delegated-tool-target",
+            root,
+            write,
+            aliases,
+            None,
+        )
+        .await;
+        let connection_id = temporary.connection_id.as_str();
+        let stored = temporary.stored_connection();
+        let etag = stored.etag().to_string();
+
+        let target = temporary
+            .runtime
+            .tool_call_target(connection_id, "/messages")
+            .expect("a delegated Connection serves manual tool calls");
+        assert_eq!(target.authentication_kind(), "delegated_issuer_token");
+        assert!(target.credential_belongs_to_caller());
+        assert_eq!(target.credential_header_names(), &[header::AUTHORIZATION]);
+        // The assertion header is still stripped from what a caller sent, but
+        // the gateway writes no assertion there: it goes to the issuer only.
+        assert_eq!(
+            target
+                .caller_assertion_header_name()
+                .map(HeaderName::as_str),
+            Some("x-caller-assertion")
+        );
+        assert!(temporary
+            .runtime
+            .caller_assertion_signer(&target)
+            .await
+            .expect("nothing is loaded")
+            .is_none());
+
+        // A call that names nobody is refused before anything is read or
+        // sent: the issuer host does not even resolve.
+        let alice = AttestedCaller::from_principal(&principal(crate::auth::AuthMethod::Bearer))
+            .expect("a provider-vouched principal is attestable");
+        assert_eq!(
+            temporary
+                .runtime
+                .resolve_credential(&target, None)
+                .await
+                .err(),
+            Some(ConnectionHttpError::DelegatedTokenNoPrincipal)
+        );
+        assert_eq!(
+            temporary
+                .runtime
+                .resolve_credential_before(
+                    &target,
+                    None,
+                    tokio::time::Instant::now() + Duration::from_secs(5),
+                )
+                .await
+                .err(),
+            Some(ConnectionHttpError::DelegatedTokenNoPrincipal)
+        );
+        assert_eq!(temporary.runtime.delegated_token_cache_entries(), 0);
+        assert_eq!(
+            temporary
+                .runtime
+                .admit_caller_assertion(&target, Some(&alice))
+                .await,
+            Ok(())
+        );
+
+        // Every other lane refuses it before preparing anything, because it
+        // carries the caller assertion its subject token is signed with.
+        let refused = Some(ConnectionHttpError::CallerAssertionNotEnforced);
+        assert_eq!(
+            temporary.runtime.target(connection_id, "/messages").err(),
+            refused
+        );
+        assert_eq!(
+            temporary.runtime.validate_binding(connection_id).err(),
+            refused
+        );
+        assert_eq!(
+            temporary.runtime.test_target(connection_id, &etag).err(),
+            refused
+        );
+    }
+
+    #[test]
+    fn every_delegated_refusal_has_a_distinct_fixed_reason() {
+        let reasons = [
+            ConnectionHttpError::DelegatedTokenNoPrincipal,
+            ConnectionHttpError::DelegatedTokenEgressDenied,
+            ConnectionHttpError::DelegatedTokenDenied,
+            ConnectionHttpError::DelegatedTokenExchangeFailed,
+            ConnectionHttpError::DelegatedTokenUnavailable,
+        ]
+        .map(ConnectionHttpError::safe_reason);
+        assert_eq!(
+            reasons,
+            [
+                "delegated_token_no_principal",
+                "delegated_token_egress_denied",
+                "delegated_token_denied",
+                "delegated_token_exchange_failed",
+                "delegated_token_unavailable",
+            ]
+        );
+        // None of them is a secret-resolution failure: the issuer answered,
+        // or was never asked.
+        assert!(!ConnectionHttpError::DelegatedTokenDenied.is_secret_resolution_failure());
+        // A secret the exchange cannot read is reported like any other.
+        assert_eq!(
+            connection_delegated_error(DelegatedTokenError::CredentialInvalid),
+            ConnectionHttpError::CredentialInvalid
+        );
+        assert_eq!(
+            connection_delegated_error(DelegatedTokenError::CredentialUnavailable),
+            ConnectionHttpError::CredentialUnavailable
+        );
+    }
+
+    #[tokio::test]
     async fn a_kid_another_connection_publishes_for_a_different_key_refuses_the_call() {
         let mut write = record("/v1").write;
         write.caller_assertion = Some(unenforced_caller_assertion());
@@ -3470,7 +3815,7 @@ mod tests {
             .expect("current OAuth test target should remain unchanged");
         let remint_error = match tokio::time::timeout(
             Duration::from_secs(1),
-            temporary.runtime.resolve_credential(target.target()),
+            temporary.runtime.resolve_credential(target.target(), None),
         )
         .await
         .expect("invalidated token should trigger a prompt replacement attempt")
@@ -3617,7 +3962,7 @@ mod tests {
 
         let credential = temporary
             .runtime
-            .resolve_credential(&target)
+            .resolve_credential(&target, None)
             .await
             .expect("operator-owned credential should resolve")
             .expect("API-key connection should have a credential");
@@ -3668,7 +4013,7 @@ mod tests {
 
         let credential = temporary
             .runtime
-            .resolve_credential(&target)
+            .resolve_credential(&target, None)
             .await
             .expect("all configured secrets should resolve")
             .expect("credentialed target should return material");
@@ -3691,7 +4036,7 @@ mod tests {
 
         fs::remove_file(temporary.root.join("proxy-client-secret"))
             .expect("test should remove one additional secret");
-        let error = match temporary.runtime.resolve_credential(&target).await {
+        let error = match temporary.runtime.resolve_credential(&target, None).await {
             Ok(_) => panic!("one unavailable additional secret must fail the whole resolution"),
             Err(error) => error,
         };
@@ -3709,7 +4054,7 @@ mod tests {
         fs::remove_file(temporary.root.join("api-key"))
             .expect("test should remove the provider file after activation");
 
-        let error = match temporary.runtime.resolve_credential(&target).await {
+        let error = match temporary.runtime.resolve_credential(&target, None).await {
             Ok(_) => panic!("missing provider file must fail closed"),
             Err(error) => error,
         };
@@ -3753,7 +4098,7 @@ mod tests {
 
         let first = temporary
             .runtime
-            .resolve_credential(&target)
+            .resolve_credential(&target, None)
             .await
             .expect("OAuth token should mint")
             .expect("OAuth target should return a credential");
@@ -3814,7 +4159,7 @@ mod tests {
 
         let cached = temporary
             .runtime
-            .resolve_credential(&target)
+            .resolve_credential(&target, None)
             .await
             .expect("cached OAuth token should resolve")
             .expect("cached OAuth credential should exist");
@@ -3879,6 +4224,7 @@ mod tests {
             .runtime
             .resolve_credential_before(
                 &slow_target,
+                None,
                 tokio::time::Instant::now() + Duration::from_millis(20),
             )
             .await
@@ -3923,7 +4269,7 @@ mod tests {
             .expect("mixed OAuth target should build");
         mixed
             .runtime
-            .resolve_credential(&target)
+            .resolve_credential(&target, None)
             .await
             .expect("OAuth and the additional header should resolve before the timeout test")
             .expect("the mixed target should be credentialed");
@@ -3943,6 +4289,7 @@ mod tests {
             .runtime
             .resolve_credential_before(
                 &target,
+                None,
                 tokio::time::Instant::now() + Duration::from_millis(20),
             )
             .await
@@ -3986,7 +4333,7 @@ mod tests {
             .target(temporary.connection_id.as_str(), "/charges")
             .expect("OAuth target should resolve");
         let runtime = temporary.runtime.clone();
-        let waiter = tokio::spawn(async move { runtime.resolve_credential(&target).await });
+        let waiter = tokio::spawn(async move { runtime.resolve_credential(&target, None).await });
 
         request_received
             .await
@@ -4029,7 +4376,7 @@ mod tests {
         fs::remove_file(&temporary.secret_path)
             .expect("secret should be removed after activation for ordering proof");
 
-        let error = match temporary.runtime.resolve_credential(&target).await {
+        let error = match temporary.runtime.resolve_credential(&target, None).await {
             Ok(_) => panic!("blocked token endpoint must fail closed"),
             Err(error) => error,
         };
@@ -4075,7 +4422,7 @@ mod tests {
             .target(temporary.connection_id.as_str(), "/charges")
             .expect("OAuth target should resolve");
 
-        let error = match temporary.runtime.resolve_credential(&target).await {
+        let error = match temporary.runtime.resolve_credential(&target, None).await {
             Ok(_) => panic!("rejected token response must fail closed"),
             Err(error) => error,
         };
@@ -4147,7 +4494,7 @@ mod tests {
                 .target(temporary.connection_id.as_str(), "/charges")
                 .expect("OAuth target should resolve");
 
-            let error = match temporary.runtime.resolve_credential(&target).await {
+            let error = match temporary.runtime.resolve_credential(&target, None).await {
                 Ok(_) => panic!("{name} must fail closed"),
                 Err(error) => error,
             };
