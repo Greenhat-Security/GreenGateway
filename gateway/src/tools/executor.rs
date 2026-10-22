@@ -1445,11 +1445,12 @@ impl ToolExecutor {
                         reason: "connection_runtime_unavailable",
                     })
                     .and_then(|runtime| {
-                        // Both tool lanes sign a caller assertion. Each has its
+                        // Both tool lanes sign a caller assertion and serve a
+                        // delegated issuer token Connection; only a manual one
+                        // serves Google domain-wide delegation. Each has its
                         // own constructor, the one its registry binding is
                         // validated with, so a binding and its calls cannot
-                        // disagree: a managed OpenAPI tool, unlike a manual
-                        // one, still refuses a delegated Connection.
+                        // disagree.
                         if matches!(source, ToolSource::Manual) {
                             runtime.tool_call_target(connection_id, &request.path_and_query)
                         } else {

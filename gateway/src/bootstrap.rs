@@ -2707,8 +2707,9 @@ pub(super) fn validate_connection_bound_tools(
                     continue;
                 }
                 // Its calls sign a caller assertion as a manual tool's do, so
-                // an attesting Connection is accepted; a composite's steps
-                // still refuse one when they run.
+                // an attesting Connection is accepted, delegated ones
+                // included; a composite's steps still refuse a delegated one
+                // when they run.
                 if let Err(error) = runtime.validate_openapi_tool_binding(target_connection_id) {
                     problems.push(format!(
                         "OpenAPI tool '{}' Connection target is unavailable: {}",

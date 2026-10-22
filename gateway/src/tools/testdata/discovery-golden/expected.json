@@ -1000,16 +1000,16 @@
     {
       "alternatives": [
         [
-          "Unsupported { scheme_name: \"Oauth2\", category: OAuth2WithoutClientCredentials }"
+          "OAuth2UserConsent { scheme_name: \"Oauth2\", required_scopes: [\"https://mail.google.com/\"] }"
         ],
         [
-          "Unsupported { scheme_name: \"Oauth2\", category: OAuth2WithoutClientCredentials }"
+          "OAuth2UserConsent { scheme_name: \"Oauth2\", required_scopes: [\"https://www.googleapis.com/auth/gmail.metadata\"] }"
         ],
         [
-          "Unsupported { scheme_name: \"Oauth2\", category: OAuth2WithoutClientCredentials }"
+          "OAuth2UserConsent { scheme_name: \"Oauth2\", required_scopes: [\"https://www.googleapis.com/auth/gmail.modify\"] }"
         ],
         [
-          "Unsupported { scheme_name: \"Oauth2\", category: OAuth2WithoutClientCredentials }"
+          "OAuth2UserConsent { scheme_name: \"Oauth2\", required_scopes: [\"https://www.googleapis.com/auth/gmail.readonly\"] }"
         ]
       ],
       "tool_name": "gmail.users.messages.list"
@@ -1017,16 +1017,16 @@
     {
       "alternatives": [
         [
-          "Unsupported { scheme_name: \"Oauth2\", category: OAuth2WithoutClientCredentials }"
+          "OAuth2UserConsent { scheme_name: \"Oauth2\", required_scopes: [\"https://mail.google.com/\"] }"
         ],
         [
-          "Unsupported { scheme_name: \"Oauth2\", category: OAuth2WithoutClientCredentials }"
+          "OAuth2UserConsent { scheme_name: \"Oauth2\", required_scopes: [\"https://www.googleapis.com/auth/gmail.metadata\"] }"
         ],
         [
-          "Unsupported { scheme_name: \"Oauth2\", category: OAuth2WithoutClientCredentials }"
+          "OAuth2UserConsent { scheme_name: \"Oauth2\", required_scopes: [\"https://www.googleapis.com/auth/gmail.modify\"] }"
         ],
         [
-          "Unsupported { scheme_name: \"Oauth2\", category: OAuth2WithoutClientCredentials }"
+          "OAuth2UserConsent { scheme_name: \"Oauth2\", required_scopes: [\"https://www.googleapis.com/auth/gmail.readonly\"] }"
         ]
       ],
       "tool_name": "gmail.users.messages.get"
@@ -1034,16 +1034,16 @@
     {
       "alternatives": [
         [
-          "Unsupported { scheme_name: \"Oauth2\", category: OAuth2WithoutClientCredentials }"
+          "OAuth2UserConsent { scheme_name: \"Oauth2\", required_scopes: [\"https://mail.google.com/\"] }"
         ],
         [
-          "Unsupported { scheme_name: \"Oauth2\", category: OAuth2WithoutClientCredentials }"
+          "OAuth2UserConsent { scheme_name: \"Oauth2\", required_scopes: [\"https://www.googleapis.com/auth/gmail.metadata\"] }"
         ],
         [
-          "Unsupported { scheme_name: \"Oauth2\", category: OAuth2WithoutClientCredentials }"
+          "OAuth2UserConsent { scheme_name: \"Oauth2\", required_scopes: [\"https://www.googleapis.com/auth/gmail.modify\"] }"
         ],
         [
-          "Unsupported { scheme_name: \"Oauth2\", category: OAuth2WithoutClientCredentials }"
+          "OAuth2UserConsent { scheme_name: \"Oauth2\", required_scopes: [\"https://www.googleapis.com/auth/gmail.readonly\"] }"
         ]
       ],
       "tool_name": "gmail.users.getProfile"
@@ -1051,16 +1051,16 @@
     {
       "alternatives": [
         [
-          "Unsupported { scheme_name: \"Oauth2\", category: OAuth2WithoutClientCredentials }"
+          "OAuth2UserConsent { scheme_name: \"Oauth2\", required_scopes: [\"https://mail.google.com/\"] }"
         ],
         [
-          "Unsupported { scheme_name: \"Oauth2\", category: OAuth2WithoutClientCredentials }"
+          "OAuth2UserConsent { scheme_name: \"Oauth2\", required_scopes: [\"https://www.googleapis.com/auth/gmail.metadata\"] }"
         ],
         [
-          "Unsupported { scheme_name: \"Oauth2\", category: OAuth2WithoutClientCredentials }"
+          "OAuth2UserConsent { scheme_name: \"Oauth2\", required_scopes: [\"https://www.googleapis.com/auth/gmail.modify\"] }"
         ],
         [
-          "Unsupported { scheme_name: \"Oauth2\", category: OAuth2WithoutClientCredentials }"
+          "OAuth2UserConsent { scheme_name: \"Oauth2\", required_scopes: [\"https://www.googleapis.com/auth/gmail.readonly\"] }"
         ]
       ],
       "tool_name": "gmail.users.threads.list"
@@ -1068,16 +1068,16 @@
     {
       "alternatives": [
         [
-          "Unsupported { scheme_name: \"Oauth2\", category: OAuth2WithoutClientCredentials }"
+          "OAuth2UserConsent { scheme_name: \"Oauth2\", required_scopes: [\"https://mail.google.com/\"] }"
         ],
         [
-          "Unsupported { scheme_name: \"Oauth2\", category: OAuth2WithoutClientCredentials }"
+          "OAuth2UserConsent { scheme_name: \"Oauth2\", required_scopes: [\"https://www.googleapis.com/auth/gmail.metadata\"] }"
         ],
         [
-          "Unsupported { scheme_name: \"Oauth2\", category: OAuth2WithoutClientCredentials }"
+          "OAuth2UserConsent { scheme_name: \"Oauth2\", required_scopes: [\"https://www.googleapis.com/auth/gmail.modify\"] }"
         ],
         [
-          "Unsupported { scheme_name: \"Oauth2\", category: OAuth2WithoutClientCredentials }"
+          "OAuth2UserConsent { scheme_name: \"Oauth2\", required_scopes: [\"https://www.googleapis.com/auth/gmail.readonly\"] }"
         ]
       ],
       "tool_name": "gmail.users.threads.get"
@@ -1085,10 +1085,10 @@
     {
       "alternatives": [
         [
-          "Unsupported { scheme_name: \"Oauth2\", category: OAuth2WithoutClientCredentials }"
+          "OAuth2UserConsent { scheme_name: \"Oauth2\", required_scopes: [\"https://mail.google.com/\"] }"
         ],
         [
-          "Unsupported { scheme_name: \"Oauth2\", category: OAuth2WithoutClientCredentials }"
+          "OAuth2UserConsent { scheme_name: \"Oauth2\", required_scopes: [\"https://www.googleapis.com/auth/gmail.modify\"] }"
         ]
       ],
       "tool_name": "gmail.users.messages.modify"
@@ -1096,10 +1096,10 @@
     {
       "alternatives": [
         [
-          "Unsupported { scheme_name: \"Oauth2\", category: OAuth2WithoutClientCredentials }"
+          "OAuth2UserConsent { scheme_name: \"Oauth2\", required_scopes: [\"https://mail.google.com/\"] }"
         ],
         [
-          "Unsupported { scheme_name: \"Oauth2\", category: OAuth2WithoutClientCredentials }"
+          "OAuth2UserConsent { scheme_name: \"Oauth2\", required_scopes: [\"https://www.googleapis.com/auth/gmail.modify\"] }"
         ]
       ],
       "tool_name": "gmail.users.messages.trash"
@@ -1107,10 +1107,10 @@
     {
       "alternatives": [
         [
-          "Unsupported { scheme_name: \"Oauth2\", category: OAuth2WithoutClientCredentials }"
+          "OAuth2UserConsent { scheme_name: \"Oauth2\", required_scopes: [\"https://mail.google.com/\"] }"
         ],
         [
-          "Unsupported { scheme_name: \"Oauth2\", category: OAuth2WithoutClientCredentials }"
+          "OAuth2UserConsent { scheme_name: \"Oauth2\", required_scopes: [\"https://www.googleapis.com/auth/gmail.modify\"] }"
         ]
       ],
       "tool_name": "gmail.users.threads.modify"
@@ -1118,10 +1118,10 @@
     {
       "alternatives": [
         [
-          "Unsupported { scheme_name: \"Oauth2\", category: OAuth2WithoutClientCredentials }"
+          "OAuth2UserConsent { scheme_name: \"Oauth2\", required_scopes: [\"https://mail.google.com/\"] }"
         ],
         [
-          "Unsupported { scheme_name: \"Oauth2\", category: OAuth2WithoutClientCredentials }"
+          "OAuth2UserConsent { scheme_name: \"Oauth2\", required_scopes: [\"https://www.googleapis.com/auth/gmail.modify\"] }"
         ]
       ],
       "tool_name": "gmail.users.threads.trash"
@@ -1129,10 +1129,10 @@
     {
       "alternatives": [
         [
-          "Unsupported { scheme_name: \"Oauth2\", category: OAuth2WithoutClientCredentials }"
+          "OAuth2UserConsent { scheme_name: \"Oauth2\", required_scopes: [\"https://mail.google.com/\"] }"
         ],
         [
-          "Unsupported { scheme_name: \"Oauth2\", category: OAuth2WithoutClientCredentials }"
+          "OAuth2UserConsent { scheme_name: \"Oauth2\", required_scopes: [\"https://www.googleapis.com/auth/gmail.modify\"] }"
         ]
       ],
       "tool_name": "gmail.users.threads.untrash"
@@ -1140,7 +1140,7 @@
     {
       "alternatives": [
         [
-          "Unsupported { scheme_name: \"Oauth2\", category: OAuth2WithoutClientCredentials }"
+          "OAuth2UserConsent { scheme_name: \"Oauth2\", required_scopes: [\"https://mail.google.com/\"] }"
         ]
       ],
       "tool_name": "gmail.users.messages.delete"
@@ -1148,7 +1148,7 @@
     {
       "alternatives": [
         [
-          "Unsupported { scheme_name: \"Oauth2\", category: OAuth2WithoutClientCredentials }"
+          "OAuth2UserConsent { scheme_name: \"Oauth2\", required_scopes: [\"https://mail.google.com/\"] }"
         ]
       ],
       "tool_name": "gmail.users.threads.delete"

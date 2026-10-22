@@ -2,11 +2,14 @@ use serde_json::{json, Value};
 
 use super::*;
 use crate::{
-    connections::model::{ConnectionAuthentication, ConnectionId, OAuthClientAuthMethod},
+    connections::model::{
+        ConnectionAuthentication, ConnectionId, OAuthClientAuthMethod, SubjectTokenSource,
+    },
     tools::openapi::{
-        bind_generated_openapi_tools, generate_tools_from_api_document_str,
-        generate_tools_from_openapi_str, OpenApiSecuritySchemeRequirement, OpenApiSourceFormat,
-        OpenApiToolGeneration, OpenApiToolIncompatibilityReason, OpenApiUnsupportedSecurityScheme,
+        bind_generated_openapi_tools, bind_generated_openapi_tools_with_confirmations,
+        generate_tools_from_api_document_str, generate_tools_from_openapi_str,
+        OpenApiSecurityMismatch, OpenApiSecurityMismatchReason, OpenApiSecuritySchemeRequirement,
+        OpenApiSourceFormat, OpenApiToolGeneration, OpenApiToolIncompatibilityReason,
     },
 };
 
@@ -255,7 +258,9 @@ fn gmail_methods_are_named_by_their_discovery_ids_and_keep_their_requests() {
 
 /// Any one listed scope grants a Discovery method, so each scope is its own
 /// alternative on one authorization-code scheme. The generator reports that
-/// flow as user consent, which a client-credentials Connection cannot bind.
+/// flow as user consent, which a client-credentials Connection cannot bind;
+/// a per-caller one can (see
+/// `a_delegated_connection_binds_the_read_operations_its_scopes_grant`).
 #[test]
 fn scopes_become_alternative_requirements_on_one_authorization_code_scheme() {
     let generation = gmail_generation();
@@ -285,14 +290,25 @@ fn scopes_become_alternative_requirements_on_one_authorization_code_scheme() {
         .iter()
         .find(|security| security.tool_name == "gmail.users.messages.list")
         .expect("messages.list should carry security metadata");
-    assert_eq!(security.alternatives.len(), 4);
-    assert!(security.alternatives.iter().all(|alternative| matches!(
-        alternative.members.as_slice(),
-        [OpenApiSecuritySchemeRequirement::Unsupported {
-            category: OpenApiUnsupportedSecurityScheme::OAuth2WithoutClientCredentials,
-            ..
-        }]
-    )));
+    assert_eq!(
+        security
+            .alternatives
+            .iter()
+            .map(|alternative| alternative.members.clone())
+            .collect::<Vec<_>>(),
+        [
+            "https://mail.google.com/",
+            "https://www.googleapis.com/auth/gmail.metadata",
+            "https://www.googleapis.com/auth/gmail.modify",
+            "https://www.googleapis.com/auth/gmail.readonly",
+        ]
+        .map(
+            |scope| vec![OpenApiSecuritySchemeRequirement::OAuth2UserConsent {
+                scheme_name: OAUTH2_SCHEME_NAME.to_owned(),
+                required_scopes: vec![scope.to_owned()],
+            }]
+        )
+    );
 
     let connection_id = ConnectionId::parse("gmail").expect("connection ID should be valid");
     let binding = bind_generated_openapi_tools(
@@ -314,11 +330,138 @@ fn scopes_become_alternative_requirements_on_one_authorization_code_scheme() {
         binding.incompatibilities.len(),
         generation.definitions.len()
     );
+    assert!(binding.incompatibilities.iter().all(|incompatibility| {
+        incompatibility.reason == OpenApiToolIncompatibilityReason::NoCompatibleSecurityAlternative
+            && !incompatibility.security_mismatches.is_empty()
+            && incompatibility.security_mismatches.iter().all(|mismatch| {
+                mismatch.scheme_names == [OAUTH2_SCHEME_NAME]
+                    && mismatch.reason
+                        == OpenApiSecurityMismatchReason::OAuth2WithoutClientCredentials
+            })
+    }));
+}
+
+fn delegated_gmail_connection(requested_scopes: &[&str]) -> ConnectionAuthentication {
+    ConnectionAuthentication::DelegatedIssuerToken {
+        token_exchange_url: "https://issuer.example.test/oauth2/token-exchange".to_owned(),
+        client_id: "greengateway".to_owned(),
+        client_secret_id: Some("gmail-exchange-secret".to_owned()),
+        requested_scopes: requested_scopes
+            .iter()
+            .map(|scope| (*scope).to_owned())
+            .collect(),
+        audience: None,
+        resource: None,
+        revocation_url: None,
+        subject_token_source: SubjectTokenSource::CallerAssertion,
+    }
+}
+
+/// The acceptance case of issue #443: a delegated Connection that requests
+/// Gmail's read-only scope binds exactly the methods that scope grants, the
+/// messages and threads reads among them, and the preview says, for every
+/// other method, which scopes it would need.
+#[test]
+fn a_delegated_connection_binds_the_read_operations_its_scopes_grant() {
+    let generation = gmail_generation();
+    let connection_id = ConnectionId::parse("gmail").expect("connection ID should be valid");
+    let readonly = "https://www.googleapis.com/auth/gmail.readonly";
+    let binding = bind_generated_openapi_tools(
+        &generation,
+        &connection_id,
+        &delegated_gmail_connection(&[readonly]),
+    )
+    .expect("binding should report incompatibilities, not fail");
+    let mut bound = binding
+        .definitions
+        .iter()
+        .map(|definition| {
+            (
+                definition.name.as_str(),
+                definition.upstream.method.as_str(),
+            )
+        })
+        .collect::<Vec<_>>();
+    bound.sort_unstable();
+    assert_eq!(
+        bound,
+        vec![
+            ("gmail.users.getProfile", "GET"),
+            ("gmail.users.messages.get", "GET"),
+            ("gmail.users.messages.list", "GET"),
+            ("gmail.users.threads.get", "GET"),
+            ("gmail.users.threads.list", "GET"),
+        ]
+    );
     assert!(binding
+        .security_selections
+        .iter()
+        .all(|selection| selection.selected_scheme_names == [OAUTH2_SCHEME_NAME]));
+
+    let missing = |scope: &str| OpenApiSecurityMismatch {
+        scheme_names: vec![OAUTH2_SCHEME_NAME.to_owned()],
+        reason: OpenApiSecurityMismatchReason::MissingScopes {
+            scopes: vec![scope.to_owned()],
+        },
+    };
+    let full = missing("https://mail.google.com/");
+    let modify = missing("https://www.googleapis.com/auth/gmail.modify");
+    let mut incompatible = binding
         .incompatibilities
         .iter()
-        .all(|incompatibility| incompatibility.reason
-            == OpenApiToolIncompatibilityReason::NoCompatibleSecurityAlternative));
+        .map(|incompatibility| {
+            (
+                incompatibility.tool_name.as_str(),
+                incompatibility.security_mismatches.clone(),
+            )
+        })
+        .collect::<Vec<_>>();
+    incompatible.sort_by(|left, right| left.0.cmp(right.0));
+    assert_eq!(
+        incompatible,
+        vec![
+            ("gmail.users.messages.delete", vec![full.clone()]),
+            (
+                "gmail.users.messages.modify",
+                vec![full.clone(), modify.clone()]
+            ),
+            (
+                "gmail.users.messages.trash",
+                vec![full.clone(), modify.clone()]
+            ),
+            ("gmail.users.threads.delete", vec![full.clone()]),
+            (
+                "gmail.users.threads.modify",
+                vec![full.clone(), modify.clone()]
+            ),
+            (
+                "gmail.users.threads.trash",
+                vec![full.clone(), modify.clone()]
+            ),
+            ("gmail.users.threads.untrash", vec![full, modify]),
+        ]
+    );
+
+    // The registration an operator confirms from that preview binds the
+    // same read operations, and nothing else.
+    let confirmed = bind_generated_openapi_tools_with_confirmations(
+        &generation,
+        &connection_id,
+        &delegated_gmail_connection(&[readonly]),
+        &binding.security_selections,
+    )
+    .expect("the preview selections should confirm");
+    assert_eq!(confirmed.definitions, binding.definitions);
+    assert!(confirmed.incompatibilities.is_empty());
+
+    // Without any requested scope nothing that requires one binds.
+    let unscoped = bind_generated_openapi_tools(
+        &generation,
+        &connection_id,
+        &delegated_gmail_connection(&[]),
+    )
+    .expect("binding should report incompatibilities, not fail");
+    assert!(unscoped.definitions.is_empty());
 }
 
 /// The converted document generates exactly what an operator's hand

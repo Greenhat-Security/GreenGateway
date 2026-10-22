@@ -406,14 +406,15 @@ enum and label source fetches, and stored Connection tests. So is every lane
 when the stored block is one only an earlier release accepted (see
 [HTTPS only](#https-only) and [Failure reasons](#failure-reasons)). A
 `delegated_issuer_token` Connection, whose assertion is the subject token of
-the caller's own credential, is served by manual HTTP tools only, and its
-stored test runs as the principal who asks for it; see
-[Which calls are served](#which-calls-are-served).
+the caller's own credential, is served by manual HTTP tools and managed
+OpenAPI tools only, and its stored test runs as the principal who asks for
+it; see [Which calls are served](#which-calls-are-served).
 
 On the refused lanes the reason appears as follows:
 
 - Managed OpenAPI or MCP tool call on a block only an earlier release
-  accepted, or on a delegated Connection: the `failure_reason` of
+  accepted, or a managed MCP tool call on a delegated Connection: the
+  `failure_reason` of
   `tool.invoke_failure` and the `reason` of `tool.upstream_request`. A
   composite tool reports at the tool level: its `failure_reason` is
   `composite_failed`, and the failing step's `caller_assertion_not_enforced` is
@@ -1199,16 +1200,21 @@ a `refresh_token` included, are skipped unread and never kept.
 
 #### Which calls are served
 
-Only manual HTTP tool calls, whether from `/mcp` or the admin playground: they
-are the one tool lane that obtains a caller's own token. A stored Connection
-test is also served, as the principal who runs it; see
+Manual HTTP tool calls and managed OpenAPI tool calls, whether from `/mcp` or
+the admin playground: they are the tool lanes that obtain a caller's own
+token, and both run through the same exchange, cache and audit described on
+this page. A managed OpenAPI catalog binds to a delegated Connection through
+its user-consent OAuth 2.0 and OpenID Connect schemes; see
+[Security binding and read-only selection](#security-binding-and-read-only-selection).
+A stored Connection test is also served, as the principal who runs it; see
 [Testing a delegated Connection](#testing-a-delegated-connection). Every other
-lane -- managed OpenAPI and composite tools, proxied requests, discovery, enum
-and label sources -- is refused with `caller_assertion_not_enforced`,
-including the lanes that attest the caller of an ordinary attested Connection.
-There is no service-principal fallback: a call with no principal, or a service
-token's, is refused with `delegated_token_no_principal` before anything is
-read or sent.
+lane -- composite tools, proxied requests, discovery (fetching an OpenAPI
+specification from the upstream), enum and label sources -- is refused with
+`caller_assertion_not_enforced`, including the lanes that attest the caller
+of an ordinary attested Connection. So register a delegated Connection's
+OpenAPI catalog from an uploaded specification. There is no service-principal
+fallback: a call with no principal, or a service token's, is refused with
+`delegated_token_no_principal` before anything is read or sent.
 
 #### Testing a delegated Connection
 
@@ -1866,11 +1872,14 @@ convert it again.
 Response headers, `examples`, `externalDocs` and vendor extensions outside
 schemas are documentation and are not carried over.
 
-Binding does not change. An `application` flow binds to an
-`oauth2_client_credentials` Connection with the same token URL and scopes, and
-`apiKey` in a header binds to `header_api_key`. The user-consent flows
-(`accessCode`, `implicit`, `password`), `basic` and query API keys are
-reported as incompatible, as their OpenAPI 3.0 forms are.
+Converted schemes bind exactly as their OpenAPI 3.0 forms do. An
+`application` flow binds to an `oauth2_client_credentials` Connection with the
+same token URL and scopes, and `apiKey` in a header binds to
+`header_api_key`. The user-consent flows (`accessCode`, `implicit`,
+`password`) bind only to a per-caller `delegated_issuer_token` Connection
+that requests the required scopes, and `basic` and query API keys are
+reported as incompatible; see
+[Security binding and read-only selection](#security-binding-and-read-only-selection).
 
 The preview response of a converted document carries a `conversion` object
 with `source_format` `swagger_2_0` and a `warnings` list; an OpenAPI 3.x
@@ -1927,7 +1936,8 @@ then treats a missing target exactly as it treats a missing
 
 Registration publishes only the `selected_tool_names` you confirm. To keep a
 Connection to read operations, select only the tools whose
-`upstream.method` is `GET` or `HEAD` in the preview.
+`upstream.method` is `GET` or `HEAD` in the preview; see
+[Selecting read operations](#selecting-read-operations).
 
 Upgrade and rollback: releases before this one cannot generate tools from a
 Swagger 2.0 document. A replica on an earlier release keeps serving the tools
@@ -1984,11 +1994,14 @@ submitted, and refresh and overlay edits convert it again.
 Discovery documents name scopes but no OAuth 2.0 endpoints. The converted
 scheme is an `authorizationCode` flow with Google's published authorization
 and token endpoints, so that it is a complete OpenAPI 3.0 scheme; nothing on
-this path contacts them. Binding does not change: a user-consent flow is
-reported as incompatible (`OAuth2WithoutClientCredentials`), exactly as for
-an OpenAPI 3.x document, so a scoped method does not bind to a
-client-credentials Connection. A method without `scopes` declares no
-security and binds to a Connection without authentication.
+this path contacts them. It binds as any user-consent flow of an OpenAPI 3.x
+document does: never to a client-credentials or other shared credential
+(reason `oauth2_without_client_credentials`), and to a per-caller
+`delegated_issuer_token` Connection when the Connection requests one of the
+method's scopes; see
+[Security binding and read-only selection](#security-binding-and-read-only-selection).
+A method without `scopes` declares no security and binds to a Connection
+without authentication.
 
 The document-level `parameters` of a Discovery document are Google's system
 parameters (`key`, `access_token`, `oauth_token`, `alt`, `fields`,
@@ -2037,10 +2050,12 @@ the document (a remote reference included), a `minimum` or `maximum` is not
 a number, the document has more than 4,096 methods, or resources or schemas
 nest deeper than 256 levels.
 
-To keep a Connection to read operations, select only the tools whose
-`upstream.method` is `GET` in the preview: for Gmail, for example,
-`gmail.users.messages.list`, `gmail.users.messages.get`,
-`gmail.users.threads.list` and `gmail.users.threads.get`. A tool with a
+To keep a Connection to read operations, request read-only scopes on a
+delegated Connection and select only the tools whose `upstream.method` is
+`GET` in the preview: for Gmail, for example, `gmail.users.messages.list`,
+`gmail.users.messages.get`, `gmail.users.threads.list` and
+`gmail.users.threads.get`; see
+[Selecting read operations](#selecting-read-operations). A tool with a
 request body, such as `gmail.users.threads.modify`, sends its whole argument
 object as the body, path and query arguments included, as every generated
 tool does until an [overlay](#openapi-overlays) names it; naming it in an
@@ -2058,6 +2073,153 @@ while every live replica, draining ones included, advertises
 and the refusal is audited as `cluster.operation_refused`. Before rolling
 back, re-register those Connections with an OpenAPI 3.x document, or delete
 their overlays first.
+
+## Security binding and read-only selection
+
+A preview binds every generated operation, whatever format it was imported
+from, to the Connection's one credential. Each operation lists its security
+alternatives in document order (an alternative is the set of schemes one
+entry of its `security` list requires together); the first alternative the
+credential satisfies is selected and returned in `security_confirmations`,
+and registration must confirm exactly that selection. An operation that no
+alternative binds is listed in `incompatibilities` with reason
+`no_compatible_security_alternative` and cannot be registered.
+
+| Connection `authentication` | Binds these schemes |
+| --- | --- |
+| any | an operation that declares no security, or an empty alternative (`{}`) |
+| `header_api_key` | `apiKey` `in: header` with the Connection's header name (compared without case) |
+| `static_bearer` | `http` `bearer` |
+| `oauth2_client_credentials` | `oauth2` with a `clientCredentials` flow whose `tokenUrl` is the Connection's `token_url` and whose required scopes are all in the Connection's `scopes` |
+| `delegated_issuer_token` | `oauth2` with an `authorizationCode`, `implicit` or `password` flow, and `openIdConnect`, when every required scope is in the Connection's `requested_scopes` |
+
+An alternative that requires two schemes at once never binds: a Connection
+sends one credential.
+
+### User-consent schemes and per-caller Connections
+
+The user-consent OAuth 2.0 flows (`authorizationCode`, `implicit` and
+`password`, which Swagger 2.0 calls `accessCode`, `implicit` and `password`,
+and the flow a Google Discovery document's scopes convert to) and
+`openIdConnect` describe a token issued for a user. A credential shared by
+every caller can never be that token, so they bind only to a Connection whose
+credential is obtained for each caller. In this release that is
+`delegated_issuer_token`: the gateway sends each caller's own token, obtained
+from the Connection's issuer as described under
+[Delegated issuer tokens](#delegated-issuer-tokens), and nobody else's.
+
+- The document's `authorizationUrl`, `tokenUrl`, `refreshUrl` and
+  `openIdConnectUrl` are never contacted and never compared with the
+  Connection: the token comes from the Connection's `token_exchange_url`.
+- The gateway does not read the token the issuer returns, so the scopes the
+  Connection requests in every exchange are the only evidence of what the
+  token allows. An alternative binds only when every scope it requires is in
+  `requested_scopes`, compared exactly. Configure the issuer to issue no more
+  than the requested scopes; the issuer, and then the upstream, decide what
+  the token can really do.
+- An `openIdConnect` requirement without scopes binds to any delegated
+  Connection. The scheme must name a non-empty `openIdConnectUrl`.
+- A user-consent flow must be well formed: every one of them the scheme
+  declares must be an object with a `scopes` map, and every scope an
+  operation requires must be declared by one of them. Otherwise the scheme
+  is reported as `invalid_security_scheme` for every credential.
+- A scheme that declares a `clientCredentials` flow and a user-consent flow
+  binds to either kind of Connection. A scheme with only a
+  `clientCredentials` flow describes a token for the client itself and never
+  binds to a delegated Connection (`requires_oauth2_client_credentials`).
+
+On a delegated Connection a catalog is registered from an uploaded
+specification: fetching one from the upstream has no caller to exchange for
+and is refused with `caller_assertion_not_enforced`, as is a refresh that
+fetches from a discovery `path`; a refresh of a catalog without one reads the
+stored specification. Its tools refuse a call that names nobody or a service
+token with `delegated_token_no_principal`, composite tools in the catalog are
+refused when they run, and an overlay's enum and label sources are refused;
+see [Which calls are served](#which-calls-are-served).
+
+### Why an operation does not bind
+
+Every `no_compatible_security_alternative` entry of the preview carries a
+`security_alternatives` list: for each alternative, in document order, the
+`scheme_names` it requires (sorted, as a confirmation names them), a
+`reason` code, a fixed `message` that never contains document or Connection
+content, and, for `missing_scopes`, the `missing_scopes` the Connection does
+not request. At most 16 alternatives are explained;
+`unexplained_security_alternatives` counts the rest.
+
+```json
+{
+  "tool_name": "gmail.users.messages.trash",
+  "reason": "no_compatible_security_alternative",
+  "security_alternatives": [
+    {
+      "scheme_names": ["Oauth2"],
+      "reason": "missing_scopes",
+      "message": "the Connection does not request every scope the operation requires",
+      "missing_scopes": ["https://mail.google.com/"]
+    },
+    {
+      "scheme_names": ["Oauth2"],
+      "reason": "missing_scopes",
+      "message": "the Connection does not request every scope the operation requires",
+      "missing_scopes": ["https://www.googleapis.com/auth/gmail.modify"]
+    }
+  ]
+}
+```
+
+| Reason | Meaning |
+| --- | --- |
+| `multiple_schemes` | The alternative requires several schemes at once. |
+| `missing_security_scheme` | The document does not define the scheme. |
+| `invalid_security_scheme` | The scheme or the requirement naming it is malformed, or requires a scope its flows do not declare. |
+| `api_key_query`, `api_key_cookie` | An API key in the query string or a cookie; only header API keys are supported. |
+| `api_key_unsupported_location` | The API key's `in` is not one OpenAPI defines. |
+| `http_basic`, `http_unsupported_scheme` | HTTP authentication other than `bearer`. |
+| `oauth2_without_supported_flow` | An `oauth2` scheme that declares none of the flows OpenAPI defines. |
+| `mutual_tls`, `unsupported_security_scheme_type` | Mutual TLS as a scheme, or a type OpenAPI does not define. |
+| `requires_header_api_key` | A header API key, and the Connection is not `header_api_key`. |
+| `api_key_header_mismatch` | A header API key in another header than the Connection's. |
+| `requires_static_bearer` | HTTP bearer, and the Connection is not `static_bearer`. |
+| `requires_oauth2_client_credentials` | Only a `clientCredentials` flow, and the Connection is not `oauth2_client_credentials`. |
+| `token_url_mismatch` | The `clientCredentials` `tokenUrl` is not the Connection's `token_url`. |
+| `missing_scopes` | The Connection does not request every required scope; `missing_scopes` names them. |
+| `oauth2_without_client_credentials` | A user-consent `oauth2` scheme, and the Connection's credential is shared by every caller. |
+| `open_id_connect` | An `openIdConnect` scheme, and the Connection's credential is shared by every caller. |
+
+### Selecting read operations
+
+To give agents read access only, narrow the Connection first and the catalog
+second:
+
+1. Request read-only scopes on a delegated Connection, and have the issuer
+   grant no more. Operations that require another scope are then listed with
+   `missing_scopes` and cannot be registered. For Gmail, a delegated
+   Connection with `requested_scopes`
+   `["https://www.googleapis.com/auth/gmail.readonly"]` binds
+   `gmail.users.getProfile`, `gmail.users.messages.list`,
+   `gmail.users.messages.get`, `gmail.users.threads.list` and
+   `gmail.users.threads.get`, and lists `modify`, `trash`, `untrash` and
+   `delete` with the `https://mail.google.com/` or `gmail.modify` scope they
+   lack. For a Slack-style Swagger 2.0 document whose `accessCode` flow
+   declares `channels:history` and `chat:write`, requesting only
+   `channels:history` binds the history read and not the message post.
+2. Select only the tools whose `upstream.method` is `GET` or `HEAD` in
+   `selected_tool_names`. Registration publishes nothing else, whatever
+   binds. A document's scopes are its author's claim, so this step matters
+   even when the scopes look read-only.
+3. Keep tool policy and `rules[]` for what the scopes cannot express: they
+   apply per principal before any exchange.
+
+Upgrade and rollback: earlier releases bind none of these schemes, refuse to
+register a catalog on a delegated Connection, and withdraw such a catalog from
+the tool list while keeping it in storage, so no stored catalog starts serving
+on upgrade and an earlier replica does not fail on one. In a rolling upgrade
+only upgraded replicas list and serve a delegated Connection's catalog
+tools; a call that reaches an earlier replica fails as for a tool that does
+not exist there. Register and edit such catalogs through upgraded replicas.
+After a rollback the catalog stays stored, unserved, until the upgrade is
+repeated.
 
 ## OpenAPI Overlays
 
