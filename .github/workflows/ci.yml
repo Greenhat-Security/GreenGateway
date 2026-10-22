@@ -219,6 +219,14 @@ jobs:
             'rustflags = ["-Zthreads=4", "-Clinker=rust-lld"]'
           )
           Get-Content -Path $config
+      - name: Measure operator CLI security branches
+        # ggctl (issue #242, ADR-0008) is its own package with its own tests,
+        # so it is measured in its own run and the gateway measurement below
+        # stays exactly the run its floors were set against. Its integration
+        # tests run the instrumented ggctl binary itself. A failure here skips
+        # the gateway measurement, so the floor check and the evidence upload
+        # never run on a partial result.
+        run: cargo llvm-cov --no-rustc-wrapper --branch --json --output-path target/ggctl-security-coverage.json -p ggctl --locked --jobs 4
       - name: Measure security branches
         id: coverage
         # The mandatory uninstrumented test job enforces the SQLite wall-clock
@@ -230,20 +238,24 @@ jobs:
         run: cargo llvm-cov --no-rustc-wrapper --branch --json --output-path target/security-coverage.json -p gateway --bin gateway --locked --jobs 4 -- --test-threads=8 --skip audit::sqlite_sink::tests::moderate_scale_batched_inserts_complete_quickly
       - name: Enforce production-code coverage floors
         if: ${{ always() && steps.coverage.outcome == 'success' }}
-        run: python scripts/check-security-coverage.py target/security-coverage.json
+        run: python scripts/check-security-coverage.py target/security-coverage.json target/ggctl-security-coverage.json
       - name: Preserve coverage evidence
         if: ${{ always() && steps.coverage.outcome == 'success' }}
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: security-coverage
-          path: target/security-coverage.json
+          path: |
+            target/security-coverage.json
+            target/ggctl-security-coverage.json
           if-no-files-found: error
       - name: Preserve available coverage failure diagnostics
         if: ${{ always() && steps.coverage.outcome != 'success' }}
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: security-coverage-diagnostics
-          path: target/security-coverage.json
+          path: |
+            target/security-coverage.json
+            target/ggctl-security-coverage.json
           if-no-files-found: ignore
 
   supply-chain:

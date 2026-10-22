@@ -60,9 +60,13 @@ pub(crate) struct ServerUrl(Url);
 
 impl ServerUrl {
     pub(crate) fn parse(text: &str) -> Result<Self, Code> {
-        // URL parsing would silently resolve dot segments and decode or
-        // re-encode escapes; refuse them so the base used is the one typed.
+        // URL parsing would silently resolve dot segments, decode or
+        // re-encode escapes, trim surrounding spaces and drop tabs and line
+        // breaks; refuse all of them so the base used is the one typed.
         if text.contains(['%', '\\'])
+            || text
+                .bytes()
+                .any(|byte| byte.is_ascii_whitespace() || byte.is_ascii_control())
             || text
                 .split(['/', '?', '#'])
                 .any(|segment| segment == "." || segment == "..")

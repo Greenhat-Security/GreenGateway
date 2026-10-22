@@ -112,6 +112,30 @@ class CoverageGate(unittest.TestCase):
         report['data'][0]['files'][0]['summary']['branches'] = {'count': 0, 'covered': 0}
         self.assertTrue(coverage.check(report, self.limits))
 
+    def test_reports_of_several_packages_are_checked_as_one(self):
+        # ggctl (issue #242) is measured in its own run: each gated file is
+        # found in whichever report measured it.
+        cli = {'filename': 'C:\\repo\\ggctl\\src\\credential.rs', 'summary': {
+            'lines': {'count': 10, 'covered': 10}, 'branches': {'count': 10, 'covered': 9}}}
+        limits = {**self.limits, 'ggctl/src/credential.rs': {
+            'lines': 90, 'branches': 90, 'min_line_count': 10, 'min_branch_count': 10}}
+        both = coverage.merged([self.report(), {'data': [{'files': [cli]}]}])
+        self.assertEqual(coverage.check(both, limits), [])
+        errors = coverage.check(coverage.merged([self.report()]), limits)
+        self.assertEqual(len(errors), 1, errors)
+        self.assertIn('ggctl/src/credential.rs: expected exactly one instrumented source file, found 0', errors[0])
+
+    def test_a_file_measured_by_two_reports_cannot_pass_on_its_better_run(self):
+        better = self.report(branches=10)
+        errors = coverage.check(coverage.merged([self.report(branches=1), better]), self.limits)
+        self.assertEqual(errors, ['gateway/src/auth/jwt.rs: expected exactly one instrumented source file, found 2'])
+
+    def test_committed_floors_cover_the_operator_cli_credential_and_transport_code(self):
+        floors = json.loads((Path(__file__).resolve().parents[1] / '.github/security-coverage.json').read_text())
+        for path in ('ggctl/src/cli.rs', 'ggctl/src/credential.rs', 'ggctl/src/remote.rs'):
+            with self.subTest(path=path):
+                self.assertIn(path, floors)
+
 
 class SupplyChainGate(unittest.TestCase):
     def setUp(self):
@@ -737,6 +761,25 @@ class EvidenceWorkflowGate(unittest.TestCase):
         self.assertNotIn('if', tuning)
         self.assertNotIn('continue-on-error', tuning)
         self.assertLess(steps.index(tuning), steps.index(measure))
+
+    def test_the_operator_cli_is_measured_in_its_own_run_before_the_gateway(self):
+        steps = self.ci['jobs']['security-coverage']['steps']
+        gateway = next(step for step in steps if step.get('id') == 'coverage')
+        ggctl = self.step('security-coverage', 'Measure operator CLI security branches')
+        self.assertEqual(ggctl['run'], 'cargo llvm-cov --no-rustc-wrapper --branch --json --output-path '
+                         'target/ggctl-security-coverage.json -p ggctl --locked --jobs 4')
+        # Before the gateway run and unconditional, so a failure here skips
+        # the gateway measurement and with it the floor check and the upload.
+        self.assertLess(steps.index(ggctl), steps.index(gateway))
+        for key in ('if', 'env', 'continue-on-error'):
+            self.assertNotIn(key, ggctl)
+        enforce = self.step('security-coverage', 'Enforce production-code coverage floors')
+        self.assertEqual(enforce['run'], 'python scripts/check-security-coverage.py '
+                         'target/security-coverage.json target/ggctl-security-coverage.json')
+        for name in ('Preserve coverage evidence', 'Preserve available coverage failure diagnostics'):
+            with self.subTest(step=name):
+                self.assertEqual(self.step('security-coverage', name)['with']['path'].split(), [
+                    'target/security-coverage.json', 'target/ggctl-security-coverage.json'])
 
     def test_failed_or_skipped_producers_keep_optional_diagnostics(self):
         coverage_diagnostics = self.step('security-coverage', 'Preserve available coverage failure diagnostics')

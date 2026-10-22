@@ -112,6 +112,27 @@ fn server_urls_must_be_an_exact_admin_base() {
             "https://gateway.example.test/v1/ad min",
             Code::InvalidServerUrl,
         ),
+        // The URL parser would drop these and use a base nobody typed.
+        (
+            "https://gateway.example.test/v1/ad\tmin",
+            Code::InvalidServerUrl,
+        ),
+        (
+            "https://gateway.example.test/v1/ad\nmin",
+            Code::InvalidServerUrl,
+        ),
+        (
+            " https://gateway.example.test/v1/admin",
+            Code::InvalidServerUrl,
+        ),
+        (
+            "https://gateway.example.test/v1/admin\r\n",
+            Code::InvalidServerUrl,
+        ),
+        (
+            "https://gateway.example.test/v1/admin\u{0}",
+            Code::InvalidServerUrl,
+        ),
         (
             "https://gateway.example.test\\v1\\admin",
             Code::InvalidServerUrl,
@@ -135,6 +156,58 @@ fn server_urls_must_be_an_exact_admin_base() {
         ServerUrl::parse(&with_password).map(|_| ()),
         Err(Code::UserinfoRefused)
     );
+}
+
+fn remote_arguments(words: &[&str]) -> Option<RemoteArguments> {
+    let arguments: Vec<std::ffi::OsString> = words.iter().map(Into::into).collect();
+    match crate::cli::parse(&arguments) {
+        Ok(crate::cli::Parsed::Run(invocation)) => {
+            RemoteArguments::from_invocation(&invocation).expect("valid remote options")
+        }
+        other => panic!("{words:?} should run, got {other:?}"),
+    }
+}
+
+#[test]
+fn remote_options_are_taken_as_given_and_default_when_absent() {
+    assert!(remote_arguments(&["version"]).is_none());
+
+    let remote = remote_arguments(&[
+        "version",
+        "--server",
+        "https://gateway.example.test/v1/admin",
+        "--ca-file",
+        "ca.pem",
+        "--token-file",
+        "token",
+        "--timeout",
+        "300",
+    ])
+    .expect("a server");
+    assert_eq!(
+        remote.server.0.as_str(),
+        "https://gateway.example.test/v1/admin"
+    );
+    assert_eq!(remote.ca_file.as_deref(), Some(Path::new("ca.pem")));
+    assert!(matches!(&remote.token, TokenSource::File(path) if path == Path::new("token")));
+    assert_eq!(remote.timeout, Duration::from_secs(MAX_TIMEOUT_SECONDS));
+
+    let remote = remote_arguments(&[
+        "version",
+        "--server",
+        "http://127.0.0.1:9090/v1/admin",
+        "--token-stdin",
+        "--timeout=1",
+    ])
+    .expect("a server");
+    assert!(matches!(remote.token, TokenSource::Stdin));
+    assert_eq!(remote.ca_file, None);
+    assert_eq!(remote.timeout, Duration::from_secs(1));
+
+    let remote =
+        remote_arguments(&["version", "--server", "http://[::1]/v1/admin"]).expect("a server");
+    assert!(matches!(remote.token, TokenSource::None));
+    assert_eq!(remote.timeout, DEFAULT_TIMEOUT);
 }
 
 /// What a fake server saw.
