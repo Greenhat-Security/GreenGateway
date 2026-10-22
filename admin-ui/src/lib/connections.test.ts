@@ -1002,7 +1002,9 @@ describe('connections API client', () => {
   });
 });
 
-function connectionWrite(): ConnectionWrite {
+// Without a caller assertion, so it is both a valid create and a valid
+// replacement.
+function connectionWrite(): Omit<ConnectionWrite, 'caller_assertion'> {
   return {
     display_name: 'Billing API',
     enabled: false,

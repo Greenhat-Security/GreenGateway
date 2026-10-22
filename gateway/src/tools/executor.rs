@@ -575,6 +575,45 @@ struct CompositeLeafPreparationError {
     path_template: String,
 }
 
+/// Numbers the caller assertions one composite call's leaves carry.
+///
+/// Every leaf request -- a forward step, each iteration of a fan-out, and
+/// each compensation -- goes upstream on its own, so on a Connection that
+/// attests its caller each carries an assertion of its own: the `n`th leaf
+/// that signs one carries `jti` `<request ID>.<n>`, counting from 1 in the
+/// order the leaves are sent, the numbering a managed MCP session uses. A
+/// replay cache keyed on `sub` and `jti` therefore accepts every leaf of the
+/// call, and each leaf's `tool.upstream_request` names the `jti` it sent. A
+/// leaf that signs nothing, because it was refused or its Connection attests
+/// nobody, takes no number.
+struct CompositeLeafAssertions {
+    request_id: String,
+    signed: u32,
+}
+
+impl CompositeLeafAssertions {
+    fn new(request_id: &str) -> Self {
+        Self {
+            request_id: request_id.to_owned(),
+            signed: 0,
+        }
+    }
+
+    /// The `jti` the next leaf signs with, if it signs one.
+    fn next_jti(&self) -> String {
+        // The composite limits bound a call's steps, iterations and
+        // compensations far below `u32::MAX`, so the count never saturates.
+        format!("{}.{}", self.request_id, self.signed.saturating_add(1))
+    }
+
+    /// Counts the leaf that just ran, when it carried an assertion.
+    fn record(&mut self, issued: Option<&IssuedCallerAssertion>) {
+        if issued.is_some() {
+            self.signed = self.signed.saturating_add(1);
+        }
+    }
+}
+
 enum CompositeLeafCallOutcome {
     Response {
         response: EgressResponse,
@@ -1712,6 +1751,7 @@ impl ToolExecutor {
         let mut uncompensatable_writes = Vec::<CompositeOrphan>::new();
         let mut failure = None::<CompositeFailurePoint>;
         let mut total_iterations = 0usize;
+        let mut leaf_assertions = CompositeLeafAssertions::new(&context.request_id);
 
         'steps: for (step_index, step) in mapping.steps.iter().enumerate() {
             if cancel.is_cancelled() {
@@ -1823,7 +1863,7 @@ impl ToolExecutor {
                     &prepared.tool.upstream.path_template,
                 );
                 match self
-                    .call_composite_leaf(context, prepared, forward_deadline)
+                    .call_composite_leaf(context, prepared, forward_deadline, &mut leaf_assertions)
                     .await
                 {
                     CompositeLeafCallOutcome::Response {
@@ -2124,7 +2164,7 @@ impl ToolExecutor {
                 }
             };
             match self
-                .call_composite_leaf(context, prepared, admitted_deadline)
+                .call_composite_leaf(context, prepared, admitted_deadline, &mut leaf_assertions)
                 .await
             {
                 CompositeLeafCallOutcome::Response {
@@ -2168,6 +2208,24 @@ impl ToolExecutor {
                         "compensation_timeout",
                         None,
                     ));
+                }
+                // Refused before anything was sent because the caller could
+                // not be attested: nothing reached the upstream, and the
+                // reason says what to fix before the write is undone by hand.
+                CompositeLeafCallOutcome::Transport {
+                    reason,
+                    request_sent: false,
+                    ..
+                } if is_caller_assertion_refusal(&reason) => {
+                    audit.compensations.push(CompositeCompensationSummary {
+                        for_step: entry.step_id.clone(),
+                        iteration: entry.iteration,
+                        tool: entry.compensation.tool.clone(),
+                        outcome: CompositeCompensationOutcome::Skipped,
+                        upstream_status: None,
+                        reason: Some(reason.clone()),
+                    });
+                    orphans.push(composite_confirmed_orphan(entry, &reason, None));
                 }
                 CompositeLeafCallOutcome::Transport { .. } => {
                     audit.compensations.push(CompositeCompensationSummary {
@@ -2302,8 +2360,10 @@ impl ToolExecutor {
             .connection_http
             .as_ref()
             .ok_or_else(|| fail("connection_runtime_unavailable"))?;
+        // A leaf on a Connection that attests its caller carries an assertion
+        // of its own; see `CompositeLeafAssertions`.
         let target = runtime
-            .target(connection_id, &request.path_and_query)
+            .composite_leaf_target(connection_id, &request.path_and_query)
             .map_err(|error| fail(error.safe_reason()))?;
         Ok(PreparedCompositeLeaf {
             tool,
@@ -2317,11 +2377,13 @@ impl ToolExecutor {
         context: &ToolInvocationContext,
         prepared: PreparedCompositeLeaf,
         deadline: tokio::time::Instant,
+        leaf_assertions: &mut CompositeLeafAssertions,
     ) -> CompositeLeafCallOutcome {
         let started = Instant::now();
         let method = prepared.request.method.clone();
         let connection_id = prepared.target.connection_id().to_string();
         let mut issued_assertion = None;
+        let jti = leaf_assertions.next_jti();
         let result = self
             .execute_connection_http_classified(
                 context,
@@ -2329,9 +2391,11 @@ impl ToolExecutor {
                 prepared.target,
                 prepared.request,
                 Some(deadline),
+                &jti,
                 &mut issued_assertion,
             )
             .await;
+        leaf_assertions.record(issued_assertion.as_ref());
         let latency_ms = duration_millis(started.elapsed());
         match result {
             Ok(mut response) => {
@@ -2525,12 +2589,15 @@ impl ToolExecutor {
         request: ToolUpstreamRequest,
         issued_assertion: &mut Option<IssuedCallerAssertion>,
     ) -> Result<EgressResponse, ToolExecutorError> {
+        // A tool call sends one request, whose assertion carries the call's
+        // request ID as `jti`.
         self.execute_connection_http_classified(
             context,
             tool,
             target,
             request,
             None,
+            &context.request_id,
             issued_assertion,
         )
         .await
@@ -2538,9 +2605,10 @@ impl ToolExecutor {
     }
 
     /// Sends one Connection-bound request. When the target attests its
-    /// caller, `issued_assertion` is set to the assertion's `kid` and `jti`
-    /// as soon as it is on the request, so the caller's audit names it
-    /// whatever happens after.
+    /// caller, the assertion carries `assertion_jti` as its `jti`, and
+    /// `issued_assertion` is set to its `kid` and `jti` as soon as it is on
+    /// the request, so the caller's audit names it whatever happens after.
+    #[allow(clippy::too_many_arguments)]
     async fn execute_connection_http_classified(
         &self,
         context: &ToolInvocationContext,
@@ -2548,6 +2616,7 @@ impl ToolExecutor {
         target: ConnectionHttpTarget,
         mut request: ToolUpstreamRequest,
         deadline: Option<tokio::time::Instant>,
+        assertion_jti: &str,
         issued_assertion: &mut Option<IssuedCallerAssertion>,
     ) -> Result<EgressResponse, ClassifiedConnectionError> {
         let runtime = self
@@ -2747,7 +2816,7 @@ impl ToolExecutor {
             let issued = signer
                 .sign(
                     context.caller.as_deref(),
-                    &context.request_id,
+                    assertion_jti,
                     &request.method,
                     request.body.as_deref().unwrap_or_default(),
                 )
@@ -4496,13 +4565,23 @@ fn composite_confirmed_orphan(
     }
 }
 
-fn composite_compensation_preflight_reason(reason: &str) -> &'static str {
+fn composite_compensation_preflight_reason(reason: &str) -> &str {
     match reason {
         "tool_disabled" => "tool_disabled",
         "http_rule_denied" => "http_rule_denied",
         "timeout" => "compensation_timeout",
+        reason if is_caller_assertion_refusal(reason) => reason,
         _ => "compensation_transport_error",
     }
+}
+
+/// Whether a leaf's `reason` is a refusal to attest its caller: one of the
+/// fixed reasons of [`CallerAssertionError::safe_reason`], or the
+/// `caller_assertion_not_enforced` of a Connection no composite leaf can
+/// attest. Each names what to fix, so a composite reports it as it is rather
+/// than folding it into a transport error.
+fn is_caller_assertion_refusal(reason: &str) -> bool {
+    reason.starts_with("caller_assertion_")
 }
 
 async fn run_before_deadline<F, T>(deadline: Option<tokio::time::Instant>, work: F) -> Result<T, ()>
