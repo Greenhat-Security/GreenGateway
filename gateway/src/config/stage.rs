@@ -2,13 +2,14 @@
 //!
 //! `Config::from_env_vars` still asks for its inputs in the inventory's order
 //! and still reports every problem in one pass, in the order it always has.
-//! What changes, for the domains extracted so far, is where the work happens.
-//! Each block of inputs is read once into [`RawInput`]s. Functions that take
-//! only those values then parse each input on its own and validate the rules
-//! that relate them, and return a value and its [`Findings`]. They are given
-//! no reader, and they open no file, resolve no name and call no store,
-//! provider or network, so they can run where no environment exists, which is
-//! what the bundle and doctor callers of issue #242 need.
+//! What changes is where the work happens. Each block of inputs is read once
+//! into [`RawInput`]s. Functions that take only those values then parse each
+//! input on its own and validate the rules that relate them, and return a
+//! value and its [`Findings`]. They are given no reader, and they open no
+//! file, resolve no name and call no store, provider or network, so they can
+//! run where no environment exists, which is what the bundle and doctor
+//! callers of issue #242 need. `plan` runs every block, in order, into one
+//! validated plan.
 //!
 //! A stage parses every input of its block before it checks any rule, while
 //! the legacy parser checked some rules between two reads. Each finding
@@ -19,7 +20,7 @@
 use std::{env::VarError, fmt};
 
 use super::{
-    diagnostic::{ConfigRule, Rules},
+    diagnostic::{ConfigRule, Report},
     inventory, is_var_set,
 };
 
@@ -211,10 +212,9 @@ impl<T> Checked<T> {
         Self { value, findings }
     }
 
-    /// Appends the findings to the parser's problems in the order the legacy
-    /// parser reports them, records the rule behind each, and returns the
-    /// result.
-    pub(super) fn report(self, problems: &mut Vec<String>, rules: &mut Rules) -> T {
+    /// Appends the findings, each with the rule behind it, to the report in
+    /// the order the legacy parser reports them, and returns the result.
+    pub(super) fn report(self, report: &mut Report) -> T {
         let Checked {
             value,
             findings: Findings { mut found },
@@ -224,8 +224,7 @@ impl<T> Checked<T> {
         // before the rules checked once it was read.
         found.sort_by_key(|finding| inventory::position(finding.after));
         for finding in found {
-            rules.record(problems.len(), finding.rule);
-            problems.push(finding.problem);
+            report.push(finding.rule, finding.problem);
         }
         value
     }
@@ -234,10 +233,6 @@ impl<T> Checked<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn rules_of(problems: &[String], rules: &Rules) -> Vec<Option<ConfigRule>> {
-        (0..problems.len()).map(|index| rules.rule(index)).collect()
-    }
 
     #[test]
     fn findings_are_reported_where_the_legacy_parser_reports_them() {
@@ -263,13 +258,16 @@ mod tests {
         assert!(findings.refused("LISTEN_ADDR"));
         assert!(!findings.refused("ADMIN_LISTEN_ADDR"));
 
-        let mut problems = vec!["an earlier problem".to_owned()];
-        let mut rules = Rules::default();
-        let value = Checked::new(7, findings).report(&mut problems, &mut rules);
+        let mut report = Report::default();
+        report.push(
+            ConfigRule::TrustedProxyNetworksRequired,
+            "an earlier problem".to_owned(),
+        );
+        let value = Checked::new(7, findings).report(&mut report);
 
         assert_eq!(value, 7);
         assert_eq!(
-            problems,
+            report.problems(),
             [
                 "an earlier problem",
                 "LISTEN_ADDR first",
@@ -279,13 +277,13 @@ mod tests {
             ]
         );
         assert_eq!(
-            rules_of(&problems, &rules),
+            report.rules(),
             [
-                None,
-                Some(ConfigRule::Value),
-                Some(ConfigRule::AdminListenerCollision),
-                Some(ConfigRule::Value),
-                Some(ConfigRule::GrpcListenerCollision),
+                ConfigRule::TrustedProxyNetworksRequired,
+                ConfigRule::Value,
+                ConfigRule::AdminListenerCollision,
+                ConfigRule::Value,
+                ConfigRule::GrpcListenerCollision,
             ]
         );
     }

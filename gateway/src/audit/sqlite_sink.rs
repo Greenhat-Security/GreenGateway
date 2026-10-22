@@ -328,8 +328,11 @@ impl SqliteSinkShared {
         if let Err(err) = result {
             self.dropped
                 .fetch_add(events.len() as u64, Ordering::AcqRel);
-            ::metrics::counter!(crate::audit::AUDIT_EVENTS_DROPPED_TOTAL, "reason" => "sqlite")
-                .increment(events.len() as u64);
+            ::metrics::counter!(
+                crate::audit::AUDIT_EVENTS_DROPPED_TOTAL,
+                "reason" => crate::audit::DROP_REASON_SQLITE
+            )
+            .increment(events.len() as u64);
             let mut failure = self
                 .flush_failure
                 .lock()

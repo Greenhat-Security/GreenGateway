@@ -182,7 +182,7 @@ impl AuditSink for StdoutSink {
             self.record_failure(&err);
             ::metrics::counter!(
                 AUDIT_EVENTS_DROPPED_TOTAL,
-                "reason" => "sink_error"
+                "reason" => crate::audit::DROP_REASON_SINK_ERROR
             )
             .increment(1);
             tracing::error!(error = %err, "failed to write audit event to stdout");
@@ -286,7 +286,7 @@ impl AuditSink for FileSink {
                 self.record_failure(&err);
                 ::metrics::counter!(
                     AUDIT_EVENTS_DROPPED_TOTAL,
-                    "reason" => "sink_error"
+                    "reason" => crate::audit::DROP_REASON_SINK_ERROR
                 )
                 .increment(1);
                 tracing::error!(

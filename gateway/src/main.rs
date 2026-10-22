@@ -68,6 +68,8 @@ mod admin_connections;
 use admin_connections::*;
 mod admin_policy;
 use admin_policy::*;
+mod admin_policy_drafts;
+use admin_policy_drafts::*;
 mod admin_tokens;
 use admin_tokens::*;
 mod admin_tools;
