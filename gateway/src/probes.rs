@@ -216,7 +216,9 @@ pub(super) async fn readiness_blocked_reason(
     // Cluster mode: a replica whose static configuration disagrees
     // with a live member's is not ready however healthy it is locally
     // (HA state model invariant 14). The membership heartbeat
-    // re-evaluates the gate and opens it once the members agree.
+    // re-evaluates the gate and opens it once the members agree. A
+    // replica the durable contract fence excludes (issue #426, PR 3) is
+    // reported first, and that gate never opens again.
     if let Some(reason) = cluster_readiness.and_then(|readiness| readiness.blocked_reason()) {
         return Some(reason);
     }

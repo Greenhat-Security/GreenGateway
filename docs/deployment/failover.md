@@ -68,6 +68,7 @@ Expected output: `200` and `{"status":"ready"}` on a healthy replica. A `503` ca
 | --- | --- | --- |
 | `starting` | the replica has not finished coming up | wait; if it persists, read its startup logs — cluster mode fails closed at startup for schema, binding, and policy problems |
 | `draining` | the replica is shutting down on purpose | none; expected during a rollout |
+| `contract_fenced` | the deployment's durable contract fence excludes this replica's build; it can never become ready again | replace it with an eligible build; a restart of the same build fails startup ([the durable contract fence](postgres.md#the-durable-contract-fence)) |
 | `config_fingerprint_mismatch` | this replica's security-relevant static configuration disagrees with a live member's | see below |
 | `required_upstream_unavailable` | a proxy upstream marked required for readiness is down | a data-plane problem, not a cluster problem |
 

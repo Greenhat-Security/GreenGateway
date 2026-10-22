@@ -63,6 +63,13 @@ const REASON_DETAILS: Record<string, ReasonDetail> = {
     anchor: '#readiness-and-status',
     remediation: 'Readiness and status',
   },
+  contract_fenced: {
+    label: 'Contract fenced',
+    description:
+      'The deployment’s durable contract fence excludes this replica’s build, so it can never become ready again: replace it with an eligible build.',
+    anchor: '#the-durable-contract-fence',
+    remediation: 'The durable contract fence',
+  },
   config_fingerprint_mismatch: {
     label: 'Configuration fingerprint mismatch',
     description:

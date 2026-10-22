@@ -9572,6 +9572,740 @@ pub(crate) mod postgres_audit_tests {
         assert_eq!(events[5].payload["operation"], "fixture.gated_write");
     }
 
+    // ------------------------------------------------------------------
+    // The durable contract fence and the backfill ledger (issue #426, PR 3)
+    // ------------------------------------------------------------------
+
+    /// A registration of this binary that advertises only the protocol: the
+    /// shape of the prepared release of issue #426's pair, which serves the
+    /// same schema but was built before role descriptions.
+    fn prepared_registration(fingerprint_byte: char) -> MemberRegistration {
+        MemberRegistration {
+            capabilities: vec![crate::storage::compatibility::Capability::OperationRequirements],
+            ..registration(fingerprint_byte)
+        }
+    }
+
+    /// Raise the contract fence the way a newer build's admission leaves
+    /// it, writing the row directly: the generation advances and nothing is
+    /// lowered, which is all the forward-only trigger admits.
+    async fn raise_fence_directly(
+        pool: &deadpool_postgres::Pool,
+        minimum_schema: i32,
+        capabilities: &str,
+    ) {
+        let updated = pool
+            .get()
+            .await
+            .expect("client")
+            .execute(
+                "UPDATE greengateway.contract_fence
+                 SET generation = generation + 1,
+                     minimum_schema = GREATEST(minimum_schema, $1),
+                     capabilities = $2,
+                     raised_at = now(),
+                     raised_by = 'fixture.newer_build'
+                 WHERE singleton",
+                &[&minimum_schema, &capabilities],
+            )
+            .await
+            .expect("a forward-only raise is accepted");
+        assert_eq!(updated, 1, "the fence row exists to raise");
+    }
+
+    async fn wait_for_events(capture: &crate::audit::sink::tests::CaptureSink, count: usize) {
+        let started = std::time::Instant::now();
+        while capture.len() < count && started.elapsed() < Duration::from_secs(5) {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    /// The fence decides at every heartbeat: an open fence admits every
+    /// build of this schema; a raised one admits exactly the builds that
+    /// serve its minimum schema and implement every fenced capability. A
+    /// replica paused past the stale window while the deployment moved past
+    /// its build resumes into a heartbeat that writes nothing, refuses
+    /// readiness for good and audits that once; once swept, it cannot come
+    /// back, and a restart of the same build is refused at its boot row.
+    #[tokio::test]
+    async fn a_build_the_contract_fence_excludes_can_neither_boot_nor_rejoin() {
+        use crate::audit::{sink::tests::CaptureSink, AuditLog};
+        use crate::cluster_membership::BootRegistrationError;
+        use crate::ha::ClusterReadiness;
+        use crate::storage::HeartbeatOutcome;
+
+        let Some(admin_dsn) = locator() else {
+            eprintln!("skipping: no test database locator; CI runs this test");
+            return;
+        };
+        let _guard = DATABASE.lock().await;
+        let database = create_test_database(&admin_dsn).await;
+        let pool = migrated_limits_pool(&database).await;
+        let heartbeat = Duration::from_secs(1);
+        let window = Duration::from_secs(30);
+        let serving_max = migrations::schema_version_range().1;
+        let capture = CaptureSink::new();
+        let audit = AuditLog::new(Arc::new(capture.clone()));
+        let lifecycle = crate::lifecycle::GatewayLifecycle::new();
+
+        // The fence migration 20 seeds admits both builds.
+        let running_store = member_store(&pool);
+        let running =
+            ClusterMembership::new(running_store.clone(), registration('a'), heartbeat, window);
+        running
+            .register_boot()
+            .await
+            .expect("an open fence admits this build");
+        assert_eq!(running.readiness().blocked_reason(), None);
+        let prepared_store = member_store(&pool);
+        assert_eq!(
+            prepared_store
+                .heartbeat(
+                    &prepared_registration('a'),
+                    MemberRevisions::default(),
+                    None
+                )
+                .await
+                .expect("heartbeat"),
+            HeartbeatOutcome::Written
+        );
+
+        // Raised for role descriptions: the full build still writes; the
+        // prepared one is refused, and its row is not refreshed.
+        backdate_heartbeat(&pool, prepared_store.instance_id(), 60.0).await;
+        raise_fence_directly(&pool, 0, "operation_requirements,policy_role_descriptions").await;
+        assert_eq!(
+            running_store
+                .heartbeat(&registration('a'), MemberRevisions::default(), None)
+                .await
+                .expect("heartbeat"),
+            HeartbeatOutcome::Written
+        );
+        assert_eq!(
+            prepared_store
+                .heartbeat(
+                    &prepared_registration('a'),
+                    MemberRevisions::default(),
+                    None
+                )
+                .await
+                .expect("heartbeat"),
+            HeartbeatOutcome::Fenced
+        );
+        let prepared_row = running_store
+            .members(window)
+            .await
+            .expect("members")
+            .into_iter()
+            .find(|member| member.instance_id == prepared_store.instance_id())
+            .expect("the prepared row is still on the roster");
+        assert!(!prepared_row.live, "a fenced heartbeat refreshes nothing");
+        // Nor do its ready and draining stamps, which also count as
+        // heartbeats: a replica stopped before its next heartbeat found out
+        // must not reappear live on its way out.
+        prepared_store.mark_ready().await.expect("ready stamp");
+        prepared_store
+            .mark_draining()
+            .await
+            .expect("draining stamp");
+        let prepared_row = running_store
+            .members(window)
+            .await
+            .expect("members")
+            .into_iter()
+            .find(|member| member.instance_id == prepared_store.instance_id())
+            .expect("the prepared row is still on the roster");
+        assert!(
+            !prepared_row.live && prepared_row.ready_at.is_none(),
+            "a fenced stamp refreshes nothing: {prepared_row:?}"
+        );
+        assert!(prepared_row.draining_at.is_none(), "{prepared_row:?}");
+        // The raised fence still admits the full build's stamp.
+        running_store.mark_ready().await.expect("ready stamp");
+        assert!(running_store
+            .members(window)
+            .await
+            .expect("members")
+            .iter()
+            .any(|member| member.instance_id == running_store.instance_id()
+                && member.live
+                && member.ready_at.is_some()));
+
+        // Raised past this build's serving range while it is paused past
+        // the stale window. It resumes: the heartbeat lands nowhere.
+        backdate_heartbeat(&pool, running_store.instance_id(), 60.0).await;
+        raise_fence_directly(
+            &pool,
+            serving_max + 1,
+            "operation_requirements,policy_role_descriptions",
+        )
+        .await;
+        assert_eq!(
+            running_store
+                .heartbeat(&registration('a'), MemberRevisions::default(), None)
+                .await
+                .expect("heartbeat"),
+            HeartbeatOutcome::Fenced
+        );
+        assert!(running_store
+            .members(window)
+            .await
+            .expect("members")
+            .iter()
+            .all(|member| !member.live));
+
+        // Its own heartbeat task: refused for good, audited once.
+        running.tick_once(&lifecycle, None, &audit).await;
+        running.tick_once(&lifecycle, None, &audit).await;
+        assert_eq!(
+            running.readiness().blocked_reason(),
+            Some(ClusterReadiness::CONTRACT_FENCED)
+        );
+        wait_for_events(&capture, 1).await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let events = capture.events();
+        assert_eq!(
+            events.len(),
+            1,
+            "the transition is audited once: {events:?}"
+        );
+        assert_eq!(events[0].event_type, "cluster.contract_fenced");
+        assert_eq!(events[0].payload["reason"], "contract_fenced");
+        assert_eq!(events[0].payload["fence_generation"], 2);
+        assert_eq!(events[0].payload["minimum_schema"], serving_max + 1);
+        assert_eq!(events[0].payload["schema_max"], serving_max);
+        assert_eq!(events[0].payload["missing_capabilities"], 0);
+        assert!(!events[0]
+            .payload
+            .to_string()
+            .contains(&running_store.instance_id().to_string()));
+
+        // Swept, neither replica can come back.
+        assert_eq!(
+            running_store.sweep_stale(window, 10).await.expect("sweep"),
+            2
+        );
+        for (store, registration) in [
+            (&running_store, registration('a')),
+            (&prepared_store, prepared_registration('a')),
+        ] {
+            assert_eq!(
+                store
+                    .heartbeat(&registration, MemberRevisions::default(), None)
+                    .await
+                    .expect("heartbeat"),
+                HeartbeatOutcome::Fenced
+            );
+        }
+        assert!(running_store
+            .members(window)
+            .await
+            .expect("members")
+            .is_empty());
+
+        // And a restart of this build is refused at its boot row.
+        let restarted =
+            ClusterMembership::new(member_store(&pool), registration('a'), heartbeat, window);
+        assert!(matches!(
+            restarted.register_boot().await,
+            Err(BootRegistrationError::ContractFenced)
+        ));
+        assert_eq!(
+            restarted.readiness().blocked_reason(),
+            Some(ClusterReadiness::CONTRACT_FENCED)
+        );
+        assert!(running_store
+            .members(window)
+            .await
+            .expect("members")
+            .is_empty());
+    }
+
+    /// A heartbeat that arrives while a raise holds the fence row waits for
+    /// it and is judged against the raised fence: it cannot slip in behind
+    /// a raise whose roster read did not see it.
+    #[tokio::test]
+    async fn a_heartbeat_racing_a_fence_raise_waits_for_it_and_is_refused() {
+        use crate::storage::HeartbeatOutcome;
+
+        let Some(admin_dsn) = locator() else {
+            eprintln!("skipping: no test database locator; CI runs this test");
+            return;
+        };
+        let _guard = DATABASE.lock().await;
+        let database = create_test_database(&admin_dsn).await;
+        let pool = migrated_limits_pool(&database).await;
+        let store = member_store(&pool);
+        assert_eq!(
+            store
+                .heartbeat(&registration('a'), MemberRevisions::default(), None)
+                .await
+                .expect("heartbeat"),
+            HeartbeatOutcome::Written
+        );
+
+        let raiser = pool.get().await.expect("client");
+        raiser
+            .batch_execute(
+                "BEGIN;
+                 SELECT 1 FROM greengateway.contract_fence WHERE singleton FOR UPDATE;
+                 UPDATE greengateway.contract_fence
+                 SET generation = generation + 1,
+                     capabilities = 'future_capability',
+                     raised_at = now(),
+                     raised_by = 'fixture.newer_build'
+                 WHERE singleton;",
+            )
+            .await
+            .expect("a raise is in flight");
+        let racing = tokio::spawn({
+            let store = store.clone();
+            async move {
+                store
+                    .heartbeat(&registration('a'), MemberRevisions::default(), None)
+                    .await
+            }
+        });
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(
+            !racing.is_finished(),
+            "the heartbeat waits behind the raise's row lock"
+        );
+        raiser.batch_execute("COMMIT").await.expect("commit");
+        assert_eq!(
+            racing.await.expect("join").expect("heartbeat"),
+            HeartbeatOutcome::Fenced,
+            "and is judged against the fence the raise committed"
+        );
+    }
+
+    /// An operation declaring a durable fence is admitted only by raising
+    /// the fence, in the transaction that confirms every live member already
+    /// meets the raised fence: a live prepared member holds it, a stale one
+    /// does not -- and once it is raised, that member cannot rejoin. The
+    /// raise is idempotent, audited, refused while a migrator holds the
+    /// schema lock or the ledger is not this build's, waits for a backfill
+    /// to be recorded verified, and cannot be overtaken by a heartbeat that
+    /// was mid-statement when it began.
+    #[tokio::test]
+    async fn a_durable_fence_operation_raises_the_fence_only_when_every_live_member_meets_it() {
+        use crate::audit::{sink::tests::CaptureSink, AuditLog};
+        use crate::cluster_membership::{BootRegistrationError, GatedWriteRequest};
+        use crate::storage::compatibility::{
+            Activation, Backfill, BackfillState, Capability, OperationAdmission, OperationRefusal,
+            OperationRequirement,
+        };
+        use crate::storage::HeartbeatOutcome;
+
+        let Some(admin_dsn) = locator() else {
+            eprintln!("skipping: no test database locator; CI runs this test");
+            return;
+        };
+        let _guard = DATABASE.lock().await;
+        let database = create_test_database(&admin_dsn).await;
+        let pool = migrated_limits_pool(&database).await;
+        let heartbeat = Duration::from_secs(1);
+        let window = Duration::from_secs(30);
+        let serving = migrations::schema_version_range();
+
+        let fenced = OperationRequirement {
+            operation: "fixture.fenced_write",
+            minimum_schema: serving.0,
+            document_format: None,
+            capability: Capability::PolicyRoleDescriptions,
+            backfill: Backfill::NotRequired,
+            activation: Activation::DurableFence,
+        };
+        let backfilled = OperationRequirement {
+            operation: "fixture.backfilled_write",
+            backfill: Backfill::Required {
+                name: "fixture_backfill",
+            },
+            ..fenced
+        };
+        let live_backfilled = OperationRequirement {
+            operation: "fixture.live_backfilled_write",
+            activation: Activation::LiveMembers,
+            ..backfilled
+        };
+        let registry = [fenced, backfilled, live_backfilled];
+        let capture = CaptureSink::new();
+        let audit = AuditLog::new(Arc::new(capture.clone()));
+        let request = GatedWriteRequest {
+            request_id: "request-fence".to_owned(),
+            source_ip: "203.0.113.9".to_owned(),
+            actor: None,
+        };
+        let read_fence = |pool: deadpool_postgres::Pool| async move {
+            crate::storage::read_contract_fence(&pool)
+                .await
+                .expect("the fence reads")
+        };
+
+        let successor_store = member_store(&pool);
+        let successor = ClusterMembership::new(
+            successor_store.clone(),
+            registration('a'),
+            heartbeat,
+            window,
+        );
+        successor.register_boot().await.expect("boot");
+        let prepared_store = member_store(&pool);
+        let prepared = ClusterMembership::new(
+            prepared_store.clone(),
+            prepared_registration('a'),
+            heartbeat,
+            window,
+        );
+        prepared.register_boot().await.expect("boot");
+
+        // A live prepared member holds the raise, and nothing is written.
+        assert_eq!(
+            successor
+                .admit_registered(&fenced, &registry, &audit, &request)
+                .await,
+            Err(OperationRefusal::MembersLackRequirement {
+                lacking: vec![prepared_store.instance_id()],
+                live: 2
+            })
+        );
+        assert_eq!(read_fence(pool.clone()).await.generation, 0);
+
+        // Stopped and stale, it no longer holds it: the fence is raised in
+        // the admitting transaction.
+        backdate_heartbeat(&pool, prepared_store.instance_id(), 60.0).await;
+        assert_eq!(
+            successor
+                .admit_registered(&fenced, &registry, &audit, &request)
+                .await,
+            Ok(OperationAdmission { live_members: 1 })
+        );
+        let raised = read_fence(pool.clone()).await;
+        assert_eq!(raised.generation, 1);
+        assert_eq!(raised.minimum_schema, serving.0);
+        assert_eq!(raised.capabilities, "policy_role_descriptions");
+        let raised_by: String = pool
+            .get()
+            .await
+            .expect("client")
+            .query_one(
+                "SELECT raised_by FROM greengateway.contract_fence WHERE singleton",
+                &[],
+            )
+            .await
+            .expect("the fence reads")
+            .get(0);
+        assert_eq!(raised_by, "fixture.fenced_write");
+
+        // The stale member's return is refused, and so is a new boot of it.
+        assert_eq!(
+            prepared_store
+                .heartbeat(
+                    &prepared_registration('a'),
+                    MemberRevisions::default(),
+                    None
+                )
+                .await
+                .expect("heartbeat"),
+            HeartbeatOutcome::Fenced
+        );
+        let again = ClusterMembership::new(
+            member_store(&pool),
+            prepared_registration('a'),
+            heartbeat,
+            window,
+        );
+        assert!(matches!(
+            again.register_boot().await,
+            Err(BootRegistrationError::ContractFenced)
+        ));
+
+        // A repeat admission is the same decision and writes nothing.
+        assert_eq!(
+            successor
+                .admit_registered(&fenced, &registry, &audit, &request)
+                .await,
+            Ok(OperationAdmission { live_members: 1 })
+        );
+        assert_eq!(read_fence(pool.clone()).await.generation, 1);
+
+        // A migrator holding the schema lock refuses the decision outright.
+        let migrator = pool.get().await.expect("client");
+        migrator
+            .execute(
+                "SELECT pg_advisory_lock($1)",
+                &[&migrations::migration_lock_key()],
+            )
+            .await
+            .expect("hold the migration lock");
+        assert_eq!(
+            successor
+                .admit_registered(&fenced, &registry, &audit, &request)
+                .await,
+            Err(OperationRefusal::MigrationInProgress)
+        );
+        migrator
+            .execute(
+                "SELECT pg_advisory_unlock($1)",
+                &[&migrations::migration_lock_key()],
+            )
+            .await
+            .expect("release the migration lock");
+        drop(migrator);
+
+        // A ledger this build does not serve refuses it too.
+        let ledger = pool.get().await.expect("client");
+        ledger
+            .execute(
+                "INSERT INTO greengateway.schema_migrations (version, name, checksum)
+                 VALUES ($1, 'from_a_newer_gateway', repeat('0', 64))",
+                &[&(i64::from(serving.1) + 1)],
+            )
+            .await
+            .expect("plant a newer migration");
+        let unserved = successor
+            .admit_registered(&fenced, &registry, &audit, &request)
+            .await;
+        ledger
+            .execute(
+                "DELETE FROM greengateway.schema_migrations WHERE version = $1",
+                &[&(i64::from(serving.1) + 1)],
+            )
+            .await
+            .expect("remove it");
+        assert_eq!(unserved, Err(OperationRefusal::SchemaNotServed));
+
+        // A backfill is admitted only once it is recorded verified, on both
+        // paths through the gate.
+        let set_backfill = |state: Option<&'static str>| {
+            let pool = pool.clone();
+            async move {
+                let client = pool.get().await.expect("client");
+                client
+                    .execute("DELETE FROM greengateway.schema_backfills", &[])
+                    .await
+                    .expect("clear the ledger");
+                if let Some(state) = state {
+                    client
+                        .execute(
+                            "INSERT INTO greengateway.schema_backfills (name, state, finished_at)
+                             VALUES ('fixture_backfill', $1,
+                                     CASE WHEN $1 = 'running' THEN NULL ELSE now() END)",
+                            &[&state],
+                        )
+                        .await
+                        .expect("record the backfill");
+                }
+            }
+        };
+        for (row, state) in [
+            (None, BackfillState::Missing),
+            (Some("running"), BackfillState::Running),
+            (Some("failed"), BackfillState::Failed),
+        ] {
+            set_backfill(row).await;
+            for requirement in [&backfilled, &live_backfilled] {
+                assert_eq!(
+                    successor
+                        .admit_registered(requirement, &registry, &audit, &request)
+                        .await,
+                    Err(OperationRefusal::BackfillUnverified {
+                        backfill: "fixture_backfill",
+                        state: Some(state)
+                    }),
+                    "{}: {state:?}",
+                    requirement.operation
+                );
+            }
+        }
+        set_backfill(Some("verified")).await;
+        for requirement in [&backfilled, &live_backfilled] {
+            assert_eq!(
+                successor
+                    .admit_registered(requirement, &registry, &audit, &request)
+                    .await,
+                Ok(OperationAdmission { live_members: 1 }),
+                "{}",
+                requirement.operation
+            );
+        }
+
+        // A heartbeat mid-statement when the raise begins is not overtaken:
+        // the raise waits for it and then counts it. A booting member that
+        // lacks the capability holds FOR SHARE as its heartbeat does, writes
+        // its row, and commits after the raise has asked for the lock.
+        let fresh = create_test_database(&admin_dsn).await;
+        let fresh_pool = migrated_limits_pool(&fresh).await;
+        let admitting_store = member_store(&fresh_pool);
+        let admitting = ClusterMembership::new(
+            admitting_store.clone(),
+            registration('a'),
+            heartbeat,
+            window,
+        );
+        admitting.register_boot().await.expect("boot");
+        let booting = uuid::Uuid::new_v4();
+        let joiner = fresh_pool.get().await.expect("client");
+        joiner
+            .batch_execute(&format!(
+                "BEGIN;
+                 SELECT 1 FROM greengateway.contract_fence WHERE singleton FOR SHARE;
+                 INSERT INTO greengateway.cluster_members
+                     (deployment_id, instance_id, boot_id, binary_version,
+                      schema_version_min, schema_version_max,
+                      document_version_min, document_version_max, fingerprint, capabilities)
+                 VALUES ('{MEMBERS_DEPLOYMENT}', '{booting}', '{}', '1.0.1', {min}, {max}, 0, 0,
+                         repeat('a', 64), 'operation_requirements');",
+                uuid::Uuid::new_v4(),
+                min = serving.0,
+                max = serving.1,
+            ))
+            .await
+            .expect("a heartbeat is mid-statement");
+        let admission = tokio::spawn({
+            let audit = audit.clone();
+            let request = request.clone();
+            async move {
+                admitting
+                    .admit_registered(&fenced, &registry, &audit, &request)
+                    .await
+            }
+        });
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(
+            !admission.is_finished(),
+            "the raise waits for the heartbeat's share lock"
+        );
+        joiner.batch_execute("COMMIT").await.expect("commit");
+        assert_eq!(
+            admission.await.expect("join"),
+            Err(OperationRefusal::MembersLackRequirement {
+                lacking: vec![booting],
+                live: 2
+            }),
+            "the raise saw the member that joined before it took the lock"
+        );
+        assert_eq!(read_fence(fresh_pool.clone()).await.generation, 0);
+
+        // One raise was audited, with the numbers before and after, and
+        // every refusal above was audited as one, none naming a member.
+        wait_for_events(&capture, 11).await;
+        let events = capture.events();
+        let raised_events: Vec<_> = events
+            .iter()
+            .filter(|event| event.event_type == "cluster.contract_fence_raised")
+            .collect();
+        assert_eq!(raised_events.len(), 1, "{events:?}");
+        assert_eq!(raised_events[0].request_id, "request-fence");
+        assert_eq!(
+            raised_events[0].payload["operation"],
+            "fixture.fenced_write"
+        );
+        assert_eq!(raised_events[0].payload["outcome"], "raised");
+        assert_eq!(raised_events[0].payload["previous_generation"], 0);
+        assert_eq!(raised_events[0].payload["fence_generation"], 1);
+        assert_eq!(raised_events[0].payload["minimum_schema"], serving.0);
+        assert_eq!(raised_events[0].payload["live_members"], 1);
+        let reasons: Vec<&str> = events
+            .iter()
+            .filter(|event| event.event_type == "cluster.operation_refused")
+            .map(|event| {
+                assert!(!event
+                    .payload
+                    .to_string()
+                    .contains(&prepared_store.instance_id().to_string()));
+                assert!(!event.payload.to_string().contains(&booting.to_string()));
+                event.payload["reason"].as_str().expect("a reason")
+            })
+            .collect();
+        assert_eq!(
+            reasons,
+            [
+                "capability_not_advertised",
+                "migration_in_progress",
+                "schema_incompatible",
+                "backfill_unverified",
+                "backfill_unverified",
+                "backfill_unverified",
+                "backfill_unverified",
+                "backfill_unverified",
+                "backfill_unverified",
+                "capability_not_advertised",
+            ]
+        );
+    }
+
+    /// A fence that cannot be read or raised refuses the operation on both
+    /// paths through the gate rather than admitting it on the roster alone.
+    #[tokio::test]
+    async fn an_unreadable_contract_fence_refuses_every_gated_operation() {
+        use crate::audit::{sink::tests::CaptureSink, AuditLog};
+        use crate::cluster_membership::GatedWriteRequest;
+        use crate::storage::compatibility::{
+            Activation, Backfill, Capability, OperationRefusal, OperationRequirement,
+        };
+
+        let Some(admin_dsn) = locator() else {
+            eprintln!("skipping: no test database locator; CI runs this test");
+            return;
+        };
+        let _guard = DATABASE.lock().await;
+        let database = create_test_database(&admin_dsn).await;
+        let pool = migrated_limits_pool(&database).await;
+        let live = OperationRequirement {
+            operation: "fixture.live_write",
+            minimum_schema: migrations::schema_version_range().0,
+            document_format: None,
+            capability: Capability::OperationRequirements,
+            backfill: Backfill::NotRequired,
+            activation: Activation::LiveMembers,
+        };
+        let fenced = OperationRequirement {
+            operation: "fixture.fenced_write",
+            activation: Activation::DurableFence,
+            ..live
+        };
+        let registry = [live, fenced];
+        let audit = AuditLog::new(Arc::new(CaptureSink::new()));
+        let request = GatedWriteRequest {
+            request_id: "request-fence".to_owned(),
+            source_ip: "203.0.113.9".to_owned(),
+            actor: None,
+        };
+        let membership = ClusterMembership::new(
+            member_store(&pool),
+            registration('a'),
+            Duration::from_secs(1),
+            Duration::from_secs(30),
+        );
+        membership.register_boot().await.expect("boot");
+
+        let client = pool.get().await.expect("client");
+        client
+            .batch_execute(
+                "ALTER TABLE greengateway.contract_fence RENAME TO contract_fence_hidden",
+            )
+            .await
+            .expect("hide the fence");
+        let refusals = [
+            membership
+                .admit_registered(&live, &registry, &audit, &request)
+                .await,
+            membership
+                .admit_registered(&fenced, &registry, &audit, &request)
+                .await,
+        ];
+        client
+            .batch_execute(
+                "ALTER TABLE greengateway.contract_fence_hidden RENAME TO contract_fence",
+            )
+            .await
+            .expect("restore the fence");
+        for refusal in refusals {
+            assert_eq!(refusal, Err(OperationRefusal::ActivationFenceUnavailable));
+        }
+    }
+
     /// A swept row comes back as the same boot: a replica partitioned past
     /// the stale window has its row swept by the singleton; when it
     /// reconnects, its next heartbeat re-creates the row with the

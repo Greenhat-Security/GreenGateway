@@ -148,6 +148,16 @@ pub(crate) enum PostgresFoundationError {
     /// The database is bound to another deployment (migration 0007's
     /// `deployment_binding`); deployments never share a database.
     DeploymentMismatch { bound: String },
+    /// The durable contract fence (migration 20, issue #426) excludes this
+    /// build: the deployment has activated an operation past what this
+    /// build can read. A retired build never returns; there is nothing to
+    /// retry.
+    ContractFenced {
+        exclusion: super::compatibility::FenceExclusion,
+    },
+    /// The durable contract fence could not be read. A fence that cannot
+    /// be consulted is a fail-closed condition, like a ledger that cannot.
+    ContractFenceUnreadable,
     /// Cluster mode was selected but the configuration this build validated
     /// did not carry the settings the mode requires. Unreachable through
     /// `Config::from_env`; a defensive fail-closed arm.
@@ -219,6 +229,21 @@ impl fmt::Display for PostgresFoundationError {
                 "this database is bound to deployment '{bound}'; STATE_BACKEND=postgres \
                  deployments never share a database -- point DEPLOYMENT_ID at that deployment \
                  or this replica at its own database"
+            ),
+            Self::ContractFenced { exclusion } => write!(
+                formatter,
+                "this gateway build is excluded by the database's durable contract fence: \
+                 {exclusion}. A retired build cannot return once the deployment has moved past \
+                 it, and restoring or rewinding the database to admit it could resurrect revoked \
+                 authority -- run a build that serves the fenced schema and implements the \
+                 fenced capabilities"
+            ),
+            Self::ContractFenceUnreadable => write!(
+                formatter,
+                "the durable contract fence (greengateway.contract_fence) could not be read; a \
+                 fence that cannot be consulted is a fail-closed condition -- check that the \
+                 runtime role holds its grants on the schema's tables and that the database \
+                 answers, then restart this gateway"
             ),
             Self::NotConfigured => write!(
                 formatter,
@@ -301,6 +326,20 @@ impl PostgresFoundation {
             // The ledger could not be read at all: an authority that cannot
             // be consulted is a fail-closed condition, never a serve-anyway.
             Err(_) => return Err(PostgresFoundationError::SchemaCheckFailed),
+        }
+        // The durable contract fence (migration 20, issue #426 PR 3), read
+        // as soon as the schema check above has proven its table is there
+        // and before anything else is read or written: a build the
+        // deployment has moved past neither binds the database nor gets as
+        // far as compiling a policy it could misread. One-shot commands are
+        // refused the same way. The membership heartbeat decides again,
+        // atomically with writing the boot row, so a raise that lands after
+        // this read is still caught before the replica serves.
+        let fence = super::read_contract_fence(foundation.pool())
+            .await
+            .map_err(|_| PostgresFoundationError::ContractFenceUnreadable)?;
+        if let Some(exclusion) = super::compatibility::BinaryContract::shipped().fenced_by(&fence) {
+            return Err(PostgresFoundationError::ContractFenced { exclusion });
         }
         // Bound to one deployment: the first boot records this
         // DEPLOYMENT_ID and every later boot refuses another. The binding
