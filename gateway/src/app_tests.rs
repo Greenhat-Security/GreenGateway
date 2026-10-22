@@ -8631,6 +8631,7 @@ fn expected_ha_metric_names() -> Vec<&'static str> {
         metrics::AUTHORITY_EVENT_DELIVERED_TOTAL,
         metrics::AUTHORITY_EVENT_DELIVERY_FAILURES_TOTAL,
         metrics::AUTHORITY_EVENT_CAPACITY_REFUSALS_TOTAL,
+        metrics::AUTHORITY_EVENT_EVIDENCE_FAILURES_TOTAL,
     ]);
     names
 }
@@ -8937,8 +8938,8 @@ async fn synthetic_ha_run() {
         record_audit_stream_duplicates(1);
 
         // Authority-event delivery: the journal gauges, every failure step,
-        // a delivered batch and a refused mutation. None names an event,
-        // an actor, a resource or a position.
+        // a delivered batch and both kinds of refused mutation. None names
+        // an event, an actor, a resource or a position.
         authority_events::dispatcher::record_journal_stats(
             &storage::postgres_authority_events::JournalStats {
                 retained: 7,
@@ -8954,6 +8955,7 @@ async fn synthetic_ha_run() {
         }
         authority_events::dispatcher::record_delivered(3);
         storage::postgres_authority_events::record_capacity_refusal();
+        storage::postgres_authority_events::record_evidence_failure();
     }
 }
 
