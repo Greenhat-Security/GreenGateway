@@ -79,6 +79,8 @@ pub(super) const TRAFFIC_ENDPOINT_DETAIL_ADMIN_ROUTE: &str = "/v1/admin/traffic/
 pub(super) const TRAFFIC_ENDPOINT_REVIEW_ADMIN_ROUTE: &str = "/v1/admin/traffic/endpoints/review";
 pub(super) const PRINCIPALS_ADMIN_ROUTE: &str = "/v1/admin/principals";
 pub(super) const PRINCIPAL_ADMIN_ROUTE: &str = "/v1/admin/principal";
+pub(super) const PRINCIPAL_DELEGATED_TOKENS_REVOKE_ADMIN_ROUTE: &str =
+    "/v1/admin/principal/delegated-tokens/revoke";
 pub(super) const ADMIN_AUDIT_READ_PERMISSION: &str = "admin:audit:read";
 pub(super) const ADMIN_AUDIT_STREAM_PERMISSION: &str = "admin:audit:stream";
 pub(super) const ADMIN_STATUS_READ_PERMISSION: &str = "admin:status:read";
@@ -109,6 +111,7 @@ pub(super) const ADMIN_SUGGESTIONS_WRITE_PERMISSION: &str = "admin:suggestions:w
 pub(super) const ADMIN_TRAFFIC_READ_PERMISSION: &str = "admin:traffic:read";
 pub(super) const ADMIN_TRAFFIC_WRITE_PERMISSION: &str = "admin:traffic:write";
 pub(super) const ADMIN_PRINCIPALS_READ_PERMISSION: &str = "admin:principals:read";
+pub(super) const ADMIN_PRINCIPALS_WRITE_PERMISSION: &str = "admin:principals:write";
 #[cfg(test)]
 pub(super) const ADMIN_MCP_USE_PERMISSION: &str = "admin:mcp:use";
 #[cfg(test)]
@@ -237,6 +240,7 @@ pub(super) struct AdminRoutes {
     pub(super) traffic_endpoint_review_route: String,
     pub(super) principals_route: String,
     pub(super) principal_detail_route: String,
+    pub(super) principal_delegated_tokens_revoke_route: String,
 }
 
 impl GatewayRoutes {
@@ -343,6 +347,9 @@ impl AdminRoutes {
             traffic_endpoint_review_route: format!("{api_prefix}/traffic/endpoints/review"),
             principals_route: format!("{api_prefix}/principals"),
             principal_detail_route: format!("{api_prefix}/principal"),
+            principal_delegated_tokens_revoke_route: format!(
+                "{api_prefix}/principal/delegated-tokens/revoke"
+            ),
             api_prefix,
         }
     }
@@ -634,6 +641,12 @@ pub(super) struct PrincipalAdminState {
     pub(super) audit_query_store: Option<Arc<storage::SqliteAuditEventStore>>,
     pub(super) discovery_store: Option<DiscoveryReadHandle>,
     pub(super) rbac_state: Option<middleware::rbac::RbacState>,
+    /// The Connection runtime whose delegated tokens an operator can purge
+    /// by principal. `None` in cluster mode: each replica caches its own
+    /// tokens, and nothing would carry a purge to the others.
+    pub(super) delegated_tokens: Option<connections::http::ConnectionHttpRuntime>,
+    pub(super) client_ip_policy: client_ip::ClientIpPolicy,
+    pub(super) max_body_size: usize,
 }
 
 #[derive(Clone)]

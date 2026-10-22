@@ -1814,6 +1814,10 @@ fn admin_routes_keep_default_api_prefix_and_remap_custom_api_under_v1() {
     );
     assert_eq!(default_routes.principals_route, PRINCIPALS_ADMIN_ROUTE);
     assert_eq!(default_routes.principal_detail_route, PRINCIPAL_ADMIN_ROUTE);
+    assert_eq!(
+        default_routes.principal_delegated_tokens_revoke_route,
+        PRINCIPAL_DELEGATED_TOKENS_REVOKE_ADMIN_ROUTE
+    );
 
     let custom_routes = AdminRoutes::from_prefix("/ops");
     assert_eq!(custom_routes.ui_prefix, "/ops");
@@ -1931,6 +1935,10 @@ fn admin_routes_keep_default_api_prefix_and_remap_custom_api_under_v1() {
     );
     assert_eq!(custom_routes.principals_route, "/v1/ops/principals");
     assert_eq!(custom_routes.principal_detail_route, "/v1/ops/principal");
+    assert_eq!(
+        custom_routes.principal_delegated_tokens_revoke_route,
+        "/v1/ops/principal/delegated-tokens/revoke"
+    );
 }
 
 #[test]
@@ -7217,6 +7225,129 @@ async fn principal_directory_admin_reports_not_configured() {
             r#"{"error":"principal directory requires PRINCIPAL_SQLITE_PATH to be configured"}"#
         );
     }
+}
+
+#[tokio::test]
+async fn principal_delegated_token_revocation_needs_principals_write_and_a_well_formed_principal() {
+    let capture = audit::sink::tests::CaptureSink::new();
+    let audit_log = audit::AuditLog::new(Arc::new(capture.clone()) as Arc<dyn audit::AuditSink>);
+    let policy = TempPolicyFile::new(&principal_policy_document_string());
+    let recorder = PrometheusBuilder::new().build_recorder();
+    // No principal directory: the purge does not need one.
+    let router = app(
+        principal_admin_config(None, None, None, &policy),
+        recorder.handle(),
+        audit_log,
+        test_audit_event_sender(),
+    )
+    .expect("app should build");
+    let request = |principal: Option<auth::Principal>, body: &str| {
+        traffic_admin_json_request(
+            Method::POST,
+            PRINCIPAL_DELEGATED_TOKENS_REVOKE_ADMIN_ROUTE,
+            principal,
+            Some(body.to_owned()),
+        )
+    };
+    let body = json!({ "issuer": "https://idp.example.test/", "subject": "alice" }).to_string();
+
+    let unauthenticated = router
+        .clone()
+        .oneshot(request(None, &body))
+        .await
+        .expect("revocation request should complete");
+    assert_eq!(unauthenticated.status(), StatusCode::UNAUTHORIZED);
+    let read_only = router
+        .clone()
+        .oneshot(request(Some(test_principal(&["principal-reader"])), &body))
+        .await
+        .expect("revocation request should complete");
+    assert_eq!(read_only.status(), StatusCode::FORBIDDEN);
+
+    let purged = router
+        .clone()
+        .oneshot(request(Some(test_principal(&["principal-writer"])), &body))
+        .await
+        .expect("revocation request should complete");
+    assert_eq!(purged.status(), StatusCode::OK);
+    assert_eq!(purged.headers()[header::CACHE_CONTROL], "no-store");
+    assert_eq!(json_body(purged).await, json!({ "purged_entries": 0 }));
+    // An operator's purge is audited even when it finds nothing, naming the
+    // operator and the canonical principal.
+    assert_eventually(Duration::from_secs(1), || {
+        capture
+            .events()
+            .iter()
+            .any(|event| event.event_type == audit::event::CONNECTION_DELEGATED_TOKEN_PURGE)
+    });
+    let purge = capture
+        .events()
+        .into_iter()
+        .find(|event| event.event_type == audit::event::CONNECTION_DELEGATED_TOKEN_PURGE)
+        .expect("the purge is audited");
+    assert_eq!(
+        purge.actor.as_ref().map(|actor| actor.user_id.as_str()),
+        Some("user-123")
+    );
+    assert_eq!(purge.payload["trigger"], json!("operator"));
+    assert_eq!(
+        purge.payload["principal"],
+        json!({ "issuer": "https://idp.example.test", "subject": "alice" })
+    );
+    assert_eq!(purge.payload["purged_entries"], json!(0));
+
+    for malformed in [
+        "not json".to_owned(),
+        json!({ "issuer": "https://idp.example.test" }).to_string(),
+        json!({ "issuer": "https://idp.example.test", "subject": "" }).to_string(),
+        json!({ "issuer": " / ", "subject": "alice" }).to_string(),
+        json!({ "issuer": "https://idp.example.test", "subject": "alice", "email": "a@b" })
+            .to_string(),
+        json!({ "issuer": "https://idp.example.test", "subject": "a".repeat(4097) }).to_string(),
+    ] {
+        let refused = router
+            .clone()
+            .oneshot(request(
+                Some(test_principal(&["principal-writer"])),
+                &malformed,
+            ))
+            .await
+            .expect("revocation request should complete");
+        assert_eq!(refused.status(), StatusCode::BAD_REQUEST, "{malformed}");
+    }
+}
+
+#[tokio::test]
+async fn principal_delegated_token_revocation_is_refused_where_replicas_cache_their_own() {
+    let policy = parse_policy_body(&Bytes::from(principal_policy_document_string()))
+        .expect("principal policy should parse");
+    let state = PrincipalAdminState {
+        directory: auth::PrincipalDirectory::disabled(),
+        audit_query_store: None,
+        discovery_store: None,
+        rbac_state: Some(middleware::rbac::RbacState::new(
+            policy,
+            Vec::new(),
+            false,
+            test_audit_log(),
+        )),
+        // What cluster mode builds.
+        delegated_tokens: None,
+        client_ip_policy: client_ip::ClientIpPolicy::from_config(&test_config(Vec::new())),
+        max_body_size: 1_024,
+    };
+    let response = principal_delegated_tokens_revoke_endpoint(
+        State(state),
+        traffic_admin_json_request(
+            Method::POST,
+            PRINCIPAL_DELEGATED_TOKENS_REVOKE_ADMIN_ROUTE,
+            Some(test_principal(&["principal-writer"])),
+            Some(json!({ "issuer": "https://idp.example.test", "subject": "alice" }).to_string()),
+        ),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::CONFLICT);
+    assert!(body_string(response).await.contains("cluster mode"));
 }
 
 #[tokio::test]
@@ -24840,6 +24971,7 @@ async fn auth_validator_resolves_oidc_discovery_for_issuer_only_provider() {
         &discovered_oidc_jwks_urls,
         None,
         None,
+        None,
     )
     .expect("issuer-only provider should build")
     .expect("auth validator should be configured");
@@ -24853,6 +24985,103 @@ async fn auth_validator_resolves_oidc_discovery_for_issuer_only_provider() {
         .expect("token should validate through discovered JWKS URI");
 
     assert_eq!(principal.user_id, "oidc-user");
+    server
+        .join()
+        .expect("OIDC discovery test server should finish");
+}
+
+/// Startup hands every JWT validator that has a denylist the observer it
+/// passes in, so a JWT refused as revoked names its principal to the
+/// Connection runtime, which purges that principal's delegated tokens (issue
+/// #441).
+#[tokio::test]
+async fn a_denylisted_jwt_validator_reports_the_principal_of_a_revoked_token() {
+    struct DenyEveryJti;
+
+    #[async_trait::async_trait]
+    impl auth::RevocationStore for DenyEveryJti {
+        async fn is_revoked(&self, _jti: &str) -> Result<bool, auth::AuthError> {
+            Ok(true)
+        }
+    }
+
+    #[derive(Default)]
+    struct RecordingObserver(std::sync::Mutex<Vec<(String, String)>>);
+
+    impl auth::RevokedCredentialObserver for RecordingObserver {
+        fn credential_revoked(&self, issuer: &str, subject: &str) {
+            self.0
+                .lock()
+                .expect("observer lock")
+                .push((issuer.to_owned(), subject.to_owned()));
+        }
+    }
+
+    let (issuer, server) = spawn_oidc_jwks_server();
+    let issuer_claim = issuer.clone();
+    let mut config = test_config(Vec::new());
+    config.auth_providers = vec![config::AuthProviderConfig {
+        name: "oidc".to_owned(),
+        provider_type: config::AuthProviderType::Jwt,
+        jwks_url: None,
+        issuer: Some(issuer.clone()),
+        audience: None,
+        jwks_timeout_ms: 2000,
+        jwks_max_key_age_secs: 300,
+        require_jti: true,
+        roles_claim: "roles".to_owned(),
+        roles_claim_delimiter: None,
+        org_claim: None,
+        introspection_url: None,
+        introspection_timeout_ms: config::DEFAULT_COOKIE_SESSION_INTROSPECTION_TIMEOUT_MS,
+        cache_ttl_ms: config::DEFAULT_COOKIE_SESSION_CACHE_TTL_MS,
+        user_id_claim: None,
+        email_claim: None,
+        client_id: None,
+        client_secret: None,
+        redirect_uri: None,
+    }];
+    config.egress_deny_private_ips = false;
+    let egress_client = Arc::new(
+        egress::EgressClient::new(egress::EgressConfig::from_config(&config))
+            .expect("egress client should build"),
+    );
+    let discovered_oidc_jwks_urls =
+        discover_oidc_jwks_urls_from_config(&config, Arc::clone(&egress_client))
+            .expect("issuer-only provider should discover JWKS URI");
+    let denylist = |_issuer: &str| Arc::new(DenyEveryJti) as Arc<dyn auth::RevocationStore>;
+    let observer = Arc::new(RecordingObserver::default());
+
+    let validator = auth_validator_from_config(
+        &config,
+        egress_client,
+        None,
+        &discovered_oidc_jwks_urls,
+        Some(&denylist as JwtRevocationStoreFactory<'_>),
+        Some(Arc::clone(&observer) as Arc<dyn auth::RevokedCredentialObserver>),
+        None,
+    )
+    .expect("issuer-only provider should build")
+    .expect("auth validator should be configured");
+    let error = validator
+        .validate_session(&auth::SessionCredential::Bearer(signed_token_with_issuer(
+            "oidc-user",
+            &["member"],
+            &issuer_claim,
+        )))
+        .await
+        .expect_err("a denylisted jti is refused");
+
+    // The provider chain reports every provider's refusal alike, so the
+    // observer is what tells this one apart from a bad signature.
+    assert!(
+        matches!(&error, auth::AuthError::InvalidSession(_)),
+        "{error:?}"
+    );
+    assert_eq!(
+        *observer.0.lock().expect("observer lock"),
+        [(issuer, "oidc-user".to_owned())]
+    );
     server
         .join()
         .expect("OIDC discovery test server should finish");
@@ -24889,13 +25118,20 @@ async fn a_client_certificate_only_deployment_still_builds_an_auth_chain() {
             .expect("egress client should build"),
     );
 
-    let validator =
-        auth_validator_from_config(&config, egress_client, None, &HashMap::new(), None, None)
-            .expect("a certificate-only configuration should build")
-            .expect(
-                "a certificate-only configuration must produce a validator, not None; None \
+    let validator = auth_validator_from_config(
+        &config,
+        egress_client,
+        None,
+        &HashMap::new(),
+        None,
+        None,
+        None,
+    )
+    .expect("a certificate-only configuration should build")
+    .expect(
+        "a certificate-only configuration must produce a validator, not None; None \
                      makes the auth middleware fail closed on every request",
-            );
+    );
 
     assert!(
         validator.supports_client_certificate(),
@@ -26700,6 +26936,9 @@ fn principal_policy_document_string() -> String {
         "roles": {
             "principal-reader": {
                 "permissions": ["admin:principals:read"]
+            },
+            "principal-writer": {
+                "permissions": [ADMIN_PRINCIPALS_WRITE_PERMISSION]
             },
             "reader": {
                 "permissions": []

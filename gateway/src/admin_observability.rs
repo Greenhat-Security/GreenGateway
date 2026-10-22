@@ -945,6 +945,86 @@ pub(super) async fn principal_list_endpoint(
         .into_response()
 }
 
+/// Purges one principal's cached delegated tokens and revokes them at their
+/// issuers (issue #441): what an operator does after disabling the user at
+/// their identity provider, so that nothing exchanged for them before is
+/// served again without asking the issuer.
+///
+/// It does not need the principal directory: the cache is keyed by issuer and
+/// subject whether or not the directory ever recorded the principal. The
+/// purge and each revocation are audited by the Connection runtime with the
+/// operator as actor; this answers once the cache entries are gone, before
+/// the issuers answer.
+pub(super) async fn principal_delegated_tokens_revoke_endpoint(
+    State(state): State<PrincipalAdminState>,
+    request: AxumRequest,
+) -> Response {
+    record_request(PRINCIPAL_DELEGATED_TOKENS_REVOKE_ADMIN_ROUTE);
+
+    let (parts, body) = request.into_parts();
+    let Some(principal) = parts.extensions.get::<auth::Principal>().cloned() else {
+        return unauthorized();
+    };
+    if let Err(error) =
+        authorized_principal_state(&state, &principal, ADMIN_PRINCIPALS_WRITE_PERMISSION)
+    {
+        return principal_admin_authz_error_response(error);
+    }
+    // Refused rather than run on the one replica that happens to serve the
+    // request: the others would keep serving the tokens it reports purged.
+    let Some(connection_http) = state.delegated_tokens.as_ref() else {
+        return conflict(
+            "purging delegated tokens by principal is not available in cluster mode, where each replica caches its own; disable the Connection instead",
+        );
+    };
+    let body = match read_request_body(body, state.max_body_size).await {
+        Ok(body) => body,
+        Err(response) => return *response,
+    };
+    let request = match serde_json::from_slice::<PrincipalDelegatedTokensRevokeRequest>(&body) {
+        Ok(request) => request,
+        Err(err) => {
+            tracing::warn!(error = %err, "delegated token revocation request body was invalid");
+            return bad_request("invalid delegated token revocation request body");
+        }
+    };
+    let Some(issuer) = auth::principal::canonical_issuer(&request.issuer)
+        .filter(|issuer| issuer.len() <= auth::principal::MAX_PRINCIPAL_ISSUER_BYTES)
+    else {
+        return bad_request("invalid delegated token revocation request body: issuer");
+    };
+    // The subject is matched exactly as the validator produced it, so it is
+    // not trimmed here.
+    if request.subject.is_empty()
+        || request.subject.len() > auth::principal::MAX_PRINCIPAL_SUBJECT_BYTES
+    {
+        return bad_request("invalid delegated token revocation request body: subject");
+    }
+
+    let purged_entries = connection_http.purge_delegated_tokens(
+        &issuer,
+        &request.subject,
+        connections::token_exchange::DelegatedTokenPurgeTrigger::Operator {
+            actor: auth::actor_from_principal(&principal),
+            request_id: client_ip::request_id(&parts.headers, &parts.extensions),
+            source_ip: client_ip::canonical_client_ip(
+                &parts.headers,
+                &parts.extensions,
+                &state.client_ip_policy,
+            ),
+        },
+    );
+    let mut response = (
+        StatusCode::OK,
+        Json(PrincipalDelegatedTokensRevokeResponse { purged_entries }),
+    )
+        .into_response();
+    response
+        .headers_mut()
+        .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    response
+}
+
 pub(super) async fn principal_detail_endpoint(
     State(state): State<PrincipalAdminState>,
     principal: Option<Extension<auth::Principal>>,

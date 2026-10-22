@@ -69,6 +69,14 @@ export function DelegatedIssuerTokenSummary({
           code={authentication.resource !== undefined}
         />
         <Row
+          label="Revocation URL"
+          value={
+            authentication.revocation_url ??
+            'Not set: a purged token is only dropped'
+          }
+          code={authentication.revocation_url !== undefined}
+        />
+        <Row
           label="Subject token"
           value="Caller assertion signed by the gateway"
         />

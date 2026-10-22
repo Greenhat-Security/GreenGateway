@@ -1498,12 +1498,17 @@ pub(super) fn gateway_app_with_process_started_at_and_overrides(
         .map(|factory| factory as JwtRevocationStoreFactory<'_>);
     #[cfg(not(feature = "postgres"))]
     let jwt_revocation: Option<JwtRevocationStoreFactory<'_>> = None;
+    // A JWT refused because its `jti` is on the shared denylist purges the
+    // principal's delegated tokens on this replica (issue #441).
+    let revoked_credentials =
+        Arc::new(connection_http_runtime.clone()) as Arc<dyn auth::RevokedCredentialObserver>;
     let validator = auth_validator_from_config(
         &config,
         Arc::clone(&egress_client),
         service_token_validator.clone(),
         &discovered_oidc.jwks_urls,
         jwt_revocation,
+        Some(Arc::clone(&revoked_credentials)),
         Some(&lifecycle),
     )?;
     #[cfg(feature = "postgres")]
@@ -1572,6 +1577,7 @@ pub(super) fn gateway_app_with_process_started_at_and_overrides(
                 None,
                 &discovered_oidc.jwks_urls,
                 jwt_revocation,
+                Some(Arc::clone(&revoked_credentials)),
                 Some(&lifecycle),
             )?
             .ok_or_else(|| {
@@ -2211,6 +2217,10 @@ pub(super) fn gateway_app_with_process_started_at_and_overrides(
         audit_query_store: audit_query_store.clone(),
         discovery_store: discovery_read_store.clone(),
         rbac_state: rbac_state.clone(),
+        delegated_tokens: (config.state_backend == config::StateBackend::Sqlite)
+            .then(|| connection_http_runtime.clone()),
+        client_ip_policy: client_ip_policy.clone(),
+        max_body_size: config.max_body_size,
     };
     let traffic_admin_state = TrafficAdminState {
         discovery_store: discovery_read_store,
@@ -2267,6 +2277,7 @@ pub(super) fn auth_validator_from_config(
     service_token_validator: Option<Arc<auth::ServiceTokenValidator>>,
     discovered_oidc_jwks_urls: &HashMap<String, String>,
     jwt_revocation: Option<JwtRevocationStoreFactory<'_>>,
+    revoked_credentials: Option<Arc<dyn auth::RevokedCredentialObserver>>,
     lifecycle: Option<&GatewayLifecycle>,
 ) -> Result<Option<Arc<dyn auth::SessionValidator>>, auth::AuthError> {
     let client_certificate_auth = config.client_certificate_auth_enabled();
@@ -2327,12 +2338,20 @@ pub(super) fn auth_validator_from_config(
                             &jwt_config,
                             &provider.name,
                         )?;
-                        auth::JwtValidator::new_for_provider_with_revocation(
+                        let validator = auth::JwtValidator::new_for_provider_with_revocation(
                             jwt_config,
                             &provider.name,
                             Arc::clone(&egress_client),
                             factory(&boundary),
-                        )?
+                        )?;
+                        // Only a denylist can refuse a token as revoked, so
+                        // only a validator with one has anything to report.
+                        match revoked_credentials.as_ref() {
+                            Some(observer) => {
+                                validator.with_revoked_credential_observer(Arc::clone(observer))
+                            }
+                            None => validator,
+                        }
                     }
                     None => auth::JwtValidator::new_for_provider(
                         jwt_config,
