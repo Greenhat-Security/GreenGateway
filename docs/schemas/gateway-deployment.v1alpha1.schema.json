@@ -1,0 +1,59 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://greengateway.dev/schemas/gateway-deployment.v1alpha1.schema.json",
+  "title": "GreenGateway Deployment Configuration",
+  "description": "The deployment document of a greengateway.dev/v1alpha1 configuration bundle. In this alpha the specification carries only the deployment profile: the deployment settings are added from the configuration field catalog (issue #242) before a gateway can start from a bundle, and until then any other member is refused rather than ignored. The $defs fix the typed value forms those settings will use: a sensitive setting accepts only a secretReference, a fractional setting only a decimal string, and no setting accepts an unresolved placeholder. This schema is necessary but not sufficient: the gateway's reader is authoritative.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["apiVersion", "kind", "spec"],
+  "properties": {
+    "apiVersion": {
+      "description": "Exact document version. No other version, prefix, or spelling is accepted.",
+      "const": "greengateway.dev/v1alpha1"
+    },
+    "kind": {
+      "const": "GatewayDeployment"
+    },
+    "spec": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["profile"],
+      "properties": {
+        "profile": {
+          "description": "The deployment profile. Its invariants are enforced by the configuration compiler, not by this schema.",
+          "enum": ["production", "migration", "development"]
+        }
+      }
+    }
+  },
+  "$defs": {
+    "secretReference": {
+      "description": "An opaque secret alias ID resolved by the gateway's secret providers. It is never a secret value, an environment-variable name, a file path, a provider locator, or ciphertext.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["secret"],
+      "properties": {
+        "secret": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+        }
+      }
+    },
+    "unresolved": {
+      "description": "A placeholder an export, conversion, or template writes where it could not or would not supply a value. No setting accepts one, so a document that contains one never validates.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["unresolved"],
+      "properties": {
+        "unresolved": {
+          "enum": ["legacy_inline_secret", "template_value", "not_representable"]
+        }
+      }
+    },
+    "decimal": {
+      "description": "A fractional setting written as a string; JSON numbers in bundle documents are integers only. The canonical form is the shortest exact spelling.",
+      "type": "string",
+      "pattern": "^(0|[1-9][0-9]{0,15})(\\.[0-9]{1,6})?$"
+    }
+  }
+}
