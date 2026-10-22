@@ -370,6 +370,9 @@ fn data_name(name: &str) -> bool {
         "Prompt",
         "ServerInfo",
         "ClientInfo",
+        // rmcp 3 names for the `initialize` data ServerInfo/ClientInfo carried.
+        "ServerConfig",
+        "ClientConfig",
         "ProtocolVersion",
         "RequestId",
     ]
@@ -814,6 +817,16 @@ mod tests {
     #[test]
     fn type_alias_and_function_pointer_are_reviewed() {
         let s = scan("type Quiet = reqwest::Client; fn new_path() { let factory = Quiet::new; }");
+        assert!(s
+            .iter()
+            .any(|s| s.scope.contains("new_path")
+                && s.reasons.contains("network-or-process-reference")));
+    }
+    #[test]
+    fn imported_mcp_initialize_data_does_not_alias_same_named_tls_config() {
+        let s = scan("use rmcp::model::{ClientConfig, ServerConfig}; fn tls(config: tokio_rustls::rustls::ClientConfig) -> Option<ServerConfig> { None } fn new_path() { rmcp::serve_client(ClientConfig::default(), PLACEHOLDER); }");
+        let scopes = s.iter().map(|s| s.scope.as_str()).collect::<Vec<_>>();
+        assert!(!scopes.iter().any(|s| s.contains("::tls")), "{scopes:?}");
         assert!(s
             .iter()
             .any(|s| s.scope.contains("new_path")
