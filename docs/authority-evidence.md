@@ -1,10 +1,11 @@
 # Durable authority-change evidence inventory and contract
 
-Part of [#425](https://github.com/Greenhat-Security/GreenGateway/issues/425), PR 1
-and the first two PR 2 slices (PostgreSQL Connection deletion evidence; service-token
-rotate/revoke and JWT revocation evidence), plus the keyed safe-reference derivation
-every future event producer needs ([Keyed safe references](#keyed-safe-references)).
-Reviewed source: `4a32d10e38d2ac36d6bcbee627443b1fbb80d059`.
+Part of [#425](https://github.com/Greenhat-Security/GreenGateway/issues/425), PR 1,
+the first two PR 2 slices (PostgreSQL Connection deletion evidence; service-token
+rotate/revoke and JWT revocation evidence), the keyed safe-reference derivation
+([Keyed safe references](#keyed-safe-references)) and PR 3's durable delivery
+([Durable delivery](#durable-delivery)).
+Reviewed source: `146d5063801270fe23852fb6caa946862fb4390f`.
 
 This inventory identifies existing atomic records and the work needed for required
 authority-change evidence. PR 1 added the inventory and the proposed event
@@ -13,8 +14,12 @@ contract. The first PR 2 slice adds migration 16's
 deletes. The second adds migration 18's `greengateway.service_token_change_evidence`
 and `greengateway.jwt_revocation_evidence`, written by PostgreSQL token rotate/revoke
 and JWT revokes, and the same token evidence table inside the standalone SQLite token
-database. None of them implements a dispatcher or a standalone revision ledger, and
-no row is qualified for required-durability mode. Storage selection is unchanged.
+database. PR 3 adds migration 21's authority-event journal, which every PostgreSQL
+producer of those three evidence tables appends to in the same transaction, and an
+opt-in dispatcher that delivers it behind a persisted cursor. None of them
+implements or enables the authority-evidence required-durability mode or a standalone
+revision ledger, and no row is qualified for that future mode. Storage selection is
+unchanged.
 
 `AUDIT_DURABILITY=required`, the default since the request-path slice of this issue,
 is a different and narrower guarantee: the authentication and authorization stages
@@ -23,8 +28,8 @@ refuse the request with `503 audit_unavailable` when they cannot (see
 [the configuration reference](configuration.md#audit_durability)). It does not
 make any authority-change row below qualified, which is why the inventory's
 `required_durability_mode` stays `not_implemented`: an admin mutation's evidence is
-still its own transaction's rows, or the ordinary audit event its handler emits
-after the commit.
+still its own transaction's rows, its journal entry, or the ordinary audit event its
+handler emits after the commit.
 
 Run the executable inventory and proposed event-contract tests with the pinned
 Node version from `build-tools.json`:
@@ -58,12 +63,12 @@ or unconfigured individual stores.
 | Policy publish, rollback, rule edits and suggestion acceptance | Immutable document/history, actor subject, action/diff, active pointer, shared revision and outbox; suggestion acceptance composes its own state in the same transaction | Stable operation/event identity, scoped actor context, durable delivery |
 | Tools publication | Shared document transaction plus name reservations | Same metadata/delivery extension as policy |
 | Connection and credential binding changes | Record, bindings, immutable version, shared revision and outbox | Actor/history must survive Connection deletion; safe per-operation metadata and delivery |
-| Connection deletion | Outbox tombstone with prior version and shared revision, plus a non-cascading `connection_change_evidence` row (actor, action, event/operation UUIDs, prior version, the tombstone's shared revision, database-clock time) in the same transaction | Issuer/auth mode, caller-bound operation identity, safe-reference projection, durable delivery and retention |
+| Connection deletion | Outbox tombstone with prior version and shared revision, plus a non-cascading `connection_change_evidence` row (actor, action, event/operation UUIDs, prior version, the tombstone's shared revision, database-clock time) and its journal row in the same transaction; delivered with keyed safe references since PR 3 | Issuer/auth mode and a caller-bound operation identity, without which the delivered record cannot be `authority_event.v1` |
 | Managed MCP/OpenAPI catalog and overlay publication | Catalog/overlay CAS, entries, dependencies, reservations, revision and outbox | Current actor rows are replaced or cascaded; retain per-change evidence |
 | Service-token issue | Token row with creator, row/shared revisions and outbox | Creation retains only `created_by`; no issue evidence row, operation identity or delivery |
-| Service-token rotate/revoke | Token change, row/shared revisions and outbox, plus a non-cascading `service_token_change_evidence` row (actor, action, event/operation UUIDs, prior/new row revision, the outbox row's shared revision, database-clock time) in the same transaction; repeated revoke and refused rotate write none. Standalone writes the same evidence in the token database's own transaction | Issuer/auth mode, caller-bound operation identity, safe-reference projection, durable delivery and retention |
-| JWT revocation | Scoped JTI digest, actor row, shared revision and outbox, plus one non-cascading `jwt_revocation_evidence` row per effective revoke (actor, JTI digest, resulting expiry, shared revision) that extension, reactivation and expiry cleanup never rewrite | CLI actor is system provenance, not a named human; no actor kind, issuer/auth mode or delivery |
-| Admin session grant/withdrawal (#424) | With `ADMIN_SESSION_MODE=cluster_postgres`, the session row and one non-cascading `admin_session_evidence` row (event/operation UUIDs, session ID, action, reason, subject and issuer, absolute deadline, database-clock time) commit together for each grant and each withdrawal; a replacement's withdrawal and grant share one operation ID | Actor kind/auth mode, keyed safe actor reference, a session revision axis, durable delivery and retention. Standalone sessions are process-local memory with no durable record and stay `unsupported_future_operation` |
+| Service-token rotate/revoke | Token change, row/shared revisions and outbox, plus a non-cascading `service_token_change_evidence` row (actor, action, event/operation UUIDs, prior/new row revision, the outbox row's shared revision, database-clock time) in the same transaction; repeated revoke and refused rotate write none. Standalone writes the same evidence in the token database's own transaction. In PostgreSQL the change also journals its evidence and is delivered since PR 3 | Issuer/auth mode and a caller-bound operation identity; standalone evidence is not delivered |
+| JWT revocation | Scoped JTI digest, actor row, shared revision and outbox, plus one non-cascading `jwt_revocation_evidence` row per effective revoke (actor, JTI digest, resulting expiry, shared revision) that extension, reactivation and expiry cleanup never rewrite, journaled in the same transaction and delivered since PR 3 | CLI actor is system provenance, not a named human; no actor kind or issuer/auth mode |
+| Admin session grant/withdrawal (#424) | With `ADMIN_SESSION_MODE=cluster_postgres`, the session row and one non-cascading `admin_session_evidence` row (event/operation UUIDs, session ID, action, reason, subject and issuer, absolute deadline, database-clock time) commit together for each grant and each withdrawal; a replacement's withdrawal and grant share one operation ID | Actor kind/auth mode, keyed safe actor reference, a session revision axis, and delivery: these rows are not journaled (see [Durable delivery](#durable-delivery)). Standalone sessions are process-local memory with no durable record and stay `unsupported_future_operation` |
 
 These foundations are already sufficient for their **existing atomic change-record
 purpose**. The inventory uses `missing_metadata` and `missing_delivery` for
@@ -141,9 +146,11 @@ define a **proposed** safe projection. Current `security_outbox` rows,
 satisfy this schema, and neither do migration 18's `service_token_change_evidence`
 and `jwt_revocation_evidence` rows, migration 19's `admin_session_evidence` rows or
 the standalone token evidence rows: the evidence rows hold the internal actor
-ID, not a keyed safe reference, and no `authority_id`. The keyed reference derivation exists (see
-[Keyed safe references](#keyed-safe-references)) but nothing calls it yet; runtime
-producer and dispatcher integration belong to later slices.
+ID, not a keyed safe reference, and no `authority_id`. Since PR 3 the dispatcher
+delivers the journaled evidence with keyed references under a persisted
+`authority_id`, but as `authority_event_delivery.v1` ([Durable delivery](#durable-delivery)),
+not as this schema: the evidence records neither the actor's issuer nor its auth
+mode, and a v1 event cannot be produced faithfully without both.
 
 Revision transitions are operation-specific. Resource creation (`connection.create`,
 `secret.create`, `service_token.issue`, `admin_session.grant`) has no prior revision; replacement,
@@ -173,8 +180,8 @@ authority-scoped keyed derivation described under
 [Keyed safe references](#keyed-safe-references) for principal and sensitive
 resource correlation; a schema cannot prove that a digest was safely derived. That
 derivation, its key source and its rotation and backup policy are implemented and
-tested, but no runtime producer calls it yet. Non-sensitive identities may also
-use the same reference format for one closed projection.
+tested, and the dispatcher derives every delivered reference through it. Non-sensitive
+identities may also use the same reference format for one closed projection.
 
 The operation record must bind authenticated actor, operation, payload digest and
 conditional revision/ETag tuple in the owning transaction. The schema is the
@@ -211,10 +218,13 @@ records, logs and metrics.
 ## Keyed safe references
 
 `gateway/src/authority_events/pseudonym.rs` derives the `subject_ref`, `issuer_ref`
-and `resource.ref` values of the proposed event. It is a pure module with tests and
-no runtime caller: nothing reads a pseudonym key at startup, no setting names one,
-and no stored record carries a reference yet. The producer slice that adopts it
-must also deliver the integration requirements listed at the end of this section.
+and `resource.ref` values of the proposed event, and the `actor.recorded_ref` and
+`resource.ref` values the dispatcher delivers today. Its runtime caller is the
+authority-event dispatcher: a cluster replica with `AUTHORITY_EVENT_SINK` set
+resolves the keyring named by `AUTHORITY_PSEUDONYM_KEY_ALIAS` at startup and derives
+each delivered reference at delivery time. No stored record carries a reference: the
+journal and the evidence hold identifiers, and references exist only in what is
+delivered.
 
 ### Derivation
 
@@ -238,6 +248,7 @@ is the label `greengateway.authority_pseudonym.v1`, the 16 bytes of the
 | --- | --- |
 | `actor.subject` | Exactly two: the canonical issuer, then the subject. A subject is never referenced without the issuer that vouched for it, as `Principal` and caller assertions already scope it |
 | `actor.issuer` | Exactly one: the canonical issuer |
+| `actor.recorded` | Exactly one: an actor identifier exactly as an evidence row recorded it, with no issuer. Migrations 16 and 18 record only the acting principal's subject, or a command's fixed system label (`operator:revoke-jwt`), so this is how the dispatcher names their actors. It is its own domain, so it never yields the reference `actor.subject` gives the same subject |
 | `resource.<kind>` for each schema `resource.kind` | One to four: the resource identifier, optionally preceded by the identifiers of the resources that own it |
 
 A component is the identifier's canonical text exactly as its store keeps it, at most
@@ -320,59 +331,143 @@ recalled.
   continuity. A clone re-namespaced under a new `authority_id` derives unrelated
   references even with the same key, by design.
 
-### Integration requirements for the producer slice
+### Integration with the dispatcher
 
-- Name the current and previous aliases in validated startup configuration, with
-  `.env.example` and the configuration reference, and refuse startup, not degrade,
-  when either fails to resolve or parse.
-- Require every replica of one authority to hold the same keys, for example by
-  including the key IDs in the replica configuration fingerprint. Two replicas
-  deriving under different keys would emit unrelated references for one identity.
-- Refuse any Connection binding of a pseudonym-key alias, as the store already
-  refuses binding a token-exchange client secret's alias under any other field. An
-  operator or provider alias is not tied to a purpose, so a Connection bound to it
-  would otherwise send the key upstream.
-- Emit a structured audit event when the keyring loads or rotates, with key IDs and
-  roles only.
-- Build event references only through this module, and extend the
-  synthetic-marker tests to stored records, logs and metrics.
+What the producer slice was required to add, and where PR 3 stands on each:
 
-## Delivery, retention and recovery contract
+- **Configured aliases, refusing startup (done).** `AUTHORITY_PSEUDONYM_KEY_ALIAS`
+  and `AUTHORITY_PSEUDONYM_PREVIOUS_KEY_ALIAS` are validated startup settings in
+  `.env.example` and the [configuration reference](configuration.md#authority_pseudonym_key_alias).
+  A replica with a sink configured resolves both before any listener binds, and a
+  missing alias, a provider failure or rejected material refuses startup.
+- **Every replica holds the same keys (partly).** Both aliases are part of the static
+  configuration fingerprint, so replicas naming different aliases are held at the
+  fingerprint door. The key IDs are not in the fingerprint: the fingerprint is
+  computed before the network secret providers that may hold the key exist. Every
+  replica therefore logs and audits the key ID it loaded, and an operator must make
+  each alias resolve to the same material everywhere.
+- **No Connection may bind a pseudonym-key alias (done).** A create or replace that
+  binds a configured alias under any field is refused with `422`
+  `secret_purpose_conflict`, naming the field and not the alias, and a replica
+  refuses to start while a stored Connection binds one.
+- **A structured audit event when the keyring loads (done).**
+  `authority_event.keyring_loaded` carries the authority ID, the current and previous
+  key IDs and the sink kind. A rotation is a restart with new aliases, so it emits the
+  same event with the new key IDs.
+- **References only through this module, with synthetic-marker tests (done for what
+  is delivered).** The delivery tests put marker identifiers into every evidence
+  column the projection reads and assert none reaches a delivered record, and the
+  metric registry audit covers the new series.
 
-`security_outbox` already has `outbox_after`, a bounded read helper.
-The reviewed production paths do not call it from an authority-event dispatcher.
-The security runtime reconciles authority revisions. That reconciliation
-mechanism is not a durable downstream evidence cursor.
+## Durable delivery
 
 Ordinary request audit is bounded asynchronous telemetry, with one exception.
 Its PostgreSQL sink retries a bounded number of times, then drops/counts failed
 batches or overflow. The SQLite sink is also separate from authority mutation
 transactions. Neither delivery path establishes required evidence by accepting an
-event into memory after the mutation commits. The exception is
-`AUDIT_DURABILITY=required` (the default): the request path's authentication and
-authorization records are acknowledged by the same sinks only once the transaction
-carrying them commits, and the request is not acted on until then. That is
-write-ahead evidence of a request's admission decision, not authority-change
-evidence: the records an admin handler emits after its mutation commits keep the
-bounded asynchronous delivery described here.
+event into memory after the mutation commits, and PR 3 changes neither. The
+exception is `AUDIT_DURABILITY=required` (the default): the request path's
+authentication and authorization records are acknowledged by the same sinks only
+once the transaction carrying them commits, and the request is not acted on until
+then. That is write-ahead evidence of a request's admission decision, not
+authority-change evidence: the records an admin handler emits after its mutation
+commits keep the bounded asynchronous delivery described here. `security_outbox`
+and its `outbox_after` reader remain the security runtime's reconciliation
+mechanism, not a downstream evidence cursor.
 
-PR 3 must persist a consumer cursor and deduplication identity independently of
-ordinary request telemetry. Read bounded committed batches, deliver outside the
-mutation transaction, and advance the cursor only after an accepted downstream
-batch. A crash after downstream acceptance and before cursor commit produces a
-duplicate with the **same event ID**. Consumers deduplicate on
-`(authority_id, event_id)`; exactly-once network delivery is not promised.
+PR 3 delivers authority evidence through its own journal (cluster mode only,
+migration 21; `gateway/src/storage/postgres_authority_events.rs` and
+`gateway/src/authority_events/`):
 
-Keep events until every required consumer's durable cursor has passed them and
-the configured minimum retention has elapsed. Connection/JWT authority cleanup
-must not erase required evidence. Reserve bounded capacity within the mutation
-transaction: if evidence cannot be accepted, required-mode mutation fails without
-committing or releasing an artifact. Existing accepted events must never be
-evicted to admit new work. Emit low-cardinality lag, oldest-undelivered age,
-capacity and retry/failure signals; operators restore delivery, archive accepted
-evidence or increase capacity. No subject/resource/operation ID or secret
-material belongs in metric labels. Downstream network availability must never
-become a call inside the authority transaction.
+- **Journal, in the mutation's transaction.** Every PostgreSQL producer of
+  `connection_change_evidence`, `service_token_change_evidence` and
+  `jwt_revocation_evidence` appends one `authority_event_journal` row in the same
+  transaction as its evidence row, under the evidence row's `event_id`. The row
+  holds identifiers only. Its position is reserved from the
+  `authority_event_state` row, whose lock is held to COMMIT, so position order is
+  commit order and the committed journal has no gaps. Evidence committed before
+  migration 21 is journaled by the migration in commit order.
+- **Bounded capacity, failing closed.** The same reservation succeeds only while
+  fewer than `AUTHORITY_EVENT_JOURNAL_CAPACITY` rows are retained. When the
+  journal is full, the mutation rolls back as a whole and is answered `503` (a CLI
+  `revoke-jwt` exits with a store error); nothing is committed and no accepted
+  event is evicted. This applies whatever `AUTHORITY_EVENT_SINK` says. The cost is
+  deliberate and has to be watched: a refused service-token revoke or JWT revoke
+  leaves the credential live until the change can commit.
+- **Dispatch, outside every authority transaction.** With `AUTHORITY_EVENT_SINK`
+  set, one replica at a time (the holder of the `authority-event-dispatcher`
+  execution lease) claims the cursor at its lease fence, reads at most 100 rows
+  after it, projects each into an `authority_event_delivery.v1` record
+  ([schema](schemas/authority_event_delivery.v1.schema.json)), offers the batch to
+  the sink, and only then advances the cursor with a compare-and-set on
+  `(fence, position)`. A fenced-out leader's advance commits nothing. A refused
+  batch is offered again after an exponential backoff from 0.5 s to 60 s and is
+  never skipped; a row whose evidence cannot be projected faithfully stalls
+  delivery at that row. A crash between the sink's acceptance and the cursor
+  advance delivers the batch again with the same event IDs and, under the same
+  key, identical records: delivery is at least once, and consumers deduplicate on
+  `(authority_id, event_id)`. Exactly-once network delivery is not promised.
+- **Sinks.** `log` writes one structured `INFO` line per record (target
+  `greengateway::authority_event`, the JSON in the `authority_event` field);
+  accepted means handed to the process's log writer, so it is a reference for a log
+  pipeline rather than a durable store. `file` appends JSON lines to
+  `AUTHORITY_EVENT_FILE` and calls `fsync` before a batch counts as accepted; a
+  crash mid-write leaves at most one partial final line, which a reader skips and
+  whose records are delivered again. Neither opens a network connection. A sink is
+  a small trait (`authority_events::sink::AuthorityEventSink`); a network sink is
+  future work and would carry its own transport review.
+- **Retention floors.** The maintenance leader's `authority_event_retention` job
+  deletes, one bounded step per pass, journal rows at or below the dispatcher's
+  cursor and journaled at least `AUTHORITY_EVENT_RETENTION_HOURS` ago (default 168),
+  and gives their capacity back. Once a dispatcher has claimed the cursor, no
+  undelivered row is ever pruned, whatever its age. Before any dispatcher has run
+  there is no required consumer, and rows are pruned by age alone. Retention never
+  touches an evidence table: the evidence rows remain the append-only record.
+- **What is delivered.** Each record carries the persisted `authority_id`, the
+  evidence row's `event_id` and `operation_id`, the journal position as
+  `sequence`, the operation, `result: committed`, the evidence row's
+  database-clock `committed_at`, `actor.recorded_ref` (the `actor.recorded`
+  reference of the recorded actor), the resource kind and its keyed reference (a
+  JWT revocation's under its issuer and `jti` digest), and the v1 revision
+  transition as decimal strings. No identifier, token material, `jti`, issuer or
+  secret reaches it.
+- **Signals.** `greengateway_authority_event_journal_retained` and `_capacity`,
+  `_undelivered`, `_oldest_undelivered_age_seconds`, `_delivered_total`,
+  `_delivery_failures_total{kind}` and `_capacity_refusals_total`, every label from
+  a fixed vocabulary ([metrics](deployment/postgres.md#metrics)). No shipped alert
+  rule covers them yet; the [threshold inventory](deployment/postgres.md#alert-thresholds)
+  lists the conditions to alert on.
+
+Operator actions at capacity, in order of preference: restore delivery (fix the
+sink, or the dispatcher's key, so the cursor advances and retention can free
+room), shorten `AUTHORITY_EVENT_RETENTION_HOURS`, or raise
+`AUTHORITY_EVENT_JOURNAL_CAPACITY` on every replica. A dispatcher that has claimed
+the cursor stays a required consumer when the sink is later turned off: its
+cursor keeps holding undelivered rows. To stop delivering deliberately, remove the
+cursor as the migration role (`DELETE FROM greengateway.authority_event_cursors WHERE
+consumer = 'dispatcher'`) after the sink is off on every replica; retention then
+prunes by age.
+
+A database restore rewinds the journal, the cursor and the evidence together. Events
+committed after the backup are gone with the changes they describe; events delivered
+after the backup are delivered again under the same event IDs, which consumers
+already deduplicate. The persisted `authority_id` survives the restore, so the same
+key derives the same references.
+
+Not covered by PR 3, and still open:
+
+- **Required-durability mode.** Nothing makes a sink mandatory, so a deployment
+  with `AUTHORITY_EVENT_SINK=none` journals and retains evidence but delivers none.
+- **Admin sessions.** Migration 19's `admin_session_evidence` is not journaled and
+  not delivered. A withdrawal must stay possible when the journal is full, so
+  journaling it needs its own capacity decision first.
+- **Standalone mode.** There is no journal and no dispatcher; the SQLite token
+  evidence is not delivered.
+- **The v1 contract.** Issuer, auth mode, actor kind and caller-bound operation
+  identity at the store boundary, after which the delivered record can become
+  `authority_event.v1`.
+- **Every other operation.** Policy, tools, catalogs, Connection create/replace,
+  credential bindings and token issue have no evidence rows to journal yet.
 
 ## Next reviewable slices and validation gates
 
@@ -411,10 +506,21 @@ become a call inside the authority transaction.
    for policy/tools, retaining suggestion transaction composition. Add immutable
    catalog/overlay evidence before replacement/cascade. Cover CAS rollback, name
    conflicts, system refresh, and commit followed by local installation failure.
-4. **Durable dispatch.** Test crash before commit, crash after commit before
-   dispatch, downstream acceptance before cursor commit, restart, duplicates,
-   bounded batches/backoff, retention floors and capacity rejection. Keep
-   request-audit sink regressions separate.
+4. **Durable dispatch (landed for the journaled evidence).** Migration 21's
+   journal, capacity reservation and dispatcher cursor, the leased dispatcher and
+   the log and file sinks, as described under [Durable delivery](#durable-delivery).
+   Migration 21 moves the serving contract from exactly schema 20 to exactly schema
+   21, a coordinated drain/migrate/restart. PostgreSQL-gated tests cover commit
+   order under the evidence rows' own event IDs, a rolled-back append leaving no
+   gap, concurrent producers on two pools, a crash between sink acceptance and the
+   cursor advance redelivering identical records, a sink outage retried without
+   advancing, bounded batches, a fenced-out leader refused, a missing evidence row
+   stalling delivery rather than being skipped, retention never pruning an
+   undelivered row, capacity exhaustion refusing every producer while committing
+   nothing, the running dispatcher's lease and shutdown, and migration 21's
+   backfill; the request-audit sink regressions are unchanged. CI runs them against
+   its disposable loopback database, not verified TLS. Still open: the items listed
+   at the end of that section.
 5. **Standalone evidence and #242 ledger integration.** Add evidence only within
    each owning SQLite store transaction; test forced insert failure and restart.
    For policy/tools/configuration, require ledger-owned safe manifest/digest,

@@ -2711,6 +2711,7 @@ fn route_with_enforcement(
     enforcement_mode: Option<EnforcementMode>,
 ) -> RouteRule {
     RouteRule {
+        id: None,
         methods: methods.iter().map(|method| (*method).to_owned()).collect(),
         hosts: Vec::new(),
         path_prefix: path_prefix.to_owned(),
@@ -3055,6 +3056,7 @@ async fn evaluating_a_policy_emits_no_audit_events() {
         )],
     );
     policy.rate_limits = vec![crate::rbac::policy::RateLimitRule {
+        id: None,
         principal: PrincipalMatcher::default(),
         methods: Vec::new(),
         path: Some("/data/**".to_owned()),

@@ -344,7 +344,9 @@ describe('ConnectionDetail', () => {
     expect(section?.textContent).toContain('Caller assertion configured.');
     expect(section?.textContent).toContain('caller_assertion_no_principal');
     expect(section?.textContent).toContain('caller_assertion_not_enforced');
-    expect(section?.textContent).toContain('"caller_assertion": null');
+    expect(section?.textContent).toContain(
+      'Editing or removing it in the connection editor needs the secrets-write permission',
+    );
     expect(specValue('Key ID')).toBe('gw-2026-09');
     expect(specValue('Algorithm')).toBe('RS256');
     expect(specValue('Assertion header')).toBe('x-caller-assertion');

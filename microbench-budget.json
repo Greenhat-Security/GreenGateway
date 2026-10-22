@@ -1,12 +1,14 @@
 {
-  "schema_version": 2,
+  "schema_version": 3,
   "harness_sha256": [
     "0e005f7903991f9f4eb7b22cf2b56871c9a0d0a554f3d4ecf4d9a85598881f73",
     "f0c6abba555cb81e8cc419f39473895eeefb3ad558537f95659dfcdfcf22285e"
   ],
   "kernel_harness_sha256": [
-    "f10830a181046792488b7749f2c367276756027eee7b31a9f7157e446d634936",
     "0afee7ba79d7531eb2c7fbccef0e99605eeb09b8329973debf957b864569120c"
+  ],
+  "lane_harness_sha256": [
+    "9e70d5c545a5cb02316de2922cfb12518ba3fd803032b70ba72383a142018deb"
   ],
   "targets": [
     {
@@ -31,6 +33,16 @@
     },
     {
       "id": "http_policy",
+      "max_allocation_growth": 0,
+      "max_allocated_bytes_growth": 0
+    },
+    {
+      "id": "tool_policy",
+      "max_allocation_growth": 0,
+      "max_allocated_bytes_growth": 0
+    },
+    {
+      "id": "rate_lane",
       "max_allocation_growth": 0,
       "max_allocated_bytes_growth": 0
     }

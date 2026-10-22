@@ -315,8 +315,9 @@ pub const CLUSTER_CONFIG_MISMATCH: &str = "greengateway_cluster_config_mismatch"
 /// How long this replica has held a singleton lease, in seconds, per
 /// scope.
 ///
-/// `scope` is one of the two *singleton* scopes ([`crate::tools::lease::LEASE_SCOPE_MAINTENANCE`],
-/// [`crate::tools::lease::LEASE_SCOPE_DISCOVERY_PROJECTOR`]) and nothing
+/// `scope` is one of the three *singleton* scopes ([`crate::tools::lease::LEASE_SCOPE_MAINTENANCE`],
+/// [`crate::tools::lease::LEASE_SCOPE_DISCOVERY_PROJECTOR`],
+/// [`crate::tools::lease::LEASE_SCOPE_AUTHORITY_EVENT_DISPATCHER`]) and nothing
 /// else: per-tool lease scopes are `tool:<name>`, which is control-plane
 /// data and would mint a series per tool. `0` (or absent) on every replica
 /// for longer than the acquisition backoff means nobody is leading.
@@ -392,6 +393,59 @@ pub const AUDIT_STREAM_REPLAY_BACKLOG_EVENTS: &str =
 #[cfg(feature = "postgres")]
 pub const AUDIT_STREAM_DUPLICATE_POSITIONS_TOTAL: &str =
     "greengateway_audit_stream_duplicate_positions_total";
+
+// --- Authority-event delivery (issue #425, PR 3) ----------------------------
+//
+// The journal is shared state, so its gauges are published by whichever
+// replica reads it: the dispatcher's leader after every step, and the
+// maintenance leader after every retention step (so a deployment with no
+// sink configured still sees its journal fill). No label names an event, an
+// actor, a resource or a position.
+
+/// Journal rows retained: undelivered rows plus delivered rows still inside
+/// `AUTHORITY_EVENT_RETENTION_HOURS`. Every retained row holds one unit of
+/// capacity.
+#[cfg(feature = "postgres")]
+pub const AUTHORITY_EVENT_JOURNAL_RETAINED: &str = "greengateway_authority_event_journal_retained";
+
+/// The journal's configured capacity. When retained reaches it, every
+/// mutation that must journal evidence is refused with `503` until
+/// retention frees room; no accepted event is evicted.
+#[cfg(feature = "postgres")]
+pub const AUTHORITY_EVENT_JOURNAL_CAPACITY: &str = "greengateway_authority_event_journal_capacity";
+
+/// Retained journal rows after the dispatcher's cursor: committed events no
+/// sink has accepted yet (every retained row before the first claim).
+#[cfg(feature = "postgres")]
+pub const AUTHORITY_EVENT_UNDELIVERED: &str = "greengateway_authority_event_undelivered";
+
+/// How long the oldest undelivered journal row has waited, on the database
+/// clock; `0` when nothing is waiting. A value that grows while the
+/// undelivered count does not shrink is a stalled dispatcher or sink.
+#[cfg(feature = "postgres")]
+pub const AUTHORITY_EVENT_OLDEST_UNDELIVERED_AGE_SECONDS: &str =
+    "greengateway_authority_event_oldest_undelivered_age_seconds";
+
+/// Events a sink accepted and the cursor committed past, counted by the
+/// replica that delivered them. A redelivery after a lost cursor advance is
+/// counted again.
+#[cfg(feature = "postgres")]
+pub const AUTHORITY_EVENT_DELIVERED_TOTAL: &str = "greengateway_authority_event_delivered_total";
+
+/// Dispatcher failures by the step that failed.
+///
+/// Every label value is a compile-time constant from
+/// [`crate::authority_events::dispatcher::FAILURE_KINDS`]. The sink's or the
+/// store's error text goes to the log line, never to a label.
+#[cfg(feature = "postgres")]
+pub const AUTHORITY_EVENT_DELIVERY_FAILURES_TOTAL: &str =
+    "greengateway_authority_event_delivery_failures_total";
+
+/// Authority mutations refused because the journal was at capacity, counted
+/// by the replica that refused them.
+#[cfg(feature = "postgres")]
+pub const AUTHORITY_EVENT_CAPACITY_REFUSALS_TOTAL: &str =
+    "greengateway_authority_event_capacity_refusals_total";
 
 /// Client-certificate outcomes, per listener.
 ///

@@ -2064,6 +2064,7 @@ mod tests {
         burst: u32,
     ) -> RateLimitRule {
         RateLimitRule {
+            id: None,
             principal: PrincipalMatcher {
                 principal_ids: principal_ids
                     .iter()

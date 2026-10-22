@@ -1233,5 +1233,606 @@ async fn an_openapi_tool_call_is_attested_and_bound_like_a_manual_one() {
     assert_absent(&rendered, &canaries, "the audit");
 }
 
+/// The tools of the composite fixture: the composite, its two forward steps
+/// and their compensations.
+const COMPOSITE_TOOLS: [&str; 5] = [
+    "create_note_for_records",
+    "create_note",
+    "attach_note",
+    "delete_attachment",
+    "delete_note",
+];
+
+fn composite_failure(error: ToolRuntimeError) -> (Option<String>, Value) {
+    let ToolRuntimeError::WorkFailed {
+        reason,
+        details: Some(details),
+        ..
+    } = error
+    else {
+        panic!("a composite failure should carry its structured details");
+    };
+    (reason, details)
+}
+
+#[tokio::test]
+async fn every_composite_leaf_signs_its_own_assertion_with_a_distinct_jti() {
+    let (logs, _logs_guard) = capture_all_logs();
+    // A note, then two attachments of which the second is rejected, then the
+    // two compensations that undo the first attachment and the note.
+    let (addr, ca_pem, server) = scripted_tls_server(vec![
+        (StatusCode::CREATED, json!({ "id": "note-1" })),
+        (StatusCode::CREATED, json!({ "id": "attachment-a" })),
+        (StatusCode::BAD_REQUEST, json!({ "error": "rejected" })),
+        (StatusCode::NO_CONTENT, Value::Null),
+        (StatusCode::NO_CONTENT, Value::Null),
+    ])
+    .await;
+    let signing_key = generated_es256_pem();
+    let mut settings = TemporaryStaticAuthRuntime::caller_assertion_settings();
+    settings.bind_request = true;
+    let (connection, secrets) = TemporaryStaticAuthRuntime::attested(
+        addr,
+        &ca_pem,
+        API_KEY.as_bytes(),
+        signing_key.as_bytes(),
+        settings,
+        &[],
+    )
+    .await;
+    let saved = secrets.resolutions();
+    let (executor, capture) = executor_for_composite_definitions(
+        composite_note_definitions(&connection.connection_id),
+        &connection,
+        COMPOSITE_TOOLS,
+    );
+
+    let error = executor
+        .execute(
+            "create_note_for_records",
+            json!({ "title": "hello", "targets": ["a", "b"] }),
+            context_for(&bearer("alice", &[]), "request-composite"),
+            CancellationToken::new(),
+        )
+        .await
+        .expect_err("the rejected attachment fails the composite");
+    let (reason, details) = composite_failure(error);
+    assert_eq!(reason.as_deref(), Some("composite_failed"));
+    assert_eq!(details["failure_reason"], json!("upstream_status:400"));
+    assert_eq!(details["compensation"], json!("complete"));
+    // Each leaf reads the API key and the signing key once, as a tool call
+    // does.
+    assert_eq!(secrets.resolutions(), saved + 10);
+
+    let requests = server.await.expect("the TLS server task should join");
+    assert_eq!(
+        requests
+            .iter()
+            .map(|request| (request.method.as_str(), request.target.as_str()))
+            .collect::<Vec<_>>(),
+        vec![
+            ("POST", "/v1/notes"),
+            ("POST", "/v1/attachments/a"),
+            ("POST", "/v1/attachments/b"),
+            ("DELETE", "/v1/attachments/a"),
+            ("DELETE", "/v1/notes/note-1"),
+        ]
+    );
+    let jwks = connection
+        .control_plane
+        .caller_assertion_jwks()
+        .await
+        .expect("the signing key is published");
+    let mut tokens = Vec::new();
+    let mut jtis = Vec::new();
+    for request in &requests {
+        // Every leaf carries the credential and exactly one assertion.
+        assert_eq!(request.header("x-api-key"), Some(API_KEY));
+        assert_eq!(request.header_count(ASSERTION_HEADER), 1);
+        let token = request
+            .header(ASSERTION_HEADER)
+            .expect("every leaf carries an assertion")
+            .to_owned();
+        let claims = verify_with_published_set(&token, jwks.body());
+        assert_eq!(claims["sub"], json!(format!("{PROVIDER}#alice")));
+        // Each binds its own leaf: the method, target and exact body sent.
+        assert_eq!(claims["method"], json!(request.method));
+        assert_eq!(claims["path"], json!(request.target));
+        assert_eq!(
+            claims["request_sha256"],
+            json!(upstream_digest(&request.body))
+        );
+        jtis.push(
+            claims["jti"]
+                .as_str()
+                .expect("the jti is a string")
+                .to_owned(),
+        );
+        tokens.push(token);
+    }
+    // Forward steps, fan-out iterations and compensations alike each have
+    // their own `jti`, numbered in the order they were sent, so a replay
+    // cache keyed on `sub` and `jti` accepts the whole call.
+    assert_eq!(
+        jtis,
+        (1..=5)
+            .map(|leaf| format!("request-composite.{leaf}"))
+            .collect::<Vec<_>>()
+    );
+
+    wait_until(Duration::from_secs(1), || {
+        let events = capture.events();
+        events
+            .iter()
+            .filter(|event| event.event_type == audit::event::TOOL_UPSTREAM_REQUEST)
+            .count()
+            == 5
+            && events
+                .iter()
+                .any(|event| event.event_type == audit::event::TOOL_COMPOSITE_COMPLETED)
+    })
+    .await;
+    let events = capture.events();
+    // Each leaf's event names the `jti` its upstream received, which is how
+    // the upstream's log line is joined to the leaf that sent it.
+    for (jti, tool_name) in jtis.iter().zip([
+        "create_note",
+        "attach_note",
+        "attach_note",
+        "delete_attachment",
+        "delete_note",
+    ]) {
+        let upstream = events
+            .iter()
+            .find(|event| {
+                event.event_type == audit::event::TOOL_UPSTREAM_REQUEST
+                    && event.payload["caller_assertion"]["jti"] == json!(jti)
+            })
+            .expect("every leaf is audited with the jti it sent");
+        assert_eq!(upstream.request_id, "request-composite");
+        assert_eq!(upstream.payload["tool_name"], json!(tool_name));
+        assert_eq!(
+            upstream.payload["caller_assertion"],
+            json!({ "kid": "gw-test-1", "jti": jti })
+        );
+        assert_eq!(
+            upstream.actor.as_ref().map(|actor| actor.user_id.as_str()),
+            Some("alice")
+        );
+    }
+    let completed = events
+        .iter()
+        .find(|event| event.event_type == audit::event::TOOL_COMPOSITE_COMPLETED)
+        .expect("the composite is audited");
+    assert_eq!(completed.payload["outcome"], json!("failed"));
+    assert_eq!(
+        completed.payload["compensations"]
+            .as_array()
+            .map(|compensations| {
+                compensations
+                    .iter()
+                    .map(|compensation| compensation["outcome"].clone())
+                    .collect::<Vec<_>>()
+            }),
+        Some(vec![json!("succeeded"), json!("succeeded")])
+    );
+
+    let mut canaries = vec![API_KEY];
+    canaries.extend(pem_body_lines(&signing_key));
+    canaries.extend(tokens.iter().map(String::as_str));
+    let signatures = tokens
+        .iter()
+        .filter_map(|token| token.rsplit('.').next())
+        .collect::<Vec<_>>();
+    canaries.extend(signatures);
+    let rendered = serde_json::to_string(&events).expect("events serialize");
+    assert_absent(&rendered, &canaries, "the audit");
+    assert_absent(&logs.contents(), &canaries, "the logs");
+    assert_absent(&details.to_string(), &canaries, "the caller error");
+}
+
+#[tokio::test]
+async fn a_composite_call_naming_nobody_is_refused_before_any_leaf_io() {
+    let (addr, ca_pem, server) = one_request_tls_server().await;
+    let (connection, secrets) = TemporaryStaticAuthRuntime::header_api_key_with_caller_assertion(
+        addr,
+        &ca_pem,
+        API_KEY.as_bytes(),
+        generated_es256_pem().as_bytes(),
+    )
+    .await;
+    let saved = secrets.resolutions();
+    let (executor, capture) = executor_for_composite_definitions(
+        composite_note_definitions(&connection.connection_id),
+        &connection,
+        COMPOSITE_TOOLS,
+    );
+    let service = Principal {
+        user_id: "service-token:svc_1".to_owned(),
+        issuer: None,
+        email: None,
+        org_id: None,
+        roles: Vec::new(),
+        session_id: "svc_1".to_owned(),
+        auth_method: AuthMethod::ServiceToken,
+    };
+    let context = context_for(&service, "request-composite-service");
+    assert!(context.caller.is_none());
+
+    let error = executor
+        .execute(
+            "create_note_for_records",
+            json!({ "title": "hello", "targets": ["a"] }),
+            context,
+            CancellationToken::new(),
+        )
+        .await
+        .expect_err("a composite naming nobody must not be attested");
+    // The composite fails as a whole, and its first leaf's reason survives
+    // into what the caller is told.
+    let (reason, details) = composite_failure(error);
+    assert_eq!(reason.as_deref(), Some("composite_failed"));
+    assert_eq!(details["failed_step"], json!("note"));
+    assert_eq!(
+        details["failure_reason"],
+        json!("caller_assertion_no_principal")
+    );
+    assert_eq!(details["compensation"], json!("complete"));
+    assert_eq!(details["orphans"], json!([]));
+
+    wait_until(Duration::from_secs(1), || {
+        let events = capture.events();
+        events
+            .iter()
+            .any(|event| event.event_type == audit::event::TOOL_INVOKE_FAILURE)
+            && events
+                .iter()
+                .any(|event| event.event_type == audit::event::TOOL_COMPOSITE_COMPLETED)
+    })
+    .await;
+    let events = capture.events();
+    // The refused leaf is audited with its reason and without an assertion.
+    let refused = events
+        .iter()
+        .filter(|event| event.event_type == audit::event::TOOL_UPSTREAM_REQUEST)
+        .collect::<Vec<_>>();
+    assert_eq!(refused.len(), 1, "only the first leaf was attempted");
+    assert_eq!(refused[0].payload["tool_name"], json!("create_note"));
+    assert_eq!(refused[0].payload["outcome"], json!("failure"));
+    assert_eq!(
+        refused[0].payload["reason"],
+        json!("caller_assertion_no_principal")
+    );
+    assert!(refused[0].payload.get("caller_assertion").is_none());
+    assert_eq!(
+        refused[0]
+            .actor
+            .as_ref()
+            .map(|actor| actor.auth_mode.as_str()),
+        Some("service_token")
+    );
+    let failure = events
+        .iter()
+        .find(|event| event.event_type == audit::event::TOOL_INVOKE_FAILURE)
+        .expect("the composite refusal is audited");
+    assert_eq!(failure.payload["failure_reason"], json!("composite_failed"));
+    let completed = events
+        .iter()
+        .find(|event| event.event_type == audit::event::TOOL_COMPOSITE_COMPLETED)
+        .expect("the composite is audited");
+    assert_eq!(completed.payload["outcome"], json!("failed"));
+    assert_eq!(completed.payload["failed_step"], json!("note"));
+    assert_eq!(completed.payload["steps"][0]["outcome"], json!("failed"));
+
+    assert_eq!(secrets.resolutions(), saved, "no secret is read");
+    assert!(
+        tokio::time::timeout(Duration::from_millis(100), server)
+            .await
+            .is_err(),
+        "the upstream receives nothing"
+    );
+}
+
+#[tokio::test]
+async fn a_compensation_the_key_can_no_longer_sign_is_skipped_with_its_reason() {
+    let (addr, ca_pem, server, requests_seen) = scripted_tls_server_with_delays(vec![
+        (
+            StatusCode::CREATED,
+            json!({ "id": "note-1" }),
+            Duration::ZERO,
+        ),
+        // Held until the key has changed, then rejected, so the note has to
+        // be undone with the changed key.
+        (
+            StatusCode::BAD_REQUEST,
+            json!({ "error": "rejected" }),
+            Duration::from_millis(1_000),
+        ),
+    ])
+    .await;
+    let signing_key = generated_es256_pem();
+    let (connection, secrets) = TemporaryStaticAuthRuntime::header_api_key_with_caller_assertion(
+        addr,
+        &ca_pem,
+        API_KEY.as_bytes(),
+        signing_key.as_bytes(),
+    )
+    .await;
+    let (executor, capture) = executor_for_composite_definitions(
+        composite_note_definitions(&connection.connection_id),
+        &connection,
+        COMPOSITE_TOOLS,
+    );
+    // An RSA key behind an alias the Connection uses for ES256.
+    let replacement = generated_rs256_pem();
+
+    let (result, ()) = tokio::join!(
+        executor.execute(
+            "create_note_for_records",
+            json!({ "title": "hello", "targets": ["a"] }),
+            context_for(&bearer("alice", &[]), "request-composite-key"),
+            CancellationToken::new(),
+        ),
+        async {
+            // The attachment was signed with the configured key before it
+            // was sent; the compensation after it is not.
+            wait_until(Duration::from_secs(2), || {
+                requests_seen.load(Ordering::Acquire) == 2
+            })
+            .await;
+            secrets.replace("assertion-signing-key", replacement.clone().into_bytes());
+        },
+    );
+    let (reason, details) =
+        composite_failure(result.expect_err("the rejected attachment fails the composite"));
+    assert_eq!(
+        reason.as_deref(),
+        Some("composite_failed_compensation_incomplete")
+    );
+    assert_eq!(details["failed_step"], json!("attach"));
+    assert_eq!(details["failure_reason"], json!("upstream_status:400"));
+    assert_eq!(details["compensation"], json!("incomplete"));
+    // The note stays, for the reason the compensation could not be sent
+    // rather than as a transport error.
+    assert_eq!(
+        details["orphans"],
+        json!([{
+            "step": "note",
+            "tool": "create_note",
+            "certainty": "confirmed",
+            "reason": "caller_assertion_key_unusable"
+        }])
+    );
+
+    let requests = server.await.expect("the TLS server task should join");
+    assert_eq!(
+        requests
+            .iter()
+            .map(|request| request.target.as_str())
+            .collect::<Vec<_>>(),
+        vec!["/v1/notes", "/v1/attachments/a"],
+        "nothing was sent to undo the note"
+    );
+
+    wait_until(Duration::from_secs(1), || {
+        capture
+            .events()
+            .iter()
+            .any(|event| event.event_type == audit::event::TOOL_COMPOSITE_COMPLETED)
+    })
+    .await;
+    let events = capture.events();
+    let completed = events
+        .iter()
+        .find(|event| event.event_type == audit::event::TOOL_COMPOSITE_COMPLETED)
+        .expect("the composite is audited");
+    assert_eq!(
+        completed.payload["outcome"],
+        json!("failed_compensation_incomplete")
+    );
+    assert_eq!(
+        completed.payload["compensations"],
+        json!([{
+            "for_step": "note",
+            "tool": "delete_note",
+            "outcome": "skipped",
+            "reason": "caller_assertion_key_unusable"
+        }])
+    );
+    assert_eq!(
+        completed.payload["pending_compensation"],
+        json!([{ "step": "note", "tool": "delete_note" }])
+    );
+    let signed = events
+        .iter()
+        .filter(|event| event.event_type == audit::event::TOOL_UPSTREAM_REQUEST)
+        .filter_map(|event| event.payload["caller_assertion"]["jti"].as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        signed,
+        vec!["request-composite-key.1", "request-composite-key.2"]
+    );
+    let refused = events
+        .iter()
+        .find(|event| {
+            event.event_type == audit::event::TOOL_UPSTREAM_REQUEST
+                && event.payload["tool_name"] == json!("delete_note")
+        })
+        .expect("the refused compensation is audited");
+    assert_eq!(
+        refused.payload["reason"],
+        json!("caller_assertion_key_unusable")
+    );
+    assert!(refused.payload.get("caller_assertion").is_none());
+    let resolution = events
+        .iter()
+        .find(|event| event.event_type == audit::event::CONNECTION_SECRET_RESOLUTION_FAILED)
+        .expect("the key failure is reported like any secret failure");
+    assert_eq!(
+        resolution.payload["reason"],
+        json!("caller_assertion_key_unusable")
+    );
+    assert_eq!(resolution.payload["consumer_id"], json!("delete_note"));
+
+    let mut canaries = vec![API_KEY];
+    canaries.extend(pem_body_lines(&signing_key));
+    canaries.extend(pem_body_lines(&replacement));
+    let rendered = serde_json::to_string(&events).expect("events serialize");
+    assert_absent(&rendered, &canaries, "the audit");
+    assert_absent(&details.to_string(), &canaries, "the caller error");
+}
+
+#[tokio::test]
+async fn a_composite_leaf_on_a_block_no_lane_honours_is_refused_before_member_io() {
+    // A block only an earlier release accepted is honoured by no lane, so the
+    // leaf is refused while it is prepared, and the composite reports why.
+    let (addr, ca_pem, server) = one_request_tls_server().await;
+    let (connection, secrets) = TemporaryStaticAuthRuntime::header_api_key_with_caller_assertion(
+        addr,
+        &ca_pem,
+        API_KEY.as_bytes(),
+        generated_es256_pem().as_bytes(),
+    )
+    .await;
+    let mut legacy = connection
+        .control_plane
+        .runtime_snapshot()
+        .managed()
+        .values()
+        .next()
+        .cloned()
+        .expect("the Connection is stored");
+    legacy
+        .write
+        .caller_assertion
+        .as_mut()
+        .expect("the Connection attests its caller")
+        .bind_approval = true;
+    assert!(!legacy.write.caller_assertion_enforceable());
+    connection
+        .control_plane
+        .publish_authoritative_records(vec![legacy])
+        .await
+        .expect("a legacy document still loads");
+    let saved = secrets.resolutions();
+    let (executor, capture) = executor_for_composite_definitions(
+        composite_note_definitions(&connection.connection_id),
+        &connection,
+        COMPOSITE_TOOLS,
+    );
+
+    let error = executor
+        .execute(
+            "create_note_for_records",
+            json!({ "title": "hello", "targets": ["a"] }),
+            context_for(&bearer("alice", &[]), "request-composite-legacy"),
+            CancellationToken::new(),
+        )
+        .await
+        .expect_err("a composite leaf on a block no lane honours must fail closed");
+    let (reason, details) = composite_failure(error);
+    assert_eq!(reason.as_deref(), Some("composite_failed"));
+    assert_eq!(details["failed_step"], json!("note"));
+    assert_eq!(
+        details["failure_reason"],
+        json!("caller_assertion_not_enforced")
+    );
+    assert_eq!(details["orphans"], json!([]));
+
+    wait_until(Duration::from_secs(1), || {
+        capture
+            .events()
+            .iter()
+            .any(|event| event.event_type == audit::event::TOOL_COMPOSITE_COMPLETED)
+    })
+    .await;
+    let events = capture.events();
+    assert!(
+        events
+            .iter()
+            .all(|event| event.event_type != audit::event::TOOL_UPSTREAM_REQUEST),
+        "no leaf request was attempted"
+    );
+    assert_eq!(
+        secrets.resolutions(),
+        saved,
+        "a refused composite leaf must not consult a secret provider"
+    );
+    assert!(
+        tokio::time::timeout(Duration::from_millis(100), server)
+            .await
+            .is_err(),
+        "the refusal must happen before composite member I/O"
+    );
+}
+
+#[test]
+fn composite_leaves_are_numbered_by_the_assertions_they_sign() {
+    let mut leaves = CompositeLeafAssertions::new("request-9");
+    assert_eq!(leaves.next_jti(), "request-9.1");
+    // A leaf that signed nothing, refused or on a Connection that attests
+    // nobody, takes no number.
+    leaves.record(None);
+    assert_eq!(leaves.next_jti(), "request-9.1");
+    let issued = IssuedCallerAssertion {
+        kid: "gw-test-1".to_owned(),
+        jti: leaves.next_jti(),
+    };
+    leaves.record(Some(&issued));
+    assert_eq!(leaves.next_jti(), "request-9.2");
+}
+
+#[test]
+fn a_refused_composite_leaf_keeps_its_caller_assertion_reason() {
+    let refusals = [
+        CallerAssertionError::NoPrincipal,
+        CallerAssertionError::InvalidClaim("jti"),
+        CallerAssertionError::InvalidLifetime,
+        CallerAssertionError::KeyUnusable,
+        CallerAssertionError::KeyUnavailable,
+        CallerAssertionError::KeyNotPublished,
+        CallerAssertionError::HeaderConflict,
+        CallerAssertionError::ApprovalRequired,
+        CallerAssertionError::SignatureFailed,
+        CallerAssertionError::TokenTooLong,
+    ];
+    // Exhaustive, so a new refusal is listed above before this compiles.
+    for refusal in refusals {
+        match refusal {
+            CallerAssertionError::NoPrincipal
+            | CallerAssertionError::InvalidClaim(_)
+            | CallerAssertionError::InvalidLifetime
+            | CallerAssertionError::KeyUnusable
+            | CallerAssertionError::KeyUnavailable
+            | CallerAssertionError::KeyNotPublished
+            | CallerAssertionError::HeaderConflict
+            | CallerAssertionError::ApprovalRequired
+            | CallerAssertionError::SignatureFailed
+            | CallerAssertionError::TokenTooLong => {}
+        }
+    }
+    let reasons = refusals
+        .map(CallerAssertionError::safe_reason)
+        .into_iter()
+        .chain([ConnectionHttpError::CallerAssertionNotEnforced.safe_reason()]);
+    for reason in reasons {
+        assert!(is_caller_assertion_refusal(reason), "{reason}");
+        // A compensation refused while it was prepared reports it as it is.
+        assert_eq!(composite_compensation_preflight_reason(reason), reason);
+    }
+    // Every other failure keeps the reason a composite already gave it.
+    assert!(!is_caller_assertion_refusal(
+        "upstream_authentication_rejected"
+    ));
+    assert_eq!(
+        composite_compensation_preflight_reason("catalog_stale"),
+        "compensation_transport_error"
+    );
+    assert_eq!(
+        composite_compensation_preflight_reason("timeout"),
+        "compensation_timeout"
+    );
+}
+
 #[path = "executor_delegated_token_tests.rs"]
 mod delegated_token_tests;

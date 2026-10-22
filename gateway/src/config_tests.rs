@@ -6325,3 +6325,186 @@ fn greenpm_research_profile_is_opt_in_and_pinned_to_the_owned_origin() {
         .body_limit_profile
         .is_none());
 }
+
+// --- authority-event delivery (issue #425, PR 3) -------------------------
+
+fn authority_event_error(vars: &[(&str, &str)]) -> String {
+    Config::from_env_vars(postgres_mode_vars(vars))
+        .expect_err("the configuration must be refused")
+        .to_string()
+}
+
+#[test]
+fn authority_event_delivery_is_off_by_default_and_the_journal_bounded() {
+    let config = Config::from_env_vars(postgres_mode_vars(&[]))
+        .expect("a postgres-mode configuration without a sink validates");
+    assert_eq!(config.authority_events, AuthorityEventSettings::default());
+    assert_eq!(
+        config.authority_events.sink,
+        AuthorityEventSinkSetting::None
+    );
+    assert_eq!(config.authority_events.journal_capacity, 1_000_000);
+    assert_eq!(config.authority_events.retention_hours, 168);
+    assert_eq!(
+        config.authority_events.retention(),
+        std::time::Duration::from_secs(168 * 3_600)
+    );
+    // Standalone defaults are the same values, and nothing reads them.
+    let standalone = Config::from_env_vars(|_| Err(VarError::NotPresent))
+        .expect("an unconfigured gateway is standalone");
+    assert_eq!(
+        standalone.authority_events,
+        AuthorityEventSettings::default()
+    );
+}
+
+#[test]
+fn a_configured_sink_parses_with_its_key_aliases() {
+    let config = Config::from_env_vars(postgres_mode_vars(&[
+        ("AUTHORITY_EVENT_SINK", "file"),
+        (
+            "AUTHORITY_EVENT_FILE",
+            "/var/lib/greengateway/authority-events.jsonl",
+        ),
+        ("AUTHORITY_PSEUDONYM_KEY_ALIAS", "pseudonym-2026-10"),
+        (
+            "AUTHORITY_PSEUDONYM_PREVIOUS_KEY_ALIAS",
+            "pseudonym-2026-04",
+        ),
+        ("AUTHORITY_EVENT_JOURNAL_CAPACITY", "5000"),
+        ("AUTHORITY_EVENT_RETENTION_HOURS", "0"),
+    ]))
+    .expect("a complete file-sink configuration validates");
+    assert_eq!(
+        config.authority_events.sink,
+        AuthorityEventSinkSetting::File("/var/lib/greengateway/authority-events.jsonl".to_owned())
+    );
+    assert_eq!(
+        config
+            .authority_events
+            .pseudonym_key_aliases()
+            .collect::<Vec<_>>(),
+        ["pseudonym-2026-10", "pseudonym-2026-04"]
+    );
+    assert_eq!(config.authority_events.journal_capacity, 5_000);
+    assert_eq!(config.authority_events.retention_hours, 0);
+
+    let log = Config::from_env_vars(postgres_mode_vars(&[
+        ("AUTHORITY_EVENT_SINK", "log"),
+        ("AUTHORITY_PSEUDONYM_KEY_ALIAS", "pseudonym-2026-10"),
+    ]))
+    .expect("a log sink needs only its key");
+    assert_eq!(log.authority_events.sink, AuthorityEventSinkSetting::Log);
+    assert_eq!(log.authority_events.previous_pseudonym_key_alias, None);
+
+    // Blank is unset, as for every cluster-only setting in .env.example.
+    let blank = Config::from_env_vars(postgres_mode_vars(&[
+        ("AUTHORITY_EVENT_SINK", " "),
+        ("AUTHORITY_EVENT_FILE", ""),
+        ("AUTHORITY_PSEUDONYM_KEY_ALIAS", ""),
+        ("AUTHORITY_EVENT_JOURNAL_CAPACITY", ""),
+        ("AUTHORITY_EVENT_RETENTION_HOURS", ""),
+    ]))
+    .expect("blank values are unset");
+    assert_eq!(blank.authority_events, AuthorityEventSettings::default());
+}
+
+#[test]
+fn a_sink_without_its_key_or_file_fails_startup() {
+    for (vars, expected) in [
+        (
+            vec![("AUTHORITY_EVENT_SINK", "log")],
+            "AUTHORITY_PSEUDONYM_KEY_ALIAS is required when AUTHORITY_EVENT_SINK is set",
+        ),
+        (
+            vec![
+                ("AUTHORITY_EVENT_SINK", "file"),
+                ("AUTHORITY_PSEUDONYM_KEY_ALIAS", "pseudonym-a"),
+            ],
+            "AUTHORITY_EVENT_FILE is required when AUTHORITY_EVENT_SINK=file",
+        ),
+        (
+            vec![
+                ("AUTHORITY_EVENT_SINK", "log"),
+                ("AUTHORITY_PSEUDONYM_KEY_ALIAS", "pseudonym-a"),
+                ("AUTHORITY_EVENT_FILE", "/tmp/events.jsonl"),
+            ],
+            "only the file sink writes a file",
+        ),
+        (
+            vec![
+                ("AUTHORITY_EVENT_SINK", "log"),
+                ("AUTHORITY_PSEUDONYM_KEY_ALIAS", "pseudonym-a"),
+                ("AUTHORITY_PSEUDONYM_PREVIOUS_KEY_ALIAS", "pseudonym-a"),
+            ],
+            "must name different aliases",
+        ),
+        (
+            vec![
+                ("AUTHORITY_EVENT_SINK", "log"),
+                ("AUTHORITY_PSEUDONYM_KEY_ALIAS", "0123456789abcdef/../key"),
+            ],
+            "AUTHORITY_PSEUDONYM_KEY_ALIAS must be a secret alias ID",
+        ),
+        (
+            vec![("AUTHORITY_EVENT_SINK", "syslog")],
+            "AUTHORITY_EVENT_SINK must be a valid authority event sink",
+        ),
+        (
+            vec![("AUTHORITY_EVENT_JOURNAL_CAPACITY", "0")],
+            "AUTHORITY_EVENT_JOURNAL_CAPACITY must be between 1 and 1000000000",
+        ),
+        (
+            vec![("AUTHORITY_EVENT_JOURNAL_CAPACITY", "1000000001")],
+            "AUTHORITY_EVENT_JOURNAL_CAPACITY must be between 1 and 1000000000",
+        ),
+        (
+            vec![("AUTHORITY_EVENT_RETENTION_HOURS", "87601")],
+            "AUTHORITY_EVENT_RETENTION_HOURS must be at most 87600",
+        ),
+    ] {
+        let error = authority_event_error(&vars);
+        assert!(error.contains(expected), "{vars:?}: {error}");
+    }
+}
+
+#[test]
+fn delivery_material_without_a_sink_is_refused_rather_than_ignored() {
+    for name in [
+        "AUTHORITY_EVENT_FILE",
+        "AUTHORITY_PSEUDONYM_KEY_ALIAS",
+        "AUTHORITY_PSEUDONYM_PREVIOUS_KEY_ALIAS",
+    ] {
+        let error = authority_event_error(&[(name, "pseudonym-a")]);
+        assert!(
+            error.contains(&format!("{name} is set while AUTHORITY_EVENT_SINK is none")),
+            "{name}: {error}"
+        );
+    }
+}
+
+#[test]
+fn every_authority_event_setting_is_refused_in_standalone_mode() {
+    for (name, value) in [
+        ("AUTHORITY_EVENT_SINK", "log"),
+        ("AUTHORITY_EVENT_FILE", "/tmp/events.jsonl"),
+        ("AUTHORITY_PSEUDONYM_KEY_ALIAS", "pseudonym-a"),
+        ("AUTHORITY_PSEUDONYM_PREVIOUS_KEY_ALIAS", "pseudonym-b"),
+        ("AUTHORITY_EVENT_JOURNAL_CAPACITY", "10"),
+        ("AUTHORITY_EVENT_RETENTION_HOURS", "1"),
+    ] {
+        let error = Config::from_env_vars(|key| {
+            if key == name {
+                Ok(value.to_owned())
+            } else {
+                Err(VarError::NotPresent)
+            }
+        })
+        .expect_err("standalone mode has no journal")
+        .to_string();
+        assert!(
+            error.contains(&format!("{name} is set while STATE_BACKEND is sqlite")),
+            "{name}: {error}"
+        );
+    }
+}
