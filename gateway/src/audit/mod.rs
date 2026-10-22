@@ -11,8 +11,9 @@ use std::{
     time::{Duration, Instant},
 };
 
-use crate::config::Config;
+use crate::config::{AuditDurability, Config};
 
+pub mod durable;
 pub mod event;
 /// The cluster-mode audit of record (issue #11, PR 3), on the same
 /// `postgres` feature as the store it writes through.
@@ -23,6 +24,7 @@ pub mod redact;
 pub mod sink;
 pub mod sqlite_sink;
 
+pub use durable::{AuditReceipt, AuditUnavailable, DurableAck};
 pub use event::{Actor, AuditEvent};
 pub use sink::AuditSink;
 
@@ -106,12 +108,24 @@ struct AuditLogInner {
     /// flush. `None` when the channel closed for any other reason (the log
     /// was dropped), in which case the sink flushes under its own bound.
     drain_deadline: Arc<Mutex<Option<Instant>>>,
+    /// `AUDIT_DURABILITY` (issue #425): whether [`AuditLog::record`] waits
+    /// for the audit store of record or only queues.
+    durability: AuditDurability,
+    /// How long a required record may take to commit before its receipt
+    /// fails (`AUDIT_DURABILITY_TIMEOUT_MS`).
+    durable_timeout: Duration,
+    /// Whether the last confirmed receipt failed, so the start and the end
+    /// of a refusal episode are logged once each rather than once per
+    /// refused request.
+    refusing: AtomicBool,
 }
 
-/// One event on its way to the writer, stamped when it was admitted.
+/// One event on its way to the writer, stamped when it was admitted. A
+/// required record carries the acknowledgement its durable sink reports on.
 struct QueuedEvent {
     enqueued_at: Instant,
     event: AuditEvent,
+    ack: Option<DurableAck>,
 }
 
 /// Record (or clear) the enqueue instant of the event the writer holds.
@@ -175,12 +189,42 @@ impl AuditLogInner {
 }
 
 impl AuditLog {
+    /// A best-effort log, as most tests want it: [`Self::record`] queues and
+    /// never waits.
     #[cfg(test)]
     pub fn new(sink: Arc<dyn AuditSink>) -> Self {
-        Self::try_new(sink).expect("audit writer thread should start")
+        Self::try_new_with_durability(
+            sink,
+            AuditDurability::BestEffort,
+            Duration::from_millis(crate::config::DEFAULT_AUDIT_DURABILITY_TIMEOUT_MS),
+        )
+        .expect("audit writer thread should start")
     }
 
-    pub fn try_new(sink: Arc<dyn AuditSink>) -> io::Result<Self> {
+    /// A log whose request-path records wait for `sink`'s durable member
+    /// (`AUDIT_DURABILITY=required`), bounded by `timeout`.
+    #[cfg(test)]
+    pub fn new_required(sink: Arc<dyn AuditSink>, timeout: Duration) -> Self {
+        Self::try_new_with_durability(sink, AuditDurability::Required, timeout)
+            .expect("a required audit log over a durable sink should start")
+    }
+
+    /// A log in the given durability mode. Required durability over a sink
+    /// with no durable member is refused here as well as by the builder: a
+    /// receipt nothing could ever settle would refuse every request, and a
+    /// configuration that does that is a startup error, not an outage.
+    pub fn try_new_with_durability(
+        sink: Arc<dyn AuditSink>,
+        durability: AuditDurability,
+        durable_timeout: Duration,
+    ) -> io::Result<Self> {
+        if durability == AuditDurability::Required && !sink.is_durable() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "AUDIT_DURABILITY=required needs a durable audit store, and the configured \
+                 audit sinks include none",
+            ));
+        }
         let (tx, rx) = mpsc::sync_channel::<QueuedEvent>(AUDIT_CHANNEL_CAPACITY);
         let queued = Arc::new(AtomicUsize::new(0));
         let in_flight_since = Arc::new(Mutex::new(None));
@@ -192,10 +236,18 @@ impl AuditLog {
         let writer = thread::Builder::new()
             .name("audit-log-writer".to_owned())
             .spawn(move || {
-                while let Ok(queued_event) = rx.recv() {
+                while let Ok(QueuedEvent {
+                    enqueued_at,
+                    event,
+                    ack,
+                }) = rx.recv()
+                {
                     writer_queued.fetch_sub(1, Ordering::AcqRel);
-                    set_in_flight(&writer_in_flight, Some(queued_event.enqueued_at));
-                    sink.emit(&queued_event.event);
+                    set_in_flight(&writer_in_flight, Some(enqueued_at));
+                    match ack {
+                        Some(ack) => sink.emit_durable(&event, ack),
+                        None => sink.emit(&event),
+                    }
                     set_in_flight(&writer_in_flight, None);
                 }
                 // The terminal flush at shutdown, counted like every other
@@ -232,8 +284,18 @@ impl AuditLog {
                 dropped: Arc::new(AtomicU64::new(0)),
                 in_flight_since,
                 drain_deadline,
+                durability,
+                durable_timeout,
+                refusing: AtomicBool::new(false),
             }),
         })
+    }
+
+    /// Whether request-path decision records wait for the audit store of
+    /// record (`AUDIT_DURABILITY=required`).
+    #[cfg(test)]
+    pub fn requires_durability(&self) -> bool {
+        self.inner.durability == AuditDurability::Required
     }
 
     /// Events waiting in the writer's channel.
@@ -299,7 +361,15 @@ impl AuditLog {
         config: &Config,
     ) -> Result<(Self, AuditEventSender), Box<dyn std::error::Error>> {
         let (sink, broadcast_sender) = sink::build_sink_from_config(config)?;
-        Ok((Self::try_new(sink)?, broadcast_sender))
+        Ok((Self::from_configured_sink(config, sink)?, broadcast_sender))
+    }
+
+    fn from_configured_sink(config: &Config, sink: Arc<dyn AuditSink>) -> io::Result<Self> {
+        Self::try_new_with_durability(
+            sink,
+            config.audit_durability,
+            Duration::from_millis(config.audit_durability_timeout_ms),
+        )
     }
 
     /// [`Self::from_config`] with cluster mode's durable audit sink
@@ -314,7 +384,7 @@ impl AuditLog {
     ) -> Result<(Self, AuditEventSender), Box<dyn std::error::Error>> {
         let (sink, broadcast_sender) =
             sink::build_sink_from_config_with_durable_store(config, durable)?;
-        Ok((Self::try_new(sink)?, broadcast_sender))
+        Ok((Self::from_configured_sink(config, sink)?, broadcast_sender))
     }
 
     /// Queue an audit event for best-effort background emission.
@@ -325,32 +395,97 @@ impl AuditLog {
     /// events is preferable to stalling request handling on blocking stdout or
     /// file I/O.
     pub fn emit(&self, event: AuditEvent) {
+        if let Err(reason) = self.admit(event, None) {
+            self.note_dropped(reason);
+        }
+    }
+
+    /// Record a request-path decision and hand back the receipt to confirm
+    /// before acting on it (issue #425).
+    ///
+    /// Best effort, this is [`Self::emit`] and the receipt is already
+    /// settled. Required, the event travels with an acknowledgement that the
+    /// durable sink reports once its transaction commits or fails, and the
+    /// receipt waits for that report until `AUDIT_DURABILITY_TIMEOUT_MS`
+    /// from now. An event the writer does not admit is counted on
+    /// `audit_events_dropped_total` exactly as `emit` counts it, and its
+    /// receipt fails at once. Either way this never blocks: the waiting
+    /// happens in [`Self::confirm`].
+    pub fn record(&self, event: AuditEvent) -> AuditReceipt {
+        if self.inner.durability == AuditDurability::BestEffort {
+            self.emit(event);
+            return AuditReceipt::settled();
+        }
+        let (ack, outcome) = DurableAck::channel();
+        match self.admit(event, Some(ack)) {
+            Ok(()) => AuditReceipt::pending(outcome, self.inner.durable_timeout),
+            Err(reason) => {
+                self.note_dropped(reason);
+                AuditReceipt::refused(AuditUnavailable::Admission)
+            }
+        }
+    }
+
+    /// Wait for a receipt from [`Self::record`]. `Err` means the decision
+    /// it records is not durable and must not be acted on: the caller
+    /// refuses the request instead. Each failure is counted on
+    /// `greengateway_audit_durability_refusals_total`; the first of a run of
+    /// failures, and the first success after one, are logged.
+    pub async fn confirm(&self, receipt: AuditReceipt) -> Result<(), AuditUnavailable> {
+        if receipt.is_settled() {
+            return Ok(());
+        }
+        let outcome = receipt.outcome().await;
+        match outcome {
+            Ok(()) => {
+                if self.inner.refusing.swap(false, Ordering::AcqRel) {
+                    tracing::info!(
+                        "audit records are being durably recorded again; requests are served"
+                    );
+                }
+            }
+            Err(reason) => {
+                durable::record_durability_refusal(reason);
+                if !self.inner.refusing.swap(true, Ordering::AcqRel) {
+                    tracing::error!(
+                        reason = reason.as_str(),
+                        error = %reason,
+                        "audit records cannot be durably recorded; refusing requests until they can"
+                    );
+                }
+            }
+        }
+        outcome
+    }
+
+    /// Admit one event to the writer's channel, keeping the reserve for
+    /// lifecycle events. `Err` is the `audit_events_dropped_total` reason
+    /// the caller counts.
+    fn admit(&self, event: AuditEvent, ack: Option<DurableAck>) -> Result<(), &'static str> {
         if self.inner.closed.load(Ordering::Acquire) {
-            self.note_dropped("closed");
-            return;
+            return Err("closed");
         }
         let tx = self.inner.tx_guard();
         let Some(tx) = tx.as_ref() else {
-            self.note_dropped("closed");
-            return;
+            return Err("closed");
         };
         if self.inner.queued.load(Ordering::Acquire) >= AUDIT_NORMAL_CAPACITY {
-            self.note_dropped("full");
-            return;
+            return Err("full");
         }
         self.inner.queued.fetch_add(1, Ordering::AcqRel);
         match tx.try_send(QueuedEvent {
             enqueued_at: Instant::now(),
             event,
+            ack,
         }) {
-            Ok(()) => {}
+            Ok(()) => Ok(()),
             Err(TrySendError::Full(_)) => {
                 self.inner.queued.fetch_sub(1, Ordering::AcqRel);
-                self.note_dropped("full");
+                Err("full")
             }
             Err(TrySendError::Disconnected(_)) => {
                 self.inner.queued.fetch_sub(1, Ordering::AcqRel);
-                self.note_dropped("disconnected");
+                Err("disconnected")
             }
         }
     }
@@ -373,6 +508,7 @@ impl AuditLog {
         match tx.try_send(QueuedEvent {
             enqueued_at: Instant::now(),
             event,
+            ack: None,
         }) {
             Ok(()) => Ok(()),
             Err(TrySendError::Full(_)) => {
@@ -443,7 +579,7 @@ mod tests {
     use serde_json::json;
 
     use super::*;
-    use crate::audit::sink::tests::CaptureSink;
+    use crate::audit::sink::tests::{CaptureSink, DurableBehaviour, DurableCaptureSink};
 
     #[test]
     fn audit_log_emits_to_sink_asynchronously() {
@@ -777,6 +913,182 @@ mod tests {
         assert!(
             condition(),
             "condition did not become true within {timeout:?}"
+        );
+    }
+
+    /// Run `body` on a current-thread runtime inside `recorder`'s scope, so
+    /// the counters `confirm` increments land in it.
+    fn with_recorder<T>(
+        recorder: &crate::audit::sink::tests::CountingRecorder,
+        body: impl std::future::Future<Output = T>,
+    ) -> T {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("test runtime should build");
+        ::metrics::with_local_recorder(recorder, || runtime.block_on(body))
+    }
+
+    fn refusals(recorder: &crate::audit::sink::tests::CountingRecorder, reason: &str) -> u64 {
+        recorder.count(
+            crate::metrics::AUDIT_DURABILITY_REFUSALS_TOTAL,
+            &[("reason", reason)],
+        )
+    }
+
+    /// Required durability (issue #425): a record is confirmed only once the
+    /// store of record reports it stored, and it travels through the same
+    /// writer, in the same order, as every other event.
+    #[test]
+    fn a_required_record_is_confirmed_once_the_store_of_record_stores_it() {
+        let durable = DurableCaptureSink::new();
+        let audit_log = AuditLog::new_required(
+            Arc::new(durable.clone()) as Arc<dyn AuditSink>,
+            Duration::from_secs(5),
+        );
+        assert!(audit_log.requires_durability());
+        let recorder = crate::audit::sink::tests::CountingRecorder::default();
+
+        let confirmed = with_recorder(&recorder, async {
+            audit_log.emit(test_event("audit.ordinary"));
+            let receipt = audit_log.record(test_event("audit.decision"));
+            audit_log.confirm(receipt).await
+        });
+
+        assert_eq!(confirmed, Ok(()));
+        assert_eq!(
+            durable
+                .events()
+                .iter()
+                .map(|event| event.event_type.as_str())
+                .collect::<Vec<_>>(),
+            ["audit.ordinary", "audit.decision"]
+        );
+        for reason in durable::AUDIT_DURABILITY_REFUSAL_REASONS {
+            assert_eq!(refusals(&recorder, reason), 0);
+        }
+    }
+
+    /// A record the store refuses is not confirmed and is counted once; the
+    /// next one the store takes is confirmed again, with nothing to reset.
+    #[test]
+    fn a_refused_record_fails_its_receipt_and_the_next_stored_one_recovers() {
+        let durable = DurableCaptureSink::new();
+        durable.set(DurableBehaviour::Refuse);
+        let audit_log = AuditLog::new_required(
+            Arc::new(durable.clone()) as Arc<dyn AuditSink>,
+            Duration::from_secs(5),
+        );
+        let recorder = crate::audit::sink::tests::CountingRecorder::default();
+
+        let (refused, recovered) = with_recorder(&recorder, async {
+            let refused = audit_log
+                .confirm(audit_log.record(test_event("audit.refused")))
+                .await;
+            durable.set(DurableBehaviour::Store);
+            let recovered = audit_log
+                .confirm(audit_log.record(test_event("audit.recovered")))
+                .await;
+            (refused, recovered)
+        });
+
+        assert_eq!(refused, Err(AuditUnavailable::Store));
+        assert_eq!(recovered, Ok(()));
+        assert_eq!(refusals(&recorder, "store"), 1);
+        assert_eq!(
+            durable.events().len(),
+            1,
+            "only the recovered record is stored"
+        );
+    }
+
+    /// A store that never answers costs a request its bound and no more.
+    #[test]
+    fn a_record_the_store_never_answers_times_out_at_its_bound() {
+        let durable = DurableCaptureSink::new();
+        durable.set(DurableBehaviour::Hold);
+        let audit_log = AuditLog::new_required(
+            Arc::new(durable.clone()) as Arc<dyn AuditSink>,
+            Duration::from_millis(50),
+        );
+        let recorder = crate::audit::sink::tests::CountingRecorder::default();
+
+        let started = Instant::now();
+        let outcome = with_recorder(&recorder, async {
+            audit_log
+                .confirm(audit_log.record(test_event("audit.stuck")))
+                .await
+        });
+
+        assert_eq!(outcome, Err(AuditUnavailable::Timeout));
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "the wait must end at the bound, took {:?}",
+            started.elapsed()
+        );
+        assert_eq!(refusals(&recorder, "timeout"), 1);
+        assert_eventually(Duration::from_secs(1), || durable.held() == 1);
+        // The late report reaches nobody and breaks nothing.
+        durable.release();
+    }
+
+    /// Once admission is closed for shutdown a record cannot reach the
+    /// writer, so its receipt fails at once rather than waiting its bound.
+    #[test]
+    fn a_record_after_admission_closes_is_refused_at_once() {
+        let durable = DurableCaptureSink::new();
+        let audit_log = AuditLog::new_required(
+            Arc::new(durable.clone()) as Arc<dyn AuditSink>,
+            Duration::from_secs(30),
+        );
+        let recorder = crate::audit::sink::tests::CountingRecorder::default();
+
+        let started = Instant::now();
+        let outcome = with_recorder(&recorder, async {
+            audit_log
+                .close_and_drain(Duration::from_secs(1))
+                .await
+                .expect("an idle log drains");
+            audit_log
+                .confirm(audit_log.record(test_event("audit.after_close")))
+                .await
+        });
+
+        assert_eq!(outcome, Err(AuditUnavailable::Admission));
+        assert!(started.elapsed() < Duration::from_secs(5));
+        assert_eq!(refusals(&recorder, "admission"), 1);
+        assert_eq!(
+            recorder.count(AUDIT_EVENTS_DROPPED_TOTAL, &[("reason", "closed")]),
+            1,
+            "a refused record is also counted where every refused event is"
+        );
+        assert_eq!(audit_log.dropped_total(), 1);
+    }
+
+    /// Best effort is the opt-out: `record` is `emit`, the receipt is
+    /// settled, and a store that never answers costs the request nothing.
+    #[test]
+    fn a_best_effort_record_never_waits_for_the_store() {
+        let durable = DurableCaptureSink::new();
+        durable.set(DurableBehaviour::Hold);
+        let audit_log = AuditLog::new(Arc::new(durable.clone()) as Arc<dyn AuditSink>);
+        assert!(!audit_log.requires_durability());
+        let recorder = crate::audit::sink::tests::CountingRecorder::default();
+
+        let started = Instant::now();
+        let outcome = with_recorder(&recorder, async {
+            audit_log
+                .confirm(audit_log.record(test_event("audit.best_effort")))
+                .await
+        });
+
+        assert_eq!(outcome, Ok(()));
+        assert!(started.elapsed() < Duration::from_secs(1));
+        assert_eventually(Duration::from_secs(1), || durable.events().len() == 1);
+        assert_eq!(
+            durable.held(),
+            0,
+            "a best-effort event is emitted, not handed an acknowledgement"
         );
     }
 

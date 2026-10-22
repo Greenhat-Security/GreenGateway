@@ -559,11 +559,20 @@ fn performance_options(replicas: usize) -> ClusterOptions {
         // that refused its own traffic would be measuring
         // `RATE_LIMIT_WRITE_RPS`, which is an operator's choice and not a
         // property of the deployment.
+        //
+        // `AUDIT_DURABILITY=best_effort`: the published budgets are the
+        // authority's cost and exclude the audit commits the default
+        // `required` adds to each decision stage (ha-state-model.md §6), and
+        // the `audit_enqueue` row is a claim about the opt-out's request
+        // path. Measured under `required`, every row would carry a cost the
+        // budgets do not describe and the stall experiment would measure
+        // refusals.
         shared_env: vec![
             ("RATE_LIMIT_READ_RPS".to_owned(), "100000".to_owned()),
             ("RATE_LIMIT_READ_BURST".to_owned(), "100000".to_owned()),
             ("RATE_LIMIT_WRITE_RPS".to_owned(), "100000".to_owned()),
             ("RATE_LIMIT_WRITE_BURST".to_owned(), "100000".to_owned()),
+            ("AUDIT_DURABILITY".to_owned(), "best_effort".to_owned()),
         ],
         ..ClusterOptions::default()
     }

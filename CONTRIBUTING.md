@@ -18,7 +18,7 @@ cargo clippy --workspace -- -D warnings
 The Cargo build for `gateway` runs the reviewed npm installer (`scripts/npm-script-policy.mjs`) and `npm run build` in `admin-ui/` so the Rust binary embeds the production UI assets. For frontend hot reload, run two terminals:
 
 ```sh
-cargo run
+AUDIT_SQLITE_PATH=target/dev-audit.sqlite cargo run
 ```
 
 ```sh

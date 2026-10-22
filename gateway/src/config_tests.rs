@@ -1786,6 +1786,65 @@ fn shutdown_config_defaults_and_explicit_values_parse() {
     assert_eq!(configured.audit_drain_timeout_ms, 7_500);
 }
 
+/// `AUDIT_DURABILITY` defaults to `required` (issue #425); `best_effort`
+/// is accepted only when spelled out, and its wait bound is a positive,
+/// bounded millisecond count.
+#[test]
+fn audit_durability_defaults_to_required_and_parses_its_bound() {
+    let defaults =
+        Config::from_env_vars(|_| Err(VarError::NotPresent)).expect("config should parse");
+    assert_eq!(defaults.audit_durability, AuditDurability::Required);
+    assert_eq!(
+        defaults.audit_durability_timeout_ms,
+        DEFAULT_AUDIT_DURABILITY_TIMEOUT_MS
+    );
+
+    let configured = Config::from_env_vars(|name| match name {
+        "AUDIT_DURABILITY" => Ok("best_effort".to_owned()),
+        "AUDIT_DURABILITY_TIMEOUT_MS" => Ok("250".to_owned()),
+        _ => Err(VarError::NotPresent),
+    })
+    .expect("an explicit opt-out should parse");
+    assert_eq!(configured.audit_durability, AuditDurability::BestEffort);
+    assert_eq!(configured.audit_durability_timeout_ms, 250);
+
+    let explicit = Config::from_env_vars(|name| match name {
+        "AUDIT_DURABILITY" => Ok("required".to_owned()),
+        _ => Err(VarError::NotPresent),
+    })
+    .expect("the default spelled out should parse");
+    assert_eq!(explicit.audit_durability, AuditDurability::Required);
+}
+
+#[test]
+fn invalid_audit_durability_config_is_rejected_rather_than_defaulted() {
+    let error = Config::from_env_vars(|name| match name {
+        "AUDIT_DURABILITY" => Ok("Best_Effort".to_owned()),
+        "AUDIT_DURABILITY_TIMEOUT_MS" => Ok("0".to_owned()),
+        _ => Err(VarError::NotPresent),
+    })
+    .expect_err("an unrecognised mode and a zero bound must fail startup");
+    let message = error.to_string();
+    assert!(
+        message.contains("AUDIT_DURABILITY must be a valid audit durability mode"),
+        "{message}"
+    );
+    assert!(
+        message.contains("AUDIT_DURABILITY_TIMEOUT_MS must be between 1 and 60000"),
+        "{message}"
+    );
+    assert_eq!(error.problems.len(), 2);
+
+    let error = Config::from_env_vars(|name| match name {
+        "AUDIT_DURABILITY_TIMEOUT_MS" => Ok("60001".to_owned()),
+        _ => Err(VarError::NotPresent),
+    })
+    .expect_err("a bound past a minute must fail startup");
+    assert!(error
+        .to_string()
+        .contains("AUDIT_DURABILITY_TIMEOUT_MS must be between 1 and 60000"));
+}
+
 #[test]
 fn invalid_shutdown_config_is_rejected_with_all_problems() {
     let error = Config::from_env_vars(|name| match name {

@@ -232,7 +232,13 @@ Per replica, independent of request rate unless noted:
 - The PostgreSQL audit sink: one batched store call per 200 events or 250 ms
   ([`audit/postgres_sink.rs`](../../gateway/src/audit/postgres_sink.rs)).
   Every audited request adds to these batches, so audit volume is pool load
-  even though no request waits for it.
+  even though, with `AUDIT_DURABILITY=best_effort`, no request waits for it.
+  Under the default `required`, a request's authentication and authorization
+  records also wake the flusher, so it commits whenever such records are
+  waiting -- still one store call and one connection at a time per replica --
+  and the request does wait for that commit. The nightly matrix runs
+  `best_effort` (`performance_options` in `gateway/tests/ha/performance.rs`),
+  so its numbers do not include that wait.
 - The cluster conformance snapshot refresher in
   [`middleware/observation.rs`](../../gateway/src/middleware/observation.rs).
 - The singleton leases: every replica keeps trying the maintenance and

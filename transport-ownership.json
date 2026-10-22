@@ -6079,6 +6079,13 @@
             "file": "gateway/src/main.rs"
           },
           {
+            "name": "audit_durability_startup",
+            "kind": [
+              "test"
+            ],
+            "file": "gateway/tests/audit_durability_startup.rs"
+          },
+          {
             "name": "connection_admin_contract",
             "kind": [
               "test"
@@ -6716,12 +6723,32 @@
       "purpose": "Reviewed exact import/reexport or alias for this module; constructor bodies require separate scope review."
     },
     {
+      "file": "gateway/src/audit/durable.rs",
+      "reasons": [
+        "unexpanded-attribute"
+      ],
+      "scope": "gateway::audit::durable::AUDIT_DURABILITY_REFUSAL_REASONS#1",
+      "sha256": "1045a913c8b4a4c973cc926eb25c6fd8aed944ab5b48ce4dd831ada427a1afff",
+      "owner": "GreenGateway maintainers",
+      "purpose": "Audit/storage operations and instrumentation with existing shared backend authority."
+    },
+    {
+      "file": "gateway/src/audit/durable.rs",
+      "reasons": [
+        "unexpanded-macro"
+      ],
+      "scope": "gateway::audit::durable::record_durability_refusal#1",
+      "sha256": "dda830fa11dc8bfb9251734bea07678ab458c2a851bd8d97f8af857c2d593ec0",
+      "owner": "GreenGateway maintainers",
+      "purpose": "Audit/storage operations and instrumentation with existing shared backend authority."
+    },
+    {
       "file": "gateway/src/audit/postgres_sink.rs",
       "reasons": [
         "capability-import-or-glob"
       ],
-      "scope": "gateway::audit::postgres_sink::use crate :: { audit :: { record_flush_outcome , AuditEvent , AuditSink , AUDIT_EVENTS_DROPPED_TOTAL } , metrics :: LOCK_POISON_RECOVERIES_TOTAL , storage :: { postgres_audit :: PostgresAuditEventStore , AuditEventStore as _ } , }#1",
-      "sha256": "63f79eb95f90db11924f3b591e8f632ff1dbdbb7415d32eb53b6c8b20147477f",
+      "scope": "gateway::audit::postgres_sink::use crate :: { audit :: { record_flush_outcome , AuditEvent , AuditSink , DurableAck , AUDIT_EVENTS_DROPPED_TOTAL } , metrics :: LOCK_POISON_RECOVERIES_TOTAL , storage :: { postgres_audit :: PostgresAuditEventStore , AuditEventStore as _ } , }#1",
+      "sha256": "492022a3c0f104059f690ae08b8e418fcc95cd8b3e4a0bb73d8b4a1c87c8088a",
       "owner": "GreenGateway maintainers",
       "purpose": "Reviewed exact import/reexport or alias for this module; constructor bodies require separate scope review."
     },
@@ -6851,7 +6878,7 @@
         "unexpanded-attribute"
       ],
       "scope": "gateway::audit::sink::AuditSink#1",
-      "sha256": "8b569b6763e25f667758ff4f8690938b7fed3c9fcd08f88656d2d9b679d9f9d7",
+      "sha256": "7b48927f214602ffd437c2b9db7989276ec1c3a30a2f097c32a0bb5fb5ee8636",
       "owner": "GreenGateway maintainers",
       "purpose": "Audit/storage operations and instrumentation with existing shared backend authority."
     },
@@ -6931,7 +6958,7 @@
         "unexpanded-macro"
       ],
       "scope": "gateway::audit::sqlite_sink::impl  SqliteSink::new_with_intervals#1",
-      "sha256": "95e004c950cb13f28e1f43971486c611901ce4c0d6bc521d92d622143fbafed5",
+      "sha256": "843878f8ffb8d07891209f4e4c07855e8402e59b382d12042c698694ba5bc6e2",
       "owner": "GreenGateway maintainers",
       "purpose": "Reviewed standalone reliability changes: process-local readiness state, fixed-label metrics and exact audit loss accounting. No new outbound transport authority; SQLite probes use configured local paths and observation filtering preserves security findings."
     },
@@ -6941,7 +6968,7 @@
         "unexpanded-macro"
       ],
       "scope": "gateway::audit::sqlite_sink::impl  SqliteSinkShared::flush_buffer#1",
-      "sha256": "beda9dab8b35db4b541f7e51db66463672a67416fc08af78c6ddc05ef1839bce",
+      "sha256": "9cbbeca4aadcc96e727597cce1a390cf5b6fea4d9d82634c84072f6f51463a94",
       "owner": "GreenGateway maintainers",
       "purpose": "Reviewed standalone reliability changes: process-local readiness state, fixed-label metrics and exact audit loss accounting. No new outbound transport authority; SQLite probes use configured local paths and observation filtering preserves security findings."
     },
@@ -6961,7 +6988,7 @@
         "unexpanded-macro"
       ],
       "scope": "gateway::audit::sqlite_sink::impl  SqliteSinkShared::buffer_guard#1",
-      "sha256": "16006470c7fbc9ca6213d61df777b162c0edf229dd487827195182ba88e68a3f",
+      "sha256": "1cdd25f428df504d11de455b7eaad1cff4a743ceb5b54351e1b51b688c6fd04a",
       "owner": "GreenGateway maintainers",
       "purpose": "Audit/storage operations and instrumentation with existing shared backend authority."
     },
@@ -7031,7 +7058,7 @@
         "unexpanded-attribute"
       ],
       "scope": "gateway::audit::impl  AuditLog::from_config#1",
-      "sha256": "a0d11a858f168120d0f328ca393a040e7a98ac329f5008448f9256ccfea891f7",
+      "sha256": "3f2a895ef13b3cc86deb4ddf7488d933027be71d459399666e3c76f46de094f3",
       "owner": "GreenGateway maintainers",
       "purpose": "Audit/storage operations and instrumentation with existing shared backend authority."
     },
@@ -10229,7 +10256,7 @@
         "unexpanded-attribute"
       ],
       "scope": "gateway::middleware::rbac::rbac_middleware#1",
-      "sha256": "7e1d1bffaeae03b1176d652411b710a1ad4d343736059ca2235d6be6283b6fbd",
+      "sha256": "71ad797e8337593c2d836296f7d97b3807e46f869223143a6fd84b76740be163",
       "owner": "GreenGateway maintainers",
       "purpose": "Issue #422 HTTP adapter: evaluate the admitted immutable policy snapshot and translate its result into existing audit and response behavior. Existing cfg/cfg_attr inputs only; no new transport, provider, resolver or process authority."
     },

@@ -13,9 +13,18 @@ contract. The first PR 2 slice adds migration 16's
 deletes. The second adds migration 18's `greengateway.service_token_change_evidence`
 and `greengateway.jwt_revocation_evidence`, written by PostgreSQL token rotate/revoke
 and JWT revokes, and the same token evidence table inside the standalone SQLite token
-database. None of them implements or enables required-durability mode, a dispatcher,
-or a standalone revision ledger, and no row is qualified for that future mode.
-Storage selection is unchanged.
+database. None of them implements a dispatcher or a standalone revision ledger, and
+no row is qualified for required-durability mode. Storage selection is unchanged.
+
+`AUDIT_DURABILITY=required`, the default since the request-path slice of this issue,
+is a different and narrower guarantee: the authentication and authorization stages
+wait for their own decision records to commit to the audit store of record, and
+refuse the request with `503 audit_unavailable` when they cannot (see
+[the configuration reference](configuration.md#audit_durability)). It does not
+make any authority-change row below qualified, which is why the inventory's
+`required_durability_mode` stays `not_implemented`: an admin mutation's evidence is
+still its own transaction's rows, or the ordinary audit event its handler emits
+after the commit.
 
 Run the executable inventory and proposed event-contract tests with the pinned
 Node version from `build-tools.json`:
@@ -335,11 +344,17 @@ The reviewed production paths do not call it from an authority-event dispatcher.
 The security runtime reconciles authority revisions. That reconciliation
 mechanism is not a durable downstream evidence cursor.
 
-Ordinary request audit remains bounded asynchronous telemetry. Its PostgreSQL
-sink retries a bounded number of times, then drops/counts failed batches or
-overflow. The SQLite sink is also separate from authority mutation transactions.
-Neither delivery path establishes required evidence by accepting an event into
-memory after the mutation commits.
+Ordinary request audit is bounded asynchronous telemetry, with one exception.
+Its PostgreSQL sink retries a bounded number of times, then drops/counts failed
+batches or overflow. The SQLite sink is also separate from authority mutation
+transactions. Neither delivery path establishes required evidence by accepting an
+event into memory after the mutation commits. The exception is
+`AUDIT_DURABILITY=required` (the default): the request path's authentication and
+authorization records are acknowledged by the same sinks only once the transaction
+carrying them commits, and the request is not acted on until then. That is
+write-ahead evidence of a request's admission decision, not authority-change
+evidence: the records an admin handler emits after its mutation commits keep the
+bounded asynchronous delivery described here.
 
 PR 3 must persist a consumer cursor and deduplication identity independently of
 ordinary request telemetry. Read bounded committed batches, deliver outside the

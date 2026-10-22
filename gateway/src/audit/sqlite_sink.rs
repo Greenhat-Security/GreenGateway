@@ -16,7 +16,7 @@ use serde_json::Value;
 use time::{format_description::well_known::Rfc3339, Duration as TimeDuration, OffsetDateTime};
 
 use crate::{
-    audit::{AuditEvent, AuditSink, AUDIT_SQLITE_FLUSH_ERRORS_TOTAL},
+    audit::{AuditEvent, AuditSink, DurableAck, AUDIT_SQLITE_FLUSH_ERRORS_TOTAL},
     metrics::LOCK_POISON_RECOVERIES_TOTAL,
 };
 
@@ -176,7 +176,10 @@ impl SqliteSink {
             path: config.path,
             retention_days: config.retention_days,
             connection: Mutex::new(connection),
-            buffer: Mutex::new(Vec::with_capacity(SQLITE_BATCH_SIZE)),
+            buffer: Mutex::new(PendingEvents {
+                events: Vec::with_capacity(SQLITE_BATCH_SIZE),
+                acks: Vec::new(),
+            }),
             flush_failure: Mutex::new(None),
             dropped: AtomicU64::new(0),
             #[cfg(test)]
@@ -251,10 +254,26 @@ impl AuditSink for SqliteSink {
         "sqlite"
     }
 
+    fn is_durable(&self) -> bool {
+        true
+    }
+
     fn emit(&self, event: &AuditEvent) {
         if self.shared.push_event(event.clone()) {
             self.shared.flush_buffer();
         }
+    }
+
+    /// A request is waiting on this record (issue #425), so it is not left
+    /// for the flush timer: the buffer is committed now, on the writer
+    /// thread, with this record and whatever was queued ahead of it in one
+    /// transaction, and the acknowledgement reports that transaction's
+    /// outcome. A local WAL commit is short, which is why the writer can
+    /// carry it, and committing in the writer's order keeps the `id` order
+    /// the audit query API pages by.
+    fn emit_durable(&self, event: &AuditEvent, ack: DurableAck) {
+        self.shared.push_durable(event.clone(), ack);
+        self.shared.flush_buffer();
     }
 
     fn flush(&self) -> Result<(), String> {
@@ -274,11 +293,20 @@ impl Drop for SqliteSink {
     }
 }
 
+/// Events waiting for the next flush, and the acknowledgements of the
+/// required records among them. One lock covers both, so a flush always
+/// drains an acknowledgement together with its event and reports it the
+/// outcome of the transaction that event was in.
+struct PendingEvents {
+    events: Vec<AuditEvent>,
+    acks: Vec<DurableAck>,
+}
+
 struct SqliteSinkShared {
     path: PathBuf,
     retention_days: Option<u32>,
     connection: Mutex<Connection>,
-    buffer: Mutex<Vec<AuditEvent>>,
+    buffer: Mutex<PendingEvents>,
     flush_failure: Mutex<Option<String>>,
     dropped: AtomicU64,
     // Fires once, between the drain and the INSERT, so a test can drive a
@@ -291,8 +319,14 @@ struct SqliteSinkShared {
 impl SqliteSinkShared {
     fn push_event(&self, event: AuditEvent) -> bool {
         let mut buffer = self.buffer_guard();
-        buffer.push(event);
-        buffer.len() >= SQLITE_BATCH_SIZE
+        buffer.events.push(event);
+        buffer.events.len() >= SQLITE_BATCH_SIZE
+    }
+
+    fn push_durable(&self, event: AuditEvent, ack: DurableAck) {
+        let mut buffer = self.buffer_guard();
+        buffer.events.push(event);
+        buffer.acks.push(ack);
     }
 
     fn flush_buffer(&self) {
@@ -304,13 +338,16 @@ impl SqliteSinkShared {
         // the connection lock before the buffer lock makes drain order and
         // commit order the same order; nothing may take these two in reverse.
         let mut connection = self.connection_guard();
-        let events = {
+        let (events, acks) = {
             let mut buffer = self.buffer_guard();
-            if buffer.is_empty() {
+            if buffer.events.is_empty() {
                 return;
             }
 
-            buffer.drain(..).collect::<Vec<_>>()
+            (
+                std::mem::replace(&mut buffer.events, Vec::with_capacity(SQLITE_BATCH_SIZE)),
+                std::mem::take(&mut buffer.acks),
+            )
         };
 
         #[cfg(test)]
@@ -319,6 +356,15 @@ impl SqliteSinkShared {
         let result = write_events(&mut connection, &events);
         drop(connection);
 
+        // Reported only once the transaction has resolved: a waiter told
+        // `stored` may act on its decision, so the commit must come first.
+        for ack in acks {
+            if result.is_ok() {
+                ack.stored();
+            } else {
+                ack.not_stored();
+            }
+        }
         crate::audit::record_flush_outcome(result.is_ok());
         ::metrics::gauge!(crate::metrics::AUDIT_SQLITE_HEALTHY).set(if result.is_ok() {
             1.0
@@ -395,7 +441,7 @@ impl SqliteSinkShared {
         }
     }
 
-    fn buffer_guard(&self) -> MutexGuard<'_, Vec<AuditEvent>> {
+    fn buffer_guard(&self) -> MutexGuard<'_, PendingEvents> {
         match self.buffer.lock() {
             Ok(guard) => guard,
             Err(poisoned) => {
@@ -780,6 +826,77 @@ mod tests {
             recorder.gauge_value(crate::metrics::AUDIT_SQLITE_HEALTHY, &[]),
             Some(1.0)
         );
+    }
+
+    /// Required durability (issue #425): the acknowledgement is reported
+    /// after the commit, never before it, and the record does not wait for
+    /// the flush timer -- it commits with everything queued ahead of it.
+    #[test]
+    fn a_required_record_is_acknowledged_only_once_its_transaction_commits() {
+        use crate::audit::durable::DurableOutcome;
+
+        let db = TempDb::new("durable-ack");
+        let sink = sqlite_sink_with_intervals(
+            &db.path,
+            None,
+            StdDuration::from_secs(3_600),
+            StdDuration::from_secs(3_600),
+        );
+        assert!(sink.is_durable());
+        sink.emit(&test_event("audit.ordinary", json!({ "status": 200 })));
+        assert_eq!(
+            row_count(&db.path),
+            0,
+            "an ordinary event waits for the timer"
+        );
+
+        let (ack, mut outcome) = DurableAck::channel();
+        sink.emit_durable(&test_event("audit.decision", json!({ "status": 200 })), ack);
+
+        assert_eq!(outcome.try_recv(), Ok(DurableOutcome::Stored));
+        assert_eq!(
+            event_types_in_id_order(&db.path),
+            ["audit.ordinary", "audit.decision"],
+            "the record commits with what was queued ahead of it, in order"
+        );
+    }
+
+    /// A commit that fails reports the record not stored, counts it as
+    /// every failed batch is counted, and the next commit that succeeds is
+    /// acknowledged with nothing to reset.
+    #[test]
+    fn a_required_record_whose_commit_fails_is_not_stored_and_the_next_one_recovers() {
+        use crate::audit::durable::DurableOutcome;
+
+        let db = TempDb::new("durable-refused");
+        let sink = sqlite_sink_with_intervals(
+            &db.path,
+            None,
+            StdDuration::from_secs(3_600),
+            StdDuration::from_secs(3_600),
+        );
+        sink.shared
+            .connection_guard()
+            .execute_batch("PRAGMA query_only = ON")
+            .unwrap();
+
+        let (ack, mut outcome) = DurableAck::channel();
+        sink.emit_durable(&test_event("audit.refused", json!({ "status": 200 })), ack);
+        assert_eq!(outcome.try_recv(), Ok(DurableOutcome::NotStored));
+        assert_eq!(row_count(&db.path), 0);
+        assert_eq!(sink.backlog().dropped, 1);
+
+        sink.shared
+            .connection_guard()
+            .execute_batch("PRAGMA query_only = OFF")
+            .unwrap();
+        let (ack, mut outcome) = DurableAck::channel();
+        sink.emit_durable(
+            &test_event("audit.recovered", json!({ "status": 200 })),
+            ack,
+        );
+        assert_eq!(outcome.try_recv(), Ok(DurableOutcome::Stored));
+        assert_eq!(event_types_in_id_order(&db.path), ["audit.recovered"]);
     }
 
     #[test]
