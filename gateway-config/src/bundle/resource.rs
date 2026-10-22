@@ -5,18 +5,16 @@
 //! validator, exactly as environment mode reads it. The bundle boundary adds
 //! only what environment mode cannot promise -- strict JSON (a duplicate
 //! member is refused, not overwritten), the exact `schema_version` the
-//! manifest declares, and refusal of any top-level member the policy loader
-//! would warn about and drop. Validator messages can quote document values,
-//! so a refusal is reported by code alone.
+//! manifest declares, refusal of any top-level member the policy loader
+//! would warn about and drop, and the published schema of each document,
+//! which the environment-mode policy loader does not apply. The production
+//! validators run after these checks, through the caller's
+//! [`ResourceValidators`](super::ResourceValidators). Validator messages can
+//! quote document values, so a refusal is reported by code alone.
 
 use std::sync::LazyLock;
 
 use serde_json::Value;
-
-use crate::{
-    rbac::policy::{Policy, KNOWN_TOP_LEVEL_KEYS},
-    tools::definitions::{definitions_from_json_value, ToolDefinition},
-};
 
 use super::{
     diagnostic::{BundleDiagnostic, Code, Pointer},
@@ -26,30 +24,58 @@ use super::{
 };
 
 /// The bound environment mode already applies to each document.
-pub(crate) const MAX_RESOURCE_BYTES: usize = 1024 * 1024;
+pub const MAX_RESOURCE_BYTES: usize = 1024 * 1024;
 
-const POLICY_SCHEMA_JSON: &str = include_str!("../../../../docs/schemas/policy.v0.schema.json");
+/// The top-level members a policy `0.x` document may have: exactly the ones
+/// the gateway's policy loader reads (`KNOWN_TOP_LEVEL_KEYS` in
+/// `gateway/src/rbac/policy.rs`, which a gateway test holds equal to this
+/// list). The loader warns about any other member and drops it; at the
+/// bundle boundary it is refused instead.
+pub const POLICY_TOP_LEVEL_MEMBERS: &[&str] = &[
+    "schema_version",
+    "id",
+    "default_action",
+    "enforcement_mode",
+    "roles",
+    "routes",
+    "rules",
+    "egress",
+    "rate_limits",
+    "tools",
+];
+
+const POLICY_SCHEMA_JSON: &str = include_str!("../../../docs/schemas/policy.v0.schema.json");
+const TOOLS_SCHEMA_JSON: &str = include_str!("../../../docs/schemas/tools.v0.schema.json");
 
 /// The environment-mode policy loader does not apply the published schema;
 /// in a bundle the document must pass it as well as the loader.
-static POLICY_SCHEMA_VALIDATOR: LazyLock<Option<jsonschema::Validator>> = LazyLock::new(|| {
-    let schema: Value = serde_json::from_str(POLICY_SCHEMA_JSON).ok()?;
-    jsonschema::validator_for(&schema).ok()
-});
+static POLICY_SCHEMA_VALIDATOR: LazyLock<Option<jsonschema::Validator>> =
+    LazyLock::new(|| compile(POLICY_SCHEMA_JSON));
 
-/// Validates a referenced policy document.
+/// The production tools validator applies this schema first as well; the
+/// reader applies it so that a caller without that validator still does.
+static TOOLS_SCHEMA_VALIDATOR: LazyLock<Option<jsonschema::Validator>> =
+    LazyLock::new(|| compile(TOOLS_SCHEMA_JSON));
+
+fn compile(schema: &str) -> Option<jsonschema::Validator> {
+    let schema: Value = serde_json::from_str(schema).ok()?;
+    jsonschema::validator_for(&schema).ok()
+}
+
+/// Checks a referenced policy document at the bundle boundary and returns
+/// its JSON value for the production validator.
 pub(crate) fn policy(
     text: &str,
     schema_version: &str,
     file: &FileName,
     diagnostics: &mut Vec<BundleDiagnostic>,
-) -> Option<Policy> {
+) -> Option<Value> {
     let (node, value) = resource_value(text, schema_version, file, diagnostics)?;
     let unknown: Vec<_> = node
         .as_object()
         .unwrap_or_default()
         .iter()
-        .filter(|member| !KNOWN_TOP_LEVEL_KEYS.contains(&member.key.as_str()))
+        .filter(|member| !POLICY_TOP_LEVEL_MEMBERS.contains(&member.key.as_str()))
         .map(|member| {
             BundleDiagnostic::at(
                 Code::ResourceUnknownMember,
@@ -63,40 +89,39 @@ pub(crate) fn policy(
         diagnostics.extend(unknown);
         return None;
     }
-    // A schema that does not compile is a build defect the tests catch; it
-    // refuses every policy rather than skipping the check.
-    let schema_valid = POLICY_SCHEMA_VALIDATOR
-        .as_ref()
-        .is_some_and(|validator| validator.is_valid(&value));
-    if !schema_valid {
-        diagnostics.push(BundleDiagnostic::file(Code::ResourceInvalid, file));
-        return None;
-    }
-    match Policy::validate_json_value(value) {
-        Ok(policy) => Some(policy),
-        Err(_) => {
-            diagnostics.push(BundleDiagnostic::file(Code::ResourceInvalid, file));
-            None
-        }
-    }
+    published_schema(&POLICY_SCHEMA_VALIDATOR, value, file, diagnostics)
 }
 
-/// Validates a referenced tools document.
+/// Checks a referenced tools document at the bundle boundary and returns
+/// its JSON value for the production validator.
 pub(crate) fn tools(
     text: &str,
     schema_version: &str,
     file: &FileName,
     diagnostics: &mut Vec<BundleDiagnostic>,
-) -> Option<Vec<ToolDefinition>> {
-    // The tools validator applies its published schema, which closes the top
-    // level, and refuses unknown members throughout.
+) -> Option<Value> {
+    // The published tools schema closes the top level and refuses unknown
+    // members throughout.
     let (_, value) = resource_value(text, schema_version, file, diagnostics)?;
-    match definitions_from_json_value(value, None) {
-        Ok(definitions) => Some(definitions),
-        Err(_) => {
-            diagnostics.push(BundleDiagnostic::file(Code::ResourceInvalid, file));
-            None
-        }
+    published_schema(&TOOLS_SCHEMA_VALIDATOR, value, file, diagnostics)
+}
+
+fn published_schema(
+    validator: &LazyLock<Option<jsonschema::Validator>>,
+    value: Value,
+    file: &FileName,
+    diagnostics: &mut Vec<BundleDiagnostic>,
+) -> Option<Value> {
+    // A schema that does not compile is a build defect the tests catch; it
+    // refuses every document rather than skipping the check.
+    let valid = validator
+        .as_ref()
+        .is_some_and(|validator| validator.is_valid(&value));
+    if valid {
+        Some(value)
+    } else {
+        diagnostics.push(BundleDiagnostic::file(Code::ResourceInvalid, file));
+        None
     }
 }
 
@@ -155,6 +180,6 @@ fn resource_value(
 }
 
 #[cfg(test)]
-pub(crate) fn policy_schema_compiles() -> bool {
-    POLICY_SCHEMA_VALIDATOR.is_some()
+pub(crate) fn published_schemas_compile() -> bool {
+    POLICY_SCHEMA_VALIDATOR.is_some() && TOOLS_SCHEMA_VALIDATOR.is_some()
 }
