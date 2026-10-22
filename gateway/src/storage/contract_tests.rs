@@ -38,8 +38,12 @@ use crate::rbac::{
     Policy,
 };
 use crate::storage::{
-    AuditEventStore, PolicyHistory, PrincipalDirectoryStore, RepositoryError, RepositoryErrorKind,
-    ServiceTokenStore, SqliteAuditEventStore,
+    policy_drafts::{
+        is_policy_draft_id, NewPolicyDraft, PolicyDraftChange, PolicyDraftCreated,
+        PolicyDraftLimits, PolicyDraftOwner, POLICY_DRAFT_ID_PREFIX,
+    },
+    AuditEventStore, PolicyDraftStore, PolicyHistory, PrincipalDirectoryStore, RepositoryError,
+    RepositoryErrorKind, ServiceTokenStore, SqliteAuditEventStore, SqlitePolicyDraftStore,
 };
 
 // ---------------------------------------------------------------------------
@@ -1243,6 +1247,470 @@ async fn sqlite_policy_history_satisfies_the_contract() {
     let db = TempDb::new("history-contract");
     let history = PolicyHistoryStore::open(&db.path).expect("history store should open");
     policy_history_contract(&history).await;
+}
+
+// ---------------------------------------------------------------------------
+// Policy-draft contract (issue #243, slice 9)
+// ---------------------------------------------------------------------------
+
+/// What a draft contract test needs from an adapter beyond the trait: a way
+/// to move time and a way to corrupt a row, each on the adapter's own
+/// storage, so expiry and tamper refusal are tested without waiting and
+/// without a store method that could do either in production.
+#[async_trait::async_trait]
+pub(crate) trait PolicyDraftBackdoor: Sync {
+    /// Move the draft's expiry (and its earlier timestamps) into the past
+    /// on the adapter's clock.
+    async fn expire(&self, draft_id: &str);
+    /// Rewrite the recorded candidate ETag so it no longer describes the
+    /// stored candidate.
+    async fn tamper(&self, draft_id: &str);
+}
+
+/// The bounds the draft contract runs under: small enough to fill.
+pub(crate) const CONTRACT_DRAFT_LIMITS: PolicyDraftLimits = PolicyDraftLimits {
+    ttl_secs: 3_600,
+    max_per_owner: 2,
+    max_total: 3,
+};
+
+fn contract_draft_id(index: u8) -> String {
+    format!(
+        "{POLICY_DRAFT_ID_PREFIX}{:032x}",
+        u128::from(index) + 0xd7a0
+    )
+}
+
+fn contract_owner(issuer: &str, subject: &str) -> PolicyDraftOwner {
+    PolicyDraftOwner {
+        issuer: issuer.to_owned(),
+        subject: subject.to_owned(),
+    }
+}
+
+fn contract_etag(policy: &Policy) -> String {
+    crate::policy_etag(policy).expect("contract policy ETag")
+}
+
+async fn create_contract_draft(
+    store: &dyn PolicyDraftStore,
+    index: u8,
+    owner: &PolicyDraftOwner,
+    candidate: &Policy,
+    base_etag: &str,
+) -> PolicyDraftCreated {
+    store
+        .create(NewPolicyDraft {
+            draft_id: &contract_draft_id(index),
+            owner,
+            base_etag,
+            candidate,
+        })
+        .await
+        .expect("draft create should not fail")
+}
+
+/// Assert the draft contract: owner scope, revision compare-and-set,
+/// publication freezing a draft, quotas, expiry on the store's clock, and
+/// fail-closed reads of a row that does not reproduce its ETag.
+pub(crate) async fn policy_draft_store_contract(
+    store: &dyn PolicyDraftStore,
+    backdoor: &dyn PolicyDraftBackdoor,
+) {
+    assert_eq!(store.limits(), CONTRACT_DRAFT_LIMITS);
+    let alice = contract_owner("https://issuer.example", "alice");
+    let alice_elsewhere = contract_owner("https://other-issuer.example", "alice");
+    let bob = contract_owner("", "bob");
+    let base = contract_policy("draft-base");
+    let base_etag = contract_etag(&base);
+    let candidate = contract_policy("draft-candidate");
+    let candidate_etag = contract_etag(&candidate);
+
+    // Create: revision 1, open, the store's own ETag for the candidate.
+    let PolicyDraftCreated::Created(created) =
+        create_contract_draft(store, 1, &alice, &candidate, &base_etag).await
+    else {
+        panic!("the first draft should be admitted");
+    };
+    let draft_id = contract_draft_id(1);
+    assert_eq!(created.summary.draft_id, draft_id);
+    assert_eq!(created.summary.revision, 1);
+    assert_eq!(created.summary.base_etag, base_etag);
+    assert_eq!(created.summary.candidate_etag, candidate_etag);
+    assert_eq!(created.summary.published_etag, None);
+    assert!(!created.summary.expired);
+    assert_eq!(created.summary.created_at, created.summary.updated_at);
+    assert_eq!(
+        created.summary.expires_at - created.summary.updated_at,
+        CONTRACT_DRAFT_LIMITS.ttl_secs
+    );
+    assert_eq!(created.candidate, candidate);
+
+    // Owner scope: the same subject under another issuer, and another
+    // subject, see nothing and change nothing.
+    let read = store
+        .get(&alice, &draft_id)
+        .await
+        .expect("owner read")
+        .expect("the owner sees the draft");
+    assert_eq!(read.summary, created.summary);
+    assert_eq!(read.candidate, candidate);
+    for stranger in [&alice_elsewhere, &bob] {
+        assert!(store
+            .get(stranger, &draft_id)
+            .await
+            .expect("stranger read")
+            .is_none());
+        assert!(store
+            .list(stranger)
+            .await
+            .expect("stranger list")
+            .is_empty());
+        assert!(store
+            .update(
+                stranger,
+                &draft_id,
+                1,
+                PolicyDraftChange::Candidate {
+                    candidate: &base,
+                    base_etag: &base_etag,
+                },
+            )
+            .await
+            .expect("stranger update")
+            .is_none());
+        assert!(!store
+            .delete(stranger, &draft_id, 1)
+            .await
+            .expect("stranger delete"));
+    }
+    assert_eq!(
+        store.list(&alice).await.expect("owner list"),
+        vec![created.summary.clone()]
+    );
+
+    // Compare-and-set: a stale revision writes nothing; the current one
+    // advances the revision and restarts the TTL.
+    let edited = contract_policy("draft-edited");
+    let rebased_etag = contract_etag(&contract_policy("draft-new-base"));
+    assert!(store
+        .update(
+            &alice,
+            &draft_id,
+            7,
+            PolicyDraftChange::Candidate {
+                candidate: &edited,
+                base_etag: &rebased_etag,
+            },
+        )
+        .await
+        .expect("stale update")
+        .is_none());
+    let updated = store
+        .update(
+            &alice,
+            &draft_id,
+            1,
+            PolicyDraftChange::Candidate {
+                candidate: &edited,
+                base_etag: &rebased_etag,
+            },
+        )
+        .await
+        .expect("update")
+        .expect("the current revision wins");
+    assert_eq!(updated.summary.revision, 2);
+    assert_eq!(updated.summary.base_etag, rebased_etag);
+    assert_eq!(updated.summary.candidate_etag, contract_etag(&edited));
+    assert_eq!(updated.summary.created_at, created.summary.created_at);
+    assert_eq!(
+        updated.summary.expires_at - updated.summary.updated_at,
+        CONTRACT_DRAFT_LIMITS.ttl_secs
+    );
+    assert_eq!(updated.candidate, edited);
+
+    // Two writers holding one revision: exactly one wins.
+    let (first, second) = tokio::join!(
+        store.update(
+            &alice,
+            &draft_id,
+            2,
+            PolicyDraftChange::Candidate {
+                candidate: &candidate,
+                base_etag: &rebased_etag,
+            },
+        ),
+        store.update(
+            &alice,
+            &draft_id,
+            2,
+            PolicyDraftChange::Candidate {
+                candidate: &base,
+                base_etag: &rebased_etag,
+            },
+        ),
+    );
+    let winners = [first.expect("first racer"), second.expect("second racer")]
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>();
+    assert_eq!(winners.len(), 1, "one revision admits exactly one write");
+    assert_eq!(winners[0].summary.revision, 3);
+
+    // Publication freezes the draft without extending its TTL.
+    let published_etag = contract_etag(&winners[0].candidate);
+    let published = store
+        .update(
+            &alice,
+            &draft_id,
+            3,
+            PolicyDraftChange::Published {
+                published_etag: &published_etag,
+            },
+        )
+        .await
+        .expect("publish mark")
+        .expect("the current revision is marked");
+    assert_eq!(published.summary.revision, 4);
+    assert_eq!(
+        published.summary.published_etag.as_deref(),
+        Some(published_etag.as_str())
+    );
+    assert_eq!(published.summary.expires_at, winners[0].summary.expires_at);
+    for change in [
+        PolicyDraftChange::Candidate {
+            candidate: &base,
+            base_etag: &base_etag,
+        },
+        PolicyDraftChange::Published {
+            published_etag: &published_etag,
+        },
+    ] {
+        assert!(
+            store
+                .update(&alice, &draft_id, 4, change)
+                .await
+                .expect("write to a published draft")
+                .is_none(),
+            "a published draft accepts no further change"
+        );
+    }
+
+    // Delete: stale revisions delete nothing; a published draft can go.
+    assert!(!store
+        .delete(&alice, &draft_id, 3)
+        .await
+        .expect("stale delete"));
+    assert!(store.delete(&alice, &draft_id, 4).await.expect("delete"));
+    assert!(store
+        .get(&alice, &draft_id)
+        .await
+        .expect("read after delete")
+        .is_none());
+
+    // Quotas count unexpired drafts per owner, then per deployment.
+    for index in [2, 3] {
+        assert!(matches!(
+            create_contract_draft(store, index, &alice, &candidate, &base_etag).await,
+            PolicyDraftCreated::Created(_)
+        ));
+    }
+    assert!(matches!(
+        create_contract_draft(store, 4, &alice, &candidate, &base_etag).await,
+        PolicyDraftCreated::OwnerQuotaExceeded
+    ));
+    assert!(matches!(
+        create_contract_draft(store, 5, &bob, &candidate, &base_etag).await,
+        PolicyDraftCreated::Created(_)
+    ));
+    assert!(matches!(
+        create_contract_draft(store, 6, &alice_elsewhere, &candidate, &base_etag).await,
+        PolicyDraftCreated::DeploymentQuotaExceeded
+    ));
+    assert!(store
+        .get(&alice, &contract_draft_id(4))
+        .await
+        .expect("refused draft read")
+        .is_none());
+
+    // Expiry is the store's: an expired draft reads as expired, takes no
+    // write, leaves the listing and the quota, and is pruned by a create.
+    let expiring = contract_draft_id(2);
+    backdoor.expire(&expiring).await;
+    let expired = store
+        .get(&alice, &expiring)
+        .await
+        .expect("expired read")
+        .expect("an expired row is still reported until it is pruned");
+    assert!(expired.summary.expired);
+    assert!(store
+        .update(
+            &alice,
+            &expiring,
+            1,
+            PolicyDraftChange::Candidate {
+                candidate: &base,
+                base_etag: &base_etag,
+            },
+        )
+        .await
+        .expect("write to an expired draft")
+        .is_none());
+    assert!(!store
+        .delete(&alice, &expiring, 1)
+        .await
+        .expect("delete of an expired draft"));
+    assert_eq!(
+        store
+            .list(&alice)
+            .await
+            .expect("list without the expired draft")
+            .into_iter()
+            .map(|summary| summary.draft_id)
+            .collect::<Vec<_>>(),
+        vec![contract_draft_id(3)]
+    );
+    assert!(matches!(
+        create_contract_draft(store, 7, &alice, &candidate, &base_etag).await,
+        PolicyDraftCreated::Created(_)
+    ));
+    assert!(
+        store
+            .get(&alice, &expiring)
+            .await
+            .expect("read after the prune")
+            .is_none(),
+        "the create pruned the expired row"
+    );
+
+    // Two creators racing for one owner's last slot: exactly one is admitted.
+    assert!(store
+        .delete(&bob, &contract_draft_id(5), 1)
+        .await
+        .expect("free a deployment slot"));
+    assert!(store
+        .delete(&alice, &contract_draft_id(7), 1)
+        .await
+        .expect("free an owner slot"));
+    let (first, second) = tokio::join!(
+        create_contract_draft(store, 8, &alice, &candidate, &base_etag),
+        create_contract_draft(store, 9, &alice, &candidate, &base_etag),
+    );
+    let admitted = [&first, &second]
+        .into_iter()
+        .filter(|outcome| matches!(outcome, PolicyDraftCreated::Created(_)))
+        .count();
+    assert_eq!(admitted, 1, "{first:?} / {second:?}");
+
+    // A row that does not reproduce its recorded ETag is never served.
+    backdoor.tamper(&contract_draft_id(3)).await;
+    let refused = store
+        .get(&alice, &contract_draft_id(3))
+        .await
+        .expect_err("a tampered draft must not be served");
+    assert_eq!(refused.kind(), RepositoryErrorKind::InvalidData);
+}
+
+struct SqliteDraftBackdoor {
+    path: PathBuf,
+}
+
+impl SqliteDraftBackdoor {
+    fn connection(&self) -> rusqlite::Connection {
+        rusqlite::Connection::open(&self.path).expect("backdoor connection")
+    }
+}
+
+#[async_trait::async_trait]
+impl PolicyDraftBackdoor for SqliteDraftBackdoor {
+    async fn expire(&self, draft_id: &str) {
+        let now = time::OffsetDateTime::now_utc().unix_timestamp();
+        let changed = self
+            .connection()
+            .execute(
+                "UPDATE policy_drafts
+                 SET created_at = ?1 - 7200, updated_at = ?1 - 7200, expires_at = ?1 - 1
+                 WHERE draft_id = ?2",
+                rusqlite::params![now, draft_id],
+            )
+            .expect("expire draft");
+        assert_eq!(changed, 1);
+    }
+
+    async fn tamper(&self, draft_id: &str) {
+        let changed = self
+            .connection()
+            .execute(
+                "UPDATE policy_drafts SET candidate_etag = ?1 WHERE draft_id = ?2",
+                rusqlite::params![format!("\"sha256:{}\"", "0".repeat(64)), draft_id],
+            )
+            .expect("tamper draft");
+        assert_eq!(changed, 1);
+    }
+}
+
+#[tokio::test]
+async fn sqlite_policy_draft_store_satisfies_the_contract() {
+    let db = TempDb::new("draft-contract");
+    let store = SqlitePolicyDraftStore::open(&db.path)
+        .expect("draft store should open")
+        .with_limits(CONTRACT_DRAFT_LIMITS);
+    policy_draft_store_contract(
+        &store,
+        &SqliteDraftBackdoor {
+            path: db.path.clone(),
+        },
+    )
+    .await;
+}
+
+/// The draft table shares the policy history database: opening both on one
+/// file leaves each its own table, and reopening keeps the drafts.
+#[tokio::test]
+async fn sqlite_policy_drafts_share_the_history_database_and_survive_reopen() {
+    let db = TempDb::new("draft-history-share");
+    let history = PolicyHistoryStore::open(&db.path).expect("history store should open");
+    let store = SqlitePolicyDraftStore::open(&db.path).expect("draft store should open");
+    let candidate = contract_policy("shared-file-candidate");
+    let owner = contract_owner("", "operator");
+    assert!(matches!(
+        create_contract_draft(&store, 1, &owner, &candidate, &contract_etag(&candidate)).await,
+        PolicyDraftCreated::Created(_)
+    ));
+    PolicyHistory::append_version(
+        &history,
+        "operator",
+        &json!({ "action": "test" }),
+        &candidate,
+    )
+    .await
+    .expect("history should append beside drafts");
+    drop(store);
+
+    let reopened = SqlitePolicyDraftStore::open(&db.path).expect("draft store should reopen");
+    let read = reopened
+        .get(&owner, &contract_draft_id(1))
+        .await
+        .expect("draft read after reopen")
+        .expect("the draft survives a reopen");
+    assert_eq!(read.candidate, candidate);
+}
+
+#[test]
+fn policy_draft_ids_have_one_exact_shape() {
+    assert!(is_policy_draft_id(&contract_draft_id(1)));
+    for invalid in [
+        "",
+        "pd_",
+        "pd_0123456789abcdef0123456789abcde",
+        "pd_0123456789abcdef0123456789abcdef0",
+        "pd_0123456789ABCDEF0123456789ABCDEF",
+        "px_0123456789abcdef0123456789abcdef",
+        "pd_0123456789abcdef0123456789abcdeg",
+        "../pd_0123456789abcdef0123456789abcd",
+    ] {
+        assert!(!is_policy_draft_id(invalid), "{invalid:?}");
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -5907,6 +6375,172 @@ pub(crate) mod postgres_audit_tests {
             )),
             "store errors classify without leaking query values: {commit_error}"
         );
+    }
+
+    // ------------------------------------------------------------------
+    // Policy drafts (issue #243, slice 9)
+    // ------------------------------------------------------------------
+
+    struct PostgresDraftBackdoor {
+        pool: deadpool_postgres::Pool,
+    }
+
+    #[async_trait::async_trait]
+    impl super::PolicyDraftBackdoor for PostgresDraftBackdoor {
+        async fn expire(&self, draft_id: &str) {
+            let changed = self
+                .pool
+                .get()
+                .await
+                .expect("backdoor checkout")
+                .execute(
+                    "UPDATE greengateway.policy_drafts
+                     SET created_at = c.now - interval '2 hours',
+                         updated_at = c.now - interval '2 hours',
+                         expires_at = c.now - interval '1 second'
+                     FROM (SELECT clock_timestamp() AS now) c
+                     WHERE draft_id = $1",
+                    &[&draft_id],
+                )
+                .await
+                .expect("expire draft");
+            assert_eq!(changed, 1);
+        }
+
+        async fn tamper(&self, draft_id: &str) {
+            let changed = self
+                .pool
+                .get()
+                .await
+                .expect("backdoor checkout")
+                .execute(
+                    "UPDATE greengateway.policy_drafts
+                     SET candidate_etag = '\"sha256:' || repeat('0', 64) || '\"'
+                     WHERE draft_id = $1",
+                    &[&draft_id],
+                )
+                .await
+                .expect("tamper draft");
+            assert_eq!(changed, 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn postgres_policy_draft_store_satisfies_the_contract() {
+        let Some(admin_dsn) = locator() else {
+            eprintln!("skipping: no test database locator; CI runs this test");
+            return;
+        };
+        let _guard = DATABASE.lock().await;
+        let database = create_test_database(&admin_dsn).await;
+        let (store, pool) = migrated_policy_store(&database).await;
+        let drafts = store
+            .draft_store()
+            .with_limits(super::CONTRACT_DRAFT_LIMITS);
+
+        super::policy_draft_store_contract(&drafts, &PostgresDraftBackdoor { pool: pool.clone() })
+            .await;
+
+        // Drafts are workspace, not authority: nothing above advanced the
+        // security revision or wrote the outbox.
+        assert_eq!(
+            store
+                .revision_source()
+                .current()
+                .await
+                .expect("revision read"),
+            0
+        );
+        assert_eq!(count_rows(&pool, "security_outbox").await, 0);
+    }
+
+    /// Migration 22's constraints refuse rows no gateway path writes, so a
+    /// store defect or an out-of-band edit cannot plant one.
+    #[tokio::test]
+    async fn policy_drafts_table_refuses_rows_the_store_never_writes() {
+        let Some(admin_dsn) = locator() else {
+            eprintln!("skipping: no test database locator; CI runs this test");
+            return;
+        };
+        let _guard = DATABASE.lock().await;
+        let database = create_test_database(&admin_dsn).await;
+        let (_store, pool) = migrated_policy_store(&database).await;
+        let client = pool.get().await.expect("checkout");
+        let etag = format!("\"sha256:{}\"", "a".repeat(64));
+        let id = format!("pd_{}", "b".repeat(32));
+        let insert = |draft_id: String,
+                      subject: String,
+                      base_etag: String,
+                      candidate_json: String,
+                      expires: &'static str| {
+            format!(
+                "INSERT INTO greengateway.policy_drafts (
+                     draft_id, owner_issuer, owner_subject, revision, base_etag,
+                     candidate_json, candidate_etag, created_at, updated_at, expires_at
+                 ) VALUES (
+                     '{draft_id}', '', '{subject}', 1, '{base_etag}', '{candidate_json}',
+                     '{etag}', now(), now(), {expires}
+                 )"
+            )
+        };
+        let valid = insert(
+            id.clone(),
+            "operator".to_owned(),
+            etag.clone(),
+            "{}".to_owned(),
+            "now() + interval '1 hour'",
+        );
+        for refused in [
+            insert(
+                "pd_NOT-HEX".to_owned(),
+                "operator".to_owned(),
+                etag.clone(),
+                "{}".to_owned(),
+                "now() + interval '1 hour'",
+            ),
+            insert(
+                id.clone(),
+                String::new(),
+                etag.clone(),
+                "{}".to_owned(),
+                "now() + interval '1 hour'",
+            ),
+            insert(
+                id.clone(),
+                "operator".to_owned(),
+                "W/\"weak\"".to_owned(),
+                "{}".to_owned(),
+                "now() + interval '1 hour'",
+            ),
+            insert(
+                id.clone(),
+                "operator".to_owned(),
+                etag.clone(),
+                "x".repeat(1024 * 1024 + 1),
+                "now() + interval '1 hour'",
+            ),
+            insert(
+                id.clone(),
+                "operator".to_owned(),
+                etag.clone(),
+                "{}".to_owned(),
+                "now()",
+            ),
+        ] {
+            let error = client
+                .batch_execute(&refused)
+                .await
+                .expect_err("the row must be refused");
+            assert_eq!(
+                error.code(),
+                Some(&tokio_postgres::error::SqlState::CHECK_VIOLATION),
+                "{error}"
+            );
+        }
+        client
+            .batch_execute(&valid)
+            .await
+            .expect("a well-formed row is accepted");
     }
 
     #[tokio::test]

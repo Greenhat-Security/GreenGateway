@@ -680,7 +680,8 @@ impl RbacState {
     ///
     /// The tool runtime runs every invocation inside it, from admission through
     /// the queue wait to the rendered request, so one invocation is never judged
-    /// by two snapshots in either mode.
+    /// by two snapshots in either mode. Every MCP `tools/list` listing runs
+    /// inside it too, so no listing is either.
     pub(crate) async fn with_request_policy_snapshot<F: std::future::Future>(
         &self,
         future: F,

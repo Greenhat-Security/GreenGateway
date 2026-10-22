@@ -179,9 +179,13 @@ HTTP authentication is one of:
 - `static_bearer` with an opaque token secret ID;
 - `oauth2_client_credentials` with explicit client ID, opaque client-secret ID,
   explicit HTTPS token URL, bounded scopes/audience/resource, and
-  `client_secret_basic`; or
+  `client_secret_basic`;
 - `delegated_issuer_token`, the caller's own token by RFC 8693 token exchange
-  (see [Delegated issuer tokens](#delegated-issuer-tokens-issue-441-phase-8)).
+  (see [Delegated issuer tokens](#delegated-issuer-tokens-issue-441-phase-8));
+  or
+- `google_domain_wide_delegation`, the caller's own Google Workspace token by
+  domain-wide delegation (see
+  [Google domain-wide delegation](#google-domain-wide-delegation-issue-442-phase-8)).
 
 TLS is independent of HTTP authentication. A custom CA alias and an optional
 paired client-certificate/private-key identity can accompany any authentication
@@ -366,7 +370,43 @@ if compromised, the storage and cache bounds, the audit of every hand-out,
 the controls only the issuer or the upstream can provide, and what remains
 out of scope, raw forwarding of the caller's inbound bearer token included.
 It is part of issue #446 and must be extended by any later per-caller
-credential, such as the domain-wide delegation of issue #442.
+credential, as it was for the domain-wide delegation below.
+
+### Google domain-wide delegation (issue #442, Phase 8)
+
+`google_domain_wide_delegation` is the second credential that belongs to the
+caller, for Google Workspace tenants that keep no grant store. A Workspace
+super-admin authorises one service account for fixed scopes; the gateway
+builds a JWT naming that account as `iss` and the caller's email as `sub`,
+and exchanges it at Google's token endpoint with the JWT bearer grant
+(RFC 7523).
+
+- No service-account key is held, consistent with the GCP Secret Manager
+  provider. Google signs each assertion through IAM Credentials `signJwt`,
+  authenticated as the federated identity of a `CONNECTION_GCP_PROVIDER`
+  workload identity profile, which the Connection names by `id` only, so the
+  identity stays trusted startup configuration rather than admin input. The
+  credential therefore binds no secret alias.
+- Both Google endpoints are fixed and egress-checked before the identity is
+  read, and a signed assertion whose claims differ from those sent is
+  refused.
+- The caller is named only by an email that one of the Connection's
+  `subject_issuers` attested: any configured provider can put any address in
+  its tokens. There is no fallback to a shared identity.
+- It is served on the same lanes as a delegated issuer token, manual HTTP
+  tool calls and stored tests run as the tester, refuses a `caller_assertion`
+  block (Google verifies none of the gateway's), and shares the bounded
+  per-caller cache and the principal purge. Google offers no revocation, so a
+  dropped token stays valid there until it expires.
+- Every mint is audited as `connection.google_delegation_token` with the
+  caller as actor and no token material.
+
+The trust sits in the service account and in the right to write the
+Connection: whoever can sign as the account, or choose its scopes and trusted
+issuers, can act as every user of the domain for those scopes. The operator
+guide and the trust-boundary page document the dedicated account, read-only
+scopes, the minimal Workspace scope list and restricted-scope app
+verification.
 
 ### Secret trust and confidentiality
 

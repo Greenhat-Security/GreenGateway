@@ -288,6 +288,40 @@ class AlertRepositoryContractTests(unittest.TestCase):
                 runtime_used.update(runtime)
         self.assertTrue(runtime_used, "the rule pack must exercise runtime metrics")
 
+    # Rules that read a counter with increase() but do not page on a single
+    # event, so their counter may stay lazy. The dispatcher's failure series
+    # must: its presence is how GreenGatewayAuthorityEventDeliveryLag tells a
+    # replica with AUTHORITY_EVENT_SINK from one without.
+    UNSEEDED_COUNTER_ALERTS = {"GreenGatewayAuthorityEventDeliveryFailures"}
+
+    def test_single_event_counter_rules_read_counters_seeded_at_startup(self):
+        # A series created by its first event appears at 1, and increase()
+        # cannot see a change without an earlier sample: the gateway must
+        # export every counter such a rule reads at 0 from install onward.
+        registry = "\n".join((ROOT / path).read_text() for path in [
+            "gateway/src/metrics.rs", "gateway/src/audit/mod.rs"])
+        constants = {value: name for name, value in re.findall(
+            r'^pub const (\w+): &str\s*=\s*"([^"]+)";', registry, re.MULTILINE)}
+        routing = (ROOT / "gateway/src/routing.rs").read_text()
+        seeding = re.search(r'^fn seed_alerted_counters\(.*?^\}', routing, re.MULTILINE | re.DOTALL)
+        self.assertIsNotNone(seeding, "the recorder's startup seeding must stay discoverable")
+        seeded = set(re.findall(r'counter!\(\s*(?:\w+::)*(\w+)', seeding.group(0)))
+        rules = self.rules()
+        self.assertLessEqual(self.UNSEEDED_COUNTER_ALERTS, {rule["alert"] for rule in rules})
+        checked = set()
+        for rule in rules:
+            counters = set(re.findall(r'increase\(\s*([a-zA-Z_:][a-zA-Z0-9_:]*)', rule["expr"]))
+            if rule["alert"] in self.UNSEEDED_COUNTER_ALERTS:
+                self.assertTrue(counters, "an exemption must name a counter rule")
+                continue
+            for counter in counters:
+                with self.subTest(alert=rule["alert"], counter=counter):
+                    self.assertIn(counter, constants, "rule reads an undeclared counter")
+                    self.assertIn(constants[counter], seeded,
+                                  "a single-event rule's counter must be seeded at 0 on install")
+                    checked.add(counter)
+        self.assertTrue(checked, "the rule pack must exercise seeded counters")
+
     def test_alerts_are_documented_and_runbook_anchors_exist(self):
         document = (ROOT / "docs/deployment/operational-alerts.md").read_text()
         headings = re.findall(r'^#{1,6}\s+(.+)$', document, re.MULTILINE)

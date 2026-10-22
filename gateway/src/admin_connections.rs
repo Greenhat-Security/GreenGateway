@@ -2436,7 +2436,10 @@ pub(super) fn connection_secret_dependency_counts(
                 client_secret_id,
                 ..
             } => client_secret_id.as_deref(),
-            connections::model::ConnectionAuthentication::None => None,
+            connections::model::ConnectionAuthentication::None
+            | connections::model::ConnectionAuthentication::GoogleDomainWideDelegation { .. } => {
+                None
+            }
         };
         for id in [
             authentication_id,

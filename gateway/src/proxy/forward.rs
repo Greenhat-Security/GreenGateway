@@ -2067,6 +2067,9 @@ fn connection_failure_response(
         | ConnectionHttpError::TlsUnavailable
         | ConnectionHttpError::OAuthTokenUnavailable
         | ConnectionHttpError::DelegatedTokenUnavailable
+        | ConnectionHttpError::GoogleDelegation(
+            crate::connections::google_delegation::GoogleDelegationError::Unavailable,
+        )
         | ConnectionHttpError::TransportUnavailable => StatusCode::SERVICE_UNAVAILABLE,
         ConnectionHttpError::InvalidConnectionId
         | ConnectionHttpError::ConnectionNotFound
@@ -2084,6 +2087,7 @@ fn connection_failure_response(
         | ConnectionHttpError::DelegatedTokenEgressDenied
         | ConnectionHttpError::DelegatedTokenDenied
         | ConnectionHttpError::DelegatedTokenExchangeFailed
+        | ConnectionHttpError::GoogleDelegation(_)
         | ConnectionHttpError::UpstreamAuthenticationRejected => StatusCode::BAD_GATEWAY,
     };
     let code = if status == StatusCode::SERVICE_UNAVAILABLE {

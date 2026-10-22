@@ -264,8 +264,11 @@ export function ConnectionEditor() {
           ? configuredBinding()
           : emptyBinding(),
         // A new delegated Connection drafts its block as the subject token
-        // instead, so an edit of the general block in progress is dropped.
-        ...(next === 'delegated_issuer_token'
+        // instead, and a domain-wide delegation carries none, so an edit of
+        // the general block in progress is dropped. Switching back finds the
+        // stored block kept.
+        ...(next === 'delegated_issuer_token' ||
+        next === 'google_domain_wide_delegation'
           ? { callerAssertionMode: 'keep' as const }
           : {}),
       };

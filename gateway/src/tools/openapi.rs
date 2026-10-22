@@ -1644,7 +1644,10 @@ fn per_caller_requested_scopes(authentication: &ConnectionAuthentication) -> Opt
         ConnectionAuthentication::DelegatedIssuerToken {
             requested_scopes, ..
         } => Some(requested_scopes),
-        ConnectionAuthentication::None
+        // Per caller too, but the managed OpenAPI tool lane refuses it
+        // (`authentication_not_supported`), so a catalog never binds to it.
+        ConnectionAuthentication::GoogleDomainWideDelegation { .. }
+        | ConnectionAuthentication::None
         | ConnectionAuthentication::HeaderApiKey { .. }
         | ConnectionAuthentication::StaticBearer { .. }
         | ConnectionAuthentication::OAuth2ClientCredentials { .. } => None,
