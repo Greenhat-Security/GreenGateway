@@ -55,4 +55,6 @@ random credentials; it published no host ports and removed its resources.
 These checks do not validate Kubernetes CNI enforcement, production identity
 configuration, database failover/PITR, capacity SLOs or mixed-version upgrades.
 Track those environment-specific checks in
-[#389](https://github.com/Greenhat-Security/GreenGateway/issues/389) before rollout.
+[#389](https://github.com/Greenhat-Security/GreenGateway/issues/389) before rollout,
+and run them with [the production qualification kit](../../docs/deployment/qualification.md),
+whose deploy check also reads these manifests rendered with `kubectl kustomize`.

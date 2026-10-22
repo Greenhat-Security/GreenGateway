@@ -1,0 +1,105 @@
+{
+  "schema_version": 1,
+  "probe_image": "busybox:1.37.0@sha256:9db7b59979c38555a39def84a31fb98b5296952f9e3afd4f6f11f05b07adfab0",
+  "timeout_seconds": 5,
+  "node_selector": {
+    "kubernetes.io/os": "linux"
+  },
+  "cases": [
+    {
+      "name": "ingress-from-controller",
+      "namespace": "ingress-nginx",
+      "labels": {
+        "app.kubernetes.io/component": "controller"
+      },
+      "kind": "tcp",
+      "host": "greengateway.greengateway.svc.cluster.local",
+      "port": 8080,
+      "expect": "allow",
+      "purpose": "A peer carrying the ingress controller's labels reaches the data listener."
+    },
+    {
+      "name": "ingress-from-same-namespace",
+      "namespace": "greengateway",
+      "labels": {},
+      "kind": "tcp",
+      "host": "greengateway.greengateway.svc.cluster.local",
+      "port": 8080,
+      "expect": "deny",
+      "control": "ingress-from-controller",
+      "purpose": "An unlabelled pod beside the gateway is refused at the data listener."
+    },
+    {
+      "name": "ingress-from-other-namespace",
+      "namespace": "default",
+      "labels": {
+        "app.kubernetes.io/component": "controller"
+      },
+      "kind": "tcp",
+      "host": "greengateway.greengateway.svc.cluster.local",
+      "port": 8080,
+      "expect": "deny",
+      "control": "ingress-from-controller",
+      "purpose": "Controller labels outside the ingress namespace are not enough."
+    },
+    {
+      "name": "dns-from-gateway",
+      "namespace": "greengateway",
+      "labels": {
+        "app": "greengateway"
+      },
+      "kind": "dns",
+      "host": "kubernetes.default.svc.cluster.local",
+      "expect": "allow",
+      "purpose": "Gateway pods resolve names through cluster DNS."
+    },
+    {
+      "name": "egress-to-upstream",
+      "namespace": "greengateway",
+      "labels": {
+        "app": "greengateway"
+      },
+      "kind": "tcp",
+      "host": "upstream.example-upstream.svc.cluster.local",
+      "port": 443,
+      "expect": "allow",
+      "purpose": "Gateway pods reach a labelled upstream on 443. Replace with the real upstream, IdP and database destinations."
+    },
+    {
+      "name": "api-from-unrestricted-pod",
+      "namespace": "default",
+      "labels": {},
+      "kind": "tcp",
+      "host": "kubernetes.default.svc.cluster.local",
+      "port": 443,
+      "expect": "allow",
+      "purpose": "The Kubernetes API is reachable from a pod no egress policy restricts."
+    },
+    {
+      "name": "egress-to-api-server",
+      "namespace": "greengateway",
+      "labels": {
+        "app": "greengateway"
+      },
+      "kind": "tcp",
+      "host": "kubernetes.default.svc.cluster.local",
+      "port": 443,
+      "expect": "deny",
+      "control": "api-from-unrestricted-pod",
+      "purpose": "Gateway pods cannot open connections to the Kubernetes API."
+    },
+    {
+      "name": "egress-to-metadata",
+      "namespace": "greengateway",
+      "labels": {
+        "app": "greengateway"
+      },
+      "kind": "tcp",
+      "host": "169.254.169.254",
+      "port": 80,
+      "expect": "deny",
+      "unattributed_reason": "Not every platform serves instance metadata to pods. Where it does, add an allow case from an unrestricted pod and name it as the control.",
+      "purpose": "Gateway pods cannot reach the cloud instance metadata endpoint."
+    }
+  ]
+}

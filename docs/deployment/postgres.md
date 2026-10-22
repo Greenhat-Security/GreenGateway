@@ -19,6 +19,7 @@ This guide explains the mode. The runbooks beside it are the procedures — exac
 | [The rollback boundary](rollback-boundary.md) | exactly when going back is still free, and the queries that tell you which side of the line you are on |
 | [Disaster recovery](disaster-recovery.md) | rebuilding a deployment from the database, the secret store and the static configuration |
 | [Operational alerts](operational-alerts.md) | checked Prometheus rules, signal limits, severity and ownership, and first-response procedures |
+| [Production qualification](qualification.md) | the drills to run on the target platform before rollout: image and hardening verification, NetworkPolicy enforcement, an SLO load run, replica loss, database failover and point-in-time restore with RTO and RPO, upgrade and alert delivery, and an evidence record that holds no secrets |
 | [Security incident rehearsal](incident-rehearsal.md) | withdrawing a JWT and a service token, rotating a Connection's secret reference, verifying revision convergence and sanitized evidence, replacing a suspect replica, and what a withdrawal cannot recall |
 
 An example two-replica deployment is in [`docker-compose.ha.yml`](docker-compose.ha.yml) beside them. Its PostgreSQL service is a single container and is labelled as an example only — use a managed or HA PostgreSQL in production.
