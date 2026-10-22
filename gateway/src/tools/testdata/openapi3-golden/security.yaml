@@ -1,0 +1,145 @@
+openapi: 3.1.0
+info:
+  title: Golden security API
+  version: 1.0.0
+security:
+  - HeaderKey: []
+components:
+  securitySchemes:
+    HeaderKey:
+      type: apiKey
+      in: header
+      name: X-API-Key
+    OtherHeaderKey:
+      type: apiKey
+      in: header
+      name: X-Other-Key
+    QueryKey:
+      type: apiKey
+      in: query
+      name: key
+    CookieKey:
+      type: apiKey
+      in: cookie
+      name: session
+    BearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+    BasicAuth:
+      type: http
+      scheme: basic
+    DigestAuth:
+      type: http
+      scheme: digest
+    ServiceOAuth:
+      type: oauth2
+      flows:
+        clientCredentials:
+          tokenUrl: https://idp.example.test/oauth/token
+          scopes:
+            widgets.read: Read widgets
+            widgets.write: Write widgets
+    UserOAuth:
+      type: oauth2
+      flows:
+        authorizationCode:
+          authorizationUrl: https://idp.example.test/oauth/authorize
+          tokenUrl: https://idp.example.test/oauth/token
+          scopes:
+            widgets.read: Read widgets
+    OpenId:
+      type: openIdConnect
+      openIdConnectUrl: https://idp.example.test/.well-known/openid-configuration
+    Mtls:
+      type: mutualTLS
+    Custom:
+      type: x-custom
+paths:
+  /default:
+    get:
+      operationId: inheritsDocumentSecurity
+  /anonymous:
+    get:
+      operationId: anonymousOperation
+      security: []
+  /optional:
+    get:
+      operationId: optionalAuth
+      security:
+        - {}
+        - BearerAuth: []
+  /or:
+    get:
+      operationId: orAlternatives
+      security:
+        - QueryKey: []
+        - OtherHeaderKey: []
+        - HeaderKey: []
+  /and:
+    get:
+      operationId: andAlternative
+      security:
+        - HeaderKey: []
+          BearerAuth: []
+  /bearer:
+    get:
+      operationId: bearerOnly
+      security:
+        - BearerAuth: []
+  /service:
+    get:
+      operationId: serviceRead
+      security:
+        - ServiceOAuth: [widgets.read]
+    post:
+      operationId: serviceWrite
+      security:
+        - ServiceOAuth: [widgets.write, widgets.read]
+    delete:
+      operationId: serviceUndeclaredScope
+      security:
+        - ServiceOAuth: [widgets.admin]
+  /user:
+    get:
+      operationId: userConsent
+      security:
+        - UserOAuth: [widgets.read]
+  /unsupported:
+    get:
+      operationId: cookieOnly
+      security:
+        - CookieKey: []
+    post:
+      operationId: basicOnly
+      security:
+        - BasicAuth: []
+    put:
+      operationId: digestOnly
+      security:
+        - DigestAuth: []
+    patch:
+      operationId: openIdOnly
+      security:
+        - OpenId: []
+    delete:
+      operationId: mtlsOnly
+      security:
+        - Mtls: []
+    options:
+      operationId: customOnly
+      security:
+        - Custom: []
+  /missing:
+    get:
+      operationId: missingScheme
+      security:
+        - NotDeclared: []
+  /invalid:
+    get:
+      operationId: invalidScopes
+      security:
+        - HeaderKey: [unexpected]
+    post:
+      operationId: invalidRequirementShape
+      security: not-a-list

@@ -983,6 +983,8 @@ pub(super) async fn run() -> Result<(), Box<dyn std::error::Error>> {
             disable_proxy_health_checks: false,
             #[cfg(test)]
             stream_proxy_request_bodies: false,
+            #[cfg(test)]
+            gate_converted_openapi_catalogs: false,
         },
     )?;
     let background_lifecycle = lifecycle.clone();
@@ -1801,6 +1803,21 @@ pub(super) fn gateway_app_with_process_started_at_and_overrides(
             enum_source_runtime.clone(),
         )?
         .with_rbac_state(rbac_state.clone());
+    // Cluster mode: every replica regenerates from the stored specification,
+    // and one built before Swagger 2.0 import cannot, so storing a catalog
+    // converted from one waits for the operation gate (issue #443).
+    #[cfg(feature = "postgres")]
+    let gate_converted_openapi_catalogs = build_overrides.pg_connections.is_some();
+    #[cfg(not(feature = "postgres"))]
+    let gate_converted_openapi_catalogs = false;
+    #[cfg(test)]
+    let gate_converted_openapi_catalogs =
+        gate_converted_openapi_catalogs || build_overrides.gate_converted_openapi_catalogs;
+    let openapi_catalog_service = if gate_converted_openapi_catalogs {
+        openapi_catalog_service.with_converted_catalog_gate()
+    } else {
+        openapi_catalog_service
+    };
     // Cluster mode: register the Connection control plane with the security
     // runtime so every committed record or catalog change reconciles here
     // before the next protected request is served, and start the task that
@@ -2132,6 +2149,8 @@ pub(super) fn gateway_app_with_process_started_at_and_overrides(
         client_ip_policy: client_ip_policy.clone(),
         max_body_size: config.max_body_size,
         secret_precondition_lock: Arc::new(Mutex::new(())),
+        #[cfg(feature = "postgres")]
+        membership: build_overrides.pg_membership.clone(),
     };
     let tool_admin_state = ToolAdminState {
         tools_file: config.tools_file.as_ref().map(PathBuf::from),
