@@ -193,20 +193,63 @@ fn simulation_run_events(harness: &Harness) -> Vec<audit::AuditEvent> {
         .collect()
 }
 
+fn is_access_record(event: &audit::AuditEvent, method: &str, path: &str) -> bool {
+    event.event_type == "http.request_observed"
+        && event.payload["method"] == json!(method)
+        && event.payload["path"] == json!(path)
+}
+
+/// Block until the capture holds `count` access records for `method` `path`.
+///
+/// The audit writer delivers on its own thread, so a record can land after
+/// the snapshot it belongs before. It drains one FIFO queue and a request's
+/// access record is the last record the request emits, so once that record
+/// is in the capture every earlier one is too.
+fn wait_for_access_records(harness: &Harness, method: &str, path: &str, count: usize) {
+    let deadline = Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        let delivered = harness
+            .capture
+            .events()
+            .iter()
+            .filter(|event| is_access_record(event, method, path))
+            .count();
+        if delivered >= count {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the audit writer should deliver {count} access record(s) for {method} {path}"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+}
+
+/// How many records the capture holds once the one policy read every
+/// side-effect test starts with has been delivered.
+fn events_after_policy_read(harness: &Harness) -> usize {
+    wait_for_access_records(harness, "GET", POLICY_ADMIN_ROUTE, 1);
+    harness.capture.events().len()
+}
+
 /// The records the gateway wrote since `start`, less the access record every
 /// HTTP request gets: the observation middleware's `http.request_observed`
 /// for the `POST` to the simulations route itself. That record describes the
 /// request, not anything the simulation did, and it is asserted to be the only
-/// one dropped.
+/// one dropped. Waits for it first, so every record the simulation wrote has
+/// been delivered.
 fn records_since(harness: &Harness, start: usize) -> Vec<String> {
+    let before = harness.capture.events()[..start]
+        .iter()
+        .filter(|event| is_access_record(event, "POST", SIMULATIONS))
+        .count();
+    wait_for_access_records(harness, "POST", SIMULATIONS, before + 1);
     let events = harness.capture.events();
     let mut access_records = 0;
     let records = events[start..]
         .iter()
         .filter(|event| {
-            let own_access_record = event.event_type == "http.request_observed"
-                && event.payload["method"] == json!("POST")
-                && event.payload["path"] == json!(SIMULATIONS);
+            let own_access_record = is_access_record(event, "POST", SIMULATIONS);
             if own_access_record {
                 access_records += 1;
             }
@@ -214,8 +257,8 @@ fn records_since(harness: &Harness, start: usize) -> Vec<String> {
         })
         .map(|event| event.event_type.clone())
         .collect();
-    assert!(
-        access_records <= 1,
+    assert_eq!(
+        access_records, 1,
         "one simulation request, one access record"
     );
     records
@@ -291,7 +334,7 @@ async fn a_simulation_explains_both_projections_and_audits_digests_and_counts_on
     let harness = harness();
     let before = fs::read_to_string(&harness.policy.path).expect("policy reads");
     let etag = current_etag(&harness).await;
-    let events_before = harness.capture.events().len();
+    let events_before = events_after_policy_read(&harness);
     let response = simulate_request(
         &harness,
         simulator(),
@@ -435,6 +478,9 @@ async fn an_inline_candidate_is_validated_like_a_policy_write_and_never_stored()
         json!("policy_candidate_invalid")
     );
     assert_eq!(current_etag(&harness).await, etag);
+    // The second policy read is the last request: once its access record is
+    // delivered, so is the first simulation's record.
+    wait_for_access_records(&harness, "GET", POLICY_ADMIN_ROUTE, 2);
     assert_eq!(simulation_run_events(&harness).len(), 1);
 }
 
@@ -544,7 +590,7 @@ fn a_simulation_has_no_side_effect_but_its_own_audit_record() {
             format!("http://127.0.0.1:{}", upstream_addr.port()),
         )
     });
-    let events_before = harness.capture.events().len();
+    let events_before = events_after_policy_read(&harness);
 
     let response = ::metrics::with_local_recorder(&recorder, || {
         runtime.block_on(simulate_request(
@@ -621,6 +667,7 @@ fn a_simulation_has_no_side_effect_but_its_own_audit_record() {
     assert_eq!(second.status(), StatusCode::TOO_MANY_REQUESTS);
     // Audit, against the live path: the same capture records each live
     // request, so the audit trail above was not empty by accident.
+    wait_for_access_records(&harness, "GET", "/limited/a", 2);
     let live_records = harness.capture.events()[events_before..]
         .iter()
         .filter(|event| event.payload["path"] == json!("/limited/a"))
