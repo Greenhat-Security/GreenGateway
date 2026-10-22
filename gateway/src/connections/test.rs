@@ -16,6 +16,7 @@ use crate::{
 };
 
 use super::{
+    caller_assertion::{AttestedCaller, CallerAssertionError},
     http::{ConnectionHttpError, ConnectionHttpRuntime},
     model::{ConnectionId, ConnectionKind},
     oauth::scope_connection_test_oauth_mints,
@@ -85,15 +86,37 @@ pub enum ConnectionTestReason {
     TlsInvalid,
     TlsUnavailable,
     AuthenticationNotSupported,
-    /// The Connection asks for a signed caller assertion, which a stored test
-    /// has no caller to sign for, so it is refused before any request.
+    /// The Connection asks for a signed caller assertion on every upstream
+    /// request, which a stored test does not sign, so it is refused before any
+    /// request. A `delegated_issuer_token` Connection is the exception: its
+    /// assertion is the subject token of the tester's own exchange.
     CallerAssertionNotEnforced,
+    /// A delegated Connection's subject-token keys are not in the JWKS this
+    /// replica publishes -- the Connection is disabled, or a key did not load
+    /// -- so the issuer could not verify the tester's subject token.
+    CallerAssertionKeyNotPublished,
     CredentialInvalid,
     CredentialUnavailable,
     OauthTokenEgressDenied,
     OauthTokenUnavailable,
     OauthTokenRejected,
     OauthTokenInvalidResponse,
+    /// A delegated Connection is tested as the principal running the test,
+    /// and this one names nobody an issuer can look up: a service token, or a
+    /// principal without an identity-provider issuer.
+    DelegatedTokenNoPrincipal,
+    /// The egress policy refuses the delegated Connection's token-exchange
+    /// endpoint.
+    DelegatedTokenEgressDenied,
+    /// The issuer refused the tester: usually they have no grant for the
+    /// upstream at the issuer, or it was revoked.
+    DelegatedTokenDenied,
+    /// The exchange produced no usable token for a reason the tester cannot
+    /// fix.
+    DelegatedTokenExchangeFailed,
+    /// No delegated token could be held. A test exchanges inline and never
+    /// uses the cache, so this is not expected from a test.
+    DelegatedTokenUnavailable,
     AuthenticationFailed,
     TransportUnavailable,
     InvalidTargetPath,
@@ -417,23 +440,45 @@ impl ConnectionTestService {
         self.admission.admit(principal, connection_id)
     }
 
+    /// Runs the stored test for no principal at all. A `delegated_issuer_token`
+    /// Connection is refused with `delegated_token_no_principal`; see
+    /// [`Self::execute_as`].
     pub async fn execute(
         &self,
         record: &StoredConnection,
         expected_etag: &str,
     ) -> ConnectionTestExecution {
+        self.execute_as(record, expected_etag, None).await
+    }
+
+    /// Runs the stored test as `caller`, the principal who asked for it.
+    pub async fn execute_as(
+        &self,
+        record: &StoredConnection,
+        expected_etag: &str,
+        caller: Option<&AttestedCaller>,
+    ) -> ConnectionTestExecution {
         self.execute_before(
             record,
             expected_etag,
+            caller,
             tokio::time::Instant::now() + self.deadline(),
         )
         .await
     }
 
+    /// Runs the stored test as `caller` within `deadline`.
+    ///
+    /// `caller` matters only to a `delegated_issuer_token` Connection, whose
+    /// credential is the caller's own: the test exchanges `caller`'s token
+    /// inline, sends its one request with it and drops it, and is refused
+    /// without one. Every other Connection is tested with its own credential,
+    /// whoever asks.
     pub async fn execute_before(
         &self,
         record: &StoredConnection,
         expected_etag: &str,
+        caller: Option<&AttestedCaller>,
         deadline: tokio::time::Instant,
     ) -> ConnectionTestExecution {
         scope_connection_test_oauth_mints(async {
@@ -442,7 +487,7 @@ impl ConnectionTestService {
                 ConnectionKind::HttpApi => {
                     match tokio::time::timeout_at(
                         deadline,
-                        self.execute_http(record, expected_etag),
+                        self.execute_http(record, expected_etag, caller),
                     )
                     .await
                     {
@@ -462,6 +507,7 @@ impl ConnectionTestService {
         &self,
         record: &StoredConnection,
         expected_etag: &str,
+        caller: Option<&AttestedCaller>,
     ) -> ConnectionTestExecution {
         let started = Instant::now();
         let test_target = match self.runtime.test_target(record.id.as_str(), expected_etag) {
@@ -482,6 +528,29 @@ impl ConnectionTestService {
             }
         };
         let target = test_target.target();
+        // A delegated credential is the tester's own token, so a test that
+        // names nobody is refused before the egress preflight resolves
+        // anything or any secret is read, as a tool call would be.
+        if target.credential_belongs_to_caller() && caller.is_none() {
+            return failed_connection_execution(
+                started,
+                ConnectionHttpError::DelegatedTokenNoPrincipal,
+            );
+        }
+        // The issuer verifies the tester's subject token against the keys
+        // this replica publishes, so a test is refused, before any I/O but
+        // the JWKS build's own key reads, when they are not published.
+        if let Err(error) = self.runtime.admit_caller_assertion(target, caller).await {
+            return failed_execution(
+                started,
+                ConnectionOperationalState::Unavailable,
+                ConnectionStatusReason::RequestFailed,
+                vec![ConnectionTestStage::failure(
+                    ConnectionTestStageName::Authenticated,
+                    test_reason_from_caller_assertion(error),
+                )],
+            );
+        }
         let uses_authentication = target.is_credentialed();
         let uses_tls = !record.write.tls.is_empty();
         let mut stages = Vec::with_capacity(6);
@@ -523,9 +592,10 @@ impl ConnectionTestService {
             }
         };
 
-        // A stored test runs for no caller, so a credential that belongs to
-        // one is refused rather than resolved.
-        let credential = match self.runtime.resolve_credential(target, None).await {
+        // Resolved for the tester: a delegated credential is their own token,
+        // exchanged inline and never cached (see `execute_before`). Every
+        // other credential is the Connection's and ignores `caller`.
+        let credential = match self.runtime.resolve_credential(target, caller).await {
             Ok(credential) => {
                 stages.push(if uses_authentication || uses_tls {
                     ConnectionTestStage::success(ConnectionTestStageName::SecretAvailable)
@@ -961,20 +1031,22 @@ fn test_reason_from_connection(error: ConnectionHttpError) -> ConnectionTestReas
         ConnectionHttpError::OAuthTokenInvalidResponse => {
             ConnectionTestReason::OauthTokenInvalidResponse
         }
-        // Unreachable: a delegated Connection carries a caller assertion,
-        // which a stored test refuses before it resolves anything, and a test
-        // has no caller to exchange a token for. Mapped onto the token
-        // reasons a test already reports rather than widening that set.
+        // A delegated Connection is tested with the tester's own token, so
+        // each refusal keeps the reason a tool call would report: the issuer
+        // refusing this tester is not the gateway's client authentication
+        // failing.
         ConnectionHttpError::DelegatedTokenNoPrincipal => {
-            ConnectionTestReason::AuthenticationNotSupported
+            ConnectionTestReason::DelegatedTokenNoPrincipal
         }
         ConnectionHttpError::DelegatedTokenEgressDenied => {
-            ConnectionTestReason::OauthTokenEgressDenied
+            ConnectionTestReason::DelegatedTokenEgressDenied
         }
-        ConnectionHttpError::DelegatedTokenDenied => ConnectionTestReason::OauthTokenRejected,
-        ConnectionHttpError::DelegatedTokenExchangeFailed
-        | ConnectionHttpError::DelegatedTokenUnavailable => {
-            ConnectionTestReason::OauthTokenUnavailable
+        ConnectionHttpError::DelegatedTokenDenied => ConnectionTestReason::DelegatedTokenDenied,
+        ConnectionHttpError::DelegatedTokenExchangeFailed => {
+            ConnectionTestReason::DelegatedTokenExchangeFailed
+        }
+        ConnectionHttpError::DelegatedTokenUnavailable => {
+            ConnectionTestReason::DelegatedTokenUnavailable
         }
         // Unreachable for the same reason: a stored test refuses a domain-wide
         // delegation before it resolves anything.
@@ -992,6 +1064,26 @@ fn test_reason_from_connection(error: ConnectionHttpError) -> ConnectionTestReas
             ConnectionTestReason::AuthenticationFailed
         }
         ConnectionHttpError::TransportUnavailable => ConnectionTestReason::TransportUnavailable,
+    }
+}
+
+/// Why a test was not admitted to sign its tester's subject token. Admission
+/// refuses only a test that names nobody or whose keys are not published; the
+/// other arms keep the mapping total without a wildcard.
+fn test_reason_from_caller_assertion(error: CallerAssertionError) -> ConnectionTestReason {
+    match error {
+        CallerAssertionError::NoPrincipal => ConnectionTestReason::DelegatedTokenNoPrincipal,
+        CallerAssertionError::KeyNotPublished => {
+            ConnectionTestReason::CallerAssertionKeyNotPublished
+        }
+        CallerAssertionError::KeyUnusable => ConnectionTestReason::CredentialInvalid,
+        CallerAssertionError::KeyUnavailable => ConnectionTestReason::CredentialUnavailable,
+        CallerAssertionError::InvalidClaim(_)
+        | CallerAssertionError::InvalidLifetime
+        | CallerAssertionError::HeaderConflict
+        | CallerAssertionError::ApprovalRequired
+        | CallerAssertionError::SignatureFailed
+        | CallerAssertionError::TokenTooLong => ConnectionTestReason::InternalError,
     }
 }
 
@@ -1252,6 +1344,56 @@ mod tests {
         assert_eq!(
             serde_json::to_value(reason).expect("reason should serialize"),
             serde_json::json!("caller_assertion_not_enforced")
+        );
+    }
+
+    #[test]
+    fn a_delegated_test_reports_the_reason_a_tool_call_would() {
+        // A delegated Connection is tested with the tester's own token, so an
+        // operator reading a failed test must see the same fixed reason a
+        // tool call reports, not the client-credentials vocabulary.
+        for error in [
+            ConnectionHttpError::DelegatedTokenNoPrincipal,
+            ConnectionHttpError::DelegatedTokenEgressDenied,
+            ConnectionHttpError::DelegatedTokenDenied,
+            ConnectionHttpError::DelegatedTokenExchangeFailed,
+            ConnectionHttpError::DelegatedTokenUnavailable,
+        ] {
+            assert_eq!(
+                serde_json::to_value(test_reason_from_connection(error))
+                    .expect("reason should serialize"),
+                serde_json::json!(error.safe_reason())
+            );
+        }
+        for error in [
+            CallerAssertionError::NoPrincipal,
+            CallerAssertionError::KeyNotPublished,
+        ] {
+            let expected = match error {
+                CallerAssertionError::NoPrincipal => "delegated_token_no_principal",
+                _ => error.safe_reason(),
+            };
+            assert_eq!(
+                serde_json::to_value(test_reason_from_caller_assertion(error))
+                    .expect("reason should serialize"),
+                serde_json::json!(expected)
+            );
+        }
+        assert_eq!(
+            connection_failure_classification(ConnectionHttpError::DelegatedTokenDenied),
+            (
+                ConnectionTestStageName::SecretAvailable,
+                ConnectionOperationalState::Unavailable,
+                ConnectionStatusReason::SecretUnavailable,
+            )
+        );
+        assert_eq!(
+            connection_failure_classification(ConnectionHttpError::DelegatedTokenEgressDenied),
+            (
+                ConnectionTestStageName::EgressPolicy,
+                ConnectionOperationalState::Unavailable,
+                ConnectionStatusReason::EgressDenied,
+            )
         );
     }
 

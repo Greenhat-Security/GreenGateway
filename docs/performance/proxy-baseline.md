@@ -37,6 +37,11 @@ evidence. Record `docker stats`, gateway `/proc/1/status`, descriptor count, and
 upstream accept evidence as described in the
 [deployment guide](../deployment/production-data-plane.md#load-and-soak-reproduction).
 
+These commands target the seeded development stack. Against a real deployment,
+`node scripts/run-load-suite.mjs --profile <file>` runs a representative route
+against explicit SLO targets instead; see
+[the qualification kit](../deployment/qualification.md#3-representative-load-and-slo).
+
 ## Comparison rules
 
 - Use a release image, not `cargo run` or a debug binary.

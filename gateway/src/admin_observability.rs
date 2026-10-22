@@ -1867,10 +1867,10 @@ pub(super) fn enrich_endpoint_summaries_with_rule_coverage(
     let Some(rbac_state) = rbac_state else {
         return;
     };
-    let policy = rbac_state.current_policy();
+    let snapshot = rbac_state.live_policy_snapshot();
 
     for endpoint in endpoints {
-        apply_endpoint_summary_rule_coverage(endpoint, &policy);
+        apply_endpoint_summary_rule_coverage(endpoint, snapshot.compiled());
     }
 }
 
@@ -2032,17 +2032,18 @@ pub(super) fn apply_endpoint_detail_rule_coverage(
         endpoint.covered_by_rule = false;
         return;
     }
-    let policy = rbac_state.current_policy();
+    let snapshot = rbac_state.live_policy_snapshot();
+    let policy = snapshot.compiled();
     let method = endpoint.method.clone();
     let endpoint_template = endpoint.endpoint_template.clone();
     apply_routing_context_coverage(
         &mut endpoint.routing_contexts,
-        &policy,
+        policy,
         &method,
         &endpoint_template,
     );
     endpoint.coverage_scope = aggregate_coverage_scope(
-        &policy,
+        policy,
         &method,
         &endpoint_template,
         &endpoint.routing_contexts,
@@ -2053,7 +2054,7 @@ pub(super) fn apply_endpoint_detail_rule_coverage(
 
 pub(super) fn apply_endpoint_summary_rule_coverage(
     endpoint: &mut discovery::query::EndpointSummary,
-    policy: &rbac::Policy,
+    policy: &policy_eval::CompiledPolicy,
 ) {
     if !endpoint.routing_context_known {
         endpoint.coverage_scope = discovery::query::EndpointCoverageScope::Unknown;
@@ -2080,7 +2081,7 @@ pub(super) fn apply_endpoint_summary_rule_coverage(
 
 pub(super) fn apply_routing_context_coverage(
     contexts: &mut [discovery::query::EndpointRoutingContext],
-    policy: &rbac::Policy,
+    policy: &policy_eval::CompiledPolicy,
     method: &str,
     endpoint_template: &str,
 ) {
@@ -2093,7 +2094,7 @@ pub(super) fn apply_routing_context_coverage(
 }
 
 pub(super) fn aggregate_coverage_scope(
-    policy: &rbac::Policy,
+    policy: &policy_eval::CompiledPolicy,
     method: &str,
     endpoint_template: &str,
     contexts: &[discovery::query::EndpointRoutingContext],
@@ -2113,94 +2114,184 @@ pub(super) fn aggregate_coverage_scope(
     }
 }
 
+/// How far the policy's rules cover one discovered endpoint in one routing
+/// context, judged by the shared evaluator over representative requests
+/// (#422 PR 4).
+///
+/// Each step asks [`policy_eval::CompiledPolicy::evaluate`] what the policy
+/// would decide for a representative request -- the endpoint template with
+/// each capture filled in, the context's recorded dispatch, and no `Host`
+/// header -- and reads which rule decided it:
+///
+/// 1. An anonymous caller decided by a direct rule is endpoint-wide coverage.
+/// 2. A representative caller of a principal-constrained rule decided by a
+///    direct rule is principal-scoped coverage.
+/// 3. On a host-routed context only, a caller holding one role, able to
+///    activate it, is principal-scoped coverage when a host-bound route
+///    authorizes it -- the role grants that route's permission -- or a
+///    direct deny decides it first.
+///
+/// The evaluator narrows a host-routed request to direct denies, as live
+/// evaluation does, and an ordinary route is never coverage here. A context
+/// that cannot be asked -- no recorded routing context, route facts without an
+/// origin, a method or representative path the evaluator refuses -- is
+/// `unknown`, and so is one where no step found coverage but a step could not
+/// be answered. A positive answer from any step stands.
 pub(super) fn endpoint_coverage_scope(
-    policy: &rbac::Policy,
+    policy: &policy_eval::CompiledPolicy,
     method: &str,
     endpoint_template: &str,
     context: Option<&discovery::query::EndpointRoutingContext>,
 ) -> discovery::query::EndpointCoverageScope {
-    if policy.rules.is_empty() {
-        return host_route_coverage_scope(policy, method, endpoint_template, context);
-    }
-
-    let path = representative_path_from_endpoint_template(endpoint_template);
-    let matcher = rbac::RuleMatcher::new(&policy.rules);
-    let host_qualified = context.and_then(|context| context.route_host.as_deref());
-    let dispatch_context = context.map_or_else(rbac::RuleDispatchContext::unknown, |context| {
-        rbac::RuleDispatchContext::classified_with_route_id(
-            context
-                .upstream_origin
-                .as_deref()
-                .and_then(|origin| origin.strip_prefix("pool:")),
-            context.route_host.as_deref(),
-            context.route_path_prefix.as_deref(),
-            context.upstream_origin.as_deref(),
-        )
-    });
-    let endpoint_wide = if host_qualified.is_some() {
-        matcher
-            .evaluate_denies_with_dispatch(method, &path, None, dispatch_context)
-            .is_some()
-    } else {
-        matcher
-            .evaluate_with_dispatch(method, &path, None, dispatch_context)
-            .is_some()
+    let Some(question) = CoverageQuestion::new(policy, method, endpoint_template, context) else {
+        return discovery::query::EndpointCoverageScope::Unknown;
     };
-    if endpoint_wide {
-        return discovery::query::EndpointCoverageScope::Endpoint;
+    match question.ask(policy_eval::PrincipalFact::Anonymous) {
+        CoverageAnswer::Unanswerable => return discovery::query::EndpointCoverageScope::Unknown,
+        CoverageAnswer::DirectRule => return discovery::query::EndpointCoverageScope::Endpoint,
+        CoverageAnswer::RouteAllow | CoverageAnswer::Undecided => {}
     }
 
-    let principal_scoped = policy.rules.iter().any(|rule| {
-        let Some(principal) = representative_principal_for_rule(rule) else {
-            return false;
-        };
-        if host_qualified.is_some() {
-            matcher
-                .evaluate_denies_with_dispatch(method, &path, Some(&principal), dispatch_context)
-                .is_some()
-        } else {
-            matcher
-                .evaluate_with_dispatch(method, &path, Some(&principal), dispatch_context)
-                .is_some()
+    let mut unanswerable = false;
+    for principal in policy
+        .direct_rules()
+        .iter()
+        .filter_map(representative_principal_for_rule)
+    {
+        match question.ask(authenticated_fact(&principal)) {
+            CoverageAnswer::DirectRule => {
+                return discovery::query::EndpointCoverageScope::Principal
+            }
+            CoverageAnswer::Unanswerable => unanswerable = true,
+            CoverageAnswer::RouteAllow | CoverageAnswer::Undecided => {}
         }
-    });
-    if principal_scoped {
-        return discovery::query::EndpointCoverageScope::Principal;
     }
 
-    host_route_coverage_scope(policy, method, endpoint_template, context)
-}
+    if question.host_routed() {
+        for (role_name, role) in policy.roles() {
+            let principal = representative_principal_for_role(role_name, role);
+            match question.ask(authenticated_fact(&principal)) {
+                CoverageAnswer::RouteAllow | CoverageAnswer::DirectRule => {
+                    return discovery::query::EndpointCoverageScope::Principal
+                }
+                CoverageAnswer::Unanswerable => unanswerable = true,
+                CoverageAnswer::Undecided => {}
+            }
+        }
+    }
 
-pub(super) fn host_route_coverage_scope(
-    policy: &rbac::Policy,
-    method: &str,
-    endpoint_template: &str,
-    context: Option<&discovery::query::EndpointRoutingContext>,
-) -> discovery::query::EndpointCoverageScope {
-    let Some(host) = context.and_then(|context| context.route_host.as_deref()) else {
-        return discovery::query::EndpointCoverageScope::None;
-    };
-    let path = representative_path_from_endpoint_template(endpoint_template);
-    let Some(route) = policy.routes.iter().find(|route| {
-        rbac::matcher::method_matches(&route.methods, method)
-            && path_match::path_prefix_matches(&path, &route.path_prefix)
-            && route
-                .hosts
-                .iter()
-                .any(|route_host| route_host.eq_ignore_ascii_case(host))
-    }) else {
-        return discovery::query::EndpointCoverageScope::None;
-    };
-    let permission_granted = policy.roles.values().any(|role| {
-        role.permissions
-            .iter()
-            .any(|permission| permission == "*" || permission == &route.permission)
-    });
-    if permission_granted {
-        discovery::query::EndpointCoverageScope::Principal
+    if unanswerable {
+        discovery::query::EndpointCoverageScope::Unknown
     } else {
         discovery::query::EndpointCoverageScope::None
     }
+}
+
+/// The representative request one coverage judgement asks about, every fact
+/// but the caller fixed.
+struct CoverageQuestion<'a> {
+    policy: &'a policy_eval::CompiledPolicy,
+    method: Method,
+    path: String,
+    target: policy_eval::HttpTarget,
+    dispatch: Option<policy_eval::DispatchFacts>,
+}
+
+/// What the evaluator decided for one representative caller, as coverage
+/// reads it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CoverageAnswer {
+    /// A direct rule decided, whatever its action.
+    DirectRule,
+    /// A route authorized the caller.
+    RouteAllow,
+    /// Neither: a route refused, or a default or host refusal decided.
+    Undecided,
+    /// The evaluator could not answer.
+    Unanswerable,
+}
+
+impl<'a> CoverageQuestion<'a> {
+    /// `None` when the question cannot be built from what discovery recorded.
+    fn new(
+        policy: &'a policy_eval::CompiledPolicy,
+        method: &str,
+        endpoint_template: &str,
+        context: Option<&discovery::query::EndpointRoutingContext>,
+    ) -> Option<Self> {
+        let method = Method::from_bytes(method.as_bytes()).ok()?;
+        // Discovery keeps the routing classification but not the route id;
+        // the origin of a pooled route names it, as the classifier derives it.
+        let (target, dispatch) = match context {
+            Some(context) => policy_eval::analysis::recorded_dispatch(
+                context
+                    .upstream_origin
+                    .as_deref()
+                    .and_then(|origin| origin.strip_prefix("pool:")),
+                context.route_host.as_deref(),
+                context.route_path_prefix.as_deref(),
+                context.upstream_origin.as_deref(),
+            )
+            .ok()?,
+            None => (policy_eval::HttpTarget::Missing, None),
+        };
+        Some(Self {
+            policy,
+            method,
+            path: representative_path_from_endpoint_template(endpoint_template),
+            target,
+            dispatch,
+        })
+    }
+
+    fn host_routed(&self) -> bool {
+        self.dispatch
+            .as_ref()
+            .is_some_and(|dispatch| dispatch.route_host.is_some())
+    }
+
+    fn ask(&self, principal: policy_eval::PrincipalFact) -> CoverageAnswer {
+        let context = policy_eval::PolicyEvaluationContext {
+            version: policy_eval::CONTEXT_VERSION,
+            snapshot: self.policy.snapshot(),
+            method: Some(self.method.clone()),
+            path: Some(self.path.clone()),
+            principal,
+            target: self.target.clone(),
+            // A representative request carries no Host. Only a route bound to
+            // a host reads one, and a host-routed context supplies the bound
+            // host through its dispatch facts instead.
+            request_host: policy_eval::HostFact::Absent,
+            dispatch: self.dispatch.clone(),
+        };
+        match self.policy.evaluate(&context) {
+            Ok(evaluation) if evaluation.is_complete() => match evaluation.matched() {
+                Some(policy_eval::RuleReference::Direct(_)) => CoverageAnswer::DirectRule,
+                Some(policy_eval::RuleReference::Route(_))
+                    if evaluation.logical() == policy_eval::LogicalDecision::Allow =>
+                {
+                    CoverageAnswer::RouteAllow
+                }
+                _ => CoverageAnswer::Undecided,
+            },
+            Ok(_) => CoverageAnswer::Unanswerable,
+            Err(error) => {
+                // Refused facts are an unknown coverage scope. Any other error
+                // is this question's own mistake: it is still reported as
+                // unknown, never as coverage, and logged with bounded enums.
+                if !error.rejects_supplied_facts() {
+                    tracing::warn!(?error, "endpoint coverage evaluation failed");
+                }
+                CoverageAnswer::Unanswerable
+            }
+        }
+    }
+}
+
+fn authenticated_fact(principal: &auth::Principal) -> policy_eval::PrincipalFact {
+    policy_eval::PrincipalFact::Authenticated(policy_eval::PrincipalIdentity::from_principal(
+        principal,
+    ))
 }
 
 pub(super) fn representative_path_from_endpoint_template(endpoint_template: &str) -> String {
@@ -2270,6 +2361,32 @@ pub(super) fn representative_principal_for_rule(rule: &rbac::Rule) -> Option<aut
         session_id: "traffic-coverage".to_owned(),
         auth_method,
     })
+}
+
+/// A caller who holds only `role_name` and can activate it: the role's first
+/// issuer and first authentication method when it restricts either. Whether
+/// a host-bound route authorizes such a caller is whether that role grants
+/// the route's permission, asked of the evaluator rather than decided beside
+/// it.
+pub(super) fn representative_principal_for_role(
+    role_name: &str,
+    role: &rbac::policy::RoleEntry,
+) -> auth::Principal {
+    let auth_method = match role.auth_methods.first().map(String::as_str) {
+        Some(rbac::rule::AUTH_METHOD_SESSION_COOKIE) => auth::AuthMethod::Cookie,
+        Some(rbac::rule::AUTH_METHOD_SERVICE_TOKEN) => auth::AuthMethod::ServiceToken,
+        Some(rbac::rule::AUTH_METHOD_CLIENT_CERTIFICATE) => auth::AuthMethod::ClientCertificate,
+        _ => auth::AuthMethod::Bearer,
+    };
+    auth::Principal {
+        user_id: "traffic-coverage-principal".to_owned(),
+        issuer: role.issuers.first().cloned(),
+        email: None,
+        org_id: None,
+        roles: vec![role_name.to_owned()],
+        session_id: "traffic-coverage".to_owned(),
+        auth_method,
+    }
 }
 
 pub(super) fn policy_error_message(error: &rbac::policy::PolicyError) -> String {

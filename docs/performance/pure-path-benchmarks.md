@@ -225,6 +225,71 @@ allocation count or allocated bytes fails the job, and a head budget cannot
 retire the target. Changing the harness follows the same two-hash procedure as
 the pure-path harness below.
 
+## Tool-admission and rate-lane decisions
+
+Two more targets measure the shared evaluator's other live lanes. They run in
+the same gateway test binary as `http_policy`, under the same warmup, sample
+and iteration counts, compiler and Cargo profile:
+
+| Target | Kernel call | Live caller | Cases per iteration | Fact bytes |
+| --- | --- | --- | ---: | ---: |
+| `tool_policy` | `CompiledPolicy::evaluate_tool` | tool invocation, visibility, inventory, composite and rendered-HTTP adapters | 27 | 1,409 |
+| `rate_lane` | `CompiledPolicy::select_rate_lane` | the rate-limit stage's override selection | 14 | 830 |
+
+The tool dataset covers all five tool operations and every reason and
+limitation the tool lane reports: invocations with no rule and with allow,
+deny and shadow rules; role, issuer and authentication-method constraints;
+unknown and disabled tools; both preview operations, where a shadow rule does
+not hide a tool; composite enablement without a principal; rendered HTTP
+rules under unknown dispatch, including a percent-encoded path; and each
+uncaptured fact. The rate dataset covers first-match selection over
+principal, method and path constraints, an override shadowed by an earlier
+one, capture and recursive-wildcard patterns, a principal-id override, no
+override, the anonymous bypass and each uncaptured fact. Its contexts have the
+shape the live rate stage supplies, with routing, host and dispatch facts
+uncaptured. Fact bytes sum the tool name, method, path and the principal's
+subject, issuer and roles across the cases.
+
+Selecting a rate lane is not admitting a request: token buckets and their
+remaining capacity are mutable state outside the kernel and are not measured.
+Neither target measures registry visibility, composite grants, request
+rendering, leases, credentials, egress or transport.
+
+The benchmarks are the ignored `tool_policy_evaluation` and
+`rate_lane_selection` tests in `gateway/tests/support/lane_benchmark.rs`. That
+file is a child module of the `http_policy` harness: a binary has exactly one
+global allocator, and a child can count through its parent's without the
+parent widening its visibility. The declaration is therefore part of the
+`http_policy` digest, while the lane file has a digest of its own, so a lane
+dataset can change without touching the enforced `http_policy` harness. Each
+build checks that discovery lists both lane tests exactly when the revision
+declares them. Their evidence is saved as `base.tool_policy.kernel.json`,
+`head.rate_lane.kernel.json` and so on, beside the raw reports, and is
+summarized under `lanes` in `summary.json`. The self-test also requires a
+neutral rebuild to pass and the deliberate regression fixture to fail for each
+lane target.
+
+These targets are adopted in the same reviewed steps as `http_policy`, with
+one more step first, because declaring the child module changes the enforced
+`http_policy` harness:
+
+1. Pre-approval: `kernel_harness_sha256` approves the digest of the
+   `http_policy` harness with the declaration, beside the current digest,
+   while the harness itself stays unchanged.
+2. Harness: the declaration and the lane benchmarks land. No budget lists the
+   lane targets, so they are `pending`: measured wherever the revision carries
+   them, reported, never blocking. The `http_policy` comparison stays enforced
+   across the change, because its base budget approves both digests.
+3. Budget: `microbench-budget.json` moves to schema 3, which adds
+   `lane_harness_sha256` approving the lane harness digest and zero-growth
+   `tool_policy` and `rate_lane` entries after `http_policy`. That change runs
+   `proposed` against its schema-2 base. Every later comparison whose base
+   carries schema 3 is `enforced`, and a head budget cannot retire the lanes.
+
+Steps 1 and 2 have landed; until step 3 lands, these targets are measured and
+reported but do not block. After it, a lane harness change follows the
+two-hash procedure below for `lane_harness_sha256`.
+
 ## Base ownership and reviewed updates
 
 `microbench-budget.json` versions the benchmark schema and regression budget.

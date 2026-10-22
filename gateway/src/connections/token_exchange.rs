@@ -58,10 +58,11 @@ use super::{
     control_plane::ConnectionControlPlane,
     model::ConnectionId,
     oauth::{
-        duration_millis, is_json_content_type, token_request_headers, MintedOAuthToken,
-        OAuthTokenCache, OAuthTokenCacheKey, OAuthTokenLease, RetiredTokenSlot, SecretString,
-        SystemOAuthClock, TokenCacheFailure, MAX_RESPONSE_SCOPE_BYTES, MAX_TOKEN_LIFETIME_SECS,
-        MAX_TOKEN_TYPE_BYTES, OAUTH_MAX_REQUEST_BYTES,
+        connection_test_owns_token_requests, duration_millis, is_json_content_type,
+        token_request_headers, MintedOAuthToken, OAuthTokenCache, OAuthTokenCacheKey,
+        OAuthTokenLease, RetiredTokenSlot, SecretString, SystemOAuthClock, TokenCacheFailure,
+        MAX_RESPONSE_SCOPE_BYTES, MAX_TOKEN_LIFETIME_SECS, MAX_TOKEN_TYPE_BYTES,
+        OAUTH_MAX_REQUEST_BYTES,
     },
     secret::{SecretPurpose, SecretResolveErrorKind, MAX_HTTP_CREDENTIAL_BYTES},
 };
@@ -294,11 +295,21 @@ impl DelegatedTokenRuntime {
     ///
     /// Concurrent calls of one caller share one exchange, and an exchange outlives a call that
     /// stops waiting for it, so a cancelled call never cancels another caller's work or its audit.
+    ///
+    /// A Connection test is the exception: it exchanges inline, within its own deadline, for the
+    /// principal running it, and neither reads nor fills the cache. The token serves the test's one
+    /// request and is dropped with it, so a test never hands a later call a token, and a later
+    /// call never lets a test pass on a token an earlier exchange obtained.
     pub(crate) async fn access_token(
         &self,
         binding: &DelegatedTokenBinding,
         caller: &AttestedCaller,
     ) -> Result<DelegatedTokenLease, DelegatedTokenError> {
+        if connection_test_owns_token_requests() {
+            return Ok(OAuthTokenLease::uncached(
+                self.exchange(binding, caller).await?,
+            ));
+        }
         let identity = caller.identity();
         let key = OAuthTokenCacheKey {
             connection_id: binding.connection_id.to_string(),

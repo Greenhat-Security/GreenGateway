@@ -106,6 +106,11 @@ export type PolicyRulePreviewRequest = {
 export type PolicyRulePreviewResponse = {
   match_count: number;
   scanned_event_count: number;
+  // Scanned observations the gateway could not judge the rule against:
+  // neither matches nor non-matches. complete is then false and match_count
+  // a lower bound. unevaluated_reasons counts them per stable reason.
+  unevaluated_event_count?: number;
+  unevaluated_reasons?: Record<string, number>;
   // True when the window held more observations than one preview scans;
   // match_count then covers only the newest scanned_event_count of them.
   scan_truncated: boolean;

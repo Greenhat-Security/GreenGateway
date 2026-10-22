@@ -29,15 +29,17 @@ import {
   BindingDraft,
   configuredBinding,
   ConnectionFormState,
+  createWriteFromForm,
   DEFAULT_FORM,
+  delegatedIssuerTokenOffered,
   detailConfiguresCredentialAuthority,
   EditorLoadState,
+  editorUnsupportedReason,
   emptyAdditionalHeader,
   emptyBinding,
   FieldErrors,
   fieldErrorsFromProblems,
   focusFirstProblem,
-  editorUnsupportedReason,
   formFromDetail,
   MAX_ADDITIONAL_HEADERS,
   requiredEtag,
@@ -46,6 +48,7 @@ import {
   secretInventoryLoadError,
   SecretInventoryState,
   secretMutationReloadRequired,
+  subjectTokenDraftApplies,
   toLoadError,
   toSaveError,
   validateForm,
@@ -59,6 +62,7 @@ import {
   ConnectionIdentitySection,
   EditorAlert,
   LocalSecretManager,
+  SubjectTokenSection,
   TestProfileSection,
   TimeoutsAndDiscoverySection,
   TlsSection,
@@ -381,7 +385,6 @@ export function ConnectionEditor() {
       return;
     }
 
-    const write = writeFromForm(form);
     saveController.current?.abort();
     const controller = new AbortController();
     saveController.current = controller;
@@ -390,7 +393,7 @@ export function ConnectionEditor() {
       const resource =
         id === undefined
           ? await createConnection(
-            write,
+            createWriteFromForm(form),
             requiredEtag(
               collectionEtag,
               'Connection collection ETag is unavailable. Reload and retry.',
@@ -399,7 +402,7 @@ export function ConnectionEditor() {
           )
           : await updateConnection(
             id,
-            write,
+            writeFromForm(form),
             requiredEtag(
               etag,
               'Connection ETag is unavailable. Reload and retry.',
@@ -454,7 +457,10 @@ export function ConnectionEditor() {
         setRequiresReload(true);
       }
       if (error instanceof AdminApiError && error.problems.length > 0) {
-        const serverErrors = fieldErrorsFromProblems(error.problems);
+        const serverErrors = fieldErrorsFromProblems(
+          error.problems,
+          subjectTokenDraftApplies(form),
+        );
         setFieldErrors(serverErrors);
         focusFirstProblem(serverErrors);
       }
@@ -575,6 +581,13 @@ export function ConnectionEditor() {
         current.clientPrivateKeyBinding,
         secretId,
       ),
+      subjectToken: {
+        ...current.subjectToken,
+        signingKeyBinding: withoutDeletedBinding(
+          current.subjectToken.signingKeyBinding,
+          secretId,
+        ),
+      },
     }));
   }
 
@@ -687,9 +700,23 @@ export function ConnectionEditor() {
                 credentialAuthorityLocked ||
                 !canBindSecret
               }
+              delegatedOffered={delegatedIssuerTokenOffered(
+                form,
+                id === undefined,
+              )}
               onUpdate={updateForm}
               onAuthenticationTypeChange={updateAuthenticationType}
             />
+            {subjectTokenDraftApplies(form) ? (
+              <SubjectTokenSection
+                draft={form.subjectToken}
+                errors={fieldErrors}
+                canBindSecret={canUseSecretBindings}
+                secrets={availableSecrets}
+                disabled={!canEdit || editorBusy || !canBindSecret}
+                onChange={(subjectToken) => updateForm({ subjectToken })}
+              />
+            ) : null}
             <AdditionalHeadersSection
               headers={form.additionalHeaders}
               errors={fieldErrors}
@@ -705,7 +732,12 @@ export function ConnectionEditor() {
               onUpdate={updateAdditionalHeader}
               onRemove={removeAdditionalHeader}
             />
-            <CallerAssertionSection assertion={form.callerAssertion} />
+            <CallerAssertionSection
+              assertion={form.callerAssertion}
+              subjectTokenOnly={
+                form.authenticationType === 'delegated_issuer_token'
+              }
+            />
             <TlsSection
               form={form}
               errors={fieldErrors}

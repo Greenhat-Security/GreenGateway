@@ -131,6 +131,18 @@ export type ConnectionAuthentication =
       audience?: string;
       resource?: string;
       client_auth_method: OAuthClientAuthMethod;
+    }
+  | {
+      type: 'delegated_issuer_token';
+      token_exchange_url: string;
+      client_id: string;
+      client_secret_id?: string;
+      client_secret_configured?: boolean;
+      requested_scopes?: string[];
+      audience?: string;
+      resource?: string;
+      revocation_url?: string;
+      subject_token_source: 'caller_assertion';
     };
 
 export type SafeConnectionAuthentication =
@@ -175,8 +187,8 @@ export type SafeGoogleDomainWideDelegation = {
 
 /**
  * The calling user's own upstream token, obtained per caller by RFC 8693
- * token exchange. Read only: the admin UI shows it and never writes it, so it
- * has no counterpart in `ConnectionAuthentication`.
+ * token exchange. The client secret's alias is reduced to
+ * `client_secret_configured`, like every other secret binding.
  */
 export type SafeDelegatedIssuerToken = {
   type: 'delegated_issuer_token';
@@ -283,10 +295,9 @@ export type CallerAssertionKeyProblem = {
  * A Connection's caller assertion as the safe read returns it: every field
  * except the signing key alias, which is reduced to `signing_key_configured`.
  *
- * The gateway accepts and stores the block but does not enforce it yet, and
- * refuses every call, test and discovery on a Connection that carries one.
- * This UI only displays it. See `ConnectionWrite.caller_assertion` for why a
- * save never sends it.
+ * This UI displays a stored block and never changes it. See
+ * `ConnectionWrite.caller_assertion` for why a replacement never sends it,
+ * and `CallerAssertionWrite` for the one block this UI writes.
  */
 export type SafeCallerAssertion = {
   signing_key_configured: boolean;
@@ -314,18 +325,43 @@ export type ConnectionWrite = {
   authentication: ConnectionAuthentication;
   additional_headers?: ConnectionAdditionalHeader[];
   /**
-   * Never sent. A replacement that omits `caller_assertion` keeps the stored
-   * block, and `null` removes it. The safe read hides the block's signing key
-   * alias, so this UI cannot send the block back, and anything it could send
-   * would at best remove the block: that lifts the refusal and puts a
-   * Connection that cannot yet attest its caller back into service. The type
-   * rules the key out so no save can include it.
+   * Never sent on a replacement. A replacement that omits `caller_assertion`
+   * keeps the stored block, and `null` removes it. The safe read hides the
+   * block's signing key alias, so this UI cannot send the block back, and
+   * anything it could send would at best remove or replace the block, which
+   * changes whom the Connection attests and with which key. The type rules
+   * the key out so no replacement can include it; only a create may carry a
+   * block (see `ConnectionCreateWrite`).
    */
   caller_assertion?: never;
   tls: TlsProfile;
   timeouts?: ConnectionTimeouts;
   discovery?: DiscoveryConfig;
   test_profile?: ConnectionTestProfile;
+};
+
+/**
+ * The caller assertion a new `delegated_issuer_token` Connection signs its
+ * subject tokens with: the one block this UI writes, and only when it creates
+ * the Connection. `bind_request` and `bind_approval` are left to their
+ * default, `false`, which a delegated Connection requires, and no published
+ * keys are configured; rotation goes through the admin API.
+ */
+export type CallerAssertionWrite = {
+  signing_key_id: string;
+  kid: string;
+  algorithm: CallerAssertionAlgorithm;
+  issuer: string;
+  audience: string;
+  token_type: string;
+  header_name: string;
+  lifetime_seconds: number;
+  claims?: CallerAssertionClaim[];
+};
+
+/** A create: a `ConnectionWrite` that may also carry a new caller assertion. */
+export type ConnectionCreateWrite = Omit<ConnectionWrite, 'caller_assertion'> & {
+  caller_assertion?: CallerAssertionWrite;
 };
 
 export type SafeConnectionConfiguration = {
@@ -402,12 +438,18 @@ export type ConnectionTestReason =
   | 'tls_unavailable'
   | 'authentication_not_supported'
   | 'caller_assertion_not_enforced'
+  | 'caller_assertion_key_not_published'
   | 'credential_invalid'
   | 'credential_unavailable'
   | 'oauth_token_egress_denied'
   | 'oauth_token_unavailable'
   | 'oauth_token_rejected'
   | 'oauth_token_invalid_response'
+  | 'delegated_token_no_principal'
+  | 'delegated_token_egress_denied'
+  | 'delegated_token_denied'
+  | 'delegated_token_exchange_failed'
+  | 'delegated_token_unavailable'
   | 'authentication_failed'
   | 'transport_unavailable'
   | 'invalid_target_path'
@@ -504,7 +546,7 @@ export async function getConnection(
 }
 
 export async function createConnection(
-  write: ConnectionWrite,
+  write: ConnectionCreateWrite,
   collectionEtag: string,
   signal?: AbortSignal,
 ): Promise<AdminResource<ConnectionDetail>> {
@@ -1528,12 +1570,18 @@ function isConnectionTestReason(
     value === 'tls_unavailable' ||
     value === 'authentication_not_supported' ||
     value === 'caller_assertion_not_enforced' ||
+    value === 'caller_assertion_key_not_published' ||
     value === 'credential_invalid' ||
     value === 'credential_unavailable' ||
     value === 'oauth_token_egress_denied' ||
     value === 'oauth_token_unavailable' ||
     value === 'oauth_token_rejected' ||
     value === 'oauth_token_invalid_response' ||
+    value === 'delegated_token_no_principal' ||
+    value === 'delegated_token_egress_denied' ||
+    value === 'delegated_token_denied' ||
+    value === 'delegated_token_exchange_failed' ||
+    value === 'delegated_token_unavailable' ||
     value === 'authentication_failed' ||
     value === 'transport_unavailable' ||
     value === 'invalid_target_path' ||

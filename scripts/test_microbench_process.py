@@ -484,6 +484,153 @@ class KernelConfigurationPolicyTests(unittest.TestCase):
                     self.configure(directory, **options)
 
 
+LANE_DECLARATION = bench.LANE_ATTRIBUTES + bench.LANE_MODULE + "\n"
+LANE_HARNESS = (ROOT / bench.LANE_HARNESS_PATH).read_text(encoding="utf-8")
+LANE_CASES = {"tool_policy": 27, "rate_lane": 14}
+
+
+def schema_three(kernel_digests, lane_digests):
+    value = schema_two(kernel_digests)
+    value["schema_version"] = 3
+    value["lane_harness_sha256"] = list(lane_digests)
+    value["targets"].extend({"id": target, "max_allocation_growth": 0,
+                             "max_allocated_bytes_growth": 0}
+                            for target in ("tool_policy", "rate_lane"))
+    return value
+
+
+def lane_result(target, allocations=None, regression=False):
+    cases = LANE_CASES[target]
+    metadata = bench.LANE_METADATA[target]
+    return {
+        "schema_version": 1, "harness": "gateway-test-binary", "regression_fixture": regression,
+        "warmup": 10, "iterations": 100, "samples": 9,
+        "targets": [{
+            "id": target, "input_cases": cases, "input_bytes": metadata["input_bytes"],
+            "operations_per_iteration": cases, "expected_checksum": cases * 100,
+            "allocation_samples": [
+                {"allocations": cases * 1000 if allocations is None else allocations,
+                 "allocated_bytes": cases * 64000, "checksum": cases * 100}
+                for _ in range(9)
+            ],
+            "timing_samples_ns": [20000000] * 9,
+        }],
+    }
+
+
+def lane_results_by_target():
+    return {target: lane_result(target) for target in LANE_CASES}
+
+
+class LaneConfigurationPolicyTests(unittest.TestCase):
+    def configure(self, directory, *, base_budget=None, proposed_budget=None,
+                  base_lanes=LANE_HARNESS, head_lanes=LANE_HARNESS, base_declared=True,
+                  head_declared=True, base_kernel=True):
+        def tree(kernel, declared, lane_harness):
+            files = {}
+            if kernel:
+                files[bench.KERNEL_HARNESS_PATH] = (
+                    KERNEL_HARNESS if declared else KERNEL_HARNESS.replace(LANE_DECLARATION, ""))
+            if lane_harness is not None:
+                files[bench.LANE_HARNESS_PATH] = lane_harness
+            return files
+
+        files = {BASE: tree(base_kernel, base_declared, base_lanes),
+                 HEAD: tree(True, head_declared, head_lanes)}
+
+        def blob(_root, revision, path):
+            if path not in files[revision]:
+                raise ValueError("Git object lookup failed: " + path)
+            return files[revision][path]
+
+        state = {"budget": schema_two(["f" * 64]) if base_budget is None else base_budget,
+                 "proposed_budget": (schema_two(["f" * 64]) if proposed_budget is None
+                                     else proposed_budget)}
+        with ExitStack() as stack:
+            stack.enter_context(mock.patch.object(bench, "_blob", side_effect=blob))
+            stack.enter_context(mock.patch.object(
+                bench, "_has_blob", side_effect=lambda _root, revision, path: path in files[revision]))
+            return bench._lane_configuration(ROOT, BASE, HEAD, Path(directory), state)
+
+    def test_pending_lanes_run_on_head_over_a_base_that_predates_them(self):
+        for options in ({"base_declared": False, "base_lanes": None},
+                        {"base_kernel": False, "base_lanes": None}):
+            with self.subTest(options=sorted(options)), tempfile.TemporaryDirectory() as directory:
+                lanes = self.configure(directory, **options)
+                self.assertEqual(lanes["state"], "pending")
+                self.assertEqual(lanes["harness_sha256"], {"base": None, "head": digest(LANE_HARNESS)})
+                self.assertEqual(lanes["targets"], ["tool_policy", "rate_lane"])
+                self.assertEqual(lanes["budget"], {
+                    target: {"id": target, "max_allocation_growth": 0,
+                             "max_allocated_bytes_growth": 0}
+                    for target in ("tool_policy", "rate_lane")})
+                self.assertEqual(json.loads((Path(directory) / "lane-context.json").read_text()),
+                                 lanes)
+
+    def test_lane_budget_cannot_land_before_its_harness_is_on_the_base(self):
+        proposed = schema_three(["f" * 64], [digest(LANE_HARNESS)])
+        with tempfile.TemporaryDirectory() as directory:
+            with self.assertRaisesRegex(ValueError, "harness before its budget"):
+                self.configure(directory, proposed_budget=proposed, base_declared=False,
+                               base_lanes=None)
+
+    def test_proposed_lane_budget_must_approve_both_measured_harnesses(self):
+        with tempfile.TemporaryDirectory() as directory:
+            lanes = self.configure(
+                directory, proposed_budget=schema_three(["f" * 64], [digest(LANE_HARNESS)]))
+            self.assertEqual(lanes["state"], "proposed")
+            self.assertEqual(lanes["budget"]["tool_policy"]["id"], "tool_policy")
+        changed = LANE_HARNESS + "\n// different head workload\n"
+        for options in ({"proposed_budget": schema_three(["f" * 64], ["a" * 64])},
+                        {"proposed_budget": schema_three(["f" * 64], [digest(LANE_HARNESS)]),
+                         "head_lanes": changed}):
+            with self.subTest(options=sorted(options)), tempfile.TemporaryDirectory() as directory:
+                with self.assertRaisesRegex(ValueError, "approved digests"):
+                    self.configure(directory, **options)
+
+    def test_enforced_lane_harness_changes_need_the_two_step_transition(self):
+        current = digest(LANE_HARNESS)
+        changed = LANE_HARNESS + "\n// reviewed next workload\n"
+        with tempfile.TemporaryDirectory() as directory:
+            lanes = self.configure(directory, base_budget=schema_three(["f" * 64], [current]),
+                                   proposed_budget=schema_three(["f" * 64], [current]))
+            self.assertEqual(lanes["state"], "enforced")
+            self.assertEqual(lanes["budget"]["rate_lane"]["id"], "rate_lane")
+        with tempfile.TemporaryDirectory() as directory:
+            lanes = self.configure(directory, head_lanes=changed,
+                                   base_budget=schema_three(["f" * 64], [current, digest(changed)]),
+                                   proposed_budget=schema_three(["f" * 64], [digest(changed)]))
+            self.assertEqual(lanes["harness_sha256"]["head"], digest(changed))
+        rejected = (
+            {"head_lanes": changed, "base_budget": schema_three(["f" * 64], [current]),
+             "proposed_budget": schema_three(["f" * 64], [current, digest(changed)])},
+            {"head_lanes": changed,
+             "base_budget": schema_three(["f" * 64], [current, digest(changed)]),
+             "proposed_budget": schema_three(["f" * 64], [current])},
+            {"base_lanes": changed, "base_budget": schema_three(["f" * 64], [current]),
+             "proposed_budget": schema_three(["f" * 64], [current])},
+        )
+        for options in rejected:
+            with self.subTest(options=sorted(options)), tempfile.TemporaryDirectory() as directory:
+                with self.assertRaisesRegex(ValueError, "approved digests"):
+                    self.configure(directory, **options)
+
+    def test_enforced_lanes_cannot_be_retired_by_the_proposal(self):
+        with tempfile.TemporaryDirectory() as directory:
+            with self.assertRaisesRegex(ValueError, "retire"):
+                self.configure(directory,
+                               base_budget=schema_three(["f" * 64], [digest(LANE_HARNESS)]))
+
+    def test_missing_or_inconsistent_lane_wiring_rejects(self):
+        for options, message in (({"head_declared": False, "head_lanes": None}, "lacks"),
+                                 ({"head_lanes": None}, "disagree"),
+                                 ({"base_declared": False}, "disagree"),
+                                 ({"base_kernel": False}, "disagree")):
+            with self.subTest(options=sorted(options)), tempfile.TemporaryDirectory() as directory:
+                with self.assertRaisesRegex(ValueError, message):
+                    self.configure(directory, **options)
+
+
 class KernelBuildInputTests(unittest.TestCase):
     def test_cargo_report_must_name_one_gateway_test_executable_in_the_target(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -590,25 +737,37 @@ class KernelStageExecutionTests(unittest.TestCase):
                 "result": measured_result()}
 
     def run_stage(self, directory, *, state="pending", base_digest=None, base_listing=None,
-                  results=None, failures=None, build_executables=1):
+                  results=None, failures=None, build_executables=1, lane_state="pending",
+                  lane_base_digest=None, lane_base_listing=None, lane_results=None):
         """Run `run_comparison` with only the kernel processes simulated.
 
-        `results` maps base/head to a kernel report (or None for no file);
+        `results` maps base/head to a kernel report (or None for no file), and
+        `lane_results` maps base/head to each lane target's report;
         `failures` maps a process label to "crash" or "timeout".
         """
         directory = Path(directory)
         output, work = directory / "comparison", directory / "work"
         executable = work / "cargo-target" / "debug" / "deps" / "gateway-test"
         results = {"base": kernel_result(), "head": kernel_result()} if results is None else results
+        if lane_results is None:
+            lane_results = {"base": lane_results_by_target(), "head": lane_results_by_target()}
         failures = failures or {}
         if base_listing is None:
             base_listing = base_digest is not None
+        if lane_base_listing is None:
+            lane_base_listing = lane_base_digest is not None
         kernel = {"state": state, "target": "http_policy", "test": bench.KERNEL_TEST,
                   "budget": {"id": "http_policy", "max_allocation_growth": 0,
                              "max_allocated_bytes_growth": 0},
                   "harness_sha256": {"base": base_digest, "head": "f" * 64},
                   "cargo": sys.executable, "ui_source": HEAD,
                   "ui_build_inputs": list(bench.UI_BUILD_INPUTS), "context": kernel_context()}
+        lanes = {"state": lane_state, "targets": list(bench.LANE_TARGETS),
+                 "tests": dict(bench.LANE_TESTS),
+                 "budget": {target: {"id": target, "max_allocation_growth": 0,
+                                     "max_allocated_bytes_growth": 0}
+                            for target in bench.LANE_TARGETS},
+                 "harness_sha256": {"base": lane_base_digest, "head": "e" * 64}}
         real_bounded = bench._bounded
         self.kernel_calls = []
 
@@ -630,10 +789,17 @@ class KernelStageExecutionTests(unittest.TestCase):
                     other = dict(artifact, executable=str(executable) + "-other")
                     code = "print(" + repr(json.dumps(artifact) + "\n" + json.dumps(other)) + ")"
             elif label == "list":
-                listed = base_listing if side == "base" else True
-                code = "print(" + repr(f"{bench.KERNEL_TEST}: test\n" if listed else "") + ")"
+                listing = ""
+                if base_listing if side == "base" else True:
+                    listing += f"{bench.KERNEL_TEST}: test\n"
+                if lane_base_listing if side == "base" else True:
+                    listing += "".join(f"{test}: test\n" for test in bench.LANE_TESTS.values())
+                code = "print(" + repr(listing) + ")"
             elif label.endswith("-run"):
-                report = results.get(side)
+                if label == f"{side}-run":
+                    report = results.get(side)
+                else:
+                    report = lane_results.get(side, {}).get(label[len(side) + 1:-len("-run")])
                 code = "pass" if report is None else (
                     "import os; open(os.environ[" + repr(bench.KERNEL_RESULT_ENV) + "], 'x').write("
                     + repr(json.dumps(report)) + ")")
@@ -655,6 +821,7 @@ class KernelStageExecutionTests(unittest.TestCase):
             stack.enter_context(mock.patch.object(
                 bench, "_measure", side_effect=lambda _root, revision, *_args, **_kwargs: self.pure_envelope(revision)))
             stack.enter_context(mock.patch.object(bench, "_kernel_configuration", return_value=kernel))
+            stack.enter_context(mock.patch.object(bench, "_lane_configuration", return_value=lanes))
             stack.enter_context(mock.patch.object(bench, "_prepare_tree", side_effect=prepare))
             stack.enter_context(mock.patch.object(bench, "_bounded", side_effect=bounded))
             report = bench.run_comparison(BASE, HEAD, output, root=ROOT, work=work)
@@ -731,6 +898,82 @@ class KernelStageExecutionTests(unittest.TestCase):
                 self.assertIn(message, " ".join(report["errors"]))
                 self.assertFalse((output / "head.kernel.json").exists())
                 self.assertNotIn("kernel", report)
+
+    def test_pending_lanes_over_a_base_without_them_are_measured_and_informational(self):
+        with tempfile.TemporaryDirectory() as directory:
+            report, output = self.run_stage(directory)
+            self.assertEqual(report["status"], "passed", report["errors"])
+            lanes = report["lanes"]
+            self.assertEqual((lanes["state"], lanes["base"], lanes["status"], lanes["blocking"]),
+                             ("pending", "absent", "informational", False))
+            self.assertEqual(sorted(lanes["head"]), ["rate_lane", "tool_policy"])
+            self.assertEqual(lanes["comparisons"], [])
+            for target in ("tool_policy", "rate_lane"):
+                self.assertTrue((output / f"head.{target}.kernel.json").is_file())
+                self.assertTrue((output / f"head.{target}.kernel.raw.json").is_file())
+                self.assertFalse((output / f"base.{target}.kernel.json").exists())
+            for side, listed in (("base", False), ("head", True)):
+                build = json.loads((output / f"{side}-kernel" / "build.json").read_text(encoding="utf-8"))
+                self.assertEqual(build["lanes_listed"], {"tool_policy": listed, "rate_lane": listed})
+
+    def test_enforced_lane_growth_blocks_and_neutral_counts_pass(self):
+        for target in ("tool_policy", "rate_lane"):
+            for delta, status in ((0, "passed"), (-1, "passed"), (1, "failed")):
+                with self.subTest(target=target, delta=delta), tempfile.TemporaryDirectory() as directory:
+                    head = lane_results_by_target()
+                    head[target] = lane_result(target, LANE_CASES[target] * 1000 + delta)
+                    report, _ = self.run_stage(
+                        directory, lane_state="enforced", lane_base_digest="e" * 64,
+                        lane_results={"base": lane_results_by_target(), "head": head})
+                    self.assertEqual(report["status"], status, report["errors"])
+                    self.assertEqual(report["lanes"]["status"], status)
+                    self.assertEqual(report["lanes"]["base"], "measured")
+                    statuses = {entry["id"]: entry["status"] for entry in report["lanes"]["comparisons"]}
+                    self.assertEqual(statuses[target], status)
+                    if status == "failed":
+                        self.assertIn(f"{target}: allocation growth", " ".join(report["errors"]))
+
+    def test_unenforced_lane_growth_is_reported_without_blocking(self):
+        for lane_state in ("pending", "proposed"):
+            with self.subTest(lane_state=lane_state), tempfile.TemporaryDirectory() as directory:
+                head = lane_results_by_target()
+                head["rate_lane"] = lane_result("rate_lane", 14001)
+                report, _ = self.run_stage(
+                    directory, lane_state=lane_state, lane_base_digest="e" * 64,
+                    lane_results={"base": lane_results_by_target(), "head": head})
+                self.assertEqual(report["status"], "passed", report["errors"])
+                self.assertEqual(report["lanes"]["status"], "informational")
+                statuses = {entry["id"]: entry["status"] for entry in report["lanes"]["comparisons"]}
+                self.assertEqual(statuses, {"tool_policy": "passed", "rate_lane": "failed"})
+
+    def test_lane_discovery_that_disagrees_with_the_source_wiring_fails(self):
+        for options in ({"lane_base_listing": True},
+                        {"lane_base_digest": "e" * 64, "lane_base_listing": False}):
+            with self.subTest(options=options), tempfile.TemporaryDirectory() as directory:
+                report, _ = self.run_stage(directory, **options)
+                self.assertEqual(report["status"], "failed")
+                self.assertIn("lane benchmark test discovery", " ".join(report["errors"]))
+
+    def test_lane_crash_timeout_missing_or_mislabelled_report_fails(self):
+        def head(**reports):
+            return {"base": lane_results_by_target(), "head": {**lane_results_by_target(), **reports}}
+
+        cases = (
+            ({"failures": {"head:head-tool_policy-run": "crash"}}, "exit code 23"),
+            ({"failures": {"head:head-rate_lane-run": "timeout"}}, "runtime bound"),
+            ({"lane_results": head(rate_lane=None)}, ""),
+            ({"lane_results": head(tool_policy=lane_result("rate_lane"))}, "schema order"),
+            ({"lane_results": head(rate_lane=lane_result("rate_lane", regression=True))},
+             "fixture marker"),
+        )
+        for options, message in cases:
+            with self.subTest(options=sorted(options)), tempfile.TemporaryDirectory() as directory:
+                report, _ = self.run_stage(directory, lane_state="enforced",
+                                           lane_base_digest="e" * 64, **options)
+                self.assertEqual(report["status"], "failed")
+                self.assertTrue(report["errors"])
+                self.assertIn(message, " ".join(report["errors"]))
+                self.assertNotIn("lanes", report)
 
     def test_kernel_failure_after_a_passing_pure_comparison_cannot_pass(self):
         with tempfile.TemporaryDirectory() as directory:

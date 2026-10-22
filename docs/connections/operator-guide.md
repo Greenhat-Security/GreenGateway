@@ -9,7 +9,10 @@ before GreenGateway resolves its protected material or contacts an upstream.
 This guide covers production custody and day-two operations. See the
 [migration guide](migration.md) for moving legacy settings and the
 [admin guide](admin-guide.md) for the browser workflow. The complete field and
-limit reference remains in [configuration.md](../configuration.md).
+limit reference remains in [configuration.md](../configuration.md). Where
+trust sits when a Connection acts for the calling user, through a signed
+caller assertion or a delegated issuer token, is collected in the
+[per-caller credential trust boundary](per-caller-trust-boundary.md).
 
 ## Production Readiness Checklist
 
@@ -370,6 +373,9 @@ the gateway's published key set (see [The published JWKS](#the-published-jwks))
 and can then apply its own per-user ownership and entitlement checks, which a
 single shared credential makes impossible. It is the same shape as Google IAP's
 `X-Goog-IAP-JWT-Assertion` and Cloudflare Access's `Cf-Access-Jwt-Assertion`.
+What the signing key can do in the wrong hands, and what a verifier must
+check, is summarized in the
+[per-caller credential trust boundary](per-caller-trust-boundary.md).
 
 #### Which calls are attested
 
@@ -395,8 +401,8 @@ own, and every lane when the stored block is one only an earlier release
 accepted (see [HTTPS only](#https-only) and
 [Failure reasons](#failure-reasons)). A `delegated_issuer_token` Connection,
 whose assertion is the subject token of the caller's own credential, is
-served by manual HTTP tools only; see
-[Which calls are served](#which-calls-are-served).
+served by manual HTTP tools only, and its stored test runs as the principal
+who asks for it; see [Which calls are served](#which-calls-are-served).
 
 On the refused lanes the reason appears as follows:
 
@@ -587,7 +593,7 @@ Each refusal is a fixed string in the `failure_reason` of `tool.invoke_failure`
 | `caller_assertion_claim_invalid` | A value would not survive as a claim: a subject longer than 256 bytes, an issuer longer than 512 bytes or containing `#`, a role longer than 128 bytes, an email longer than 320 bytes, a request ID (a `jti`, with a managed MCP session's sequence suffix) longer than 128 bytes or missing, with `bind_request` a request target longer than 2048 bytes or a method longer than 16 bytes, or any of them containing a control character. |
 | `caller_assertion_header_conflict` | Another header source had already set the assertion header. |
 | `caller_assertion_signature_failed`, `caller_assertion_token_too_long` | Signing failed, including on a host whose clock reads before 1970 and a managed MCP session asked to sign after its call ended, or the assertion would exceed 8 KiB. |
-| `caller_assertion_not_enforced` | The lane has no caller to attest (discovery, enum and label sources, stored tests), is a composite tool's step, serves a `delegated_issuer_token` Connection other than through a manual tool, or the stored block is one only an earlier release accepted: `bind_approval: true`, an assertion header that matches an additional header, or a plain HTTP endpoint. |
+| `caller_assertion_not_enforced` | The lane has no caller to attest (discovery, enum and label sources, stored tests), is a composite tool's step, serves a `delegated_issuer_token` Connection other than through a manual tool or a stored test, or the stored block is one only an earlier release accepted: `bind_approval: true`, an assertion header that matches an additional header, or a plain HTTP endpoint. |
 
 A signing key that cannot be read or loaded at call time also raises
 `connection.secret_resolution_failed` with the same reason. A proxied request
@@ -1089,13 +1095,53 @@ a `refresh_token` included, are skipped unread and never kept.
 #### Which calls are served
 
 Only manual HTTP tool calls, whether from `/mcp` or the admin playground: they
-are the one lane that obtains a caller's own token. Every other lane --
-managed OpenAPI and composite tools, proxied requests, discovery, enum and
-label sources and stored Connection tests -- is refused with
-`caller_assertion_not_enforced`, including the lanes that attest the caller of
-an ordinary attested Connection. There is no service-principal fallback: a
-call with no principal, or a service token's, is refused with
-`delegated_token_no_principal` before anything is read or sent.
+are the one tool lane that obtains a caller's own token. A stored Connection
+test is also served, as the principal who runs it; see
+[Testing a delegated Connection](#testing-a-delegated-connection). Every other
+lane -- managed OpenAPI and composite tools, proxied requests, discovery, enum
+and label sources -- is refused with `caller_assertion_not_enforced`,
+including the lanes that attest the caller of an ordinary attested Connection.
+There is no service-principal fallback: a call with no principal, or a service
+token's, is refused with `delegated_token_no_principal` before anything is
+read or sent.
+
+#### Testing a delegated Connection
+
+`POST /v1{ADMIN_PREFIX}/connections/{id}/test` on a delegated Connection runs
+as the administrator who sends it, exactly as the admin playground calls tools
+as them. The gateway signs a subject token naming that principal, exchanges it
+at `token_exchange_url` for the administrator's own access token, and sends the
+saved `GET` or `HEAD` test request with it. So a passing test shows that the
+issuer, the client secret, the signing key, the egress policy and the
+upstream work for the tester's own grant; it says nothing about any other
+user's.
+
+- The exchange runs inline, within the test's own deadline, and its token is
+  used for the one test request and then dropped. It is never cached: a test
+  never serves a later call, and a later call's cached token never makes a test
+  pass. The issuer still sees an ordinary exchange, and the token it issued stays
+  valid there until it expires: a purge never revokes it, since the gateway no
+  longer holds it.
+- A tester with no principal an issuer could look up -- a service token, or a
+  session without an identity-provider issuer -- is refused with
+  `delegated_token_no_principal` in the `secret_available` stage before any
+  DNS lookup, secret read or request.
+- A disabled Connection is refused with `caller_assertion_key_not_published`
+  in the `authenticated` stage, before any I/O: the published JWKS carries
+  only enabled Connections' keys, so the issuer could not verify the subject
+  token. Enable the Connection (with no tool bound to it yet, nothing calls it)
+  to test it. The same reason refuses an enabled Connection whose keys this
+  replica leaves out of the JWKS.
+- An issuer refusal is reported as `delegated_token_denied`, an egress refusal
+  of the issuer host as `delegated_token_egress_denied` (in the
+  `egress_policy` stage), any other failed exchange as
+  `delegated_token_exchange_failed`, and a client secret or signing key that
+  cannot be resolved as `credential_invalid` or `credential_unavailable`, in
+  the `secret_available` stage, with nothing sent upstream. These are the
+  reasons a tool call reports.
+- The exchange emits `connection.delegated_token_exchange` with the tester as
+  its `actor`, and the test emits `connection.tested` as usual. The status the
+  test records on the Connection reflects the tester's grant.
 
 #### The cache
 
@@ -1271,12 +1317,17 @@ error, a log line, a metric or an audit event.
 #### Trust boundary
 
 Phase 8 moves per-user systems behind the gateway; this credential is where
-the trust sits:
+the trust sits. The
+[per-caller credential trust boundary](per-caller-trust-boundary.md) covers
+it together with signed caller assertions: what each component can do in the
+wrong hands, the bounded caches, the audit of every hand-out, what the issuer
+must enforce because the gateway cannot, and what is out of scope. In short:
 
 - **The issuer's grant store is the most sensitive component in the
-  deployment.** Whoever holds this Connection's client secret can ask the
-  issuer for any user's upstream token, so one leaked secret unlocks every
-  stored grant. Keep the secret in an external provider, restrict the issuer
+  deployment.** Whoever holds this Connection's client secret can exchange
+  any subject token the issuer accepts for that user's upstream token, and
+  with the signing key as well, any user's, so one leaked secret can unlock
+  every stored grant. Keep the secret in an external provider, restrict the issuer
   to this client's subject tokens and audience, have it store grants
   encrypted, grant read-only scopes wherever the upstream allows it, and
   have it log every hand-out.
@@ -1289,7 +1340,8 @@ the trust sits:
   Connection's upstream is also a subject token the issuer accepts, and only
   the client secret stands between that upstream and the caller's grant.
 - **The gateway keeps tokens only in the bounded cache above**, never on disk,
-  and for at most 900 seconds.
+  and for at most 900 seconds; a Connection test's token only for its one
+  request.
 - **Disabling a user is not something the gateway learns by itself.** A
   disabled user cannot call the gateway once their sign-in no longer validates,
   but a bearer token issued before keeps validating until it expires unless its
@@ -1311,13 +1363,36 @@ the trust sits:
 
 #### In the admin UI
 
-The Connection detail page shows this credential read only -- every field but
-the client secret's alias, which appears only as configured or not, the
-revocation endpoint included -- and the caller assertion as its subject
-token. The editor does not open such a Connection, because saving through a
-form that cannot represent the credential would replace it; create and change
-it through the admin API. A principal's tokens are purged through the admin
-API only.
+The editor creates and edits delegated Connections:
+
+- **Create.** Choose *Delegated issuer token* on an HTTP API Connection, then
+  set the client ID, token exchange URL, requested scopes, audience,
+  resource and optional revocation URL, and select the client secret from the
+  aliases whose compatible purposes include `token_exchange_client_secret`. The *Subject token* section
+  configures the `caller_assertion` block the subject token is signed with:
+  the signing key (an alias compatible with `assertion_signing_key`), `kid`,
+  algorithm, `iss`, `aud`, `typ`, lifetime, the `email` and `roles` claims, and
+  the reserved header name, which carries nothing on a delegated Connection.
+  It never sets `bind_request`, `bind_approval` or `published_keys`. Both
+  aliases come from operator aliases or external providers; the encrypted local
+  store holds neither. Creating such a Connection binds a caller assertion, so
+  it needs `admin:connections:secrets:write`.
+- **Edit.** Every credential field above can change, and the client secret can
+  be kept, replaced or cleared. The credential type cannot: the stored
+  `caller_assertion` is kept through every save, and under any other type the
+  gateway would start sending it upstream. A replacement never sends the
+  block, so it is shown read only; change it, or rotate its key, through the
+  admin API. For the same reason the editor does not offer the delegated
+  type on a Connection created with another one.
+- **Test.** *Test connection* runs as you; see
+  [Testing a delegated Connection](#testing-a-delegated-connection). The page
+  explains each refusal, for example that the issuer has no grant for your
+  account.
+
+The detail page shows every field but the client secret's alias, which
+appears only as configured or not, the revocation endpoint included, and the
+caller assertion as the subject token. A principal's tokens are purged through
+the admin API only.
 
 ## TLS, Custom CAs, and Mutual TLS
 
@@ -1347,6 +1422,10 @@ or egress override. HTTP tests use only the saved `GET` or `HEAD` profile and
 expected status set. MCP tests perform a bounded protocol check and do not call
 a tool, read a resource, or publish a catalog.
 
+A delegated issuer token Connection is tested as the administrator who runs
+the test, with their own exchanged token; see
+[Testing a delegated Connection](#testing-a-delegated-connection).
+
 Run Test after:
 
 - changing endpoint, authentication, TLS, timeout, or test-profile settings;
@@ -1366,6 +1445,126 @@ For OpenAPI, preview and confirm the selected generated tools before the first
 registration. Subsequent refreshes preserve a surviving public tool name only
 when it still represents the same operation and safe mapping; a document
 cannot silently move an existing name to a different request.
+
+## Importing Swagger 2.0 Documents
+
+Managed OpenAPI Connections accept Swagger 2.0 documents, in JSON or YAML, in
+preview, registration and refresh, beside OpenAPI 3.x. A document is read as
+Swagger 2.0 when it has a `swagger` field and no `openapi` field, and its
+`swagger` value must be the string `"2.0"`: quote it in YAML, where an
+unquoted `2.0` is a number and is refused. A document that declares `openapi`
+is always read as OpenAPI 3.x, exactly as before. The legacy tools-file import
+(`/v1/admin/tools/openapi/preview` and `/register`) remains OpenAPI 3.x only.
+
+GreenGateway converts the document to the OpenAPI 3.0 document it describes
+and generates tools from that, so the tools, security alternatives and
+bindings are the ones a hand conversion would produce. The stored
+specification, its digest and the 2 MiB limit all apply to the document you
+submitted; registration stores it unchanged, and refresh and overlay edits
+convert it again.
+
+| Swagger 2.0 | Converted to |
+| --- | --- |
+| `definitions` | `components.schemas`; every `#/definitions/` reference is rewritten to `#/components/schemas/` |
+| `query`, `header` and `path` parameters | parameters with a `schema`; array `collectionFormat` `csv`, `multi`, `ssv` and `pipes` become explicit `style`/`explode` |
+| one `body` parameter | `requestBody`, one content entry per `consumes` media type |
+| `formData` parameters | a form `requestBody` (`application/x-www-form-urlencoded`, or `multipart/form-data` when the operation consumes it or has a `file` field) |
+| response `schema` | response content, one entry per `produces` media type |
+| `#/parameters/` and `#/responses/` references | inlined into each operation |
+| `securityDefinitions` | `components.securitySchemes`: `basic` becomes HTTP basic, `apiKey` keeps `in: header` or `in: query`, and the `oauth2` flows `implicit`, `password`, `application` and `accessCode` become `implicit`, `password`, `clientCredentials` and `authorizationCode` |
+| `host`, `basePath`, `schemes` | `servers`, which generated tools do not use |
+| `discriminator`, `type: file`, `x-nullable` | their OpenAPI 3.0 forms |
+
+Response headers, `examples`, `externalDocs` and vendor extensions outside
+schemas are documentation and are not carried over.
+
+Binding does not change. An `application` flow binds to an
+`oauth2_client_credentials` Connection with the same token URL and scopes, and
+`apiKey` in a header binds to `header_api_key`. The user-consent flows
+(`accessCode`, `implicit`, `password`), `basic` and query API keys are
+reported as incompatible, as their OpenAPI 3.0 forms are.
+
+The preview response of a converted document carries a `conversion` object
+with `source_format` `swagger_2_0` and a `warnings` list; an OpenAPI 3.x
+preview has no `conversion` field. Each warning has a `code`, a fixed
+`message`, an `operation_omitted` flag, and, where they apply, the `method`
+and `path_template` of the operation and a `subject` (the field, parameter,
+location, security definition or base path concerned, cut to 256 bytes).
+Review them before registering:
+
+- `base_path_not_in_paths`: generated tools call the Connection's endpoint
+  plus the operation path, and the document's `basePath` is not added. Put it
+  in the Connection's `base_path` (for an API with `basePath: /api`, set
+  `base_path` to `/api`).
+- `request_body_not_mapped`: the operation's request body has no JSON media
+  type, as with every `formData` body. Generated tools send JSON bodies only,
+  so its fields are not tool arguments and the tool sends no body, exactly as
+  for an OpenAPI 3.x form body. Leave such tools unselected unless the
+  upstream accepts the call without them.
+- `consumes_defaulted`, `produces_defaulted`: neither the operation nor the
+  document declares a media type, so body parameters or response schemas are
+  treated as `application/json`. Reported once per document.
+- `security_definition_not_converted`: the definition is incomplete (for
+  example an `oauth2` flow without its URLs or scopes) or has no OpenAPI 3.0
+  form. It is left out, so operations that require it bind as incompatible.
+- `unsupported_document_field`, `unsupported_path_item_field`: a field that
+  is not part of Swagger 2.0, such as an OpenAPI 3.x `servers` or a `trace`
+  operation, was ignored.
+- `warnings_truncated`: the list stopped at its bound; fix the reported
+  problems and preview again.
+
+These codes leave the operation out of the converted document, so no tool is
+generated for it, and set `operation_omitted`: `unsupported_operation_field`
+(for example an OpenAPI 3.x `requestBody` inside a Swagger operation),
+`invalid_parameter` (no usable name, location, body schema or items),
+`unsupported_parameter_location`, `unsupported_parameter_field` (for example
+an OpenAPI 3.x `schema` on a query parameter), `unsupported_collection_format`
+(`tsv`, a nested array format, or anything but `csv` on a path or header),
+`file_parameter_outside_form`, `multiple_body_parameters` and
+`body_and_form_parameters`. A problem in a path item's own `parameters` leaves
+out every operation of that path.
+
+The whole document is refused, and preview or registration fails as for any
+invalid specification, when `swagger` is not the string `"2.0"`, a structural
+field has the wrong type, a reference is remote, a local reference points
+anywhere but `#/definitions/`, `#/parameters/` or `#/responses/` (or a path
+item uses `$ref`), a `#/parameters/` or `#/responses/` reference names no
+component or points into one instead of at it, the document has more than
+4,096 operations, conversion would copy more than 262,144 nodes more than
+once (inlined references, path-level body fields, schemas repeated under
+several media types), or schemas nest deeper than 256 levels. A
+`#/definitions/` reference is rewritten without being resolved; the generator
+then treats a missing target exactly as it treats a missing
+`#/components/schemas/` target in an OpenAPI 3.x document.
+
+Registration publishes only the `selected_tool_names` you confirm. To keep a
+Connection to read operations, select only the tools whose
+`upstream.method` is `GET` or `HEAD` in the preview.
+
+Upgrade and rollback: releases before this one cannot generate tools from a
+Swagger 2.0 document. A replica on an earlier release keeps serving the tools
+already published for such a catalog, but cannot refresh it (it reports
+`degraded/catalog_stale`), and if the Connection also has an overlay it cannot
+rebuild the overlay's source plan from the stored document: it fails at
+startup, and a running one holds its Connection reconciliation unavailable.
+
+In cluster mode this is enforced: storing a catalog converted from a Swagger
+2.0 document (registering one, refreshing to one, or putting an overlay over
+one) is the gated operation `connections.openapi_swagger2_catalog`, admitted
+only while every live replica, draining ones included, advertises the
+`openapi_swagger2_catalogs` capability. While an earlier replica is live the
+write is refused with `409` and reason `capability_not_advertised`, nothing is
+stored, and the refusal is audited as `cluster.operation_refused`; finish the
+rollout, or wait for the earlier replicas' rows to go stale, and retry. A
+refresh learns that its document is Swagger 2.0 only after fetching it, so an
+admitted refresh fetches it again. Preview, OpenAPI 3.x documents and deleting
+an overlay never ask. See
+[operation gating](../deployment/postgres.md#membership-and-maintenance).
+
+In standalone mode there is no other replica to wait for. In either mode,
+before rolling back to an earlier release, re-register those Connections with
+an OpenAPI 3.x document (or delete their overlays first, so the earlier
+release can still start).
 
 ## OpenAPI Overlays
 

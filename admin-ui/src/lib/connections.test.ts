@@ -656,6 +656,51 @@ describe('connections API client', () => {
     });
   });
 
+  it('accepts every reason a delegated issuer token test reports for its tester', async () => {
+    // A delegated Connection is tested as the administrator who asks, so its
+    // refusals are the tool-call reasons; an unknown one would reject the
+    // whole result and hide why the test failed.
+    for (const reason of [
+      'delegated_token_no_principal',
+      'delegated_token_egress_denied',
+      'delegated_token_denied',
+      'delegated_token_exchange_failed',
+      'delegated_token_unavailable',
+      'caller_assertion_key_not_published',
+    ] as const) {
+      vi.stubGlobal(
+        'fetch',
+        vi.fn(() =>
+          Promise.resolve(
+            jsonResponse(
+              200,
+              {
+                ok: false,
+                state: 'unavailable',
+                tested_at: '2026-10-21T12:00:00Z',
+                latency_ms: 3,
+                stages: [
+                  {
+                    name: 'secret_available',
+                    outcome: 'failure',
+                    reason,
+                  },
+                ],
+              },
+              { ETag: '"connection:v1"' },
+            ),
+          ),
+        ),
+      );
+
+      const tested = await testConnection('connection-1', '"connection:v1"');
+
+      expect(tested.value.stages).toEqual([
+        { name: 'secret_available', outcome: 'failure', reason },
+      ]);
+    }
+  });
+
   it('requires unambiguous identities and versions after mutations', async () => {
     const detail = {
       ...connectionDetail(),

@@ -6,6 +6,7 @@ import {
   ConnectionContractError,
   type ConnectionCatalogRefreshResult,
   type ConnectionDetail as ConnectionDetailData,
+  type ConnectionTestReason,
   type ConnectionTestResult,
   deleteConnection,
   getConnection,
@@ -319,8 +320,10 @@ export function ConnectionDetail() {
               <div className="alert warning" role="status">
                 <h3>Disabled draft</h3>
                 <p>
-                  This connection cannot receive production traffic. You can
-                  safely test the saved settings before enabling it.
+                  This connection cannot receive production traffic.{' '}
+                  {detail.authentication === 'delegated_issuer_token'
+                    ? 'A delegated issuer token connection can be tested only once it is enabled: the issuer verifies its subject token against published keys, which include only enabled connections.'
+                    : 'You can safely test the saved settings before enabling it.'}
                 </p>
               </div>
             ) : null}
@@ -854,7 +857,15 @@ function ConnectionActionsPanel({
         </p>
       ) : null}
 
-      {!detail.enabled && detail.actions.can_test ? (
+      {detail.authentication === 'delegated_issuer_token' &&
+      detail.actions.can_test ? (
+        <p className="alert info" role="status">
+          Testing this connection exchanges a token for your own account at
+          its issuer and sends the saved test request with it. The token is
+          not cached, and the result says whether your grant works, not
+          anyone else&apos;s.
+        </p>
+      ) : !detail.enabled && detail.actions.can_test ? (
         <p className="alert info" role="status">
           Testing this disabled draft uses its saved settings but does not
           enable it or route production requests to it.
@@ -865,6 +876,11 @@ function ConnectionActionsPanel({
 }
 
 function ConnectionTestPanel({ result }: { result: ConnectionTestResult }) {
+  const hint = result.stages
+    .map((stage) =>
+      stage.reason === undefined ? undefined : TEST_REASON_HINTS[stage.reason],
+    )
+    .find((text) => text !== undefined);
   return (
     <section
       className={`connection-detail-section alert ${
@@ -902,7 +918,7 @@ function ConnectionTestPanel({ result }: { result: ConnectionTestResult }) {
             {result.stages.map((stage, index) => (
               <tr
                 className={`event-row ${index % 2 === 1 ? 'is-even' : ''}`}
-                key={stage.name}
+                key={`${stage.name}-${index}`}
               >
                 <td data-label="Stage">{humanize(stage.name)}</td>
                 <td data-label="Outcome">
@@ -926,9 +942,27 @@ function ConnectionTestPanel({ result }: { result: ConnectionTestResult }) {
           </tbody>
         </table>
       </div>
+      {hint ? <p className="rule-hint">{hint}</p> : null}
     </section>
   );
 }
+
+/**
+ * What to do about a failed delegated issuer token test, which runs as the
+ * administrator who asked for it.
+ */
+const TEST_REASON_HINTS: Partial<Record<ConnectionTestReason, string>> = {
+  delegated_token_no_principal:
+    'This connection is tested as you, and your sign-in names nobody the issuer can look up: a service token, or a session without an identity provider issuer. Sign in through your identity provider to test it.',
+  delegated_token_denied:
+    'The issuer refused your account: usually you have not connected this upstream at the issuer, or your grant was revoked. Connect it there and test again.',
+  delegated_token_egress_denied:
+    'The gateway egress policy does not allow the token exchange URL. Add its host to the egress allowlist.',
+  delegated_token_exchange_failed:
+    'The issuer returned no usable token: it was unreachable or failed, refused the client ID and secret, or answered with something other than a bearer access token. The connection.delegated_token_exchange audit event records the issuer status and error code.',
+  caller_assertion_key_not_published:
+    'The gateway does not publish the subject-token keys of this connection, so the issuer could not verify a subject token and nothing was sent: the connection is disabled, or one of its keys does not load. Enable it, or fix the key, and test again.',
+};
 
 function ConnectionRefreshPanel({
   result,

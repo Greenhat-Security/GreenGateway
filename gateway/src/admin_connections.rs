@@ -1057,6 +1057,58 @@ pub(super) async fn connection_delete_endpoint(
     )
 }
 
+/// Refresh a managed OpenAPI catalog, asking the operation gate when the
+/// refreshed document turns out to be converted. Whether it is converted is
+/// known only once it is fetched, so an admitted refresh fetches it again;
+/// the service stopped the first pass before writing or recording anything.
+async fn refresh_managed_openapi_catalog(
+    state: &ConnectionAdminState,
+    parts: &http::request::Parts,
+    principal: &auth::Principal,
+    id: &connections::model::ConnectionId,
+    current_etag: &str,
+) -> Result<
+    connections::openapi::OpenApiCatalogPublishResult,
+    Box<(ConnectionRefreshFailure, Response)>,
+> {
+    let mut converted_catalog = connections::openapi::ConvertedCatalogAdmission::NotAsked;
+    loop {
+        let result = state
+            .openapi_catalogs
+            .refresh_with_admission(
+                id.as_str(),
+                current_etag,
+                converted_catalog,
+                &principal.user_id,
+            )
+            .await;
+        match result {
+            Err(connections::openapi::OpenApiCatalogError::ConvertedCatalogNeedsAdmission)
+                if converted_catalog
+                    == connections::openapi::ConvertedCatalogAdmission::NotAsked =>
+            {
+                admit_converted_openapi_catalog(state, parts, principal)
+                    .await
+                    .map_err(|refusal| {
+                        Box::new((
+                            ConnectionRefreshFailure::plain(refusal.reason),
+                            *refusal.response,
+                        ))
+                    })?;
+                converted_catalog = connections::openapi::ConvertedCatalogAdmission::Admitted;
+            }
+            result => {
+                return result.map_err(|error| {
+                    Box::new((
+                        ConnectionRefreshFailure::plain(error.safe_reason()),
+                        openapi_catalog_error_response(error, "refresh"),
+                    ))
+                });
+            }
+        }
+    }
+}
+
 pub(super) async fn connection_refresh_endpoint(
     State(state): State<ConnectionAdminState>,
     Path(raw_id): Path<String>,
@@ -1123,17 +1175,12 @@ pub(super) async fn connection_refresh_endpoint(
                     connection_refresh_error_response(error),
                 )
             }),
-        Some(connections::model::DiscoveryConfig::ManagedOpenapi { .. }) => state
-            .openapi_catalogs
-            .refresh(id.as_str(), current_etag.as_str(), &principal.user_id)
-            .await
-            .map(ConnectionCatalogRefreshResponse::OpenApi)
-            .map_err(|error| {
-                (
-                    ConnectionRefreshFailure::plain(error.safe_reason()),
-                    openapi_catalog_error_response(error, "refresh"),
-                )
-            }),
+        Some(connections::model::DiscoveryConfig::ManagedOpenapi { .. }) => {
+            refresh_managed_openapi_catalog(&state, &parts, &principal, &id, current_etag.as_str())
+                .await
+                .map(ConnectionCatalogRefreshResponse::OpenApi)
+                .map_err(|failure| *failure)
+        }
         None => Err((
             ConnectionRefreshFailure::plain("discovery_not_configured"),
             (
@@ -1334,9 +1381,18 @@ pub(super) async fn connection_test_endpoint(
         );
     }
 
+    // The test runs as the principal who asked for it: a delegated Connection
+    // is tested with that principal's own token, exactly as the admin tool
+    // playground calls tools as them. Every other credential ignores it.
+    let tester = connections::caller_assertion::AttestedCaller::from_principal(&principal);
     let execution = state
         .tests
-        .execute_before(record, current_etag.as_str(), probe_deadline)
+        .execute_before(
+            record,
+            current_etag.as_str(),
+            tester.as_ref(),
+            probe_deadline,
+        )
         .await;
     let persistence = state
         .control_plane
@@ -1582,18 +1638,40 @@ pub(super) async fn connection_openapi_overlay_put_endpoint(
     };
     let secrets_write_authorized =
         rbac_state.principal_has_permission(&principal, ADMIN_CONNECTIONS_SECRETS_WRITE_PERMISSION);
-    match state
-        .openapi_catalogs
-        .put_overlay_with_authorization(
-            &raw_id,
-            &expected_etag,
-            &document,
-            params.allow_unresolved_enum_sources,
-            secrets_write_authorized,
-            &principal.user_id,
-        )
-        .await
-    {
+    // At most two passes, as for registration: an overlay over a converted
+    // catalog asks the operation gate before anything is written.
+    let mut converted_catalog = connections::openapi::ConvertedCatalogAdmission::NotAsked;
+    let updated = loop {
+        let result = state
+            .openapi_catalogs
+            .put_overlay_with_authorization(
+                &raw_id,
+                &expected_etag,
+                &document,
+                params.allow_unresolved_enum_sources,
+                secrets_write_authorized,
+                converted_catalog,
+                &principal.user_id,
+            )
+            .await;
+        if converted_catalog == connections::openapi::ConvertedCatalogAdmission::NotAsked
+            && matches!(
+                result,
+                Err(connections::openapi::OpenApiOverlayOperationError::Catalog(
+                    connections::openapi::OpenApiCatalogError::ConvertedCatalogNeedsAdmission
+                ))
+            )
+        {
+            if let Err(refusal) = admit_converted_openapi_catalog(&state, &parts, &principal).await
+            {
+                return *refusal.response;
+            }
+            converted_catalog = connections::openapi::ConvertedCatalogAdmission::Admitted;
+            continue;
+        }
+        break result;
+    };
+    match updated {
         Ok(result) => {
             emit_managed_openapi_catalog_changed(&state, &parts, &principal, &result.catalog);
             overlay_mutation_response(result)
@@ -1639,6 +1717,87 @@ pub(super) async fn connection_openapi_overlay_delete_endpoint(
             overlay_mutation_response(result)
         }
         Err(error) => openapi_overlay_operation_error_response(error, "overlay delete"),
+    }
+}
+
+/// The operation gate refused to store a converted managed OpenAPI catalog.
+/// Nothing was written; `reason` is the refusal's stable code.
+pub(super) struct ConvertedCatalogRefusal {
+    pub(super) reason: &'static str,
+    pub(super) response: Box<Response>,
+}
+
+/// Ask the cluster's operation gate before storing a managed OpenAPI catalog
+/// generated from a Swagger 2.0 document (issue #443).
+///
+/// The catalog service answers `ConvertedCatalogNeedsAdmission`, before it
+/// writes or records anything, only when it gates converted catalogs
+/// (cluster mode) and only for a converted document, so an OpenAPI 3.x
+/// document never asks. The write is the registered operation
+/// `connections.openapi_swagger2_catalog`: it proceeds only while every live
+/// member, draining ones included, advertises `openapi_swagger2_catalogs`,
+/// because a member built before the conversion cannot regenerate from the
+/// stored document. The gate reads the roster for every such write and logs
+/// and audits each refusal (`cluster.operation_refused`). A deployment with
+/// no roster to ask refuses rather than admits.
+pub(super) async fn admit_converted_openapi_catalog(
+    state: &ConnectionAdminState,
+    parts: &http::request::Parts,
+    principal: &auth::Principal,
+) -> Result<(), ConvertedCatalogRefusal> {
+    #[cfg(feature = "postgres")]
+    {
+        let requirement = &storage::compatibility::OPENAPI_SWAGGER2_CATALOGS;
+        let Some(membership) = state.membership.as_ref() else {
+            tracing::error!(
+                operation = requirement.operation,
+                "a gated managed OpenAPI write has no roster to ask; the write is refused"
+            );
+            let refusal = storage::compatibility::OperationRefusal::RosterUnavailable;
+            return Err(ConvertedCatalogRefusal {
+                reason: refusal.reason(),
+                response: Box::new(operation_refused(&refusal)),
+            });
+        };
+        let request = cluster_membership::GatedWriteRequest {
+            request_id: client_ip::request_id(&parts.headers, &parts.extensions),
+            source_ip: client_ip::canonical_client_ip(
+                &parts.headers,
+                &parts.extensions,
+                &state.client_ip_policy,
+            ),
+            actor: Some(auth::actor_from_principal(principal)),
+        };
+        membership
+            .admit_operation(requirement, &state.audit, &request)
+            .await
+            .map(|_| ())
+            .map_err(|refusal| ConvertedCatalogRefusal {
+                reason: refusal.reason(),
+                response: Box::new(operation_refused(&refusal)),
+            })
+    }
+    // A build without cluster mode has no roster, and its catalog service
+    // never gates outside tests; refuse exactly as a roster-less cluster
+    // deployment does.
+    #[cfg(not(feature = "postgres"))]
+    {
+        let _ = (state, parts, principal);
+        tracing::error!("a gated managed OpenAPI write has no roster to ask; the write is refused");
+        Err(ConvertedCatalogRefusal {
+            reason: "roster_unavailable",
+            response: Box::new(
+                (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    Json(json!({
+                        "error": "no cluster roster can be read, so no live member can be shown to \
+                                  support the operation; nothing was written",
+                        "reason": "roster_unavailable",
+                    })),
+                )
+                    .into_response(),
+            ),
+        })
     }
 }
 
@@ -1706,21 +1865,48 @@ pub(super) async fn connection_openapi_register_endpoint(
         })
         .collect::<Vec<_>>();
 
-    match state
-        .openapi_catalogs
-        .register(
-            id.as_str(),
-            current_etag.as_str(),
-            requested.expected_spec_revision,
-            requested.expected_catalog_revision,
-            &requested.spec_digest,
-            &requested.spec,
-            &requested.selected_tool_names,
-            &confirmations,
-            &principal.user_id,
-        )
-        .await
-    {
+    // At most two passes: the second only after the operation gate admitted
+    // a converted document the first pass stopped at, before writing.
+    let mut converted_catalog = connections::openapi::ConvertedCatalogAdmission::NotAsked;
+    let registered = loop {
+        let result = state
+            .openapi_catalogs
+            .register_with_admission(
+                id.as_str(),
+                current_etag.as_str(),
+                requested.expected_spec_revision,
+                requested.expected_catalog_revision,
+                &requested.spec_digest,
+                &requested.spec,
+                &requested.selected_tool_names,
+                &confirmations,
+                converted_catalog,
+                &principal.user_id,
+            )
+            .await;
+        if converted_catalog == connections::openapi::ConvertedCatalogAdmission::NotAsked
+            && matches!(
+                result,
+                Err(connections::openapi::OpenApiCatalogError::ConvertedCatalogNeedsAdmission)
+            )
+        {
+            if let Err(refusal) = admit_converted_openapi_catalog(&state, &parts, &principal).await
+            {
+                emit_managed_openapi_catalog_rejected(
+                    &state,
+                    &parts,
+                    &principal,
+                    &id,
+                    refusal.reason,
+                );
+                return with_etag(*refusal.response, current_etag.as_str());
+            }
+            converted_catalog = connections::openapi::ConvertedCatalogAdmission::Admitted;
+            continue;
+        }
+        break result;
+    };
+    match registered {
         Ok(result) => {
             emit_managed_openapi_catalog_changed(&state, &parts, &principal, &result);
             (

@@ -2311,12 +2311,37 @@ describe('ConnectionEditor', () => {
     expect(writes).toBe(0);
   });
 
-  it('refuses to edit a delegated issuer token connection rather than save over it', async () => {
+  it('edits a delegated issuer token connection, keeping its type and its caller assertion', async () => {
+    const puts: RequestInit[] = [];
     const fetchMock = vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
       const url = requestUrl(input);
       if (url.pathname === '/v1/admin/connections/billing' && !init?.method) {
         return Promise.resolve(
-          jsonResponse(200, delegatedDetail(), { ETag: '"record-7"' }),
+          jsonResponse(200, delegatedDetail({ canBindSecret: true }), {
+            ETag: '"record-7"',
+          }),
+        );
+      }
+      if (
+        url.pathname === '/v1/admin/connection-secrets' &&
+        !init?.method
+      ) {
+        return Promise.resolve(
+          jsonResponse(200, secretList({ secrets: delegatedAliases() }), {
+            ETag: '"secret-entity"',
+            'X-GreenGateway-Connection-Secrets-ETag': '"secret-collection"',
+          }),
+        );
+      }
+      if (
+        url.pathname === '/v1/admin/connections/billing' &&
+        init?.method === 'PUT'
+      ) {
+        puts.push(init);
+        return Promise.resolve(
+          jsonResponse(200, delegatedDetail({ canBindSecret: true }), {
+            ETag: '"record-8"',
+          }),
         );
       }
       return Promise.reject(new Error(`unexpected request: ${url.pathname}`));
@@ -2324,15 +2349,341 @@ describe('ConnectionEditor', () => {
     vi.stubGlobal('fetch', fetchMock);
 
     renderEditor('/connections/billing/edit');
-
-    expect(await screen.findByText('Editing not available')).toBeTruthy();
+    const exchangeUrl = (await screen.findByLabelText(
+      'Token exchange URL',
+    )) as HTMLInputElement;
+    expect(exchangeUrl.value).toBe(
+      'https://issuer.example.test/oauth2/token-exchange',
+    );
     expect(
-      screen.getByText(/delegated issuer token, which the editor cannot change/),
+      (screen.getByLabelText('Issuer client ID') as HTMLInputElement).value,
+    ).toBe('greengateway');
+    expect(
+      (screen.getByLabelText('Requested scopes') as HTMLInputElement).value,
+    ).toBe('mail.read');
+    expect(
+      (screen.getByLabelText('Token exchange client secret') as HTMLSelectElement)
+        .value,
+    ).toBe('intent:preserve');
+    // The type is fixed: under any other credential the kept assertion would
+    // start going upstream.
+    const type = screen.getByLabelText(
+      'Authentication type',
+    ) as HTMLSelectElement;
+    expect(type.disabled).toBe(true);
+    expect(Array.from(type.options).map((option) => option.value)).toEqual([
+      'delegated_issuer_token',
+    ]);
+    expect(
+      screen.getByText(/keeps its credential type/),
     ).toBeTruthy();
-    // No form that could replace the credential with another type.
-    expect(screen.queryByLabelText('Display name')).toBeNull();
-    expect(screen.queryByRole('button', { name: 'Save connection' })).toBeNull();
-    expect(fetchMock.mock.calls.every(([, init]) => !init?.method)).toBe(true);
+    // The stored block is the subject token, shown read only.
+    const subjectToken = screen
+      .getByRole('heading', { name: 'Subject token' })
+      .closest('section');
+    expect(subjectToken?.textContent).toContain(
+      'Caller assertion configured as the subject token.',
+    );
+    expect(
+      subjectToken?.querySelectorAll('input, select, textarea, button'),
+    ).toHaveLength(0);
+
+    fireEvent.change(screen.getByLabelText('Requested scopes'), {
+      target: { value: 'mail.read mail.send' },
+    });
+    fireEvent.click(screen.getByRole('button', { name: 'Save connection' }));
+
+    expect(await screen.findByText('Connection detail route')).toBeTruthy();
+    expect(puts).toHaveLength(1);
+    expect(headerValue(puts[0]?.headers, 'If-Match')).toBe('"record-7"');
+    const body = JSON.parse(String(puts[0]?.body)) as Record<string, unknown>;
+    expect(body.authentication).toEqual({
+      type: 'delegated_issuer_token',
+      token_exchange_url: 'https://issuer.example.test/oauth2/token-exchange',
+      client_id: 'greengateway',
+      requested_scopes: ['mail.read', 'mail.send'],
+      subject_token_source: 'caller_assertion',
+      client_secret_configured: true,
+    });
+    // Omitted, never `null`: the gateway keeps an omitted block.
+    expect(Object.hasOwn(body, 'caller_assertion')).toBe(false);
+    expect(String(puts[0]?.body)).not.toContain('secret_id');
+  });
+
+  it('creates a delegated issuer token connection with the caller assertion that signs its subject tokens', async () => {
+    const posts: RequestInit[] = [];
+    vi.stubGlobal(
+      'fetch',
+      vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
+        const url = requestUrl(input);
+        if (url.pathname === '/v1/admin/connections' && !init?.method) {
+          return Promise.resolve(
+            jsonResponse(200, connectionList(true, { canManageSecrets: false }), {
+              ETag: '"connections"',
+              'X-GreenGateway-Connections-ETag': '"connections-collection"',
+            }),
+          );
+        }
+        if (
+          url.pathname === '/v1/admin/connection-secrets' &&
+          !init?.method
+        ) {
+          return Promise.resolve(
+            jsonResponse(200, secretList({ secrets: delegatedAliases() }), {
+              ETag: '"secrets"',
+              'X-GreenGateway-Connection-Secrets-ETag': '"secret-collection"',
+            }),
+          );
+        }
+        if (
+          url.pathname === '/v1/admin/connections' &&
+          init?.method === 'POST'
+        ) {
+          posts.push(init);
+          return Promise.resolve(
+            jsonResponse(201, delegatedDetail({ canBindSecret: true }), {
+              ETag: '"connection-created"',
+              'X-GreenGateway-Connections-ETag': '"connections-collection-2"',
+            }),
+          );
+        }
+        return Promise.reject(new Error(`unexpected request: ${url.pathname}`));
+      }),
+    );
+
+    renderEditor('/connections/new');
+    fireEvent.change(await screen.findByLabelText('Display name'), {
+      target: { value: 'Mail API' },
+    });
+    fireEvent.change(screen.getByLabelText('Base URL'), {
+      target: { value: 'https://mail.example.test' },
+    });
+    const type = screen.getByLabelText(
+      'Authentication type',
+    ) as HTMLSelectElement;
+    await waitFor(() => expect(type.disabled).toBe(false));
+    fireEvent.change(type, { target: { value: 'delegated_issuer_token' } });
+    expect(
+      screen.getByText(/Each caller reaches the upstream as themselves/),
+    ).toBeTruthy();
+    fireEvent.change(screen.getByLabelText('Issuer client ID'), {
+      target: { value: 'greengateway' },
+    });
+    fireEvent.change(screen.getByLabelText('Token exchange URL'), {
+      target: { value: 'https://issuer.example.test/oauth2/token-exchange' },
+    });
+    fireEvent.change(screen.getByLabelText('Requested scopes'), {
+      target: { value: 'mail.read calendar.read' },
+    });
+    fireEvent.change(screen.getByLabelText('Requested audience'), {
+      target: { value: 'https://mail.example.test' },
+    });
+    fireEvent.change(screen.getByLabelText('Revocation URL (optional)'), {
+      target: { value: 'https://issuer.example.test/oauth2/revoke' },
+    });
+    // Each binding lists only aliases compatible with its own purpose.
+    const clientSecret = screen.getByLabelText(
+      'Token exchange client secret',
+    ) as HTMLSelectElement;
+    await waitFor(() =>
+      expect(
+        Array.from(clientSecret.options).map((option) => option.value),
+      ).toEqual(['intent:none', 'secret:issuer-exchange-secret']),
+    );
+    fireEvent.change(clientSecret, {
+      target: { value: 'secret:issuer-exchange-secret' },
+    });
+    const signingKey = screen.getByLabelText('Signing key') as HTMLSelectElement;
+    expect(Array.from(signingKey.options).map((option) => option.value)).toEqual(
+      ['intent:none', 'secret:gateway-assertion-key'],
+    );
+    fireEvent.change(signingKey, {
+      target: { value: 'secret:gateway-assertion-key' },
+    });
+    fireEvent.change(screen.getByLabelText('Key ID (kid)'), {
+      target: { value: 'gw-2026-10' },
+    });
+    fireEvent.change(screen.getByLabelText('Issuer (iss)'), {
+      target: { value: 'https://gateway.example.test' },
+    });
+    fireEvent.change(screen.getByLabelText('Audience (aud)'), {
+      target: { value: 'https://issuer.example.test' },
+    });
+    fireEvent.change(screen.getByLabelText('Token type (typ)'), {
+      target: { value: 'caller-assertion+jwt' },
+    });
+    fireEvent.click(screen.getByLabelText('Roles'));
+    fireEvent.click(screen.getByLabelText('Email'));
+    fireEvent.click(
+      screen.getByRole('button', { name: 'Save disabled draft' }),
+    );
+
+    expect(await screen.findByText('Connection detail route')).toBeTruthy();
+    expect(posts).toHaveLength(1);
+    expect(headerValue(posts[0]?.headers, 'If-Match')).toBe(
+      '"connections-collection"',
+    );
+    const body = JSON.parse(String(posts[0]?.body)) as Record<string, unknown>;
+    expect(body).toMatchObject({
+      display_name: 'Mail API',
+      enabled: false,
+      kind: 'http_api',
+      endpoint: { base_url: 'https://mail.example.test', base_path: '/' },
+    });
+    expect(body.authentication).toEqual({
+      type: 'delegated_issuer_token',
+      token_exchange_url: 'https://issuer.example.test/oauth2/token-exchange',
+      client_id: 'greengateway',
+      requested_scopes: ['mail.read', 'calendar.read'],
+      audience: 'https://mail.example.test',
+      revocation_url: 'https://issuer.example.test/oauth2/revoke',
+      subject_token_source: 'caller_assertion',
+      client_secret_id: 'issuer-exchange-secret',
+    });
+    // Claims in the gateway's order, whatever order they were ticked in, and
+    // no request or approval binding, which a delegated Connection refuses.
+    expect(body.caller_assertion).toEqual({
+      signing_key_id: 'gateway-assertion-key',
+      kid: 'gw-2026-10',
+      algorithm: 'es256',
+      issuer: 'https://gateway.example.test',
+      audience: 'https://issuer.example.test',
+      token_type: 'caller-assertion+jwt',
+      header_name: 'x-caller-assertion',
+      lifetime_seconds: 60,
+      claims: ['email', 'roles'],
+    });
+  });
+
+  it('refuses an incomplete delegated issuer token draft before writing', async () => {
+    let writes = 0;
+    vi.stubGlobal(
+      'fetch',
+      vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
+        const url = requestUrl(input);
+        if (init?.method) {
+          writes += 1;
+        }
+        if (url.pathname === '/v1/admin/connections' && !init?.method) {
+          return Promise.resolve(
+            jsonResponse(200, connectionList(true, { canManageSecrets: false }), {
+              ETag: '"connections"',
+              'X-GreenGateway-Connections-ETag': '"connections-collection"',
+            }),
+          );
+        }
+        if (
+          url.pathname === '/v1/admin/connection-secrets' &&
+          !init?.method
+        ) {
+          return Promise.resolve(
+            jsonResponse(200, secretList({ secrets: delegatedAliases() }), {
+              ETag: '"secrets"',
+              'X-GreenGateway-Connection-Secrets-ETag': '"secret-collection"',
+            }),
+          );
+        }
+        return Promise.reject(new Error(`unexpected request: ${url.pathname}`));
+      }),
+    );
+
+    renderEditor('/connections/new');
+    fireEvent.change(await screen.findByLabelText('Display name'), {
+      target: { value: 'Mail API' },
+    });
+    fireEvent.change(screen.getByLabelText('Base URL'), {
+      target: { value: 'https://mail.example.test' },
+    });
+    const type = screen.getByLabelText(
+      'Authentication type',
+    ) as HTMLSelectElement;
+    await waitFor(() => expect(type.disabled).toBe(false));
+    fireEvent.change(type, { target: { value: 'delegated_issuer_token' } });
+    fireEvent.change(screen.getByLabelText('Token exchange URL'), {
+      target: { value: 'http://issuer.example.test/oauth2/token-exchange' },
+    });
+    fireEvent.change(screen.getByLabelText('Revocation URL (optional)'), {
+      target: { value: 'https://issuer.example.test/oauth2/revoke#now' },
+    });
+    fireEvent.change(screen.getByLabelText('Lifetime (seconds)'), {
+      target: { value: '301' },
+    });
+    fireEvent.change(screen.getByLabelText('Reserved header name'), {
+      target: { value: 'Authorization' },
+    });
+    fireEvent.click(
+      screen.getByRole('button', { name: 'Save disabled draft' }),
+    );
+
+    expect(
+      await screen.findByText(/Enter an HTTPS token exchange URL/),
+    ).toBeTruthy();
+    expect(screen.getByText(/Enter an HTTPS revocation URL/)).toBeTruthy();
+    expect(
+      screen.getByText('Enter the client ID the gateway uses at the issuer.'),
+    ).toBeTruthy();
+    expect(
+      screen.getByText('Select a configured assertion signing key alias.'),
+    ).toBeTruthy();
+    expect(screen.getByText(/Enter a key ID of 1 to 128 bytes/)).toBeTruthy();
+    expect(
+      screen.getByText(/Enter the audience the token issuer expects/),
+    ).toBeTruthy();
+    expect(
+      screen.getByText(/whole number of seconds from 1 to 300/),
+    ).toBeTruthy();
+    expect(
+      document
+        .getElementById('connection-subject-token-header')
+        ?.getAttribute('aria-invalid'),
+    ).toBe('true');
+    expect(
+      screen.getByText(
+        'Enter a valid, non-reserved HTTP header name of at most 64 bytes.',
+      ),
+    ).toBeTruthy();
+    expect(writes).toBe(0);
+  });
+
+  it('does not offer a delegated issuer token to a connection that was saved without one', async () => {
+    vi.stubGlobal(
+      'fetch',
+      vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
+        const url = requestUrl(input);
+        if (url.pathname === '/v1/admin/connections/billing' && !init?.method) {
+          return Promise.resolve(
+            jsonResponse(200, managedDetail({ canBindSecret: true }), {
+              ETag: '"record-7"',
+            }),
+          );
+        }
+        if (
+          url.pathname === '/v1/admin/connection-secrets' &&
+          !init?.method
+        ) {
+          return Promise.resolve(
+            jsonResponse(200, secretList(), {
+              ETag: '"secrets"',
+              'X-GreenGateway-Connection-Secrets-ETag': '"secret-collection"',
+            }),
+          );
+        }
+        return Promise.reject(new Error(`unexpected request: ${url.pathname}`));
+      }),
+    );
+
+    renderEditor('/connections/billing/edit');
+    const type = (await screen.findByLabelText(
+      'Authentication type',
+    )) as HTMLSelectElement;
+    // A replacement never carries a caller assertion, so it could not add the
+    // subject-token block this credential needs.
+    expect(Array.from(type.options).map((option) => option.value)).toEqual([
+      'none',
+      'header_api_key',
+      'static_bearer',
+      'oauth2_client_credentials',
+    ]);
   });
 
   it('refuses to edit a Google domain-wide delegation rather than save over it', async () => {
@@ -2379,8 +2730,10 @@ describe('ConnectionEditor', () => {
   });
 });
 
-function delegatedDetail(): ConnectionDetail {
-  const detail = managedDetail();
+function delegatedDetail({
+  canBindSecret = false,
+}: { canBindSecret?: boolean } = {}): ConnectionDetail {
+  const detail = managedDetail({ canBindSecret, authentication: 'none' });
   if (detail.configuration === undefined) {
     throw new Error('the managed fixture carries a configuration');
   }
@@ -2389,6 +2742,7 @@ function delegatedDetail(): ConnectionDetail {
     authentication: 'delegated_issuer_token',
     configuration: {
       ...detail.configuration,
+      discovery: undefined,
       authentication: {
         type: 'delegated_issuer_token',
         token_exchange_url: 'https://issuer.example.test/oauth2/token-exchange',
@@ -2434,6 +2788,30 @@ function googleDelegationDetail(): ConnectionDetail {
       },
     },
   };
+}
+
+/**
+ * Operator aliases for a delegated Connection: its token-exchange client
+ * secret and the key its subject tokens are signed with. Neither can live in
+ * the encrypted local store.
+ */
+function delegatedAliases(): ConnectionSecretMetadata[] {
+  return [
+    localSecret({
+      id: 'issuer-exchange-secret',
+      label: 'Issuer exchange secret',
+      provider: 'operator_environment',
+      compatible_purposes: ['token_exchange_client_secret'],
+      actions: { can_rotate: false, can_delete: false },
+    }),
+    localSecret({
+      id: 'gateway-assertion-key',
+      label: 'Gateway assertion key',
+      provider: 'operator_file',
+      compatible_purposes: ['assertion_signing_key'],
+      actions: { can_rotate: false, can_delete: false },
+    }),
+  ];
 }
 
 function renderEditor(path: string) {

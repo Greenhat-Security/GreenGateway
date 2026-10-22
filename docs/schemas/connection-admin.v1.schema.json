@@ -8,7 +8,7 @@
     "CallerAssertion": {
       "type": "object",
       "additionalProperties": false,
-      "description": "Attests the calling principal to the upstream on every manual HTTP, managed OpenAPI and managed MCP tool call and every proxied request made through this Connection, alongside the primary credential rather than instead of it: the credential says which system is calling, the assertion says on whose behalf, so an upstream the operator controls can apply its own per-user checks. Per request the gateway signs one short-lived JWT naming the validated principal (sub is the identity provider's issuer, '#', and its subject; jti is the gateway request ID, with '.' and a sequence number for each request of a managed MCP tool call's session) and writes it, as the last header, in header_name; with bind_request it also binds the method, the request target and the SHA-256 of the exact body sent. A call with no principal to name, a service token included, is refused with caller_assertion_no_principal before any network or secret I/O. The endpoint must use https. Lanes with no caller to attest (discovery, enum and label sources, stored tests) and composite tool steps are refused with caller_assertion_not_enforced, as is every lane but manual tools on a delegated_issuer_token Connection and every lane for a stored block only an earlier release accepted. Saving an enabled Connection resolves its signing key and every published key, from whichever secret source holds it, and loads each for its algorithm; a key that cannot be used refuses the save, and every call reads and loads the signing key again. The public halves of every enabled Connection's keys are served at /.well-known/caller-assertion-jwks.json, which the upstream verifies against. A stored Connection whose keys can no longer be used is left out of that set, with a diagnostic, rather than stopping the gateway, and its calls are refused with caller_assertion_key_not_published until its keys load again. Omit the block to send only the credential.",
+      "description": "Attests the calling principal to the upstream on every manual HTTP, managed OpenAPI and managed MCP tool call and every proxied request made through this Connection, alongside the primary credential rather than instead of it: the credential says which system is calling, the assertion says on whose behalf, so an upstream the operator controls can apply its own per-user checks. Per request the gateway signs one short-lived JWT naming the validated principal (sub is the identity provider's issuer, '#', and its subject; jti is the gateway request ID, with '.' and a sequence number for each request of a managed MCP tool call's session) and writes it, as the last header, in header_name; with bind_request it also binds the method, the request target and the SHA-256 of the exact body sent. A call with no principal to name, a service token included, is refused with caller_assertion_no_principal before any network or secret I/O. The endpoint must use https. Lanes with no caller to attest (discovery, enum and label sources, stored tests) and composite tool steps are refused with caller_assertion_not_enforced, as is every lane but manual tools and stored tests, which run as the principal who asks for them, on a delegated_issuer_token Connection and every lane for a stored block only an earlier release accepted. Saving an enabled Connection resolves its signing key and every published key, from whichever secret source holds it, and loads each for its algorithm; a key that cannot be used refuses the save, and every call reads and loads the signing key again. The public halves of every enabled Connection's keys are served at /.well-known/caller-assertion-jwks.json, which the upstream verifies against. A stored Connection whose keys can no longer be used is left out of that set, with a diagnostic, rather than stopping the gateway, and its calls are refused with caller_assertion_key_not_published until its keys load again. Omit the block to send only the credential.",
       "required": [
         "signing_key_id",
         "kid",
@@ -52,7 +52,7 @@
     "SafeCallerAssertion": {
       "type": "object",
       "additionalProperties": false,
-      "description": "Attests the calling principal to the upstream on every manual HTTP, managed OpenAPI and managed MCP tool call and every proxied request made through this Connection, alongside the primary credential rather than instead of it: the credential says which system is calling, the assertion says on whose behalf, so an upstream the operator controls can apply its own per-user checks. Per request the gateway signs one short-lived JWT naming the validated principal (sub is the identity provider's issuer, '#', and its subject; jti is the gateway request ID, with '.' and a sequence number for each request of a managed MCP tool call's session) and writes it, as the last header, in header_name; with bind_request it also binds the method, the request target and the SHA-256 of the exact body sent. A call with no principal to name, a service token included, is refused with caller_assertion_no_principal before any network or secret I/O. The endpoint must use https. Lanes with no caller to attest (discovery, enum and label sources, stored tests) and composite tool steps are refused with caller_assertion_not_enforced, as is every lane but manual tools on a delegated_issuer_token Connection and every lane for a stored block only an earlier release accepted. Saving an enabled Connection resolves its signing key and every published key, from whichever secret source holds it, and loads each for its algorithm; a key that cannot be used refuses the save, and every call reads and loads the signing key again. The public halves of every enabled Connection's keys are served at /.well-known/caller-assertion-jwks.json, which the upstream verifies against. A stored Connection whose keys can no longer be used is left out of that set, with a diagnostic, rather than stopping the gateway, and its calls are refused with caller_assertion_key_not_published until its keys load again. Omit the block to send only the credential.",
+      "description": "Attests the calling principal to the upstream on every manual HTTP, managed OpenAPI and managed MCP tool call and every proxied request made through this Connection, alongside the primary credential rather than instead of it: the credential says which system is calling, the assertion says on whose behalf, so an upstream the operator controls can apply its own per-user checks. Per request the gateway signs one short-lived JWT naming the validated principal (sub is the identity provider's issuer, '#', and its subject; jti is the gateway request ID, with '.' and a sequence number for each request of a managed MCP tool call's session) and writes it, as the last header, in header_name; with bind_request it also binds the method, the request target and the SHA-256 of the exact body sent. A call with no principal to name, a service token included, is refused with caller_assertion_no_principal before any network or secret I/O. The endpoint must use https. Lanes with no caller to attest (discovery, enum and label sources, stored tests) and composite tool steps are refused with caller_assertion_not_enforced, as is every lane but manual tools and stored tests, which run as the principal who asks for them, on a delegated_issuer_token Connection and every lane for a stored block only an earlier release accepted. Saving an enabled Connection resolves its signing key and every published key, from whichever secret source holds it, and loads each for its algorithm; a key that cannot be used refuses the save, and every call reads and loads the signing key again. The public halves of every enabled Connection's keys are served at /.well-known/caller-assertion-jwks.json, which the upstream verifies against. A stored Connection whose keys can no longer be used is left out of that set, with a diagnostic, rather than stopping the gateway, and its calls are refused with caller_assertion_key_not_published until its keys load again. Omit the block to send only the credential.",
       "required": [
         "signing_key_configured",
         "kid",
@@ -449,7 +449,7 @@
         {
           "type": "object",
           "additionalProperties": false,
-          "description": "The calling user's own upstream token, obtained per caller from a trusted issuer by OAuth 2.0 token exchange (RFC 8693) and injected as Authorization: Bearer. The subject token is a JWT signed with this Connection's caller_assertion key naming the validated caller; the caller's own inbound bearer token is never forwarded. Requires kind http_api and a caller_assertion block without bind_request, whose assertion goes to the issuer only. Only manual HTTP tool calls are served; a call with no principal, a service token included, is refused with delegated_token_no_principal. The admin UI shows this type read only.",
+          "description": "The calling user's own upstream token, obtained per caller from a trusted issuer by OAuth 2.0 token exchange (RFC 8693) and injected as Authorization: Bearer. The subject token is a JWT signed with this Connection's caller_assertion key naming the validated caller; the caller's own inbound bearer token is never forwarded. Requires kind http_api and a caller_assertion block without bind_request, whose assertion goes to the issuer only. Only manual HTTP tool calls are served, and stored Connection tests, which exchange the testing principal's own token inline, use it for the one test request and cache nothing; a call or test with no principal, a service token included, is refused with delegated_token_no_principal, and a test of a disabled Connection, whose keys are not published, with caller_assertion_key_not_published. The admin UI creates and edits this type, and writes its caller_assertion block only when it creates the Connection.",
           "required": [
             "type",
             "token_exchange_url",
@@ -4135,6 +4135,81 @@
         }
       }
     },
+    "OpenApiConversionReport": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "How a document that was not OpenAPI 3.x was converted to OpenAPI 3.0 before generation (issue #443).",
+      "required": [
+        "source_format",
+        "warnings"
+      ],
+      "properties": {
+        "source_format": {
+          "enum": [
+            "swagger_2_0"
+          ]
+        },
+        "warnings": {
+          "type": "array",
+          "maxItems": 4096,
+          "items": {
+            "$ref": "#/$defs/OpenApiConversionWarning"
+          }
+        }
+      }
+    },
+    "OpenApiConversionWarning": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "code",
+        "message",
+        "operation_omitted"
+      ],
+      "properties": {
+        "code": {
+          "enum": [
+            "base_path_not_in_paths",
+            "unsupported_document_field",
+            "unsupported_path_item_field",
+            "security_definition_not_converted",
+            "consumes_defaulted",
+            "produces_defaulted",
+            "request_body_not_mapped",
+            "unsupported_operation_field",
+            "invalid_parameter",
+            "unsupported_parameter_location",
+            "unsupported_parameter_field",
+            "unsupported_collection_format",
+            "file_parameter_outside_form",
+            "multiple_body_parameters",
+            "body_and_form_parameters",
+            "warnings_truncated"
+          ]
+        },
+        "message": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Fixed text for the code; it never contains document content."
+        },
+        "operation_omitted": {
+          "type": "boolean",
+          "description": "True when the named operation was left out of the converted document, so no tool was generated for it."
+        },
+        "method": {
+          "type": "string"
+        },
+        "path_template": {
+          "type": "string",
+          "maxLength": 256
+        },
+        "subject": {
+          "type": "string",
+          "maxLength": 256,
+          "description": "The field, parameter, location, security definition or base path the warning names, cut to 256 bytes."
+        }
+      }
+    },
     "OpenApiPreviewResponse": {
       "type": "object",
       "additionalProperties": false,
@@ -4207,6 +4282,10 @@
         },
         "overlay": {
           "$ref": "#/$defs/OpenApiOverlayReport"
+        },
+        "conversion": {
+          "$ref": "#/$defs/OpenApiConversionReport",
+          "description": "Present only when the submitted document was not OpenAPI 3.x and was converted to OpenAPI 3.0 before generation."
         }
       }
     },
@@ -5514,7 +5593,7 @@
         {
           "type": "object",
           "additionalProperties": false,
-          "description": "The calling user's own upstream token, obtained per caller from a trusted issuer by OAuth 2.0 token exchange (RFC 8693) and injected as Authorization: Bearer. The subject token is a JWT signed with this Connection's caller_assertion key naming the validated caller; the caller's own inbound bearer token is never forwarded. Requires kind http_api and a caller_assertion block without bind_request, whose assertion goes to the issuer only. Only manual HTTP tool calls are served; a call with no principal, a service token included, is refused with delegated_token_no_principal. The admin UI shows this type read only.",
+          "description": "The calling user's own upstream token, obtained per caller from a trusted issuer by OAuth 2.0 token exchange (RFC 8693) and injected as Authorization: Bearer. The subject token is a JWT signed with this Connection's caller_assertion key naming the validated caller; the caller's own inbound bearer token is never forwarded. Requires kind http_api and a caller_assertion block without bind_request, whose assertion goes to the issuer only. Only manual HTTP tool calls are served, and stored Connection tests, which exchange the testing principal's own token inline, use it for the one test request and cache nothing; a call or test with no principal, a service token included, is refused with delegated_token_no_principal, and a test of a disabled Connection, whose keys are not published, with caller_assertion_key_not_published. The admin UI creates and edits this type, and writes its caller_assertion block only when it creates the Connection.",
           "required": [
             "type",
             "token_exchange_url",
