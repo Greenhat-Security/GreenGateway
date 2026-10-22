@@ -19,6 +19,10 @@ use tokio_util::sync::CancellationToken as StopSignal;
 use super::*;
 use crate::connections::{
     model::SubjectTokenSource,
+    test::{
+        ConnectionTestReason, ConnectionTestResult, ConnectionTestService, ConnectionTestStage,
+        ConnectionTestStageName,
+    },
     token_exchange::{DelegatedTokenPurgeTrigger, ManualTokenClock},
 };
 
@@ -409,7 +413,12 @@ async fn delegated_connection(
         tls: TlsProfile::default(),
         timeouts: None,
         discovery: None,
-        test_profile: None,
+        // What a stored Connection test sends, as the principal running it.
+        test_profile: Some(crate::connections::model::ConnectionTestProfile {
+            method: "GET".to_owned(),
+            path: "/messages".to_owned(),
+            expected_statuses: vec![200],
+        }),
     };
     control_plane
         .ensure_deferred_bindings_resolvable(&write)
@@ -1463,4 +1472,235 @@ async fn a_refused_unavailable_or_disallowed_revocation_is_audited_once_and_neve
     assert_eq!(revocation.payload["issuer_status"], Value::Null);
     assert_eq!(disallowed.secrets.resolutions(), saved);
     assert_eq!(disallowed.deployment.revocation_count(), 0);
+}
+
+/// The stored test of the harness's Connection, run as `tester` the way the admin endpoint runs
+/// it for the principal who asked.
+async fn test_connection_as(harness: &Harness, tester: Option<&Principal>) -> ConnectionTestResult {
+    let record = harness
+        .connection
+        .control_plane
+        .runtime_snapshot()
+        .managed()
+        .values()
+        .next()
+        .cloned()
+        .expect("the Connection is stored");
+    let tester = tester.and_then(AttestedCaller::from_principal);
+    ConnectionTestService::new(harness.connection.runtime.clone())
+        .execute_as(&record, record.etag().as_str(), tester.as_ref())
+        .await
+        .result
+}
+
+#[tokio::test]
+async fn a_connection_test_runs_as_the_tester_with_a_token_it_never_caches() {
+    let (logs, _logs_guard) = capture_all_logs();
+    let harness = harness(Issuer::Grant { expires_in: 3_600 }).await;
+    let alice = bearer("alice", &["mail:read"]);
+    let bob = bearer("bob", &["mail:read"]);
+
+    for tester in [&alice, &bob, &alice] {
+        let result = test_connection_as(&harness, Some(tester)).await;
+        assert!(result.ok, "{:?}", result.stages);
+        assert_eq!(
+            result.stages,
+            [
+                ConnectionTestStage::success(ConnectionTestStageName::EgressPolicy),
+                ConnectionTestStage::success(ConnectionTestStageName::SecretAvailable),
+                ConnectionTestStage::success(ConnectionTestStageName::Connected),
+                ConnectionTestStage::not_applicable(ConnectionTestStageName::TlsValid),
+                ConnectionTestStage::success(ConnectionTestStageName::Authenticated),
+                ConnectionTestStage::success(ConnectionTestStageName::ProtocolValid),
+            ]
+        );
+    }
+
+    // Each test exchanged for its own tester and sent its one request with that tester's token.
+    // Nothing was cached, so alice's second test exchanged again rather than reusing her first
+    // token, and no later call can be served a token a test obtained.
+    assert_eq!(harness.deployment.exchange_count(), 3);
+    assert_eq!(harness.deployment.upstream_count(), 3);
+    assert_eq!(
+        harness.connection.runtime.delegated_token_cache_entries(),
+        0
+    );
+    harness.deployment.with_requests(|requests| {
+        let upstream: Vec<_> = requests
+            .iter()
+            .filter(|request| request.target != EXCHANGE_PATH)
+            .collect();
+        for request in &upstream {
+            assert_eq!(request.target, "/v1/messages");
+            assert_eq!(request.header_count("x-caller-assertion"), 0);
+        }
+        let bearers: Vec<_> = upstream
+            .iter()
+            .filter_map(|request| request.header("authorization"))
+            .collect();
+        assert_eq!(
+            bearers,
+            [
+                "Bearer delegated-alice-1",
+                "Bearer delegated-bob-2",
+                "Bearer delegated-alice-3",
+            ]
+        );
+    });
+    let mut subject_tokens = Vec::new();
+    harness.deployment.with_requests(|requests| {
+        for request in requests {
+            if request.target == EXCHANGE_PATH {
+                subject_tokens
+                    .extend(form_field(&form_fields(request), "subject_token").map(str::to_owned));
+            }
+        }
+    });
+    let mut testers = Vec::new();
+    for token in &subject_tokens {
+        testers.push(verify_subject_token(&harness.connection, token).await["caller_sub"].clone());
+    }
+    assert_eq!(testers, [json!("alice"), json!("bob"), json!("alice")]);
+
+    // A tool call afterwards exchanges for itself, and only it fills the cache.
+    harness
+        .call(&alice, "request-after-test")
+        .await
+        .expect("alice's call");
+    assert_eq!(harness.deployment.exchange_count(), 4);
+    assert_eq!(
+        harness.connection.runtime.delegated_token_cache_entries(),
+        1
+    );
+
+    harness
+        .wait_for(audit::event::CONNECTION_DELEGATED_TOKEN_EXCHANGE, 4)
+        .await;
+    let actors: Vec<_> = harness
+        .events_of(audit::event::CONNECTION_DELEGATED_TOKEN_EXCHANGE)
+        .iter()
+        .map(|exchange| {
+            assert_eq!(exchange.payload["outcome"], json!("success"));
+            exchange
+                .actor
+                .as_ref()
+                .map(|actor| actor.user_id.clone())
+                .expect("the exchange names its tester")
+        })
+        .collect();
+    assert_eq!(actors, ["alice", "bob", "alice", "alice"]);
+
+    let rendered_audit =
+        serde_json::to_string(&harness.capture.events()).expect("audit serializes");
+    let rendered_logs = logs.contents();
+    for canary in harness.secrets_on_the_wire() {
+        assert!(!rendered_audit.contains(&canary), "audit leaked {canary:?}");
+        assert!(!rendered_logs.contains(&canary), "logs leaked {canary:?}");
+    }
+}
+
+#[tokio::test]
+async fn a_connection_test_reports_why_the_tester_got_no_token_and_sends_nothing_upstream() {
+    let harness = harness(Issuer::Deny).await;
+    let saved = harness.secrets.resolutions();
+    let alice = bearer("alice", &["mail:read"]);
+
+    // Nobody an issuer could look up: no principal, a service token, or a principal without an
+    // identity-provider issuer. Refused before the egress preflight or any secret read.
+    let service = Principal {
+        auth_method: AuthMethod::ServiceToken,
+        ..bearer("service-token:svc_1", &["mail:read"])
+    };
+    let without_issuer = Principal {
+        issuer: None,
+        ..bearer("carol", &["mail:read"])
+    };
+    for tester in [None, Some(&service), Some(&without_issuer)] {
+        let result = test_connection_as(&harness, tester).await;
+        assert!(!result.ok);
+        assert_eq!(
+            result.stages,
+            [ConnectionTestStage::failure(
+                ConnectionTestStageName::SecretAvailable,
+                ConnectionTestReason::DelegatedTokenNoPrincipal,
+            )]
+        );
+    }
+    assert_eq!(harness.secrets.resolutions(), saved);
+    assert_eq!(harness.deployment.exchange_count(), 0);
+
+    // The issuer refusing the tester, and the issuer failing, each keep the reason a tool call
+    // would report, and the upstream is never contacted.
+    for (issuer, reason) in [
+        (Issuer::Deny, ConnectionTestReason::DelegatedTokenDenied),
+        (
+            Issuer::Fail,
+            ConnectionTestReason::DelegatedTokenExchangeFailed,
+        ),
+    ] {
+        harness.deployment.set_issuer(issuer);
+        let result = test_connection_as(&harness, Some(&alice)).await;
+        assert!(!result.ok);
+        assert_eq!(
+            result.stages,
+            [
+                ConnectionTestStage::success(ConnectionTestStageName::EgressPolicy),
+                ConnectionTestStage::failure(ConnectionTestStageName::SecretAvailable, reason),
+            ]
+        );
+    }
+    assert_eq!(harness.deployment.exchange_count(), 2);
+    assert_eq!(harness.deployment.upstream_count(), 0);
+    assert_eq!(
+        harness.connection.runtime.delegated_token_cache_entries(),
+        0
+    );
+    harness
+        .wait_for(audit::event::CONNECTION_DELEGATED_TOKEN_EXCHANGE, 2)
+        .await;
+    for exchange in harness.events_of(audit::event::CONNECTION_DELEGATED_TOKEN_EXCHANGE) {
+        assert_eq!(exchange.payload["outcome"], json!("failure"));
+        assert_eq!(
+            exchange.actor.as_ref().map(|actor| actor.user_id.as_str()),
+            Some("alice")
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_disabled_delegated_connection_is_not_tested_because_its_keys_are_not_published() {
+    let harness = harness(Issuer::Grant { expires_in: 3_600 }).await;
+    let current = harness
+        .connection
+        .control_plane
+        .runtime_snapshot()
+        .managed()
+        .values()
+        .next()
+        .cloned()
+        .expect("the Connection is stored");
+    let mut disabled = current.write.clone();
+    disabled.enabled = false;
+    harness
+        .connection
+        .control_plane
+        .replace_managed(&current.id, &current.etag(), disabled, "test-admin")
+        .await
+        .expect("the Connection disables");
+    let saved = harness.secrets.resolutions();
+
+    // The JWKS carries enabled Connections' keys only, so the issuer could not verify the
+    // tester's subject token: the test says so instead of asking the issuer.
+    let result = test_connection_as(&harness, Some(&bearer("alice", &["mail:read"]))).await;
+    assert!(!result.ok);
+    assert_eq!(
+        result.stages,
+        [ConnectionTestStage::failure(
+            ConnectionTestStageName::Authenticated,
+            ConnectionTestReason::CallerAssertionKeyNotPublished,
+        )]
+    );
+    assert_eq!(harness.secrets.resolutions(), saved);
+    assert_eq!(harness.deployment.exchange_count(), 0);
+    assert_eq!(harness.deployment.upstream_count(), 0);
 }

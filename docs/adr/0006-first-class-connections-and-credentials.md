@@ -303,11 +303,18 @@ is explicit.
   or fragment) and passes the token client's egress check before any key or
   secret is read.
 - Only the manual HTTP tool-call lane obtains a caller's own token, so only it
-  serves such a Connection; every other lane, the ones that attest an ordinary
-  Connection's caller included, refuses it through the caller-assertion
-  refusal. A call with no principal, or a service token's, is
+  serves such a Connection among the call lanes; every other one, the ones
+  that attest an ordinary Connection's caller included, refuses it through the
+  caller-assertion refusal. A call with no principal, or a service token's, is
   refused with `delegated_token_no_principal`. There is no fallback to a
   service identity.
+- A stored Connection test has no caller of its own, so it is run as the
+  administrator who asks for it, as the admin playground already calls tools:
+  the test exchanges that principal's token inline, under the test deadline
+  like an OAuth probe's mint, uses it for the one test request and caches
+  nothing. A test therefore proves the tester's grant only. A disabled
+  Connection's keys are not in the JWKS, so its test is refused before any I/O
+  rather than sending the issuer a subject token it cannot verify.
 - The token cache reuses the OAuth cache's single flight and generation-bound
   `401` invalidation, adds the attested caller to the key, holds at most 1,024
   entries, never reuses a token for more than 900 seconds, and drops every
