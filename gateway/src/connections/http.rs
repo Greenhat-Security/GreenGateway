@@ -714,8 +714,9 @@ impl ConnectionHttpRuntime {
 
     /// The target of one manual HTTP tool call. Like every attesting lane's
     /// constructor it serves a Connection carrying a `caller_assertion`, and
-    /// it is the only tool lane that serves a `delegated_issuer_token`
-    /// Connection, whose assertion is the subject token of its exchange.
+    /// it is one of the two tool lanes, with [`Self::openapi_tool_target`],
+    /// that serve a `delegated_issuer_token` Connection, whose assertion is
+    /// the subject token of its exchange.
     ///
     /// A lane may attest its caller when it has a validated principal to
     /// attest and the exact bytes it sends in hand before it sends them: tool
@@ -747,10 +748,11 @@ impl ConnectionHttpRuntime {
     }
 
     /// The target of one managed OpenAPI tool call, attested like a manual
-    /// tool's; see [`Self::tool_call_target`]. A `delegated_issuer_token`
-    /// Connection is refused with `caller_assertion_not_enforced`, as before
-    /// OpenAPI tools signed anything: only manual tools obtain the caller's
-    /// own token.
+    /// tool's; see [`Self::tool_call_target`]. Like a manual tool's, it
+    /// serves a `delegated_issuer_token` Connection: the call runs through
+    /// the same executor path, which obtains the caller's own token, so a
+    /// catalog whose user-consent schemes bound to the per-caller credential
+    /// (issue #443) sends each caller's token and no one else's.
     pub fn openapi_tool_target(
         &self,
         connection_id: &str,
@@ -2090,10 +2092,11 @@ fn refuse_unenforced_caller_assertion(
 /// caller, and so may serve a Connection carrying a `caller_assertion`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AttestingLane {
-    /// A manual HTTP tool call. The one tool lane that also serves a
-    /// `delegated_issuer_token` Connection.
+    /// A manual HTTP tool call. It also serves a `delegated_issuer_token`
+    /// Connection.
     ManualTool,
-    /// A managed OpenAPI tool call.
+    /// A managed OpenAPI tool call. It also serves a `delegated_issuer_token`
+    /// Connection, for the catalogs bound to it (issue #443).
     OpenApiTool,
     /// One leaf request of a composite tool, each signed separately.
     CompositeLeaf,
@@ -2113,12 +2116,13 @@ pub enum AttestingLane {
 /// A stored block only the legacy reading admits is served by no lane (see
 /// [`ConnectionWrite::caller_assertion_enforceable`]). A
 /// `delegated_issuer_token` Connection, whose assertion is the subject token
-/// of the caller's own credential, is served by manual tool calls and by
-/// stored tests alone: those are the lanes that obtain a caller's delegated
-/// token, so on every other lane the Connection stays refused exactly as it
-/// was before those lanes signed anything. A stored test serves no other
-/// attested Connection: it would have to send the upstream an assertion
-/// naming the tester, which no operator configured a test to do.
+/// of the caller's own credential, is served by manual and managed OpenAPI
+/// tool calls and by stored tests alone: those are the lanes that obtain a
+/// caller's delegated token, so on every other lane the Connection stays
+/// refused exactly as it was before those lanes signed anything. A stored
+/// test serves no other attested Connection: it would have to send the
+/// upstream an assertion naming the tester, which no operator configured a
+/// test to do.
 ///
 /// [`ConnectionWrite::caller_assertion_enforceable`]:
 ///     super::model::ConnectionWrite::caller_assertion_enforceable
@@ -2132,10 +2136,9 @@ pub fn caller_assertion_servable_on(write: &ConnectionWrite, lane: AttestingLane
     );
     write.caller_assertion_enforceable()
         && match lane {
-            AttestingLane::ManualTool => true,
+            AttestingLane::ManualTool | AttestingLane::OpenApiTool => true,
             AttestingLane::ConnectionTest => delegated,
-            AttestingLane::OpenApiTool
-            | AttestingLane::CompositeLeaf
+            AttestingLane::CompositeLeaf
             | AttestingLane::ProxyRoute
             | AttestingLane::ManagedMcpTool => !delegated,
         }
@@ -3723,11 +3726,40 @@ mod tests {
         // A delegated subject token is never a request binding.
         assert!(!target.caller_assertion_binds_request_body());
 
+        // A managed OpenAPI tool is served the same way (issue #443): its
+        // target carries the caller's own credential and keeps the
+        // assertion for the issuer alone.
+        let openapi = temporary
+            .runtime
+            .openapi_tool_target(connection_id, "/messages")
+            .expect("a delegated Connection serves managed OpenAPI tool calls");
+        assert_eq!(openapi.authentication_kind(), "delegated_issuer_token");
+        assert!(openapi.credential_belongs_to_caller());
+        assert_eq!(openapi.credential_header_names(), &[header::AUTHORIZATION]);
+        assert!(temporary
+            .runtime
+            .caller_assertion_signer(&openapi)
+            .await
+            .expect("nothing is loaded")
+            .is_none());
+        assert_eq!(
+            temporary
+                .runtime
+                .resolve_credential(&openapi, None)
+                .await
+                .err(),
+            Some(ConnectionHttpError::DelegatedTokenNoPrincipal)
+        );
+        assert!(temporary
+            .runtime
+            .validate_openapi_tool_binding(connection_id)
+            .is_ok());
+
         // Every other tool and proxy lane refuses it before preparing
         // anything, because it carries the caller assertion its subject token
         // is signed with. That includes the lanes that attest their callers:
-        // only a manual tool obtains a caller's own delegated token, and a
-        // stored test its tester's (see the next test).
+        // only a manual or managed OpenAPI tool obtains a caller's own
+        // delegated token, and a stored test its tester's (see the next test).
         let refused = Some(ConnectionHttpError::CallerAssertionNotEnforced);
         assert_eq!(
             temporary.runtime.target(connection_id, "/messages").err(),
@@ -3735,20 +3767,6 @@ mod tests {
         );
         assert_eq!(
             temporary.runtime.validate_binding(connection_id).err(),
-            refused
-        );
-        assert_eq!(
-            temporary
-                .runtime
-                .openapi_tool_target(connection_id, "/messages")
-                .err(),
-            refused
-        );
-        assert_eq!(
-            temporary
-                .runtime
-                .validate_openapi_tool_binding(connection_id)
-                .err(),
             refused
         );
         assert_eq!(
@@ -3766,21 +3784,19 @@ mod tests {
             refused
         );
         for lane in [
-            AttestingLane::OpenApiTool,
             AttestingLane::CompositeLeaf,
             AttestingLane::ProxyRoute,
             AttestingLane::ManagedMcpTool,
         ] {
             assert!(!caller_assertion_servable_on(&stored.write, lane));
         }
-        assert!(caller_assertion_servable_on(
-            &stored.write,
-            AttestingLane::ManualTool
-        ));
-        assert!(caller_assertion_servable_on(
-            &stored.write,
-            AttestingLane::ConnectionTest
-        ));
+        for lane in [
+            AttestingLane::ManualTool,
+            AttestingLane::OpenApiTool,
+            AttestingLane::ConnectionTest,
+        ] {
+            assert!(caller_assertion_servable_on(&stored.write, lane));
+        }
     }
 
     #[tokio::test]

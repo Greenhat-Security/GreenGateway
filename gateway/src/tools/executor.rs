@@ -1392,11 +1392,10 @@ impl ToolExecutor {
                         reason: "connection_runtime_unavailable",
                     })
                     .and_then(|runtime| {
-                        // Both tool lanes sign a caller assertion. Each has its
-                        // own constructor, the one its registry binding is
-                        // validated with, so a binding and its calls cannot
-                        // disagree: a managed OpenAPI tool, unlike a manual
-                        // one, still refuses a delegated Connection.
+                        // Both tool lanes sign a caller assertion and serve a
+                        // delegated Connection. Each has its own constructor,
+                        // the one its registry binding is validated with, so a
+                        // binding and its calls cannot disagree.
                         if matches!(source, ToolSource::Manual) {
                             runtime.tool_call_target(connection_id, &request.path_and_query)
                         } else {

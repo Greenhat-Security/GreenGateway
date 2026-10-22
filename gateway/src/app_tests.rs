@@ -13233,14 +13233,46 @@ async fn managed_openapi_preview_reports_google_discovery_conversion_and_registe
         vec![json!("widgets.widgets.get")],
         "tools are named by their Discovery method IDs; the omitted method generates none"
     );
-    assert!(
-        preview["incompatibilities"]
-            .as_array()
-            .expect("preview should list incompatibilities")
+    // A scoped method needs a token for the user, which this Connection's
+    // shared credential is not, and the preview says so per alternative.
+    let incompatibilities = preview["incompatibilities"]
+        .as_array()
+        .expect("preview should list incompatibilities");
+    assert_eq!(
+        incompatibilities
             .iter()
-            .any(|incompatibility| incompatibility["tool_name"] == json!("widgets.widgets.list")),
-        "a scoped method needs an OAuth 2.0 credential the Connection does not have: {preview}"
+            .find(|incompatibility| incompatibility["tool_name"] == json!("widgets.widgets.list")),
+        Some(&json!({
+            "tool_name": "widgets.widgets.list",
+            "reason": "no_compatible_security_alternative",
+            "security_alternatives": [{
+                "scheme_names": ["Oauth2"],
+                "reason": "oauth2_without_client_credentials",
+                "message": "the OAuth 2.0 scheme has no clientCredentials flow, so it needs a token for the user; bind it with a per-caller Connection such as delegated_issuer_token"
+            }]
+        })),
+        "{preview}"
     );
+    let schema: Value = serde_json::from_str(
+        &std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../docs/schemas/connection-admin.v1.schema.json"),
+        )
+        .expect("the admin schema should read"),
+    )
+    .expect("the admin schema should parse");
+    let incompatibility_schema = jsonschema::validator_for(&json!({
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "$defs": schema["$defs"].clone(),
+        "$ref": "#/$defs/OpenApiIncompatibility"
+    }))
+    .expect("the incompatibility schema should compile");
+    for incompatibility in incompatibilities {
+        assert!(
+            incompatibility_schema.is_valid(incompatibility),
+            "{incompatibility} should match the published schema"
+        );
+    }
 
     let registered = preview_and_register_managed_openapi(
         &router,

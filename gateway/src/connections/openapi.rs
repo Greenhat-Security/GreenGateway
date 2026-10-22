@@ -278,9 +278,8 @@ pub enum OpenApiCatalogError {
     AuthenticationMismatch,
     /// The Connection asks for a signed caller assertion that this operation
     /// cannot honour: fetching the specification is discovery, which has no
-    /// caller to attest, and a block only an earlier release accepted, or a
-    /// delegated credential, is honoured by no OpenAPI lane. Nothing is
-    /// fetched or published for it.
+    /// caller to attest, and a block only an earlier release accepted is
+    /// honoured by no OpenAPI lane. Nothing is fetched or published for it.
     CallerAssertionNotEnforced,
     ToolConflict,
     EgressDenied,
@@ -2928,9 +2927,10 @@ fn supports_managed_openapi_catalog(record: &StoredConnection) -> bool {
 /// Whether a Connection's stored OpenAPI catalog may be live in the registry.
 ///
 /// Its tools sign a caller assertion on every call, so a Connection that
-/// attests its caller keeps its catalog. One whose block no OpenAPI tool can
-/// honour -- a block only an earlier release accepted, or a
-/// `delegated_issuer_token` credential -- is withdrawn like one on a disabled
+/// attests its caller keeps its catalog, and so does a
+/// `delegated_issuer_token` Connection, whose tools obtain each caller's own
+/// token (issue #443). One whose block no OpenAPI tool can honour -- a block
+/// only an earlier release accepted -- is withdrawn like one on a disabled
 /// Connection: every call would be refused, and the binding validation each
 /// registry change runs refuses its tools, so leaving them installed would
 /// fail every later change to any lane, and a restart.
@@ -3925,6 +3925,151 @@ paths:
             OpenApiCatalogError::CallerAssertionNotEnforced.safe_reason(),
             "caller_assertion_not_enforced"
         );
+    }
+
+    const DELEGATED_TEST_SPEC: &str = r#"
+openapi: 3.0.3
+info:
+  title: Mail
+  version: 1.0.0
+components:
+  securitySchemes:
+    MailAuth:
+      type: oauth2
+      flows:
+        authorizationCode:
+          authorizationUrl: https://mail.example.test/oauth/authorize
+          tokenUrl: https://mail.example.test/oauth/token
+          scopes:
+            mail.read: Read mail
+            mail.send: Send mail
+paths:
+  /messages:
+    get:
+      operationId: list_messages
+      security:
+        - MailAuth: [mail.read]
+    post:
+      operationId: send_message
+      security:
+        - MailAuth: [mail.send]
+"#;
+
+    #[tokio::test]
+    async fn a_delegated_connection_registers_the_user_consent_operations_its_scopes_grant() {
+        let database = TemporaryDatabase::new();
+        let mut config = Config::test_defaults();
+        config.connections_sqlite_path = Some(database.0.display().to_string());
+        let secrets = crate::connections::test_support::AssertionSigningKeyRoot::new();
+        secrets.configure(&mut config);
+        secrets.bind_secret(
+            &mut config,
+            "issuer-exchange-secret",
+            b"issuer-exchange-value",
+        );
+        let control_plane =
+            ConnectionControlPlane::from_config(&config).expect("control plane should build");
+        let snapshot = control_plane.runtime_snapshot();
+        let candidate: ConnectionWrite = serde_json::from_value(json!({
+            "display_name": "Delegated Mail OpenAPI",
+            "enabled": true,
+            "kind": "http_api",
+            "endpoint": {
+                "base_url": "https://mail.example.test",
+                "base_path": "/v1"
+            },
+            "authentication": {
+                "type": "delegated_issuer_token",
+                "token_exchange_url": "https://issuer.example.test/oauth2/token-exchange",
+                "client_id": "greengateway",
+                "client_secret_id": "issuer-exchange-secret",
+                "requested_scopes": ["mail.read"],
+                "subject_token_source": "caller_assertion"
+            },
+            "caller_assertion": caller_assertion_json(),
+            "tls": {},
+            "discovery": {
+                "type": "managed_openapi",
+                "path": "/openapi.json",
+                "use_connection_authentication": false
+            }
+        }))
+        .expect("delegated OpenAPI Connection should deserialize");
+        let record = control_plane
+            .create_managed(snapshot.collection_etag(), candidate, "test-admin")
+            .await
+            .expect("delegated OpenAPI Connection should create");
+        // The default egress policy denies every host, so a regression that
+        // reached the spec fetch or an exchange would fail as `egress_denied`.
+        let egress_config = EgressConfig::from_config(&config);
+        let egress_client =
+            Arc::new(EgressClient::new(egress_config.clone()).expect("egress should build"));
+        let http = ConnectionHttpRuntime::new(control_plane.clone(), egress_config, egress_client);
+        let registry = ToolRegistry::disabled();
+        let service =
+            OpenApiConnectionCatalogService::load(control_plane.clone(), http, registry.clone())
+                .expect("managed OpenAPI service should load");
+        let spec = DELEGATED_TEST_SPEC;
+
+        // The authorization-code scheme binds to the per-caller credential
+        // for the scope it requests; the send operation needs one it does
+        // not, and the preview says which.
+        let preview = service
+            .preview(record.id.as_str(), spec)
+            .await
+            .expect("a delegated Connection previews an uploaded specification");
+        assert_eq!(
+            preview
+                .binding
+                .definitions
+                .iter()
+                .map(|definition| definition.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["list_messages"]
+        );
+        let [send] = preview.binding.incompatibilities.as_slice() else {
+            panic!("only the send operation should be incompatible");
+        };
+        assert_eq!(send.tool_name, "send_message");
+        assert_eq!(
+            send.security_mismatches,
+            vec![openapi::OpenApiSecurityMismatch {
+                scheme_names: vec!["MailAuth".to_owned()],
+                reason: openapi::OpenApiSecurityMismatchReason::MissingScopes {
+                    scopes: vec!["mail.send".to_owned()],
+                },
+            }]
+        );
+
+        service
+            .register(
+                record.id.as_str(),
+                record.etag().as_str(),
+                preview.spec_revision,
+                preview.catalog_revision,
+                &preview.spec_digest,
+                spec,
+                &["list_messages".to_owned()],
+                &preview.binding.security_selections,
+                "test-admin",
+            )
+            .await
+            .expect("a delegated Connection registers the operation its scopes bind");
+        assert!(registry.get("list_messages").is_some());
+        assert!(registry.get("send_message").is_none());
+        assert!(service.runtime().current_revision(&record.id).is_some());
+
+        // Fetching the specification from the upstream has no caller to
+        // exchange a token for: refused before any request, and the
+        // registered catalog stays served.
+        assert_eq!(
+            service
+                .refresh(record.id.as_str(), record.etag().as_str(), "test-admin")
+                .await
+                .err(),
+            Some(OpenApiCatalogError::CallerAssertionNotEnforced)
+        );
+        assert!(registry.get("list_messages").is_some());
     }
 
     #[tokio::test]

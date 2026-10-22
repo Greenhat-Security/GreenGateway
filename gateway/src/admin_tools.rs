@@ -941,6 +941,18 @@ pub(super) fn managed_openapi_incompatibility_response(
         reason,
         path_template,
         detail,
+        security_alternatives: incompatibility
+            .security_mismatches
+            .into_iter()
+            .map(|mismatch| ManagedOpenApiSecurityMismatchResponse {
+                reason: mismatch.reason.as_str(),
+                message: mismatch.reason.message(),
+                missing_scopes: mismatch.reason.missing_scopes().to_vec(),
+                scheme_names: mismatch.scheme_names,
+            })
+            .collect(),
+        unexplained_security_alternatives: (incompatibility.unexplained_security_alternatives > 0)
+            .then_some(incompatibility.unexplained_security_alternatives),
     }
 }
 
