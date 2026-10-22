@@ -54,7 +54,7 @@ use crate::{
         signals::{DEFAULT_SCHEMA_MISMATCH_SIGNAL_THRESHOLD, SCHEMA_MISMATCH_SIGNAL_TYPE},
     },
     egress::EgressConfig,
-    rbac::{Policy, PrincipalMatcher, Rule, RuleAction},
+    rbac::Policy,
     tools::{
         definitions::{EnumBinding, HttpToolMapping, ToolVisibility},
         overlay::{
@@ -845,24 +845,35 @@ async fn composite_step_http_deny_blocks_rendered_path_before_member_io() {
         "delete_attachment",
         "delete_note",
     ];
-    let mut config = runtime_config(
+    let config = runtime_config(
         tool_names.map(|name| (name, enabled_tool(5_000, 1))),
         2,
         1,
         100,
     );
-    config.rules.push(Rule {
-        id: Some("deny-rendered-attachment".to_owned()),
-        enabled: true,
-        methods: vec!["POST".to_owned()],
-        path: "/attachments/blocked".to_owned(),
-        tool_name: None,
-        dispatch: None,
-        principal: PrincipalMatcher::default(),
-        action: RuleAction::Deny,
-    });
-    let (executor, _capture) =
-        executor_for_composite_definitions_with_config(definitions, &connection, config);
+    // A rendered-HTTP rule judges a member only through the policy's
+    // `RbacState`, the one place a policy's rules apply.
+    let policy = Policy::validate_json_value(json!({
+        "schema_version": "0.1.0",
+        "tools": tool_names
+            .iter()
+            .map(|name| ((*name).to_owned(), json!({"timeout_ms": 5_000, "max_concurrent": 1})))
+            .collect::<serde_json::Map<_, _>>(),
+        "rules": [{
+            "id": "deny-rendered-attachment",
+            "methods": ["POST"],
+            "path": "/attachments/blocked",
+            "action": "deny"
+        }]
+    }))
+    .expect("the composite member policy should validate");
+    let (executor, _capture) = executor_for_composite_definitions_with_config_and_leases(
+        definitions,
+        &connection,
+        config,
+        Some(policy),
+        None,
+    );
 
     let error = executor
         .execute(
@@ -1135,6 +1146,7 @@ async fn composite_lease_loss_sends_no_compensation_tail_after_runtime_returns()
         definitions,
         &connection,
         config,
+        None,
         Some(leases),
     );
     let running = tokio::spawn({
@@ -5117,13 +5129,17 @@ fn executor_for_composite_definitions_with_config(
         connection,
         runtime_config,
         None,
+        None,
     )
 }
 
+/// `policy`, when given, decides through the `RbacState` built from it;
+/// otherwise the runtime's own entries decide and no rule applies.
 fn executor_for_composite_definitions_with_config_and_leases(
     definitions: Vec<ToolDefinition>,
     connection: &TemporaryStaticAuthRuntime,
     runtime_config: ToolRuntimeConfig,
+    policy: Option<Policy>,
     leases: Option<Arc<dyn crate::tools::lease::ExecutionLeaseStore>>,
 ) -> (ToolExecutor, CaptureSink) {
     let record = connection
@@ -5176,8 +5192,15 @@ fn executor_for_composite_definitions_with_config_and_leases(
         .expect("composite definitions should publish");
     let capture = CaptureSink::new();
     let audit = AuditLog::new(Arc::new(capture.clone()) as Arc<dyn AuditSink>);
-    let runtime =
-        ToolRuntime::new_with_rbac_state_and_leases(runtime_config, audit.clone(), None, leases);
+    let rbac_state = policy.map(|policy| {
+        crate::middleware::rbac::RbacState::new(policy, Vec::new(), false, audit.clone())
+    });
+    let runtime = ToolRuntime::new_with_rbac_state_and_leases(
+        runtime_config,
+        audit.clone(),
+        rbac_state,
+        leases,
+    );
     let executor = ToolExecutor::new_inner(
         registry,
         runtime,
@@ -5440,7 +5463,6 @@ fn runtime_config<const N: usize>(
         max_concurrent_global,
         default_policy: DefaultToolPolicy::Deny,
         default_timeout: Duration::from_millis(500),
-        rules: Vec::new(),
         tools: tools
             .into_iter()
             .map(|(name, config)| (name.to_owned(), config))
@@ -5455,7 +5477,6 @@ fn runtime_config_without_tools(default_policy: DefaultToolPolicy) -> ToolRuntim
         max_concurrent_global: 1,
         default_policy,
         default_timeout: Duration::from_millis(500),
-        rules: Vec::new(),
         tools: HashMap::new(),
     }
 }

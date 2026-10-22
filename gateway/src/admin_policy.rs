@@ -287,17 +287,50 @@ pub(super) async fn policy_validate_endpoint(
         Err(response) => return *response,
     };
 
-    match parse_policy_body(&body) {
-        Ok(policy) => match rbac_state.validate_proxy_dispatch_policy(&policy) {
-            Ok(()) => Json(PolicyValidationResponse {
-                valid: true,
-                errors: Vec::new(),
-            })
-            .into_response(),
-            Err(error) => policy_validation_failed(vec![policy_error_message(&error)]),
-        },
-        Err(errors) => policy_validation_failed(errors),
+    let mut inspection = rbac::policy_document::inspect_source(&body);
+    // What the document cannot show about itself: whether this deployment
+    // can enforce and commit it. The same checks refuse a replace.
+    let dispatch_error = inspection.policy().and_then(|policy| {
+        rbac_state
+            .validate_proxy_dispatch_policy(policy)
+            .err()
+            .map(|error| policy_error_message(&error))
+    });
+    if let Some(detail) = dispatch_error {
+        inspection.refuse(
+            rbac::policy_document::IssueCode::DispatchNotConfigured,
+            "/rules",
+            detail,
+        );
     }
+    let format_error = inspection
+        .policy()
+        .and_then(|policy| deployment_document_format_refusal(&state, policy));
+    if let Some(detail) = format_error {
+        inspection.refuse(
+            rbac::policy_document::IssueCode::DocumentFormatUnsupportedInCluster,
+            "/schema_version",
+            detail,
+        );
+    }
+
+    let status = if inspection.is_valid() {
+        StatusCode::OK
+    } else {
+        StatusCode::BAD_REQUEST
+    };
+    (
+        status,
+        Json(PolicyInspectionResponse {
+            valid: inspection.is_valid(),
+            errors: inspection.error_details(),
+            schema_version: inspection.schema_version(),
+            diagnostics: inspection.diagnostics(),
+            source_digest: inspection.source_digest(),
+            semantic_digest: inspection.semantic_digest(),
+        }),
+    )
+        .into_response()
 }
 
 pub(super) async fn policy_rule_post_endpoint(
@@ -1249,11 +1282,11 @@ pub(super) fn parse_openapi_tools_register_body(
     })
 }
 
+/// A whole-policy request body, read from its bytes so a v1 document is
+/// held to its exact-source rules. A 0.x document reports its single error
+/// in the words it always has; a v1 document reports every structural one.
 pub(super) fn parse_policy_body(body: &Bytes) -> Result<rbac::Policy, Vec<String>> {
-    let value = serde_json::from_slice::<Value>(body)
-        .map_err(|err| vec![format!("invalid JSON: {err}")])?;
-
-    rbac::Policy::validate_json_value(value).map_err(|err| vec![policy_error_message(&err)])
+    rbac::policy_document::inspect_source(body).into_policy()
 }
 
 pub(super) fn parse_rule_body(body: &Bytes) -> Result<rbac::Rule, Vec<String>> {
@@ -2130,6 +2163,12 @@ pub(super) async fn persist_policy_mutation(
 /// through [`persist_policy_mutation`] and a discovery suggestion's
 /// acceptance, which commits the whole document with the new rule in it. A
 /// control plane with no roster to read refuses rather than admits.
+///
+/// Before any of that, the document's format must be one every replica can
+/// read. This build advertises `cluster_membership::DOCUMENT_VERSION_RANGE`,
+/// and a policy v1 document lies outside it: a replica built before v1
+/// refuses the whole document, and no capability gates v1 yet, so the
+/// commit is refused here with a `400` and nothing is written.
 #[cfg(feature = "postgres")]
 pub(super) async fn admit_policy_document(
     state: &PolicyAdminState,
@@ -2137,6 +2176,9 @@ pub(super) async fn admit_policy_document(
     principal: &auth::Principal,
     candidate: &rbac::Policy,
 ) -> ResponseResult<()> {
+    if let Some(detail) = cluster_document_format_refusal(candidate) {
+        return Err(Box::new(policy_validation_failed(vec![detail])));
+    }
     if !candidate.uses_role_descriptions() {
         return Ok(());
     }
@@ -2164,6 +2206,39 @@ pub(super) async fn admit_policy_document(
         .await
         .map(|_| ())
         .map_err(|refusal| Box::new(operation_refused(&refusal)))
+}
+
+/// Why this deployment could not commit `policy`, if it could not. Only
+/// cluster mode restricts document formats; a standalone gateway commits
+/// every format it parses.
+pub(super) fn deployment_document_format_refusal(
+    state: &PolicyAdminState,
+    policy: &rbac::Policy,
+) -> Option<String> {
+    #[cfg(feature = "postgres")]
+    if state.control_plane.is_some() {
+        return cluster_document_format_refusal(policy);
+    }
+    #[cfg(not(feature = "postgres"))]
+    let _ = (state, policy);
+    None
+}
+
+/// Why cluster mode cannot commit `policy`, if it cannot: its document
+/// format major is outside the range every replica of this build
+/// advertises and reads.
+#[cfg(feature = "postgres")]
+pub(super) fn cluster_document_format_refusal(policy: &rbac::Policy) -> Option<String> {
+    if policy.cluster_serves_document_format() {
+        return None;
+    }
+    let (minimum, maximum) = cluster_membership::DOCUMENT_VERSION_RANGE;
+    Some(format!(
+        "policy schema_version '{}' cannot be committed in cluster mode: replicas of this build \
+         read only document formats {minimum} to {maximum}, and no capability yet lets them \
+         agree to read another",
+        policy.schema_version
+    ))
 }
 
 pub(super) async fn append_policy_version_after_commit(
