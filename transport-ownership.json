@@ -1101,6 +1101,16 @@
         ]
       },
       {
+        "package": "gateway-config@0.1.0|workspace",
+        "checksum": null,
+        "features": [],
+        "dependencies": [
+          "jsonschema@0.58.6|registry+https://github.com/rust-lang/crates.io-index",
+          "serde@1.0.229|registry+https://github.com/rust-lang/crates.io-index",
+          "serde_json@1.0.154|registry+https://github.com/rust-lang/crates.io-index"
+        ]
+      },
+      {
         "package": "gateway@1.0.1|workspace",
         "checksum": null,
         "features": [
@@ -1119,6 +1129,7 @@
           "chacha20poly1305@0.11.0|registry+https://github.com/rust-lang/crates.io-index",
           "deadpool-postgres@0.14.2|registry+https://github.com/rust-lang/crates.io-index",
           "futures-util@0.3.34|registry+https://github.com/rust-lang/crates.io-index",
+          "gateway-config@0.1.0|workspace",
           "getrandom@0.4.3|registry+https://github.com/rust-lang/crates.io-index",
           "hex@0.4.3|registry+https://github.com/rust-lang/crates.io-index",
           "hmac@0.13.0|registry+https://github.com/rust-lang/crates.io-index",
@@ -1243,6 +1254,23 @@
           "r-efi@6.0.0|registry+https://github.com/rust-lang/crates.io-index",
           "rand_core@0.10.1|registry+https://github.com/rust-lang/crates.io-index",
           "wasm-bindgen@0.2.128|registry+https://github.com/rust-lang/crates.io-index"
+        ]
+      },
+      {
+        "package": "ggctl@0.1.0|workspace",
+        "checksum": null,
+        "features": [],
+        "dependencies": [
+          "gateway-config@0.1.0|workspace",
+          "jsonschema@0.58.6|registry+https://github.com/rust-lang/crates.io-index",
+          "rcgen@0.14.10|registry+https://github.com/rust-lang/crates.io-index",
+          "reqwest@0.13.5|registry+https://github.com/rust-lang/crates.io-index",
+          "serde@1.0.229|registry+https://github.com/rust-lang/crates.io-index",
+          "serde_json@1.0.154|registry+https://github.com/rust-lang/crates.io-index",
+          "tokio-rustls@0.26.5|registry+https://github.com/rust-lang/crates.io-index",
+          "tokio@1.53.1|registry+https://github.com/rust-lang/crates.io-index",
+          "url@2.5.8|registry+https://github.com/rust-lang/crates.io-index",
+          "zeroize@1.9.1|registry+https://github.com/rust-lang/crates.io-index"
         ]
       },
       {
@@ -5713,6 +5741,17 @@
             "source": "registry+https://github.com/rust-lang/crates.io-index"
           },
           {
+            "name": "gateway-config",
+            "rename": null,
+            "kind": null,
+            "target": null,
+            "req": "*",
+            "optional": false,
+            "uses_default_features": true,
+            "features": [],
+            "source": null
+          },
+          {
             "name": "getrandom",
             "rename": null,
             "kind": null,
@@ -6119,6 +6158,215 @@
             "file": "gateway/tests/release_gate_workflow.rs"
           }
         ]
+      },
+      {
+        "package": "gateway-config",
+        "dependencies": [
+          {
+            "name": "jsonschema",
+            "rename": null,
+            "kind": "dev",
+            "target": null,
+            "req": "^0.58.6",
+            "optional": false,
+            "uses_default_features": false,
+            "features": [
+              "arbitrary-precision",
+              "idna"
+            ],
+            "source": "registry+https://github.com/rust-lang/crates.io-index"
+          },
+          {
+            "name": "serde_json",
+            "rename": null,
+            "kind": null,
+            "target": null,
+            "req": "^1.0.150",
+            "optional": false,
+            "uses_default_features": true,
+            "features": [
+              "arbitrary_precision"
+            ],
+            "source": "registry+https://github.com/rust-lang/crates.io-index"
+          },
+          {
+            "name": "serde",
+            "rename": null,
+            "kind": null,
+            "target": null,
+            "req": "^1.0.228",
+            "optional": false,
+            "uses_default_features": true,
+            "features": [
+              "derive"
+            ],
+            "source": "registry+https://github.com/rust-lang/crates.io-index"
+          }
+        ],
+        "features": {},
+        "targets": [
+          {
+            "name": "gateway_config",
+            "kind": [
+              "lib"
+            ],
+            "file": "gateway-config/src/lib.rs"
+          }
+        ]
+      },
+      {
+        "package": "ggctl",
+        "dependencies": [
+          {
+            "name": "jsonschema",
+            "rename": null,
+            "kind": "dev",
+            "target": null,
+            "req": "^0.58.6",
+            "optional": false,
+            "uses_default_features": false,
+            "features": [
+              "arbitrary-precision",
+              "idna"
+            ],
+            "source": "registry+https://github.com/rust-lang/crates.io-index"
+          },
+          {
+            "name": "serde_json",
+            "rename": null,
+            "kind": null,
+            "target": null,
+            "req": "^1.0.150",
+            "optional": false,
+            "uses_default_features": true,
+            "features": [
+              "arbitrary_precision"
+            ],
+            "source": "registry+https://github.com/rust-lang/crates.io-index"
+          },
+          {
+            "name": "serde",
+            "rename": null,
+            "kind": null,
+            "target": null,
+            "req": "^1.0.228",
+            "optional": false,
+            "uses_default_features": true,
+            "features": [
+              "derive"
+            ],
+            "source": "registry+https://github.com/rust-lang/crates.io-index"
+          },
+          {
+            "name": "tokio",
+            "rename": null,
+            "kind": null,
+            "target": null,
+            "req": "^1.52.3",
+            "optional": false,
+            "uses_default_features": true,
+            "features": [
+              "io-util",
+              "macros",
+              "net",
+              "rt-multi-thread",
+              "signal",
+              "sync",
+              "time"
+            ],
+            "source": "registry+https://github.com/rust-lang/crates.io-index"
+          },
+          {
+            "name": "reqwest",
+            "rename": null,
+            "kind": null,
+            "target": null,
+            "req": "^0.13.2",
+            "optional": false,
+            "uses_default_features": false,
+            "features": [
+              "json",
+              "rustls",
+              "stream"
+            ],
+            "source": "registry+https://github.com/rust-lang/crates.io-index"
+          },
+          {
+            "name": "tokio-rustls",
+            "rename": null,
+            "kind": "dev",
+            "target": null,
+            "req": "^0.26.4",
+            "optional": false,
+            "uses_default_features": false,
+            "features": [
+              "ring",
+              "tls12"
+            ],
+            "source": "registry+https://github.com/rust-lang/crates.io-index"
+          },
+          {
+            "name": "rcgen",
+            "rename": null,
+            "kind": "dev",
+            "target": null,
+            "req": "^0.14.10",
+            "optional": false,
+            "uses_default_features": true,
+            "features": [],
+            "source": "registry+https://github.com/rust-lang/crates.io-index"
+          },
+          {
+            "name": "gateway-config",
+            "rename": null,
+            "kind": null,
+            "target": null,
+            "req": "*",
+            "optional": false,
+            "uses_default_features": true,
+            "features": [],
+            "source": null
+          },
+          {
+            "name": "url",
+            "rename": null,
+            "kind": null,
+            "target": null,
+            "req": "^2.5.7",
+            "optional": false,
+            "uses_default_features": true,
+            "features": [],
+            "source": "registry+https://github.com/rust-lang/crates.io-index"
+          },
+          {
+            "name": "zeroize",
+            "rename": null,
+            "kind": null,
+            "target": null,
+            "req": "^1.8.2",
+            "optional": false,
+            "uses_default_features": true,
+            "features": [],
+            "source": "registry+https://github.com/rust-lang/crates.io-index"
+          }
+        ],
+        "features": {},
+        "targets": [
+          {
+            "name": "ggctl",
+            "kind": [
+              "bin"
+            ],
+            "file": "ggctl/src/main.rs"
+          },
+          {
+            "name": "cli",
+            "kind": [
+              "test"
+            ],
+            "file": "ggctl/tests/cli.rs"
+          }
+        ]
       }
     ]
   },
@@ -6343,7 +6591,7 @@
         "unexpanded-attribute"
       ],
       "scope": "gateway::routing::add_admin_api_routes#1",
-      "sha256": "563c6d4b21b74d87e1394a6a5216220cc4f8c3a650edcc7dda9cb3e43ff0beaf",
+      "sha256": "cfed34c09f86d4f12ed5a3dcc7b46f88088884e1d60fbf2b60ca79b34b6df19f",
       "owner": "GreenGateway maintainers",
       "purpose": "Existing macro/attribute inputs for this exact application item; changed expansion inputs require explicit review."
     },
@@ -14308,6 +14556,196 @@
       "sha256": "87dbe589566ff4025878beadf88e208a24525debebf264e4a7bea7b08748ea5e",
       "owner": "GreenGateway maintainers",
       "purpose": "Existing macro/attribute inputs for this exact application item; changed expansion inputs require explicit review."
+    },
+    {
+      "file": "gateway/src/admin_config.rs",
+      "reasons": [
+        "capability-import-or-glob"
+      ],
+      "scope": "gateway::admin_config::use super :: *#1",
+      "sha256": "5d9f812e6d6973f484fcf6f9205e773ecbb4503112229f85e702d7904367395b",
+      "owner": "GreenGateway maintainers",
+      "purpose": "Reviewed exact import/reexport or alias for this module; constructor bodies require separate scope review."
+    },
+    {
+      "file": "gateway/src/main.rs",
+      "reasons": [
+        "capability-import-or-glob"
+      ],
+      "scope": "gateway::use admin_config :: *#1",
+      "sha256": "f7ea42fbe0a39befb09e21a9a49ab5caef8ef939b0a749d731b79a43836992a0",
+      "owner": "GreenGateway maintainers",
+      "purpose": "Reviewed exact import/reexport or alias for this module; constructor bodies require separate scope review."
+    },
+    {
+      "file": "ggctl/src/completion.rs",
+      "reasons": [
+        "capability-import-or-glob"
+      ],
+      "scope": "ggctl::completion::use std :: fmt :: Write as _#1",
+      "sha256": "ae6db2eb90a4daf2aea533b77a1b4679e616f8a55a6de96b23c20145d7f90905",
+      "owner": "GreenGateway maintainers: operator CLI (#242)",
+      "purpose": "Reviewed for #242 PR 5: the in-memory string formatting trait for generated shell completion scripts; no I/O, network or process capability."
+    },
+    {
+      "file": "ggctl/src/credential.rs",
+      "reasons": [
+        "capability-import-or-glob"
+      ],
+      "scope": "ggctl::credential::permissions_are_owner_only#1",
+      "sha256": "93ff7585a3de003ce522965c8b37e7eccea29bf2b7270b83cf280a0c4e86cf41",
+      "owner": "GreenGateway maintainers: operator CLI (#242)",
+      "purpose": "Reviewed for #242 PR 5: reads the Unix mode bits of token-file metadata through PermissionsExt to refuse a credential readable or writable by group or other; read-only metadata, no network or process capability."
+    },
+    {
+      "file": "ggctl/src/help.rs",
+      "reasons": [
+        "capability-import-or-glob"
+      ],
+      "scope": "ggctl::help::use std :: fmt :: Write as _#1",
+      "sha256": "ae6db2eb90a4daf2aea533b77a1b4679e616f8a55a6de96b23c20145d7f90905",
+      "owner": "GreenGateway maintainers: operator CLI (#242)",
+      "purpose": "Reviewed for #242 PR 5: the in-memory string formatting trait for generated help text; no I/O, network or process capability."
+    },
+    {
+      "file": "ggctl/src/remote.rs",
+      "reasons": [
+        "capability-import-or-glob"
+      ],
+      "scope": "ggctl::remote::use std :: { future :: Future , io :: Read , net :: IpAddr , path :: { Path , PathBuf } , time :: Duration , }#1",
+      "sha256": "519844834c83f9a615cbcca2314fc3114bfad820fe5340dc03ddefa6e3297d03",
+      "owner": "GreenGateway maintainers: operator CLI (#242)",
+      "purpose": "Reviewed for #242 PR 5: value types, Read and Future for the admin API client and its credential and trust-anchor loading; constructor bodies require separate scope review."
+    },
+    {
+      "file": "ggctl/src/remote.rs",
+      "reasons": [
+        "capability-import-or-glob"
+      ],
+      "scope": "ggctl::remote::use url :: { Host , Url }#1",
+      "sha256": "f588e18c20f4040c5ad5e5131d34958e68bc9b3deea55c624013775e0bece6c4",
+      "owner": "GreenGateway maintainers: operator CLI (#242)",
+      "purpose": "Reviewed for #242 PR 5: URL parsing and host classification for the --server admin API base; parsing opens no connection."
+    },
+    {
+      "file": "ggctl/src/remote.rs",
+      "reasons": [
+        "network-or-process-reference"
+      ],
+      "scope": "ggctl::remote::is_loopback_literal#1",
+      "sha256": "45ab40ae51078e3356ff77f004a1ce782bffcde6a4da69a445c3c18d25c0048e",
+      "owner": "GreenGateway maintainers: operator CLI (#242)",
+      "purpose": "Reviewed for #242 PR 5: classifies an already-parsed --server host as a loopback IP literal for the plaintext-HTTP exception. A pure address check: no resolution and no connection."
+    },
+    {
+      "file": "ggctl/src/remote.rs",
+      "reasons": [
+        "network-or-process-reference"
+      ],
+      "scope": "ggctl::remote::TrustAnchors#1",
+      "sha256": "832d33b99ef60be4067ab707669658ba4d80a3cef8fbec721f22c61c3bcfbd0b",
+      "owner": "GreenGateway maintainers: operator CLI (#242)",
+      "purpose": "Reviewed for #242 PR 5: ggctl's admin API client, its only network capability. One reqwest client, built in admin_http_client with no proxy, no redirects, no transparent retries, HTTP/1.1, platform certificate and hostname verification plus optional --ca-file trust anchors, and bounded time and response size. It talks only to the operator-named admin API base, is not linked into the gateway, and scripts/check-egress-only.sh pins its builder."
+    },
+    {
+      "file": "ggctl/src/remote.rs",
+      "reasons": [
+        "network-or-process-reference"
+      ],
+      "scope": "ggctl::remote::roots_from_pem#1",
+      "sha256": "1e5326e1f02a642c34105d734e615c79f5ccb4f34178a49e65cf95844b1147a8",
+      "owner": "GreenGateway maintainers: operator CLI (#242)",
+      "purpose": "Reviewed for #242 PR 5: ggctl's admin API client, its only network capability. One reqwest client, built in admin_http_client with no proxy, no redirects, no transparent retries, HTTP/1.1, platform certificate and hostname verification plus optional --ca-file trust anchors, and bounded time and response size. It talks only to the operator-named admin API base, is not linked into the gateway, and scripts/check-egress-only.sh pins its builder."
+    },
+    {
+      "file": "ggctl/src/remote.rs",
+      "reasons": [
+        "network-or-process-reference"
+      ],
+      "scope": "ggctl::remote::admin_http_client#1",
+      "sha256": "a70eeaa206a9dbc600b3ee3b4f54c9c704fb4aaa91766ccadb522ad08bf3848d",
+      "owner": "GreenGateway maintainers: operator CLI (#242)",
+      "purpose": "Reviewed for #242 PR 5: ggctl's admin API client, its only network capability. One reqwest client, built in admin_http_client with no proxy, no redirects, no transparent retries, HTTP/1.1, platform certificate and hostname verification plus optional --ca-file trust anchors, and bounded time and response size. It talks only to the operator-named admin API base, is not linked into the gateway, and scripts/check-egress-only.sh pins its builder."
+    },
+    {
+      "file": "ggctl/src/remote.rs",
+      "reasons": [
+        "network-or-process-reference"
+      ],
+      "scope": "ggctl::remote::AdminClient#1",
+      "sha256": "43b21611fc66aae86ac956a1edadcf3114b519b6dc0fc5c4ecf1ee3cf9400d69",
+      "owner": "GreenGateway maintainers: operator CLI (#242)",
+      "purpose": "Reviewed for #242 PR 5: ggctl's admin API client, its only network capability. One reqwest client, built in admin_http_client with no proxy, no redirects, no transparent retries, HTTP/1.1, platform certificate and hostname verification plus optional --ca-file trust anchors, and bounded time and response size. It talks only to the operator-named admin API base, is not linked into the gateway, and scripts/check-egress-only.sh pins its builder."
+    },
+    {
+      "file": "ggctl/src/remote.rs",
+      "reasons": [
+        "network-or-process-reference"
+      ],
+      "scope": "ggctl::remote::impl  AdminClient::get_json#1",
+      "sha256": "919dd904f3f34d16bb35cc015270dc214805dba8228af411f13406150619572a",
+      "owner": "GreenGateway maintainers: operator CLI (#242)",
+      "purpose": "Reviewed for #242 PR 5: ggctl's admin API client, its only network capability. One reqwest client, built in admin_http_client with no proxy, no redirects, no transparent retries, HTTP/1.1, platform certificate and hostname verification plus optional --ca-file trust anchors, and bounded time and response size. It talks only to the operator-named admin API base, is not linked into the gateway, and scripts/check-egress-only.sh pins its builder."
+    },
+    {
+      "file": "ggctl/src/remote.rs",
+      "reasons": [
+        "network-or-process-reference"
+      ],
+      "scope": "ggctl::remote::transport_code#1",
+      "sha256": "6a704453d153c85d9ad2fb8946ddfd2366470a82fd117605fcc94b0074524f23",
+      "owner": "GreenGateway maintainers: operator CLI (#242)",
+      "purpose": "Reviewed for #242 PR 5: ggctl's admin API client, its only network capability. One reqwest client, built in admin_http_client with no proxy, no redirects, no transparent retries, HTTP/1.1, platform certificate and hostname verification plus optional --ca-file trust anchors, and bounded time and response size. It talks only to the operator-named admin API base, is not linked into the gateway, and scripts/check-egress-only.sh pins its builder."
+    },
+    {
+      "file": "ggctl/src/remote.rs",
+      "reasons": [
+        "network-or-process-reference"
+      ],
+      "scope": "ggctl::remote::is_json#1",
+      "sha256": "0d43a2a52b437659c7e44cf99d58e59eac6e246a40e4765980a9b2f6d1f2871e",
+      "owner": "GreenGateway maintainers: operator CLI (#242)",
+      "purpose": "Reviewed for #242 PR 5: ggctl's admin API client, its only network capability. One reqwest client, built in admin_http_client with no proxy, no redirects, no transparent retries, HTTP/1.1, platform certificate and hostname verification plus optional --ca-file trust anchors, and bounded time and response size. It talks only to the operator-named admin API base, is not linked into the gateway, and scripts/check-egress-only.sh pins its builder."
+    },
+    {
+      "file": "ggctl/src/remote.rs",
+      "reasons": [
+        "network-or-process-reference"
+      ],
+      "scope": "ggctl::remote::read_body#1",
+      "sha256": "e4bfa7df187811ce65092898177761a846fc06fb7c728b97f4913bc46666e6bd",
+      "owner": "GreenGateway maintainers: operator CLI (#242)",
+      "purpose": "Reviewed for #242 PR 5: ggctl's admin API client, its only network capability. One reqwest client, built in admin_http_client with no proxy, no redirects, no transparent retries, HTTP/1.1, platform certificate and hostname verification plus optional --ca-file trust anchors, and bounded time and response size. It talks only to the operator-named admin API base, is not linked into the gateway, and scripts/check-egress-only.sh pins its builder."
+    },
+    {
+      "file": "ggctl/src/sarif.rs",
+      "reasons": [
+        "unexpanded-attribute"
+      ],
+      "scope": "ggctl::sarif::file_attributes#1",
+      "sha256": "b00904082cc65a1f3303a0ba6a7be66e26e8fbdb8f97bf07a7f5bb17a2d02b5f",
+      "owner": "GreenGateway maintainers: operator CLI (#242)",
+      "purpose": "Narrow cfg_attr(not(test), expect(dead_code)) for the SARIF writer, which ggctl validate (#242 PR 8) will call; it builds JSON in memory only, with no I/O and no transport or process capability."
+    },
+    {
+      "file": "ggctl/src/main.rs",
+      "reasons": [
+        "capability-import-or-glob"
+      ],
+      "scope": "ggctl::use std :: { ffi :: OsString , io :: IsTerminal , process :: ExitCode }#1",
+      "sha256": "6fb1d83fb3d783f26969f80640ce163ecf6fd3539acf3efdecf6eaaecf5a034d",
+      "owner": "GreenGateway maintainers: operator CLI (#242)",
+      "purpose": "Reviewed for #242 PR 5: argument, terminal-detection and exit-status types for the ggctl entry point; it imports no way to spawn a process or open a connection."
+    },
+    {
+      "file": "ggctl/src/main.rs",
+      "reasons": [
+        "network-or-process-reference"
+      ],
+      "scope": "ggctl::main#1",
+      "sha256": "734eeba6449bfb1313d54c2d92461c135c56f69ade467d7d68284b3dfb867d85",
+      "owner": "GreenGateway maintainers: operator CLI (#242)",
+      "purpose": "Reviewed for #242 PR 5: the ggctl entry point reads its arguments, locks the standard streams, detects a terminal on standard input and returns a std::process::ExitCode. It spawns no process and opens no connection itself."
     },
     {
       "file": "gateway/src/storage/postgres_authority_events.rs",

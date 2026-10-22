@@ -704,6 +704,8 @@ Connection setup, safe migration, and control-plane operation are documented in:
 |-- admin-ui/              # React/TypeScript admin UI
 |-- cloudflare/            # Cloudflare Worker entrypoint and config helpers
 |-- gateway/               # Rust gateway server
+|-- gateway-config/        # Configuration contracts shared by gateway and ggctl
+|-- ggctl/                 # Operator CLI (alpha; see docs/ggctl.md)
 |-- docs/                  # Configuration, deployment, examples, and guides
 |-- dev/                   # Local development fixtures
 |-- scripts/               # Helper scripts and traffic generation
