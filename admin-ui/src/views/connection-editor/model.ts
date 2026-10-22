@@ -176,6 +176,12 @@ export function editorUnsupportedReason(
   if (detail.configuration?.authentication.type === 'delegated_issuer_token') {
     return 'This connection uses a delegated issuer token, which the editor cannot change yet. Its settings are shown on the connection page; change them through the admin API.';
   }
+  if (
+    detail.configuration?.authentication.type ===
+    'google_domain_wide_delegation'
+  ) {
+    return 'This connection uses Google domain-wide delegation, which the editor cannot change yet. Change it through the admin API.';
+  }
   return null;
 }
 
@@ -192,7 +198,10 @@ export function formFromDetail(detail: ConnectionDetail): ConnectionFormState {
   }
 
   const authentication = configuration.authentication;
-  if (authentication.type === 'delegated_issuer_token') {
+  if (
+    authentication.type === 'delegated_issuer_token' ||
+    authentication.type === 'google_domain_wide_delegation'
+  ) {
     // The editor refuses such a connection before it builds a form; see
     // `editorUnsupportedReason`.
     throw new Error(editorUnsupportedReason(detail) ?? 'Unsupported connection');

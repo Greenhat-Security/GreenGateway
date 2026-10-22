@@ -15,6 +15,8 @@ use tokio::sync::{
 
 use crate::config::Config;
 
+use super::google_delegation::GoogleWorkloadIdentity;
+
 use super::caller_assertion::{
     load_signing_key, CallerAssertionKeyProblem, JwksDocument, SigningKeyRejection,
     JWKS_MAX_AGE_SECONDS, KEY_PROBLEM_DUPLICATE_KID, KEY_PROBLEM_UNAVAILABLE,
@@ -932,6 +934,13 @@ impl ConnectionControlPlane {
             network_alias_ids,
             network_alias_metadata,
             network_alias_generations,
+            workload_identity_profiles: config
+                .connection_gcp_provider
+                .profiles
+                .iter()
+                .map(|profile| profile.id.clone())
+                .collect(),
+            google_identity: OnceLock::new(),
         });
         let mut caller_assertion_problems = BTreeMap::new();
         for record in &managed_records {
@@ -1099,7 +1108,11 @@ impl ConnectionControlPlane {
             | ConnectionAuthentication::DelegatedIssuerToken {
                 client_secret_id: None,
                 ..
-            } => return None,
+            }
+            // Every caller's token is minted afresh from a federated identity
+            // whose generation no configuration pins, so the credential is
+            // volatile by construction.
+            | ConnectionAuthentication::GoogleDomainWideDelegation { .. } => return None,
         }
         for (purpose, alias) in [
             ("tls_ca_bundle", record.write.tls.ca_bundle_alias.as_deref()),
@@ -1209,9 +1222,16 @@ impl ConnectionControlPlane {
         if !self.gcp_config.is_empty() {
             let transport: Arc<dyn GcpTransport> =
                 Arc::new(EgressGcpTransport::new(Arc::clone(egress)));
-            let provider =
-                GcpSecretManagerProvider::from_config(&self.gcp_config, &reserved_ids, transport)?;
-            providers.push(Arc::new(provider));
+            let provider = Arc::new(GcpSecretManagerProvider::from_config(
+                &self.gcp_config,
+                &reserved_ids,
+                transport,
+            )?);
+            // The same provider, and so the same per-profile token cache, is
+            // the identity a domain-wide delegation signs through.
+            let identity: Arc<dyn GoogleWorkloadIdentity> = provider.clone();
+            let _ = self.secret_resolver.google_identity.set(identity);
+            providers.push(provider);
             reserved_ids.extend(self.gcp_config.aliases.iter().map(|alias| alias.id.clone()));
         }
         if !self.azure_config.is_empty() {
@@ -1264,6 +1284,24 @@ impl ConnectionControlPlane {
         }
         self.install_network_secret_providers(providers);
         Ok(())
+    }
+
+    /// The federated identity a `google_domain_wide_delegation` Connection
+    /// signs its callers' assertions through: the GCP provider, once the
+    /// network providers are activated with a GCP configuration. `None`
+    /// before then and without one, which refuses every such mint.
+    pub(crate) fn google_workload_identity(&self) -> Option<Arc<dyn GoogleWorkloadIdentity>> {
+        self.secret_resolver.google_identity.get().cloned()
+    }
+
+    /// Installs a federated identity directly, for tests that substitute the
+    /// GCP provider; see [`Self::install_network_secret_providers`].
+    #[cfg(test)]
+    pub(crate) fn install_google_workload_identity(
+        &self,
+        identity: Arc<dyn GoogleWorkloadIdentity>,
+    ) {
+        let _ = self.secret_resolver.google_identity.set(identity);
     }
 
     /// Install pre-built network providers directly. Production activation goes
@@ -1861,7 +1899,8 @@ impl ConnectionControlPlane {
             | ConnectionAuthentication::HeaderApiKey { .. }
             | ConnectionAuthentication::StaticBearer { .. }
             | ConnectionAuthentication::OAuth2ClientCredentials { .. }
-            | ConnectionAuthentication::DelegatedIssuerToken { .. } => None,
+            | ConnectionAuthentication::DelegatedIssuerToken { .. }
+            | ConnectionAuthentication::GoogleDomainWideDelegation { .. } => None,
         };
         if let Some((field, secret_id, purpose)) = deferred_auth {
             if resolver.is_deferred_alias(&secret_id) {
@@ -2460,6 +2499,13 @@ struct ConnectionSecretResolver {
     /// Stable generations derived from trusted startup configuration. Values
     /// are `None` for movable/volatile aliases.
     network_alias_generations: BTreeMap<String, Option<String>>,
+    /// The IDs of the GCP provider's workload identity profiles, known from
+    /// startup configuration before the provider is activated.
+    workload_identity_profiles: BTreeSet<String>,
+    /// The GCP provider, as the federated identity a
+    /// `google_domain_wide_delegation` Connection signs through. Set once,
+    /// with the network providers.
+    google_identity: OnceLock<Arc<dyn GoogleWorkloadIdentity>>,
 }
 
 #[derive(Debug)]
@@ -2678,10 +2724,26 @@ impl ConnectionSecretResolver {
                     SecretPurpose::TokenExchangeClientSecret,
                 )?;
             }
+            // The profile is the identity every caller's assertion is signed
+            // through. It is trusted startup configuration rather than a
+            // secret, so this checks it is configured; whether Google lets it
+            // sign as the service account is only known on the first mint.
+            ConnectionAuthentication::GoogleDomainWideDelegation {
+                workload_identity_profile,
+                ..
+            } if !self
+                .workload_identity_profiles
+                .contains(workload_identity_profile) =>
+            {
+                return Err(BindingActivationError::Invalid {
+                    fields: vec!["authentication.workload_identity_profile"],
+                });
+            }
             ConnectionAuthentication::HeaderApiKey { .. }
             | ConnectionAuthentication::StaticBearer { .. }
             | ConnectionAuthentication::OAuth2ClientCredentials { .. }
-            | ConnectionAuthentication::DelegatedIssuerToken { .. } => {}
+            | ConnectionAuthentication::DelegatedIssuerToken { .. }
+            | ConnectionAuthentication::GoogleDomainWideDelegation { .. } => {}
         }
 
         for header in &candidate.additional_headers {
@@ -3792,6 +3854,8 @@ mod tests {
                 ("alpha".to_owned(), None),
                 ("beta".to_owned(), None),
             ]),
+            workload_identity_profiles: BTreeSet::new(),
+            google_identity: OnceLock::new(),
         };
 
         let blocked = resolver

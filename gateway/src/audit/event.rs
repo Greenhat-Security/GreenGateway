@@ -35,6 +35,11 @@ pub const CONNECTION_OAUTH_TOKEN_REFRESH: &str = "connection.oauth_token_refresh
 /// caller (issue #441): the actor it was made for, the outcome and the
 /// issuer's decision, never any token.
 pub const CONNECTION_DELEGATED_TOKEN_EXCHANGE: &str = "connection.delegated_token_exchange";
+/// One mint of a caller's own Google token by a `google_domain_wide_delegation`
+/// Connection (issue #442): the actor it was minted for, the service account
+/// and scopes, how far it got and Google's status and registered error code,
+/// never the assertion or any token.
+pub const CONNECTION_GOOGLE_DELEGATION_TOKEN: &str = "connection.google_delegation_token";
 /// One decision about the signed caller assertion of a request a
 /// connection-bound proxy route forwards (issue #463): the `kid` and `jti` of
 /// the assertion it carried, or the reason it was refused. The caller is the

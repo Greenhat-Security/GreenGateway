@@ -865,8 +865,14 @@ pub(crate) fn connection_failure_classification(
             ConnectionOperationalState::Unavailable,
             ConnectionStatusReason::SecretUnavailable,
         ),
+        ConnectionHttpError::GoogleDelegation(error) if !error.is_egress_denial() => (
+            ConnectionTestStageName::SecretAvailable,
+            ConnectionOperationalState::Unavailable,
+            ConnectionStatusReason::SecretUnavailable,
+        ),
         ConnectionHttpError::OAuthTokenEgressDenied
-        | ConnectionHttpError::DelegatedTokenEgressDenied => (
+        | ConnectionHttpError::DelegatedTokenEgressDenied
+        | ConnectionHttpError::GoogleDelegation(_) => (
             ConnectionTestStageName::EgressPolicy,
             ConnectionOperationalState::Unavailable,
             ConnectionStatusReason::EgressDenied,
@@ -970,6 +976,18 @@ fn test_reason_from_connection(error: ConnectionHttpError) -> ConnectionTestReas
         | ConnectionHttpError::DelegatedTokenUnavailable => {
             ConnectionTestReason::OauthTokenUnavailable
         }
+        // Unreachable for the same reason: a stored test refuses a domain-wide
+        // delegation before it resolves anything.
+        ConnectionHttpError::GoogleDelegation(error) if error.is_egress_denial() => {
+            ConnectionTestReason::OauthTokenEgressDenied
+        }
+        ConnectionHttpError::GoogleDelegation(error) if error.is_caller_refusal() => {
+            ConnectionTestReason::AuthenticationNotSupported
+        }
+        ConnectionHttpError::GoogleDelegation(
+            crate::connections::google_delegation::GoogleDelegationError::Denied,
+        ) => ConnectionTestReason::OauthTokenRejected,
+        ConnectionHttpError::GoogleDelegation(_) => ConnectionTestReason::OauthTokenUnavailable,
         ConnectionHttpError::UpstreamAuthenticationRejected => {
             ConnectionTestReason::AuthenticationFailed
         }

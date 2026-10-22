@@ -2335,6 +2335,28 @@ describe('ConnectionEditor', () => {
     expect(fetchMock.mock.calls.every(([, init]) => !init?.method)).toBe(true);
   });
 
+  it('refuses to edit a Google domain-wide delegation rather than save over it', async () => {
+    const fetchMock = vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
+      const url = requestUrl(input);
+      if (url.pathname === '/v1/admin/connections/billing' && !init?.method) {
+        return Promise.resolve(
+          jsonResponse(200, googleDelegationDetail(), { ETag: '"record-8"' }),
+        );
+      }
+      return Promise.reject(new Error(`unexpected request: ${url.pathname}`));
+    });
+    vi.stubGlobal('fetch', fetchMock);
+
+    renderEditor('/connections/billing/edit');
+
+    expect(await screen.findByText('Editing not available')).toBeTruthy();
+    expect(
+      screen.getByText(/Google domain-wide delegation, which the editor cannot change/),
+    ).toBeTruthy();
+    expect(screen.queryByLabelText('Display name')).toBeNull();
+    expect(fetchMock.mock.calls.every(([, init]) => !init?.method)).toBe(true);
+  });
+
   it('renders legacy projections as read only without an editor form', async () => {
     vi.stubGlobal(
       'fetch',
@@ -2386,6 +2408,29 @@ function delegatedDetail(): ConnectionDetail {
         lifetime_seconds: 60,
         bind_request: false,
         bind_approval: false,
+      },
+    },
+  };
+}
+
+function googleDelegationDetail(): ConnectionDetail {
+  const detail = managedDetail();
+  if (detail.configuration === undefined) {
+    throw new Error('the managed fixture carries a configuration');
+  }
+  return {
+    ...detail,
+    authentication: 'google_domain_wide_delegation',
+    configuration: {
+      ...detail.configuration,
+      authentication: {
+        type: 'google_domain_wide_delegation',
+        service_account_email:
+          'gateway-delegate@example-project.iam.gserviceaccount.com',
+        workload_identity_profile: 'gateway-wif',
+        scopes: ['https://www.googleapis.com/auth/gmail.readonly'],
+        subject_claim: 'email',
+        subject_issuers: ['https://idp.example.test'],
       },
     },
   };

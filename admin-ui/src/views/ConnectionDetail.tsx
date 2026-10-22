@@ -1173,6 +1173,8 @@ function formatSafeAuthentication(
           ? 'secret configured'
           : 'secret not configured'
       }`;
+    case 'google_domain_wide_delegation':
+      return `Google domain-wide delegation as ${authentication.service_account_email}`;
   }
 }
 
