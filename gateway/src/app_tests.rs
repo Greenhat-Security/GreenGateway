@@ -18763,6 +18763,8 @@ async fn policy_rule_preview_returns_matches_samples_and_does_not_mutate_policy(
     let body = json_body(response).await;
     assert_eq!(body["match_count"], json!(2));
     assert_eq!(body["scanned_event_count"], json!(3));
+    assert_eq!(body["unevaluated_event_count"], json!(0));
+    assert_eq!(body["unevaluated_reasons"], json!({}));
     assert_eq!(body["scan_truncated"], json!(false));
     assert_eq!(body["complete"], json!(true));
     assert_eq!(body["sample_strategy"], json!("newest_matches"));
@@ -18888,6 +18890,18 @@ async fn policy_rule_preview_contextless_binding_excludes_unclassified_history()
     let body = json_body(response).await;
     assert_eq!(body["match_count"], json!(1));
     assert_eq!(body["samples"][0]["event_id"], json!("match-new"));
+    // The other three scanned observations were never classified, and the
+    // rule is bound to a dispatch, so the evaluator cannot say whether it
+    // matches them. They are reported rather than counted as non-matches, and
+    // the count is a lower bound for the window.
+    assert_eq!(body["scanned_event_count"], json!(4));
+    assert_eq!(body["unevaluated_event_count"], json!(3));
+    assert_eq!(
+        body["unevaluated_reasons"],
+        json!({"missing_dispatch_fact": 3})
+    );
+    assert_eq!(body["scan_truncated"], json!(false));
+    assert_eq!(body["complete"], json!(false));
 }
 
 #[tokio::test]
@@ -22277,6 +22291,21 @@ async fn traffic_endpoint_lifecycle_flags_rule_coverage_and_hot_reload() {
             status_counts: &[(200, 2)],
         },
     );
+    // Classified traffic without a proxy dispatch, as the aggregator records
+    // it. Coverage is judged in that routing context; with none recorded at
+    // all the evaluator would be missing the dispatch fact.
+    for (endpoint_template, call_count) in [("/covered/{id}", 3), ("/open/{id}", 2)] {
+        insert_discovery_routing_context(
+            &discovery_db.path,
+            "GET",
+            endpoint_template,
+            "",
+            "",
+            "",
+            call_count,
+            1,
+        );
+    }
     let policy = TempPolicyFile::new(&traffic_policy_document_with_rules(json!([
         {
             "id": "cover-id-endpoint",
@@ -24574,15 +24603,34 @@ async fn suggestions_admin_dismiss_rejects_non_open_suggestion_without_overwriti
 
 #[test]
 fn endpoint_rule_coverage_without_rules_is_none() {
-    let policy: rbac::Policy = serde_json::from_value(json!({
-        "schema_version": "0.1.0",
-        "default_action": "deny",
-        "roles": {}
-    }))
-    .expect("policy should parse");
+    let policy = policy_eval::CompiledPolicy::for_analysis(
+        serde_json::from_value(json!({
+            "schema_version": "0.1.0",
+            "default_action": "deny",
+            "roles": {}
+        }))
+        .expect("policy should parse"),
+    );
+    let contextless = discovery::query::EndpointRoutingContext {
+        route_host: None,
+        route_path_prefix: None,
+        upstream_origin: None,
+        first_seen: "2024-06-01T12:00:00Z".to_owned(),
+        last_seen: "2024-06-01T12:00:00Z".to_owned(),
+        call_count: 1,
+        distinct_principal_count: 1,
+        covered_by_rule: false,
+        coverage_scope: discovery::query::EndpointCoverageScope::None,
+    };
+    assert_eq!(
+        endpoint_coverage_scope(&policy, "GET", "/anything/{id}", Some(&contextless)),
+        discovery::query::EndpointCoverageScope::None
+    );
+    // With no routing context recorded at all the evaluator is missing the
+    // dispatch fact, so coverage is unknown rather than none.
     assert_eq!(
         endpoint_coverage_scope(&policy, "GET", "/anything/{id}", None),
-        discovery::query::EndpointCoverageScope::None
+        discovery::query::EndpointCoverageScope::Unknown
     );
 }
 
