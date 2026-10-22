@@ -419,6 +419,9 @@ paths:
     assert_eq!(bound_names(&shared), vec!["mixedUndeclared"]);
 }
 
+/// Each incompatible tool with the reason codes of its alternatives.
+type ExpectedMismatches = &'static [(&'static str, &'static [&'static str])];
+
 /// The reasons for every alternative of the security golden document under
 /// every credential type: the explanation an operator reads in the preview.
 #[test]
@@ -428,7 +431,7 @@ fn every_incompatible_alternative_of_the_golden_document_says_why() {
         include_str!("testdata/openapi3-golden/security.yaml"),
     )
     .expect("golden security document should generate");
-    let expectations: [(&str, ConnectionAuthentication, &[(&str, &[&str])]); 5] = [
+    let expectations: [(&str, ConnectionAuthentication, ExpectedMismatches); 5] = [
         (
             "none",
             ConnectionAuthentication::None,
