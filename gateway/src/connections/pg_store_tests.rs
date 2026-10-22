@@ -4046,7 +4046,7 @@ async fn concurrent_writes_cannot_both_bind_one_alias_under_two_purposes() {
     );
 }
 
-// ==== Catalog change evidence (issue #425, PR 2c; migration 22) ====
+// ==== Catalog change evidence (issue #425, PR 2c; migration 23) ====
 
 /// One `catalog_change_evidence` row, every column, UUIDs and the timestamp
 /// read as text.

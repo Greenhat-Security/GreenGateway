@@ -108,10 +108,14 @@
         {
           "path": "gateway/src/admin_policy.rs",
           "anchor": "async fn policy_rules_order_put_endpoint("
+        },
+        {
+          "path": "gateway/src/admin_policy_drafts.rs",
+          "anchor": "async fn policy_draft_publish_endpoint("
         }
       ],
       "boundary": "persist_policy_mutation -> PolicyControlPlane::commit -> commit_policy_in / postgres_documents::commit_in; active row lock and expected ETag guard; document/history, shared revision, active pointer, security_outbox and one document_change_evidence row commit together. Discovery acceptance invokes commit_policy_in inside its suggestion transaction, so its evidence row shares that transaction. An empty or oversized actor, or an action that cannot describe the resource, is refused before anything is written; an evidence insert failure rolls the whole commit (and an acceptance's transition) back.",
-      "record": "Immutable policy_documents retain actor subject, diff/action, document ETag and version; security_outbox retains committed revision/from/to. document_change_evidence (migration 22) has no foreign key and holds one row per committed change: operation code, event/operation UUIDs, actor kind/subject/issuer/auth mode, prior/new version, the outbox row's shared revision and database-clock committed_at. Stale ETag, lost initialize race and refused acceptance write none.",
+      "record": "Immutable policy_documents retain actor subject, diff/action, document ETag and version; security_outbox retains committed revision/from/to. document_change_evidence (migration 23) has no foreign key and holds one row per committed change: operation code, event/operation UUIDs, actor kind/subject/issuer/auth mode, prior/new version, the outbox row's shared revision and database-clock committed_at. Stale ETag, lost initialize race and refused acceptance write none.",
       "actor": "The handler names the operation and passes the authenticated principal: subject (1 to 4096 bytes), issuer (1 to 4096 bytes, or none) and auth mode (session_cookie, bearer_token, service_token, client_certificate), the principal bounds. The import's activation is the system actor import-standalone with auth mode system. No keyed safe actor reference yet.",
       "identity": "Generated event_id and operation_id UUIDs; operation code policy.publish, policy.rollback, policy.rule.create/update/delete/reorder or policy.suggestion.accept (configuration.import for the import); prior/new version and shared security revision equal to the outbox row's; exactly one row per activated version. operation_id is minted per commit, not bound to a client idempotency key; a lost response is reconciled from the version's evidence row.",
       "delivery": "post_commit_telemetry",
@@ -138,7 +142,7 @@
           "anchor": "commit_policy_in"
         },
         {
-          "path": "gateway/src/storage/migrations/0022_document_and_catalog_change_evidence.sql",
+          "path": "gateway/src/storage/migrations/0023_document_and_catalog_change_evidence.sql",
           "anchor": "CREATE TABLE greengateway.document_change_evidence ("
         }
       ],
@@ -209,6 +213,10 @@
         {
           "path": "gateway/src/admin_policy.rs",
           "anchor": "async fn policy_rules_order_put_endpoint("
+        },
+        {
+          "path": "gateway/src/admin_policy_drafts.rs",
+          "anchor": "async fn policy_draft_publish_endpoint("
         }
       ],
       "boundary": "persist_to_file writes temporary file and renames; reload swaps runtime; append_policy_version_after_commit writes a separately configured SQLite history database afterward.",
@@ -336,7 +344,7 @@
         }
       ],
       "boundary": "register_tools_via_control_plane -> commit_tools -> shared document transaction with CAS, name reservations, immutable version, pointer, revision, outbox and one document_change_evidence row. The first-boot seed and the import's activation use the same transaction.",
-      "record": "tool_documents retain actor subject and action/diff with version and ETag; the outbox row and the non-cascading document_change_evidence row (migration 22) commit with them. A later failed local install does not undo that commit, and its evidence row keeps describing the committed version. A tool name another lane holds writes none.",
+      "record": "tool_documents retain actor subject and action/diff with version and ETag; the outbox row and the non-cascading document_change_evidence row (migration 23) commit with them. A later failed local install does not undo that commit, and its evidence row keeps describing the committed version. A tool name another lane holds writes none.",
       "actor": "Authenticated principal kind/subject/issuer/auth mode for registration; the system actors bootstrap (first-boot seed) and import-standalone (import), auth mode system. No keyed safe actor reference yet.",
       "identity": "Generated event/operation UUIDs, tools.publish (configuration.import for the import), prior/new tools version and the outbox row's shared security revision; operation_id minted per commit, no client-bound operation ID.",
       "delivery": "post_commit_telemetry",
@@ -715,7 +723,7 @@
         }
       ],
       "boundary": "MCP/OpenAPI replacements and overlay updates share the Connection-state transaction and revision/CAS checks; entries, reservations, dependencies, outbox and one catalog_change_evidence row commit together. Registration, refresh and overlay put/delete all reach the OpenAPI replacement. An empty or oversized actor is refused before the transaction opens; an evidence insert failure rolls the publication back.",
-      "record": "Current catalog/overlay rows keep their actor and are still replaced or cascaded. catalog_change_evidence (migration 22) has no foreign key and keeps one row per publication: action, event/operation UUIDs, actor subject, Connection ID, prior/new catalog revision, the overlay revision the catalog was compiled from, the outbox row's shared revision and committed_at. A stale catalog or overlay revision, a conflict or a limit writes none.",
+      "record": "Current catalog/overlay rows keep their actor and are still replaced or cascaded. catalog_change_evidence (migration 23) has no foreign key and keeps one row per publication: action, event/operation UUIDs, actor subject, Connection ID, prior/new catalog revision, the overlay revision the catalog was compiled from, the outbox row's shared revision and committed_at. A stale catalog or overlay revision, a conflict or a limit writes none.",
       "actor": "actor_user_id (the authenticated principal subject, 1 to 4096 bytes, the principal bound) survives replacement and Connection deletion. Every catalog writer is an admin endpoint. Issuer, auth mode and a keyed safe actor reference are still absent, as for Connection deletion.",
       "identity": "Generated event/operation UUIDs; catalog.mcp.publish, catalog.openapi.publish, catalog.overlay.replace or catalog.overlay.delete, derived from the write; the catalog revision transition of the connection_catalog outbox row (its 0 stored as NULL), overlay revision and shared revision. Catalog revisions restart when a Connection re-enters a managed kind, so evidence is ordered by security revision. No client-bound operation ID.",
       "delivery": "post_commit_telemetry",
@@ -742,7 +750,7 @@
           "anchor": "async fn record_catalog_change_evidence("
         },
         {
-          "path": "gateway/src/storage/migrations/0022_document_and_catalog_change_evidence.sql",
+          "path": "gateway/src/storage/migrations/0023_document_and_catalog_change_evidence.sql",
           "anchor": "CREATE TABLE greengateway.catalog_change_evidence ("
         }
       ],
@@ -1670,7 +1678,7 @@
       ],
       "entrypoints": [],
       "boundary": "import-standalone apply is offline and commits each section separately. Policy/tools activation reuse document transactions; Connection/token imports preserve state and intentionally do not replay old outbox entries.",
-      "record": "Imported durable state and policy/tools activation records; each activation also writes one configuration.import document_change_evidence row (migration 22), which the import's validation counts. JSON stdout report carries section counts/checksums. The entire import/report has no single transaction or immutable operator-operation ledger.",
+      "record": "Imported durable state and policy/tools activation records; each activation also writes one configuration.import document_change_evidence row (migration 23), which the import's validation counts. JSON stdout report carries section counts/checksums. The entire import/report has no single transaction or immutable operator-operation ledger.",
       "actor": "IMPORT_ACTOR marks migration provenance, recorded as a system actor (auth mode system) on the activation evidence; historic actors retained for imported policy history. It is not authenticated human attribution.",
       "identity": "Natural-key idempotence per section and canonical checksums support resume; report has no persisted whole-import operation ID.",
       "delivery": "operator_output",

@@ -25,7 +25,7 @@
 //! 5. The pointer advances (or is initialized under `ON CONFLICT DO
 //!    NOTHING`, whose zero-row result is the initialize race's loser).
 //! 6. One `security_outbox` row records the change with identifiers and
-//!    revisions only, and one `document_change_evidence` row (migration 22,
+//!    revisions only, and one `document_change_evidence` row (migration 23,
 //!    issue #425 PR 2c) records who made it and which operation it was:
 //!    the actor's kind, subject, issuer and auth mode, the action, fresh
 //!    event and operation IDs, the prior and new versions and the shared
@@ -111,7 +111,7 @@ fn classify_query(error: tokio_postgres::Error, operation: &'static str) -> Repo
 /// The classified operation label of the evidence append and its refusals.
 const OPERATION_DOCUMENT_EVIDENCE: &str = "document_change_evidence_append";
 
-/// The longest subject and issuer migration 22 accepts. They are exactly the
+/// The longest subject and issuer migration 23 accepts. They are exactly the
 /// principal bounds authentication enforces, so evidence never refuses a
 /// principal a validator produced; the assertions keep the immutable SQL
 /// bounds and the Rust bounds from drifting apart silently.
@@ -126,7 +126,7 @@ const _: () =
 /// is refused before the transaction writes anything rather than committed
 /// anonymously: an empty or oversized subject or issuer, or an action that
 /// cannot describe this resource. An authenticated principal and every
-/// shipped call site satisfy it; migration 22's CHECKs are the backstop.
+/// shipped call site satisfy it; migration 23's CHECKs are the backstop.
 fn validate_change(
     resource: DocumentResource,
     change: &DocumentChange<'_>,

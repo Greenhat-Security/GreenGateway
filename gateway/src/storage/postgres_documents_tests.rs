@@ -21,7 +21,7 @@ use crate::storage::{
     PolicyControlPlane, ToolControlPlane,
 };
 
-const MIGRATION_22: &str = include_str!("migrations/0022_document_and_catalog_change_evidence.sql");
+const MIGRATION_23: &str = include_str!("migrations/0023_document_and_catalog_change_evidence.sql");
 
 const ALL_ACTIONS: [DocumentAction; 9] = [
     DocumentAction::PolicyPublish,
@@ -35,19 +35,19 @@ const ALL_ACTIONS: [DocumentAction; 9] = [
     DocumentAction::ConfigurationImport,
 ];
 
-/// The quoted values of the CHECK that follows `column` in migration 22's
+/// The quoted values of the CHECK that follows `column` in migration 23's
 /// `document_change_evidence` definition.
 fn document_check_values(column: &str) -> BTreeSet<String> {
-    let table = MIGRATION_22
+    let table = MIGRATION_23
         .split("CREATE TABLE greengateway.document_change_evidence")
         .nth(1)
         .and_then(|rest| rest.split("CREATE TABLE").next())
-        .expect("migration 22 defines document_change_evidence");
+        .expect("migration 23 defines document_change_evidence");
     let check = table
         .split(&format!("{column} IN ("))
         .nth(1)
         .and_then(|rest| rest.split(')').next())
-        .unwrap_or_else(|| panic!("migration 22 constrains {column}"));
+        .unwrap_or_else(|| panic!("migration 23 constrains {column}"));
     check
         .split(',')
         .map(|value| value.trim().trim_matches('\'').to_owned())
@@ -120,10 +120,10 @@ fn actor_vocabulary_and_bounds_are_the_migrations() {
         document_check_values("actor_kind"),
         BTreeSet::from(["principal".to_owned(), "system".to_owned()])
     );
-    assert!(MIGRATION_22.contains(&format!(
+    assert!(MIGRATION_23.contains(&format!(
         "octet_length(actor_user_id) BETWEEN 1 AND {EVIDENCE_ACTOR_MAX_BYTES}"
     )));
-    assert!(MIGRATION_22.contains(&format!(
+    assert!(MIGRATION_23.contains(&format!(
         "octet_length(actor_issuer) BETWEEN 1 AND {EVIDENCE_ISSUER_MAX_BYTES}"
     )));
 }

@@ -184,6 +184,13 @@ impl PostgresPolicyStore {
         SecurityRevisionSource::new(self.pool.clone())
     }
 
+    /// The policy draft store over this store's pool (issue #243, slice 9).
+    /// Drafts are not part of the control plane; they share its pool and
+    /// nothing else.
+    pub fn draft_store(&self) -> super::postgres_policy_drafts::PostgresPolicyDraftStore {
+        super::postgres_policy_drafts::PostgresPolicyDraftStore::new(self.pool.clone())
+    }
+
     /// Outbox entries after a revision, oldest-first. The durable half of
     /// reconciliation: correctness never depends on notifications, only on
     /// these rows plus the revision counter.

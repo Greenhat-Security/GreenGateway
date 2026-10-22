@@ -1,5 +1,5 @@
 //! What a policy or tools document commit's durable evidence says about it
-//! (issue #425, PR 2c): the closed action vocabulary of migration 22's
+//! (issue #425, PR 2c): the closed action vocabulary of migration 23's
 //! `document_change_evidence` and, in cluster mode, the actor it records.
 //!
 //! The rows are written by the transaction they describe
@@ -10,7 +10,7 @@
 
 /// The operation a policy or tools document commit performed, in the proposed
 /// authority-event vocabulary (`docs/schemas/authority_event.v1.schema.json`).
-/// Each code is exactly one of the values migration 22's `action` CHECK
+/// Each code is exactly one of the values migration 23's `action` CHECK
 /// accepts.
 ///
 /// Standalone policy writes pass one too, and ignore it: their file and
@@ -56,7 +56,7 @@ impl DocumentAction {
     }
 
     /// Whether this action can describe a commit of the document whose
-    /// outbox `resource_type` is `resource_type`. Migration 22 enforces the
+    /// outbox `resource_type` is `resource_type`. Migration 23 enforces the
     /// same pairing; checking it first turns a caller's mistake into a
     /// refusal before any transaction opens.
     pub(crate) fn applies_to(self, resource_type: &str) -> bool {

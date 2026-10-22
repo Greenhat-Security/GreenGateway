@@ -1,4 +1,4 @@
--- Migration 22: durable policy, tools and catalog change evidence (issue
+-- Migration 23: durable policy, tools and catalog change evidence (issue
 -- #425, PR 2c).
 --
 -- A policy or tools commit already writes an immutable document version

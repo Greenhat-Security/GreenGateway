@@ -18,7 +18,7 @@ and JWT revokes, and the same token evidence table inside the standalone SQLite 
 database. PR 3 adds migration 21's authority-event journal, which every PostgreSQL
 producer of those three evidence tables appends to in the same transaction, and an
 opt-in dispatcher that delivers it behind a persisted cursor. The third PR 2 slice
-adds migration 22's `greengateway.document_change_evidence`, written by every
+adds migration 23's `greengateway.document_change_evidence`, written by every
 PostgreSQL policy and tools document commit, and `greengateway.catalog_change_evidence`,
 written by every managed MCP and OpenAPI catalog publication; neither is a journal
 source yet, so the dispatcher does not deliver them. None of them implements or
@@ -108,6 +108,15 @@ grant authority. They are outside the operation matrix; their cleanup can still
 affect evidence retention. The inventory includes JWT expiry and Connection
 cascade consequences explicitly.
 
+Server-side policy drafts (#243) are outside the matrix for the same reason:
+creating, editing, re-pinning or deleting one changes no enforcement, advances
+no revision and writes no outbox row. Publishing one does change authority, and
+it is `policy.publish`: `policy_draft_publish_endpoint` commits through
+`persist_policy_mutation` exactly as `PUT /policy` does, so it is listed as an
+entrypoint of both policy rows and inherits their boundaries and gaps. Marking
+the draft published afterwards is a separate draft-store write, not part of the
+authority transaction.
+
 Admin sessions (#424) are in the matrix as `admin_session.grant` and
 `admin_session.withdraw`. In standalone mode, `ADMIN_SESSION_MODE=standalone_memory`
 keeps each session in a bounded process-local map: a grant follows a successful
@@ -139,14 +148,14 @@ define a **proposed** safe projection. Current `security_outbox` rows,
 `connection_change_evidence` rows and `audit_event.v0` events do not already
 satisfy this schema, and neither do migration 18's `service_token_change_evidence`
 and `jwt_revocation_evidence` rows, migration 19's `admin_session_evidence` rows,
-migration 22's `document_change_evidence` and `catalog_change_evidence` rows or
+migration 23's `document_change_evidence` and `catalog_change_evidence` rows or
 the standalone token evidence rows: the evidence rows hold the internal actor
 ID, not a keyed safe reference, and no `authority_id`. Since PR 3 the dispatcher
 delivers the journaled evidence with keyed references under a persisted
 `authority_id`, but as `authority_event_delivery.v1` ([Durable delivery](#durable-delivery)),
 not as this schema: the journaled evidence records neither the actor's issuer nor
 its auth mode, and a v1 event cannot be produced faithfully without both. Migration
-22's document rows are the first to carry the actor's kind, issuer and auth mode,
+23's document rows are the first to carry the actor's kind, issuer and auth mode,
 the facts the schema's `actor` object projects, but they are not journaled yet.
 
 Revision transitions are operation-specific. Resource creation (`connection.create`,
@@ -462,7 +471,7 @@ Not covered by PR 3, and still open:
 - **The v1 contract.** Issuer, auth mode, actor kind and caller-bound operation
   identity at the store boundary, after which the delivered record can become
   `authority_event.v1`.
-- **Policy, tools and catalog evidence.** Migration 22's `document_change_evidence`
+- **Policy, tools and catalog evidence.** Migration 23's `document_change_evidence`
   and `catalog_change_evidence` rows exist but are not journal sources, so they are
   retained and not delivered. Journaling them adds the journal's capacity
   reservation to every policy, tools and catalog commit, and to the first-boot
@@ -506,7 +515,7 @@ Not covered by PR 3, and still open:
    operation identity, and token issue evidence (`created_by` remains its only
    actor record).
 3. **Shared documents/catalog metadata (landed).** The shared document core
-   (`postgres_documents::commit_in`) now writes one migration 22
+   (`postgres_documents::commit_in`) now writes one migration 23
    `document_change_evidence` row beside the outbox row of every policy and tools
    commit, so suggestion acceptance, which runs it inside its own transaction,
    records its evidence there too. Each handler names its operation explicitly
@@ -525,8 +534,8 @@ Not covered by PR 3, and still open:
    lane holds write nothing; an empty or oversized actor, or an action that cannot
    describe the resource, is refused before anything is written. A tools commit
    followed by a failed local install keeps its evidence, because the commit is
-   durable. Migration 22 moves the serving contract from exactly schema 21 to
-   exactly schema 22, a coordinated drain/migrate/restart. PostgreSQL-gated tests
+   durable. Migration 23 moves the serving contract from exactly schema 22 to
+   exactly schema 23, a coordinated drain/migrate/restart. PostgreSQL-gated tests
    cover attribution of each operation and the system actors, outbox agreement,
    refusals that write nothing, forced evidence-insert failure and its rollback
    (including inside a suggestion acceptance), principal bounds, survival after

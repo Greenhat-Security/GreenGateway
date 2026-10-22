@@ -767,7 +767,7 @@ impl PostgresConnectionStore {
     /// per-entry managed-tool dependency replacement, and -- the cluster
     /// addition -- the shared security revision, the connections
     /// high-water mark, the outbox row and the replacement's durable
-    /// evidence (`catalog_change_evidence`, migration 22), all in the one
+    /// evidence (`catalog_change_evidence`, migration 23), all in the one
     /// transaction. The evidence outlives the catalog row it describes,
     /// which the next replacement deletes and a Connection delete cascades;
     /// a refused or failed replacement writes none, and a replacement whose
@@ -1569,7 +1569,7 @@ impl PostgresConnectionStore {
     /// The OpenAPI catalog replacement every OpenAPI publication goes
     /// through: a registration, a refresh, and an overlay put or delete.
     /// Like the MCP replacement it commits its durable evidence
-    /// (`catalog_change_evidence`, migration 22) in the same transaction,
+    /// (`catalog_change_evidence`, migration 23) in the same transaction,
     /// named by what the write did to the overlay: an overlay put is
     /// `catalog.overlay.replace`, an overlay delete `catalog.overlay.delete`,
     /// and anything else (no overlay change, or only refreshed source
@@ -4967,7 +4967,7 @@ async fn bump_connection_state(
 /// anything else.
 const EVIDENCE_ACTION_DELETE: &str = "connection.delete";
 
-/// The longest actor migrations 16 and 22 accept. It is exactly the
+/// The longest actor migrations 16 and 23 accept. It is exactly the
 /// principal subject bound authentication enforces, so evidence never
 /// refuses a principal a validator produced; the assertion keeps the
 /// immutable SQL bounds and the Rust bound from drifting apart silently.
@@ -4980,7 +4980,7 @@ const OPERATION_CHANGE_EVIDENCE: &str = "change_evidence_append";
 /// An unattributable change has no evidence to record, so it is refused
 /// before any transaction opens rather than committed anonymously. An
 /// authenticated principal always satisfies this; the CHECKs in
-/// migrations 16 and 22 are the backstop.
+/// migrations 16 and 23 are the backstop.
 fn validate_evidence_actor(actor_user_id: &str) -> Result<(), ConnectionStoreError> {
     if actor_user_id.is_empty() || actor_user_id.len() > EVIDENCE_ACTOR_MAX_BYTES {
         return Err(ConnectionStoreError::Validation {
@@ -5061,7 +5061,7 @@ async fn record_change_evidence(
 }
 
 /// The closed action vocabulary of `catalog_change_evidence` (migration
-/// 22), in the same proposed authority-event operation codes as
+/// 23), in the same proposed authority-event operation codes as
 /// [`EVIDENCE_ACTION_DELETE`]; the migration's CHECK refuses anything else.
 const CATALOG_EVIDENCE_ACTION_MCP_PUBLISH: &str = "catalog.mcp.publish";
 const CATALOG_EVIDENCE_ACTION_OPENAPI_PUBLISH: &str = "catalog.openapi.publish";

@@ -11,7 +11,7 @@ an exit code. Implementation is grouped by responsibility:
 | `api_contracts` | Request/response types and application error contracts |
 | `probes` | Health/readiness, metrics and proxy fallback |
 | `admin_identity`, `admin_authorization` | Admin login, capabilities and final permission checks |
-| `admin_connections`, `admin_tools`, `admin_tokens`, `admin_policy` | Domain-specific handlers and mutations |
+| `admin_connections`, `admin_tools`, `admin_tokens`, `admin_policy`, `admin_policy_drafts` | Domain-specific handlers and mutations; policy drafts publish only through `admin_policy`'s mutation path |
 | `admin_observability`, `admin_events` | Audit, traffic, signals, suggestions and change telemetry |
 | `admin_responses`, `admin_ui` | Shared error mapping and embedded UI serving |
 
